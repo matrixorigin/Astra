@@ -5,7 +5,7 @@
 //! natural-language plan editing via LLM.
 
 use super::*;
-use crate::sse_utils::collect_sse_text;
+use crate::sse_utils::collect_sse_with_preview;
 use astra_runtime::plan::PlanCommand;
 use astra_runtime::plan;
 use astra_runtime::plan::progress_bar_segments;
@@ -71,18 +71,25 @@ pub(super) async fn enrich_with_templates(
     }
 }
 
-pub(super) fn eprint_plan_json_parse_failed(full_text: &str, err: &str) {
-    eprintln!("  {} Failed to parse plan: {}", theme::icon_err(), err);
-    let prev = plan::plan_response_parse_error_preview(full_text, 10, 700);
-    if !prev.is_empty() {
-        eprintln!("  {}", "Model reply:".dim());
-        for line in prev.lines() {
-            eprintln!("    {}", line.dim());
-        }
-    }
+pub(super) fn eprint_plan_json_parse_failed(full_text: &str, _err: &str) {
+    eprintln!(
+        "  {} Plan response was not structured JSON — showing as text:",
+        theme::icon_warn()
+    );
+    eprintln!();
+
+    // Render the model's reply as markdown so the user at least gets useful output
+    let tw = crossterm::terminal::size()
+        .map(|(w, _)| w as usize)
+        .unwrap_or(80);
+    let mut md = super::streaming_md::StreamingMarkdown::new(tw);
+    md.push(full_text);
+    md.finish();
+    eprintln!();
+
     eprintln!(
         "  {}",
-        "Tip: Plan decomposition expects JSON only. For git/files without JSON plans, exit plan mode (`exit`) or `/plan off` and use normal chat with tools."
+        "Tip: try rephrasing, or type `exit` to leave plan mode and use normal chat."
             .dim()
     );
 }
@@ -505,9 +512,7 @@ pub async fn handle_plan_mode_input(
 
         match resp {
             Ok(r) if r.status().is_success() => {
-                let spinner = effects::Spinner::start("Generating plan".into());
-                let sse_result = collect_sse_text(r, false).await;
-                spinner.stop_clear();
+                let sse_result = collect_sse_with_preview(r).await;
                 let full_text = sse_result.text;
 
                 match parse_plan_response(&full_text) {
@@ -723,9 +728,7 @@ pub async fn handle_plan_mode_input(
 
     match resp {
         Ok(r) if r.status().is_success() => {
-            let spinner = effects::Spinner::start("Regenerating plan".into());
-            let sse_result = collect_sse_text(r, false).await;
-            spinner.stop_clear();
+            let sse_result = collect_sse_with_preview(r).await;
 
             if sse_result.text.is_empty() {
                 if sse_result.event_count == 0 {
@@ -1311,9 +1314,7 @@ async fn handle_goal_submission(
 
     match resp {
         Ok(r) if r.status().is_success() => {
-            let spinner = effects::Spinner::start("Generating plan".into());
-            let sse_result = collect_sse_text(r, false).await;
-            spinner.stop_clear();
+            let sse_result = collect_sse_with_preview(r).await;
             let full_text = sse_result.text;
 
             if let Some(questions) = detect_clarification_questions(&full_text) {

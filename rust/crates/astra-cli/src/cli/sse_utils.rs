@@ -233,6 +233,110 @@ pub async fn stream_sse_markdown(resp: reqwest::Response) -> SseTextResult {
     result
 }
 
+/// Collect SSE text while showing a live thinking-style preview pane.
+///
+/// Feeds each `text_delta` chunk into a [`ThinkingPreviewPane`] so the user
+/// sees the LLM's output streaming in real-time. When the stream ends the
+/// pane is cleared and a one-line summary is printed (word count + elapsed).
+///
+/// Returns the accumulated text (same as `collect_sse_text`) so callers can
+/// parse it afterwards (e.g. plan JSON extraction).
+pub async fn collect_sse_with_preview(resp: reqwest::Response) -> SseTextResult {
+    use super::effects::{ThinkingPreviewPane, thinking_viewport_rows};
+
+    let tw = crossterm::terminal::size()
+        .map(|(w, _)| w as usize)
+        .unwrap_or(80);
+    let rows = thinking_viewport_rows();
+    let mut pane = ThinkingPreviewPane::new(rows, tw);
+
+    let mut result = SseTextResult {
+        text: String::new(),
+        event_count: 0,
+        event_types: Vec::new(),
+    };
+    let mut buffer = String::new();
+    let mut stream = resp.bytes_stream();
+
+    while let Some(chunk) = stream.next().await {
+        let Ok(bytes) = chunk else { break };
+        buffer.push_str(&String::from_utf8_lossy(&bytes));
+
+        if buffer.len() > MAX_SSE_BUFFER {
+            buffer.clear();
+        }
+
+        while let Some(event_end) = buffer.find("\n\n") {
+            let event_str = buffer[..event_end].to_string();
+            buffer = buffer[event_end + 2..].to_string();
+
+            for line in event_str.lines() {
+                if let Some(data) = line.strip_prefix("data: ") {
+                    result.event_count += 1;
+                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
+                        let event_type = json
+                            .get("type")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown");
+
+                        if !result.event_types.contains(&event_type.to_string()) {
+                            result.event_types.push(event_type.to_string());
+                        }
+
+                        match event_type {
+                            "text_delta" => {
+                                if let Some(content) =
+                                    json.get("content").and_then(|v| v.as_str())
+                                {
+                                    result.text.push_str(content);
+                                    pane.push_chunk(content);
+                                }
+                            }
+                            "error" => {
+                                if let Some(msg) = json
+                                    .get("message")
+                                    .or_else(|| json.get("error"))
+                                    .and_then(|v| v.as_str())
+                                {
+                                    eprintln!(
+                                        "\r  {} Server error: {}",
+                                        theme::icon_err(),
+                                        msg
+                                    );
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Drain remaining buffer
+    for line in buffer.lines() {
+        if let Some(data) = line.strip_prefix("data: ") {
+            result.event_count += 1;
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(data)
+                && json.get("type").and_then(|v| v.as_str()) == Some("text_delta")
+                && let Some(content) = json.get("content").and_then(|v| v.as_str())
+            {
+                result.text.push_str(content);
+                pane.push_chunk(content);
+            }
+        }
+    }
+
+    // Show summary, then clear the preview
+    let summary = pane.summary_line();
+    pane.clear();
+    if !summary.is_empty() {
+        eprintln!("{}", summary);
+    }
+
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

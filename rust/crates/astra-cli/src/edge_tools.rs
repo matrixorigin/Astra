@@ -1440,13 +1440,8 @@ pub struct ToolExecutor {
     tasks: std::sync::Mutex<Vec<SessionTask>>,
     /// Counter for generating unique task IDs within the session.
     task_id_counter: std::sync::atomic::AtomicU32,
-<<<<<<< Updated upstream
     /// Optional agent spawning context for the `spawn_agent` tool.
     pub spawn_context: Option<agent_spawning::SpawnAgentContext>,
-=======
-    /// Context for spawning sub-agents. When set, `spawn_agent` tool is functional.
-    spawn_context: Option<agent_spawning::SpawnAgentContext>,
->>>>>>> Stashed changes
 }
 
 /// A task tracked within the current CLI session.
