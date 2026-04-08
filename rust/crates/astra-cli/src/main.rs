@@ -3443,12 +3443,33 @@ enum PlanMonitorOutcome {
     Finished,
 }
 
+/// Wrapper enum for the different spinner types used in plan mode.
+/// Provides a uniform interface so the plan monitor can swap spinner styles.
+enum PlanSpinner {
+    /// Plan-specific spinner: `[subtask] Ns Label ⣾`
+    Activity(effects::PlanActivitySpinner),
+    /// Chat-style TTFT spinner: `Ns Waiting for stream ⣾`
+    Ttft(effects::TtftWaitLineSpinner),
+    /// Chat-style tool spinner: `Ns Running… description ⣾`
+    Tool(effects::ToolRunningLineSpinner),
+}
+
+impl PlanSpinner {
+    fn stop_clear(self) {
+        match self {
+            Self::Activity(s) => s.stop_clear(),
+            Self::Ttft(s) => s.stop_clear(),
+            Self::Tool(s) => s.stop_clear(),
+        }
+    }
+}
+
 /// Drain plan updates from the executor channel and display them via
 /// `eprintln!`. Returns the monitor outcome so the caller can decide
 /// whether to keep polling.
 fn display_plan_updates_live(
     state: &mut ReplState,
-    plan_spinner: &mut Option<effects::PlanActivitySpinner>,
+    plan_spinner: &mut Option<PlanSpinner>,
     current_subtask_tag: &mut String,
 ) -> PlanMonitorOutcome {
     use plan_executor::PlanUpdate;
@@ -3457,7 +3478,7 @@ fn display_plan_updates_live(
     /// Finish any in-flight markdown stream: clear spinner, finalize renderer, newline.
     fn finalize_plan_stream(
         in_stream: &mut bool,
-        spinner: &mut Option<effects::PlanActivitySpinner>,
+        spinner: &mut Option<PlanSpinner>,
         md: &mut Option<streaming_md::StreamingMarkdown>,
         thinking_pane: &mut Option<effects::ThinkingPreviewPane>,
     ) {
@@ -3482,7 +3503,7 @@ fn display_plan_updates_live(
 
     /// Clear active plan spinner (if any), finalize token/md stream, then print a line.
     fn print_plan_monitor_line(
-        spinner: &mut Option<effects::PlanActivitySpinner>,
+        spinner: &mut Option<PlanSpinner>,
         in_stream: &mut bool,
         md: &mut Option<streaming_md::StreamingMarkdown>,
         thinking_pane: &mut Option<effects::ThinkingPreviewPane>,
@@ -3501,9 +3522,14 @@ fn display_plan_updates_live(
     };
 
     while let Some(update) = handle.try_recv() {
-        // Determine the message to display and whether to start a spinner after.
-        // `post_spinner` is (label, should_start_spinner_after_printing).
-        let (msg, post_spinner): (String, Option<&str>) = match update {
+        // Determine the message to display and what spinner to start after printing.
+        enum PostSpinner {
+            None,
+            Ttft,
+            Tool(String),
+            Activity(String),
+        }
+        let (msg, post_spinner): (String, PostSpinner) = match update {
             PlanUpdate::SubtaskStarted {
                 id,
                 title,
@@ -3514,7 +3540,7 @@ fn display_plan_updates_live(
                 *current_subtask_tag = id;
                 (
                     format!("\n▸  [{index}/{total}] {title}"),
-                    Some("Waiting for model"),
+                    PostSpinner::Ttft,
                 )
             }
             PlanUpdate::SubtaskCompleted {
@@ -3527,9 +3553,9 @@ fn display_plan_updates_live(
                     .map(|d| format!(" ({})", format_duration_short(d)))
                     .unwrap_or_default();
                 if verification_passed {
-                    (format!("  ✅ {id}{dur}"), None)
+                    (format!("  ✅ {id}{dur}"), PostSpinner::None)
                 } else {
-                    (format!("  ⚠ {id} — verification failed{dur}"), None)
+                    (format!("  ⚠ {id} — verification failed{dur}"), PostSpinner::None)
                 }
             }
             PlanUpdate::SubtaskTurnResult {
@@ -3563,8 +3589,8 @@ fn display_plan_updates_live(
                 let eta_str = eta
                     .map(|d| format!(" — ETA ~{}", format_duration_short(d)))
                     .unwrap_or_default();
-                // Feed ETA into the active spinner so it shows elapsed/~ETA
-                if let Some(spinner) = plan_spinner.as_ref() {
+                // Feed ETA into the active spinner (only PlanActivitySpinner supports it)
+                if let Some(PlanSpinner::Activity(spinner)) = plan_spinner.as_ref() {
                     spinner.set_eta_secs(eta.map(|d| d.as_secs()).unwrap_or(0));
                 }
                 (
@@ -3572,7 +3598,7 @@ fn display_plan_updates_live(
                         "  📊 {done}/{total} ({pct}%) — {}{eta_str}",
                         format_duration_short(elapsed),
                     ),
-                    None,
+                    PostSpinner::None,
                 )
             }
             PlanUpdate::PlanCompleted { pct, elapsed } => {
@@ -3648,11 +3674,11 @@ fn display_plan_updates_live(
                         "\n⏸  Plan paused — {pct}% done, {remaining} remaining ({})",
                         format_duration_short(elapsed),
                     ),
-                    None,
+                    PostSpinner::None,
                 )
             }
             PlanUpdate::GlobalVerificationFailed => {
-                ("  ⚠ Global verification failed".to_string(), None)
+                ("  ⚠ Global verification failed".to_string(), PostSpinner::None)
             }
             PlanUpdate::JournalEvent(event) => {
                 // Write journal event to the REPL-owned journal writer
@@ -3698,12 +3724,12 @@ fn display_plan_updates_live(
                 if retries_exhausted {
                     (
                         format!("  ⚠ {id} — verification failed{attempt_str}{hint_str}"),
-                        None,
+                        PostSpinner::None,
                     )
                 } else {
                     (
                         format!("  ↻ {id} — verification failed{attempt_str}{hint_str}, retrying…"),
-                        Some("Waiting for model"),
+                        PostSpinner::Ttft,
                     )
                 }
             }
@@ -3712,7 +3738,7 @@ fn display_plan_updates_live(
                 match event {
                     StreamEvent::ToolStarted { name, description } => (
                         format!("  ⚡ {name} {description}"),
-                        Some("running-tool"), // Placeholder — replaced below
+                        PostSpinner::Tool(description),
                     ),
                     StreamEvent::ToolCompleted {
                         name,
@@ -3723,16 +3749,15 @@ fn display_plan_updates_live(
                         let dur = format_duration_ms(duration_ms);
                         let icon = if status == "error" { "✗" } else { "✓" };
                         let summary = output_summary.map(|s| format!("  {s}")).unwrap_or_default();
-                        (format!("  {icon} {name} ({dur}){summary}"), None)
+                        (format!("  {icon} {name} ({dur}){summary}"), PostSpinner::None)
                     }
                     StreamEvent::WaitingForModel => {
                         finalize_plan_stream(&mut state.plan_in_token_stream, plan_spinner, &mut state.plan_md_renderer, &mut state.plan_thinking_pane);
                         if let Some(s) = plan_spinner.take() {
                             s.stop_clear();
                         }
-                        *plan_spinner = Some(effects::PlanActivitySpinner::start(
-                            current_subtask_tag,
-                            "Waiting for model",
+                        *plan_spinner = Some(PlanSpinner::Ttft(
+                            effects::TtftWaitLineSpinner::start(),
                         ));
                         continue;
                     }
@@ -3741,9 +3766,11 @@ fn display_plan_updates_live(
                         if let Some(s) = plan_spinner.take() {
                             s.stop_clear();
                         }
-                        *plan_spinner = Some(effects::PlanActivitySpinner::start(
-                            current_subtask_tag,
-                            "Model responding",
+                        *plan_spinner = Some(PlanSpinner::Activity(
+                            effects::PlanActivitySpinner::start(
+                                current_subtask_tag,
+                                "Model responding",
+                            ),
                         ));
                         continue;
                     }
@@ -3760,9 +3787,11 @@ fn display_plan_updates_live(
                             state.plan_thinking_pane = Some(effects::ThinkingPreviewPane::new(rows, tw));
                         } else {
                             // Fallback: spinner-only for non-terminal
-                            *plan_spinner = Some(effects::PlanActivitySpinner::start(
-                                current_subtask_tag,
-                                "Thinking",
+                            *plan_spinner = Some(PlanSpinner::Activity(
+                                effects::PlanActivitySpinner::start(
+                                    current_subtask_tag,
+                                    "Thinking",
+                                ),
                             ));
                         }
                         continue;
@@ -3847,17 +3876,23 @@ fn display_plan_updates_live(
         print_plan_monitor_line(plan_spinner, &mut state.plan_in_token_stream, &mut state.plan_md_renderer, &mut state.plan_thinking_pane, msg);
 
         // Optionally start a new spinner after the printed line
-        if let Some(label) = post_spinner {
-            // For tool-started events, show "Running <tool>" instead of placeholder
-            let spinner_label = if label == "running-tool" {
-                "Running tool"
-            } else {
-                label
-            };
-            *plan_spinner = Some(effects::PlanActivitySpinner::start(
-                current_subtask_tag,
-                spinner_label,
-            ));
+        match post_spinner {
+            PostSpinner::Ttft => {
+                *plan_spinner = Some(PlanSpinner::Ttft(
+                    effects::TtftWaitLineSpinner::start(),
+                ));
+            }
+            PostSpinner::Tool(desc) => {
+                *plan_spinner = Some(PlanSpinner::Tool(
+                    effects::ToolRunningLineSpinner::start(desc),
+                ));
+            }
+            PostSpinner::Activity(label) => {
+                *plan_spinner = Some(PlanSpinner::Activity(
+                    effects::PlanActivitySpinner::start(current_subtask_tag, &label),
+                ));
+            }
+            PostSpinner::None => {}
         }
     }
     // Tick thinking pane header (elapsed time) after draining all events
@@ -3965,7 +4000,7 @@ fn flush_plan_updates_between_prompts(state: &mut ReplState) -> bool {
         return false;
     }
 
-    let mut plan_spinner: Option<effects::PlanActivitySpinner> = None;
+    let mut plan_spinner: Option<PlanSpinner> = None;
     let mut current_subtask_tag = state.current_plan_subtask_id.clone().unwrap_or_default();
     let outcome = display_plan_updates_live(state, &mut plan_spinner, &mut current_subtask_tag);
     if let Some(spinner) = plan_spinner.take() {
@@ -3975,7 +4010,7 @@ fn flush_plan_updates_between_prompts(state: &mut ReplState) -> bool {
 }
 
 /// Clear REPL state when the plan update channel closed without `PlanCompleted` / `PlanError`.
-fn cleanup_orphan_plan_executor(state: &mut ReplState, plan_spinner: &mut Option<effects::PlanActivitySpinner>) {
+fn cleanup_orphan_plan_executor(state: &mut ReplState, plan_spinner: &mut Option<PlanSpinner>) {
     if let Some(s) = plan_spinner.take() {
         s.stop_clear();
     }
@@ -4002,7 +4037,7 @@ fn cleanup_orphan_plan_executor(state: &mut ReplState, plan_spinner: &mut Option
 /// at the prompt while a plan is running. First Ctrl-C sends Pause; a second
 /// Ctrl-C within two seconds sends Cancel. Approval prompts are read from stdin inline.
 async fn run_blocking_plan_monitor(state: &mut ReplState) {
-    let mut plan_spinner: Option<effects::PlanActivitySpinner> = None;
+    let mut plan_spinner: Option<PlanSpinner> = None;
     let mut current_subtask_tag = state.current_plan_subtask_id.clone().unwrap_or_default();
     let mut last_ctrl_c: Option<std::time::Instant> = None;
     const CTRL_C_CANCEL_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
