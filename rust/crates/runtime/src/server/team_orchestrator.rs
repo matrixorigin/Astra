@@ -80,6 +80,8 @@ pub struct TeamExecutionOrchestrator {
     profile_registry: Arc<RwLock<AgentProfileRegistry>>,
     config: OrchestratorConfig,
     repo_lock: RepoLock,
+    /// Optional conflict resolver for LLM-assisted merge conflict resolution.
+    conflict_resolver: Option<Arc<dyn super::conflict_resolver::ConflictResolver>>,
 }
 
 impl TeamExecutionOrchestrator {
@@ -97,12 +99,22 @@ impl TeamExecutionOrchestrator {
             profile_registry,
             config,
             repo_lock: super::worktree_isolation::new_repo_lock(),
+            conflict_resolver: None,
         }
     }
 
     /// Set a shared repository lock for concurrent team executions.
     pub fn with_repo_lock(mut self, lock: RepoLock) -> Self {
         self.repo_lock = lock;
+        self
+    }
+
+    /// Enable LLM-assisted merge conflict resolution.
+    pub fn with_conflict_resolver(
+        mut self,
+        resolver: Arc<dyn super::conflict_resolver::ConflictResolver>,
+    ) -> Self {
+        self.conflict_resolver = Some(resolver);
         self
     }
 
@@ -185,7 +197,11 @@ impl TeamExecutionOrchestrator {
 
         // Create worktrees if isolated mode
         let mut worktree_mgr = repo_root.map(|root| {
-            WorktreeManager::new(root).with_repo_lock(self.repo_lock.clone())
+            let mut mgr = WorktreeManager::new(root).with_repo_lock(self.repo_lock.clone());
+            if let Some(ref resolver) = self.conflict_resolver {
+                mgr = mgr.with_conflict_resolver(resolver.clone(), task.to_string());
+            }
+            mgr
         });
 
         let agent_ids: Vec<String> = profiles.iter().map(|p| p.agent_id.clone()).collect();
