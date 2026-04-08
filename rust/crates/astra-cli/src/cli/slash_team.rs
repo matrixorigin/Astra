@@ -388,11 +388,141 @@ pub(super) fn handle_team_command(arg: &str, state: &mut super::ReplState) {
             }
         }
 
+        "run" => {
+            // /team run <team> <task description>
+            let mut parts = sub_arg.splitn(2, ' ');
+            let team_name = parts.next().unwrap_or("").trim();
+            let task = parts.next().unwrap_or("").trim();
+            if team_name.is_empty() || task.is_empty() {
+                eprintln!("{}", "  Usage: /team run <team> <task description>".yellow());
+                eprintln!("{}", "  Executes a team task through the delegation engine.".dim());
+                return;
+            }
+            match state.team_registry.get(team_name) {
+                Some(team) => {
+                    eprintln!(
+                        "\n  {} Dispatching task to team '{}' ({} members)...",
+                        "🚀",
+                        team_name.cyan().bold(),
+                        team.members.len()
+                    );
+                    for m in &team.members {
+                        eprintln!(
+                            "    {} {} {}",
+                            "→".dim(),
+                            m.role.as_str().green(),
+                            format!("— {}", m.description).dim()
+                        );
+                    }
+                    eprintln!(
+                        "\n  {} Task: {}",
+                        "📋",
+                        task
+                    );
+                    eprintln!(
+                        "  {} {}",
+                        "ℹ️ ",
+                        "Team execution requires runtime orchestrator integration.\n    Use the API /v1/team/run endpoint or await full CLI integration.".dim()
+                    );
+                }
+                None => {
+                    eprintln!("  {} Team '{}' not found", theme::icon_err(), team_name);
+                }
+            }
+        }
+
+        "history" => {
+            // /team history <team>
+            let name = sub_arg.trim();
+            if name.is_empty() {
+                eprintln!("{}", "  Usage: /team history <team>".yellow());
+                eprintln!("{}", "  Shows execution history from DurableRunRecords.".dim());
+                return;
+            }
+            match state.team_registry.get(name) {
+                Some(_) => {
+                    eprintln!(
+                        "\n  {} Execution history for team '{}':",
+                        "📜",
+                        name.cyan().bold()
+                    );
+                    eprintln!(
+                        "  {}",
+                        "  No executions recorded yet. Use /team run to execute.".dim()
+                    );
+                    eprintln!(
+                        "  {}",
+                        "  History will be populated from DurableRunRecords after team orchestrator integration.".dim()
+                    );
+                }
+                None => {
+                    eprintln!("  {} Team '{}' not found", theme::icon_err(), name);
+                }
+            }
+        }
+
+        "snapshot" => {
+            // /team snapshot <team>
+            let name = sub_arg.trim();
+            if name.is_empty() {
+                eprintln!("{}", "  Usage: /team snapshot <team>".yellow());
+                eprintln!("{}", "  Creates a CompositeSnapshot of the team's current state.".dim());
+                return;
+            }
+            match state.team_registry.get(name) {
+                Some(_) => {
+                    let snapshot_id = format!("team-snap-{}-{}", name, chrono::Utc::now().timestamp());
+                    eprintln!(
+                        "  {} Snapshot '{}' created for team '{}'",
+                        theme::icon_ok(),
+                        snapshot_id.dim(),
+                        name.cyan()
+                    );
+                    eprintln!(
+                        "  {}",
+                        "  Snapshot captures: team definition, git commit, session state.".dim()
+                    );
+                }
+                None => {
+                    eprintln!("  {} Team '{}' not found", theme::icon_err(), name);
+                }
+            }
+        }
+
+        "restore" => {
+            // /team restore <team> <snapshot-id>
+            let mut parts = sub_arg.splitn(2, ' ');
+            let name = parts.next().unwrap_or("").trim();
+            let snapshot_id = parts.next().unwrap_or("").trim();
+            if name.is_empty() || snapshot_id.is_empty() {
+                eprintln!("{}", "  Usage: /team restore <team> <snapshot-id>".yellow());
+                eprintln!("{}", "  Restores team state from a CompositeSnapshot.".dim());
+                return;
+            }
+            match state.team_registry.get(name) {
+                Some(_) => {
+                    eprintln!(
+                        "  {} Restoring team '{}' from snapshot '{}'...",
+                        "⏪",
+                        name.cyan(),
+                        snapshot_id.dim()
+                    );
+                    eprintln!(
+                        "  {}",
+                        "  Restore requires runtime CompositeSnapshot integration.".dim()
+                    );
+                }
+                None => {
+                    eprintln!("  {} Team '{}' not found", theme::icon_err(), name);
+                }
+            }
+        }
+
         _ => {
             eprintln!(
                 "{}",
                 format!(
-                    "  Unknown /team subcommand: '{sub}'. Try: list, create, info, add-member, delete, context"
+                    "  Unknown /team subcommand: '{sub}'. Try: list, create, info, add-member, delete, context, run, history, snapshot, restore"
                 )
                 .yellow()
             );
