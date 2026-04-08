@@ -52,6 +52,7 @@ pub(crate) mod decisions;
 pub(crate) mod events;
 pub mod jobs;
 pub mod marketplace;
+pub mod messaging;
 pub(crate) mod models;
 pub mod replay;
 pub mod sandbox;

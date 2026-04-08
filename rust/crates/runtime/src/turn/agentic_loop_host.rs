@@ -344,6 +344,12 @@ pub struct AgenticLoopState {
     /// hosts use this to re-inject recent file contents so the LLM retains
     /// awareness of recently-read code.
     pub recent_file_reads: Vec<(String, u32)>,
+
+    // ── Inter-agent messaging ──
+    /// Optional mailbox for receiving messages from other agents.
+    /// When set, incoming messages are drained at each turn start and
+    /// progress updates are sent to the parent at turn end.
+    pub mailbox: Option<crate::messaging::router::AgentMailbox>,
 }
 
 /// Consecutive same-category error turns before forcing a strategy change.
@@ -888,6 +894,55 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
         }
         state.remaining_turns = state.remaining_turns.saturating_sub(1);
         state.step_recorder.begin_turn(turn_index as u32);
+
+        // ─── Drain inter-agent mailbox ──────────────────────────────────
+        // Inject any pending messages from peer/parent agents as a system
+        // message so the LLM is aware of coordination context.
+        if let Some(ref mut mailbox) = state.mailbox {
+            let pending = mailbox.drain();
+            if !pending.is_empty() {
+                let mut parts = Vec::with_capacity(pending.len());
+                for msg in &pending {
+                    let from_label = &msg.from.agent_id;
+                    match &msg.payload {
+                        crate::messaging::types::MessagePayload::Text { content, .. } => {
+                            parts.push(format!("[{from_label}]: {content}"));
+                        }
+                        crate::messaging::types::MessagePayload::Progress {
+                            status, detail, ..
+                        } => {
+                            let extra = detail.as_deref().unwrap_or("");
+                            parts.push(format!("[{from_label} progress]: {status} {extra}"));
+                        }
+                        crate::messaging::types::MessagePayload::Request {
+                            request_type, ..
+                        } => {
+                            parts.push(format!(
+                                "[{from_label} request]: {request_type:?}"
+                            ));
+                        }
+                        crate::messaging::types::MessagePayload::Response {
+                            accepted, ..
+                        } => {
+                            parts.push(format!(
+                                "[{from_label} response]: accepted={accepted}"
+                            ));
+                        }
+                        crate::messaging::types::MessagePayload::Signal(sig) => {
+                            parts.push(format!("[{from_label} signal]: {sig:?}"));
+                        }
+                    }
+                }
+                let mailbox_text = format!(
+                    "📬 Messages from other agents:\n{}",
+                    parts.join("\n")
+                );
+                state.messages.push(serde_json::json!({
+                    "role": "system",
+                    "content": mailbox_text,
+                }));
+            }
+        }
 
         // ─── Refresh ephemeral skill listing (picks up hot-reload changes) ──
         if let Some(resolver) = &state.skill_resolver {
@@ -1658,6 +1713,17 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
                 state.tool_results.clear();
             }
             AgenticPostToolIterationControl::ProceedEndTurn => {
+                // Send progress update to parent agent (best-effort).
+                if let Some(ref mailbox) = state.mailbox {
+                    let _ = mailbox
+                        .send_progress(
+                            turn_index as u32,
+                            state.total_tool_calls,
+                            "turn_complete",
+                            None,
+                        )
+                        .await;
+                }
                 state.step_recorder.end_turn(false);
             }
         }
@@ -1958,6 +2024,7 @@ mod tests {
             skill_listing_message: None,
             invoked_skills: std::collections::HashMap::new(),
             recent_file_reads: Vec::new(),
+            mailbox: None,
         }
     }
 
