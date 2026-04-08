@@ -920,6 +920,9 @@ struct ReplState {
         Option<std::sync::Arc<astra_runtime::server::delegation_engine::DelegationEngine>>,
     /// Team coordination registry for multi-agent team patterns.
     team_registry: slash_team::TeamRegistry,
+    /// Shared team persistence service (in-memory or MatrixOne-backed).
+    /// Used for execution history and snapshot persistence.
+    team_store: std::sync::Arc<dyn astra_services::team_persistence::TeamPersistenceService>,
     /// Handle for communicating with a background plan executor.
     /// When Some, a plan is running in the background and the REPL can
     /// poll for updates via `plan_handle.try_recv()`.
@@ -1007,6 +1010,9 @@ impl Default for ReplState {
             plan_execution_corrections: Vec::new(),
             delegation_engine: None,
             team_registry: slash_team::TeamRegistry::new(),
+            team_store: std::sync::Arc::new(
+                astra_services::team_persistence::InMemoryTeamStore::new(),
+            ),
             plan_handle: None,
             pending_approval: None,
             plan_in_token_stream: false,

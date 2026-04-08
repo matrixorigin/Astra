@@ -2,6 +2,7 @@ use super::*;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
+#[allow(unused_imports)]
 use astra_services::team_persistence::TeamPersistenceService;
 use astra_runtime::server::team_orchestrator::ExecutionPhase;
 
@@ -580,9 +581,8 @@ pub(super) async fn handle_team_command(arg: &str, state: &mut super::ReplState)
             let team_def = cli_team_to_definition(&cli_team, &user_id);
 
             // Build team store with this team pre-loaded
-            let team_store = Arc::new(
-                astra_services::team_persistence::InMemoryTeamStore::new(),
-            );
+            // Use the shared team store; ensure this team is loaded into it
+            let team_store = state.team_store.clone();
             if let Err(e) = team_store.save_team(&team_def).await {
                 eprintln!("  {} Failed to prepare team store: {e}", theme::icon_err());
                 return;
@@ -672,6 +672,16 @@ pub(super) async fn handle_team_command(arg: &str, state: &mut super::ReplState)
 
             let started_at = chrono::Utc::now().to_rfc3339();
             let timer = Instant::now();
+
+            // Record execution start in persistence store (best-effort)
+            let exec_id = uuid::Uuid::new_v4().to_string();
+            let _ = state.team_store.record_execution_start(
+                &exec_id,
+                team_name,
+                "",  // user_id (empty for CLI sessions)
+                task,
+            ).await;
+
             let repo_root = std::env::current_dir().ok();
             let report = orchestrator.execute_team(team_name, task, repo_root).await;
             let elapsed = timer.elapsed();
@@ -815,7 +825,7 @@ pub(super) async fn handle_team_command(arg: &str, state: &mut super::ReplState)
             }
             eprintln!();
 
-            // Record this execution in history
+            // Record this execution in history (in-memory + persistence service)
             let (prompt_tok, compl_tok, agent_count) = report
                 .delegation_result
                 .as_ref()
@@ -833,10 +843,26 @@ pub(super) async fn handle_team_command(arg: &str, state: &mut super::ReplState)
                 error: report.error.clone(),
                 started_at,
             });
+
+            // Persist execution complete to the store (best-effort)
+            let result_summary = serde_json::json!({
+                "agent_count": agent_count,
+                "prompt_tokens": prompt_tok,
+                "completion_tokens": compl_tok,
+                "delegation_id": &report.delegation_id,
+                "error": &report.error,
+            });
+            let _ = state.team_store.record_execution_complete(
+                &report.delegation_id,
+                &report.status.to_string(),
+                Some(&result_summary.to_string()),
+            ).await;
         }
 
         "history" => {
             // /team history <team>
+            // Currently reads from in-memory TeamRegistry. When MatrixOne backend is active,
+            // state.team_store.list_executions() becomes the primary source.
             let name = sub_arg.trim();
             if name.is_empty() {
                 eprintln!("{}", "  Usage: /team history <team>".yellow());
@@ -848,8 +874,11 @@ pub(super) async fn handle_team_command(arg: &str, state: &mut super::ReplState)
                 return;
             }
 
-            let entries = state.team_registry.get_history(name);
-            if entries.is_empty() {
+            // Check persistence store for additional records
+            let store_entries = state.team_store.list_executions(name, 50).await.unwrap_or_default();
+            let registry_entries = state.team_registry.get_history(name);
+
+            if registry_entries.is_empty() && store_entries.is_empty() {
                 eprintln!(
                     "\n  {} No execution history for team '{}'.",
                     "📜", name.cyan().bold()
@@ -858,10 +887,19 @@ pub(super) async fn handle_team_command(arg: &str, state: &mut super::ReplState)
                 return;
             }
 
+            // Display from in-memory registry (primary for this session)
+            let entries = &registry_entries;
+            let store_extra = if store_entries.len() > entries.len() {
+                store_entries.len() - entries.len()
+            } else {
+                0
+            };
+
             eprintln!(
                 "\n{}",
-                format!("─── History: {} ({} run{}) ───",
-                    name, entries.len(), if entries.len() == 1 { "" } else { "s" }
+                format!("─── History: {} ({} run{}{}) ───",
+                    name, entries.len(), if entries.len() == 1 { "" } else { "s" },
+                    if store_extra > 0 { format!(", +{} in store", store_extra) } else { String::new() }
                 ).bold()
             );
             for (i, e) in entries.iter().enumerate().rev() {
@@ -943,11 +981,38 @@ pub(super) async fn handle_team_command(arg: &str, state: &mut super::ReplState)
             state.team_registry.add_snapshot(TeamSnapshotEntry {
                 snapshot_id: snapshot_id.clone(),
                 team_name: name.to_string(),
-                label: snap_label,
+                label: snap_label.clone(),
+                git_commit: git_sha.clone(),
+                session_id: session_id.clone(),
+                created_at: now.clone(),
+            });
+
+            // Persist snapshot to store (with full team definition JSON)
+            let team_def_json = state.team_registry.get(name)
+                .map(|t| {
+                    serde_json::json!({
+                        "name": t.name,
+                        "description": t.description,
+                        "members": t.members.iter().map(|m| serde_json::json!({
+                            "role": m.role,
+                            "description": m.description,
+                            "skills": m.skills,
+                            "model_override": m.model_override,
+                        })).collect::<Vec<_>>(),
+                        "shared_context": t.shared_context,
+                    }).to_string()
+                });
+            let snap_record = astra_services::team_persistence::TeamSnapshotRecord {
+                snapshot_id: snapshot_id.clone(),
+                team_name: name.to_string(),
+                user_id: String::new(),
+                label: snap_label.clone(),
                 git_commit: git_sha.clone(),
                 session_id,
+                team_definition_json: team_def_json,
                 created_at: now,
-            });
+            };
+            let _ = state.team_store.save_snapshot(&snap_record).await;
 
             eprintln!(
                 "\n  {} Snapshot '{}' created for team '{}'",
@@ -995,23 +1060,35 @@ pub(super) async fn handle_team_command(arg: &str, state: &mut super::ReplState)
             let snap = match state.team_registry.find_snapshot(snapshot_id) {
                 Some(s) => s.clone(),
                 None => {
-                    // Try prefix match
+                    // Try prefix match in registry
                     let matches: Vec<_> = state.team_registry.get_snapshots(name)
                         .into_iter()
                         .filter(|s| s.snapshot_id.starts_with(snapshot_id))
                         .collect();
                     match matches.len() {
                         0 => {
-                            eprintln!("  {} Snapshot '{}' not found", theme::icon_err(), snapshot_id);
-                            let available = state.team_registry.get_snapshots(name);
-                            if !available.is_empty() {
-                                eprintln!("  {} Available snapshots:", "💡".dim());
-                                for s in available {
-                                    eprintln!("    {} {} — {}",
-                                        "•".dim(), s.snapshot_id.as_str().dim(), s.label);
+                            // Fallback: try persistence store
+                            if let Ok(Some(stored)) = state.team_store.find_snapshot(snapshot_id, "").await {
+                                TeamSnapshotEntry {
+                                    snapshot_id: stored.snapshot_id,
+                                    team_name: stored.team_name,
+                                    label: stored.label,
+                                    git_commit: stored.git_commit,
+                                    session_id: stored.session_id,
+                                    created_at: stored.created_at,
                                 }
+                            } else {
+                                eprintln!("  {} Snapshot '{}' not found", theme::icon_err(), snapshot_id);
+                                let available = state.team_registry.get_snapshots(name);
+                                if !available.is_empty() {
+                                    eprintln!("  {} Available snapshots:", "💡".dim());
+                                    for s in available {
+                                        eprintln!("    {} {} — {}",
+                                            "•".dim(), s.snapshot_id.as_str().dim(), s.label);
+                                    }
+                                }
+                                return;
                             }
-                            return;
                         }
                         1 => matches[0].clone(),
                         _ => {

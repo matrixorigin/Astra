@@ -438,13 +438,15 @@ pub fn team_to_delegation_request(
 
 // ─── Persistence Trait ──────────────────────────────────────────────────────
 
-/// CRUD operations for team definitions and execution history.
+/// CRUD operations for team definitions, execution history, and snapshots.
 #[async_trait]
 pub trait TeamPersistenceService: Send + Sync {
     async fn save_team(&self, team: &TeamDefinition) -> Result<(), String>;
     async fn load_team(&self, user_id: &str, name: &str) -> Result<Option<TeamDefinition>, String>;
     async fn list_teams(&self, user_id: &str) -> Result<Vec<TeamDefinition>, String>;
     async fn delete_team(&self, user_id: &str, name: &str) -> Result<bool, String>;
+
+    // ── Execution history ───────────────────────────────────────
 
     /// Record the start of a team execution. Default: no-op.
     async fn record_execution_start(
@@ -475,6 +477,40 @@ pub trait TeamPersistenceService: Send + Sync {
     ) -> Result<Vec<TeamExecutionRecord>, String> {
         Ok(vec![])
     }
+
+    // ── Snapshots ───────────────────────────────────────────────
+
+    /// Save a team snapshot. Default: no-op.
+    async fn save_snapshot(&self, _snapshot: &TeamSnapshotRecord) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// List snapshots for a team, most recent first. Default: empty.
+    async fn list_snapshots(
+        &self,
+        _team_name: &str,
+        _user_id: &str,
+    ) -> Result<Vec<TeamSnapshotRecord>, String> {
+        Ok(vec![])
+    }
+
+    /// Find a snapshot by exact ID or unique prefix. Default: None.
+    async fn find_snapshot(
+        &self,
+        _snapshot_id: &str,
+        _user_id: &str,
+    ) -> Result<Option<TeamSnapshotRecord>, String> {
+        Ok(None)
+    }
+
+    /// Delete a snapshot by ID. Returns true if found and deleted.
+    async fn delete_snapshot(
+        &self,
+        _snapshot_id: &str,
+        _user_id: &str,
+    ) -> Result<bool, String> {
+        Ok(false)
+    }
 }
 
 // ─── In-Memory Implementation ───────────────────────────────────────────────
@@ -482,12 +518,16 @@ pub trait TeamPersistenceService: Send + Sync {
 /// In-memory implementation suitable for CLI use and testing.
 pub struct InMemoryTeamStore {
     teams: RwLock<HashMap<String, TeamDefinition>>,
+    executions: RwLock<Vec<TeamExecutionRecord>>,
+    snapshots: RwLock<Vec<TeamSnapshotRecord>>,
 }
 
 impl InMemoryTeamStore {
     pub fn new() -> Self {
         Self {
             teams: RwLock::new(HashMap::new()),
+            executions: RwLock::new(Vec::new()),
+            snapshots: RwLock::new(Vec::new()),
         }
     }
 
@@ -544,6 +584,115 @@ impl TeamPersistenceService for InMemoryTeamStore {
         let key = format!("{user_id}:{name}");
         let mut map = self.teams.write().map_err(|e| e.to_string())?;
         Ok(map.remove(&key).is_some())
+    }
+
+    // ── Execution history ───────────────────────────────────────
+
+    async fn record_execution_start(
+        &self,
+        execution_id: &str,
+        team_id: &str,
+        user_id: &str,
+        task: &str,
+    ) -> Result<(), String> {
+        let mut execs = self.executions.write().map_err(|e| e.to_string())?;
+        execs.push(TeamExecutionRecord {
+            execution_id: execution_id.to_string(),
+            team_id: team_id.to_string(),
+            user_id: user_id.to_string(),
+            task: task.to_string(),
+            status: "running".to_string(),
+            result_json: None,
+            started_at: chrono::Utc::now().to_rfc3339(),
+            completed_at: None,
+        });
+        Ok(())
+    }
+
+    async fn record_execution_complete(
+        &self,
+        execution_id: &str,
+        status: &str,
+        result_json: Option<&str>,
+    ) -> Result<(), String> {
+        let mut execs = self.executions.write().map_err(|e| e.to_string())?;
+        if let Some(rec) = execs.iter_mut().find(|r| r.execution_id == execution_id) {
+            rec.status = status.to_string();
+            rec.result_json = result_json.map(|s| s.to_string());
+            rec.completed_at = Some(chrono::Utc::now().to_rfc3339());
+        }
+        Ok(())
+    }
+
+    async fn list_executions(
+        &self,
+        team_id: &str,
+        limit: u32,
+    ) -> Result<Vec<TeamExecutionRecord>, String> {
+        let execs = self.executions.read().map_err(|e| e.to_string())?;
+        let mut matching: Vec<_> = execs
+            .iter()
+            .filter(|r| r.team_id == team_id)
+            .cloned()
+            .collect();
+        matching.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+        matching.truncate(limit as usize);
+        Ok(matching)
+    }
+
+    // ── Snapshots ───────────────────────────────────────────────
+
+    async fn save_snapshot(&self, snapshot: &TeamSnapshotRecord) -> Result<(), String> {
+        let mut snaps = self.snapshots.write().map_err(|e| e.to_string())?;
+        snaps.push(snapshot.clone());
+        Ok(())
+    }
+
+    async fn list_snapshots(
+        &self,
+        team_name: &str,
+        _user_id: &str,
+    ) -> Result<Vec<TeamSnapshotRecord>, String> {
+        let snaps = self.snapshots.read().map_err(|e| e.to_string())?;
+        let mut matching: Vec<_> = snaps
+            .iter()
+            .filter(|s| s.team_name == team_name)
+            .cloned()
+            .collect();
+        matching.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        Ok(matching)
+    }
+
+    async fn find_snapshot(
+        &self,
+        snapshot_id: &str,
+        _user_id: &str,
+    ) -> Result<Option<TeamSnapshotRecord>, String> {
+        let snaps = self.snapshots.read().map_err(|e| e.to_string())?;
+        // Exact match first
+        if let Some(s) = snaps.iter().find(|s| s.snapshot_id == snapshot_id) {
+            return Ok(Some(s.clone()));
+        }
+        // Prefix match — return only if unique
+        let matches: Vec<_> = snaps
+            .iter()
+            .filter(|s| s.snapshot_id.starts_with(snapshot_id))
+            .collect();
+        match matches.len() {
+            1 => Ok(Some(matches[0].clone())),
+            _ => Ok(None),
+        }
+    }
+
+    async fn delete_snapshot(
+        &self,
+        snapshot_id: &str,
+        _user_id: &str,
+    ) -> Result<bool, String> {
+        let mut snaps = self.snapshots.write().map_err(|e| e.to_string())?;
+        let before = snaps.len();
+        snaps.retain(|s| s.snapshot_id != snapshot_id);
+        Ok(snaps.len() < before)
     }
 }
 
@@ -698,9 +847,195 @@ impl TeamPersistenceService for MatrixOneTeamStore {
 
         Ok(result.rows_affected() > 0)
     }
-}
 
-/// Parse a database row into a [`TeamDefinition`].
+    // ── Execution history ───────────────────────────────────────
+
+    async fn record_execution_start(
+        &self,
+        execution_id: &str,
+        team_id: &str,
+        user_id: &str,
+        task: &str,
+    ) -> Result<(), String> {
+        sqlx::query(
+            "INSERT INTO team_execution_history \
+             (execution_id, team_id, user_id, task, status, started_at) \
+             VALUES (?, ?, ?, ?, 'running', NOW(6))",
+        )
+        .bind(execution_id)
+        .bind(team_id)
+        .bind(user_id)
+        .bind(task)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| format!("execution INSERT failed: {e}"))?;
+        Ok(())
+    }
+
+    async fn record_execution_complete(
+        &self,
+        execution_id: &str,
+        status: &str,
+        result_json: Option<&str>,
+    ) -> Result<(), String> {
+        sqlx::query(
+            "UPDATE team_execution_history SET \
+                 status       = ?, \
+                 result_json  = ?, \
+                 completed_at = NOW(6) \
+             WHERE execution_id = ?",
+        )
+        .bind(status)
+        .bind(result_json)
+        .bind(execution_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| format!("execution UPDATE failed: {e}"))?;
+        Ok(())
+    }
+
+    async fn list_executions(
+        &self,
+        team_id: &str,
+        limit: u32,
+    ) -> Result<Vec<TeamExecutionRecord>, String> {
+        use sqlx::Row;
+
+        let rows = sqlx::query(
+            "SELECT execution_id, team_id, user_id, task, status, \
+                    result_json, started_at, completed_at \
+             FROM team_execution_history \
+             WHERE team_id = ? \
+             ORDER BY started_at DESC \
+             LIMIT ?",
+        )
+        .bind(team_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| format!("execution SELECT failed: {e}"))?;
+
+        let mut records = Vec::with_capacity(rows.len());
+        for row in &rows {
+            records.push(TeamExecutionRecord {
+                execution_id: row.get("execution_id"),
+                team_id: row.get("team_id"),
+                user_id: row.get("user_id"),
+                task: row.get("task"),
+                status: row.get("status"),
+                result_json: row.try_get("result_json").ok(),
+                started_at: row.try_get::<String, _>("started_at").unwrap_or_default(),
+                completed_at: row.try_get::<String, _>("completed_at").ok(),
+            });
+        }
+        Ok(records)
+    }
+
+    // ── Snapshots ───────────────────────────────────────────────
+
+    async fn save_snapshot(&self, snapshot: &TeamSnapshotRecord) -> Result<(), String> {
+        sqlx::query(
+            "INSERT INTO team_snapshots \
+             (snapshot_id, team_name, user_id, label, git_commit, session_id, \
+              team_definition_json, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, NOW(6))",
+        )
+        .bind(&snapshot.snapshot_id)
+        .bind(&snapshot.team_name)
+        .bind(&snapshot.user_id)
+        .bind(&snapshot.label)
+        .bind(&snapshot.git_commit)
+        .bind(&snapshot.session_id)
+        .bind(&snapshot.team_definition_json)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| format!("snapshot INSERT failed: {e}"))?;
+        Ok(())
+    }
+
+    async fn list_snapshots(
+        &self,
+        team_name: &str,
+        user_id: &str,
+    ) -> Result<Vec<TeamSnapshotRecord>, String> {
+        use sqlx::Row;
+
+        let rows = sqlx::query(
+            "SELECT snapshot_id, team_name, user_id, label, git_commit, \
+                    session_id, team_definition_json, created_at \
+             FROM team_snapshots \
+             WHERE team_name = ? AND user_id = ? \
+             ORDER BY created_at DESC",
+        )
+        .bind(team_name)
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| format!("snapshot SELECT failed: {e}"))?;
+
+        let mut records = Vec::with_capacity(rows.len());
+        for row in &rows {
+            records.push(TeamSnapshotRecord {
+                snapshot_id: row.get("snapshot_id"),
+                team_name: row.get("team_name"),
+                user_id: row.get("user_id"),
+                label: row.try_get::<String, _>("label").unwrap_or_default(),
+                git_commit: row.try_get("git_commit").ok(),
+                session_id: row.try_get("session_id").ok(),
+                team_definition_json: row.try_get("team_definition_json").ok(),
+                created_at: row.try_get::<String, _>("created_at").unwrap_or_default(),
+            });
+        }
+        Ok(records)
+    }
+
+    async fn find_snapshot(
+        &self,
+        snapshot_id: &str,
+        user_id: &str,
+    ) -> Result<Option<TeamSnapshotRecord>, String> {
+        use sqlx::Row;
+
+        let row = sqlx::query(
+            "SELECT snapshot_id, team_name, user_id, label, git_commit, \
+                    session_id, team_definition_json, created_at \
+             FROM team_snapshots \
+             WHERE snapshot_id = ? AND user_id = ?",
+        )
+        .bind(snapshot_id)
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| format!("snapshot SELECT failed: {e}"))?;
+
+        Ok(row.map(|r| TeamSnapshotRecord {
+            snapshot_id: r.get("snapshot_id"),
+            team_name: r.get("team_name"),
+            user_id: r.get("user_id"),
+            label: r.try_get::<String, _>("label").unwrap_or_default(),
+            git_commit: r.try_get("git_commit").ok(),
+            session_id: r.try_get("session_id").ok(),
+            team_definition_json: r.try_get("team_definition_json").ok(),
+            created_at: r.try_get::<String, _>("created_at").unwrap_or_default(),
+        }))
+    }
+
+    async fn delete_snapshot(
+        &self,
+        snapshot_id: &str,
+        user_id: &str,
+    ) -> Result<bool, String> {
+        let result = sqlx::query(
+            "DELETE FROM team_snapshots WHERE snapshot_id = ? AND user_id = ?",
+        )
+        .bind(snapshot_id)
+        .bind(user_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| format!("snapshot DELETE failed: {e}"))?;
+        Ok(result.rows_affected() > 0)
+    }
+}
 fn row_to_team_definition(row: &sqlx::mysql::MySqlRow) -> Result<TeamDefinition, String> {
     use sqlx::Row;
 
@@ -760,90 +1095,17 @@ pub struct TeamExecutionRecord {
     pub completed_at: Option<String>,
 }
 
-impl MatrixOneTeamStore {
-    /// Record the start of a team execution.
-    pub async fn record_execution_start(
-        &self,
-        execution_id: &str,
-        team_id: &str,
-        user_id: &str,
-        task: &str,
-    ) -> Result<(), String> {
-        sqlx::query(
-            "INSERT INTO team_execution_history \
-             (execution_id, team_id, user_id, task, status, started_at) \
-             VALUES (?, ?, ?, ?, 'running', NOW(6))",
-        )
-        .bind(execution_id)
-        .bind(team_id)
-        .bind(user_id)
-        .bind(task)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| format!("execution INSERT failed: {e}"))?;
-        Ok(())
-    }
-
-    /// Record the completion of a team execution.
-    pub async fn record_execution_complete(
-        &self,
-        execution_id: &str,
-        status: &str,
-        result_json: Option<&str>,
-    ) -> Result<(), String> {
-        sqlx::query(
-            "UPDATE team_execution_history SET \
-                 status       = ?, \
-                 result_json  = ?, \
-                 completed_at = NOW(6) \
-             WHERE execution_id = ?",
-        )
-        .bind(status)
-        .bind(result_json)
-        .bind(execution_id)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| format!("execution UPDATE failed: {e}"))?;
-        Ok(())
-    }
-
-    /// List execution history for a team, most recent first.
-    pub async fn list_executions(
-        &self,
-        team_id: &str,
-        limit: u32,
-    ) -> Result<Vec<TeamExecutionRecord>, String> {
-        use sqlx::Row;
-
-        let rows = sqlx::query(
-            "SELECT execution_id, team_id, user_id, task, status, \
-                    result_json, started_at, completed_at \
-             FROM team_execution_history \
-             WHERE team_id = ? \
-             ORDER BY started_at DESC \
-             LIMIT ?",
-        )
-        .bind(team_id)
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| format!("execution SELECT failed: {e}"))?;
-
-        let mut records = Vec::with_capacity(rows.len());
-        for row in &rows {
-            records.push(TeamExecutionRecord {
-                execution_id: row.get("execution_id"),
-                team_id: row.get("team_id"),
-                user_id: row.get("user_id"),
-                task: row.get("task"),
-                status: row.get("status"),
-                result_json: row.try_get("result_json").ok(),
-                started_at: row.try_get::<String, _>("started_at").unwrap_or_default(),
-                completed_at: row.try_get::<String, _>("completed_at").ok(),
-            });
-        }
-        Ok(records)
-    }
+/// A team snapshot record, capturing team state + git commit for restore.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TeamSnapshotRecord {
+    pub snapshot_id: String,
+    pub team_name: String,
+    pub user_id: String,
+    pub label: String,
+    pub git_commit: Option<String>,
+    pub session_id: Option<String>,
+    pub team_definition_json: Option<String>,
+    pub created_at: String,
 }
 
 // ─── Built-in Teams ─────────────────────────────────────────────────────────
@@ -1765,5 +2027,164 @@ mod tests {
             }
             _ => panic!("expected FanOut pattern"),
         }
+    }
+
+    // ── Execution Recording ──
+
+    #[tokio::test]
+    async fn in_memory_store_execution_recording() {
+        let store = InMemoryTeamStore::new();
+
+        // Record start
+        store
+            .record_execution_start("exec-1", "team-1", "user-1", "build the app")
+            .await
+            .unwrap();
+
+        // List should show 1 running execution
+        let list = store.list_executions("team-1", 10).await.unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].execution_id, "exec-1");
+        assert_eq!(list[0].task, "build the app");
+        assert_eq!(list[0].status, "running");
+
+        // Complete it
+        store
+            .record_execution_complete("exec-1", "completed", Some(r#"{"ok":true}"#))
+            .await
+            .unwrap();
+
+        let list = store.list_executions("team-1", 10).await.unwrap();
+        assert_eq!(list[0].status, "completed");
+        assert!(list[0].result_json.is_some());
+    }
+
+    #[tokio::test]
+    async fn in_memory_store_execution_list_limit() {
+        let store = InMemoryTeamStore::new();
+        for i in 0..5 {
+            store
+                .record_execution_start(
+                    &format!("exec-{i}"),
+                    "team-1",
+                    "user-1",
+                    &format!("task {i}"),
+                )
+                .await
+                .unwrap();
+        }
+        let list = store.list_executions("team-1", 3).await.unwrap();
+        assert_eq!(list.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn in_memory_store_execution_complete_unknown_id() {
+        let store = InMemoryTeamStore::new();
+        // Completing a non-existent execution should succeed silently (no-op)
+        let result = store
+            .record_execution_complete("nonexistent", "completed", None)
+            .await;
+        assert!(result.is_ok());
+    }
+
+    // ── Snapshot CRUD ──
+
+    #[tokio::test]
+    async fn in_memory_store_snapshot_crud() {
+        let store = InMemoryTeamStore::new();
+
+        let snap = TeamSnapshotRecord {
+            snapshot_id: "snap-1".to_string(),
+            team_name: "team-a".to_string(),
+            user_id: "user-1".to_string(),
+            label: "before refactor".to_string(),
+            git_commit: Some("abc123".to_string()),
+            session_id: Some("sess-1".to_string()),
+            team_definition_json: Some(r#"{"name":"team-a"}"#.to_string()),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+
+        // Save
+        store.save_snapshot(&snap).await.unwrap();
+
+        // List
+        let list = store.list_snapshots("team-a", "user-1").await.unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].label, "before refactor");
+
+        // Find by exact ID
+        let found = store.find_snapshot("snap-1", "user-1").await.unwrap();
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().git_commit, Some("abc123".to_string()));
+
+        // Delete
+        let deleted = store.delete_snapshot("snap-1", "user-1").await.unwrap();
+        assert!(deleted);
+
+        // Verify gone
+        let gone = store.find_snapshot("snap-1", "user-1").await.unwrap();
+        assert!(gone.is_none());
+    }
+
+    #[tokio::test]
+    async fn in_memory_store_snapshot_list_by_team() {
+        let store = InMemoryTeamStore::new();
+
+        for (id, team) in [("s1", "team-a"), ("s2", "team-a"), ("s3", "team-b")] {
+            store
+                .save_snapshot(&TeamSnapshotRecord {
+                    snapshot_id: id.to_string(),
+                    team_name: team.to_string(),
+                    user_id: "u1".to_string(),
+                    label: format!("snap {id}"),
+                    git_commit: None,
+                    session_id: None,
+                    team_definition_json: None,
+                    created_at: "2026-01-01T00:00:00Z".to_string(),
+                })
+                .await
+                .unwrap();
+        }
+
+        let a_snaps = store.list_snapshots("team-a", "u1").await.unwrap();
+        assert_eq!(a_snaps.len(), 2);
+
+        let b_snaps = store.list_snapshots("team-b", "u1").await.unwrap();
+        assert_eq!(b_snaps.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn in_memory_store_snapshot_find_not_found() {
+        let store = InMemoryTeamStore::new();
+        let result = store.find_snapshot("nonexistent", "u1").await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn in_memory_store_snapshot_with_team_definition() {
+        let store = InMemoryTeamStore::new();
+
+        let def_json = serde_json::json!({
+            "name": "test-team",
+            "members": [{"role": "coder"}],
+        })
+        .to_string();
+
+        store
+            .save_snapshot(&TeamSnapshotRecord {
+                snapshot_id: "snap-def".to_string(),
+                team_name: "test-team".to_string(),
+                user_id: "u1".to_string(),
+                label: "with definition".to_string(),
+                git_commit: None,
+                session_id: None,
+                team_definition_json: Some(def_json.clone()),
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let found = store.find_snapshot("snap-def", "u1").await.unwrap().unwrap();
+        assert_eq!(found.team_definition_json, Some(def_json));
     }
 }
