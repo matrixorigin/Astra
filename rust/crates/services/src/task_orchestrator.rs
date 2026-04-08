@@ -24,7 +24,7 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use crate::durable_task::VerifierKind;
+use crate::verification::VerifierKind;
 
 // ─── Task Model ─────────────────────────────────────────────────────────────
 

@@ -42,6 +42,7 @@ pub mod sync_engine;
 pub mod task_orchestrator;
 pub mod team_persistence;
 pub mod triggers;
+pub mod verification;
 pub mod workflows;
 
 pub use admin::{
