@@ -1217,6 +1217,11 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
                             crate::messaging::send_tool::execute_send_message(mailbox, &args)
                                 .await;
                         msg_results.push((call_id, result));
+                    } else if let Some(call_id) = tc.get("id").and_then(|v| v.as_str()) {
+                        msg_results.push((
+                            call_id.to_string(),
+                            "Error: could not parse send_message arguments. Expected JSON with 'target' and 'content' fields.".to_string(),
+                        ));
                     }
                 } else {
                     remaining.push(tc.clone());

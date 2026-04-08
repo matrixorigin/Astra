@@ -797,8 +797,10 @@ impl DelegationEngine {
         for config in configs {
             let executor = self.executor.clone();
             let run_engine = self.run_engine.clone();
+            let mailbox_router = self.mailbox_router.clone();
             handles.push(tokio::spawn(async move {
                 let run_id = config.run_id.clone();
+                let agent_id = config.agent_profile.agent_id.clone();
                 let result = executor.execute(config).await;
                 // Persist final status
                 match &result {
@@ -812,6 +814,14 @@ impl DelegationEngine {
                             .persist_status(&run_id, "failed", None, Some(e.as_str()))
                             .await;
                     }
+                }
+                // Unregister mailbox to prevent memory leak.
+                if let Some(router) = &mailbox_router {
+                    let addr = crate::messaging::types::AgentAddress {
+                        run_id: run_id.clone(),
+                        agent_id,
+                    };
+                    let _ = router.unregister(&addr).await;
                 }
                 result
             }));
@@ -992,7 +1002,7 @@ impl DelegationEngine {
                         .await;
                     AgentResult {
                         agent_id: agent_id.clone(),
-                        run_id: sub_run_id,
+                        run_id: sub_run_id.clone(),
                         status: "failed".to_string(),
                         output: None,
                         error: Some(e),
@@ -1002,6 +1012,15 @@ impl DelegationEngine {
                     }
                 }
             };
+
+            // Unregister mailbox after sub-run completion to prevent memory leak.
+            if let Some(router) = &self.mailbox_router {
+                let addr = crate::messaging::types::AgentAddress {
+                    run_id: sub_run_id.clone(),
+                    agent_id: agent_id.clone(),
+                };
+                let _ = router.unregister(&addr).await;
+            }
 
             // ── Verification gate with retry for sequential sub-runs ──
             let result = if self.gate.is_some() {
@@ -1168,7 +1187,7 @@ impl DelegationEngine {
                         .await;
                     AgentResult {
                         agent_id: producer_id.to_string(),
-                        run_id: prod_run_id,
+                        run_id: prod_run_id.clone(),
                         status: "failed".to_string(),
                         output: None,
                         error: Some(e),
@@ -1178,6 +1197,15 @@ impl DelegationEngine {
                     }
                 }
             };
+
+            // Unregister producer mailbox after completion.
+            if let Some(router) = &self.mailbox_router {
+                let addr = crate::messaging::types::AgentAddress {
+                    run_id: prod_run_id,
+                    agent_id: producer_id.to_string(),
+                };
+                let _ = router.unregister(&addr).await;
+            }
 
             // ── Gate on producer output before reviewer sees it ──
             let prod_result = if self.gate.is_some() {
@@ -1293,7 +1321,7 @@ impl DelegationEngine {
                         .await;
                     AgentResult {
                         agent_id: reviewer_id.to_string(),
-                        run_id: rev_run_id,
+                        run_id: rev_run_id.clone(),
                         status: "failed".to_string(),
                         output: None,
                         error: Some(e),
@@ -1303,6 +1331,16 @@ impl DelegationEngine {
                     }
                 }
             };
+
+            // Unregister reviewer mailbox after completion.
+            if let Some(router) = &self.mailbox_router {
+                let addr = crate::messaging::types::AgentAddress {
+                    run_id: rev_run_id,
+                    agent_id: reviewer_id.to_string(),
+                };
+                let _ = router.unregister(&addr).await;
+            }
+
             results.push(rev_result);
         }
 
@@ -1438,6 +1476,8 @@ impl DelegationEngine {
 
             let executor = self.executor.clone();
             let run_engine = self.run_engine.clone();
+            let mailbox_router = self.mailbox_router.clone();
+            let fork_agent_id = agent_id.to_string();
             handles.push(tokio::spawn(async move {
                 let result = executor.execute(config).await;
                 match &result {
@@ -1451,6 +1491,14 @@ impl DelegationEngine {
                             .persist_status(&run_id, "failed", None, Some(e))
                             .await;
                     }
+                }
+                // Unregister mailbox to prevent memory leak.
+                if let Some(router) = &mailbox_router {
+                    let addr = crate::messaging::types::AgentAddress {
+                        run_id: run_id.clone(),
+                        agent_id: fork_agent_id,
+                    };
+                    let _ = router.unregister(&addr).await;
                 }
                 result
             }));
