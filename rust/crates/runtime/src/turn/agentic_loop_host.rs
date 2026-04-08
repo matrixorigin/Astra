@@ -901,10 +901,12 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
         state.step_recorder.begin_turn(turn_index as u32);
 
         // ─── Drain inter-agent mailbox ──────────────────────────────────
-        // Inject any pending messages from peer/parent agents as a system
+        // Inject pending messages from peer/parent agents as a system
         // message so the LLM is aware of coordination context.
+        // Cap per turn to prevent slow starts.
+        const MAX_MAILBOX_DRAIN_PER_TURN: usize = 64;
         if let Some(ref mut mailbox) = state.mailbox {
-            let pending = mailbox.drain();
+            let (pending, has_more) = mailbox.drain_bounded(MAX_MAILBOX_DRAIN_PER_TURN);
             if !pending.is_empty() {
                 let mut parts = Vec::with_capacity(pending.len());
                 for msg in &pending {
@@ -939,7 +941,9 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
                     }
                 }
                 let mailbox_text = format!(
-                    "📬 Messages from other agents:\n{}",
+                    "📬 Messages from other agents ({}{}):\n{}",
+                    pending.len(),
+                    if has_more { "+, more queued" } else { "" },
                     parts.join("\n")
                 );
                 state.messages.push(serde_json::json!({

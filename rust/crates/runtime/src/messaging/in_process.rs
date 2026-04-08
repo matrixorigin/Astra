@@ -16,16 +16,19 @@ use super::types::{AgentAddress, AgentMessage, MailboxError};
 /// Broadcast channel capacity. Messages beyond this are dropped for slow receivers.
 const BROADCAST_CAPACITY: usize = 256;
 
+/// Direct message channel capacity. Provides backpressure under load.
+const DIRECT_CHANNEL_CAPACITY: usize = 4096;
+
 // ─── InProcessTransport ─────────────────────────────────────────────────────
 
 /// In-process message transport using tokio channels.
 ///
-/// - **Direct messages**: unbounded `mpsc` channel per agent.
+/// - **Direct messages**: bounded `mpsc` channel per agent (cap [`DIRECT_CHANNEL_CAPACITY`]).
 /// - **Broadcasts**: `broadcast` channel per delegation group.
 /// - **Zero serialization**: messages are `Arc<AgentMessage>`, shared by reference.
 pub struct InProcessTransport {
     /// Direct message senders keyed by agent address.
-    inboxes: RwLock<HashMap<AgentAddress, mpsc::UnboundedSender<Arc<AgentMessage>>>>,
+    inboxes: RwLock<HashMap<AgentAddress, mpsc::Sender<Arc<AgentMessage>>>>,
     /// Broadcast senders keyed by delegation ID.
     broadcasts: RwLock<HashMap<String, broadcast::Sender<Arc<AgentMessage>>>>,
     /// Maps agent addresses to their delegation group (for broadcast subscription).
@@ -79,21 +82,9 @@ impl MessageTransport for InProcessTransport {
         addr: AgentAddress,
         delegation_id: Option<String>,
     ) -> Result<(), MailboxError> {
-        let (tx, _rx) = mpsc::unbounded_channel();
+        let (tx, _rx) = mpsc::channel(DIRECT_CHANNEL_CAPACITY);
 
-        // We store the sender; the receiver is returned via subscribe().
-        // But since subscribe() needs a fresh receiver, we actually store the
-        // channel and create a paired receiver on subscribe. Since mpsc doesn't
-        // allow multiple receivers, we create a fresh channel on register and
-        // hand the receiver to subscribe().
-        //
-        // Re-design: store sender in inboxes. On subscribe(), if there's no
-        // stored receiver, return error. We need a different approach.
-        //
-        // Solution: Store the sender, and use a separate map for pending receivers.
-        // Actually, the simplest approach: create the channel in register(),
-        // store the sender, and return. subscribe() creates a NEW channel,
-        // replaces the old sender, and returns the receiver.
+        // Store the sender; subscribe() creates a fresh channel and replaces it.
 
         self.inboxes.write().await.insert(addr.clone(), tx);
 
@@ -125,7 +116,7 @@ impl MessageTransport for InProcessTransport {
         addr: &AgentAddress,
     ) -> Result<Box<dyn MessageStream>, MailboxError> {
         // Create a fresh channel and replace the sender in inboxes.
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(DIRECT_CHANNEL_CAPACITY);
         {
             let mut inboxes = self.inboxes.write().await;
             if !inboxes.contains_key(addr) {
@@ -161,7 +152,12 @@ impl MessageTransport for InProcessTransport {
         let tx = inboxes
             .get(&target)
             .ok_or_else(|| MailboxError::AgentNotFound(target))?;
-        tx.send(msg).map_err(|_| MailboxError::ChannelClosed)
+        tx.try_send(msg).map_err(|e| match e {
+            mpsc::error::TrySendError::Full(_) => {
+                MailboxError::Transport("direct channel full (backpressure)".into())
+            }
+            mpsc::error::TrySendError::Closed(_) => MailboxError::ChannelClosed,
+        })
     }
 
     async fn broadcast(
@@ -182,7 +178,7 @@ impl MessageTransport for InProcessTransport {
 
 /// Receives both direct and broadcast messages for a single agent.
 struct InProcessStream {
-    direct: mpsc::UnboundedReceiver<Arc<AgentMessage>>,
+    direct: mpsc::Receiver<Arc<AgentMessage>>,
     broadcast: Option<broadcast::Receiver<Arc<AgentMessage>>>,
 }
 
@@ -199,7 +195,7 @@ impl MessageStream for InProcessStream {
                         match rx.recv().await {
                             Ok(m) => break Some(m),
                             Err(broadcast::error::RecvError::Lagged(n)) => {
-                                eprintln!("  ⚠ agent broadcast lagged by {n} messages");
+                                eprintln!("  ⚠ messaging: broadcast receiver lagged by {n} messages (some dropped)");
                                 continue;
                             }
                             Err(broadcast::error::RecvError::Closed) => break None,

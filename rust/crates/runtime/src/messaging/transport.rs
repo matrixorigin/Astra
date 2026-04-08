@@ -32,6 +32,26 @@ pub trait MessageStream: Send {
         }
         msgs
     }
+
+    /// Drain up to `limit` buffered messages. Returns `true` if more remain.
+    fn drain_bounded(&mut self, limit: usize) -> (Vec<Arc<AgentMessage>>, bool) {
+        let mut msgs = Vec::with_capacity(limit);
+        while msgs.len() < limit {
+            match self.try_recv() {
+                Some(m) => msgs.push(m),
+                None => return (msgs, false),
+            }
+        }
+        // Check if there's at least one more (peek without consuming isn't
+        // available, but this single extra message is acceptable).
+        match self.try_recv() {
+            Some(m) => {
+                msgs.push(m);
+                (msgs, true) // limit+1 messages, more may exist
+            }
+            None => (msgs, false),
+        }
+    }
 }
 
 // ─── MessageTransport ───────────────────────────────────────────────────────
@@ -72,4 +92,16 @@ pub trait MessageTransport: Send + Sync {
         delegation_id: &str,
         msg: Arc<AgentMessage>,
     ) -> Result<(), MailboxError>;
+
+    /// Health check. Returns Ok if the transport is operational.
+    /// Default implementation assumes healthy.
+    async fn health_check(&self) -> Result<(), MailboxError> {
+        Ok(())
+    }
+
+    /// Graceful shutdown. Implementations should drain in-flight messages.
+    /// Default implementation is a no-op.
+    async fn shutdown(&self) -> Result<(), MailboxError> {
+        Ok(())
+    }
 }
