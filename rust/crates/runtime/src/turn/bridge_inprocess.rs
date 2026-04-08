@@ -348,7 +348,7 @@ fn build_system_message(
     confidence: f64,
     task_type: Option<&str>,
     cache_cfg: &PromptCacheConfig,
-) -> Value {
+) -> (Value, Option<Value>) {
     let key = section_cache_key(tool_names, task_type, confidence);
 
     // Try cache for the stable (Global + Session) sections
@@ -3166,7 +3166,7 @@ mod tests {
         for i in 0..34 {
             let tool_name = format!("tool_{i}");
             let tools: Vec<&str> = vec![tool_name.as_str()];
-            let _msg = build_system_message(
+            let (_msg, _) = build_system_message(
                 &tools,
                 "",
                 0.8,
@@ -3674,14 +3674,14 @@ mod tests {
     fn openai_global_prefix_stable_across_tool_sets() {
         let _lock = CACHE_ENV_MUTEX.lock().unwrap();
 
-        let msg1 = build_system_message(
+        let (msg1, _) = build_system_message(
             &["bash"],
             "",
             0.8,
             None,
             &PromptCacheConfig::latch("openai", "gpt-4o"),
         );
-        let msg2 = build_system_message(
+        let (msg2, _) = build_system_message(
             &["bash", "git_diff", "memory_store", "find_definition"],
             "",
             0.8,
