@@ -18,12 +18,18 @@ use super::types::{AgentAddress, MessageTarget};
 /// Lightweight latency tracker — records min/max/sum/count without histograms.
 ///
 /// Thread-safe via atomics. All values in microseconds.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct LatencyTracker {
     count: AtomicU64,
     sum_us: AtomicU64,
     min_us: AtomicU64,
     max_us: AtomicU64,
+}
+
+impl Default for LatencyTracker {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl LatencyTracker {
