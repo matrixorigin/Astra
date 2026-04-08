@@ -3781,24 +3781,25 @@ fn display_plan_updates_live(
                         continue;
                     }
                     StreamEvent::Thinking(true) => {
-                        finalize_plan_stream(&mut state.plan_in_token_stream, plan_spinner, &mut state.plan_md_renderer, &mut state.plan_thinking_pane);
-                        if let Some(s) = plan_spinner.take() {
-                            s.stop_clear();
-                        }
-                        // Start ThinkingPreviewPane if terminal supports it
-                        use std::io::IsTerminal;
-                        let rows = effects::thinking_viewport_rows();
-                        let tw = crossterm::terminal::size().map(|(w, _)| w as usize).unwrap_or(80);
-                        if rows > 0 && std::io::stdout().is_terminal() {
-                            state.plan_thinking_pane = Some(effects::ThinkingPreviewPane::new(rows, tw));
-                        } else {
-                            // Fallback: spinner-only for non-terminal
-                            *plan_spinner = Some(PlanSpinner::Activity(
-                                effects::PlanActivitySpinner::start(
-                                    current_subtask_tag,
-                                    "Thinking",
-                                ),
-                            ));
+                        // Reuse existing pane if model sends multiple thinking blocks
+                        if state.plan_thinking_pane.is_none() {
+                            finalize_plan_stream(&mut state.plan_in_token_stream, plan_spinner, &mut state.plan_md_renderer, &mut state.plan_thinking_pane);
+                            if let Some(s) = plan_spinner.take() {
+                                s.stop_clear();
+                            }
+                            use std::io::IsTerminal;
+                            let rows = effects::thinking_viewport_rows();
+                            let tw = crossterm::terminal::size().map(|(w, _)| w as usize).unwrap_or(80);
+                            if rows > 0 && std::io::stdout().is_terminal() {
+                                state.plan_thinking_pane = Some(effects::ThinkingPreviewPane::new(rows, tw));
+                            } else {
+                                *plan_spinner = Some(PlanSpinner::Activity(
+                                    effects::PlanActivitySpinner::start(
+                                        current_subtask_tag,
+                                        "Thinking",
+                                    ),
+                                ));
+                            }
                         }
                         continue;
                     }
@@ -3809,12 +3810,8 @@ fn display_plan_updates_live(
                         continue;
                     }
                     StreamEvent::Thinking(false) => {
-                        // Stop thinking pane, print summary
-                        if let Some(mut pane) = state.plan_thinking_pane.take() {
-                            let summary = pane.summary_line();
-                            pane.clear();
-                            eprintln!("{summary}");
-                        }
+                        // Don't destroy the pane — the model may send more thinking blocks.
+                        // Summary is printed when we transition to tokens/tools.
                         continue;
                     }
                     StreamEvent::Token(text) => {
@@ -4134,6 +4131,7 @@ async fn run_blocking_plan_monitor(state: &mut ReplState) {
                             "\n{}  Second interrupt — cancelling plan.",
                             "⏹".yellow()
                         );
+                        break; // Exit monitor immediately after cancel
                     } else {
                         let _ = handle.send_command(plan_executor::PlanCommand::Pause);
                         if let Some(s) = plan_spinner.take() {
