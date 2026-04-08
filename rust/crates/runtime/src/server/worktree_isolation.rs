@@ -56,6 +56,10 @@ pub struct WorktreeManager {
     worktree_base: PathBuf,
     active: HashMap<String, WorktreeInfo>,
     repo_lock: RepoLock,
+    /// Optional conflict resolver for LLM-assisted merge conflict resolution.
+    conflict_resolver: Option<Arc<dyn super::conflict_resolver::ConflictResolver>>,
+    /// Task context for the conflict resolver (team task description).
+    task_context: String,
 }
 
 /// Metadata for a single agent's worktree.
@@ -125,6 +129,8 @@ impl WorktreeManager {
             worktree_base,
             active: HashMap::new(),
             repo_lock: new_repo_lock(),
+            conflict_resolver: None,
+            task_context: String::new(),
         }
     }
 
@@ -134,6 +140,18 @@ impl WorktreeManager {
     /// concurrently — pass the same [`RepoLock`] to each manager.
     pub fn with_repo_lock(mut self, lock: RepoLock) -> Self {
         self.repo_lock = lock;
+        self
+    }
+
+    /// Set an LLM-based (or other) conflict resolver for automatic merge
+    /// conflict resolution.
+    pub fn with_conflict_resolver(
+        mut self,
+        resolver: Arc<dyn super::conflict_resolver::ConflictResolver>,
+        task_context: String,
+    ) -> Self {
+        self.conflict_resolver = Some(resolver);
+        self.task_context = task_context;
         self
     }
 
@@ -340,23 +358,81 @@ impl WorktreeManager {
             if output.status.success() {
                 result.merged.push(agent_id.clone());
             } else {
-                // Merge conflict
+                // Merge conflict — try LLM resolution if a resolver is configured
                 let conflict_files = self.get_conflict_files().await?;
-                let conflict_snapshot = CompositeSnapshot {
-                    snapshot_id: format!("conflict-{}-{agent_id}", &delegation_id[..delegation_id.len().min(8)]),
-                    session_id: delegation_id.to_string(),
-                    turn: 0,
-                    created_at: chrono::Utc::now().to_rfc3339(),
-                    label: Some(format!("merge conflict for {agent_id}")),
-                    refs: vec![SnapshotRef::GitCommit(pre_merge_head)],
+
+                let resolved_by_llm = if let Some(ref resolver) = self.conflict_resolver {
+                    // Extract base/ours/theirs while merge is still in progress
+                    let file_conflicts = super::conflict_resolver::extract_file_conflicts(
+                        &self.repo_root,
+                        &conflict_files,
+                    )
+                    .await;
+
+                    let resolution = resolver
+                        .resolve_conflicts(agent_id, &self.task_context, &file_conflicts)
+                        .await;
+
+                    if resolution.failed.is_empty() && !resolution.resolved.is_empty() {
+                        // All files resolved — apply and commit
+                        match super::conflict_resolver::apply_resolutions(
+                            &self.repo_root,
+                            agent_id,
+                            delegation_id,
+                            &resolution.resolved,
+                        )
+                        .await
+                        {
+                            Ok(()) => {
+                                eprintln!(
+                                    "[worktree] LLM resolved {} conflict(s) for agent {agent_id}",
+                                    resolution.resolved.len()
+                                );
+                                true
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "[worktree] LLM resolution apply failed for {agent_id}: {e}"
+                                );
+                                false
+                            }
+                        }
+                    } else {
+                        eprintln!(
+                            "[worktree] LLM could not resolve all conflicts for {agent_id} \
+                             ({} resolved, {} failed)",
+                            resolution.resolved.len(),
+                            resolution.failed.len()
+                        );
+                        false
+                    }
+                } else {
+                    false
                 };
-                result.conflicts.push(ConflictInfo {
-                    agent_id: agent_id.clone(),
-                    files: conflict_files,
-                    snapshot: conflict_snapshot,
-                });
-                // Abort the failed merge so we can continue with others
-                self.git_merge_abort().await?;
+
+                if resolved_by_llm {
+                    result.merged.push(agent_id.clone());
+                } else {
+                    let pre_merge_head_ref = pre_merge_head.clone();
+                    let conflict_snapshot = CompositeSnapshot {
+                        snapshot_id: format!(
+                            "conflict-{}-{agent_id}",
+                            &delegation_id[..delegation_id.len().min(8)]
+                        ),
+                        session_id: delegation_id.to_string(),
+                        turn: 0,
+                        created_at: chrono::Utc::now().to_rfc3339(),
+                        label: Some(format!("merge conflict for {agent_id}")),
+                        refs: vec![SnapshotRef::GitCommit(pre_merge_head_ref)],
+                    };
+                    result.conflicts.push(ConflictInfo {
+                        agent_id: agent_id.clone(),
+                        files: conflict_files,
+                        snapshot: conflict_snapshot,
+                    });
+                    // Abort the failed merge so we can continue with others
+                    self.git_merge_abort().await?;
+                }
             }
         }
 
@@ -733,6 +809,87 @@ mod tests {
         assert!(result.merged.is_empty());
         assert!(result.skipped.is_empty());
         assert!(result.conflicts.is_empty());
+
+        mgr.cleanup().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn llm_resolver_auto_resolves_conflict() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().to_path_buf();
+        init_test_repo(&repo).await;
+
+        let resolver: Arc<dyn super::super::conflict_resolver::ConflictResolver> =
+            Arc::new(super::super::conflict_resolver::TheirsWinsResolver);
+        let base = repo.join("_worktrees");
+        let mut mgr = WorktreeManager::new(repo.clone())
+            .with_worktree_base(base)
+            .with_conflict_resolver(resolver, "test task".to_string());
+
+        let agents = vec!["a1".to_string(), "a2".to_string()];
+        let paths = mgr.create_worktrees("del-resolve1", &agents).await.unwrap();
+
+        // a1: modify README.md
+        tokio::fs::write(paths["a1"].join("README.md"), "a1 content\n").await.unwrap();
+        Command::new("git").args(["add", "."]).current_dir(&paths["a1"]).output().await.unwrap();
+        Command::new("git").args(["commit", "-m", "a1"]).current_dir(&paths["a1"]).output().await.unwrap();
+
+        // a2: modify README.md differently (conflict)
+        tokio::fs::write(paths["a2"].join("README.md"), "a2 content\n").await.unwrap();
+        Command::new("git").args(["add", "."]).current_dir(&paths["a2"]).output().await.unwrap();
+        Command::new("git").args(["commit", "-m", "a2"]).current_dir(&paths["a2"]).output().await.unwrap();
+
+        // With TheirsWinsResolver, a2's conflict should be auto-resolved
+        let result = mgr
+            .merge_worktrees("del-resolve1", &["a1".to_string(), "a2".to_string()])
+            .await
+            .unwrap();
+
+        // Both should be merged (a1 directly, a2 via LLM resolution)
+        assert_eq!(result.merged.len(), 2, "expected both agents merged, got: {:?}", result.merged);
+        assert!(result.conflicts.is_empty(), "expected no conflicts, got: {:?}", result.conflicts);
+
+        // Verify the resolved content is a2's version (theirs wins)
+        let final_content = tokio::fs::read_to_string(repo.join("README.md")).await.unwrap();
+        assert_eq!(final_content, "a2 content\n");
+
+        mgr.cleanup().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn failing_resolver_falls_back_to_conflict() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().to_path_buf();
+        init_test_repo(&repo).await;
+
+        let resolver: Arc<dyn super::super::conflict_resolver::ConflictResolver> =
+            Arc::new(super::super::conflict_resolver::FailingResolver);
+        let base = repo.join("_worktrees");
+        let mut mgr = WorktreeManager::new(repo.clone())
+            .with_worktree_base(base)
+            .with_conflict_resolver(resolver, "test task".to_string());
+
+        let agents = vec!["a1".to_string(), "a2".to_string()];
+        let paths = mgr.create_worktrees("del-failres1", &agents).await.unwrap();
+
+        // Both modify same file
+        tokio::fs::write(paths["a1"].join("README.md"), "a1\n").await.unwrap();
+        Command::new("git").args(["add", "."]).current_dir(&paths["a1"]).output().await.unwrap();
+        Command::new("git").args(["commit", "-m", "a1"]).current_dir(&paths["a1"]).output().await.unwrap();
+
+        tokio::fs::write(paths["a2"].join("README.md"), "a2\n").await.unwrap();
+        Command::new("git").args(["add", "."]).current_dir(&paths["a2"]).output().await.unwrap();
+        Command::new("git").args(["commit", "-m", "a2"]).current_dir(&paths["a2"]).output().await.unwrap();
+
+        let result = mgr
+            .merge_worktrees("del-failres1", &["a1".to_string(), "a2".to_string()])
+            .await
+            .unwrap();
+
+        // a1 merged fine, a2 should fall back to conflict since resolver fails
+        assert_eq!(result.merged, vec!["a1"]);
+        assert_eq!(result.conflicts.len(), 1);
+        assert_eq!(result.conflicts[0].agent_id, "a2");
 
         mgr.cleanup().await.unwrap();
     }

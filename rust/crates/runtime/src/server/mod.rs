@@ -39,6 +39,7 @@ pub mod run_engine;
 mod run_handlers;
 pub mod team_orchestrator;
 pub mod worktree_isolation;
+pub mod conflict_resolver;
 pub mod run_lifecycle;
 pub mod server_loop_host;
 mod session_handlers;
