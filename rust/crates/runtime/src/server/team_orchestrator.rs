@@ -174,15 +174,13 @@ impl TeamExecutionOrchestrator {
 
         let agent_ids: Vec<String> = profiles.iter().map(|p| p.agent_id.clone()).collect();
 
+        let mut effective_request = request;
         if team.worktree_mode == WorktreeMode::Isolated {
             if let Some(ref mut mgr) = worktree_mgr {
                 match mgr.create_worktrees(&delegation_id, &agent_ids).await {
                     Ok(paths) => {
-                        // Inject worktree paths into delegation context
-                        // The SubRunExecutor will read these to set CWD
-                        let mut req_mut = request.clone();
                         for (agent_id, path) in &paths {
-                            req_mut.context.insert(
+                            effective_request.context.insert(
                                 format!("worktree_path_{agent_id}"),
                                 serde_json::Value::String(
                                     path.to_string_lossy().to_string(),
@@ -213,7 +211,7 @@ impl TeamExecutionOrchestrator {
         // ── Phase 2: Execute ────────────────────────────────────────────
         let delegation_result = match self
             .delegation_engine
-            .execute(request, &self.config.source_agent_id)
+            .execute(effective_request, &self.config.source_agent_id)
             .await
         {
             Ok(r) => r,
@@ -333,7 +331,7 @@ mod tests {
     use super::*;
     use astra_services::coordination::AgentTier;
     use astra_services::runs::InMemoryRunStateStore;
-    use astra_services::team_persistence::{InMemoryTeamStore, TeamCoordination, TeamMemberDef};
+    use astra_services::team_persistence::InMemoryTeamStore;
     use super::super::delegation_engine::{DelegationTracker, StubSubRunExecutor};
 
     async fn setup_orchestrator(team_store: Arc<InMemoryTeamStore>) -> TeamExecutionOrchestrator {
