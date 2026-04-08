@@ -47,6 +47,8 @@ mod integration_tests;
 mod e2e_loop_tests;
 #[cfg(test)]
 mod db_transport_integration_tests;
+#[cfg(test)]
+mod delegation_mailbox_tests;
 
 // Re-export key types for convenience.
 pub use db_transport::DatabaseTransport;
