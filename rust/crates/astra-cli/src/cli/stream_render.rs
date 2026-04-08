@@ -466,9 +466,21 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                             )
                             .await
                             .unwrap_or('n');
-                            let approved = matches!(ch, 'y' | 'a');
+                            let approved = matches!(ch, 'y' | 'a' | '!');
                             if approved {
                                 pm.record_approval(&t, true);
+                            }
+                            if ch == '!' {
+                                pm.set_mode(
+                                    crate::permission_manager::PermissionMode::Auto,
+                                );
+                                eprintln!(
+                                    "  {}",
+                                    format!(
+                                        "  ⚡ Auto-run enabled for this session. Use /allow prompt to restore."
+                                    )
+                                    .yellow()
+                                );
                             }
                             if ch == 'a' {
                                 let rule =
@@ -585,9 +597,22 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                                     )
                                     .await
                                     .unwrap_or('n');
-                                    let grant = matches!(ch, 'y' | 'a');
+                                    let grant = matches!(ch, 'y' | 'a' | '!');
                                     if grant {
                                         pm.record_approval(&sandbox_tool_key, true);
+                                    }
+                                    if ch == '!' {
+                                        pm.set_mode(
+                                            crate::permission_manager::PermissionMode::Auto,
+                                        );
+                                        use crossterm::style::Stylize;
+                                        eprintln!(
+                                            "  {}",
+                                            format!(
+                                                "  ⚡ Auto-run enabled for this session. Use /allow prompt to restore."
+                                            )
+                                            .yellow()
+                                        );
                                     }
                                     if ch == 's' {
                                         pm.record_approval(&sandbox_tool_key, false);

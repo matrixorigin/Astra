@@ -113,6 +113,15 @@ impl PermissionRule {
     }
 }
 
+impl std::fmt::Display for PermissionRule {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.pattern {
+            Some(pat) => write!(f, "{}({}:*)", self.tool, pat),
+            None => write!(f, "{}", self.tool),
+        }
+    }
+}
+
 /// Persistent permission settings, loaded from and saved to disk.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(super) struct PermissionSettings {
@@ -509,7 +518,10 @@ impl PermissionManager {
             }
         }
 
-        eprint!("  {} (y)es (n)o (a)lways (s)kip: ", "Allow?".bold());
+        eprint!(
+            "  {} (y)es (n)o (a)lways (!)auto-run (s)kip: ",
+            "Allow?".bold()
+        );
         let _ = io::stderr().flush();
 
         if enable_raw_mode().is_ok() {
@@ -521,6 +533,7 @@ impl PermissionManager {
                         KeyCode::Char('a') | KeyCode::Char('A') => break 'a',
                         KeyCode::Char('n') | KeyCode::Char('N') => break 'n',
                         KeyCode::Char('s') | KeyCode::Char('S') => break 's',
+                        KeyCode::Char('!') => break '!',
                         KeyCode::Enter => break 'n',
                         KeyCode::Char('c') => break 'n',
                         KeyCode::Esc => break 'n',
@@ -534,7 +547,12 @@ impl PermissionManager {
         } else {
             let mut response = String::new();
             let _ = io::stdin().read_line(&mut response);
-            response.trim().to_lowercase().chars().next().unwrap_or('n')
+            let ch = response.trim().to_lowercase().chars().next().unwrap_or('n');
+            if response.trim() == "!" {
+                '!'
+            } else {
+                ch
+            }
         }
     }
 
@@ -857,6 +875,43 @@ impl PermissionManager {
     /// Whether this manager has a project root (for scope display).
     pub(crate) fn has_project_root(&self) -> bool {
         self.project_root.is_some()
+    }
+
+    /// Summary of current permission state for `/allow rules`.
+    pub(super) fn rules_summary(&self) -> String {
+        use std::fmt::Write;
+        let mut out = String::new();
+        let _ = writeln!(out, "  Mode: {}", self.mode);
+        if !self.cached_allow.is_empty() {
+            let _ = writeln!(out, "  Allow rules ({}):", self.cached_allow.len());
+            for rule in &self.cached_allow {
+                let _ = writeln!(out, "    ✓ {rule}");
+            }
+        }
+        if !self.cached_deny.is_empty() {
+            let _ = writeln!(out, "  Deny rules ({}):", self.cached_deny.len());
+            for rule in &self.cached_deny {
+                let _ = writeln!(out, "    ✗ {rule}");
+            }
+        }
+        if !self.session_overrides.is_empty() {
+            let _ = writeln!(
+                out,
+                "  Session overrides ({}):",
+                self.session_overrides.len()
+            );
+            for (tool, allowed) in &self.session_overrides {
+                let icon = if *allowed { "✓" } else { "✗" };
+                let _ = writeln!(out, "    {icon} {tool}");
+            }
+        }
+        if self.cached_allow.is_empty()
+            && self.cached_deny.is_empty()
+            && self.session_overrides.is_empty()
+        {
+            let _ = writeln!(out, "  No custom rules.");
+        }
+        out
     }
 }
 
@@ -1581,5 +1636,37 @@ mod tests {
         let args = serde_json::json!({"command": "cargo test"});
         assert!(!pm.check_allow_rules("bash", &args));
         assert!(!pm.check_deny_rules("bash", &args));
+    }
+
+    #[test]
+    fn rules_summary_shows_mode_and_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let kiro = root.join(".kiro");
+        std::fs::create_dir_all(&kiro).unwrap();
+        std::fs::write(
+            kiro.join("permissions.json"),
+            r#"{"allow":["Bash(cargo:*)"],"deny":["Bash(rm:*)"]}"#,
+        )
+        .unwrap();
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, root);
+        pm.record_approval("edit_file", true);
+        let summary = pm.rules_summary();
+        assert!(summary.contains("prompt"), "should show mode");
+        assert!(summary.contains("cargo"), "should show allow rule");
+        assert!(summary.contains("rm"), "should show deny rule");
+        assert!(summary.contains("edit_file"), "should show session override");
+    }
+
+    #[test]
+    fn display_permission_rule_bare() {
+        let rule = PermissionRule::parse("Edit");
+        assert_eq!(format!("{rule}"), "edit");
+    }
+
+    #[test]
+    fn display_permission_rule_with_pattern() {
+        let rule = PermissionRule::parse("Bash(git commit:*)");
+        assert_eq!(format!("{rule}"), "bash(git commit:*)");
     }
 }
