@@ -4761,6 +4761,7 @@ async fn handle_task_command(
                 );
                 for t in &tasks {
                     let icon = match t.status {
+                        TaskStatus::Completed if t.items_total > 0 && t.items_done < t.items_total => "△",
                         TaskStatus::Completed => "✓",
                         TaskStatus::Failed => "✗",
                         TaskStatus::InProgress => "▶",
@@ -4768,6 +4769,11 @@ async fn handle_task_command(
                         _ => "○",
                     };
                     let short_id = &t.task_id[..8.min(t.task_id.len())];
+                    let status_label = match t.status {
+                        TaskStatus::Completed if t.items_total > 0 && t.items_done < t.items_total =>
+                            "partial".to_string(),
+                        _ => t.status.as_str().to_string(),
+                    };
                     let progress = if t.items_total > 0 {
                         format!(" ({}/{})", t.items_done, t.items_total)
                     } else {
@@ -4778,7 +4784,7 @@ async fn handle_task_command(
                         short_id.dim(),
                         icon,
                         t.title,
-                        t.status.as_str().cyan(),
+                        status_label.cyan(),
                         progress,
                     );
                 }
@@ -4838,7 +4844,12 @@ async fn handle_task_command(
                         );
                         eprintln!("  {:<12} {}", "id:".dim(), t.task_id.cyan());
                         eprintln!("  {:<12} {}", "title:".dim(), t.title);
-                        eprintln!("  {:<12} {}", "status:".dim(), t.status.as_str().cyan());
+                        let detail_status_label = match t.status {
+                            TaskStatus::Completed if t.items_total > 0 && t.items_done < t.items_total =>
+                                "partial",
+                            _ => t.status.as_str(),
+                        };
+                        eprintln!("  {:<12} {}", "status:".dim(), detail_status_label.cyan());
                         eprintln!("  {:<12} {}%", "progress:".dim(), t.progress_pct);
                         if let Some(ref desc) = t.description {
                             eprintln!("  {:<12} {}", "desc:".dim(), desc);
