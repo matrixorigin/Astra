@@ -983,6 +983,110 @@ pub fn all_tool_schemas() -> Vec<Value> {
                 }
             }
         }),
+        // ─── Task management tools ────────────────────────────────────────────
+        json!({
+            "type": "function",
+            "function": {
+                "name": "task_create",
+                "description": "Create a structured task for tracking complex multi-step work. Use proactively when: (1) task requires 3+ distinct steps, (2) plan mode is active, (3) user provides multiple tasks. Skip for single trivial tasks.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "title": {
+                            "type": "string",
+                            "description": "Brief, actionable title in imperative form (e.g., 'Fix authentication bug in login flow')"
+                        },
+                        "description": {
+                            "type": "string",
+                            "description": "What needs to be done - detailed requirements and context"
+                        },
+                        "subtasks": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "id": {"type": "string", "description": "Unique subtask ID (e.g., 'setup-db', 'add-tests')"},
+                                    "title": {"type": "string"},
+                                    "description": {"type": "string"},
+                                    "depends_on": {
+                                        "type": "array",
+                                        "items": {"type": "string"},
+                                        "description": "IDs of subtasks that must complete first"
+                                    }
+                                },
+                                "required": ["id", "title"]
+                            },
+                            "description": "Optional breakdown into subtasks with dependencies"
+                        }
+                    },
+                    "required": ["title"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "task_list",
+                "description": "List all tasks in the current session. Use to: (1) see available work, (2) check overall progress, (3) find blocked tasks needing attention.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "status": {
+                            "type": "string",
+                            "enum": ["all", "pending", "in_progress", "completed", "active"],
+                            "description": "Filter by status. 'active' = pending + in_progress. Default: 'all'"
+                        }
+                    }
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "task_get",
+                "description": "Get full details of a task by ID, including description, subtasks, and dependencies.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "task_id": {
+                            "type": "string",
+                            "description": "The task ID to retrieve"
+                        }
+                    },
+                    "required": ["task_id"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "task_update",
+                "description": "Update a task's status or progress. Always mark task as 'in_progress' BEFORE starting work, then 'completed' when done.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "task_id": {
+                            "type": "string",
+                            "description": "The task ID to update"
+                        },
+                        "status": {
+                            "type": "string",
+                            "enum": ["pending", "in_progress", "completed", "failed", "cancelled"],
+                            "description": "New status for the task"
+                        },
+                        "subtask_id": {
+                            "type": "string",
+                            "description": "If provided, update this subtask instead of the main task"
+                        },
+                        "error_message": {
+                            "type": "string",
+                            "description": "Error details if status is 'failed'"
+                        }
+                    },
+                    "required": ["task_id"]
+                }
+            }
+        }),
     ]
 }
 
@@ -1234,6 +1338,33 @@ pub struct ToolExecutor {
     /// Active worktree session state. When set, `effective_project_root()` returns
     /// the worktree path instead of the original `project_root`.
     worktree_session: std::sync::Mutex<Option<WorktreeSession>>,
+    /// In-memory task storage for the current session.
+    /// Tasks survive across tool calls but not across CLI restarts.
+    tasks: std::sync::Mutex<Vec<SessionTask>>,
+    /// Counter for generating unique task IDs within the session.
+    task_id_counter: std::sync::atomic::AtomicU32,
+}
+
+/// A task tracked within the current CLI session.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SessionTask {
+    pub id: String,
+    pub title: String,
+    pub description: Option<String>,
+    pub status: String,
+    pub subtasks: Vec<SessionSubtask>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// A subtask within a SessionTask.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SessionSubtask {
+    pub id: String,
+    pub title: String,
+    pub description: Option<String>,
+    pub status: String,
+    pub depends_on: Vec<String>,
 }
 
 /// State for an active worktree session created by `git_worktree enter`.
@@ -1364,6 +1495,8 @@ impl ToolExecutor {
             ),
             journal_turn_index: std::sync::atomic::AtomicU32::new(0),
             worktree_session: std::sync::Mutex::new(None),
+            tasks: std::sync::Mutex::new(Vec::new()),
+            task_id_counter: std::sync::atomic::AtomicU32::new(1),
         }
     }
 
@@ -1764,6 +1897,189 @@ impl ToolExecutor {
                 "was_custom": !choices.contains(&answer.as_str())
             }).to_string()
         }
+    }
+
+    // ─── Task management methods ──────────────────────────────────────────────
+
+    /// Create a new task in the session-local task list.
+    async fn task_create(&self, args: &Value) -> String {
+        let title = match args.get("title").and_then(Value::as_str) {
+            Some(t) if !t.is_empty() => t.to_string(),
+            _ => return "Error: 'title' is required".to_string(),
+        };
+
+        let description = args.get("description").and_then(Value::as_str).map(String::from);
+        let now = chrono::Utc::now().to_rfc3339();
+
+        // Parse subtasks if provided
+        let subtasks: Vec<SessionSubtask> = args
+            .get("subtasks")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|st| {
+                        let id = st.get("id").and_then(Value::as_str)?;
+                        let title = st.get("title").and_then(Value::as_str)?;
+                        Some(SessionSubtask {
+                            id: id.to_string(),
+                            title: title.to_string(),
+                            description: st.get("description").and_then(Value::as_str).map(String::from),
+                            status: "pending".to_string(),
+                            depends_on: st
+                                .get("depends_on")
+                                .and_then(Value::as_array)
+                                .map(|deps| deps.iter().filter_map(Value::as_str).map(String::from).collect())
+                                .unwrap_or_default(),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let task_id = format!(
+            "task-{}",
+            self.task_id_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        );
+
+        let task = SessionTask {
+            id: task_id.clone(),
+            title: title.clone(),
+            description,
+            status: "pending".to_string(),
+            subtasks,
+            created_at: now.clone(),
+            updated_at: now,
+        };
+
+        if let Ok(mut tasks) = self.tasks.lock() {
+            tasks.push(task);
+        }
+
+        serde_json::json!({
+            "success": true,
+            "task_id": task_id,
+            "message": format!("Task '{}' created successfully", title)
+        }).to_string()
+    }
+
+    /// List tasks in the session, optionally filtered by status.
+    async fn task_list(&self, args: &Value) -> String {
+        let status_filter = args.get("status").and_then(Value::as_str).unwrap_or("all");
+
+        let tasks = match self.tasks.lock() {
+            Ok(guard) => guard.clone(),
+            Err(_) => return "Error: failed to access task list".to_string(),
+        };
+
+        let filtered: Vec<_> = tasks
+            .iter()
+            .filter(|t| match status_filter {
+                "all" => true,
+                "active" => t.status == "pending" || t.status == "in_progress",
+                s => t.status == s,
+            })
+            .map(|t| {
+                let subtask_summary = if t.subtasks.is_empty() {
+                    String::new()
+                } else {
+                    let done = t.subtasks.iter().filter(|st| st.status == "completed").count();
+                    format!(" [{}/{}]", done, t.subtasks.len())
+                };
+                serde_json::json!({
+                    "id": t.id,
+                    "title": t.title,
+                    "status": t.status,
+                    "subtasks": subtask_summary,
+                    "updated_at": t.updated_at,
+                })
+            })
+            .collect();
+
+        if filtered.is_empty() {
+            return format!("No tasks found with status '{}'", status_filter);
+        }
+
+        serde_json::json!({
+            "count": filtered.len(),
+            "tasks": filtered
+        }).to_string()
+    }
+
+    /// Get full details of a task by ID.
+    async fn task_get(&self, args: &Value) -> String {
+        let task_id = match args.get("task_id").and_then(Value::as_str) {
+            Some(id) if !id.is_empty() => id,
+            _ => return "Error: 'task_id' is required".to_string(),
+        };
+
+        let tasks = match self.tasks.lock() {
+            Ok(guard) => guard.clone(),
+            Err(_) => return "Error: failed to access task list".to_string(),
+        };
+
+        match tasks.iter().find(|t| t.id == task_id) {
+            Some(task) => serde_json::to_string_pretty(task).unwrap_or_else(|_| "Error: serialization failed".to_string()),
+            None => format!("Error: task '{}' not found", task_id),
+        }
+    }
+
+    /// Update a task's status or a specific subtask's status.
+    async fn task_update(&self, args: &Value) -> String {
+        let task_id = match args.get("task_id").and_then(Value::as_str) {
+            Some(id) if !id.is_empty() => id,
+            _ => return "Error: 'task_id' is required".to_string(),
+        };
+
+        let new_status = args.get("status").and_then(Value::as_str);
+        let subtask_id = args.get("subtask_id").and_then(Value::as_str);
+        let error_message = args.get("error_message").and_then(Value::as_str);
+        let now = chrono::Utc::now().to_rfc3339();
+
+        let mut tasks = match self.tasks.lock() {
+            Ok(guard) => guard,
+            Err(_) => return "Error: failed to access task list".to_string(),
+        };
+
+        let task = match tasks.iter_mut().find(|t| t.id == task_id) {
+            Some(t) => t,
+            None => return format!("Error: task '{}' not found", task_id),
+        };
+
+        if let Some(st_id) = subtask_id {
+            // Update subtask
+            match task.subtasks.iter_mut().find(|st| st.id == st_id) {
+                Some(subtask) => {
+                    if let Some(status) = new_status {
+                        subtask.status = status.to_string();
+                    }
+                    task.updated_at = now;
+                    return serde_json::json!({
+                        "success": true,
+                        "message": format!("Subtask '{}' updated to '{}'", st_id, subtask.status)
+                    }).to_string();
+                }
+                None => return format!("Error: subtask '{}' not found in task '{}'", st_id, task_id),
+            }
+        }
+
+        // Update main task
+        if let Some(status) = new_status {
+            task.status = status.to_string();
+        }
+        if let Some(err) = error_message {
+            task.description = Some(format!("{}\n\nError: {}", task.description.as_deref().unwrap_or(""), err));
+        }
+        task.updated_at = now;
+
+        // Auto-complete task if all subtasks are completed
+        if !task.subtasks.is_empty() && task.subtasks.iter().all(|st| st.status == "completed") {
+            task.status = "completed".to_string();
+        }
+
+        serde_json::json!({
+            "success": true,
+            "message": format!("Task '{}' updated to '{}'", task_id, task.status)
+        }).to_string()
     }
 
     /// Set the MCP client manager for external tool routing.
@@ -2303,12 +2619,18 @@ impl ToolExecutor {
                 }
             }
             "ask_user" => self.ask_user(args),
+            // Task management tools
+            "task_create" => self.task_create(args).await,
+            "task_list" => self.task_list(args).await,
+            "task_get" => self.task_get(args).await,
+            "task_update" => self.task_update(args).await,
             _ if name.starts_with("mcp_") => self.execute_mcp_tool(name, args).await,
             _ => format!(
                 "Unknown tool: {name}. Available tools: bash, read_file, write_file, str_replace, \
                  list_dir, grep, glob, symbols, find_definition, find_references, git_status, \
                  git_diff, git_log, git_show, git_blame, call_graph, run_build_test, web_fetch, \
-                 mo_query, memory_search, memory_profile, ask_user"
+                 mo_query, memory_search, memory_profile, ask_user, task_create, task_list, \
+                 task_get, task_update"
             ),
         };
         // Normalize empty output, then apply global safety net
@@ -9185,5 +9507,101 @@ impl MyType {
         let result = exe.git_worktree(&json!({"action": "exit"}));
         assert!(result.contains("Error"));
         assert!(result.contains("Not in a worktree session"));
+    }
+
+    // ── Task tool tests ──────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn task_create_requires_title() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = ToolExecutor::new(dir.path());
+        let result = exe.task_create(&json!({})).await;
+        assert!(result.contains("Error"));
+        assert!(result.contains("title"));
+    }
+
+    #[tokio::test]
+    async fn task_create_returns_task_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = ToolExecutor::new(dir.path());
+        let result = exe.task_create(&json!({"title": "Test task"})).await;
+        assert!(result.contains("task-1"));
+        assert!(result.contains("success"));
+    }
+
+    #[tokio::test]
+    async fn task_list_shows_created_tasks() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = ToolExecutor::new(dir.path());
+        
+        // Create a task
+        exe.task_create(&json!({"title": "First task"})).await;
+        
+        // List should show it
+        let list = exe.task_list(&json!({})).await;
+        assert!(list.contains("First task"));
+        assert!(list.contains("task-1"));
+    }
+
+    #[tokio::test]
+    async fn task_get_returns_details() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = ToolExecutor::new(dir.path());
+        
+        exe.task_create(&json!({
+            "title": "Detailed task",
+            "description": "This is a test"
+        })).await;
+        
+        let details = exe.task_get(&json!({"task_id": "task-1"})).await;
+        assert!(details.contains("Detailed task"));
+        assert!(details.contains("This is a test"));
+    }
+
+    #[tokio::test]
+    async fn task_update_changes_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = ToolExecutor::new(dir.path());
+        
+        exe.task_create(&json!({"title": "Status test"})).await;
+        
+        // Update to in_progress
+        let result = exe.task_update(&json!({
+            "task_id": "task-1",
+            "status": "in_progress"
+        })).await;
+        assert!(result.contains("success"));
+        
+        // Verify status changed
+        let details = exe.task_get(&json!({"task_id": "task-1"})).await;
+        assert!(details.contains("in_progress"));
+    }
+
+    #[tokio::test]
+    async fn task_with_subtasks_tracks_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = ToolExecutor::new(dir.path());
+        
+        exe.task_create(&json!({
+            "title": "Multi-step task",
+            "subtasks": [
+                {"id": "step-1", "title": "First step"},
+                {"id": "step-2", "title": "Second step", "depends_on": ["step-1"]}
+            ]
+        })).await;
+        
+        // List shows subtask count
+        let list = exe.task_list(&json!({})).await;
+        assert!(list.contains("[0/2]"));
+        
+        // Complete first subtask
+        exe.task_update(&json!({
+            "task_id": "task-1",
+            "subtask_id": "step-1",
+            "status": "completed"
+        })).await;
+        
+        let list2 = exe.task_list(&json!({})).await;
+        assert!(list2.contains("[1/2]"));
     }
 }
