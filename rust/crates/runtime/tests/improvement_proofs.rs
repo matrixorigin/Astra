@@ -2996,8 +2996,8 @@ mod error_recovery_proofs {
         // Exponential backoff with random jitter:
         // attempt 0: base=500, backoff=500, jitter ∈ [0, 250) → [500, 750)
         // attempt 1: base=500, backoff=1000, jitter ∈ [0, 250) → [1000, 1250)
-        assert!(d0 >= 500 && d0 < 750, "attempt 0 out of range: {d0}");
-        assert!(d1 >= 1000 && d1 < 1250, "attempt 1 out of range: {d1}");
+        assert!((500..750).contains(&d0), "attempt 0 out of range: {d0}");
+        assert!((1000..1250).contains(&d1), "attempt 1 out of range: {d1}");
         assert!(d1 > d0, "backoff should increase");
         assert!(
             should_retry(ErrorCategory::Transient, 2).is_none(),

@@ -978,11 +978,7 @@ mod tests {
         // Negative values fail as_u64() → both None → error branch
         assert!(!a.has_usage);
         assert!(a.error_message.is_some());
-        assert!(a
-            .error_message
-            .as_ref()
-            .unwrap()
-            .contains("invalid usage"));
+        assert!(a.error_message.as_ref().unwrap().contains("invalid usage"));
     }
 
     #[test]
@@ -990,8 +986,7 @@ mod tests {
         let mut a = ChatTurnSseAccum::default();
         // Float values cannot be parsed as i64 by serde, so as_i64() returns None.
         dispatch_chat_turn_sse_event_block(
-            &"data: {\"type\":\"usage\",\"prompt_tokens\":3.14,\"completion_tokens\":2.71}\n\n"
-                .to_string(),
+            "data: {\"type\":\"usage\",\"prompt_tokens\":3.14,\"completion_tokens\":2.71}\n\n",
             &mut a,
             &mut vec![],
         );
@@ -1025,11 +1020,7 @@ mod tests {
     #[test]
     fn invalid_json_in_data_line_sets_error() {
         let mut a = ChatTurnSseAccum::default();
-        dispatch_chat_turn_sse_event_block(
-            "data: {not valid json}\n\n",
-            &mut a,
-            &mut vec![],
-        );
+        dispatch_chat_turn_sse_event_block("data: {not valid json}\n\n", &mut a, &mut vec![]);
         assert!(a.error_message.is_some());
     }
 

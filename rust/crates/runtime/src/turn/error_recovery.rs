@@ -699,14 +699,14 @@ mod tests {
     fn retry_transient_first_attempt() {
         // base=500, attempt=0: backoff=500, jitter ∈ [0, 250) → [500, 750)
         let d = should_retry(ErrorCategory::Transient, 0).unwrap();
-        assert!(d >= 500 && d < 750, "attempt 0 delay={d}");
+        assert!((500..750).contains(&d), "attempt 0 delay={d}");
     }
 
     #[test]
     fn retry_transient_second_attempt() {
         // base=500, attempt=1: backoff=1000, jitter ∈ [0, 250) → [1000, 1250)
         let d = should_retry(ErrorCategory::Transient, 1).unwrap();
-        assert!(d >= 1000 && d < 1250, "attempt 1 delay={d}");
+        assert!((1000..1250).contains(&d), "attempt 1 delay={d}");
     }
 
     #[test]
@@ -1128,28 +1128,28 @@ mod tests {
     fn retry_with_hint_honours_server_delay() {
         let delay = should_retry_with_hint(ErrorCategory::Transient, 0, Some(5000)).unwrap();
         // hint=5000ms, clamped to [500, 30000], plus jitter [0, 250)
-        assert!(delay >= 5000 && delay < 5250, "delay={delay}");
+        assert!((5000..5250).contains(&delay), "delay={delay}");
     }
 
     #[test]
     fn retry_with_hint_clamps_low_to_base() {
         // Server says 50ms but base is 500ms → clamped up to 500
         let delay = should_retry_with_hint(ErrorCategory::Transient, 0, Some(50)).unwrap();
-        assert!(delay >= 500 && delay < 750, "delay={delay}");
+        assert!((500..750).contains(&delay), "delay={delay}");
     }
 
     #[test]
     fn retry_with_hint_clamps_high_to_max() {
         // Server says 60s but max is 30s → clamped down to 30000
         let delay = should_retry_with_hint(ErrorCategory::Transient, 0, Some(60_000)).unwrap();
-        assert!(delay >= 30_000 && delay < 30_250, "delay={delay}");
+        assert!((30_000..30_250).contains(&delay), "delay={delay}");
     }
 
     #[test]
     fn retry_with_hint_none_uses_exponential() {
         let delay = should_retry_with_hint(ErrorCategory::Transient, 0, None).unwrap();
         // Same as should_retry: base=500 + jitter [0, 250) → [500, 750)
-        assert!(delay >= 500 && delay < 750, "delay={delay}");
+        assert!((500..750).contains(&delay), "delay={delay}");
     }
 
     #[test]

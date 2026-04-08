@@ -27,14 +27,9 @@ pub enum CacheBreakReason {
         removed: Vec<String>,
     },
     /// Model changed between turns.
-    ModelChanged {
-        from: String,
-        to: String,
-    },
+    ModelChanged { from: String, to: String },
     /// Cache TTL expired (inferred from time gap + cache miss).
-    TtlExpired {
-        gap_seconds: u64,
-    },
+    TtlExpired { gap_seconds: u64 },
     /// Multiple causes at once.
     Multiple(Vec<CacheBreakReason>),
 }
@@ -128,6 +123,7 @@ const MIN_CACHE_MISS_TOKENS: usize = 2_000;
 
 /// Cache TTL thresholds for expiration detection.
 const CACHE_TTL_5MIN_SECS: u64 = 300;
+#[cfg(test)]
 const CACHE_TTL_1HOUR_SECS: u64 = 3_600;
 
 /// Detects and classifies prompt cache breaks between turns.
@@ -227,10 +223,16 @@ impl CacheBreakDetector {
 
         // 3. Tool schemas change — diff which tools changed
         if prev.tools_hash != curr.tools_hash {
-            let prev_names: std::collections::HashSet<&str> =
-                prev.per_tool_hashes.iter().map(|(n, _)| n.as_str()).collect();
-            let curr_names: std::collections::HashSet<&str> =
-                curr.per_tool_hashes.iter().map(|(n, _)| n.as_str()).collect();
+            let prev_names: std::collections::HashSet<&str> = prev
+                .per_tool_hashes
+                .iter()
+                .map(|(n, _)| n.as_str())
+                .collect();
+            let curr_names: std::collections::HashSet<&str> = curr
+                .per_tool_hashes
+                .iter()
+                .map(|(n, _)| n.as_str())
+                .collect();
 
             let added: Vec<String> = curr_names
                 .difference(&prev_names)
@@ -249,9 +251,7 @@ impl CacheBreakDetector {
             if let Some(cache_read) = actual_cache_read {
                 let gap = curr.timestamp_secs.saturating_sub(prev.timestamp_secs);
                 if cache_read < MIN_CACHE_MISS_TOKENS as u64 && gap > CACHE_TTL_5MIN_SECS {
-                    reasons.push(CacheBreakReason::TtlExpired {
-                        gap_seconds: gap,
-                    });
+                    reasons.push(CacheBreakReason::TtlExpired { gap_seconds: gap });
                 }
             }
         }
@@ -456,7 +456,11 @@ mod tests {
         let e = event.unwrap();
         match &e.reason {
             CacheBreakReason::Multiple(reasons) => {
-                assert!(reasons.iter().any(|r| matches!(r, CacheBreakReason::ModelChanged { .. })));
+                assert!(
+                    reasons
+                        .iter()
+                        .any(|r| matches!(r, CacheBreakReason::ModelChanged { .. }))
+                );
             }
             CacheBreakReason::ModelChanged { from, to } => {
                 assert_eq!(from, "claude-3.5-sonnet");
@@ -508,10 +512,7 @@ mod tests {
     fn multiple_reasons_combined() {
         let mut det = CacheBreakDetector::new();
 
-        det.record_turn(
-            snap("prompt v1", &make_tools(&["bash"]), "claude"),
-            None,
-        );
+        det.record_turn(snap("prompt v1", &make_tools(&["bash"]), "claude"), None);
         let event = det.record_turn(
             snap("prompt v2", &make_tools(&["bash", "edit"]), "gpt-4o"),
             None,
@@ -695,7 +696,10 @@ mod tests {
             let mut det = CacheBreakDetector::new();
             det.record_turn(snap("v1", &tools, "c"), None);
             let e = det.record_turn(snap("v2", &tools, "c"), None).unwrap();
-            assert!(e.suggestion.is_some(), "SystemPromptChanged should have remediation");
+            assert!(
+                e.suggestion.is_some(),
+                "SystemPromptChanged should have remediation"
+            );
         }
         // ToolSchemasChanged
         {
@@ -704,7 +708,10 @@ mod tests {
             let e = det
                 .record_turn(snap("p", &make_tools(&["bash", "edit"]), "c"), None)
                 .unwrap();
-            assert!(e.suggestion.is_some(), "ToolSchemasChanged should have remediation");
+            assert!(
+                e.suggestion.is_some(),
+                "ToolSchemasChanged should have remediation"
+            );
         }
         // ModelChanged
         {

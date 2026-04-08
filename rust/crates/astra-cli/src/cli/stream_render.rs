@@ -471,14 +471,10 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                                 pm.record_approval(&t, true);
                             }
                             if ch == '!' {
-                                pm.set_mode(
-                                    crate::permission_manager::PermissionMode::Auto,
-                                );
+                                pm.set_mode(crate::permission_manager::PermissionMode::Auto);
                                 eprintln!(
                                     "  {}",
-                                    format!(
-                                        "  ⚡ Auto-run enabled for this session. Use /allow prompt to restore."
-                                    )
+                                    "  ⚡ Auto-run enabled for this session. Use /allow prompt to restore."
                                     .yellow()
                                 );
                             }
@@ -608,9 +604,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                                         use crossterm::style::Stylize;
                                         eprintln!(
                                             "  {}",
-                                            format!(
-                                                "  ⚡ Auto-run enabled for this session. Use /allow prompt to restore."
-                                            )
+                                            "  ⚡ Auto-run enabled for this session. Use /allow prompt to restore."
                                             .yellow()
                                         );
                                     }

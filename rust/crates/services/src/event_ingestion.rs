@@ -694,6 +694,9 @@ mod tests {
             coordination: None,
             edge_policy: None,
             selection_trace: None,
+            selector_confidence: None,
+            routing_domain_hint: None,
+            entity_learn_skipped_no_domain: false,
         }
     }
 

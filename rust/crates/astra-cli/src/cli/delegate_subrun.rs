@@ -199,6 +199,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             first_context_assembly_ms: None,
             first_memoria_ms: None,
             first_selector_ms: None,
+            first_selector_confidence: None,
             first_selector_strategy: None,
             selector_tokens_in: 0,
             selector_tokens_out: 0,
@@ -220,8 +221,8 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             skill_allowed_tools: None,
             skill_sandbox_policy: None,
             skill_quality_tracker: astra_runtime::skills::quality::SkillQualityTracker::new(),
-            skill_improvement_tracker:
-                astra_runtime::skills::improvement::ImprovementTracker::new(),
+            skill_improvement_tracker: astra_runtime::skills::improvement::ImprovementTracker::new(
+            ),
             pinned_skills: HashSet::new(),
             discovered_skills: HashSet::new(),
             skill_search: self.skill_search.clone(),
@@ -381,10 +382,7 @@ mod tests {
                 profile.system_prompt.is_some(),
                 "{id} should have a system prompt"
             );
-            assert!(
-                !profile.can_delegate,
-                "{id} should not be able to delegate"
-            );
+            assert!(!profile.can_delegate, "{id} should not be able to delegate");
         }
     }
 
@@ -395,10 +393,7 @@ mod tests {
 
         for id in &["coder", "reviewer", "writer"] {
             let profile = registry.get(id).unwrap();
-            assert_eq!(
-                profile.tier,
-                astra_services::coordination::AgentTier::User
-            );
+            assert_eq!(profile.tier, astra_services::coordination::AgentTier::User);
         }
     }
 }

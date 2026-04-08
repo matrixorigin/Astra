@@ -3588,8 +3588,8 @@ mcp_servers:
     fn sampling_max_tokens_capped() {
         // Verify the cap constant exists and is reasonable
         const SAMPLING_MAX_TOKENS_CAP: i64 = 4096;
-        assert!(SAMPLING_MAX_TOKENS_CAP > 0);
-        assert!(SAMPLING_MAX_TOKENS_CAP <= 8192);
+        const { assert!(SAMPLING_MAX_TOKENS_CAP > 0) };
+        const { assert!(SAMPLING_MAX_TOKENS_CAP <= 8192) };
         // Verify capping logic
         let requested: i64 = 100_000;
         let capped = requested.min(SAMPLING_MAX_TOKENS_CAP);
@@ -3601,10 +3601,10 @@ mcp_servers:
 
     #[test]
     fn timeout_constants_reasonable() {
-        assert!(MCP_CONNECT_TIMEOUT_SECS >= 10, "connect timeout too short");
-        assert!(MCP_CONNECT_TIMEOUT_SECS <= 120, "connect timeout too long");
-        assert!(MCP_TOOL_CALL_TIMEOUT_SECS >= 30, "call timeout too short");
-        assert!(MCP_TOOL_CALL_TIMEOUT_SECS <= 600, "call timeout too long");
+        const { assert!(MCP_CONNECT_TIMEOUT_SECS >= 10) };
+        const { assert!(MCP_CONNECT_TIMEOUT_SECS <= 120) };
+        const { assert!(MCP_TOOL_CALL_TIMEOUT_SECS >= 30) };
+        const { assert!(MCP_TOOL_CALL_TIMEOUT_SECS <= 600) };
     }
 
     #[test]
