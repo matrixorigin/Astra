@@ -894,6 +894,45 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
     .execute(&pool)
     .await?;
 
+    // ─── Team definitions ───────────────────────────────────────────────────────
+
+    query(
+        "CREATE TABLE IF NOT EXISTS team_definitions (
+            team_id       VARCHAR(64)  PRIMARY KEY,
+            user_id       VARCHAR(64)  NOT NULL,
+            name          VARCHAR(128) NOT NULL,
+            description   TEXT,
+            coordination  TEXT         NOT NULL,
+            members_json  TEXT         NOT NULL,
+            context_json  TEXT,
+            worktree_mode VARCHAR(32)  DEFAULT 'shared',
+            created_at    DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at    DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            UNIQUE KEY uq_team_user_name (user_id, name)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    // ─── Team execution history ─────────────────────────────────────────────────
+
+    query(
+        "CREATE TABLE IF NOT EXISTS team_execution_history (
+            execution_id  VARCHAR(64)  PRIMARY KEY,
+            team_id       VARCHAR(64)  NOT NULL,
+            user_id       VARCHAR(64)  NOT NULL,
+            task          TEXT         NOT NULL,
+            status        VARCHAR(32)  NOT NULL DEFAULT 'pending',
+            result_json   LONGTEXT,
+            started_at    DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            completed_at  DATETIME(6),
+            INDEX idx_teh_team (team_id, started_at),
+            INDEX idx_teh_user (user_id, started_at)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
     // ─── Schema migration tracking ──────────────────────────────────────────────
 
     query(

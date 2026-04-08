@@ -296,6 +296,305 @@ impl TeamPersistenceService for InMemoryTeamStore {
     }
 }
 
+// ─── MatrixOne-backed Implementation ────────────────────────────────────────
+
+/// Team persistence backed by MatrixOne's `team_definitions` table.
+///
+/// Uses sqlx connection pool with parameterized queries. The schema is created
+/// by [`crate::storage::ensure_core_schema`].
+///
+/// Serialization: `coordination`, `members`, and `context` are stored as JSON
+/// text columns. `worktree_mode` is stored as a lowercase string ("shared",
+/// "isolated", "staged").
+pub struct MatrixOneTeamStore {
+    pool: sqlx::Pool<sqlx::MySql>,
+}
+
+impl MatrixOneTeamStore {
+    /// Create from an existing connection pool.
+    pub fn new(pool: sqlx::Pool<sqlx::MySql>) -> Self {
+        Self { pool }
+    }
+
+    /// Seed built-in teams for a user if they don't already exist.
+    pub async fn ensure_builtins(&self, user_id: &str) -> Result<(), String> {
+        let now = chrono::Utc::now().to_rfc3339();
+        for team in builtin_teams(user_id, &now) {
+            let existing = self.load_team(user_id, &team.name).await?;
+            if existing.is_none() {
+                self.save_team(&team).await?;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl TeamPersistenceService for MatrixOneTeamStore {
+    async fn save_team(&self, team: &TeamDefinition) -> Result<(), String> {
+        let coordination_json =
+            serde_json::to_string(&team.coordination).map_err(|e| e.to_string())?;
+        let members_json =
+            serde_json::to_string(&team.members).map_err(|e| e.to_string())?;
+        let context_json =
+            serde_json::to_string(&team.context).map_err(|e| e.to_string())?;
+        let worktree_str = serde_json::to_string(&team.worktree_mode)
+            .map_err(|e| e.to_string())?
+            .trim_matches('"')
+            .to_string();
+
+        // Upsert: try UPDATE first (by user_id + name), INSERT if no rows affected.
+        let updated = sqlx::query(
+            "UPDATE team_definitions SET \
+                 team_id       = ?, \
+                 description   = ?, \
+                 coordination  = ?, \
+                 members_json  = ?, \
+                 context_json  = ?, \
+                 worktree_mode = ?, \
+                 updated_at    = NOW(6) \
+             WHERE user_id = ? AND name = ?",
+        )
+        .bind(&team.team_id)
+        .bind(&team.description)
+        .bind(&coordination_json)
+        .bind(&members_json)
+        .bind(&context_json)
+        .bind(&worktree_str)
+        .bind(&team.user_id)
+        .bind(&team.name)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| format!("team UPDATE failed: {e}"))?;
+
+        if updated.rows_affected() == 0 {
+            sqlx::query(
+                "INSERT INTO team_definitions \
+                 (team_id, user_id, name, description, coordination, members_json, \
+                  context_json, worktree_mode, created_at, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW(6), NOW(6))",
+            )
+            .bind(&team.team_id)
+            .bind(&team.user_id)
+            .bind(&team.name)
+            .bind(&team.description)
+            .bind(&coordination_json)
+            .bind(&members_json)
+            .bind(&context_json)
+            .bind(&worktree_str)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| format!("team INSERT failed: {e}"))?;
+        }
+
+        Ok(())
+    }
+
+    async fn load_team(
+        &self,
+        user_id: &str,
+        name: &str,
+    ) -> Result<Option<TeamDefinition>, String> {
+        let row = sqlx::query(
+            "SELECT team_id, user_id, name, description, coordination, \
+                    members_json, context_json, worktree_mode, \
+                    created_at, updated_at \
+             FROM team_definitions WHERE user_id = ? AND name = ?",
+        )
+        .bind(user_id)
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| format!("team SELECT failed: {e}"))?;
+
+        match row {
+            None => Ok(None),
+            Some(row) => {
+                let team = row_to_team_definition(&row)?;
+                Ok(Some(team))
+            }
+        }
+    }
+
+    async fn list_teams(&self, user_id: &str) -> Result<Vec<TeamDefinition>, String> {
+        let rows = sqlx::query(
+            "SELECT team_id, user_id, name, description, coordination, \
+                    members_json, context_json, worktree_mode, \
+                    created_at, updated_at \
+             FROM team_definitions WHERE user_id = ? ORDER BY name",
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| format!("team SELECT ALL failed: {e}"))?;
+
+        let mut teams = Vec::with_capacity(rows.len());
+        for row in &rows {
+            teams.push(row_to_team_definition(row)?);
+        }
+        Ok(teams)
+    }
+
+    async fn delete_team(&self, user_id: &str, name: &str) -> Result<bool, String> {
+        let result = sqlx::query(
+            "DELETE FROM team_definitions WHERE user_id = ? AND name = ?",
+        )
+        .bind(user_id)
+        .bind(name)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| format!("team DELETE failed: {e}"))?;
+
+        Ok(result.rows_affected() > 0)
+    }
+}
+
+/// Parse a database row into a [`TeamDefinition`].
+fn row_to_team_definition(row: &sqlx::mysql::MySqlRow) -> Result<TeamDefinition, String> {
+    use sqlx::Row;
+
+    let team_id: String = row.get("team_id");
+    let user_id: String = row.get("user_id");
+    let name: String = row.get("name");
+    let description: String = row.try_get("description").unwrap_or_default();
+    let coord_json: String = row.get("coordination");
+    let members_str: String = row.get("members_json");
+    let context_str: String = row.try_get("context_json").unwrap_or_default();
+    let wt_str: String = row.try_get("worktree_mode").unwrap_or_else(|_| "shared".to_string());
+    let created_at: String = row
+        .try_get::<String, _>("created_at")
+        .unwrap_or_default();
+    let updated_at: String = row
+        .try_get::<String, _>("updated_at")
+        .unwrap_or_default();
+
+    let coordination: TeamCoordination =
+        serde_json::from_str(&coord_json).map_err(|e| format!("bad coordination JSON: {e}"))?;
+    let members: Vec<TeamMemberDef> =
+        serde_json::from_str(&members_str).map_err(|e| format!("bad members JSON: {e}"))?;
+    let context: HashMap<String, String> = if context_str.is_empty() {
+        HashMap::new()
+    } else {
+        serde_json::from_str(&context_str).map_err(|e| format!("bad context JSON: {e}"))?
+    };
+    let worktree_mode: WorktreeMode =
+        serde_json::from_str(&format!("\"{wt_str}\"")).unwrap_or_default();
+
+    Ok(TeamDefinition {
+        team_id,
+        user_id,
+        name,
+        description,
+        coordination,
+        members,
+        context,
+        worktree_mode,
+        created_at,
+        updated_at,
+    })
+}
+
+// ─── Execution History ──────────────────────────────────────────────────────
+
+/// A record of a team execution in the `team_execution_history` table.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TeamExecutionRecord {
+    pub execution_id: String,
+    pub team_id: String,
+    pub user_id: String,
+    pub task: String,
+    pub status: String,
+    pub result_json: Option<String>,
+    pub started_at: String,
+    pub completed_at: Option<String>,
+}
+
+impl MatrixOneTeamStore {
+    /// Record the start of a team execution.
+    pub async fn record_execution_start(
+        &self,
+        execution_id: &str,
+        team_id: &str,
+        user_id: &str,
+        task: &str,
+    ) -> Result<(), String> {
+        sqlx::query(
+            "INSERT INTO team_execution_history \
+             (execution_id, team_id, user_id, task, status, started_at) \
+             VALUES (?, ?, ?, ?, 'running', NOW(6))",
+        )
+        .bind(execution_id)
+        .bind(team_id)
+        .bind(user_id)
+        .bind(task)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| format!("execution INSERT failed: {e}"))?;
+        Ok(())
+    }
+
+    /// Record the completion of a team execution.
+    pub async fn record_execution_complete(
+        &self,
+        execution_id: &str,
+        status: &str,
+        result_json: Option<&str>,
+    ) -> Result<(), String> {
+        sqlx::query(
+            "UPDATE team_execution_history SET \
+                 status       = ?, \
+                 result_json  = ?, \
+                 completed_at = NOW(6) \
+             WHERE execution_id = ?",
+        )
+        .bind(status)
+        .bind(result_json)
+        .bind(execution_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| format!("execution UPDATE failed: {e}"))?;
+        Ok(())
+    }
+
+    /// List execution history for a team, most recent first.
+    pub async fn list_executions(
+        &self,
+        team_id: &str,
+        limit: u32,
+    ) -> Result<Vec<TeamExecutionRecord>, String> {
+        use sqlx::Row;
+
+        let rows = sqlx::query(
+            "SELECT execution_id, team_id, user_id, task, status, \
+                    result_json, started_at, completed_at \
+             FROM team_execution_history \
+             WHERE team_id = ? \
+             ORDER BY started_at DESC \
+             LIMIT ?",
+        )
+        .bind(team_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| format!("execution SELECT failed: {e}"))?;
+
+        let mut records = Vec::with_capacity(rows.len());
+        for row in &rows {
+            records.push(TeamExecutionRecord {
+                execution_id: row.get("execution_id"),
+                team_id: row.get("team_id"),
+                user_id: row.get("user_id"),
+                task: row.get("task"),
+                status: row.get("status"),
+                result_json: row.try_get("result_json").ok(),
+                started_at: row.try_get::<String, _>("started_at").unwrap_or_default(),
+                completed_at: row.try_get::<String, _>("completed_at").ok(),
+            });
+        }
+        Ok(records)
+    }
+}
+
 // ─── Built-in Teams ─────────────────────────────────────────────────────────
 
 /// The three standard team templates: review, research, dev.
@@ -705,5 +1004,119 @@ mod tests {
             parse_aggregation("custom prompt"),
             AggregationStrategy::LlmGuided { .. }
         ));
+    }
+
+    // ── MatrixOne serialization helpers ──
+
+    #[test]
+    fn coordination_json_roundtrips_through_matrixone_format() {
+        // Simulate what MatrixOneTeamStore does: serialize to JSON text, store, deserialize
+        let coords = vec![
+            TeamCoordination::Adversarial {
+                max_rounds: 5,
+                threshold: 0.85,
+            },
+            TeamCoordination::FanOut {
+                aggregation: "consensus".to_string(),
+            },
+            TeamCoordination::Pipeline,
+            TeamCoordination::Sequential {
+                stop_on_success: true,
+            },
+        ];
+
+        for coord in &coords {
+            let json = serde_json::to_string(coord).unwrap();
+            let parsed: TeamCoordination = serde_json::from_str(&json).unwrap();
+            assert_eq!(*coord, parsed, "roundtrip failed for {json}");
+        }
+    }
+
+    #[test]
+    fn members_json_roundtrip() {
+        let members = vec![
+            TeamMemberDef {
+                role: "coder".to_string(),
+                agent_id: Some("my-coder".to_string()),
+                system_prompt: None,
+                skills: vec!["edit".to_string(), "test".to_string()],
+                model_override: Some("gpt-4".to_string()),
+                mcp_servers: vec!["github".to_string()],
+            },
+            TeamMemberDef {
+                role: "reviewer".to_string(),
+                agent_id: None,
+                system_prompt: Some("Be thorough".to_string()),
+                skills: vec![],
+                model_override: None,
+                mcp_servers: vec![],
+            },
+        ];
+
+        let json = serde_json::to_string(&members).unwrap();
+        let parsed: Vec<TeamMemberDef> = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].role, "coder");
+        assert_eq!(parsed[0].agent_id.as_deref(), Some("my-coder"));
+        assert_eq!(parsed[1].system_prompt.as_deref(), Some("Be thorough"));
+    }
+
+    #[test]
+    fn worktree_mode_string_format() {
+        // MatrixOneTeamStore stores worktree_mode as a bare string, not JSON
+        for (mode, expected) in [
+            (WorktreeMode::Shared, "shared"),
+            (WorktreeMode::Isolated, "isolated"),
+            (WorktreeMode::Staged, "staged"),
+        ] {
+            let json = serde_json::to_string(&mode).unwrap();
+            // serde produces "\"shared\"", trim quotes for DB storage
+            let bare = json.trim_matches('"');
+            assert_eq!(bare, expected);
+            // Reverse: wrap in quotes for deserialization
+            let restored: WorktreeMode =
+                serde_json::from_str(&format!("\"{bare}\"")).unwrap();
+            assert_eq!(restored, mode);
+        }
+    }
+
+    #[test]
+    fn context_json_handles_empty() {
+        let empty: HashMap<String, String> = HashMap::new();
+        let json = serde_json::to_string(&empty).unwrap();
+        assert_eq!(json, "{}");
+        let parsed: HashMap<String, String> = serde_json::from_str(&json).unwrap();
+        assert!(parsed.is_empty());
+    }
+
+    #[test]
+    fn team_execution_record_serde_roundtrip() {
+        let record = TeamExecutionRecord {
+            execution_id: "exec-1".to_string(),
+            team_id: "team-1".to_string(),
+            user_id: "user-1".to_string(),
+            task: "Fix auth bug".to_string(),
+            status: "completed".to_string(),
+            result_json: Some(r#"{"merged":true}"#.to_string()),
+            started_at: "2026-01-01T00:00:00Z".to_string(),
+            completed_at: Some("2026-01-01T00:05:00Z".to_string()),
+        };
+        let json = serde_json::to_string(&record).unwrap();
+        let parsed: TeamExecutionRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.execution_id, "exec-1");
+        assert_eq!(parsed.status, "completed");
+        assert!(parsed.completed_at.is_some());
+    }
+
+    #[test]
+    fn full_team_definition_serde_roundtrip() {
+        let team = test_team();
+        let json = serde_json::to_string(&team).unwrap();
+        let parsed: TeamDefinition = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.team_id, team.team_id);
+        assert_eq!(parsed.name, team.name);
+        assert_eq!(parsed.worktree_mode, WorktreeMode::Isolated);
+        assert_eq!(parsed.members.len(), 2);
+        assert!(parsed.context.contains_key("project"));
     }
 }
