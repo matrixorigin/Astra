@@ -252,6 +252,50 @@ fn rate_limit_cooldown() -> &'static PerModelCooldown {
     COOLDOWN.get_or_init(PerModelCooldown::new)
 }
 
+// ── Cache Configuration (session-latched) ────────────────────────────────────
+// Latched at session start to prevent mid-session flips from busting the cache.
+// Claude Code calls these "session-stable latches."
+
+/// Prompt cache configuration, latched once per session.
+///
+/// Instead of reading `MO_PROMPT_CACHE_DISABLED` on every LLM call (which risks
+/// mid-session env var changes busting the KV cache), this struct captures the
+/// config at session init and is passed to all cache-related functions.
+#[derive(Debug, Clone)]
+pub struct PromptCacheConfig {
+    /// Whether cache_control annotations are enabled for Anthropic.
+    pub cache_enabled: bool,
+    /// Whether the provider supports cache_control (Anthropic/Claude).
+    pub is_anthropic: bool,
+}
+
+impl PromptCacheConfig {
+    /// Latch config from environment and provider info. Call once at session start.
+    pub fn latch(provider: &str, model_name: &str) -> Self {
+        let cache_enabled = !std::env::var("MO_PROMPT_CACHE_DISABLED")
+            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+        let is_anthropic = provider == "anthropic" || model_name.contains("claude");
+        Self {
+            cache_enabled,
+            is_anthropic,
+        }
+    }
+
+    /// Convenience: should we emit cache_control annotations?
+    pub fn should_annotate(&self) -> bool {
+        self.cache_enabled && self.is_anthropic
+    }
+}
+
+impl Default for PromptCacheConfig {
+    fn default() -> Self {
+        Self {
+            cache_enabled: true,
+            is_anthropic: false,
+        }
+    }
+}
+
 // ── System Prompt Cache ──────────────────────────────────────────────────────
 // Two-level cache for static/dynamic prompt boundary:
 // - Global+Session sections are cached by (tool_names, task_type, confidence) — stable within a session
@@ -303,9 +347,8 @@ fn build_system_message(
     profile_desc: &str,
     confidence: f64,
     task_type: Option<&str>,
-    provider: &str,
-    model_name: &str,
-) -> (Value, Option<Value>) {
+    cache_cfg: &PromptCacheConfig,
+) -> Value {
     let key = section_cache_key(tool_names, task_type, confidence);
 
     // Try cache for the stable (Global + Session) sections
@@ -346,7 +389,7 @@ fn build_system_message(
         (text, stable)
     });
 
-    let is_anthropic = provider == "anthropic" || model_name.contains("claude");
+    let is_anthropic = cache_cfg.is_anthropic;
 
     if is_anthropic {
         // Anthropic: multi-block content with cache_control on stable sections.
@@ -362,8 +405,7 @@ fn build_system_message(
         //   Global  → scope:"global" + ttl:"1h"  (shared across all sessions/orgs)
         //   Session → ttl:"1h"                    (stable within a session)
         //   None    → no cache_control             (changes every turn)
-        let cache_disabled = std::env::var("MO_PROMPT_CACHE_DISABLED")
-            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+        let cache_disabled = !cache_cfg.cache_enabled;
 
         // Find the last index of each scope group for breakpoint placement
         let last_global = sections
@@ -430,14 +472,8 @@ fn build_system_message(
 
 /// Add `cache_control` to the last tool schema for Anthropic,
 /// marking the tool definitions as cache-eligible.
-fn annotate_tool_schemas_for_caching(tools: &mut [Value], provider: &str, model_name: &str) {
-    let is_anthropic = provider == "anthropic" || model_name.contains("claude");
-    if !is_anthropic || tools.is_empty() {
-        return;
-    }
-    if std::env::var("MO_PROMPT_CACHE_DISABLED")
-        .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-    {
+fn annotate_tool_schemas_for_caching(tools: &mut [Value], cache_cfg: &PromptCacheConfig) {
+    if !cache_cfg.should_annotate() || tools.is_empty() {
         return;
     }
     // Mark last tool definition with cache_control — Anthropic caches the prefix
@@ -450,14 +486,8 @@ fn annotate_tool_schemas_for_caching(tools: &mut [Value], provider: &str, model_
 
 /// Add a cache breakpoint on the last conversation message for Anthropic.
 /// This enables turn-to-turn KV cache reuse for the conversation prefix.
-fn add_message_cache_breakpoint(messages: &mut [Value], provider: &str, model_name: &str) {
-    let is_anthropic = provider == "anthropic" || model_name.contains("claude");
-    if !is_anthropic || messages.is_empty() {
-        return;
-    }
-    if std::env::var("MO_PROMPT_CACHE_DISABLED")
-        .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-    {
+fn add_message_cache_breakpoint(messages: &mut [Value], cache_cfg: &PromptCacheConfig) {
+    if !cache_cfg.should_annotate() || messages.is_empty() {
         return;
     }
     // Find the last non-system message and add cache_control to it
@@ -1073,6 +1103,10 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
             };
             let has_fallback = fallback_model_name.is_some();
 
+            // Latch cache config at session init — prevents mid-session env var
+            // changes from busting the KV cache.
+            let cache_cfg = PromptCacheConfig::latch(&provider, &model_name);
+
             // Check rate-limit cooldown and handle fallback model resolution
             let cooldown = rate_limit_cooldown();
             match cooldown.with(&model_name, |c| c.check_request(has_fallback)) {
@@ -1295,8 +1329,7 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                 &dynamic_desc,
                 selection_confidence,
                 task_type,
-                &provider,
-                &model_name,
+                &cache_cfg,
             );
             llm_messages.push(system_msg);
             if let Some(dyn_msg) = dynamic_msg {
@@ -1440,7 +1473,7 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                     bridge_ptl_streak,
                 );
                 let mut pruned_tools = prune_tool_schemas(&edge_tools, round_tier);
-                annotate_tool_schemas_for_caching(&mut pruned_tools, &provider, &model_name);
+                annotate_tool_schemas_for_caching(&mut pruned_tools, &cache_cfg);
 
                 let loop_started = Instant::now();
                 let mut loop_tool_calls: Vec<Value> = Vec::new();
@@ -1473,7 +1506,7 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                     }
                 } else {
                     // Add cache breakpoint on last conversation message for Anthropic
-                    add_message_cache_breakpoint(&mut llm_messages, &provider, &model_name);
+                    add_message_cache_breakpoint(&mut llm_messages, &cache_cfg);
                     let mut client_stopped = false;
                     let llm_stream = match call_llm_stream(
                         &llm_messages,
@@ -1557,7 +1590,7 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
 
                             // Also prune tool schemas more aggressively
                             pruned_tools = prune_tool_schemas(&edge_tools, crate::prompts::CompactionTier::AggressivePrune);
-                            annotate_tool_schemas_for_caching(&mut pruned_tools, &provider, &model_name);
+                            annotate_tool_schemas_for_caching(&mut pruned_tools, &cache_cfg);
 
                             // Retry LLM call
                             match call_llm_stream(
@@ -2476,8 +2509,7 @@ mod tests {
             "cwd: /test",
             0.8,
             Some("implementation"),
-            "anthropic",
-            "claude-sonnet-4-20250514",
+            &PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514"),
         );
 
         // Should be multi-block content array
@@ -2529,8 +2561,7 @@ mod tests {
             "cwd: /test",
             0.8,
             Some("implementation"),
-            "anthropic",
-            "claude-sonnet-4-20250514",
+            &PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514"),
         );
 
         let content = msg.get("content").expect("should have content");
@@ -2567,8 +2598,7 @@ mod tests {
             "cwd: /test",
             0.8,
             None,
-            "anthropic",
-            "claude-sonnet-4-20250514",
+            &PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514"),
         );
 
         let content = msg.get("content").expect("should have content");
@@ -2592,8 +2622,7 @@ mod tests {
             "cwd: /test",
             0.8,
             None,
-            "openai",
-            "gpt-4",
+            &PromptCacheConfig::latch("openai", "gpt-4"),
         );
 
         // Primary should be a single string content (stable prefix)
@@ -2619,8 +2648,7 @@ mod tests {
             "",
             0.8,
             None,
-            "openrouter",               // not "anthropic"
-            "claude-sonnet-4-20250514", // but model is claude
+            &PromptCacheConfig::latch("openrouter", "claude-sonnet-4-20250514"),
         );
 
         let content = msg.get("content").expect("should have content");
@@ -2641,7 +2669,7 @@ mod tests {
             json!({"function": {"name": "bash"}}),
             json!({"function": {"name": "read_file"}}),
         ];
-        annotate_tool_schemas_for_caching(&mut tools, "anthropic", "claude-sonnet-4-20250514");
+        annotate_tool_schemas_for_caching(&mut tools, &PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514"));
 
         // Only last tool should have cache_control
         assert!(
@@ -2663,7 +2691,7 @@ mod tests {
     #[test]
     fn annotate_tool_schemas_noop_for_openai() {
         let mut tools = vec![json!({"function": {"name": "bash"}})];
-        annotate_tool_schemas_for_caching(&mut tools, "openai", "gpt-4");
+        annotate_tool_schemas_for_caching(&mut tools, &PromptCacheConfig::latch("openai", "gpt-4"));
         assert!(
             tools[0].get("cache_control").is_none(),
             "OpenAI tools should not get cache_control"
@@ -2678,7 +2706,7 @@ mod tests {
             json!({"role": "user", "content": "hello"}),
             json!({"role": "assistant", "content": "hi there"}),
         ];
-        add_message_cache_breakpoint(&mut messages, "anthropic", "claude-sonnet-4-20250514");
+        add_message_cache_breakpoint(&mut messages, &PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514"));
 
         // System message should be untouched
         assert!(messages[0]["content"].is_string(), "system msg unchanged");
@@ -2701,7 +2729,7 @@ mod tests {
             json!({"role": "system", "content": "sys"}),
             json!({"role": "user", "content": "hi"}),
         ];
-        add_message_cache_breakpoint(&mut messages, "openai", "gpt-4");
+        add_message_cache_breakpoint(&mut messages, &PromptCacheConfig::latch("openai", "gpt-4"));
 
         // Should remain unchanged
         assert!(
@@ -2744,8 +2772,7 @@ mod tests {
     fn intermediate_text_is_suppressed_when_tool_calls_exist() {
         let loop_text = "draft review text";
         let loop_tool_calls = [json!({
-            "id": "call_1",
-            "type": "function",
+            "id": "call_1", "type": "function",
             "function": {"name": "git_show", "arguments": "{\"rev\":\"HEAD\"}"}
         })];
         let should_emit = !loop_text.trim().is_empty() && loop_tool_calls.is_empty();
@@ -2894,8 +2921,7 @@ mod tests {
             "cwd: /test",
             0.8,
             Some("implementation"),
-            "anthropic",
-            "claude-sonnet-4-20250514",
+            &PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514"),
         );
         let sys_blocks = sys["content"].as_array().expect("array content");
         let has_sys_cache = sys_blocks.iter().any(|b| b.get("cache_control").is_some());
@@ -2909,7 +2935,7 @@ mod tests {
             json!({"function": {"name": "bash"}}),
             json!({"function": {"name": "read_file"}}),
         ];
-        annotate_tool_schemas_for_caching(&mut tools, "anthropic", "claude-sonnet-4-20250514");
+        annotate_tool_schemas_for_caching(&mut tools, &PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514"));
         assert!(
             tools.last().unwrap().get("cache_control").is_some(),
             "Layer 2: last tool should have cache_control"
@@ -2920,7 +2946,7 @@ mod tests {
             json!({"role": "user", "content": "hello"}),
             json!({"role": "assistant", "content": "hi"}),
         ];
-        add_message_cache_breakpoint(&mut messages, "anthropic", "claude-sonnet-4-20250514");
+        add_message_cache_breakpoint(&mut messages, &PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514"));
         let last = messages.last().unwrap();
         let last_arr = last["content"].as_array().expect("converted to array");
         assert!(
@@ -2942,8 +2968,7 @@ mod tests {
             "cwd: /test",
             0.8,
             None,
-            "anthropic",
-            "claude-sonnet-4-20250514",
+            &PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514"),
         );
         let sys_blocks = sys["content"].as_array().unwrap();
         for block in sys_blocks {
@@ -2955,7 +2980,7 @@ mod tests {
 
         // Layer 2: tool schemas
         let mut tools = vec![json!({"function": {"name": "bash"}})];
-        annotate_tool_schemas_for_caching(&mut tools, "anthropic", "claude-sonnet-4-20250514");
+        annotate_tool_schemas_for_caching(&mut tools, &PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514"));
         assert!(
             tools[0].get("cache_control").is_none(),
             "tools should not have cache_control when disabled"
@@ -2963,7 +2988,7 @@ mod tests {
 
         // Layer 3: message breakpoint
         let mut messages = vec![json!({"role": "user", "content": "hello"})];
-        add_message_cache_breakpoint(&mut messages, "anthropic", "claude-sonnet-4-20250514");
+        add_message_cache_breakpoint(&mut messages, &PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514"));
         assert!(
             messages[0]["content"].is_string(),
             "messages should not be modified when cache disabled"
@@ -2989,7 +3014,7 @@ mod tests {
         for i in 0..34 {
             let tool_name = format!("tool_{i}");
             let tools: Vec<&str> = vec![tool_name.as_str()];
-            let (_msg, _) = build_system_message(&tools, "", 0.8, None, "openai", "gpt-4");
+            let _msg = build_system_message(&tools, "", 0.8, None, &PromptCacheConfig::latch("openai", "gpt-4"));
         }
 
         let cache_size = section_cache().lock().unwrap().len();
@@ -3040,7 +3065,7 @@ mod tests {
         }
 
         let mut messages = vec![json!({"role": "system", "content": "sys prompt"})];
-        add_message_cache_breakpoint(&mut messages, "anthropic", "claude-sonnet-4-20250514");
+        add_message_cache_breakpoint(&mut messages, &PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514"));
         // System message should not be modified
         assert!(
             messages[0]["content"].is_string(),
@@ -3052,7 +3077,7 @@ mod tests {
     fn message_breakpoint_empty_messages_noop() {
         let _lock = CACHE_ENV_MUTEX.lock().unwrap();
         let mut messages: Vec<Value> = vec![];
-        add_message_cache_breakpoint(&mut messages, "anthropic", "claude-sonnet-4-20250514");
+        add_message_cache_breakpoint(&mut messages, &PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514"));
         assert!(messages.is_empty());
     }
 
@@ -3070,7 +3095,7 @@ mod tests {
                 {"type": "text", "text": "world"},
             ]
         })];
-        add_message_cache_breakpoint(&mut messages, "anthropic", "claude-sonnet-4-20250514");
+        add_message_cache_breakpoint(&mut messages, &PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514"));
 
         let blocks = messages[0]["content"].as_array().unwrap();
         // First block should NOT have cache_control
@@ -3089,7 +3114,7 @@ mod tests {
     fn tool_schemas_empty_list_noop() {
         let _lock = CACHE_ENV_MUTEX.lock().unwrap();
         let mut tools: Vec<Value> = vec![];
-        annotate_tool_schemas_for_caching(&mut tools, "anthropic", "claude-sonnet-4-20250514");
+        annotate_tool_schemas_for_caching(&mut tools, &PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514"));
         assert!(tools.is_empty());
     }
 
@@ -3257,8 +3282,7 @@ mod tests {
             "profile",
             0.8,
             Some("code_review"),
-            "anthropic",
-            "claude-sonnet-4-20250514",
+            &PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514"),
         );
 
         let blocks = msg["content"].as_array().unwrap();
@@ -3285,8 +3309,7 @@ mod tests {
             "profile",
             0.8,
             Some("debugging"),
-            "anthropic",
-            "claude-sonnet-4-20250514",
+            &PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514"),
         );
 
         let blocks = msg["content"].as_array().unwrap();
@@ -3325,16 +3348,14 @@ mod tests {
             "p1",
             0.8,
             None,
-            "anthropic",
-            "claude-sonnet-4-20250514",
+            &PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514"),
         );
         let (msg2, _) = build_system_message(
             &["bash", "git_diff", "memory_store"],
             "p2",
             0.5,
             Some("debugging"),
-            "anthropic",
-            "claude-sonnet-4-20250514",
+            &PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514"),
         );
 
         let blocks1 = msg1["content"].as_array().unwrap();
@@ -3392,16 +3413,14 @@ mod tests {
             "turn1 profile",
             0.8,
             None,
-            "anthropic",
-            "claude-sonnet-4-20250514",
+            &PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514"),
         );
         let (msg_turn2, _) = build_system_message(
             &["bash", "read_file", "git_diff"],
             "turn2 profile",
             0.8,
             None,
-            "anthropic",
-            "claude-sonnet-4-20250514",
+            &PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514"),
         );
 
         let b1 = msg_turn1["content"].as_array().unwrap();
@@ -3448,16 +3467,14 @@ mod tests {
             "turn1 profile",
             0.8,
             None,
-            "openai",
-            "gpt-4o",
+            &PromptCacheConfig::latch("openai", "gpt-4o"),
         );
         let (msg2, dyn2) = build_system_message(
             &["bash", "read_file"],
             "turn2 profile",
             0.8,
             None,
-            "openai",
-            "gpt-4o",
+            &PromptCacheConfig::latch("openai", "gpt-4o"),
         );
 
         let s1 = msg1["content"].as_str().unwrap();
@@ -3487,14 +3504,13 @@ mod tests {
     fn openai_global_prefix_stable_across_tool_sets() {
         let _lock = CACHE_ENV_MUTEX.lock().unwrap();
 
-        let (msg1, _) = build_system_message(&["bash"], "", 0.8, None, "openai", "gpt-4o");
-        let (msg2, _) = build_system_message(
+        let msg1 = build_system_message(&["bash"], "", 0.8, None, &PromptCacheConfig::latch("openai", "gpt-4o"));
+        let msg2 = build_system_message(
             &["bash", "git_diff", "memory_store", "find_definition"],
             "",
             0.8,
             Some("code_review"),
-            "openai",
-            "gpt-4o",
+            &PromptCacheConfig::latch("openai", "gpt-4o"),
         );
 
         let s1 = msg1["content"].as_str().unwrap();
@@ -3527,8 +3543,7 @@ mod tests {
             "",
             0.8,
             None,
-            "anthropic",
-            "claude-sonnet-4-20250514",
+            &PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514"),
         );
 
         let blocks = msg["content"].as_array().unwrap();
@@ -3577,24 +3592,21 @@ mod tests {
             "",
             0.8,
             None,
-            "anthropic",
-            "claude-sonnet-4-20250514",
+            &PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514"),
         );
         let (msg_review, _) = build_system_message(
             &tools,
             "",
             0.8,
             Some("code_review"),
-            "anthropic",
-            "claude-sonnet-4-20250514",
+            &PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514"),
         );
         let (msg_debug, _) = build_system_message(
             &tools,
             "",
             0.8,
             Some("debugging"),
-            "anthropic",
-            "claude-sonnet-4-20250514",
+            &PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514"),
         );
 
         let get_global_blocks = |msg: &Value| -> Vec<String> {

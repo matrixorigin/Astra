@@ -422,14 +422,24 @@ pub fn budget_for_model(model: Option<&str>) -> ContextBudget {
 
 /// Conservative default output token cap (8K) with escalation on `finish_reason: "length"`.
 ///
-/// Default cap on output tokens. Most responses fit within 8K (p99 ≈ 5K).
-const DEFAULT_OUTPUT_TOKEN_CAP: usize = 8192;
+/// Default cap on output tokens — used for models with large context windows
+/// (≥128K). Smaller models keep 8K to preserve context headroom.
+const DEFAULT_OUTPUT_TOKEN_CAP: usize = 16_384;
 
-/// Most responses fit within 8K tokens (p99 ≈ 5K). Starting low frees context
-/// headroom; the existing escalation logic retries at 2× then 4× if truncated.
+/// Fallback cap for models with smaller context windows (<128K).
+const SMALL_MODEL_OUTPUT_TOKEN_CAP: usize = 8192;
+
+/// Cap on output tokens that balances quality (longer code generation) with
+/// context headroom. Large-context models (≥128K) get 16K; smaller models
+/// get 8K. The existing escalation logic retries at 2× then 4× if truncated.
 pub fn capped_output_tokens(budget: &ContextBudget) -> usize {
+    let cap = if budget.model_limit >= 128_000 {
+        DEFAULT_OUTPUT_TOKEN_CAP
+    } else {
+        SMALL_MODEL_OUTPUT_TOKEN_CAP
+    };
     let full_reserve = (budget.model_limit as f64 * budget.output_reserve_ratio) as usize;
-    full_reserve.min(DEFAULT_OUTPUT_TOKEN_CAP)
+    full_reserve.min(cap)
 }
 
 // ---------------------------------------------------------------------------
@@ -902,24 +912,24 @@ mod tests {
     // ── capped_output_tokens tests ──
 
     #[test]
-    fn capped_output_tokens_default_8k() {
+    fn capped_output_tokens_default_16k() {
         let b = budget_for_model(None); // 128K, 0.15
-        // full_reserve = 128_000 * 0.15 = 19_200 → capped to 8192
-        assert_eq!(capped_output_tokens(&b), 8192);
+        // full_reserve = 128_000 * 0.15 = 19_200 → capped to 16_384 (large model)
+        assert_eq!(capped_output_tokens(&b), 16_384);
     }
 
     #[test]
     fn capped_output_tokens_scales_for_small_model() {
         let b = budget_for_model(Some("gpt-3.5")); // 16K, 0.12
-        // full_reserve = 16_000 * 0.12 = 1_920 → min(1920, 8192) = 1920
+        // full_reserve = 16_000 * 0.12 = 1_920 → min(1920, 8192) = 1920 (small model cap)
         assert_eq!(capped_output_tokens(&b), 1920);
     }
 
     #[test]
-    fn capped_output_tokens_claude() {
+    fn capped_output_tokens_claude_16k() {
         let b = budget_for_model(Some("claude-3.5-sonnet")); // 200K, 0.20
-        // full_reserve = 200_000 * 0.20 = 40_000 → capped to 8192
-        assert_eq!(capped_output_tokens(&b), 8192);
+        // full_reserve = 200_000 * 0.20 = 40_000 → capped to 16_384 (large model)
+        assert_eq!(capped_output_tokens(&b), 16_384);
     }
 
     // -----------------------------------------------------------------------
@@ -1020,8 +1030,8 @@ mod tests {
             output_reserve_ratio: 0.20,
             compact_config: CompactConfig::default(),
         };
-        // 2M * 0.20 = 400K → capped to 8192
-        assert_eq!(capped_output_tokens(&b), 8192);
+        // 2M * 0.20 = 400K → capped to 16_384 (large model)
+        assert_eq!(capped_output_tokens(&b), 16_384);
     }
 
     #[test]

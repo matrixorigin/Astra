@@ -322,7 +322,7 @@ pub mod tests {
     #[tokio::test]
     async fn success_on_first_attempt() {
         let body =
-            "### Primary Request\nDoing stuff\n### Pending Tasks\nNone\n### Current State\nDone";
+            "### Primary Request\nDoing stuff\n### Pending Tasks\nNone\n### Current Work\nIn progress\n### Current State\nDone";
         let client = MockSummaryClient::success(body);
         let msgs = make_messages(3);
         let result = generate_compact_summary(&msgs, &client).await;
@@ -332,7 +332,7 @@ pub mod tests {
 
     #[tokio::test]
     async fn ptl_retry_drops_oldest_round_and_succeeds() {
-        let body = "### Primary Request\nX\n### Pending Tasks\nY\n### Current State\nZ";
+        let body = "### Primary Request\nX\n### Pending Tasks\nY\n### Current Work\nW\n### Current State\nZ";
         let client = MockSummaryClient::ptl_then_success(body);
         let msgs = make_messages(4); // 4 rounds, enough to drop one
         let result = generate_compact_summary(&msgs, &client).await;

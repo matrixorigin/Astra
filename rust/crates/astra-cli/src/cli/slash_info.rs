@@ -1292,19 +1292,17 @@ pub(super) async fn handle_info_command(
         "/context" => {
             let sep = "─".repeat(38);
             eprintln!("\n  {}", format!("─── Context Window {sep}").cyan());
-            let session_display = state
-                .session_id
-                .as_deref()
-                .map(|s| prefix_chars(s, 8))
-                .unwrap_or_else(|| "none".to_string());
+
+            // ── Identity ──
             let model_display = state.model.clone().unwrap_or_else(|| "default".to_string());
-            let run_display = state
-                .run_id
-                .as_deref()
-                .map(|s| prefix_chars(s, 8))
-                .unwrap_or_else(|| "none".to_string());
-            let msg_count = state.history.len() * 2;
-            // Estimate tokens from history
+            eprintln!("  {:<12}  {}", "model".cyan(), model_display.dim());
+            eprintln!(
+                "  {:<12}  {}",
+                "turn".cyan(),
+                state.turn.to_string().dim()
+            );
+
+            // ── Token usage bar ──
             let est_messages: Vec<serde_json::Value> = state
                 .history
                 .iter()
@@ -1319,52 +1317,129 @@ pub(super) async fn handle_info_command(
                     pair
                 })
                 .collect();
-            let est_tokens = prompts::estimate_tokens(&est_messages);
+            let history_tokens = prompts::estimate_tokens(&est_messages);
             let budget = &state.context_budget;
-            let usage_pct = if budget.model_limit > 0 {
-                (est_tokens as f64 / budget.model_limit as f64 * 100.0) as u32
+            let limit = budget.model_limit;
+            let usage_pct = if limit > 0 {
+                (history_tokens as f64 / limit as f64 * 100.0).min(100.0)
             } else {
-                0
+                0.0
             };
-            let compact_trigger_k = budget.compact_trigger() / 1000;
-            eprintln!("  {:<10}  {}", "session".cyan(), session_display.dim());
-            eprintln!("  {:<10}  {}", "model".cyan(), model_display.dim());
-            eprintln!("  {:<10}  {}", "turn".cyan(), state.turn.to_string().dim());
-            eprintln!(
-                "  {:<10}  {}",
-                "history".cyan(),
-                format!("{msg_count} messages").dim()
+
+            // Visual bar: 30 chars wide
+            let bar_width = 30usize;
+            let filled = ((usage_pct / 100.0) * bar_width as f64) as usize;
+            let empty = bar_width.saturating_sub(filled);
+            let bar_color = if usage_pct < 60.0 {
+                "green"
+            } else if usage_pct < 85.0 {
+                "yellow"
+            } else {
+                "red"
+            };
+            let bar_str = format!(
+                "[{}{}] {:.0}%  (~{}k / {}k)",
+                "█".repeat(filled),
+                "░".repeat(empty),
+                usage_pct,
+                history_tokens / 1000,
+                limit / 1000
             );
+            let bar_display = match bar_color {
+                "green" => bar_str.green(),
+                "yellow" => bar_str.yellow(),
+                _ => bar_str.red(),
+            };
+            eprintln!("  {:<12}  {bar_display}", "usage".cyan());
+
+            // ── Breakdown ──
+            // System+tools estimate: typically ~5-15% of budget
+            let free = limit.saturating_sub(history_tokens);
             eprintln!(
-                "  {:<10}  {}",
-                "tokens".cyan(),
+                "  {:<12}  {}",
+                "breakdown".cyan(),
                 format!(
-                    "~{}k / {}k ({usage_pct}%)",
-                    est_tokens / 1000,
-                    budget.model_limit / 1000
+                    "History ~{}k │ Free ~{}k │ {} messages",
+                    history_tokens / 1000,
+                    free / 1000,
+                    state.history.len() * 2
                 )
                 .dim()
             );
+
+            // ── Compaction tier ──
+            let compact_trigger_k = budget.compact_trigger() / 1000;
+            // Estimate pressure from current token usage vs trigger threshold
+            let est_pressure = if budget.compact_trigger() > 0 {
+                (history_tokens as f64 / budget.compact_trigger() as f64).min(1.0)
+            } else {
+                0.0
+            };
+            let tier_emoji = if est_pressure < 0.5 {
+                "🟢"
+            } else if est_pressure < 0.85 {
+                "🟡"
+            } else {
+                "🔴"
+            };
+            let tier_label = if est_pressure < 0.5 {
+                "Normal"
+            } else if est_pressure < 0.85 {
+                "Approaching compact"
+            } else {
+                "Near compact trigger"
+            };
             eprintln!(
-                "  {:<10}  {}",
-                "compact".cyan(),
+                "  {:<12}  {}",
+                "compaction".cyan(),
                 format!(
-                    "auto at ~{compact_trigger_k}k tokens, keep {} turns",
+                    "{tier_emoji} {tier_label}  (trigger ~{compact_trigger_k}k, keep {} turns)",
                     budget.keep_recent_turns
                 )
                 .dim()
             );
+
+            // ── Cache status ──
+            let total_cr = state.total_cache_read_tokens;
+            let total_cw = state.total_cache_creation_tokens;
+            let cache_emoji = if total_cr > 0 { "🟢" } else { "⚪" };
             eprintln!(
-                "  {:<10}  {}",
-                "explain".cyan(),
-                state.explain.to_string().dim()
+                "  {:<12}  {}",
+                "cache".cyan(),
+                format!(
+                    "{cache_emoji} total: read {}k / write {}k",
+                    total_cr / 1000,
+                    total_cw / 1000
+                )
+                .dim()
             );
-            eprintln!(
-                "  {:<10}  {}",
-                "verbose".cyan(),
-                state.verbose_mode.to_string().dim()
-            );
-            eprintln!("  {:<10}  {}", "run_id".cyan(), run_display.dim());
+
+            // ── Attention ──
+            if let Some(ref anchor) = state.continuation_anchor {
+                let display = if anchor.len() > 60 {
+                    format!("{}…", &anchor[..60])
+                } else {
+                    anchor.clone()
+                };
+                eprintln!(
+                    "  {:<12}  {}",
+                    "anchor".cyan(),
+                    display.dim()
+                );
+            }
+            if let Some(ref goal) = state.session_goal {
+                let display = if goal.len() > 60 {
+                    format!("{}…", &goal[..60])
+                } else {
+                    goal.clone()
+                };
+                eprintln!(
+                    "  {:<12}  {}",
+                    "goal".cyan(),
+                    display.dim()
+                );
+            }
+
             eprintln!("  {}", "─".repeat(56).cyan().dim());
             eprintln!();
         }
