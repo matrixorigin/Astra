@@ -166,6 +166,11 @@ struct PanicSessionGuard {
 static PANIC_SESSION_GUARD: std::sync::Mutex<Option<PanicSessionGuard>> =
     std::sync::Mutex::new(None);
 
+/// Global reference to the MatrixCloudRuntime so the SIGTERM handler can flush
+/// ingestion before exit. Set once when the REPL creates the runtime.
+static SIGTERM_RUNTIME: OnceLock<std::sync::Arc<astra_runtime::MatrixCloudRuntime>> =
+    OnceLock::new();
+
 /// Best-effort write of `session_end` to journal from the global guard.
 /// Safe to call from panic hooks and signal handlers (no async, no cloud).
 fn emergency_session_end() {
@@ -192,7 +197,7 @@ fn install_session_panic_hook() {
     }));
 }
 
-/// Install a SIGTERM handler that writes `session_end` and exits cleanly.
+/// Install a SIGTERM handler that writes `session_end` and flushes ingestion before exit.
 /// Must be called inside a tokio runtime.
 fn install_sigterm_handler() {
     tokio::spawn(async {
@@ -202,6 +207,10 @@ fn install_sigterm_handler() {
             if let Ok(mut sigterm) = signal(SignalKind::terminate()) {
                 sigterm.recv().await;
                 emergency_session_end();
+                // Flush cloud ingestion before exit (best-effort, 15s timeout)
+                if let Some(mc) = SIGTERM_RUNTIME.get() {
+                    mc.shutdown_ingestion_and_wait().await;
+                }
                 std::process::exit(0);
             }
         }
@@ -5167,6 +5176,34 @@ async fn run_chat_repl(
         }
     }
 
+    // Session lifecycle maintenance: compress old journals and delete expired sessions.
+    // Non-blocking, best-effort — errors are silently ignored.
+    {
+        let ttl_days: u64 = std::env::var("ASTRA_SESSION_TTL_DAYS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(30);
+        let compress_days: u64 = std::env::var("ASTRA_JOURNAL_COMPRESS_DAYS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(7);
+        let maint = session_journal::run_session_maintenance(ttl_days, compress_days);
+        if maint.sessions_deleted > 0 || maint.journals_compressed > 0 {
+            let mut parts = Vec::new();
+            if maint.sessions_deleted > 0 {
+                parts.push(format!("{} expired sessions removed", maint.sessions_deleted));
+            }
+            if maint.journals_compressed > 0 {
+                parts.push(format!("{} journals compressed", maint.journals_compressed));
+            }
+            eprintln!(
+                "  {} {}",
+                theme::icon_ok(),
+                parts.join(", ").dim()
+            );
+        }
+    }
+
     // Load persisted skill quality data from previous sessions
     let skill_quality_path = dirs::config_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("."))
@@ -5298,6 +5335,10 @@ async fn run_chat_repl(
             }
             Err(_) => None,
         };
+        // Register runtime in global so SIGTERM handler can flush ingestion.
+        if let Some(ref mc) = state.matrix_runtime {
+            let _ = SIGTERM_RUNTIME.set(mc.clone());
+        }
     }
 
     // Store pipeline learning modules for /learn command and learning feedback loop

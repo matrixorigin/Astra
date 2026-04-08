@@ -233,7 +233,7 @@ impl MatrixCloudRuntime {
         // Await the worker join handle with a timeout to avoid hanging forever.
         let handle = self.ingestion_handle.lock().ok().and_then(|mut g| g.take());
         if let Some(jh) = handle {
-            match tokio::time::timeout(std::time::Duration::from_secs(5), jh).await {
+            match tokio::time::timeout(std::time::Duration::from_secs(15), jh).await {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
                     astra_core::agent_warn!(
@@ -244,7 +244,7 @@ impl MatrixCloudRuntime {
                 Err(_) => {
                     astra_core::agent_warn!(
                         "ingestion",
-                        "worker flush timed out after 5s, some events may be lost"
+                        "worker flush timed out after 15s, some events may be lost"
                     );
                 }
             }
