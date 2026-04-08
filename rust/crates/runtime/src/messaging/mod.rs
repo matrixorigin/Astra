@@ -51,8 +51,8 @@ mod db_transport_integration_tests;
 mod delegation_mailbox_tests;
 
 // Re-export key types for convenience.
-pub use db_transport::DatabaseTransport;
-pub use in_process::InProcessTransport;
+pub use db_transport::{CleanupScheduler, DatabaseTransport, TransportMetrics as DbTransportMetrics};
+pub use in_process::{InProcessMetrics, InProcessTransport};
 pub use router::{AgentMailbox, AgentMailboxRouter};
 pub use transport::{MessageStream, MessageTransport};
 pub use types::{

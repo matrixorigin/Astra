@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use tokio::sync::{broadcast, mpsc, RwLock};
@@ -18,6 +19,17 @@ const BROADCAST_CAPACITY: usize = 256;
 
 /// Direct message channel capacity. Provides backpressure under load.
 const DIRECT_CHANNEL_CAPACITY: usize = 4096;
+
+// ─── Metrics ────────────────────────────────────────────────────────────────
+
+/// Observable counters for the in-process transport.
+#[derive(Debug, Default)]
+pub struct InProcessMetrics {
+    pub messages_sent: AtomicU64,
+    pub messages_received: AtomicU64,
+    pub messages_dropped: AtomicU64,
+    pub broadcast_lag_events: AtomicU64,
+}
 
 // ─── InProcessTransport ─────────────────────────────────────────────────────
 
@@ -33,6 +45,10 @@ pub struct InProcessTransport {
     broadcasts: RwLock<HashMap<String, broadcast::Sender<Arc<AgentMessage>>>>,
     /// Maps agent addresses to their delegation group (for broadcast subscription).
     memberships: RwLock<HashMap<AgentAddress, String>>,
+    /// Whether shutdown has been called.
+    is_shutdown: AtomicBool,
+    /// Observable metrics.
+    metrics: Arc<InProcessMetrics>,
 }
 
 impl InProcessTransport {
@@ -41,6 +57,8 @@ impl InProcessTransport {
             inboxes: RwLock::new(HashMap::new()),
             broadcasts: RwLock::new(HashMap::new()),
             memberships: RwLock::new(HashMap::new()),
+            is_shutdown: AtomicBool::new(false),
+            metrics: Arc::new(InProcessMetrics::default()),
         }
     }
 
@@ -66,6 +84,11 @@ impl InProcessTransport {
     /// Number of currently registered agents (for diagnostics).
     pub async fn agent_count(&self) -> usize {
         self.inboxes.read().await.len()
+    }
+
+    /// Get a reference to the transport's metrics counters.
+    pub fn metrics(&self) -> &Arc<InProcessMetrics> {
+        &self.metrics
     }
 }
 
@@ -143,6 +166,10 @@ impl MessageTransport for InProcessTransport {
     }
 
     async fn send(&self, msg: Arc<AgentMessage>) -> Result<(), MailboxError> {
+        if self.is_shutdown.load(Ordering::Relaxed) {
+            return Err(MailboxError::Transport("transport is shut down".into()));
+        }
+
         let target = match &msg.to {
             super::types::MessageTarget::Direct { address } => address.clone(),
             _ => return Err(MailboxError::Transport("send() requires Direct target".into())),
@@ -152,12 +179,17 @@ impl MessageTransport for InProcessTransport {
         let tx = inboxes
             .get(&target)
             .ok_or_else(|| MailboxError::AgentNotFound(target))?;
-        tx.try_send(msg).map_err(|e| match e {
-            mpsc::error::TrySendError::Full(_) => {
-                MailboxError::Transport("direct channel full (backpressure)".into())
+        match tx.try_send(msg) {
+            Ok(()) => {
+                self.metrics.messages_sent.fetch_add(1, Ordering::Relaxed);
+                Ok(())
             }
-            mpsc::error::TrySendError::Closed(_) => MailboxError::ChannelClosed,
-        })
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.metrics.messages_dropped.fetch_add(1, Ordering::Relaxed);
+                Err(MailboxError::Transport("direct channel full (backpressure)".into()))
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(MailboxError::ChannelClosed),
+        }
     }
 
     async fn broadcast(
@@ -165,11 +197,24 @@ impl MessageTransport for InProcessTransport {
         delegation_id: &str,
         msg: Arc<AgentMessage>,
     ) -> Result<(), MailboxError> {
+        if self.is_shutdown.load(Ordering::Relaxed) {
+            return Err(MailboxError::Transport("transport is shut down".into()));
+        }
+
         let broadcasts = self.broadcasts.read().await;
         if let Some(tx) = broadcasts.get(delegation_id) {
-            // broadcast::send returns Err only if there are 0 receivers, which is fine.
             let _ = tx.send(msg);
+            self.metrics.messages_sent.fetch_add(1, Ordering::Relaxed);
         }
+        Ok(())
+    }
+
+    async fn shutdown(&self) -> Result<(), MailboxError> {
+        self.is_shutdown.store(true, Ordering::Relaxed);
+        // Close all direct channels by dropping senders.
+        self.inboxes.write().await.clear();
+        // Close all broadcast channels.
+        self.broadcasts.write().await.clear();
         Ok(())
     }
 }
@@ -359,5 +404,81 @@ mod tests {
         // Unregister last — broadcast should be cleaned up.
         transport.unregister(&b).await.unwrap();
         assert!(!transport.broadcasts.read().await.contains_key(del));
+    }
+
+    #[tokio::test]
+    async fn shutdown_prevents_new_sends() {
+        let transport = InProcessTransport::new();
+        let a = addr("r1", "a");
+        let b = addr("r2", "b");
+
+        transport.register(a.clone(), None).await.unwrap();
+        transport.register(b.clone(), None).await.unwrap();
+
+        transport.shutdown().await.unwrap();
+
+        let msg = text_msg(a.clone(), b.clone(), "after shutdown");
+        assert!(transport.send(msg).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn shutdown_prevents_new_broadcasts() {
+        let transport = InProcessTransport::new();
+        let a = addr("r1", "a");
+
+        transport.register(a.clone(), Some("del".into())).await.unwrap();
+        transport.shutdown().await.unwrap();
+
+        let msg = Arc::new(AgentMessage::new(
+            a.clone(),
+            MessageTarget::Broadcast { delegation_id: "del".into() },
+            MessagePayload::Signal(AgentSignal::Heartbeat),
+        ));
+        assert!(transport.broadcast("del", msg).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn metrics_track_send_count() {
+        let transport = InProcessTransport::new();
+        let a = addr("r1", "a");
+        let b = addr("r2", "b");
+
+        transport.register(a.clone(), None).await.unwrap();
+        transport.register(b.clone(), None).await.unwrap();
+        let _stream = transport.subscribe(&b).await.unwrap();
+
+        for i in 0..3 {
+            let msg = text_msg(a.clone(), b.clone(), &format!("m{i}"));
+            transport.send(msg).await.unwrap();
+        }
+
+        assert_eq!(transport.metrics().messages_sent.load(Ordering::Relaxed), 3);
+    }
+
+    #[tokio::test]
+    async fn metrics_track_dropped_on_backpressure() {
+        let transport = InProcessTransport::new();
+        let a = addr("r1", "a");
+        let b = addr("r2", "b");
+
+        transport.register(a.clone(), None).await.unwrap();
+        transport.register(b.clone(), None).await.unwrap();
+        // Subscribe creates a bounded channel (cap 4096).
+        let _stream = transport.subscribe(&b).await.unwrap();
+
+        // Fill the channel beyond capacity.
+        let mut sent = 0u64;
+        let mut dropped = 0u64;
+        for i in 0..5000 {
+            let msg = text_msg(a.clone(), b.clone(), &format!("flood-{i}"));
+            match transport.send(msg).await {
+                Ok(()) => sent += 1,
+                Err(_) => dropped += 1,
+            }
+        }
+
+        assert_eq!(transport.metrics().messages_sent.load(Ordering::Relaxed), sent);
+        assert_eq!(transport.metrics().messages_dropped.load(Ordering::Relaxed), dropped);
+        assert!(dropped > 0, "should have dropped some messages due to backpressure");
     }
 }
