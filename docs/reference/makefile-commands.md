@@ -34,11 +34,11 @@
 
 | Command | Description |
 | --- | --- |
-| `make build` | Build the Rust workspace in debug mode (`rust/target/debug`) |
+| `make build` | Build the Rust workspace in release mode (same as `build-release`) |
 | `make build-release` | Build the Rust workspace in release mode (`rust/target/release`) |
-| `make build-server` | Build `astra-server` in debug mode |
+| `make build-server` | Build `astra-server` in release mode (same as `build-server-release`) |
 | `make build-server-release` | Build `astra-server` in release mode |
-| `make build-cli` | Build `astra` and `astra-admin` in debug mode |
+| `make build-cli` | Build `astra` and `astra-admin` in release mode (same as `build-cli-release`) |
 | `make build-cli-release` | Build `astra` and `astra-admin` in release mode |
 
 ## Memoria

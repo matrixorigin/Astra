@@ -39,11 +39,11 @@ help:
 	@echo "  make format-check       - Check formatting"
 	@echo ""
 	@echo "Build:"
-	@echo "  make build              - Build entire Rust workspace (debug)"
+	@echo "  make build              - Build entire Rust workspace (release)"
 	@echo "  make build-release      - Build entire Rust workspace (release)"
-	@echo "  make build-server       - Build astra-server (debug)"
+	@echo "  make build-server       - Build astra-server (release)"
 	@echo "  make build-server-release - Build astra-server (release)"
-	@echo "  make build-cli          - Build astra + astra-admin (debug)"
+	@echo "  make build-cli          - Build astra + astra-admin (release)"
 	@echo "  make build-cli-release  - Build astra + astra-admin (release)"
 	@echo ""
 	@echo "Cleanup:"
@@ -350,10 +350,7 @@ dev-seed:
 # ============================================================================
 
 .PHONY: build
-build:
-	@echo "Building Rust workspace (debug)..."
-	@$(CARGO) build $(CARGO_MANIFEST_FLAG)
-	@echo "✅ Debug artifacts: $(RUST_DEBUG_BIN_DIR)/"
+build: build-release
 
 .PHONY: build-release
 build-release:
@@ -362,11 +359,7 @@ build-release:
 	@echo "✅ Release artifacts: $(RUST_RELEASE_BIN_DIR)/"
 
 .PHONY: build-cli
-build-cli:
-	@echo "Building astra + astra-admin (debug)..."
-	@$(CARGO) build $(CARGO_MANIFEST_FLAG) -p astra-cli -p astra-admin-cli
-	@echo "Binaries:"
-	@for bin in $(CLI_BINS); do echo "  $(RUST_DEBUG_BIN_DIR)/$$bin"; done
+build-cli: build-cli-release
 
 .PHONY: build-cli-release
 build-cli-release:
@@ -376,10 +369,7 @@ build-cli-release:
 	@for bin in $(CLI_BINS); do echo "  $(RUST_RELEASE_BIN_DIR)/$$bin"; done
 
 .PHONY: build-server
-build-server:
-	@echo "Building astra-server (debug)..."
-	@$(CARGO) build $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --bin $(API_SERVER_BIN)
-	@echo "Binary: $(RUST_DEBUG_BIN_DIR)/$(API_SERVER_BIN)"
+build-server: build-server-release
 
 .PHONY: build-server-release
 build-server-release:

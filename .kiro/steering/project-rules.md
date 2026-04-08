@@ -9,7 +9,7 @@ You are working on astra-engine, a Rust-first agent platform. Your primary tasks
 ## Quick Reference
 
 ```bash
-make build              # Debug build
+make build              # Release workspace build
 make test               # Unit + contract tests (no live DB)
 make test-integration   # Full E2E with MatrixOne
 make check              # lint + format + type checks (run before commit)
