@@ -67,9 +67,10 @@ pub async fn execute_send_message(
     // Resolve target
     let target = match target_str.to_lowercase().as_str() {
         "parent" | "orchestrator" => MessageTarget::Parent,
-        "broadcast" | "all" | "peers" => MessageTarget::Broadcast {
-            delegation_id: String::new(), // Router resolves from agent's registration
-        },
+        "broadcast" | "all" | "peers" => {
+            let did = mailbox.delegation_id.clone().unwrap_or_default();
+            MessageTarget::Broadcast { delegation_id: did }
+        }
         agent_id => MessageTarget::Direct {
             address: super::types::AgentAddress {
                 run_id: String::new(), // Router resolves by agent_id within delegation group
