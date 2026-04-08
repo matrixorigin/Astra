@@ -338,6 +338,7 @@ mod tests {
             mailbox: None,
             ack_tracker: None,
             dead_letter_queue: None,
+            messaging_metrics: None,
         }
     }
 

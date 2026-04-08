@@ -282,6 +282,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             mailbox: config.mailbox,
             ack_tracker: None,
             dead_letter_queue: None,
+            messaging_metrics: None,
         };
 
         let loop_result = run_agentic_loop_with_host(&mut host, &mut state).await;
