@@ -127,6 +127,133 @@ pub(super) fn eprint_plan_mode_banner(goal: &str) {
     eprintln!();
 }
 
+/// Render plan markdown progressively through `StreamingMarkdown`.
+///
+/// Instead of dumping the entire plan at once via `eprintln!`, this function
+/// pushes each subtask block independently through the incremental markdown
+/// renderer. Each subtask is a self-contained block separated by `\n\n`,
+/// which aligns perfectly with `StreamingMarkdown`'s block boundary detection.
+/// This produces a smooth, progressive rendering effect in the terminal.
+fn eprint_plan_markdown_streaming(plan: &astra_runtime::plan::TaskPlan, goal: Option<&str>) {
+    use std::io::IsTerminal;
+    if !std::io::stdout().is_terminal() {
+        // Non-terminal: fall back to all-at-once
+        eprintln!("{}", astra_runtime::plan::format_plan_markdown(plan, goal));
+        return;
+    }
+    let tw = crossterm::terminal::size().map(|(w, _)| w as usize).unwrap_or(80);
+    let mut md = streaming_md::StreamingMarkdown::new(tw);
+
+    // Header block
+    if let Some(g) = goal {
+        md.push(&format!("**Plan:** {g}\n\n"));
+    }
+    if let Some(ref notes) = plan.notes {
+        md.push(&format!("{notes}\n\n"));
+    }
+
+    // Each subtask as an independent block
+    for (i, st) in plan.subtasks.iter().enumerate() {
+        let block = format_subtask_block(i, st);
+        md.push(&block);
+    }
+
+    // Footer
+    md.push("---\n");
+    let summary = format_plan_summary_line(plan);
+    md.push(&format!("{summary}\n"));
+
+    md.finish();
+    // Newline after the rendered output (StreamingMarkdown uses stdout)
+    println!();
+}
+
+/// Format a single subtask as a markdown block (ending with `\n\n`).
+fn format_subtask_block(index: usize, st: &astra_runtime::plan::SubtaskPlan) -> String {
+    use astra_runtime::plan::TaskStatus;
+
+    let status_icon = match st.status {
+        TaskStatus::Completed => "✓",
+        TaskStatus::InProgress => "▶",
+        TaskStatus::Failed => "✗",
+        TaskStatus::Paused => "⏸",
+        _ => "○",
+    };
+
+    let effort_badge = match st.effort.as_deref() {
+        Some("small") => " `S`",
+        Some("medium") => " `M`",
+        Some("large") => " `L`",
+        _ => "",
+    };
+
+    let mut block = format!(
+        "{}. {} **{}**{} — {}\n",
+        index + 1,
+        status_icon,
+        st.id,
+        effort_badge,
+        st.title,
+    );
+
+    if let Some(ref desc) = st.description {
+        block.push_str(&format!("   {desc}\n"));
+    }
+
+    if !st.files.is_empty() {
+        let files: Vec<_> = st.files.iter().map(|f| format!("`{f}`")).collect();
+        block.push_str(&format!("   Files: {}\n", files.join(", ")));
+    }
+
+    if !st.acceptance_checks.is_empty() {
+        let checks: Vec<_> = st.acceptance_checks.iter().map(|vk| {
+            use astra_services::durable_task::VerifierKind;
+            match vk {
+                VerifierKind::FileExists { paths } => format!("`file_exists: {}`", paths.join(", ")),
+                VerifierKind::ReadFileContains { path, .. } => format!("`read_file: {path}`"),
+                VerifierKind::GrepCheck { file, pattern, .. } => format!("`grep '{pattern}' {file}`"),
+                VerifierKind::Command { cmd, .. } => format!("`{cmd}`"),
+                VerifierKind::BuildPass { cmd } => format!("`build: {cmd}`"),
+                VerifierKind::TestPass { cmd, .. } => format!("`test: {cmd}`"),
+                _ => "`check`".into(),
+            }
+        }).collect();
+        block.push_str(&format!("   Verify: {}\n", checks.join(", ")));
+    }
+
+    if !st.depends_on.is_empty() {
+        block.push_str(&format!(
+            "   _(depends on: {})_\n",
+            st.depends_on.join(", ")
+        ));
+    }
+
+    block.push('\n');
+    block
+}
+
+/// Build the summary line (effort counts + progress) for plan footer.
+fn format_plan_summary_line(plan: &astra_runtime::plan::TaskPlan) -> String {
+    let mut parts = Vec::new();
+    let small = plan.subtasks.iter().filter(|s| s.effort.as_deref() == Some("small")).count();
+    let medium = plan.subtasks.iter().filter(|s| s.effort.as_deref() == Some("medium")).count();
+    let large = plan.subtasks.iter().filter(|s| s.effort.as_deref() == Some("large")).count();
+    if small + medium + large > 0 {
+        let mut effort = Vec::new();
+        if small > 0 { effort.push(format!("{small} small")); }
+        if medium > 0 { effort.push(format!("{medium} medium")); }
+        if large > 0 { effort.push(format!("{large} large")); }
+        parts.push(effort.join(", "));
+    }
+    parts.push(format!(
+        "{}% ({}/{})",
+        plan.progress_pct(),
+        plan.items_done(),
+        plan.subtasks.len(),
+    ));
+    parts.join(" | ")
+}
+
 /// Write a plan lifecycle journal event.
 fn journal_plan_event(
     journal: &mut Option<session_journal::JournalWriter>,
@@ -557,7 +684,6 @@ async fn handle_plan_command(
 ) -> Result<(), String> {
     use plan::{
         PlanExecutionConfig, PlanModeState, format_execution_preview,
-        format_plan_markdown,
     };
 
     match cmd {
@@ -882,7 +1008,7 @@ async fn handle_plan_command(
         PlanCommand::Show => {
             if let Some(ref ps) = state.plan_mode {
                 eprintln!();
-                eprintln!("{}", format_plan_markdown(&ps.plan, Some(&ps.goal)));
+                eprint_plan_markdown_streaming(&ps.plan, Some(&ps.goal));
             } else {
                 eprintln!("  No active plan");
             }
@@ -919,7 +1045,7 @@ async fn handle_plan_command(
                         );
                         eprintln!("  {} {}", theme::icon_ok(), msg);
                         eprintln!();
-                        eprintln!("{}", format_plan_markdown(&ps.plan, Some(&ps.goal)));
+                        eprint_plan_markdown_streaming(&ps.plan, Some(&ps.goal));
                     }
                     Err(e) => eprintln!("  {} {}", theme::icon_err(), e),
                 }
