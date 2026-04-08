@@ -1313,23 +1313,18 @@ pub trait TaskBranchOps: Send + Sync {
 ///   DROP SNAPSHOT IF EXISTS name;
 pub struct TaskBranchService {
     pool: sqlx::Pool<sqlx::MySql>,
-    /// MatrixOne account name (e.g. "sys") — required for RESTORE ACCOUNT.
-    account: String,
-    /// Database to snapshot. When set, uses database-level snapshots;
-    /// otherwise falls back to account-level.
-    database: Option<String>,
+    /// Database to snapshot.
+    database: String,
 }
 
 impl TaskBranchService {
     pub fn new(
         pool: sqlx::Pool<sqlx::MySql>,
-        account: impl Into<String>,
-        database: Option<String>,
+        database: impl Into<String>,
     ) -> Self {
         Self {
             pool,
-            account: account.into(),
-            database,
+            database: database.into(),
         }
     }
 }
@@ -1372,11 +1367,7 @@ impl TaskBranchOps for TaskBranchService {
     ) -> Result<String, String> {
         let name = sanitize_snapshot_name(&format!("task_{task_id}_{subtask_id}_v{version}"));
         validate_snapshot_name(&name)?;
-        let sql = if let Some(ref db) = self.database {
-            format!("CREATE SNAPSHOT {name} FOR DATABASE {db}")
-        } else {
-            format!("CREATE SNAPSHOT {name} FOR ACCOUNT")
-        };
+        let sql = crate::snapshot_sql::create_snapshot_for_db_sql(&name, &self.database);
         sqlx::query(&sql)
             .execute(&self.pool)
             .await
@@ -1400,14 +1391,8 @@ impl TaskBranchOps for TaskBranchService {
 
     async fn rollback_to_snapshot(&self, snapshot: &str) -> Result<(), String> {
         validate_snapshot_name(snapshot)?;
-        let sql = if let Some(ref db) = self.database {
-            format!(
-                "RESTORE ACCOUNT {} DATABASE {db} FROM SNAPSHOT {snapshot}",
-                self.account
-            )
-        } else {
-            format!("RESTORE ACCOUNT {} FROM SNAPSHOT {snapshot}", self.account)
-        };
+        let account = crate::snapshot_sql::resolve_account_name(&self.pool).await?;
+        let sql = crate::snapshot_sql::restore_snapshot_db_sql(snapshot, &account, &self.database);
         sqlx::query(&sql)
             .execute(&self.pool)
             .await
@@ -2143,9 +2128,10 @@ pub struct MatrixOneDurableTaskLifecycle {
 
 impl MatrixOneDurableTaskLifecycle {
     pub fn new(pool: sqlx::Pool<sqlx::MySql>, work_dir: std::path::PathBuf) -> Self {
-        // Default: account-level snapshot (account "sys", no database filter)
+        // Default: database-level snapshot for the configured database.
+        let database = std::env::var("MATRIXONE_DATABASE").unwrap_or_else(|_| "astra_runtime".into());
         let branch_ops: Arc<dyn TaskBranchOps> =
-            Arc::new(TaskBranchService::new(pool.clone(), "sys", None));
+            Arc::new(TaskBranchService::new(pool.clone(), database));
         Self {
             pool,
             branch_ops,
@@ -2163,15 +2149,12 @@ impl MatrixOneDurableTaskLifecycle {
     pub fn with_database(
         pool: sqlx::Pool<sqlx::MySql>,
         work_dir: std::path::PathBuf,
-        account: impl Into<String>,
         database: impl Into<String>,
     ) -> Self {
-        let account = account.into();
         let database = database.into();
         let branch_ops: Arc<dyn TaskBranchOps> = Arc::new(TaskBranchService::new(
             pool.clone(),
-            account,
-            Some(database),
+            database,
         ));
         Self {
             pool,

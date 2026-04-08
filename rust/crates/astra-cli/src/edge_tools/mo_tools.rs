@@ -19,6 +19,40 @@ use super::*;
 
 // ─── MatrixOne connection helper ────────────────────────────────────────────
 
+/// Cached account name — queried once via `SELECT current_account_name()`.
+fn mo_current_account() -> &'static str {
+    use std::sync::OnceLock;
+    static ACCOUNT: OnceLock<String> = OnceLock::new();
+    ACCOUNT.get_or_init(|| {
+        let out = mo_execute_sql("SELECT current_account_name() AS name", None);
+        // Parse the value from mysql --table output.
+        out.lines()
+            .filter(|l| !l.starts_with('+') && !l.contains("name"))
+            .find_map(|l| {
+                let trimmed = l.trim().trim_matches('|').trim();
+                if trimmed.is_empty() { None } else { Some(trimmed.to_string()) }
+            })
+            .unwrap_or_else(|| "sys".to_string())
+    })
+}
+
+fn mo_database() -> &'static str {
+    use std::sync::OnceLock;
+    static DB: OnceLock<String> = OnceLock::new();
+    DB.get_or_init(|| {
+        std::env::var("MATRIXONE_DATABASE").unwrap_or_else(|_| "astra_runtime".into())
+    })
+}
+
+fn mo_create_snapshot_sql(name: &str) -> String {
+    format!("CREATE SNAPSHOT `{name}` FOR DATABASE {}", mo_database())
+}
+
+fn mo_restore_snapshot_sql(name: &str) -> String {
+    let account = mo_current_account();
+    format!("RESTORE ACCOUNT {account} DATABASE {} FROM SNAPSHOT `{name}`", mo_database())
+}
+
 /// Build a mysql Command with connection parameters from environment.
 fn mo_mysql_cmd(database: Option<&str>) -> Command {
     astra_core::warn_default_credentials_once();
@@ -202,8 +236,8 @@ impl ToolExecutor {
                     }
                     None => return "Error: missing 'name' for snapshot creation".to_string(),
                 };
-                // MatrixOne uses account-level snapshots
-                let sql = format!("CREATE SNAPSHOT `{}` FOR ACCOUNT root", name);
+                // MatrixOne database-level snapshot
+                let sql = mo_create_snapshot_sql(name);
                 mo_execute_sql(&sql, None)
             }
             "list" => mo_execute_sql("SHOW SNAPSHOTS", None),
@@ -232,7 +266,7 @@ impl ToolExecutor {
                     }
                     None => return "Error: missing 'name' for snapshot restore".to_string(),
                 };
-                let sql = format!("RESTORE ACCOUNT root FROM SNAPSHOT `{}`", name);
+                let sql = mo_restore_snapshot_sql(name);
                 mo_execute_sql(&sql, None)
             }
             other => format!(
@@ -291,7 +325,7 @@ impl ToolExecutor {
                                 branch, auto_name
                             );
                         }
-                        let sql = format!("CREATE SNAPSHOT `{}` FOR ACCOUNT root", auto_name);
+                        let sql = mo_create_snapshot_sql(&auto_name);
                         return format!(
                             "Creating data branch '{}' aligned with git branch '{}'\n\n{}",
                             auto_name,
@@ -300,7 +334,7 @@ impl ToolExecutor {
                         );
                     }
                 };
-                let sql = format!("CREATE SNAPSHOT `{}` FOR ACCOUNT root", name);
+                let sql = mo_create_snapshot_sql(name);
                 mo_execute_sql(&sql, None)
             }
             "sync" => {

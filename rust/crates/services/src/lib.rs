@@ -33,6 +33,7 @@ pub mod session_restore;
 pub mod session_workspace;
 pub mod skill_config;
 pub mod skills;
+pub mod snapshot_sql;
 pub mod state_sync;
 pub mod storage;
 pub mod streaming;

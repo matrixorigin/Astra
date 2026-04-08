@@ -292,7 +292,7 @@ pub trait DataSnapshotProvider: Send + Sync {
     /// Restore data state from a previously created snapshot reference.
     ///
     /// The provider translates the `DataSnapshotRef` back into the
-    /// appropriate SQL commands (e.g. `RESTORE ACCOUNT FROM SNAPSHOT`).
+    /// appropriate SQL commands (e.g. `RESTORE ACCOUNT {acc} DATABASE {db} FROM SNAPSHOT`).
     fn restore_snapshot(
         &self,
         snapshot: &DataSnapshotRef,
