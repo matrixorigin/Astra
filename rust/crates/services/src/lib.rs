@@ -73,8 +73,8 @@ pub use context::{
     SnapshotListItem, SnapshotListRecord, SnapshotRecord, UnconfiguredContextService,
 };
 pub use contract_generator::{
-    ContractGenerator, ProjectDetection, detect_build_command, detect_lint_command,
-    detect_test_command,
+    ContractGenerator, ProjectDetection, acceptance_checks_to_criteria, detect_build_command,
+    detect_lint_command, detect_test_command,
 };
 pub use coordination::{
     AgentProfile, AgentProfileRegistry, AgentResult, AgentTier, AgentTrigger, AggregationStrategy,

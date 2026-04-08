@@ -1520,4 +1520,30 @@ mod tests {
         assert!(!res.tool_names.is_empty());
         assert!(!res.failed);
     }
+
+    #[test]
+    fn turn_retry_counts_increments_correctly() {
+        let mut counts: std::collections::HashMap<String, u32> =
+            std::collections::HashMap::new();
+        // First failure for "s1" → count becomes 1
+        let c = counts.entry("s1".into()).and_modify(|c| *c += 1).or_insert(1);
+        assert_eq!(*c, 1);
+        // Second failure for "s1" → count becomes 2
+        let c = counts.entry("s1".into()).and_modify(|c| *c += 1).or_insert(1);
+        assert_eq!(*c, 2);
+        // "s10" is distinct from "s1" (no substring confusion)
+        let c = counts.entry("s10".into()).and_modify(|c| *c += 1).or_insert(1);
+        assert_eq!(*c, 1);
+        // "s1" is still at 2
+        assert_eq!(counts["s1"], 2);
+    }
+
+    #[test]
+    fn turn_retry_counts_in_context_starts_empty() {
+        let ctx = test_background_plan_context(None, None, None);
+        assert!(
+            ctx.turn_retry_counts.is_empty(),
+            "fresh context should have no retry counts"
+        );
+    }
 }

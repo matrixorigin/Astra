@@ -2577,22 +2577,29 @@ impl DurableTaskLifecycle for MatrixOneDurableTaskLifecycle {
         let subtasks: Vec<DurableSubtask> = plan
             .subtasks
             .iter()
-            .map(|sp| DurableSubtask {
-                id: sp.id.clone(),
-                title: sp.title.clone(),
-                description: sp.description.clone(),
-                depends_on: sp.depends_on.clone(),
-                effort: sp.effort.clone(),
-                files: sp.files.clone(),
-                stage: SubtaskStage::Pending,
-                criteria: Vec::new(), // populated by LLM or user later
-                max_retries: 2,
-                retry_count: 0,
-                snapshot_name: None,
-                data_branch: None,
-                diff_summary: None,
-                last_verification: None,
-                tools_used: Vec::new(),
+            .map(|sp| {
+                let criteria = crate::contract_generator::acceptance_checks_to_criteria(
+                    &sp.id,
+                    &sp.acceptance_checks,
+                    &sp.files,
+                );
+                DurableSubtask {
+                    id: sp.id.clone(),
+                    title: sp.title.clone(),
+                    description: sp.description.clone(),
+                    depends_on: sp.depends_on.clone(),
+                    effort: sp.effort.clone(),
+                    files: sp.files.clone(),
+                    stage: SubtaskStage::Pending,
+                    criteria,
+                    max_retries: 2,
+                    retry_count: 0,
+                    snapshot_name: None,
+                    data_branch: None,
+                    diff_summary: None,
+                    last_verification: None,
+                    tools_used: Vec::new(),
+                }
             })
             .collect();
 
@@ -3394,14 +3401,22 @@ impl DurableTaskLifecycle for LocalDurableTaskLifecycle {
         let subtasks = plan
             .subtasks
             .iter()
-            .map(|sp| DurableSubtask {
-                id: sp.id.clone(),
-                title: sp.title.clone(),
-                description: sp.description.clone(),
-                depends_on: sp.depends_on.clone(),
-                effort: sp.effort.clone(),
-                files: sp.files.clone(),
-                ..Default::default()
+            .map(|sp| {
+                let criteria = crate::contract_generator::acceptance_checks_to_criteria(
+                    &sp.id,
+                    &sp.acceptance_checks,
+                    &sp.files,
+                );
+                DurableSubtask {
+                    id: sp.id.clone(),
+                    title: sp.title.clone(),
+                    description: sp.description.clone(),
+                    depends_on: sp.depends_on.clone(),
+                    effort: sp.effort.clone(),
+                    files: sp.files.clone(),
+                    criteria,
+                    ..Default::default()
+                }
             })
             .collect();
 
@@ -4542,10 +4557,20 @@ mod tests {
         let ctx = svc.begin_subtask(&contract.task_id, "sub-1").await.unwrap();
         assert_eq!(ctx.title, "First subtask");
 
-        // Complete (no criteria → auto-verified)
+        // Create the file that the acceptance_check expects
+        std::fs::write(work.join("test.txt"), "content").unwrap();
+
+        // Complete execution
         svc.complete_subtask_execution(&contract.task_id, "sub-1")
             .await
             .unwrap();
+
+        // Verify (now has criteria from acceptance_checks)
+        let report = svc
+            .verify_subtask(&contract.task_id, "sub-1")
+            .await
+            .unwrap();
+        assert!(report.all_required_passed);
 
         // Check state persisted
         let c = svc
@@ -5885,6 +5910,8 @@ mod tests {
         // Add a criterion that will pass
         let target = work.join("output.txt");
         std::fs::write(&target, "hello").unwrap();
+        // Also create test.txt — now generated from acceptance_checks
+        std::fs::write(work.join("test.txt"), "").unwrap();
         contract.subtasks[0].criteria.push(VerificationCriterion {
             id: "file-check".into(),
             description: "output.txt exists".into(),
@@ -5922,8 +5949,9 @@ mod tests {
     #[tokio::test]
     async fn deliver_task_invokes_learning_bridge() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let mut svc =
-            LocalDurableTaskLifecycle::new(tmp.path().join("data"), tmp.path().join("work"));
+        let work = tmp.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let mut svc = LocalDurableTaskLifecycle::new(tmp.path().join("data"), work.clone());
 
         let recorder = std::sync::Arc::new(RecordingLearningBridge::new());
         svc.set_learning_bridge(recorder.clone());
@@ -5940,11 +5968,20 @@ mod tests {
             .await
             .unwrap();
 
-        // Complete both subtasks (no criteria → auto-verified)
+        // Create test.txt so sub-1's FileExists criterion passes
+        std::fs::write(work.join("test.txt"), "").unwrap();
+
+        // Complete sub-1 and verify (has criteria from acceptance_checks)
         svc.begin_subtask(&contract.task_id, "sub-1").await.unwrap();
         svc.complete_subtask_execution(&contract.task_id, "sub-1")
             .await
             .unwrap();
+        let _ = svc
+            .verify_subtask(&contract.task_id, "sub-1")
+            .await
+            .unwrap();
+
+        // Complete sub-2 (no criteria → auto-verified)
         svc.begin_subtask(&contract.task_id, "sub-2").await.unwrap();
         svc.complete_subtask_execution(&contract.task_id, "sub-2")
             .await

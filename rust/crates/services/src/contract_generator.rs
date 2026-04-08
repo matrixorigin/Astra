@@ -135,6 +135,46 @@ pub fn detect_lint_command(det: &ProjectDetection) -> Option<String> {
 
 // ─── VerifierKind → VerificationCriterion ───────────────────────────────────
 
+/// Convert `acceptance_checks` from a subtask plan into `VerificationCriterion`s.
+///
+/// Filters out `Command`/`CommandOutput` verifiers (security: prevent arbitrary
+/// command execution from LLM output).  When `checks` is empty, falls back to a
+/// `FileExists` criterion if `files` is non-empty.
+pub fn acceptance_checks_to_criteria(
+    subtask_id: &str,
+    checks: &[VerifierKind],
+    files: &[String],
+) -> Vec<VerificationCriterion> {
+    if checks.is_empty() {
+        if files.is_empty() {
+            Vec::new()
+        } else {
+            vec![VerificationCriterion {
+                id: format!("{subtask_id}-files"),
+                description: format!("Modified files exist: {}", files.join(", ")),
+                verifier: VerifierKind::FileExists {
+                    paths: files.to_vec(),
+                },
+                required: true,
+                timeout_sec: 10,
+                global_only: false,
+            }]
+        }
+    } else {
+        checks
+            .iter()
+            .filter(|vk| {
+                !matches!(
+                    vk,
+                    VerifierKind::Command { .. } | VerifierKind::CommandOutput { .. }
+                )
+            })
+            .enumerate()
+            .map(|(i, vk)| wrap_verifier(format!("{subtask_id}-ac{i}"), vk.clone()))
+            .collect()
+    }
+}
+
 /// Wrap a `VerifierKind` into a `VerificationCriterion` with sensible defaults.
 fn wrap_verifier(id: String, verifier: VerifierKind) -> VerificationCriterion {
     let global_only = matches!(
@@ -243,29 +283,7 @@ impl ContractGenerator {
     /// Wraps each `VerifierKind` from `acceptance_checks` into a `VerificationCriterion`.
     /// If no checks are provided but `files` are listed, adds a `FileExists` check.
     fn convert_subtask(&self, sp: &SubtaskPlan) -> DurableSubtask {
-        let criteria: Vec<VerificationCriterion> = if sp.acceptance_checks.is_empty() {
-            if sp.files.is_empty() {
-                Vec::new()
-            } else {
-                vec![VerificationCriterion {
-                    id: format!("{}-files", sp.id),
-                    description: format!("Modified files exist: {}", sp.files.join(", ")),
-                    verifier: VerifierKind::FileExists {
-                        paths: sp.files.clone(),
-                    },
-                    required: true,
-                    timeout_sec: 10,
-                    global_only: false,
-                }]
-            }
-        } else {
-            sp.acceptance_checks
-                .iter()
-                .filter(|vk| !matches!(vk, VerifierKind::Command { .. } | VerifierKind::CommandOutput { .. }))
-                .enumerate()
-                .map(|(i, vk)| wrap_verifier(format!("{}-ac{i}", sp.id), vk.clone()))
-                .collect()
-        };
+        let criteria = acceptance_checks_to_criteria(&sp.id, &sp.acceptance_checks, &sp.files);
 
         DurableSubtask {
             id: sp.id.clone(),

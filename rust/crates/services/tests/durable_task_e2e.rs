@@ -141,18 +141,28 @@ async fn e2e_verify_subtask_fails_when_file_missing() {
         .await
         .unwrap();
 
-    // Check if criteria were generated — if not, auto-verified
+    // The plan's "create-file" subtask has a FileExists criterion for hello.txt.
+    // Since we never created hello.txt, verification must report a failure.
     let sub1 = contract
         .subtasks
         .iter()
         .find(|s| s.id == "create-file")
         .unwrap();
-    if !sub1.criteria.is_empty() {
-        // Verify should succeed structurally (returns report), but may have failures
-        let report = svc.verify_subtask(&task_id, "create-file").await.unwrap();
-        assert!(!report.results.is_empty());
-    }
-    // Test completes without panic — that's the key assertion
+    assert!(
+        !sub1.criteria.is_empty(),
+        "create-file subtask should have at least one verification criterion"
+    );
+
+    let report = svc.verify_subtask(&task_id, "create-file").await.unwrap();
+    assert!(!report.results.is_empty(), "should have verification results");
+    assert!(
+        !report.all_required_passed,
+        "verification should FAIL because hello.txt was never created, got: {:?}",
+        report.results
+    );
+    // At least one result should be a failure
+    let any_failed = report.results.iter().any(|r| !r.passed);
+    assert!(any_failed, "at least one criterion should have failed");
 }
 
 #[tokio::test]
