@@ -1068,8 +1068,13 @@ impl Default for ReplState {
             plan_in_token_stream: false,
             plan_md_renderer: None,
             project_instructions: None,
-            messaging_metrics: None,
-            dead_letter_queue: None,
+            // Create shared messaging infrastructure eagerly so /messaging always has data
+            messaging_metrics: Some(std::sync::Arc::new(
+                astra_runtime::messaging::MessagingMetrics::new(),
+            )),
+            dead_letter_queue: Some(std::sync::Arc::new(
+                astra_runtime::messaging::dead_letter::DeadLetterQueue::new(),
+            )),
         }
     }
 }
