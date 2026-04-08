@@ -1774,7 +1774,7 @@ pub fn git_worktree(project_root: &Path, args: &Value) -> String {
     }
 }
 
-fn worktree_add(project_root: &Path, args: &Value) -> String {
+pub(crate) fn worktree_add(project_root: &Path, args: &Value) -> String {
     let branch = match args.get("branch").and_then(Value::as_str) {
         Some(b) if !b.is_empty() => b,
         _ => return "Error: 'branch' is required for add".to_string(),
@@ -1848,7 +1848,7 @@ fn worktree_add(project_root: &Path, args: &Value) -> String {
     }
 }
 
-fn worktree_list(project_root: &Path) -> String {
+pub(crate) fn worktree_list(project_root: &Path) -> String {
     let out = std::process::Command::new("git")
         .args(["worktree", "list", "--porcelain"])
         .current_dir(project_root)
@@ -1922,7 +1922,7 @@ fn format_worktree_entry(path: &str, branch: &str, head: &str, bare: bool) -> St
     }
 }
 
-fn worktree_remove(project_root: &Path, args: &Value) -> String {
+pub(crate) fn worktree_remove(project_root: &Path, args: &Value) -> String {
     let path = match args.get("path").and_then(Value::as_str) {
         Some(p) if !p.is_empty() => p,
         _ => return "Error: 'path' is required for remove".to_string(),
