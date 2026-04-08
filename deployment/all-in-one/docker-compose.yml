@@ -61,6 +61,8 @@ services:
       - MATRIXONE_HOST=matrixone
       - MATRIXONE_PORT=6001
       - REDIS_URL=redis://redis:6379
+    env_file:
+      - ../../.env
     depends_on:
       matrixone:
         condition: service_healthy
@@ -86,7 +88,7 @@ services:
       - MATRIXONE_PORT=6001
       - MATRIXONE_DATABASE=${MATRIXONE_DATABASE:-mo_astra_runtime}
       - REDIS_URL=redis://redis:6379
-      - JWT_SECRET=${JWT_SECRET:-change-me-in-production}
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY:-change-me-in-production}
     env_file:
       - ../../.env
     depends_on:
