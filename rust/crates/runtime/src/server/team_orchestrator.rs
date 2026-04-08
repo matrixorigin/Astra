@@ -221,7 +221,9 @@ impl TeamExecutionOrchestrator {
                     .persist_status(&parent_run_id, "failed", None, Some(&e))
                     .await;
                 if let Some(ref mut mgr) = worktree_mgr {
-                    let _ = mgr.cleanup().await;
+                    if let Err(ce) = mgr.cleanup().await {
+                        eprintln!("[team-orchestrator] worktree cleanup failed after delegation error: {ce}");
+                    }
                 }
                 return TeamExecutionReport {
                     team_name: team_name.to_string(),
@@ -285,7 +287,9 @@ impl TeamExecutionOrchestrator {
 
         // Cleanup worktrees
         if let Some(ref mut mgr) = worktree_mgr {
-            let _ = mgr.cleanup().await;
+            if let Err(ce) = mgr.cleanup().await {
+                eprintln!("[team-orchestrator] worktree cleanup failed: {ce}");
+            }
         }
 
         TeamExecutionReport {
