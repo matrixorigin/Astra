@@ -77,6 +77,7 @@ impl LlmRequestDump {
             event_id: Uuid::now_v7().to_string(),
             user_id: user_id.to_string(),
             session_id: self.session_id.clone(),
+            agent_id: None,
             event_type: "llm_request_dump".to_string(),
             content: serde_json::to_string(&self.to_json()).unwrap_or_default(),
             parent_event_id: None,

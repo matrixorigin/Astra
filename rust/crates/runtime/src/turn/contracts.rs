@@ -19,6 +19,7 @@ pub struct TurnCoreEventRecord {
     pub event_id: String,
     pub user_id: String,
     pub session_id: String,
+    pub agent_id: Option<String>,
     pub event_type: String,
     pub content: String,
     pub parent_event_id: Option<String>,
@@ -41,6 +42,7 @@ pub struct TurnToolEventRecord {
     pub event_id: String,
     pub user_id: String,
     pub session_id: String,
+    pub agent_id: Option<String>,
     pub event_type: String,
     pub content: String,
     pub parent_event_id: Option<String>,
@@ -172,6 +174,7 @@ pub struct TurnAuxiliaryEventRecord {
     pub event_id: String,
     pub user_id: String,
     pub session_id: String,
+    pub agent_id: Option<String>,
     pub event_type: String,
     pub content: String,
     pub parent_event_id: Option<String>,
@@ -239,5 +242,79 @@ mod tests {
     fn core_persist_outcome_default_none() {
         let outcome = TurnCorePersistOutcome::default();
         assert!(outcome.llm_response_event_id.is_none());
+    }
+
+    #[test]
+    fn core_event_record_carries_agent_id() {
+        let record = TurnCoreEventRecord {
+            event_id: "e1".into(),
+            user_id: "u1".into(),
+            session_id: "s1".into(),
+            agent_id: Some("astra-cli".into()),
+            event_type: "user_query".into(),
+            content: "hi".into(),
+            parent_event_id: None,
+            causal_chain_id: "c1".into(),
+            llm_model_used: None,
+            token_usage: None,
+            llm_params: None,
+            reasoning_content: None,
+        };
+        assert_eq!(record.agent_id.as_deref(), Some("astra-cli"));
+    }
+
+    #[test]
+    fn core_event_record_agent_id_none() {
+        let record = TurnCoreEventRecord {
+            event_id: "e1".into(),
+            user_id: "u1".into(),
+            session_id: "s1".into(),
+            agent_id: None,
+            event_type: "user_query".into(),
+            content: "hi".into(),
+            parent_event_id: None,
+            causal_chain_id: "c1".into(),
+            llm_model_used: None,
+            token_usage: None,
+            llm_params: None,
+            reasoning_content: None,
+        };
+        assert!(record.agent_id.is_none());
+    }
+
+    #[test]
+    fn tool_event_record_carries_agent_id() {
+        let record = TurnToolEventRecord {
+            event_id: "e1".into(),
+            user_id: "u1".into(),
+            session_id: "s1".into(),
+            agent_id: Some("custom-agent".into()),
+            event_type: "tool_call".into(),
+            content: "{}".into(),
+            parent_event_id: None,
+            causal_chain_id: "c1".into(),
+            metadata: None,
+            skill_name: None,
+            skill_version: None,
+            reasoning_content: None,
+        };
+        assert_eq!(record.agent_id.as_deref(), Some("custom-agent"));
+    }
+
+    #[test]
+    fn auxiliary_event_record_carries_agent_id() {
+        let record = TurnAuxiliaryEventRecord {
+            event_id: "e1".into(),
+            user_id: "u1".into(),
+            session_id: "s1".into(),
+            agent_id: Some("astra-cli".into()),
+            event_type: "routing_decision".into(),
+            content: "{}".into(),
+            parent_event_id: None,
+            causal_chain_id: "c1".into(),
+            metadata: None,
+            reasoning_content: None,
+        };
+        assert_eq!(record.agent_id.as_deref(), Some("astra-cli"));
     }
 }

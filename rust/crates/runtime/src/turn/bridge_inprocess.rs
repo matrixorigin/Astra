@@ -1003,6 +1003,7 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
 
         // Parse request body
         let payload: Value = serde_json::from_slice(&body).unwrap_or(json!({}));
+        let agent_id = payload.get("agent_id").and_then(Value::as_str).map(ToString::to_string);
         let messages = payload
             .get("messages")
             .and_then(Value::as_array)
@@ -1885,6 +1886,7 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                 event_id: user_query_event_id.clone(),
                 user_id: user_id.clone(),
                 session_id: session_id.clone(),
+                agent_id: agent_id.clone(),
                 event_type: "user_query".to_string(),
                 content: content.clone(),
                 parent_event_id: None,
@@ -1899,6 +1901,7 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                 event_id: Uuid::now_v7().to_string(),
                 user_id: user_id.clone(),
                 session_id: session_id.clone(),
+                agent_id: agent_id.clone(),
                 event_type: "llm_response".to_string(),
                 content: llm_content.clone(),
                 parent_event_id: Some(user_query_event_id.clone()),
@@ -1925,6 +1928,7 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                             event_id: Uuid::now_v7().to_string(),
                             user_id: user_id.clone(),
                             session_id: session_id.clone(),
+                            agent_id: agent_id.clone(),
                             event_type: "tool_call".to_string(),
                             content: match payload.content {
                                 Value::String(s) => s,
@@ -1949,6 +1953,7 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                             event_id: Uuid::now_v7().to_string(),
                             user_id: user_id.clone(),
                             session_id: session_id.clone(),
+                            agent_id: agent_id.clone(),
                             event_type: "tool_result".to_string(),
                             content: match payload.content {
                                 Value::String(s) => s,
@@ -2075,6 +2080,7 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                 let aux_writer = turn_auxiliary_event_writer.clone();
                 let aux_uid = user_id.clone();
                 let aux_sid = session_id.clone();
+                let aux_aid = agent_id.clone();
                 let aux_chain = turn_chain_id.clone();
                 let aux_parent = user_query_event_id.clone();
                 tokio::spawn(async move {
@@ -2083,6 +2089,7 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                         event_id: Uuid::now_v7().to_string(),
                         user_id: aux_uid.clone(),
                         session_id: aux_sid.clone(),
+                        agent_id: aux_aid,
                         event_type: "routing_decision".to_string(),
                         content: json!({"router": "inprocess-default", "intent": "default"}).to_string(),
                         parent_event_id: Some(aux_parent),

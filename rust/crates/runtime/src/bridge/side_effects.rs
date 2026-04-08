@@ -227,6 +227,7 @@ fn build_auxiliary_event_persist_from_payload(
     }
     let user_id = optional_object_str(persist_payload, "user_id")?.to_string();
     let session_id = optional_object_str(persist_payload, "session_id")?.to_string();
+    let agent_id = optional_object_str(persist_payload, "agent_id").map(ToString::to_string);
     let parent_event_id =
         optional_object_str(persist_payload, "user_query_event_id").map(ToString::to_string);
     let causal_chain_id = optional_object_str(persist_payload, "turn_chain_id")
@@ -256,6 +257,7 @@ fn build_auxiliary_event_persist_from_payload(
         events.push(build_auxiliary_event_record(
             &user_id,
             &session_id,
+            agent_id.as_deref(),
             "routing_decision",
             payload,
             parent_event_id.clone(),
@@ -273,6 +275,7 @@ fn build_auxiliary_event_persist_from_payload(
         events.push(build_auxiliary_event_record(
             &user_id,
             &session_id,
+            agent_id.as_deref(),
             "tool_result_quality",
             payload,
             parent_event_id.clone(),
@@ -297,6 +300,7 @@ fn build_auxiliary_event_persist_from_payload(
         events.push(build_auxiliary_event_record(
             &user_id,
             &session_id,
+            agent_id.as_deref(),
             "session_history_snapshot",
             payload,
             parent_event_id,
@@ -325,6 +329,7 @@ fn build_core_event_persist_from_payload(
     }
     let user_id = optional_object_str(persist_payload, "user_id")?.to_string();
     let session_id = optional_object_str(persist_payload, "session_id")?.to_string();
+    let agent_id = optional_object_str(persist_payload, "agent_id").map(ToString::to_string);
     let messages = object_array(persist_payload, "messages");
     let turn_chain_id = optional_object_str(persist_payload, "turn_chain_id")
         .map(ToString::to_string)
@@ -338,6 +343,7 @@ fn build_core_event_persist_from_payload(
                 .unwrap_or_else(|| Uuid::now_v7().to_string()),
             user_id: user_id.clone(),
             session_id: session_id.clone(),
+            agent_id: agent_id.clone(),
             event_type: "user_query".to_string(),
             content: user_content.to_string(),
             parent_event_id: None,
@@ -362,6 +368,7 @@ fn build_core_event_persist_from_payload(
             event_id: Uuid::now_v7().to_string(),
             user_id: user_id.clone(),
             session_id: session_id.clone(),
+            agent_id: agent_id.clone(),
             event_type: "llm_response".to_string(),
             content: llm_plan.content,
             parent_event_id: parent_event_id.clone(),
@@ -412,6 +419,7 @@ fn build_tool_event_persist_from_payload(
     }
     let user_id = optional_object_str(persist_payload, "user_id")?.to_string();
     let session_id = optional_object_str(persist_payload, "session_id")?.to_string();
+    let agent_id = optional_object_str(persist_payload, "agent_id").map(ToString::to_string);
     let parent_event_id =
         optional_object_str(persist_payload, "user_query_event_id").map(ToString::to_string);
     let causal_chain_id = optional_object_str(persist_payload, "turn_chain_id")
@@ -429,6 +437,7 @@ fn build_tool_event_persist_from_payload(
         events.push(build_tool_event_record(
             &user_id,
             &session_id,
+            agent_id.as_deref(),
             "tool_result",
             payload,
             parent_event_id.clone(),
@@ -440,6 +449,7 @@ fn build_tool_event_persist_from_payload(
         events.push(build_tool_event_record(
             &user_id,
             &session_id,
+            agent_id.as_deref(),
             "tool_call",
             payload,
             parent_event_id.clone(),
@@ -452,6 +462,7 @@ fn build_tool_event_persist_from_payload(
         events.push(build_tool_event_record(
             &user_id,
             &session_id,
+            agent_id.as_deref(),
             "tool_result",
             payload,
             parent_event_id.clone(),
@@ -748,6 +759,7 @@ async fn resolve_reflection_transfer(
 fn build_auxiliary_event_record(
     user_id: &str,
     session_id: &str,
+    agent_id: Option<&str>,
     event_type: &str,
     payload: serde_json::Map<String, serde_json::Value>,
     parent_event_id: Option<String>,
@@ -757,6 +769,7 @@ fn build_auxiliary_event_record(
         event_id: Uuid::now_v7().to_string(),
         user_id: user_id.to_string(),
         session_id: session_id.to_string(),
+        agent_id: agent_id.map(ToString::to_string),
         event_type: event_type.to_string(),
         content: payload
             .get("content")
@@ -782,6 +795,7 @@ fn build_auxiliary_event_record(
 fn build_tool_event_record(
     user_id: &str,
     session_id: &str,
+    agent_id: Option<&str>,
     event_type: &str,
     payload: PersistEventPayload,
     parent_event_id: Option<String>,
@@ -791,6 +805,7 @@ fn build_tool_event_record(
         event_id: Uuid::now_v7().to_string(),
         user_id: user_id.to_string(),
         session_id: session_id.to_string(),
+        agent_id: agent_id.map(ToString::to_string),
         event_type: event_type.to_string(),
         content: match payload.content {
             serde_json::Value::String(content) => content,
