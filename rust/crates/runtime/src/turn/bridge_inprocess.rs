@@ -2738,6 +2738,94 @@ mod tests {
         );
     }
 
+    // ── PromptCacheConfig unhappy-path / edge-case tests ────────────────────
+
+    #[test]
+    fn prompt_cache_config_latch_anthropic() {
+        let _lock = CACHE_ENV_MUTEX.lock().unwrap();
+        unsafe { std::env::remove_var("MO_PROMPT_CACHE_DISABLED"); }
+
+        let cfg = PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514");
+        assert!(cfg.cache_enabled, "cache should be enabled by default");
+        assert!(cfg.is_anthropic, "anthropic provider should set is_anthropic");
+        assert!(cfg.should_annotate(), "anthropic with cache enabled should annotate");
+    }
+
+    #[test]
+    fn prompt_cache_config_latch_openai() {
+        let _lock = CACHE_ENV_MUTEX.lock().unwrap();
+        unsafe { std::env::remove_var("MO_PROMPT_CACHE_DISABLED"); }
+
+        let cfg = PromptCacheConfig::latch("openai", "gpt-4");
+        assert!(!cfg.is_anthropic, "openai should not be anthropic");
+        assert!(!cfg.should_annotate(), "non-anthropic should not annotate even if cache enabled");
+    }
+
+    #[test]
+    fn prompt_cache_config_latch_unknown_provider() {
+        let _lock = CACHE_ENV_MUTEX.lock().unwrap();
+        unsafe { std::env::remove_var("MO_PROMPT_CACHE_DISABLED"); }
+
+        let cfg = PromptCacheConfig::latch("my-custom-provider", "my-model");
+        assert!(!cfg.is_anthropic, "unknown provider should not be anthropic");
+        assert!(!cfg.should_annotate(), "unknown provider should not annotate");
+    }
+
+    #[test]
+    fn prompt_cache_config_env_disabled() {
+        let _lock = CACHE_ENV_MUTEX.lock().unwrap();
+        unsafe { std::env::set_var("MO_PROMPT_CACHE_DISABLED", "1"); }
+
+        let cfg = PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514");
+        assert!(!cfg.cache_enabled, "cache should be disabled when env var is set");
+        assert!(!cfg.should_annotate(), "should not annotate when cache disabled");
+
+        unsafe { std::env::remove_var("MO_PROMPT_CACHE_DISABLED"); }
+    }
+
+    #[test]
+    fn prompt_cache_config_latch_idempotent() {
+        let _lock = CACHE_ENV_MUTEX.lock().unwrap();
+        unsafe { std::env::remove_var("MO_PROMPT_CACHE_DISABLED"); }
+
+        let a = PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514");
+        let b = PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514");
+        assert_eq!(a.cache_enabled, b.cache_enabled, "idempotent cache_enabled");
+        assert_eq!(a.is_anthropic, b.is_anthropic, "idempotent is_anthropic");
+    }
+
+    #[test]
+    fn annotate_tool_schemas_noop_when_cache_disabled() {
+        let cfg = PromptCacheConfig { cache_enabled: false, is_anthropic: true };
+        let mut tools = vec![
+            json!({"function": {"name": "bash"}}),
+            json!({"function": {"name": "read_file"}}),
+        ];
+        annotate_tool_schemas_for_caching(&mut tools, &cfg);
+
+        for (i, tool) in tools.iter().enumerate() {
+            assert!(
+                tool.get("cache_control").is_none(),
+                "tool {i} should not have cache_control when cache is disabled"
+            );
+        }
+    }
+
+    #[test]
+    fn add_message_breakpoint_noop_when_not_anthropic() {
+        let cfg = PromptCacheConfig { cache_enabled: true, is_anthropic: false };
+        let mut messages = vec![
+            json!({"role": "system", "content": "sys"}),
+            json!({"role": "user", "content": "hello"}),
+        ];
+        add_message_cache_breakpoint(&mut messages, &cfg);
+
+        assert!(
+            messages[1]["content"].is_string(),
+            "messages should not be modified when not anthropic"
+        );
+    }
+
     // ── is_valid_tool_name ───────────────────────────────────────────────────
 
     #[test]
