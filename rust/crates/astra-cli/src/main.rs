@@ -953,6 +953,14 @@ struct ReplState {
     /// waiting for Resume/Cancel).
     plan_handle: Option<plan_executor::PlanExecutorHandle>,
 
+    /// `agent_tasks` row created when plan execution starts (`go`); used to sync
+    /// `/task list` with the background executor (progress + terminal status).
+    plan_run_task_id: Option<String>,
+    /// Latest `(progress_pct, items_done, items_total)` from [`PlanUpdate::PlanProgress`].
+    plan_run_task_last_progress: Option<(u32, u32, u32)>,
+    /// Set when the executor exits with [`PlanUpdate::PlanError`].
+    plan_run_task_last_error: Option<String>,
+
     /// Set by `handle_plan_command(Resume)` so the main loop re-enters
     /// the blocking plan monitor after `handle_plan_mode_input` returns.
     plan_resume_pending: bool,
@@ -1044,6 +1052,9 @@ impl Default for ReplState {
                 astra_services::team_persistence::InMemoryTeamStore::new(),
             ),
             plan_handle: None,
+            plan_run_task_id: None,
+            plan_run_task_last_progress: None,
+            plan_run_task_last_error: None,
             plan_resume_pending: false,
             pending_approval: None,
             plan_in_token_stream: false,
@@ -3512,6 +3523,15 @@ fn display_plan_updates_live(
                 elapsed,
                 eta,
             } => {
+                if state.plan_run_task_id.is_some() {
+                    let pct = if total > 0 {
+                        (done * 100 / total) as u32
+                    } else {
+                        0
+                    };
+                    state.plan_run_task_last_progress =
+                        Some((pct, done as u32, total as u32));
+                }
                 let pct = if total > 0 { done * 100 / total } else { 0 };
                 let eta_str = eta
                     .map(|d| format!(" — ETA ~{}", format_duration_short(d)))
@@ -3564,6 +3584,7 @@ fn display_plan_updates_live(
                 return PlanMonitorOutcome::Finished;
             }
             PlanUpdate::PlanError { error } => {
+                state.plan_run_task_last_error = Some(error.clone());
                 // Stop spinner
                 if let Some(s) = plan_spinner.take() {
                     s.stop_clear();
@@ -3834,17 +3855,64 @@ async fn refresh_dynamic_completions(state: &ReplState) {
     repl_ui::update_mcp_completions(mcp_entries);
 }
 
-fn flush_plan_updates_between_prompts(state: &mut ReplState) {
-    if state.plan_handle.is_none() {
+/// Push latest plan progress to [`ReplState::task_service`] for `/task list`.
+async fn sync_plan_run_task_progress(state: &mut ReplState) {
+    let Some(ref tid) = state.plan_run_task_id else {
         return;
+    };
+    let Some((pct, done, total)) = state.plan_run_task_last_progress else {
+        return;
+    };
+    let Some(ref svc) = state.task_service else {
+        return;
+    };
+    use astra_services::TaskService;
+    let _ = svc.update_progress(tid, pct, done, total).await;
+}
+
+/// Terminal sync: `/task list` stays `pending` unless we mark the row completed here.
+async fn finalize_plan_run_task_after_executor(state: &mut ReplState) {
+    let Some(tid) = state.plan_run_task_id.clone() else {
+        return;
+    };
+    let Some(ref svc) = state.task_service else {
+        return;
+    };
+    use astra_services::{TaskService, task_orchestrator::TaskOutcome};
+    if let Some(ref err) = state.plan_run_task_last_error {
+        let err = err.clone();
+        let _ = svc.fail_task(&tid, &err).await;
+    } else if let Some(ref report) = state.last_delivery_report {
+        let (outcome, pct, done, total) =
+            durable_bridge::plan_run_finish_from_delivery_report(report);
+        let _ = svc
+            .complete_plan_run(&tid, pct, done, total, outcome)
+            .await;
+    } else if let Some((pct, done, total)) = state.plan_run_task_last_progress {
+        let _ = svc
+            .complete_plan_run(&tid, pct, done, total, TaskOutcome::Success)
+            .await;
+    } else {
+        let _ = svc.complete_task(&tid).await;
+    }
+    state.plan_run_task_id = None;
+    state.plan_run_task_last_progress = None;
+    state.plan_run_task_last_error = None;
+}
+
+/// Returns `true` when the executor sent a terminal event (`PlanCompleted` / `PlanError`).
+fn flush_plan_updates_between_prompts(state: &mut ReplState) -> bool {
+    if state.plan_handle.is_none() {
+        return false;
     }
 
     let mut plan_spinner: Option<effects::PlanActivitySpinner> = None;
     let mut current_subtask_tag = state.current_plan_subtask_id.clone().unwrap_or_default();
-    let _ = display_plan_updates_live(state, &mut plan_spinner, &mut current_subtask_tag);
+    let outcome = display_plan_updates_live(state, &mut plan_spinner, &mut current_subtask_tag);
     if let Some(spinner) = plan_spinner.take() {
         spinner.stop_clear();
     }
+    outcome == PlanMonitorOutcome::Finished
 }
 
 /// Clear REPL state when the plan update channel closed without `PlanCompleted` / `PlanError`.
@@ -3882,8 +3950,17 @@ async fn run_blocking_plan_monitor(state: &mut ReplState) {
         let outcome =
             display_plan_updates_live(state, &mut plan_spinner, &mut current_subtask_tag);
 
-        if outcome != PlanMonitorOutcome::Continue {
-            break;
+        sync_plan_run_task_progress(state).await;
+
+        match outcome {
+            PlanMonitorOutcome::Finished => {
+                finalize_plan_run_task_after_executor(state).await;
+                break;
+            }
+            PlanMonitorOutcome::Paused => {
+                break;
+            }
+            PlanMonitorOutcome::Continue => {}
         }
 
         // Executor exited without sending PlanCompleted / PlanError (e.g. task panic).
@@ -3893,6 +3970,14 @@ async fn run_blocking_plan_monitor(state: &mut ReplState) {
             .is_some_and(|h| h.is_finished())
         {
             cleanup_orphan_plan_executor(state, &mut plan_spinner);
+            sync_plan_run_task_progress(state).await;
+            if state.plan_run_task_id.is_some() {
+                state.plan_run_task_last_error.get_or_insert(
+                    "Plan executor stopped without PlanCompleted/PlanError (channel closed)."
+                        .into(),
+                );
+                finalize_plan_run_task_after_executor(state).await;
+            }
             break;
         }
 
@@ -5655,7 +5740,11 @@ async fn run_chat_repl(
 
     // ── Main loop ─────────────────────────────────────────────────────────────
     loop {
-        flush_plan_updates_between_prompts(&mut state);
+        let plan_terminal = flush_plan_updates_between_prompts(&mut state);
+        sync_plan_run_task_progress(&mut state).await;
+        if plan_terminal {
+            finalize_plan_run_task_after_executor(&mut state).await;
+        }
         // Refresh Tab-completion data (skills/MCP may change mid-session).
         refresh_dynamic_completions(&state).await;
         let current_token = current_access_token(profile);

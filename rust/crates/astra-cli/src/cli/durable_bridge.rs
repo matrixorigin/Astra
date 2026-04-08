@@ -13,6 +13,7 @@ use astra_services::{
     LocalDurableTaskLifecycle, MatrixOneDurableTaskLifecycle, SubtaskStage,
     SubtaskVerificationReport, TaskContract, TaskDeliveryReport, VerificationRunner, VerifierKind,
 };
+use astra_services::task_orchestrator::TaskOutcome;
 use async_trait::async_trait;
 use crossterm::style::Stylize;
 use std::sync::Arc;
@@ -616,6 +617,40 @@ pub(super) fn display_delivery_report(report: &TaskDeliveryReport) {
 
     // ─── Footer ──────────────────────────────────────────────────────────────
     eprintln!("{}", format!("╚{bar}╝").cyan());
+}
+
+/// Outcome and `(progress_pct, items_done, items_total)` for `/task list` after plan execution.
+/// Aligns with [`display_delivery_report`] (Delivered → [`TaskOutcome::Success`], else [`TaskOutcome::Partial`]).
+pub fn plan_run_finish_from_delivery_report(
+    report: &TaskDeliveryReport,
+) -> (TaskOutcome, u32, u32, u32) {
+    let all_subtasks_verified = report
+        .subtask_summaries
+        .iter()
+        .all(|s| s.criteria_passed == s.criteria_total);
+    let all_global_passed = report.global_verification.iter().all(|r| r.passed);
+    let fully_delivered = all_subtasks_verified && all_global_passed;
+
+    let items_total = report.subtask_summaries.len() as u32;
+    let items_done = report
+        .subtask_summaries
+        .iter()
+        .filter(|s| s.criteria_passed == s.criteria_total)
+        .count() as u32;
+    let progress_pct = if items_total > 0 {
+        items_done.saturating_mul(100) / items_total
+    } else if fully_delivered {
+        100
+    } else {
+        0
+    };
+
+    let outcome = if fully_delivered {
+        TaskOutcome::Success
+    } else {
+        TaskOutcome::Partial
+    };
+    (outcome, progress_pct, items_done, items_total)
 }
 
 /// Save the delivery report as JSON to the working directory.

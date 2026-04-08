@@ -339,6 +339,19 @@ pub trait TaskService: Send + Sync {
     /// Mark task as completed.
     async fn complete_task(&self, task_id: &str) -> Result<(), String>;
 
+    /// Mark a plan-run task finished with explicit progress and learning outcome.
+    ///
+    /// Sets `status = completed`, `completed_at`, and `outcome` (e.g. `success` vs `partial`).
+    /// Used when the background plan executor finishes so `/task list` matches delivery state.
+    async fn complete_plan_run(
+        &self,
+        task_id: &str,
+        progress_pct: u32,
+        items_done: u32,
+        items_total: u32,
+        outcome: TaskOutcome,
+    ) -> Result<(), String>;
+
     /// Record user feedback for learning.
     async fn record_feedback(
         &self,
@@ -680,6 +693,30 @@ impl TaskService for MatrixOneTaskService {
         .execute(&self.pool)
         .await
         .map_err(|e| format!("complete_task: {e}"))?;
+        Ok(())
+    }
+
+    async fn complete_plan_run(
+        &self,
+        task_id: &str,
+        progress_pct: u32,
+        items_done: u32,
+        items_total: u32,
+        outcome: TaskOutcome,
+    ) -> Result<(), String> {
+        sqlx::query(
+            "UPDATE agent_tasks SET status = 'completed', progress_pct = ?, items_done = ?, \
+             items_total = ?, outcome = ?, error_message = NULL, \
+             updated_at = NOW(), completed_at = NOW() WHERE task_id = ?",
+        )
+        .bind(progress_pct as i32)
+        .bind(items_done as i32)
+        .bind(items_total as i32)
+        .bind(outcome.as_str())
+        .bind(task_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| format!("complete_plan_run: {e}"))?;
         Ok(())
     }
 
@@ -1179,6 +1216,29 @@ impl TaskService for LocalTaskService {
         self.save_task(&record)
     }
 
+    async fn complete_plan_run(
+        &self,
+        task_id: &str,
+        progress_pct: u32,
+        items_done: u32,
+        items_total: u32,
+        outcome: TaskOutcome,
+    ) -> Result<(), String> {
+        let mut record = self
+            .load_task(task_id)?
+            .ok_or_else(|| format!("task not found: {task_id}"))?;
+        record.status = TaskStatus::Completed;
+        record.progress_pct = progress_pct;
+        record.items_done = items_done;
+        record.items_total = items_total;
+        record.outcome = Some(outcome);
+        record.error_message = None;
+        let now = chrono::Utc::now().to_rfc3339();
+        record.updated_at = now.clone();
+        record.completed_at = Some(now);
+        self.save_task(&record)
+    }
+
     async fn record_feedback(
         &self,
         task_id: &str,
@@ -1475,6 +1535,16 @@ impl TaskService for UnconfiguredTaskService {
         Err("task service not configured".into())
     }
     async fn complete_task(&self, _: &str) -> Result<(), String> {
+        Err("task service not configured".into())
+    }
+    async fn complete_plan_run(
+        &self,
+        _: &str,
+        _: u32,
+        _: u32,
+        _: u32,
+        _: TaskOutcome,
+    ) -> Result<(), String> {
         Err("task service not configured".into())
     }
     async fn record_feedback(
@@ -1822,6 +1892,33 @@ mod tests {
         svc.complete_task(&tid).await.unwrap();
         let t = svc.get_task(&tid).await.unwrap().unwrap();
         assert_eq!(t.status, TaskStatus::Completed);
+        assert!(t.completed_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn local_task_complete_plan_run_sets_progress_and_outcome() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let svc = LocalTaskService::new(tmp.path().to_path_buf());
+        let tid = svc
+            .create_task(
+                "user1",
+                "s1",
+                TaskCreateRequest {
+                    title: "goal".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        svc.complete_plan_run(&tid, 66, 2, 3, TaskOutcome::Partial)
+            .await
+            .unwrap();
+        let t = svc.get_task(&tid).await.unwrap().unwrap();
+        assert_eq!(t.status, TaskStatus::Completed);
+        assert_eq!(t.progress_pct, 66);
+        assert_eq!(t.items_done, 2);
+        assert_eq!(t.items_total, 3);
+        assert_eq!(t.outcome, Some(TaskOutcome::Partial));
         assert!(t.completed_at.is_some());
     }
 

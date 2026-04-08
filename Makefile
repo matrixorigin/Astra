@@ -325,7 +325,7 @@ dev-setup-demo:
 dev-seed:
 	@echo "⚠️  This will reset the database and reseed admin + models."
 	@printf "Are you sure? [y/N] "; read REPLY; \
-	[ "$$REPLY" = "y" ] || [ "$$REPLY" = "Y" ] || { echo "Cancelled"; exit 0; }
+	[ "$$REPLY" = "y" ] || [ "$$REPLY" = "Y" ] || { echo "Cancelled"; exit 1; }
 	@mysql -h127.0.0.1 -P6001 -uroot -p111 \
 		-e "DROP DATABASE IF EXISTS astra_runtime; CREATE DATABASE astra_runtime;" 2>/dev/null || \
 	mysql -h127.0.0.1 -P6001 -uroot -p111 --skip-ssl \

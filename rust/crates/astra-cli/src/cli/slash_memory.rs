@@ -1920,6 +1920,9 @@ async fn _old_handle_plan_mode_input(
         eprintln!();
 
         // Persist to task service if available
+        state.plan_run_task_id = None;
+        state.plan_run_task_last_progress = None;
+        state.plan_run_task_last_error = None;
         if let Some(ref svc) = state.task_service {
             use astra_services::{TaskCreateRequest, TaskService};
             let user_id = state.ingestion_user_id.as_deref().unwrap_or("local");
@@ -1951,6 +1954,7 @@ async fn _old_handle_plan_mode_input(
                 .await
             {
                 Ok(tid) => {
+                    state.plan_run_task_id = Some(tid.clone());
                     let short = &tid[..8.min(tid.len())];
                     eprintln!(
                         "{}  Task created: {} ({})",
