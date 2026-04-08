@@ -347,6 +347,7 @@ pub(crate) fn register_default_agents(
             max_delegation_depth: 0,
             triggers: Vec::new(),
             metadata: HashMap::new(),
+            mcp_servers: Vec::new(),
         },
         AgentProfile {
             agent_id: "reviewer".into(),
@@ -365,6 +366,7 @@ pub(crate) fn register_default_agents(
             max_delegation_depth: 0,
             triggers: Vec::new(),
             metadata: HashMap::new(),
+            mcp_servers: Vec::new(),
         },
         AgentProfile {
             agent_id: "writer".into(),
@@ -383,6 +385,7 @@ pub(crate) fn register_default_agents(
             max_delegation_depth: 0,
             triggers: Vec::new(),
             metadata: HashMap::new(),
+            mcp_servers: Vec::new(),
         },
     ];
 

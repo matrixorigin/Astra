@@ -106,6 +106,9 @@ pub struct AgentProfile {
     pub triggers: Vec<AgentTrigger>,
     /// Additional metadata.
     pub metadata: HashMap<String, serde_json::Value>,
+    /// MCP server names to connect when this agent starts (D-10).
+    /// These are looked up from a project-level MCP config.
+    pub mcp_servers: Vec<String>,
 }
 
 impl AgentProfile {
@@ -126,6 +129,7 @@ impl AgentProfile {
             },
             triggers: Vec::new(),
             metadata: HashMap::new(),
+            mcp_servers: Vec::new(),
         }
     }
 
@@ -193,6 +197,20 @@ pub enum CoordinationPattern {
         agent_ids: Vec<String>,
         /// Stop on first success?
         stop_on_success: bool,
+    },
+
+    /// Fork: dispatch N tasks sharing the parent's full conversation context.
+    /// All fork children receive the same message prefix (enabling prompt cache sharing).
+    /// Fork children cannot recursively fork or delegate.
+    Fork {
+        /// Per-child task descriptions.
+        tasks: Vec<String>,
+        /// Agent ID to use for all fork children (must be a User-tier agent).
+        agent_id: String,
+        /// Maximum turns per fork child (lower than normal delegation).
+        max_turns: u32,
+        /// How to aggregate fork results.
+        aggregation: AggregationStrategy,
     },
 }
 
@@ -402,6 +420,7 @@ impl AgentProfileRegistry {
                 ..
             } => vec![producer_id.clone(), reviewer_id.clone()],
             CoordinationPattern::Sequential { agent_ids, .. } => agent_ids.clone(),
+            CoordinationPattern::Fork { agent_id, .. } => vec![agent_id.clone()],
         };
 
         for target_id in &agent_ids {

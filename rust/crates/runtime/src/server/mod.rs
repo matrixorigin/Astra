@@ -23,6 +23,8 @@ mod audit_handlers;
 mod auth_handlers;
 mod bridge_prep;
 mod chat_handlers;
+pub mod agent_mailbox;
+pub mod agent_mcp;
 pub mod delegation_engine;
 mod delegation_handlers;
 mod edge_callback_handlers;

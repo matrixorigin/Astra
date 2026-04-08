@@ -627,10 +627,21 @@ impl ToolExecutor {
             }
         }
 
+        // Journal: snapshot before-state for undo
+        let turn_idx = self.journal_turn_index.load(std::sync::atomic::Ordering::Relaxed);
+        let journal_call_id = format!("write_file:{}", path.display());
+        if let Ok(mut journal) = self.file_journal.lock() {
+            journal.record_before(&path, &journal_call_id, turn_idx);
+        }
+
         match fs::write(&path, content) {
             Ok(_) => {
                 // Record write state so subsequent reads/edits know the mtime
                 self.record_write(&path);
+                // Journal: record after-state
+                if let Ok(mut journal) = self.file_journal.lock() {
+                    journal.record_after(&path, &journal_call_id, content.as_bytes());
+                }
                 let old_slice = prior_for_diff.as_deref().unwrap_or("");
                 let cli_diff = cap_cli_unified_diff(unified_diff_raw(old_slice, content, &path));
                 json!({
@@ -771,10 +782,21 @@ impl ToolExecutor {
             return format!("Error: Pre-write staleness check failed: {e}");
         }
 
+        // Journal: snapshot before-state for undo
+        let turn_idx = self.journal_turn_index.load(std::sync::atomic::Ordering::Relaxed);
+        let journal_call_id = format!("str_replace:{}", path.display());
+        if let Ok(mut journal) = self.file_journal.lock() {
+            journal.record_before_patch(&path, &journal_call_id, turn_idx);
+        }
+
         match fs::write(&path, &new_content) {
             Ok(_) => {
                 // Record write state for staleness tracking
                 self.record_write(&path);
+                // Journal: record after-state
+                if let Ok(mut journal) = self.file_journal.lock() {
+                    journal.record_after(&path, &journal_call_id, new_content.as_bytes());
+                }
 
                 // Auto-format if formatter is available
                 let format_result = auto_format_file(&path, &self.project_root);
