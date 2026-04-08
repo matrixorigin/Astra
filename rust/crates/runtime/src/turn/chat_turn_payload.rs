@@ -166,6 +166,7 @@ mod tests {
         });
         assert_eq!(p["messages"], json!(msgs));
         assert_eq!(p["session_id"], Value::Null);
+        assert_eq!(p["agent_id"], "test-agent");
         assert_eq!(p["model"], "gpt-test");
         assert_eq!(p["explain"], json!(true));
         assert_eq!(p["edge_executor_id"], "edge-unit");
@@ -194,6 +195,7 @@ mod tests {
             thinking_budget_tokens: None,
         });
         assert_eq!(p["session_id"], "sess-1");
+        assert_eq!(p["agent_id"], Value::Null);
         assert_eq!(p["explain"], json!("verbose"));
     }
 

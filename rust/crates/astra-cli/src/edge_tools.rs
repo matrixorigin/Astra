@@ -3041,13 +3041,14 @@ impl ToolExecutor {
             "sleep" => self.sleep_tool(args).await,
             "tool_search" => self.tool_search(args),
             "web_search" => self.web_search(args),
+            "spawn_agent" => agent_spawning::handle_spawn_agent_tool(args, self.spawn_context.as_ref()),
             _ if name.starts_with("mcp_") => self.execute_mcp_tool(name, args).await,
             _ => format!(
                 "Unknown tool: {name}. Available tools: bash, read_file, write_file, str_replace, \
                  list_dir, grep, glob, symbols, find_definition, find_references, git_status, \
                  git_diff, git_log, git_show, git_blame, call_graph, run_build_test, web_fetch, \
                  mo_query, memory_search, memory_profile, ask_user, task_create, task_list, \
-                 task_get, task_update, task_stop, sleep, tool_search, web_search"
+                 task_get, task_update, task_stop, sleep, tool_search, web_search, spawn_agent"
             ),
         };
         // Normalize empty output, then apply global safety net
