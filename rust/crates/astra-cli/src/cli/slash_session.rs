@@ -640,6 +640,34 @@ pub(super) fn handle_session_command(arg: &str, state: &mut ReplState) {
                                     pct,
                                 );
                             }
+                            session_journal::JournalEventType::PlanEdit => {
+                                let action = evt
+                                    .metadata
+                                    .as_ref()
+                                    .and_then(|m| m.get("action"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("edit");
+                                eprintln!(
+                                    "  {} {} plan edit: {}",
+                                    ts_short.dim(),
+                                    "✏".cyan(),
+                                    action,
+                                );
+                            }
+                            session_journal::JournalEventType::PlanLifecycle => {
+                                let summary = evt
+                                    .metadata
+                                    .as_ref()
+                                    .and_then(|m| m.get("summary"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("lifecycle");
+                                eprintln!(
+                                    "  {} {} plan: {}",
+                                    ts_short.dim(),
+                                    "📋".cyan(),
+                                    summary,
+                                );
+                            }
                             session_journal::JournalEventType::SessionFork => {
                                 let parent = evt
                                     .session_lineage

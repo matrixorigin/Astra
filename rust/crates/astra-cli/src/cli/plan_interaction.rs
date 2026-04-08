@@ -150,6 +150,52 @@ pub(super) fn eprint_plan_json_parse_failed(full_text: &str, err: &str) {
     );
 }
 
+/// Print available plan mode commands (compact, for after plan generation).
+pub(super) fn eprint_plan_commands_help() {
+    eprintln!("  Type {} for all commands.", "help".cyan());
+    eprintln!(
+        "  {} {} to run · {} to modify · {} to leave",
+        "→".dim(),
+        "go".cyan(),
+        "<describe changes>".dim(),
+        "exit".cyan(),
+    );
+}
+
+/// Print the full plan mode banner (shown on entry and on `help` command).
+pub(super) fn eprint_plan_mode_banner(goal: &str) {
+    eprintln!();
+    eprintln!("┌─────────────────────────────────────────────────────────────");
+    eprintln!("│ {} {}", "📋 PLAN MODE".yellow().bold(), "— interactive plan editor".dim());
+    if !goal.is_empty() {
+        let display_goal: String = goal.chars().take(50).collect();
+        let suffix = if goal.len() > 50 { "…" } else { "" };
+        eprintln!("│ Goal: {}{}", display_goal.cyan(), suffix);
+    }
+    eprintln!("│");
+    eprintln!("│ {}", "Quick actions:".bold());
+    eprintln!("│   {} / {} / {}   Execute the plan", "go".cyan(), "execute".cyan(), "run".cyan());
+    eprintln!("│   {}                 Execute step-by-step", "step".cyan());
+    eprintln!("│   {} / {} / {}  Leave plan mode", "exit".cyan(), "quit".cyan(), "cancel".cyan());
+    eprintln!("│");
+    eprintln!("│ {}", "Inspect:".bold());
+    eprintln!("│   {}               Current plan status + progress", "status".cyan());
+    eprintln!("│   {}                 Show current plan in detail", "show".cyan());
+    eprintln!("│   {}              Plan cost & metrics", "metrics".cyan());
+    eprintln!("│   {}             Execution timeline", "timeline".cyan());
+    eprintln!("│   {}              Version history", "history".cyan());
+    eprintln!("│   {} <from> <to>  Diff between plan versions", "diff".cyan());
+    eprintln!("│");
+    eprintln!("│ {}", "Edit:".bold());
+    eprintln!("│   {}     Rollback to a version", "rollback <ver>".cyan());
+    eprintln!("│   {}                 List saved plans", "list".cyan());
+    eprintln!("│   {}        Type anything to edit via LLM", "<natural language>".dim());
+    eprintln!("│");
+    eprintln!("│   {} / {}    Show this help", "help".cyan(), "?".cyan());
+    eprintln!("└─────────────────────────────────────────────────────────────");
+    eprintln!();
+}
+
 /// Write a plan lifecycle journal event.
 fn journal_plan_event(
     journal: &mut Option<session_journal::JournalWriter>,
@@ -172,6 +218,46 @@ fn journal_plan_event(
         }
     };
     let _ = writer.append(&event);
+}
+
+/// True while a plan run is active: persisted flag and/or live background executor handle.
+///
+/// Both must be considered — `background_execution` can be missing from disk after an
+/// older save, while `plan_handle` proves the executor is still running.
+pub fn plan_execution_ui_active(state: &ReplState) -> bool {
+    state.plan_handle.is_some()
+        || state
+            .plan_mode
+            .as_ref()
+            .is_some_and(|p| p.background_execution)
+}
+
+/// Idle plan status line: "review — not started" when there is a plan and no subtask has started yet.
+pub fn plan_idle_review_not_started(ps: &plan::PlanModeState) -> bool {
+    use astra_services::task_orchestrator::TaskStatus;
+    !ps.plan.subtasks.is_empty()
+        && ps
+            .plan
+            .subtasks
+            .iter()
+            .all(|s| s.status == TaskStatus::Pending)
+}
+
+/// Clear `background_execution` after the background executor finishes or errors.
+pub fn clear_plan_background_execution(state: &mut ReplState) {
+    use plan::PlanModeState;
+    if let Some(ref mut ps) = state.plan_mode {
+        if ps.background_execution {
+            ps.background_execution = false;
+            if let Err(e) = ps.save_to_file(&PlanModeState::state_path()) {
+                eprintln!(
+                    "  {} Could not persist plan state (prompt is updated in memory): {}",
+                    theme::icon_warn(),
+                    e
+                );
+            }
+        }
+    }
 }
 
 /// Handle user input while in interactive plan mode (`plan>` prompt).
@@ -303,10 +389,7 @@ pub async fn handle_plan_mode_input(
                         eprintln!();
                         eprintln!("{}", format_plan(&plan_state.plan));
                         eprintln!();
-                        eprintln!("  {} Commands:", "💡".cyan());
-                        eprintln!("    'go' or 'execute' → Run the plan");
-                        eprintln!("    'step' → Run step-by-step with confirmation");
-                        eprintln!("    Or describe changes to modify the plan");
+                        eprint_plan_commands_help();
                     }
                     Err(e) => {
                         eprint_plan_json_parse_failed(&full_text, &e.to_string());
@@ -336,9 +419,9 @@ pub async fn handle_plan_mode_input(
 
         match choice {
             PlanEntryChoice::Exit => {
-                eprintln!();
-                eprintln!("{}  Exiting plan mode", "📋".yellow());
                 state.plan_mode = None;
+                eprintln!();
+                eprintln!("  {} Left plan mode → back to normal chat.", "←".cyan());
                 return Ok(());
             }
             PlanEntryChoice::Continue => {
@@ -355,7 +438,13 @@ pub async fn handle_plan_mode_input(
                 return Ok(());
             }
             PlanEntryChoice::Resume => {
-                if state.executing_plan.is_some() {
+                if state.plan_handle.is_some() {
+                    eprintln!(
+                        "  {} Type {} to resume background execution.",
+                        "💡".cyan(),
+                        "resume".cyan()
+                    );
+                } else if state.executing_plan.is_some() {
                     eprintln!("  {} Resuming plan execution...", "▶".cyan());
                 }
                 return Ok(());
@@ -376,6 +465,13 @@ pub async fn handle_plan_mode_input(
     if let Some(done_id) = input_lower.strip_prefix("done ").map(|s| s.trim())
         && !done_id.is_empty()
     {
+        if plan_execution_ui_active(state) {
+            eprintln!(
+                "  {} Cannot use done while a plan run is active (background executor).",
+                theme::icon_warn()
+            );
+            return Ok(());
+        }
         let plan_state = state.plan_mode.as_mut().unwrap();
         match plan_state.complete_subtask(done_id) {
             Ok(title) => {
@@ -440,6 +536,16 @@ pub async fn handle_plan_mode_input(
     }
 
     // ── Natural-language plan editing via LLM ───────────────────────────
+    if plan_execution_ui_active(state) {
+        eprintln!(
+            "  {} Plan run is active; LLM edits are paused. Try {}, {}, or {}.",
+            theme::icon_warn(),
+            "status".cyan(),
+            "show".cyan(),
+            "exit".cyan()
+        );
+        return Ok(());
+    }
     let plan_state = state.plan_mode.as_mut().unwrap();
     let prompt = plan_state.plan_mode_prompt(&input);
     plan_state.add_turn(&input, "");
@@ -556,8 +662,10 @@ async fn handle_plan_command(
 
     match cmd {
         PlanCommand::Cancel => {
-            eprintln!();
-            eprintln!("{}  Exiting plan mode", "📋".yellow());
+            if let Some(mut h) = state.plan_handle.take() {
+                let _ = h.send_command(crate::plan_executor::PlanCommand::Cancel);
+                while h.try_recv().is_some() {}
+            }
 
             journal_plan_event(
                 &mut state.journal,
@@ -568,60 +676,106 @@ async fn handle_plan_command(
 
             PlanModeState::clear_saved_state();
             state.plan_mode = None;
+            state.executing_plan_goal = None;
+            eprintln!();
+            eprintln!("  {} Left plan mode → back to normal chat.", "←".cyan());
+            eprintln!();
         }
 
         PlanCommand::Status => {
             if let Some(ref ps) = state.plan_mode {
-                let pct = ps.plan.progress_pct();
-                let done = ps.plan.items_done();
-                let total = ps.plan.subtasks.len();
-                let versions = ps.version_history.versions.len();
-                let edits = ps.history.len();
+                if plan_execution_ui_active(state) {
+                    let pct = ps.plan.progress_pct();
+                    let done = ps.plan.items_done();
+                    let total = ps.plan.subtasks.len();
+                    let goal_display = state
+                        .executing_plan_goal
+                        .as_deref()
+                        .unwrap_or(ps.goal.as_str());
+                    let round = state.plan_execution_rounds;
 
-                eprintln!("┌── Plan Status ────────────────────────────────────");
-                eprintln!("│ Goal:     {}", ps.goal);
-                eprintln!("│ Phase:    refining");
-                eprintln!("│");
-
-                let bar_width = 30;
-                let filled = (pct as usize * bar_width) / 100;
-                let empty = bar_width - filled;
-                let bar = format!(
-                    "{}{}",
-                    "█".repeat(filled).green(),
-                    "░".repeat(empty).dim()
-                );
-                eprintln!("│ Progress: [{bar}] {done}/{total} ({pct}%)");
-                eprintln!("│ Versions: {versions}  |  Edits: {edits}");
-
-                let ready = ps.plan.ready_subtasks();
-                if !ready.is_empty() {
-                    eprintln!("│");
-                    eprintln!("│ {} Ready subtasks:", "→".cyan());
-                    for st in &ready {
-                        eprintln!("│   {} [{}] {}", "○".dim(), st.id, st.title);
+                    eprintln!("┌── Execution Status ───────────────────────────────");
+                    eprintln!("│ Goal:      {goal_display}");
+                    eprintln!("│ Phase:     running in background (still in plan mode)");
+                    let bar_width = 30;
+                    let filled = (pct as usize * bar_width) / 100;
+                    let empty = bar_width - filled;
+                    let bar = format!(
+                        "{}{}",
+                        "█".repeat(filled).green(),
+                        "░".repeat(empty).dim()
+                    );
+                    eprintln!("│ Progress:  [{bar}] {done}/{total} ({pct}%) — bar may lag vs live output");
+                    eprintln!("│ Round:     {round}");
+                    if let Some(ref stid) = state.current_plan_subtask_id {
+                        eprintln!("│ Current:   {stid}");
                     }
-                }
-
-                let blocked: Vec<_> = ps.plan.subtasks.iter()
-                    .filter(|s| s.status == astra_services::task_orchestrator::TaskStatus::Pending
-                        && !s.depends_on.is_empty()
-                        && s.depends_on.iter().any(|dep| {
-                            ps.plan.subtasks.iter().any(|d| d.id == *dep && d.status != astra_services::task_orchestrator::TaskStatus::Completed)
-                        }))
-                    .collect();
-                if !blocked.is_empty() {
-                    eprintln!("│");
-                    eprintln!("│ {} Blocked subtasks:", "⏳".yellow());
-                    for st in &blocked {
-                        let deps: Vec<_> = st.depends_on.iter().map(|d| d.as_str()).collect();
-                        eprintln!("│   {} [{}] {} (waiting on: {})", "●".dim(), st.id, st.title, deps.join(", "));
+                    if !state.plan_execution_corrections.is_empty() {
+                        eprintln!(
+                            "│ Corrections: {} queued",
+                            state.plan_execution_corrections.len()
+                        );
                     }
-                }
+                    eprintln!("│");
+                    eprintln!("│ Commands: pause | resume | show | help | exit");
+                    eprintln!("└───────────────────────────────────────────────────");
+                } else {
+                    let pct = ps.plan.progress_pct();
+                    let done = ps.plan.items_done();
+                    let total = ps.plan.subtasks.len();
+                    let versions = ps.version_history.versions.len();
+                    let edits = ps.history.len();
 
-                eprintln!("│");
-                eprintln!("│ Commands: execute | step | edit <instruction> | diff | history");
-                eprintln!("└───────────────────────────────────────────────────");
+                    eprintln!("┌── Plan Status ────────────────────────────────────");
+                    eprintln!("│ Goal:     {}", ps.goal);
+                    let phase = if plan_idle_review_not_started(ps) {
+                        format!("review — not started (type {} to run)", "go".cyan())
+                    } else {
+                        "editing plan".to_string()
+                    };
+                    eprintln!("│ Phase:    {phase}");
+                    eprintln!("│");
+
+                    let bar_width = 30;
+                    let filled = (pct as usize * bar_width) / 100;
+                    let empty = bar_width - filled;
+                    let bar = format!(
+                        "{}{}",
+                        "█".repeat(filled).green(),
+                        "░".repeat(empty).dim()
+                    );
+                    eprintln!("│ Progress: [{bar}] {done}/{total} ({pct}%)");
+                    eprintln!("│ Versions: {versions}  |  Edits: {edits}");
+
+                    let ready = ps.plan.ready_subtasks();
+                    if !ready.is_empty() {
+                        eprintln!("│");
+                        eprintln!("│ {} Ready subtasks:", "→".cyan());
+                        for st in &ready {
+                            eprintln!("│   {} [{}] {}", "○".dim(), st.id, st.title);
+                        }
+                    }
+
+                    let blocked: Vec<_> = ps.plan.subtasks.iter()
+                        .filter(|s| s.status == astra_services::task_orchestrator::TaskStatus::Pending
+                            && !s.depends_on.is_empty()
+                            && s.depends_on.iter().any(|dep| {
+                                ps.plan.subtasks.iter().any(|d| d.id == *dep && d.status != astra_services::task_orchestrator::TaskStatus::Completed)
+                            }))
+                        .collect();
+                    if !blocked.is_empty() {
+                        eprintln!("│");
+                        eprintln!("│ {} Blocked subtasks:", "⏳".yellow());
+                        for st in &blocked {
+                            let deps: Vec<_> = st.depends_on.iter().map(|d| d.as_str()).collect();
+                            eprintln!("│   {} [{}] {} (waiting on: {})", "●".dim(), st.id, st.title, deps.join(", "));
+                        }
+                    }
+
+                    eprintln!("│");
+                    eprintln!("│ Commands: execute | step | edit <instruction> | diff | history");
+                    eprintln!("└───────────────────────────────────────────────────");
+                }
             } else if let Some(plan) = &state.executing_plan {
                 let pct = plan.progress_pct();
                 let done = plan.items_done();
@@ -664,6 +818,16 @@ async fn handle_plan_command(
                 None => return Ok(()),
             };
 
+            if plan_execution_ui_active(state) {
+                eprintln!(
+                    "  {} A plan is already running. Wait for it to finish, or use {} / {}.",
+                    theme::icon_warn(),
+                    "pause".cyan(),
+                    "exit".cyan()
+                );
+                return Ok(());
+            }
+
             let plan = plan_state.plan.clone();
             let goal = plan_state.goal.clone();
 
@@ -675,6 +839,11 @@ async fn handle_plan_command(
                 eprintln!(
                     "{}  Step-by-step mode: you'll confirm each subtask before execution.",
                     "⚙".cyan()
+                );
+                eprintln!(
+                    "{}  Staying in plan mode — prompt shows {} while the run is active.",
+                    "💡".cyan(),
+                    "plan*[…]>".yellow()
                 );
                 eprintln!();
             }
@@ -733,6 +902,13 @@ async fn handle_plan_command(
                     "🚀".green(),
                     plan.subtasks.len()
                 );
+                eprintln!(
+                    "{}  Staying in plan mode — prompt becomes {} ({} = running). {} still works.",
+                    "💡".cyan(),
+                    "plan*[…]>".yellow(),
+                    "*".yellow(),
+                    "status".cyan()
+                );
                 eprintln!();
             }
 
@@ -758,12 +934,25 @@ async fn handle_plan_command(
             state.plan_execution_rounds = 0;
             state.plan_execution_corrections.clear();
             state.executing_plan = Some(plan);
-            PlanModeState::clear_saved_state();
-            state.plan_mode = None;
+            if let Some(ref mut ps) = state.plan_mode {
+                ps.background_execution = true;
+                let _ = ps.save_to_file(&PlanModeState::state_path());
+            }
         }
 
         PlanCommand::Resume => {
-            if state.executing_plan.is_some() {
+            if let Some(ref handle) = state.plan_handle {
+                let corrections = if state.plan_execution_corrections.is_empty() {
+                    None
+                } else {
+                    Some(std::mem::take(&mut state.plan_execution_corrections))
+                };
+                match handle.send_command(crate::plan_executor::PlanCommand::Resume { corrections })
+                {
+                    Ok(()) => eprintln!("  {} Resuming plan execution...", "▶".cyan()),
+                    Err(e) => eprintln!("  {} {}", theme::icon_err(), e),
+                }
+            } else if state.executing_plan.is_some() {
                 eprintln!("  {} Resuming plan execution...", "▶".cyan());
             } else {
                 eprintln!("  {} No paused plan to resume", theme::icon_warn());
@@ -771,7 +960,14 @@ async fn handle_plan_command(
         }
 
         PlanCommand::Pause => {
-            eprintln!("  {} Use Ctrl+C during execution to pause", "💡".cyan());
+            if let Some(ref handle) = state.plan_handle {
+                match handle.send_command(crate::plan_executor::PlanCommand::Pause) {
+                    Ok(()) => eprintln!("  {} Pause requested.", "⏸".cyan()),
+                    Err(e) => eprintln!("  {} {}", theme::icon_err(), e),
+                }
+            } else {
+                eprintln!("  {} Use Ctrl+C during execution to pause", "💡".cyan());
+            }
         }
 
         PlanCommand::Timeline => {
@@ -850,6 +1046,13 @@ async fn handle_plan_command(
         }
 
         PlanCommand::Rollback { version } => {
+            if plan_execution_ui_active(state) {
+                eprintln!(
+                    "  {} Rollback is disabled while a plan run is active. Pause or cancel first.",
+                    theme::icon_warn()
+                );
+                return Ok(());
+            }
             if let Some(ref mut ps) = state.plan_mode {
                 match ps.rollback_to_version(version) {
                     Ok(msg) => {
@@ -908,6 +1111,12 @@ async fn handle_plan_command(
                     }
                     Err(e) => eprintln!("  {} {}", theme::icon_err(), e),
                 }
+            } else if plan_execution_ui_active(state) {
+                eprintln!(
+                    "  {} Rewind targets the live executor after a pause. Pause the run first ({} or Ctrl+C).",
+                    theme::icon_warn(),
+                    "pause".cyan()
+                );
             } else if state.plan_mode.is_some() {
                 eprintln!("  {} Rewind is only available during execution", theme::icon_warn());
             }
@@ -927,12 +1136,23 @@ async fn handle_plan_command(
             eprintln!("  {} Approval commands are handled by the execution loop", "💡".cyan());
         }
 
+        PlanCommand::Help => {
+            let goal = state.plan_mode.as_ref().map(|ps| ps.goal.as_str()).unwrap_or("");
+            eprint_plan_mode_banner(goal);
+        }
+
         PlanCommand::Create { goal } => {
             return handle_goal_submission(goal, token, state, api).await;
         }
 
         PlanCommand::Edit { instruction } => {
-            // Re-route through the natural-language handler (box the future to avoid recursive async)
+            if plan_execution_ui_active(state) {
+                eprintln!(
+                    "  {} Cannot edit the plan via LLM while a plan run is active.",
+                    theme::icon_warn()
+                );
+                return Ok(());
+            }
             return Box::pin(handle_plan_mode_input(instruction, token, state, api)).await;
         }
     }
@@ -1088,10 +1308,7 @@ async fn handle_goal_submission(
                         eprintln!();
                         eprintln!("{}", format_plan(&plan_state.plan));
                         eprintln!();
-                        eprintln!("  {} Commands:", "💡".cyan());
-                        eprintln!("    'go' or 'execute' → Run the plan");
-                        eprintln!("    'step' → Run step-by-step with confirmation");
-                        eprintln!("    Or describe changes to modify the plan");
+                        eprint_plan_commands_help();
                     }
                     Err(e) => {
                         eprint_plan_json_parse_failed(&full_text, &e.to_string());
@@ -1176,6 +1393,93 @@ pub(super) fn extract_goal_pattern(goal: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plan_executor;
+    use astra_services::task_orchestrator::{SubtaskPlan, TaskStatus};
+
+    #[test]
+    fn plan_execution_ui_active_matrix() {
+        let ctx = plan::ProjectContext::default();
+
+        let state = ReplState::default();
+        assert!(
+            !plan_execution_ui_active(&state),
+            "no handle and no plan_mode => inactive"
+        );
+
+        let mut state = ReplState::default();
+        let (handle, _update_tx, _cmd_rx) = plan_executor::create_plan_channels();
+        state.plan_handle = Some(handle);
+        assert!(
+            plan_execution_ui_active(&state),
+            "handle set => active even without plan_mode"
+        );
+
+        let mut state = ReplState::default();
+        let mut ps = plan::PlanModeState::new("g".into(), ctx.clone());
+        ps.background_execution = true;
+        state.plan_mode = Some(ps);
+        assert!(
+            plan_execution_ui_active(&state),
+            "background_execution without handle => active"
+        );
+
+        let mut state = ReplState::default();
+        let (handle, _update_tx, _cmd_rx) = plan_executor::create_plan_channels();
+        state.plan_handle = Some(handle);
+        let mut ps = plan::PlanModeState::new("g".into(), ctx.clone());
+        ps.background_execution = false;
+        state.plan_mode = Some(ps);
+        assert!(
+            plan_execution_ui_active(&state),
+            "handle + plan_mode with bg false => still active"
+        );
+
+        let mut state = ReplState::default();
+        let mut ps = plan::PlanModeState::new("g".into(), ctx);
+        ps.background_execution = false;
+        state.plan_mode = Some(ps);
+        assert!(
+            !plan_execution_ui_active(&state),
+            "no handle and bg false => inactive"
+        );
+    }
+
+    #[test]
+    fn plan_idle_review_not_started_empty_subtasks() {
+        let ctx = plan::ProjectContext::default();
+        let ps = plan::PlanModeState::new("goal".into(), ctx);
+        assert!(!plan_idle_review_not_started(&ps));
+    }
+
+    #[test]
+    fn plan_idle_review_not_started_all_pending() {
+        let ctx = plan::ProjectContext::default();
+        let mut ps = plan::PlanModeState::new("goal".into(), ctx);
+        ps.plan.subtasks.push(SubtaskPlan {
+            id: "s1".into(),
+            title: "one".into(),
+            ..Default::default()
+        });
+        assert!(plan_idle_review_not_started(&ps));
+    }
+
+    #[test]
+    fn plan_idle_review_not_started_any_non_pending() {
+        let ctx = plan::ProjectContext::default();
+        let mut ps = plan::PlanModeState::new("goal".into(), ctx);
+        ps.plan.subtasks.push(SubtaskPlan {
+            id: "s1".into(),
+            title: "done".into(),
+            status: TaskStatus::Completed,
+            ..Default::default()
+        });
+        ps.plan.subtasks.push(SubtaskPlan {
+            id: "s2".into(),
+            title: "wait".into(),
+            ..Default::default()
+        });
+        assert!(!plan_idle_review_not_started(&ps));
+    }
 
     #[test]
     fn extract_goal_pattern_empty_string_returns_wildcard() {

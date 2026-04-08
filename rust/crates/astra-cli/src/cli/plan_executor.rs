@@ -1372,6 +1372,14 @@ mod tests {
     }
 
     #[test]
+    fn repl_to_executor_cancel_roundtrip() {
+        let (handle, _update_tx, mut cmd_rx) = create_plan_channels();
+        handle.send_command(PlanCommand::Cancel).unwrap();
+        let cmd = cmd_rx.try_recv().unwrap();
+        assert!(matches!(cmd, PlanCommand::Cancel));
+    }
+
+    #[test]
     fn handle_is_finished_when_sender_dropped() {
         let (handle, update_tx, _cmd_rx) = create_plan_channels();
         assert!(!handle.is_finished());

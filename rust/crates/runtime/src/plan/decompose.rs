@@ -1023,6 +1023,9 @@ pub struct PlanModeState {
     /// Wall-clock origin for CLI "Assembling plan · Ns" (plan> session; not serialized).
     #[serde(skip)]
     pub assemble_wall_start: Option<Instant>,
+    /// `go` / auto-run started a background executor; CLI keeps the plan prompt and routes commands here.
+    #[serde(default)]
+    pub background_execution: bool,
 }
 
 impl PlanModeState {
@@ -1040,6 +1043,7 @@ impl PlanModeState {
             version: 1,
             created_by: None,
             assemble_wall_start: Some(Instant::now()),
+            background_execution: false,
         }
     }
 
@@ -3991,6 +3995,48 @@ Done!"#;
         assert_eq!(loaded.plan.notes, Some("my notes".into()));
         assert_eq!(loaded.history.len(), 1);
         assert_eq!(loaded.context.languages, vec!["Rust".to_string()]);
+        assert!(
+            !loaded.background_execution,
+            "fresh save/load should not set background_execution"
+        );
+    }
+
+    #[test]
+    fn plan_mode_state_omitted_background_execution_defaults_false() {
+        let mut ps = PlanModeState::new("goal".into(), ProjectContext::default());
+        ps.set_plan(TaskPlan {
+            subtasks: vec![],
+            notes: None,
+        });
+        let mut v = serde_json::to_value(&ps).expect("serialize");
+        let obj = v.as_object_mut().expect("object");
+        obj.remove("background_execution");
+        let loaded: PlanModeState = serde_json::from_value(v).expect("deserialize without field");
+        assert!(
+            !loaded.background_execution,
+            "serde(default) must yield false when key is absent"
+        );
+    }
+
+    #[test]
+    fn plan_mode_state_background_execution_roundtrips_json() {
+        let mut ps = PlanModeState::new("run".into(), ProjectContext::default());
+        ps.background_execution = true;
+        ps.set_plan(TaskPlan {
+            subtasks: vec![SubtaskPlan {
+                id: "a".into(),
+                title: "A".into(),
+                description: None,
+                depends_on: vec![],
+                status: TaskStatus::Pending,
+                ..Default::default()
+            }],
+            notes: None,
+        });
+        let v = serde_json::to_value(&ps).unwrap();
+        let loaded: PlanModeState = serde_json::from_value(v).unwrap();
+        assert!(loaded.background_execution);
+        assert_eq!(loaded.goal, "run");
     }
 
     #[test]

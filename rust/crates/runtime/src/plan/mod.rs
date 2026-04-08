@@ -566,6 +566,8 @@ pub enum PlanCommand {
     History,
     /// Show the current plan in detail.
     Show,
+    /// Show available commands.
+    Help,
 }
 
 impl PlanCommand {
@@ -576,6 +578,11 @@ impl PlanCommand {
     pub fn parse(input: &str) -> Option<PlanCommand> {
         let trimmed = input.trim();
         let lower = trimmed.to_lowercase();
+
+        // Help
+        if matches!(lower.as_str(), "help" | "?" | "帮助" | "commands") {
+            return Some(PlanCommand::Help);
+        }
 
         // Execute commands
         if matches!(

@@ -655,6 +655,10 @@ pub enum JournalEventType {
     /// A composite snapshot was taken — captures references to session state,
     /// data snapshot, memory snapshot, git commit, etc.
     CompositeSnapshot,
+    /// Plan was edited (subtask added/removed/reordered, goal changed).
+    PlanEdit,
+    /// Plan lifecycle event (created, completed, abandoned, replanned).
+    PlanLifecycle,
 }
 
 /// Writer that appends events to a session journal file.
@@ -1576,6 +1580,34 @@ impl JournalEvent {
         evt
     }
 
+    /// Plan edited — subtask added/removed/reordered, goal changed.
+    pub fn plan_edit(
+        session_id: Option<&str>,
+        action: &str,
+        metadata: Option<serde_json::Value>,
+    ) -> Self {
+        let mut evt = Self::base(JournalEventType::PlanEdit, session_id);
+        evt.metadata = Some(serde_json::json!({
+            "action": action,
+            "detail": metadata,
+        }));
+        evt
+    }
+
+    /// Plan lifecycle event — created, completed, abandoned, replanned.
+    pub fn plan_lifecycle(
+        session_id: Option<&str>,
+        summary: &str,
+        metadata: Option<serde_json::Value>,
+    ) -> Self {
+        let mut evt = Self::base(JournalEventType::PlanLifecycle, session_id);
+        evt.metadata = Some(serde_json::json!({
+            "summary": summary,
+            "detail": metadata,
+        }));
+        evt
+    }
+
     /// Verification completed — emitted after subtask or global verification.
     pub fn verification_completed(
         session_id: Option<&str>,
@@ -1909,6 +1941,40 @@ mod tests {
         assert!(json.contains("\"model\":\"gpt-4\""));
         // Shouldn't have null fields
         assert!(!json.contains("\"turn\""));
+    }
+
+    #[test]
+    fn journal_event_plan_edit_serializes_and_round_trips() {
+        let meta = serde_json::json!({"subtask_count": 2});
+        let evt = JournalEvent::plan_edit(Some("sid-plan"), "Plan edited: add step", Some(meta));
+        assert_eq!(evt.event_type, JournalEventType::PlanEdit);
+        let json = serde_json::to_string(&evt).unwrap();
+        assert!(json.contains("\"type\":\"plan_edit\""));
+        assert!(json.contains("Plan edited"));
+        let parsed: JournalEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.event_type, JournalEventType::PlanEdit);
+        let m = parsed.metadata.expect("metadata");
+        assert_eq!(m.get("action").and_then(|v| v.as_str()), Some("Plan edited: add step"));
+    }
+
+    #[test]
+    fn journal_event_plan_lifecycle_serializes_and_round_trips() {
+        let detail = serde_json::json!({"mode": "auto", "subtask_count": 3});
+        let evt = JournalEvent::plan_lifecycle(
+            Some("sid-lc"),
+            "Plan execution started",
+            Some(detail),
+        );
+        assert_eq!(evt.event_type, JournalEventType::PlanLifecycle);
+        let json = serde_json::to_string(&evt).unwrap();
+        assert!(json.contains("\"type\":\"plan_lifecycle\""));
+        let parsed: JournalEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.event_type, JournalEventType::PlanLifecycle);
+        let m = parsed.metadata.expect("metadata");
+        assert_eq!(
+            m.get("summary").and_then(|v| v.as_str()),
+            Some("Plan execution started")
+        );
     }
 
     #[test]

@@ -100,6 +100,8 @@ mod slash_debug;
 mod slash_info;
 #[path = "cli/slash_mcp.rs"]
 mod slash_mcp;
+#[path = "cli/plan_interaction.rs"]
+mod plan_interaction;
 #[path = "cli/slash_memory.rs"]
 mod slash_memory;
 #[path = "cli/slash_session.rs"]
@@ -150,7 +152,10 @@ use slash_account::handle_account_command;
 use slash_bug::handle_bug_command;
 use slash_debug::handle_debug_command;
 use slash_info::handle_info_command;
-use slash_memory::{handle_memory_domain_command, handle_plan_mode_input};
+use plan_interaction::{
+    clear_plan_background_execution, handle_plan_mode_input, plan_execution_ui_active,
+};
+use slash_memory::handle_memory_domain_command;
 use slash_session::handle_session_command;
 #[cfg(test)]
 use slash_session::resolve_journal_target_session;
@@ -3483,6 +3488,7 @@ fn display_plan_updates_live(
                 );
                 state.executing_plan = None;
                 state.current_plan_subtask_id = None;
+                clear_plan_background_execution(state);
                 // Deny any pending approval (plan is done)
                 if let Some(tx) = state.pending_approval.take() {
                     let _ = tx.send(false);
@@ -3492,6 +3498,12 @@ fn display_plan_updates_live(
                 if let Some(ref report) = state.last_delivery_report {
                     eprintln!();
                     durable_bridge::display_delivery_report(report);
+                }
+                if state.plan_mode.is_some() {
+                    eprintln!(
+                        "{}",
+                        "  Still in plan mode — type exit when you want normal chat.".dim()
+                    );
                 }
                 return;
             }
@@ -3508,11 +3520,18 @@ fn display_plan_updates_live(
                 let msg = format!("\n❌  Plan error: {error}");
                 state.executing_plan = None;
                 state.current_plan_subtask_id = None;
+                clear_plan_background_execution(state);
                 // Deny any pending approval (plan failed)
                 if let Some(tx) = state.pending_approval.take() {
                     let _ = tx.send(false);
                 }
                 print_line(plan_spinner, &mut state.plan_in_token_stream, msg);
+                if state.plan_mode.is_some() {
+                    eprintln!(
+                        "{}",
+                        "  Still in plan mode — type exit to leave or resume after fixing.".dim()
+                    );
+                }
                 return;
             }
             PlanUpdate::PlanPaused {
@@ -5466,11 +5485,24 @@ async fn run_chat_repl(
                 format!("Skill dev: {}", dev.name).cyan().dim()
             );
         }
-        let prompt_str = if state.plan_mode.is_some() {
-            theme::PROMPT_PLAN.to_string()
+        // Single source for "plan run in progress": live handle and/or persisted background flag.
+        let plan_run_active = plan_execution_ui_active(&state);
+        let prompt_str = if let Some(ref ps) = state.plan_mode {
+            if ps.goal.is_empty() {
+                if plan_run_active {
+                    "\x1b[1;33mplan*>\x1b[0m ".to_string()
+                } else {
+                    theme::PROMPT_PLAN.to_string()
+                }
+            } else {
+                let short_goal: String = ps.goal.chars().take(20).collect();
+                let suffix = if ps.goal.len() > 20 { "…" } else { "" };
+                let star = if plan_run_active { "*" } else { "" };
+                format!("\x1b[1;33mplan{star}[{short_goal}{suffix}]>\x1b[0m ")
+            }
         } else if state.executing_plan.is_some() {
             theme::PROMPT_PAUSE.to_string()
-        } else if state.plan_handle.is_some() {
+        } else if plan_run_active {
             theme::PROMPT_BG.to_string()
         } else if state.chat_plan_only {
             theme::PROMPT_PLAN_ONLY.to_string()
@@ -6365,6 +6397,39 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clear_plan_background_execution_clears_flag_when_set() {
+        let mut state = ReplState::default();
+        let ctx = plan_decompose::ProjectContext::default();
+        let mut ps = plan_decompose::PlanModeState::new("test goal".into(), ctx);
+        ps.background_execution = true;
+        state.plan_mode = Some(ps);
+
+        plan_interaction::clear_plan_background_execution(&mut state);
+
+        let ps = state.plan_mode.as_ref().expect("plan_mode retained");
+        assert!(
+            !ps.background_execution,
+            "background_execution must clear so prompt loses *"
+        );
+    }
+
+    #[test]
+    fn clear_plan_background_execution_no_op_without_plan_mode() {
+        let mut state = ReplState::default();
+        plan_interaction::clear_plan_background_execution(&mut state);
+        assert!(state.plan_mode.is_none());
+    }
+
+    #[test]
+    fn clear_plan_background_execution_no_op_when_not_running() {
+        let mut state = ReplState::default();
+        let ctx = plan_decompose::ProjectContext::default();
+        state.plan_mode = Some(plan_decompose::PlanModeState::new("g".into(), ctx));
+        plan_interaction::clear_plan_background_execution(&mut state);
+        assert!(!state.plan_mode.as_ref().unwrap().background_execution);
+    }
 
     #[test]
     fn dispatch_turn_event_collects_explain_events() {

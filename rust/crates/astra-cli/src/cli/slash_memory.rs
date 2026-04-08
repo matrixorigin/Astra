@@ -359,7 +359,9 @@ pub(super) async fn handle_memory_domain_command(
                     // Restore saved plan or create new
                     if let Some(plan) = saved_plan {
                         state.chat_plan_only = false;
+                        let goal = plan.goal.clone();
                         state.plan_mode = Some(plan);
+                        plan_interaction::eprint_plan_mode_banner(&goal);
                         if let Some(ref ps) = state.plan_mode {
                             eprintln!(
                                 "  {} Restored saved plan: {}",
@@ -371,14 +373,14 @@ pub(super) async fn handle_memory_domain_command(
                             eprintln!("{formatted}");
                         }
                     } else {
-                        // Create empty plan mode state - user will provide goal via conversation
                         let project_root = std::env::current_dir()
                             .unwrap_or_else(|_| std::path::PathBuf::from("."));
                         let context = plan_decompose::analyze_project(&project_root);
                         state.chat_plan_only = false;
                         state.plan_mode = Some(PlanModeState::new(String::new(), context));
+                        plan_interaction::eprint_plan_mode_banner("");
                         eprintln!(
-                            "  {} Entered plan mode. Describe your goal to start planning.",
+                            "  {} Describe your goal to start planning.",
                             "→".cyan()
                         );
                     }
@@ -637,28 +639,16 @@ pub(super) async fn handle_memory_domain_command(
                                 let _ = ps.save_to_file(&PlanModeState::state_path());
                             }
 
-                            eprintln!();
-                            eprintln!(
-                                "{}  Entered plan mode for: {}",
-                                "📋".yellow(),
-                                sub_arg.cyan()
-                            );
-                            eprintln!();
+                            plan_interaction::eprint_plan_mode_banner(sub_arg);
 
-                            // Display the plan
                             if let Ok(ref p) = plan_result {
                                 let formatted = format_plan(p);
                                 eprintln!("{formatted}");
+                                eprintln!();
+                                plan_interaction::eprint_plan_commands_help();
                             } else if let Err(ref e) = plan_result {
                                 eprint_plan_json_parse_failed(&full_text, &e.to_string());
                             }
-
-                            eprintln!();
-                            eprintln!(
-                                "  {} Commands: 'exit' to leave, 'execute' or 'go' to run the plan",
-                                "💡".cyan()
-                            );
-                            eprintln!("  {} Or ask questions to modify the plan", "💬".cyan());
                         }
                         Ok(r) => {
                             eprintln!("{}", format!("  ✗ LLM call failed ({})", r.status()).red());
@@ -1516,8 +1506,10 @@ pub(super) async fn handle_memory_domain_command(
     Ok(())
 }
 
-/// Handle user input in plan mode - sends to LLM for plan editing
-pub async fn handle_plan_mode_input(
+/// Old plan-mode handler — replaced by `plan_interaction::handle_plan_mode_input`.
+/// Kept temporarily for reference; will be removed in a follow-up cleanup.
+#[allow(dead_code)]
+async fn _old_handle_plan_mode_input(
     input: String,
     token: Option<&str>,
     state: &mut ReplState,
