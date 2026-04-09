@@ -299,7 +299,7 @@ impl SharedContextCache {
         self.agent_results
             .iter()
             .flat_map(|e: RefMulti<'_, String, AgentFindings>| {
-                e.value().findings.iter().cloned().collect::<Vec<_>>()
+                e.value().findings.to_vec()
             })
             .filter(|f| &f.category == category)
             .collect()

@@ -178,7 +178,7 @@ impl MessageTransport for InProcessTransport {
         let inboxes = self.inboxes.read().await;
         let tx = inboxes
             .get(&target)
-            .ok_or_else(|| MailboxError::AgentNotFound(target))?;
+            .ok_or(MailboxError::AgentNotFound(target))?;
         match tx.try_send(msg) {
             Ok(()) => {
                 self.metrics.messages_sent.fetch_add(1, Ordering::Relaxed);

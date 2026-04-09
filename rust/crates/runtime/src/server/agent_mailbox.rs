@@ -131,7 +131,7 @@ impl AgentMailbox {
     pub fn register(&self, agent_id: &str) {
         let id = agent_id.to_string();
         let mut s = self.state.write().unwrap();
-        s.queues.entry(id.clone()).or_insert_with(VecDeque::new);
+        s.queues.entry(id.clone()).or_default();
         s.notifiers.entry(id.clone()).or_insert_with(|| Arc::new(Notify::new()));
         if !s.agents.contains(&id) {
             s.agents.push(id);

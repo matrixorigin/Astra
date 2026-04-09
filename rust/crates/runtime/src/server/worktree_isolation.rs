@@ -211,7 +211,7 @@ impl WorktreeManager {
                 ))
             })?;
             let branch_name = format!("agent/{safe_id}-{del_prefix}");
-            let wt_path = self.worktree_base.join(&branch_name.replace('/', "_"));
+            let wt_path = self.worktree_base.join(branch_name.replace('/', "_"));
 
             let wt_path_str = wt_path.to_str().ok_or_else(|| {
                 WorktreeError::Git(format!(

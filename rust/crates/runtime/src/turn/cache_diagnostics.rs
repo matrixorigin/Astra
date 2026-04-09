@@ -403,7 +403,7 @@ impl CacheBreakDetector {
 
         // If cache hit rate is high, protect the prefix
         let cache_healthy = hit_rate >= 70.0;
-        let cache_marginal = hit_rate >= 40.0 && hit_rate < 70.0;
+        let cache_marginal = (40.0..70.0).contains(&hit_rate);
 
         let strategy = if cache_healthy {
             CompressionStrategy::PreservePrefix

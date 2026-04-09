@@ -1387,7 +1387,7 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
         // If the agent has a mailbox, intercept send_message tool calls and
         // route them through the messaging system.
         let post_send_tool_calls;
-        let effective_tool_calls = if state.mailbox.is_some() {
+        let effective_tool_calls = if let Some(ref mailbox) = state.mailbox {
             let mut msg_results: Vec<(String, String)> = Vec::new();
             let mut remaining = Vec::new();
             for tc in effective_tool_calls {
@@ -1395,7 +1395,6 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
                     if let Some((call_id, args)) =
                         crate::messaging::send_tool::parse_send_message_call(tc)
                     {
-                        let mailbox = state.mailbox.as_ref().unwrap();
                         let send_result =
                             crate::messaging::send_tool::execute_send_message(mailbox, &args)
                                 .await;

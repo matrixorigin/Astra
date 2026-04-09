@@ -831,11 +831,8 @@ async fn http_post_json(
 
         let text = String::from_utf8_lossy(&response);
         // Simple HTTP response body extraction: find blank line after headers.
-        if let Some(idx) = text.find("\r\n\r\n") {
-            Some(text[idx + 4..].to_string())
-        } else {
-            None
-        }
+        text.find("\r\n\r\n")
+            .map(|idx| text[idx + 4..].to_string())
     };
 
     match tokio::time::timeout(timeout, connect_fut).await {
