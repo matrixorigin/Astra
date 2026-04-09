@@ -206,7 +206,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
             }
             let ranked =
                 astra_runtime::turn::retrieval::rank_memory_results(ctx.message, &memory_contents);
-            
+
             // Record memory retrieval trace (M1 observability)
             if let Some(collector) = ctx.telem.trace_collector {
                 collector.record_memory_retrieval(
@@ -216,7 +216,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
                     mem_latency_ms,
                 );
             }
-            
+
             astra_runtime::turn::retrieval::append_boost_terms_from_ranked_memory(
                 &mut boost_terms,
                 ctx.message,
@@ -287,7 +287,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
             sel_result.selector_tokens_in,
             sel_result.selector_tokens_out,
         );
-        
+
         // Record tool selection trace (M1 observability)
         if let Some(collector) = ctx.telem.trace_collector {
             collector.record_tool_selection(
@@ -301,7 +301,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
                 sel_latency_ms,
             );
         }
-        
+
         let conf = sel_result.confidence;
         let (schemas, report) = tool_selector::resolve_schemas_with_pressure(
             ctx.registry,

@@ -71,9 +71,15 @@ pub struct PipelineOutcome {
 
 impl PipelineOutcome {
     /// Convert to telemetry trace format.
-    pub fn to_compression_trace(&self) -> Vec<(String, super::context_assembly_trace::CompressionMethod, u32)> {
+    pub fn to_compression_trace(
+        &self,
+    ) -> Vec<(
+        String,
+        super::context_assembly_trace::CompressionMethod,
+        u32,
+    )> {
         use super::context_assembly_trace::CompressionMethod;
-        
+
         self.layer_results
             .iter()
             .map(|(name, result)| {

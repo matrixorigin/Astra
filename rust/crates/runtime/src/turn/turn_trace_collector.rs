@@ -22,10 +22,10 @@ use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use super::context_assembly_trace::{
-    build_history_trace_from_compression, build_memory_trace_from_retrieval,
-    build_tool_trace_from_selection, CompressionMethod, ContextAssemblyTrace,
-    ContextAssemblyTraceBuilder, DecisionExplanation, HistorySelectionTrace,
-    MemoryRetrievalTrace, SystemPromptBreakdown, TokenBudgetTrace, ToolSelectionTrace,
+    CompressionMethod, ContextAssemblyTrace, ContextAssemblyTraceBuilder, DecisionExplanation,
+    HistorySelectionTrace, MemoryRetrievalTrace, SystemPromptBreakdown, TokenBudgetTrace,
+    ToolSelectionTrace, build_history_trace_from_compression, build_memory_trace_from_retrieval,
+    build_tool_trace_from_selection,
 };
 
 /// Thread-safe trace collector for a single turn.
@@ -167,8 +167,7 @@ impl TurnTraceCollector {
     pub fn finalize(&self) -> ContextAssemblyTrace {
         let state = self.inner.read().expect("lock poisoned");
 
-        let mut builder =
-            ContextAssemblyTraceBuilder::new(&state.turn_id, &state.session_id);
+        let mut builder = ContextAssemblyTraceBuilder::new(&state.turn_id, &state.session_id);
 
         if let Some(ref sp) = state.system_prompt {
             builder = builder.with_system_prompt(sp.clone());

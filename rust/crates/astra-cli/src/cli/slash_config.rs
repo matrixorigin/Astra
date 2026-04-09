@@ -54,7 +54,11 @@ fn show_config() {
     );
     println!(
         "  preserve_recent_turns: {}",
-        config.compression.preserve_recent_turns.to_string().yellow()
+        config
+            .compression
+            .preserve_recent_turns
+            .to_string()
+            .yellow()
     );
     println!(
         "  strategy: {}",
@@ -92,7 +96,11 @@ fn show_config() {
     );
     println!(
         "  prefer_recent_tools: {}",
-        config.tool_selection.prefer_recent_tools.to_string().yellow()
+        config
+            .tool_selection
+            .prefer_recent_tools
+            .to_string()
+            .yellow()
     );
 
     // Learning settings
@@ -103,7 +111,11 @@ fn show_config() {
     );
     println!(
         "  entity_decay_half_life_days: {}",
-        config.learning.entity_decay_half_life_days.to_string().yellow()
+        config
+            .learning
+            .entity_decay_half_life_days
+            .to_string()
+            .yellow()
     );
     println!(
         "  exploration_rate: {}",
@@ -114,11 +126,19 @@ fn show_config() {
     println!("\n{}", "🎯 Token Budget".bold());
     println!(
         "  max_turn_input_tokens: {}",
-        config.token_budget.max_turn_input_tokens.to_string().yellow()
+        config
+            .token_budget
+            .max_turn_input_tokens
+            .to_string()
+            .yellow()
     );
     println!(
         "  system_prompt_reserve: {}",
-        config.token_budget.system_prompt_reserve.to_string().yellow()
+        config
+            .token_budget
+            .system_prompt_reserve
+            .to_string()
+            .yellow()
     );
     println!(
         "  tools_reserve: {}",
@@ -140,7 +160,10 @@ fn show_config() {
         config.telemetry.persist_to_journal.to_string().yellow()
     );
 
-    println!("\n{}", "Use `/config paths` to see configuration file locations.".dim());
+    println!(
+        "\n{}",
+        "Use `/config paths` to see configuration file locations.".dim()
+    );
 }
 
 fn show_paths() {
@@ -185,9 +208,15 @@ fn show_paths() {
     println!("\n{}", "Environment Variables:".bold());
     let env_vars = [
         ("MO_MAX_HISTORY_TOKENS", "compression.max_history_tokens"),
-        ("MO_COMPRESSION_THRESHOLD", "compression.compression_threshold"),
+        (
+            "MO_COMPRESSION_THRESHOLD",
+            "compression.compression_threshold",
+        ),
         ("MO_RETRIEVAL_TOP_K", "memory.retrieval_top_k"),
-        ("MO_MAX_TURN_INPUT_TOKENS", "token_budget.max_turn_input_tokens"),
+        (
+            "MO_MAX_TURN_INPUT_TOKENS",
+            "token_budget.max_turn_input_tokens",
+        ),
         ("MO_CAPTURE_TRACES", "telemetry.capture_context_traces"),
     ];
 
@@ -250,7 +279,10 @@ fn show_diff() {
     let current = RuntimeConfig::load();
     let default = RuntimeConfig::default();
 
-    println!("\n{}", "Configuration Differences from Defaults".bold().cyan());
+    println!(
+        "\n{}",
+        "Configuration Differences from Defaults".bold().cyan()
+    );
     println!("{}", "═".repeat(50).dim());
 
     let mut has_diff = false;
@@ -264,7 +296,8 @@ fn show_diff() {
             current.compression.max_history_tokens.to_string().yellow()
         );
     }
-    if (current.compression.compression_threshold - default.compression.compression_threshold).abs() > 0.001
+    if (current.compression.compression_threshold - default.compression.compression_threshold).abs()
+        > 0.001
     {
         has_diff = true;
         println!(
@@ -290,7 +323,11 @@ fn show_diff() {
         println!(
             "  token_budget.max_turn_input_tokens: {} → {}",
             default.token_budget.max_turn_input_tokens.to_string().dim(),
-            current.token_budget.max_turn_input_tokens.to_string().yellow()
+            current
+                .token_budget
+                .max_turn_input_tokens
+                .to_string()
+                .yellow()
         );
     }
 
@@ -300,7 +337,11 @@ fn show_diff() {
         println!(
             "  telemetry.capture_context_traces: {} → {}",
             default.telemetry.capture_context_traces.to_string().dim(),
-            current.telemetry.capture_context_traces.to_string().yellow()
+            current
+                .telemetry
+                .capture_context_traces
+                .to_string()
+                .yellow()
         );
     }
 

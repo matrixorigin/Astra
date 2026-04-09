@@ -121,7 +121,12 @@ impl DecisionExplanation {
     }
 
     /// Add an input factor.
-    pub fn with_input(mut self, name: impl Into<String>, value: impl Into<String>, influence: f64) -> Self {
+    pub fn with_input(
+        mut self,
+        name: impl Into<String>,
+        value: impl Into<String>,
+        influence: f64,
+    ) -> Self {
         self.inputs.push(ExplainableInput {
             name: name.into(),
             value: value.into(),
@@ -188,7 +193,10 @@ impl DecisionExplanation {
             lines.push("### Key Factors".to_string());
             for input in &self.inputs {
                 let influence = format!("({:.0}% influence)", input.influence * 100.0);
-                lines.push(format!("- **{}**: {} {}", input.name, input.value, influence));
+                lines.push(format!(
+                    "- **{}**: {} {}",
+                    input.name, input.value, influence
+                ));
                 if let Some(ref exp) = input.explanation {
                     lines.push(format!("  → {}", exp));
                 }
@@ -200,7 +208,10 @@ impl DecisionExplanation {
         if !self.alternatives.is_empty() {
             lines.push("### Alternatives Considered".to_string());
             for alt in &self.alternatives {
-                let score = alt.score.map(|s| format!(" (score: {:.2})", s)).unwrap_or_default();
+                let score = alt
+                    .score
+                    .map(|s| format!(" (score: {:.2})", s))
+                    .unwrap_or_default();
                 lines.push(format!("- **{}**{}", alt.description, score));
                 lines.push(format!("  → Rejected: {}", alt.rejection_reason));
             }
@@ -349,7 +360,13 @@ impl FocusDriftAnalysis {
     }
 
     /// Add evidence.
-    pub fn with_evidence(mut self, turn: u32, evidence_type: EvidenceType, description: impl Into<String>, confidence: f64) -> Self {
+    pub fn with_evidence(
+        mut self,
+        turn: u32,
+        evidence_type: EvidenceType,
+        description: impl Into<String>,
+        confidence: f64,
+    ) -> Self {
         self.evidence.push(DriftEvidence {
             turn,
             evidence_type,
@@ -374,7 +391,10 @@ impl FocusDriftAnalysis {
             return lines.join("\n");
         }
 
-        lines.push(format!("⚠️ Focus Drift Detected (severity: {:.0}%)", self.drift_severity * 100.0));
+        lines.push(format!(
+            "⚠️ Focus Drift Detected (severity: {:.0}%)",
+            self.drift_severity * 100.0
+        ));
         if let Some(turn) = self.drift_turn {
             lines.push(format!("Started at turn: {}", turn));
         }
@@ -438,34 +458,52 @@ fn suggest_recovery(cause: &DriftCause) -> String {
 
 fn format_cause(cause: &DriftCause) -> String {
     match cause {
-        DriftCause::HistoryCompression { lost_context, compression_turn } => {
+        DriftCause::HistoryCompression {
+            lost_context,
+            compression_turn,
+        } => {
             format!(
                 "History compression at turn {} removed important context: {}",
                 compression_turn,
                 lost_context.join(", ")
             )
         }
-        DriftCause::MemoryMiss { expected_but_not_retrieved, query_used } => {
+        DriftCause::MemoryMiss {
+            expected_but_not_retrieved,
+            query_used,
+        } => {
             format!(
                 "Memory query '{}' failed to retrieve expected memories: {}",
                 query_used,
                 expected_but_not_retrieved.join(", ")
             )
         }
-        DriftCause::TopicShift { original_topic, new_topic, shift_turn } => {
+        DriftCause::TopicShift {
+            original_topic,
+            new_topic,
+            shift_turn,
+        } => {
             format!(
                 "Topic shifted at turn {} from '{}' to '{}'",
                 shift_turn, original_topic, new_topic
             )
         }
-        DriftCause::TokenBudgetPressure { budget_available, budget_needed, sacrificed_context } => {
+        DriftCause::TokenBudgetPressure {
+            budget_available,
+            budget_needed,
+            sacrificed_context,
+        } => {
             format!(
                 "Token budget pressure (had {}, needed {}) forced sacrifice of: {}",
-                budget_available, budget_needed,
+                budget_available,
+                budget_needed,
                 sacrificed_context.join(", ")
             )
         }
-        DriftCause::AmbiguousInstruction { instruction, interpretations } => {
+        DriftCause::AmbiguousInstruction {
+            instruction,
+            interpretations,
+        } => {
             format!(
                 "Ambiguous instruction '{}' could mean: {}",
                 instruction,
@@ -531,7 +569,10 @@ impl DriftDetector {
                 evidence.push(DriftEvidence {
                     turn: i as u32,
                     evidence_type: EvidenceType::ToolCallTopicChange,
-                    description: format!("Low keyword overlap ({:.0}%) with original query", overlap * 100.0),
+                    description: format!(
+                        "Low keyword overlap ({:.0}%) with original query",
+                        overlap * 100.0
+                    ),
                     confidence: 0.6,
                 });
                 severity += 0.2;
@@ -588,7 +629,12 @@ impl DriftDetector {
 /// Extract simple keywords from text (lowercase, 4+ chars).
 fn extract_keywords(text: &str) -> Vec<String> {
     text.split_whitespace()
-        .map(|w| w.to_lowercase().chars().filter(|c| c.is_alphanumeric()).collect::<String>())
+        .map(|w| {
+            w.to_lowercase()
+                .chars()
+                .filter(|c| c.is_alphanumeric())
+                .collect::<String>()
+        })
         .filter(|w| w.len() >= 4)
         .collect()
 }
@@ -644,7 +690,12 @@ mod tests {
             0.7,
             5,
         )
-        .with_evidence(5, EvidenceType::CompressionLoss, "Turns 1-4 compressed", 0.8)
+        .with_evidence(
+            5,
+            EvidenceType::CompressionLoss,
+            "Turns 1-4 compressed",
+            0.8,
+        )
         .with_affected_context(vec!["Original task description".to_string()]);
 
         assert!(analysis.drift_detected);
@@ -657,7 +708,10 @@ mod tests {
         let detector = DriftDetector::default();
         let analysis = detector.analyze(
             "implement user authentication",
-            &["implement auth module".to_string(), "add login function".to_string()],
+            &[
+                "implement auth module".to_string(),
+                "add login function".to_string(),
+            ],
             &[],
             &[],
         );
@@ -688,7 +742,11 @@ mod tests {
 
     #[test]
     fn test_keyword_overlap() {
-        let a = vec!["quick".to_string(), "brown".to_string(), "jumps".to_string()];
+        let a = vec![
+            "quick".to_string(),
+            "brown".to_string(),
+            "jumps".to_string(),
+        ];
         let b = vec!["quick".to_string(), "lazy".to_string(), "dogs".to_string()];
         let overlap = keyword_overlap(&a, &b);
         assert!(overlap > 0.0 && overlap < 1.0);

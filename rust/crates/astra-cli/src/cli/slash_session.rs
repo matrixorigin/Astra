@@ -972,7 +972,7 @@ pub(super) fn handle_session_command(arg: &str, state: &mut ReplState) {
                 }
                 _ => (Some(parts[0]), parts[1]),
             };
-            
+
             let (target_sid, resolved_prefix) =
                 match resolve_journal_target_session(session_arg, state, "  No active session.") {
                     Ok(value) => value,
@@ -989,7 +989,7 @@ pub(super) fn handle_session_command(arg: &str, state: &mut ReplState) {
                     target_sid.as_str().cyan()
                 );
             }
-            
+
             match session_journal::read_journal(&target_sid) {
                 Ok(events) => {
                     // Find context assembly traces
@@ -1000,19 +1000,20 @@ pub(super) fn handle_session_command(arg: &str, state: &mut ReplState) {
                                 == session_journal::JournalEventType::ContextAssemblyRecorded
                         })
                         .collect();
-                    
+
                     if traces.is_empty() {
                         eprintln!(
                             "  {} {}",
                             "ℹ".cyan(),
-                            "No context traces in this session. Enable telemetry to record traces.".dim()
+                            "No context traces in this session. Enable telemetry to record traces."
+                                .dim()
                         );
                         return;
                     }
-                    
+
                     // If no turn specified, show summary of all traces
                     let turn_filter: Option<u32> = turn_str.and_then(|s| s.parse().ok());
-                    
+
                     if turn_filter.is_none() {
                         eprintln!(
                             "\n{}",
@@ -1027,7 +1028,7 @@ pub(super) fn handle_session_command(arg: &str, state: &mut ReplState) {
                             let ts_short = evt.ts.get(11..19).unwrap_or(&evt.ts);
                             let turn = evt.turn.unwrap_or(0);
                             let trace = evt.context_assembly_trace.as_ref();
-                            
+
                             // Extract summary from trace
                             let tokens_used = trace
                                 .and_then(|t| t.get("token_budget"))
@@ -1046,7 +1047,7 @@ pub(super) fn handle_session_command(arg: &str, state: &mut ReplState) {
                                 .and_then(|v| v.as_array())
                                 .map(|a| a.len())
                                 .unwrap_or(0);
-                            
+
                             eprintln!(
                                 "  {} T{:<3} {} tokens · {} tools · {} memories",
                                 ts_short.dim(),
@@ -1066,27 +1067,17 @@ pub(super) fn handle_session_command(arg: &str, state: &mut ReplState) {
                         // Show detailed trace for specific turn
                         let turn = turn_filter.unwrap();
                         let trace_evt = traces.iter().find(|e| e.turn == Some(turn));
-                        
+
                         match trace_evt {
                             Some(evt) => {
                                 print_context_trace_detail(evt, turn);
                             }
                             None => {
-                                eprintln!(
-                                    "  {} No context trace for turn {}",
-                                    "✗".red(),
-                                    turn
-                                );
-                                let available: Vec<_> = traces
-                                    .iter()
-                                    .filter_map(|e| e.turn)
-                                    .collect();
+                                eprintln!("  {} No context trace for turn {}", "✗".red(), turn);
+                                let available: Vec<_> =
+                                    traces.iter().filter_map(|e| e.turn).collect();
                                 if !available.is_empty() {
-                                    eprintln!(
-                                        "  {} Available turns: {:?}",
-                                        "ℹ".cyan(),
-                                        available
-                                    );
+                                    eprintln!("  {} Available turns: {:?}", "ℹ".cyan(), available);
                                 }
                             }
                         }
@@ -1211,21 +1202,35 @@ fn print_context_trace_detail(evt: &session_journal::JournalEvent, turn: u32) {
     // ─── Token Budget ───────────────────────────────────────────────────────
     if let Some(tb) = trace.get("token_budget") {
         eprintln!("\n  {}", "Token Budget".bold());
-        let total = tb.get("total_tokens_used").and_then(|v| v.as_u64()).unwrap_or(0);
-        let limit = tb.get("context_limit").and_then(|v| v.as_u64()).unwrap_or(0);
-        let pct = if limit > 0 { (total as f64 / limit as f64 * 100.0) as u32 } else { 0 };
+        let total = tb
+            .get("total_tokens_used")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let limit = tb
+            .get("context_limit")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let pct = if limit > 0 {
+            (total as f64 / limit as f64 * 100.0) as u32
+        } else {
+            0
+        };
         eprintln!(
             "    {} / {} ({pct}%)",
             format_u64_grouped(total).cyan(),
             format_u64_grouped(limit).dim()
         );
-        
+
         // Breakdown
         if let Some(breakdown) = tb.get("breakdown").and_then(|b| b.as_object()) {
             for (key, val) in breakdown {
                 let tokens = val.as_u64().unwrap_or(0);
                 if tokens > 0 {
-                    eprintln!("      {:<20} {}", key.as_str().dim(), format_u64_grouped(tokens));
+                    eprintln!(
+                        "      {:<20} {}",
+                        key.as_str().dim(),
+                        format_u64_grouped(tokens)
+                    );
                 }
             }
         }
@@ -1236,16 +1241,30 @@ fn print_context_trace_detail(evt: &session_journal::JournalEvent, turn: u32) {
         eprintln!("\n  {}", "System Prompt".bold());
         let total = sp.get("total_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
         eprintln!("    Total: {} tokens", format_u64_grouped(total).cyan());
-        
-        let base = sp.get("base_persona_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-        let env = sp.get("environment_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+
+        let base = sp
+            .get("base_persona_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let env = sp
+            .get("environment_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
         if base > 0 {
-            eprintln!("      {:<20} {}", "base_persona".dim(), format_u64_grouped(base));
+            eprintln!(
+                "      {:<20} {}",
+                "base_persona".dim(),
+                format_u64_grouped(base)
+            );
         }
         if env > 0 {
-            eprintln!("      {:<20} {}", "environment".dim(), format_u64_grouped(env));
+            eprintln!(
+                "      {:<20} {}",
+                "environment".dim(),
+                format_u64_grouped(env)
+            );
         }
-        
+
         // Skills
         if let Some(skills) = sp.get("skills_injected").and_then(|s| s.as_array()) {
             if !skills.is_empty() {
@@ -1260,7 +1279,7 @@ fn print_context_trace_detail(evt: &session_journal::JournalEvent, turn: u32) {
                 }
             }
         }
-        
+
         // Memories
         if let Some(memories) = sp.get("repository_memories").and_then(|m| m.as_array()) {
             if !memories.is_empty() {
@@ -1272,14 +1291,34 @@ fn print_context_trace_detail(evt: &session_journal::JournalEvent, turn: u32) {
     // ─── History Selection ──────────────────────────────────────────────────
     if let Some(hist) = trace.get("history") {
         eprintln!("\n  {}", "History Selection".bold());
-        let total = hist.get("total_turns_available").and_then(|v| v.as_u64()).unwrap_or(0);
-        let retained = hist.get("turns_retained").and_then(|t| t.as_array()).map(|a| a.len()).unwrap_or(0);
-        let compressed = hist.get("turns_compressed").and_then(|t| t.as_array()).map(|a| a.len()).unwrap_or(0);
-        let dropped = hist.get("turns_dropped").and_then(|t| t.as_array()).map(|a| a.len()).unwrap_or(0);
-        
-        eprintln!("    {} available → {} retained, {} compressed, {} dropped",
-            total, retained.to_string().green(), compressed.to_string().yellow(), dropped.to_string().red());
-        
+        let total = hist
+            .get("total_turns_available")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let retained = hist
+            .get("turns_retained")
+            .and_then(|t| t.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0);
+        let compressed = hist
+            .get("turns_compressed")
+            .and_then(|t| t.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0);
+        let dropped = hist
+            .get("turns_dropped")
+            .and_then(|t| t.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0);
+
+        eprintln!(
+            "    {} available → {} retained, {} compressed, {} dropped",
+            total,
+            retained.to_string().green(),
+            compressed.to_string().yellow(),
+            dropped.to_string().red()
+        );
+
         if let Some(ratio) = hist.get("compression_ratio").and_then(|v| v.as_f64()) {
             eprintln!("    Compression ratio: {:.1}%", ratio * 100.0);
         }
@@ -1296,19 +1335,39 @@ fn print_context_trace_detail(evt: &session_journal::JournalEvent, turn: u32) {
             };
             eprintln!("    Query: \"{}\"", q_short.dim());
         }
-        
-        let candidates = mem.get("candidates_considered").and_then(|v| v.as_u64()).unwrap_or(0);
-        let selected = mem.get("memories_selected").and_then(|m| m.as_array()).map(|a| a.len()).unwrap_or(0);
-        let total_tokens = mem.get("total_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-        
-        eprintln!("    {} candidates → {} selected ({} tokens)",
-            candidates, selected.to_string().green(), format_u64_grouped(total_tokens));
-        
+
+        let candidates = mem
+            .get("candidates_considered")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let selected = mem
+            .get("memories_selected")
+            .and_then(|m| m.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0);
+        let total_tokens = mem
+            .get("total_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+
+        eprintln!(
+            "    {} candidates → {} selected ({} tokens)",
+            candidates,
+            selected.to_string().green(),
+            format_u64_grouped(total_tokens)
+        );
+
         // Show top memories
         if let Some(memories) = mem.get("memories_selected").and_then(|m| m.as_array()) {
             for m in memories.iter().take(3) {
-                let content = m.get("content_preview").and_then(|v| v.as_str()).unwrap_or("?");
-                let score = m.get("relevance_score").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let content = m
+                    .get("content_preview")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?");
+                let score = m
+                    .get("relevance_score")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0);
                 let short = if content.len() > 50 {
                     format!("{}…", &content[..content.floor_char_boundary(50)])
                 } else {
@@ -1322,17 +1381,32 @@ fn print_context_trace_detail(evt: &session_journal::JournalEvent, turn: u32) {
     // ─── Tool Selection ─────────────────────────────────────────────────────
     if let Some(tools) = trace.get("tools") {
         eprintln!("\n  {}", "Tool Selection".bold());
-        let strategy = tools.get("strategy").and_then(|v| v.as_str()).unwrap_or("?");
-        let confidence = tools.get("confidence").and_then(|v| v.as_f64()).unwrap_or(0.0);
-        let available = tools.get("tools_available").and_then(|v| v.as_u64()).unwrap_or(0);
-        
-        eprintln!("    Strategy: {} (confidence: {:.2})", strategy.cyan(), confidence);
-        
+        let strategy = tools
+            .get("strategy")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?");
+        let confidence = tools
+            .get("confidence")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+        let available = tools
+            .get("tools_available")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+
+        eprintln!(
+            "    Strategy: {} (confidence: {:.2})",
+            strategy.cyan(),
+            confidence
+        );
+
         if let Some(selected) = tools.get("tools_selected").and_then(|t| t.as_array()) {
-            eprintln!("    Selected ({}/{}): {}", 
+            eprintln!(
+                "    Selected ({}/{}): {}",
                 selected.len(),
                 available,
-                selected.iter()
+                selected
+                    .iter()
                     .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
                     .take(10)
                     .collect::<Vec<_>>()
@@ -1340,11 +1414,17 @@ fn print_context_trace_detail(evt: &session_journal::JournalEvent, turn: u32) {
                     .green()
             );
         }
-        
+
         // Budget stats
-        let budget_used = tools.get("budget_used").and_then(|v| v.as_u64()).unwrap_or(0);
+        let budget_used = tools
+            .get("budget_used")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
         if budget_used > 0 {
-            eprintln!("    Tool schemas: {} tokens", format_u64_grouped(budget_used));
+            eprintln!(
+                "    Tool schemas: {} tokens",
+                format_u64_grouped(budget_used)
+            );
         }
     }
 
@@ -1353,7 +1433,10 @@ fn print_context_trace_detail(evt: &session_journal::JournalEvent, turn: u32) {
         if !explanations.is_empty() {
             eprintln!("\n  {}", "Decision Explanations".bold());
             for exp in explanations.iter().take(5) {
-                let decision = exp.get("decision_type").and_then(|v| v.as_str()).unwrap_or("?");
+                let decision = exp
+                    .get("decision_type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?");
                 let reasoning = exp.get("reasoning").and_then(|v| v.as_str()).unwrap_or("?");
                 eprintln!("    {} {}", decision.cyan(), reasoning.dim());
             }
