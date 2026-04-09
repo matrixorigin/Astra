@@ -155,6 +155,10 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             StepRecorder::with_persistence(&subrun_session_id, &format!("{}-run", config.run_id));
 
         let max_turns = config.max_turns as usize;
+        let start_time = std::time::Instant::now();
+        let progress_emitter = config.progress_emitter.clone();
+
+        let max_turns = config.max_turns as usize;
 
         let mut state = AgenticLoopState {
             messages,
@@ -253,57 +257,93 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
         let run_id = config.run_id;
         let prompt_tokens = state.total_prompt;
         let completion_tokens = state.total_completion;
+        let duration_ms = start_time.elapsed().as_millis() as u64;
 
         match loop_result {
-            Ok(AgenticLoopOutcome::Completed) => Ok(SpawnRunResult {
-                agent_id,
-                run_id,
-                status: "completed".to_string(),
-                output: Some(state.final_text),
-                error: None,
-                prompt_tokens,
-                completion_tokens,
-                tool_calls,
-            }),
-            Ok(AgenticLoopOutcome::Cancelled) => Ok(SpawnRunResult {
-                agent_id,
-                run_id,
-                status: "cancelled".to_string(),
-                output: if state.final_text.is_empty() {
-                    None
-                } else {
-                    Some(state.final_text)
-                },
-                error: None,
-                prompt_tokens,
-                completion_tokens,
-                tool_calls,
-            }),
-            Ok(AgenticLoopOutcome::Error(error)) => Ok(SpawnRunResult {
-                agent_id,
-                run_id,
-                status: "failed".to_string(),
-                output: if state.final_text.is_empty() {
-                    None
-                } else {
-                    Some(state.final_text)
-                },
-                error: Some(error),
-                prompt_tokens,
-                completion_tokens,
-                tool_calls,
-            }),
-            Ok(AgenticLoopOutcome::Waiting(reason)) => Ok(SpawnRunResult {
-                agent_id,
-                run_id,
-                status: "waiting".to_string(),
-                output: Some(reason),
-                error: None,
-                prompt_tokens,
-                completion_tokens,
-                tool_calls,
-            }),
-            Err(e) => Err(e),
+            Ok(AgenticLoopOutcome::Completed) => {
+                // Emit completed event
+                if let Some(ref emitter) = progress_emitter {
+                    let summary = if state.final_text.len() > 100 {
+                        format!("{}...", &state.final_text[..100])
+                    } else {
+                        state.final_text.clone()
+                    };
+                    emitter.completed(summary, tool_calls, (prompt_tokens, completion_tokens), duration_ms);
+                }
+                Ok(SpawnRunResult {
+                    agent_id,
+                    run_id,
+                    status: "completed".to_string(),
+                    output: Some(state.final_text),
+                    error: None,
+                    prompt_tokens,
+                    completion_tokens,
+                    tool_calls,
+                })
+            }
+            Ok(AgenticLoopOutcome::Cancelled) => {
+                // Emit cancelled event
+                if let Some(ref emitter) = progress_emitter {
+                    emitter.cancelled("user cancellation");
+                }
+                Ok(SpawnRunResult {
+                    agent_id,
+                    run_id,
+                    status: "cancelled".to_string(),
+                    output: if state.final_text.is_empty() {
+                        None
+                    } else {
+                        Some(state.final_text)
+                    },
+                    error: None,
+                    prompt_tokens,
+                    completion_tokens,
+                    tool_calls,
+                })
+            }
+            Ok(AgenticLoopOutcome::Error(error)) => {
+                // Emit failed event
+                if let Some(ref emitter) = progress_emitter {
+                    emitter.failed(&error);
+                }
+                Ok(SpawnRunResult {
+                    agent_id,
+                    run_id,
+                    status: "failed".to_string(),
+                    output: if state.final_text.is_empty() {
+                        None
+                    } else {
+                        Some(state.final_text)
+                    },
+                    error: Some(error),
+                    prompt_tokens,
+                    completion_tokens,
+                    tool_calls,
+                })
+            }
+            Ok(AgenticLoopOutcome::Waiting(reason)) => {
+                // Emit idle event
+                if let Some(ref emitter) = progress_emitter {
+                    emitter.idle();
+                }
+                Ok(SpawnRunResult {
+                    agent_id,
+                    run_id,
+                    status: "waiting".to_string(),
+                    output: Some(reason),
+                    error: None,
+                    prompt_tokens,
+                    completion_tokens,
+                    tool_calls,
+                })
+            }
+            Err(e) => {
+                // Emit failed event for unexpected errors
+                if let Some(ref emitter) = progress_emitter {
+                    emitter.failed(&e);
+                }
+                Err(e)
+            }
         }
     }
 }
