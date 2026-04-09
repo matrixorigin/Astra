@@ -1,10 +1,10 @@
 use super::*;
+use astra_runtime::server::team_orchestrator::ExecutionPhase;
+#[allow(unused_imports)]
+use astra_services::team_persistence::TeamPersistenceService;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
-#[allow(unused_imports)]
-use astra_services::team_persistence::TeamPersistenceService;
-use astra_runtime::server::team_orchestrator::ExecutionPhase;
 
 // ── Team History & Snapshot Tracking ────────────────────────────────────
 
@@ -305,8 +305,12 @@ fn infer_coordination(team: &Team) -> astra_services::team_persistence::TeamCoor
     let roles: Vec<&str> = team.members.iter().map(|m| m.role.as_str()).collect();
 
     // Adversarial: if roles contain producer+reviewer
-    if roles.iter().any(|r| r.contains("producer") || r.contains("writer"))
-        && roles.iter().any(|r| r.contains("reviewer") || r.contains("critic"))
+    if roles
+        .iter()
+        .any(|r| r.contains("producer") || r.contains("writer"))
+        && roles
+            .iter()
+            .any(|r| r.contains("reviewer") || r.contains("critic"))
     {
         return TeamCoordination::Adversarial {
             max_rounds: 3,
@@ -323,9 +327,7 @@ fn infer_coordination(team: &Team) -> astra_services::team_persistence::TeamCoor
                 || r.contains("researcher")
         })
         && roles.iter().any(|r| {
-            r.contains("synthesizer")
-                || r.contains("implementer")
-                || r.contains("executor")
+            r.contains("synthesizer") || r.contains("implementer") || r.contains("executor")
         })
     {
         return TeamCoordination::Pipeline;
@@ -345,7 +347,41 @@ pub(super) async fn handle_team_command(arg: &str, state: &mut super::ReplState)
     let sub_arg = parts.next().unwrap_or("").trim();
 
     match sub {
-        "" | "list" => {
+        "" | "help" => {
+            eprintln!(
+                "\n{}",
+                "─── Team ───────────────────────────────────────".bold()
+            );
+            let teams = state.team_registry.list();
+            let names = teams
+                .iter()
+                .map(|t| t.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            eprintln!(
+                "  {:<16} {}",
+                "teams:".dim(),
+                if names.is_empty() {
+                    "(none)".dim().to_string()
+                } else {
+                    names.cyan().to_string()
+                }
+            );
+            eprintln!(
+                "  {:<16} {}",
+                "built-ins:".dim(),
+                "review, research, dev".cyan()
+            );
+            eprintln!();
+            eprintln!("  {}", team_subcommands_hint().dim());
+            eprintln!("  {}", "Examples:".dim());
+            eprintln!("    {}", "/team info review".cyan());
+            eprintln!("    {}", "/team run review review the latest diff".cyan());
+            eprintln!("    {}", "/team snapshot dev before-refactor".cyan());
+            eprintln!();
+        }
+
+        "list" => {
             let teams = state.team_registry.list();
             if teams.is_empty() {
                 eprintln!(
@@ -547,8 +583,14 @@ pub(super) async fn handle_team_command(arg: &str, state: &mut super::ReplState)
             let team_name = parts.next().unwrap_or("").trim();
             let task = parts.next().unwrap_or("").trim();
             if team_name.is_empty() || task.is_empty() {
-                eprintln!("{}", "  Usage: /team run <team> <task description>".yellow());
-                eprintln!("{}", "  Executes a team task through the delegation engine.".dim());
+                eprintln!(
+                    "{}",
+                    "  Usage: /team run <team> <task description>".yellow()
+                );
+                eprintln!(
+                    "{}",
+                    "  Executes a team task through the delegation engine.".dim()
+                );
                 return;
             }
 
@@ -561,21 +603,33 @@ pub(super) async fn handle_team_command(arg: &str, state: &mut super::ReplState)
             };
 
             if cli_team.members.is_empty() {
-                eprintln!("  {} Team '{}' has no members. Use /team add-member to add agents first.",
-                    theme::icon_err(), team_name);
+                eprintln!(
+                    "  {} Team '{}' has no members. Use /team add-member to add agents first.",
+                    theme::icon_err(),
+                    team_name
+                );
                 return;
             }
 
             let delegation_engine = match state.delegation_engine {
                 Some(ref e) => e.clone(),
                 None => {
-                    eprintln!("  {} Delegation engine not available (not logged in?)", theme::icon_err());
+                    eprintln!(
+                        "  {} Delegation engine not available (not logged in?)",
+                        theme::icon_err()
+                    );
                     return;
                 }
             };
 
-            let user_id = state.ingestion_user_id.clone().unwrap_or_else(|| "local".into());
-            let session_id = state.session_id.clone().unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            let user_id = state
+                .ingestion_user_id
+                .clone()
+                .unwrap_or_else(|| "local".into());
+            let session_id = state
+                .session_id
+                .clone()
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
             // Convert CLI team → TeamDefinition for the orchestrator
             let team_def = cli_team_to_definition(&cli_team, &user_id);
@@ -593,51 +647,53 @@ pub(super) async fn handle_team_command(arg: &str, state: &mut super::ReplState)
             let run_engine = delegation_engine.run_engine().clone();
 
             // Wire live progress callback for phase updates
-            let progress: astra_runtime::server::team_orchestrator::ProgressCallback = Arc::new(
-                move |phase: ExecutionPhase| {
-                    match phase {
-                        ExecutionPhase::Preparing { team_name, member_count } => {
-                            eprintln!(
-                                "  {} Preparing team '{}' ({} members)...",
-                                "🔄".dim(), team_name.cyan(), member_count
-                            );
-                        }
-                        ExecutionPhase::WorktreesCreated { ref agent_ids } => {
-                            eprintln!(
-                                "  {} Worktrees created for {} agent{}",
-                                "📂".dim(),
-                                agent_ids.len(),
-                                if agent_ids.len() == 1 { "" } else { "s" }
-                            );
-                            for id in agent_ids {
-                                eprintln!("    {} {}", "→".dim(), id.as_str().dim());
-                            }
-                        }
-                        ExecutionPhase::Executing { ref delegation_id } => {
-                            eprintln!(
-                                "  {} Executing delegation {}...",
-                                "🚀".dim(),
-                                delegation_id.get(..8).unwrap_or(delegation_id).dim()
-                            );
-                        }
-                        ExecutionPhase::Merging { agent_count } => {
-                            eprintln!(
-                                "  {} Merging results from {} agent{}...",
-                                "🔀".dim(),
-                                agent_count,
-                                if agent_count == 1 { "" } else { "s" }
-                            );
-                        }
-                        ExecutionPhase::Reporting { ref status } => {
-                            eprintln!(
-                                "  {} Generating report ({})...",
-                                "📊".dim(),
-                                status.to_string().dim()
-                            );
+            let progress: astra_runtime::server::team_orchestrator::ProgressCallback =
+                Arc::new(move |phase: ExecutionPhase| match phase {
+                    ExecutionPhase::Preparing {
+                        team_name,
+                        member_count,
+                    } => {
+                        eprintln!(
+                            "  {} Preparing team '{}' ({} members)...",
+                            "🔄".dim(),
+                            team_name.cyan(),
+                            member_count
+                        );
+                    }
+                    ExecutionPhase::WorktreesCreated { ref agent_ids } => {
+                        eprintln!(
+                            "  {} Worktrees created for {} agent{}",
+                            "📂".dim(),
+                            agent_ids.len(),
+                            if agent_ids.len() == 1 { "" } else { "s" }
+                        );
+                        for id in agent_ids {
+                            eprintln!("    {} {}", "→".dim(), id.as_str().dim());
                         }
                     }
-                },
-            );
+                    ExecutionPhase::Executing { ref delegation_id } => {
+                        eprintln!(
+                            "  {} Executing delegation {}...",
+                            "🚀".dim(),
+                            delegation_id.get(..8).unwrap_or(delegation_id).dim()
+                        );
+                    }
+                    ExecutionPhase::Merging { agent_count } => {
+                        eprintln!(
+                            "  {} Merging results from {} agent{}...",
+                            "🔀".dim(),
+                            agent_count,
+                            if agent_count == 1 { "" } else { "s" }
+                        );
+                    }
+                    ExecutionPhase::Reporting { ref status } => {
+                        eprintln!(
+                            "  {} Generating report ({})...",
+                            "📊".dim(),
+                            status.to_string().dim()
+                        );
+                    }
+                });
 
             let config = astra_runtime::server::team_orchestrator::OrchestratorConfig {
                 user_id: user_id.clone(),
@@ -646,20 +702,18 @@ pub(super) async fn handle_team_command(arg: &str, state: &mut super::ReplState)
                 progress: Some(progress),
             };
 
-            let orchestrator = astra_runtime::server::team_orchestrator::TeamExecutionOrchestrator::new(
-                team_store,
-                delegation_engine.clone(),
-                delegation_engine.tracker().clone(),
-                run_engine,
-                profile_registry,
-                config,
-            );
+            let orchestrator =
+                astra_runtime::server::team_orchestrator::TeamExecutionOrchestrator::new(
+                    team_store,
+                    delegation_engine.clone(),
+                    delegation_engine.tracker().clone(),
+                    run_engine,
+                    profile_registry,
+                    config,
+                );
 
             // Print header
-            eprintln!(
-                "\n{}",
-                format!("─── Team Run: {} ───", team_name).bold()
-            );
+            eprintln!("\n{}", format!("─── Team Run: {} ───", team_name).bold());
             for m in &cli_team.members {
                 eprintln!(
                     "    {} {} {}",
@@ -675,12 +729,13 @@ pub(super) async fn handle_team_command(arg: &str, state: &mut super::ReplState)
 
             // Record execution start in persistence store (best-effort)
             let exec_id = uuid::Uuid::new_v4().to_string();
-            let _ = state.team_store.record_execution_start(
-                &exec_id,
-                team_name,
-                "",  // user_id (empty for CLI sessions)
-                task,
-            ).await;
+            let _ = state
+                .team_store
+                .record_execution_start(
+                    &exec_id, team_name, "", // user_id (empty for CLI sessions)
+                    task,
+                )
+                .await;
 
             let repo_root = std::env::current_dir().ok();
             let report = orchestrator.execute_team(team_name, task, repo_root).await;
@@ -734,8 +789,13 @@ pub(super) async fn handle_team_command(arg: &str, state: &mut super::ReplState)
                     } else {
                         ("✗", "red")
                     };
-                    let first_line = ar.output.as_deref().unwrap_or("(no output)")
-                        .lines().next().unwrap_or("");
+                    let first_line = ar
+                        .output
+                        .as_deref()
+                        .unwrap_or("(no output)")
+                        .lines()
+                        .next()
+                        .unwrap_or("");
                     let agent_tokens = ar.prompt_tokens + ar.completion_tokens;
                     match status_color {
                         "green" => eprintln!(
@@ -770,13 +830,15 @@ pub(super) async fn handle_team_command(arg: &str, state: &mut super::ReplState)
                 } else {
                     eprintln!(
                         "\n  {} Merge: {} conflict{}",
-                        "🔀", merge.conflicts.len(),
+                        "🔀",
+                        merge.conflicts.len(),
                         if merge.conflicts.len() == 1 { "" } else { "s" }
                     );
                     for c in &merge.conflicts {
                         eprintln!(
                             "    {} {} — {}",
-                            "!".red().bold(), c.agent_id.as_str().yellow(),
+                            "!".red().bold(),
+                            c.agent_id.as_str().yellow(),
                             c.files.join(", ")
                         );
                     }
@@ -789,20 +851,27 @@ pub(super) async fn handle_team_command(arg: &str, state: &mut super::ReplState)
                 let has_facts = !learning.facts.is_empty();
                 let has_caution = !learning.cautionary_patterns.is_empty();
                 if has_patterns || has_facts || has_caution {
-                    eprintln!("\n  {} Learning from {} agent{}:",
+                    eprintln!(
+                        "\n  {} Learning from {} agent{}:",
                         "🧠",
                         learning.agent_count,
                         if learning.agent_count == 1 { "" } else { "s" }
                     );
                     if has_patterns {
-                        eprintln!("    {} {} consensus pattern{}",
+                        eprintln!(
+                            "    {} {} consensus pattern{}",
                             "•".dim(),
                             learning.consensus_patterns.len(),
-                            if learning.consensus_patterns.len() == 1 { "" } else { "s" }
+                            if learning.consensus_patterns.len() == 1 {
+                                ""
+                            } else {
+                                "s"
+                            }
                         );
                     }
                     if has_facts {
-                        eprintln!("    {} {} discovered fact{}",
+                        eprintln!(
+                            "    {} {} discovered fact{}",
                             "•".dim(),
                             learning.facts.len(),
                             if learning.facts.len() == 1 { "" } else { "s" }
@@ -811,14 +880,23 @@ pub(super) async fn handle_team_command(arg: &str, state: &mut super::ReplState)
                             eprintln!("      {} {}", "→".dim(), truncate_str(fact, 70).dim());
                         }
                         if learning.facts.len() > 3 {
-                            eprintln!("      {} ...and {} more", "→".dim(), learning.facts.len() - 3);
+                            eprintln!(
+                                "      {} ...and {} more",
+                                "→".dim(),
+                                learning.facts.len() - 3
+                            );
                         }
                     }
                     if has_caution {
-                        eprintln!("    {} {} cautionary pattern{}",
+                        eprintln!(
+                            "    {} {} cautionary pattern{}",
                             "⚡".dim(),
                             learning.cautionary_patterns.len(),
-                            if learning.cautionary_patterns.len() == 1 { "" } else { "s" }
+                            if learning.cautionary_patterns.len() == 1 {
+                                ""
+                            } else {
+                                "s"
+                            }
                         );
                     }
                 }
@@ -829,7 +907,13 @@ pub(super) async fn handle_team_command(arg: &str, state: &mut super::ReplState)
             let (prompt_tok, compl_tok, agent_count) = report
                 .delegation_result
                 .as_ref()
-                .map(|dr| (dr.total_prompt_tokens, dr.total_completion_tokens, dr.agent_results.len()))
+                .map(|dr| {
+                    (
+                        dr.total_prompt_tokens,
+                        dr.total_completion_tokens,
+                        dr.agent_results.len(),
+                    )
+                })
                 .unwrap_or((0, 0, 0));
             state.team_registry.record_execution(TeamHistoryEntry {
                 team_name: team_name.to_string(),
@@ -852,11 +936,14 @@ pub(super) async fn handle_team_command(arg: &str, state: &mut super::ReplState)
                 "delegation_id": &report.delegation_id,
                 "error": &report.error,
             });
-            let _ = state.team_store.record_execution_complete(
-                &report.delegation_id,
-                &report.status.to_string(),
-                Some(&result_summary.to_string()),
-            ).await;
+            let _ = state
+                .team_store
+                .record_execution_complete(
+                    &report.delegation_id,
+                    &report.status.to_string(),
+                    Some(&result_summary.to_string()),
+                )
+                .await;
         }
 
         "history" => {
@@ -875,13 +962,18 @@ pub(super) async fn handle_team_command(arg: &str, state: &mut super::ReplState)
             }
 
             // Check persistence store for additional records
-            let store_entries = state.team_store.list_executions(name, 50).await.unwrap_or_default();
+            let store_entries = state
+                .team_store
+                .list_executions(name, 50)
+                .await
+                .unwrap_or_default();
             let registry_entries = state.team_registry.get_history(name);
 
             if registry_entries.is_empty() && store_entries.is_empty() {
                 eprintln!(
                     "\n  {} No execution history for team '{}'.",
-                    "📜", name.cyan().bold()
+                    "📜",
+                    name.cyan().bold()
                 );
                 eprintln!("  {}", "  Use /team run to execute a task.".dim());
                 return;
@@ -897,10 +989,18 @@ pub(super) async fn handle_team_command(arg: &str, state: &mut super::ReplState)
 
             eprintln!(
                 "\n{}",
-                format!("─── History: {} ({} run{}{}) ───",
-                    name, entries.len(), if entries.len() == 1 { "" } else { "s" },
-                    if store_extra > 0 { format!(", +{} in store", store_extra) } else { String::new() }
-                ).bold()
+                format!(
+                    "─── History: {} ({} run{}{}) ───",
+                    name,
+                    entries.len(),
+                    if entries.len() == 1 { "" } else { "s" },
+                    if store_extra > 0 {
+                        format!(", +{} in store", store_extra)
+                    } else {
+                        String::new()
+                    }
+                )
+                .bold()
             );
             for (i, e) in entries.iter().enumerate().rev() {
                 let status_icon = match e.status.as_str() {
@@ -947,11 +1047,7 @@ pub(super) async fn handle_team_command(arg: &str, state: &mut super::ReplState)
                 return;
             }
 
-            let snapshot_id = format!(
-                "team-{}-{}",
-                name,
-                chrono::Utc::now().timestamp()
-            );
+            let snapshot_id = format!("team-{}-{}", name, chrono::Utc::now().timestamp());
             let git_sha = git_head_sha();
             let session_id = state.session_id.clone();
             let now = chrono::Utc::now().to_rfc3339();
@@ -988,20 +1084,20 @@ pub(super) async fn handle_team_command(arg: &str, state: &mut super::ReplState)
             });
 
             // Persist snapshot to store (with full team definition JSON)
-            let team_def_json = state.team_registry.get(name)
-                .map(|t| {
-                    serde_json::json!({
-                        "name": t.name,
-                        "description": t.description,
-                        "members": t.members.iter().map(|m| serde_json::json!({
-                            "role": m.role,
-                            "description": m.description,
-                            "skills": m.skills,
-                            "model_override": m.model_override,
-                        })).collect::<Vec<_>>(),
-                        "shared_context": t.shared_context,
-                    }).to_string()
-                });
+            let team_def_json = state.team_registry.get(name).map(|t| {
+                serde_json::json!({
+                    "name": t.name,
+                    "description": t.description,
+                    "members": t.members.iter().map(|m| serde_json::json!({
+                        "role": m.role,
+                        "description": m.description,
+                        "skills": m.skills,
+                        "model_override": m.model_override,
+                    })).collect::<Vec<_>>(),
+                    "shared_context": t.shared_context,
+                })
+                .to_string()
+            });
             let snap_record = astra_services::team_persistence::TeamSnapshotRecord {
                 snapshot_id: snapshot_id.clone(),
                 team_name: name.to_string(),
@@ -1021,17 +1117,9 @@ pub(super) async fn handle_team_command(arg: &str, state: &mut super::ReplState)
                 name.cyan()
             );
             let dims = composite.dimensions();
-            eprintln!(
-                "    {} Captured: {}",
-                "📸".dim(),
-                dims.join(", "),
-            );
+            eprintln!("    {} Captured: {}", "📸".dim(), dims.join(", "),);
             if let Some(ref sha) = git_sha {
-                eprintln!(
-                    "    {} Git: {}",
-                    "🔖".dim(),
-                    sha.get(..12).unwrap_or(sha),
-                );
+                eprintln!("    {} Git: {}", "🔖".dim(), sha.get(..12).unwrap_or(sha),);
             }
             eprintln!(
                 "    {} Use '/team restore {} {}' to restore.",
@@ -1061,14 +1149,18 @@ pub(super) async fn handle_team_command(arg: &str, state: &mut super::ReplState)
                 Some(s) => s.clone(),
                 None => {
                     // Try prefix match in registry
-                    let matches: Vec<_> = state.team_registry.get_snapshots(name)
+                    let matches: Vec<_> = state
+                        .team_registry
+                        .get_snapshots(name)
                         .into_iter()
                         .filter(|s| s.snapshot_id.starts_with(snapshot_id))
                         .collect();
                     match matches.len() {
                         0 => {
                             // Fallback: try persistence store
-                            if let Ok(Some(stored)) = state.team_store.find_snapshot(snapshot_id, "").await {
+                            if let Ok(Some(stored)) =
+                                state.team_store.find_snapshot(snapshot_id, "").await
+                            {
                                 TeamSnapshotEntry {
                                     snapshot_id: stored.snapshot_id,
                                     team_name: stored.team_name,
@@ -1078,13 +1170,21 @@ pub(super) async fn handle_team_command(arg: &str, state: &mut super::ReplState)
                                     created_at: stored.created_at,
                                 }
                             } else {
-                                eprintln!("  {} Snapshot '{}' not found", theme::icon_err(), snapshot_id);
+                                eprintln!(
+                                    "  {} Snapshot '{}' not found",
+                                    theme::icon_err(),
+                                    snapshot_id
+                                );
                                 let available = state.team_registry.get_snapshots(name);
                                 if !available.is_empty() {
                                     eprintln!("  {} Available snapshots:", "💡".dim());
                                     for s in available {
-                                        eprintln!("    {} {} — {}",
-                                            "•".dim(), s.snapshot_id.as_str().dim(), s.label);
+                                        eprintln!(
+                                            "    {} {} — {}",
+                                            "•".dim(),
+                                            s.snapshot_id.as_str().dim(),
+                                            s.label
+                                        );
                                     }
                                 }
                                 return;
@@ -1092,7 +1192,11 @@ pub(super) async fn handle_team_command(arg: &str, state: &mut super::ReplState)
                         }
                         1 => matches[0].clone(),
                         _ => {
-                            eprintln!("  {} Ambiguous snapshot prefix '{}'. Matches:", theme::icon_err(), snapshot_id);
+                            eprintln!(
+                                "  {} Ambiguous snapshot prefix '{}'. Matches:",
+                                theme::icon_err(),
+                                snapshot_id
+                            );
                             for s in matches {
                                 eprintln!("    {} {}", "•".dim(), s.snapshot_id);
                             }
@@ -1103,37 +1207,59 @@ pub(super) async fn handle_team_command(arg: &str, state: &mut super::ReplState)
             };
 
             if snap.team_name != name {
-                eprintln!("  {} Snapshot '{}' belongs to team '{}', not '{}'",
-                    theme::icon_err(), snap.snapshot_id, snap.team_name, name);
+                eprintln!(
+                    "  {} Snapshot '{}' belongs to team '{}', not '{}'",
+                    theme::icon_err(),
+                    snap.snapshot_id,
+                    snap.team_name,
+                    name
+                );
                 return;
             }
 
             eprintln!(
                 "\n  {} Restoring team '{}' from snapshot '{}'...",
-                "⏪", name.cyan(), snap.snapshot_id.dim()
+                "⏪",
+                name.cyan(),
+                snap.snapshot_id.dim()
             );
             eprintln!("    {} {}", "Label:".dim(), snap.label);
 
             // Restore git state if snapshot has a commit
             if let Some(ref sha) = snap.git_commit {
-                eprintln!("    {} Checking out git commit {}...", "🔖".dim(), sha.get(..12).unwrap_or(sha));
+                eprintln!(
+                    "    {} Checking out git commit {}...",
+                    "🔖".dim(),
+                    sha.get(..12).unwrap_or(sha)
+                );
                 let output = std::process::Command::new("git")
                     .args(["checkout", sha])
                     .output();
                 match output {
                     Ok(o) if o.status.success() => {
-                        eprintln!("    {} Git restored to {}", theme::icon_ok(), sha.get(..12).unwrap_or(sha));
+                        eprintln!(
+                            "    {} Git restored to {}",
+                            theme::icon_ok(),
+                            sha.get(..12).unwrap_or(sha)
+                        );
                     }
                     Ok(o) => {
                         let stderr = String::from_utf8_lossy(&o.stderr);
-                        eprintln!("    {} Git checkout failed: {}", theme::icon_err(), truncate_str(stderr.trim(), 60));
+                        eprintln!(
+                            "    {} Git checkout failed: {}",
+                            theme::icon_err(),
+                            truncate_str(stderr.trim(), 60)
+                        );
                     }
                     Err(e) => {
                         eprintln!("    {} Git checkout error: {}", theme::icon_err(), e);
                     }
                 }
             } else {
-                eprintln!("    {} No git commit in snapshot (git state unchanged)", "ℹ️ ".dim());
+                eprintln!(
+                    "    {} No git commit in snapshot (git state unchanged)",
+                    "ℹ️ ".dim()
+                );
             }
 
             eprintln!("  {} Restore complete.\n", theme::icon_ok());
@@ -1143,12 +1269,17 @@ pub(super) async fn handle_team_command(arg: &str, state: &mut super::ReplState)
             eprintln!(
                 "{}",
                 format!(
-                    "  Unknown /team subcommand: '{sub}'. Try: list, create, info, add-member, delete, context, run, history, snapshot, restore"
+                    "  Unknown /team subcommand: '{sub}'. {}",
+                    team_subcommands_hint()
                 )
                 .yellow()
             );
         }
     }
+}
+
+fn team_subcommands_hint() -> &'static str {
+    "Subcommands: /team list · info · create · add-member · context · run · history · snapshot · restore · delete · help"
 }
 
 // ─── Formatting helpers ────────────────────────────────────────────────────
@@ -1329,17 +1460,13 @@ mod tests {
         assert_eq!(def.members[0].role, "coder");
         assert_eq!(def.members[1].role, "tester");
         assert!(def.members[0].agent_id.is_none());
-        assert_eq!(
-            def.members[0].system_prompt.as_deref(),
-            Some("coder agent")
-        );
+        assert_eq!(def.members[0].system_prompt.as_deref(), Some("coder agent"));
     }
 
     #[test]
     fn cli_team_to_definition_preserves_context() {
         let mut team = make_team(&["a"]);
-        team.shared_context
-            .insert("lang".into(), "rust".into());
+        team.shared_context.insert("lang".into(), "rust".into());
         let def = cli_team_to_definition(&team, "u");
         assert_eq!(def.context.get("lang").unwrap(), "rust");
     }
@@ -1428,6 +1555,14 @@ mod tests {
         assert!(sha.is_some(), "Expected Some(sha) in a git repo");
         let sha = sha.unwrap();
         assert!(sha.len() >= 7, "SHA too short: {}", sha);
+    }
+
+    #[test]
+    fn team_subcommands_hint_mentions_run_and_restore() {
+        let hint = team_subcommands_hint();
+        assert!(hint.contains("run"));
+        assert!(hint.contains("restore"));
+        assert!(hint.contains("help"));
     }
 
     // ── Formatting helper tests ─────────────────────────────────

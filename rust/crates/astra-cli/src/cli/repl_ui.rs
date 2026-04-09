@@ -115,16 +115,10 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     // ── Team & account ───────────────────────────────────────────────────
     (
         "/team",
-        "Teams: create, list, info, add-member, context, delete",
+        "Teams: list|info|create|add-member|context|run|history|snapshot|restore|delete|help",
     ),
-    (
-        "/agent",
-        "Spawned agents: list, status, stop, logs",
-    ),
-    (
-        "/messaging",
-        "Inter-agent messaging: metrics, dlq, status",
-    ),
+    ("/agent", "Spawned agents: list, status, stop, logs"),
+    ("/messaging", "Inter-agent messaging: metrics, dlq, status"),
     ("/login", "Authenticate with the API"),
     ("/register", "Register a new account"),
     ("/logout", "Logout from the API"),
@@ -419,8 +413,13 @@ const SLASH_FIRST_TOKEN_COMPLETIONS: &[(&str, &[(&str, &str)])] = &[
             ("context", "Set shared context for team"),
             ("create", "Create new team"),
             ("delete", "Delete a team"),
+            ("help", "Show team overview and examples"),
+            ("history", "Show team execution history"),
             ("info", "Show team information"),
             ("list", "List all teams"),
+            ("restore", "Restore team snapshot"),
+            ("run", "Run a task with the team"),
+            ("snapshot", "Save a team snapshot"),
         ],
     ),
     (
@@ -849,9 +848,7 @@ fn slash_argument_hint(command: &str) -> Option<&'static str> {
         "/memory" => Some("[list|search <q>|inspect <id>]"),
         "/diff" => Some("[staged|unstaged|stat|show <rev>|help|<paths…>]"),
         "/session" => Some("[history|errors|export|fork|list|cleanup|verify]"),
-        "/plan" => {
-            Some("[go|step|pause|resume|exit|status|show|help]")
-        }
+        "/plan" => Some("[go|step|pause|resume|exit|status|show|help]"),
         "/task" => Some("[list|add <title>|done <id>|status <id>|run <prompt>|result <id>]"),
         "/resume" => Some("[session_id]"),
         "/stats" => Some("[history]"),
@@ -859,7 +856,9 @@ fn slash_argument_hint(command: &str) -> Option<&'static str> {
         "/health" => Some("[detail]"),
         "/sync" => Some("[log|push|pull]"),
         "/style" => Some("[list|default|minimal|colorful|high-contrast]"),
-        "/team" => Some("[list|create|info|add-member|delete|context]"),
+        "/team" => {
+            Some("[list|info|create|add-member|context|run|history|snapshot|restore|delete|help]")
+        }
         "/agent" => Some("[list|status|stop|logs|help]"),
         "/messaging" => Some("[metrics|dlq|status|help]"),
         _ => None,
@@ -1399,7 +1398,15 @@ pub(super) fn print_slash_commands(query: Option<&str>) {
         (
             "👥",
             "Team & account",
-            &["/team", "/agent", "/messaging", "/login", "/register", "/logout", "/memory-setup"],
+            &[
+                "/team",
+                "/agent",
+                "/messaging",
+                "/login",
+                "/register",
+                "/logout",
+                "/memory-setup",
+            ],
         ),
         (
             "🔧",
@@ -2006,6 +2013,14 @@ mod tests {
         assert!(candidates.iter().any(|(cmd, _)| *cmd == "/help"));
     }
 
+    #[test]
+    fn slash_inline_hint_for_team_includes_recent_subcommands() {
+        let hint = slash_inline_hint("/team").expect("hint");
+        assert!(hint.contains("run"));
+        assert!(hint.contains("history"));
+        assert!(hint.contains("restore"));
+    }
+
     // ── slash_first_token_completions (Tab after `/cmd `) ─────────────────────
 
     #[test]
@@ -2058,6 +2073,16 @@ mod tests {
         assert_eq!(&line[start..], "H");
         assert_eq!(pairs.len(), 1);
         assert_eq!(pairs[0].replacement, "history");
+    }
+
+    #[test]
+    fn first_token_complete_team_lists_run_and_history() {
+        let line = "/team ";
+        let (_start, pairs) = slash_first_token_completions(line, line.len()).expect("completions");
+        let replacements: Vec<_> = pairs.iter().map(|p| p.replacement.as_str()).collect();
+        assert!(replacements.contains(&"run"));
+        assert!(replacements.contains(&"history"));
+        assert!(replacements.contains(&"restore"));
     }
 
     #[test]
@@ -2524,7 +2549,15 @@ mod tests {
             &["/memory", "/task"],
             &["/skill"],
             &["/mcp"],
-            &["/team", "/agent", "/messaging", "/login", "/register", "/logout", "/memory-setup"],
+            &[
+                "/team",
+                "/agent",
+                "/messaging",
+                "/login",
+                "/register",
+                "/logout",
+                "/memory-setup",
+            ],
             &["/diagnostics", "/allow", "/yolo", "/instructions", "/style"],
         ];
         let known: std::collections::HashSet<&str> =
