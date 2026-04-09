@@ -234,11 +234,11 @@ impl SharedContextCache {
     // ─── Knowledge Store ────────────────────────────────────────────────
 
     /// Store a knowledge fragment.
-    pub fn share_knowledge(&self, key: String, value: serde_json::Value, source_agent: &str) {
+    pub fn share_knowledge(&self, key: &str, value: serde_json::Value, source_agent: &str) {
         self.knowledge.insert(
-            key.clone(),
+            key.to_string(),
             Knowledge {
-                key,
+                key: key.to_string(),
                 value,
                 source_agent: source_agent.to_string(),
                 created_at: SystemTime::now(),
@@ -518,17 +518,17 @@ mod tests {
 
         // Share knowledge
         cache.share_knowledge(
-            "auth/jwt-secret".to_string(),
+            "auth/jwt-secret",
             serde_json::json!({"algorithm": "HS256"}),
             "explore-agent",
         );
         cache.share_knowledge(
-            "auth/session-ttl".to_string(),
+            "auth/session-ttl",
             serde_json::json!(3600),
             "explore-agent",
         );
         cache.share_knowledge(
-            "db/version".to_string(),
+            "db/version",
             serde_json::json!("14.2"),
             "db-agent",
         );

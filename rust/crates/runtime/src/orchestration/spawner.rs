@@ -3,7 +3,8 @@
 use crate::messaging::router::AgentMailboxRouter;
 use crate::messaging::types::AgentAddress;
 use crate::orchestration::builtin_agents::get_agent_type_definition;
-use crate::orchestration::progress::{ProgressBroadcaster, AgentProgressEvent, ProgressEventType};
+use crate::orchestration::context_cache::SharedContextCache;
+use crate::orchestration::progress::{AgentProgressEvent, ProgressBroadcaster, ProgressEventType};
 use crate::orchestration::spawn_tool::{SpawnAgentInput, SpawnAgentOutput};
 
 use std::collections::HashMap;
@@ -127,6 +128,8 @@ pub struct SpawnRunConfig {
     pub mailbox: Option<crate::messaging::router::AgentMailbox>,
     /// Optional progress emitter for broadcasting turn completion events.
     pub progress_emitter: Option<super::progress::AgentProgressEmitter>,
+    /// Optional shared context cache for cross-agent knowledge sharing.
+    pub context_cache: Option<Arc<SharedContextCache>>,
 }
 
 impl std::fmt::Debug for SpawnRunConfig {
@@ -187,6 +190,8 @@ pub struct DynamicAgentSpawner {
     active_agents: Arc<RwLock<HashMap<String, SpawnedAgentState>>>,
     /// Progress event broadcaster.
     progress_broadcaster: Arc<ProgressBroadcaster>,
+    /// Shared context cache for cross-agent knowledge sharing.
+    context_cache: Arc<SharedContextCache>,
     /// Optional executor for running agents (provided by CLI layer).
     executor: Option<Arc<dyn SpawnAgentExecutor>>,
 }
@@ -198,6 +203,18 @@ impl DynamicAgentSpawner {
             mailbox_router,
             active_agents: Arc::new(RwLock::new(HashMap::new())),
             progress_broadcaster: Arc::new(ProgressBroadcaster::default()),
+            context_cache: Arc::new(SharedContextCache::default()),
+            executor: None,
+        }
+    }
+
+    /// Create a new spawner with a custom context cache.
+    pub fn with_context_cache(mailbox_router: Arc<AgentMailboxRouter>, context_cache: Arc<SharedContextCache>) -> Self {
+        Self {
+            mailbox_router,
+            active_agents: Arc::new(RwLock::new(HashMap::new())),
+            progress_broadcaster: Arc::new(ProgressBroadcaster::default()),
+            context_cache,
             executor: None,
         }
     }
@@ -206,6 +223,11 @@ impl DynamicAgentSpawner {
     pub fn with_executor(mut self, executor: Arc<dyn SpawnAgentExecutor>) -> Self {
         self.executor = Some(executor);
         self
+    }
+
+    /// Get the shared context cache.
+    pub fn context_cache(&self) -> &Arc<SharedContextCache> {
+        &self.context_cache
     }
 
     /// Check if an executor is configured.
@@ -286,6 +308,7 @@ impl DynamicAgentSpawner {
             working_dir: context.working_dir.clone(),
             mailbox,
             progress_emitter: Some(emitter.clone()),
+            context_cache: Some(Arc::clone(&self.context_cache)),
         };
 
         // 8. Execute or launch
@@ -386,6 +409,7 @@ impl DynamicAgentSpawner {
             mailbox_router: Arc::clone(&self.mailbox_router),
             active_agents: Arc::clone(&self.active_agents),
             progress_broadcaster: Arc::clone(&self.progress_broadcaster),
+            context_cache: Arc::clone(&self.context_cache),
             executor: self.executor.clone(),
         }
     }
@@ -576,5 +600,54 @@ mod tests {
 
         let agents = spawner.list_agents("parent-123").await;
         assert_eq!(agents.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_context_cache_shared_across_spawns() {
+        use crate::orchestration::context_cache::SharedContextCache;
+        
+        // Create a shared context cache
+        let cache = Arc::new(SharedContextCache::default());
+        
+        // Create spawner with custom cache
+        let spawner = DynamicAgentSpawner::with_context_cache(mock_router(), Arc::clone(&cache));
+        
+        // Verify spawner has the same cache
+        assert!(Arc::ptr_eq(&cache, spawner.context_cache()));
+        
+        // Parent agent stores some knowledge
+        cache.share_knowledge("project/tech-stack", serde_json::json!({"db": "postgres"}), "parent-agent");
+        
+        let context = SpawnContext {
+            parent_run_id: "parent-123".to_string(),
+            parent_agent_id: "parent".to_string(),
+            working_dir: PathBuf::from("/tmp"),
+        };
+        
+        // Spawn an agent
+        let input = SpawnAgentInput {
+            description: "Explore codebase".to_string(),
+            prompt: "Explore".to_string(),
+            agent_type: "explore".to_string(),
+            model: None,
+            background: true,
+            name: None,
+            max_turns: None,
+            isolated: false,
+            allowed_tools: None,
+        };
+        let result = spawner.spawn(input, &context).await.unwrap();
+        assert!(matches!(result, SpawnAgentOutput::Launched { .. }));
+        
+        // The cache still has the knowledge from parent
+        let knowledge = cache.get_knowledge("project/tech-stack");
+        assert!(knowledge.is_some());
+        assert_eq!(knowledge.unwrap()["db"], "postgres");
+        
+        // Spawned agent can also add knowledge (simulated)
+        cache.share_knowledge("project/auth", serde_json::json!({"type": "jwt"}), "spawned-agent");
+        
+        // All knowledge is accessible
+        assert_eq!(cache.knowledge_count(), 2);
     }
 }
