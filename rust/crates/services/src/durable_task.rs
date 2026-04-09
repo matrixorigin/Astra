@@ -902,14 +902,12 @@ impl VerificationRunner {
                         .canonicalize()
                         .map_err(|e| format!("work_dir canonicalization failed: {e}"))?;
                     if !canonical.starts_with(&work_canonical) {
-                        return Err(format!(
-                            "path '{path}' escapes work directory boundary"
-                        ));
+                        return Err(format!("path '{path}' escapes work directory boundary"));
                     }
                     canonical
                 };
-                let content = std::fs::read_to_string(&resolved)
-                    .map_err(|e| format!("read {path}: {e}"))?;
+                let content =
+                    std::fs::read_to_string(&resolved).map_err(|e| format!("read {path}: {e}"))?;
                 let has_all = contains.iter().all(|s| content.contains(s));
                 let has_none = not_contains.iter().all(|s| !content.contains(s));
                 let passed = has_all && has_none;
@@ -932,7 +930,10 @@ impl VerificationRunner {
                 Ok((
                     passed,
                     evidence,
-                    format!("file {path} contains: {:?}, not_contains: {:?}", contains, not_contains),
+                    format!(
+                        "file {path} contains: {:?}, not_contains: {:?}",
+                        contains, not_contains
+                    ),
                 ))
             }
 
@@ -1272,10 +1273,7 @@ pub struct TaskBranchService {
 }
 
 impl TaskBranchService {
-    pub fn new(
-        pool: sqlx::Pool<sqlx::MySql>,
-        database: impl Into<String>,
-    ) -> Self {
+    pub fn new(pool: sqlx::Pool<sqlx::MySql>, database: impl Into<String>) -> Self {
         Self {
             pool,
             database: database.into(),
@@ -2074,7 +2072,8 @@ pub struct MatrixOneDurableTaskLifecycle {
 impl MatrixOneDurableTaskLifecycle {
     pub fn new(pool: sqlx::Pool<sqlx::MySql>, work_dir: std::path::PathBuf) -> Self {
         // Default: database-level snapshot for the configured database.
-        let database = std::env::var("MATRIXONE_DATABASE").unwrap_or_else(|_| "astra_runtime".into());
+        let database =
+            std::env::var("MATRIXONE_DATABASE").unwrap_or_else(|_| "astra_runtime".into());
         let branch_ops: Arc<dyn TaskBranchOps> =
             Arc::new(TaskBranchService::new(pool.clone(), database));
         Self {
@@ -2097,10 +2096,8 @@ impl MatrixOneDurableTaskLifecycle {
         database: impl Into<String>,
     ) -> Self {
         let database = database.into();
-        let branch_ops: Arc<dyn TaskBranchOps> = Arc::new(TaskBranchService::new(
-            pool.clone(),
-            database,
-        ));
+        let branch_ops: Arc<dyn TaskBranchOps> =
+            Arc::new(TaskBranchService::new(pool.clone(), database));
         Self {
             pool,
             branch_ops,

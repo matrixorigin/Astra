@@ -55,9 +55,7 @@ mod tests {
                 let did = mailbox.delegation_id.clone().unwrap_or_default();
                 let broadcast_msg = AgentMessage::new(
                     mailbox.address.clone(),
-                    MessageTarget::Broadcast {
-                        delegation_id: did,
-                    },
+                    MessageTarget::Broadcast { delegation_id: did },
                     MessagePayload::Text {
                         content: format!("{agent_id} reporting in"),
                         summary: None,
@@ -85,10 +83,7 @@ mod tests {
                     agent_id,
                     run_id,
                     status: "completed".to_string(),
-                    output: Some(format!(
-                        "mailbox=true, sent=2, received={}",
-                        received.len()
-                    )),
+                    output: Some(format!("mailbox=true, sent=2, received={}", received.len())),
                     error: None,
                     prompt_tokens: 10,
                     completion_tokens: 5,
@@ -113,8 +108,12 @@ mod tests {
 
     fn setup_profiles() -> Arc<RwLock<AgentProfileRegistry>> {
         let mut reg = AgentProfileRegistry::new();
-        reg.register(AgentProfile::new("orch", "Orchestrator", AgentTier::Orchestrator))
-            .unwrap();
+        reg.register(AgentProfile::new(
+            "orch",
+            "Orchestrator",
+            AgentTier::Orchestrator,
+        ))
+        .unwrap();
         reg.register(AgentProfile::new("coder", "Coder", AgentTier::System))
             .unwrap();
         reg.register(AgentProfile::new("reviewer", "Reviewer", AgentTier::System))
@@ -232,8 +231,10 @@ mod tests {
         );
 
         // Verify senders.
-        let senders: std::collections::HashSet<_> =
-            hello_msgs.iter().map(|m| m.from.agent_id.as_str()).collect();
+        let senders: std::collections::HashSet<_> = hello_msgs
+            .iter()
+            .map(|m| m.from.agent_id.as_str())
+            .collect();
         assert!(senders.contains("coder"), "missing coder hello");
         assert!(senders.contains("reviewer"), "missing reviewer hello");
 

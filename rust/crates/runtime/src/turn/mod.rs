@@ -1,4 +1,5 @@
 pub mod activity;
+pub mod agent_progress_ui;
 pub mod agentic_headless_round;
 pub mod agentic_loop_host;
 pub mod agentic_post_tool_policy;
@@ -8,7 +9,6 @@ pub mod agentic_turn_flow;
 pub mod agentic_turn_ingest;
 pub mod agentic_turn_telemetry;
 pub mod agentic_verdict_audit;
-pub mod agent_progress_ui;
 pub mod boost_domain_hints;
 #[cfg(feature = "bridge-e2e-hooks")]
 pub mod bridge_e2e_hooks;

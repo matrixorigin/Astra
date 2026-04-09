@@ -173,7 +173,10 @@ impl DataVersioningService for DatabaseDataVersioningService {
 
         let pool = self.get_pool().await.map_err(internal_error)?;
 
-        let sql = crate::snapshot_sql::create_snapshot_for_db_sql(&request.name, &self.matrixone.database);
+        let sql = crate::snapshot_sql::create_snapshot_for_db_sql(
+            &request.name,
+            &self.matrixone.database,
+        );
         query(&sql).execute(&pool).await.map_err(internal_error)?;
 
         query(
@@ -401,7 +404,8 @@ impl DataVersioningService for DatabaseDataVersioningService {
         let pool = self.get_pool().await.map_err(internal_error)?;
 
         let full_name = format!("{}__{}", sandbox_name, request.checkpoint_name);
-        let sql = crate::snapshot_sql::create_snapshot_for_db_sql(&full_name, &self.matrixone.database);
+        let sql =
+            crate::snapshot_sql::create_snapshot_for_db_sql(&full_name, &self.matrixone.database);
         query(&sql).execute(&pool).await.map_err(internal_error)?;
 
         query(
@@ -434,8 +438,14 @@ impl DataVersioningService for DatabaseDataVersioningService {
         let pool = self.get_pool().await.map_err(internal_error)?;
 
         let full_name = format!("{}__{}", sandbox_name, request.checkpoint_name);
-        let account = crate::snapshot_sql::resolve_account_name(&pool).await.map_err(internal_error)?;
-        let sql = crate::snapshot_sql::restore_snapshot_db_sql(&full_name, &account, &self.matrixone.database);
+        let account = crate::snapshot_sql::resolve_account_name(&pool)
+            .await
+            .map_err(internal_error)?;
+        let sql = crate::snapshot_sql::restore_snapshot_db_sql(
+            &full_name,
+            &account,
+            &self.matrixone.database,
+        );
         query(&sql).execute(&pool).await.map_err(internal_error)?;
 
         Ok(StatusResponse {

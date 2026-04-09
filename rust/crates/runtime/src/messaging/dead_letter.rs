@@ -220,7 +220,12 @@ mod tests {
         assert_eq!(dlq.count().await, 0);
 
         dlq.store(test_msg("1"), DeadLetterReason::Expired, 0).await;
-        dlq.store(test_msg("2"), DeadLetterReason::AckTimeout { attempts: 3 }, 3).await;
+        dlq.store(
+            test_msg("2"),
+            DeadLetterReason::AckTimeout { attempts: 3 },
+            3,
+        )
+        .await;
         assert_eq!(dlq.count().await, 2);
     }
 
@@ -229,11 +234,8 @@ mod tests {
         let dlq = DeadLetterQueue::with_capacity(3);
 
         for i in 0..5 {
-            dlq.store(
-                test_msg(&i.to_string()),
-                DeadLetterReason::Expired,
-                0,
-            ).await;
+            dlq.store(test_msg(&i.to_string()), DeadLetterReason::Expired, 0)
+                .await;
         }
 
         assert_eq!(dlq.count().await, 3);
@@ -263,7 +265,8 @@ mod tests {
     async fn purge_all_clears_queue() {
         let dlq = DeadLetterQueue::new();
         for i in 0..10 {
-            dlq.store(test_msg(&i.to_string()), DeadLetterReason::Expired, 0).await;
+            dlq.store(test_msg(&i.to_string()), DeadLetterReason::Expired, 0)
+                .await;
         }
         let purged = dlq.purge_all().await;
         assert_eq!(purged, 10);
@@ -273,10 +276,34 @@ mod tests {
     #[tokio::test]
     async fn reason_summary_categorizes() {
         let dlq = DeadLetterQueue::new();
-        dlq.store(test_msg("1"), DeadLetterReason::AckTimeout { attempts: 3 }, 3).await;
-        dlq.store(test_msg("2"), DeadLetterReason::AckTimeout { attempts: 5 }, 5).await;
-        dlq.store(test_msg("3"), DeadLetterReason::Rejected { reason: Some("bad".into()) }, 1).await;
-        dlq.store(test_msg("4"), DeadLetterReason::TransportFailure { error: "closed".into() }, 1).await;
+        dlq.store(
+            test_msg("1"),
+            DeadLetterReason::AckTimeout { attempts: 3 },
+            3,
+        )
+        .await;
+        dlq.store(
+            test_msg("2"),
+            DeadLetterReason::AckTimeout { attempts: 5 },
+            5,
+        )
+        .await;
+        dlq.store(
+            test_msg("3"),
+            DeadLetterReason::Rejected {
+                reason: Some("bad".into()),
+            },
+            1,
+        )
+        .await;
+        dlq.store(
+            test_msg("4"),
+            DeadLetterReason::TransportFailure {
+                error: "closed".into(),
+            },
+            1,
+        )
+        .await;
         dlq.store(test_msg("5"), DeadLetterReason::Expired, 0).await;
 
         let summary = dlq.reason_summary().await;
@@ -291,7 +318,8 @@ mod tests {
     async fn list_page_pagination() {
         let dlq = DeadLetterQueue::new();
         for i in 0..10 {
-            dlq.store(test_msg(&i.to_string()), DeadLetterReason::Expired, 0).await;
+            dlq.store(test_msg(&i.to_string()), DeadLetterReason::Expired, 0)
+                .await;
         }
 
         let page1 = dlq.list_page(0, 3).await;
@@ -310,7 +338,8 @@ mod tests {
     async fn drain_all_empties_queue() {
         let dlq = DeadLetterQueue::new();
         for i in 0..5 {
-            dlq.store(test_msg(&i.to_string()), DeadLetterReason::Expired, 0).await;
+            dlq.store(test_msg(&i.to_string()), DeadLetterReason::Expired, 0)
+                .await;
         }
         let drained = dlq.drain_all().await;
         assert_eq!(drained.len(), 5);
@@ -322,10 +351,14 @@ mod tests {
         let r1 = DeadLetterReason::AckTimeout { attempts: 3 };
         assert!(r1.to_string().contains("3 attempts"));
 
-        let r2 = DeadLetterReason::Rejected { reason: Some("bad data".into()) };
+        let r2 = DeadLetterReason::Rejected {
+            reason: Some("bad data".into()),
+        };
         assert!(r2.to_string().contains("bad data"));
 
-        let r3 = DeadLetterReason::TransportFailure { error: "channel closed".into() };
+        let r3 = DeadLetterReason::TransportFailure {
+            error: "channel closed".into(),
+        };
         assert!(r3.to_string().contains("channel closed"));
 
         let r4 = DeadLetterReason::Expired;

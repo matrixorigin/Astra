@@ -10,17 +10,15 @@
 //! - DeadLetterQueue store/list/purge
 //! - LatencyTracker record throughput
 
-use criterion::{
-    black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput,
-};
+use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use std::sync::Arc;
 use std::time::Duration;
 
-use astra_runtime::messaging::{
-    AgentAddress, AgentMailboxRouter, AgentMessage, AckConfig, DeadLetterQueue,
-    DeadLetterReason, InProcessTransport, MessagePayload, MessageTarget, PendingAckTracker,
-};
 use astra_runtime::messaging::metrics::LatencyTracker;
+use astra_runtime::messaging::{
+    AckConfig, AgentAddress, AgentMailboxRouter, AgentMessage, DeadLetterQueue, DeadLetterReason,
+    InProcessTransport, MessagePayload, MessageTarget, PendingAckTracker,
+};
 use astra_runtime::server::delegation_engine::DelegationTracker;
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
@@ -76,15 +74,11 @@ fn bench_message_creation(c: &mut Criterion) {
     for size in [64, 256, 1024, 4096, 16384] {
         let body: String = "x".repeat(size);
         group.throughput(Throughput::Bytes(size as u64));
-        group.bench_with_input(
-            BenchmarkId::new("text_payload", size),
-            &body,
-            |b, body| {
-                b.iter(|| {
-                    black_box(text_msg_with_body(("r1", "a1"), ("r2", "a2"), body));
-                })
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("text_payload", size), &body, |b, body| {
+            b.iter(|| {
+                black_box(text_msg_with_body(("r1", "a1"), ("r2", "a2"), body));
+            })
+        });
     }
 
     group.bench_function("make_ack", |b| {
@@ -121,7 +115,9 @@ fn bench_inprocess_transport(c: &mut Criterion) {
             for _ in 0..1000 {
                 let msg = AgentMessage::new(
                     mb1.address.clone(),
-                    MessageTarget::Direct { address: a2.clone() },
+                    MessageTarget::Direct {
+                        address: a2.clone(),
+                    },
                     MessagePayload::Text {
                         content: "bench".into(),
                         summary: None,
@@ -193,8 +189,7 @@ fn bench_ack_tracker(c: &mut Criterion) {
             let mut ids = Vec::with_capacity(1000);
             for i in 0..1000u32 {
                 let msg = Arc::new(
-                    text_msg(("r1", "sender"), ("r2", &format!("recv-{i}")))
-                        .with_ack_required(),
+                    text_msg(("r1", "sender"), ("r2", &format!("recv-{i}"))).with_ack_required(),
                 );
                 ids.push(msg.id.clone());
                 tracker.track(msg).await;
@@ -216,10 +211,8 @@ fn bench_ack_tracker(c: &mut Criterion) {
             };
             let tracker = PendingAckTracker::with_config(config);
             for i in 0..1000u32 {
-                let msg = Arc::new(
-                    text_msg(("r1", "s"), ("r2", &format!("r-{i}")))
-                        .with_ack_required(),
-                );
+                let msg =
+                    Arc::new(text_msg(("r1", "s"), ("r2", &format!("r-{i}"))).with_ack_required());
                 tracker.track(msg).await;
             }
             tokio::time::sleep(Duration::from_millis(1)).await;
@@ -247,12 +240,8 @@ fn bench_dead_letter_queue(c: &mut Criterion) {
             let dlq = DeadLetterQueue::new();
             for i in 0..1000u32 {
                 let msg = Arc::new(text_msg(("r1", "s"), ("r2", &format!("r-{i}"))));
-                dlq.store(
-                    msg,
-                    DeadLetterReason::AckTimeout { attempts: 3 },
-                    3,
-                )
-                .await;
+                dlq.store(msg, DeadLetterReason::AckTimeout { attempts: 3 }, 3)
+                    .await;
             }
             assert_eq!(dlq.count().await, 1000);
         })
@@ -264,12 +253,8 @@ fn bench_dead_letter_queue(c: &mut Criterion) {
             let dlq = DeadLetterQueue::with_capacity(100);
             for i in 0..1000u32 {
                 let msg = Arc::new(text_msg(("r1", "s"), ("r2", &format!("r-{i}"))));
-                dlq.store(
-                    msg,
-                    DeadLetterReason::AckTimeout { attempts: 3 },
-                    3,
-                )
-                .await;
+                dlq.store(msg, DeadLetterReason::AckTimeout { attempts: 3 }, 3)
+                    .await;
             }
             assert_eq!(dlq.count().await, 100);
         })
@@ -365,7 +350,9 @@ fn bench_router(c: &mut Criterion) {
             for _ in 0..1000 {
                 let msg = AgentMessage::new(
                     mb1.address.clone(),
-                    MessageTarget::Direct { address: a2.clone() },
+                    MessageTarget::Direct {
+                        address: a2.clone(),
+                    },
                     MessagePayload::Text {
                         content: "x".into(),
                         summary: None,

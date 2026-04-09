@@ -222,14 +222,7 @@ impl WorktreeManager {
 
             // git worktree add -b <branch> <path> HEAD
             let output = Command::new("git")
-                .args([
-                    "worktree",
-                    "add",
-                    "-b",
-                    &branch_name,
-                    wt_path_str,
-                    "HEAD",
-                ])
+                .args(["worktree", "add", "-b", &branch_name, wt_path_str, "HEAD"])
                 .current_dir(&self.repo_root)
                 .output()
                 .await?;
@@ -272,11 +265,7 @@ impl WorktreeManager {
     }
 
     /// Check if a branch has commits beyond the base.
-    async fn has_commits_since(
-        &self,
-        branch: &str,
-        base: &str,
-    ) -> Result<bool, WorktreeError> {
+    async fn has_commits_since(&self, branch: &str, base: &str) -> Result<bool, WorktreeError> {
         let output = Command::new("git")
             .args(["log", "--oneline", &format!("{base}..{branch}")])
             .current_dir(&self.repo_root)
@@ -350,7 +339,16 @@ impl WorktreeManager {
 
             // Attempt merge
             let output = Command::new("git")
-                .args(["merge", "--no-ff", "-m", &format!("merge agent {agent_id} from team delegation {}", &delegation_id[..delegation_id.len().min(8)]), &info.branch_name])
+                .args([
+                    "merge",
+                    "--no-ff",
+                    "-m",
+                    &format!(
+                        "merge agent {agent_id} from team delegation {}",
+                        &delegation_id[..delegation_id.len().min(8)]
+                    ),
+                    &info.branch_name,
+                ])
                 .current_dir(&self.repo_root)
                 .output()
                 .await?;
@@ -569,10 +567,7 @@ mod tests {
         let mut mgr = make_manager(&repo);
 
         let agents = vec!["alpha".to_string(), "beta".to_string()];
-        let paths = mgr
-            .create_worktrees("del-12345678", &agents)
-            .await
-            .unwrap();
+        let paths = mgr.create_worktrees("del-12345678", &agents).await.unwrap();
 
         assert_eq!(paths.len(), 2);
         for (_, p) in &paths {
@@ -602,9 +597,7 @@ mod tests {
 
         let mut mgr = make_manager(&repo);
         let agents = vec!["agent-a".to_string()];
-        mgr.create_worktrees("del-aabbccdd", &agents)
-            .await
-            .unwrap();
+        mgr.create_worktrees("del-aabbccdd", &agents).await.unwrap();
 
         // Don't commit anything in the worktree → should be skipped
         let result = mgr
@@ -669,7 +662,10 @@ mod tests {
 
         let mut mgr = make_manager(&repo);
         let agents = vec!["a1".to_string(), "a2".to_string()];
-        let paths = mgr.create_worktrees("del-conflict1", &agents).await.unwrap();
+        let paths = mgr
+            .create_worktrees("del-conflict1", &agents)
+            .await
+            .unwrap();
 
         // Agent a1 modifies README.md
         tokio::fs::write(paths["a1"].join("README.md"), "agent a1 version\n")
@@ -749,20 +745,50 @@ mod tests {
 
         let mut mgr = make_manager(&repo);
         let agents = vec!["a1".to_string(), "a2".to_string()];
-        let paths = mgr.create_worktrees("del-snaptest1", &agents).await.unwrap();
+        let paths = mgr
+            .create_worktrees("del-snaptest1", &agents)
+            .await
+            .unwrap();
         let original_base = mgr.active["a1"].base_commit.clone();
 
         // a1: modify README.md
-        tokio::fs::write(paths["a1"].join("README.md"), "a1 version\n").await.unwrap();
-        Command::new("git").args(["add", "."]).current_dir(&paths["a1"]).output().await.unwrap();
-        Command::new("git").args(["commit", "-m", "a1"]).current_dir(&paths["a1"]).output().await.unwrap();
+        tokio::fs::write(paths["a1"].join("README.md"), "a1 version\n")
+            .await
+            .unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(&paths["a1"])
+            .output()
+            .await
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "a1"])
+            .current_dir(&paths["a1"])
+            .output()
+            .await
+            .unwrap();
 
         // a2: modify README.md differently (will conflict)
-        tokio::fs::write(paths["a2"].join("README.md"), "a2 version\n").await.unwrap();
-        Command::new("git").args(["add", "."]).current_dir(&paths["a2"]).output().await.unwrap();
-        Command::new("git").args(["commit", "-m", "a2"]).current_dir(&paths["a2"]).output().await.unwrap();
+        tokio::fs::write(paths["a2"].join("README.md"), "a2 version\n")
+            .await
+            .unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(&paths["a2"])
+            .output()
+            .await
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "a2"])
+            .current_dir(&paths["a2"])
+            .output()
+            .await
+            .unwrap();
 
-        let result = mgr.merge_worktrees("del-snaptest1", &["a1".into(), "a2".into()]).await.unwrap();
+        let result = mgr
+            .merge_worktrees("del-snaptest1", &["a1".into(), "a2".into()])
+            .await
+            .unwrap();
 
         assert_eq!(result.merged, vec!["a1"]);
         assert_eq!(result.conflicts.len(), 1);
@@ -770,13 +796,19 @@ mod tests {
         // The conflict snapshot should reference the post-a1-merge HEAD,
         // NOT the original base commit.
         let conflict_snap = &result.conflicts[0].snapshot;
-        let snap_commit = conflict_snap.refs.iter().find_map(|r| match r {
-            SnapshotRef::GitCommit(sha) => Some(sha.clone()),
-            _ => None,
-        }).expect("conflict snapshot should have a GitCommit ref");
+        let snap_commit = conflict_snap
+            .refs
+            .iter()
+            .find_map(|r| match r {
+                SnapshotRef::GitCommit(sha) => Some(sha.clone()),
+                _ => None,
+            })
+            .expect("conflict snapshot should have a GitCommit ref");
 
-        assert_ne!(snap_commit, original_base,
-            "conflict snapshot should reference pre-merge HEAD (after a1 merged), not original base");
+        assert_ne!(
+            snap_commit, original_base,
+            "conflict snapshot should reference pre-merge HEAD (after a1 merged), not original base"
+        );
 
         mgr.cleanup().await.unwrap();
     }
@@ -803,7 +835,9 @@ mod tests {
 
         let mut mgr = make_manager(&repo);
         let agents = vec!["alpha".to_string()];
-        mgr.create_worktrees("del-empty1234", &agents).await.unwrap();
+        mgr.create_worktrees("del-empty1234", &agents)
+            .await
+            .unwrap();
 
         let result = mgr.merge_worktrees("del-empty1234", &[]).await.unwrap();
         assert!(result.merged.is_empty());
@@ -830,14 +864,38 @@ mod tests {
         let paths = mgr.create_worktrees("del-resolve1", &agents).await.unwrap();
 
         // a1: modify README.md
-        tokio::fs::write(paths["a1"].join("README.md"), "a1 content\n").await.unwrap();
-        Command::new("git").args(["add", "."]).current_dir(&paths["a1"]).output().await.unwrap();
-        Command::new("git").args(["commit", "-m", "a1"]).current_dir(&paths["a1"]).output().await.unwrap();
+        tokio::fs::write(paths["a1"].join("README.md"), "a1 content\n")
+            .await
+            .unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(&paths["a1"])
+            .output()
+            .await
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "a1"])
+            .current_dir(&paths["a1"])
+            .output()
+            .await
+            .unwrap();
 
         // a2: modify README.md differently (conflict)
-        tokio::fs::write(paths["a2"].join("README.md"), "a2 content\n").await.unwrap();
-        Command::new("git").args(["add", "."]).current_dir(&paths["a2"]).output().await.unwrap();
-        Command::new("git").args(["commit", "-m", "a2"]).current_dir(&paths["a2"]).output().await.unwrap();
+        tokio::fs::write(paths["a2"].join("README.md"), "a2 content\n")
+            .await
+            .unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(&paths["a2"])
+            .output()
+            .await
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "a2"])
+            .current_dir(&paths["a2"])
+            .output()
+            .await
+            .unwrap();
 
         // With TheirsWinsResolver, a2's conflict should be auto-resolved
         let result = mgr
@@ -846,11 +904,22 @@ mod tests {
             .unwrap();
 
         // Both should be merged (a1 directly, a2 via LLM resolution)
-        assert_eq!(result.merged.len(), 2, "expected both agents merged, got: {:?}", result.merged);
-        assert!(result.conflicts.is_empty(), "expected no conflicts, got: {:?}", result.conflicts);
+        assert_eq!(
+            result.merged.len(),
+            2,
+            "expected both agents merged, got: {:?}",
+            result.merged
+        );
+        assert!(
+            result.conflicts.is_empty(),
+            "expected no conflicts, got: {:?}",
+            result.conflicts
+        );
 
         // Verify the resolved content is a2's version (theirs wins)
-        let final_content = tokio::fs::read_to_string(repo.join("README.md")).await.unwrap();
+        let final_content = tokio::fs::read_to_string(repo.join("README.md"))
+            .await
+            .unwrap();
         assert_eq!(final_content, "a2 content\n");
 
         mgr.cleanup().await.unwrap();
@@ -873,13 +942,37 @@ mod tests {
         let paths = mgr.create_worktrees("del-failres1", &agents).await.unwrap();
 
         // Both modify same file
-        tokio::fs::write(paths["a1"].join("README.md"), "a1\n").await.unwrap();
-        Command::new("git").args(["add", "."]).current_dir(&paths["a1"]).output().await.unwrap();
-        Command::new("git").args(["commit", "-m", "a1"]).current_dir(&paths["a1"]).output().await.unwrap();
+        tokio::fs::write(paths["a1"].join("README.md"), "a1\n")
+            .await
+            .unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(&paths["a1"])
+            .output()
+            .await
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "a1"])
+            .current_dir(&paths["a1"])
+            .output()
+            .await
+            .unwrap();
 
-        tokio::fs::write(paths["a2"].join("README.md"), "a2\n").await.unwrap();
-        Command::new("git").args(["add", "."]).current_dir(&paths["a2"]).output().await.unwrap();
-        Command::new("git").args(["commit", "-m", "a2"]).current_dir(&paths["a2"]).output().await.unwrap();
+        tokio::fs::write(paths["a2"].join("README.md"), "a2\n")
+            .await
+            .unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(&paths["a2"])
+            .output()
+            .await
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "a2"])
+            .current_dir(&paths["a2"])
+            .output()
+            .await
+            .unwrap();
 
         let result = mgr
             .merge_worktrees("del-failres1", &["a1".to_string(), "a2".to_string()])

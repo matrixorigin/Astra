@@ -261,10 +261,7 @@ pub enum MailboxError {
     /// Transport-layer error.
     Transport(String),
     /// Message delivery was not acknowledged within timeout.
-    AckTimeout {
-        message_id: String,
-        attempts: u32,
-    },
+    AckTimeout { message_id: String, attempts: u32 },
     /// Message was explicitly rejected (Nack'd) by the receiver.
     Rejected {
         message_id: String,
@@ -285,8 +282,14 @@ impl std::fmt::Display for MailboxError {
             Self::ChannelClosed => write!(f, "message channel closed"),
             Self::NoParent => write!(f, "no parent agent in delegation hierarchy"),
             Self::Transport(msg) => write!(f, "transport error: {msg}"),
-            Self::AckTimeout { message_id, attempts } => {
-                write!(f, "ack timeout for message {message_id} after {attempts} attempts")
+            Self::AckTimeout {
+                message_id,
+                attempts,
+            } => {
+                write!(
+                    f,
+                    "ack timeout for message {message_id} after {attempts} attempts"
+                )
             }
             Self::Rejected { message_id, reason } => {
                 let r = reason.as_deref().unwrap_or("no reason");

@@ -76,8 +76,8 @@ mod tests {
     async fn direct_message_send_and_receive() {
         skip_without_db!(pool);
 
-        let transport = DatabaseTransport::new(pool.clone())
-            .with_poll_interval(Duration::from_millis(50));
+        let transport =
+            DatabaseTransport::new(pool.clone()).with_poll_interval(Duration::from_millis(50));
 
         let a = addr("run-db-1", "sender");
         let b = addr("run-db-2", "receiver");
@@ -120,17 +120,26 @@ mod tests {
     async fn broadcast_delivers_to_all_members() {
         skip_without_db!(pool);
 
-        let transport = DatabaseTransport::new(pool.clone())
-            .with_poll_interval(Duration::from_millis(50));
+        let transport =
+            DatabaseTransport::new(pool.clone()).with_poll_interval(Duration::from_millis(50));
 
         let leader = addr("run-db-lead", "leader");
         let w1 = addr("run-db-w1", "worker-1");
         let w2 = addr("run-db-w2", "worker-2");
         let del = "del-db-test";
 
-        transport.register(leader.clone(), Some(del.into())).await.unwrap();
-        transport.register(w1.clone(), Some(del.into())).await.unwrap();
-        transport.register(w2.clone(), Some(del.into())).await.unwrap();
+        transport
+            .register(leader.clone(), Some(del.into()))
+            .await
+            .unwrap();
+        transport
+            .register(w1.clone(), Some(del.into()))
+            .await
+            .unwrap();
+        transport
+            .register(w2.clone(), Some(del.into()))
+            .await
+            .unwrap();
 
         let mut stream_w1 = transport.subscribe(&w1).await.unwrap();
         let mut stream_w2 = transport.subscribe(&w2).await.unwrap();
@@ -138,7 +147,9 @@ mod tests {
 
         let msg = Arc::new(AgentMessage::new(
             leader.clone(),
-            MessageTarget::Broadcast { delegation_id: del.into() },
+            MessageTarget::Broadcast {
+                delegation_id: del.into(),
+            },
             MessagePayload::Signal(AgentSignal::Heartbeat),
         ));
         transport.broadcast(del, msg).await.unwrap();
@@ -148,9 +159,18 @@ mod tests {
         let r2 = tokio::time::timeout(Duration::from_secs(2), stream_w2.recv()).await;
         let r_leader = tokio::time::timeout(Duration::from_secs(2), stream_leader.recv()).await;
 
-        assert!(r1.is_ok() && r1.unwrap().is_some(), "worker-1 should receive broadcast");
-        assert!(r2.is_ok() && r2.unwrap().is_some(), "worker-2 should receive broadcast");
-        assert!(r_leader.is_ok() && r_leader.unwrap().is_some(), "leader should receive own broadcast");
+        assert!(
+            r1.is_ok() && r1.unwrap().is_some(),
+            "worker-1 should receive broadcast"
+        );
+        assert!(
+            r2.is_ok() && r2.unwrap().is_some(),
+            "worker-2 should receive broadcast"
+        );
+        assert!(
+            r_leader.is_ok() && r_leader.unwrap().is_some(),
+            "leader should receive own broadcast"
+        );
 
         cleanup(&pool).await;
     }
@@ -161,8 +181,8 @@ mod tests {
     async fn messages_arrive_in_fifo_order() {
         skip_without_db!(pool);
 
-        let transport = DatabaseTransport::new(pool.clone())
-            .with_poll_interval(Duration::from_millis(50));
+        let transport =
+            DatabaseTransport::new(pool.clone()).with_poll_interval(Duration::from_millis(50));
 
         let a = addr("run-db-order-a", "alice");
         let b = addr("run-db-order-b", "bob");
@@ -207,8 +227,8 @@ mod tests {
     async fn expired_messages_not_delivered() {
         skip_without_db!(pool);
 
-        let transport = DatabaseTransport::new(pool.clone())
-            .with_poll_interval(Duration::from_millis(50));
+        let transport =
+            DatabaseTransport::new(pool.clone()).with_poll_interval(Duration::from_millis(50));
 
         let a = addr("run-db-ttl-a", "alice");
         let b = addr("run-db-ttl-b", "bob");
@@ -264,8 +284,8 @@ mod tests {
     async fn cleanup_expired_removes_old_messages() {
         skip_without_db!(pool);
 
-        let transport = DatabaseTransport::new(pool.clone())
-            .with_poll_interval(Duration::from_millis(50));
+        let transport =
+            DatabaseTransport::new(pool.clone()).with_poll_interval(Duration::from_millis(50));
 
         let a = addr("run-db-clean-a", "alice");
         let b = addr("run-db-clean-b", "bob");
@@ -285,7 +305,10 @@ mod tests {
         transport.send(Arc::new(msg)).await.unwrap();
 
         let removed = transport.cleanup_expired().await.unwrap();
-        assert!(removed >= 1, "should have removed at least 1 expired message");
+        assert!(
+            removed >= 1,
+            "should have removed at least 1 expired message"
+        );
 
         cleanup(&pool).await;
     }
@@ -296,8 +319,8 @@ mod tests {
     async fn unregister_stops_poll_task() {
         skip_without_db!(pool);
 
-        let transport = DatabaseTransport::new(pool.clone())
-            .with_poll_interval(Duration::from_millis(50));
+        let transport =
+            DatabaseTransport::new(pool.clone()).with_poll_interval(Duration::from_millis(50));
 
         let a = addr("run-db-unreg", "agent");
         transport.register(a.clone(), None).await.unwrap();

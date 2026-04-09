@@ -172,7 +172,11 @@ impl PendingAckTracker {
                 if now.duration_since(entry.last_sent_at) >= self.config.ack_timeout {
                     if entry.attempts >= self.config.max_retries {
                         // Permanently failed — collect message for DLQ.
-                        to_remove.push((msg_id.clone(), entry.attempts, Arc::clone(&entry.message)));
+                        to_remove.push((
+                            msg_id.clone(),
+                            entry.attempts,
+                            Arc::clone(&entry.message),
+                        ));
                     } else {
                         // Needs retry.
                         entry.attempts += 1;
@@ -325,7 +329,10 @@ mod tests {
 
         let outcomes = tracker.sweep().await;
         assert_eq!(outcomes.len(), 1);
-        assert!(matches!(&outcomes[0], AckOutcome::Failed { attempts: 1, .. }));
+        assert!(matches!(
+            &outcomes[0],
+            AckOutcome::Failed { attempts: 1, .. }
+        ));
         assert_eq!(tracker.pending_count().await, 0);
         assert_eq!(tracker.failed_count().await, 1);
     }
@@ -337,9 +344,7 @@ mod tests {
         let msg_id = msg.id.clone();
 
         tracker.track(msg).await;
-        tracker
-            .reject(&msg_id, Some("bad format".into()))
-            .await;
+        tracker.reject(&msg_id, Some("bad format".into())).await;
 
         assert_eq!(tracker.pending_count().await, 0);
         assert_eq!(tracker.failed_count().await, 1);

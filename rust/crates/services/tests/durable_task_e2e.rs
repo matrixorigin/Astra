@@ -154,7 +154,10 @@ async fn e2e_verify_subtask_fails_when_file_missing() {
     );
 
     let report = svc.verify_subtask(&task_id, "create-file").await.unwrap();
-    assert!(!report.results.is_empty(), "should have verification results");
+    assert!(
+        !report.results.is_empty(),
+        "should have verification results"
+    );
     assert!(
         !report.all_required_passed,
         "verification should FAIL because hello.txt was never created, got: {:?}",

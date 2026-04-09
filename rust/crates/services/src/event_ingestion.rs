@@ -1382,12 +1382,11 @@ mod tests {
     #[tokio::test]
     async fn shutdown_drains_channel_events() {
         let config = IngestionConfig {
-            batch_size: 100, // large batch so nothing auto-flushes
+            batch_size: 100,          // large batch so nothing auto-flushes
             flush_interval_secs: 300, // long interval so timer doesn't fire
             ..Default::default()
         };
-        let (sender, shutdown, stats, jh) =
-            EventIngestionWorker::spawn(dummy_pool(), config);
+        let (sender, shutdown, stats, jh) = EventIngestionWorker::spawn(dummy_pool(), config);
 
         for i in 0..5 {
             sender.enqueue(test_event(&format!("e{i}"), "s1", "turn"));
@@ -1400,8 +1399,14 @@ mod tests {
         assert!(result.is_ok(), "worker should exit after signal");
 
         let s = stats.lock().unwrap();
-        assert_eq!(s.events_received, 5, "all 5 events should be counted (recv + drain)");
-        assert!(s.errors > 0, "flush should have been attempted (and failed on dummy pool)");
+        assert_eq!(
+            s.events_received, 5,
+            "all 5 events should be counted (recv + drain)"
+        );
+        assert!(
+            s.errors > 0,
+            "flush should have been attempted (and failed on dummy pool)"
+        );
         drop(sender);
     }
 
@@ -1414,7 +1419,10 @@ mod tests {
         shutdown.signal(); // second signal should be harmless
 
         let result = tokio::time::timeout(std::time::Duration::from_secs(3), jh).await;
-        assert!(result.is_ok(), "worker should exit cleanly on double signal");
+        assert!(
+            result.is_ok(),
+            "worker should exit cleanly on double signal"
+        );
     }
 
     #[test]

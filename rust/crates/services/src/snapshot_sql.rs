@@ -1,7 +1,8 @@
 //! MatrixOne snapshot SQL helpers.
 //!
 //! Snapshots should target the specific database, not the entire account/cluster.
-//! All identifiers are backtick-quoted to prevent SQL injection.
+//! Identifiers are backtick-quoted, and embedded backticks are escaped to prevent
+//! SQL injection.
 //! Syntax: ``CREATE SNAPSHOT `{name}` FOR DATABASE `{db}` ``
 //! Restore: ``RESTORE ACCOUNT `{account}` DATABASE `{db}` FROM SNAPSHOT `{name}` ``
 
@@ -23,6 +24,10 @@ pub fn validate_sql_identifier(value: &str, label: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn quote_identifier(value: &str) -> String {
+    format!("`{}`", value.replace('`', "``"))
+}
+
 /// Cached account name — queried once per process via `SELECT current_account_name()`.
 static ACCOUNT_NAME: OnceLock<String> = OnceLock::new();
 
@@ -35,22 +40,33 @@ pub async fn resolve_account_name(pool: &sqlx::Pool<sqlx::MySql>) -> Result<Stri
         .fetch_one(pool)
         .await
         .map_err(|e| format!("resolve_account_name: {e}"))?;
-    let name: String = row.try_get("name").map_err(|e| format!("resolve_account_name column: {e}"))?;
+    let name: String = row
+        .try_get("name")
+        .map_err(|e| format!("resolve_account_name column: {e}"))?;
     Ok(ACCOUNT_NAME.get_or_init(|| name).clone())
 }
 
 /// ``CREATE SNAPSHOT `{name}` FOR DATABASE `{db}` ``.
 ///
-/// All identifiers are validated and backtick-quoted.
+/// All identifiers are backtick-quoted, with embedded backticks escaped.
 pub fn create_snapshot_for_db_sql(name: &str, db: &str) -> String {
-    format!("CREATE SNAPSHOT `{name}` FOR DATABASE `{db}`")
+    format!(
+        "CREATE SNAPSHOT {} FOR DATABASE {}",
+        quote_identifier(name),
+        quote_identifier(db)
+    )
 }
 
 /// ``RESTORE ACCOUNT `{account}` DATABASE `{db}` FROM SNAPSHOT `{snap}` ``.
 ///
-/// All identifiers are validated and backtick-quoted.
+/// All identifiers are backtick-quoted, with embedded backticks escaped.
 pub fn restore_snapshot_db_sql(snapshot: &str, account: &str, db: &str) -> String {
-    format!("RESTORE ACCOUNT `{account}` DATABASE `{db}` FROM SNAPSHOT `{snapshot}`")
+    format!(
+        "RESTORE ACCOUNT {} DATABASE {} FROM SNAPSHOT {}",
+        quote_identifier(account),
+        quote_identifier(db),
+        quote_identifier(snapshot)
+    )
 }
 
 #[cfg(test)]
@@ -70,6 +86,22 @@ mod tests {
         assert_eq!(
             restore_snapshot_db_sql("sp1", "sys", "astra_runtime"),
             "RESTORE ACCOUNT `sys` DATABASE `astra_runtime` FROM SNAPSHOT `sp1`"
+        );
+    }
+
+    #[test]
+    fn create_snapshot_escapes_backticks() {
+        assert_eq!(
+            create_snapshot_for_db_sql("sp`1", "astra`runtime"),
+            "CREATE SNAPSHOT `sp``1` FOR DATABASE `astra``runtime`"
+        );
+    }
+
+    #[test]
+    fn restore_snapshot_escapes_backticks() {
+        assert_eq!(
+            restore_snapshot_db_sql("sp`1", "sy`s", "astra`runtime"),
+            "RESTORE ACCOUNT `sy``s` DATABASE `astra``runtime` FROM SNAPSHOT `sp``1`"
         );
     }
 

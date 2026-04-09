@@ -179,7 +179,10 @@ impl BranchService for DatabaseBranchService {
             .snapshot
             .unwrap_or_else(|| format!("{}__snap", request.name));
 
-        let sql = crate::snapshot_sql::create_snapshot_for_db_sql(&snapshot_name, &self.matrixone.database);
+        let sql = crate::snapshot_sql::create_snapshot_for_db_sql(
+            &snapshot_name,
+            &self.matrixone.database,
+        );
         query(&sql).execute(&pool).await.map_err(internal_error)?;
 
         Ok(CreateBranchResponse {
@@ -254,8 +257,14 @@ impl BranchService for DatabaseBranchService {
 
         let pool = self.get_pool().await.map_err(internal_error)?;
 
-        let account = crate::snapshot_sql::resolve_account_name(&pool).await.map_err(internal_error)?;
-        let sql = crate::snapshot_sql::restore_snapshot_db_sql(&request.source, &account, &self.matrixone.database);
+        let account = crate::snapshot_sql::resolve_account_name(&pool)
+            .await
+            .map_err(internal_error)?;
+        let sql = crate::snapshot_sql::restore_snapshot_db_sql(
+            &request.source,
+            &account,
+            &self.matrixone.database,
+        );
         let result = query(&sql).execute(&pool).await.map_err(internal_error)?;
 
         Ok(MergeResponse {

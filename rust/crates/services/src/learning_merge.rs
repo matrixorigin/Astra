@@ -64,9 +64,7 @@ impl VersionVector {
 
     /// Returns true if the events are concurrent (incomparable).
     pub fn concurrent_with(&self, other: &VersionVector) -> bool {
-        !self.happened_before(other)
-            && !other.happened_before(self)
-            && !self.vv_equal(other)
+        !self.happened_before(other) && !other.happened_before(self) && !self.vv_equal(other)
     }
 
     /// VV-aware equality (treats missing keys as 0).
@@ -182,10 +180,11 @@ pub fn merge_agent_learnings(learnings: &[AgentLearning]) -> MergedLearning {
         total_quality += l.quality_score;
 
         for p in &l.successful_patterns {
-            pattern_votes
-                .entry(p.name.clone())
-                .or_default()
-                .push((l.quality_score, p.success_rate, p.frequency));
+            pattern_votes.entry(p.name.clone()).or_default().push((
+                l.quality_score,
+                p.success_rate,
+                p.frequency,
+            ));
             success_set.insert(p.name.clone());
         }
 
@@ -212,11 +211,8 @@ pub fn merge_agent_learnings(learnings: &[AgentLearning]) -> MergedLearning {
         .map(|(name, votes)| {
             let total_quality_for_pattern: f64 = votes.iter().map(|(q, _, _)| q).sum();
             // Quality-weighted average success rate
-            let weighted_rate: f64 = votes
-                .iter()
-                .map(|(q, r, _)| q * r)
-                .sum::<f64>()
-                / total_quality_for_pattern;
+            let weighted_rate: f64 =
+                votes.iter().map(|(q, r, _)| q * r).sum::<f64>() / total_quality_for_pattern;
             let total_freq: u32 = votes.iter().map(|(_, _, f)| f).sum();
             LearningPattern {
                 name: name.clone(),
@@ -234,10 +230,7 @@ pub fn merge_agent_learnings(learnings: &[AgentLearning]) -> MergedLearning {
         .collect();
 
     // Detect conflicted patterns (in both success and failed sets)
-    let conflicted: Vec<String> = success_set
-        .intersection(&failed_set)
-        .cloned()
-        .collect();
+    let conflicted: Vec<String> = success_set.intersection(&failed_set).cloned().collect();
     let mut conflicted_sorted = conflicted;
     conflicted_sorted.sort();
 
@@ -297,14 +290,14 @@ pub fn merge_incremental(
     let mut pattern_votes: HashMap<String, Vec<(f64, f64, u32)>> = HashMap::new();
     for p in &existing.consensus_patterns {
         // Re-encode existing consensus as a "virtual vote" with existing total quality
-        pattern_votes
-            .entry(p.name.clone())
-            .or_default()
-            .push((existing.total_quality, p.success_rate, p.frequency));
+        pattern_votes.entry(p.name.clone()).or_default().push((
+            existing.total_quality,
+            p.success_rate,
+            p.frequency,
+        ));
     }
 
-    let mut failed_set: HashSet<String> =
-        existing.cautionary_patterns.iter().cloned().collect();
+    let mut failed_set: HashSet<String> = existing.cautionary_patterns.iter().cloned().collect();
     let mut success_set: HashSet<String> = existing
         .consensus_patterns
         .iter()
@@ -318,10 +311,11 @@ pub fn merge_incremental(
         total_quality += l.quality_score;
 
         for p in &l.successful_patterns {
-            pattern_votes
-                .entry(p.name.clone())
-                .or_default()
-                .push((l.quality_score, p.success_rate, p.frequency));
+            pattern_votes.entry(p.name.clone()).or_default().push((
+                l.quality_score,
+                p.success_rate,
+                p.frequency,
+            ));
             success_set.insert(p.name.clone());
         }
 
@@ -347,8 +341,7 @@ pub fn merge_incremental(
         })
         .map(|(name, votes)| {
             let total_q: f64 = votes.iter().map(|(q, _, _)| q).sum();
-            let weighted_rate: f64 =
-                votes.iter().map(|(q, r, _)| q * r).sum::<f64>() / total_q;
+            let weighted_rate: f64 = votes.iter().map(|(q, r, _)| q * r).sum::<f64>() / total_q;
             let total_freq: u32 = votes.iter().map(|(_, _, f)| f).sum();
             LearningPattern {
                 name: name.clone(),
@@ -518,7 +511,13 @@ mod tests {
     #[test]
     fn merge_majority_consensus() {
         // 3 agents: pattern-a in 2/3 → consensus; pattern-b in 1/3 → not
-        let l1 = make_learning("a1", &[("pattern-a", 0.9), ("pattern-b", 0.5)], &[], &[], 0.8);
+        let l1 = make_learning(
+            "a1",
+            &[("pattern-a", 0.9), ("pattern-b", 0.5)],
+            &[],
+            &[],
+            0.8,
+        );
         let l2 = make_learning("a2", &[("pattern-a", 0.8)], &[], &[], 0.7);
         let l3 = make_learning("a3", &[("pattern-c", 0.7)], &[], &[], 0.6);
         let result = merge_agent_learnings(&[l1, l2, l3]);
@@ -539,7 +538,11 @@ mod tests {
         let l1 = make_learning("a1", &[("good", 0.9)], &["bad-pattern"], &[], 0.8);
         let l2 = make_learning("a2", &[("good", 0.8)], &[], &[], 0.7);
         let result = merge_agent_learnings(&[l1, l2]);
-        assert!(result.cautionary_patterns.contains(&"bad-pattern".to_string()));
+        assert!(
+            result
+                .cautionary_patterns
+                .contains(&"bad-pattern".to_string())
+        );
     }
 
     #[test]
@@ -582,8 +585,15 @@ mod tests {
         let l2 = make_learning("a2", &[("pattern-b", 0.5)], &[], &[], 0.3);
         let l3 = make_learning("a3", &[("pattern-b", 0.5)], &[], &[], 0.3);
         let result = merge_agent_learnings(&[l1, l2, l3]);
-        let names: Vec<_> = result.consensus_patterns.iter().map(|p| p.name.as_str()).collect();
-        assert!(names.contains(&"pattern-a"), "high-quality agent should drive consensus");
+        let names: Vec<_> = result
+            .consensus_patterns
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect();
+        assert!(
+            names.contains(&"pattern-a"),
+            "high-quality agent should drive consensus"
+        );
     }
 
     #[test]
@@ -595,9 +605,19 @@ mod tests {
         let l2 = make_learning("a2", &[("pattern-a", 0.5)], &[], &[], 0.2);
         let l3 = make_learning("a3", &[("pattern-b", 0.9)], &[], &[], 1.6);
         let result = merge_agent_learnings(&[l1, l2, l3]);
-        let names: Vec<_> = result.consensus_patterns.iter().map(|p| p.name.as_str()).collect();
-        assert!(!names.contains(&"pattern-a"), "low-quality majority should not reach threshold");
-        assert!(names.contains(&"pattern-b"), "high-quality single agent should reach threshold");
+        let names: Vec<_> = result
+            .consensus_patterns
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect();
+        assert!(
+            !names.contains(&"pattern-a"),
+            "low-quality majority should not reach threshold"
+        );
+        assert!(
+            names.contains(&"pattern-b"),
+            "high-quality single agent should reach threshold"
+        );
     }
 
     #[test]
@@ -615,8 +635,16 @@ mod tests {
         let l1 = make_learning("a1", &[("risky-pattern", 0.8)], &[], &[], 0.5);
         let l2 = make_learning("a2", &[], &["risky-pattern"], &[], 0.5);
         let result = merge_agent_learnings(&[l1, l2]);
-        assert!(result.conflicted_patterns.contains(&"risky-pattern".to_string()));
-        assert!(result.cautionary_patterns.contains(&"risky-pattern".to_string()));
+        assert!(
+            result
+                .conflicted_patterns
+                .contains(&"risky-pattern".to_string())
+        );
+        assert!(
+            result
+                .cautionary_patterns
+                .contains(&"risky-pattern".to_string())
+        );
     }
 
     #[test]
@@ -748,7 +776,8 @@ mod tests {
             agent_count: 1,
             total_quality: 0.8,
         };
-        let new_agent = make_learning_with_version("a2", 1, &[("new-p", 0.85)], &[], &["new-fact"], 0.7);
+        let new_agent =
+            make_learning_with_version("a2", 1, &[("new-p", 0.85)], &[], &["new-fact"], 0.7);
         let result = merge_incremental(&existing, &[new_agent]);
         assert_eq!(result.agent_count, 2);
         assert_eq!(result.version.get("a1"), 1);
@@ -777,7 +806,11 @@ mod tests {
         // New agent reports the same pattern as FAILED
         let new_agent = make_learning_with_version("a2", 1, &[], &["controversial"], &[], 0.7);
         let result = merge_incremental(&existing, &[new_agent]);
-        assert!(result.conflicted_patterns.contains(&"controversial".to_string()));
+        assert!(
+            result
+                .conflicted_patterns
+                .contains(&"controversial".to_string())
+        );
     }
 
     // ── Serialization ──
@@ -798,7 +831,10 @@ mod tests {
         let json = serde_json::to_string(&merged).unwrap();
         let parsed: MergedLearning = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.agent_count, 2);
-        assert_eq!(parsed.consensus_patterns.len(), merged.consensus_patterns.len());
+        assert_eq!(
+            parsed.consensus_patterns.len(),
+            merged.consensus_patterns.len()
+        );
         assert_eq!(parsed.conflicted_patterns, merged.conflicted_patterns);
         assert!((parsed.total_quality - merged.total_quality).abs() < 0.001);
     }

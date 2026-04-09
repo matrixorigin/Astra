@@ -127,11 +127,7 @@ pub fn build_execution_layers(hooks: &[StopHook]) -> Option<Vec<Vec<usize>>> {
 pub fn filter_cached(hooks: &[StopHook], cache: &StopHookCache) -> Vec<StopHook> {
     hooks
         .iter()
-        .filter(|h| {
-            h.cache_key
-                .as_ref()
-                .map_or(true, |k| !cache.should_skip(k))
-        })
+        .filter(|h| h.cache_key.as_ref().map_or(true, |k| !cache.should_skip(k)))
         .cloned()
         .collect()
 }
@@ -169,10 +165,7 @@ pub fn build_stop_hook_prompt(hooks: &[StopHook]) -> Option<serde_json::Value> {
                             h.command, h.label, timeout_hint
                         ));
                     } else {
-                        parts.push(format!(
-                            "  - `{}` — {}{}",
-                            h.command, h.label, timeout_hint
-                        ));
+                        parts.push(format!("  - `{}` — {}{}", h.command, h.label, timeout_hint));
                     }
                 }
             }
@@ -194,7 +187,10 @@ pub fn build_stop_hook_prompt(hooks: &[StopHook]) -> Option<serde_json::Value> {
                         .map(|t| format!(" [timeout: {t}s]"))
                         .unwrap_or_default();
                     if let Some(dir) = &h.working_dir {
-                        format!("- `{}` (in `{dir}`) — {}{}", h.command, h.label, timeout_hint)
+                        format!(
+                            "- `{}` (in `{dir}`) — {}{}",
+                            h.command, h.label, timeout_hint
+                        )
                     } else {
                         format!("- `{}` — {}{}", h.command, h.label, timeout_hint)
                     }

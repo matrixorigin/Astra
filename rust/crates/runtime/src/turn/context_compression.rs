@@ -34,7 +34,8 @@ impl TokenBudget {
 
     /// Estimated excess tokens (0 if under budget).
     pub fn excess_tokens(&self) -> u64 {
-        self.last_measured_tokens.saturating_sub(self.max_prompt_tokens)
+        self.last_measured_tokens
+            .saturating_sub(self.max_prompt_tokens)
     }
 
     /// Rough pressure ratio (0.0 = no pressure, 1.0+ = over budget).
@@ -87,11 +88,7 @@ pub trait CompressionLayer: Send + Sync {
 
     /// Execute compression, mutating the message list in place.
     /// Returns metadata about what was done.
-    fn compress(
-        &self,
-        messages: &mut Vec<Value>,
-        budget: &TokenBudget,
-    ) -> CompressionResult;
+    fn compress(&self, messages: &mut Vec<Value>, budget: &TokenBudget) -> CompressionResult;
 }
 
 // ───────────────────────────── Pipeline ──────────────────────────────────
@@ -115,7 +112,9 @@ impl CompressionPipeline {
     /// Build a pipeline with the default layer stack.
     pub fn default_pipeline() -> Self {
         let mut p = Self::new();
-        p.add_layer(Box::new(ToolResultTruncation::new(Duration::from_secs(3600))));
+        p.add_layer(Box::new(ToolResultTruncation::new(Duration::from_secs(
+            3600,
+        ))));
         p.add_layer(Box::new(DuplicateReadElimination));
         p.add_layer(Box::new(TieredCompaction::default()));
         p.add_layer(Box::new(ReactiveCompact));
@@ -217,11 +216,7 @@ impl CompressionLayer for ToolResultTruncation {
         budget.pressure() > 0.6 && self.estimate_savings(messages, budget) > 100
     }
 
-    fn compress(
-        &self,
-        messages: &mut Vec<Value>,
-        _budget: &TokenBudget,
-    ) -> CompressionResult {
+    fn compress(&self, messages: &mut Vec<Value>, _budget: &TokenBudget) -> CompressionResult {
         let cutoff = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default()
@@ -250,11 +245,8 @@ impl CompressionLayer for ToolResultTruncation {
                         .last()
                         .map(|(i, c)| i + c.len_utf8())
                         .unwrap_or(0);
-                    let truncated = format!(
-                        "{}… [truncated, was {} chars]",
-                        &content[..safe_end],
-                        len
-                    );
+                    let truncated =
+                        format!("{}… [truncated, was {} chars]", &content[..safe_end], len);
                     removed_chars += len - truncated.len();
                     if let Some(obj) = msg.as_object_mut() {
                         obj.insert("content".into(), Value::String(truncated));
@@ -267,7 +259,10 @@ impl CompressionLayer for ToolResultTruncation {
         CompressionResult {
             messages_removed: 0,
             estimated_tokens_freed: (removed_chars / 4) as u64,
-            description: format!("Truncated {} old tool results, freed ~{} chars", count, removed_chars),
+            description: format!(
+                "Truncated {} old tool results, freed ~{} chars",
+                count, removed_chars
+            ),
         }
     }
 }
@@ -292,13 +287,10 @@ impl CompressionLayer for DuplicateReadElimination {
         budget.pressure() > 0.5 && self.estimate_savings(messages, budget) > 50
     }
 
-    fn compress(
-        &self,
-        messages: &mut Vec<Value>,
-        _budget: &TokenBudget,
-    ) -> CompressionResult {
+    fn compress(&self, messages: &mut Vec<Value>, _budget: &TokenBudget) -> CompressionResult {
         // Track last-seen index for each read path
-        let mut last_index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut last_index: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
         let mut read_indices: Vec<(usize, String)> = Vec::new();
 
         for (i, msg) in messages.iter().enumerate() {
@@ -339,7 +331,10 @@ impl CompressionLayer for DuplicateReadElimination {
         CompressionResult {
             messages_removed: 0,
             estimated_tokens_freed: (freed_chars / 4) as u64,
-            description: format!("Stubbed {} duplicate reads, freed ~{} chars", count, freed_chars),
+            description: format!(
+                "Stubbed {} duplicate reads, freed ~{} chars",
+                count, freed_chars
+            ),
         }
     }
 }
@@ -418,11 +413,7 @@ impl CompressionLayer for TieredCompaction {
         budget.pressure() > 0.75 && messages.len() > self.keep_recent_turns * 2 + 4
     }
 
-    fn compress(
-        &self,
-        messages: &mut Vec<Value>,
-        _budget: &TokenBudget,
-    ) -> CompressionResult {
+    fn compress(&self, messages: &mut Vec<Value>, _budget: &TokenBudget) -> CompressionResult {
         let before_count = messages.len();
         if before_count <= self.keep_recent_turns * 2 + 2 {
             return CompressionResult {
@@ -517,11 +508,7 @@ impl CompressionLayer for ReactiveCompact {
         budget.pressure() > 0.95
     }
 
-    fn compress(
-        &self,
-        messages: &mut Vec<Value>,
-        _budget: &TokenBudget,
-    ) -> CompressionResult {
+    fn compress(&self, messages: &mut Vec<Value>, _budget: &TokenBudget) -> CompressionResult {
         if messages.len() <= 6 {
             return CompressionResult {
                 messages_removed: 0,

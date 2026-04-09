@@ -4,8 +4,8 @@
 //! and `skill` tools).  The LLM emits a `send_message` function call, the loop
 //! intercepts it, and this module routes the message through the agent's mailbox.
 
-use std::sync::Arc;
 use serde_json::Value;
+use std::sync::Arc;
 
 use super::router::AgentMailbox;
 use super::types::{AgentMessage, AgentSignal, MessagePayload, MessageTarget};
@@ -58,18 +58,25 @@ pub struct SendResult {
     pub tracked_message: Option<Arc<AgentMessage>>,
 }
 
-pub async fn execute_send_message(
-    mailbox: &AgentMailbox,
-    args: &Value,
-) -> SendResult {
+pub async fn execute_send_message(mailbox: &AgentMailbox, args: &Value) -> SendResult {
     let target_str = match args.get("target").and_then(|v| v.as_str()) {
         Some(t) => t,
-        None => return SendResult { display: "Error: 'target' parameter is required.".to_string(), tracked_message: None },
+        None => {
+            return SendResult {
+                display: "Error: 'target' parameter is required.".to_string(),
+                tracked_message: None,
+            };
+        }
     };
 
     let content = match args.get("content").and_then(|v| v.as_str()) {
         Some(c) => c,
-        None => return SendResult { display: "Error: 'content' parameter is required.".to_string(), tracked_message: None },
+        None => {
+            return SendResult {
+                display: "Error: 'content' parameter is required.".to_string(),
+                tracked_message: None,
+            };
+        }
     };
 
     let message_type = args
@@ -88,10 +95,14 @@ pub async fn execute_send_message(
         "broadcast" | "all" | "peers" => {
             match mailbox.delegation_id.clone().filter(|s| !s.is_empty()) {
                 Some(did) => MessageTarget::Broadcast { delegation_id: did },
-                None => return SendResult {
-                    display: "Error: cannot broadcast — agent is not part of a delegation group.".to_string(),
-                    tracked_message: None,
-                },
+                None => {
+                    return SendResult {
+                        display:
+                            "Error: cannot broadcast — agent is not part of a delegation group."
+                                .to_string(),
+                        tracked_message: None,
+                    };
+                }
             }
         }
         agent_id => MessageTarget::Direct {
@@ -152,10 +163,7 @@ pub async fn execute_send_message(
 
 /// Check whether a tool call is a `send_message` invocation.
 pub fn is_send_message_call(tool_call: &Value) -> bool {
-    tool_call
-        .pointer("/function/name")
-        .and_then(|v| v.as_str())
-        == Some(SEND_MESSAGE_TOOL_NAME)
+    tool_call.pointer("/function/name").and_then(|v| v.as_str()) == Some(SEND_MESSAGE_TOOL_NAME)
 }
 
 /// Extract the call ID and arguments from a send_message tool call.

@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use async_trait::async_trait;
-use tokio::sync::{broadcast, mpsc, RwLock};
+use tokio::sync::{RwLock, broadcast, mpsc};
 
 use super::transport::{MessageStream, MessageTransport};
 use super::types::{AgentAddress, AgentMessage, MailboxError};
@@ -63,10 +63,7 @@ impl InProcessTransport {
     }
 
     /// Get or create a broadcast channel for a delegation group.
-    async fn ensure_broadcast(
-        &self,
-        delegation_id: &str,
-    ) -> broadcast::Sender<Arc<AgentMessage>> {
+    async fn ensure_broadcast(&self, delegation_id: &str) -> broadcast::Sender<Arc<AgentMessage>> {
         let read = self.broadcasts.read().await;
         if let Some(tx) = read.get(delegation_id) {
             return tx.clone();
@@ -134,10 +131,7 @@ impl MessageTransport for InProcessTransport {
         Ok(())
     }
 
-    async fn subscribe(
-        &self,
-        addr: &AgentAddress,
-    ) -> Result<Box<dyn MessageStream>, MailboxError> {
+    async fn subscribe(&self, addr: &AgentAddress) -> Result<Box<dyn MessageStream>, MailboxError> {
         // Create a fresh channel and replace the sender in inboxes.
         let (tx, rx) = mpsc::channel(DIRECT_CHANNEL_CAPACITY);
         {
@@ -173,7 +167,11 @@ impl MessageTransport for InProcessTransport {
 
         let target = match &msg.to {
             super::types::MessageTarget::Direct { address } => address.clone(),
-            _ => return Err(MailboxError::Transport("send() requires Direct target".into())),
+            _ => {
+                return Err(MailboxError::Transport(
+                    "send() requires Direct target".into(),
+                ));
+            }
         };
 
         let inboxes = self.inboxes.read().await;
@@ -186,8 +184,12 @@ impl MessageTransport for InProcessTransport {
                 Ok(())
             }
             Err(mpsc::error::TrySendError::Full(_)) => {
-                self.metrics.messages_dropped.fetch_add(1, Ordering::Relaxed);
-                Err(MailboxError::Transport("direct channel full (backpressure)".into()))
+                self.metrics
+                    .messages_dropped
+                    .fetch_add(1, Ordering::Relaxed);
+                Err(MailboxError::Transport(
+                    "direct channel full (backpressure)".into(),
+                ))
             }
             Err(mpsc::error::TrySendError::Closed(_)) => Err(MailboxError::ChannelClosed),
         }
@@ -288,9 +290,7 @@ mod tests {
     fn text_msg(from: AgentAddress, to: AgentAddress, content: &str) -> Arc<AgentMessage> {
         Arc::new(AgentMessage::new(
             from,
-            MessageTarget::Direct {
-                address: to,
-            },
+            MessageTarget::Direct { address: to },
             MessagePayload::Text {
                 content: content.into(),
                 summary: None,
@@ -327,9 +327,18 @@ mod tests {
         let b = addr("r2", "worker-b");
         let del_id = "del-1";
 
-        transport.register(leader.clone(), Some(del_id.into())).await.unwrap();
-        transport.register(a.clone(), Some(del_id.into())).await.unwrap();
-        transport.register(b.clone(), Some(del_id.into())).await.unwrap();
+        transport
+            .register(leader.clone(), Some(del_id.into()))
+            .await
+            .unwrap();
+        transport
+            .register(a.clone(), Some(del_id.into()))
+            .await
+            .unwrap();
+        transport
+            .register(b.clone(), Some(del_id.into()))
+            .await
+            .unwrap();
 
         let mut stream_a = transport.subscribe(&a).await.unwrap();
         let mut stream_b = transport.subscribe(&b).await.unwrap();
@@ -397,8 +406,14 @@ mod tests {
         let b = addr("r2", "b");
         let del = "del-x";
 
-        transport.register(a.clone(), Some(del.into())).await.unwrap();
-        transport.register(b.clone(), Some(del.into())).await.unwrap();
+        transport
+            .register(a.clone(), Some(del.into()))
+            .await
+            .unwrap();
+        transport
+            .register(b.clone(), Some(del.into()))
+            .await
+            .unwrap();
 
         // Unregister one — broadcast should remain.
         transport.unregister(&a).await.unwrap();
@@ -429,12 +444,17 @@ mod tests {
         let transport = InProcessTransport::new();
         let a = addr("r1", "a");
 
-        transport.register(a.clone(), Some("del".into())).await.unwrap();
+        transport
+            .register(a.clone(), Some("del".into()))
+            .await
+            .unwrap();
         transport.shutdown().await.unwrap();
 
         let msg = Arc::new(AgentMessage::new(
             a.clone(),
-            MessageTarget::Broadcast { delegation_id: "del".into() },
+            MessageTarget::Broadcast {
+                delegation_id: "del".into(),
+            },
             MessagePayload::Signal(AgentSignal::Heartbeat),
         ));
         assert!(transport.broadcast("del", msg).await.is_err());
@@ -480,8 +500,17 @@ mod tests {
             }
         }
 
-        assert_eq!(transport.metrics().messages_sent.load(Ordering::Relaxed), sent);
-        assert_eq!(transport.metrics().messages_dropped.load(Ordering::Relaxed), dropped);
-        assert!(dropped > 0, "should have dropped some messages due to backpressure");
+        assert_eq!(
+            transport.metrics().messages_sent.load(Ordering::Relaxed),
+            sent
+        );
+        assert_eq!(
+            transport.metrics().messages_dropped.load(Ordering::Relaxed),
+            dropped
+        );
+        assert!(
+            dropped > 0,
+            "should have dropped some messages due to backpressure"
+        );
     }
 }

@@ -255,8 +255,8 @@ impl DatabaseTransport {
     ///
     /// This is called periodically to handle crashed consumers.
     pub async fn reclaim_stale(&self) -> Result<u64, MailboxError> {
-        let cutoff_ms = chrono::Utc::now().timestamp_millis()
-            - self.visibility_timeout.as_millis() as i64;
+        let cutoff_ms =
+            chrono::Utc::now().timestamp_millis() - self.visibility_timeout.as_millis() as i64;
 
         // Messages under max attempts: set back to 'pending' for re-delivery.
         let reclaimed = query(
@@ -290,12 +290,10 @@ impl DatabaseTransport {
 
     /// Count messages in each status (for diagnostics).
     pub async fn status_counts(&self) -> Result<HashMap<String, i64>, MailboxError> {
-        let rows = query(
-            "SELECT status, COUNT(*) as cnt FROM agent_message_queue GROUP BY status",
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| MailboxError::Transport(format!("status_counts: {e}")))?;
+        let rows = query("SELECT status, COUNT(*) as cnt FROM agent_message_queue GROUP BY status")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| MailboxError::Transport(format!("status_counts: {e}")))?;
 
         let mut counts = HashMap::new();
         for row in rows {
@@ -307,11 +305,17 @@ impl DatabaseTransport {
     }
 
     /// Insert a message into the database.
-    async fn insert_message(&self, msg: &AgentMessage, is_broadcast: bool) -> Result<(), MailboxError> {
+    async fn insert_message(
+        &self,
+        msg: &AgentMessage,
+        is_broadcast: bool,
+    ) -> Result<(), MailboxError> {
         let (to_run_id, to_agent_id, delegation_id) = match &msg.to {
-            super::types::MessageTarget::Direct { address } => {
-                (Some(address.run_id.as_str()), Some(address.agent_id.as_str()), None)
-            }
+            super::types::MessageTarget::Direct { address } => (
+                Some(address.run_id.as_str()),
+                Some(address.agent_id.as_str()),
+                None,
+            ),
             super::types::MessageTarget::Broadcast { delegation_id } => {
                 (None, None, Some(delegation_id.as_str()))
             }
@@ -357,10 +361,7 @@ impl MessageTransport for DatabaseTransport {
         addr: AgentAddress,
         delegation_id: Option<String>,
     ) -> Result<(), MailboxError> {
-        self.registrations
-            .write()
-            .await
-            .insert(addr, delegation_id);
+        self.registrations.write().await.insert(addr, delegation_id);
         Ok(())
     }
 
@@ -369,10 +370,7 @@ impl MessageTransport for DatabaseTransport {
         Ok(())
     }
 
-    async fn subscribe(
-        &self,
-        addr: &AgentAddress,
-    ) -> Result<Box<dyn MessageStream>, MailboxError> {
+    async fn subscribe(&self, addr: &AgentAddress) -> Result<Box<dyn MessageStream>, MailboxError> {
         let regs = self.registrations.read().await;
         let delegation_id = regs
             .get(addr)
@@ -405,16 +403,20 @@ impl MessageTransport for DatabaseTransport {
             _ => {
                 return Err(MailboxError::Transport(
                     "send() requires Direct target".into(),
-                ))
+                ));
             }
         }
         match self.insert_message(&msg, false).await {
             Ok(()) => {
-                self.metrics.messages_sent.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.metrics
+                    .messages_sent
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Ok(())
             }
             Err(e) => {
-                self.metrics.send_errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.metrics
+                    .send_errors
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Err(e)
             }
         }
@@ -436,11 +438,15 @@ impl MessageTransport for DatabaseTransport {
         };
         match self.insert_message(&stored_msg, true).await {
             Ok(()) => {
-                self.metrics.messages_sent.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.metrics
+                    .messages_sent
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Ok(())
             }
             Err(e) => {
-                self.metrics.send_errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.metrics
+                    .send_errors
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Err(e)
             }
         }
@@ -528,7 +534,9 @@ async fn poll_loop(
 
                         if let Ok(msg) = serde_json::from_str::<AgentMessage>(&json) {
                             if !msg.is_expired() {
-                                metrics.messages_received.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                metrics
+                                    .messages_received
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 if tx.send(Arc::new(msg)).is_err() {
                                     return;
                                 }
@@ -537,10 +545,14 @@ async fn poll_loop(
                     }
                 } else {
                     had_error = true;
-                    metrics.poll_errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    metrics
+                        .poll_errors
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     eprintln!(
                         "  ⚠ messaging: direct fetch error for {}@{}: {:?}",
-                        addr.agent_id, addr.run_id, fetch_result.unwrap_err()
+                        addr.agent_id,
+                        addr.run_id,
+                        fetch_result.unwrap_err()
                     );
                 }
             }
@@ -549,7 +561,9 @@ async fn poll_loop(
             }
             Err(e) => {
                 had_error = true;
-                metrics.poll_errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                metrics
+                    .poll_errors
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 eprintln!(
                     "  ⚠ messaging: direct claim error for {}@{}: {:?}",
                     addr.agent_id, addr.run_id, e
@@ -587,7 +601,9 @@ async fn poll_loop(
 
                     if let Ok(msg) = serde_json::from_str::<AgentMessage>(&json) {
                         if !msg.is_expired() {
-                            metrics.messages_received.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            metrics
+                                .messages_received
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             if tx.send(Arc::new(msg)).is_err() {
                                 return;
                             }
@@ -597,10 +613,13 @@ async fn poll_loop(
                 }
             } else {
                 had_error = true;
-                metrics.poll_errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                metrics
+                    .poll_errors
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 eprintln!(
                     "  ⚠ messaging: broadcast poll error for delegation {}: {:?}",
-                    did, broadcast_result.unwrap_err()
+                    did,
+                    broadcast_result.unwrap_err()
                 );
             }
         }
@@ -736,7 +755,10 @@ impl CleanupScheduler {
                     Ok(result) => {
                         let n = result.rows_affected();
                         if n > 0 {
-                            eprintln!("  ℹ messaging: cleaned up {n} messages older than {:?}", age);
+                            eprintln!(
+                                "  ℹ messaging: cleaned up {n} messages older than {:?}",
+                                age
+                            );
                         }
                     }
                     Err(e) => {
@@ -757,9 +779,7 @@ impl CleanupScheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::messaging::types::{
-        AgentSignal, MessagePayload, MessageTarget,
-    };
+    use crate::messaging::types::{AgentSignal, MessagePayload, MessageTarget};
 
     fn addr(run: &str, agent: &str) -> AgentAddress {
         AgentAddress::new(run, agent)
@@ -827,7 +847,9 @@ mod tests {
         );
 
         // Should already have broadcast target.
-        assert!(matches!(&msg.to, MessageTarget::Broadcast { delegation_id } if delegation_id == "del-1"));
+        assert!(
+            matches!(&msg.to, MessageTarget::Broadcast { delegation_id } if delegation_id == "del-1")
+        );
 
         let json = serde_json::to_string(&msg).unwrap();
         let restored: AgentMessage = serde_json::from_str(&json).unwrap();
@@ -856,7 +878,10 @@ mod tests {
     #[test]
     fn transport_metrics_default() {
         let m = TransportMetrics::default();
-        assert_eq!(m.messages_sent.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(
+            m.messages_sent.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
         assert_eq!(m.poll_errors.load(std::sync::atomic::Ordering::Relaxed), 0);
     }
 

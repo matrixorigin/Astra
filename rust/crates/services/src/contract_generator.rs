@@ -755,9 +755,19 @@ mod tests {
         };
         let contract = cg.generate("Do thing", &plan, None).unwrap();
         let s0 = &contract.subtasks[0];
-        assert_eq!(s0.criteria.len(), 2, "Command and CommandOutput should be filtered");
-        assert!(matches!(s0.criteria[0].verifier, VerifierKind::FileExists { .. }));
-        assert!(matches!(s0.criteria[1].verifier, VerifierKind::GrepCheck { .. }));
+        assert_eq!(
+            s0.criteria.len(),
+            2,
+            "Command and CommandOutput should be filtered"
+        );
+        assert!(matches!(
+            s0.criteria[0].verifier,
+            VerifierKind::FileExists { .. }
+        ));
+        assert!(matches!(
+            s0.criteria[1].verifier,
+            VerifierKind::GrepCheck { .. }
+        ));
     }
 
     #[test]

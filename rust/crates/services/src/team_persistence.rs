@@ -52,20 +52,13 @@ pub struct TeamDefinition {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TeamCoordination {
     /// Producer + reviewer loop.
-    Adversarial {
-        max_rounds: u32,
-        threshold: f64,
-    },
+    Adversarial { max_rounds: u32, threshold: f64 },
     /// Parallel dispatch with aggregation.
-    FanOut {
-        aggregation: String,
-    },
+    FanOut { aggregation: String },
     /// Sequential chain: output of member N feeds member N+1.
     Pipeline,
     /// One-by-one with optional early exit.
-    Sequential {
-        stop_on_success: bool,
-    },
+    Sequential { stop_on_success: bool },
 }
 
 /// Lightweight member declaration within a team.
@@ -212,7 +205,10 @@ impl std::fmt::Display for TeamValidationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::AdversarialMemberCount(n) => {
-                write!(f, "adversarial coordination requires exactly 2 members, got {n}")
+                write!(
+                    f,
+                    "adversarial coordination requires exactly 2 members, got {n}"
+                )
             }
             Self::EmptyMembers => write!(f, "team must have at least one member"),
             Self::DuplicateRoles(roles) => {
@@ -499,11 +495,7 @@ pub trait TeamPersistenceService: Send + Sync {
     }
 
     /// Delete a snapshot by ID. Returns true if found and deleted.
-    async fn delete_snapshot(
-        &self,
-        _snapshot_id: &str,
-        _user_id: &str,
-    ) -> Result<bool, String> {
+    async fn delete_snapshot(&self, _snapshot_id: &str, _user_id: &str) -> Result<bool, String> {
         Ok(false)
     }
 }
@@ -679,11 +671,7 @@ impl TeamPersistenceService for InMemoryTeamStore {
         }
     }
 
-    async fn delete_snapshot(
-        &self,
-        snapshot_id: &str,
-        _user_id: &str,
-    ) -> Result<bool, String> {
+    async fn delete_snapshot(&self, snapshot_id: &str, _user_id: &str) -> Result<bool, String> {
         let mut snaps = self.snapshots.write().map_err(|e| e.to_string())?;
         let before = snaps.len();
         snaps.retain(|s| s.snapshot_id != snapshot_id);
@@ -729,10 +717,8 @@ impl TeamPersistenceService for MatrixOneTeamStore {
     async fn save_team(&self, team: &TeamDefinition) -> Result<(), String> {
         let coordination_json =
             serde_json::to_string(&team.coordination).map_err(|e| e.to_string())?;
-        let members_json =
-            serde_json::to_string(&team.members).map_err(|e| e.to_string())?;
-        let context_json =
-            serde_json::to_string(&team.context).map_err(|e| e.to_string())?;
+        let members_json = serde_json::to_string(&team.members).map_err(|e| e.to_string())?;
+        let context_json = serde_json::to_string(&team.context).map_err(|e| e.to_string())?;
         let worktree_str = serde_json::to_string(&team.worktree_mode)
             .map_err(|e| e.to_string())?
             .trim_matches('"')
@@ -785,11 +771,7 @@ impl TeamPersistenceService for MatrixOneTeamStore {
         Ok(())
     }
 
-    async fn load_team(
-        &self,
-        user_id: &str,
-        name: &str,
-    ) -> Result<Option<TeamDefinition>, String> {
+    async fn load_team(&self, user_id: &str, name: &str) -> Result<Option<TeamDefinition>, String> {
         let row = sqlx::query(
             "SELECT team_id, user_id, name, description, coordination, \
                     members_json, context_json, worktree_mode, \
@@ -831,14 +813,12 @@ impl TeamPersistenceService for MatrixOneTeamStore {
     }
 
     async fn delete_team(&self, user_id: &str, name: &str) -> Result<bool, String> {
-        let result = sqlx::query(
-            "DELETE FROM team_definitions WHERE user_id = ? AND name = ?",
-        )
-        .bind(user_id)
-        .bind(name)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| format!("team DELETE failed: {e}"))?;
+        let result = sqlx::query("DELETE FROM team_definitions WHERE user_id = ? AND name = ?")
+            .bind(user_id)
+            .bind(name)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| format!("team DELETE failed: {e}"))?;
 
         Ok(result.rows_affected() > 0)
     }
@@ -1015,19 +995,14 @@ impl TeamPersistenceService for MatrixOneTeamStore {
         }))
     }
 
-    async fn delete_snapshot(
-        &self,
-        snapshot_id: &str,
-        user_id: &str,
-    ) -> Result<bool, String> {
-        let result = sqlx::query(
-            "DELETE FROM team_snapshots WHERE snapshot_id = ? AND user_id = ?",
-        )
-        .bind(snapshot_id)
-        .bind(user_id)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| format!("snapshot DELETE failed: {e}"))?;
+    async fn delete_snapshot(&self, snapshot_id: &str, user_id: &str) -> Result<bool, String> {
+        let result =
+            sqlx::query("DELETE FROM team_snapshots WHERE snapshot_id = ? AND user_id = ?")
+                .bind(snapshot_id)
+                .bind(user_id)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| format!("snapshot DELETE failed: {e}"))?;
         Ok(result.rows_affected() > 0)
     }
 }
@@ -1041,13 +1016,11 @@ fn row_to_team_definition(row: &sqlx::mysql::MySqlRow) -> Result<TeamDefinition,
     let coord_json: String = row.get("coordination");
     let members_str: String = row.get("members_json");
     let context_str: String = row.try_get("context_json").unwrap_or_default();
-    let wt_str: String = row.try_get("worktree_mode").unwrap_or_else(|_| "shared".to_string());
-    let created_at: String = row
-        .try_get::<String, _>("created_at")
-        .unwrap_or_default();
-    let updated_at: String = row
-        .try_get::<String, _>("updated_at")
-        .unwrap_or_default();
+    let wt_str: String = row
+        .try_get("worktree_mode")
+        .unwrap_or_else(|_| "shared".to_string());
+    let created_at: String = row.try_get::<String, _>("created_at").unwrap_or_default();
+    let updated_at: String = row.try_get::<String, _>("updated_at").unwrap_or_default();
 
     let coordination: TeamCoordination =
         serde_json::from_str(&coord_json).map_err(|e| format!("bad coordination JSON: {e}"))?;
@@ -1205,7 +1178,8 @@ pub fn builtin_teams(user_id: &str, now: &str) -> Vec<TeamDefinition> {
                     role: "planner".to_string(),
                     agent_id: None,
                     system_prompt: Some(
-                        "You decompose the task into subtasks with acceptance criteria.".to_string(),
+                        "You decompose the task into subtasks with acceptance criteria."
+                            .to_string(),
                     ),
                     skills: vec![],
                     model_override: None,
@@ -1604,8 +1578,7 @@ mod tests {
             let bare = json.trim_matches('"');
             assert_eq!(bare, expected);
             // Reverse: wrap in quotes for deserialization
-            let restored: WorktreeMode =
-                serde_json::from_str(&format!("\"{bare}\"")).unwrap();
+            let restored: WorktreeMode = serde_json::from_str(&format!("\"{bare}\"")).unwrap();
             assert_eq!(restored, mode);
         }
     }
@@ -1679,9 +1652,10 @@ mod tests {
             max_delegation_depth: 0,
         });
         let err = validate_team(&team).unwrap_err();
-        assert!(err
-            .iter()
-            .any(|e| matches!(e, TeamValidationError::AdversarialMemberCount(3))));
+        assert!(
+            err.iter()
+                .any(|e| matches!(e, TeamValidationError::AdversarialMemberCount(3)))
+        );
     }
 
     #[test]
@@ -1700,7 +1674,10 @@ mod tests {
         // Make both members have the same role
         team.members[1].role = team.members[0].role.clone();
         let err = validate_team(&team).unwrap_err();
-        assert!(err.iter().any(|e| matches!(e, TeamValidationError::DuplicateRoles(_))));
+        assert!(
+            err.iter()
+                .any(|e| matches!(e, TeamValidationError::DuplicateRoles(_)))
+        );
     }
 
     #[test]
@@ -1709,9 +1686,10 @@ mod tests {
         team.members[0].agent_id = Some("same-id".to_string());
         team.members[1].agent_id = Some("same-id".to_string());
         let err = validate_team(&team).unwrap_err();
-        assert!(err
-            .iter()
-            .any(|e| matches!(e, TeamValidationError::DuplicateAgentIds(_))));
+        assert!(
+            err.iter()
+                .any(|e| matches!(e, TeamValidationError::DuplicateAgentIds(_)))
+        );
     }
 
     #[test]
@@ -1732,10 +1710,9 @@ mod tests {
         base.system_prompt = Some("I am the registered coder.".to_string());
         base.skill_filter = vec!["search".to_string(), "read".to_string()];
         base.model_override = Some("gpt-4".to_string());
-        registry.register(base);
+        registry.register(base).unwrap();
 
-        let profile =
-            resolve_member_to_profile_with_registry(member, &team, Some(&registry));
+        let profile = resolve_member_to_profile_with_registry(member, &team, Some(&registry));
 
         // Member has no system_prompt override → registry prompt used
         assert_eq!(
@@ -1761,10 +1738,9 @@ mod tests {
         base.system_prompt = Some("Registry prompt.".to_string());
         base.skill_filter = vec!["search".to_string()];
         base.model_override = Some("gpt-4".to_string());
-        registry.register(base);
+        registry.register(base).unwrap();
 
-        let profile =
-            resolve_member_to_profile_with_registry(&member, &team, Some(&registry));
+        let profile = resolve_member_to_profile_with_registry(&member, &team, Some(&registry));
 
         // Member overrides win
         assert_eq!(
@@ -1827,10 +1803,9 @@ mod tests {
 
         let mut registry = AgentProfileRegistry::new();
         let base = AgentProfile::new("coder-agent", "coder", AgentTier::User);
-        registry.register(base);
+        registry.register(base).unwrap();
 
-        let profile =
-            resolve_member_to_profile_with_registry(&member, &team, Some(&registry));
+        let profile = resolve_member_to_profile_with_registry(&member, &team, Some(&registry));
         assert_eq!(profile.tier, AgentTier::System);
         assert!(profile.can_delegate);
     }
@@ -1898,10 +1873,9 @@ mod tests {
         let mut registry = AgentProfileRegistry::new();
         let mut base = AgentProfile::new("coder-agent", "coder", AgentTier::System);
         base.system_prompt = Some("Registered coder prompt.".to_string());
-        registry.register(base);
+        registry.register(base).unwrap();
 
-        let (_request, profiles) =
-            resolve_team(&team, "task", "run-1", Some(&registry)).unwrap();
+        let (_request, profiles) = resolve_team(&team, "task", "run-1", Some(&registry)).unwrap();
 
         // First profile (coder-agent) should use registry base prompt
         assert_eq!(
@@ -2179,7 +2153,11 @@ mod tests {
             .await
             .unwrap();
 
-        let found = store.find_snapshot("snap-def", "u1").await.unwrap().unwrap();
+        let found = store
+            .find_snapshot("snap-def", "u1")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(found.team_definition_json, Some(def_json));
     }
 }

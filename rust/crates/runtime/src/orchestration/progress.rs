@@ -113,7 +113,13 @@ impl AgentProgressEmitter {
         });
     }
 
-    pub fn completed(&self, summary: impl Into<String>, tool_calls: u32, tokens: (u64, u64), duration_ms: u64) {
+    pub fn completed(
+        &self,
+        summary: impl Into<String>,
+        tool_calls: u32,
+        tokens: (u64, u64),
+        duration_ms: u64,
+    ) {
         self.emit(ProgressEventType::Completed {
             result_summary: summary.into(),
             total_tool_calls: tool_calls,
@@ -161,7 +167,10 @@ mod tests {
 
         let event = rx.recv().await.unwrap();
         assert_eq!(event.agent_id, "test-agent");
-        assert!(matches!(event.event_type, ProgressEventType::Started { .. }));
+        assert!(matches!(
+            event.event_type,
+            ProgressEventType::Started { .. }
+        ));
     }
 
     #[tokio::test]

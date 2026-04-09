@@ -435,12 +435,16 @@ pub struct InMemoryAgentService {
 }
 
 impl Default for InMemoryAgentService {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl InMemoryAgentService {
     pub fn new() -> Self {
-        Self { agents: std::sync::RwLock::new(Vec::new()) }
+        Self {
+            agents: std::sync::RwLock::new(Vec::new()),
+        }
     }
 }
 
@@ -452,8 +456,14 @@ impl AgentService for InMemoryAgentService {
         request: AgentCreateRequestData,
     ) -> Result<AgentRecord, (StatusCode, Json<ErrorResponse>)> {
         let mut agents = self.agents.write().expect("agent lock poisoned");
-        if agents.iter().any(|a| a.owner_user_id == user_id && a.name == request.name) {
-            return Err(error_response(StatusCode::CONFLICT, "agent name already exists"));
+        if agents
+            .iter()
+            .any(|a| a.owner_user_id == user_id && a.name == request.name)
+        {
+            return Err(error_response(
+                StatusCode::CONFLICT,
+                "agent name already exists",
+            ));
         }
         let now = chrono::Utc::now().to_rfc3339();
         let record = AgentRecord {
@@ -476,7 +486,8 @@ impl AgentService for InMemoryAgentService {
         user_id: String,
     ) -> Result<AgentListRecord, (StatusCode, Json<ErrorResponse>)> {
         let agents = self.agents.read().expect("agent lock poisoned");
-        let items: Vec<AgentListItem> = agents.iter()
+        let items: Vec<AgentListItem> = agents
+            .iter()
             .filter(|a| a.owner_user_id == user_id)
             .map(|a| AgentListItem {
                 agent_id: a.agent_id.clone(),
@@ -489,7 +500,10 @@ impl AgentService for InMemoryAgentService {
             })
             .collect();
         let total = items.len() as i64;
-        Ok(AgentListRecord { agents: items, total })
+        Ok(AgentListRecord {
+            agents: items,
+            total,
+        })
     }
 
     async fn get_agent(
@@ -498,7 +512,8 @@ impl AgentService for InMemoryAgentService {
         user_id: String,
     ) -> Result<AgentRecord, (StatusCode, Json<ErrorResponse>)> {
         let agents = self.agents.read().expect("agent lock poisoned");
-        agents.iter()
+        agents
+            .iter()
             .find(|a| a.agent_id == agent_id && a.owner_user_id == user_id)
             .cloned()
             .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "agent not found"))
@@ -511,13 +526,22 @@ impl AgentService for InMemoryAgentService {
         request: AgentUpdateRequestData,
     ) -> Result<AgentRecord, (StatusCode, Json<ErrorResponse>)> {
         let mut agents = self.agents.write().expect("agent lock poisoned");
-        let agent = agents.iter_mut()
+        let agent = agents
+            .iter_mut()
             .find(|a| a.agent_id == agent_id && a.owner_user_id == user_id)
             .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "agent not found"))?;
-        if let Some(name) = request.name { agent.name = name; }
-        if let Some(config) = request.agent_config { agent.agent_config = config; }
-        if let Some(ds) = request.data_source { agent.data_source = ds; }
-        if let Some(active) = request.is_active { agent.is_active = active; }
+        if let Some(name) = request.name {
+            agent.name = name;
+        }
+        if let Some(config) = request.agent_config {
+            agent.agent_config = config;
+        }
+        if let Some(ds) = request.data_source {
+            agent.data_source = ds;
+        }
+        if let Some(active) = request.is_active {
+            agent.is_active = active;
+        }
         agent.updated_at = Some(chrono::Utc::now().to_rfc3339());
         Ok(agent.clone())
     }
@@ -631,11 +655,17 @@ mod tests {
     #[tokio::test]
     async fn create_agent_returns_record() {
         let svc = InMemoryAgentService::new();
-        let record = svc.create_agent("u1".into(), AgentCreateRequestData {
-            name: "my-agent".into(),
-            agent_config: Some(serde_json::json!({"model": "gpt-4"})),
-            data_source: None,
-        }).await.unwrap();
+        let record = svc
+            .create_agent(
+                "u1".into(),
+                AgentCreateRequestData {
+                    name: "my-agent".into(),
+                    agent_config: Some(serde_json::json!({"model": "gpt-4"})),
+                    data_source: None,
+                },
+            )
+            .await
+            .unwrap();
         assert_eq!(record.name, "my-agent");
         assert_eq!(record.owner_user_id, "u1");
         assert!(record.is_active);
@@ -645,12 +675,26 @@ mod tests {
     #[tokio::test]
     async fn list_agents_filters_by_user() {
         let svc = InMemoryAgentService::new();
-        svc.create_agent("u1".into(), AgentCreateRequestData {
-            name: "a1".into(), agent_config: None, data_source: None,
-        }).await.unwrap();
-        svc.create_agent("u2".into(), AgentCreateRequestData {
-            name: "a2".into(), agent_config: None, data_source: None,
-        }).await.unwrap();
+        svc.create_agent(
+            "u1".into(),
+            AgentCreateRequestData {
+                name: "a1".into(),
+                agent_config: None,
+                data_source: None,
+            },
+        )
+        .await
+        .unwrap();
+        svc.create_agent(
+            "u2".into(),
+            AgentCreateRequestData {
+                name: "a2".into(),
+                agent_config: None,
+                data_source: None,
+            },
+        )
+        .await
+        .unwrap();
 
         let list = svc.list_agents("u1".into()).await.unwrap();
         assert_eq!(list.total, 1);
@@ -660,12 +704,26 @@ mod tests {
     #[tokio::test]
     async fn create_duplicate_name_returns_conflict() {
         let svc = InMemoryAgentService::new();
-        svc.create_agent("u1".into(), AgentCreateRequestData {
-            name: "dup".into(), agent_config: None, data_source: None,
-        }).await.unwrap();
-        let result = svc.create_agent("u1".into(), AgentCreateRequestData {
-            name: "dup".into(), agent_config: None, data_source: None,
-        }).await;
+        svc.create_agent(
+            "u1".into(),
+            AgentCreateRequestData {
+                name: "dup".into(),
+                agent_config: None,
+                data_source: None,
+            },
+        )
+        .await
+        .unwrap();
+        let result = svc
+            .create_agent(
+                "u1".into(),
+                AgentCreateRequestData {
+                    name: "dup".into(),
+                    agent_config: None,
+                    data_source: None,
+                },
+            )
+            .await;
         assert!(result.is_err());
         let (status, _) = result.unwrap_err();
         assert_eq!(status, StatusCode::CONFLICT);
@@ -674,23 +732,48 @@ mod tests {
     #[tokio::test]
     async fn same_name_different_user_ok() {
         let svc = InMemoryAgentService::new();
-        svc.create_agent("u1".into(), AgentCreateRequestData {
-            name: "shared".into(), agent_config: None, data_source: None,
-        }).await.unwrap();
+        svc.create_agent(
+            "u1".into(),
+            AgentCreateRequestData {
+                name: "shared".into(),
+                agent_config: None,
+                data_source: None,
+            },
+        )
+        .await
+        .unwrap();
         // Different user can use the same name
-        svc.create_agent("u2".into(), AgentCreateRequestData {
-            name: "shared".into(), agent_config: None, data_source: None,
-        }).await.unwrap();
+        svc.create_agent(
+            "u2".into(),
+            AgentCreateRequestData {
+                name: "shared".into(),
+                agent_config: None,
+                data_source: None,
+            },
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn get_agent_by_id() {
         let svc = InMemoryAgentService::new();
-        let created = svc.create_agent("u1".into(), AgentCreateRequestData {
-            name: "test".into(), agent_config: None, data_source: None,
-        }).await.unwrap();
+        let created = svc
+            .create_agent(
+                "u1".into(),
+                AgentCreateRequestData {
+                    name: "test".into(),
+                    agent_config: None,
+                    data_source: None,
+                },
+            )
+            .await
+            .unwrap();
 
-        let fetched = svc.get_agent(created.agent_id.clone(), "u1".into()).await.unwrap();
+        let fetched = svc
+            .get_agent(created.agent_id.clone(), "u1".into())
+            .await
+            .unwrap();
         assert_eq!(fetched.agent_id, created.agent_id);
     }
 
@@ -706,16 +789,31 @@ mod tests {
     #[tokio::test]
     async fn update_agent_fields() {
         let svc = InMemoryAgentService::new();
-        let created = svc.create_agent("u1".into(), AgentCreateRequestData {
-            name: "old".into(), agent_config: None, data_source: None,
-        }).await.unwrap();
+        let created = svc
+            .create_agent(
+                "u1".into(),
+                AgentCreateRequestData {
+                    name: "old".into(),
+                    agent_config: None,
+                    data_source: None,
+                },
+            )
+            .await
+            .unwrap();
 
-        let updated = svc.update_agent(created.agent_id.clone(), "u1".into(), AgentUpdateRequestData {
-            name: Some("new".into()),
-            agent_config: None,
-            data_source: None,
-            is_active: Some(false),
-        }).await.unwrap();
+        let updated = svc
+            .update_agent(
+                created.agent_id.clone(),
+                "u1".into(),
+                AgentUpdateRequestData {
+                    name: Some("new".into()),
+                    agent_config: None,
+                    data_source: None,
+                    is_active: Some(false),
+                },
+            )
+            .await
+            .unwrap();
         assert_eq!(updated.name, "new");
         assert!(!updated.is_active);
         assert!(updated.updated_at.is_some());
@@ -724,11 +822,21 @@ mod tests {
     #[tokio::test]
     async fn delete_agent_removes_it() {
         let svc = InMemoryAgentService::new();
-        let created = svc.create_agent("u1".into(), AgentCreateRequestData {
-            name: "doomed".into(), agent_config: None, data_source: None,
-        }).await.unwrap();
+        let created = svc
+            .create_agent(
+                "u1".into(),
+                AgentCreateRequestData {
+                    name: "doomed".into(),
+                    agent_config: None,
+                    data_source: None,
+                },
+            )
+            .await
+            .unwrap();
 
-        svc.delete_agent(created.agent_id.clone(), "u1".into()).await.unwrap();
+        svc.delete_agent(created.agent_id.clone(), "u1".into())
+            .await
+            .unwrap();
         let result = svc.get_agent(created.agent_id, "u1".into()).await;
         assert!(result.is_err());
     }
@@ -743,9 +851,17 @@ mod tests {
     #[tokio::test]
     async fn user_isolation_on_get() {
         let svc = InMemoryAgentService::new();
-        let created = svc.create_agent("u1".into(), AgentCreateRequestData {
-            name: "private".into(), agent_config: None, data_source: None,
-        }).await.unwrap();
+        let created = svc
+            .create_agent(
+                "u1".into(),
+                AgentCreateRequestData {
+                    name: "private".into(),
+                    agent_config: None,
+                    data_source: None,
+                },
+            )
+            .await
+            .unwrap();
 
         // u2 cannot access u1's agent
         let result = svc.get_agent(created.agent_id, "u2".into()).await;
@@ -756,9 +872,18 @@ mod tests {
     async fn unconfigured_service_returns_error() {
         let svc = UnconfiguredAgentService;
         assert!(svc.list_agents("u1".into()).await.is_err());
-        assert!(svc.create_agent("u1".into(), AgentCreateRequestData {
-            name: "x".into(), agent_config: None, data_source: None,
-        }).await.is_err());
+        assert!(
+            svc.create_agent(
+                "u1".into(),
+                AgentCreateRequestData {
+                    name: "x".into(),
+                    agent_config: None,
+                    data_source: None,
+                }
+            )
+            .await
+            .is_err()
+        );
     }
 
     #[test]

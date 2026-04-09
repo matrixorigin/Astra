@@ -78,10 +78,7 @@ pub trait MessageTransport: Send + Sync {
     ///
     /// Must be called after `register`. Returns a stream that yields messages
     /// addressed to this agent (both direct and broadcast).
-    async fn subscribe(
-        &self,
-        addr: &AgentAddress,
-    ) -> Result<Box<dyn MessageStream>, MailboxError>;
+    async fn subscribe(&self, addr: &AgentAddress) -> Result<Box<dyn MessageStream>, MailboxError>;
 
     /// Send a message to a single agent (`MessageTarget::Direct`).
     async fn send(&self, msg: Arc<AgentMessage>) -> Result<(), MailboxError>;

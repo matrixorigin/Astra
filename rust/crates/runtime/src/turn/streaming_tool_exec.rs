@@ -24,7 +24,7 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, Semaphore};
 use tokio::task::JoinHandle;
 
-use super::parallel_tool_exec::{is_read_only_tool, ToolExecutorFn, ToolExecResult};
+use super::parallel_tool_exec::{ToolExecResult, ToolExecutorFn, is_read_only_tool};
 
 /// Maximum speculative executions during streaming.
 const MAX_SPECULATIVE: usize = 5;
@@ -252,13 +252,8 @@ mod tests {
     async fn discard_intercepted() {
         let exec = StreamingToolExecutor::new(make_slow_executor(200));
 
-        exec.on_tool_block(
-            "c1".into(),
-            "grep".into(),
-            tool_block("grep", "c1"),
-            0,
-        )
-        .await;
+        exec.on_tool_block("c1".into(), "grep".into(), tool_block("grep", "c1"), 0)
+            .await;
 
         // Discard before completion
         exec.discard("c1").await;

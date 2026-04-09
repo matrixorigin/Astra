@@ -460,7 +460,11 @@ pub async fn evaluate_pre_tool_hooks(
                     PreToolDecision::Allow => {}
                 }
             }
-            HookAction::Http { url, headers, timeout_secs } => {
+            HookAction::Http {
+                url,
+                headers,
+                timeout_secs,
+            } => {
                 let decision =
                     run_http_pre_hook(url, headers, tool_name, tool_args, *timeout_secs).await;
                 match decision {
@@ -535,7 +539,11 @@ pub async fn evaluate_post_tool_hooks(
                     current_output = modified;
                 }
             }
-            HookAction::Http { url, headers, timeout_secs } => {
+            HookAction::Http {
+                url,
+                headers,
+                timeout_secs,
+            } => {
                 if let Some(modified) = run_http_post_hook(
                     url,
                     headers,
@@ -820,8 +828,13 @@ async fn http_post_json(
 
         let request = format!(
             "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{}\r\n{}",
-            path, host, body.len(),
-            extra_headers.iter().map(|(k, v)| format!("{}: {}\r\n", k, v)).collect::<String>(),
+            path,
+            host,
+            body.len(),
+            extra_headers
+                .iter()
+                .map(|(k, v)| format!("{}: {}\r\n", k, v))
+                .collect::<String>(),
             body
         );
         stream.write_all(request.as_bytes()).await.ok()?;
@@ -1104,7 +1117,11 @@ pub async fn evaluate_session_hooks(
                     event
                 );
             }
-            HookAction::Http { url, headers, timeout_secs } => {
+            HookAction::Http {
+                url,
+                headers,
+                timeout_secs,
+            } => {
                 let payload = serde_json::json!({
                     "hook_event": format!("{:?}", event).to_lowercase(),
                     "session_id": session_id,
@@ -1443,10 +1460,10 @@ mod tests {
                 command: "check".into(),
             },
             timeout_secs: 10,
-        is_async: false,
-        condition: None,
-        once: false,
-        priority: 0,
+            is_async: false,
+            condition: None,
+            once: false,
+            priority: 0,
         };
         assert!(hook.matches_tool("bash"));
         assert!(!hook.matches_tool("read_file"));
@@ -1461,10 +1478,10 @@ mod tests {
                 command: "lint".into(),
             },
             timeout_secs: 10,
-        is_async: false,
-        condition: None,
-        once: false,
-        priority: 0,
+            is_async: false,
+            condition: None,
+            once: false,
+            priority: 0,
         };
         assert!(hook.matches_tool("write_file"));
         assert!(hook.matches_tool("write_new_file"));
@@ -1480,10 +1497,10 @@ mod tests {
                 command: "log".into(),
             },
             timeout_secs: 10,
-        is_async: false,
-        condition: None,
-        once: false,
-        priority: 0,
+            is_async: false,
+            condition: None,
+            once: false,
+            priority: 0,
         };
         assert!(hook.matches_tool("bash"));
         assert!(hook.matches_tool("read_file"));
@@ -1498,10 +1515,10 @@ mod tests {
                 command: "echo pre".into(),
             },
             timeout_secs: 5,
-        is_async: false,
-        condition: None,
-        once: false,
-        priority: 0,
+            is_async: false,
+            condition: None,
+            once: false,
+            priority: 0,
         };
         let json = serde_json::to_string(&hook).unwrap();
         let parsed: ToolEventHook = serde_json::from_str(&json).unwrap();
@@ -1518,10 +1535,10 @@ mod tests {
                     command: "pre-bash".into(),
                 },
                 timeout_secs: 10,
-            is_async: false,
-            condition: None,
-            once: false,
-            priority: 0,
+                is_async: false,
+                condition: None,
+                once: false,
+                priority: 0,
             },
             ToolEventHook {
                 event: ToolEventKind::PostToolUse,
@@ -1530,10 +1547,10 @@ mod tests {
                     command: "post-bash".into(),
                 },
                 timeout_secs: 10,
-            is_async: false,
-            condition: None,
-            once: false,
-            priority: 0,
+                is_async: false,
+                condition: None,
+                once: false,
+                priority: 0,
             },
             ToolEventHook {
                 event: ToolEventKind::PreToolUse,
@@ -1542,10 +1559,10 @@ mod tests {
                     command: "pre-read".into(),
                 },
                 timeout_secs: 10,
-            is_async: false,
-            condition: None,
-            once: false,
-            priority: 0,
+                is_async: false,
+                condition: None,
+                once: false,
+                priority: 0,
             },
         ]);
         assert_eq!(registry.len(), 3);
@@ -1684,10 +1701,10 @@ mod tests {
                     command: "validate-command.sh".into(),
                 },
                 timeout_secs: 10,
-            is_async: false,
-            condition: None,
-            once: false,
-            priority: 0,
+                is_async: false,
+                condition: None,
+                once: false,
+                priority: 0,
             },
             ToolEventHook {
                 event: ToolEventKind::PostToolUse,
@@ -1696,10 +1713,10 @@ mod tests {
                     command: "run-linter.sh".into(),
                 },
                 timeout_secs: 30,
-            is_async: false,
-            condition: None,
-            once: false,
-            priority: 0,
+                is_async: false,
+                condition: None,
+                once: false,
+                priority: 0,
             },
         ];
 
@@ -1725,10 +1742,10 @@ mod tests {
                     command: "specific-bash-check".into(),
                 },
                 timeout_secs: 5,
-            is_async: false,
-            condition: None,
-            once: false,
-            priority: 0,
+                is_async: false,
+                condition: None,
+                once: false,
+                priority: 0,
             },
             ToolEventHook {
                 event: ToolEventKind::PreToolUse,
@@ -1737,10 +1754,10 @@ mod tests {
                     command: "glob-bash-check".into(),
                 },
                 timeout_secs: 5,
-            is_async: false,
-            condition: None,
-            once: false,
-            priority: 0,
+                is_async: false,
+                condition: None,
+                once: false,
+                priority: 0,
             },
             ToolEventHook {
                 event: ToolEventKind::PreToolUse,
@@ -1749,10 +1766,10 @@ mod tests {
                     command: "catch-all".into(),
                 },
                 timeout_secs: 5,
-            is_async: false,
-            condition: None,
-            once: false,
-            priority: 0,
+                is_async: false,
+                condition: None,
+                once: false,
+                priority: 0,
             },
         ]);
 
@@ -1784,10 +1801,10 @@ mod tests {
                 command: r#"echo '{"decision": "allow"}'"#.into(),
             },
             timeout_secs: 5,
-        is_async: false,
-        condition: None,
-        once: false,
-        priority: 0,
+            is_async: false,
+            condition: None,
+            once: false,
+            priority: 0,
         }]);
 
         let decision = evaluate_pre_tool_hooks(&registry, "bash", &serde_json::json!({})).await;
@@ -1803,10 +1820,10 @@ mod tests {
                 command: r#"echo '{"decision": "block", "reason": "rm -rf detected"}'"#.into(),
             },
             timeout_secs: 5,
-        is_async: false,
-        condition: None,
-        once: false,
-        priority: 0,
+            is_async: false,
+            condition: None,
+            once: false,
+            priority: 0,
         }]);
 
         let decision = evaluate_pre_tool_hooks(&registry, "bash", &serde_json::json!({})).await;
@@ -1822,10 +1839,10 @@ mod tests {
                 command: r#"echo '{"decision": "allow", "context": "hook injected info"}'"#.into(),
             },
             timeout_secs: 5,
-        is_async: false,
-        condition: None,
-        once: false,
-        priority: 0,
+            is_async: false,
+            condition: None,
+            once: false,
+            priority: 0,
         }]);
 
         let decision =
@@ -1845,10 +1862,10 @@ mod tests {
                 command: "exit 1".into(),
             },
             timeout_secs: 5,
-        is_async: false,
-        condition: None,
-        once: false,
-        priority: 0,
+            is_async: false,
+            condition: None,
+            once: false,
+            priority: 0,
         }]);
 
         let decision = evaluate_pre_tool_hooks(&registry, "bash", &serde_json::json!({})).await;
@@ -1867,10 +1884,10 @@ mod tests {
                 command: r#"echo '{"decision": "block", "reason": "nope"}'"#.into(),
             },
             timeout_secs: 5,
-        is_async: false,
-        condition: None,
-        once: false,
-        priority: 0,
+            is_async: false,
+            condition: None,
+            once: false,
+            priority: 0,
         }]);
 
         let decision =
@@ -1909,10 +1926,10 @@ mod tests {
                 command: r#"echo '{"output": "modified output"}'"#.into(),
             },
             timeout_secs: 5,
-        is_async: false,
-        condition: None,
-        once: false,
-        priority: 0,
+            is_async: false,
+            condition: None,
+            once: false,
+            priority: 0,
         }]);
 
         let result =
@@ -1930,10 +1947,10 @@ mod tests {
                 command: r#"echo '{}'"#.into(),
             },
             timeout_secs: 5,
-        is_async: false,
-        condition: None,
-        once: false,
-        priority: 0,
+            is_async: false,
+            condition: None,
+            once: false,
+            priority: 0,
         }]);
 
         let result =
@@ -1958,10 +1975,10 @@ mod tests {
                 command: "true".into(),
             },
             timeout_secs: 5,
-        is_async: false,
-        condition: None,
-        once: false,
-        priority: 0,
+            is_async: false,
+            condition: None,
+            once: false,
+            priority: 0,
         }]);
 
         let decision = evaluate_pre_tool_hooks(&registry, "bash", &serde_json::json!({})).await;
@@ -1978,10 +1995,10 @@ mod tests {
                     command: r#"echo '{"decision":"allow","context":"hook1 info"}'"#.into(),
                 },
                 timeout_secs: 5,
-            is_async: false,
-            condition: None,
-            once: false,
-            priority: 0,
+                is_async: false,
+                condition: None,
+                once: false,
+                priority: 0,
             },
             ToolEventHook {
                 event: ToolEventKind::PreToolUse,
@@ -1990,10 +2007,10 @@ mod tests {
                     command: r#"echo '{"decision":"allow","context":"hook2 info"}'"#.into(),
                 },
                 timeout_secs: 5,
-            is_async: false,
-            condition: None,
-            once: false,
-            priority: 0,
+                is_async: false,
+                condition: None,
+                once: false,
+                priority: 0,
             },
         ]);
 
@@ -2197,10 +2214,10 @@ hooks:
                 command: "a".into(),
             },
             timeout_secs: 10,
-        is_async: false,
-        condition: None,
-        once: false,
-        priority: 0,
+            is_async: false,
+            condition: None,
+            once: false,
+            priority: 0,
         }];
         // No default → no change
         let result = apply_default_timeout(hooks, None);
@@ -2217,10 +2234,10 @@ hooks:
                 command: "echo hello".into(),
             },
             timeout_secs: 5,
-        is_async: false,
-        condition: None,
-        once: false,
-        priority: 0,
+            is_async: false,
+            condition: None,
+            once: false,
+            priority: 0,
         };
         let json = serde_json::to_string(&hook).unwrap();
         let parsed: SessionEventHook = serde_json::from_str(&json).unwrap();
@@ -2253,10 +2270,10 @@ hooks:
                     command: "greet".into(),
                 },
                 timeout_secs: 5,
-            is_async: false,
-            condition: None,
-            once: false,
-            priority: 0,
+                is_async: false,
+                condition: None,
+                once: false,
+                priority: 0,
             },
             SessionEventHook {
                 event: SessionEvent::SessionEnd,
@@ -2264,10 +2281,10 @@ hooks:
                     command: "cleanup".into(),
                 },
                 timeout_secs: 5,
-            is_async: false,
-            condition: None,
-            once: false,
-            priority: 0,
+                is_async: false,
+                condition: None,
+                once: false,
+                priority: 0,
             },
             SessionEventHook {
                 event: SessionEvent::SessionStart,
@@ -2276,10 +2293,10 @@ hooks:
                     value: "1".into(),
                 },
                 timeout_secs: 10,
-            is_async: false,
-            condition: None,
-            once: false,
-            priority: 0,
+                is_async: false,
+                condition: None,
+                once: false,
+                priority: 0,
             },
         ]);
         assert_eq!(registry.len(), 3);
@@ -2446,10 +2463,10 @@ session_hooks:
                 command: r#"echo '{"context": "Welcome back, user!"}'"#.into(),
             },
             timeout_secs: 5,
-        is_async: false,
-        condition: None,
-        once: false,
-        priority: 0,
+            is_async: false,
+            condition: None,
+            once: false,
+            priority: 0,
         }]);
 
         let output = evaluate_session_hooks(
@@ -2471,10 +2488,10 @@ session_hooks:
                 value: "done".into(),
             },
             timeout_secs: 10,
-        is_async: false,
-        condition: None,
-        once: false,
-        priority: 0,
+            is_async: false,
+            condition: None,
+            once: false,
+            priority: 0,
         }]);
 
         let output =
@@ -2491,10 +2508,10 @@ session_hooks:
                 command: "echo bye".into(),
             },
             timeout_secs: 5,
-        is_async: false,
-        condition: None,
-        once: false,
-        priority: 0,
+            is_async: false,
+            condition: None,
+            once: false,
+            priority: 0,
         }]);
 
         let output =
@@ -2512,10 +2529,10 @@ session_hooks:
                     command: r#"echo '{"context": "hook1"}'"#.into(),
                 },
                 timeout_secs: 5,
-            is_async: false,
-            condition: None,
-            once: false,
-            priority: 0,
+                is_async: false,
+                condition: None,
+                once: false,
+                priority: 0,
             },
             SessionEventHook {
                 event: SessionEvent::SessionStart,
@@ -2523,10 +2540,10 @@ session_hooks:
                     command: r#"echo '{"context": "hook2"}'"#.into(),
                 },
                 timeout_secs: 5,
-            is_async: false,
-            condition: None,
-            once: false,
-            priority: 0,
+                is_async: false,
+                condition: None,
+                once: false,
+                priority: 0,
             },
         ]);
 
@@ -2545,10 +2562,10 @@ session_hooks:
                 command: "exit 1".into(),
             },
             timeout_secs: 5,
-        is_async: false,
-        condition: None,
-        once: false,
-        priority: 0,
+            is_async: false,
+            condition: None,
+            once: false,
+            priority: 0,
         }]);
 
         let output =

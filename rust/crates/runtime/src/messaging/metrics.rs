@@ -5,8 +5,8 @@
 //! [`MessagingEventHandler`] trait for external observability integration
 //! (e.g., OpenTelemetry, Prometheus, or custom dashboards).
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use tokio::sync::RwLock;
@@ -48,12 +48,16 @@ impl LatencyTracker {
         self.count.fetch_add(1, Ordering::Relaxed);
         self.sum_us.fetch_add(us, Ordering::Relaxed);
         // Approximate min/max (racy but acceptable for metrics).
-        let _ = self.min_us.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
-            if us < cur { Some(us) } else { None }
-        });
-        let _ = self.max_us.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
-            if us > cur { Some(us) } else { None }
-        });
+        let _ = self
+            .min_us
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                if us < cur { Some(us) } else { None }
+            });
+        let _ = self
+            .max_us
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                if us > cur { Some(us) } else { None }
+            });
     }
 
     /// Snapshot of current latency stats.
@@ -249,20 +253,11 @@ pub enum MessagingEvent {
         reason: Option<String>,
     },
     /// A message is being retried.
-    Retried {
-        message_id: String,
-        attempt: u32,
-    },
+    Retried { message_id: String, attempt: u32 },
     /// A message was dead-lettered.
-    DeadLettered {
-        message_id: String,
-        reason: String,
-    },
+    DeadLettered { message_id: String, reason: String },
     /// A message was dropped (backpressure / channel full).
-    Dropped {
-        message_id: String,
-        reason: String,
-    },
+    Dropped { message_id: String, reason: String },
 }
 
 /// Handler for messaging events — implement this to integrate with your
@@ -317,17 +312,31 @@ impl MessagingEventHandler for StderrEventHandler {
             MessagingEvent::Sent { message_id, to, .. } => {
                 eprintln!("  📤 messaging: sent {message_id} → {to:?}");
             }
-            MessagingEvent::Received { message_id, from, .. } => {
-                eprintln!("  📥 messaging: received {message_id} from {}", from.agent_id);
+            MessagingEvent::Received {
+                message_id, from, ..
+            } => {
+                eprintln!(
+                    "  📥 messaging: received {message_id} from {}",
+                    from.agent_id
+                );
             }
-            MessagingEvent::Acked { message_id, latency } => {
-                eprintln!("  ✅ messaging: acked {message_id} ({}ms)", latency.as_millis());
+            MessagingEvent::Acked {
+                message_id,
+                latency,
+            } => {
+                eprintln!(
+                    "  ✅ messaging: acked {message_id} ({}ms)",
+                    latency.as_millis()
+                );
             }
             MessagingEvent::Nacked { message_id, reason } => {
                 let r = reason.as_deref().unwrap_or("no reason");
                 eprintln!("  ❌ messaging: nacked {message_id}: {r}");
             }
-            MessagingEvent::Retried { message_id, attempt } => {
+            MessagingEvent::Retried {
+                message_id,
+                attempt,
+            } => {
                 eprintln!("  🔄 messaging: retry {message_id} attempt #{attempt}");
             }
             MessagingEvent::DeadLettered { message_id, reason } => {
@@ -428,8 +437,12 @@ mod tests {
         }
 
         let dispatcher = EventDispatcher::new();
-        let h1 = Arc::new(CountingHandler { count: AtomicU32::new(0) });
-        let h2 = Arc::new(CountingHandler { count: AtomicU32::new(0) });
+        let h1 = Arc::new(CountingHandler {
+            count: AtomicU32::new(0),
+        });
+        let h2 = Arc::new(CountingHandler {
+            count: AtomicU32::new(0),
+        });
 
         dispatcher.add_handler(h1.clone()).await;
         dispatcher.add_handler(h2.clone()).await;

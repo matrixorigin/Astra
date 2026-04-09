@@ -950,9 +950,13 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
                                 tracker.acknowledge(message_id).await;
                             }
                             if let Some(ref metrics) = state.messaging_metrics {
-                                metrics.acks_received.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                metrics
+                                    .acks_received
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             }
-                            parts.push(format!("[{from_label} ack]: message {message_id} acknowledged"));
+                            parts.push(format!(
+                                "[{from_label} ack]: message {message_id} acknowledged"
+                            ));
                             continue;
                         }
                         crate::messaging::types::MessagePayload::Nack { message_id, reason } => {
@@ -960,10 +964,14 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
                                 tracker.reject(message_id, reason.clone()).await;
                             }
                             if let Some(ref metrics) = state.messaging_metrics {
-                                metrics.nacks_received.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                metrics
+                                    .nacks_received
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             }
                             let r = reason.as_deref().unwrap_or("no reason");
-                            parts.push(format!("[{from_label} nack]: message {message_id} rejected — {r}"));
+                            parts.push(format!(
+                                "[{from_label} nack]: message {message_id} rejected — {r}"
+                            ));
                             continue;
                         }
                         _ => {}
@@ -971,7 +979,9 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
 
                     // Track received message.
                     if let Some(ref metrics) = state.messaging_metrics {
-                        metrics.messages_received.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        metrics
+                            .messages_received
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
 
                     // Auto-ack: if the sender requested ack, send one back.
@@ -979,7 +989,9 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
                         let ack_reply = msg.make_ack(mailbox.address.clone());
                         let _ = mailbox.send(ack_reply).await;
                         if let Some(ref metrics) = state.messaging_metrics {
-                            metrics.acks_sent.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            metrics
+                                .acks_sent
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         }
                     }
 
@@ -997,7 +1009,9 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
                             parts.push(format!("[{from_label}]: {content}"));
                         }
                         crate::messaging::types::MessagePayload::Progress {
-                            status, detail, ..
+                            status,
+                            detail,
+                            ..
                         } => {
                             let extra = detail.as_deref().unwrap_or("");
                             parts.push(format!("[{from_label} progress]: {status} {extra}"));
@@ -1005,16 +1019,10 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
                         crate::messaging::types::MessagePayload::Request {
                             request_type, ..
                         } => {
-                            parts.push(format!(
-                                "[{from_label} request]: {request_type:?}"
-                            ));
+                            parts.push(format!("[{from_label} request]: {request_type:?}"));
                         }
-                        crate::messaging::types::MessagePayload::Response {
-                            accepted, ..
-                        } => {
-                            parts.push(format!(
-                                "[{from_label} response]: accepted={accepted}"
-                            ));
+                        crate::messaging::types::MessagePayload::Response { accepted, .. } => {
+                            parts.push(format!("[{from_label} response]: accepted={accepted}"));
                         }
                         crate::messaging::types::MessagePayload::Signal(sig) => {
                             parts.push(format!("[{from_label} signal]: {sig:?}"));
@@ -1049,12 +1057,19 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
                     let _ = mb.send((**retry_msg).clone()).await;
                 }
                 if let Some(ref metrics) = state.messaging_metrics {
-                    metrics.retries.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    metrics
+                        .retries
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
             }
             // Log failures and store in dead-letter queue.
             for outcome in &outcomes {
-                if let crate::messaging::ack_tracker::AckOutcome::Failed { message_id, attempts, message } = outcome {
+                if let crate::messaging::ack_tracker::AckOutcome::Failed {
+                    message_id,
+                    attempts,
+                    message,
+                } = outcome
+                {
                     eprintln!(
                         "  ⚠ messaging: ack timeout exhausted for message {} after {} attempts",
                         message_id, attempts
@@ -1062,28 +1077,44 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
                     if let Some(ref dlq) = state.dead_letter_queue {
                         dlq.store(
                             Arc::clone(message),
-                            crate::messaging::dead_letter::DeadLetterReason::AckTimeout { attempts: *attempts },
+                            crate::messaging::dead_letter::DeadLetterReason::AckTimeout {
+                                attempts: *attempts,
+                            },
                             *attempts,
-                        ).await;
+                        )
+                        .await;
                     }
                     if let Some(ref metrics) = state.messaging_metrics {
-                        metrics.dead_letters.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        metrics
+                            .dead_letters
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
-                if let crate::messaging::ack_tracker::AckOutcome::Rejected { message_id, reason, message } = outcome {
+                if let crate::messaging::ack_tracker::AckOutcome::Rejected {
+                    message_id,
+                    reason,
+                    message,
+                } = outcome
+                {
                     eprintln!(
                         "  ⚠ messaging: nack for message {}: {}",
-                        message_id, reason.as_deref().unwrap_or("no reason")
+                        message_id,
+                        reason.as_deref().unwrap_or("no reason")
                     );
                     if let Some(ref dlq) = state.dead_letter_queue {
                         dlq.store(
                             Arc::clone(message),
-                            crate::messaging::dead_letter::DeadLetterReason::Rejected { reason: reason.clone() },
+                            crate::messaging::dead_letter::DeadLetterReason::Rejected {
+                                reason: reason.clone(),
+                            },
                             1,
-                        ).await;
+                        )
+                        .await;
                     }
                     if let Some(ref metrics) = state.messaging_metrics {
-                        metrics.dead_letters.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        metrics
+                            .dead_letters
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
             }
@@ -1396,12 +1427,15 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
                         crate::messaging::send_tool::parse_send_message_call(tc)
                     {
                         let send_result =
-                            crate::messaging::send_tool::execute_send_message(mailbox, &args)
-                                .await;
+                            crate::messaging::send_tool::execute_send_message(mailbox, &args).await;
                         // Track metrics for successful sends.
-                        if send_result.tracked_message.is_some() || !send_result.display.starts_with("Error:") {
+                        if send_result.tracked_message.is_some()
+                            || !send_result.display.starts_with("Error:")
+                        {
                             if let Some(ref metrics) = state.messaging_metrics {
-                                metrics.messages_sent.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                metrics
+                                    .messages_sent
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             }
                         }
                         // Track ack-requiring messages.
@@ -4984,10 +5018,10 @@ mod tests {
                     command: r#"echo '{"context": "Branch: main | Last session: audit"}'"#.into(),
                 },
                 timeout_secs: 5,
-            is_async: false,
-            condition: None,
-            once: false,
-            priority: 0,
+                is_async: false,
+                condition: None,
+                once: false,
+                priority: 0,
             },
         ]);
 
@@ -5045,10 +5079,10 @@ mod tests {
                     value: "session_active".into(),
                 },
                 timeout_secs: 10,
-            is_async: false,
-            condition: None,
-            once: false,
-            priority: 0,
+                is_async: false,
+                condition: None,
+                once: false,
+                priority: 0,
             },
         ]);
 
@@ -5080,10 +5114,10 @@ mod tests {
                     command: r#"echo '{"context": "git: main, 3 uncommitted"}'"#.into(),
                 },
                 timeout_secs: 5,
-            is_async: false,
-            condition: None,
-            once: false,
-            priority: 0,
+                is_async: false,
+                condition: None,
+                once: false,
+                priority: 0,
             },
             crate::skills::hooks::SessionEventHook {
                 event: crate::skills::hooks::SessionEvent::SessionStart,
@@ -5091,10 +5125,10 @@ mod tests {
                     command: r#"echo '{"context": "last session: reviewed PR #42"}'"#.into(),
                 },
                 timeout_secs: 5,
-            is_async: false,
-            condition: None,
-            once: false,
-            priority: 0,
+                is_async: false,
+                condition: None,
+                once: false,
+                priority: 0,
             },
         ]);
 
@@ -5127,10 +5161,10 @@ mod tests {
                     command: "exit 1".into(), // fails
                 },
                 timeout_secs: 5,
-            is_async: false,
-            condition: None,
-            once: false,
-            priority: 0,
+                is_async: false,
+                condition: None,
+                once: false,
+                priority: 0,
             },
         ]);
 
@@ -5193,10 +5227,10 @@ print(json.dumps({'context': 'user said: ' + msg}))
                     .into(),
                 },
                 timeout_secs: 5,
-            is_async: false,
-            condition: None,
-            once: false,
-            priority: 0,
+                is_async: false,
+                condition: None,
+                once: false,
+                priority: 0,
             },
         ]);
 
@@ -5227,10 +5261,10 @@ print(json.dumps({'context': 'user said: ' + msg}))
                     command: r#"echo '{"context": "SHOULD NOT APPEAR"}'"#.into(),
                 },
                 timeout_secs: 5,
-            is_async: false,
-            condition: None,
-            once: false,
-            priority: 0,
+                is_async: false,
+                condition: None,
+                once: false,
+                priority: 0,
             },
         ]);
 
@@ -5270,10 +5304,10 @@ print(json.dumps({'context': 'user said: ' + msg}))
                     ),
                 },
                 timeout_secs: 5,
-            is_async: false,
-            condition: None,
-            once: false,
-            priority: 0,
+                is_async: false,
+                condition: None,
+                once: false,
+                priority: 0,
             },
         ]);
 

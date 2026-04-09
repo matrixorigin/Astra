@@ -99,7 +99,11 @@ impl LlmConflictResolver {
     }
 
     /// Build the prompt for a single file conflict.
-    fn build_prompt(task_context: &str, agent_id: &str, conflict: &FileConflict) -> Vec<serde_json::Value> {
+    fn build_prompt(
+        task_context: &str,
+        agent_id: &str,
+        conflict: &FileConflict,
+    ) -> Vec<serde_json::Value> {
         let system = format!(
             "You are a precise code merge conflict resolver. A multi-agent team is working on: {task_context}\n\n\
              Agent '{agent_id}' made changes that conflict with the main branch.\n\
@@ -147,7 +151,12 @@ impl LlmConflictResolver {
         let explanation = remainder
             .lines()
             .find(|l| l.trim().starts_with("Explanation:"))
-            .map(|l| l.trim().trim_start_matches("Explanation:").trim().to_string())
+            .map(|l| {
+                l.trim()
+                    .trim_start_matches("Explanation:")
+                    .trim()
+                    .to_string()
+            })
             .unwrap_or_default();
 
         // Reject if content still has conflict markers
@@ -220,7 +229,11 @@ impl ConflictResolver for LlmConflictResolver {
                     eprintln!(
                         "[conflict-resolver] resolved {}: {}",
                         rf.path,
-                        if rf.explanation.is_empty() { "(no explanation)" } else { &rf.explanation }
+                        if rf.explanation.is_empty() {
+                            "(no explanation)"
+                        } else {
+                            &rf.explanation
+                        }
                     );
                     resolved.push(rf);
                 }
@@ -509,7 +522,8 @@ bar
     #[tokio::test]
     async fn extract_file_conflicts_on_non_git_dir() {
         // When called outside a git repo, all stages return None → empty strings
-        let conflicts = extract_file_conflicts(Path::new("/tmp"), &["nonexistent.txt".to_string()]).await;
+        let conflicts =
+            extract_file_conflicts(Path::new("/tmp"), &["nonexistent.txt".to_string()]).await;
         assert_eq!(conflicts.len(), 1);
         assert!(conflicts[0].base.is_empty());
         assert!(conflicts[0].ours.is_empty());

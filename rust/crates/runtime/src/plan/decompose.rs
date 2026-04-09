@@ -778,23 +778,26 @@ struct SubtaskResponse {
 /// Try-parse each raw JSON value into a `VerifierKind`, skipping entries that
 /// fail (unknown/hallucinated kind) and filtering out shell-execution variants
 /// (`Command`, `CommandOutput`) that could be an RCE vector from LLM output.
-fn parse_acceptance_checks(raw: Vec<serde_json::Value>) -> Vec<astra_services::durable_task::VerifierKind> {
+fn parse_acceptance_checks(
+    raw: Vec<serde_json::Value>,
+) -> Vec<astra_services::durable_task::VerifierKind> {
     use astra_services::durable_task::VerifierKind;
     raw.into_iter()
-        .filter_map(|v| {
-            match serde_json::from_value::<VerifierKind>(v.clone()) {
+        .filter_map(
+            |v| match serde_json::from_value::<VerifierKind>(v.clone()) {
                 Ok(vk) => {
-                    if matches!(vk, VerifierKind::Command { .. } | VerifierKind::CommandOutput { .. }) {
+                    if matches!(
+                        vk,
+                        VerifierKind::Command { .. } | VerifierKind::CommandOutput { .. }
+                    ) {
                         None
                     } else {
                         Some(vk)
                     }
                 }
-                Err(_e) => {
-                    None
-                }
-            }
-        })
+                Err(_e) => None,
+            },
+        )
         .collect()
 }
 
@@ -906,7 +909,10 @@ pub fn format_plan(plan: &TaskPlan) -> String {
         // Acceptance checks
         if !st.acceptance_checks.is_empty() {
             let count = st.acceptance_checks.len();
-            let line = format!("✅ {count} verification check{}", if count == 1 { "" } else { "s" });
+            let line = format!(
+                "✅ {count} verification check{}",
+                if count == 1 { "" } else { "s" }
+            );
             for l in wrap_text(&line, wrap_width - 6) {
                 out.push_str(&format!("      {}\n", l));
             }
@@ -1015,17 +1021,31 @@ pub fn format_plan_markdown(plan: &TaskPlan, goal: Option<&str>) -> String {
         }
 
         if !st.acceptance_checks.is_empty() {
-            let checks: Vec<_> = st.acceptance_checks.iter().map(|vk| {
-                match vk {
-                    astra_services::durable_task::VerifierKind::FileExists { paths } => format!("`file_exists: {}`", paths.join(", ")),
-                    astra_services::durable_task::VerifierKind::ReadFileContains { path, .. } => format!("`read_file: {path}`"),
-                    astra_services::durable_task::VerifierKind::GrepCheck { file, pattern, .. } => format!("`grep '{pattern}' {file}`"),
-                    astra_services::durable_task::VerifierKind::Command { cmd, .. } => format!("`{cmd}`"),
-                    astra_services::durable_task::VerifierKind::BuildPass { cmd } => format!("`build: {cmd}`"),
-                    astra_services::durable_task::VerifierKind::TestPass { cmd, .. } => format!("`test: {cmd}`"),
+            let checks: Vec<_> = st
+                .acceptance_checks
+                .iter()
+                .map(|vk| match vk {
+                    astra_services::durable_task::VerifierKind::FileExists { paths } => {
+                        format!("`file_exists: {}`", paths.join(", "))
+                    }
+                    astra_services::durable_task::VerifierKind::ReadFileContains {
+                        path, ..
+                    } => format!("`read_file: {path}`"),
+                    astra_services::durable_task::VerifierKind::GrepCheck {
+                        file, pattern, ..
+                    } => format!("`grep '{pattern}' {file}`"),
+                    astra_services::durable_task::VerifierKind::Command { cmd, .. } => {
+                        format!("`{cmd}`")
+                    }
+                    astra_services::durable_task::VerifierKind::BuildPass { cmd } => {
+                        format!("`build: {cmd}`")
+                    }
+                    astra_services::durable_task::VerifierKind::TestPass { cmd, .. } => {
+                        format!("`test: {cmd}`")
+                    }
                     _ => "`check`".into(),
-                }
-            }).collect();
+                })
+                .collect();
             out.push_str(&format!("   Verify: {}\n", checks.join(", ")));
         }
 
@@ -1042,14 +1062,32 @@ pub fn format_plan_markdown(plan: &TaskPlan, goal: Option<&str>) -> String {
     out.push_str("---\n");
 
     let mut summary_parts = Vec::new();
-    let small = plan.subtasks.iter().filter(|s| s.effort.as_deref() == Some("small")).count();
-    let medium = plan.subtasks.iter().filter(|s| s.effort.as_deref() == Some("medium")).count();
-    let large = plan.subtasks.iter().filter(|s| s.effort.as_deref() == Some("large")).count();
+    let small = plan
+        .subtasks
+        .iter()
+        .filter(|s| s.effort.as_deref() == Some("small"))
+        .count();
+    let medium = plan
+        .subtasks
+        .iter()
+        .filter(|s| s.effort.as_deref() == Some("medium"))
+        .count();
+    let large = plan
+        .subtasks
+        .iter()
+        .filter(|s| s.effort.as_deref() == Some("large"))
+        .count();
     if small + medium + large > 0 {
         let mut effort_parts = Vec::new();
-        if small > 0 { effort_parts.push(format!("{small} small")); }
-        if medium > 0 { effort_parts.push(format!("{medium} medium")); }
-        if large > 0 { effort_parts.push(format!("{large} large")); }
+        if small > 0 {
+            effort_parts.push(format!("{small} small"));
+        }
+        if medium > 0 {
+            effort_parts.push(format!("{medium} medium"));
+        }
+        if large > 0 {
+            effort_parts.push(format!("{large} large"));
+        }
         summary_parts.push(effort_parts.join(", "));
     }
     summary_parts.push(format!(
@@ -2411,10 +2449,18 @@ pub fn format_subtask_prompt(subtask: &SubtaskPlan) -> String {
                 astra_services::durable_task::VerifierKind::FileExists { paths } => {
                     format!("Files exist: {}", paths.join(", "))
                 }
-                astra_services::durable_task::VerifierKind::ReadFileContains { path, contains, .. } => {
+                astra_services::durable_task::VerifierKind::ReadFileContains {
+                    path,
+                    contains,
+                    ..
+                } => {
                     format!("{path} contains {:?}", contains)
                 }
-                astra_services::durable_task::VerifierKind::GrepCheck { file, pattern, should_match } => {
+                astra_services::durable_task::VerifierKind::GrepCheck {
+                    file,
+                    pattern,
+                    should_match,
+                } => {
                     if *should_match {
                         format!("grep '{pattern}' matches in {file}")
                     } else {
@@ -2424,11 +2470,17 @@ pub fn format_subtask_prompt(subtask: &SubtaskPlan) -> String {
                 astra_services::durable_task::VerifierKind::Command { cmd, .. } => {
                     format!("Command succeeds: {cmd}")
                 }
-                astra_services::durable_task::VerifierKind::CommandOutput { cmd, contains, .. } => {
+                astra_services::durable_task::VerifierKind::CommandOutput {
+                    cmd, contains, ..
+                } => {
                     format!("{cmd} output contains {:?}", contains)
                 }
-                astra_services::durable_task::VerifierKind::BuildPass { cmd } => format!("Build: {cmd}"),
-                astra_services::durable_task::VerifierKind::TestPass { cmd, .. } => format!("Test: {cmd}"),
+                astra_services::durable_task::VerifierKind::BuildPass { cmd } => {
+                    format!("Build: {cmd}")
+                }
+                astra_services::durable_task::VerifierKind::TestPass { cmd, .. } => {
+                    format!("Test: {cmd}")
+                }
                 _ => "Automated check".into(),
             };
             prompt.push_str(&format!("  {}. {}\n", i + 1, desc));
@@ -2602,7 +2654,14 @@ pub fn format_execution_preview(plan: &TaskPlan) -> String {
         let conflict_strs: Vec<_> = analysis
             .conflicts
             .iter()
-            .map(|c| format!("{} ↔ {} ({})", c.subtask_a, c.subtask_b, c.shared_files.join(", ")))
+            .map(|c| {
+                format!(
+                    "{} ↔ {} ({})",
+                    c.subtask_a,
+                    c.subtask_b,
+                    c.shared_files.join(", ")
+                )
+            })
             .collect();
         out.push_str(&conflict_strs.join(", "));
         out.push('\n');
@@ -2622,7 +2681,9 @@ pub fn format_execution_preview(plan: &TaskPlan) -> String {
         4..=8 => "medium",
         _ => "high",
     };
-    out.push_str(&format!("  Effort: {effort_label} ({total_effort} units)\n"));
+    out.push_str(&format!(
+        "  Effort: {effort_label} ({total_effort} units)\n"
+    ));
 
     out
 }
@@ -4480,7 +4541,10 @@ Done!"#;
 
         let s1 = &plan.subtasks[1];
         assert_eq!(s1.effort.as_deref(), Some("large"));
-        assert!(s1.acceptance_checks.is_empty(), "missing field should default to empty");
+        assert!(
+            s1.acceptance_checks.is_empty(),
+            "missing field should default to empty"
+        );
     }
 
     #[test]
@@ -4495,12 +4559,10 @@ Done!"#;
                     status: TaskStatus::Pending,
                     effort: Some("medium".into()),
                     files: vec!["src/feat.rs".into(), "tests/feat_test.rs".into()],
-                    acceptance_checks: vec![
-                        astra_services::durable_task::VerifierKind::TestPass {
-                            cmd: "cargo test".into(),
-                            min_pass_rate: 1.0,
-                        },
-                    ],
+                    acceptance_checks: vec![astra_services::durable_task::VerifierKind::TestPass {
+                        cmd: "cargo test".into(),
+                        min_pass_rate: 1.0,
+                    }],
                 },
                 SubtaskPlan {
                     id: "docs".into(),
@@ -4554,7 +4616,11 @@ Done!"#;
             ]
         }]}"#;
         let plan = parse_plan_response(response).unwrap();
-        assert_eq!(plan.subtasks[0].acceptance_checks.len(), 2, "unknown kind should be skipped");
+        assert_eq!(
+            plan.subtasks[0].acceptance_checks.len(),
+            2,
+            "unknown kind should be skipped"
+        );
         assert!(matches!(
             &plan.subtasks[0].acceptance_checks[0],
             astra_services::durable_task::VerifierKind::FileExists { paths } if paths == &["a.rs"]
@@ -4578,7 +4644,8 @@ Done!"#;
         }]}"#;
         let plan = parse_plan_response(response).unwrap();
         assert_eq!(
-            plan.subtasks[0].acceptance_checks.len(), 2,
+            plan.subtasks[0].acceptance_checks.len(),
+            2,
             "Command and CommandOutput should be filtered out"
         );
         assert!(matches!(
@@ -4627,20 +4694,21 @@ Done!"#;
             title: "Add auth middleware".into(),
             description: Some("JWT token validation for all /api routes".into()),
             files: vec!["src/middleware.rs".into(), "src/auth.rs".into()],
-            acceptance_checks: vec![
-                astra_services::durable_task::VerifierKind::GrepCheck {
-                    file: "src/middleware.rs".into(),
-                    pattern: "401".into(),
-                    should_match: true,
-                },
-            ],
+            acceptance_checks: vec![astra_services::durable_task::VerifierKind::GrepCheck {
+                file: "src/middleware.rs".into(),
+                pattern: "401".into(),
+                should_match: true,
+            }],
             ..Default::default()
         };
         let prompt = format_subtask_prompt(&st);
         assert!(prompt.contains("Add auth middleware"));
         assert!(prompt.contains("JWT token validation"));
         assert!(prompt.contains("src/middleware.rs, src/auth.rs"));
-        assert!(prompt.contains("401"), "should mention 401 from acceptance checks");
+        assert!(
+            prompt.contains("401"),
+            "should mention 401 from acceptance checks"
+        );
     }
 
     #[test]
@@ -5703,7 +5771,11 @@ Done!"#;
         };
         let preview = format_execution_preview(&plan);
         assert!(preview.contains("Round"));
-        assert!(preview.contains("parallel") || preview.contains("Round 1") || preview.contains("Round 2"));
+        assert!(
+            preview.contains("parallel")
+                || preview.contains("Round 1")
+                || preview.contains("Round 2")
+        );
     }
 
     #[test]

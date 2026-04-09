@@ -45,17 +45,19 @@ pub mod transport;
 pub mod types;
 
 #[cfg(test)]
-mod integration_tests;
-#[cfg(test)]
-mod e2e_loop_tests;
-#[cfg(test)]
 mod db_transport_integration_tests;
 #[cfg(test)]
 mod delegation_mailbox_tests;
+#[cfg(test)]
+mod e2e_loop_tests;
+#[cfg(test)]
+mod integration_tests;
 
 // Re-export key types for convenience.
 pub use ack_tracker::{AckConfig, AckOutcome, PendingAckTracker};
-pub use db_transport::{CleanupScheduler, DatabaseTransport, TransportMetrics as DbTransportMetrics};
+pub use db_transport::{
+    CleanupScheduler, DatabaseTransport, TransportMetrics as DbTransportMetrics,
+};
 pub use dead_letter::{DeadLetter, DeadLetterQueue, DeadLetterReason, DeadLetterSummary};
 pub use in_process::{InProcessMetrics, InProcessTransport};
 pub use metrics::{

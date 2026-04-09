@@ -168,7 +168,8 @@ pub async fn execute_parallel_round(
                         content,
                         success,
                     }
-                }).await;
+                })
+                .await;
                 match res {
                     Ok(r) => r,
                     Err(e) => {
@@ -272,9 +273,7 @@ mod tests {
         })
     }
 
-    fn make_executor(
-        delay_ms: u64,
-    ) -> ToolExecutorFn {
+    fn make_executor(delay_ms: u64) -> ToolExecutorFn {
         Arc::new(move |tc: Value| {
             Box::pin(async move {
                 if delay_ms > 0 {

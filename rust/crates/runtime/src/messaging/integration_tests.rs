@@ -37,10 +37,7 @@ mod tests {
 
         // Register parent (orchestrator)
         let parent_addr = addr("run-parent", "orchestrator");
-        let parent_mb = router
-            .register(parent_addr.clone(), None)
-            .await
-            .unwrap();
+        let parent_mb = router.register(parent_addr.clone(), None).await.unwrap();
 
         let mut children = Vec::new();
         for i in 0..n_children {
@@ -72,8 +69,7 @@ mod tests {
 
     #[tokio::test]
     async fn fanout_agents_can_send_to_each_other() {
-        let (_router, _parent, mut children, _dt) =
-            setup_delegation(3, "del-fanout").await;
+        let (_router, _parent, mut children, _dt) = setup_delegation(3, "del-fanout").await;
 
         // Agent-0 sends a direct message to Agent-1
         let msg = AgentMessage::new(
@@ -104,8 +100,7 @@ mod tests {
 
     #[tokio::test]
     async fn fanout_agents_broadcast_to_peers() {
-        let (_router, _parent, mut children, _dt) =
-            setup_delegation(3, "del-broadcast").await;
+        let (_router, _parent, mut children, _dt) = setup_delegation(3, "del-broadcast").await;
 
         // Agent-0 broadcasts to all peers in the delegation group
         let msg = AgentMessage::new(
@@ -184,8 +179,7 @@ mod tests {
 
     #[tokio::test]
     async fn child_sends_to_parent() {
-        let (_router, mut parent, children, _dt) =
-            setup_delegation(2, "del-parent").await;
+        let (_router, mut parent, children, _dt) = setup_delegation(2, "del-parent").await;
 
         // Child-0 sends a message to parent
         children[0].send_to_parent("task complete").await.unwrap();
@@ -202,8 +196,7 @@ mod tests {
 
     #[tokio::test]
     async fn child_sends_progress_to_parent() {
-        let (_router, mut parent, children, _dt) =
-            setup_delegation(1, "del-progress").await;
+        let (_router, mut parent, children, _dt) = setup_delegation(1, "del-progress").await;
 
         children[0]
             .send_progress(3, 7, "running", Some("executing bash".into()))
@@ -229,8 +222,7 @@ mod tests {
 
     #[tokio::test]
     async fn parent_sends_to_child() {
-        let (_router, parent, mut children, _dt) =
-            setup_delegation(2, "del-parent-to-child").await;
+        let (_router, parent, mut children, _dt) = setup_delegation(2, "del-parent-to-child").await;
 
         // Parent sends directly to child-1
         let msg = AgentMessage::new(
@@ -256,15 +248,18 @@ mod tests {
 
     #[tokio::test]
     async fn send_tool_text_to_parent() {
-        let (_router, mut parent, children, _dt) =
-            setup_delegation(1, "del-tool").await;
+        let (_router, mut parent, children, _dt) = setup_delegation(1, "del-tool").await;
 
         let args = serde_json::json!({
             "target": "parent",
             "content": "I finished the refactoring"
         });
         let result = send_tool::execute_send_message(&children[0], &args).await;
-        assert!(result.display.starts_with("✓"), "Expected success, got: {}", result.display);
+        assert!(
+            result.display.starts_with("✓"),
+            "Expected success, got: {}",
+            result.display
+        );
 
         let received = parent.try_recv().unwrap();
         match &received.payload {
@@ -277,8 +272,7 @@ mod tests {
 
     #[tokio::test]
     async fn send_tool_broadcast_to_peers() {
-        let (_router, _parent, mut children, _dt) =
-            setup_delegation(3, "del-tool-bcast").await;
+        let (_router, _parent, mut children, _dt) = setup_delegation(3, "del-tool-bcast").await;
 
         let args = serde_json::json!({
             "target": "broadcast",
@@ -286,7 +280,11 @@ mod tests {
             "message_type": "progress"
         });
         let result = send_tool::execute_send_message(&children[0], &args).await;
-        assert!(result.display.starts_with("✓"), "Expected success, got: {}", result.display);
+        assert!(
+            result.display.starts_with("✓"),
+            "Expected success, got: {}",
+            result.display
+        );
 
         // All children should receive the broadcast
         for (i, child) in children.iter_mut().enumerate() {
@@ -297,8 +295,7 @@ mod tests {
 
     #[tokio::test]
     async fn send_tool_direct_to_peer() {
-        let (_router, _parent, mut children, _dt) =
-            setup_delegation(2, "del-tool-direct").await;
+        let (_router, _parent, mut children, _dt) = setup_delegation(2, "del-tool-direct").await;
 
         let args = serde_json::json!({
             "target": "agent-1",
@@ -310,7 +307,8 @@ mod tests {
         // Router resolves agent_id-only Direct targets via agent_id_index.
         assert!(
             result.display.starts_with("✓"),
-            "expected success, got: {}", result.display
+            "expected success, got: {}",
+            result.display
         );
         let received = children[1].try_recv();
         assert!(received.is_some(), "peer should have received the message");
@@ -318,8 +316,7 @@ mod tests {
 
     #[tokio::test]
     async fn send_tool_missing_content_returns_error() {
-        let (_router, _parent, children, _dt) =
-            setup_delegation(1, "del-tool-err").await;
+        let (_router, _parent, children, _dt) = setup_delegation(1, "del-tool-err").await;
 
         let args = serde_json::json!({ "target": "parent" });
         let result = send_tool::execute_send_message(&children[0], &args).await;
@@ -329,8 +326,7 @@ mod tests {
 
     #[tokio::test]
     async fn send_tool_missing_target_returns_error() {
-        let (_router, _parent, children, _dt) =
-            setup_delegation(1, "del-tool-err2").await;
+        let (_router, _parent, children, _dt) = setup_delegation(1, "del-tool-err2").await;
 
         let args = serde_json::json!({ "content": "hello" });
         let result = send_tool::execute_send_message(&children[0], &args).await;
@@ -342,8 +338,7 @@ mod tests {
 
     #[tokio::test]
     async fn simulate_fanout_conversation() {
-        let (_router, mut parent, mut children, _dt) =
-            setup_delegation(2, "del-convo").await;
+        let (_router, mut parent, mut children, _dt) = setup_delegation(2, "del-convo").await;
 
         // Turn 1: Both children report progress
         children[0]
@@ -382,7 +377,10 @@ mod tests {
         }
 
         // Turn 3: Both report completion to parent
-        children[0].send_to_parent("Fixed race condition").await.unwrap();
+        children[0]
+            .send_to_parent("Fixed race condition")
+            .await
+            .unwrap();
         children[1].send_to_parent("Tests updated").await.unwrap();
 
         let final_msgs = parent.drain();
@@ -393,8 +391,7 @@ mod tests {
 
     #[tokio::test]
     async fn messages_arrive_in_send_order() {
-        let (_router, mut parent, children, _dt) =
-            setup_delegation(1, "del-order").await;
+        let (_router, mut parent, children, _dt) = setup_delegation(1, "del-order").await;
 
         for i in 0..10 {
             children[0]
@@ -419,8 +416,7 @@ mod tests {
 
     #[tokio::test]
     async fn requires_ack_message_receives_ack_reply() {
-        let (_router, mut parent, mut children, _dt) =
-            setup_delegation(1, "del-ack-reply").await;
+        let (_router, mut parent, mut children, _dt) = setup_delegation(1, "del-ack-reply").await;
 
         // Child sends message with requires_ack.
         let msg = AgentMessage::new(
@@ -459,8 +455,7 @@ mod tests {
 
     #[tokio::test]
     async fn nack_message_carries_reason() {
-        let (_router, mut parent, mut children, _dt) =
-            setup_delegation(1, "del-nack").await;
+        let (_router, mut parent, mut children, _dt) = setup_delegation(1, "del-nack").await;
 
         let msg = AgentMessage::new(
             children[0].address.clone(),
@@ -477,10 +472,8 @@ mod tests {
         assert_eq!(received.len(), 1);
 
         // Parent nacks.
-        let nack = received[0].make_nack(
-            parent.address.clone(),
-            Some("invalid format".to_string()),
-        );
+        let nack =
+            received[0].make_nack(parent.address.clone(), Some("invalid format".to_string()));
         parent.send(nack).await.unwrap();
 
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -497,8 +490,7 @@ mod tests {
 
     #[tokio::test]
     async fn send_tool_with_requires_ack_returns_tracked_message() {
-        let (_router, _parent, children, _dt) =
-            setup_delegation(2, "del-ack-tracked").await;
+        let (_router, _parent, children, _dt) = setup_delegation(2, "del-ack-tracked").await;
 
         let args = serde_json::json!({
             "target": "parent",
@@ -507,15 +499,21 @@ mod tests {
         });
 
         let result = send_tool::execute_send_message(&children[0], &args).await;
-        assert!(result.display.starts_with("✓"), "Expected success: {}", result.display);
-        assert!(result.tracked_message.is_some(), "Should return tracked message");
+        assert!(
+            result.display.starts_with("✓"),
+            "Expected success: {}",
+            result.display
+        );
+        assert!(
+            result.tracked_message.is_some(),
+            "Should return tracked message"
+        );
         assert!(result.tracked_message.unwrap().requires_ack);
     }
 
     #[tokio::test]
     async fn send_tool_without_ack_returns_no_tracked_message() {
-        let (_router, _parent, children, _dt) =
-            setup_delegation(2, "del-no-ack").await;
+        let (_router, _parent, children, _dt) = setup_delegation(2, "del-no-ack").await;
 
         let args = serde_json::json!({
             "target": "parent",
@@ -524,15 +522,17 @@ mod tests {
 
         let result = send_tool::execute_send_message(&children[0], &args).await;
         assert!(result.display.starts_with("✓"));
-        assert!(result.tracked_message.is_none(), "Should NOT track when requires_ack is false");
+        assert!(
+            result.tracked_message.is_none(),
+            "Should NOT track when requires_ack is false"
+        );
     }
 
     #[tokio::test]
     async fn ack_tracker_end_to_end_with_mailbox() {
         use crate::messaging::ack_tracker::{AckConfig, PendingAckTracker};
 
-        let (_router, mut parent, mut children, _dt) =
-            setup_delegation(1, "del-ack-e2e").await;
+        let (_router, mut parent, mut children, _dt) = setup_delegation(1, "del-ack-e2e").await;
 
         // Create a tracker for the child.
         let tracker = PendingAckTracker::with_config(AckConfig {
@@ -581,8 +581,7 @@ mod tests {
         use crate::messaging::dead_letter::DeadLetterQueue;
         use std::time::Duration;
 
-        let (_router, _parent, children, _dt) =
-            setup_delegation(2, "del-dlq-timeout").await;
+        let (_router, _parent, children, _dt) = setup_delegation(2, "del-dlq-timeout").await;
 
         let dlq = Arc::new(DeadLetterQueue::new());
         let tracker = PendingAckTracker::with_config(AckConfig {
@@ -614,7 +613,10 @@ mod tests {
 
         // Store failed in DLQ
         for outcome in &outcomes {
-            if let AckOutcome::Failed { message, attempts, .. } = outcome {
+            if let AckOutcome::Failed {
+                message, attempts, ..
+            } = outcome
+            {
                 dlq.store(
                     Arc::clone(message),
                     crate::messaging::dead_letter::DeadLetterReason::AckTimeout {
@@ -636,8 +638,7 @@ mod tests {
         use crate::messaging::ack_tracker::{AckOutcome, PendingAckTracker};
         use crate::messaging::dead_letter::DeadLetterQueue;
 
-        let (_router, _parent, children, _dt) =
-            setup_delegation(2, "del-dlq-nack").await;
+        let (_router, _parent, children, _dt) = setup_delegation(2, "del-dlq-nack").await;
 
         let dlq = Arc::new(DeadLetterQueue::new());
         let tracker = PendingAckTracker::new();
@@ -660,9 +661,7 @@ mod tests {
         children[0].send((*msg).clone()).await.unwrap();
 
         // Receiver nacks
-        tracker
-            .reject(&msg_id, Some("invalid format".into()))
-            .await;
+        tracker.reject(&msg_id, Some("invalid format".into())).await;
 
         let failures = tracker.failed_outcomes().await;
         for outcome in &failures {
@@ -697,8 +696,7 @@ mod tests {
         use crate::messaging::dead_letter::DeadLetterQueue;
         use std::time::Duration;
 
-        let (_router, _parent, children, _dt) =
-            setup_delegation(2, "del-dlq-retry").await;
+        let (_router, _parent, children, _dt) = setup_delegation(2, "del-dlq-retry").await;
 
         let dlq = Arc::new(DeadLetterQueue::new());
         let tracker = PendingAckTracker::with_config(AckConfig {
@@ -763,8 +761,7 @@ mod tests {
         use std::sync::atomic::Ordering;
         use std::time::Duration;
 
-        let (_router, _parent, mut children, _dt) =
-            setup_delegation(2, "del-metrics").await;
+        let (_router, _parent, mut children, _dt) = setup_delegation(2, "del-metrics").await;
 
         let metrics = Arc::new(MessagingMetrics::new());
 
@@ -830,8 +827,7 @@ mod tests {
             }
         }
 
-        let (_router, _parent, children, _dt) =
-            setup_delegation(2, "del-events").await;
+        let (_router, _parent, children, _dt) = setup_delegation(2, "del-events").await;
 
         let dispatcher = EventDispatcher::new();
         let counter = Arc::new(Counter {
@@ -928,7 +924,9 @@ mod tests {
                 for j in 0..MSGS_PER_SENDER {
                     let msg = AgentMessage::new(
                         sender_addr.clone(),
-                        MessageTarget::Direct { address: recv_addr.clone() },
+                        MessageTarget::Direct {
+                            address: recv_addr.clone(),
+                        },
                         MessagePayload::Text {
                             content: format!("Hello from sender {i} msg {j}"),
                             summary: None,
@@ -1022,7 +1020,9 @@ mod tests {
                     for recv_addr in &receivers {
                         let msg = AgentMessage::new(
                             sender_addr.clone(),
-                            MessageTarget::Direct { address: recv_addr.clone() },
+                            MessageTarget::Direct {
+                                address: recv_addr.clone(),
+                            },
                             MessagePayload::Text {
                                 content: format!("Broadcast {i}-{j}"),
                                 summary: None,
@@ -1112,7 +1112,9 @@ mod tests {
                     // Create and send a message via router
                     let mut msg = AgentMessage::new(
                         sender_addr.clone(),
-                        MessageTarget::Direct { address: recv_addr.clone() },
+                        MessageTarget::Direct {
+                            address: recv_addr.clone(),
+                        },
                         MessagePayload::Text {
                             content: format!("Mixed op {i}-{j}"),
                             summary: None,
@@ -1121,7 +1123,7 @@ mod tests {
                     // Override the auto-generated ID for tracking
                     msg.id = msg_id.clone();
                     msg.requires_ack = true;
-                    
+
                     let msg = Arc::new(msg);
                     router_clone.send((*msg).clone()).await.unwrap();
                     ack_clone.track(msg.clone()).await;
@@ -1134,7 +1136,9 @@ mod tests {
                         }
                         1 => {
                             // Nack (reject)
-                            ack_clone.reject(&msg_id, Some("test rejection".to_string())).await;
+                            ack_clone
+                                .reject(&msg_id, Some("test rejection".to_string()))
+                                .await;
                         }
                         _ => {
                             // Simulate dead-letter after "timeout"

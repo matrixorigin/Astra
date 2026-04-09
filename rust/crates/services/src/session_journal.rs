@@ -1991,17 +1991,17 @@ mod tests {
         let parsed: JournalEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.event_type, JournalEventType::PlanEdit);
         let m = parsed.metadata.expect("metadata");
-        assert_eq!(m.get("action").and_then(|v| v.as_str()), Some("Plan edited: add step"));
+        assert_eq!(
+            m.get("action").and_then(|v| v.as_str()),
+            Some("Plan edited: add step")
+        );
     }
 
     #[test]
     fn journal_event_plan_lifecycle_serializes_and_round_trips() {
         let detail = serde_json::json!({"mode": "auto", "subtask_count": 3});
-        let evt = JournalEvent::plan_lifecycle(
-            Some("sid-lc"),
-            "Plan execution started",
-            Some(detail),
-        );
+        let evt =
+            JournalEvent::plan_lifecycle(Some("sid-lc"), "Plan execution started", Some(detail));
         assert_eq!(evt.event_type, JournalEventType::PlanLifecycle);
         let json = serde_json::to_string(&evt).unwrap();
         assert!(json.contains("\"type\":\"plan_lifecycle\""));

@@ -19,12 +19,13 @@ use uuid::Uuid;
 use super::*;
 
 mod admin_handlers;
+pub mod agent_mailbox;
+pub mod agent_mcp;
 mod audit_handlers;
 mod auth_handlers;
 mod bridge_prep;
 mod chat_handlers;
-pub mod agent_mailbox;
-pub mod agent_mcp;
+pub mod conflict_resolver;
 pub mod delegation_engine;
 mod delegation_handlers;
 mod edge_callback_handlers;
@@ -37,14 +38,13 @@ mod reflect_handlers;
 mod router_builder;
 pub mod run_engine;
 mod run_handlers;
-pub mod team_orchestrator;
-pub mod worktree_isolation;
-pub mod conflict_resolver;
 pub mod run_lifecycle;
 pub mod server_loop_host;
 mod session_handlers;
 mod state_builder;
 mod task_handlers;
+pub mod team_orchestrator;
+pub mod worktree_isolation;
 mod ws_handler;
 
 use self::{

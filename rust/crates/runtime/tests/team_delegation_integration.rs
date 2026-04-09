@@ -9,12 +9,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tokio::sync::RwLock;
 
-use astra_services::agents::{
-    AgentCreateRequestData, InMemoryAgentService, AgentService,
-};
-use astra_services::coordination::{
-    AgentProfile, AgentProfileRegistry, AgentResult, AgentTier,
-};
+use astra_services::agents::{AgentCreateRequestData, AgentService, InMemoryAgentService};
+use astra_services::coordination::{AgentProfile, AgentProfileRegistry, AgentResult, AgentTier};
 use astra_services::runs::InMemoryRunStateStore;
 use astra_services::team_persistence::{
     InMemoryTeamStore, TeamCoordination, TeamDefinition, TeamMemberDef, TeamPersistenceService,
@@ -22,7 +18,7 @@ use astra_services::team_persistence::{
 };
 
 use astra_runtime::server::delegation_engine::{
-    DelegationEngine, DelegationTracker, SubRunConfig, SubRunExecutor, StubSubRunExecutor,
+    DelegationEngine, DelegationTracker, StubSubRunExecutor, SubRunConfig, SubRunExecutor,
 };
 use astra_runtime::server::run_engine::RunEngine;
 use astra_runtime::server::team_orchestrator::{
@@ -31,7 +27,11 @@ use astra_runtime::server::team_orchestrator::{
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
-fn test_team(name: &str, coord: TeamCoordination, members: Vec<(&str, Option<&str>)>) -> TeamDefinition {
+fn test_team(
+    name: &str,
+    coord: TeamCoordination,
+    members: Vec<(&str, Option<&str>)>,
+) -> TeamDefinition {
     TeamDefinition {
         team_id: format!("team-{name}"),
         user_id: "test-user".to_string(),
@@ -60,18 +60,30 @@ fn test_team(name: &str, coord: TeamCoordination, members: Vec<(&str, Option<&st
 
 async fn setup_orchestrator(
     team_store: Arc<InMemoryTeamStore>,
-) -> (TeamExecutionOrchestrator, Arc<RunEngine>, Arc<DelegationTracker>) {
+) -> (
+    TeamExecutionOrchestrator,
+    Arc<RunEngine>,
+    Arc<DelegationTracker>,
+) {
     setup_orchestrator_with_executor(team_store, Arc::new(StubSubRunExecutor)).await
 }
 
 async fn setup_orchestrator_with_executor(
     team_store: Arc<InMemoryTeamStore>,
     executor: Arc<dyn SubRunExecutor>,
-) -> (TeamExecutionOrchestrator, Arc<RunEngine>, Arc<DelegationTracker>) {
+) -> (
+    TeamExecutionOrchestrator,
+    Arc<RunEngine>,
+    Arc<DelegationTracker>,
+) {
     let registry = Arc::new(RwLock::new(AgentProfileRegistry::new()));
     {
         let mut reg = registry.write().await;
-        let _ = reg.register(AgentProfile::new("orchestrator", "orchestrator", AgentTier::Orchestrator));
+        let _ = reg.register(AgentProfile::new(
+            "orchestrator",
+            "orchestrator",
+            AgentTier::Orchestrator,
+        ));
     }
 
     let run_store = Arc::new(InMemoryRunStateStore::new());
@@ -79,11 +91,18 @@ async fn setup_orchestrator_with_executor(
     let tracker = Arc::new(DelegationTracker::new());
 
     let delegation = Arc::new(DelegationEngine::with_executor(
-        registry.clone(), run_engine.clone(), tracker.clone(), executor,
+        registry.clone(),
+        run_engine.clone(),
+        tracker.clone(),
+        executor,
     ));
 
     let orch = TeamExecutionOrchestrator::new(
-        team_store, delegation, tracker.clone(), run_engine.clone(), registry,
+        team_store,
+        delegation,
+        tracker.clone(),
+        run_engine.clone(),
+        registry,
         OrchestratorConfig {
             user_id: "test-user".to_string(),
             session_id: "test-session".to_string(),
@@ -100,10 +119,14 @@ async fn setup_orchestrator_with_executor(
 #[tokio::test]
 async fn full_pipeline_team_execution() {
     let store = Arc::new(InMemoryTeamStore::new());
-    let team = test_team("pipe", TeamCoordination::Pipeline, vec![
-        ("coder", Some("Write code")),
-        ("reviewer", Some("Review code")),
-    ]);
+    let team = test_team(
+        "pipe",
+        TeamCoordination::Pipeline,
+        vec![
+            ("coder", Some("Write code")),
+            ("reviewer", Some("Review code")),
+        ],
+    );
     store.save_team(&team).await.unwrap();
 
     let (orch, run_engine, tracker) = setup_orchestrator(store.clone()).await;
@@ -116,7 +139,11 @@ async fn full_pipeline_team_execution() {
     assert_eq!(dr.agent_results.len(), 2);
 
     // Verify run was persisted
-    let run = run_engine.load_run(&report.parent_run_id).await.unwrap().unwrap();
+    let run = run_engine
+        .load_run(&report.parent_run_id)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(run.status, "completed");
 
     // Verify sub-runs tracked
@@ -131,10 +158,14 @@ async fn full_pipeline_team_execution() {
 #[tokio::test]
 async fn full_adversarial_team_execution() {
     let store = Arc::new(InMemoryTeamStore::new());
-    let team = test_team("adv", TeamCoordination::Adversarial { max_rounds: 2, threshold: 0.8 }, vec![
-        ("writer", Some("Write")),
-        ("critic", Some("Critique")),
-    ]);
+    let team = test_team(
+        "adv",
+        TeamCoordination::Adversarial {
+            max_rounds: 2,
+            threshold: 0.8,
+        },
+        vec![("writer", Some("Write")), ("critic", Some("Critique"))],
+    );
     store.save_team(&team).await.unwrap();
 
     let (orch, _, _) = setup_orchestrator(store).await;
@@ -149,11 +180,17 @@ async fn full_adversarial_team_execution() {
 #[tokio::test]
 async fn full_fan_out_team_execution() {
     let store = Arc::new(InMemoryTeamStore::new());
-    let team = test_team("fan", TeamCoordination::FanOut { aggregation: "all_results".into() }, vec![
-        ("analyst-a", Some("Analyze A")),
-        ("analyst-b", Some("Analyze B")),
-        ("analyst-c", Some("Analyze C")),
-    ]);
+    let team = test_team(
+        "fan",
+        TeamCoordination::FanOut {
+            aggregation: "all_results".into(),
+        },
+        vec![
+            ("analyst-a", Some("Analyze A")),
+            ("analyst-b", Some("Analyze B")),
+            ("analyst-c", Some("Analyze C")),
+        ],
+    );
     store.save_team(&team).await.unwrap();
 
     let (orch, _, _) = setup_orchestrator(store).await;
@@ -167,10 +204,16 @@ async fn full_fan_out_team_execution() {
 #[tokio::test]
 async fn full_sequential_team_execution() {
     let store = Arc::new(InMemoryTeamStore::new());
-    let team = test_team("seq", TeamCoordination::Sequential { stop_on_success: true }, vec![
-        ("attempt-1", Some("Try approach 1")),
-        ("attempt-2", Some("Try approach 2")),
-    ]);
+    let team = test_team(
+        "seq",
+        TeamCoordination::Sequential {
+            stop_on_success: true,
+        },
+        vec![
+            ("attempt-1", Some("Try approach 1")),
+            ("attempt-2", Some("Try approach 2")),
+        ],
+    );
     store.save_team(&team).await.unwrap();
 
     let (orch, _, _) = setup_orchestrator(store).await;
@@ -207,7 +250,11 @@ async fn orchestrator_empty_team_fails_validation() {
     assert!(report.error.as_ref().unwrap().contains("validation failed"));
 
     // Parent run should be marked failed
-    let run = run_engine.load_run(&report.parent_run_id).await.unwrap().unwrap();
+    let run = run_engine
+        .load_run(&report.parent_run_id)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(run.status, "failed");
 }
 
@@ -224,9 +271,11 @@ impl SubRunExecutor for ErrorExecutor {
 #[tokio::test]
 async fn orchestrator_delegation_failure_propagates() {
     let store = Arc::new(InMemoryTeamStore::new());
-    let team = test_team("fail", TeamCoordination::Pipeline, vec![
-        ("worker", Some("Do work")),
-    ]);
+    let team = test_team(
+        "fail",
+        TeamCoordination::Pipeline,
+        vec![("worker", Some("Do work"))],
+    );
     store.save_team(&team).await.unwrap();
 
     let (orch, _, _) = setup_orchestrator_with_executor(store, Arc::new(ErrorExecutor)).await;
@@ -237,7 +286,13 @@ async fn orchestrator_delegation_failure_propagates() {
     let dr = report.delegation_result.unwrap();
     assert_eq!(dr.status, "failed");
     assert_eq!(dr.agent_results[0].status, "failed");
-    assert!(dr.agent_results[0].error.as_ref().unwrap().contains("crashed"));
+    assert!(
+        dr.agent_results[0]
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("crashed")
+    );
 }
 
 // ─── Pause / Resume Tests ───────────────────────────────────────────────────
@@ -281,11 +336,21 @@ async fn orchestrator_persists_events_and_checkpoint() {
     let report = orch.execute_team("research", "task", None).await;
     assert_eq!(report.status, TeamExecutionStatus::Completed);
 
-    let run = run_engine.load_run(&report.parent_run_id).await.unwrap().unwrap();
+    let run = run_engine
+        .load_run(&report.parent_run_id)
+        .await
+        .unwrap()
+        .unwrap();
 
     // Should have events: team_prepare, team_execute_start, team_execute_complete, team_complete
-    let event_types: Vec<String> = run.events.iter()
-        .filter_map(|e| e.get("event_type").and_then(|v| v.as_str()).map(String::from))
+    let event_types: Vec<String> = run
+        .events
+        .iter()
+        .filter_map(|e| {
+            e.get("event_type")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+        })
         .collect();
     assert!(event_types.contains(&"team_prepare".to_string()));
     assert!(event_types.contains(&"team_execute_start".to_string()));
@@ -293,7 +358,8 @@ async fn orchestrator_persists_events_and_checkpoint() {
 
     // Checkpoint should be set
     assert!(run.checkpoint_json.is_some());
-    let cp: serde_json::Value = serde_json::from_str(run.checkpoint_json.as_ref().unwrap()).unwrap();
+    let cp: serde_json::Value =
+        serde_json::from_str(run.checkpoint_json.as_ref().unwrap()).unwrap();
     assert_eq!(cp["phase"], "prepared");
 }
 
@@ -304,11 +370,17 @@ async fn agent_service_crud_lifecycle() {
     let svc = InMemoryAgentService::new();
 
     // Create
-    let agent = svc.create_agent("u1".into(), AgentCreateRequestData {
-        name: "test-agent".into(),
-        agent_config: Some(serde_json::json!({"model": "claude-4"})),
-        data_source: None,
-    }).await.unwrap();
+    let agent = svc
+        .create_agent(
+            "u1".into(),
+            AgentCreateRequestData {
+                name: "test-agent".into(),
+                agent_config: Some(serde_json::json!({"model": "claude-4"})),
+                data_source: None,
+            },
+        )
+        .await
+        .unwrap();
     assert_eq!(agent.name, "test-agent");
 
     // List
@@ -316,17 +388,26 @@ async fn agent_service_crud_lifecycle() {
     assert_eq!(list.total, 1);
 
     // Update
-    let updated = svc.update_agent(agent.agent_id.clone(), "u1".into(), astra_services::agents::AgentUpdateRequestData {
-        name: Some("renamed".into()),
-        agent_config: None,
-        data_source: None,
-        is_active: Some(false),
-    }).await.unwrap();
+    let updated = svc
+        .update_agent(
+            agent.agent_id.clone(),
+            "u1".into(),
+            astra_services::agents::AgentUpdateRequestData {
+                name: Some("renamed".into()),
+                agent_config: None,
+                data_source: None,
+                is_active: Some(false),
+            },
+        )
+        .await
+        .unwrap();
     assert_eq!(updated.name, "renamed");
     assert!(!updated.is_active);
 
     // Delete
-    svc.delete_agent(agent.agent_id.clone(), "u1".into()).await.unwrap();
+    svc.delete_agent(agent.agent_id.clone(), "u1".into())
+        .await
+        .unwrap();
     assert!(svc.get_agent(agent.agent_id, "u1".into()).await.is_err());
 
     // List should be empty
@@ -341,7 +422,9 @@ async fn orchestrator_extracts_learning_from_results() {
     let store = Arc::new(InMemoryTeamStore::with_builtins("test-user"));
     let (orch, _, _) = setup_orchestrator(store).await;
 
-    let report = orch.execute_team("research", "analyze patterns", None).await;
+    let report = orch
+        .execute_team("research", "analyze patterns", None)
+        .await;
     assert_eq!(report.status, TeamExecutionStatus::Completed);
 
     // Merged learning should be present (even if minimal from stub executor)
@@ -356,16 +439,21 @@ async fn orchestrator_extracts_learning_from_results() {
 async fn team_persistence_full_lifecycle() {
     let store = InMemoryTeamStore::new();
 
-    let team = test_team("lifecycle", TeamCoordination::Pipeline, vec![
-        ("a", Some("Agent A")),
-        ("b", Some("Agent B")),
-    ]);
+    let team = test_team(
+        "lifecycle",
+        TeamCoordination::Pipeline,
+        vec![("a", Some("Agent A")), ("b", Some("Agent B"))],
+    );
 
     // Save
     store.save_team(&team).await.unwrap();
 
     // Load
-    let loaded = store.load_team("test-user", "lifecycle").await.unwrap().unwrap();
+    let loaded = store
+        .load_team("test-user", "lifecycle")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(loaded.team_id, team.team_id);
     assert_eq!(loaded.members.len(), 2);
 
@@ -374,13 +462,25 @@ async fn team_persistence_full_lifecycle() {
     assert_eq!(list.len(), 1);
 
     // Execution recording
-    store.record_execution_start("exec-1", &team.team_id, "test-user", "task").await.unwrap();
-    store.record_execution_complete("exec-1", "completed", Some(r#"{"ok":true}"#)).await.unwrap();
+    store
+        .record_execution_start("exec-1", &team.team_id, "test-user", "task")
+        .await
+        .unwrap();
+    store
+        .record_execution_complete("exec-1", "completed", Some(r#"{"ok":true}"#))
+        .await
+        .unwrap();
     let execs = store.list_executions(&team.team_id, 10).await.unwrap();
     assert_eq!(execs.len(), 1);
     assert_eq!(execs[0].status, "completed");
 
     // Delete
     assert!(store.delete_team("test-user", "lifecycle").await.unwrap());
-    assert!(store.load_team("test-user", "lifecycle").await.unwrap().is_none());
+    assert!(
+        store
+            .load_team("test-user", "lifecycle")
+            .await
+            .unwrap()
+            .is_none()
+    );
 }

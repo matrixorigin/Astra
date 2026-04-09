@@ -192,10 +192,7 @@ impl McpLifecycleManager {
                     );
                 }
                 None => {
-                    errors.push(format!(
-                        "MCP server '{}' not found in project config",
-                        name
-                    ));
+                    errors.push(format!("MCP server '{}' not found in project config", name));
                 }
             }
         }
@@ -264,9 +261,7 @@ mod tests {
                 McpServerConfig {
                     name: "github".into(),
                     command: "npx".into(),
-                    args: vec![
-                        "@modelcontextprotocol/server-github".into(),
-                    ],
+                    args: vec!["@modelcontextprotocol/server-github".into()],
                     env: HashMap::from([("GITHUB_TOKEN".into(), "xxx".into())]),
                     cwd: None,
                     timeout_secs: 30,

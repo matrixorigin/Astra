@@ -34,7 +34,10 @@ pub enum AgentStatus {
 
 impl AgentStatus {
     pub fn is_terminal(&self) -> bool {
-        matches!(self, AgentStatus::Completed { .. } | AgentStatus::Failed { .. })
+        matches!(
+            self,
+            AgentStatus::Completed { .. } | AgentStatus::Failed { .. }
+        )
     }
 }
 
@@ -105,11 +108,8 @@ impl AgentProgress {
     }
 
     pub fn elapsed(&self) -> Option<Duration> {
-        self.started_at.map(|s| {
-            self.ended_at
-                .unwrap_or_else(Instant::now)
-                .duration_since(s)
-        })
+        self.started_at
+            .map(|s| self.ended_at.unwrap_or_else(Instant::now).duration_since(s))
     }
 
     /// Render a single-line status for this agent.
@@ -122,10 +122,7 @@ impl AgentProgress {
 
         match &self.status {
             AgentStatus::Pending => {
-                format!(
-                    "{color}⏳ {}{RESET}{DIM} pending{RESET}",
-                    self.display_name
-                )
+                format!("{color}⏳ {}{RESET}{DIM} pending{RESET}", self.display_name)
             }
             AgentStatus::Running {
                 current_turn,
@@ -198,7 +195,8 @@ impl MultiAgentProgress {
     /// Add an agent to track.
     pub fn add_agent(&mut self, agent_id: &str, display_name: &str) {
         let color = AgentColor::from_index(self.agents.len());
-        self.agents.push(AgentProgress::new(agent_id, display_name, color));
+        self.agents
+            .push(AgentProgress::new(agent_id, display_name, color));
     }
 
     /// Update an agent's status.
@@ -293,21 +291,27 @@ mod tests {
     #[test]
     fn agent_status_terminal() {
         assert!(!AgentStatus::Pending.is_terminal());
-        assert!(!AgentStatus::Running {
-            current_turn: 1,
-            max_turns: 10,
-            last_tool: None,
-        }
-        .is_terminal());
-        assert!(AgentStatus::Completed {
-            turns_used: 5,
-            tool_calls: 10,
-        }
-        .is_terminal());
-        assert!(AgentStatus::Failed {
-            reason: "err".into(),
-        }
-        .is_terminal());
+        assert!(
+            !AgentStatus::Running {
+                current_turn: 1,
+                max_turns: 10,
+                last_tool: None,
+            }
+            .is_terminal()
+        );
+        assert!(
+            AgentStatus::Completed {
+                turns_used: 5,
+                tool_calls: 10,
+            }
+            .is_terminal()
+        );
+        assert!(
+            AgentStatus::Failed {
+                reason: "err".into(),
+            }
+            .is_terminal()
+        );
     }
 
     #[test]
