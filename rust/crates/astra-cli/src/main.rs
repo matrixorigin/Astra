@@ -325,18 +325,29 @@ enum Command {
     Interactive,
     /// Start the HTTP API server
     Serve(ServeArgs),
+    /// Register a new account
     Register(RegisterArgs),
+    /// Log in with stored credentials
     Login(LoginArgs),
+    /// Show the current authenticated user
     Whoami,
+    /// Refresh the current auth token
     Refresh,
+    /// Log out and clear local credentials
     Logout,
+    /// Check API health
     Health,
+    /// Run a non-REPL chat request
     Chat(ChatArgs),
+    /// Replay a recorded session
     Replay(ReplayArgs),
+    /// Inspect and manage sessions
     #[command(subcommand)]
     Session(SessionCmd),
+    /// Inspect available models
     #[command(subcommand)]
     Model(ModelCmd),
+    /// Inspect and manage skills
     #[command(subcommand)]
     Skill(SkillCmd),
     /// Session audit: astra audit list/show/turns/tools
@@ -403,19 +414,28 @@ enum PlanCmd {
 }
 
 #[derive(Args, Debug)]
+#[command(
+    after_help = "Examples:\n  astra register --username alice --email alice@example.com --password secret"
+)]
 struct RegisterArgs {
+    /// Username for the new account
     #[arg(long)]
     username: Option<String>,
+    /// Email for the new account
     #[arg(long)]
     email: Option<String>,
+    /// Password for the new account
     #[arg(long)]
     password: Option<String>,
 }
 
 #[derive(Args, Debug)]
+#[command(after_help = "Examples:\n  astra login --username alice --password secret")]
 struct LoginArgs {
+    /// Username to log in with
     #[arg(long)]
     username: Option<String>,
+    /// Password to log in with
     #[arg(long)]
     password: Option<String>,
 }
@@ -431,15 +451,23 @@ struct ServeArgs {
 }
 
 #[derive(Args, Debug)]
+#[command(
+    after_help = "Examples:\n  astra chat -m \"总结当前仓库结构\"\n  echo \"修复测试失败\" | astra chat --stdin --json"
+)]
 struct ChatArgs {
+    /// Chat message text
     #[arg(short = 'm', long = "message")]
     message: Option<String>,
+    /// Existing session id to continue
     #[arg(long)]
     session_id: Option<String>,
+    /// Model override
     #[arg(long)]
     model: Option<String>,
+    /// Enable explain mode
     #[arg(long, default_value_t = false)]
     explain: bool,
+    /// Auto-approve tool calls
     #[arg(short = 'y', long = "auto-approve", default_value_t = false)]
     auto_approve: bool,
     /// Permission mode: auto (approve all), prompt (interactive, default), deny (reject all writes)
@@ -919,12 +947,19 @@ struct SkillRegisterArgs {
 }
 
 #[derive(Args, Debug)]
+#[command(
+    after_help = "Examples:\n  astra replay 550e8400-e29b-41d4-a716-446655440000\n  astra replay 550e8400-e29b-41d4-a716-446655440000 --compare"
+)]
 struct ReplayArgs {
+    /// Session id to replay
     session_id: String,
+    /// Optional sandbox profile
     #[arg(long)]
     sandbox_name: Option<String>,
+    /// Use mock mode during replay
     #[arg(long, default_value_t = true)]
     mock_mode: bool,
+    /// Compare replay output against the recorded run
     #[arg(long)]
     compare: bool,
 }
