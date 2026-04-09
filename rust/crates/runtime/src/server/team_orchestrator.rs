@@ -18,10 +18,7 @@ use astra_services::coordination::{
     AgentProfile, AgentProfileRegistry, AgentResult, AgentTier, DelegationResult,
 };
 use astra_services::learning_merge::{AgentLearning, MergedLearning, merge_agent_learnings};
-use astra_services::team_persistence::{
-    TeamPersistenceService, WorktreeMode,
-    resolve_team,
-};
+use astra_services::team_persistence::{TeamPersistenceService, WorktreeMode, resolve_team};
 
 use super::delegation_engine::{DelegationEngine, DelegationTracker};
 use super::run_engine::RunEngine;
@@ -33,7 +30,10 @@ use super::worktree_isolation::{MergeResult, RepoLock, WorktreeManager};
 #[derive(Debug, Clone, PartialEq)]
 pub enum ExecutionPhase {
     /// Team loaded and validated, profiles resolved.
-    Preparing { team_name: String, member_count: usize },
+    Preparing {
+        team_name: String,
+        member_count: usize,
+    },
     /// Worktrees created (only for Isolated mode).
     WorktreesCreated { agent_ids: Vec<String> },
     /// Delegation started via DelegationEngine.
@@ -73,6 +73,7 @@ pub struct TeamExecutionReport {
 #[derive(Debug, Clone, PartialEq)]
 pub enum TeamExecutionStatus {
     Completed,
+    Partial,
     CompletedWithConflicts,
     Failed,
 }
@@ -81,6 +82,7 @@ impl std::fmt::Display for TeamExecutionStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Completed => write!(f, "completed"),
+            Self::Partial => write!(f, "partial"),
             Self::CompletedWithConflicts => write!(f, "completed_with_conflicts"),
             Self::Failed => write!(f, "failed"),
         }
@@ -155,8 +157,17 @@ impl TeamExecutionOrchestrator {
             .await
         {
             Ok(Some(t)) => t,
-            Ok(None) => return self.fail_report(team_name, "", "", format!("team '{team_name}' not found")),
-            Err(e) => return self.fail_report(team_name, "", "", format!("failed to load team: {e}")),
+            Ok(None) => {
+                return self.fail_report(
+                    team_name,
+                    "",
+                    "",
+                    format!("team '{team_name}' not found"),
+                );
+            }
+            Err(e) => {
+                return self.fail_report(team_name, "", "", format!("failed to load team: {e}"));
+            }
         };
 
         // Start parent durable run with team metadata
@@ -173,20 +184,28 @@ impl TeamExecutionOrchestrator {
             )
             .await
         {
-            return self.fail_report(team_name, "", &parent_run_id, format!("failed to start run: {e}"));
+            return self.fail_report(
+                team_name,
+                "",
+                &parent_run_id,
+                format!("failed to start run: {e}"),
+            );
         }
 
         // Emit preparation event
-        let _ = self.run_engine.append_event(
-            &parent_run_id,
-            serde_json::json!({
-                "event_type": "team_prepare",
-                "team_name": team_name,
-                "coordination": format!("{:?}", team.coordination),
-                "member_count": team.members.len(),
-                "worktree_mode": format!("{:?}", team.worktree_mode),
-            }),
-        ).await;
+        let _ = self
+            .run_engine
+            .append_event(
+                &parent_run_id,
+                serde_json::json!({
+                    "event_type": "team_prepare",
+                    "team_name": team_name,
+                    "coordination": format!("{:?}", team.coordination),
+                    "member_count": team.members.len(),
+                    "worktree_mode": format!("{:?}", team.worktree_mode),
+                }),
+            )
+            .await;
 
         // Resolve members → profiles using the new resolve_team with registry lookup
         let registry = self.profile_registry.read().await;
@@ -194,10 +213,16 @@ impl TeamExecutionOrchestrator {
             Ok(r) => r,
             Err(e) => {
                 drop(registry);
-                let _ = self.run_engine
+                let _ = self
+                    .run_engine
                     .persist_status(&parent_run_id, "failed", None, Some(&e))
                     .await;
-                return self.fail_report(team_name, "", &parent_run_id, format!("team validation failed: {e}"));
+                return self.fail_report(
+                    team_name,
+                    "",
+                    &parent_run_id,
+                    format!("team validation failed: {e}"),
+                );
             }
         };
         drop(registry);
@@ -242,9 +267,7 @@ impl TeamExecutionOrchestrator {
                         for (agent_id, path) in &paths {
                             effective_request.context.insert(
                                 format!("worktree_path_{agent_id}"),
-                                serde_json::Value::String(
-                                    path.to_string_lossy().to_string(),
-                                ),
+                                serde_json::Value::String(path.to_string_lossy().to_string()),
                             );
                         }
                         self.emit_progress(ExecutionPhase::WorktreesCreated {
@@ -257,7 +280,9 @@ impl TeamExecutionOrchestrator {
                             .persist_status(&parent_run_id, "failed", None, Some(&e.to_string()))
                             .await;
                         return self.fail_report(
-                            team_name, &delegation_id, &parent_run_id,
+                            team_name,
+                            &delegation_id,
+                            &parent_run_id,
                             format!("failed to create worktrees: {e}"),
                         );
                     }
@@ -271,24 +296,28 @@ impl TeamExecutionOrchestrator {
             "delegation_id": &delegation_id,
             "agent_ids": &agent_ids,
             "worktree_mode": format!("{:?}", team.worktree_mode),
-        }).to_string();
-        let _ = self.run_engine.persist_checkpoint(
-            &parent_run_id,
-            &checkpoint,
-        ).await;
+        })
+        .to_string();
+        let _ = self
+            .run_engine
+            .persist_checkpoint(&parent_run_id, &checkpoint)
+            .await;
 
         // ── Phase 2: Execute ────────────────────────────────────────────
         self.emit_progress(ExecutionPhase::Executing {
             delegation_id: delegation_id.clone(),
         });
 
-        let _ = self.run_engine.append_event(
-            &parent_run_id,
-            serde_json::json!({
-                "event_type": "team_execute_start",
-                "delegation_id": &delegation_id,
-            }),
-        ).await;
+        let _ = self
+            .run_engine
+            .append_event(
+                &parent_run_id,
+                serde_json::json!({
+                    "event_type": "team_execute_start",
+                    "delegation_id": &delegation_id,
+                }),
+            )
+            .await;
 
         let delegation_result = match self
             .delegation_engine
@@ -303,11 +332,15 @@ impl TeamExecutionOrchestrator {
                     .await;
                 if let Some(ref mut mgr) = worktree_mgr {
                     if let Err(ce) = mgr.cleanup().await {
-                        eprintln!("[team-orchestrator] worktree cleanup failed after delegation error: {ce}");
+                        eprintln!(
+                            "[team-orchestrator] worktree cleanup failed after delegation error: {ce}"
+                        );
                     }
                 }
                 return self.fail_report(
-                    team_name, &delegation_id, &parent_run_id,
+                    team_name,
+                    &delegation_id,
+                    &parent_run_id,
                     format!("delegation failed: {e}"),
                 );
             }
@@ -315,22 +348,23 @@ impl TeamExecutionOrchestrator {
 
         // Persist token usage from delegation results
         let (total_prompt, total_completion, total_tools) = sum_usage(&delegation_result);
-        let _ = self.run_engine.persist_usage(
-            &parent_run_id,
-            total_prompt,
-            total_completion,
-            total_tools,
-        ).await;
+        let _ = self
+            .run_engine
+            .persist_usage(&parent_run_id, total_prompt, total_completion, total_tools)
+            .await;
 
-        let _ = self.run_engine.append_event(
-            &parent_run_id,
-            serde_json::json!({
-                "event_type": "team_execute_complete",
-                "agent_results": delegation_result.agent_results.len(),
-                "total_prompt_tokens": total_prompt,
-                "total_completion_tokens": total_completion,
-            }),
-        ).await;
+        let _ = self
+            .run_engine
+            .append_event(
+                &parent_run_id,
+                serde_json::json!({
+                    "event_type": "team_execute_complete",
+                    "agent_results": delegation_result.agent_results.len(),
+                    "total_prompt_tokens": total_prompt,
+                    "total_completion_tokens": total_completion,
+                }),
+            )
+            .await;
 
         // ── Phase 3: Merge ──────────────────────────────────────────────
         self.emit_progress(ExecutionPhase::Merging {
@@ -367,15 +401,13 @@ impl TeamExecutionOrchestrator {
         };
 
         // ── Phase 4: Report ─────────────────────────────────────────────
-        let has_conflicts = merge_result
+        let conflict_count = merge_result
             .as_ref()
-            .is_some_and(|m| !m.conflicts.is_empty());
+            .map(|m| m.conflicts.len())
+            .unwrap_or(0);
+        let has_conflicts = conflict_count > 0;
 
-        let status = if has_conflicts {
-            TeamExecutionStatus::CompletedWithConflicts
-        } else {
-            TeamExecutionStatus::Completed
-        };
+        let (status, error) = derive_team_status(&delegation_result, conflict_count);
 
         self.emit_progress(ExecutionPhase::Reporting {
             status: status.clone(),
@@ -384,7 +416,7 @@ impl TeamExecutionOrchestrator {
         // Persist final run status
         let _ = self
             .run_engine
-            .persist_status(&parent_run_id, &status.to_string(), None, None)
+            .persist_status(&parent_run_id, &status.to_string(), None, error.as_deref())
             .await;
 
         // Record team execution history for /team history
@@ -396,22 +428,31 @@ impl TeamExecutionOrchestrator {
             "has_conflicts": has_conflicts,
             "merged_learning_patterns": merged_learning.as_ref().map(|l| l.consensus_patterns.len()).unwrap_or(0),
         });
-        let _ = self.team_store.record_execution_start(
-            &delegation_id, &team.team_id, &self.config.user_id, task,
-        ).await;
-        let _ = self.team_store.record_execution_complete(
-            &delegation_id, &status.to_string(), Some(&result_summary.to_string()),
-        ).await;
+        let _ = self
+            .team_store
+            .record_execution_start(&delegation_id, &team.team_id, &self.config.user_id, task)
+            .await;
+        let _ = self
+            .team_store
+            .record_execution_complete(
+                &delegation_id,
+                &status.to_string(),
+                Some(&result_summary.to_string()),
+            )
+            .await;
 
         // Final event
-        let _ = self.run_engine.append_event(
-            &parent_run_id,
-            serde_json::json!({
-                "event_type": "team_complete",
-                "status": status.to_string(),
-                "has_conflicts": has_conflicts,
-            }),
-        ).await;
+        let _ = self
+            .run_engine
+            .append_event(
+                &parent_run_id,
+                serde_json::json!({
+                    "event_type": "team_complete",
+                    "status": status.to_string(),
+                    "has_conflicts": has_conflicts,
+                }),
+            )
+            .await;
 
         // Cleanup worktrees
         if let Some(ref mut mgr) = worktree_mgr {
@@ -434,12 +475,16 @@ impl TeamExecutionOrchestrator {
 
     /// Pause all agents in an active team delegation.
     pub async fn pause_team(&self, delegation_id: &str) -> usize {
-        self.delegation_tracker.pause_delegation(delegation_id).await
+        self.delegation_tracker
+            .pause_delegation(delegation_id)
+            .await
     }
 
     /// Resume all agents in a paused team delegation.
     pub async fn resume_team(&self, delegation_id: &str) -> usize {
-        self.delegation_tracker.resume_delegation(delegation_id).await
+        self.delegation_tracker
+            .resume_delegation(delegation_id)
+            .await
     }
 
     /// Check if a delegation is currently paused.
@@ -498,6 +543,98 @@ fn sum_usage(result: &DelegationResult) -> (u64, u64, u32) {
     (prompt, completion, tools)
 }
 
+fn summarize_failed_agents(result: &DelegationResult) -> String {
+    if result.agent_results.is_empty() {
+        return "delegation produced no agent results".to_string();
+    }
+
+    let failed: Vec<&AgentResult> = result
+        .agent_results
+        .iter()
+        .filter(|agent| !agent.is_success())
+        .collect();
+    if failed.is_empty() {
+        return "delegation did not produce a successful result".to_string();
+    }
+
+    let details: Vec<String> = failed
+        .iter()
+        .take(3)
+        .map(|agent| {
+            let reason = agent
+                .error
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or(agent.status.as_str());
+            format!("{}: {}", agent.agent_id, reason)
+        })
+        .collect();
+    let remainder = failed.len().saturating_sub(details.len());
+    let suffix = if remainder > 0 {
+        format!(" (+{} more)", remainder)
+    } else {
+        String::new()
+    };
+
+    format!(
+        "{} of {} agents failed ({}){}",
+        failed.len(),
+        result.agent_results.len(),
+        details.join("; "),
+        suffix
+    )
+}
+
+fn append_merge_conflict_summary(summary: String, conflict_count: usize) -> String {
+    if conflict_count == 0 {
+        return summary;
+    }
+
+    format!("{summary}; merge produced {conflict_count} conflict(s)")
+}
+
+fn derive_team_status(
+    result: &DelegationResult,
+    conflict_count: usize,
+) -> (TeamExecutionStatus, Option<String>) {
+    match result.status.as_str() {
+        "completed" => {
+            let status = if conflict_count > 0 {
+                TeamExecutionStatus::CompletedWithConflicts
+            } else {
+                TeamExecutionStatus::Completed
+            };
+            let error = if conflict_count > 0 {
+                Some(format!("merge produced {conflict_count} conflict(s)"))
+            } else {
+                None
+            };
+            (status, error)
+        }
+        "partial" => (
+            TeamExecutionStatus::Partial,
+            Some(append_merge_conflict_summary(
+                summarize_failed_agents(result),
+                conflict_count,
+            )),
+        ),
+        "failed" => (
+            TeamExecutionStatus::Failed,
+            Some(append_merge_conflict_summary(
+                summarize_failed_agents(result),
+                conflict_count,
+            )),
+        ),
+        other => (
+            TeamExecutionStatus::Failed,
+            Some(append_merge_conflict_summary(
+                format!("delegation ended in unexpected status '{other}'"),
+                conflict_count,
+            )),
+        ),
+    }
+}
+
 /// Extract a synthetic AgentLearning from an agent result.
 ///
 /// Real implementations would parse structured output from the agent's
@@ -523,11 +660,11 @@ fn extract_learning_from_result(result: &AgentResult) -> AgentLearning {
 
 #[cfg(test)]
 mod tests {
+    use super::super::delegation_engine::{DelegationTracker, StubSubRunExecutor};
     use super::*;
     use astra_services::coordination::AgentTier;
     use astra_services::runs::InMemoryRunStateStore;
     use astra_services::team_persistence::InMemoryTeamStore;
-    use super::super::delegation_engine::{DelegationTracker, StubSubRunExecutor};
 
     async fn setup_orchestrator(team_store: Arc<InMemoryTeamStore>) -> TeamExecutionOrchestrator {
         let registry = Arc::new(RwLock::new(AgentProfileRegistry::new()));
@@ -535,8 +672,11 @@ mod tests {
         // Register an Orchestrator-tier agent as the source for delegation validation
         {
             let mut reg = registry.write().await;
-            let orch_profile =
-                astra_services::coordination::AgentProfile::new("orchestrator", "orchestrator", AgentTier::Orchestrator);
+            let orch_profile = astra_services::coordination::AgentProfile::new(
+                "orchestrator",
+                "orchestrator",
+                AgentTier::Orchestrator,
+            );
             let _ = reg.register(orch_profile);
         }
 
@@ -622,6 +762,7 @@ mod tests {
     #[test]
     fn execution_status_display() {
         assert_eq!(TeamExecutionStatus::Completed.to_string(), "completed");
+        assert_eq!(TeamExecutionStatus::Partial.to_string(), "partial");
         assert_eq!(
             TeamExecutionStatus::CompletedWithConflicts.to_string(),
             "completed_with_conflicts"
@@ -634,7 +775,11 @@ mod tests {
     /// Setup returning orchestrator + run_engine for introspection.
     async fn setup_with_engines(
         team_store: Arc<InMemoryTeamStore>,
-    ) -> (TeamExecutionOrchestrator, Arc<RunEngine>, Arc<DelegationTracker>) {
+    ) -> (
+        TeamExecutionOrchestrator,
+        Arc<RunEngine>,
+        Arc<DelegationTracker>,
+    ) {
         let registry = Arc::new(RwLock::new(AgentProfileRegistry::new()));
 
         {
@@ -680,12 +825,26 @@ mod tests {
         assert_eq!(report.status, TeamExecutionStatus::Completed);
 
         // The parent run should have events logged
-        let run = run_engine.load_run(&report.parent_run_id).await.unwrap().unwrap();
-        assert!(run.events.len() >= 3, "expected at least 3 events (prepare, exec_start, complete), got {}", run.events.len());
+        let run = run_engine
+            .load_run(&report.parent_run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            run.events.len() >= 3,
+            "expected at least 3 events (prepare, exec_start, complete), got {}",
+            run.events.len()
+        );
 
         // Verify event types
-        let event_types: Vec<String> = run.events.iter()
-            .filter_map(|e| e.get("event_type").and_then(|v| v.as_str()).map(String::from))
+        let event_types: Vec<String> = run
+            .events
+            .iter()
+            .filter_map(|e| {
+                e.get("event_type")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+            })
             .collect();
         assert!(event_types.contains(&"team_prepare".to_string()));
         assert!(event_types.contains(&"team_execute_start".to_string()));
@@ -700,7 +859,11 @@ mod tests {
         let report = orch.execute_team("research", "task", None).await;
         assert_eq!(report.status, TeamExecutionStatus::Completed);
 
-        let run = run_engine.load_run(&report.parent_run_id).await.unwrap().unwrap();
+        let run = run_engine
+            .load_run(&report.parent_run_id)
+            .await
+            .unwrap()
+            .unwrap();
         // StubSubRunExecutor produces results with default token counts
         // Usage should have been persisted (even if 0 from stubs)
         assert_eq!(run.status, "completed");
@@ -714,10 +877,18 @@ mod tests {
         let report = orch.execute_team("research", "task", None).await;
         assert_eq!(report.status, TeamExecutionStatus::Completed);
 
-        let run = run_engine.load_run(&report.parent_run_id).await.unwrap().unwrap();
+        let run = run_engine
+            .load_run(&report.parent_run_id)
+            .await
+            .unwrap()
+            .unwrap();
         // Checkpoint should be set after preparation phase
-        assert!(run.checkpoint_json.is_some(), "expected checkpoint to be persisted");
-        let cp: serde_json::Value = serde_json::from_str(run.checkpoint_json.as_ref().unwrap()).unwrap();
+        assert!(
+            run.checkpoint_json.is_some(),
+            "expected checkpoint to be persisted"
+        );
+        let cp: serde_json::Value =
+            serde_json::from_str(run.checkpoint_json.as_ref().unwrap()).unwrap();
         assert_eq!(cp["phase"], "prepared");
     }
 
@@ -732,7 +903,8 @@ mod tests {
         // registry after execution, meaning resolve_team used registry lookup.
         {
             let mut reg = orch.profile_registry.write().await;
-            let mut custom = AgentProfile::new("team-research-explorer", "explorer", AgentTier::System);
+            let mut custom =
+                AgentProfile::new("team-research-explorer", "explorer", AgentTier::System);
             custom.system_prompt = Some("Custom registered prompt.".to_string());
             custom.model_override = Some("gpt-4-turbo".to_string());
             let _ = reg.register(custom);
@@ -746,7 +918,13 @@ mod tests {
         let reg = orch.profile_registry.read().await;
         let profile = reg.get("team-research-explorer").unwrap();
         // Member system_prompt takes precedence over registry
-        assert!(profile.system_prompt.as_ref().unwrap().contains("search the codebase"));
+        assert!(
+            profile
+                .system_prompt
+                .as_ref()
+                .unwrap()
+                .contains("search the codebase")
+        );
         // But the resolve path DID use registry as base — model_override was empty
         // on the member, so it should be None (member override is None → no override)
         // This confirms the profile was freshly resolved.
@@ -794,7 +972,11 @@ mod tests {
         assert_eq!(report.status, TeamExecutionStatus::Completed);
 
         let collected = phases.lock().unwrap();
-        assert!(collected.len() >= 3, "expected at least 3 progress phases, got {}", collected.len());
+        assert!(
+            collected.len() >= 3,
+            "expected at least 3 progress phases, got {}",
+            collected.len()
+        );
         assert!(collected[0].contains("Preparing"));
         assert!(collected.iter().any(|p| p.contains("Executing")));
         assert!(collected.iter().any(|p| p.contains("Reporting")));

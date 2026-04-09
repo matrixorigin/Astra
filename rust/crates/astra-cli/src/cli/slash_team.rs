@@ -751,12 +751,25 @@ pub(super) async fn handle_team_command(arg: &str, state: &mut super::ReplState)
                         format!("({})", format_duration(elapsed)).dim()
                     );
                 }
+                astra_runtime::server::team_orchestrator::TeamExecutionStatus::Partial => {
+                    eprintln!(
+                        "  ⚠️  Team '{}' completed partially {}",
+                        team_name.yellow().bold(),
+                        format!("({})", format_duration(elapsed)).dim()
+                    );
+                    if let Some(ref err) = report.error {
+                        eprintln!("    {} {}", "Warning:".yellow().bold(), err);
+                    }
+                }
                 astra_runtime::server::team_orchestrator::TeamExecutionStatus::CompletedWithConflicts => {
                     eprintln!(
                         "  ⚠️  Team '{}' completed with merge conflicts {}",
                         team_name.yellow().bold(),
                         format!("({})", format_duration(elapsed)).dim()
                     );
+                    if let Some(ref err) = report.error {
+                        eprintln!("    {} {}", "Warning:".yellow().bold(), err);
+                    }
                 }
                 astra_runtime::server::team_orchestrator::TeamExecutionStatus::Failed => {
                     eprintln!(
@@ -783,7 +796,8 @@ pub(super) async fn handle_team_command(arg: &str, state: &mut super::ReplState)
                     dr.delegation_id.get(..8).unwrap_or(&dr.delegation_id).dim(),
                 );
                 for ar in &dr.agent_results {
-                    let (status_icon, status_color) = if ar.status == "completed" {
+                    let is_success = ar.status == "completed" && ar.error.is_none();
+                    let (status_icon, status_color) = if is_success {
                         ("✓", "green")
                     } else {
                         ("✗", "red")
@@ -791,24 +805,31 @@ pub(super) async fn handle_team_command(arg: &str, state: &mut super::ReplState)
                     let first_line = ar
                         .output
                         .as_deref()
-                        .unwrap_or("(no output)")
+                        .filter(|value| !value.trim().is_empty())
+                        .or_else(|| ar.error.as_deref().filter(|value| !value.trim().is_empty()))
+                        .unwrap_or(ar.status.as_str())
                         .lines()
                         .next()
                         .unwrap_or("");
                     let agent_tokens = ar.prompt_tokens + ar.completion_tokens;
+                    let status_label = if is_success {
+                        format!("({}tok)", format_tokens(agent_tokens))
+                    } else {
+                        format!("({} · {}tok)", ar.status, format_tokens(agent_tokens))
+                    };
                     match status_color {
                         "green" => eprintln!(
                             "    {} {} {} — {}",
                             status_icon.green(),
                             ar.agent_id.as_str().cyan(),
-                            format!("({}tok)", format_tokens(agent_tokens)).dim(),
+                            status_label.dim(),
                             truncate_str(first_line, 72),
                         ),
                         _ => eprintln!(
                             "    {} {} {} — {}",
                             status_icon.red(),
                             ar.agent_id.as_str().cyan(),
-                            format!("({}tok)", format_tokens(agent_tokens)).dim(),
+                            status_label.dim(),
                             truncate_str(first_line, 72),
                         ),
                     }
@@ -848,7 +869,8 @@ pub(super) async fn handle_team_command(arg: &str, state: &mut super::ReplState)
                 let has_facts = !learning.facts.is_empty();
                 let has_caution = !learning.cautionary_patterns.is_empty();
                 if has_patterns || has_facts || has_caution {
-                    eprintln!("\n  🧠 Learning from {} agent{}:",
+                    eprintln!(
+                        "\n  🧠 Learning from {} agent{}:",
                         learning.agent_count,
                         if learning.agent_count == 1 { "" } else { "s" }
                     );
@@ -999,6 +1021,7 @@ pub(super) async fn handle_team_command(arg: &str, state: &mut super::ReplState)
             for (i, e) in entries.iter().enumerate().rev() {
                 let status_icon = match e.status.as_str() {
                     "completed" => "✅",
+                    "partial" => "⚠️ ",
                     "completed_with_conflicts" => "⚠️ ",
                     _ => "❌",
                 };
@@ -1213,7 +1236,8 @@ pub(super) async fn handle_team_command(arg: &str, state: &mut super::ReplState)
 
             eprintln!(
                 "\n  ⏪ Restoring team '{}' from snapshot '{}'...",
-                name.cyan(), snap.snapshot_id.dim()
+                name.cyan(),
+                snap.snapshot_id.dim()
             );
             eprintln!("    {} {}", "Label:".dim(), snap.label);
 
