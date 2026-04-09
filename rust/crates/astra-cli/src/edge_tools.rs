@@ -394,6 +394,11 @@ pub struct ToolExecutor {
     task_manager: task_mgmt::TaskManager,
     /// Optional agent spawning context for the `spawn_agent` tool.
     pub spawn_context: Option<agent_spawning::SpawnAgentContext>,
+    /// Optional shared context cache for cross-agent knowledge sharing.
+    /// Used by share_context and query_context tools.
+    pub context_cache: Option<std::sync::Arc<astra_runtime::orchestration::SharedContextCache>>,
+    /// Agent ID for context sharing attribution.
+    pub agent_id: Option<String>,
 }
 
 /// State for an active worktree session created by `git_worktree enter`.
@@ -526,12 +531,25 @@ impl ToolExecutor {
             worktree_session: std::sync::Mutex::new(None),
             task_manager: task_mgmt::TaskManager::new(),
             spawn_context: None,
+            context_cache: None,
+            agent_id: None,
         }
     }
 
     /// Set the spawn context for agent spawning.
     pub fn with_spawn_context(mut self, ctx: agent_spawning::SpawnAgentContext) -> Self {
         self.spawn_context = Some(ctx);
+        self
+    }
+
+    /// Set the shared context cache for cross-agent knowledge sharing.
+    pub fn with_context_cache(
+        mut self,
+        cache: std::sync::Arc<astra_runtime::orchestration::SharedContextCache>,
+        agent_id: impl Into<String>,
+    ) -> Self {
+        self.context_cache = Some(cache);
+        self.agent_id = Some(agent_id.into());
         self
     }
 
@@ -2023,6 +2041,37 @@ impl ToolExecutor {
         }
     }
 
+    /// Share context with other agents via SharedContextCache.
+    fn share_context(&self, args: &Value) -> String {
+        let cache = match &self.context_cache {
+            Some(c) => c,
+            None => {
+                return json!({
+                    "success": false,
+                    "error": "Context sharing not available - no cache configured"
+                })
+                .to_string();
+            }
+        };
+        let agent_id = self.agent_id.as_deref().unwrap_or("unknown");
+        context_sharing::execute_share_context(cache, agent_id, args).to_string()
+    }
+
+    /// Query shared context from other agents via SharedContextCache.
+    fn query_context(&self, args: &Value) -> String {
+        let cache = match &self.context_cache {
+            Some(c) => c,
+            None => {
+                return json!({
+                    "success": false,
+                    "error": "Context sharing not available - no cache configured"
+                })
+                .to_string();
+            }
+        };
+        context_sharing::execute_query_context(cache, args).to_string()
+    }
+
     /// Return a compact summary of the current session state.
     fn brief(&self, args: &Value) -> String {
         let focus = args
@@ -2721,6 +2770,8 @@ impl ToolExecutor {
             "tool_search" => self.tool_search(args),
             "web_search" => self.web_search(args),
             "spawn_agent" => agent_spawning::handle_spawn_agent_tool(args, self.spawn_context.as_ref()).await,
+            "share_context" => self.share_context(args),
+            "query_context" => self.query_context(args),
             "diagnose" => self.diagnose(args).await,
             "lsp" => self.lsp(args),
             "env" => self.env_tool(args),
@@ -2734,7 +2785,7 @@ impl ToolExecutor {
                  git_diff, git_log, git_show, git_blame, call_graph, run_build_test, web_fetch, \
                  mo_query, memory_search, memory_profile, ask_user, task_create, task_list, \
                  task_get, task_update, task_stop, sleep, tool_search, web_search, spawn_agent, \
-                 diagnose, lsp, env, notebook_edit, config, powershell, brief"
+                 share_context, query_context, diagnose, lsp, env, notebook_edit, config, powershell, brief"
             ),
         };
         // Normalize empty output, then apply global safety net
