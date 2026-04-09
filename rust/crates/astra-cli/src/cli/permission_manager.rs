@@ -632,114 +632,79 @@ impl PermissionManager {
     }
 
     pub(crate) fn prompt_approval(kind: ApprovalPromptKind) -> char {
-        use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+        use std::io::IsTerminal;
 
-        struct RawModeGuard;
+        // Build options based on prompt kind
+        let options: Vec<(&str, char)> = match kind {
+            ApprovalPromptKind::LocalStandard => vec![
+                ("✓  Yes (once)", 'y'),
+                ("✕  No", 'n'),
+                ("◉  Always allow this tool", 'a'),
+                ("▶  Auto-run session", '!'),
+                ("⏭  Skip tool", 's'),
+            ],
+            ApprovalPromptKind::CloudStandard => vec![
+                ("✓  Yes (once)", 'y'),
+                ("✕  No", 'n'),
+                ("◉  Allow tool (session)", 'a'),
+                ("▶  Auto-run session", '!'),
+                ("⏭  Skip tool", 's'),
+            ],
+            ApprovalPromptKind::ConfirmOnce => vec![
+                ("✓  Confirm", 'y'),
+                ("✕  Cancel", 'n'),
+            ],
+        };
 
-        impl Drop for RawModeGuard {
-            fn drop(&mut self) {
-                let _ = disable_raw_mode();
+        // Use inquire Select if terminal, fallback to single-char input
+        if std::io::stdin().is_terminal() {
+            let labels: Vec<String> = options.iter().map(|(s, _)| s.to_string()).collect();
+            match inquire::Select::new("", labels)
+                .with_render_config(Self::approval_select_theme())
+                .without_help_message()
+                .prompt()
+            {
+                Ok(choice) => {
+                    // Find the char for the selected option
+                    options
+                        .iter()
+                        .find(|(label, _)| choice == *label)
+                        .map(|(_, c)| *c)
+                        .unwrap_or('n')
+                }
+                Err(_) => 'n', // Esc or interrupt
             }
-        }
-
-        match kind {
-            ApprovalPromptKind::LocalStandard => eprint!(
-                "  {} {} · {} · {} · {} · {}  {} ",
-                "▸".cyan(),
-                "[y] yes".cyan().bold(),
-                "[n] no".cyan().bold(),
-                "[a] always tool".cyan().bold(),
-                "[!] auto-run session".cyan().bold(),
-                "[s] skip tool".cyan().bold(),
-                "→".dim(),
-            ),
-            ApprovalPromptKind::CloudStandard => eprint!(
-                "  {} {} · {} · {} · {} · {}  {} ",
-                "▸".cyan(),
-                "[y] yes".cyan().bold(),
-                "[n] no".cyan().bold(),
-                "[a] allow tool session".cyan().bold(),
-                "[!] auto-run session".cyan().bold(),
-                "[s] skip tool".cyan().bold(),
-                "→".dim(),
-            ),
-            ApprovalPromptKind::ConfirmOnce => eprint!(
-                "  {} {} · {}  {} ",
-                "▸".cyan(),
-                "[y] confirm once".cyan().bold(),
-                "[n] cancel".cyan().bold(),
-                "→".dim(),
-            ),
-        }
-        let _ = io::stderr().flush();
-
-        if enable_raw_mode().is_ok() {
-            let _guard = RawModeGuard;
-            let result = loop {
-                if let Ok(Event::Key(KeyEvent { code, .. })) = event::read() {
-                    match code {
-                        KeyCode::Char('y') | KeyCode::Char('Y') => break 'y',
-                        KeyCode::Char('n') | KeyCode::Char('N') => break 'n',
-                        KeyCode::Char('a') | KeyCode::Char('A')
-                            if matches!(
-                                kind,
-                                ApprovalPromptKind::LocalStandard
-                                    | ApprovalPromptKind::CloudStandard
-                            ) =>
-                        {
-                            break 'a';
-                        }
-                        KeyCode::Char('s') | KeyCode::Char('S')
-                            if matches!(
-                                kind,
-                                ApprovalPromptKind::LocalStandard
-                                    | ApprovalPromptKind::CloudStandard
-                            ) =>
-                        {
-                            break 's';
-                        }
-                        KeyCode::Char('!')
-                            if matches!(
-                                kind,
-                                ApprovalPromptKind::LocalStandard
-                                    | ApprovalPromptKind::CloudStandard
-                            ) =>
-                        {
-                            break '!';
-                        }
-                        KeyCode::Enter => break 'n',
-                        KeyCode::Char('c') => break 'n',
-                        KeyCode::Esc => break 'n',
-                        _ => {}
-                    }
-                }
-            };
-            drop(_guard);
-            let label: String = match (kind, result) {
-                (_, 'y') => format!("{}", "yes".green()),
-                (ApprovalPromptKind::LocalStandard, 'a') => {
-                    format!("{}", "always tool".green())
-                }
-                (ApprovalPromptKind::CloudStandard, 'a') => {
-                    format!("{}", "allow tool session".green())
-                }
-                (_, 'n') => format!("{}", "no".red()),
-                (ApprovalPromptKind::LocalStandard | ApprovalPromptKind::CloudStandard, 's') => {
-                    format!("{}", "skip tool".yellow())
-                }
-                (ApprovalPromptKind::LocalStandard | ApprovalPromptKind::CloudStandard, '!') => {
-                    format!("{}", "auto-run session".green())
-                }
-                (_, c) => c.to_string(),
-            };
-            eprintln!("{label}");
-            result
         } else {
+            // Non-terminal fallback: single character input
+            let hint = options
+                .iter()
+                .map(|(label, c)| format!("[{}] {}", c, label.trim_start_matches(|x: char| !x.is_alphabetic())))
+                .collect::<Vec<_>>()
+                .join(" · ");
+            eprint!("  {} {hint} → ", "▸".cyan());
+            let _ = io::stderr().flush();
+
             let mut response = String::new();
             let _ = io::stdin().read_line(&mut response);
             let ch = response.trim().to_lowercase().chars().next().unwrap_or('n');
             if response.trim() == "!" { '!' } else { ch }
         }
+    }
+
+    /// Theme for approval Select prompt, matching plan_interaction style.
+    fn approval_select_theme() -> inquire::ui::RenderConfig<'static> {
+        use inquire::ui::{Attributes, Color, RenderConfig, StyleSheet};
+        let cyan = Color::Rgb {
+            r: 0,
+            g: 200,
+            b: 200,
+        };
+        let mut rc = RenderConfig::default_colored();
+        rc.prompt_prefix = inquire::ui::Styled::new("▸").with_fg(cyan);
+        rc.highlighted_option_prefix = inquire::ui::Styled::new("▸").with_fg(cyan);
+        rc.selected_option = Some(StyleSheet::new().with_fg(cyan).with_attr(Attributes::BOLD));
+        rc.answer = StyleSheet::new().with_fg(cyan).with_attr(Attributes::BOLD);
+        rc
     }
 
     fn apply_cloud_approval_choice(
