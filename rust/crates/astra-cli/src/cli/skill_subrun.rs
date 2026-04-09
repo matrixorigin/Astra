@@ -451,6 +451,8 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             dead_letter_queue: None,
             messaging_metrics: None,
             progress_emitter: None,
+            permission_context: None,
+            permission_handler: None,
         };
 
         run_agentic_loop_with_host(&mut host, &mut state).await?;

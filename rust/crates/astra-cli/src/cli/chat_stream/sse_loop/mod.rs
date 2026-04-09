@@ -406,6 +406,8 @@ pub(crate) async fn stream_chat_sse(
         dead_letter_queue: None,
         messaging_metrics: p.messaging_metrics.clone(),
         progress_emitter: None,
+        permission_context: None,
+        permission_handler: None,
     };
 
     // ─── Run the runtime loop ────────────────────────────────────────────

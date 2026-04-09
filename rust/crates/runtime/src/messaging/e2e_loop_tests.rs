@@ -217,6 +217,8 @@ mod tests {
             dead_letter_queue: None,
             messaging_metrics: None,
             progress_emitter: None,
+            permission_context: None,
+            permission_handler: None,
         }
     }
 

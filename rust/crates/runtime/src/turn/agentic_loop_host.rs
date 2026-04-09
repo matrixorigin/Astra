@@ -364,6 +364,17 @@ pub struct AgenticLoopState {
     /// Optional progress emitter for broadcasting turn events to UI/subscribers.
     /// When set, the loop emits `TurnCompleted` events after each turn.
     pub progress_emitter: Option<crate::orchestration::AgentProgressEmitter>,
+
+    // ── Permission sync ──
+    /// Optional permission sync context for runtime permission management.
+    /// When set, tool execution checks permissions before running and can
+    /// request permission from parent agent via mailbox if denied.
+    pub permission_context:
+        Option<std::sync::Arc<tokio::sync::RwLock<crate::orchestration::PermissionSyncContext>>>,
+
+    /// Optional permission request handler for processing child requests.
+    /// When set, incoming PermissionRequest messages are handled automatically.
+    pub permission_handler: Option<crate::orchestration::PermissionRequestHandler>,
 }
 
 /// Consecutive same-category error turns before forcing a strategy change.
@@ -2218,6 +2229,8 @@ mod tests {
             dead_letter_queue: None,
             messaging_metrics: None,
             progress_emitter: None,
+            permission_context: None,
+            permission_handler: None,
         }
     }
 

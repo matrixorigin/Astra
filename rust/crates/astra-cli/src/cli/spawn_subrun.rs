@@ -256,6 +256,8 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             dead_letter_queue: None,
             messaging_metrics: None,
             progress_emitter: config.progress_emitter,
+            permission_context: config.permission_context,
+            permission_handler: None, // Child agents don't handle permission requests
         };
 
         let loop_result = run_agentic_loop_with_host(&mut host, &mut state).await;

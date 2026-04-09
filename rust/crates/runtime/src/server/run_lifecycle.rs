@@ -339,6 +339,8 @@ impl AgenticRunLifecycleService {
             dead_letter_queue: None,
             messaging_metrics: None,
             progress_emitter: None,
+            permission_context: None,
+            permission_handler: None,
         }
     }
 
@@ -1042,6 +1044,8 @@ impl SubRunExecutor for ServerSubRunExecutor {
             dead_letter_queue: None,
             messaging_metrics: None,
             progress_emitter: None,
+            permission_context: None,
+            permission_handler: None,
         };
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut loop_state).await;

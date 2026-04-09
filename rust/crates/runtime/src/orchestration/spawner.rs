@@ -140,6 +140,10 @@ pub struct SpawnRunConfig {
     pub inherited_permissions: Option<super::permission_sync::InheritedPermissions>,
     /// Parent agent address for permission requests (if this is a child agent).
     pub parent_address: Option<crate::messaging::types::AgentAddress>,
+    /// Permission context for runtime permission management.
+    /// Created from inherited_permissions or as a fresh root context.
+    pub permission_context:
+        Option<std::sync::Arc<tokio::sync::RwLock<super::permission_sync::PermissionSyncContext>>>,
 }
 
 impl std::fmt::Debug for SpawnRunConfig {
@@ -345,6 +349,12 @@ impl DynamicAgentSpawner {
             &context.parent_agent_id,
         );
 
+        // 7b. Build permission context from inherited permissions
+        let permission_context = context.inherited_permissions.as_ref().map(|inherited| {
+            let ctx = super::permission_sync::PermissionSyncContext::new(inherited.clone());
+            std::sync::Arc::new(tokio::sync::RwLock::new(ctx))
+        });
+
         // 8. Build run config
         let run_config = SpawnRunConfig {
             run_id: run_id.clone(),
@@ -364,6 +374,8 @@ impl DynamicAgentSpawner {
             inherited_permissions: context.inherited_permissions.clone(),
             // Parent address for permission requests
             parent_address: Some(parent_address),
+            // Permission context for runtime permission management
+            permission_context,
         };
 
         // 8. Execute or launch
@@ -776,6 +788,7 @@ mod tests {
             parent_agent_id: "main".to_string(),
             inherited_permissions: None,
             working_dir: PathBuf::from("/tmp"),
+            inherited_permissions: None,
         };
         let input = SpawnAgentInput {
             description: "Named agent".to_string(),
@@ -847,6 +860,7 @@ mod tests {
             parent_agent_id: "main".to_string(),
             inherited_permissions: None,
             working_dir: PathBuf::from("/tmp"),
+            inherited_permissions: None,
         };
         let input = SpawnAgentInput {
             description: "Background agent".to_string(),
