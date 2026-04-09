@@ -442,7 +442,7 @@ impl PermissionManager {
         if let Some(detail) = detail.filter(|s| !s.is_empty()) {
             eprintln!("{}", format!("     {detail}").dim());
         }
-        self.apply_cloud_approval_choice(tool, Self::prompt_approval())
+        self.apply_cloud_approval_choice(tool, Self::prompt_approval(ApprovalPromptKind::Standard))
     }
 
     fn classify(name: &str) -> SideEffect {
@@ -624,7 +624,7 @@ impl PermissionManager {
         (header, detail)
     }
 
-    pub(crate) fn prompt_approval() -> char {
+    pub(crate) fn prompt_approval(kind: ApprovalPromptKind) -> char {
         use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 
         struct RawModeGuard;
@@ -635,17 +635,25 @@ impl PermissionManager {
             }
         }
 
-        // Styled prompt: highlight key letters, dim separators
-        eprint!(
-            "  {} {} · {} · {} · {} · {}  {} ",
-            "▸".cyan(),
-            "[y] yes".cyan().bold(),
-            "[n] no".cyan().bold(),
-            "[a] always tool".cyan().bold(),
-            "[!] auto-run session".cyan().bold(),
-            "[s] skip tool".cyan().bold(),
-            "→".dim(),
-        );
+        match kind {
+            ApprovalPromptKind::Standard => eprint!(
+                "  {} {} · {} · {} · {} · {}  {} ",
+                "▸".cyan(),
+                "[y] yes".cyan().bold(),
+                "[n] no".cyan().bold(),
+                "[a] always tool".cyan().bold(),
+                "[!] auto-run session".cyan().bold(),
+                "[s] skip tool".cyan().bold(),
+                "→".dim(),
+            ),
+            ApprovalPromptKind::ConfirmOnce => eprint!(
+                "  {} {} · {}  {} ",
+                "▸".cyan(),
+                "[y] confirm once".cyan().bold(),
+                "[n] cancel".cyan().bold(),
+                "→".dim(),
+            ),
+        }
         let _ = io::stderr().flush();
 
         if enable_raw_mode().is_ok() {
@@ -654,10 +662,20 @@ impl PermissionManager {
                 if let Ok(Event::Key(KeyEvent { code, .. })) = event::read() {
                     match code {
                         KeyCode::Char('y') | KeyCode::Char('Y') => break 'y',
-                        KeyCode::Char('a') | KeyCode::Char('A') => break 'a',
                         KeyCode::Char('n') | KeyCode::Char('N') => break 'n',
-                        KeyCode::Char('s') | KeyCode::Char('S') => break 's',
-                        KeyCode::Char('!') => break '!',
+                        KeyCode::Char('a') | KeyCode::Char('A')
+                            if matches!(kind, ApprovalPromptKind::Standard) =>
+                        {
+                            break 'a';
+                        }
+                        KeyCode::Char('s') | KeyCode::Char('S')
+                            if matches!(kind, ApprovalPromptKind::Standard) =>
+                        {
+                            break 's';
+                        }
+                        KeyCode::Char('!') if matches!(kind, ApprovalPromptKind::Standard) => {
+                            break '!';
+                        }
                         KeyCode::Enter => break 'n',
                         KeyCode::Char('c') => break 'n',
                         KeyCode::Esc => break 'n',
@@ -666,13 +684,15 @@ impl PermissionManager {
                 }
             };
             drop(_guard);
-            let label: String = match result {
-                'y' => format!("{}", "yes".green()),
-                'a' => format!("{}", "always tool".green()),
-                'n' => format!("{}", "no".red()),
-                's' => format!("{}", "skip tool".yellow()),
-                '!' => format!("{}", "auto-run session".green()),
-                c => c.to_string(),
+            let label: String = match (kind, result) {
+                (_, 'y') => format!("{}", "yes".green()),
+                (ApprovalPromptKind::Standard, 'a') => format!("{}", "always tool".green()),
+                (_, 'n') => format!("{}", "no".red()),
+                (ApprovalPromptKind::Standard, 's') => format!("{}", "skip tool".yellow()),
+                (ApprovalPromptKind::Standard, '!') => {
+                    format!("{}", "auto-run session".green())
+                }
+                (_, c) => c.to_string(),
             };
             eprintln!("{label}");
             result
@@ -789,9 +809,8 @@ impl PermissionManager {
                 if let Some(detail) = detail {
                     eprintln!("{}", detail.dim());
                 }
-                return match Self::prompt_approval() {
+                return match Self::prompt_approval(ApprovalPromptKind::ConfirmOnce) {
                     'y' => true,
-                    'a' => true, // Don't persist "always" for git safety violations
                     _ => false,
                 };
             }
@@ -812,7 +831,7 @@ impl PermissionManager {
             if let Some(detail) = detail {
                 eprintln!("{}", detail.dim());
             }
-            return matches!(Self::prompt_approval(), 'y' | 'a');
+            return Self::prompt_approval(ApprovalPromptKind::ConfirmOnce) == 'y';
         }
 
         // Step 4: Execute decision (deny/allowlist/ask).
@@ -862,7 +881,7 @@ impl PermissionManager {
         if let Some(detail) = detail {
             eprintln!("{}", detail.dim());
         }
-        match Self::prompt_approval() {
+        match Self::prompt_approval(ApprovalPromptKind::Standard) {
             'y' => true,
             'a' => {
                 self.session_overrides.insert(name.to_string(), true);
@@ -1074,6 +1093,12 @@ pub(super) enum PermissionDecision {
         detail: Option<String>,
         reason: String,
     },
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ApprovalPromptKind {
+    Standard,
+    ConfirmOnce,
 }
 
 fn is_read_only_allowlisted(lower_cmd: &str) -> bool {

@@ -461,9 +461,11 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                             if !reason.is_empty() {
                                 eprintln!("  {}", reason.dim());
                             }
-                            let ch = tokio::task::spawn_blocking(
-                                crate::permission_manager::PermissionManager::prompt_approval,
-                            )
+                            let ch = tokio::task::spawn_blocking(|| {
+                                crate::permission_manager::PermissionManager::prompt_approval(
+                                    crate::permission_manager::ApprovalPromptKind::Standard,
+                                )
+                            })
                             .await
                             .unwrap_or('n');
                             let approved = matches!(ch, 'y' | 'a' | '!');
@@ -597,7 +599,11 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                                         eprintln!("  {}", reason.dim());
                                     }
                                     let ch = tokio::task::spawn_blocking(
-                                        crate::permission_manager::PermissionManager::prompt_approval,
+                                        || {
+                                            crate::permission_manager::PermissionManager::prompt_approval(
+                                                crate::permission_manager::ApprovalPromptKind::Standard,
+                                            )
+                                        },
                                     )
                                     .await
                                     .unwrap_or('n');
