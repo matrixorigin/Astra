@@ -764,8 +764,14 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         // `resolve_cloud_approval` writes to stderr only. Never bump `lines_written` here:
         // that counter drives stdout `MoveUp` when clearing streamed text before the first
         // tool line; mixing in stderr line counts caused a large blank gap after prompts.
+        //
+        // Stop spinner/animation before prompting so inquire::Select renders
+        // cleanly and doesn't fight the running-tool spinner on stderr.
+        self.render.stop_tool_stderr_running();
+        self.render.stop_tool_stdout_anim();
+        self.render.stop_thinking();
         let decision = match &mut self.perm_manager {
-            Some(pm) => pm.resolve_cloud_approval(tool, detail, self.quiet),
+            Some(pm) => pm.resolve_cloud_approval_async(tool, detail, self.quiet).await,
             None => astra_thin_client::ApprovalDecision::Deny,
         };
         let decision_str = match &decision {

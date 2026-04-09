@@ -7751,6 +7751,8 @@ mod tests {
             discovered_skills: None,
             messaging_metrics: None,
             agent_spawner: None,
+            root_agent_id: None,
+            root_mailbox_slot: None,
         })
         .await
         .unwrap();
@@ -7810,6 +7812,8 @@ mod tests {
             discovered_skills: None,
             messaging_metrics: None,
             agent_spawner: None,
+            root_agent_id: None,
+            root_mailbox_slot: None,
         })
         .await;
         assert!(result.is_err());
@@ -7885,6 +7889,8 @@ mod tests {
             discovered_skills: None,
             messaging_metrics: None,
             agent_spawner: None,
+            root_agent_id: None,
+            root_mailbox_slot: None,
         })
         .await
         .unwrap();

@@ -448,6 +448,52 @@ impl PermissionManager {
         )
     }
 
+    /// Async version of [`resolve_cloud_approval`] that runs the interactive
+    /// prompt on a blocking thread via `spawn_blocking`, preventing the
+    /// `inquire::Select` TUI from blocking the tokio worker and conflicting
+    /// with concurrent terminal output (spinners, SSE rendering).
+    pub(super) async fn resolve_cloud_approval_async(
+        &mut self,
+        tool: &str,
+        detail: Option<&str>,
+        quiet: bool,
+    ) -> astra_thin_client::ApprovalDecision {
+        use astra_thin_client::ApprovalDecision;
+        if quiet {
+            return if self.mode == PermissionMode::Auto {
+                ApprovalDecision::Allow
+            } else {
+                ApprovalDecision::Deny
+            };
+        }
+        match self.mode {
+            PermissionMode::Auto => return ApprovalDecision::Allow,
+            PermissionMode::Deny => return ApprovalDecision::Deny,
+            PermissionMode::Prompt => {}
+        }
+        if let Some(&allowed) = self.session_overrides.get(tool) {
+            return if allowed {
+                ApprovalDecision::Allow
+            } else {
+                ApprovalDecision::Deny
+            };
+        }
+
+        eprintln!(
+            "{}",
+            format!("  ☁  Cloud approval required: {tool}").yellow()
+        );
+        if let Some(detail) = detail.filter(|s| !s.is_empty()) {
+            eprintln!("{}", Self::format_prompt_detail(detail).dim());
+        }
+        let ch = tokio::task::spawn_blocking(|| {
+            Self::prompt_approval(ApprovalPromptKind::CloudStandard)
+        })
+        .await
+        .unwrap_or('n');
+        self.apply_cloud_approval_choice(tool, ch)
+    }
+
     fn classify(name: &str) -> SideEffect {
         match cloud_gated_tool_kind(name) {
             Some(CloudGatedToolKind::Execute) => SideEffect::Execute,
@@ -1994,5 +2040,176 @@ mod tests {
         let pm = PermissionManager::with_inherited(std::path::Path::new("/tmp"), inherited);
 
         assert!(pm.is_background_agent());
+    }
+
+    // ── resolve_cloud_approval_async: early-return parity with sync version ──
+
+    #[tokio::test]
+    async fn cloud_approval_async_quiet_denies_without_auto() {
+        let mut pm = PermissionManager::new(false);
+        let decision = pm
+            .resolve_cloud_approval_async("write_file", Some("x.rs"), true)
+            .await;
+        assert_eq!(decision, astra_thin_client::ApprovalDecision::Deny);
+    }
+
+    #[tokio::test]
+    async fn cloud_approval_async_quiet_allows_when_auto() {
+        let mut pm = PermissionManager::new(true);
+        let decision = pm
+            .resolve_cloud_approval_async("write_file", Some("x.rs"), true)
+            .await;
+        assert_eq!(decision, astra_thin_client::ApprovalDecision::Allow);
+    }
+
+    #[tokio::test]
+    async fn cloud_approval_async_auto_mode_allows() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Auto, dir.path());
+        let decision = pm
+            .resolve_cloud_approval_async("bash", Some("/tmp"), false)
+            .await;
+        assert_eq!(decision, astra_thin_client::ApprovalDecision::Allow);
+    }
+
+    #[tokio::test]
+    async fn cloud_approval_async_deny_mode_denies() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Deny, dir.path());
+        let decision = pm
+            .resolve_cloud_approval_async("bash", Some("/tmp"), false)
+            .await;
+        assert_eq!(decision, astra_thin_client::ApprovalDecision::Deny);
+    }
+
+    #[tokio::test]
+    async fn cloud_approval_async_session_override_allows() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
+        pm.session_overrides.insert("bash".to_string(), true);
+        let decision = pm
+            .resolve_cloud_approval_async("bash", Some("/tmp"), false)
+            .await;
+        assert_eq!(decision, astra_thin_client::ApprovalDecision::Allow);
+    }
+
+    #[tokio::test]
+    async fn cloud_approval_async_session_override_denies() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
+        pm.session_overrides.insert("bash".to_string(), false);
+        let decision = pm
+            .resolve_cloud_approval_async("bash", Some("/tmp"), false)
+            .await;
+        assert_eq!(decision, astra_thin_client::ApprovalDecision::Deny);
+    }
+
+    // ── Regression: session override from cloud approval must persist to local check ──
+
+    /// Simulates the double-approval flow: cloud approval sets session override,
+    /// then local check_nonblocking must see it and auto-allow.
+    /// This is the exact scenario that was broken before the async fix.
+    #[tokio::test]
+    async fn cloud_always_persists_to_local_check_nonblocking() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
+
+        // Simulate user selecting "always allow this tool" in cloud approval
+        let decision = pm.apply_cloud_approval_choice("bash", 'a');
+        assert_eq!(decision, astra_thin_client::ApprovalDecision::AllowSession);
+
+        // Now the local check_nonblocking must auto-allow (no prompt)
+        let args = serde_json::json!({"command": "cargo test --release"});
+        let local = pm.check_nonblocking("bash", &args);
+        assert!(
+            matches!(local, PermissionDecision::Allow),
+            "local check must auto-allow after cloud 'always': got {local:?}"
+        );
+    }
+
+    /// Simulates auto-run ('!') in cloud approval: mode switches to Auto,
+    /// then local check_nonblocking must auto-allow ALL tools.
+    #[tokio::test]
+    async fn cloud_autorun_persists_to_local_check_nonblocking() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
+
+        // Simulate user selecting "auto-run session" in cloud approval
+        let decision = pm.apply_cloud_approval_choice("bash", '!');
+        assert_eq!(decision, astra_thin_client::ApprovalDecision::Allow);
+        assert_eq!(pm.mode, PermissionMode::Auto);
+
+        // Local check must auto-allow ANY write/execute tool (not just bash)
+        let write_args = serde_json::json!({"path": "foo.rs", "content": "hello"});
+        let local = pm.check_nonblocking("write_file", &write_args);
+        assert!(
+            matches!(local, PermissionDecision::Allow),
+            "auto-run must allow write_file: got {local:?}"
+        );
+    }
+
+    /// Simulates the full double-check flow across multiple tool calls:
+    /// 1st call: cloud approval 'a' → local check auto-allows
+    /// 2nd call: cloud approval auto-allows → local check auto-allows
+    #[tokio::test]
+    async fn session_override_persists_across_multiple_calls() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
+
+        // 1st call: user selects 'a' in cloud approval
+        pm.apply_cloud_approval_choice("bash", 'a');
+
+        // 1st call: local check
+        let args1 = serde_json::json!({"command": "cargo test"});
+        assert!(matches!(
+            pm.check_nonblocking("bash", &args1),
+            PermissionDecision::Allow
+        ));
+
+        // 2nd call: cloud approval must auto-allow (session override)
+        let decision2 = pm
+            .resolve_cloud_approval_async("bash", Some("echo hello"), false)
+            .await;
+        assert_eq!(decision2, astra_thin_client::ApprovalDecision::Allow);
+
+        // 2nd call: local check must also auto-allow
+        let args2 = serde_json::json!({"command": "echo hello"});
+        assert!(matches!(
+            pm.check_nonblocking("bash", &args2),
+            PermissionDecision::Allow
+        ));
+    }
+
+    /// Verify that async and sync cloud approval have identical early-return
+    /// behavior for all non-interactive paths.
+    #[tokio::test]
+    async fn async_sync_parity_all_early_returns() {
+        let cases: Vec<(PermissionMode, bool, &str, Option<bool>)> = vec![
+            // (mode, quiet, tool, session_override) → expected same result
+            (PermissionMode::Auto, true, "bash", None),
+            (PermissionMode::Auto, false, "bash", None),
+            (PermissionMode::Deny, true, "bash", None),
+            (PermissionMode::Deny, false, "bash", None),
+            (PermissionMode::Prompt, true, "bash", None),
+            (PermissionMode::Prompt, false, "bash", Some(true)),
+            (PermissionMode::Prompt, false, "bash", Some(false)),
+        ];
+        for (mode, quiet, tool, override_val) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let mut pm_sync = PermissionManager::with_project_mode(mode, dir.path());
+            let mut pm_async = PermissionManager::with_project_mode(mode, dir.path());
+            if let Some(v) = override_val {
+                pm_sync.session_overrides.insert(tool.to_string(), v);
+                pm_async.session_overrides.insert(tool.to_string(), v);
+            }
+            let sync_result = pm_sync.resolve_cloud_approval(tool, Some("detail"), quiet);
+            let async_result = pm_async
+                .resolve_cloud_approval_async(tool, Some("detail"), quiet)
+                .await;
+            assert_eq!(
+                sync_result, async_result,
+                "parity failed for mode={mode:?} quiet={quiet} override={override_val:?}"
+            );
+        }
     }
 }
