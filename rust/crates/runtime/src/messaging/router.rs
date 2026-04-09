@@ -185,6 +185,10 @@ impl AgentMailbox {
                                 Ok(PermissionResponse::deny("denied by parent"))
                             };
                         }
+                        return Err(MailboxError::Protocol(format!(
+                            "expected response payload for permission request {request_id}, got {:?}",
+                            msg.payload
+                        )));
                     }
                     skipped.push_back(msg);
                 }
@@ -621,6 +625,74 @@ mod tests {
         match &preserved.payload {
             MessagePayload::Text { content, .. } => assert_eq!(content, "keep this message"),
             other => panic!("expected preserved text message, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn request_permission_rejects_wrong_payload_for_matching_correlation() {
+        use crate::orchestration::permission_sync::PermissionRequest;
+
+        let transport = Arc::new(InProcessTransport::new());
+        let dt = tracker();
+        let router = Arc::new(AgentMailboxRouter::new(transport, dt.clone()));
+
+        let parent = addr("r0", "orchestrator");
+        let child = addr("r1", "worker");
+
+        let mut parent_mailbox = router.register(parent.clone(), None).await.unwrap();
+        let mut child_mailbox = router.register(child.clone(), None).await.unwrap();
+
+        dt.record_sub_run(SubRunRecord {
+            run_id: "r1".into(),
+            parent_run_id: "r0".into(),
+            delegation_id: "del-protocol".into(),
+            agent_id: "worker".into(),
+            depth: 1,
+        })
+        .await;
+
+        let router_clone = router.clone();
+        let parent_clone = parent.clone();
+        let child_clone = child.clone();
+        let responder = tokio::spawn(async move {
+            loop {
+                if let Some(msg) = parent_mailbox.try_recv() {
+                    let correlation_id = msg.correlation_id.clone().unwrap();
+                    router_clone
+                        .send(
+                            AgentMessage::new(
+                                parent_clone.clone(),
+                                MessageTarget::Direct {
+                                    address: child_clone.clone(),
+                                },
+                                MessagePayload::Text {
+                                    content: "wrong payload".into(),
+                                    summary: None,
+                                },
+                            )
+                            .with_correlation(&correlation_id),
+                        )
+                        .await
+                        .unwrap();
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        });
+
+        let result = child_mailbox
+            .request_permission(
+                PermissionRequest::new("bash", serde_json::json!({"command": "echo hi"})),
+                std::time::Duration::from_secs(1),
+            )
+            .await;
+        responder.await.unwrap();
+
+        match result {
+            Err(MailboxError::Protocol(msg)) => {
+                assert!(msg.contains("expected response payload"));
+            }
+            other => panic!("expected protocol error, got {other:?}"),
         }
     }
 }

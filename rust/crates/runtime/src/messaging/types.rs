@@ -274,6 +274,8 @@ pub enum MailboxError {
     Timeout(String),
     /// The mailbox was disconnected while waiting.
     Disconnected,
+    /// Received a message that violated mailbox request/response protocol.
+    Protocol(String),
 }
 
 impl std::fmt::Display for MailboxError {
@@ -292,6 +294,7 @@ impl std::fmt::Display for MailboxError {
             }
             Self::Timeout(msg) => write!(f, "request timeout: {msg}"),
             Self::Disconnected => write!(f, "mailbox disconnected"),
+            Self::Protocol(msg) => write!(f, "mailbox protocol error: {msg}"),
         }
     }
 }
