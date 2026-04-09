@@ -134,6 +134,8 @@ pub struct SpawnRunConfig {
     pub context_cache: Option<Arc<SharedContextCache>>,
     /// Inherited permissions from parent agent.
     pub inherited_permissions: Option<super::permission_sync::InheritedPermissions>,
+    /// Parent agent address for permission requests (if this is a child agent).
+    pub parent_address: Option<crate::messaging::types::AgentAddress>,
 }
 
 impl std::fmt::Debug for SpawnRunConfig {
@@ -303,7 +305,13 @@ impl DynamicAgentSpawner {
         let emitter = self.progress_broadcaster.for_agent(agent_id.clone());
         emitter.started(&input.description);
 
-        // 7. Build run config
+        // 7. Build parent address for permission requests
+        let parent_address = crate::messaging::types::AgentAddress::new(
+            &context.parent_run_id,
+            &context.parent_agent_id,
+        );
+
+        // 8. Build run config
         let run_config = SpawnRunConfig {
             run_id: run_id.clone(),
             agent_id: agent_id.clone(),
@@ -320,6 +328,8 @@ impl DynamicAgentSpawner {
             context_cache: Some(Arc::clone(&self.context_cache)),
             // Inherit permissions from parent context
             inherited_permissions: context.inherited_permissions.clone(),
+            // Parent address for permission requests
+            parent_address: Some(parent_address),
         };
 
         // 8. Execute or launch

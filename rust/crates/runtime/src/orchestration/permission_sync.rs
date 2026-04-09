@@ -505,6 +505,59 @@ impl PermissionSyncContext {
     }
 }
 
+// ─── Permission Request/Response Messaging ─────────────────────────────────
+
+use crate::messaging::types::{AgentAddress, AgentMessage, MessagePayload, MessageTarget, RequestType};
+
+impl PermissionRequest {
+    /// Build an AgentMessage to send this permission request to a parent.
+    pub fn to_message(
+        &self,
+        from: &AgentAddress,
+        to: &AgentAddress,
+    ) -> AgentMessage {
+        AgentMessage::new(
+            from.clone(),
+            MessageTarget::Direct { address: to.clone() },
+            MessagePayload::Request {
+                request_type: RequestType::ToolPermission,
+                data: serde_json::to_value(self).unwrap_or_default(),
+            },
+        )
+    }
+
+    /// Parse a permission request from an incoming message payload.
+    pub fn from_message_payload(data: &serde_json::Value) -> Option<Self> {
+        serde_json::from_value(data.clone()).ok()
+    }
+}
+
+impl PermissionResponse {
+    /// Build an AgentMessage to send this permission response to a child.
+    pub fn to_message(
+        &self,
+        from: &AgentAddress,
+        to: &AgentAddress,
+        correlation_id: &str,
+    ) -> AgentMessage {
+        AgentMessage::new(
+            from.clone(),
+            MessageTarget::Direct { address: to.clone() },
+            MessagePayload::Response {
+                request_id: correlation_id.to_string(),
+                accepted: self.approved,
+                data: Some(serde_json::to_value(self).unwrap_or_default()),
+            },
+        )
+        .with_correlation(correlation_id)
+    }
+
+    /// Parse a permission response from an incoming message payload.
+    pub fn from_message_payload(data: &serde_json::Value) -> Option<Self> {
+        serde_json::from_value(data.clone()).ok()
+    }
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -592,5 +645,53 @@ mod tests {
         assert!(inherited.is_tool_allowed_by_allowlist("grep"));
         assert!(!inherited.is_tool_allowed_by_allowlist("bash"));
         assert!(!inherited.is_tool_allowed_by_allowlist("edit"));
+    }
+
+    #[test]
+    fn test_permission_request_to_message() {
+        let request = PermissionRequest::new("bash", serde_json::json!({"command": "git status"}));
+        let from = AgentAddress::new("child-run", "child-agent");
+        let to = AgentAddress::new("parent-run", "parent-agent");
+        
+        let msg = request.to_message(&from, &to);
+        
+        assert_eq!(&msg.from, &from);
+        if let MessageTarget::Direct { address } = &msg.to {
+            assert_eq!(address, &to);
+        } else {
+            panic!("Expected Direct target");
+        }
+        
+        if let MessagePayload::Request { request_type, data } = &msg.payload {
+            assert!(matches!(request_type, RequestType::ToolPermission));
+            let parsed = PermissionRequest::from_message_payload(data).unwrap();
+            assert_eq!(parsed.tool_name, "bash");
+        } else {
+            panic!("Expected Request payload");
+        }
+    }
+
+    #[test]
+    fn test_permission_response_to_message() {
+        let response = PermissionResponse::approve()
+            .with_update(PermissionUpdate::allow(PermissionRule::parse("bash(git:*)")));
+        let from = AgentAddress::new("parent-run", "parent-agent");
+        let to = AgentAddress::new("child-run", "child-agent");
+        
+        let msg = response.to_message(&from, &to, "req-123");
+        
+        assert_eq!(&msg.from, &from);
+        assert_eq!(msg.correlation_id.as_deref(), Some("req-123"));
+        
+        if let MessagePayload::Response { request_id, accepted, data } = &msg.payload {
+            assert_eq!(request_id, "req-123");
+            assert!(accepted);
+            let data_ref = data.as_ref().expect("Should have data");
+            let parsed = PermissionResponse::from_message_payload(data_ref).unwrap();
+            assert!(parsed.approved);
+            assert_eq!(parsed.updates.len(), 1);
+        } else {
+            panic!("Expected Response payload");
+        }
     }
 }
