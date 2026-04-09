@@ -31,6 +31,7 @@ pub mod cloud_tool_delivery;
 pub mod complete;
 pub mod context_assembly_trace;
 pub mod context_compression;
+pub mod decision_explainer;
 pub mod contracts;
 pub mod counter;
 pub mod edge_executor_id;
