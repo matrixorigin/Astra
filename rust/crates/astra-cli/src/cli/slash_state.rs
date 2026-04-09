@@ -229,7 +229,7 @@ pub(super) async fn handle_state_command(
                     discovered_skills: None,
                     messaging_metrics: state.messaging_metrics.clone(),
                     agent_spawner: state.agent_spawner.clone(),
-                    root_mailbox_slot: None,
+                    root_mailbox_slot: Some(&mut state.root_mailbox),
                 }) => r,
                 _ = tokio::signal::ctrl_c() => {
                     if let Some(ref t) = _cancel_token_guard { t.cancel(); }
@@ -323,7 +323,7 @@ pub(super) async fn handle_state_command(
                             discovered_skills: None,
                             messaging_metrics: state.messaging_metrics.clone(),
                             agent_spawner: state.agent_spawner.clone(),
-                            root_mailbox_slot: None,
+                            root_mailbox_slot: Some(&mut state.root_mailbox),
                         })
                         .await;
 
@@ -397,7 +397,7 @@ pub(super) async fn handle_state_command(
                                     discovered_skills: None,
                                     messaging_metrics: state.messaging_metrics.clone(),
                                     agent_spawner: state.agent_spawner.clone(),
-                                    root_mailbox_slot: None,
+                                    root_mailbox_slot: Some(&mut state.root_mailbox),
                                 })
                                 .await;
                                 if let Ok(sr2) = synth_result {

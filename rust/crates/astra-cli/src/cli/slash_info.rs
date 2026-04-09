@@ -1089,7 +1089,7 @@ pub(super) async fn handle_info_command(
                 discovered_skills: None,
                 messaging_metrics: state.messaging_metrics.clone(),
                 agent_spawner: state.agent_spawner.clone(),
-                root_mailbox_slot: None,
+                root_mailbox_slot: Some(&mut state.root_mailbox),
             })
             .await
             .map_err(|f| f.error)?;
