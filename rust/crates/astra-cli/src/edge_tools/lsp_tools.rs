@@ -5,14 +5,164 @@ use std::path::PathBuf;
 
 use serde_json::{Value, json};
 
+use super::lsp_stdio_session::path_to_uri;
 use super::{MAX_LSP_FILE_SIZE, ToolExecutor, utf16_col_to_char_idx};
 
 impl ToolExecutor {
     // ─── LSP tool: unified language server interface ─────────────────────────────
 
+    fn active_lsp_response(operation: &str, method: &str, result: Value) -> String {
+        json!({
+            "backend": "lsp",
+            "operation": operation,
+            "method": method,
+            "result": result,
+        })
+        .to_string()
+    }
+
+    fn resolve_lsp_file_path(&self, file: &str) -> PathBuf {
+        if file.starts_with('/') {
+            PathBuf::from(file)
+        } else {
+            self.project_root.join(file)
+        }
+    }
+
+    fn ensure_lsp_file_ready(&self, file: &str) -> Result<(PathBuf, String), String> {
+        let file_path = self.resolve_lsp_file_path(file);
+        if let Ok(metadata) = std::fs::metadata(&file_path)
+            && metadata.len() > MAX_LSP_FILE_SIZE as u64
+        {
+            return Err(format!(
+                "File too large for LSP operations ({} bytes, max {} bytes)",
+                metadata.len(),
+                MAX_LSP_FILE_SIZE
+            ));
+        }
+        let uri = path_to_uri(&file_path)
+            .ok_or_else(|| format!("Failed to create file URI for {}", file_path.display()))?;
+        Ok((file_path, uri))
+    }
+
+    fn lsp_position_params(
+        &self,
+        file: &str,
+        line: usize,
+        column: usize,
+    ) -> Result<(PathBuf, Value), String> {
+        if line == 0 || column == 0 {
+            return Err("line and column must be 1-based positive integers".to_string());
+        }
+        let (file_path, uri) = self.ensure_lsp_file_ready(file)?;
+        Ok((
+            file_path,
+            json!({
+                "textDocument": { "uri": uri },
+                "position": {
+                    "line": line.saturating_sub(1),
+                    "character": column.saturating_sub(1),
+                }
+            }),
+        ))
+    }
+
+    fn try_active_file_request(
+        &self,
+        operation: &str,
+        file: &str,
+        method: &str,
+        params: Value,
+    ) -> Result<Option<String>, String> {
+        let (file_path, _) = self.ensure_lsp_file_ready(file)?;
+        self.passive_lsp
+            .request_for_file(&self.project_root, &file_path, method, params)
+            .map(|result| result.map(|value| Self::active_lsp_response(operation, method, value)))
+    }
+
+    fn try_active_position_request(
+        &self,
+        operation: &str,
+        file: &str,
+        line: usize,
+        column: usize,
+        method: &str,
+        extra_params: Option<Value>,
+    ) -> Result<Option<String>, String> {
+        let (file_path, mut params) = self.lsp_position_params(file, line, column)?;
+        if let Some(extra) = extra_params
+            && let Some(root) = params.as_object_mut()
+            && let Some(extra_obj) = extra.as_object()
+        {
+            for (key, value) in extra_obj {
+                root.insert(key.clone(), value.clone());
+            }
+        }
+        self.passive_lsp
+            .request_for_file(&self.project_root, &file_path, method, params)
+            .map(|result| result.map(|value| Self::active_lsp_response(operation, method, value)))
+    }
+
+    fn try_active_workspace_symbols(&self, query: &str) -> Result<Option<String>, String> {
+        self.passive_lsp
+            .request_workspace(
+                &self.project_root,
+                "workspace/symbol",
+                json!({ "query": query }),
+            )
+            .map(|result| {
+                result.map(|value| {
+                    Self::active_lsp_response("workspace_symbols", "workspace/symbol", value)
+                })
+            })
+    }
+
+    fn try_active_call_hierarchy(
+        &self,
+        operation: &str,
+        file: &str,
+        line: usize,
+        column: usize,
+    ) -> Result<Option<String>, String> {
+        let (file_path, prepare_params) = self.lsp_position_params(file, line, column)?;
+        let prepared = self.passive_lsp.request_for_file(
+            &self.project_root,
+            &file_path,
+            "textDocument/prepareCallHierarchy",
+            prepare_params,
+        )?;
+        let Some(prepared) = prepared else {
+            return Ok(None);
+        };
+        let Some(item) = prepared
+            .as_array()
+            .and_then(|items| items.first())
+            .cloned()
+            .or_else(|| prepared.as_object().map(|_| prepared.clone()))
+        else {
+            return Ok(Some(Self::active_lsp_response(
+                operation,
+                "textDocument/prepareCallHierarchy",
+                prepared,
+            )));
+        };
+        let method = match operation {
+            "incoming_calls" => "callHierarchy/incomingCalls",
+            _ => "callHierarchy/outgoingCalls",
+        };
+        self.passive_lsp
+            .request_for_file(
+                &self.project_root,
+                &file_path,
+                method,
+                json!({ "item": item }),
+            )
+            .map(|result| result.map(|value| Self::active_lsp_response(operation, method, value)))
+    }
+
     /// Unified LSP tool providing code intelligence operations.
-    /// Routes to existing implementations (find_definition, find_references, etc.)
-    /// but offers a consistent interface matching the LSP protocol.
+    /// Prefers a real stdio LSP backend when one is available for the workspace/file,
+    /// then falls back to the existing symbol/AST-based implementations.
     pub(super) fn lsp(&self, args: &Value) -> String {
         let operation = match args.get("operation").and_then(Value::as_str) {
             Some(op) => op,
@@ -41,15 +191,24 @@ impl ToolExecutor {
 
         match operation {
             "goto_definition" => {
-                // Requires either symbol or file+position
-                if let Some(sym) = symbol {
+                if let (Some(f), Some(l), Some(c)) = (file, line, column) {
+                    match self.try_active_position_request(
+                        operation,
+                        f,
+                        l,
+                        c,
+                        "textDocument/definition",
+                        None,
+                    ) {
+                        Ok(Some(result)) => result,
+                        Ok(None) => self.find_definition_at_position(f, l, c),
+                        Err(error) => json!({ "error": error }).to_string(),
+                    }
+                } else if let Some(sym) = symbol {
                     self.find_definition(&json!({
                         "symbol": sym,
                         "file": file
                     }))
-                } else if let (Some(f), Some(l), Some(c)) = (file, line, column) {
-                    // For position-based definition lookup, we extract symbol at position
-                    self.find_definition_at_position(f, l, c)
                 } else {
                     json!({
                         "error": "goto_definition requires 'symbol' or 'file'+'line'+'column'"
@@ -58,7 +217,22 @@ impl ToolExecutor {
             }
 
             "find_references" => {
-                if let Some(sym) = symbol {
+                if let (Some(f), Some(l), Some(c)) = (file, line, column) {
+                    match self.try_active_position_request(
+                        operation,
+                        f,
+                        l,
+                        c,
+                        "textDocument/references",
+                        Some(json!({ "context": { "includeDeclaration": true } })),
+                    ) {
+                        Ok(Some(result)) => result,
+                        Ok(None) => json!({
+                            "error": "find_references requires 'symbol' when no active LSP backend is available"
+                        }).to_string(),
+                        Err(error) => json!({ "error": error }).to_string(),
+                    }
+                } else if let Some(sym) = symbol {
                     self.find_references(&json!({
                         "symbol": sym,
                         "path": file,
@@ -74,13 +248,23 @@ impl ToolExecutor {
 
             "hover" => {
                 if let (Some(f), Some(l), Some(c)) = (file, line, column) {
-                    self.hover_info(&json!({
-                        "file": f,
-                        "line": l,
-                        "column": c
-                    }))
+                    match self.try_active_position_request(
+                        operation,
+                        f,
+                        l,
+                        c,
+                        "textDocument/hover",
+                        None,
+                    ) {
+                        Ok(Some(result)) => result,
+                        Ok(None) => self.hover_info(&json!({
+                            "file": f,
+                            "line": l,
+                            "column": c
+                        })),
+                        Err(error) => json!({ "error": error }).to_string(),
+                    }
                 } else if let (Some(f), Some(sym)) = (file, symbol) {
-                    // Find symbol in file and get hover for it
                     self.hover_info(&json!({
                         "file": f,
                         "symbol": sym
@@ -94,10 +278,23 @@ impl ToolExecutor {
 
             "document_symbols" => {
                 if let Some(f) = file {
-                    self.symbols(&json!({
-                        "path": f,
-                        "include_body": include_body
-                    }))
+                    let _ = include_body;
+                    match self.try_active_file_request(
+                        operation,
+                        f,
+                        "textDocument/documentSymbol",
+                        match self.ensure_lsp_file_ready(f) {
+                            Ok((_, uri)) => json!({ "textDocument": { "uri": uri } }),
+                            Err(error) => return json!({ "error": error }).to_string(),
+                        },
+                    ) {
+                        Ok(Some(result)) => result,
+                        Ok(None) => self.symbols(&json!({
+                            "path": f,
+                            "include_body": include_body
+                        })),
+                        Err(error) => json!({ "error": error }).to_string(),
+                    }
                 } else {
                     json!({
                         "error": "document_symbols requires 'file' parameter"
@@ -107,14 +304,30 @@ impl ToolExecutor {
 
             "workspace_symbols" => {
                 let search_query = query.or(symbol).unwrap_or("");
-                self.symbol_search(&json!({
-                    "query": search_query,
-                    "limit": 50
-                }))
+                match self.try_active_workspace_symbols(search_query) {
+                    Ok(Some(result)) => result,
+                    Ok(None) => self.symbol_search(&json!({
+                        "query": search_query,
+                        "limit": 50
+                    })),
+                    Err(error) => json!({ "error": error }).to_string(),
+                }
             }
 
             "call_hierarchy" | "outgoing_calls" => {
-                if let Some(f) = file {
+                if let (Some(f), Some(l), Some(c)) = (file, line, column) {
+                    match self.try_active_call_hierarchy(operation, f, l, c) {
+                        Ok(Some(result)) => result,
+                        Ok(None) => self.call_graph(&json!({
+                            "path": f,
+                            "symbol": symbol,
+                            "start_line": Some(l),
+                            "callers": false,
+                            "scope": scope
+                        })),
+                        Err(error) => json!({ "error": error }).to_string(),
+                    }
+                } else if let Some(f) = file {
                     self.call_graph(&json!({
                         "path": f,
                         "symbol": symbol,
@@ -130,7 +343,19 @@ impl ToolExecutor {
             }
 
             "incoming_calls" => {
-                if let Some(f) = file {
+                if let (Some(f), Some(l), Some(c)) = (file, line, column) {
+                    match self.try_active_call_hierarchy(operation, f, l, c) {
+                        Ok(Some(result)) => result,
+                        Ok(None) => self.call_graph(&json!({
+                            "path": f,
+                            "symbol": symbol,
+                            "start_line": Some(l),
+                            "callers": true,
+                            "scope": scope
+                        })),
+                        Err(error) => json!({ "error": error }).to_string(),
+                    }
+                } else if let Some(f) = file {
                     self.call_graph(&json!({
                         "path": f,
                         "symbol": symbol,
@@ -146,7 +371,6 @@ impl ToolExecutor {
             }
 
             "diagnostics" => {
-                // Return diagnostic information about LSP capabilities
                 json!({
                     "capabilities": {
                         "goto_definition": true,
@@ -157,11 +381,12 @@ impl ToolExecutor {
                         "call_hierarchy": true,
                         "rename": true
                     },
-                    "supported_languages": [
-                        "rust", "python", "typescript", "javascript",
-                        "go", "java", "c", "cpp", "ruby"
-                    ],
-                    "note": "Uses tree-sitter AST parsing for accurate results. Some features may have reduced accuracy for unsupported languages."
+                    "active_backends": self.passive_lsp.active_status(&self.project_root),
+                    "supported_languages": {
+                        "active_lsp": ["rust", "typescript", "typescriptreact"],
+                        "fallback_tools": ["rust", "python", "typescript", "javascript", "go", "java", "c", "cpp", "ruby"]
+                    },
+                    "note": "The lsp tool now prefers a real stdio LSP backend when a matching workspace/server is available, and falls back to the existing AST/symbol tools otherwise."
                 }).to_string()
             }
 

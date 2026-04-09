@@ -1,4 +1,126 @@
 use super::*;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
+#[cfg(unix)]
+fn fake_lsp_server_script(dir: &std::path::Path) -> std::path::PathBuf {
+    let script = dir.join("fake-rust-analyzer");
+    std::fs::write(
+        &script,
+        r#"#!/usr/bin/env python3
+import json
+import sys
+
+def read_frame():
+    headers = {}
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line:
+            return None
+        if line in (b"\r\n", b"\n"):
+            break
+        key, value = line.decode("utf-8").split(":", 1)
+        headers[key.strip().lower()] = value.strip()
+    length = int(headers["content-length"])
+    body = sys.stdin.buffer.read(length)
+    return json.loads(body.decode("utf-8"))
+
+def write_frame(payload):
+    body = json.dumps(payload).encode("utf-8")
+    sys.stdout.buffer.write(f"Content-Length: {len(body)}\r\n\r\n".encode("utf-8"))
+    sys.stdout.buffer.write(body)
+    sys.stdout.buffer.flush()
+
+while True:
+    message = read_frame()
+    if message is None:
+        break
+    method = message.get("method")
+    msg_id = message.get("id")
+    if method == "initialize":
+        write_frame({
+            "jsonrpc": "2.0",
+            "id": msg_id,
+            "result": {
+                "capabilities": {
+                    "definitionProvider": True,
+                    "documentSymbolProvider": True
+                }
+            }
+        })
+    elif method == "textDocument/documentSymbol":
+        uri = message["params"]["textDocument"]["uri"]
+        write_frame({
+            "jsonrpc": "2.0",
+            "id": msg_id,
+            "result": [{
+                "name": "hello_from_lsp",
+                "kind": 12,
+                "range": {
+                    "start": {"line": 0, "character": 0},
+                    "end": {"line": 0, "character": 18}
+                },
+                "selectionRange": {
+                    "start": {"line": 0, "character": 3},
+                    "end": {"line": 0, "character": 17}
+                },
+                "detail": uri
+            }]
+        })
+    elif method == "textDocument/definition":
+        uri = message["params"]["textDocument"]["uri"]
+        write_frame({
+            "jsonrpc": "2.0",
+            "id": msg_id,
+            "result": [{
+                "uri": uri,
+                "range": {
+                    "start": {"line": 0, "character": 3},
+                    "end": {"line": 0, "character": 17}
+                }
+            }]
+        })
+    elif msg_id is not None:
+        write_frame({"jsonrpc": "2.0", "id": msg_id, "result": None})
+"#,
+    )
+    .unwrap();
+    let mut perms = std::fs::metadata(&script).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&script, perms).unwrap();
+    script
+}
+
+#[cfg(unix)]
+struct EnvGuard {
+    key: &'static str,
+    old: Option<String>,
+}
+
+#[cfg(unix)]
+impl EnvGuard {
+    fn set(key: &'static str, value: &str) -> Self {
+        let old = std::env::var(key).ok();
+        unsafe {
+            std::env::set_var(key, value);
+        }
+        Self { key, old }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        match &self.old {
+            Some(value) => unsafe {
+                std::env::set_var(self.key, value);
+            },
+            None => unsafe {
+                std::env::remove_var(self.key);
+            },
+        }
+    }
+}
 
 // ─── lsp tests ────────────────────────────────────────────────────────────────
 
@@ -32,7 +154,8 @@ fn lsp_diagnostics_returns_capabilities() {
 
     assert!(parsed["capabilities"]["goto_definition"].as_bool().unwrap());
     assert!(parsed["capabilities"]["find_references"].as_bool().unwrap());
-    assert!(parsed["supported_languages"].as_array().is_some());
+    assert!(parsed["supported_languages"]["active_lsp"].as_array().is_some());
+    assert!(parsed["active_backends"]["rust"]["workspace_detected"].is_boolean());
 }
 
 #[test]
@@ -120,4 +243,37 @@ impl Config {
 
     // Should find symbols
     assert!(!result.contains("Error:") || result.contains("main"));
+}
+
+#[cfg(unix)]
+#[test]
+fn lsp_document_symbols_prefers_real_lsp_when_available() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname=\"demo\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(
+        dir.path().join("src/lib.rs"),
+        "pub fn hello_from_lsp() {}\n",
+    )
+    .unwrap();
+    let script = fake_lsp_server_script(dir.path());
+    let _guard = EnvGuard::set("ASTRA_RUST_ANALYZER_CMD", script.to_str().unwrap());
+    let exe = ToolExecutor::new(dir.path());
+
+    let result = exe.lsp(&json!({
+        "operation": "document_symbols",
+        "file": "src/lib.rs"
+    }));
+    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+
+    assert_eq!(parsed["backend"].as_str(), Some("lsp"));
+    assert_eq!(
+        parsed["method"].as_str(),
+        Some("textDocument/documentSymbol")
+    );
+    assert_eq!(parsed["result"][0]["name"].as_str(), Some("hello_from_lsp"));
 }

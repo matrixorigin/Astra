@@ -18,6 +18,7 @@ use tokio::time::sleep;
 use super::lsp_stdio_session::{LanguageIdPolicy, LspSpawnSpec, LspStdioSession};
 
 pub(crate) const POST_SYNC_DRAIN_MS: u64 = 80;
+pub(crate) const ACTIVE_LSP_REQUEST_TIMEOUT_MS: u64 = 3_000;
 
 fn env_truthy(name: &str) -> bool {
     match std::env::var(name) {
@@ -109,6 +110,23 @@ fn ensure_session(
     g.as_ref().map(Arc::clone)
 }
 
+fn rust_active_supported(project_root: &Path, path: Option<&Path>) -> bool {
+    project_root.join("Cargo.toml").is_file()
+        && path
+            .map(|p| p.extension().and_then(|e| e.to_str()) == Some("rs"))
+            .unwrap_or(true)
+}
+
+fn typescript_active_supported(project_root: &Path, path: Option<&Path>) -> bool {
+    let ts_workspace =
+        project_root.join("tsconfig.json").is_file() || project_root.join("package.json").is_file();
+    if !ts_workspace {
+        return false;
+    }
+    path.map(|p| matches!(p.extension().and_then(|e| e.to_str()), Some("ts" | "tsx")))
+        .unwrap_or(true)
+}
+
 /// Holds one lazy stdio session per language server kind.
 pub(crate) struct PassiveLspManager {
     rust: Mutex<Option<Arc<LspStdioSession>>>,
@@ -135,6 +153,79 @@ impl PassiveLspManager {
         {
             let _ = s.sync_document_from_disk(path);
         }
+    }
+
+    pub fn request_for_file(
+        &self,
+        root: &Path,
+        path: &Path,
+        method: &str,
+        params: Value,
+    ) -> Result<Option<Value>, String> {
+        let root_buf = root.to_path_buf();
+        let session = if rust_active_supported(root, Some(path)) {
+            ensure_session(&self.rust, root_buf.clone(), rust_spawn_spec())
+        } else if typescript_active_supported(root, Some(path)) {
+            ensure_session(&self.typescript, root_buf, typescript_spawn_spec())
+        } else {
+            None
+        };
+        let Some(session) = session else {
+            return Ok(None);
+        };
+        session
+            .sync_document_from_disk(path)
+            .map_err(|e| format!("failed to sync file into LSP: {e}"))?;
+        session
+            .request(
+                method,
+                params,
+                Duration::from_millis(ACTIVE_LSP_REQUEST_TIMEOUT_MS),
+            )
+            .map(Some)
+            .map_err(|e| format!("LSP request {method} failed: {e}"))
+    }
+
+    pub fn request_workspace(
+        &self,
+        root: &Path,
+        method: &str,
+        params: Value,
+    ) -> Result<Option<Value>, String> {
+        let root_buf = root.to_path_buf();
+        let session = if rust_active_supported(root, None) {
+            ensure_session(&self.rust, root_buf.clone(), rust_spawn_spec())
+        } else if typescript_active_supported(root, None) {
+            ensure_session(&self.typescript, root_buf, typescript_spawn_spec())
+        } else {
+            None
+        };
+        let Some(session) = session else {
+            return Ok(None);
+        };
+        session
+            .request(
+                method,
+                params,
+                Duration::from_millis(ACTIVE_LSP_REQUEST_TIMEOUT_MS),
+            )
+            .map(Some)
+            .map_err(|e| format!("LSP request {method} failed: {e}"))
+    }
+
+    pub fn active_status(&self, root: &Path) -> Value {
+        serde_json::json!({
+            "rust": {
+                "workspace_detected": rust_active_supported(root, None),
+                "passive_diagnostics_enabled": lsp_rust_enabled(),
+                "command": rust_analyzer_cmd(),
+            },
+            "typescript": {
+                "workspace_detected": typescript_active_supported(root, None),
+                "passive_diagnostics_enabled": lsp_typescript_enabled(),
+                "command": typescript_server_cmd(),
+            }
+        })
     }
 
     pub async fn take_diagnostic_messages(&self, tool_results_nonempty: bool) -> Vec<Value> {

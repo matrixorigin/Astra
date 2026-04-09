@@ -5,8 +5,11 @@ use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 use serde_json::{Value, json};
 use url::Url;
@@ -54,6 +57,8 @@ pub(crate) struct LspStdioSession {
     stdin: StdinShared,
     versions: Mutex<HashMap<String, i32>>,
     pending_diags: Arc<Mutex<Vec<Value>>>,
+    next_request_id: AtomicU64,
+    pending_requests: Arc<Mutex<HashMap<u64, Sender<io::Result<Value>>>>>,
 }
 
 fn write_frame(mut w: impl Write, v: &Value) -> io::Result<()> {
@@ -119,8 +124,24 @@ fn reader_loop(
     mut reader: BufReader<std::process::ChildStdout>,
     stdin: StdinShared,
     pending: Arc<Mutex<Vec<Value>>>,
+    pending_requests: Arc<Mutex<HashMap<u64, Sender<io::Result<Value>>>>>,
 ) {
     while let Ok(msg) = read_frame(&mut reader) {
+        if let Some(id) = msg.get("id").and_then(Value::as_u64)
+            && (msg.get("result").is_some() || msg.get("error").is_some())
+        {
+            if let Ok(mut reqs) = pending_requests.lock()
+                && let Some(tx) = reqs.remove(&id)
+            {
+                let send_result = if let Some(err) = msg.get("error") {
+                    tx.send(Err(io::Error::other(format!("LSP request failed: {err}"))))
+                } else {
+                    tx.send(Ok(msg.get("result").cloned().unwrap_or(Value::Null)))
+                };
+                let _ = send_result;
+            }
+            continue;
+        }
         if let Some(method) = msg.get("method").and_then(|m| m.as_str()) {
             if method == "textDocument/publishDiagnostics" {
                 if let Some(p) = msg.get("params").cloned()
@@ -251,8 +272,10 @@ impl LspStdioSession {
         let pending_diags = Arc::new(Mutex::new(Vec::new()));
         let pending_clone = Arc::clone(&pending_diags);
         let stdin_reader = Arc::clone(&stdin);
+        let pending_requests = Arc::new(Mutex::new(HashMap::new()));
+        let pending_requests_reader = Arc::clone(&pending_requests);
         thread::spawn(move || {
-            reader_loop(reader, stdin_reader, pending_clone);
+            reader_loop(reader, stdin_reader, pending_clone, pending_requests_reader);
         });
 
         Ok(Some(Arc::new(Self {
@@ -264,6 +287,8 @@ impl LspStdioSession {
             stdin,
             versions: Mutex::new(HashMap::new()),
             pending_diags,
+            next_request_id: AtomicU64::new(2),
+            pending_requests,
         })))
     }
 
@@ -274,6 +299,55 @@ impl LspStdioSession {
             .lock()
             .map_err(|_| io::Error::other("stdin mutex poisoned"))?;
         write_frame(&mut *w, &msg)
+    }
+
+    pub fn request(&self, method: &str, params: Value, timeout: Duration) -> io::Result<Value> {
+        let id = self.next_request_id.fetch_add(1, Ordering::SeqCst);
+        let (tx, rx) = mpsc::channel();
+        {
+            let mut pending = self
+                .pending_requests
+                .lock()
+                .map_err(|_| io::Error::other("pending_requests mutex poisoned"))?;
+            pending.insert(id, tx);
+        }
+
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        });
+        let write_result = {
+            let mut w = self
+                .stdin
+                .lock()
+                .map_err(|_| io::Error::other("stdin mutex poisoned"))?;
+            write_frame(&mut *w, &msg)
+        };
+        if let Err(err) = write_result {
+            if let Ok(mut pending) = self.pending_requests.lock() {
+                pending.remove(&id);
+            }
+            return Err(err);
+        }
+
+        match rx.recv_timeout(timeout) {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if let Ok(mut pending) = self.pending_requests.lock() {
+                    pending.remove(&id);
+                }
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("LSP request timed out: {method}"),
+                ))
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                format!("LSP request channel closed: {method}"),
+            )),
+        }
     }
 
     pub fn sync_document_from_disk(&self, path: &Path) -> io::Result<()> {

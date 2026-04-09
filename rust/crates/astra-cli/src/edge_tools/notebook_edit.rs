@@ -24,7 +24,7 @@ impl ToolExecutor {
 
         // Validate file extension
         if !file_path.extension().map(|e| e == "ipynb").unwrap_or(false) {
-            return json!({ 
+            return json!({
                 "error": "File must be a Jupyter notebook (.ipynb). For other files, use str_replace or write_file."
             }).to_string();
         }
