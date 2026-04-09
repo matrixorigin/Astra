@@ -578,10 +578,24 @@ async fn collect_llm_stream(
 
     let mut sorted_tcs: Vec<_> = tool_calls_map.into_iter().collect();
     sorted_tcs.sort_by_key(|(idx, _)| *idx);
-    let tool_calls: Vec<Value> = sorted_tcs
+    let mut tool_calls: Vec<Value> = sorted_tcs
         .into_iter()
         .map(|(_, v)| Value::Object(v))
         .collect();
+
+    // XML fallback: some models emit <invoke> XML in content instead of
+    // structured tool_calls.  Recover them so the agentic loop can proceed.
+    if tool_calls.is_empty() {
+        if let Some(parsed) = super::xml_tool_call_fallback::parse_xml_tool_calls(&full_text) {
+            astra_core::agent_warn!(
+                "llm",
+                "recovered {} tool call(s) from XML <invoke> in content (stream)",
+                parsed.len()
+            );
+            full_text = super::xml_tool_call_fallback::strip_parsed_invocations(&full_text);
+            tool_calls = parsed;
+        }
+    }
 
     Ok(LlmCallResult {
         full_text,
@@ -732,6 +746,19 @@ fn parse_nonstream_response(v: &Value, model_name: &str, started: Instant) -> Ll
         .and_then(|c| c.get("finish_reason"))
         .and_then(Value::as_str)
         .map(String::from);
+
+    // XML fallback: same recovery for non-stream responses.
+    if tool_calls.is_empty() {
+        if let Some(parsed) = super::xml_tool_call_fallback::parse_xml_tool_calls(&full_text) {
+            astra_core::agent_warn!(
+                "llm",
+                "recovered {} tool call(s) from XML <invoke> in content (non-stream)",
+                parsed.len()
+            );
+            full_text = super::xml_tool_call_fallback::strip_parsed_invocations(&full_text);
+            tool_calls = parsed;
+        }
+    }
 
     LlmCallResult {
         full_text,

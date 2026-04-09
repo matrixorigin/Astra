@@ -854,7 +854,20 @@ async fn call_llm_stream(
                 // Emit final summary as a special internal event (not forwarded to client)
                 let mut sorted_tcs: Vec<_> = tool_calls_map.into_iter().collect();
                 sorted_tcs.sort_by_key(|(idx, _)| *idx);
-                let tool_calls: Vec<Value> = sorted_tcs.into_iter().map(|(_, v)| Value::Object(v)).collect();
+                let mut tool_calls: Vec<Value> = sorted_tcs.into_iter().map(|(_, v)| Value::Object(v)).collect();
+
+                // XML fallback: recover <invoke> blocks from content.
+                if tool_calls.is_empty() {
+                    if let Some(parsed) = crate::turn::xml_tool_call_fallback::parse_xml_tool_calls(&full_text) {
+                        astra_core::agent_warn!(
+                            "llm",
+                            "recovered {} tool call(s) from XML <invoke> in content (inprocess)",
+                            parsed.len()
+                        );
+                        full_text = crate::turn::xml_tool_call_fallback::strip_parsed_invocations(&full_text);
+                        tool_calls = parsed;
+                    }
+                }
 
                 yield render_sse(&json!({
                     "type": "_inprocess_summary",

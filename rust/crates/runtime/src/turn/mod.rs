@@ -96,3 +96,4 @@ pub mod tool_selection;
 pub mod turn_guard;
 pub mod unconsumed;
 pub mod view;
+pub mod xml_tool_call_fallback;
