@@ -216,6 +216,7 @@ dependencies = [
  "base64",
  "chrono",
  "criterion",
+ "dashmap",
  "dirs",
  "dotenvy",
  "fastrand",
