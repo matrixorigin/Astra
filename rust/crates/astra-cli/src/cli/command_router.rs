@@ -151,6 +151,52 @@ fn render_messaging_args(args: &MessagingArgs) -> String {
     }
 }
 
+fn render_diff_args(args: &DiffArgs) -> String {
+    match &args.command {
+        None => join_words(&args.paths),
+        Some(DiffSubcommand::Staged(cmd)) => {
+            let suffix = join_words(&cmd.paths);
+            if suffix.is_empty() {
+                "staged".to_string()
+            } else {
+                format!("staged {suffix}")
+            }
+        }
+        Some(DiffSubcommand::Unstaged(cmd)) => {
+            let suffix = join_words(&cmd.paths);
+            if suffix.is_empty() {
+                "unstaged".to_string()
+            } else {
+                format!("unstaged {suffix}")
+            }
+        }
+        Some(DiffSubcommand::Stat(cmd)) => {
+            let suffix = join_words(&cmd.paths);
+            if suffix.is_empty() {
+                "stat".to_string()
+            } else {
+                format!("stat {suffix}")
+            }
+        }
+        Some(DiffSubcommand::Show(cmd)) => {
+            let suffix = join_words(&cmd.paths);
+            if suffix.is_empty() {
+                format!("show {}", cmd.rev)
+            } else {
+                format!("show {} {}", cmd.rev, suffix)
+            }
+        }
+    }
+}
+
+fn render_bug_args(args: &BugArgs) -> String {
+    match &args.command {
+        None | Some(BugSubcommand::Print) => String::new(),
+        Some(BugSubcommand::Copy) => "copy".to_string(),
+        Some(BugSubcommand::Save) => "save".to_string(),
+    }
+}
+
 fn maybe_load_project_instructions(state: &mut ReplState) {
     let no_instructions = std::env::var("ASTRA_NO_INSTRUCTIONS")
         .map(|v| v == "1")
@@ -630,7 +676,7 @@ pub(super) async fn execute_cli_command(
         Some(Command::Diff(args)) => {
             execute_repl_bridge_command(
                 "/diff",
-                &forwarded_args(&args),
+                &render_diff_args(&args),
                 profile.as_deref(),
                 global_model.as_deref(),
                 api,
@@ -663,7 +709,7 @@ pub(super) async fn execute_cli_command(
         Some(Command::Bug(args)) => {
             execute_repl_bridge_command(
                 "/bug",
-                &forwarded_args(&args),
+                &render_bug_args(&args),
                 profile.as_deref(),
                 global_model.as_deref(),
                 api,

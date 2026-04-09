@@ -369,13 +369,13 @@ enum Command {
     /// Search workspace content or changed files
     Grep(GrepArgs),
     /// Show git diffs
-    Diff(ForwardArgs),
+    Diff(DiffArgs),
     /// Permission mode and rule inspection
     Permissions(PermissionsArgs),
     /// Inspect session checkpoints and turn payloads
     Debug(DebugArgs),
     /// Generate a bug report from current local state
-    Bug(ForwardArgs),
+    Bug(BugArgs),
     /// Inspect spawned agents
     Agent(AgentArgs),
     /// Inspect inter-agent messaging state
@@ -768,11 +768,72 @@ enum MessagingSubcommand {
     Status,
 }
 
+#[derive(Args, Debug)]
+#[command(
+    after_help = "Examples:\n  astra diff\n  astra diff staged\n  astra diff stat rust/crates/astra-cli/src/main.rs\n  astra diff show HEAD~1"
+)]
+struct DiffArgs {
+    #[command(subcommand)]
+    command: Option<DiffSubcommand>,
+    /// Optional path filters when not using a named subcommand
+    #[arg(trailing_var_arg = true)]
+    paths: Vec<String>,
+}
+
+#[derive(Subcommand, Debug)]
+enum DiffSubcommand {
+    /// Show staged changes
+    Staged(DiffPathsArgs),
+    /// Show unstaged changes
+    Unstaged(DiffPathsArgs),
+    /// Show diff stat summary
+    Stat(DiffPathsArgs),
+    /// Show a specific revision
+    Show(DiffShowArgs),
+}
+
+#[derive(Args, Debug)]
+struct DiffPathsArgs {
+    /// Optional path filters
+    #[arg(trailing_var_arg = true)]
+    paths: Vec<String>,
+}
+
+#[derive(Args, Debug)]
+struct DiffShowArgs {
+    /// Revision, commit hash, or ref
+    rev: String,
+    /// Optional path filters
+    #[arg(trailing_var_arg = true)]
+    paths: Vec<String>,
+}
+
+#[derive(Args, Debug)]
+#[command(after_help = "Examples:\n  astra bug\n  astra bug copy\n  astra bug save")]
+struct BugArgs {
+    #[command(subcommand)]
+    command: Option<BugSubcommand>,
+}
+
+#[derive(Subcommand, Debug)]
+enum BugSubcommand {
+    /// Print the report to the terminal
+    Print,
+    /// Copy the report to the clipboard
+    Copy,
+    /// Save the report to a file
+    Save,
+}
+
 #[derive(Subcommand, Debug)]
 enum SessionCmd {
+    /// List sessions
     List(SessionListArgs),
+    /// Show session details
     Show(SessionShowArgs),
+    /// Close an active session
     Close(SessionShowArgs),
+    /// Delete a session record
     Delete(SessionShowArgs),
 }
 
@@ -795,7 +856,9 @@ struct SessionShowArgs {
 
 #[derive(Subcommand, Debug)]
 enum ModelCmd {
+    /// List available models
     List,
+    /// Show model details
     Show(ModelShowArgs),
 }
 
@@ -806,9 +869,13 @@ struct ModelShowArgs {
 
 #[derive(Subcommand, Debug)]
 enum SkillCmd {
+    /// List registered skills
     List(SkillListArgs),
+    /// Show skill details
     Show(SkillShowArgs),
+    /// Register a skill
     Register(SkillRegisterArgs),
+    /// Show skill group status
     Status(SkillStatusArgs),
 }
 
@@ -10326,6 +10393,33 @@ total_tokens_out: 500
             Some(Command::Messaging(args)) => match args.command {
                 Some(MessagingSubcommand::Dlq) => {}
                 other => panic!("unexpected messaging subcommand: {other:?}"),
+            },
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_diff_command_parses_show_subcommand() {
+        let cli = Cli::try_parse_from(["astra", "diff", "show", "HEAD~1"]).unwrap();
+        match cli.command {
+            Some(Command::Diff(args)) => match args.command {
+                Some(DiffSubcommand::Show(show)) => {
+                    assert_eq!(show.rev, "HEAD~1");
+                    assert!(show.paths.is_empty());
+                }
+                other => panic!("unexpected diff subcommand: {other:?}"),
+            },
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_bug_command_parses_save_subcommand() {
+        let cli = Cli::try_parse_from(["astra", "bug", "save"]).unwrap();
+        match cli.command {
+            Some(Command::Bug(args)) => match args.command {
+                Some(BugSubcommand::Save) => {}
+                other => panic!("unexpected bug subcommand: {other:?}"),
             },
             other => panic!("unexpected command: {other:?}"),
         }
