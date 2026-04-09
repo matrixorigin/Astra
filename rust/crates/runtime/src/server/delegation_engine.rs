@@ -897,7 +897,42 @@ impl DelegationEngine {
         // Validate first
         self.validate(&request, source_agent_id).await?;
 
-        match &request.pattern {
+        let session_id = request
+            .context
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("delegation");
+
+        // Extract pattern name and agent_ids for journal event.
+        let (pattern_name, agent_ids_for_journal): (&str, Vec<String>) = match &request.pattern {
+            CoordinationPattern::FanOut { agent_ids, .. } => ("fan_out", agent_ids.clone()),
+            CoordinationPattern::Pipeline { stages } => {
+                ("pipeline", stages.iter().map(|s| s.agent_id.clone()).collect())
+            }
+            CoordinationPattern::Sequential { agent_ids, .. } => ("sequential", agent_ids.clone()),
+            CoordinationPattern::AdversarialReview {
+                producer_id,
+                reviewer_id,
+                ..
+            } => ("adversarial_review", vec![producer_id.clone(), reviewer_id.clone()]),
+            CoordinationPattern::Fork { agent_id, tasks, .. } => {
+                ("fork", vec![format!("{}×{}", agent_id, tasks.len())])
+            }
+        };
+
+        // Journal: delegation started
+        Self::write_journal_event(
+            session_id,
+            astra_services::session_journal::JournalEvent::delegation_started(
+                Some(session_id),
+                &request.delegation_id,
+                &request.parent_run_id,
+                pattern_name,
+                &agent_ids_for_journal,
+            ),
+        );
+
+        let result = match &request.pattern {
             CoordinationPattern::FanOut {
                 agent_ids,
                 aggregation,
@@ -932,6 +967,46 @@ impl DelegationEngine {
                 self.execute_fork(&request, tasks, agent_id, *max_turns, aggregation)
                     .await
             }
+        };
+
+        // Journal: sub-run completions + delegation completed
+        if let Ok(ref dr) = result {
+            for ar in &dr.agent_results {
+                Self::write_journal_event(
+                    session_id,
+                    astra_services::session_journal::JournalEvent::delegation_sub_run_completed(
+                        Some(session_id),
+                        &request.delegation_id,
+                        &ar.run_id,
+                        &ar.agent_id,
+                        &ar.status,
+                        ar.error.as_deref(),
+                    ),
+                );
+            }
+            let succeeded = dr.agent_results.iter().filter(|r| r.is_success()).count();
+            let failed = dr.agent_results.len() - succeeded;
+            Self::write_journal_event(
+                session_id,
+                astra_services::session_journal::JournalEvent::delegation_completed(
+                    Some(session_id),
+                    &request.delegation_id,
+                    pattern_name,
+                    dr.agent_results.len(),
+                    succeeded,
+                    failed,
+                    &dr.status,
+                ),
+            );
+        }
+
+        result
+    }
+
+    /// Write a journal event (best-effort, non-blocking).
+    fn write_journal_event(session_id: &str, event: astra_services::session_journal::JournalEvent) {
+        if let Ok(writer) = astra_services::session_journal::JournalWriter::new(session_id) {
+            let _ = writer.append(&event);
         }
     }
 
