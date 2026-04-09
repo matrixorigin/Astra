@@ -24,8 +24,28 @@ pub(crate) fn try_replace_plan_from_llm_json(
         return Ok(false);
     }
     match plan::parse_plan_response(text) {
-        Ok(plan) => {
-            plan_state.set_plan(plan);
+        Ok(mut new_plan) => {
+            // Preserve completed subtasks that LLM may have dropped
+            let old_completed: Vec<_> = plan_state
+                .plan
+                .subtasks
+                .iter()
+                .filter(|s| s.status == astra_services::task_orchestrator::TaskStatus::Completed)
+                .collect();
+            if !old_completed.is_empty() {
+                for old in &old_completed {
+                    let kept = new_plan.subtasks.iter().any(|n| n.id == old.id);
+                    if !kept {
+                        new_plan.subtasks.insert(0, (*old).clone());
+                    } else {
+                        // Ensure status stays completed even if LLM reset it
+                        if let Some(n) = new_plan.subtasks.iter_mut().find(|n| n.id == old.id) {
+                            n.status = astra_services::task_orchestrator::TaskStatus::Completed;
+                        }
+                    }
+                }
+            }
+            plan_state.set_plan(new_plan);
             Ok(true)
         }
         Err(e) => Err(e),
@@ -895,6 +915,43 @@ pub async fn handle_plan_mode_input(
                                 "subtask_count": plan_state.plan.subtasks.len(),
                             })),
                         );
+
+                        // Auto-prompt execution if there are new pending subtasks
+                        let pending_count = plan_state.plan.subtasks.iter()
+                            .filter(|s| s.status == astra_services::task_orchestrator::TaskStatus::Pending)
+                            .count();
+                        if pending_count > 0 {
+                            eprintln!();
+                            eprintln!(
+                                "  {} {} new subtask{} added.",
+                                theme::icon_ok(),
+                                format!("{pending_count}").cyan(),
+                                if pending_count == 1 { "" } else { "s" }
+                            );
+                            if let Some(choice) = prompt_plan_confirmation(pending_count) {
+                                match choice {
+                                    PlanConfirmChoice::ExecuteAll => {
+                                        return Box::pin(handle_plan_mode_input(
+                                            "go".into(),
+                                            token,
+                                            state,
+                                            api,
+                                        ))
+                                        .await;
+                                    }
+                                    PlanConfirmChoice::StepByStep => {
+                                        return Box::pin(handle_plan_mode_input(
+                                            "step".into(),
+                                            token,
+                                            state,
+                                            api,
+                                        ))
+                                        .await;
+                                    }
+                                    PlanConfirmChoice::Edit | PlanConfirmChoice::Cancel => {}
+                                }
+                            }
+                        }
                     }
                     Ok(false) => {}
                     Err(e) => {
@@ -1793,5 +1850,87 @@ mod tests {
             "expected Cancel command, got {:?}",
             cmd
         );
+    }
+
+    #[test]
+    fn try_replace_preserves_completed_subtasks_when_llm_drops_them() {
+        let mut ps = plan::PlanModeState::new("build login".into(), plan::ProjectContext::default());
+        // Simulate a completed plan
+        ps.set_plan(astra_services::task_orchestrator::TaskPlan {
+            subtasks: vec![
+                astra_services::task_orchestrator::SubtaskPlan {
+                    id: "html".into(),
+                    title: "Create HTML".into(),
+                    status: TaskStatus::Completed,
+                    ..Default::default()
+                },
+                astra_services::task_orchestrator::SubtaskPlan {
+                    id: "css".into(),
+                    title: "Add CSS".into(),
+                    status: TaskStatus::Completed,
+                    ..Default::default()
+                },
+            ],
+            notes: None,
+        });
+
+        // LLM returns only the new subtask, dropping completed ones
+        let json = r#"{"subtasks":[{"id":"move-files","title":"Move files to directory"}]}"#;
+        assert!(try_replace_plan_from_llm_json(json, &mut ps).unwrap());
+
+        // All three subtasks should be present
+        assert_eq!(ps.plan.subtasks.len(), 3);
+        // Completed ones preserved at front
+        assert_eq!(ps.plan.subtasks[0].id, "html");
+        assert_eq!(ps.plan.subtasks[0].status, TaskStatus::Completed);
+        assert_eq!(ps.plan.subtasks[1].id, "css");
+        assert_eq!(ps.plan.subtasks[1].status, TaskStatus::Completed);
+        // New one appended
+        assert_eq!(ps.plan.subtasks[2].id, "move-files");
+        assert_eq!(ps.plan.subtasks[2].status, TaskStatus::Pending);
+    }
+
+    #[test]
+    fn try_replace_preserves_status_when_llm_resets_completed_to_pending() {
+        let mut ps = plan::PlanModeState::new("build login".into(), plan::ProjectContext::default());
+        ps.set_plan(astra_services::task_orchestrator::TaskPlan {
+            subtasks: vec![astra_services::task_orchestrator::SubtaskPlan {
+                id: "html".into(),
+                title: "Create HTML".into(),
+                status: TaskStatus::Completed,
+                ..Default::default()
+            }],
+            notes: None,
+        });
+
+        // LLM includes the old subtask but resets status to pending
+        let json = r#"{"subtasks":[{"id":"html","title":"Create HTML"},{"id":"new","title":"New task"}]}"#;
+        assert!(try_replace_plan_from_llm_json(json, &mut ps).unwrap());
+
+        assert_eq!(ps.plan.subtasks.len(), 2);
+        assert_eq!(ps.plan.subtasks[0].id, "html");
+        assert_eq!(ps.plan.subtasks[0].status, TaskStatus::Completed);
+        assert_eq!(ps.plan.subtasks[1].id, "new");
+        assert_eq!(ps.plan.subtasks[1].status, TaskStatus::Pending);
+    }
+
+    #[test]
+    fn try_replace_no_protection_when_nothing_completed() {
+        let mut ps = plan::PlanModeState::new("goal".into(), plan::ProjectContext::default());
+        ps.set_plan(astra_services::task_orchestrator::TaskPlan {
+            subtasks: vec![astra_services::task_orchestrator::SubtaskPlan {
+                id: "old".into(),
+                title: "Old".into(),
+                status: TaskStatus::Pending,
+                ..Default::default()
+            }],
+            notes: None,
+        });
+
+        // Full replacement is fine when nothing was completed
+        let json = r#"{"subtasks":[{"id":"new","title":"Replacement"}]}"#;
+        assert!(try_replace_plan_from_llm_json(json, &mut ps).unwrap());
+        assert_eq!(ps.plan.subtasks.len(), 1);
+        assert_eq!(ps.plan.subtasks[0].id, "new");
     }
 }

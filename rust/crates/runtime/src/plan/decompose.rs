@@ -1315,8 +1315,40 @@ impl PlanModeState {
 
         prompt.push_str(&format!("## User Request\n{}\n\n", user_message));
 
-        prompt.push_str(
-            r#"## Instructions
+        // Detect completed plan — tailor instructions for follow-up edits
+        let all_done = !self.plan.subtasks.is_empty()
+            && self.plan.subtasks.iter().all(|s| {
+                s.status == TaskStatus::Completed
+            });
+
+        if all_done {
+            prompt.push_str(
+                r#"## Instructions
+The plan above is ALREADY COMPLETED. The user is requesting a follow-up change.
+
+Assess the scope of the request:
+- **Small tweak** (move files, rename, minor edit): Add ONLY the new subtask(s) needed. Keep all existing completed subtasks as-is with their current status.
+- **Significant rework** (restructure, rewrite): You may replace subtasks, but preserve completed ones that are still valid.
+
+Output the FULL plan as JSON (including existing completed subtasks unchanged) with the new subtask(s) appended:
+```json
+{
+  "subtasks": [
+    {"id": "existing-1", "title": "...", "status": "completed", ...},
+    {"id": "followup-1", "title": "...", "description": "...", "depends_on": [...]}
+  ],
+  "notes": "..."
+}
+```
+
+Rules:
+- New subtasks get status "pending" (or omit status field).
+- Do NOT reset completed subtasks to pending unless the user explicitly asks to redo them.
+- Keep the JSON valid and concise."#,
+            );
+        } else {
+            prompt.push_str(
+                r#"## Instructions
 Based on the user's request, respond in ONE of these ways:
 
 1. **If modifying the plan**: Output the updated plan as JSON with format:
@@ -1330,7 +1362,8 @@ Based on the user's request, respond in ONE of these ways:
 2. **If answering a question**: Respond naturally, no JSON needed.
 
 Keep responses concise. The plan JSON must be valid if provided."#,
-        );
+            );
+        }
 
         prompt
     }
@@ -4265,6 +4298,68 @@ Done!"#;
         let prompt = ps.plan_mode_prompt("q3");
         assert!(prompt.contains("Recent Discussion"), "should have history");
         assert!(prompt.contains("q1"), "should contain first turn");
+    }
+
+    #[test]
+    fn plan_mode_prompt_uses_followup_instructions_when_all_completed() {
+        let ctx = ProjectContext::default();
+        let mut ps = PlanModeState::new("build login".into(), ctx);
+        ps.set_plan(TaskPlan {
+            subtasks: vec![SubtaskPlan {
+                id: "html".into(),
+                title: "Create HTML".into(),
+                status: TaskStatus::Completed,
+                ..Default::default()
+            }],
+            notes: None,
+        });
+
+        let prompt = ps.plan_mode_prompt("move files into a directory");
+        assert!(
+            prompt.contains("ALREADY COMPLETED"),
+            "should use follow-up instructions"
+        );
+        assert!(
+            prompt.contains("Small tweak"),
+            "should mention scope assessment"
+        );
+        assert!(
+            !prompt.contains("If answering a question"),
+            "should NOT use default instructions"
+        );
+    }
+
+    #[test]
+    fn plan_mode_prompt_uses_default_instructions_when_not_all_completed() {
+        let ctx = ProjectContext::default();
+        let mut ps = PlanModeState::new("build login".into(), ctx);
+        ps.set_plan(TaskPlan {
+            subtasks: vec![
+                SubtaskPlan {
+                    id: "html".into(),
+                    title: "Create HTML".into(),
+                    status: TaskStatus::Completed,
+                    ..Default::default()
+                },
+                SubtaskPlan {
+                    id: "css".into(),
+                    title: "Add CSS".into(),
+                    status: TaskStatus::Pending,
+                    ..Default::default()
+                },
+            ],
+            notes: None,
+        });
+
+        let prompt = ps.plan_mode_prompt("change approach");
+        assert!(
+            !prompt.contains("ALREADY COMPLETED"),
+            "should NOT use follow-up instructions"
+        );
+        assert!(
+            prompt.contains("If answering a question"),
+            "should use default instructions"
+        );
     }
 
     #[test]
