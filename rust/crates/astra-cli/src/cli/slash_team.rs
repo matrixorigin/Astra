@@ -1,7 +1,7 @@
 use super::*;
 use astra_runtime::server::team_orchestrator::ExecutionPhase;
 #[allow(unused_imports)]
-use astra_services::team_persistence::TeamPersistenceService;
+use astra_services::team_persistence::{TeamPersistenceService, WorktreeMode};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
@@ -43,6 +43,7 @@ pub(super) struct Team {
     pub description: String,
     pub members: Vec<TeamMember>,
     pub shared_context: HashMap<String, String>,
+    pub worktree_mode: WorktreeMode,
     pub created_at: String,
 }
 
@@ -97,6 +98,7 @@ impl TeamRegistry {
                     },
                 ],
                 shared_context: HashMap::new(),
+                worktree_mode: WorktreeMode::Shared,
                 created_at: chrono::Utc::now().to_rfc3339(),
             },
         );
@@ -123,6 +125,7 @@ impl TeamRegistry {
                     },
                 ],
                 shared_context: HashMap::new(),
+                worktree_mode: WorktreeMode::Shared,
                 created_at: chrono::Utc::now().to_rfc3339(),
             },
         );
@@ -157,6 +160,7 @@ impl TeamRegistry {
                     },
                 ],
                 shared_context: HashMap::new(),
+                worktree_mode: WorktreeMode::Isolated,
                 created_at: chrono::Utc::now().to_rfc3339(),
             },
         );
@@ -183,6 +187,7 @@ impl TeamRegistry {
                 description,
                 members: Vec::new(),
                 shared_context: HashMap::new(),
+                worktree_mode: WorktreeMode::Shared,
                 created_at: chrono::Utc::now().to_rfc3339(),
             },
         );
@@ -292,7 +297,7 @@ fn cli_team_to_definition(
             })
             .collect(),
         context: team.shared_context.clone(),
-        worktree_mode: WorktreeMode::Shared,
+        worktree_mode: team.worktree_mode.clone(),
         created_at: now.clone(),
         updated_at: now,
     }
@@ -1422,6 +1427,7 @@ mod tests {
                 })
                 .collect(),
             shared_context: HashMap::new(),
+            worktree_mode: WorktreeMode::Shared,
             created_at: "2024-01-01T00:00:00Z".into(),
         }
     }
@@ -1485,6 +1491,19 @@ mod tests {
         team.shared_context.insert("lang".into(), "rust".into());
         let def = cli_team_to_definition(&team, "u");
         assert_eq!(def.context.get("lang").unwrap(), "rust");
+    }
+
+    #[test]
+    fn cli_team_to_definition_preserves_worktree_mode() {
+        let mut reg = TeamRegistry::new();
+        let dev = reg.get("dev").unwrap().clone();
+        let def = cli_team_to_definition(&dev, "u");
+        assert_eq!(def.worktree_mode, WorktreeMode::Isolated);
+
+        reg.create("custom".into(), "custom".into()).unwrap();
+        let custom = reg.get("custom").unwrap().clone();
+        let custom_def = cli_team_to_definition(&custom, "u");
+        assert_eq!(custom_def.worktree_mode, WorktreeMode::Shared);
     }
 
     // ── History / Snapshot tests ─────────────────────────────────
