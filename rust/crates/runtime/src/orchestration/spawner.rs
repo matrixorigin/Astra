@@ -774,6 +774,7 @@ mod tests {
         let context = SpawnContext {
             parent_run_id: "parent-123".to_string(),
             parent_agent_id: "main".to_string(),
+            inherited_permissions: None,
             working_dir: PathBuf::from("/tmp"),
         };
         let input = SpawnAgentInput {
@@ -844,6 +845,7 @@ mod tests {
         let context = SpawnContext {
             parent_run_id: "parent-123".to_string(),
             parent_agent_id: "main".to_string(),
+            inherited_permissions: None,
             working_dir: PathBuf::from("/tmp"),
         };
         let input = SpawnAgentInput {

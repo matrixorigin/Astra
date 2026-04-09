@@ -772,7 +772,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         // Persist pause
         if let Some(engine) = &self.run_engine {
             astra_core::log_persist!(
-                engine.persist_status(&run_id, STATUS_PAUSED, Some("user_pause"), None).await,
+                engine.persist_status(&run_id, STATUS_PAUSED, Some("user_resume"), None).await,
                 "run_lifecycle", &run_id, "pause_status"
             );
             astra_core::log_persist!(
