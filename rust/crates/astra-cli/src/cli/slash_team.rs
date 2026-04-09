@@ -1,5 +1,5 @@
 use super::*;
-use crate::current_access_token;
+use crate::{current_access_token, is_session_not_found_error};
 use astra_runtime::server::team_orchestrator::ExecutionPhase;
 #[allow(unused_imports)]
 use astra_services::team_persistence::{TeamPersistenceService, WorktreeMode};
@@ -352,11 +352,23 @@ async fn ensure_team_run_session(
     profile: Option<&str>,
     state: &mut super::ReplState,
 ) -> Result<String, String> {
+    let token = current_access_token(profile).ok_or_else(|| "Not logged in".to_string())?;
     if let Some(session_id) = state.session_id.clone() {
-        return Ok(session_id);
+        match api.get_session_text(&token, &session_id).await {
+            Ok(_) => return Ok(session_id),
+            Err(err) => {
+                let err = map_thin_err(err);
+                if !is_session_not_found_error(&err) {
+                    return Ok(session_id);
+                }
+                let _ = crate::auth_flow::clear_profile_last_session(profile);
+                state.session_id = None;
+                state.run_id = None;
+                state.journal = None;
+            }
+        }
     }
 
-    let token = current_access_token(profile).ok_or_else(|| "Not logged in".to_string())?;
     let body = api
         .post_sessions_json(&token, &serde_json::json!({}))
         .await
@@ -1430,7 +1442,7 @@ fn format_tokens(n: u64) -> String {
 mod tests {
     use super::*;
     use crate::cli_utils::{CredentialsFile, Profile};
-    use axum::{Router, routing::post};
+    use axum::{Router, routing::get, routing::post};
     use tempfile::tempdir;
 
     async fn spawn_mock(app: Router) -> String {
@@ -1744,6 +1756,65 @@ mod tests {
         assert_eq!(
             creds.profiles["default"].last_session_id.as_deref(),
             Some("team-sess-1")
+        );
+
+        unsafe {
+            std::env::remove_var("ASTRA_CREDENTIALS_DIR");
+        }
+    }
+
+    #[tokio::test]
+    async fn ensure_team_run_session_replaces_stale_remote_session() {
+        let creds_dir = tempdir().unwrap();
+        unsafe {
+            std::env::set_var("ASTRA_CREDENTIALS_DIR", creds_dir.path());
+        }
+
+        let mut creds = CredentialsFile::default();
+        creds.profiles.insert(
+            "default".to_string(),
+            Profile {
+                access_token: Some("team-token".to_string()),
+                last_session_id: Some("stale-sess".to_string()),
+                ..Default::default()
+            },
+        );
+        save_credentials(&creds).unwrap();
+
+        let app = Router::new()
+            .route(
+                "/sessions/{id}",
+                get(|| async {
+                    (
+                        axum::http::StatusCode::NOT_FOUND,
+                        axum::Json(serde_json::json!({ "detail": "Session not found" })),
+                    )
+                }),
+            )
+            .route(
+                "/sessions",
+                post(|| async { axum::Json(serde_json::json!({ "session_id": "team-sess-2" })) }),
+            );
+        let base = spawn_mock(app).await;
+        let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
+        let mut state = ReplState {
+            session_id: Some("stale-sess".to_string()),
+            journal: session_journal::JournalWriter::new("stale-sess").ok(),
+            ..Default::default()
+        };
+
+        let session_id = ensure_team_run_session(&api, None, &mut state)
+            .await
+            .unwrap();
+
+        assert_eq!(session_id, "team-sess-2");
+        assert_eq!(state.session_id.as_deref(), Some("team-sess-2"));
+        assert!(state.journal.is_some());
+
+        let creds = load_credentials();
+        assert_eq!(
+            creds.profiles["default"].last_session_id.as_deref(),
+            Some("team-sess-2")
         );
 
         unsafe {
