@@ -29,6 +29,7 @@ pub mod cloud;
 pub mod cloud_approval_policy;
 pub mod cloud_tool_delivery;
 pub mod complete;
+pub mod context_assembly_trace;
 pub mod context_compression;
 pub mod contracts;
 pub mod counter;

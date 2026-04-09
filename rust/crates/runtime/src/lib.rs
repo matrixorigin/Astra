@@ -89,6 +89,7 @@ pub mod pipeline;
 pub mod plan;
 pub mod plan_decompose;
 pub mod prompts;
+pub mod runtime_config;
 pub mod server;
 pub mod sync_adapters;
 pub mod tool_registry;
