@@ -849,6 +849,23 @@ pub(super) fn handle_session_command(arg: &str, state: &mut ReplState) {
                                     components,
                                 );
                             }
+                            session_journal::JournalEventType::ContextAssemblyRecorded => {
+                                // Context assembly trace (M1 telemetry) — detailed view via /session context
+                                let tokens = evt
+                                    .context_assembly_trace
+                                    .as_ref()
+                                    .and_then(|t| t.get("token_budget"))
+                                    .and_then(|tb| tb.get("total_tokens_used"))
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0);
+                                eprintln!(
+                                    "  {} {} T{} context trace ({} tokens)",
+                                    ts_short.dim(),
+                                    "📊".cyan(),
+                                    evt.turn.unwrap_or(0),
+                                    tokens,
+                                );
+                            }
                         }
                     }
                     // Summary stats

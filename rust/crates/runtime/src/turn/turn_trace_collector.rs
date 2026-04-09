@@ -192,6 +192,35 @@ impl TurnTraceCollector {
         builder.build()
     }
 
+    /// Finalize and persist the trace to the session journal.
+    ///
+    /// Returns the finalized trace if persistence succeeded, or an error.
+    /// This is a convenience method that combines `finalize()` with journal write.
+    pub fn finalize_and_persist(
+        &self,
+        turn_number: u32,
+    ) -> Result<ContextAssemblyTrace, std::io::Error> {
+        use astra_services::session_journal::{JournalEvent, JournalWriter};
+
+        let trace = self.finalize();
+
+        // Only persist if we have meaningful data
+        if !self.has_data() {
+            return Ok(trace);
+        }
+
+        let state = self.inner.read().expect("lock poisoned");
+        let writer = JournalWriter::new(&state.session_id)?;
+        let event = JournalEvent::context_assembly_recorded(
+            Some(&state.session_id),
+            turn_number,
+            trace.to_json_value(),
+        );
+        writer.append(&event)?;
+
+        Ok(trace)
+    }
+
     /// Check if any data has been recorded.
     pub fn has_data(&self) -> bool {
         let state = self.inner.read().expect("lock poisoned");

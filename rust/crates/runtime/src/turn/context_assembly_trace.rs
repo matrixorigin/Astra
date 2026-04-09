@@ -45,6 +45,21 @@ pub struct ContextAssemblyTrace {
     pub explanations: Vec<DecisionExplanation>,
 }
 
+impl ContextAssemblyTrace {
+    /// Serialize this trace to a JSON value for journal persistence.
+    ///
+    /// The journal stores traces as `serde_json::Value` to avoid cross-crate
+    /// type dependencies. This method provides a convenient serialization point.
+    pub fn to_json_value(&self) -> serde_json::Value {
+        serde_json::to_value(self).unwrap_or_else(|e| {
+            serde_json::json!({
+                "serialization_error": e.to_string(),
+                "turn_id": self.turn_id,
+            })
+        })
+    }
+}
+
 impl Default for ContextAssemblyTrace {
     fn default() -> Self {
         Self {
