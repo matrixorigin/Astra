@@ -1,6 +1,6 @@
 # Permission Sync System
 
-Mo-Agent's permission sync system enables hierarchical permission management across parent and child agents. When a parent agent spawns a child, permissions flow down automatically, and children can request additional permissions dynamically.
+Mo-Agent's permission sync system enables hierarchical permission management across parent and child agents. When a parent agent spawns a child, permissions flow down automatically, and children can request additional permissions dynamically through the mailbox system.
 
 ## Architecture Overview
 
@@ -23,6 +23,14 @@ Mo-Agent's permission sync system enables hierarchical permission management acr
 │  │  - session_rules: child's own additions                │ │
 │  └────────────────────────────────────────────────────────┘ │
 │                           │                                 │
+│    ┌──────────────────────┼───────────────────────┐        │
+│    │ Permission Gate      │ (agentic_headless_round)       │
+│    │  1. Check local PermissionSyncContext                 │
+│    │  2. If denied + mailbox → request_permission()        │
+│    │  3. If approved → apply rules and execute             │
+│    │  4. If denied → return 🔒 error                       │
+│    └───────────────────────────────────────────────────────┘ │
+│                           │                                 │
 │              request_permission() via Mailbox               │
 │                           ▼                                 │
 │  ┌────────────────────────────────────────────────────────┐ │
@@ -33,6 +41,16 @@ Mo-Agent's permission sync system enables hierarchical permission management acr
 │  └────────────────────────────────────────────────────────┘ │
 └─────────────────────────────────────────────────────────────┘
 ```
+
+## Key Components
+
+| Component | Location | Purpose |
+|-----------|----------|---------|
+| `PermissionSyncContext` | `orchestration/permission_sync.rs` | Runtime permission state |
+| `PermissionRule` | `orchestration/permission_sync.rs` | Tool+args pattern matching |
+| `check_tool_permission()` | `turn/permission_gate.rs` | Gate function for tool execution |
+| `PermissionRequestHandler` | `orchestration/permission_sync.rs` | Parent-side request processor |
+| `AgentMailbox.request_permission()` | `messaging/types.rs` | Async parent request |
 
 ## Core Types
 
@@ -296,12 +314,160 @@ match mailbox.request_permission(request, timeout).await {
 
 ## Integration with Agentic Loop
 
-The permission sync system integrates with the agentic loop at tool execution time:
+The permission sync system integrates at the **permission gate** in `agentic_headless_round.rs`:
 
-1. Before executing a tool, check `ctx.is_allowed(tool, args)`
-2. If denied and child has parent mailbox, call `request_permission()`
-3. If approved, apply updates and proceed
-4. If denied or timeout, skip tool or return error
+```rust
+// Before executing each tool call:
+let result = check_tool_permission(
+    &tool_call,
+    permission_context.as_ref(),
+    mailbox.as_ref(),
+).await;
+
+match result {
+    PermissionCheckResult::Allowed => {
+        // Execute tool normally
+    }
+    PermissionCheckResult::AllowedViaRequest { new_rules } => {
+        // Parent approved - apply rules and execute
+        for rule in new_rules {
+            permission_context.add_session_allow_rule(&rule);
+        }
+        // Execute tool
+    }
+    PermissionCheckResult::Denied { reason } => {
+        // Return error result: 🔒 Permission denied: {reason}
+    }
+}
+```
+
+### Permission Check Flow
+
+```
+Tool Call Arrives
+       │
+       ▼
+┌──────────────────────────────────┐
+│ 1. Check PermissionSyncContext   │
+│    - is_allowed(tool, args)?     │
+└──────────────┬───────────────────┘
+               │
+       ┌───────┴───────┐
+       │               │
+    Allowed         Denied
+       │               │
+       ▼               ▼
+   Execute      ┌──────────────────┐
+               │ 2. Mailbox avail? │
+               └──────┬────────────┘
+                      │
+              ┌───────┴───────┐
+              │               │
+            Yes             No
+              │               │
+              ▼               ▼
+┌────────────────────┐    Return
+│ 3. request_permission │   Error
+│    to parent        │
+└──────────┬─────────┘
+           │
+   ┌───────┴───────┐
+   │               │
+Approved        Denied
+   │               │
+   ▼               ▼
+Apply rules    Return
+& Execute      Error
+```
+
+### PermissionCheckResult
+
+```rust
+pub enum PermissionCheckResult {
+    /// Tool is allowed by local permission context
+    Allowed,
+    /// Tool was approved by parent, with optional new rules
+    AllowedViaRequest { new_rules: Vec<String> },
+    /// Tool is denied
+    Denied { reason: String },
+}
+```
+
+## CLI Commands
+
+### `/agent list`
+
+Shows all spawned agents with permission indicators:
+
+```
+Active Agents:
+┌────────────────┬──────────────┬───────────┬───────────┐
+│ ID             │ Type         │ Status    │ Runtime   │
+├────────────────┼──────────────┼───────────┼───────────┤
+│ code-review-1  │ code-review  │ Running   │ 45s       │
+│ file-analyzer  │ explore  🔒  │ Idle      │ 2m 15s    │  ← 🔒 = permission issues
+│ test-runner    │ task         │ Completed │ 1m 30s    │
+└────────────────┴──────────────┴───────────┴───────────┘
+```
+
+The 🔒 indicator appears when an agent has:
+- Tools blocked by permission rules
+- Pending permission requests that timed out or were denied
+
+### `/agent status <id>`
+
+Shows detailed agent status including permission summary:
+
+```
+Agent: file-analyzer
+──────────────────────────────────
+Type: explore
+Status: Idle
+Runtime: 2m 15s
+
+Metrics:
+  Tool calls: 12
+  Tokens: 8,234 prompt / 1,456 completion
+
+Permissions: 🔒 Issues detected
+  Mode: Auto
+  Allow rules: 3
+  Deny rules: 1
+  Requests: 2 (1 approved, 0 denied, 1 blocked)
+```
+
+### `/agent permissions <id>`
+
+Shows detailed permission information for an agent:
+
+```
+Permission Details for: file-analyzer
+──────────────────────────────────────
+
+Mode: Auto
+Parent: main-agent
+
+Inherited Permissions:
+  Mode: Auto
+  Allowed tools: view, grep, glob, bash
+
+Allow Rules (3):
+  • view(src:*)
+  • grep
+  • bash(git:*)
+
+Deny Rules (1):
+  • bash(rm:*)
+
+Session Rules:
+  • edit(docs:*) [added during session]
+
+Permission Metrics:
+  Requests sent: 2
+  Approved: 1
+  Denied: 0
+  Blocked (timeout/error): 1
+```
 
 ## Best Practices
 
@@ -310,3 +476,40 @@ The permission sync system integrates with the agentic loop at tool execution ti
 3. **Background agents should be read-only** - Only allow view/grep/glob tools
 4. **Set reasonable timeouts** - 30s is typical for permission requests
 5. **Apply suggested rules in Auto mode** - Reduces future requests for same pattern
+6. **Monitor `/agent permissions`** - Check for blocked requests that indicate permission gaps
+
+## Testing
+
+The permission sync system has comprehensive tests:
+
+### Unit Tests (`permission_sync.rs`)
+- `test_permission_mode_default`: Verify default mode is Auto
+- `test_permission_rule_parsing`: Pattern syntax validation
+- `test_permission_sync_context_inheritance`: Parent→child rule flow
+- `test_permission_request_handler_*`: Handler behavior for all modes
+
+### Unit Tests (`permission_gate.rs`)
+- `test_allowed_without_context`: Legacy mode (no permission context)
+- `test_allowed_with_context`: Context allows tool
+- `test_denied_with_context`: Context denies tool
+- `test_denied_no_mailbox`: Denied when no mailbox available
+
+### E2E Tests (`e2e_loop_tests.rs`)
+- `child_permission_request_via_mailbox_approved`: Full flow with parent approval
+- `child_permission_request_via_mailbox_denied`: Flow with parent denial
+
+Run tests:
+```bash
+# Unit tests
+cargo test -p astra-runtime permission_sync
+cargo test -p astra-runtime permission_gate
+
+# E2E tests  
+cargo test -p astra-runtime e2e_loop_tests
+```
+
+## Related Documentation
+
+- [Multi-Agent Delegation Guide](design/multi-agent-delegation-guide.md)
+- [Agents and Orchestration](design/agents-and-orchestration.md)
+- [CLI Commands Reference](reference/cli-commands.md)
