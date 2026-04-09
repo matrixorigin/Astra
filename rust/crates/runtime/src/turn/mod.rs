@@ -60,6 +60,7 @@ pub mod parallel_tool_exec;
 pub mod persist;
 pub mod persist_inputs;
 pub mod prepare_turn_explain_text;
+pub mod progress_display;
 pub mod quality;
 pub mod refresh;
 pub mod response_guard;

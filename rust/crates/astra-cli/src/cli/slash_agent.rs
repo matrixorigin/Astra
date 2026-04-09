@@ -203,26 +203,118 @@ fn show_logs(ctx: &AgentCommandContext, agent_id: &str) {
         return;
     };
 
-    // Subscribe to progress events (for future streaming)
-    let _rx = spawner.subscribe_progress();
+    // Check if agent exists
+    let rt = match tokio::runtime::Handle::try_current() {
+        Ok(rt) => rt,
+        Err(_) => {
+            eprintln!("  {}", "No tokio runtime available.".red());
+            return;
+        }
+    };
+
+    let agent = rt.block_on(spawner.get_agent_state(agent_id));
+    if agent.is_none() {
+        eprintln!("  {}", format!("Agent not found: {agent_id}").yellow());
+        return;
+    }
 
     eprintln!(
-        "\n  {} Showing logs for {} (Ctrl+C to stop)\n",
+        "\n  {} Streaming logs for {} (Ctrl+C to stop)\n",
         "📋".cyan(),
         agent_id.white().bold()
     );
 
-    // For now, just show that we're listening
-    // In a full implementation, this would poll for events
-    eprintln!(
-        "  {}",
-        format!("Waiting for events from {agent_id}...").dim()
-    );
-    eprintln!(
-        "  {}",
-        "Note: Live log streaming requires active agent execution.".dim()
-    );
+    // Subscribe to progress events
+    let mut rx = spawner.subscribe_progress();
+    let target_agent_id = agent_id.to_string();
+
+    // Block and stream events
+    rt.block_on(async {
+        loop {
+            match rx.recv().await {
+                Ok(event) => {
+                    if event.agent_id == target_agent_id {
+                        print_progress_event(&event);
+
+                        // Stop on terminal events
+                        if matches!(
+                            event.event_type,
+                            astra_runtime::orchestration::ProgressEventType::Completed { .. }
+                                | astra_runtime::orchestration::ProgressEventType::Failed { .. }
+                                | astra_runtime::orchestration::ProgressEventType::Cancelled { .. }
+                        ) {
+                            break;
+                        }
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    eprintln!("  {}", format!("(skipped {n} events)").dim());
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    eprintln!("  {}", "Event stream closed.".dim());
+                    break;
+                }
+            }
+        }
+    });
+
     eprintln!();
+}
+
+fn print_progress_event(event: &astra_runtime::orchestration::AgentProgressEvent) {
+    use astra_runtime::orchestration::ProgressEventType;
+    use crossterm::style::Stylize;
+
+    let timestamp = std::time::UNIX_EPOCH
+        + std::time::Duration::from_millis(event.timestamp_epoch_ms);
+    let time_str = timestamp
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| {
+            let secs = d.as_secs();
+            let mins = (secs / 60) % 60;
+            let hours = (secs / 3600) % 24;
+            format!("{:02}:{:02}:{:02}", hours, mins, secs % 60)
+        })
+        .unwrap_or_else(|_| "??:??:??".to_string());
+
+    let msg = match &event.event_type {
+        ProgressEventType::Started { description } => {
+            format!("{} {}", "▶ Started:".green(), description)
+        }
+        ProgressEventType::TurnCompleted {
+            turn,
+            tool_calls_this_turn,
+            activity,
+        } => {
+            format!(
+                "{} Turn {} ({} tools): {}",
+                "◆".cyan(),
+                turn.to_string().as_str().cyan(),
+                tool_calls_this_turn,
+                activity
+            )
+        }
+        ProgressEventType::Idle => format!("{}", "⏸ Idle".blue()),
+        ProgressEventType::Busy { activity } => format!("⚡ Busy: {}", activity),
+        ProgressEventType::Completed {
+            result_summary,
+            total_tool_calls,
+            duration_ms,
+            ..
+        } => {
+            format!(
+                "{} ({} tools, {}ms): {}",
+                "✓ Completed".green(),
+                total_tool_calls,
+                duration_ms,
+                result_summary
+            )
+        }
+        ProgressEventType::Failed { error } => format!("{} {}", "✗ Failed:".red(), error),
+        ProgressEventType::Cancelled { reason } => format!("{} {}", "⊘ Cancelled:".yellow(), reason),
+    };
+
+    eprintln!("  [{}] {}", time_str.as_str().dim(), msg);
 }
 
 fn show_help() {
