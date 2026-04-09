@@ -96,6 +96,7 @@ pub mod tool_result_storage;
 pub mod tool_schema_prune;
 pub mod tool_selection;
 pub mod turn_guard;
+pub mod turn_trace_collector;
 pub mod unconsumed;
 pub mod view;
 pub mod xml_tool_call_fallback;
