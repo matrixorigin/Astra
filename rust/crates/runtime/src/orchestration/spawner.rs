@@ -27,6 +27,8 @@ pub struct SpawnContext {
     pub parent_agent_id: String,
     /// Working directory for the spawned agent.
     pub working_dir: PathBuf,
+    /// Permissions inherited from the parent agent.
+    pub inherited_permissions: Option<super::permission_sync::InheritedPermissions>,
 }
 
 // ─── Agent Status ───────────────────────────────────────────────────────────
@@ -316,8 +318,8 @@ impl DynamicAgentSpawner {
             mailbox,
             progress_emitter: Some(emitter.clone()),
             context_cache: Some(Arc::clone(&self.context_cache)),
-            // TODO: Populate from parent's permission context when available
-            inherited_permissions: None,
+            // Inherit permissions from parent context
+            inherited_permissions: context.inherited_permissions.clone(),
         };
 
         // 8. Execute or launch
@@ -552,6 +554,7 @@ mod tests {
             parent_run_id: "parent-123".to_string(),
             parent_agent_id: "parent".to_string(),
             working_dir: PathBuf::from("/tmp"),
+            inherited_permissions: None,
         };
 
         let result = spawner.spawn(input, &context).await.unwrap();
@@ -576,6 +579,7 @@ mod tests {
             parent_run_id: "parent-123".to_string(),
             parent_agent_id: "parent".to_string(),
             working_dir: PathBuf::from("/tmp"),
+            inherited_permissions: None,
         };
 
         let result = spawner.spawn(input, &context).await;
@@ -589,6 +593,7 @@ mod tests {
             parent_run_id: "parent-123".to_string(),
             parent_agent_id: "parent".to_string(),
             working_dir: PathBuf::from("/tmp"),
+            inherited_permissions: None,
         };
 
         // Spawn two agents
@@ -631,6 +636,7 @@ mod tests {
             parent_run_id: "parent-123".to_string(),
             parent_agent_id: "parent".to_string(),
             working_dir: PathBuf::from("/tmp"),
+            inherited_permissions: None,
         };
         
         // Spawn an agent

@@ -169,6 +169,14 @@ pub struct InheritedPermissions {
 }
 
 impl InheritedPermissions {
+    /// Create inherited permissions with the given mode.
+    pub fn new(mode: PermissionMode) -> Self {
+        Self {
+            mode,
+            ..Default::default()
+        }
+    }
+
     /// Create inherited permissions with auto-approve mode (no restrictions).
     pub fn auto_approve() -> Self {
         Self {

@@ -80,6 +80,8 @@ pub async fn handle_spawn_agent_tool(
         parent_run_id: ctx.run_id.clone(),
         parent_agent_id: ctx.agent_id.clone(),
         working_dir: ctx.working_dir.clone(),
+        // TODO: Get inherited permissions from parent context when available
+        inherited_permissions: None,
     };
 
     // Execute spawn

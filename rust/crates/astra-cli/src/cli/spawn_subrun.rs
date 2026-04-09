@@ -80,12 +80,21 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
         let all_schemas = edge_tools::all_tool_schemas();
         let valid_tool_names = openai_tool_names_from_schemas(&all_schemas);
 
-        let perm_manager = super::permission_manager::PermissionManager::with_project_mode(
-            self.permission_mode,
-            &self.project_root,
-        );
+        // Create permission manager - use inherited permissions if available
+        let perm_manager = if let Some(ref inherited) = config.inherited_permissions {
+            super::permission_manager::PermissionManager::with_inherited(
+                &self.project_root,
+                inherited.clone(),
+            )
+        } else {
+            super::permission_manager::PermissionManager::with_project_mode(
+                self.permission_mode,
+                &self.project_root,
+            )
+        };
 
         // Use the working directory from config (may be a worktree)
+        let effective_root = config.working_dir.clone();
         let effective_root = config.working_dir.clone();
 
         let mut host = SubRunHost {

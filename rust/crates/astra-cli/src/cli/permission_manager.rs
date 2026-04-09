@@ -202,6 +202,8 @@ pub(super) struct PermissionManager {
     /// Cached parsed user-level rules.
     cached_user_allow: Vec<PermissionRule>,
     cached_user_deny: Vec<PermissionRule>,
+    /// Permissions inherited from parent agent (if this is a child agent).
+    inherited: Option<astra_runtime::orchestration::InheritedPermissions>,
 }
 
 impl PermissionManager {
@@ -255,6 +257,7 @@ impl PermissionManager {
             user_settings: PermissionSettings::default(),
             cached_user_allow: Vec::new(),
             cached_user_deny: Vec::new(),
+            inherited: None,
         }
     }
 
@@ -287,7 +290,74 @@ impl PermissionManager {
             user_settings,
             cached_user_allow,
             cached_user_deny,
+            inherited: None,
         }
+    }
+
+    /// Create with inherited permissions from a parent agent.
+    ///
+    /// The child agent inherits the parent's permission mode and rules,
+    /// but can still load project-level settings for additional rules.
+    pub(super) fn with_inherited(
+        project_root: &Path,
+        inherited: astra_runtime::orchestration::InheritedPermissions,
+    ) -> Self {
+        // Use inherited mode, but load project settings too
+        let mode = match inherited.mode {
+            astra_runtime::orchestration::PermissionMode::Auto => PermissionMode::Auto,
+            astra_runtime::orchestration::PermissionMode::Prompt => PermissionMode::Prompt,
+            astra_runtime::orchestration::PermissionMode::Deny => PermissionMode::Deny,
+        };
+        let settings = PermissionSettings::load(project_root);
+        let cached_allow = settings.parsed_allow_rules();
+        let cached_deny = settings.parsed_deny_rules();
+        let user_settings = PermissionSettings::load_user();
+        let cached_user_allow = user_settings.parsed_allow_rules();
+        let cached_user_deny = user_settings.parsed_deny_rules();
+        Self {
+            mode,
+            session_overrides: HashMap::new(),
+            settings,
+            project_root: Some(project_root.to_path_buf()),
+            cached_allow,
+            cached_deny,
+            user_settings,
+            cached_user_allow,
+            cached_user_deny,
+            inherited: Some(inherited),
+        }
+    }
+
+    /// Check if a tool is allowed by inherited permissions.
+    fn is_inherited_allowed(&self, tool_name: &str, command: Option<&str>) -> bool {
+        if let Some(ref inherited) = self.inherited {
+            inherited.is_allowed(tool_name, command)
+        } else {
+            false
+        }
+    }
+
+    /// Check if a tool is denied by inherited permissions.
+    fn is_inherited_denied(&self, tool_name: &str, command: Option<&str>) -> bool {
+        if let Some(ref inherited) = self.inherited {
+            inherited.is_denied(tool_name, command)
+        } else {
+            false
+        }
+    }
+
+    /// Check if the tool is in the inherited tool allowlist (if any).
+    fn is_tool_in_inherited_allowlist(&self, tool_name: &str) -> bool {
+        if let Some(ref inherited) = self.inherited {
+            inherited.is_tool_allowed_by_allowlist(tool_name)
+        } else {
+            true // No allowlist = all tools allowed
+        }
+    }
+
+    /// Check if this is a background agent (cannot show prompts).
+    pub(super) fn is_background_agent(&self) -> bool {
+        self.inherited.as_ref().map_or(false, |i| i.is_background)
     }
 
     /// Resolve §5.5 `approval_required` for cloud-orchestrated tools (posts to `/approval/respond`).
@@ -351,9 +421,13 @@ impl PermissionManager {
         }
     }
 
-    /// Check persistent deny rules (project + user, bypass-immune).
+    /// Check persistent deny rules (inherited + project + user, bypass-immune).
     fn check_deny_rules(&self, name: &str, args: &serde_json::Value) -> bool {
         let cmd = command_hint_from_args(args);
+        // Check inherited deny rules first (from parent agent)
+        if self.is_inherited_denied(name, cmd) {
+            return true;
+        }
         self.cached_deny.iter().any(|rule| rule.matches(name, cmd))
             || self
                 .cached_user_deny
@@ -361,9 +435,13 @@ impl PermissionManager {
                 .any(|rule| rule.matches(name, cmd))
     }
 
-    /// Check persistent allow rules: project-level first, then user-level.
+    /// Check persistent allow rules: inherited first, then project-level, then user-level.
     fn check_allow_rules(&self, name: &str, args: &serde_json::Value) -> bool {
         let cmd = command_hint_from_args(args);
+        // Check inherited allow rules first (from parent agent)
+        if self.is_inherited_allowed(name, cmd) {
+            return true;
+        }
         self.cached_allow.iter().any(|rule| rule.matches(name, cmd))
             || self
                 .cached_user_allow
@@ -1709,5 +1787,91 @@ mod tests {
     fn display_permission_rule_with_pattern() {
         let rule = PermissionRule::parse("Bash(git commit:*)");
         assert_eq!(format!("{rule}"), "bash(git commit:*)");
+    }
+
+    // ── inherited permissions ──────────────────────────────────────────────────
+
+    #[test]
+    fn with_inherited_uses_parent_mode() {
+        use astra_runtime::orchestration::{InheritedPermissions, PermissionMode as RuntimeMode};
+        
+        let inherited = InheritedPermissions::new(RuntimeMode::Auto);
+        let pm = PermissionManager::with_inherited(
+            std::path::Path::new("/tmp"),
+            inherited,
+        );
+        assert_eq!(pm.mode, PermissionMode::Auto);
+    }
+
+    #[test]
+    fn with_inherited_checks_parent_allow_rules() {
+        use astra_runtime::orchestration::{
+            InheritedPermissions, PermissionMode as RuntimeMode, PermissionRule as RuntimeRule,
+        };
+        
+        let mut inherited = InheritedPermissions::new(RuntimeMode::Prompt);
+        inherited.add_allow(RuntimeRule::parse("bash(git commit:*)"));
+        
+        let pm = PermissionManager::with_inherited(
+            std::path::Path::new("/tmp"),
+            inherited,
+        );
+        
+        // Should be allowed by inherited rules
+        let args = serde_json::json!({"command": "git commit -m 'test'"});
+        assert!(pm.is_inherited_allowed("bash", Some("git commit -m 'test'")));
+        assert!(pm.check_allow_rules("bash", &args));
+    }
+
+    #[test]
+    fn with_inherited_checks_parent_deny_rules() {
+        use astra_runtime::orchestration::{
+            InheritedPermissions, PermissionMode as RuntimeMode, PermissionRule as RuntimeRule,
+        };
+        
+        let mut inherited = InheritedPermissions::new(RuntimeMode::Prompt);
+        inherited.add_deny(RuntimeRule::parse("bash(rm -rf:*)"));
+        
+        let pm = PermissionManager::with_inherited(
+            std::path::Path::new("/tmp"),
+            inherited,
+        );
+        
+        // Should be denied by inherited rules
+        assert!(pm.is_inherited_denied("bash", Some("rm -rf /tmp")));
+    }
+
+    #[test]
+    fn with_inherited_tool_allowlist() {
+        use astra_runtime::orchestration::{InheritedPermissions, PermissionMode as RuntimeMode};
+        
+        let mut inherited = InheritedPermissions::new(RuntimeMode::Auto);
+        inherited.allowed_tools = Some(["view".to_string(), "grep".to_string()].into_iter().collect());
+        
+        let pm = PermissionManager::with_inherited(
+            std::path::Path::new("/tmp"),
+            inherited,
+        );
+        
+        // Only allowed tools should pass
+        assert!(pm.is_tool_in_inherited_allowlist("view"));
+        assert!(pm.is_tool_in_inherited_allowlist("grep"));
+        assert!(!pm.is_tool_in_inherited_allowlist("bash"));
+        assert!(!pm.is_tool_in_inherited_allowlist("edit"));
+    }
+
+    #[test]
+    fn with_inherited_background_agent_flag() {
+        use astra_runtime::orchestration::{InheritedPermissions, PermissionMode as RuntimeMode};
+        
+        let mut inherited = InheritedPermissions::new(RuntimeMode::Auto);
+        inherited.is_background = true;
+        
+        let pm = PermissionManager::with_inherited(
+            std::path::Path::new("/tmp"),
+            inherited,
+        );
+        
+        assert!(pm.is_background_agent());
     }
 }
