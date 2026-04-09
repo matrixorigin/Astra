@@ -98,6 +98,8 @@ mod slash_account;
 mod slash_agent;
 #[path = "cli/slash_bug.rs"]
 mod slash_bug;
+#[path = "cli/slash_config.rs"]
+mod slash_config;
 #[path = "cli/slash_debug.rs"]
 mod slash_debug;
 #[path = "cli/slash_info.rs"]
@@ -6011,6 +6013,8 @@ async fn handle_slash_command(
         }
 
         "/session" => handle_session_command(arg, state),
+
+        "/config" => slash_config::handle_config_command(arg),
 
         "/checkpoint" => match create_manual_repl_checkpoint(state, arg) {
             Ok(msg) => {
