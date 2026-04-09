@@ -101,7 +101,8 @@ pub(crate) struct CliDelegateSubRunExecutor {
     cancel_token: Option<Arc<tokio_util::sync::CancellationToken>>,
     skill_resolver: Option<Arc<dyn astra_runtime::turn::skill_tool::SkillResolver>>,
     skill_search: SkillSearchSettings,
-    progress_tx: Option<tokio::sync::mpsc::UnboundedSender<super::skill_subrun::SubRunProgressEvent>>,
+    progress_tx:
+        Option<tokio::sync::mpsc::UnboundedSender<super::skill_subrun::SubRunProgressEvent>>,
 }
 
 impl CliDelegateSubRunExecutor {

@@ -726,8 +726,7 @@ pub(super) async fn handle_team_command(
                 Some(cancel_token.clone()),
             )
             .with_progress_tx(progress_tx);
-            let mut profile_registry =
-                astra_services::coordination::AgentProfileRegistry::new();
+            let mut profile_registry = astra_services::coordination::AgentProfileRegistry::new();
             super::delegate_subrun::register_default_agents(&mut profile_registry);
             let _ = super::agent_loader::load_and_merge(&project_root, &mut profile_registry);
             let profile_registry = Arc::new(tokio::sync::RwLock::new(profile_registry));
