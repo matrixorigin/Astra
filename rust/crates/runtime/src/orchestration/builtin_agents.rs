@@ -73,7 +73,9 @@ pub fn get_builtin_agent_types() -> Vec<AgentTypeDefinition> {
             default_model: "claude-haiku".to_string(),
             max_turns: 20,
             allowed_tools: ["view", "glob", "grep", "bash"]
-                .into_iter().map(String::from).collect(),
+                .into_iter()
+                .map(String::from)
+                .collect(),
             read_only: true,
         },
         AgentTypeDefinition {
@@ -83,7 +85,9 @@ pub fn get_builtin_agent_types() -> Vec<AgentTypeDefinition> {
             default_model: "claude-sonnet".to_string(),
             max_turns: 15,
             allowed_tools: ["view", "glob", "grep", "bash"]
-                .into_iter().map(String::from).collect(),
+                .into_iter()
+                .map(String::from)
+                .collect(),
             read_only: true,
         },
         AgentTypeDefinition {
@@ -93,7 +97,9 @@ pub fn get_builtin_agent_types() -> Vec<AgentTypeDefinition> {
             default_model: "claude-haiku".to_string(),
             max_turns: 30,
             allowed_tools: ["bash", "view", "glob", "grep", "edit", "create"]
-                .into_iter().map(String::from).collect(),
+                .into_iter()
+                .map(String::from)
+                .collect(),
             read_only: false,
         },
         AgentTypeDefinition {
@@ -142,8 +148,14 @@ mod tests {
 
     #[test]
     fn test_builtin_agent_type_from_str() {
-        assert_eq!("explore".parse::<BuiltinAgentType>(), Ok(BuiltinAgentType::Explore));
-        assert_eq!("code-review".parse::<BuiltinAgentType>(), Ok(BuiltinAgentType::CodeReview));
+        assert_eq!(
+            "explore".parse::<BuiltinAgentType>(),
+            Ok(BuiltinAgentType::Explore)
+        );
+        assert_eq!(
+            "code-review".parse::<BuiltinAgentType>(),
+            Ok(BuiltinAgentType::CodeReview)
+        );
         assert!("unknown".parse::<BuiltinAgentType>().is_err());
     }
 

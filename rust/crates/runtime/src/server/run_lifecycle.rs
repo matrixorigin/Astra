@@ -428,7 +428,12 @@ impl RunLifecycleService for AgenticRunLifecycleService {
 
         // Persist to durable store if available
         if let Some(engine) = &self.run_engine {
-            astra_core::log_persist!(engine.start_run(&run_id, &user_id, &session_id).await, "run_lifecycle", &run_id, "start_run");
+            astra_core::log_persist!(
+                engine.start_run(&run_id, &user_id, &session_id).await,
+                "run_lifecycle",
+                &run_id,
+                "start_run"
+            );
         }
 
         // Spawn background agentic loop.
@@ -543,17 +548,25 @@ impl RunLifecycleService for AgenticRunLifecycleService {
 
             if let Some(engine) = &run_engine {
                 astra_core::log_persist!(
-                    engine.persist_status(&bg_run_id, status_str, None, error_msg.as_deref()).await,
-                    "run_lifecycle", &bg_run_id, "status"
+                    engine
+                        .persist_status(&bg_run_id, status_str, None, error_msg.as_deref())
+                        .await,
+                    "run_lifecycle",
+                    &bg_run_id,
+                    "status"
                 );
                 astra_core::log_persist!(
-                    engine.persist_usage(
-                        &bg_run_id,
-                        loop_state.total_prompt,
-                        loop_state.total_completion,
-                        loop_state.total_tool_calls,
-                    ).await,
-                    "run_lifecycle", &bg_run_id, "usage"
+                    engine
+                        .persist_usage(
+                            &bg_run_id,
+                            loop_state.total_prompt,
+                            loop_state.total_completion,
+                            loop_state.total_tool_calls,
+                        )
+                        .await,
+                    "run_lifecycle",
+                    &bg_run_id,
+                    "usage"
                 );
             }
         });
@@ -702,15 +715,23 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             // Persist cancellation
             if let Some(engine) = &self.run_engine {
                 astra_core::log_persist!(
-                    engine.persist_status(&run_id, STATUS_CANCELLED, None, None).await,
-                    "run_lifecycle", &run_id, "cancel_status"
+                    engine
+                        .persist_status(&run_id, STATUS_CANCELLED, None, None)
+                        .await,
+                    "run_lifecycle",
+                    &run_id,
+                    "cancel_status"
                 );
                 astra_core::log_persist!(
-                    engine.append_event(
-                        &run_id,
-                        json!({"event_type": "run_finished", "data": {"cancelled": true}}),
-                    ).await,
-                    "run_lifecycle", &run_id, "cancel_event"
+                    engine
+                        .append_event(
+                            &run_id,
+                            json!({"event_type": "run_finished", "data": {"cancelled": true}}),
+                        )
+                        .await,
+                    "run_lifecycle",
+                    &run_id,
+                    "cancel_event"
                 );
             }
         }
@@ -775,12 +796,20 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         // Persist pause
         if let Some(engine) = &self.run_engine {
             astra_core::log_persist!(
-                engine.persist_status(&run_id, STATUS_PAUSED, Some("user_resume"), None).await,
-                "run_lifecycle", &run_id, "pause_status"
+                engine
+                    .persist_status(&run_id, STATUS_PAUSED, Some("user_resume"), None)
+                    .await,
+                "run_lifecycle",
+                &run_id,
+                "pause_status"
             );
             astra_core::log_persist!(
-                engine.append_event(&run_id, json!({"event_type": "run_paused", "data": {}})).await,
-                "run_lifecycle", &run_id, "pause_event"
+                engine
+                    .append_event(&run_id, json!({"event_type": "run_paused", "data": {}}))
+                    .await,
+                "run_lifecycle",
+                &run_id,
+                "pause_event"
             );
         }
         // Cascade: pause all delegated sub-runs of this parent.
@@ -825,12 +854,20 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         // Persist resume
         if let Some(engine) = &self.run_engine {
             astra_core::log_persist!(
-                engine.persist_status(&run_id, STATUS_RUNNING, None, None).await,
-                "run_lifecycle", &run_id, "resume_status"
+                engine
+                    .persist_status(&run_id, STATUS_RUNNING, None, None)
+                    .await,
+                "run_lifecycle",
+                &run_id,
+                "resume_status"
             );
             astra_core::log_persist!(
-                engine.append_event(&run_id, json!({"event_type": "run_resumed", "data": {}})).await,
-                "run_lifecycle", &run_id, "resume_event"
+                engine
+                    .append_event(&run_id, json!({"event_type": "run_resumed", "data": {}}))
+                    .await,
+                "run_lifecycle",
+                &run_id,
+                "resume_event"
             );
         }
         // Cascade: resume all delegated sub-runs of this parent.

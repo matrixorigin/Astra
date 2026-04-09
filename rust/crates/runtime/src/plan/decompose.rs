@@ -1317,9 +1317,11 @@ impl PlanModeState {
 
         // Detect completed plan — tailor instructions for follow-up edits
         let all_done = !self.plan.subtasks.is_empty()
-            && self.plan.subtasks.iter().all(|s| {
-                s.status == TaskStatus::Completed
-            });
+            && self
+                .plan
+                .subtasks
+                .iter()
+                .all(|s| s.status == TaskStatus::Completed);
 
         if all_done {
             prompt.push_str(

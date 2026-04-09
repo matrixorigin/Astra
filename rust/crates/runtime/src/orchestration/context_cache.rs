@@ -5,8 +5,8 @@
 //! 2. Knowledge fragments — semantic key-value store for agent discoveries
 //! 3. Agent findings — structured results from spawned agents
 
-use dashmap::mapref::multiple::RefMulti;
 use dashmap::DashMap;
+use dashmap::mapref::multiple::RefMulti;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -298,9 +298,7 @@ impl SharedContextCache {
     pub fn get_findings_by_category(&self, category: &FindingCategory) -> Vec<Finding> {
         self.agent_results
             .iter()
-            .flat_map(|e: RefMulti<'_, String, AgentFindings>| {
-                e.value().findings.to_vec()
-            })
+            .flat_map(|e: RefMulti<'_, String, AgentFindings>| e.value().findings.to_vec())
             .filter(|f| &f.category == category)
             .collect()
     }
@@ -319,10 +317,7 @@ impl SharedContextCache {
         for entry in self.agent_results.iter() {
             let entry: RefMulti<'_, String, AgentFindings> = entry;
             let val = entry.value();
-            lines.push(format!(
-                "## Agent: {} ({})",
-                val.agent_id, val.agent_type
-            ));
+            lines.push(format!("## Agent: {} ({})", val.agent_id, val.agent_type));
             lines.push(val.summary.clone());
             for finding in &val.findings {
                 lines.push(format!(
@@ -522,16 +517,8 @@ mod tests {
             serde_json::json!({"algorithm": "HS256"}),
             "explore-agent",
         );
-        cache.share_knowledge(
-            "auth/session-ttl",
-            serde_json::json!(3600),
-            "explore-agent",
-        );
-        cache.share_knowledge(
-            "db/version",
-            serde_json::json!("14.2"),
-            "db-agent",
-        );
+        cache.share_knowledge("auth/session-ttl", serde_json::json!(3600), "explore-agent");
+        cache.share_knowledge("db/version", serde_json::json!("14.2"), "db-agent");
 
         // Get by exact key
         let jwt = cache.get_knowledge("auth/jwt-secret").unwrap();
@@ -621,30 +608,15 @@ mod tests {
         let mtime = SystemTime::now();
 
         // Add first file (50 bytes)
-        cache.put_file(
-            PathBuf::from("file1.txt"),
-            "x".repeat(50),
-            mtime,
-            "agent-1",
-        );
+        cache.put_file(PathBuf::from("file1.txt"), "x".repeat(50), mtime, "agent-1");
         assert_eq!(cache.file_count(), 1);
 
         // Add second file (50 bytes) - should fit
-        cache.put_file(
-            PathBuf::from("file2.txt"),
-            "y".repeat(50),
-            mtime,
-            "agent-1",
-        );
+        cache.put_file(PathBuf::from("file2.txt"), "y".repeat(50), mtime, "agent-1");
         assert_eq!(cache.file_count(), 2);
 
         // Add third file (60 bytes) - should evict oldest
-        cache.put_file(
-            PathBuf::from("file3.txt"),
-            "z".repeat(60),
-            mtime,
-            "agent-1",
-        );
+        cache.put_file(PathBuf::from("file3.txt"), "z".repeat(60), mtime, "agent-1");
         // file1 should be evicted
         assert!(cache.get_file(&PathBuf::from("file1.txt")).is_none());
     }

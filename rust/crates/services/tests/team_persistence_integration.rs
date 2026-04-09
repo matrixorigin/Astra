@@ -31,8 +31,7 @@ fn require_it_env() -> MatrixOneSettings {
         user: std::env::var("MATRIXONE_USER").unwrap_or_else(|_| "root".into()),
         password: std::env::var("MATRIXONE_PASSWORD")
             .unwrap_or_else(|_| DEV_MATRIXONE_PASSWORD.to_string()),
-        database: std::env::var("MATRIXONE_DATABASE")
-            .unwrap_or_else(|_| "astra_runtime".into()),
+        database: std::env::var("MATRIXONE_DATABASE").unwrap_or_else(|_| "astra_runtime".into()),
     }
 }
 
@@ -142,11 +141,13 @@ async fn team_crud_roundtrip() {
 
     // Delete
     assert!(store.delete_team(&team.user_id, &team.name).await.unwrap());
-    assert!(store
-        .load_team(&team.user_id, &team.name)
-        .await
-        .unwrap()
-        .is_none());
+    assert!(
+        store
+            .load_team(&team.user_id, &team.name)
+            .await
+            .unwrap()
+            .is_none()
+    );
 
     cleanup_team(&pool, &team.team_id).await;
 }
@@ -159,9 +160,12 @@ async fn execution_history_lifecycle() {
     let shared = setup_pool().await;
     let pool = shared.get().clone();
     let store = MatrixOneTeamStore::new(pool.clone());
-    let team = test_team("exec-hist", TeamCoordination::FanOut {
-        aggregation: "merge".into(),
-    });
+    let team = test_team(
+        "exec-hist",
+        TeamCoordination::FanOut {
+            aggregation: "merge".into(),
+        },
+    );
     cleanup_team(&pool, &team.team_id).await;
 
     store.save_team(&team).await.unwrap();
@@ -195,7 +199,10 @@ async fn execution_history_lifecycle() {
 
     // Querying by team name should NOT find it (uses team_id, not name)
     let by_name = store.list_executions(&team.name, 10).await.unwrap();
-    assert!(by_name.is_empty(), "list_executions uses team_id, not display name");
+    assert!(
+        by_name.is_empty(),
+        "list_executions uses team_id, not display name"
+    );
 
     cleanup_team(&pool, &team.team_id).await;
 }
@@ -206,9 +213,12 @@ async fn execution_history_respects_limit() {
     let shared = setup_pool().await;
     let pool = shared.get().clone();
     let store = MatrixOneTeamStore::new(pool.clone());
-    let team = test_team("exec-limit", TeamCoordination::Sequential {
-        stop_on_success: false,
-    });
+    let team = test_team(
+        "exec-limit",
+        TeamCoordination::Sequential {
+            stop_on_success: false,
+        },
+    );
     cleanup_team(&pool, &team.team_id).await;
     store.save_team(&team).await.unwrap();
 
@@ -277,7 +287,10 @@ async fn coordination_variants_roundtrip() {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(loaded.coordination, coord, "coordination roundtrip failed for {suffix}");
+        assert_eq!(
+            loaded.coordination, coord,
+            "coordination roundtrip failed for {suffix}"
+        );
 
         cleanup_team(&pool, &team.team_id).await;
     }
@@ -317,7 +330,10 @@ async fn budget_and_max_parallel_roundtrip() {
     let mut updated = team.clone();
     updated.budget = None;
     updated.max_parallel = 0;
-    store.save_team(&updated).await.expect("save without budget");
+    store
+        .save_team(&updated)
+        .await
+        .expect("save without budget");
     let reloaded = store
         .load_team(&team.user_id, &team.name)
         .await
@@ -340,12 +356,21 @@ async fn ensure_builtins_idempotent() {
     let store = MatrixOneTeamStore::new(pool.clone());
 
     // First call seeds built-in teams
-    store.ensure_builtins(&user_id).await.expect("ensure_builtins");
+    store
+        .ensure_builtins(&user_id)
+        .await
+        .expect("ensure_builtins");
     let list1 = store.list_teams(&user_id).await.unwrap();
-    assert!(list1.len() >= 3, "should have at least review, research, dev");
+    assert!(
+        list1.len() >= 3,
+        "should have at least review, research, dev"
+    );
 
     // Second call is idempotent
-    store.ensure_builtins(&user_id).await.expect("ensure_builtins (2)");
+    store
+        .ensure_builtins(&user_id)
+        .await
+        .expect("ensure_builtins (2)");
     let list2 = store.list_teams(&user_id).await.unwrap();
     assert_eq!(list1.len(), list2.len());
 

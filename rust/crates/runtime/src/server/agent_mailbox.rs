@@ -132,7 +132,9 @@ impl AgentMailbox {
         let id = agent_id.to_string();
         let mut s = self.state.write().unwrap();
         s.queues.entry(id.clone()).or_default();
-        s.notifiers.entry(id.clone()).or_insert_with(|| Arc::new(Notify::new()));
+        s.notifiers
+            .entry(id.clone())
+            .or_insert_with(|| Arc::new(Notify::new()));
         if !s.agents.contains(&id) {
             s.agents.push(id);
         }
@@ -152,10 +154,7 @@ impl AgentMailbox {
         if msg.is_broadcast() {
             let from = msg.from.clone();
             let s = self.state.read().unwrap();
-            let targets: Vec<String> = s.agents.iter()
-                .filter(|a| **a != from)
-                .cloned()
-                .collect();
+            let targets: Vec<String> = s.agents.iter().filter(|a| **a != from).cloned().collect();
             drop(s); // release read lock before enqueue which needs write
             for target in targets {
                 let mut cloned = msg.clone();
@@ -182,7 +181,12 @@ impl AgentMailbox {
 
     /// Try to receive a message without waiting. Returns `None` if queue is empty.
     pub fn try_recv(&self, agent_id: &str) -> Option<AgentMessage> {
-        self.state.write().unwrap().queues.get_mut(agent_id)?.pop_front()
+        self.state
+            .write()
+            .unwrap()
+            .queues
+            .get_mut(agent_id)?
+            .pop_front()
     }
 
     /// Drain all pending messages for an agent.
@@ -214,7 +218,12 @@ impl AgentMailbox {
 
     /// Number of pending messages for an agent.
     pub fn pending_count(&self, agent_id: &str) -> usize {
-        self.state.read().unwrap().queues.get(agent_id).map_or(0, |q| q.len())
+        self.state
+            .read()
+            .unwrap()
+            .queues
+            .get(agent_id)
+            .map_or(0, |q| q.len())
     }
 
     /// List all registered agent IDs.
@@ -328,10 +337,18 @@ mod tests {
         mb.register("lead");
         mb.register("worker");
 
-        mb.send(AgentMessage::status_update("worker", "lead", 75, "3/4 files processed"));
+        mb.send(AgentMessage::status_update(
+            "worker",
+            "lead",
+            75,
+            "3/4 files processed",
+        ));
         let msg = mb.try_recv("lead").unwrap();
         match &msg.msg_type {
-            MessageType::StatusUpdate { progress_pct, detail } => {
+            MessageType::StatusUpdate {
+                progress_pct,
+                detail,
+            } => {
                 assert_eq!(*progress_pct, 75);
                 assert_eq!(detail, "3/4 files processed");
             }

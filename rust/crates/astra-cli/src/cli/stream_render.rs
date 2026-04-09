@@ -771,7 +771,10 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         self.render.stop_tool_stdout_anim();
         self.render.stop_thinking();
         let decision = match &mut self.perm_manager {
-            Some(pm) => pm.resolve_cloud_approval_async(tool, detail, self.quiet).await,
+            Some(pm) => {
+                pm.resolve_cloud_approval_async(tool, detail, self.quiet)
+                    .await
+            }
             None => astra_thin_client::ApprovalDecision::Deny,
         };
         let decision_str = match &decision {

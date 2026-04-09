@@ -9,7 +9,9 @@
 //!   POST   /teams/{name}/execute        — trigger a team execution (future)
 
 use super::*;
-use astra_services::team_persistence::{TeamDefinition, TeamExecutionRecord, TeamPersistenceService};
+use astra_services::team_persistence::{
+    TeamDefinition, TeamExecutionRecord, TeamPersistenceService,
+};
 
 fn require_team_store(
     state: &AppState,
@@ -105,11 +107,14 @@ pub(super) async fn upsert_team_handler(
     };
 
     // Validate before saving
-    astra_services::team_persistence::validate_team(&def)
-        .map_err(|errs| {
-            let msg = errs.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("; ");
-            error_response(StatusCode::BAD_REQUEST, msg)
-        })?;
+    astra_services::team_persistence::validate_team(&def).map_err(|errs| {
+        let msg = errs
+            .iter()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
+            .join("; ");
+        error_response(StatusCode::BAD_REQUEST, msg)
+    })?;
 
     store
         .save_team(&def)

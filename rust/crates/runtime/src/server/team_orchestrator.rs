@@ -276,7 +276,9 @@ impl TeamExecutionOrchestrator {
         // Inject budget and max_parallel into request context for downstream consumers
         if let Some(ref budget) = team.budget {
             if let Ok(budget_json) = serde_json::to_value(budget) {
-                effective_request.context.insert("team_budget".to_string(), budget_json);
+                effective_request
+                    .context
+                    .insert("team_budget".to_string(), budget_json);
             }
         }
         if team.max_parallel > 0 {
@@ -365,8 +367,7 @@ impl TeamExecutionOrchestrator {
             None => delegation_future.await,
         };
 
-        let delegation_result = match delegation_outcome
-        {
+        let delegation_result = match delegation_outcome {
             Ok(r) => r,
             Err(e) => {
                 let _ = self

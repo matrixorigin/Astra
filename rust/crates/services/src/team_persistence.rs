@@ -714,9 +714,7 @@ impl TeamPersistenceService for InMemoryTeamStore {
         // Prefix match — return only if unique
         let matches: Vec<_> = snaps
             .iter()
-            .filter(|s| {
-                s.user_id == user_id && s.snapshot_id.starts_with(snapshot_id)
-            })
+            .filter(|s| s.user_id == user_id && s.snapshot_id.starts_with(snapshot_id))
             .collect();
         match matches.len() {
             1 => Ok(Some(matches[0].clone())),
@@ -724,11 +722,7 @@ impl TeamPersistenceService for InMemoryTeamStore {
         }
     }
 
-    async fn delete_snapshot(
-        &self,
-        snapshot_id: &str,
-        user_id: &str,
-    ) -> Result<bool, String> {
+    async fn delete_snapshot(&self, snapshot_id: &str, user_id: &str) -> Result<bool, String> {
         let mut snaps = self.snapshots.write().map_err(|e| e.to_string())?;
         let before = snaps.len();
         snaps.retain(|s| !(s.snapshot_id == snapshot_id && s.user_id == user_id));
@@ -1797,7 +1791,10 @@ mod tests {
             max_duration_secs: 60,
         });
         let errs = validate_team(&team).unwrap_err();
-        assert!(errs.iter().any(|e| matches!(e, TeamValidationError::InvalidBudget(_))));
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, TeamValidationError::InvalidBudget(_)))
+        );
     }
 
     #[test]
@@ -2308,7 +2305,13 @@ mod tests {
         };
         store.save_snapshot(&snap).await.unwrap();
 
-        assert!(store.find_snapshot("snap-shared-id", "bob").await.unwrap().is_none());
+        assert!(
+            store
+                .find_snapshot("snap-shared-id", "bob")
+                .await
+                .unwrap()
+                .is_none()
+        );
         assert!(
             store
                 .list_snapshots("team-x", "bob", 50)
@@ -2323,7 +2326,13 @@ mod tests {
             .unwrap();
         assert!(!deleted, "other user must not delete alice snapshot");
 
-        assert!(store.find_snapshot("snap-shared-id", "alice").await.unwrap().is_some());
+        assert!(
+            store
+                .find_snapshot("snap-shared-id", "alice")
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[tokio::test]

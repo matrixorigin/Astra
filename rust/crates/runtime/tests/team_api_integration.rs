@@ -14,13 +14,12 @@ use axum::{
     body::{self, Body},
     http::{HeaderMap, Request, StatusCode},
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tower::util::ServiceExt;
 
 use astra_runtime::{
-    AppState, AuthService, AuthTokenRecord, AuthRegisterRequestData, AuthLoginRequestData,
-    AuthRefreshRequestData, AuthUserRecord, ErrorResponse, HealthChecker, ServiceInfo,
-    build_app,
+    AppState, AuthLoginRequestData, AuthRefreshRequestData, AuthRegisterRequestData, AuthService,
+    AuthTokenRecord, AuthUserRecord, ErrorResponse, HealthChecker, ServiceInfo, build_app,
 };
 use astra_services::team_persistence::{InMemoryTeamStore, TeamPersistenceService};
 
@@ -68,10 +67,7 @@ impl AuthService for StubAuth {
         &self,
         headers: &HeaderMap,
     ) -> Result<AuthUserRecord, (StatusCode, axum::Json<ErrorResponse>)> {
-        match headers
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-        {
+        match headers.get("authorization").and_then(|v| v.to_str().ok()) {
             Some(h) if h.starts_with("Bearer ") => {
                 let user_id = h.trim_start_matches("Bearer ");
                 Ok(AuthUserRecord {
@@ -386,7 +382,10 @@ async fn scenario_full_team_lifecycle() {
     assert_eq!(status, StatusCode::OK);
     let team_list = body["teams"].as_array().unwrap();
     assert_eq!(team_list.len(), 4);
-    let names: Vec<&str> = team_list.iter().map(|t| t["name"].as_str().unwrap()).collect();
+    let names: Vec<&str> = team_list
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
     assert!(names.contains(&"dev-cycle"));
     assert!(names.contains(&"adversarial-review"));
     assert!(names.contains(&"parallel-research"));
@@ -398,7 +397,10 @@ async fn scenario_full_team_lifecycle() {
     assert_eq!(dev_summary["budget"]["max_cost_usd"], 25.0);
     assert_eq!(dev_summary["coordination"]["type"], "pipeline");
     assert_eq!(dev_summary["worktree_mode"], "isolated");
-    let migration_summary = team_list.iter().find(|t| t["name"] == "db-migration").unwrap();
+    let migration_summary = team_list
+        .iter()
+        .find(|t| t["name"] == "db-migration")
+        .unwrap();
     assert_eq!(migration_summary["max_parallel"], 0);
     assert!(migration_summary.get("budget").is_none() || migration_summary["budget"].is_null());
 
@@ -529,7 +531,11 @@ async fn scenario_validation_rejects_bad_teams() {
         }),
     )
     .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "adversarial 3 members: {body}");
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "adversarial 3 members: {body}"
+    );
 
     // Duplicate roles
     let (status, body) = post(
@@ -586,7 +592,11 @@ async fn scenario_upsert_preserves_team_id() {
     let mut updated = sequential_migration_payload();
     updated["description"] = json!("Updated migration workflow v2");
     let (_, body2) = post(app.clone(), "/teams", user, updated).await;
-    assert_eq!(body2["team_id"].as_str().unwrap(), team_id, "team_id must be stable across upserts");
+    assert_eq!(
+        body2["team_id"].as_str().unwrap(),
+        team_id,
+        "team_id must be stable across upserts"
+    );
     assert_eq!(body2["description"], "Updated migration workflow v2");
 }
 
@@ -605,12 +615,7 @@ async fn scenario_execution_history_via_api() {
     let team_name = body["name"].as_str().unwrap();
 
     // No executions yet
-    let (s, body) = get(
-        app.clone(),
-        &format!("/teams/{team_name}/executions"),
-        user,
-    )
-    .await;
+    let (s, body) = get(app.clone(), &format!("/teams/{team_name}/executions"), user).await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(body["executions"].as_array().unwrap().len(), 0);
     assert_eq!(body["team_name"], team_name);
@@ -800,7 +805,10 @@ async fn scenario_complex_team_full_roundtrip() {
 
     let (status, body) = post(app.clone(), "/teams", user, updated).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["team_id"], team["team_id"], "team_id stable after upsert");
+    assert_eq!(
+        body["team_id"], team["team_id"],
+        "team_id stable after upsert"
+    );
     assert_eq!(body["budget"]["max_cost_usd"], 50.0);
     assert_eq!(body["max_parallel"], 5);
     assert_eq!(
@@ -945,7 +953,10 @@ async fn scenario_execution_history_and_limit_clamp() {
     let (status, body) = get(app, "/teams/exec-history-team/executions?limit=10", user).await;
     assert_eq!(status, StatusCode::OK);
     let execs = body["executions"].as_array().unwrap();
-    let done = execs.iter().find(|e| e["execution_id"] == "exec-0").unwrap();
+    let done = execs
+        .iter()
+        .find(|e| e["execution_id"] == "exec-0")
+        .unwrap();
     assert_eq!(done["status"], "completed");
 }
 
@@ -1006,7 +1017,13 @@ async fn scenario_snapshot_user_isolation() {
     let app = build_test_app();
 
     // Alice creates a team and snapshot
-    let (s, _) = post(app.clone(), "/teams", "alice", sequential_migration_payload()).await;
+    let (s, _) = post(
+        app.clone(),
+        "/teams",
+        "alice",
+        sequential_migration_payload(),
+    )
+    .await;
     assert_eq!(s, StatusCode::OK);
     let (s, snap) = post(
         app.clone(),

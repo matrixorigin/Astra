@@ -493,15 +493,21 @@ async fn team_persistence_full_lifecycle() {
 async fn orchestrator_records_execution_with_stable_team_id() {
     let store = Arc::new(InMemoryTeamStore::new());
 
-    let team = test_team("consistency", TeamCoordination::Pipeline, vec![
-        ("coder", Some("Code agent")),
-        ("tester", Some("Test agent")),
-    ]);
+    let team = test_team(
+        "consistency",
+        TeamCoordination::Pipeline,
+        vec![
+            ("coder", Some("Code agent")),
+            ("tester", Some("Test agent")),
+        ],
+    );
     let expected_team_id = team.team_id.clone();
     store.save_team(&team).await.unwrap();
 
     let (orch, _, _) = setup_orchestrator(store.clone()).await;
-    let report = orch.execute_team("consistency", "build feature", None).await;
+    let report = orch
+        .execute_team("consistency", "build feature", None)
+        .await;
 
     // Verify execution was recorded with the correct team_id (not team name)
     let by_team_id = store.list_executions(&expected_team_id, 10).await.unwrap();
@@ -510,31 +516,50 @@ async fn orchestrator_records_execution_with_stable_team_id() {
 
     // Querying by display name should return nothing (team_id != name)
     let by_name = store.list_executions("consistency", 10).await.unwrap();
-    assert!(by_name.is_empty(), "team display name should not match team_id in execution history");
+    assert!(
+        by_name.is_empty(),
+        "team display name should not match team_id in execution history"
+    );
 }
 
 #[tokio::test]
 async fn orchestrator_writes_start_then_complete_not_duplicate() {
     let store = Arc::new(InMemoryTeamStore::new());
 
-    let team = test_team("lifecycle-order", TeamCoordination::FanOut {
-        aggregation: "all_results".into(),
-    }, vec![
-        ("analyzer", Some("Analyze agent")),
-        ("reporter", Some("Report agent")),
-    ]);
+    let team = test_team(
+        "lifecycle-order",
+        TeamCoordination::FanOut {
+            aggregation: "all_results".into(),
+        },
+        vec![
+            ("analyzer", Some("Analyze agent")),
+            ("reporter", Some("Report agent")),
+        ],
+    );
     store.save_team(&team).await.unwrap();
 
     let (orch, _, _) = setup_orchestrator(store.clone()).await;
-    let _report = orch.execute_team("lifecycle-order", "analyze logs", None).await;
+    let _report = orch
+        .execute_team("lifecycle-order", "analyze logs", None)
+        .await;
 
     // Exactly one execution record (no duplicates from CLI + orchestrator)
     let execs = store.list_executions(&team.team_id, 10).await.unwrap();
-    assert_eq!(execs.len(), 1, "should have exactly one execution record, not duplicates");
+    assert_eq!(
+        execs.len(),
+        1,
+        "should have exactly one execution record, not duplicates"
+    );
 
     // The record should be completed (not stuck in running)
-    assert_ne!(execs[0].status, "running", "execution should be marked complete");
-    assert!(execs[0].completed_at.is_some(), "completed_at should be set");
+    assert_ne!(
+        execs[0].status, "running",
+        "execution should be marked complete"
+    );
+    assert!(
+        execs[0].completed_at.is_some(),
+        "completed_at should be set"
+    );
 }
 
 // ─── Budget Timeout Enforcement ─────────────────────────────────────────────
@@ -545,9 +570,11 @@ async fn budget_timeout_aborts_slow_execution() {
 
     let store = Arc::new(InMemoryTeamStore::new());
 
-    let mut team = test_team("slow-team", TeamCoordination::Pipeline, vec![
-        ("worker", Some("Slow worker")),
-    ]);
+    let mut team = test_team(
+        "slow-team",
+        TeamCoordination::Pipeline,
+        vec![("worker", Some("Slow worker"))],
+    );
     team.budget = Some(TeamBudget {
         max_cost_usd: 100.0,
         max_tokens: 1_000_000,
@@ -574,12 +601,17 @@ async fn budget_timeout_aborts_slow_execution() {
         }
     }
 
-    let (orch, _, _) = setup_orchestrator_with_executor(store.clone(), Arc::new(SlowExecutor)).await;
+    let (orch, _, _) =
+        setup_orchestrator_with_executor(store.clone(), Arc::new(SlowExecutor)).await;
     let report = orch.execute_team("slow-team", "do work", None).await;
 
     assert_eq!(report.status, TeamExecutionStatus::Failed);
     assert!(
-        report.error.as_ref().unwrap().contains("exceeded budget timeout"),
+        report
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("exceeded budget timeout"),
         "error should mention timeout, got: {:?}",
         report.error
     );
@@ -591,9 +623,11 @@ async fn budget_timeout_zero_means_no_limit() {
 
     let store = Arc::new(InMemoryTeamStore::new());
 
-    let mut team = test_team("no-limit", TeamCoordination::Pipeline, vec![
-        ("worker", Some("Fast worker")),
-    ]);
+    let mut team = test_team(
+        "no-limit",
+        TeamCoordination::Pipeline,
+        vec![("worker", Some("Fast worker"))],
+    );
     team.budget = Some(TeamBudget {
         max_cost_usd: 10.0,
         max_tokens: 100_000,
@@ -616,13 +650,17 @@ async fn fan_out_respects_max_parallel() {
 
     let store = Arc::new(InMemoryTeamStore::new());
 
-    let mut team = test_team("parallel-test", TeamCoordination::FanOut {
-        aggregation: "all_results".into(),
-    }, vec![
-        ("a", Some("Agent A")),
-        ("b", Some("Agent B")),
-        ("c", Some("Agent C")),
-    ]);
+    let mut team = test_team(
+        "parallel-test",
+        TeamCoordination::FanOut {
+            aggregation: "all_results".into(),
+        },
+        vec![
+            ("a", Some("Agent A")),
+            ("b", Some("Agent B")),
+            ("c", Some("Agent C")),
+        ],
+    );
     team.max_parallel = 1; // Only 1 at a time
     store.save_team(&team).await.unwrap();
 

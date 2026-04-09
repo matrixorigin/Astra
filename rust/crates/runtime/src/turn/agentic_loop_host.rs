@@ -944,7 +944,8 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
         if state.permission_handler.is_none()
             && let Some(ctx) = state.permission_context.clone()
         {
-            state.permission_handler = Some(crate::orchestration::PermissionRequestHandler::new(ctx));
+            state.permission_handler =
+                Some(crate::orchestration::PermissionRequestHandler::new(ctx));
         }
 
         // ─── Drain inter-agent mailbox ──────────────────────────────────
@@ -1371,7 +1372,10 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
                     .map(|tc| {
                         let id = tc.get("id").and_then(Value::as_str).unwrap_or("");
                         let name = tc.get("name").and_then(Value::as_str).unwrap_or("delegate");
-                        let args = tc.get("arguments").cloned().unwrap_or(serde_json::json!({}));
+                        let args = tc
+                            .get("arguments")
+                            .cloned()
+                            .unwrap_or(serde_json::json!({}));
                         serde_json::json!({
                             "id": id,
                             "type": "function",
@@ -2025,18 +2029,18 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
             AgenticPostToolIterationControl::ProceedEndTurn => {
                 // Emit progress event for subscribers (UI, monitors).
                 if let Some(ref emitter) = state.progress_emitter {
-                    let tool_calls_this_turn = state.total_tool_calls.saturating_sub(
-                        if turn_index > 0 { state.total_tool_calls } else { 0 }
-                    );
-                    let last_tool = turn_result.edge_tool_round
+                    let tool_calls_this_turn =
+                        state.total_tool_calls.saturating_sub(if turn_index > 0 {
+                            state.total_tool_calls
+                        } else {
+                            0
+                        });
+                    let last_tool = turn_result
+                        .edge_tool_round
                         .last()
                         .map(|r| r.tool.clone())
                         .unwrap_or_else(|| "thinking".to_string());
-                    emitter.turn_completed(
-                        turn_index as u32 + 1,
-                        tool_calls_this_turn,
-                        last_tool,
-                    );
+                    emitter.turn_completed(turn_index as u32 + 1, tool_calls_this_turn, last_tool);
                 }
 
                 // Send progress update to parent agent (best-effort).

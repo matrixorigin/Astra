@@ -101,7 +101,11 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
     tool_event_hooks: &crate::skills::hooks::ToolEventHookRegistry,
     term: &mut dyn HeadlessRoundTerminal,
     mut mailbox: Option<&mut crate::messaging::router::AgentMailbox>,
-    permission_context: Option<&std::sync::Arc<tokio::sync::RwLock<crate::orchestration::permission_sync::PermissionSyncContext>>>,
+    permission_context: Option<
+        &std::sync::Arc<
+            tokio::sync::RwLock<crate::orchestration::permission_sync::PermissionSyncContext>,
+        >,
+    >,
 ) {
     const PERMISSION_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 

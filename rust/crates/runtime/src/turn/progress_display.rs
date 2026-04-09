@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::orchestration::{AgentProgressEvent, ProgressBroadcaster, ProgressEventType};
-use crate::turn::agent_progress_ui::{AgentProgress, AgentStatus, AgentColor, MultiAgentProgress};
+use crate::turn::agent_progress_ui::{AgentColor, AgentProgress, AgentStatus, MultiAgentProgress};
 
 /// Terminal progress display mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -233,10 +233,7 @@ impl ProgressDisplay {
             .filter(|a| matches!(a.status, AgentStatus::Failed { .. }))
             .count();
 
-        let elapsed = self
-            .start_time
-            .map(|t| t.elapsed().as_secs())
-            .unwrap_or(0);
+        let elapsed = self.start_time.map(|t| t.elapsed().as_secs()).unwrap_or(0);
 
         // Get activity from most recent running agent
         let activity = self
@@ -269,8 +266,7 @@ impl ProgressDisplay {
 
     /// Check if all tracked agents have completed.
     pub fn all_done(&self) -> bool {
-        !self.agents.is_empty()
-            && self.agents.values().all(|a| a.status.is_terminal())
+        !self.agents.is_empty() && self.agents.values().all(|a| a.status.is_terminal())
     }
 }
 

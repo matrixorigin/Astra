@@ -20,9 +20,8 @@ use astra_runtime::messaging::in_process::InProcessTransport;
 use astra_runtime::messaging::router::AgentMailboxRouter;
 use astra_runtime::messaging::types::AgentAddress;
 use astra_runtime::orchestration::{
-    InheritedPermissions, PermissionDecision, PermissionMode,
-    PermissionRequest, PermissionRequestHandler, PermissionRule,
-    PermissionSyncContext, PermissionUpdate,
+    InheritedPermissions, PermissionDecision, PermissionMode, PermissionRequest,
+    PermissionRequestHandler, PermissionRule, PermissionSyncContext, PermissionUpdate,
 };
 use astra_runtime::server::delegation_engine::{DelegationTracker, SubRunRecord};
 
@@ -274,7 +273,9 @@ async fn e2e_inherited_permissions_propagate() {
 /// Test: permission updates are applied and persist in context
 #[tokio::test]
 async fn e2e_permission_updates_persist() {
-    let parent_ctx = Arc::new(RwLock::new(PermissionSyncContext::root(PermissionMode::Auto)));
+    let parent_ctx = Arc::new(RwLock::new(PermissionSyncContext::root(
+        PermissionMode::Auto,
+    )));
     let handler = PermissionRequestHandler::new(parent_ctx.clone());
 
     // Request with suggested rule for bash git commands
@@ -340,7 +341,9 @@ async fn e2e_multi_level_delegation() {
 
     // Add allow rule at root level
     let mut root_ctx = root_ctx;
-    root_ctx.apply_update(&PermissionUpdate::allow(PermissionRule::parse("bash(git:*)")));
+    root_ctx.apply_update(&PermissionUpdate::allow(PermissionRule::parse(
+        "bash(git:*)",
+    )));
 
     // Create child inherited
     let child_inherited = root_ctx.for_child(false);

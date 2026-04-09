@@ -21,21 +21,20 @@ mod tests {
         InheritedPermissions, PermissionMode, PermissionRequest, PermissionResponse,
         PermissionSyncContext,
     };
-    use crate::server::delegation_engine::{DelegationTracker, SubRunRecord};
-    use crate::turn::agentic_loop_host::{
-        AgenticLoopHost, AgenticLoopState, HostTurnResult,
-        run_agentic_loop_with_host,
-    };
-    use crate::turn::agentic_headless_round::{
-        HeadlessStderrStyle, NoopHeadlessTerminal, run_agentic_headless_tool_round,
-    };
-    use crate::turn::chat_turn_sse_dispatch::ChatTurnSseAccum;
-    use crate::turn::sse_stream_host::EdgeToolExecResult;
-    use crate::turn::turn_guard::TurnGuard;
     use crate::pipeline::step_protocol::InMemoryIdempotencyCache;
     use crate::pipeline::step_recorder::StepRecorder;
     use crate::semantic_dedup::SemanticDedup;
+    use crate::server::delegation_engine::{DelegationTracker, SubRunRecord};
+    use crate::turn::agentic_headless_round::{
+        HeadlessStderrStyle, NoopHeadlessTerminal, run_agentic_headless_tool_round,
+    };
+    use crate::turn::agentic_loop_host::{
+        AgenticLoopHost, AgenticLoopState, HostTurnResult, run_agentic_loop_with_host,
+    };
     use crate::turn::chat_turn_heuristics::TaskExecutionProfile;
+    use crate::turn::chat_turn_sse_dispatch::ChatTurnSseAccum;
+    use crate::turn::sse_stream_host::EdgeToolExecResult;
+    use crate::turn::turn_guard::TurnGuard;
 
     // ── Mock Host ───────────────────────────────────────────────────────────
 
@@ -242,10 +241,7 @@ mod tests {
         let router = Arc::new(AgentMailboxRouter::new(transport, dt.clone()));
 
         let parent_addr = AgentAddress::new("run-parent", "orchestrator");
-        let parent_mb = router
-            .register(parent_addr, None)
-            .await
-            .unwrap();
+        let parent_mb = router.register(parent_addr, None).await.unwrap();
 
         let child_addr = AgentAddress::new("run-child-0", "worker");
         dt.record_sub_run(SubRunRecord {
@@ -361,7 +357,11 @@ mod tests {
         assert!(
             has_mailbox_msg,
             "should have system message with drained mailbox: {:?}",
-            state.messages.iter().filter(|m| m.get("role").and_then(Value::as_str) == Some("system")).collect::<Vec<_>>()
+            state
+                .messages
+                .iter()
+                .filter(|m| m.get("role").and_then(Value::as_str) == Some("system"))
+                .collect::<Vec<_>>()
         );
     }
 
@@ -480,7 +480,10 @@ mod tests {
 
         // Parent should have received the send_message.
         let received = parent_mb.try_recv();
-        assert!(received.is_some(), "parent should have received text message");
+        assert!(
+            received.is_some(),
+            "parent should have received text message"
+        );
         match &received.unwrap().payload {
             MessagePayload::Text { content, .. } => {
                 assert_eq!(content, "Starting work");
@@ -677,9 +680,9 @@ mod tests {
         let (router, parent_mb, mut child_mb, _dt) = setup_two_agents().await;
 
         // Parent has a handler that approves bash(git:*) requests
-        let parent_ctx = Arc::new(tokio::sync::RwLock::new(
-            PermissionSyncContext::root(PermissionMode::Prompt),
-        ));
+        let parent_ctx = Arc::new(tokio::sync::RwLock::new(PermissionSyncContext::root(
+            PermissionMode::Prompt,
+        )));
         let handler = PermissionRequestHandler::new(parent_ctx.clone());
 
         // Child has permission context that requires asking parent for bash
@@ -691,29 +694,28 @@ mod tests {
             allowed_tools: None,
             is_background: false,
         };
-        let child_permission_ctx = Arc::new(tokio::sync::RwLock::new(
-            PermissionSyncContext::new(child_inherited),
-        ));
+        let child_permission_ctx = Arc::new(tokio::sync::RwLock::new(PermissionSyncContext::new(
+            child_inherited,
+        )));
 
         // Spawn parent handler task
         let parent_router = router.clone();
         let parent_handler = tokio::spawn(async move {
             // Wait for permission request
-            let msg = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                parent_mb.recv(),
-            )
-            .await
-            .expect("should receive within timeout")
-            .expect("should have message");
+            let msg = tokio::time::timeout(std::time::Duration::from_secs(5), parent_mb.recv())
+                .await
+                .expect("should receive within timeout")
+                .expect("should have message");
 
             // Process and respond
             if let Some((correlation_id, mut response)) = handler.process_message(&msg).await {
                 // Approve with suggested rule
                 response.approved = true;
-                response.updates.push(PermissionUpdate::allow(
-                    PermissionRule::parse("bash(git:*)"),
-                ));
+                response
+                    .updates
+                    .push(PermissionUpdate::allow(PermissionRule::parse(
+                        "bash(git:*)",
+                    )));
 
                 // Extract the target address from the Direct variant
                 let target_addr = match &msg.to {
@@ -721,11 +723,7 @@ mod tests {
                     _ => panic!("expected Direct target"),
                 };
 
-                let response_msg = response.to_message(
-                    &target_addr,
-                    &msg.from,
-                    &correlation_id,
-                );
+                let response_msg = response.to_message(&target_addr, &msg.from, &correlation_id);
                 parent_router.send(response_msg).await.unwrap();
             }
         });
@@ -803,9 +801,9 @@ mod tests {
         let (router, parent_mb, mut child_mb, _dt) = setup_two_agents().await;
 
         // Parent has deny mode - rejects all requests
-        let parent_ctx = Arc::new(tokio::sync::RwLock::new(
-            PermissionSyncContext::root(PermissionMode::Deny),
-        ));
+        let parent_ctx = Arc::new(tokio::sync::RwLock::new(PermissionSyncContext::root(
+            PermissionMode::Deny,
+        )));
         let handler = PermissionRequestHandler::new(parent_ctx.clone());
 
         // Child requires asking parent for all tools
@@ -817,20 +815,17 @@ mod tests {
             allowed_tools: Some(HashSet::new()), // Empty = nothing allowed locally
             is_background: false,
         };
-        let child_permission_ctx = Arc::new(tokio::sync::RwLock::new(
-            PermissionSyncContext::new(child_inherited),
-        ));
+        let child_permission_ctx = Arc::new(tokio::sync::RwLock::new(PermissionSyncContext::new(
+            child_inherited,
+        )));
 
         // Spawn parent handler that denies
         let parent_router = router.clone();
         let parent_handler = tokio::spawn(async move {
-            let msg = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                parent_mb.recv(),
-            )
-            .await
-            .expect("should receive within timeout")
-            .expect("should have message");
+            let msg = tokio::time::timeout(std::time::Duration::from_secs(5), parent_mb.recv())
+                .await
+                .expect("should receive within timeout")
+                .expect("should have message");
 
             if let Some((correlation_id, response)) = handler.process_message(&msg).await {
                 // Response should already be denied due to Deny mode
@@ -842,11 +837,7 @@ mod tests {
                     _ => panic!("expected Direct target"),
                 };
 
-                let response_msg = response.to_message(
-                    &target_addr,
-                    &msg.from,
-                    &correlation_id,
-                );
+                let response_msg = response.to_message(&target_addr, &msg.from, &correlation_id);
                 parent_router.send(response_msg).await.unwrap();
             }
         });

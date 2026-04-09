@@ -93,7 +93,8 @@ pub struct AppState {
     /// Delegation engine — coordinates multi-agent runs.
     pub(crate) delegation_engine: Option<Arc<crate::server::delegation_engine::DelegationEngine>>,
     /// Team persistence store — CRUD for team definitions and execution history.
-    pub(crate) team_store: Option<Arc<dyn astra_services::team_persistence::TeamPersistenceService>>,
+    pub(crate) team_store:
+        Option<Arc<dyn astra_services::team_persistence::TeamPersistenceService>>,
 }
 
 impl AppState {

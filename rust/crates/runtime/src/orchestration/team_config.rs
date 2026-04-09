@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use super::builtin_agents::{get_builtin_agent_types, AgentTypeDefinition};
+use super::builtin_agents::{AgentTypeDefinition, get_builtin_agent_types};
 
 // ─── YAML Schema ────────────────────────────────────────────────────────────
 
@@ -102,7 +102,10 @@ impl AgentRegistry {
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension().is_some_and(|ext| ext == "yaml" || ext == "yml") {
+            if path
+                .extension()
+                .is_some_and(|ext| ext == "yaml" || ext == "yml")
+            {
                 if let Err(e) = self.load_file(&path) {
                     eprintln!("  ⚠ team config: failed to load {}: {}", path.display(), e);
                 }
@@ -112,8 +115,7 @@ impl AgentRegistry {
 
     /// Load and merge a single YAML config file.
     fn load_file(&mut self, path: &Path) -> Result<(), String> {
-        let content =
-            std::fs::read_to_string(path).map_err(|e| format!("read error: {e}"))?;
+        let content = std::fs::read_to_string(path).map_err(|e| format!("read error: {e}"))?;
         let config: TeamConfigFile =
             serde_yaml::from_str(&content).map_err(|e| format!("YAML parse error: {e}"))?;
 
@@ -159,9 +161,7 @@ impl AgentRegistry {
                 agent_type: config.name,
                 description: config.description,
                 system_prompt_addendum: config.system_prompt,
-                default_model: config
-                    .model
-                    .unwrap_or_else(|| "claude-sonnet".to_string()),
+                default_model: config.model.unwrap_or_else(|| "claude-sonnet".to_string()),
                 max_turns: config.max_turns.unwrap_or(30),
                 allowed_tools: config
                     .allowed_tools
@@ -174,7 +174,10 @@ impl AgentRegistry {
 
     /// Get a definition by type name.
     pub fn get(&self, agent_type: &str) -> Option<AgentTypeDefinition> {
-        self.agents.iter().find(|a| a.agent_type == agent_type).cloned()
+        self.agents
+            .iter()
+            .find(|a| a.agent_type == agent_type)
+            .cloned()
     }
 
     /// List all available agent type definitions.

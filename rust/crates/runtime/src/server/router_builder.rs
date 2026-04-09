@@ -81,13 +81,11 @@ pub(super) fn build_router(state: AppState) -> Router {
         // Teams — CRUD + execution history
         .route(
             "/teams",
-            get(team_handlers::list_teams_handler)
-                .post(team_handlers::upsert_team_handler),
+            get(team_handlers::list_teams_handler).post(team_handlers::upsert_team_handler),
         )
         .route(
             "/teams/{name}",
-            get(team_handlers::get_team_handler)
-                .delete(team_handlers::delete_team_handler),
+            get(team_handlers::get_team_handler).delete(team_handlers::delete_team_handler),
         )
         .route(
             "/teams/{name}/executions",
@@ -95,8 +93,7 @@ pub(super) fn build_router(state: AppState) -> Router {
         )
         .route(
             "/teams/{name}/snapshots",
-            get(team_handlers::list_snapshots_handler)
-                .post(team_handlers::create_snapshot_handler),
+            get(team_handlers::list_snapshots_handler).post(team_handlers::create_snapshot_handler),
         )
         .route(
             "/teams/snapshots/{id}",

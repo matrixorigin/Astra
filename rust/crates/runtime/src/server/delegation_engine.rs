@@ -381,8 +381,14 @@ impl DelegationTracker {
     }
 
     /// Persist a delegation event to the session journal (best-effort).
-    fn persist_event(&self, event_type: astra_services::session_journal::JournalEventType, metadata: serde_json::Value) {
-        let Some(ref sid) = self.session_id else { return };
+    fn persist_event(
+        &self,
+        event_type: astra_services::session_journal::JournalEventType,
+        metadata: serde_json::Value,
+    ) {
+        let Some(ref sid) = self.session_id else {
+            return;
+        };
         let writer = match astra_services::session_journal::JournalWriter::new(sid) {
             Ok(w) => w,
             Err(_) => return,
@@ -682,7 +688,9 @@ impl DelegationEngine {
         tracker: Arc<DelegationTracker>,
     ) -> Self {
         #[cfg(debug_assertions)]
-        eprintln!("  ⚠ DelegationEngine: using StubSubRunExecutor — call with_executor() for production");
+        eprintln!(
+            "  ⚠ DelegationEngine: using StubSubRunExecutor — call with_executor() for production"
+        );
         Self {
             registry,
             run_engine,
@@ -906,18 +914,22 @@ impl DelegationEngine {
         // Extract pattern name and agent_ids for journal event.
         let (pattern_name, agent_ids_for_journal): (&str, Vec<String>) = match &request.pattern {
             CoordinationPattern::FanOut { agent_ids, .. } => ("fan_out", agent_ids.clone()),
-            CoordinationPattern::Pipeline { stages } => {
-                ("pipeline", stages.iter().map(|s| s.agent_id.clone()).collect())
-            }
+            CoordinationPattern::Pipeline { stages } => (
+                "pipeline",
+                stages.iter().map(|s| s.agent_id.clone()).collect(),
+            ),
             CoordinationPattern::Sequential { agent_ids, .. } => ("sequential", agent_ids.clone()),
             CoordinationPattern::AdversarialReview {
                 producer_id,
                 reviewer_id,
                 ..
-            } => ("adversarial_review", vec![producer_id.clone(), reviewer_id.clone()]),
-            CoordinationPattern::Fork { agent_id, tasks, .. } => {
-                ("fork", vec![format!("{}×{}", agent_id, tasks.len())])
-            }
+            } => (
+                "adversarial_review",
+                vec![producer_id.clone(), reviewer_id.clone()],
+            ),
+            CoordinationPattern::Fork {
+                agent_id, tasks, ..
+            } => ("fork", vec![format!("{}×{}", agent_id, tasks.len())]),
         };
 
         // Journal: delegation started
@@ -1076,7 +1088,9 @@ impl DelegationEngine {
                 {
                     Ok(mb) => Some(mb),
                     Err(e) => {
-                        eprintln!("  ⚠ delegation: mailbox registration failed for {agent_id}: {e}");
+                        eprintln!(
+                            "  ⚠ delegation: mailbox registration failed for {agent_id}: {e}"
+                        );
                         None
                     }
                 }
@@ -1295,7 +1309,9 @@ impl DelegationEngine {
                 {
                     Ok(mb) => Some(mb),
                     Err(e) => {
-                        eprintln!("  ⚠ delegation: mailbox registration failed for {agent_id}: {e}");
+                        eprintln!(
+                            "  ⚠ delegation: mailbox registration failed for {agent_id}: {e}"
+                        );
                         None
                     }
                 }
@@ -1486,7 +1502,9 @@ impl DelegationEngine {
                 {
                     Ok(mb) => Some(mb),
                     Err(e) => {
-                        eprintln!("  ⚠ delegation: mailbox registration failed for {producer_id}: {e}");
+                        eprintln!(
+                            "  ⚠ delegation: mailbox registration failed for {producer_id}: {e}"
+                        );
                         None
                     }
                 }
@@ -1622,7 +1640,9 @@ impl DelegationEngine {
                 {
                     Ok(mb) => Some(mb),
                     Err(e) => {
-                        eprintln!("  ⚠ delegation: mailbox registration failed for {reviewer_id}: {e}");
+                        eprintln!(
+                            "  ⚠ delegation: mailbox registration failed for {reviewer_id}: {e}"
+                        );
                         None
                     }
                 }
@@ -1780,7 +1800,9 @@ impl DelegationEngine {
                 {
                     Ok(mb) => Some(mb),
                     Err(e) => {
-                        eprintln!("  ⚠ delegation: mailbox registration failed for {agent_id}: {e}");
+                        eprintln!(
+                            "  ⚠ delegation: mailbox registration failed for {agent_id}: {e}"
+                        );
                         None
                     }
                 }

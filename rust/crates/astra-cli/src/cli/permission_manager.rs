@@ -696,10 +696,7 @@ impl PermissionManager {
                 ("▶  Auto-run session", '!'),
                 ("⏭  Skip tool", 's'),
             ],
-            ApprovalPromptKind::ConfirmOnce => vec![
-                ("✓  Confirm", 'y'),
-                ("✕  Cancel", 'n'),
-            ],
+            ApprovalPromptKind::ConfirmOnce => vec![("✓  Confirm", 'y'), ("✕  Cancel", 'n')],
         };
 
         // Use inquire Select if terminal, fallback to single-char input
@@ -724,7 +721,13 @@ impl PermissionManager {
             // Non-terminal fallback: single character input
             let hint = options
                 .iter()
-                .map(|(label, c)| format!("[{}] {}", c, label.trim_start_matches(|x: char| !x.is_alphabetic())))
+                .map(|(label, c)| {
+                    format!(
+                        "[{}] {}",
+                        c,
+                        label.trim_start_matches(|x: char| !x.is_alphabetic())
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join(" · ");
             eprint!("  {} {hint} → ", "▸".cyan());

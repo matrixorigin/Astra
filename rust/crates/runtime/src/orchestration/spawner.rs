@@ -337,7 +337,9 @@ impl DynamicAgentSpawner {
         context: &SpawnContext,
     ) -> Result<SpawnAgentOutput, SpawnError> {
         // 1. Validate agent type
-        let agent_def = self.agent_registry.get(&input.agent_type)
+        let agent_def = self
+            .agent_registry
+            .get(&input.agent_type)
             .ok_or_else(|| SpawnError::UnknownAgentType(input.agent_type.clone()))?;
 
         // 2. Generate IDs
@@ -624,7 +626,8 @@ impl DynamicAgentSpawner {
                     },
                 };
                 // Persist to journal before updating status
-                self.persist_agent_terminated(agent_id, &run_result.status).await;
+                self.persist_agent_terminated(agent_id, &run_result.status)
+                    .await;
                 self.update_status(agent_id, status).await;
                 self.archive_agent(agent_id).await;
                 self.unregister_mailbox(agent_id).await;
@@ -641,14 +644,20 @@ impl DynamicAgentSpawner {
 
     /// Persist final agent state to session journal (best-effort).
     async fn persist_agent_terminated(&self, agent_id: &str, status: &str) {
-        let Some(ref sid) = self.session_id else { return };
+        let Some(ref sid) = self.session_id else {
+            return;
+        };
         let state = self.active_agents.read().await.get(agent_id).cloned();
         let Some(state) = state else { return };
         let writer = match astra_services::session_journal::JournalWriter::new(sid) {
             Ok(w) => w,
             Err(_) => return,
         };
-        let duration_ms = state.started_at.elapsed().map(|d| d.as_millis() as u64).unwrap_or(0);
+        let duration_ms = state
+            .started_at
+            .elapsed()
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
         let event = astra_services::session_journal::JournalEvent::agent_terminated(
             Some(sid.as_str()),
             agent_id,
@@ -891,10 +900,12 @@ fn build_permission_summary(context: &SpawnContext) -> PermissionSummary {
         summary.allow_rules = inherited.allow_rules.len() as u32;
         summary.deny_rules = inherited.deny_rules.len() as u32;
         // Has parent if parent_run_id is not empty and not "root"
-        summary.has_parent = !context.parent_run_id.is_empty() && context.parent_run_id != ROOT_RUN_ID;
+        summary.has_parent =
+            !context.parent_run_id.is_empty() && context.parent_run_id != ROOT_RUN_ID;
     } else {
         summary.mode = "auto".to_string();
-        summary.has_parent = !context.parent_run_id.is_empty() && context.parent_run_id != ROOT_RUN_ID;
+        summary.has_parent =
+            !context.parent_run_id.is_empty() && context.parent_run_id != ROOT_RUN_ID;
     }
 
     summary
@@ -905,10 +916,7 @@ fn build_permission_summary(context: &SpawnContext) -> PermissionSummary {
 /// Creates `<parent_dir>/.agent-worktrees/<run_id>` via `git worktree add`.
 /// Returns the path on success. Falls back to a simple directory copy if
 /// the parent directory is not a git repo.
-fn create_agent_worktree(
-    parent_dir: &std::path::Path,
-    run_id: &str,
-) -> Result<PathBuf, String> {
+fn create_agent_worktree(parent_dir: &std::path::Path, run_id: &str) -> Result<PathBuf, String> {
     let worktree_base = parent_dir.join(".agent-worktrees");
     std::fs::create_dir_all(&worktree_base)
         .map_err(|e| format!("cannot create worktree base: {e}"))?;
@@ -968,7 +976,7 @@ mod tests {
             parent_agent_id: "parent".to_string(),
             working_dir: PathBuf::from("/tmp"),
             inherited_permissions: None,
-inherited_skills: vec![],
+            inherited_skills: vec![],
         };
 
         let result = spawner.spawn(input, &context).await.unwrap();
@@ -994,7 +1002,7 @@ inherited_skills: vec![],
             parent_agent_id: "parent".to_string(),
             working_dir: PathBuf::from("/tmp"),
             inherited_permissions: None,
-inherited_skills: vec![],
+            inherited_skills: vec![],
         };
 
         let result = spawner.spawn(input, &context).await;
@@ -1009,7 +1017,7 @@ inherited_skills: vec![],
             parent_agent_id: "parent".to_string(),
             working_dir: PathBuf::from("/tmp"),
             inherited_permissions: None,
-inherited_skills: vec![],
+            inherited_skills: vec![],
         };
 
         // Spawn two agents
@@ -1057,7 +1065,7 @@ inherited_skills: vec![],
             parent_agent_id: "parent".to_string(),
             working_dir: PathBuf::from("/tmp"),
             inherited_permissions: None,
-inherited_skills: vec![],
+            inherited_skills: vec![],
         };
 
         // Spawn an agent
@@ -1103,7 +1111,7 @@ inherited_skills: vec![],
             parent_run_id: "parent-123".to_string(),
             parent_agent_id: "main".to_string(),
             inherited_permissions: None,
-inherited_skills: vec![],
+            inherited_skills: vec![],
             working_dir: PathBuf::from("/tmp"),
         };
         let input = SpawnAgentInput {
@@ -1205,7 +1213,7 @@ inherited_skills: vec![],
             parent_run_id: "parent-123".to_string(),
             parent_agent_id: "main".to_string(),
             inherited_permissions: None,
-inherited_skills: vec![],
+            inherited_skills: vec![],
             working_dir: PathBuf::from("/tmp"),
         };
         let input = SpawnAgentInput {
@@ -1254,7 +1262,7 @@ inherited_skills: vec![],
             parent_run_id: "parent-123".to_string(),
             parent_agent_id: "main".to_string(),
             inherited_permissions: None,
-inherited_skills: vec![],
+            inherited_skills: vec![],
             working_dir: PathBuf::from("/tmp"),
         };
         let input = SpawnAgentInput {

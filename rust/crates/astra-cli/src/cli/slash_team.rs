@@ -730,17 +730,11 @@ pub(super) async fn handle_team_command(
                 astra_services::coordination::AgentProfileRegistry::new();
             super::delegate_subrun::register_default_agents(&mut profile_registry);
             let _ = super::agent_loader::load_and_merge(&project_root, &mut profile_registry);
-            let profile_registry =
-                Arc::new(tokio::sync::RwLock::new(profile_registry));
-            let run_store = Arc::new(
-                astra_services::runs::InMemoryRunStateStore::default(),
-            );
-            let run_engine = Arc::new(
-                astra_runtime::server::run_engine::RunEngine::new(run_store),
-            );
-            let tracker = Arc::new(
-                astra_runtime::server::delegation_engine::DelegationTracker::new(),
-            );
+            let profile_registry = Arc::new(tokio::sync::RwLock::new(profile_registry));
+            let run_store = Arc::new(astra_services::runs::InMemoryRunStateStore::default());
+            let run_engine = Arc::new(astra_runtime::server::run_engine::RunEngine::new(run_store));
+            let tracker =
+                Arc::new(astra_runtime::server::delegation_engine::DelegationTracker::new());
             let delegation_engine = Arc::new(
                 astra_runtime::server::delegation_engine::DelegationEngine::with_executor(
                     profile_registry.clone(),
@@ -1095,7 +1089,6 @@ pub(super) async fn handle_team_command(
                 error: report.error.clone(),
                 started_at,
             });
-
         }
 
         "history" => {

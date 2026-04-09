@@ -189,10 +189,19 @@ mod tests {
 
         // Verify all events received
         let e1 = rx.recv().await.unwrap();
-        assert!(matches!(e1.event_type, ProgressEventType::Started { description } if description == "task description"));
+        assert!(
+            matches!(e1.event_type, ProgressEventType::Started { description } if description == "task description")
+        );
 
         let e2 = rx.recv().await.unwrap();
-        assert!(matches!(e2.event_type, ProgressEventType::TurnCompleted { turn: 1, tool_calls_this_turn: 3, .. }));
+        assert!(matches!(
+            e2.event_type,
+            ProgressEventType::TurnCompleted {
+                turn: 1,
+                tool_calls_this_turn: 3,
+                ..
+            }
+        ));
 
         let e3 = rx.recv().await.unwrap();
         assert!(matches!(e3.event_type, ProgressEventType::Busy { .. }));
@@ -201,7 +210,14 @@ mod tests {
         assert!(matches!(e4.event_type, ProgressEventType::Idle));
 
         let e5 = rx.recv().await.unwrap();
-        assert!(matches!(e5.event_type, ProgressEventType::Completed { total_tool_calls: 10, duration_ms: 5000, .. }));
+        assert!(matches!(
+            e5.event_type,
+            ProgressEventType::Completed {
+                total_tool_calls: 10,
+                duration_ms: 5000,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]
@@ -213,13 +229,17 @@ mod tests {
 
         emitter.failed("connection timeout");
         let e1 = rx.recv().await.unwrap();
-        assert!(matches!(e1.event_type, ProgressEventType::Failed { error } if error == "connection timeout"));
+        assert!(
+            matches!(e1.event_type, ProgressEventType::Failed { error } if error == "connection timeout")
+        );
 
         let emitter2 = broadcaster.for_agent("agent-3".to_string());
         emitter2.cancelled("user request");
         let e2 = rx.recv().await.unwrap();
         assert_eq!(e2.agent_id, "agent-3");
-        assert!(matches!(e2.event_type, ProgressEventType::Cancelled { reason } if reason == "user request"));
+        assert!(
+            matches!(e2.event_type, ProgressEventType::Cancelled { reason } if reason == "user request")
+        );
     }
 
     #[tokio::test]

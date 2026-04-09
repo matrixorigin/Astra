@@ -917,8 +917,13 @@ pub async fn handle_plan_mode_input(
                         );
 
                         // Auto-prompt execution if there are new pending subtasks
-                        let pending_count = plan_state.plan.subtasks.iter()
-                            .filter(|s| s.status == astra_services::task_orchestrator::TaskStatus::Pending)
+                        let pending_count = plan_state
+                            .plan
+                            .subtasks
+                            .iter()
+                            .filter(|s| {
+                                s.status == astra_services::task_orchestrator::TaskStatus::Pending
+                            })
                             .count();
                         if pending_count > 0 {
                             eprintln!();
@@ -1854,7 +1859,8 @@ mod tests {
 
     #[test]
     fn try_replace_preserves_completed_subtasks_when_llm_drops_them() {
-        let mut ps = plan::PlanModeState::new("build login".into(), plan::ProjectContext::default());
+        let mut ps =
+            plan::PlanModeState::new("build login".into(), plan::ProjectContext::default());
         // Simulate a completed plan
         ps.set_plan(astra_services::task_orchestrator::TaskPlan {
             subtasks: vec![
@@ -1892,7 +1898,8 @@ mod tests {
 
     #[test]
     fn try_replace_preserves_status_when_llm_resets_completed_to_pending() {
-        let mut ps = plan::PlanModeState::new("build login".into(), plan::ProjectContext::default());
+        let mut ps =
+            plan::PlanModeState::new("build login".into(), plan::ProjectContext::default());
         ps.set_plan(astra_services::task_orchestrator::TaskPlan {
             subtasks: vec![astra_services::task_orchestrator::SubtaskPlan {
                 id: "html".into(),
@@ -1904,7 +1911,8 @@ mod tests {
         });
 
         // LLM includes the old subtask but resets status to pending
-        let json = r#"{"subtasks":[{"id":"html","title":"Create HTML"},{"id":"new","title":"New task"}]}"#;
+        let json =
+            r#"{"subtasks":[{"id":"html","title":"Create HTML"},{"id":"new","title":"New task"}]}"#;
         assert!(try_replace_plan_from_llm_json(json, &mut ps).unwrap());
 
         assert_eq!(ps.plan.subtasks.len(), 2);
