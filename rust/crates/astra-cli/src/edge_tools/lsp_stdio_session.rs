@@ -394,8 +394,15 @@ impl LspStdioSession {
         };
         let hash = text_hash(text);
         enum SyncAction {
-            Open { version: i32, language_id: String },
-            Change { version: i32 },
+            Open {
+                version: i32,
+                language_id: String,
+                next_state: SyncedDocumentState,
+            },
+            Change {
+                version: i32,
+                next_state: SyncedDocumentState,
+            },
             Noop,
         }
         let action = {
@@ -403,31 +410,39 @@ impl LspStdioSession {
                 .documents
                 .lock()
                 .map_err(|_| io::Error::other("documents mutex poisoned"))?;
-            match documents.get_mut(&uri) {
-                Some(doc) => match sync_existing_document(doc, mtime_ms, hash) {
-                    Some(version) => SyncAction::Change { version },
-                    None => SyncAction::Noop,
-                },
-                None => {
-                    documents.insert(
-                        uri.clone(),
-                        SyncedDocumentState {
-                            version: 1,
-                            last_mtime_ms: mtime_ms,
-                            last_text_hash: hash,
+            match documents.get(&uri).cloned() {
+                Some(doc) => {
+                    let mut next_state = doc.clone();
+                    match sync_existing_document(&mut next_state, mtime_ms, hash) {
+                        Some(version) => SyncAction::Change {
+                            version,
+                            next_state,
                         },
-                    );
+                        None => {
+                            documents.insert(uri.clone(), next_state);
+                            SyncAction::Noop
+                        }
+                    }
+                }
+                None => {
+                    let next_state = SyncedDocumentState {
+                        version: 1,
+                        last_mtime_ms: mtime_ms,
+                        last_text_hash: hash,
+                    };
                     SyncAction::Open {
                         version: 1,
                         language_id: lang,
+                        next_state,
                     }
                 }
             }
         };
-        match action {
+        let committed_state = match action {
             SyncAction::Open {
                 version,
                 language_id,
+                next_state,
             } => {
                 self.send_notification(
                     "textDocument/didOpen",
@@ -442,10 +457,14 @@ impl LspStdioSession {
                 )?;
                 self.send_notification(
                     "textDocument/didSave",
-                    json!({ "textDocument": { "uri": uri } }),
+                    json!({ "textDocument": { "uri": uri.clone() } }),
                 )?;
+                Some(next_state)
             }
-            SyncAction::Change { version } => {
+            SyncAction::Change {
+                version,
+                next_state,
+            } => {
                 self.send_notification(
                     "textDocument/didChange",
                     json!({
@@ -455,10 +474,18 @@ impl LspStdioSession {
                 )?;
                 self.send_notification(
                     "textDocument/didSave",
-                    json!({ "textDocument": { "uri": uri } }),
+                    json!({ "textDocument": { "uri": uri.clone() } }),
                 )?;
+                Some(next_state)
             }
-            SyncAction::Noop => {}
+            SyncAction::Noop => None,
+        };
+        if let Some(next_state) = committed_state {
+            let mut documents = self
+                .documents
+                .lock()
+                .map_err(|_| io::Error::other("documents mutex poisoned"))?;
+            documents.insert(uri, next_state);
         }
         Ok(())
     }
