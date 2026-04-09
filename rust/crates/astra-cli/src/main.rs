@@ -4346,13 +4346,10 @@ async fn run_blocking_plan_monitor(state: &mut ReplState) {
             let approved = tokio::task::spawn_blocking(|| {
                 use std::io::IsTerminal;
                 if std::io::stdin().is_terminal() {
-                    match inquire::Confirm::new("Approve?")
+                    inquire::Confirm::new("Approve?")
                         .with_default(false)
                         .prompt()
-                    {
-                        Ok(v) => v,
-                        Err(_) => false,
-                    }
+                        .unwrap_or(false)
                 } else {
                     use std::io::Write;
                     let _ = std::io::stderr().flush();

@@ -357,7 +357,7 @@ impl PermissionManager {
 
     /// Check if this is a background agent (cannot show prompts).
     pub(super) fn is_background_agent(&self) -> bool {
-        self.inherited.as_ref().map_or(false, |i| i.is_background)
+        self.inherited.as_ref().is_some_and(|i| i.is_background)
     }
 
     /// Export the current effective permission envelope for a spawned child agent.

@@ -125,7 +125,7 @@ impl ToolExecutor {
                     "source": source,
                     "metadata": {},
                     "outputs": if cell_type == "code" { json!([]) } else { json!(null) },
-                    "execution_count": if cell_type == "code" { json!(null) } else { json!(null) }
+                    "execution_count": json!(null)
                 });
                 let insert_idx = cell_index.map(|i| i + 1).unwrap_or(0);
                 if insert_idx <= cells.len() {
