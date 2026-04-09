@@ -681,17 +681,6 @@ pub(super) async fn handle_team_command(
                 return;
             }
 
-            let delegation_engine = match state.delegation_engine {
-                Some(ref e) => e.clone(),
-                None => {
-                    eprintln!(
-                        "  {} Delegation engine not available (not logged in?)",
-                        theme::icon_err()
-                    );
-                    return;
-                }
-            };
-
             let user_id = state
                 .ingestion_user_id
                 .clone()
@@ -707,7 +696,6 @@ pub(super) async fn handle_team_command(
             // Convert CLI team → TeamDefinition for the orchestrator
             let team_def = cli_team_to_definition(&cli_team, &user_id);
 
-            // Build team store with this team pre-loaded
             // Use the shared team store; ensure this team is loaded into it
             let team_store = state.team_store.clone();
             if let Err(e) = team_store.save_team(&team_def).await {
@@ -715,9 +703,42 @@ pub(super) async fn handle_team_command(
                 return;
             }
 
-            // Reuse the delegation engine's shared registry and run engine
-            let profile_registry = delegation_engine.registry().clone();
-            let run_engine = delegation_engine.run_engine().clone();
+            // Build a fresh delegation engine with a cancel token so Ctrl+C
+            // propagates into sub-agent SSE streams.
+            let cancel_token = Arc::new(tokio_util::sync::CancellationToken::new());
+            let project_root =
+                std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            let executor = super::delegate_subrun::CliDelegateSubRunExecutor::new(
+                api.clone(),
+                crate::current_access_token(profile).unwrap_or_default(),
+                state.model.clone(),
+                project_root.clone(),
+                state.perm_manager.mode(),
+                Some(cancel_token.clone()),
+            );
+            let mut profile_registry =
+                astra_services::coordination::AgentProfileRegistry::new();
+            super::delegate_subrun::register_default_agents(&mut profile_registry);
+            let _ = super::agent_loader::load_and_merge(&project_root, &mut profile_registry);
+            let profile_registry =
+                Arc::new(tokio::sync::RwLock::new(profile_registry));
+            let run_store = Arc::new(
+                astra_services::runs::InMemoryRunStateStore::default(),
+            );
+            let run_engine = Arc::new(
+                astra_runtime::server::run_engine::RunEngine::new(run_store),
+            );
+            let tracker = Arc::new(
+                astra_runtime::server::delegation_engine::DelegationTracker::new(),
+            );
+            let delegation_engine = Arc::new(
+                astra_runtime::server::delegation_engine::DelegationEngine::with_executor(
+                    profile_registry.clone(),
+                    run_engine.clone(),
+                    tracker.clone(),
+                    Arc::new(executor),
+                ),
+            );
 
             // Wire live progress callback for phase updates
             let progress: astra_runtime::server::team_orchestrator::ProgressCallback =
@@ -779,7 +800,7 @@ pub(super) async fn handle_team_command(
                 astra_runtime::server::team_orchestrator::TeamExecutionOrchestrator::new(
                     team_store,
                     delegation_engine.clone(),
-                    delegation_engine.tracker().clone(),
+                    tracker.clone(),
                     run_engine,
                     profile_registry,
                     config,
@@ -803,8 +824,45 @@ pub(super) async fn handle_team_command(
             let started_at = chrono::Utc::now().to_rfc3339();
             let timer = Instant::now();
 
+            // Elapsed-time ticker so the user sees activity during long phases
+            let ticker_cancel = cancel_token.clone();
+            let ticker = tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+                interval.tick().await; // skip first immediate tick
+                loop {
+                    tokio::select! {
+                        _ = interval.tick() => {
+                            let elapsed = timer.elapsed();
+                            eprint!(
+                                "\r  {} {}",
+                                "⏳".dim(),
+                                format!("running… {}", format_duration(elapsed)).dim()
+                            );
+                        }
+                        _ = ticker_cancel.cancelled() => break,
+                    }
+                }
+            });
+
             let repo_root = std::env::current_dir().ok();
-            let report = orchestrator.execute_team(team_name, task, repo_root).await;
+            let cancel_for_signal = cancel_token.clone();
+            let report = tokio::select! {
+                report = orchestrator.execute_team(team_name, task, repo_root) => report,
+                _ = tokio::signal::ctrl_c() => {
+                    cancel_for_signal.cancel();
+                    eprintln!("\n  {} Interrupting team run...", "⚠️ ".yellow());
+                    // Give sub-runs a moment to notice cancellation
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    eprintln!("  {} Team run interrupted.", theme::icon_err());
+                    cancel_token.cancel();
+                    ticker.abort();
+                    return;
+                }
+            };
+            cancel_token.cancel();
+            ticker.abort();
+            // Clear the ticker line
+            eprint!("\r{}\r", " ".repeat(60));
             let elapsed = timer.elapsed();
 
             // Display report header with status
