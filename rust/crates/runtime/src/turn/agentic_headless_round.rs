@@ -100,6 +100,7 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
     tool_event_hooks: &crate::skills::hooks::ToolEventHookRegistry,
     term: &mut dyn HeadlessRoundTerminal,
     permission_context: Option<&std::sync::Arc<tokio::sync::RwLock<crate::orchestration::permission_sync::PermissionSyncContext>>>,
+    mailbox: Option<&crate::messaging::router::AgentMailbox>,
 ) {
     tool_results.clear();
 
@@ -259,25 +260,46 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
 
         // ── Permission gate check ──
         // If permission_context is set, check if this tool is allowed before execution.
-        if let Some(ctx) = permission_context {
-            let ctx_guard = ctx.read().await;
+        // If not allowed locally, the check will try to request permission from parent via mailbox.
+        if permission_context.is_some() || mailbox.is_some() {
+            use super::permission_gate::{check_tool_permission, PermissionCheckResult, permission_denied_error_result};
             let args_str = serde_json::to_string(&args).ok();
-            if !ctx_guard.is_allowed(&name, args_str.as_deref()) {
-                let err_msg = super::permission_gate::permission_denied_error_result(
-                    &name,
-                    "Tool not allowed by permission rules"
-                );
-                if !quiet {
-                    term.emit_line(
-                        HeadlessStderrStyle::Yellow,
-                        format!("  🔒 Permission denied: {name}"),
-                    );
+            let timeout = std::time::Duration::from_secs(30);
+            let check_result = check_tool_permission(
+                &name,
+                args_str.as_deref(),
+                permission_context,
+                mailbox,
+                timeout,
+            ).await;
+            
+            match check_result {
+                PermissionCheckResult::Allowed => {
+                    // Proceed to execute
                 }
-                let (tool_msg, err_tr) = openai_tool_roundtrip_values(&id, &name, &err_msg);
-                messages.push(tool_msg);
-                tool_results.push(err_tr);
-                tool_call_records.push(journal_record_unknown_tool(name.clone()));
-                continue;
+                PermissionCheckResult::AllowedViaRequest { new_rules } => {
+                    // Permission was granted by parent, proceed to execute
+                    if !quiet && !new_rules.is_empty() {
+                        term.emit_line(
+                            HeadlessStderrStyle::Green,
+                            format!("  ✓ Permission granted by parent: {name}"),
+                        );
+                    }
+                }
+                PermissionCheckResult::Denied { reason } => {
+                    let err_msg = permission_denied_error_result(&name, &reason);
+                    if !quiet {
+                        term.emit_line(
+                            HeadlessStderrStyle::Yellow,
+                            format!("  🔒 Permission denied: {name}"),
+                        );
+                    }
+                    let (tool_msg, err_tr) = openai_tool_roundtrip_values(&id, &name, &err_msg);
+                    messages.push(tool_msg);
+                    tool_results.push(err_tr);
+                    tool_call_records.push(journal_record_unknown_tool(name.clone()));
+                    continue;
+                }
             }
         }
 

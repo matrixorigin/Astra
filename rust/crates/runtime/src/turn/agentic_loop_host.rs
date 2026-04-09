@@ -1708,6 +1708,7 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
                 &state.tool_event_hooks,
                 &mut term_adapter,
                 state.permission_context.as_ref(),
+                state.mailbox.as_ref(),
             )
             .await;
         }

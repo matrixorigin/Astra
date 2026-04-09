@@ -9,7 +9,6 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 
 use crate::messaging::router::AgentMailbox;
-use crate::messaging::types::AgentAddress;
 use crate::orchestration::permission_sync::{PermissionMode, PermissionRequest, PermissionSyncContext, PermissionUpdate};
 
 /// Result of a permission check.
@@ -37,8 +36,7 @@ pub async fn check_tool_permission(
     tool_name: &str,
     args: Option<&str>,
     permission_context: Option<&Arc<RwLock<PermissionSyncContext>>>,
-    mailbox: Option<&mut AgentMailbox>,
-    parent_address: Option<&AgentAddress>,
+    mailbox: Option<&AgentMailbox>,
     timeout: Duration,
 ) -> PermissionCheckResult {
     // No permission context = legacy mode, always allow
@@ -62,7 +60,7 @@ pub async fn check_tool_permission(
     }
 
     // Try to request permission from parent
-    let (Some(mailbox), Some(_parent_addr)) = (mailbox, parent_address) else {
+    let Some(mailbox) = mailbox else {
         return PermissionCheckResult::Denied {
             reason: format!(
                 "Tool '{}' requires permission but no parent available",
@@ -122,7 +120,7 @@ mod tests {
 
     #[tokio::test]
     async fn no_context_always_allowed() {
-        let result = check_tool_permission("edit", Some("src/main.rs"), None, None, None, Duration::from_secs(5)).await;
+        let result = check_tool_permission("edit", Some("src/main.rs"), None, None, Duration::from_secs(5)).await;
         assert!(matches!(result, PermissionCheckResult::Allowed));
     }
 
@@ -138,7 +136,7 @@ mod tests {
         };
         let ctx = Arc::new(RwLock::new(PermissionSyncContext::new(inherited)));
 
-        let result = check_tool_permission("edit", None, Some(&ctx), None, None, Duration::from_secs(5)).await;
+        let result = check_tool_permission("edit", None, Some(&ctx), None, Duration::from_secs(5)).await;
         assert!(matches!(result, PermissionCheckResult::Allowed));
     }
 
@@ -154,7 +152,7 @@ mod tests {
         };
         let ctx = Arc::new(RwLock::new(PermissionSyncContext::new(inherited)));
 
-        let result = check_tool_permission("edit", None, Some(&ctx), None, None, Duration::from_secs(5)).await;
+        let result = check_tool_permission("edit", None, Some(&ctx), None, Duration::from_secs(5)).await;
         assert!(matches!(result, PermissionCheckResult::Denied { .. }));
     }
 
@@ -170,7 +168,7 @@ mod tests {
         };
         let ctx = Arc::new(RwLock::new(PermissionSyncContext::new(inherited)));
 
-        let result = check_tool_permission("edit", None, Some(&ctx), None, None, Duration::from_secs(5)).await;
+        let result = check_tool_permission("edit", None, Some(&ctx), None, Duration::from_secs(5)).await;
         assert!(matches!(result, PermissionCheckResult::Denied { .. }));
     }
 }
