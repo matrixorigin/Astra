@@ -40,6 +40,8 @@ pub(super) struct TeamSnapshotEntry {
 /// A named team of agent roles that can coordinate on tasks.
 #[derive(Clone, Debug)]
 pub(super) struct Team {
+    /// Stable identifier persisted across runs (UUID assigned at creation).
+    pub team_id: String,
     pub name: String,
     pub description: String,
     pub members: Vec<TeamMember>,
@@ -82,6 +84,7 @@ impl TeamRegistry {
         self.teams.insert(
             "review".to_string(),
             Team {
+                team_id: uuid::Uuid::new_v4().to_string(),
                 name: "review".to_string(),
                 description: "Adversarial code review: one agent writes, another reviews".into(),
                 members: vec![
@@ -108,6 +111,7 @@ impl TeamRegistry {
         self.teams.insert(
             "research".to_string(),
             Team {
+                team_id: uuid::Uuid::new_v4().to_string(),
                 name: "research".to_string(),
                 description: "Deep research: explorer gathers info, synthesizer produces report"
                     .into(),
@@ -135,6 +139,7 @@ impl TeamRegistry {
         self.teams.insert(
             "dev".to_string(),
             Team {
+                team_id: uuid::Uuid::new_v4().to_string(),
                 name: "dev".to_string(),
                 description:
                     "Full development cycle: planner decomposes, implementer codes, tester verifies"
@@ -184,6 +189,7 @@ impl TeamRegistry {
         self.teams.insert(
             name.clone(),
             Team {
+                team_id: uuid::Uuid::new_v4().to_string(),
                 name,
                 description,
                 members: Vec::new(),
@@ -278,7 +284,7 @@ fn cli_team_to_definition(
     let coordination = infer_coordination(team);
     let now = chrono::Utc::now().to_rfc3339();
     TeamDefinition {
-        team_id: uuid::Uuid::new_v4().to_string(),
+        team_id: team.team_id.clone(),
         user_id: user_id.to_string(),
         name: team.name.clone(),
         description: team.description.clone(),
@@ -299,6 +305,8 @@ fn cli_team_to_definition(
             .collect(),
         context: team.shared_context.clone(),
         worktree_mode: team.worktree_mode.clone(),
+        budget: None,
+        max_parallel: 0,
         created_at: now.clone(),
         updated_at: now,
     }
@@ -596,6 +604,12 @@ pub(super) async fn handle_team_command(
             }
             match state.team_registry.remove(name) {
                 Ok(()) => {
+                    // Also delete from persistence store (best-effort)
+                    let user_id = state
+                        .ingestion_user_id
+                        .clone()
+                        .unwrap_or_else(|| "local".into());
+                    let _ = state.team_store.delete_team(&user_id, name).await;
                     eprintln!("  {} Team '{}' deleted", theme::icon_ok(), name);
                 }
                 Err(e) => eprintln!("  {} {e}", theme::icon_err()),
@@ -788,16 +802,6 @@ pub(super) async fn handle_team_command(
 
             let started_at = chrono::Utc::now().to_rfc3339();
             let timer = Instant::now();
-
-            // Record execution start in persistence store (best-effort)
-            let exec_id = uuid::Uuid::new_v4().to_string();
-            let _ = state
-                .team_store
-                .record_execution_start(
-                    &exec_id, team_name, "", // user_id (empty for CLI sessions)
-                    task,
-                )
-                .await;
 
             let repo_root = std::env::current_dir().ok();
             let report = orchestrator.execute_team(team_name, task, repo_root).await;
@@ -1007,22 +1011,6 @@ pub(super) async fn handle_team_command(
                 started_at,
             });
 
-            // Persist execution complete to the store (best-effort)
-            let result_summary = serde_json::json!({
-                "agent_count": agent_count,
-                "prompt_tokens": prompt_tok,
-                "completion_tokens": compl_tok,
-                "delegation_id": &report.delegation_id,
-                "error": &report.error,
-            });
-            let _ = state
-                .team_store
-                .record_execution_complete(
-                    &report.delegation_id,
-                    &report.status.to_string(),
-                    Some(&result_summary.to_string()),
-                )
-                .await;
         }
 
         "history" => {
@@ -1035,15 +1023,18 @@ pub(super) async fn handle_team_command(
                 eprintln!("{}", "  Shows execution history for a team.".dim());
                 return;
             }
-            if state.team_registry.get(name).is_none() {
-                eprintln!("  {} Team '{}' not found", theme::icon_err(), name);
-                return;
-            }
+            let team = match state.team_registry.get(name) {
+                Some(t) => t.clone(),
+                None => {
+                    eprintln!("  {} Team '{}' not found", theme::icon_err(), name);
+                    return;
+                }
+            };
 
-            // Check persistence store for additional records
+            // Query persistence store using stable team_id (not display name)
             let store_entries = state
                 .team_store
-                .list_executions(name, 50)
+                .list_executions(&team.team_id, 50)
                 .await
                 .unwrap_or_default();
             let registry_entries = state.team_registry.get_history(name);
@@ -1534,6 +1525,7 @@ mod tests {
 
     fn make_team(roles: &[&str]) -> Team {
         Team {
+            team_id: uuid::Uuid::new_v4().to_string(),
             name: "test".into(),
             description: "test team".into(),
             members: roles

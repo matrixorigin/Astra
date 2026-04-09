@@ -229,6 +229,12 @@ impl TeamExecutionOrchestrator {
 
         let delegation_id = request.delegation_id.clone();
 
+        // Record execution start (Phase 1 complete, entering execution)
+        let _ = self
+            .team_store
+            .record_execution_start(&delegation_id, &team.team_id, &self.config.user_id, task)
+            .await;
+
         self.emit_progress(ExecutionPhase::Preparing {
             team_name: team_name.to_string(),
             member_count: profiles.len(),
@@ -260,6 +266,19 @@ impl TeamExecutionOrchestrator {
         let agent_ids: Vec<String> = profiles.iter().map(|p| p.agent_id.clone()).collect();
 
         let mut effective_request = request;
+
+        // Inject budget and max_parallel into request context for downstream consumers
+        if let Some(ref budget) = team.budget {
+            if let Ok(budget_json) = serde_json::to_value(budget) {
+                effective_request.context.insert("team_budget".to_string(), budget_json);
+            }
+        }
+        if team.max_parallel > 0 {
+            effective_request.context.insert(
+                "team_max_parallel".to_string(),
+                serde_json::Value::Number(team.max_parallel.into()),
+            );
+        }
         if team.worktree_mode == WorktreeMode::Isolated {
             if let Some(ref mut mgr) = worktree_mgr {
                 match mgr.create_worktrees(&delegation_id, &agent_ids).await {
@@ -419,7 +438,7 @@ impl TeamExecutionOrchestrator {
             .persist_status(&parent_run_id, &status.to_string(), None, error.as_deref())
             .await;
 
-        // Record team execution history for /team history
+        // Record execution completion (started in Phase 1)
         let result_summary = serde_json::json!({
             "agent_count": delegation_result.agent_results.len(),
             "total_prompt_tokens": total_prompt,
@@ -428,10 +447,6 @@ impl TeamExecutionOrchestrator {
             "has_conflicts": has_conflicts,
             "merged_learning_patterns": merged_learning.as_ref().map(|l| l.consensus_patterns.len()).unwrap_or(0),
         });
-        let _ = self
-            .team_store
-            .record_execution_start(&delegation_id, &team.team_id, &self.config.user_id, task)
-            .await;
         let _ = self
             .team_store
             .record_execution_complete(
@@ -995,6 +1010,8 @@ mod tests {
             members: vec![],
             context: std::collections::HashMap::new(),
             worktree_mode: WorktreeMode::Shared,
+            budget: None,
+            max_parallel: 0,
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
         };

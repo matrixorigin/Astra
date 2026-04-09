@@ -906,6 +906,8 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
             members_json  TEXT         NOT NULL,
             context_json  TEXT,
             worktree_mode VARCHAR(32)  DEFAULT 'shared',
+            budget_json   TEXT,
+            max_parallel  INT UNSIGNED NOT NULL DEFAULT 0,
             created_at    DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             updated_at    DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             UNIQUE KEY uq_team_user_name (user_id, name)
@@ -928,6 +930,24 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
             completed_at  DATETIME(6),
             INDEX idx_teh_team (team_id, started_at),
             INDEX idx_teh_user (user_id, started_at)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    // ─── Team snapshots ─────────────────────────────────────────────────────────
+
+    query(
+        "CREATE TABLE IF NOT EXISTS team_snapshots (
+            snapshot_id          VARCHAR(64)  PRIMARY KEY,
+            team_name            VARCHAR(128) NOT NULL,
+            user_id              VARCHAR(64)  NOT NULL,
+            label                VARCHAR(255) DEFAULT '',
+            git_commit           VARCHAR(64),
+            session_id           VARCHAR(64),
+            team_definition_json LONGTEXT,
+            created_at           DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            INDEX idx_ts_user_team (user_id, team_name, created_at)
         )",
     )
     .execute(&pool)

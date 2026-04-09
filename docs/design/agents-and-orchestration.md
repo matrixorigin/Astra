@@ -302,6 +302,26 @@ System Agents are defined the same way as User Agents — `AgentProfile` with `s
 
 ## 5. Agent Teams
 
+### Implementation Status (updated 2026-04-09)
+
+| Capability | Status | Location |
+|---|---|---|
+| **TeamDefinition model** (team_id, members, coordination, worktree_mode, context) | **Implemented** | `services/team_persistence.rs` |
+| **Coordination patterns** (Pipeline, FanOut, Sequential, Adversarial) | **Implemented** | `runtime/server/delegation_engine.rs` |
+| **4-phase orchestrator** (Prepare → Execute → Merge → Report) | **Implemented** | `runtime/server/team_orchestrator.rs` |
+| **Worktree isolation + merge** | **Implemented** | `runtime/server/worktree_isolation.rs` |
+| **LLM-assisted merge conflict resolution** | **Implemented** | `runtime/server/conflict_resolver.rs` |
+| **CLI `/team` commands** (list, create, add-member, run, history, snapshot, info, delete, context) | **Implemented** | `astra-cli/src/cli/slash_team.rs` |
+| **MatrixOne-backed persistence** (team_definitions + team_execution_history tables) | **Implemented** | `services/team_persistence.rs` (MatrixOneTeamStore) |
+| **HTTP API** (CRUD + execution history) | **Implemented** | `runtime/server/team_handlers.rs` |
+| **Peer-to-peer agent messaging** | **Partial** — edge tool exists, not wired to event-based model | `astra-cli/src/edge_tools/agent_messaging.rs` |
+| **Learning merge** (aggregate agent learnings post-execution) | **Implemented** | `services/learning_merge.rs` |
+| **Budget / max_parallel constraints** | **Implemented** — on TeamDefinition, persisted in DB, validated, injected into delegation context | `services/team_persistence.rs`, `runtime/server/team_orchestrator.rs` |
+| **Task board (event blackboard)** | **Planned** — current model is single DelegationRequest, not persistent task board | § below |
+| **Dynamic team formation / recruit** | **Planned** — requires agent pool + selection criteria | § below |
+| **Explicit lead agent role** | **Planned** — current orchestrator is implicit lead | § below |
+| **Conflict detection & consensus (§6)** | **Planned** — conflict_resolver handles git merges, not semantic conflicts | § below |
+
 ### The Industry Shift (Feb 2026)
 
 Anthropic's Agent Teams (Opus 4.6) proved that multi-agent parallel coordination is production-ready. Their C compiler experiment: 16 parallel agents, 2000 sessions, 100K lines of code, compiled Linux kernel. The architecture: team lead coordinates, teammates work in independent context windows, shared task board, peer-to-peer messaging.
@@ -328,6 +348,13 @@ This is the direction. Not single-agent with tools, but **teams of specialized a
 ```
 
 ### Task Board (Event Blackboard via conversation_events)
+
+> **Current implementation note**: The task board described below is a vision
+> design. The current implementation uses a single `DelegationRequest` per team
+> execution, dispatched through `DelegationEngine` with coordination patterns
+> (FanOut, Pipeline, Sequential, Adversarial). Agents do not poll a shared task
+> board — the orchestrator assigns work upfront. The event-based task board
+> remains a future enhancement for long-running, iterative team workflows.
 
 Teams coordinate through the existing event system — no new tables needed:
 
@@ -378,6 +405,12 @@ send_message(AgentMessage {
 ```
 
 ### Dynamic Team Formation
+
+> **Current implementation note**: Dynamic recruitment is not yet implemented.
+> Teams are currently defined statically via CLI `/team create` or HTTP API
+> `POST /teams`, with built-in templates (review, research, dev). At runtime,
+> `resolve_team` maps `TeamMemberDef` → `AgentProfile` using optional registry
+> lookup, but no dynamic pool selection or load-based routing exists yet.
 
 Not all tasks need pre-defined teams. The lead agent can dynamically recruit:
 

@@ -78,6 +78,21 @@ pub(super) fn build_router(state: AppState) -> Router {
             "/chat/runs/{run_id}/delegations/resume",
             post(delegation_handlers::resume_delegations_handler),
         )
+        // Teams — CRUD + execution history
+        .route(
+            "/teams",
+            get(team_handlers::list_teams_handler)
+                .post(team_handlers::upsert_team_handler),
+        )
+        .route(
+            "/teams/{name}",
+            get(team_handlers::get_team_handler)
+                .delete(team_handlers::delete_team_handler),
+        )
+        .route(
+            "/teams/{name}/executions",
+            get(team_handlers::list_executions_handler),
+        )
         // Reflect / decision-trace
         .route(
             "/chat/session/{session_id}/reflect",

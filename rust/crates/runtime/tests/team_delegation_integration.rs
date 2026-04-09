@@ -53,6 +53,8 @@ fn test_team(
             .collect(),
         context: HashMap::new(),
         worktree_mode: WorktreeMode::Shared,
+        budget: None,
+        max_parallel: 0,
         created_at: "2026-01-01T00:00:00Z".to_string(),
         updated_at: "2026-01-01T00:00:00Z".to_string(),
     }
@@ -483,4 +485,54 @@ async fn team_persistence_full_lifecycle() {
             .unwrap()
             .is_none()
     );
+}
+
+// ─── Execution History team_id Consistency ──────────────────────────────────
+
+#[tokio::test]
+async fn orchestrator_records_execution_with_stable_team_id() {
+    let store = Arc::new(InMemoryTeamStore::new());
+
+    let team = test_team("consistency", TeamCoordination::Pipeline, vec![
+        ("coder", Some("Code agent")),
+        ("tester", Some("Test agent")),
+    ]);
+    let expected_team_id = team.team_id.clone();
+    store.save_team(&team).await.unwrap();
+
+    let (orch, _, _) = setup_orchestrator(store.clone()).await;
+    let report = orch.execute_team("consistency", "build feature", None).await;
+
+    // Verify execution was recorded with the correct team_id (not team name)
+    let by_team_id = store.list_executions(&expected_team_id, 10).await.unwrap();
+    assert_eq!(by_team_id.len(), 1, "should find execution by team_id");
+    assert_eq!(by_team_id[0].status, report.status.to_string());
+
+    // Querying by display name should return nothing (team_id != name)
+    let by_name = store.list_executions("consistency", 10).await.unwrap();
+    assert!(by_name.is_empty(), "team display name should not match team_id in execution history");
+}
+
+#[tokio::test]
+async fn orchestrator_writes_start_then_complete_not_duplicate() {
+    let store = Arc::new(InMemoryTeamStore::new());
+
+    let team = test_team("lifecycle-order", TeamCoordination::FanOut {
+        aggregation: "all_results".into(),
+    }, vec![
+        ("analyzer", Some("Analyze agent")),
+        ("reporter", Some("Report agent")),
+    ]);
+    store.save_team(&team).await.unwrap();
+
+    let (orch, _, _) = setup_orchestrator(store.clone()).await;
+    let _report = orch.execute_team("lifecycle-order", "analyze logs", None).await;
+
+    // Exactly one execution record (no duplicates from CLI + orchestrator)
+    let execs = store.list_executions(&team.team_id, 10).await.unwrap();
+    assert_eq!(execs.len(), 1, "should have exactly one execution record, not duplicates");
+
+    // The record should be completed (not stuck in running)
+    assert_ne!(execs[0].status, "running", "execution should be marked complete");
+    assert!(execs[0].completed_at.is_some(), "completed_at should be set");
 }

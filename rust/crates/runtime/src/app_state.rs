@@ -92,6 +92,8 @@ pub struct AppState {
     pub(crate) agent_profile_registry: Arc<astra_services::AgentProfileRegistry>,
     /// Delegation engine — coordinates multi-agent runs.
     pub(crate) delegation_engine: Option<Arc<crate::server::delegation_engine::DelegationEngine>>,
+    /// Team persistence store — CRUD for team definitions and execution history.
+    pub(crate) team_store: Option<Arc<dyn astra_services::team_persistence::TeamPersistenceService>>,
 }
 
 impl AppState {
@@ -169,6 +171,7 @@ impl AppState {
             )),
             agent_profile_registry: Arc::new(astra_services::AgentProfileRegistry::new()),
             delegation_engine: None,
+            team_store: None,
         }
     }
 
@@ -568,6 +571,14 @@ impl AppState {
         engine: Arc<crate::server::delegation_engine::DelegationEngine>,
     ) -> Self {
         self.delegation_engine = Some(engine);
+        self
+    }
+
+    pub fn with_team_store(
+        mut self,
+        store: Arc<dyn astra_services::team_persistence::TeamPersistenceService>,
+    ) -> Self {
+        self.team_store = Some(store);
         self
     }
 

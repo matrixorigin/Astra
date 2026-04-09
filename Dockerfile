@@ -10,11 +10,13 @@ FROM debian:bookworm-slim
 
 WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl && rm -rf /var/lib/apt/lists/* \
-    && useradd -m -u 1000 appuser
+    && groupadd -r appgroup && useradd --system --no-create-home --shell /usr/sbin/nologin -g appgroup appuser
 COPY --from=builder /app/rust/target/release/astra-server /usr/local/bin/astra-server
 COPY --from=builder /app/rust/target/release/astra /usr/local/bin/astra
 COPY --from=builder /app/rust/target/release/astra-admin /usr/local/bin/astra-admin
-RUN chown -R appuser:appuser /app
+# WORKDIR writable for appgroup; K8s runAsUser overrides should add supplementalGroups: [appgroup GID].
+# Prefer mounted volumes for real data rather than writing to /app at runtime.
+RUN chown root:appgroup /app && chmod 1770 /app
 USER appuser
 
 EXPOSE 8000

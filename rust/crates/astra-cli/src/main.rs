@@ -6516,6 +6516,21 @@ async fn run_chat_repl(
         if let Some(ref mc) = state.matrix_runtime {
             let _ = SIGTERM_RUNTIME.set(mc.clone());
         }
+
+        // Upgrade team persistence to MatrixOne-backed when pool is available
+        if let Some(ref mc) = state.matrix_runtime {
+            let pool = mc.shared_pool().get().clone();
+            let user_id = std::env::var("MO_USER_ID").unwrap_or_else(|_| "local".to_string());
+            let mo_team_store =
+                astra_services::team_persistence::MatrixOneTeamStore::new(pool);
+            if let Err(e) = mo_team_store.ensure_builtins(&user_id).await {
+                eprintln!(
+                    "  {} team store builtins: {e}",
+                    theme::icon_warn()
+                );
+            }
+            state.team_store = std::sync::Arc::new(mo_team_store);
+        }
     }
 
     // Store pipeline learning modules for /learn command and learning feedback loop

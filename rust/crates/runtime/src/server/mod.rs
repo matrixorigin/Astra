@@ -38,6 +38,7 @@ mod reflect_handlers;
 mod router_builder;
 pub mod run_engine;
 mod run_handlers;
+mod team_handlers;
 pub mod run_lifecycle;
 pub mod server_loop_host;
 mod session_handlers;

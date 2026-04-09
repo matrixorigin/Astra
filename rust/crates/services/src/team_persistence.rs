@@ -28,8 +28,10 @@ use crate::coordination::{
 ///     members_json  TEXT         NOT NULL,
 ///     context_json  TEXT,
 ///     worktree_mode VARCHAR(32)  DEFAULT 'shared',
-///     created_at    TIMESTAMP(6) DEFAULT NOW(6),
-///     updated_at    TIMESTAMP(6) DEFAULT NOW(6),
+///     budget_json   TEXT,
+///     max_parallel  INT UNSIGNED NOT NULL DEFAULT 0,
+///     created_at    DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+///     updated_at    DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
 ///     UNIQUE KEY uq_team_user_name (user_id, name)
 /// );
 /// ```
@@ -43,8 +45,28 @@ pub struct TeamDefinition {
     pub members: Vec<TeamMemberDef>,
     pub context: HashMap<String, String>,
     pub worktree_mode: WorktreeMode,
+    /// Optional budget constraints for the team execution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget: Option<TeamBudget>,
+    /// Maximum number of agents that may execute concurrently (0 = unlimited).
+    #[serde(default)]
+    pub max_parallel: u32,
     pub created_at: String,
     pub updated_at: String,
+}
+
+/// Budget constraints applied to a team execution.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TeamBudget {
+    /// Maximum cost in USD for the entire team execution.
+    #[serde(default)]
+    pub max_cost_usd: f64,
+    /// Maximum total tokens (prompt + completion) across all agents.
+    #[serde(default)]
+    pub max_tokens: u64,
+    /// Maximum wall-clock time in seconds for the entire execution.
+    #[serde(default)]
+    pub max_duration_secs: u64,
 }
 
 /// Coordination strategy for a team — maps to [`CoordinationPattern`] at execution time.
@@ -199,6 +221,8 @@ pub enum TeamValidationError {
     DuplicateRoles(Vec<String>),
     /// Duplicate agent IDs (explicit or generated).
     DuplicateAgentIds(Vec<String>),
+    /// Budget contains invalid values.
+    InvalidBudget(String),
 }
 
 impl std::fmt::Display for TeamValidationError {
@@ -216,6 +240,9 @@ impl std::fmt::Display for TeamValidationError {
             }
             Self::DuplicateAgentIds(ids) => {
                 write!(f, "duplicate agent IDs: {}", ids.join(", "))
+            }
+            Self::InvalidBudget(msg) => {
+                write!(f, "invalid budget: {msg}")
             }
         }
     }
@@ -273,6 +300,24 @@ pub fn validate_team(team: &TeamDefinition) -> Result<(), Vec<TeamValidationErro
         .collect();
     if !dup_ids.is_empty() {
         errors.push(TeamValidationError::DuplicateAgentIds(dup_ids));
+    }
+
+    // Budget validation
+    if let Some(budget) = &team.budget {
+        if !budget.max_cost_usd.is_finite() {
+            errors.push(TeamValidationError::InvalidBudget(
+                "max_cost_usd must be a finite number".into(),
+            ));
+        } else if budget.max_cost_usd < 0.0 {
+            errors.push(TeamValidationError::InvalidBudget(
+                "max_cost_usd must be non-negative".into(),
+            ));
+        }
+        if budget.max_cost_usd == 0.0 && budget.max_tokens == 0 && budget.max_duration_secs == 0 {
+            errors.push(TeamValidationError::InvalidBudget(
+                "budget specified but all limits are zero (no work possible)".into(),
+            ));
+        }
     }
 
     if errors.is_empty() {
@@ -481,6 +526,7 @@ pub trait TeamPersistenceService: Send + Sync {
         &self,
         _team_name: &str,
         _user_id: &str,
+        _limit: u32,
     ) -> Result<Vec<TeamSnapshotRecord>, String> {
         Ok(vec![])
     }
@@ -638,32 +684,39 @@ impl TeamPersistenceService for InMemoryTeamStore {
     async fn list_snapshots(
         &self,
         team_name: &str,
-        _user_id: &str,
+        user_id: &str,
+        limit: u32,
     ) -> Result<Vec<TeamSnapshotRecord>, String> {
         let snaps = self.snapshots.read().map_err(|e| e.to_string())?;
         let mut matching: Vec<_> = snaps
             .iter()
-            .filter(|s| s.team_name == team_name)
+            .filter(|s| s.team_name == team_name && s.user_id == user_id)
             .cloned()
             .collect();
         matching.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        matching.truncate(limit as usize);
         Ok(matching)
     }
 
     async fn find_snapshot(
         &self,
         snapshot_id: &str,
-        _user_id: &str,
+        user_id: &str,
     ) -> Result<Option<TeamSnapshotRecord>, String> {
         let snaps = self.snapshots.read().map_err(|e| e.to_string())?;
         // Exact match first
-        if let Some(s) = snaps.iter().find(|s| s.snapshot_id == snapshot_id) {
+        if let Some(s) = snaps
+            .iter()
+            .find(|s| s.snapshot_id == snapshot_id && s.user_id == user_id)
+        {
             return Ok(Some(s.clone()));
         }
         // Prefix match — return only if unique
         let matches: Vec<_> = snaps
             .iter()
-            .filter(|s| s.snapshot_id.starts_with(snapshot_id))
+            .filter(|s| {
+                s.user_id == user_id && s.snapshot_id.starts_with(snapshot_id)
+            })
             .collect();
         match matches.len() {
             1 => Ok(Some(matches[0].clone())),
@@ -671,10 +724,14 @@ impl TeamPersistenceService for InMemoryTeamStore {
         }
     }
 
-    async fn delete_snapshot(&self, snapshot_id: &str, _user_id: &str) -> Result<bool, String> {
+    async fn delete_snapshot(
+        &self,
+        snapshot_id: &str,
+        user_id: &str,
+    ) -> Result<bool, String> {
         let mut snaps = self.snapshots.write().map_err(|e| e.to_string())?;
         let before = snaps.len();
-        snaps.retain(|s| s.snapshot_id != snapshot_id);
+        snaps.retain(|s| !(s.snapshot_id == snapshot_id && s.user_id == user_id));
         Ok(snaps.len() < before)
     }
 }
@@ -723,6 +780,12 @@ impl TeamPersistenceService for MatrixOneTeamStore {
             .map_err(|e| e.to_string())?
             .trim_matches('"')
             .to_string();
+        let budget_json: Option<String> = team
+            .budget
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| e.to_string())?;
 
         // Upsert: try UPDATE first (by user_id + name), INSERT if no rows affected.
         let updated = sqlx::query(
@@ -733,6 +796,8 @@ impl TeamPersistenceService for MatrixOneTeamStore {
                  members_json  = ?, \
                  context_json  = ?, \
                  worktree_mode = ?, \
+                 budget_json   = ?, \
+                 max_parallel  = ?, \
                  updated_at    = NOW(6) \
              WHERE user_id = ? AND name = ?",
         )
@@ -742,6 +807,8 @@ impl TeamPersistenceService for MatrixOneTeamStore {
         .bind(&members_json)
         .bind(&context_json)
         .bind(&worktree_str)
+        .bind(&budget_json)
+        .bind(team.max_parallel)
         .bind(&team.user_id)
         .bind(&team.name)
         .execute(&self.pool)
@@ -752,8 +819,9 @@ impl TeamPersistenceService for MatrixOneTeamStore {
             sqlx::query(
                 "INSERT INTO team_definitions \
                  (team_id, user_id, name, description, coordination, members_json, \
-                  context_json, worktree_mode, created_at, updated_at) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW(6), NOW(6))",
+                  context_json, worktree_mode, budget_json, max_parallel, \
+                  created_at, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6), NOW(6))",
             )
             .bind(&team.team_id)
             .bind(&team.user_id)
@@ -763,6 +831,8 @@ impl TeamPersistenceService for MatrixOneTeamStore {
             .bind(&members_json)
             .bind(&context_json)
             .bind(&worktree_str)
+            .bind(&budget_json)
+            .bind(team.max_parallel)
             .execute(&self.pool)
             .await
             .map_err(|e| format!("team INSERT failed: {e}"))?;
@@ -775,7 +845,7 @@ impl TeamPersistenceService for MatrixOneTeamStore {
         let row = sqlx::query(
             "SELECT team_id, user_id, name, description, coordination, \
                     members_json, context_json, worktree_mode, \
-                    created_at, updated_at \
+                    budget_json, max_parallel, created_at, updated_at \
              FROM team_definitions WHERE user_id = ? AND name = ?",
         )
         .bind(user_id)
@@ -797,7 +867,7 @@ impl TeamPersistenceService for MatrixOneTeamStore {
         let rows = sqlx::query(
             "SELECT team_id, user_id, name, description, coordination, \
                     members_json, context_json, worktree_mode, \
-                    created_at, updated_at \
+                    budget_json, max_parallel, created_at, updated_at \
              FROM team_definitions WHERE user_id = ? ORDER BY name",
         )
         .bind(user_id)
@@ -932,6 +1002,7 @@ impl TeamPersistenceService for MatrixOneTeamStore {
         &self,
         team_name: &str,
         user_id: &str,
+        limit: u32,
     ) -> Result<Vec<TeamSnapshotRecord>, String> {
         use sqlx::Row;
 
@@ -939,11 +1010,13 @@ impl TeamPersistenceService for MatrixOneTeamStore {
             "SELECT snapshot_id, team_name, user_id, label, git_commit, \
                     session_id, team_definition_json, created_at \
              FROM team_snapshots \
-             WHERE team_name = ? AND user_id = ? \
-             ORDER BY created_at DESC",
+             WHERE user_id = ? AND team_name = ? \
+             ORDER BY created_at DESC \
+             LIMIT ?",
         )
-        .bind(team_name)
         .bind(user_id)
+        .bind(team_name)
+        .bind(limit)
         .fetch_all(&self.pool)
         .await
         .map_err(|e| format!("snapshot SELECT failed: {e}"))?;
@@ -1019,6 +1092,8 @@ fn row_to_team_definition(row: &sqlx::mysql::MySqlRow) -> Result<TeamDefinition,
     let wt_str: String = row
         .try_get("worktree_mode")
         .unwrap_or_else(|_| "shared".to_string());
+    let budget_str: Option<String> = row.try_get("budget_json").unwrap_or(None);
+    let max_parallel: u32 = row.try_get::<u32, _>("max_parallel").unwrap_or(0);
     let created_at: String = row.try_get::<String, _>("created_at").unwrap_or_default();
     let updated_at: String = row.try_get::<String, _>("updated_at").unwrap_or_default();
 
@@ -1033,6 +1108,11 @@ fn row_to_team_definition(row: &sqlx::mysql::MySqlRow) -> Result<TeamDefinition,
     };
     let worktree_mode: WorktreeMode =
         serde_json::from_str(&format!("\"{wt_str}\"")).unwrap_or_default();
+    let budget: Option<TeamBudget> = budget_str
+        .filter(|s| !s.is_empty())
+        .map(|s| serde_json::from_str(&s))
+        .transpose()
+        .map_err(|e| format!("bad budget JSON: {e}"))?;
 
     Ok(TeamDefinition {
         team_id,
@@ -1043,6 +1123,8 @@ fn row_to_team_definition(row: &sqlx::mysql::MySqlRow) -> Result<TeamDefinition,
         members,
         context,
         worktree_mode,
+        budget,
+        max_parallel,
         created_at,
         updated_at,
     })
@@ -1122,6 +1204,8 @@ pub fn builtin_teams(user_id: &str, now: &str) -> Vec<TeamDefinition> {
             ],
             context: HashMap::new(),
             worktree_mode: WorktreeMode::Shared,
+            budget: None,
+            max_parallel: 0,
             created_at: now.to_string(),
             updated_at: now.to_string(),
         },
@@ -1162,6 +1246,8 @@ pub fn builtin_teams(user_id: &str, now: &str) -> Vec<TeamDefinition> {
             ],
             context: HashMap::new(),
             worktree_mode: WorktreeMode::Shared,
+            budget: None,
+            max_parallel: 0,
             created_at: now.to_string(),
             updated_at: now.to_string(),
         },
@@ -1214,6 +1300,8 @@ pub fn builtin_teams(user_id: &str, now: &str) -> Vec<TeamDefinition> {
             ],
             context: HashMap::new(),
             worktree_mode: WorktreeMode::Isolated,
+            budget: None,
+            max_parallel: 0,
             created_at: now.to_string(),
             updated_at: now.to_string(),
         },
@@ -1257,6 +1345,8 @@ mod tests {
             ],
             context: HashMap::from([("project".to_string(), "test-project".to_string())]),
             worktree_mode: WorktreeMode::Isolated,
+            budget: None,
+            max_parallel: 0,
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
         }
@@ -1698,6 +1788,80 @@ mod tests {
         assert!(validate_team(&team).is_ok());
     }
 
+    #[test]
+    fn validate_team_negative_budget_rejected() {
+        let mut team = test_team();
+        team.budget = Some(TeamBudget {
+            max_cost_usd: -1.0,
+            max_tokens: 100_000,
+            max_duration_secs: 60,
+        });
+        let errs = validate_team(&team).unwrap_err();
+        assert!(errs.iter().any(|e| matches!(e, TeamValidationError::InvalidBudget(_))));
+    }
+
+    #[test]
+    fn validate_team_all_zero_budget_rejected() {
+        let mut team = test_team();
+        team.budget = Some(TeamBudget {
+            max_cost_usd: 0.0,
+            max_tokens: 0,
+            max_duration_secs: 0,
+        });
+        let errs = validate_team(&team).unwrap_err();
+        assert!(errs.iter().any(|e| {
+            matches!(e, TeamValidationError::InvalidBudget(msg) if msg.contains("all limits are zero"))
+        }));
+    }
+
+    #[test]
+    fn validate_team_valid_budget_accepted() {
+        let mut team = test_team();
+        team.budget = Some(TeamBudget {
+            max_cost_usd: 5.0,
+            max_tokens: 100_000,
+            max_duration_secs: 300,
+        });
+        assert!(validate_team(&team).is_ok());
+    }
+
+    #[test]
+    fn budget_serde_roundtrip() {
+        let budget = TeamBudget {
+            max_cost_usd: 10.0,
+            max_tokens: 500_000,
+            max_duration_secs: 600,
+        };
+        let json = serde_json::to_string(&budget).unwrap();
+        let back: TeamBudget = serde_json::from_str(&json).unwrap();
+        assert_eq!(budget, back);
+    }
+
+    #[test]
+    fn team_definition_serde_with_budget() {
+        let mut team = test_team();
+        team.budget = Some(TeamBudget {
+            max_cost_usd: 2.5,
+            max_tokens: 50_000,
+            max_duration_secs: 120,
+        });
+        team.max_parallel = 3;
+        let json = serde_json::to_string(&team).unwrap();
+        let back: TeamDefinition = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.max_parallel, 3);
+        assert_eq!(back.budget.unwrap().max_cost_usd, 2.5);
+    }
+
+    #[test]
+    fn team_definition_serde_without_budget() {
+        let team = test_team();
+        let json = serde_json::to_string(&team).unwrap();
+        assert!(!json.contains("budget"));
+        let back: TeamDefinition = serde_json::from_str(&json).unwrap();
+        assert!(back.budget.is_none());
+        assert_eq!(back.max_parallel, 0);
+    }
+
     // ─── T-2: Resolve with Registry Tests ──────────────────────────────────
 
     #[test]
@@ -2077,7 +2241,7 @@ mod tests {
         store.save_snapshot(&snap).await.unwrap();
 
         // List
-        let list = store.list_snapshots("team-a", "user-1").await.unwrap();
+        let list = store.list_snapshots("team-a", "user-1", 50).await.unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].label, "before refactor");
 
@@ -2115,10 +2279,10 @@ mod tests {
                 .unwrap();
         }
 
-        let a_snaps = store.list_snapshots("team-a", "u1").await.unwrap();
+        let a_snaps = store.list_snapshots("team-a", "u1", 50).await.unwrap();
         assert_eq!(a_snaps.len(), 2);
 
-        let b_snaps = store.list_snapshots("team-b", "u1").await.unwrap();
+        let b_snaps = store.list_snapshots("team-b", "u1", 50).await.unwrap();
         assert_eq!(b_snaps.len(), 1);
     }
 
@@ -2127,6 +2291,39 @@ mod tests {
         let store = InMemoryTeamStore::new();
         let result = store.find_snapshot("nonexistent", "u1").await.unwrap();
         assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn in_memory_store_snapshot_scoped_by_user_id() {
+        let store = InMemoryTeamStore::new();
+        let snap = TeamSnapshotRecord {
+            snapshot_id: "snap-shared-id".to_string(),
+            team_name: "team-x".to_string(),
+            user_id: "alice".to_string(),
+            label: "alice snap".to_string(),
+            git_commit: None,
+            session_id: None,
+            team_definition_json: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+        store.save_snapshot(&snap).await.unwrap();
+
+        assert!(store.find_snapshot("snap-shared-id", "bob").await.unwrap().is_none());
+        assert!(
+            store
+                .list_snapshots("team-x", "bob", 50)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let deleted = store
+            .delete_snapshot("snap-shared-id", "bob")
+            .await
+            .unwrap();
+        assert!(!deleted, "other user must not delete alice snapshot");
+
+        assert!(store.find_snapshot("snap-shared-id", "alice").await.unwrap().is_some());
     }
 
     #[tokio::test]
