@@ -96,6 +96,7 @@ pub mod sync_adapters;
 pub mod tool_registry;
 pub mod tool_selector;
 pub mod turn;
+pub mod user_profile;
 
 // ── Re-exports: core primitives ──────────────────────────────────────────────
 
