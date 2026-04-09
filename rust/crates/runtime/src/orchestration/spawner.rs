@@ -125,6 +125,8 @@ pub struct SpawnRunConfig {
     pub working_dir: PathBuf,
     /// Optional mailbox for inter-agent messaging.
     pub mailbox: Option<crate::messaging::router::AgentMailbox>,
+    /// Optional progress emitter for broadcasting turn completion events.
+    pub progress_emitter: Option<super::progress::AgentProgressEmitter>,
 }
 
 impl std::fmt::Debug for SpawnRunConfig {
@@ -283,6 +285,7 @@ impl DynamicAgentSpawner {
             read_only: agent_def.read_only,
             working_dir: context.working_dir.clone(),
             mailbox,
+            progress_emitter: Some(emitter.clone()),
         };
 
         // 8. Execute or launch
