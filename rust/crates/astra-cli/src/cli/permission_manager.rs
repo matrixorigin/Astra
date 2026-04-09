@@ -442,19 +442,7 @@ impl PermissionManager {
         if let Some(p) = path.filter(|s| !s.is_empty()) {
             eprintln!("{}", format!("     path: {p}").dim());
         }
-        match Self::prompt_approval() {
-            'y' => ApprovalDecision::Allow,
-            'a' => {
-                self.session_overrides.insert(tool.to_string(), true);
-                eprintln!("{}", format!("  ✓ {tool}: allowed for this session").dim());
-                ApprovalDecision::AllowSession
-            }
-            's' => {
-                self.session_overrides.insert(tool.to_string(), false);
-                ApprovalDecision::Deny
-            }
-            _ => ApprovalDecision::Deny,
-        }
+        self.apply_cloud_approval_choice(tool, Self::prompt_approval())
     }
 
     fn classify(name: &str) -> SideEffect {
@@ -649,13 +637,13 @@ impl PermissionManager {
 
         // Styled prompt: highlight key letters, dim separators
         eprint!(
-            "  {} {}es · {}o · {}lways · {}uto-run · {}kip  {} ",
+            "  {} {} · {} · {} · {} · {}  {} ",
             "▸".cyan(),
-            "y".cyan().bold(),
-            "n".cyan().bold(),
-            "a".cyan().bold(),
-            "!".cyan().bold(),
-            "s".cyan().bold(),
+            "[y] yes".cyan().bold(),
+            "[n] no".cyan().bold(),
+            "[a] always tool".cyan().bold(),
+            "[!] auto-run session".cyan().bold(),
+            "[s] skip tool".cyan().bold(),
             "→".dim(),
         );
         let _ = io::stderr().flush();
@@ -680,10 +668,10 @@ impl PermissionManager {
             drop(_guard);
             let label: String = match result {
                 'y' => format!("{}", "yes".green()),
-                'a' => format!("{}", "always".green()),
+                'a' => format!("{}", "always tool".green()),
                 'n' => format!("{}", "no".red()),
-                's' => format!("{}", "skip".yellow()),
-                '!' => format!("{}", "auto-run".green()),
+                's' => format!("{}", "skip tool".yellow()),
+                '!' => format!("{}", "auto-run session".green()),
                 c => c.to_string(),
             };
             eprintln!("{label}");
@@ -693,6 +681,38 @@ impl PermissionManager {
             let _ = io::stdin().read_line(&mut response);
             let ch = response.trim().to_lowercase().chars().next().unwrap_or('n');
             if response.trim() == "!" { '!' } else { ch }
+        }
+    }
+
+    fn apply_cloud_approval_choice(
+        &mut self,
+        tool: &str,
+        choice: char,
+    ) -> astra_thin_client::ApprovalDecision {
+        use astra_thin_client::ApprovalDecision;
+
+        match choice {
+            'y' => ApprovalDecision::Allow,
+            'a' => {
+                self.session_overrides.insert(tool.to_string(), true);
+                eprintln!("{}", format!("  ✓ {tool}: allowed for this session").dim());
+                ApprovalDecision::AllowSession
+            }
+            '!' => {
+                self.set_mode(PermissionMode::Auto);
+                eprintln!(
+                    "  {}",
+                    "  ⚡ Auto-run enabled for this session. Use /allow prompt to restore."
+                        .yellow()
+                );
+                ApprovalDecision::Allow
+            }
+            's' => {
+                self.session_overrides.insert(tool.to_string(), false);
+                eprintln!("  {}", format!("  ✗ {tool}: skipped for session").dim());
+                ApprovalDecision::Deny
+            }
+            _ => ApprovalDecision::Deny,
         }
     }
 
@@ -1502,6 +1522,39 @@ mod tests {
         let mut pm = PermissionManager::with_project_mode(PermissionMode::Auto, dir.path());
         let decision = pm.resolve_cloud_approval("bash", Some("/tmp"), false);
         assert_eq!(decision, astra_thin_client::ApprovalDecision::Allow);
+    }
+
+    #[test]
+    fn cloud_approval_auto_run_switches_session_to_auto() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
+
+        let decision = pm.apply_cloud_approval_choice("bash", '!');
+
+        assert_eq!(decision, astra_thin_client::ApprovalDecision::Allow);
+        assert_eq!(pm.mode, PermissionMode::Auto);
+    }
+
+    #[test]
+    fn cloud_approval_always_sets_session_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
+
+        let decision = pm.apply_cloud_approval_choice("bash", 'a');
+
+        assert_eq!(decision, astra_thin_client::ApprovalDecision::AllowSession);
+        assert_eq!(pm.session_overrides.get("bash"), Some(&true));
+    }
+
+    #[test]
+    fn cloud_approval_skip_sets_session_deny_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
+
+        let decision = pm.apply_cloud_approval_choice("bash", 's');
+
+        assert_eq!(decision, astra_thin_client::ApprovalDecision::Deny);
+        assert_eq!(pm.session_overrides.get("bash"), Some(&false));
     }
 
     #[test]
