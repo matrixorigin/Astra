@@ -219,6 +219,7 @@ pub enum StreamEvent {
         request_id: String,
         tool: String,
         path: Option<String>,
+        detail: Option<String>,
         raw: Value,
     },
     Error {
@@ -333,6 +334,15 @@ pub fn classify_stream_event(value: Value) -> Result<StreamEvent, crate::error::
                 .get("path")
                 .and_then(|v| v.as_str())
                 .map(std::string::ToString::to_string),
+            detail: obj
+                .get("detail")
+                .and_then(|v| v.as_str())
+                .map(std::string::ToString::to_string)
+                .or_else(|| {
+                    obj.get("path")
+                        .and_then(|v| v.as_str())
+                        .map(std::string::ToString::to_string)
+                }),
             raw,
         },
         "error" => StreamEvent::Error {

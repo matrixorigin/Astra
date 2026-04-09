@@ -753,13 +753,13 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         &mut self,
         request_id: &str,
         tool: &str,
-        path: Option<&str>,
+        detail: Option<&str>,
     ) -> EdgeApprovalResult {
         // `resolve_cloud_approval` writes to stderr only. Never bump `lines_written` here:
         // that counter drives stdout `MoveUp` when clearing streamed text before the first
         // tool line; mixing in stderr line counts caused a large blank gap after prompts.
         let decision = match &mut self.perm_manager {
-            Some(pm) => pm.resolve_cloud_approval(tool, path, self.quiet),
+            Some(pm) => pm.resolve_cloud_approval(tool, detail, self.quiet),
             None => astra_thin_client::ApprovalDecision::Deny,
         };
         let decision_str = match &decision {
@@ -2034,18 +2034,18 @@ mod tests {
         let mut r = TurnResult::new();
         let mut s = StreamRenderState::new();
         let mut pending = Vec::new();
-        let block = "data: {\"type\":\"approval_required\",\"request_id\":\"ap-1\",\"tool\":\"write_file\",\"path\":\"src/x.rs\"}\n\n";
+        let block = "data: {\"type\":\"approval_required\",\"request_id\":\"ap-1\",\"tool\":\"write_file\",\"path\":\"src/x.rs\",\"detail\":\"src/x.rs\"}\n\n";
         dispatch_turn_event_block(block, &mut r, &mut s, true, &mut pending);
         assert_eq!(pending.len(), 1);
         match &pending[0] {
             ChatTurnEdgePending::ApprovalRequired {
                 request_id,
                 tool,
-                path,
+                detail,
             } => {
                 assert_eq!(request_id, "ap-1");
                 assert_eq!(tool, "write_file");
-                assert_eq!(path.as_deref(), Some("src/x.rs"));
+                assert_eq!(detail.as_deref(), Some("src/x.rs"));
             }
             _ => panic!("expected ApprovalRequired"),
         }

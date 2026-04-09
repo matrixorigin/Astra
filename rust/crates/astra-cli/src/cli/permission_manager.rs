@@ -411,7 +411,7 @@ impl PermissionManager {
     pub(super) fn resolve_cloud_approval(
         &mut self,
         tool: &str,
-        path: Option<&str>,
+        detail: Option<&str>,
         quiet: bool,
     ) -> astra_thin_client::ApprovalDecision {
         use astra_thin_client::ApprovalDecision;
@@ -439,8 +439,8 @@ impl PermissionManager {
             "{}",
             format!("  ☁  Cloud approval required: {tool}").yellow()
         );
-        if let Some(p) = path.filter(|s| !s.is_empty()) {
-            eprintln!("{}", format!("     path: {p}").dim());
+        if let Some(detail) = detail.filter(|s| !s.is_empty()) {
+            eprintln!("{}", format!("     {detail}").dim());
         }
         self.apply_cloud_approval_choice(tool, Self::prompt_approval())
     }

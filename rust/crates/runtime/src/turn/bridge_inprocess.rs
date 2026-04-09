@@ -55,8 +55,8 @@ use crate::{
     build_explain_event, build_stream_error_event, prompts,
     turn::cloud_tool_delivery::{
         cloud_tool_requires_approval_for_delivery, sse_maps_through_tool_request,
-        tool_path_hint_for_delivery, wait_approval_ledger_for_tool,
-        wait_tool_result_ledger_for_tool,
+        tool_approval_detail_for_delivery, tool_path_hint_for_delivery,
+        wait_approval_ledger_for_tool, wait_tool_result_ledger_for_tool,
     },
     turn::edge_ledger::{
         assistant_message_with_tool_calls_and_reasoning, ensure_tool_call_ids,
@@ -1016,7 +1016,10 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
 
         // Parse request body
         let payload: Value = serde_json::from_slice(&body).unwrap_or(json!({}));
-        let agent_id = payload.get("agent_id").and_then(Value::as_str).map(ToString::to_string);
+        let agent_id = payload
+            .get("agent_id")
+            .and_then(Value::as_str)
+            .map(ToString::to_string);
         let messages = payload
             .get("messages")
             .and_then(Value::as_array)
@@ -1834,8 +1837,12 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                         .and_then(Value::as_str)
                         .unwrap_or("");
                     let path = tool_path_hint_for_delivery(tc);
+                    let detail = tool_approval_detail_for_delivery(tc);
                     yield render_sse_map(&build_approval_required_event(
-                        id, tool_name, path.as_deref(),
+                        id,
+                        tool_name,
+                        path.as_deref(),
+                        detail.as_deref(),
                     ));
                     match wait_approval_ledger_for_tool(
                         &edge_callback_ledger, &user_id, tc, ledger_wait,

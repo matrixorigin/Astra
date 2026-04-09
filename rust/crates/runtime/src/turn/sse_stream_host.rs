@@ -138,7 +138,7 @@ pub trait SseStreamHost: Send {
         &mut self,
         request_id: &str,
         tool: &str,
-        path: Option<&str>,
+        detail: Option<&str>,
     ) -> EdgeApprovalResult;
 }
 
@@ -342,13 +342,13 @@ async fn flush_pending_via_host<H: SseStreamHost>(
             ChatTurnEdgePending::ApprovalRequired {
                 request_id,
                 tool,
-                path,
+                detail,
             } => {
                 if request_id.is_empty() {
                     continue;
                 }
                 let result = host
-                    .resolve_approval(&request_id, &tool, path.as_deref())
+                    .resolve_approval(&request_id, &tool, detail.as_deref())
                     .await;
                 approval_results.push(result);
             }
@@ -391,7 +391,7 @@ impl SseStreamHost for NoopSseStreamHost {
         &mut self,
         request_id: &str,
         _tool: &str,
-        _path: Option<&str>,
+        _detail: Option<&str>,
     ) -> EdgeApprovalResult {
         EdgeApprovalResult {
             request_id: request_id.to_string(),
@@ -464,7 +464,7 @@ impl SseStreamHost for RecordingSseStreamHost {
         &mut self,
         request_id: &str,
         _tool: &str,
-        _path: Option<&str>,
+        _detail: Option<&str>,
     ) -> EdgeApprovalResult {
         EdgeApprovalResult {
             request_id: request_id.to_string(),
@@ -594,7 +594,7 @@ mod tests {
     async fn recording_host_approval_resolved() {
         let events = sse_event(
             "approval_required",
-            ",\"request_id\":\"ap-1\",\"tool\":\"write_file\",\"path\":\"src/x.rs\"",
+            ",\"request_id\":\"ap-1\",\"tool\":\"write_file\",\"path\":\"src/x.rs\",\"detail\":\"src/x.rs\"",
         );
         let chunks = chunks_from_sse(&events);
         let mut stream = stream::iter(chunks);

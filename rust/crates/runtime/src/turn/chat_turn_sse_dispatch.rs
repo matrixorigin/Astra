@@ -39,7 +39,7 @@ pub enum ChatTurnEdgePending {
     ApprovalRequired {
         request_id: String,
         tool: String,
-        path: Option<String>,
+        detail: Option<String>,
     },
 }
 
@@ -127,15 +127,21 @@ fn apply_one_event(
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let path = event
-                .get("path")
+            let detail = event
+                .get("detail")
                 .and_then(|v| v.as_str())
-                .map(std::string::ToString::to_string);
+                .map(std::string::ToString::to_string)
+                .or_else(|| {
+                    event
+                        .get("path")
+                        .and_then(|v| v.as_str())
+                        .map(std::string::ToString::to_string)
+                });
             if !request_id.is_empty() {
                 edge_pending.push(ChatTurnEdgePending::ApprovalRequired {
                     request_id,
                     tool,
-                    path,
+                    detail,
                 });
             }
         }
@@ -501,18 +507,18 @@ mod tests {
     fn approval_required_enqueues_pending() {
         let mut a = ChatTurnSseAccum::default();
         let mut pending = Vec::new();
-        let block = "data: {\"type\":\"approval_required\",\"request_id\":\"ap-1\",\"tool\":\"write_file\",\"path\":\"src/x.rs\"}\n\n";
+        let block = "data: {\"type\":\"approval_required\",\"request_id\":\"ap-1\",\"tool\":\"write_file\",\"path\":\"src/x.rs\",\"detail\":\"src/x.rs\"}\n\n";
         dispatch_chat_turn_sse_event_block(block, &mut a, &mut pending);
         assert_eq!(pending.len(), 1);
         match &pending[0] {
             ChatTurnEdgePending::ApprovalRequired {
                 request_id,
                 tool,
-                path,
+                detail,
             } => {
                 assert_eq!(request_id, "ap-1");
                 assert_eq!(tool, "write_file");
-                assert_eq!(path.as_deref(), Some("src/x.rs"));
+                assert_eq!(detail.as_deref(), Some("src/x.rs"));
             }
             _ => panic!("expected ApprovalRequired"),
         }

@@ -29,7 +29,7 @@ pub fn command_hint_from_args(args: &Value) -> Option<&str> {
     args.get("command").and_then(Value::as_str)
 }
 
-/// One-line detail next to the CLI permission icon (aligned with cloud `approval_required` path).
+/// One-line detail next to the CLI permission icon and cloud `approval_required` prompts.
 pub fn permission_prompt_primary_detail(tool_name: &str, args: &Value) -> Option<String> {
     // MCP tools: show a compact summary of arguments since they don't have
     // standard "command" or "path" keys.

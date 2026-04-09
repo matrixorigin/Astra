@@ -158,6 +158,7 @@ pub fn build_approval_required_event(
     request_id: &str,
     tool_name: &str,
     path: Option<&str>,
+    detail: Option<&str>,
 ) -> Map<String, Value> {
     let mut m = Map::from_iter([
         (
@@ -172,6 +173,9 @@ pub fn build_approval_required_event(
     ]);
     if let Some(p) = path.filter(|s| !s.is_empty()) {
         m.insert("path".to_string(), Value::String(p.to_string()));
+    }
+    if let Some(d) = detail.filter(|s| !s.is_empty()) {
+        m.insert("detail".to_string(), Value::String(d.to_string()));
     }
     m
 }
@@ -207,7 +211,7 @@ mod tests {
 
     #[test]
     fn approval_required_includes_optional_path() {
-        let ev = build_approval_required_event("a1", "write_file", Some("p/x.rs"));
+        let ev = build_approval_required_event("a1", "write_file", Some("p/x.rs"), None);
         assert_eq!(
             ev.get("type").and_then(Value::as_str),
             Some("approval_required")
@@ -215,6 +219,12 @@ mod tests {
         assert_eq!(ev.get("request_id").and_then(Value::as_str), Some("a1"));
         assert_eq!(ev.get("tool").and_then(Value::as_str), Some("write_file"));
         assert_eq!(ev.get("path").and_then(Value::as_str), Some("p/x.rs"));
+    }
+
+    #[test]
+    fn approval_required_includes_optional_detail() {
+        let ev = build_approval_required_event("a1", "bash", None, Some("git status"));
+        assert_eq!(ev.get("detail").and_then(Value::as_str), Some("git status"));
     }
 
     #[test]
@@ -442,14 +452,16 @@ mod tests {
 
     #[test]
     fn approval_required_omits_empty_path() {
-        let ev = build_approval_required_event("r1", "bash", Some(""));
+        let ev = build_approval_required_event("r1", "bash", Some(""), Some(""));
         assert!(ev.get("path").is_none());
+        assert!(ev.get("detail").is_none());
     }
 
     #[test]
     fn approval_required_omits_none_path() {
-        let ev = build_approval_required_event("r1", "bash", None);
+        let ev = build_approval_required_event("r1", "bash", None, None);
         assert!(ev.get("path").is_none());
+        assert!(ev.get("detail").is_none());
     }
 
     #[test]

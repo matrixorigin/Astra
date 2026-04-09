@@ -17,7 +17,9 @@ use super::edge_ledger::{
 use super::stream_events::{
     build_approval_required_event, build_edge_tool_call_event, build_tool_request_event,
 };
-use super::tool_argument_hints::{normalize_llm_function_arguments, path_hint_from_args};
+use super::tool_argument_hints::{
+    normalize_llm_function_arguments, path_hint_from_args, permission_prompt_primary_detail,
+};
 
 pub const MSG_APPROVAL_LEDGER_TIMEOUT: &str =
     "timed out waiting for edge POST /approval/respond (§5.5 ledger)";
@@ -63,6 +65,17 @@ fn tool_path_hint(tool_call: &Value) -> Option<String> {
     let raw = raw_tool_arguments(tool_call);
     let parsed = normalize_llm_function_arguments(&raw);
     path_hint_from_args(&parsed)
+}
+
+fn tool_approval_detail(tool_call: &Value) -> Option<String> {
+    let tool_name = tool_call
+        .get("function")
+        .and_then(|f| f.get("name"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let raw = raw_tool_arguments(tool_call);
+    let parsed = normalize_llm_function_arguments(&raw);
+    permission_prompt_primary_detail(tool_name, &parsed)
 }
 
 pub fn parse_cloud_approval_outcome(entry: Option<&Value>) -> CloudApprovalResult {
@@ -222,6 +235,10 @@ pub(crate) fn tool_path_hint_for_delivery(tool_call: &Value) -> Option<String> {
     tool_path_hint(tool_call)
 }
 
+pub(crate) fn tool_approval_detail_for_delivery(tool_call: &Value) -> Option<String> {
+    tool_approval_detail(tool_call)
+}
+
 pub async fn deliver_tool_calls_through_edge_ledger(
     ledger: &Arc<tokio::sync::Mutex<HashMap<String, Value>>>,
     user_id: &str,
@@ -243,10 +260,12 @@ pub async fn deliver_tool_calls_through_edge_ledger(
 
         if cloud_tool_requires_approval(tc) {
             let path = tool_path_hint(tc);
+            let detail = tool_approval_detail(tc);
             out.sse_maps.push(build_approval_required_event(
                 id,
                 tool_name,
                 path.as_deref(),
+                detail.as_deref(),
             ));
             match wait_approval_ledger_for_tool(ledger, user_id, tc, ledger_wait).await {
                 Ok(()) => {}
@@ -301,10 +320,12 @@ pub async fn deliver_tool_calls_concurrent(
             .and_then(Value::as_str)
             .unwrap_or("");
         let path = tool_path_hint(tc);
+        let detail = tool_approval_detail(tc);
         out.sse_maps.push(build_approval_required_event(
             id,
             tool_name,
             path.as_deref(),
+            detail.as_deref(),
         ));
         match wait_approval_ledger_for_tool(ledger, user_id, tc, ledger_wait).await {
             Ok(()) => {}
@@ -857,5 +878,14 @@ mod tests {
         let hint = tool_path_hint(&tc);
         // bash doesn't have a path arg, so hint may be None
         assert!(hint.is_none() || hint.is_some());
+    }
+
+    #[test]
+    fn tool_approval_detail_extracts_command_for_bash() {
+        let tc = json!({
+            "function": {"name": "bash", "arguments": r#"{"command": "git status"}"#}
+        });
+        let detail = tool_approval_detail(&tc);
+        assert_eq!(detail.as_deref(), Some("git status"));
     }
 }
