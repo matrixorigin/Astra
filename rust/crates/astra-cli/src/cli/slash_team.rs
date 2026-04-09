@@ -1,4 +1,5 @@
 use super::*;
+use crate::current_access_token;
 use astra_runtime::server::team_orchestrator::ExecutionPhase;
 #[allow(unused_imports)]
 use astra_services::team_persistence::{TeamPersistenceService, WorktreeMode};
@@ -346,7 +347,41 @@ fn infer_coordination(team: &Team) -> astra_services::team_persistence::TeamCoor
 
 // ── Slash Command Handler ───────────────────────────────────────────────
 
-pub(super) async fn handle_team_command(arg: &str, state: &mut super::ReplState) {
+async fn ensure_team_run_session(
+    api: &astra_thin_client::ThinClient,
+    profile: Option<&str>,
+    state: &mut super::ReplState,
+) -> Result<String, String> {
+    if let Some(session_id) = state.session_id.clone() {
+        return Ok(session_id);
+    }
+
+    let token = current_access_token(profile).ok_or_else(|| "Not logged in".to_string())?;
+    let body = api
+        .post_sessions_json(&token, &serde_json::json!({}))
+        .await
+        .map_err(map_thin_err)?;
+    let value: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+    let session_id = value
+        .get("session_id")
+        .or_else(|| value.get("id"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "session create response missing session_id".to_string())?
+        .to_string();
+
+    crate::repl_turn::initialize_journal_pub(state, &session_id);
+    crate::repl_turn::persist_last_session_id(profile, &session_id);
+    state.session_id = Some(session_id.clone());
+    Ok(session_id)
+}
+
+pub(super) async fn handle_team_command(
+    arg: &str,
+    api: &astra_thin_client::ThinClient,
+    profile: Option<&str>,
+    state: &mut super::ReplState,
+) {
     let mut parts = arg.splitn(2, ' ');
     let sub = parts.next().unwrap_or("").trim();
     let sub_arg = parts.next().unwrap_or("").trim();
@@ -355,7 +390,9 @@ pub(super) async fn handle_team_command(arg: &str, state: &mut super::ReplState)
         "" | "help" => {
             eprintln!(
                 "\n{}",
-                "─── Team ───────────────────────────────────────".bold().cyan()
+                "─── Team ───────────────────────────────────────"
+                    .bold()
+                    .cyan()
             );
             let teams = state.team_registry.list();
             let names = teams
@@ -397,7 +434,9 @@ pub(super) async fn handle_team_command(arg: &str, state: &mut super::ReplState)
             }
             eprintln!(
                 "\n{}",
-                "─── Teams ───────────────────────────────────────────────".bold().cyan()
+                "─── Teams ───────────────────────────────────────────────"
+                    .bold()
+                    .cyan()
             );
             for t in &teams {
                 let member_names: Vec<_> = t.members.iter().map(|m| m.role.as_str()).collect();
@@ -631,10 +670,13 @@ pub(super) async fn handle_team_command(arg: &str, state: &mut super::ReplState)
                 .ingestion_user_id
                 .clone()
                 .unwrap_or_else(|| "local".into());
-            let session_id = state
-                .session_id
-                .clone()
-                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            let session_id = match ensure_team_run_session(api, profile, state).await {
+                Ok(session_id) => session_id,
+                Err(e) => {
+                    eprintln!("  {} Failed to prepare session: {e}", theme::icon_err());
+                    return;
+                }
+            };
 
             // Convert CLI team → TeamDefinition for the orchestrator
             let team_def = cli_team_to_definition(&cli_team, &user_id);
@@ -718,7 +760,10 @@ pub(super) async fn handle_team_command(arg: &str, state: &mut super::ReplState)
                 );
 
             // Print header
-            eprintln!("\n{}", format!("─── Team Run: {} ───", team_name).bold().cyan());
+            eprintln!(
+                "\n{}",
+                format!("─── Team Run: {} ───", team_name).bold().cyan()
+            );
             for m in &cli_team.members {
                 eprintln!(
                     "    {} {} {}",
@@ -1301,7 +1346,9 @@ pub(super) async fn handle_team_command(arg: &str, state: &mut super::ReplState)
 
             eprintln!(
                 "\n{}",
-                "─── Agent Types ─────────────────────────────────────────".bold().cyan()
+                "─── Agent Types ─────────────────────────────────────────"
+                    .bold()
+                    .cyan()
             );
             for def in all.iter() {
                 let tag = if registry.is_custom(&def.agent_type) {
@@ -1309,11 +1356,7 @@ pub(super) async fn handle_team_command(arg: &str, state: &mut super::ReplState)
                 } else {
                     " (builtin)".dim().to_string()
                 };
-                eprintln!(
-                    "\n  {}{}",
-                    def.agent_type.as_str().cyan().bold(),
-                    tag,
-                );
+                eprintln!("\n  {}{}", def.agent_type.as_str().cyan().bold(), tag,);
                 eprintln!("    {}", def.description.as_str().dim());
                 eprintln!(
                     "    {} {} | {} {} | {}",
@@ -1386,6 +1429,20 @@ fn format_tokens(n: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli_utils::{CredentialsFile, Profile};
+    use axum::{Router, routing::post};
+    use tempfile::tempdir;
+
+    async fn spawn_mock(app: Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base = format!("http://{addr}");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        tokio::task::yield_now().await;
+        base
+    }
 
     #[test]
     fn registry_has_builtin_teams() {
@@ -1648,6 +1705,50 @@ mod tests {
         assert!(hint.contains("run"));
         assert!(hint.contains("restore"));
         assert!(hint.contains("help"));
+    }
+
+    #[tokio::test]
+    async fn ensure_team_run_session_creates_remote_session_when_missing() {
+        let creds_dir = tempdir().unwrap();
+        unsafe {
+            std::env::set_var("ASTRA_CREDENTIALS_DIR", creds_dir.path());
+        }
+
+        let mut creds = CredentialsFile::default();
+        creds.profiles.insert(
+            "default".to_string(),
+            Profile {
+                access_token: Some("team-token".to_string()),
+                ..Default::default()
+            },
+        );
+        save_credentials(&creds).unwrap();
+
+        let app = Router::new().route(
+            "/sessions",
+            post(|| async { axum::Json(serde_json::json!({ "session_id": "team-sess-1" })) }),
+        );
+        let base = spawn_mock(app).await;
+        let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
+        let mut state = ReplState::default();
+
+        let session_id = ensure_team_run_session(&api, None, &mut state)
+            .await
+            .unwrap();
+
+        assert_eq!(session_id, "team-sess-1");
+        assert_eq!(state.session_id.as_deref(), Some("team-sess-1"));
+        assert!(state.journal.is_some());
+
+        let creds = load_credentials();
+        assert_eq!(
+            creds.profiles["default"].last_session_id.as_deref(),
+            Some("team-sess-1")
+        );
+
+        unsafe {
+            std::env::remove_var("ASTRA_CREDENTIALS_DIR");
+        }
     }
 
     // ── Formatting helper tests ─────────────────────────────────

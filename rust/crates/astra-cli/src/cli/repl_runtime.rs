@@ -834,7 +834,7 @@ pub(super) fn current_access_token(profile: Option<&str>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli_utils::CredentialsFile;
+    use crate::cli_utils::{CredentialsFile, Profile};
     use tempfile::tempdir;
 
     fn isolated_sessions_dir() -> (tempfile::TempDir, session_journal::JournalDirGuard) {
