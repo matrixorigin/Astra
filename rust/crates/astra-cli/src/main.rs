@@ -662,7 +662,8 @@ struct MemorySearchArgs {
 
 #[derive(Args, Debug)]
 #[command(
-    after_help = "Examples:\n  astra review\n  astra review working\n  astra review rev HEAD~2"
+    after_help = "Examples:\n  astra review\n  astra review working\n  astra review rev HEAD~2",
+    override_usage = "astra review [head|working|rev <TARGET>|<TARGET>]"
 )]
 struct ReviewArgs {
     #[command(subcommand)]
@@ -691,7 +692,8 @@ struct ReviewTargetArgs {
 
 #[derive(Args, Debug)]
 #[command(
-    after_help = "Examples:\n  astra grep selector\n  astra grep files 'rust/**/*.rs'\n  astra grep review permission"
+    after_help = "Examples:\n  astra grep selector\n  astra grep files 'rust/**/*.rs'\n  astra grep review permission",
+    override_usage = "astra grep <PATTERN> | astra grep content <PATTERN> | astra grep files <GLOB> | astra grep review <PATTERN>"
 )]
 struct GrepArgs {
     #[command(subcommand)]
@@ -800,7 +802,8 @@ enum MessagingSubcommand {
 
 #[derive(Args, Debug)]
 #[command(
-    after_help = "Examples:\n  astra diff\n  astra diff staged\n  astra diff stat rust/crates/astra-cli/src/main.rs\n  astra diff show HEAD~1"
+    after_help = "Examples:\n  astra diff\n  astra diff staged\n  astra diff stat rust/crates/astra-cli/src/main.rs\n  astra diff show HEAD~1",
+    override_usage = "astra diff [<PATH>...] | astra diff staged [<PATH>...] | astra diff unstaged [<PATH>...] | astra diff stat [<PATH>...] | astra diff show <REV> [<PATH>...]"
 )]
 struct DiffArgs {
     #[command(subcommand)]
@@ -10407,6 +10410,18 @@ total_tokens_out: 500
     }
 
     #[test]
+    fn cli_review_command_accepts_plain_revision_target() {
+        let cli = Cli::try_parse_from(["astra", "review", "HEAD~2"]).unwrap();
+        match cli.command {
+            Some(Command::Review(args)) => {
+                assert!(args.command.is_none());
+                assert_eq!(args.target, vec!["HEAD~2"]);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
     fn cli_grep_command_accepts_default_pattern() {
         let cli = Cli::try_parse_from(["astra", "grep", "tool", "selector"]).unwrap();
         match cli.command {
@@ -10453,6 +10468,19 @@ total_tokens_out: 500
                 }
                 other => panic!("unexpected diff subcommand: {other:?}"),
             },
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_diff_command_accepts_plain_path_filter() {
+        let cli = Cli::try_parse_from(["astra", "diff", "rust/crates/astra-cli/src/main.rs"])
+            .unwrap();
+        match cli.command {
+            Some(Command::Diff(args)) => {
+                assert!(args.command.is_none());
+                assert_eq!(args.paths, vec!["rust/crates/astra-cli/src/main.rs"]);
+            }
             other => panic!("unexpected command: {other:?}"),
         }
     }
