@@ -311,8 +311,8 @@ impl PlanOutputSink for StderrSink {
         eprintln!(
             "\n{}  Plan paused (Ctrl+C). {}% done, {} subtasks remaining.",
             "⏸".yellow(),
-            pct,
-            remaining
+            pct.to_string().cyan(),
+            remaining.to_string().cyan()
         );
         eprintln!(
             "{}  (Interrupt is not sent to the model; this subtask is still in progress.)",

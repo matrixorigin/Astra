@@ -235,7 +235,7 @@ fn eprint_styled_execution_preview(plan: &astra_runtime::plan::TaskPlan) {
             .iter()
             .map(|c| format!("{} ↔ {} ({})", c.subtask_a, c.subtask_b, c.shared_files.join(", ")))
             .collect();
-        eprintln!("{}", strs.join(", "));
+        eprintln!("{}", strs.join(", ").yellow());
     }
 
     let total_effort: usize = plan
@@ -496,7 +496,7 @@ pub async fn handle_plan_mode_input(
     let plan_state = match state.plan_mode.as_mut() {
         Some(ps) => ps,
         None => {
-            eprintln!("  {} {}", "⚠".yellow(), "Not in plan mode".yellow());
+            eprintln!("  {} {}", theme::icon_warn(), "Not in plan mode".yellow());
             return Ok(());
         }
     };
@@ -510,11 +510,11 @@ pub async fn handle_plan_mode_input(
             ClarificationAnswer::Selected(idx) => {
                 let selected = &question.options[idx];
                 pending.record_answer(selected.clone());
-                eprintln!("  {} Selected: {}", theme::icon_ok(), selected);
+                eprintln!("  {} Selected: {}", theme::icon_ok(), selected.as_str().cyan());
             }
             ClarificationAnswer::Freeform(text) => {
                 pending.record_answer(text.clone());
-                eprintln!("  {} Answer: {}", theme::icon_ok(), text);
+                eprintln!("  {} Answer: {}", theme::icon_ok(), text.as_str().cyan());
             }
             ClarificationAnswer::Invalid(msg) => {
                 eprintln!("  {} {}", theme::icon_err(), msg);
@@ -547,7 +547,7 @@ pub async fn handle_plan_mode_input(
         plan_state.pending_clarifications = None;
 
         let Some(tok) = token else {
-            eprintln!("  {} Not logged in. Run /login first.", theme::icon_err());
+            eprintln!("  {} {}", theme::icon_err(), "Not logged in. Run /login first.".red());
             return Ok(());
         };
 
@@ -607,7 +607,7 @@ pub async fn handle_plan_mode_input(
                 }
             }
             Ok(r) => {
-                eprintln!("  {} LLM call failed ({})", theme::icon_err(), r.status());
+                eprintln!("  {} LLM call failed ({})", theme::icon_err(), r.status().to_string().red());
             }
             Err(e) => {
                 eprintln!("  {} Request failed: {}", theme::icon_err(), e);
@@ -688,7 +688,7 @@ pub async fn handle_plan_mode_input(
                 let pct = plan_state.plan.progress_pct();
                 let done_count = plan_state.plan.items_done();
                 let total_count = plan_state.plan.subtasks.len();
-                eprintln!("  {} Completed: {} ({}%)", theme::icon_ok(), title, pct);
+                eprintln!("  {} Completed: {} ({}%)", theme::icon_ok(), title.as_str().cyan(), pct);
                 let _ = plan_state.save_to_file(&PlanModeState::state_path());
 
                 journal_plan_event(
@@ -722,7 +722,7 @@ pub async fn handle_plan_mode_input(
                         eprintln!("    {} [{}] {}", "○".dim(), st.id, st.title);
                     }
                 } else if plan_state.plan.progress_pct() == 100 {
-                    eprintln!("  {} All tasks complete!", "🎉".green());
+                    eprintln!("  {} All tasks complete!", "✓".green());
                     if let Some(ref svc) = state.task_service {
                         use astra_services::TaskService;
                         let user_id = state.ingestion_user_id.as_deref().unwrap_or("local");
@@ -1073,7 +1073,7 @@ async fn handle_plan_command(
                         );
                     }
                     Err(e) => {
-                        eprintln!("{}  Could not persist task: {}", theme::icon_warn(), e);
+                        eprintln!("  {} Could not persist task: {}", theme::icon_warn(), e.to_string().yellow());
                     }
                 }
             }
@@ -1130,7 +1130,7 @@ async fn handle_plan_command(
             } else if state.executing_plan.is_some() {
                 eprintln!("  {} Resuming plan execution...", "▶".cyan());
             } else {
-                eprintln!("  {} No paused plan to resume", theme::icon_warn());
+                eprintln!("  {} {}", theme::icon_warn(), "No paused plan to resume".yellow());
             }
         }
 
@@ -1282,8 +1282,8 @@ async fn handle_plan_command(
                         eprintln!(
                             "  {} Rewound {} subtask(s) from '{}'",
                             theme::icon_ok(),
-                            count,
-                            anchor,
+                            count.to_string().cyan(),
+                            anchor.cyan(),
                         );
                     }
                     Err(e) => eprintln!("  {} {}", theme::icon_err(), e),
@@ -1295,7 +1295,7 @@ async fn handle_plan_command(
                     "pause".cyan()
                 );
             } else if state.plan_mode.is_some() {
-                eprintln!("  {} Rewind is only available during execution", theme::icon_warn());
+                eprintln!("  {} {}", theme::icon_warn(), "Rewind is only available during execution".yellow());
             }
         }
 

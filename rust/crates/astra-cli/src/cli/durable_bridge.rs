@@ -343,19 +343,19 @@ pub fn display_verification_report(report: &SubtaskVerificationReport) {
             let evidence: String = r.evidence.trim().chars().take(200).collect();
             let expected: String = r.expected.chars().take(120).collect();
             eprintln!(
-                "      {} {}{}",
+                "    {} {}{}",
                 "✘".red(),
                 r.criterion_id,
                 dur_tag.dark_grey(),
             );
             if !evidence.is_empty() {
-                eprintln!("        got: {}", evidence.yellow());
+                eprintln!("      {} {}", "got:".dim(), evidence.yellow());
             }
             if !expected.is_empty() {
-                eprintln!("        {} {}", "expected:".dim(), expected);
+                eprintln!("      {} {}", "expected:".dim(), expected);
             }
             if let Some(ref err) = r.error {
-                eprintln!("        error: {}", err.clone().red());
+                eprintln!("      {} {}", "error:".red(), err.clone().red());
             }
         }
     }
@@ -384,7 +384,7 @@ pub async fn on_plan_complete(durable: &mut DurableTaskState) -> bool {
             }
             _ => c.description.clone(),
         };
-        eprintln!("      {} {}", "▸".grey(), cmd_hint);
+        eprintln!("    {} {}", "▸".grey(), cmd_hint);
     }
 
     let spinner = super::stream_render::Spinner::start("Running global checks".into());
@@ -839,7 +839,7 @@ pub fn create_local_lifecycle_full(
     // with dim grey styling so it's visible but doesn't dominate the output.
     lifecycle.set_output_sink(Arc::new(|line: &str| {
         use crossterm::style::Stylize;
-        eprintln!("      {}", line.dark_grey());
+        eprintln!("    {}", line.dark_grey());
     }));
 
     Arc::new(lifecycle)
@@ -882,7 +882,7 @@ pub fn create_cloud_lifecycle_full(
 
     lifecycle.set_output_sink(Arc::new(|line: &str| {
         use crossterm::style::Stylize;
-        eprintln!("      {}", line.dark_grey());
+        eprintln!("    {}", line.dark_grey());
     }));
 
     Arc::new(lifecycle)

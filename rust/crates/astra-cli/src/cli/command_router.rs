@@ -55,7 +55,7 @@ pub(super) async fn execute_cli_command(
             eprintln!("  {} {} on {}", "▸".bold().cyan(), "Starting API server".bold(), addr.to_string().cyan());
             astra_runtime::serve(addr)
                 .await
-                .map_err(|e| format!("Server error: {e}"))?;
+                .map_err(|e| format!("API server failed to start: {e}"))?;
             Ok(ExitCode::Success)
         }
 
@@ -240,7 +240,7 @@ pub(super) async fn execute_cli_command(
             entry.access_token = Some(new_access.to_string());
             entry.refresh_token = Some(new_refresh.to_string());
             save_credentials(&creds)?;
-            println!("token refreshed");
+            println!("  {} {}", theme::icon_ok(), "Token refreshed".green());
             Ok(ExitCode::Success)
         }
 
@@ -318,7 +318,7 @@ pub(super) async fn execute_cli_command(
                 let mut buf = String::new();
                 std::io::stdin()
                     .read_to_string(&mut buf)
-                    .map_err(|e| format!("failed to read stdin: {e}"))?;
+                    .map_err(|e| format!("Could not read input from stdin: {e}"))?;
                 let msg = buf.trim().to_string();
                 if msg.is_empty() {
                     return Err(
@@ -577,7 +577,7 @@ pub(super) async fn execute_cli_command(
                 let _ = clear_profile_last_session(profile.as_deref());
             }
             if body.is_empty() {
-                println!("deleted");
+                println!("  {} {}", theme::icon_ok(), "Deleted".green());
             } else {
                 print_json_or_raw(&body);
             }

@@ -18,7 +18,7 @@ pub(super) fn handle_bug_command(arg: &str, state: &ReplState) {
             } else {
                 eprintln!(
                     "  {} Could not copy to clipboard — printing instead:",
-                    "⚠".yellow()
+                    theme::icon_warn()
                 );
                 eprintln!("{report}");
             }

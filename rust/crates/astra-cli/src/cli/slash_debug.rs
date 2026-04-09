@@ -273,11 +273,11 @@ fn inspect_turn(
     eprintln!(
         "\n  {}{} — {} tool calls, {:.1}s, {}→{}tok",
         format!("Turn {turn_n}").bold(),
-        journal_tag,
-        summary.tool_count,
+        journal_tag.dim(),
+        summary.tool_count.to_string().cyan(),
         summary.duration_ms as f64 / 1000.0,
-        summary.tokens_in,
-        summary.tokens_out,
+        summary.tokens_in.to_string().dim(),
+        summary.tokens_out.to_string().dim(),
     );
 
     if let Some(w) = view.and_then(|v| v.warning.as_deref()) {
@@ -352,7 +352,7 @@ fn show_input(view: Option<&TurnMessagesView>) {
         return;
     }
     let msgs = v.delta.as_slice();
-    eprintln!("\n  {}", "── LLM Input (delta) ──".bold());
+    eprintln!("\n  {}", "── LLM Input (delta) ──".bold().cyan());
     for m in msgs {
         let role = m.get("role").and_then(|v| v.as_str()).unwrap_or("?");
         if role == "assistant" || role == "tool" {
@@ -379,7 +379,7 @@ fn show_output(view: Option<&TurnMessagesView>) {
         return;
     }
     let msgs = v.delta.as_slice();
-    eprintln!("\n  {}", "── LLM Output (delta) ──".bold());
+    eprintln!("\n  {}", "── LLM Output (delta) ──".bold().cyan());
     for m in msgs {
         let role = m.get("role").and_then(|v| v.as_str()).unwrap_or("?");
         if role != "assistant" {
@@ -416,7 +416,7 @@ fn show_output(view: Option<&TurnMessagesView>) {
 }
 
 fn show_tools(view: Option<&TurnMessagesView>, summary: &TurnSummary) {
-    eprintln!("\n  {}", "── Tool Calls ──".bold());
+    eprintln!("\n  {}", "── Tool Calls ──".bold().cyan());
     // From journal (always available)
     for tc in &summary.tool_calls {
         let status = if tc.ok {
@@ -475,7 +475,7 @@ fn show_injected(view: Option<&TurnMessagesView>) {
         return;
     }
     let msgs = v.delta.as_slice();
-    eprintln!("\n  {}", "── Injected Messages (delta) ──".bold());
+    eprintln!("\n  {}", "── Injected Messages (delta) ──".bold().cyan());
     let mut found = false;
     for m in msgs {
         let role = m.get("role").and_then(|v| v.as_str()).unwrap_or("?");
@@ -574,7 +574,7 @@ fn file_name_str(p: &Path) -> Option<String> {
 }
 
 fn show_summary(summary: &TurnSummary) {
-    eprintln!("\n  {}", "── Journal Summary ──".bold());
+    eprintln!("\n  {}", "── Journal Summary ──".bold().cyan());
     eprintln!("  user:     {}", truncate(&summary.user_input, 120));
     eprintln!("  tokens:   {}→{}", summary.tokens_in, summary.tokens_out);
     eprintln!("  duration: {:.1}s", summary.duration_ms as f64 / 1000.0);
@@ -753,7 +753,7 @@ fn show_breakpoints(session_id: &str) {
                 eprintln!("  {}", "(no breakpoints)".dim());
                 return;
             }
-            eprintln!("\n  {}", "── Breakpoints ──".bold());
+            eprintln!("\n  {}", "── Breakpoints ──".bold().cyan());
             for bp in &index.breakpoints {
                 let short_id = &bp.breakpoint_id[..8.min(bp.breakpoint_id.len())];
                 eprintln!(
@@ -781,7 +781,7 @@ fn show_composite_snapshots(session_id: &str) {
 
     eprintln!(
         "\n  {}",
-        format!("─── Composite Snapshots ({}) ───", index.snapshots.len()).bold()
+        format!("─── Composite Snapshots ({}) ───", index.snapshots.len()).bold().cyan()
     );
 
     for snap in &index.snapshots {
@@ -822,7 +822,7 @@ fn show_correction_timeline(session_id: &str) {
         return;
     }
 
-    eprintln!("\n  {}", "── Correction Timeline ──".bold());
+    eprintln!("\n  {}", "── Correction Timeline ──".bold().cyan());
     for evt in &verdicts {
         let turn = evt
             .turn
