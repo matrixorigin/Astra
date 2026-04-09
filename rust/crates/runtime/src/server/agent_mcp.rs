@@ -257,7 +257,6 @@ impl McpLifecycleManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
     fn sample_config() -> McpProjectConfig {
         McpProjectConfig {
@@ -299,7 +298,7 @@ mod tests {
     fn lifecycle_start_stop() {
         let mgr = McpLifecycleManager::new(sample_config());
 
-        let tools = mgr
+        let _tools = mgr
             .start_agent_session("coder-1", &["github".into()])
             .unwrap();
         assert!(mgr.has_session("coder-1"));

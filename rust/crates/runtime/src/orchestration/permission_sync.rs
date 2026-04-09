@@ -699,7 +699,7 @@ mod tests {
 // ─── Permission Request Handler ─────────────────────────────────────────────
 
 use std::sync::Arc;
-use tokio::sync::{RwLock, oneshot};
+use tokio::sync::RwLock;
 
 /// Result of permission decision.
 #[derive(Clone, Debug)]
@@ -754,8 +754,6 @@ pub struct PermissionRequestHandler {
     sync_context: Arc<RwLock<PermissionSyncContext>>,
     /// Callback for making permission decisions.
     callback: Option<PermissionCallback>,
-    /// Pending requests waiting for user interaction (request_id -> response channel).
-    pending_interactive: Arc<RwLock<std::collections::HashMap<String, oneshot::Sender<PermissionResponse>>>>,
 }
 
 impl PermissionRequestHandler {
@@ -764,7 +762,6 @@ impl PermissionRequestHandler {
         Self {
             sync_context,
             callback: None,
-            pending_interactive: Arc::new(RwLock::new(std::collections::HashMap::new())),
         }
     }
     

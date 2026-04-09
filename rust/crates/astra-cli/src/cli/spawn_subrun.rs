@@ -95,7 +95,6 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
 
         // Use the working directory from config (may be a worktree)
         let effective_root = config.working_dir.clone();
-        let effective_root = config.working_dir.clone();
 
         let mut host = SubRunHost {
             api: self.api.clone(),
