@@ -30,5 +30,5 @@ pub use spawner::{
     PermissionSummary, AgentHistoryRecord,
 };
 pub use spawn_tool::{SpawnAgentInput, SpawnAgentOutput, spawn_agent_schema};
-pub use team_config::AgentRegistry;
+pub use team_config::{AgentRegistry, AgentTypeConfig};
 

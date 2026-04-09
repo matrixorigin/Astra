@@ -1286,6 +1286,56 @@ pub(super) async fn handle_team_command(arg: &str, state: &mut super::ReplState)
             eprintln!("  {} Restore complete.\n", theme::icon_ok());
         }
 
+        "agents" => {
+            // /team agents — list all available agent types (builtin + custom)
+            let spawner = match state.agent_spawner.as_ref() {
+                Some(s) => s,
+                None => {
+                    eprintln!("  {} Agent spawner not initialized", theme::icon_err());
+                    return;
+                }
+            };
+            let registry = spawner.agent_registry().read().await;
+            let all = registry.list_all();
+            let custom_count = registry.custom_count();
+            drop(registry);
+
+            eprintln!(
+                "\n{}",
+                "─── Agent Types ─────────────────────────────────────────".bold()
+            );
+            for (i, def) in all.iter().enumerate() {
+                let tag = if i < custom_count {
+                    " (custom)".yellow().to_string()
+                } else {
+                    " (builtin)".dim().to_string()
+                };
+                eprintln!(
+                    "\n  {}{}",
+                    def.agent_type.as_str().cyan().bold(),
+                    tag,
+                );
+                eprintln!("    {}", def.description.as_str().dim());
+                eprintln!(
+                    "    {} {} | {} {} | {}",
+                    "Model:".dim(),
+                    def.default_model.as_str(),
+                    "Max turns:".dim(),
+                    def.max_turns,
+                    if def.read_only {
+                        "read-only".yellow().to_string()
+                    } else {
+                        "read-write".green().to_string()
+                    }
+                );
+            }
+            eprintln!(
+                "\n  {} builtin, {} custom\n",
+                all.len() - custom_count,
+                custom_count
+            );
+        }
+
         _ => {
             eprintln!(
                 "{}",

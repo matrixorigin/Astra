@@ -5,6 +5,7 @@ use crate::messaging::types::AgentAddress;
 use crate::orchestration::context_cache::SharedContextCache;
 use crate::orchestration::progress::{AgentProgressEvent, ProgressBroadcaster, ProgressEventType};
 use crate::orchestration::spawn_tool::{SpawnAgentInput, SpawnAgentOutput};
+use crate::orchestration::team_config::AgentRegistry;
 use crate::server::delegation_engine::SubRunRecord;
 
 use std::collections::HashMap;
@@ -256,6 +257,8 @@ pub struct DynamicAgentSpawner {
     agent_registry: super::team_config::AgentRegistry,
     /// Completed agents archive for history queries.
     completed_agents: Arc<RwLock<Vec<SpawnedAgentState>>>,
+    /// Agent type registry (builtins + user-defined).
+    agent_registry: Arc<RwLock<AgentRegistry>>,
 }
 
 impl DynamicAgentSpawner {
@@ -270,6 +273,7 @@ impl DynamicAgentSpawner {
             session_id: None,
             agent_registry: super::team_config::AgentRegistry::builtins_only(),
             completed_agents: Arc::new(RwLock::new(Vec::new())),
+            agent_registry: Arc::new(RwLock::new(AgentRegistry::default())),
         }
     }
 
@@ -287,6 +291,7 @@ impl DynamicAgentSpawner {
             session_id: None,
             agent_registry: super::team_config::AgentRegistry::builtins_only(),
             completed_agents: Arc::new(RwLock::new(Vec::new())),
+            agent_registry: Arc::new(RwLock::new(AgentRegistry::default())),
         }
     }
 
@@ -702,6 +707,7 @@ impl DynamicAgentSpawner {
             session_id: self.session_id.clone(),
             agent_registry: self.agent_registry.clone(),
             completed_agents: Arc::clone(&self.completed_agents),
+            agent_registry: Arc::clone(&self.agent_registry),
         }
     }
 
