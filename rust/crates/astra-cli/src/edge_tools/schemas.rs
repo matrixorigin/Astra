@@ -1155,6 +1155,7 @@ pub fn all_tool_schemas() -> Vec<Value> {
                                 "call_hierarchy",
                                 "incoming_calls",
                                 "outgoing_calls",
+                                "rename",
                                 "diagnostics"
                             ],
                             "description": "LSP operation to perform"
@@ -1178,6 +1179,14 @@ pub fn all_tool_schemas() -> Vec<Value> {
                         "query": {
                             "type": "string",
                             "description": "Search query for workspace_symbols operation"
+                        },
+                        "new_name": {
+                            "type": "string",
+                            "description": "New identifier name for rename operations"
+                        },
+                        "dry_run": {
+                            "type": "boolean",
+                            "description": "For rename, preview by default. Set false only when falling back to symbol-based application."
                         },
                         "scope": {
                             "type": "string",

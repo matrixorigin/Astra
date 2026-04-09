@@ -170,7 +170,7 @@ impl ToolExecutor {
                 "error": "Missing required 'operation' parameter",
                 "valid_operations": [
                     "goto_definition", "find_references", "hover", "document_symbols",
-                    "workspace_symbols", "call_hierarchy", "incoming_calls", "outgoing_calls", "diagnostics"
+                    "workspace_symbols", "call_hierarchy", "incoming_calls", "outgoing_calls", "rename", "diagnostics"
                 ]
             }).to_string(),
         };
@@ -183,6 +183,8 @@ impl ToolExecutor {
             .map(|c| c as usize);
         let symbol = args.get("symbol").and_then(Value::as_str);
         let query = args.get("query").and_then(Value::as_str);
+        let new_name = args.get("new_name").and_then(Value::as_str);
+        let dry_run = args.get("dry_run").and_then(Value::as_bool).unwrap_or(true);
         let scope = args.get("scope").and_then(Value::as_str).unwrap_or("file");
         let include_body = args
             .get("include_body")
@@ -370,6 +372,55 @@ impl ToolExecutor {
                 }
             }
 
+            "rename" => {
+                let Some(next_name) = new_name.filter(|name| !name.is_empty()) else {
+                    return json!({
+                        "error": "rename requires 'new_name'"
+                    }).to_string();
+                };
+                if let (Some(f), Some(l), Some(c)) = (file, line, column) {
+                    if !dry_run && symbol.is_none() {
+                        return json!({
+                            "error": "position-based rename currently applies as a preview first. For an immediate apply fallback, also provide 'symbol' with dry_run=false."
+                        }).to_string();
+                    }
+                    match self.try_active_position_request(
+                        operation,
+                        f,
+                        l,
+                        c,
+                        "textDocument/rename",
+                        Some(json!({ "newName": next_name })),
+                    ) {
+                        Ok(Some(result)) => result,
+                        Ok(None) => {
+                            if let Some(sym) = symbol {
+                                self.rename_symbol(&json!({
+                                    "symbol": sym,
+                                    "new_name": next_name,
+                                    "dry_run": dry_run
+                                }))
+                            } else {
+                                json!({
+                                    "error": "rename requires an active LSP backend for position-based preview, or 'symbol' for fallback rename_symbol behavior"
+                                }).to_string()
+                            }
+                        }
+                        Err(error) => json!({ "error": error }).to_string(),
+                    }
+                } else if let Some(sym) = symbol {
+                    self.rename_symbol(&json!({
+                        "symbol": sym,
+                        "new_name": next_name,
+                        "dry_run": dry_run
+                    }))
+                } else {
+                    json!({
+                        "error": "rename requires either 'file'+'line'+'column'+'new_name' or 'symbol'+'new_name'"
+                    }).to_string()
+                }
+            }
+
             "diagnostics" => {
                 json!({
                     "capabilities": {
@@ -394,7 +445,7 @@ impl ToolExecutor {
                 "error": format!("Unknown operation: {}", operation),
                 "valid_operations": [
                     "goto_definition", "find_references", "hover", "document_symbols",
-                    "workspace_symbols", "call_hierarchy", "incoming_calls", "outgoing_calls", "diagnostics"
+                    "workspace_symbols", "call_hierarchy", "incoming_calls", "outgoing_calls", "rename", "diagnostics"
                 ]
             }).to_string()
         }
