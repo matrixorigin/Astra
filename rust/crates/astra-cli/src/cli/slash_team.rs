@@ -746,15 +746,15 @@ pub(super) async fn handle_team_command(arg: &str, state: &mut super::ReplState)
             match report.status {
                 astra_runtime::server::team_orchestrator::TeamExecutionStatus::Completed => {
                     eprintln!(
-                        "  {} Team '{}' completed successfully {}",
-                        "✅", team_name.green().bold(),
+                        "  ✅ Team '{}' completed successfully {}",
+                        team_name.green().bold(),
                         format!("({})", format_duration(elapsed)).dim()
                     );
                 }
                 astra_runtime::server::team_orchestrator::TeamExecutionStatus::CompletedWithConflicts => {
                     eprintln!(
-                        "  {} Team '{}' completed with merge conflicts {}",
-                        "⚠️ ", team_name.yellow().bold(),
+                        "  ⚠️  Team '{}' completed with merge conflicts {}",
+                        team_name.yellow().bold(),
                         format!("({})", format_duration(elapsed)).dim()
                     );
                 }
@@ -774,8 +774,7 @@ pub(super) async fn handle_team_command(arg: &str, state: &mut super::ReplState)
             if let Some(ref dr) = report.delegation_result {
                 let total_tokens = dr.total_prompt_tokens + dr.total_completion_tokens;
                 eprintln!(
-                    "\n  {} {} agent{} | {} tokens ({}↑ {}↓) | delegation {}",
-                    "📊",
+                    "\n  📊 {} agent{} | {} tokens ({}↑ {}↓) | delegation {}",
                     dr.agent_results.len(),
                     if dr.agent_results.len() == 1 { "" } else { "s" },
                     format_tokens(total_tokens),
@@ -821,16 +820,14 @@ pub(super) async fn handle_team_command(arg: &str, state: &mut super::ReplState)
                 if merge.conflicts.is_empty() {
                     if !merge.merged.is_empty() {
                         eprintln!(
-                            "\n  {} Merge: {} branch{} merged cleanly",
-                            "🔀",
+                            "\n  🔀 Merge: {} branch{} merged cleanly",
                             merge.merged.len(),
                             if merge.merged.len() == 1 { "" } else { "es" }
                         );
                     }
                 } else {
                     eprintln!(
-                        "\n  {} Merge: {} conflict{}",
-                        "🔀",
+                        "\n  🔀 Merge: {} conflict{}",
                         merge.conflicts.len(),
                         if merge.conflicts.len() == 1 { "" } else { "s" }
                     );
@@ -851,9 +848,7 @@ pub(super) async fn handle_team_command(arg: &str, state: &mut super::ReplState)
                 let has_facts = !learning.facts.is_empty();
                 let has_caution = !learning.cautionary_patterns.is_empty();
                 if has_patterns || has_facts || has_caution {
-                    eprintln!(
-                        "\n  {} Learning from {} agent{}:",
-                        "🧠",
+                    eprintln!("\n  🧠 Learning from {} agent{}:",
                         learning.agent_count,
                         if learning.agent_count == 1 { "" } else { "s" }
                     );
@@ -971,8 +966,7 @@ pub(super) async fn handle_team_command(arg: &str, state: &mut super::ReplState)
 
             if registry_entries.is_empty() && store_entries.is_empty() {
                 eprintln!(
-                    "\n  {} No execution history for team '{}'.",
-                    "📜",
+                    "\n  📜 No execution history for team '{}'.",
                     name.cyan().bold()
                 );
                 eprintln!("  {}", "  Use /team run to execute a task.".dim());
@@ -1218,10 +1212,8 @@ pub(super) async fn handle_team_command(arg: &str, state: &mut super::ReplState)
             }
 
             eprintln!(
-                "\n  {} Restoring team '{}' from snapshot '{}'...",
-                "⏪",
-                name.cyan(),
-                snap.snapshot_id.dim()
+                "\n  ⏪ Restoring team '{}' from snapshot '{}'...",
+                name.cyan(), snap.snapshot_id.dim()
             );
             eprintln!("    {} {}", "Label:".dim(), snap.label);
 

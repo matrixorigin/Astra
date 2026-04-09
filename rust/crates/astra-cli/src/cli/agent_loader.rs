@@ -266,17 +266,14 @@ fn parse_agent_markdown(path: &Path) -> Result<AgentProfile, String> {
 
 /// Simple title-case: "my-agent" → "My Agent".
 fn title_case(s: &str) -> String {
-    s.split(|c: char| c == '-' || c == '_')
+    s.split(['-', '_'])
         .filter(|w| !w.is_empty())
         .map(|w| {
             let mut chars = w.chars();
-            match chars.next() {
-                Some(first) => {
-                    let upper: String = first.to_uppercase().collect();
-                    format!("{upper}{}", chars.as_str())
-                }
-                None => String::new(),
-            }
+            chars.next().map_or(String::new(), |first| {
+                let upper: String = first.to_uppercase().collect();
+                format!("{upper}{}", chars.as_str())
+            })
         })
         .collect::<Vec<_>>()
         .join(" ")
