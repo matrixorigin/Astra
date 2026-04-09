@@ -267,6 +267,12 @@ impl TeamExecutionOrchestrator {
 
         let mut effective_request = request;
 
+        // Inject session_id so sub-runs can find the parent session.
+        effective_request.context.insert(
+            "session_id".to_string(),
+            serde_json::Value::String(self.config.session_id.clone()),
+        );
+
         // Inject budget and max_parallel into request context for downstream consumers
         if let Some(ref budget) = team.budget {
             if let Ok(budget_json) = serde_json::to_value(budget) {
@@ -338,10 +344,28 @@ impl TeamExecutionOrchestrator {
             )
             .await;
 
-        let delegation_result = match self
+        let budget_timeout = team
+            .budget
+            .as_ref()
+            .filter(|b| b.max_duration_secs > 0)
+            .map(|b| std::time::Duration::from_secs(b.max_duration_secs));
+
+        let delegation_future = self
             .delegation_engine
-            .execute(effective_request, &self.config.source_agent_id)
-            .await
+            .execute(effective_request, &self.config.source_agent_id);
+
+        let delegation_outcome = match budget_timeout {
+            Some(dur) => match tokio::time::timeout(dur, delegation_future).await {
+                Ok(r) => r,
+                Err(_) => Err(format!(
+                    "team execution exceeded budget timeout of {}s",
+                    dur.as_secs()
+                )),
+            },
+            None => delegation_future.await,
+        };
+
+        let delegation_result = match delegation_outcome
         {
             Ok(r) => r,
             Err(e) => {

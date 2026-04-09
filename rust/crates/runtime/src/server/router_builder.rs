@@ -93,6 +93,15 @@ pub(super) fn build_router(state: AppState) -> Router {
             "/teams/{name}/executions",
             get(team_handlers::list_executions_handler),
         )
+        .route(
+            "/teams/{name}/snapshots",
+            get(team_handlers::list_snapshots_handler)
+                .post(team_handlers::create_snapshot_handler),
+        )
+        .route(
+            "/teams/snapshots/{id}",
+            delete(team_handlers::delete_snapshot_handler),
+        )
         // Reflect / decision-trace
         .route(
             "/chat/session/{session_id}/reflect",

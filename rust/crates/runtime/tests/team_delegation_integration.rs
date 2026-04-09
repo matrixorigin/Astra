@@ -536,3 +536,136 @@ async fn orchestrator_writes_start_then_complete_not_duplicate() {
     assert_ne!(execs[0].status, "running", "execution should be marked complete");
     assert!(execs[0].completed_at.is_some(), "completed_at should be set");
 }
+
+// ─── Budget Timeout Enforcement ─────────────────────────────────────────────
+
+#[tokio::test]
+async fn budget_timeout_aborts_slow_execution() {
+    use astra_services::team_persistence::TeamBudget;
+
+    let store = Arc::new(InMemoryTeamStore::new());
+
+    let mut team = test_team("slow-team", TeamCoordination::Pipeline, vec![
+        ("worker", Some("Slow worker")),
+    ]);
+    team.budget = Some(TeamBudget {
+        max_cost_usd: 100.0,
+        max_tokens: 1_000_000,
+        max_duration_secs: 1, // 1 second timeout
+    });
+    store.save_team(&team).await.unwrap();
+
+    // Executor that sleeps longer than the budget timeout
+    struct SlowExecutor;
+    #[async_trait]
+    impl SubRunExecutor for SlowExecutor {
+        async fn execute(&self, config: SubRunConfig) -> Result<AgentResult, String> {
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            Ok(AgentResult {
+                agent_id: config.agent_profile.agent_id.clone(),
+                run_id: config.run_id,
+                status: "completed".to_string(),
+                output: Some("done".to_string()),
+                error: None,
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                tool_calls: 0,
+            })
+        }
+    }
+
+    let (orch, _, _) = setup_orchestrator_with_executor(store.clone(), Arc::new(SlowExecutor)).await;
+    let report = orch.execute_team("slow-team", "do work", None).await;
+
+    assert_eq!(report.status, TeamExecutionStatus::Failed);
+    assert!(
+        report.error.as_ref().unwrap().contains("exceeded budget timeout"),
+        "error should mention timeout, got: {:?}",
+        report.error
+    );
+}
+
+#[tokio::test]
+async fn budget_timeout_zero_means_no_limit() {
+    use astra_services::team_persistence::TeamBudget;
+
+    let store = Arc::new(InMemoryTeamStore::new());
+
+    let mut team = test_team("no-limit", TeamCoordination::Pipeline, vec![
+        ("worker", Some("Fast worker")),
+    ]);
+    team.budget = Some(TeamBudget {
+        max_cost_usd: 10.0,
+        max_tokens: 100_000,
+        max_duration_secs: 0, // 0 = no timeout
+    });
+    store.save_team(&team).await.unwrap();
+
+    let (orch, _, _) = setup_orchestrator(store).await;
+    let report = orch.execute_team("no-limit", "do work", None).await;
+
+    // Should complete normally (stub executor is instant)
+    assert_eq!(report.status, TeamExecutionStatus::Completed);
+}
+
+// ─── Max Parallel Enforcement ───────────────────────────────────────────────
+
+#[tokio::test]
+async fn fan_out_respects_max_parallel() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let store = Arc::new(InMemoryTeamStore::new());
+
+    let mut team = test_team("parallel-test", TeamCoordination::FanOut {
+        aggregation: "all_results".into(),
+    }, vec![
+        ("a", Some("Agent A")),
+        ("b", Some("Agent B")),
+        ("c", Some("Agent C")),
+    ]);
+    team.max_parallel = 1; // Only 1 at a time
+    store.save_team(&team).await.unwrap();
+
+    // Executor that tracks peak concurrency
+    struct ConcurrencyTracker {
+        current: AtomicUsize,
+        peak: AtomicUsize,
+    }
+    #[async_trait]
+    impl SubRunExecutor for ConcurrencyTracker {
+        async fn execute(&self, config: SubRunConfig) -> Result<AgentResult, String> {
+            let prev = self.current.fetch_add(1, Ordering::SeqCst);
+            let concurrent = prev + 1;
+            // Update peak
+            self.peak.fetch_max(concurrent, Ordering::SeqCst);
+            // Hold for a bit so other tasks have a chance to start
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            self.current.fetch_sub(1, Ordering::SeqCst);
+            Ok(AgentResult {
+                agent_id: config.agent_profile.agent_id.clone(),
+                run_id: config.run_id,
+                status: "completed".to_string(),
+                output: Some("done".to_string()),
+                error: None,
+                prompt_tokens: 10,
+                completion_tokens: 20,
+                tool_calls: 0,
+            })
+        }
+    }
+
+    let tracker = Arc::new(ConcurrencyTracker {
+        current: AtomicUsize::new(0),
+        peak: AtomicUsize::new(0),
+    });
+
+    let (orch, _, _) = setup_orchestrator_with_executor(store, tracker.clone()).await;
+    let report = orch.execute_team("parallel-test", "do work", None).await;
+
+    assert_eq!(report.status, TeamExecutionStatus::Completed);
+    assert_eq!(
+        tracker.peak.load(Ordering::SeqCst),
+        1,
+        "peak concurrency should be 1 with max_parallel=1"
+    );
+}

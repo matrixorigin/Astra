@@ -1104,12 +1104,28 @@ impl DelegationEngine {
         }
         drop(reg);
 
-        // Execute all sub-runs in parallel via tokio tasks.
+        // Execute sub-runs in parallel, respecting optional max_parallel limit.
+        let max_parallel = request
+            .context
+            .get("team_max_parallel")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize;
+        let semaphore = if max_parallel > 0 {
+            Some(Arc::new(tokio::sync::Semaphore::new(max_parallel)))
+        } else {
+            None
+        };
+
         let mut handles = Vec::new();
         for config in configs {
             let executor = self.executor.clone();
             let run_engine = self.run_engine.clone();
+            let sem = semaphore.clone();
             handles.push(tokio::spawn(async move {
+                let _permit = match sem {
+                    Some(ref s) => Some(s.acquire().await.expect("semaphore closed")),
+                    None => None,
+                };
                 let run_id = config.run_id.clone();
                 let result = executor.execute(config).await;
                 // Persist final status
@@ -1713,7 +1729,17 @@ impl DelegationEngine {
             .and_then(|v| v.as_str())
             .unwrap_or("delegation");
 
-        // Spawn all fork children in parallel
+        // Spawn fork children in parallel, respecting optional max_parallel limit.
+        let max_parallel = request
+            .context
+            .get("team_max_parallel")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize;
+        let fork_semaphore = if max_parallel > 0 {
+            Some(Arc::new(tokio::sync::Semaphore::new(max_parallel)))
+        } else {
+            None
+        };
         let mut handles = Vec::with_capacity(tasks.len());
         for (i, task) in tasks.iter().enumerate() {
             let run_id = uuid::Uuid::new_v4().to_string();
@@ -1799,7 +1825,12 @@ impl DelegationEngine {
 
             let executor = self.executor.clone();
             let run_engine = self.run_engine.clone();
+            let sem = fork_semaphore.clone();
             handles.push(tokio::spawn(async move {
+                let _permit = match sem {
+                    Some(ref s) => Some(s.acquire().await.expect("semaphore closed")),
+                    None => None,
+                };
                 let result = executor.execute(config).await;
                 match &result {
                     Ok(r) => {

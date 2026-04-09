@@ -263,16 +263,20 @@ pub async fn build_server_state(
     .with_run_engine(run_engine)
     .with_delegation_engine(Arc::clone(&delegation_engine));
     // Wire team persistence store backed by MatrixOne.
-    let team_store: Arc<dyn astra_services::team_persistence::TeamPersistenceService> = Arc::new(
-        astra_services::team_persistence::MatrixOneTeamStore::new(shared_pool.get().clone()),
-    );
+    let team_store =
+        astra_services::team_persistence::MatrixOneTeamStore::new(shared_pool.get().clone());
+    let user_id = std::env::var("MO_USER_ID").unwrap_or_else(|_| "local".to_string());
+    if let Err(e) = team_store.ensure_builtins(&user_id).await {
+        eprintln!("[state_builder] team builtins seed failed: {e}");
+    }
+    let team_store: Arc<dyn astra_services::team_persistence::TeamPersistenceService> =
+        Arc::new(team_store);
     let state = state
         .with_run_lifecycle_service(Arc::new(run_lifecycle))
         .with_agent_profile_registry(profile_registry)
         .with_delegation_engine(delegation_engine)
         .with_team_store(team_store);
 
-    let user_id = std::env::var("MO_USER_ID").unwrap_or_else(|_| "local".to_string());
     let matrix_rt = Arc::new(crate::matrix_cloud_runtime::MatrixCloudRuntime::attach(
         shared_pool.clone(),
         "default",
