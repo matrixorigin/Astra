@@ -135,8 +135,8 @@ use astra_runtime::turn::chat_turn_heuristics::{
 use auth_flow::{clear_profile_last_session, do_login, do_register};
 use chat_stream::{ChatTurnParams, stream_chat_sse};
 use cli_utils::{
-    compact_or_raw, get_profile_and_token, interactive_select, load_credentials,
-    map_thin_err, prefix_chars, print_json_or_raw, profile_name, prompt_or, prompt_password_masked,
+    compact_or_raw, get_profile_and_token, interactive_select, load_credentials, map_thin_err,
+    prefix_chars, print_json_or_raw, profile_name, prompt_or, prompt_password_masked,
     resumable_last_session_id, save_credentials, truncate_str, urlencoding,
 };
 use command_router::{ExitCode, execute_cli_command, run_print_mode};
@@ -6240,19 +6240,7 @@ async fn handle_slash_command(
 
         "/exit" | "/quit" => {
             eprintln!("{}", "  Goodbye.".dim());
-            // Journal + ingestion: session end (same as Ctrl+D path)
-            if let Some(ref j) = state.journal {
-                let end_event = session_journal::JournalEvent::session_end(
-                    state.session_id.as_deref(),
-                    state.turn,
-                );
-                let _ = j.append(&end_event);
-                repl_turn::enqueue_ingestion_pub(state, &end_event);
-            }
-            if let Some(mc) = state.matrix_runtime.as_ref() {
-                mc.shutdown_ingestion_and_wait().await;
-            }
-            clear_panic_guard();
+            finalize_session(state).await;
             if state.turn > 0
                 && let Some(ref sid) = state.session_id
             {
@@ -6521,13 +6509,9 @@ async fn run_chat_repl(
         if let Some(ref mc) = state.matrix_runtime {
             let pool = mc.shared_pool().get().clone();
             let user_id = std::env::var("MO_USER_ID").unwrap_or_else(|_| "local".to_string());
-            let mo_team_store =
-                astra_services::team_persistence::MatrixOneTeamStore::new(pool);
+            let mo_team_store = astra_services::team_persistence::MatrixOneTeamStore::new(pool);
             if let Err(e) = mo_team_store.ensure_builtins(&user_id).await {
-                eprintln!(
-                    "  {} team store builtins: {e}",
-                    theme::icon_warn()
-                );
+                eprintln!("  {} team store builtins: {e}", theme::icon_warn());
             }
             state.team_store = std::sync::Arc::new(mo_team_store);
         }
@@ -7040,20 +7024,7 @@ async fn run_chat_repl(
             Err(ReadlineError::Eof) => {
                 clear_slash_overlay();
                 eprintln!("{}", "\nGoodbye.".dim());
-                // Journal: session end
-                if let Some(ref j) = state.journal {
-                    let end_event = session_journal::JournalEvent::session_end(
-                        state.session_id.as_deref(),
-                        state.turn,
-                    );
-                    let _ = j.append(&end_event);
-                    repl_turn::enqueue_ingestion_pub(&state, &end_event);
-                }
-                // Graceful ingestion shutdown: await worker flush to ensure short sessions sync
-                if let Some(mc) = state.matrix_runtime.as_ref() {
-                    mc.shutdown_ingestion_and_wait().await;
-                }
-                clear_panic_guard();
+                finalize_session(&state).await;
                 // Show resume hint if session had any turns
                 if state.turn > 0
                     && let Some(ref sid) = state.session_id
@@ -7077,19 +7048,7 @@ async fn run_chat_repl(
                     "Input error — exiting session.".red()
                 );
                 eprintln!("{}", format!("  ({e})").dim());
-                // Journal + ingestion: session end on error exit
-                if let Some(ref j) = state.journal {
-                    let end_event = session_journal::JournalEvent::session_end(
-                        state.session_id.as_deref(),
-                        state.turn,
-                    );
-                    let _ = j.append(&end_event);
-                    repl_turn::enqueue_ingestion_pub(&state, &end_event);
-                }
-                if let Some(mc) = state.matrix_runtime.as_ref() {
-                    mc.shutdown_ingestion_and_wait().await;
-                }
-                clear_panic_guard();
+                finalize_session(&state).await;
                 break;
             }
         }
@@ -7200,6 +7159,221 @@ async fn run_chat_repl(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Session finalization — shared logic for all exit paths
+// ---------------------------------------------------------------------------
+
+/// Finalize session: write journal end event, persist workspace, extract learnings,
+/// flush ingestion, and clear panic guard. Deduplicated from 3 exit paths.
+async fn finalize_session(state: &ReplState) {
+    // 1. Journal: session end event
+    if let Some(ref j) = state.journal {
+        let end_event =
+            session_journal::JournalEvent::session_end(state.session_id.as_deref(), state.turn);
+        let _ = j.append(&end_event);
+        repl_turn::enqueue_ingestion_pub(state, &end_event);
+    }
+    // 2. Finalize workspace: persist compact summary + mark completed
+    if state.turn > 0 {
+        if let Some(ref sid) = state.session_id {
+            astra_services::session_workspace::finalize_workspace_on_end(sid);
+        }
+    }
+    // 3. Session-end knowledge extraction (opt-in, async with timeout)
+    let knowledge_handle = session_end_extract_learnings(&state.history);
+    // 4. Graceful ingestion shutdown: await worker flush
+    if let Some(mc) = state.matrix_runtime.as_ref() {
+        mc.shutdown_ingestion_and_wait().await;
+    }
+    // 5. Await knowledge extraction with timeout
+    await_knowledge_extraction(knowledge_handle).await;
+    // 6. Clear panic guard
+    clear_panic_guard();
+}
+
+// ---------------------------------------------------------------------------
+// Session-end knowledge extraction → .astra/knowledge.md
+// ---------------------------------------------------------------------------
+
+/// Extract learnings from the session and append to `.astra/knowledge.md`.
+///
+/// This is opt-in: gated behind `MO_SESSION_KNOWLEDGE_EXTRACT_ON_END=true`.
+/// Returns `Option<JoinHandle>` — callers should await with timeout at exit.
+fn session_end_extract_learnings(
+    history: &[(String, String)],
+) -> Option<tokio::task::JoinHandle<()>> {
+    // Gate: explicit opt-in required (involves extra LLM call)
+    if std::env::var("MO_SESSION_KNOWLEDGE_EXTRACT_ON_END")
+        .unwrap_or_default()
+        .to_lowercase()
+        != "true"
+    {
+        return None;
+    }
+
+    // Need LLM params and at least a few turns of history
+    let params = astra_runtime::turn::cloud::summary::LlmConnParams::from_env()?;
+    if history.len() < 3 {
+        return None;
+    }
+
+    // Convert history to messages for the prompt
+    let recent_messages: Vec<serde_json::Value> = history
+        .iter()
+        .rev()
+        .take(20)
+        .rev()
+        .flat_map(|(user, asst)| {
+            vec![
+                serde_json::json!({"role": "user", "content": user}),
+                serde_json::json!({"role": "assistant", "content": asst}),
+            ]
+        })
+        .collect();
+
+    // Build a summary of the conversation as "session memory" input.
+    // Include both user messages and truncated assistant responses to capture
+    // problem-solution pairs (most knowledge lives in assistant responses).
+    let session_summary = history
+        .iter()
+        .enumerate()
+        .map(|(i, (u, a))| {
+            let user_trunc: String = u.chars().take(200).collect();
+            let asst_trunc: String = a.chars().take(300).collect();
+            format!(
+                "Turn {}: User: {user_trunc}\n  Assistant: {asst_trunc}",
+                i + 1
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    Some(tokio::spawn(async move {
+        use astra_runtime::turn::cloud::session_memory_extract::{
+            build_learnings_extraction_prompt, parse_learnings_response,
+        };
+
+        let prompt = build_learnings_extraction_prompt(&session_summary, &recent_messages);
+
+        // Call LLM
+        let client = astra_runtime::turn::cloud::summary::HttpSummaryClient::new(
+            astra_runtime::turn::cloud::summary::LlmConnParams {
+                max_output_tokens: 2048,
+                ..params
+            },
+        );
+        use astra_runtime::turn::cloud::summary::SummaryLlmClient;
+        match client.summarize(&prompt).await {
+            Ok(resp) => {
+                if let Some(learnings) = parse_learnings_response(&resp.text) {
+                    if let Err(e) = append_to_knowledge_md(&learnings) {
+                        eprintln!(
+                            "  {} Failed to write .astra/knowledge.md: {e}",
+                            theme::icon_warn()
+                        );
+                    } else {
+                        let count = learnings
+                            .lines()
+                            .filter(|l| l.trim_start().starts_with("- "))
+                            .count();
+                        eprintln!(
+                            "{}",
+                            format!("  ⊕ {count} learnings saved to .astra/knowledge.md").dim()
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("  {} Knowledge extraction failed: {e}", theme::icon_warn());
+            }
+        }
+    }))
+}
+
+/// Await a knowledge extraction handle with timeout.
+async fn await_knowledge_extraction(handle: Option<tokio::task::JoinHandle<()>>) {
+    let Some(handle) = handle else { return };
+    match tokio::time::timeout(std::time::Duration::from_secs(30), handle).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            eprintln!(
+                "  {} Knowledge extraction task failed: {e}",
+                theme::icon_warn()
+            );
+        }
+        Err(_) => {
+            eprintln!("{}", "  Knowledge extraction timed out, skipping.".dim());
+        }
+    }
+}
+
+/// Append new learnings to `.astra/knowledge.md`, deduplicating against existing content.
+fn append_to_knowledge_md(new_learnings: &str) -> std::io::Result<()> {
+    let cwd = std::env::current_dir()?;
+    let knowledge_path = cwd.join(".astra").join("knowledge.md");
+    append_to_knowledge_md_at(&knowledge_path, new_learnings)
+}
+
+/// Core logic: append learnings to a specific knowledge file path (testable).
+/// Note: read-dedup-write is not atomic. Concurrent session endings for the same
+/// project may produce duplicate lines. This is acceptable since the file is
+/// append-only and duplicates are cosmetic (capped at 8KB on injection).
+fn append_to_knowledge_md_at(
+    knowledge_path: &std::path::Path,
+    new_learnings: &str,
+) -> std::io::Result<()> {
+    // Read existing content (if any)
+    let existing = std::fs::read_to_string(&knowledge_path).unwrap_or_default();
+
+    // Dedup: skip lines that already exist (normalized comparison)
+    let existing_normalized: std::collections::HashSet<String> =
+        existing.lines().map(|l| l.trim().to_lowercase()).collect();
+    let new_lines: Vec<&str> = new_learnings
+        .lines()
+        .filter(|l| {
+            let norm = l.trim().to_lowercase();
+            !norm.is_empty() && !existing_normalized.contains(&norm)
+        })
+        .collect();
+
+    if new_lines.is_empty() {
+        return Ok(());
+    }
+
+    // Ensure .astra/ directory exists
+    if let Some(parent) = knowledge_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    // Build content to append
+    let date = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let mut append_text = String::new();
+
+    // Add header if file is new
+    if existing.trim().is_empty() {
+        append_text.push_str("# Project Knowledge\n\n");
+        append_text.push_str("<!-- Auto-generated by astra session knowledge extraction. -->\n");
+        append_text.push_str("<!-- You can edit this file. It is injected into every session as project context. -->\n\n");
+    }
+
+    append_text.push_str(&format!("## Session learnings ({date})\n\n"));
+    for line in &new_lines {
+        append_text.push_str(line);
+        append_text.push('\n');
+    }
+    append_text.push('\n');
+
+    // Append (don't replace)
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&knowledge_path)?;
+    file.write_all(append_text.as_bytes())?;
+
+    Ok(())
+}
+
 /// Resolve `--system-prompt` value: if it starts with `@`, read the file;
 /// otherwise return the string as-is.
 fn resolve_system_prompt(sp: String) -> Result<String, String> {
@@ -7249,6 +7423,38 @@ fn discover_instructions_from_paths(
                 parts.push((project_path.display().to_string(), trimmed.to_string()));
             }
         }
+        // Project-level: .astra/knowledge.md (auto-generated learnings)
+        // Gated by MO_SESSION_KNOWLEDGE_INJECT (default: true). Allows users to disable
+        // cross-session knowledge injection independently of MO_SESSION_PROJECT_CONTEXT.
+        // Cap at 8KB to prevent unbounded token cost per turn.
+        let knowledge_inject = std::env::var("MO_SESSION_KNOWLEDGE_INJECT")
+            .map(|v| v != "0" && v.to_lowercase() != "false")
+            .unwrap_or(true);
+        if knowledge_inject {
+            let knowledge_path = root.join(".astra").join("knowledge.md");
+            if let Ok(content) = std::fs::read_to_string(&knowledge_path) {
+                let trimmed = content.trim();
+                if !trimmed.is_empty() {
+                    const KNOWLEDGE_MAX_BYTES: usize = 8 * 1024;
+                    let capped = if trimmed.len() > KNOWLEDGE_MAX_BYTES {
+                        // Walk back to a valid UTF-8 char boundary before truncating
+                        let mut end = KNOWLEDGE_MAX_BYTES;
+                        while end > 0 && !trimmed.is_char_boundary(end) {
+                            end -= 1;
+                        }
+                        let slice = &trimmed[..end];
+                        // Then truncate at last newline to avoid cutting mid-line
+                        match slice.rfind('\n') {
+                            Some(pos) => &slice[..pos],
+                            None => slice,
+                        }
+                    } else {
+                        trimmed
+                    };
+                    parts.push((knowledge_path.display().to_string(), capped.to_string()));
+                }
+            }
+        } // knowledge_inject gate
     }
 
     // User-level: ~/.astra/instructions.md
@@ -7607,16 +7813,16 @@ mod tests {
         }
     }
 
-    mod preamble_tests;
     mod auth_tests;
     mod chat_stream_tests;
-    mod slash_command_tests;
-    mod repl_tests;
-    mod resume_tests;
-    mod stats_tools_tests;
+    mod cli_args_tests;
     mod cloud_sync_tests;
     mod cost_tracking_tests;
-    mod cli_args_tests;
+    mod preamble_tests;
+    mod repl_tests;
+    mod resume_tests;
+    mod slash_command_tests;
+    mod stats_tools_tests;
     // ── auth_flow ─────────────────────────────────────────────────────────
 
     #[tokio::test]
@@ -11140,5 +11346,140 @@ total_tokens_out: 500
     fn cli_no_instructions_flag() {
         let cli = Cli::try_parse_from(["astra", "--no-instructions"]).unwrap();
         assert!(cli.no_instructions);
+    }
+
+    #[test]
+    fn discover_instructions_includes_knowledge_md() {
+        let dir = tempfile::tempdir().unwrap();
+        let astra_dir = dir.path().join(".astra");
+        std::fs::create_dir_all(&astra_dir).unwrap();
+        std::fs::write(astra_dir.join("instructions.md"), "Use Rust conventions").unwrap();
+        std::fs::write(
+            astra_dir.join("knowledge.md"),
+            "# Project Knowledge\n\n- Always run clippy",
+        )
+        .unwrap();
+        let result = discover_instructions_from_paths(Some(dir.path()), None).unwrap();
+        assert!(result.contains("Use Rust conventions"));
+        assert!(result.contains("Always run clippy"));
+    }
+
+    #[test]
+    fn discover_instructions_knowledge_md_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let astra_dir = dir.path().join(".astra");
+        std::fs::create_dir_all(&astra_dir).unwrap();
+        std::fs::write(astra_dir.join("knowledge.md"), "- Some learning").unwrap();
+        let result = discover_instructions_from_paths(Some(dir.path()), None).unwrap();
+        assert!(result.contains("Some learning"));
+    }
+
+    #[test]
+    fn discover_instructions_empty_knowledge_md_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let astra_dir = dir.path().join(".astra");
+        std::fs::create_dir_all(&astra_dir).unwrap();
+        std::fs::write(astra_dir.join("knowledge.md"), "   ").unwrap();
+        assert!(discover_instructions_from_paths(Some(dir.path()), None).is_none());
+    }
+
+    #[test]
+    fn append_to_knowledge_md_creates_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let knowledge_path = dir.path().join(".astra").join("knowledge.md");
+        append_to_knowledge_md_at(&knowledge_path, "- Learning one\n- Learning two").unwrap();
+        let content = std::fs::read_to_string(&knowledge_path).unwrap();
+        assert!(content.contains("# Project Knowledge"));
+        assert!(content.contains("Learning one"));
+        assert!(content.contains("Learning two"));
+    }
+
+    #[test]
+    fn append_to_knowledge_md_deduplicates() {
+        let dir = tempfile::tempdir().unwrap();
+        let knowledge_path = dir.path().join(".astra").join("knowledge.md");
+        // First write
+        append_to_knowledge_md_at(&knowledge_path, "- Learning one").unwrap();
+        // Second write with same + new content
+        append_to_knowledge_md_at(&knowledge_path, "- Learning one\n- Learning two").unwrap();
+        let content = std::fs::read_to_string(&knowledge_path).unwrap();
+        // "Learning one" should appear only once (deduplicated)
+        let count = content.matches("Learning one").count();
+        assert_eq!(count, 1, "should deduplicate: found {count} occurrences");
+        assert!(content.contains("Learning two"));
+    }
+
+    #[test]
+    fn discover_instructions_knowledge_md_capped_at_8kb() {
+        let dir = tempfile::tempdir().unwrap();
+        let astra_dir = dir.path().join(".astra");
+        std::fs::create_dir_all(&astra_dir).unwrap();
+        // Write a 12KB knowledge.md
+        let big_content = "- ".to_string() + &"x".repeat(998) + "\n";
+        let repeated = big_content.repeat(12); // ~12KB
+        std::fs::write(astra_dir.join("knowledge.md"), &repeated).unwrap();
+        let result = discover_instructions_from_paths(Some(dir.path()), None).unwrap();
+        // The injected content should be capped — less than the full 12KB
+        assert!(
+            result.len() < repeated.len(),
+            "should be capped below original size"
+        );
+        // But should have substantial content (at least 7KB from 8KB cap minus header)
+        assert!(
+            result.len() > 7000,
+            "should retain most of 8KB cap, got {}",
+            result.len()
+        );
+    }
+
+    #[test]
+    fn discover_instructions_knowledge_md_capped_at_8kb_cjk() {
+        // Regression: truncation at byte offset must not panic on multi-byte chars.
+        let dir = tempfile::tempdir().unwrap();
+        let astra_dir = dir.path().join(".astra");
+        std::fs::create_dir_all(&astra_dir).unwrap();
+        // CJK chars are 3 bytes each. Build >8KB of CJK content.
+        let cjk_line = "- 知识回流测试行内容填充\n"; // ~38 bytes per line
+        let mut content = String::new();
+        while content.len() < 12_000 {
+            content.push_str(cjk_line);
+        }
+        std::fs::write(astra_dir.join("knowledge.md"), &content).unwrap();
+        // This must not panic (previously did on non-char-boundary byte index)
+        let result = discover_instructions_from_paths(Some(dir.path()), None).unwrap();
+        assert!(result.len() > 5000, "should retain substantial CJK content");
+        assert!(
+            result.len() < content.len(),
+            "should be capped below original"
+        );
+    }
+
+    #[test]
+    fn session_end_extract_learnings_returns_none_without_env_var() {
+        // When MO_SESSION_KNOWLEDGE_EXTRACT_ON_END is not set, should return None
+        // (default behavior — feature is opt-in)
+        unsafe { std::env::remove_var("MO_SESSION_KNOWLEDGE_EXTRACT_ON_END") };
+        let history: Vec<(String, String)> = (0..10)
+            .map(|i| (format!("question {i}"), format!("answer {i}")))
+            .collect();
+        assert!(
+            session_end_extract_learnings(&history).is_none(),
+            "should not extract when env var is unset"
+        );
+    }
+
+    #[test]
+    fn session_end_extract_learnings_returns_none_for_short_history() {
+        // Even with env var set, too few turns should return None
+        // (also requires LLM params which won't be set in test env)
+        unsafe { std::env::set_var("MO_SESSION_KNOWLEDGE_EXTRACT_ON_END", "true") };
+        let short_history = vec![
+            ("q1".to_string(), "a1".to_string()),
+            ("q2".to_string(), "a2".to_string()),
+        ];
+        let result = session_end_extract_learnings(&short_history);
+        // Should return None — either due to missing LLM params or short history
+        assert!(result.is_none(), "should not extract for 2-turn history");
+        unsafe { std::env::remove_var("MO_SESSION_KNOWLEDGE_EXTRACT_ON_END") };
     }
 }

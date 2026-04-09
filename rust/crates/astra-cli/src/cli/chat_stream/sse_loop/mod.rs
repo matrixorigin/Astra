@@ -312,6 +312,42 @@ pub(crate) async fn stream_chat_sse(
         Some(router as Arc<dyn astra_runtime::skills::SkillExecutor>)
     };
 
+    // Pre-compute project-level cross-session context (knowledge backflow P2).
+    // Resolved here at session init rather than per-turn to avoid inline I/O
+    // in the runtime agentic loop hot path.
+    let project_context: Option<String> = {
+        let p2_enabled = std::env::var("MO_SESSION_PROJECT_CONTEXT")
+            .map(|v| v != "0" && v.to_lowercase() != "false")
+            .unwrap_or(true);
+        if !p2_enabled {
+            None
+        } else {
+            // Resolve git root from project_root
+            let git_root = std::process::Command::new("git")
+                .args(["rev-parse", "--show-toplevel"])
+                .current_dir(&project_root)
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .and_then(|o| {
+                    String::from_utf8(o.stdout)
+                        .ok()
+                        .map(|s| s.trim().to_string())
+                });
+            git_root.and_then(|root| {
+                let sid = current_session_id.as_deref();
+                let summaries =
+                    astra_services::session_workspace::list_sessions_by_git_root(&root, sid, 5);
+                if summaries.is_empty() {
+                    None
+                } else {
+                    let ctx = astra_services::session_workspace::format_project_context(&summaries);
+                    if ctx.is_empty() { None } else { Some(ctx) }
+                }
+            })
+        }
+    };
+
     let mut state = AgenticLoopState {
         messages,
         tool_results: Vec::new(),
@@ -390,6 +426,7 @@ pub(crate) async fn stream_chat_sse(
         teammate_idle_hooks: hook_sets.teammate_idle_hooks,
         teammate_idle_hook_runs: 0,
         workspace_root_hint: Some(project_root.to_string_lossy().into_owned()),
+        project_context,
         consecutive_same_error: 0,
         last_error_category: None,
         checkpoint_gate: None,

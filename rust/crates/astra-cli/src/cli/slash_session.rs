@@ -518,12 +518,27 @@ pub(super) fn handle_session_command(arg: &str, state: &mut ReplState) {
                                 );
                             }
                             session_journal::JournalEventType::Compact => {
+                                let summary_note = evt
+                                    .metadata
+                                    .as_ref()
+                                    .and_then(|m| m.get("compact_summary"))
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| {
+                                        let preview: String = s.chars().take(80).collect();
+                                        if s.chars().count() > 80 {
+                                            format!(" · {preview}…")
+                                        } else {
+                                            format!(" · {preview}")
+                                        }
+                                    })
+                                    .unwrap_or_default();
                                 eprintln!(
-                                    "  {} {} compacted {} turns ({} facts)",
+                                    "  {} {} compacted {} turns ({} facts){}",
                                     ts_short.dim(),
                                     "⟳".yellow(),
                                     evt.turns_compacted.unwrap_or(0),
                                     evt.facts_stored.unwrap_or(0),
+                                    summary_note.dim(),
                                 );
                             }
                             session_journal::JournalEventType::ConfigChange => {
@@ -1101,8 +1116,15 @@ fn build_export_markdown(session_id: &str, events: &[session_journal::JournalEve
                 ));
             }
             session_journal::JournalEventType::Compact => {
+                let summary_line = evt
+                    .metadata
+                    .as_ref()
+                    .and_then(|m| m.get("compact_summary"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| format!("- **Summary:** {s}\n"))
+                    .unwrap_or_default();
                 md.push_str(&format!(
-                    "### Compact\n- **Time:** {ts_short}\n- **Turns compacted:** {}\n- **Facts stored:** {}\n\n",
+                    "### Compact\n- **Time:** {ts_short}\n- **Turns compacted:** {}\n- **Facts stored:** {}\n{summary_line}\n",
                     evt.turns_compacted.unwrap_or(0),
                     evt.facts_stored.unwrap_or(0),
                 ));

@@ -345,6 +345,10 @@ pub struct AgenticLoopState {
     /// awareness of recently-read code.
     pub recent_file_reads: Vec<(String, u32)>,
 
+    /// Pre-computed cross-session project context (P2 knowledge backflow).
+    /// Set once at session init; `None` for sub-runs or when the feature is disabled.
+    pub project_context: Option<String>,
+
     // ── Inter-agent messaging ──
     /// Optional mailbox for receiving messages from other agents.
     /// When set, incoming messages are drained at each turn start and
@@ -900,6 +904,18 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
                 host.inject_tool_schema(crate::turn::skill_tool::discover_skills_tool_schema());
             }
         }
+    }
+
+    // ─── Preamble: inject cross-session project context (P2 knowledge backflow) ──
+    if let Some(ref ctx) = state.project_context {
+        state.messages.push(serde_json::json!({
+            "role": "system",
+            "content": format!(
+                "## Cross-Session Project Context\n\
+                 Below are summaries of recent sessions in this project. \
+                 Use them for continuity — avoid re-asking questions already answered.\n\n{ctx}"
+            )
+        }));
     }
 
     for turn_index in 0..state.max_turns {
@@ -2334,6 +2350,7 @@ mod tests {
             skill_listing_message: None,
             invoked_skills: std::collections::HashMap::new(),
             recent_file_reads: Vec::new(),
+            project_context: None,
             mailbox: None,
             ack_tracker: None,
             dead_letter_queue: None,

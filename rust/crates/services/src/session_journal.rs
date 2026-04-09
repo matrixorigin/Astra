@@ -1370,6 +1370,23 @@ impl JournalEvent {
         evt
     }
 
+    /// Compact event with an optional LLM-generated summary attached in metadata.
+    pub fn compact_with_summary(
+        session_id: Option<&str>,
+        turn: u32,
+        turns_compacted: usize,
+        facts_stored: usize,
+        summary: Option<&str>,
+    ) -> Self {
+        let mut evt = Self::compact(session_id, turn, turns_compacted, facts_stored);
+        if let Some(s) = summary {
+            if !s.is_empty() {
+                evt.metadata = Some(serde_json::json!({ "compact_summary": s }));
+            }
+        }
+        evt
+    }
+
     /// Config change event.
     pub fn config_change(session_id: Option<&str>, key: &str, value: &str) -> Self {
         let mut evt = Self::base(JournalEventType::ConfigChange, session_id);
@@ -2169,6 +2186,31 @@ mod tests {
         assert_eq!(evt.event_type, JournalEventType::Compact);
         assert_eq!(evt.turns_compacted, Some(10));
         assert_eq!(evt.facts_stored, Some(3));
+        assert!(evt.metadata.is_none());
+    }
+
+    #[test]
+    fn journal_event_compact_with_summary() {
+        let evt = JournalEvent::compact_with_summary(
+            Some("s"),
+            5,
+            10,
+            3,
+            Some("User worked on fixing auth bugs"),
+        );
+        assert_eq!(evt.event_type, JournalEventType::Compact);
+        assert_eq!(evt.turns_compacted, Some(10));
+        assert_eq!(evt.facts_stored, Some(3));
+        let meta = evt.metadata.unwrap();
+        assert_eq!(meta["compact_summary"], "User worked on fixing auth bugs");
+    }
+
+    #[test]
+    fn journal_event_compact_with_empty_summary() {
+        let evt = JournalEvent::compact_with_summary(Some("s"), 5, 10, 3, Some(""));
+        assert!(evt.metadata.is_none());
+        let evt2 = JournalEvent::compact_with_summary(Some("s"), 5, 10, 3, None);
+        assert!(evt2.metadata.is_none());
     }
 
     #[test]

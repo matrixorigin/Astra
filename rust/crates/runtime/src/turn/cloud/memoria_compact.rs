@@ -903,6 +903,21 @@ pub async fn compact_with_memoria(
                     summary.len(),
                     cfg.summary_token_budget
                 );
+
+                // Step 6b: Store compaction summary as semantic memory for cross-session retrieval.
+                // The LLM summary is already generated (zero additional LLM cost);
+                // storing it as "semantic" makes it persist beyond session working memory cleanup.
+                // Prefix includes a stable session tag so re-compaction can be identified.
+                // NOTE: Memoria has no delete-by-id API, so prior compaction summaries for
+                // the same session will accumulate. Dedup relies on Memoria's natural vector
+                // similarity detection (high similarity scores for same-session entries).
+                if config.store_on_compact {
+                    let tag = format!("[compaction:{}]", sid);
+                    let semantic_content = format!("{} {}", tag, summary);
+                    if let Err(e) = client.store(&semantic_content, "semantic", Some(sid)).await {
+                        eprintln!("[compact] Failed to store compaction summary as semantic: {e}");
+                    }
+                }
             }
             None => {
                 eprintln!("[compact] LLM summary failed, using truncation only");
@@ -2058,5 +2073,136 @@ mod tests {
         let data = "x".repeat(600 * 1024);
         std::fs::write(&f, &data).unwrap();
         assert_eq!(read_session_memory_file(&f), None);
+    }
+
+    #[tokio::test]
+    async fn compact_store_on_compact_stores_semantic_summary() {
+        // When store_on_compact=true and summary succeeds,
+        // the compaction summary should be stored as semantic memory with [compaction:sid] tag.
+        let msgs = vec![
+            user("implement OAuth"),
+            assistant("I'll help with OAuth. Here's a plan..."),
+            user("use JWT instead"),
+            assistant("Sure, switching to JWT tokens for auth."),
+        ];
+        let config = MemoriaCompactConfig {
+            min_tokens_for_retrieval: 100,
+            store_on_compact: true, // <-- enable semantic storage
+            ..Default::default()
+        };
+        let mock = MockMemoriaClient::new(vec![MemoriaMemory {
+            memory_id: "m1".to_string(),
+            content: "Working on auth module".to_string(),
+            memory_type: "working".to_string(),
+            retrieval_score: Some(0.8),
+        }]);
+        let params = MemoriaCompactParams {
+            budget_chars: 10000,
+            keep_chars: 2000,
+            tier: CompactionTier::AggressivePrune,
+            keep_recent_turns: 4,
+            current_tokens: 6000,
+            session_memory_file: None,
+            session_memory_combine: SessionMemoryFileCombine::None,
+        };
+        let compact_config = CompactConfig {
+            enable_summary: true,
+            summary_min_tier: CompactionTier::AggressivePrune,
+            ..Default::default()
+        };
+        let summary_client =
+            MockSummaryClient::success("User discussed OAuth then switched to JWT auth.");
+
+        let _result = compact_with_memoria(
+            &msgs,
+            Some("sess-test-42"),
+            &config,
+            &params,
+            Some(&mock),
+            Some(&compact_config),
+            Some(&summary_client as &dyn super::super::summary::SummaryLlmClient),
+        )
+        .await;
+
+        // Verify semantic store was called with correct tag and type
+        let stored = mock.stored.lock().unwrap();
+        let semantic_entries: Vec<_> = stored
+            .iter()
+            .filter(|(_, mem_type)| mem_type == "semantic")
+            .collect();
+        assert_eq!(
+            semantic_entries.len(),
+            1,
+            "should store exactly one semantic entry, got {}",
+            semantic_entries.len()
+        );
+        let (content, _) = &semantic_entries[0];
+        assert!(
+            content.starts_with("[compaction:sess-test-42]"),
+            "should have session tag prefix, got: {}",
+            &content[..50.min(content.len())]
+        );
+        assert!(content.contains("JWT"), "should contain the summary text");
+    }
+
+    #[tokio::test]
+    async fn compact_store_on_compact_false_skips_semantic_store() {
+        // When store_on_compact=false, no semantic memory should be stored.
+        let msgs = vec![
+            user("implement OAuth"),
+            assistant("I'll help with OAuth. Here's a plan..."),
+            user("use JWT instead"),
+            assistant("Sure, switching to JWT tokens for auth."),
+        ];
+        let config = MemoriaCompactConfig {
+            min_tokens_for_retrieval: 100,
+            store_on_compact: false, // <-- disabled
+            ..Default::default()
+        };
+        // Non-empty memories so we don't early-return before the store_on_compact check
+        let mock = MockMemoriaClient::new(vec![MemoriaMemory {
+            memory_id: "m1".to_string(),
+            content: "Working on auth module".to_string(),
+            memory_type: "working".to_string(),
+            retrieval_score: Some(0.8),
+        }]);
+        let params = MemoriaCompactParams {
+            budget_chars: 10000,
+            keep_chars: 2000,
+            tier: CompactionTier::AggressivePrune,
+            keep_recent_turns: 4,
+            current_tokens: 6000,
+            session_memory_file: None,
+            session_memory_combine: SessionMemoryFileCombine::None,
+        };
+        let compact_config = CompactConfig {
+            enable_summary: true,
+            summary_min_tier: CompactionTier::AggressivePrune,
+            ..Default::default()
+        };
+        let summary_client = MockSummaryClient::success("Some summary");
+
+        let _result = compact_with_memoria(
+            &msgs,
+            Some("sess-no-store"),
+            &config,
+            &params,
+            Some(&mock),
+            Some(&compact_config),
+            Some(&summary_client as &dyn super::super::summary::SummaryLlmClient),
+        )
+        .await;
+
+        // Verify NO semantic store was called
+        let stored = mock.stored.lock().unwrap();
+        let semantic_entries: Vec<_> = stored
+            .iter()
+            .filter(|(_, mem_type)| mem_type == "semantic")
+            .collect();
+        assert!(
+            semantic_entries.is_empty(),
+            "should not store semantic entries when disabled, got {}",
+            semantic_entries.len()
+        );
     }
 }

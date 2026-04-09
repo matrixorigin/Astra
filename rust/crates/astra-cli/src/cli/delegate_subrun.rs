@@ -301,6 +301,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             teammate_idle_hook_runs: 0,
             // workspace_root_hint guides tools to operate in the correct directory.
             workspace_root_hint: Some(effective_root.to_string_lossy().into_owned()),
+            project_context: None, // delegates don't inject cross-session context
             consecutive_same_error: 0,
             last_error_category: None,
             checkpoint_gate: config.checkpoint_gate.clone(),

@@ -550,13 +550,14 @@ pub(super) async fn handle_state_command(
                         .dim()
                 );
             }
-            // Journal: log compact event
+            // Journal: log compact event (include summary for knowledge backflow)
             if let Some(ref j) = state.journal {
-                let _ = j.append(&session_journal::JournalEvent::compact(
+                let _ = j.append(&session_journal::JournalEvent::compact_with_summary(
                     state.session_id.as_deref(),
                     state.turn,
                     trimmed_count,
                     facts_stored,
+                    Some(&summary),
                 ));
             }
         }

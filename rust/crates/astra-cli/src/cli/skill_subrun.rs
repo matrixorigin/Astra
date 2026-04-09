@@ -477,6 +477,7 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             teammate_idle_hooks: Vec::new(),
             teammate_idle_hook_runs: 0,
             workspace_root_hint: Some(self.project_root.to_string_lossy().into_owned()),
+            project_context: None, // skill subruns don't inject cross-session context
             consecutive_same_error: 0,
             last_error_category: None,
             checkpoint_gate: None,

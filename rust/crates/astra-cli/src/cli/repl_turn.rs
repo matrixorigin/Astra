@@ -589,6 +589,19 @@ async fn apply_auto_compact_result(
         astra_core::agent_warn!("repl_turn", "failed to persist compacted memory: {e}");
     }
 
+    // Write compact event with summary to journal so finalize_workspace_on_end
+    // can populate the workspace summary for P1/P2 knowledge backflow.
+    if let Some(ref journal) = state.journal {
+        let evt = session_journal::JournalEvent::compact_with_summary(
+            state.session_id.as_deref(),
+            state.turn,
+            compacted_count,
+            0, // facts_stored — auto-compact doesn't extract facts
+            Some(&summary),
+        );
+        let _ = journal.append(&evt);
+    }
+
     // Report which turns were kept by relevance (if any older turns survived)
     let recent_start = total.saturating_sub(keep / 2);
     let relevance_kept: Vec<usize> = kept_indices

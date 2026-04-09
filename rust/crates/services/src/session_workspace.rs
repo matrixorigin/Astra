@@ -217,7 +217,9 @@ impl WorkspaceMetadata {
     /// Mark session as completed.
     pub fn mark_completed(&mut self, summary: Option<&str>) {
         self.status = "completed".to_string();
-        self.summary = summary.map(|s| s.to_string());
+        if let Some(s) = summary {
+            self.summary = Some(s.to_string());
+        }
         self.updated_at = chrono::Utc::now().to_rfc3339();
     }
 
@@ -280,6 +282,131 @@ fn workspace_dir(session_id: &str) -> PathBuf {
 /// Get the workspace directory path (public, for use by checkpoint module).
 pub fn workspace_dir_for(session_id: &str) -> PathBuf {
     workspace_dir(session_id)
+}
+
+/// Summary of a historical session for the same project.
+#[derive(Debug, Clone)]
+pub struct ProjectSessionSummary {
+    pub session_id: String,
+    pub summary: Option<String>,
+    pub model: String,
+    pub turn_count: u32,
+    pub status: String,
+    pub updated_at: String,
+    pub git_branch: Option<String>,
+}
+
+/// Maximum number of sessions to scan when searching by git_root.
+/// We over-scan since many sessions may belong to other repos.
+const GIT_ROOT_SCAN_MULTIPLIER: usize = 5;
+/// Maximum characters for summary preview in project context formatting.
+const SUMMARY_PREVIEW_CHARS: usize = 200;
+
+/// List recent sessions that share the same `git_root`, excluding the current session.
+/// Returns up to `limit` sessions, most-recent first.
+pub fn list_sessions_by_git_root(
+    git_root: &str,
+    exclude_session: Option<&str>,
+    limit: usize,
+) -> Vec<ProjectSessionSummary> {
+    // Get recent session IDs (scan a wider set to filter down)
+    let scan_limit = limit * GIT_ROOT_SCAN_MULTIPLIER;
+    let session_ids = match crate::session_journal::list_sessions_by_time(scan_limit) {
+        Ok(ids) => ids,
+        Err(e) => {
+            eprintln!("[knowledge-backflow] Failed to scan sessions: {e}");
+            return Vec::new();
+        }
+    };
+
+    let mut results = Vec::new();
+    for sid in &session_ids {
+        if let Some(exclude) = exclude_session {
+            if sid == exclude {
+                continue;
+            }
+        }
+        // Try reading workspace metadata; skip if unavailable
+        if let Ok(ws) = read_workspace(sid) {
+            if ws.git_root.as_deref() == Some(git_root) {
+                results.push(ProjectSessionSummary {
+                    session_id: sid.clone(),
+                    summary: ws.summary,
+                    model: ws.model,
+                    turn_count: ws.turn_count,
+                    status: ws.status,
+                    updated_at: ws.updated_at,
+                    git_branch: ws.git_branch,
+                });
+                if results.len() >= limit {
+                    break;
+                }
+            }
+        }
+    }
+    results
+}
+
+/// Format project session summaries into a context string for injection.
+pub fn format_project_context(summaries: &[ProjectSessionSummary]) -> String {
+    if summaries.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("[Project context — previous sessions on this repo]\n");
+    for (i, s) in summaries.iter().enumerate() {
+        let branch = s.git_branch.as_deref().unwrap_or("?");
+        let summary = s.summary.as_deref().unwrap_or("(no summary)");
+        // Truncate summary preview
+        let summary: String = summary.chars().take(SUMMARY_PREVIEW_CHARS).collect();
+        out.push_str(&format!(
+            "{}. [{}] ({}, {} turns, branch: {}) {}\n",
+            i + 1,
+            s.status,
+            &s.updated_at[..10.min(s.updated_at.len())],
+            s.turn_count,
+            branch,
+            summary,
+        ));
+    }
+    out
+}
+
+/// Finalize workspace at session end: extract summary from journal and mark completed.
+/// Returns the summary string if one was found.
+pub fn finalize_workspace_on_end(session_id: &str) -> Option<String> {
+    // Read current workspace; bail if it doesn't exist
+    let mut ws = match read_workspace(session_id) {
+        Ok(ws) => ws,
+        Err(_) => return None,
+    };
+
+    // Extract summary from the last compact event's metadata
+    let summary = extract_last_compact_summary(session_id);
+
+    ws.mark_completed(summary.as_deref());
+
+    if let Err(e) = write_workspace(&ws) {
+        eprintln!("[knowledge-backflow] Failed to update workspace on end: {e}");
+    }
+
+    summary
+}
+
+/// Extract the summary from the last Compact journal event that has compact_summary metadata.
+fn extract_last_compact_summary(session_id: &str) -> Option<String> {
+    let events = crate::session_journal::read_journal(session_id).ok()?;
+    events
+        .iter()
+        .rev()
+        .filter(|e| e.event_type == crate::session_journal::JournalEventType::Compact)
+        .find_map(|e| {
+            e.metadata
+                .as_ref()
+                .and_then(|m| m.get("compact_summary"))
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+        })
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -456,5 +583,135 @@ mod tests {
         assert!(!yaml.contains("plan_goal"));
         assert!(!yaml.contains("plan_config_json"));
         assert!(!yaml.contains("plan_execution_rounds"));
+    }
+
+    #[test]
+    fn format_project_context_empty() {
+        assert!(format_project_context(&[]).is_empty());
+    }
+
+    #[test]
+    fn format_project_context_renders_summaries() {
+        let summaries = vec![
+            ProjectSessionSummary {
+                session_id: "s1".into(),
+                summary: Some("Fixed auth bug".into()),
+                model: "gpt-4".into(),
+                turn_count: 15,
+                status: "completed".into(),
+                updated_at: "2025-01-15T10:00:00Z".into(),
+                git_branch: Some("main".into()),
+            },
+            ProjectSessionSummary {
+                session_id: "s2".into(),
+                summary: None,
+                model: "claude".into(),
+                turn_count: 3,
+                status: "active".into(),
+                updated_at: "2025-01-14T08:00:00Z".into(),
+                git_branch: None,
+            },
+        ];
+        let ctx = format_project_context(&summaries);
+        assert!(ctx.contains("[Project context"));
+        assert!(ctx.contains("Fixed auth bug"));
+        assert!(ctx.contains("(no summary)"));
+        assert!(ctx.contains("branch: main"));
+        assert!(ctx.contains("15 turns"));
+    }
+
+    #[test]
+    fn format_project_context_truncates_long_summary() {
+        let long_summary = "x".repeat(300);
+        let summaries = vec![ProjectSessionSummary {
+            session_id: "s1".into(),
+            summary: Some(long_summary),
+            model: "gpt-4".into(),
+            turn_count: 5,
+            status: "completed".into(),
+            updated_at: "2025-01-15T10:00:00Z".into(),
+            git_branch: Some("main".into()),
+        }];
+        let ctx = format_project_context(&summaries);
+        // Summary should be truncated to 200 chars
+        assert!(
+            ctx.len() < 400,
+            "context should be bounded, got {} chars",
+            ctx.len()
+        );
+        // But should still contain the core structure
+        assert!(ctx.contains("[Project context"));
+        assert!(ctx.contains("[completed]"));
+    }
+
+    #[test]
+    fn format_project_context_handles_short_updated_at() {
+        // Edge case: updated_at shorter than 10 chars
+        let summaries = vec![ProjectSessionSummary {
+            session_id: "s1".into(),
+            summary: Some("Short summary".into()),
+            model: "m".into(),
+            turn_count: 1,
+            status: "active".into(),
+            updated_at: "2025".into(), // only 4 chars
+            git_branch: None,
+        }];
+        let ctx = format_project_context(&summaries);
+        assert!(ctx.contains("2025")); // should not panic on short string
+        assert!(ctx.contains("branch: ?"));
+    }
+
+    #[test]
+    fn finalize_workspace_on_end_with_compact_summary() {
+        use crate::session_journal;
+
+        let sid = format!("test-finalize-{}", std::process::id());
+        // Create workspace
+        let ws = WorkspaceMetadata::new(&sid, "test-model");
+        write_workspace(&ws).unwrap();
+
+        // Write a compact event with summary
+        let journal = session_journal::JournalWriter::new(&sid).unwrap();
+        let evt = session_journal::JournalEvent::compact_with_summary(
+            Some(&sid),
+            5,
+            3,
+            1,
+            Some("User implemented auth system"),
+        );
+        journal.append(&evt).unwrap();
+
+        // Finalize
+        let summary = finalize_workspace_on_end(&sid);
+        assert_eq!(summary.as_deref(), Some("User implemented auth system"));
+
+        // Verify workspace was updated
+        let ws2 = read_workspace(&sid).unwrap();
+        assert_eq!(ws2.status, "completed");
+        assert_eq!(ws2.summary.as_deref(), Some("User implemented auth system"));
+
+        // Cleanup
+        let _ = std::fs::remove_dir_all(workspace_dir_for(&sid));
+        let _ = std::fs::remove_dir_all(crate::session_journal::local_sessions_dir().join(&sid));
+    }
+
+    #[test]
+    fn finalize_workspace_on_end_no_compact_no_summary() {
+        let sid = format!("test-finalize-empty-{}", std::process::id());
+        // Create workspace with no journal events
+        let ws = WorkspaceMetadata::new(&sid, "test-model");
+        write_workspace(&ws).unwrap();
+
+        // Finalize: no compact events → no summary
+        let summary = finalize_workspace_on_end(&sid);
+        assert!(summary.is_none());
+
+        // Verify workspace was marked completed but has no summary
+        let ws2 = read_workspace(&sid).unwrap();
+        assert_eq!(ws2.status, "completed");
+        assert!(ws2.summary.is_none());
+
+        // Cleanup
+        let _ = std::fs::remove_dir_all(workspace_dir_for(&sid));
     }
 }

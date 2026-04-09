@@ -283,7 +283,9 @@ pub use turn::{
         prefilter::{CloudSkillCandidatePlan, plan_cloud_skill_candidates},
         session_memory_extract::{
             SESSION_MEMORY_TEMPLATE, SessionMemoryExtractConfig, SessionMemoryState,
-            build_extraction_prompt, should_extract as should_extract_session_memory,
+            build_extraction_prompt, build_learnings_extraction_prompt,
+            extract_learnings_for_backflow, extract_section, parse_learnings_response,
+            should_extract as should_extract_session_memory, truncate_for_prompt,
             write_session_memory_file,
         },
         summary::{HttpSummaryClient, LlmConnParams, SummaryLlmClient, SummaryResponse},

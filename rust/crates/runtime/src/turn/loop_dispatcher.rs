@@ -322,6 +322,7 @@ mod tests {
             teammate_idle_hooks: Vec::new(),
             teammate_idle_hook_runs: 0,
             workspace_root_hint: None,
+            project_context: None,
             consecutive_same_error: 0,
             last_error_category: None,
             checkpoint_gate: None,
