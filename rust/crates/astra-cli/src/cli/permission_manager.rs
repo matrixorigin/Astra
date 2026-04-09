@@ -442,7 +442,10 @@ impl PermissionManager {
         if let Some(detail) = detail.filter(|s| !s.is_empty()) {
             eprintln!("{}", format!("     {detail}").dim());
         }
-        self.apply_cloud_approval_choice(tool, Self::prompt_approval(ApprovalPromptKind::Standard))
+        self.apply_cloud_approval_choice(
+            tool,
+            Self::prompt_approval(ApprovalPromptKind::CloudStandard),
+        )
     }
 
     fn classify(name: &str) -> SideEffect {
@@ -636,12 +639,22 @@ impl PermissionManager {
         }
 
         match kind {
-            ApprovalPromptKind::Standard => eprint!(
+            ApprovalPromptKind::LocalStandard => eprint!(
                 "  {} {} · {} · {} · {} · {}  {} ",
                 "▸".cyan(),
                 "[y] yes".cyan().bold(),
                 "[n] no".cyan().bold(),
                 "[a] always tool".cyan().bold(),
+                "[!] auto-run session".cyan().bold(),
+                "[s] skip tool".cyan().bold(),
+                "→".dim(),
+            ),
+            ApprovalPromptKind::CloudStandard => eprint!(
+                "  {} {} · {} · {} · {} · {}  {} ",
+                "▸".cyan(),
+                "[y] yes".cyan().bold(),
+                "[n] no".cyan().bold(),
+                "[a] allow tool session".cyan().bold(),
                 "[!] auto-run session".cyan().bold(),
                 "[s] skip tool".cyan().bold(),
                 "→".dim(),
@@ -664,16 +677,30 @@ impl PermissionManager {
                         KeyCode::Char('y') | KeyCode::Char('Y') => break 'y',
                         KeyCode::Char('n') | KeyCode::Char('N') => break 'n',
                         KeyCode::Char('a') | KeyCode::Char('A')
-                            if matches!(kind, ApprovalPromptKind::Standard) =>
+                            if matches!(
+                                kind,
+                                ApprovalPromptKind::LocalStandard
+                                    | ApprovalPromptKind::CloudStandard
+                            ) =>
                         {
                             break 'a';
                         }
                         KeyCode::Char('s') | KeyCode::Char('S')
-                            if matches!(kind, ApprovalPromptKind::Standard) =>
+                            if matches!(
+                                kind,
+                                ApprovalPromptKind::LocalStandard
+                                    | ApprovalPromptKind::CloudStandard
+                            ) =>
                         {
                             break 's';
                         }
-                        KeyCode::Char('!') if matches!(kind, ApprovalPromptKind::Standard) => {
+                        KeyCode::Char('!')
+                            if matches!(
+                                kind,
+                                ApprovalPromptKind::LocalStandard
+                                    | ApprovalPromptKind::CloudStandard
+                            ) =>
+                        {
                             break '!';
                         }
                         KeyCode::Enter => break 'n',
@@ -686,10 +713,17 @@ impl PermissionManager {
             drop(_guard);
             let label: String = match (kind, result) {
                 (_, 'y') => format!("{}", "yes".green()),
-                (ApprovalPromptKind::Standard, 'a') => format!("{}", "always tool".green()),
+                (ApprovalPromptKind::LocalStandard, 'a') => {
+                    format!("{}", "always tool".green())
+                }
+                (ApprovalPromptKind::CloudStandard, 'a') => {
+                    format!("{}", "allow tool session".green())
+                }
                 (_, 'n') => format!("{}", "no".red()),
-                (ApprovalPromptKind::Standard, 's') => format!("{}", "skip tool".yellow()),
-                (ApprovalPromptKind::Standard, '!') => {
+                (ApprovalPromptKind::LocalStandard | ApprovalPromptKind::CloudStandard, 's') => {
+                    format!("{}", "skip tool".yellow())
+                }
+                (ApprovalPromptKind::LocalStandard | ApprovalPromptKind::CloudStandard, '!') => {
                     format!("{}", "auto-run session".green())
                 }
                 (_, c) => c.to_string(),
@@ -881,7 +915,7 @@ impl PermissionManager {
         if let Some(detail) = detail {
             eprintln!("{}", detail.dim());
         }
-        match Self::prompt_approval(ApprovalPromptKind::Standard) {
+        match Self::prompt_approval(ApprovalPromptKind::LocalStandard) {
             'y' => true,
             'a' => {
                 self.session_overrides.insert(name.to_string(), true);
@@ -1097,7 +1131,8 @@ pub(super) enum PermissionDecision {
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum ApprovalPromptKind {
-    Standard,
+    LocalStandard,
+    CloudStandard,
     ConfirmOnce,
 }
 

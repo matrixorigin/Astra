@@ -463,7 +463,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                             }
                             let ch = tokio::task::spawn_blocking(|| {
                                 crate::permission_manager::PermissionManager::prompt_approval(
-                                    crate::permission_manager::ApprovalPromptKind::Standard,
+                                    crate::permission_manager::ApprovalPromptKind::LocalStandard,
                                 )
                             })
                             .await
@@ -601,7 +601,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                                     let ch = tokio::task::spawn_blocking(
                                         || {
                                             crate::permission_manager::PermissionManager::prompt_approval(
-                                                crate::permission_manager::ApprovalPromptKind::Standard,
+                                                crate::permission_manager::ApprovalPromptKind::LocalStandard,
                                             )
                                         },
                                     )
