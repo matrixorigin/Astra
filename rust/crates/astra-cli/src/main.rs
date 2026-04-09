@@ -254,8 +254,10 @@ fn clear_panic_guard() {
 #[command(name = "astra")]
 #[command(about = "AI agent CLI — run `astra` for interactive chat")]
 struct Cli {
+    /// API server base URL
     #[arg(long, default_value = "http://127.0.0.1:8000")]
     api_url: String,
+    /// Config profile name
     #[arg(long)]
     profile: Option<String>,
     /// Model to use (overrides config default_model)
@@ -854,6 +856,9 @@ enum BugSubcommand {
 }
 
 #[derive(Subcommand, Debug)]
+#[command(
+    after_help = "Examples:\n  astra session list\n  astra session show 550e8400-e29b-41d4-a716-446655440000"
+)]
 enum SessionCmd {
     /// List sessions
     List(SessionListArgs),
@@ -883,6 +888,7 @@ struct SessionShowArgs {
 }
 
 #[derive(Subcommand, Debug)]
+#[command(after_help = "Examples:\n  astra model list\n  astra model show gpt-4o")]
 enum ModelCmd {
     /// List available models
     List,
@@ -896,6 +902,9 @@ struct ModelShowArgs {
 }
 
 #[derive(Subcommand, Debug)]
+#[command(
+    after_help = "Examples:\n  astra skill list\n  astra skill show memory-search\n  astra skill status"
+)]
 enum SkillCmd {
     /// List registered skills
     List(SkillListArgs),
