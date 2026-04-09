@@ -111,11 +111,7 @@ pub fn load_agent_profiles(project_root: &Path) -> Vec<AgentProfile> {
                     }
                 }
                 Err(e) => {
-                    eprintln!(
-                        "  ⚠ skipping agent definition {}: {}",
-                        path.display(),
-                        e
-                    );
+                    eprintln!("  ⚠ skipping agent definition {}: {}", path.display(), e);
                 }
             }
         }
@@ -171,8 +167,7 @@ fn split_frontmatter(content: &str) -> Option<(&str, &str)> {
 
 /// Parse a single agent Markdown file into an [`AgentProfile`].
 fn parse_agent_markdown(path: &Path) -> Result<AgentProfile, String> {
-    let content =
-        std::fs::read_to_string(path).map_err(|e| format!("read error: {e}"))?;
+    let content = std::fs::read_to_string(path).map_err(|e| format!("read error: {e}"))?;
 
     let (fm_str, body) = split_frontmatter(&content)
         .ok_or_else(|| "missing YAML frontmatter (expected `---` delimiters)".to_string())?;
@@ -199,10 +194,7 @@ fn parse_agent_markdown(path: &Path) -> Result<AgentProfile, String> {
         .and_then(|s| s.to_str())
         .unwrap_or("unknown");
 
-    let agent_id = fm
-        .name
-        .clone()
-        .unwrap_or_else(|| file_stem.to_string());
+    let agent_id = fm.name.clone().unwrap_or_else(|| file_stem.to_string());
 
     let tier = fm
         .tier
@@ -248,11 +240,13 @@ fn parse_agent_markdown(path: &Path) -> Result<AgentProfile, String> {
 
     Ok(AgentProfile {
         agent_id,
-        name: fm
-            .name
-            .unwrap_or_else(|| title_case(file_stem)),
+        name: fm.name.unwrap_or_else(|| title_case(file_stem)),
         tier,
-        system_prompt: if body.is_empty() { None } else { Some(body.to_string()) },
+        system_prompt: if body.is_empty() {
+            None
+        } else {
+            Some(body.to_string())
+        },
         skill_filter: fm.tools,
         model_override: fm.model,
         can_delegate,
@@ -320,10 +314,18 @@ including SQL injection, XSS, and authentication bypasses.
         assert_eq!(p.agent_id, "security-auditor");
         assert_eq!(p.tier, AgentTier::System);
         assert_eq!(p.skill_filter, vec!["read_file", "grep", "glob"]);
-        assert_eq!(p.model_override.as_deref(), Some("claude-sonnet-4-20250514"));
+        assert_eq!(
+            p.model_override.as_deref(),
+            Some("claude-sonnet-4-20250514")
+        );
         assert!(!p.can_delegate);
         assert_eq!(p.triggers.len(), 2);
-        assert!(p.system_prompt.as_ref().unwrap().contains("security auditor"));
+        assert!(
+            p.system_prompt
+                .as_ref()
+                .unwrap()
+                .contains("security auditor")
+        );
         assert_eq!(
             p.metadata.get("max_turns").and_then(|v| v.as_u64()),
             Some(15)
@@ -359,7 +361,13 @@ including SQL injection, XSS, and authentication bypasses.
 
         let profiles = load_agent_profiles(tmp.path());
         assert_eq!(profiles.len(), 1);
-        assert!(profiles[0].system_prompt.as_ref().unwrap().contains("Project coder"));
+        assert!(
+            profiles[0]
+                .system_prompt
+                .as_ref()
+                .unwrap()
+                .contains("Project coder")
+        );
     }
 
     #[test]
@@ -375,12 +383,24 @@ including SQL injection, XSS, and authentication bypasses.
     #[test]
     fn load_and_merge_skips_existing() {
         let tmp = TempDir::new().unwrap();
-        write_agent_md(tmp.path(), "coder", "---\nname: coder\n---\nCustom coder.\n");
-        write_agent_md(tmp.path(), "analyst", "---\nname: analyst\n---\nData analyst.\n");
+        write_agent_md(
+            tmp.path(),
+            "coder",
+            "---\nname: coder\n---\nCustom coder.\n",
+        );
+        write_agent_md(
+            tmp.path(),
+            "analyst",
+            "---\nname: analyst\n---\nData analyst.\n",
+        );
 
         let mut registry = astra_services::coordination::AgentProfileRegistry::new();
         // Register built-in "coder"
-        let _ = registry.register(AgentProfile::new("coder", "Built-in Coder", AgentTier::User));
+        let _ = registry.register(AgentProfile::new(
+            "coder",
+            "Built-in Coder",
+            AgentTier::User,
+        ));
 
         let added = load_and_merge(tmp.path(), &mut registry);
         assert_eq!(added, 1); // only "analyst" added

@@ -111,14 +111,14 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             state
                 .mailbox
                 .as_ref()
-                .map(|mailbox| {
-                    crate::edge_tools::agent_messaging::SendMessageRuntimeContext {
+                .map(
+                    |mailbox| crate::edge_tools::agent_messaging::SendMessageRuntimeContext {
                         agent_id: mailbox.address.agent_id.clone(),
                         router: mailbox.router(),
                         metrics: state.messaging_metrics.clone(),
                         delegation_id: mailbox.delegation_id.clone(),
-                    }
-                })
+                    },
+                )
                 .or_else(|| self.root_send_message_context.clone()),
         );
 

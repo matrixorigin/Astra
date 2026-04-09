@@ -145,7 +145,10 @@ fn show_dlq(state: &ReplState) {
                 );
             }
             if summary.rejections > 0 {
-                eprintln!("    {} rejected (nack)", summary.rejections.to_string().yellow());
+                eprintln!(
+                    "    {} rejected (nack)",
+                    summary.rejections.to_string().yellow()
+                );
             }
             if summary.transport_failures > 0 {
                 eprintln!(
@@ -190,10 +193,7 @@ fn show_dlq(state: &ReplState) {
             }
             eprintln!();
         } else {
-            eprintln!(
-                "  {}",
-                "Cannot access DLQ outside tokio runtime.".dim()
-            );
+            eprintln!("  {}", "Cannot access DLQ outside tokio runtime.".dim());
         }
     } else {
         eprintln!(
@@ -237,7 +237,10 @@ fn show_status(state: &ReplState) {
 }
 
 fn show_help() {
-    eprintln!("\n  {}", "/messaging — Inter-agent messaging inspector".cyan().bold());
+    eprintln!(
+        "\n  {}",
+        "/messaging — Inter-agent messaging inspector".cyan().bold()
+    );
     eprintln!("  {}", "─".repeat(50).dim());
     eprintln!("  {}  Show metrics snapshot", "/messaging".white().bold());
     eprintln!(

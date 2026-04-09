@@ -30,7 +30,11 @@ fn mo_current_account() -> &'static str {
             .filter(|l| !l.starts_with('+') && !l.contains("name"))
             .find_map(|l| {
                 let trimmed = l.trim().trim_matches('|').trim();
-                if trimmed.is_empty() { None } else { Some(trimmed.to_string()) }
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                }
             })
             .unwrap_or_else(|| "sys".to_string())
     })
@@ -50,7 +54,10 @@ fn mo_create_snapshot_sql(name: &str) -> String {
 
 fn mo_restore_snapshot_sql(name: &str) -> String {
     let account = mo_current_account();
-    format!("RESTORE ACCOUNT `{account}` DATABASE `{}` FROM SNAPSHOT `{name}`", mo_database())
+    format!(
+        "RESTORE ACCOUNT `{account}` DATABASE `{}` FROM SNAPSHOT `{name}`",
+        mo_database()
+    )
 }
 
 /// Build a mysql Command with connection parameters from environment.

@@ -1,6 +1,6 @@
 //! Context tools: share_context, query_context, and brief for session state.
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use super::{AGGREGATE_OUTPUT_BUDGET, ToolExecutor};
 
@@ -38,10 +38,7 @@ impl ToolExecutor {
 
     /// Return a compact summary of the current session state.
     pub(super) fn brief(&self, args: &Value) -> String {
-        let focus = args
-            .get("focus")
-            .and_then(Value::as_str)
-            .unwrap_or("all");
+        let focus = args.get("focus").and_then(Value::as_str).unwrap_or("all");
         let max_items = args
             .get("max_items")
             .and_then(Value::as_u64)
@@ -185,5 +182,4 @@ impl ToolExecutor {
 
         Value::Object(result).to_string()
     }
-
 }

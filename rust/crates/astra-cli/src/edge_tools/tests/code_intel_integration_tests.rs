@@ -1,17 +1,16 @@
 use super::*;
 
+// ── Multi-file integration tests ────────────────────────────────────────────
 
-    // ── Multi-file integration tests ────────────────────────────────────────────
+#[tokio::test]
+async fn find_definition_multifile_rust_project() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
 
-    #[tokio::test]
-    async fn find_definition_multifile_rust_project() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("src")).unwrap();
-
-        // Create a multi-file Rust project
-        std::fs::write(
-            dir.path().join("src/config.rs"),
-            r#"
+    // Create a multi-file Rust project
+    std::fs::write(
+        dir.path().join("src/config.rs"),
+        r#"
 pub struct AppConfig {
     pub name: String,
     pub port: u16,
@@ -23,12 +22,12 @@ impl AppConfig {
     }
 }
 "#,
-        )
-        .unwrap();
+    )
+    .unwrap();
 
-        std::fs::write(
-            dir.path().join("src/main.rs"),
-            r#"
+    std::fs::write(
+        dir.path().join("src/main.rs"),
+        r#"
 use crate::config::AppConfig;
 
 fn main() {
@@ -36,76 +35,76 @@ fn main() {
     println!("{}", config.name);
 }
 "#,
-        )
-        .unwrap();
+    )
+    .unwrap();
 
-        std::fs::write(
-            dir.path().join("src/handler.rs"),
-            r#"
+    std::fs::write(
+        dir.path().join("src/handler.rs"),
+        r#"
 use crate::config::AppConfig;
 
 pub fn handle_request(config: &AppConfig) -> String {
     format!("Running on port {}", config.port)
 }
 "#,
+    )
+    .unwrap();
+
+    let executor = ToolExecutor::new(dir.path());
+
+    // Find definition of AppConfig — should find it in config.rs
+    let result = executor
+        .execute(
+            "find_definition",
+            &json!({"symbol": "AppConfig", "language": "rust"}),
         )
-        .unwrap();
+        .await;
+    assert!(
+        result.contains("AppConfig") && result.contains("config.rs"),
+        "should find AppConfig in config.rs: {result}"
+    );
+    assert!(
+        result.contains("[struct]"),
+        "should identify as struct: {result}"
+    );
 
-        let executor = ToolExecutor::new(dir.path());
+    // Import-aware: from main.rs context, should prioritize config.rs
+    let result_with_file = executor
+        .execute(
+            "find_definition",
+            &json!({
+                "symbol": "AppConfig",
+                "language": "rust",
+                "file": "src/main.rs"
+            }),
+        )
+        .await;
+    assert!(
+        result_with_file.contains("AppConfig"),
+        "import-aware should find AppConfig: {result_with_file}"
+    );
 
-        // Find definition of AppConfig — should find it in config.rs
-        let result = executor
-            .execute(
-                "find_definition",
-                &json!({"symbol": "AppConfig", "language": "rust"}),
-            )
-            .await;
-        assert!(
-            result.contains("AppConfig") && result.contains("config.rs"),
-            "should find AppConfig in config.rs: {result}"
-        );
-        assert!(
-            result.contains("[struct]"),
-            "should identify as struct: {result}"
-        );
+    // Find method definition
+    let method_result = executor
+        .execute(
+            "find_definition",
+            &json!({"symbol": "new", "language": "rust", "path": "src"}),
+        )
+        .await;
+    assert!(
+        method_result.contains("new") && method_result.contains("AppConfig"),
+        "should find new() in AppConfig: {method_result}"
+    );
+}
 
-        // Import-aware: from main.rs context, should prioritize config.rs
-        let result_with_file = executor
-            .execute(
-                "find_definition",
-                &json!({
-                    "symbol": "AppConfig",
-                    "language": "rust",
-                    "file": "src/main.rs"
-                }),
-            )
-            .await;
-        assert!(
-            result_with_file.contains("AppConfig"),
-            "import-aware should find AppConfig: {result_with_file}"
-        );
+#[tokio::test]
+async fn find_definition_multifile_python_project() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("app")).unwrap();
 
-        // Find method definition
-        let method_result = executor
-            .execute(
-                "find_definition",
-                &json!({"symbol": "new", "language": "rust", "path": "src"}),
-            )
-            .await;
-        assert!(
-            method_result.contains("new") && method_result.contains("AppConfig"),
-            "should find new() in AppConfig: {method_result}"
-        );
-    }
-
-    #[tokio::test]
-    async fn find_definition_multifile_python_project() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("app")).unwrap();
-
-        std::fs::write(
-            dir.path().join("app/models.py"),
-            r#"
+    std::fs::write(
+        dir.path().join("app/models.py"),
+        r#"
 class UserModel:
     def __init__(self, name: str, email: str):
         self.name = name
@@ -117,60 +116,60 @@ class UserModel:
 def create_user(name: str, email: str) -> UserModel:
     return UserModel(name, email)
 "#,
-        )
-        .unwrap();
+    )
+    .unwrap();
 
-        std::fs::write(
-            dir.path().join("app/views.py"),
-            r#"
+    std::fs::write(
+        dir.path().join("app/views.py"),
+        r#"
 from models import UserModel, create_user
 
 def get_user_view(user_id: int):
     user = create_user("test", "test@example.com")
     return user.full_name()
 "#,
+    )
+    .unwrap();
+
+    let executor = ToolExecutor::new(dir.path());
+
+    // Find UserModel definition
+    let result = executor
+        .execute(
+            "find_definition",
+            &json!({"symbol": "UserModel", "language": "python"}),
         )
-        .unwrap();
+        .await;
+    assert!(
+        result.contains("UserModel") && result.contains("models.py"),
+        "should find UserModel in models.py: {result}"
+    );
+    assert!(
+        result.contains("[class]"),
+        "should identify as class: {result}"
+    );
 
-        let executor = ToolExecutor::new(dir.path());
+    // Find free function definition
+    let func_result = executor
+        .execute(
+            "find_definition",
+            &json!({"symbol": "create_user", "language": "python"}),
+        )
+        .await;
+    assert!(
+        func_result.contains("create_user") && func_result.contains("models.py"),
+        "should find create_user in models.py: {func_result}"
+    );
+}
 
-        // Find UserModel definition
-        let result = executor
-            .execute(
-                "find_definition",
-                &json!({"symbol": "UserModel", "language": "python"}),
-            )
-            .await;
-        assert!(
-            result.contains("UserModel") && result.contains("models.py"),
-            "should find UserModel in models.py: {result}"
-        );
-        assert!(
-            result.contains("[class]"),
-            "should identify as class: {result}"
-        );
+#[tokio::test]
+async fn find_definition_multifile_typescript_project() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
 
-        // Find free function definition
-        let func_result = executor
-            .execute(
-                "find_definition",
-                &json!({"symbol": "create_user", "language": "python"}),
-            )
-            .await;
-        assert!(
-            func_result.contains("create_user") && func_result.contains("models.py"),
-            "should find create_user in models.py: {func_result}"
-        );
-    }
-
-    #[tokio::test]
-    async fn find_definition_multifile_typescript_project() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("src")).unwrap();
-
-        std::fs::write(
-            dir.path().join("src/types.ts"),
-            r#"
+    std::fs::write(
+        dir.path().join("src/types.ts"),
+        r#"
 export interface UserConfig {
     name: string;
     port: number;
@@ -180,69 +179,69 @@ export function createConfig(name: string): UserConfig {
     return { name, port: 3000 };
 }
 "#,
-        )
-        .unwrap();
+    )
+    .unwrap();
 
-        std::fs::write(
-            dir.path().join("src/app.ts"),
-            r#"
+    std::fs::write(
+        dir.path().join("src/app.ts"),
+        r#"
 import { UserConfig, createConfig } from './types';
 
 function startApp(config: UserConfig): void {
     console.log(`Starting ${config.name} on port ${config.port}`);
 }
 "#,
+    )
+    .unwrap();
+
+    let executor = ToolExecutor::new(dir.path());
+
+    let result = executor
+        .execute(
+            "find_definition",
+            &json!({"symbol": "UserConfig", "language": "typescript"}),
         )
-        .unwrap();
+        .await;
+    assert!(
+        result.contains("UserConfig") && result.contains("types.ts"),
+        "should find UserConfig in types.ts: {result}"
+    );
+    assert!(
+        result.contains("[interface]"),
+        "should identify as interface: {result}"
+    );
 
-        let executor = ToolExecutor::new(dir.path());
-
-        let result = executor
-            .execute(
-                "find_definition",
-                &json!({"symbol": "UserConfig", "language": "typescript"}),
-            )
-            .await;
+    // Import-aware from app.ts
+    let import_result = executor
+        .execute(
+            "find_definition",
+            &json!({
+                "symbol": "createConfig",
+                "language": "typescript",
+                "file": "src/app.ts"
+            }),
+        )
+        .await;
+    assert!(
+        import_result.contains("createConfig"),
+        "import-aware should find createConfig: {import_result}"
+    );
+    // Should show import-resolved section since app.ts imports from types
+    if import_result.contains("Import-resolved") {
         assert!(
-            result.contains("UserConfig") && result.contains("types.ts"),
-            "should find UserConfig in types.ts: {result}"
+            import_result.contains("types.ts"),
+            "import-resolved should point to types.ts: {import_result}"
         );
-        assert!(
-            result.contains("[interface]"),
-            "should identify as interface: {result}"
-        );
-
-        // Import-aware from app.ts
-        let import_result = executor
-            .execute(
-                "find_definition",
-                &json!({
-                    "symbol": "createConfig",
-                    "language": "typescript",
-                    "file": "src/app.ts"
-                }),
-            )
-            .await;
-        assert!(
-            import_result.contains("createConfig"),
-            "import-aware should find createConfig: {import_result}"
-        );
-        // Should show import-resolved section since app.ts imports from types
-        if import_result.contains("Import-resolved") {
-            assert!(
-                import_result.contains("types.ts"),
-                "import-resolved should point to types.ts: {import_result}"
-            );
-        }
     }
+}
 
-    #[tokio::test]
-    async fn find_definition_multifile_go_project() {
-        let dir = tempfile::tempdir().unwrap();
+#[tokio::test]
+async fn find_definition_multifile_go_project() {
+    let dir = tempfile::tempdir().unwrap();
 
-        std::fs::write(
-            dir.path().join("config.go"),
-            r#"
+    std::fs::write(
+        dir.path().join("config.go"),
+        r#"
 package main
 
 type ServerConfig struct {
@@ -254,12 +253,12 @@ func NewServerConfig(host string, port int) *ServerConfig {
     return &ServerConfig{Host: host, Port: port}
 }
 "#,
-        )
-        .unwrap();
+    )
+    .unwrap();
 
-        std::fs::write(
-            dir.path().join("main.go"),
-            r#"
+    std::fs::write(
+        dir.path().join("main.go"),
+        r#"
 package main
 
 func main() {
@@ -267,134 +266,133 @@ func main() {
     StartServer(config)
 }
 "#,
+    )
+    .unwrap();
+
+    let executor = ToolExecutor::new(dir.path());
+
+    let result = executor
+        .execute(
+            "find_definition",
+            &json!({"symbol": "ServerConfig", "language": "go"}),
         )
-        .unwrap();
+        .await;
+    assert!(
+        result.contains("ServerConfig") && result.contains("config.go"),
+        "should find ServerConfig in config.go: {result}"
+    );
+}
 
-        let executor = ToolExecutor::new(dir.path());
+#[tokio::test]
+async fn find_definition_cross_directory_with_path_filter() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("lib")).unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
 
-        let result = executor
-            .execute(
-                "find_definition",
-                &json!({"symbol": "ServerConfig", "language": "go"}),
-            )
-            .await;
-        assert!(
-            result.contains("ServerConfig") && result.contains("config.go"),
-            "should find ServerConfig in config.go: {result}"
-        );
-    }
+    // Same symbol name in different directories
+    std::fs::write(
+        dir.path().join("lib/helper.rs"),
+        "pub fn process(data: &str) -> String { data.to_uppercase() }\n",
+    )
+    .unwrap();
 
-    #[tokio::test]
-    async fn find_definition_cross_directory_with_path_filter() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("lib")).unwrap();
-        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(
+        dir.path().join("src/helper.rs"),
+        "pub fn process(items: Vec<i32>) -> i32 { items.iter().sum() }\n",
+    )
+    .unwrap();
 
-        // Same symbol name in different directories
-        std::fs::write(
-            dir.path().join("lib/helper.rs"),
-            "pub fn process(data: &str) -> String { data.to_uppercase() }\n",
+    let executor = ToolExecutor::new(dir.path());
+
+    // Unrestricted search finds both
+    let all_result = executor
+        .execute(
+            "find_definition",
+            &json!({"symbol": "process", "language": "rust"}),
         )
-        .unwrap();
+        .await;
+    assert!(
+        all_result.contains("2 found"),
+        "should find 2 definitions: {all_result}"
+    );
 
-        std::fs::write(
-            dir.path().join("src/helper.rs"),
-            "pub fn process(items: Vec<i32>) -> i32 { items.iter().sum() }\n",
+    // Path-restricted search
+    let lib_result = executor
+        .execute(
+            "find_definition",
+            &json!({"symbol": "process", "language": "rust", "path": "lib"}),
         )
-        .unwrap();
+        .await;
+    assert!(
+        lib_result.contains("1 found"),
+        "path filter should find 1: {lib_result}"
+    );
+    assert!(
+        lib_result.contains("lib/helper.rs"),
+        "should be from lib/: {lib_result}"
+    );
+}
 
-        let executor = ToolExecutor::new(dir.path());
+#[tokio::test]
+async fn find_references_multifile_finds_all_usages() {
+    // Test find_references across a multi-file Rust project
+    // using our own codebase (guaranteed to have cross-file references)
+    let root = {
+        let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        p.pop();
+        p.pop();
+        p
+    };
+    let executor = ToolExecutor::new(root);
 
-        // Unrestricted search finds both
-        let all_result = executor
-            .execute(
-                "find_definition",
-                &json!({"symbol": "process", "language": "rust"}),
-            )
-            .await;
+    // extract_symbols is used in both code_intel.rs and edge_tools.rs
+    let result = executor
+        .execute(
+            "find_references",
+            &json!({
+                "symbol": "extract_symbols",
+                "include": "*.rs"
+            }),
+        )
+        .await;
+    assert!(
+        result.contains("extract_symbols"),
+        "should find references: {result}"
+    );
+    // Should find in multiple files
+    if !result.contains("No references") {
         assert!(
-            all_result.contains("2 found"),
-            "should find 2 definitions: {all_result}"
-        );
-
-        // Path-restricted search
-        let lib_result = executor
-            .execute(
-                "find_definition",
-                &json!({"symbol": "process", "language": "rust", "path": "lib"}),
-            )
-            .await;
-        assert!(
-            lib_result.contains("1 found"),
-            "path filter should find 1: {lib_result}"
-        );
-        assert!(
-            lib_result.contains("lib/helper.rs"),
-            "should be from lib/: {lib_result}"
+            result.contains("code_intel.rs"),
+            "should find in code_intel.rs: {result}"
         );
     }
+}
 
-    #[tokio::test]
-    async fn find_references_multifile_finds_all_usages() {
-        // Test find_references across a multi-file Rust project
-        // using our own codebase (guaranteed to have cross-file references)
-        let root = {
-            let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-            p.pop();
-            p.pop();
-            p
-        };
-        let executor = ToolExecutor::new(root);
+#[tokio::test]
+async fn find_references_categorizes_imports_and_definitions() {
+    let root = {
+        let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        p.pop();
+        p.pop();
+        p
+    };
+    let executor = ToolExecutor::new(root);
 
-        // extract_symbols is used in both code_intel.rs and edge_tools.rs
-        let result = executor
-            .execute(
-                "find_references",
-                &json!({
-                    "symbol": "extract_symbols",
-                    "include": "*.rs"
-                }),
-            )
-            .await;
+    // cached_parse is defined in code_intel.rs and used there
+    let result = executor
+        .execute(
+            "find_references",
+            &json!({
+                "symbol": "cached_parse",
+                "include": "*.rs"
+            }),
+        )
+        .await;
+    // Should find it (it's used in many functions in code_intel.rs)
+    if !result.contains("No references") {
         assert!(
-            result.contains("extract_symbols"),
-            "should find references: {result}"
+            result.contains("cached_parse"),
+            "should find cached_parse references: {result}"
         );
-        // Should find in multiple files
-        if !result.contains("No references") {
-            assert!(
-                result.contains("code_intel.rs"),
-                "should find in code_intel.rs: {result}"
-            );
-        }
     }
-
-    #[tokio::test]
-    async fn find_references_categorizes_imports_and_definitions() {
-        let root = {
-            let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-            p.pop();
-            p.pop();
-            p
-        };
-        let executor = ToolExecutor::new(root);
-
-        // cached_parse is defined in code_intel.rs and used there
-        let result = executor
-            .execute(
-                "find_references",
-                &json!({
-                    "symbol": "cached_parse",
-                    "include": "*.rs"
-                }),
-            )
-            .await;
-        // Should find it (it's used in many functions in code_intel.rs)
-        if !result.contains("No references") {
-            assert!(
-                result.contains("cached_parse"),
-                "should find cached_parse references: {result}"
-            );
-        }
-    }
-
+}

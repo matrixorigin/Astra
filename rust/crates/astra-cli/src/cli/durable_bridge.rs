@@ -8,12 +8,12 @@ use crate::cli_utils::{prefix_chars, truncate_str};
 
 use astra_runtime::{GateVerdict, VerificationGate};
 use astra_services::coordination::AgentResult;
+use astra_services::task_orchestrator::TaskOutcome;
 use astra_services::{
     ContractAmendment, ContractGenerator, DurableSubtask, DurableTaskLifecycle,
     LocalDurableTaskLifecycle, MatrixOneDurableTaskLifecycle, SubtaskStage,
     SubtaskVerificationReport, TaskContract, TaskDeliveryReport, VerificationRunner, VerifierKind,
 };
-use astra_services::task_orchestrator::TaskOutcome;
 use async_trait::async_trait;
 use crossterm::style::Stylize;
 use std::sync::Arc;
@@ -233,9 +233,10 @@ pub async fn on_subtask_complete(
         .find(|s| s.id == subtask_id)
         .map(|s| {
             let n = s.criteria.len();
-            let local = s.criteria.iter().any(|c| {
-                !c.global_only && !matches!(c.verifier, VerifierKind::LlmJudge { .. })
-            });
+            let local = s
+                .criteria
+                .iter()
+                .any(|c| !c.global_only && !matches!(c.verifier, VerifierKind::LlmJudge { .. }));
             (n, local)
         })
         .unwrap_or((0, false));

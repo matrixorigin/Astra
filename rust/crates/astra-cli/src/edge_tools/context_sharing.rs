@@ -3,7 +3,7 @@
 //! These tools allow agents to share knowledge with siblings in the same session.
 
 use astra_runtime::orchestration::context_cache::SharedContextCache;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::Arc;
 
 /// Execute the share_context tool.
@@ -59,7 +59,10 @@ pub fn execute_share_context(
 pub fn execute_query_context(cache: &Arc<SharedContextCache>, args: &Value) -> Value {
     let key = args.get("key").and_then(Value::as_str);
     let prefix = args.get("prefix").and_then(Value::as_str);
-    let list_keys = args.get("list_keys").and_then(Value::as_bool).unwrap_or(false);
+    let list_keys = args
+        .get("list_keys")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let include_findings = args
         .get("include_findings")
         .and_then(Value::as_bool)

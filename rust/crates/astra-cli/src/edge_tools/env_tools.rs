@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::process::Command;
 use std::sync::RwLock;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 // ─── Overlay storage ─────────────────────────────────────────────────────────
 
@@ -31,7 +31,8 @@ fn overlay_read() -> std::sync::RwLockReadGuard<'static, Option<HashMap<String, 
 }
 
 /// Acquire the overlay write lock, logging a warning on poison recovery.
-fn overlay_write() -> std::sync::RwLockWriteGuard<'static, Option<HashMap<String, Option<String>>>> {
+fn overlay_write() -> std::sync::RwLockWriteGuard<'static, Option<HashMap<String, Option<String>>>>
+{
     ENV_OVERLAY.write().unwrap_or_else(|p| {
         astra_core::agent_warn!("edge_tools", "ENV_OVERLAY write lock poisoned, recovering");
         p.into_inner()
@@ -274,9 +275,7 @@ fn env_search(args: &Value) -> String {
 
     let regex = match regex::Regex::new(&format!("(?i){}", pattern)) {
         Ok(r) => r,
-        Err(e) => {
-            return json!({ "error": format!("Invalid regex pattern: {}", e) }).to_string()
-        }
+        Err(e) => return json!({ "error": format!("Invalid regex pattern: {}", e) }).to_string(),
     };
 
     let vars = overlay_all();

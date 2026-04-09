@@ -4,15 +4,15 @@
 //!
 //! These are all `impl ToolExecutor` methods extracted from the hub module.
 
-use std::path::{Path, PathBuf};
 use std::fs;
+use std::path::{Path, PathBuf};
 
-use serde_json::Value;
 use astra_runtime::str_preview::truncate_str;
+use serde_json::Value;
 
 use super::{
-    build_test, code_intel, categorize_reference, parse_grep_file_line,
-    tool_output_limit, truncate_output, validate_path, ToolExecutor,
+    ToolExecutor, build_test, categorize_reference, code_intel, parse_grep_file_line,
+    tool_output_limit, truncate_output, validate_path,
 };
 
 impl ToolExecutor {
@@ -154,7 +154,11 @@ impl ToolExecutor {
     ///
     /// Groups matches by file, parses each file once with tree-sitter, and checks
     /// if the symbol at each match position falls inside a non-code node.
-    pub(super) fn ast_validate_references<'a>(&self, lines: &[&'a str], symbol: &str) -> Vec<&'a str> {
+    pub(super) fn ast_validate_references<'a>(
+        &self,
+        lines: &[&'a str],
+        symbol: &str,
+    ) -> Vec<&'a str> {
         use std::collections::HashMap;
 
         // Group lines by file path for efficient per-file parsing
@@ -301,7 +305,11 @@ impl ToolExecutor {
     }
 
     /// Use ripgrep to quickly find files that contain a symbol name (pre-filter).
-    pub(super) fn prefilter_files_with_symbol(&self, symbol: &str, extensions: &[&str]) -> Vec<PathBuf> {
+    pub(super) fn prefilter_files_with_symbol(
+        &self,
+        symbol: &str,
+        extensions: &[&str],
+    ) -> Vec<PathBuf> {
         let mut cmd = std::process::Command::new("rg");
         cmd.arg("--files-with-matches")
             .arg("--no-heading")

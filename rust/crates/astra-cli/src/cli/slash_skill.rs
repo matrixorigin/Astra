@@ -320,9 +320,18 @@ pub(super) async fn handle_skill_command(
             parts.push(format!("{} total", manifests.len()));
             eprintln!(
                 "\n  {}",
-                parts.iter().enumerate().map(|(i, p)| {
-                    if i == parts.len() - 1 { format!("{}", p.as_str().bold()) } else { p.as_str().dim().to_string() }
-                }).collect::<Vec<_>>().join(", ")
+                parts
+                    .iter()
+                    .enumerate()
+                    .map(|(i, p)| {
+                        if i == parts.len() - 1 {
+                            format!("{}", p.as_str().bold())
+                        } else {
+                            p.as_str().dim().to_string()
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
             );
             eprintln!();
         }
@@ -407,7 +416,11 @@ pub(super) async fn handle_skill_command(
                         );
                     }
                 }
-                eprintln!("\n  {} results {}", scored.len().to_string().cyan(), "(showing top 10)".dim());
+                eprintln!(
+                    "\n  {} results {}",
+                    scored.len().to_string().cyan(),
+                    "(showing top 10)".dim()
+                );
             }
             eprintln!();
         }
@@ -698,7 +711,11 @@ Follow these steps:
                 let test_file = skill_dir.join("test_skill.py");
 
                 if skill_md.exists() {
-                    eprintln!("  {} SKILL.md ({})…", "Validating".dim(), skill_dir.display().to_string().dim());
+                    eprintln!(
+                        "  {} SKILL.md ({})…",
+                        "Validating".dim(),
+                        skill_dir.display().to_string().dim()
+                    );
                     let src = std::fs::read_to_string(&skill_md).map_err(|e| e.to_string())?;
                     let issues = collect_skill_md_issues(name, &src);
                     let mut ok = issues.is_empty();

@@ -12,9 +12,12 @@ impl ToolExecutor {
     pub(super) fn web_search(&self, args: &Value) -> String {
         let query = match args.get("query").and_then(Value::as_str) {
             Some(q) if !q.trim().is_empty() => q.trim(),
-            _ => return serde_json::json!({
-                "error": "Missing or empty 'query' parameter"
-            }).to_string(),
+            _ => {
+                return serde_json::json!({
+                    "error": "Missing or empty 'query' parameter"
+                })
+                .to_string();
+            }
         };
 
         let engine = args
@@ -34,32 +37,42 @@ impl ToolExecutor {
         // Build search URL based on engine
         let (search_url, engine_name, result_tip) = match engine {
             "google" => (
-                format!("https://www.google.com/search?q={}&num={}", encoded_query, num_results),
+                format!(
+                    "https://www.google.com/search?q={}&num={}",
+                    encoded_query, num_results
+                ),
                 "Google",
-                "Use web_fetch with this URL to get search results. Parse the HTML for links."
+                "Use web_fetch with this URL to get search results. Parse the HTML for links.",
             ),
             "duckduckgo" => (
                 format!("https://html.duckduckgo.com/html/?q={}", encoded_query),
                 "DuckDuckGo",
-                "Use web_fetch with this URL. Results are in HTML format with class='result'."
+                "Use web_fetch with this URL. Results are in HTML format with class='result'.",
             ),
             "bing" => (
-                format!("https://www.bing.com/search?q={}&count={}", encoded_query, num_results),
+                format!(
+                    "https://www.bing.com/search?q={}&count={}",
+                    encoded_query, num_results
+                ),
                 "Bing",
-                "Use web_fetch with this URL to get search results."
+                "Use web_fetch with this URL to get search results.",
             ),
             "wikipedia" => (
                 format!(
                     "https://en.wikipedia.org/w/api.php?action=opensearch&search={}&limit={}&format=json",
-                    encoded_query, num_results.min(20)
+                    encoded_query,
+                    num_results.min(20)
                 ),
                 "Wikipedia",
-                "This returns JSON directly. Format: [query, [titles], [descriptions], [urls]]"
+                "This returns JSON directly. Format: [query, [titles], [descriptions], [urls]]",
             ),
             "github" => (
-                format!("https://github.com/search?q={}&type=repositories", encoded_query),
+                format!(
+                    "https://github.com/search?q={}&type=repositories",
+                    encoded_query
+                ),
                 "GitHub",
-                "Use web_fetch with this URL. Consider using gh CLI for better structured results."
+                "Use web_fetch with this URL. Consider using gh CLI for better structured results.",
             ),
             other => {
                 return serde_json::json!({
@@ -81,7 +94,9 @@ impl ToolExecutor {
             }));
         }
         // Fixed: operator precedence - parenthesize the OR conditions
-        if engine != "github" && (query.contains("code") || query.contains("library") || query.contains("package")) {
+        if engine != "github"
+            && (query.contains("code") || query.contains("library") || query.contains("package"))
+        {
             alternatives.push(serde_json::json!({
                 "engine": "GitHub",
                 "url": format!("https://github.com/search?q={}&type=repositories", encoded_query),
@@ -98,5 +113,4 @@ impl ToolExecutor {
             "usage": "Call web_fetch with the search_url to retrieve results. For Wikipedia, results are JSON. For others, parse the HTML response."
         }).to_string()
     }
-
 }

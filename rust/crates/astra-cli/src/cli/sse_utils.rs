@@ -23,10 +23,7 @@ pub struct SseTextResult {
 /// Collect text from an SSE response: `data: {...}` lines, `text_delta` → `text`, `error` → stderr.
 ///
 /// When `stream_to_stderr` is true, prints text deltas as they arrive.
-pub async fn collect_sse_text(
-    resp: reqwest::Response,
-    stream_to_stderr: bool,
-) -> SseTextResult {
+pub async fn collect_sse_text(resp: reqwest::Response, stream_to_stderr: bool) -> SseTextResult {
     let mut result = SseTextResult {
         text: String::new(),
         event_count: 0,
@@ -172,8 +169,7 @@ pub async fn stream_sse_markdown(resp: reqwest::Response) -> SseTextResult {
 
                         match event_type {
                             "text_delta" => {
-                                if let Some(content) =
-                                    json.get("content").and_then(|v| v.as_str())
+                                if let Some(content) = json.get("content").and_then(|v| v.as_str())
                                 {
                                     result.text.push_str(content);
                                     if let Some(ref mut renderer) = md {
@@ -189,11 +185,7 @@ pub async fn stream_sse_markdown(resp: reqwest::Response) -> SseTextResult {
                                     .or_else(|| json.get("error"))
                                     .and_then(|v| v.as_str())
                                 {
-                                    eprintln!(
-                                        "\r  {} Server error: {}",
-                                        theme::icon_err(),
-                                        msg
-                                    );
+                                    eprintln!("\r  {} Server error: {}", theme::icon_err(), msg);
                                 }
                             }
                             _ => {}
@@ -285,8 +277,7 @@ pub async fn collect_sse_with_preview(resp: reqwest::Response) -> SseTextResult 
 
                         match event_type {
                             "text_delta" => {
-                                if let Some(content) =
-                                    json.get("content").and_then(|v| v.as_str())
+                                if let Some(content) = json.get("content").and_then(|v| v.as_str())
                                 {
                                     result.text.push_str(content);
                                     pane.push_chunk(content);
@@ -298,11 +289,7 @@ pub async fn collect_sse_with_preview(resp: reqwest::Response) -> SseTextResult 
                                     .or_else(|| json.get("error"))
                                     .and_then(|v| v.as_str())
                                 {
-                                    eprintln!(
-                                        "\r  {} Server error: {}",
-                                        theme::icon_err(),
-                                        msg
-                                    );
+                                    eprintln!("\r  {} Server error: {}", theme::icon_err(), msg);
                                 }
                             }
                             _ => {}

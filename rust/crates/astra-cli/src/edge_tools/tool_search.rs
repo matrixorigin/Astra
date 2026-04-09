@@ -5,7 +5,7 @@
 
 use serde_json::Value;
 
-use super::{all_tool_schemas, ToolExecutor};
+use super::{ToolExecutor, all_tool_schemas};
 
 impl ToolExecutor {
     pub(super) fn tool_search(&self, args: &Value) -> String {
@@ -24,7 +24,11 @@ impl ToolExecutor {
 
         // Direct selection mode: select:tool_name or select:a,b,c
         if let Some(tool_names) = query.strip_prefix("select:") {
-            let requested: Vec<&str> = tool_names.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+            let requested: Vec<&str> = tool_names
+                .split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .collect();
             let mut found = Vec::new();
             let mut missing = Vec::new();
 
@@ -39,7 +43,10 @@ impl ToolExecutor {
                 }) {
                     if let Some(func) = tool.get("function") {
                         let tool_name = func.get("name").and_then(Value::as_str).unwrap_or("");
-                        let desc = func.get("description").and_then(Value::as_str).unwrap_or("");
+                        let desc = func
+                            .get("description")
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
                         // Truncate description for readability
                         let short_desc: String = desc.chars().take(100).collect();
                         found.push(serde_json::json!({
@@ -57,7 +64,8 @@ impl ToolExecutor {
                 "matches": found,
                 "missing": missing,
                 "total_tools": all_tools.len()
-            }).to_string();
+            })
+            .to_string();
         }
 
         // Keyword search mode
@@ -69,13 +77,16 @@ impl ToolExecutor {
             .filter_map(|tool| {
                 let func = tool.get("function")?;
                 let name = func.get("name")?.as_str()?;
-                let desc = func.get("description").and_then(Value::as_str).unwrap_or("");
-                
+                let desc = func
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+
                 let name_lower = name.to_lowercase();
                 let desc_lower = desc.to_lowercase();
-                
+
                 let mut score = 0usize;
-                
+
                 for term in &query_terms {
                     // Exact name match (high weight)
                     if name_lower == *term {
@@ -84,7 +95,7 @@ impl ToolExecutor {
                         // Partial name match
                         score += 10;
                     }
-                    
+
                     // Split camelCase/snake_case for part matching
                     let name_parts: Vec<String> = name
                         .replace('_', " ")
@@ -100,7 +111,7 @@ impl ToolExecutor {
                         .split_whitespace()
                         .map(String::from)
                         .collect();
-                    
+
                     for part in &name_parts {
                         if part == *term {
                             score += 8;
@@ -108,18 +119,14 @@ impl ToolExecutor {
                             score += 4;
                         }
                     }
-                    
+
                     // Description match (lower weight)
                     if desc_lower.contains(term) {
                         score += 2;
                     }
                 }
-                
-                if score > 0 {
-                    Some((score, tool))
-                } else {
-                    None
-                }
+
+                if score > 0 { Some((score, tool)) } else { None }
             })
             .collect();
 
@@ -146,7 +153,7 @@ impl ToolExecutor {
             "query": query,
             "matches": matches,
             "total_tools": all_tools.len()
-        }).to_string()
+        })
+        .to_string()
     }
-
 }

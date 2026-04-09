@@ -5,7 +5,7 @@
 
 use std::time::Duration;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use super::ToolExecutor;
 
@@ -57,7 +57,12 @@ impl ToolExecutor {
             .await
     }
 
-    pub(super) async fn memoria_call_with_timeout(&self, op: &str, args: &Value, timeout: Duration) -> String {
+    pub(super) async fn memoria_call_with_timeout(
+        &self,
+        op: &str,
+        args: &Value,
+        timeout: Duration,
+    ) -> String {
         // Circuit breaker: skip after 2 consecutive failures (reset on success)
         const MAX_FAILS: u32 = 2;
         if self

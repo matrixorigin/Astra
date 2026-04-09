@@ -1,7 +1,6 @@
 //! Notebook edit tool: Jupyter notebook cell editing operations.
 
-
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use super::ToolExecutor;
 
@@ -13,14 +12,16 @@ impl ToolExecutor {
     pub(super) fn notebook_edit(&self, args: &Value) -> String {
         let notebook_path = match args.get("notebook_path").and_then(|v| v.as_str()) {
             Some(p) => p,
-            None => return json!({ "error": "Missing required parameter: notebook_path" }).to_string(),
+            None => {
+                return json!({ "error": "Missing required parameter: notebook_path" }).to_string();
+            }
         };
 
         let file_path = match self.resolve_checked(notebook_path) {
             Ok(path) => path,
             Err(e) => return json!({ "error": e }).to_string(),
         };
-        
+
         // Validate file extension
         if !file_path.extension().map(|e| e == "ipynb").unwrap_or(false) {
             return json!({ 
@@ -28,16 +29,24 @@ impl ToolExecutor {
             }).to_string();
         }
 
-        let edit_mode = args.get("edit_mode").and_then(|v| v.as_str()).unwrap_or("replace");
+        let edit_mode = args
+            .get("edit_mode")
+            .and_then(|v| v.as_str())
+            .unwrap_or("replace");
         if !matches!(edit_mode, "replace" | "insert" | "delete") {
             return json!({ "error": format!("Unknown edit_mode: {}. Use replace, insert, or delete", edit_mode) }).to_string();
         }
 
         let cell_id = args.get("cell_id").and_then(|v| v.as_str());
         let new_source = args.get("new_source").and_then(|v| v.as_str());
-        let cell_type = args.get("cell_type").and_then(|v| v.as_str()).unwrap_or("code");
+        let cell_type = args
+            .get("cell_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("code");
 
-        let rel = file_path.strip_prefix(&self.project_root).unwrap_or(&file_path);
+        let rel = file_path
+            .strip_prefix(&self.project_root)
+            .unwrap_or(&file_path);
         let rel_str = rel.to_string_lossy();
         if let Some(warning) = super::fs_tools::is_dangerous_write_target(&rel_str) {
             return json!({
@@ -60,38 +69,45 @@ impl ToolExecutor {
                 }).to_string();
             }
         }
-        
+
         // Read existing notebook
         let content = match std::fs::read_to_string(&file_path) {
             Ok(c) => c,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 // Create new notebook if it doesn't exist and we're inserting
-                let edit_mode = args.get("edit_mode").and_then(|v| v.as_str()).unwrap_or("replace");
+                let edit_mode = args
+                    .get("edit_mode")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("replace");
                 if edit_mode != "insert" {
                     return json!({ "error": format!("Notebook not found: {}", file_path.display()) }).to_string();
                 }
                 // Create empty notebook structure
                 r#"{"cells":[],"metadata":{"language_info":{"name":"python"}},"nbformat":4,"nbformat_minor":5}"#.to_string()
             }
-            Err(e) => return json!({ "error": format!("Failed to read notebook: {}", e) }).to_string(),
+            Err(e) => {
+                return json!({ "error": format!("Failed to read notebook: {}", e) }).to_string();
+            }
         };
-        
+
         let mut notebook: Value = match serde_json::from_str(&content) {
             Ok(n) => n,
-            Err(e) => return json!({ "error": format!("Invalid notebook JSON: {}", e) }).to_string(),
+            Err(e) => {
+                return json!({ "error": format!("Invalid notebook JSON: {}", e) }).to_string();
+            }
         };
-        
+
         let cells = match notebook.get_mut("cells").and_then(|c| c.as_array_mut()) {
             Some(c) => c,
             None => return json!({ "error": "Notebook has no cells array" }).to_string(),
         };
-        
+
         // Find cell index if cell_id provided
         let cell_index = if let Some(id) = cell_id {
             // Try to find by ID first
-            let by_id = cells.iter().position(|c| {
-                c.get("id").and_then(|i| i.as_str()) == Some(id)
-            });
+            let by_id = cells
+                .iter()
+                .position(|c| c.get("id").and_then(|i| i.as_str()) == Some(id));
             if let Some(idx) = by_id {
                 Some(idx)
             } else {
@@ -105,7 +121,7 @@ impl ToolExecutor {
         } else {
             None
         };
-        
+
         match edit_mode {
             "delete" => {
                 let idx = match cell_index {
@@ -157,10 +173,10 @@ impl ToolExecutor {
             }
             _ => return json!({ "error": format!("Unknown edit_mode: {}. Use replace, insert, or delete", edit_mode) }).to_string(),
         }
-        
+
         // Get cell count before dropping mutable borrow
         let total_cells = cells.len();
-        
+
         // Extract language before serializing (need to drop cells borrow first)
         let language = notebook
             .get("metadata")
@@ -172,7 +188,8 @@ impl ToolExecutor {
 
         if file_path.exists() {
             if let Err(e) = self.check_staleness(&file_path) {
-                return json!({ "error": format!("Pre-write staleness check failed: {e}") }).to_string();
+                return json!({ "error": format!("Pre-write staleness check failed: {e}") })
+                    .to_string();
             }
         }
 
@@ -182,7 +199,7 @@ impl ToolExecutor {
             return json!({ "error": format!("Failed to write notebook: {}", e) }).to_string();
         }
         self.record_write(&file_path);
-        
+
         json!({
             "success": true,
             "edit_mode": edit_mode,
@@ -190,7 +207,7 @@ impl ToolExecutor {
             "language": language,
             "total_cells": total_cells,
             "notebook_path": file_path.display().to_string()
-        }).to_string()
+        })
+        .to_string()
     }
-
 }

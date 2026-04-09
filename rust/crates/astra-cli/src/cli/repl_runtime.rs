@@ -489,18 +489,12 @@ async fn try_refresh_token(
         .map_err(SilentRefreshError::Thin)?;
     let value: serde_json::Value =
         serde_json::from_str(&body).map_err(|e| SilentRefreshError::Thin(e.into()))?;
-    let new_access = value
-        .get("access_token")
-        .and_then(|v| v.as_str())
-        .ok_or(SilentRefreshError::BadResponse(
-            "refresh response: missing access_token",
-        ))?;
-    let new_refresh = value
-        .get("refresh_token")
-        .and_then(|v| v.as_str())
-        .ok_or(SilentRefreshError::BadResponse(
-            "refresh response: missing refresh_token",
-        ))?;
+    let new_access = value.get("access_token").and_then(|v| v.as_str()).ok_or(
+        SilentRefreshError::BadResponse("refresh response: missing access_token"),
+    )?;
+    let new_refresh = value.get("refresh_token").and_then(|v| v.as_str()).ok_or(
+        SilentRefreshError::BadResponse("refresh response: missing refresh_token"),
+    )?;
     let mut creds = load_credentials();
     let name = profile_name(profile, &creds);
     let entry = creds.profiles.entry(name).or_default();

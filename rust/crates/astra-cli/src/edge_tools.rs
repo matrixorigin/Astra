@@ -31,10 +31,16 @@ use serde_json::{Value, json};
 #[path = "delta_log.rs"]
 pub mod delta_log;
 
+#[path = "edge_tools/agent_messaging.rs"]
+pub mod agent_messaging;
+#[path = "edge_tools/agent_spawning.rs"]
+pub mod agent_spawning;
 #[path = "edge_tools/build_test.rs"]
 mod build_test;
 #[path = "edge_tools/code_intel.rs"]
 pub mod code_intel;
+#[path = "edge_tools/context_sharing.rs"]
+pub mod context_sharing;
 #[path = "edge_tools/fs.rs"]
 mod fs_tools;
 #[path = "edge_tools/git_gix.rs"]
@@ -51,40 +57,34 @@ mod passive_cargo_check;
 mod passive_lsp;
 #[path = "edge_tools/passive_tsc_check.rs"]
 mod passive_tsc_check;
-#[path = "edge_tools/shell.rs"]
-mod shell;
-#[path = "edge_tools/agent_messaging.rs"]
-pub mod agent_messaging;
-#[path = "edge_tools/agent_spawning.rs"]
-pub mod agent_spawning;
-#[path = "edge_tools/context_sharing.rs"]
-pub mod context_sharing;
 #[path = "edge_tools/schemas.rs"]
 mod schemas;
+#[path = "edge_tools/shell.rs"]
+mod shell;
 pub use schemas::all_tool_schemas;
 #[path = "edge_tools/env_tools.rs"]
 mod env_tools;
 pub use env_tools::apply_overlay as apply_env_overlay;
-#[path = "edge_tools/task_mgmt.rs"]
-mod task_mgmt;
 #[path = "edge_tools/code_analysis.rs"]
 mod code_analysis;
-#[path = "edge_tools/web_search.rs"]
-mod web_search;
-#[path = "edge_tools/diagnose.rs"]
-mod diagnose;
-#[path = "edge_tools/lsp_tools.rs"]
-mod lsp_tools;
-#[path = "edge_tools/notebook_edit.rs"]
-mod notebook_edit;
 #[path = "edge_tools/config_tool.rs"]
 mod config_tool;
 #[path = "edge_tools/context_tools.rs"]
 mod context_tools;
+#[path = "edge_tools/diagnose.rs"]
+mod diagnose;
 #[path = "edge_tools/file_state.rs"]
 mod file_state;
-pub(crate) use file_state::ReadDedupKey;
+#[path = "edge_tools/lsp_tools.rs"]
+mod lsp_tools;
+#[path = "edge_tools/notebook_edit.rs"]
+mod notebook_edit;
+#[path = "edge_tools/task_mgmt.rs"]
+mod task_mgmt;
+#[path = "edge_tools/web_search.rs"]
+mod web_search;
 use file_state::FileState;
+pub(crate) use file_state::ReadDedupKey;
 #[path = "edge_tools/worktree.rs"]
 mod worktree;
 pub use worktree::WorktreeSession;
@@ -97,14 +97,12 @@ mod memoria;
 use memoria::parse_memory_search_contents;
 #[path = "edge_tools/ask_user.rs"]
 mod ask_user;
-#[path = "edge_tools/tool_search.rs"]
-mod tool_search;
 #[path = "edge_tools/mcp_dispatch.rs"]
 mod mcp_dispatch;
+#[path = "edge_tools/tool_search.rs"]
+mod tool_search;
 
 // ─── Tool schema ─────────────────────────────────────────────────────────────
-
-
 
 /// Git porcelain status codes for git status --porcelain output parsing.
 /// Format: XY PATH or XY ORIG_PATH -> PATH where X and Y are status codes.
@@ -120,7 +118,6 @@ mod git_status {
     /// Untracked file marker (both positions are '?')
     pub const UNTRACKED_PREFIX: &str = "??";
 }
-
 
 // ─── Tool execution ───────────────────────────────────────────────────────────
 
@@ -289,7 +286,6 @@ fn categorize_reference(line: &str, _symbol: &str) -> &'static str {
     "usage"
 }
 
-
 pub struct ToolExecutor {
     pub project_root: PathBuf,
     /// Cloud API base URL — used to proxy memory tool calls through the server
@@ -360,7 +356,6 @@ pub struct ToolExecutor {
     /// Optional messaging context for the `send_message` tool.
     pub send_message_context: Option<agent_messaging::SendMessageRuntimeContext>,
 }
-
 
 impl ToolExecutor {
     pub fn new(project_root: impl Into<PathBuf>) -> Self {
@@ -439,11 +434,21 @@ impl ToolExecutor {
 
     // ─── Task management methods (delegated to task_mgmt module) ────────────
 
-    async fn task_create(&self, args: &Value) -> String { self.task_manager.create(args).await }
-    async fn task_list(&self, args: &Value) -> String { self.task_manager.list(args).await }
-    async fn task_get(&self, args: &Value) -> String { self.task_manager.get(args).await }
-    async fn task_update(&self, args: &Value) -> String { self.task_manager.update(args).await }
-    async fn task_stop(&self, args: &Value) -> String { self.task_manager.stop(args).await }
+    async fn task_create(&self, args: &Value) -> String {
+        self.task_manager.create(args).await
+    }
+    async fn task_list(&self, args: &Value) -> String {
+        self.task_manager.list(args).await
+    }
+    async fn task_get(&self, args: &Value) -> String {
+        self.task_manager.get(args).await
+    }
+    async fn task_update(&self, args: &Value) -> String {
+        self.task_manager.update(args).await
+    }
+    async fn task_stop(&self, args: &Value) -> String {
+        self.task_manager.stop(args).await
+    }
 
     /// Sleep for a specified duration without holding a shell process.
     async fn sleep_tool(&self, args: &Value) -> String {
@@ -455,17 +460,24 @@ impl ToolExecutor {
             None => return "Error: 'duration_ms' is required".to_string(),
         };
 
-        let reason = args.get("reason").and_then(Value::as_str).unwrap_or("waiting");
-        
-        eprintln!("  {}", format!("💤 Sleeping for {}ms ({})", duration_ms, reason).dim());
-        
+        let reason = args
+            .get("reason")
+            .and_then(Value::as_str)
+            .unwrap_or("waiting");
+
+        eprintln!(
+            "  {}",
+            format!("💤 Sleeping for {}ms ({})", duration_ms, reason).dim()
+        );
+
         tokio::time::sleep(std::time::Duration::from_millis(duration_ms)).await;
-        
+
         serde_json::json!({
             "success": true,
             "slept_ms": duration_ms,
             "reason": reason
-        }).to_string()
+        })
+        .to_string()
     }
 
     // ── Env tool: environment variable management ─────────────────────────────
@@ -573,7 +585,6 @@ impl ToolExecutor {
         }
     }
 
-
     /// Output limit scaled by budget pressure and aggregate output.
     ///
     /// Two independent pressures are combined:
@@ -606,7 +617,6 @@ impl ToolExecutor {
         self.aggregate_output_bytes
             .fetch_add(size, std::sync::atomic::Ordering::Relaxed);
     }
-
 
     /// Configure security sandbox for tool execution.
     #[allow(dead_code)] // Public builder API for library consumers
@@ -879,7 +889,6 @@ impl ToolExecutor {
         )
     }
 
-
     /// Execute a multi-step ToolChain, forwarding each step to self.execute().
     ///
     /// Returns a JSON summary with per-step outputs and the final result.
@@ -980,27 +989,27 @@ mod tests {
         (dir, executor)
     }
 
-    mod schema_tests;
+    mod aggregate_tests;
+    mod build_test_tests;
+    mod chain_tests;
+    mod code_intel_api_tests;
+    mod code_intel_enhancement_tests;
+    mod code_intel_integration_tests;
+    mod code_intel_tests;
+    mod config_tests;
+    mod cross_file_caller_tests;
+    mod diagnose_tests;
+    mod env_tests;
     mod executor_core_tests;
     mod fs_tests;
+    mod lsp_tests;
     mod memoria_tests;
-    mod worktree_tests;
-    mod chain_tests;
-    mod code_intel_tests;
-    mod code_intel_integration_tests;
-    mod build_test_tests;
-    mod code_intel_enhancement_tests;
-    mod cross_file_caller_tests;
-    mod code_intel_api_tests;
-    mod aggregate_tests;
+    mod notebook_tests;
     mod sandbox_tests;
+    mod schema_tests;
     mod task_tests;
     mod tool_search_tests;
-    mod web_search_tests;
-    mod diagnose_tests;
-    mod lsp_tests;
-    mod env_tests;
     mod utf16_tests;
-    mod notebook_tests;
-    mod config_tests;
+    mod web_search_tests;
+    mod worktree_tests;
 }

@@ -3,8 +3,11 @@
 //! Tasks are in-memory only — they survive across tool calls but not across
 //! CLI restarts. Each task can contain subtasks with dependency tracking.
 
-use std::sync::{atomic::{AtomicU32, Ordering}, Mutex};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
+use std::sync::{
+    Mutex,
+    atomic::{AtomicU32, Ordering},
+};
 
 /// A task tracked within the current CLI session.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -54,7 +57,10 @@ impl TaskManager {
             _ => return "Error: 'title' is required".to_string(),
         };
 
-        let description = args.get("description").and_then(Value::as_str).map(String::from);
+        let description = args
+            .get("description")
+            .and_then(Value::as_str)
+            .map(String::from);
         let now = chrono::Utc::now().to_rfc3339();
 
         let subtasks: Vec<SessionSubtask> = args
@@ -115,10 +121,7 @@ impl TaskManager {
 
     /// List tasks in the session, optionally filtered by status.
     pub async fn list(&self, args: &Value) -> String {
-        let status_filter = args
-            .get("status")
-            .and_then(Value::as_str)
-            .unwrap_or("all");
+        let status_filter = args.get("status").and_then(Value::as_str).unwrap_or("all");
 
         let tasks = match self.tasks.lock() {
             Ok(guard) => guard.clone(),
@@ -220,10 +223,7 @@ impl TaskManager {
                     .to_string();
                 }
                 None => {
-                    return format!(
-                        "Error: subtask '{}' not found in task '{}'",
-                        st_id, task_id
-                    )
+                    return format!("Error: subtask '{}' not found in task '{}'", st_id, task_id);
                 }
             }
         }

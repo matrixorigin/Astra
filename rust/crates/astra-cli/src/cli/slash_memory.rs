@@ -94,7 +94,11 @@ async fn enrich_with_templates(
     let uid = user_id.unwrap_or("anonymous");
 
     if verbose {
-        eprintln!("  {} {}", "⋯".cyan(), "Searching for similar plan templates…".dim());
+        eprintln!(
+            "  {} {}",
+            "⋯".cyan(),
+            "Searching for similar plan templates…".dim()
+        );
     }
 
     let templates = plan_decompose::query_similar_templates(pool, uid, goal, 3).await;
@@ -358,10 +362,7 @@ pub(super) async fn handle_memory_domain_command(
                         state.chat_plan_only = false;
                         state.plan_mode = Some(PlanModeState::new(String::new(), context));
                         plan_interaction::eprint_plan_mode_banner("");
-                        eprintln!(
-                            "  {} Describe your goal to start planning.",
-                            "→".cyan()
-                        );
+                        eprintln!("  {} Describe your goal to start planning.", "→".cyan());
                     }
                 }
                 "show" => {
@@ -1489,13 +1490,12 @@ async fn _old_handle_plan_mode_input(
     state: &mut ReplState,
     api: &astra_thin_client::ThinClient,
 ) -> Result<(), String> {
+    use super::plan_interaction::eprint_clarification_question;
     use plan_decompose::{
         ClarificationAnswer, PendingClarifications, PlanEntryChoice, PlanModeState,
-        decomposition_prompt, detect_clarification_questions,
-        format_project_context, parse_clarification_response, parse_plan_entry_choice,
-        parse_plan_response,
+        decomposition_prompt, detect_clarification_questions, format_project_context,
+        parse_clarification_response, parse_plan_entry_choice, parse_plan_response,
     };
-    use super::plan_interaction::eprint_clarification_question;
 
     let plan_state = match state.plan_mode.as_mut() {
         Some(ps) => ps,
@@ -1693,7 +1693,13 @@ async fn _old_handle_plan_mode_input(
                             eprintln!(
                                 "  {} {}",
                                 "▸".cyan(),
-                                format!("{} question{} before planning:", questions.len(), if questions.len() == 1 { "" } else { "s" }).bold().cyan()
+                                format!(
+                                    "{} question{} before planning:",
+                                    questions.len(),
+                                    if questions.len() == 1 { "" } else { "s" }
+                                )
+                                .bold()
+                                .cyan()
                             );
                             eprintln!();
 
@@ -1978,7 +1984,8 @@ async fn _old_handle_plan_mode_input(
             }
 
             if !sse_result.text.is_empty() {
-                match plan_interaction::try_replace_plan_from_llm_json(&sse_result.text, plan_state) {
+                match plan_interaction::try_replace_plan_from_llm_json(&sse_result.text, plan_state)
+                {
                     Ok(true) => {
                         plan_state.modified = true;
                         let _ = plan_state.save_to_file(&PlanModeState::state_path());

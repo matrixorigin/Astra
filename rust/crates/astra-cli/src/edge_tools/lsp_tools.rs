@@ -3,9 +3,9 @@
 
 use std::path::PathBuf;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
-use super::{utf16_col_to_char_idx, MAX_LSP_FILE_SIZE, ToolExecutor};
+use super::{MAX_LSP_FILE_SIZE, ToolExecutor, utf16_col_to_char_idx};
 
 impl ToolExecutor {
     // ─── LSP tool: unified language server interface ─────────────────────────────
@@ -27,11 +27,17 @@ impl ToolExecutor {
 
         let file = args.get("file").and_then(Value::as_str);
         let line = args.get("line").and_then(Value::as_i64).map(|l| l as usize);
-        let column = args.get("column").and_then(Value::as_i64).map(|c| c as usize);
+        let column = args
+            .get("column")
+            .and_then(Value::as_i64)
+            .map(|c| c as usize);
         let symbol = args.get("symbol").and_then(Value::as_str);
         let query = args.get("query").and_then(Value::as_str);
         let scope = args.get("scope").and_then(Value::as_str).unwrap_or("file");
-        let include_body = args.get("include_body").and_then(Value::as_bool).unwrap_or(false);
+        let include_body = args
+            .get("include_body")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
 
         match operation {
             "goto_definition" => {
@@ -171,29 +177,38 @@ impl ToolExecutor {
 
     /// Find definition at a specific file position by extracting the symbol under cursor.
     /// Column is interpreted as UTF-16 code units (LSP protocol).
-    pub(super) fn find_definition_at_position(&self, file: &str, line: usize, col_utf16: usize) -> String {
+    pub(super) fn find_definition_at_position(
+        &self,
+        file: &str,
+        line: usize,
+        col_utf16: usize,
+    ) -> String {
         // Read the file and extract symbol at position
         let file_path = if file.starts_with('/') {
             PathBuf::from(file)
         } else {
             self.project_root.join(file)
         };
-        
+
         // Check file size to prevent OOM
         if let Ok(metadata) = std::fs::metadata(&file_path) {
             if metadata.len() > MAX_LSP_FILE_SIZE as u64 {
                 return json!({
                     "error": format!("File too large for LSP operations ({} bytes, max {} bytes)",
                         metadata.len(), MAX_LSP_FILE_SIZE)
-                }).to_string();
+                })
+                .to_string();
             }
         }
-        
+
         let content = match std::fs::read_to_string(&file_path) {
             Ok(c) => c,
-            Err(e) => return json!({
-                "error": format!("Failed to read file: {}", e)
-            }).to_string(),
+            Err(e) => {
+                return json!({
+                    "error": format!("Failed to read file: {}", e)
+                })
+                .to_string();
+            }
         };
 
         // Get the line
@@ -201,21 +216,23 @@ impl ToolExecutor {
         if line == 0 || line > lines.len() {
             return json!({
                 "error": format!("Line {} out of range (file has {} lines)", line, lines.len())
-            }).to_string();
+            })
+            .to_string();
         }
 
         let line_content = lines[line - 1];
-        
+
         // Convert UTF-16 column to char index (LSP uses UTF-16 code units).
         // col_utf16 is 0-indexed per tool schema, same as utf16_col_to_char_idx expects.
         let col_idx = utf16_col_to_char_idx(line_content, col_utf16);
         let chars: Vec<char> = line_content.chars().collect();
-        
+
         if col_idx >= chars.len() {
             return json!({
-                "error": format!("Column {} (UTF-16) out of range for line {} (length {})", 
+                "error": format!("Column {} (UTF-16) out of range for line {} (length {})",
                     col_utf16, line, line_content.len())
-            }).to_string();
+            })
+            .to_string();
         }
 
         // Find word boundaries
@@ -223,7 +240,7 @@ impl ToolExecutor {
         while start > 0 && Self::is_symbol_char(chars.get(start - 1).copied().unwrap_or(' ')) {
             start -= 1;
         }
-        
+
         let mut end = col_idx;
         while end < chars.len() && Self::is_symbol_char(chars.get(end).copied().unwrap_or(' ')) {
             end += 1;
@@ -232,11 +249,12 @@ impl ToolExecutor {
         if start == end {
             return json!({
                 "error": "No symbol found at position"
-            }).to_string();
+            })
+            .to_string();
         }
 
         let symbol: String = chars[start..end].iter().collect();
-        
+
         self.find_definition(&json!({
             "symbol": symbol,
             "file": file
@@ -247,5 +265,4 @@ impl ToolExecutor {
     fn is_symbol_char(c: char) -> bool {
         c.is_alphanumeric() || c == '_'
     }
-
 }

@@ -7,7 +7,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 
-use super::{passive_cargo_check, passive_tsc_check, ToolExecutor};
+use super::{ToolExecutor, passive_cargo_check, passive_tsc_check};
 
 /// Maximum number of entries in the file state cache. When exceeded, the
 /// entry with the oldest timestamp is evicted.
@@ -196,7 +196,11 @@ impl ToolExecutor {
     /// Consecutive identical partial read (outline or same raw line range) with unchanged
     /// mtime — stub **before** disk read, like Claude Code `tengu_file_read_dedup` for
     /// the same offset/limit as the immediately previous read.
-    pub(super) fn can_dedup_identical_partial_read(&self, path: &Path, requested: &ReadDedupKey) -> bool {
+    pub(super) fn can_dedup_identical_partial_read(
+        &self,
+        path: &Path,
+        requested: &ReadDedupKey,
+    ) -> bool {
         if std::env::var("MO_DEDUP_DISABLED").is_ok_and(|v| v == "1" || v == "true") {
             return false;
         }

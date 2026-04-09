@@ -9,9 +9,7 @@
 //! - `/agent help`: Show help
 
 use super::*;
-use astra_runtime::orchestration::{
-    AgentStatus, DynamicAgentSpawner, PermissionSummary,
-};
+use astra_runtime::orchestration::{AgentStatus, DynamicAgentSpawner, PermissionSummary};
 use std::sync::Arc;
 
 /// Agent command context — passed from main.
@@ -95,12 +93,18 @@ fn show_list(ctx: &AgentCommandContext) {
 
     for agent in &agents {
         let _status_str = format_status(&agent.status);
-        let elapsed = agent.started_at.elapsed()
+        let elapsed = agent
+            .started_at
+            .elapsed()
             .map(|d| format_duration(d))
             .unwrap_or_else(|_| "?".to_string());
 
         // Permission indicator
-        let perm_icon = if agent.has_permission_issues { "🔒" } else { "" };
+        let perm_icon = if agent.has_permission_issues {
+            "🔒"
+        } else {
+            ""
+        };
 
         eprintln!(
             "  {} {} {} ({}){}",
@@ -108,19 +112,32 @@ fn show_list(ctx: &AgentCommandContext) {
             agent.agent_id.as_str().white().bold(),
             format!("[{}]", agent.agent_type).dim(),
             elapsed.dim(),
-            if agent.has_permission_issues { format!(" {}", perm_icon.red()) } else { String::new() }
+            if agent.has_permission_issues {
+                format!(" {}", perm_icon.red())
+            } else {
+                String::new()
+            }
         );
         eprintln!("    {}", agent.description.as_str().cyan());
         if agent.metrics.tool_calls > 0 || agent.metrics.tools_blocked > 0 {
             let mut metrics_parts = vec![];
             if agent.metrics.tool_calls > 0 {
-                metrics_parts.push(format!("tools: {}", agent.metrics.tool_calls.to_string().green()));
+                metrics_parts.push(format!(
+                    "tools: {}",
+                    agent.metrics.tool_calls.to_string().green()
+                ));
             }
             if agent.metrics.turns_completed > 0 {
-                metrics_parts.push(format!("turns: {}", agent.metrics.turns_completed.to_string().green()));
+                metrics_parts.push(format!(
+                    "turns: {}",
+                    agent.metrics.turns_completed.to_string().green()
+                ));
             }
             if agent.metrics.tools_blocked > 0 {
-                metrics_parts.push(format!("blocked: {}", agent.metrics.tools_blocked.to_string().red()));
+                metrics_parts.push(format!(
+                    "blocked: {}",
+                    agent.metrics.tools_blocked.to_string().red()
+                ));
             }
             eprintln!("    {} {}", "📊".dim(), metrics_parts.join(", "));
         }
@@ -144,31 +161,69 @@ fn show_status(ctx: &AgentCommandContext, agent_id: &str) {
 
     match rt.block_on(spawner.get_agent_state(agent_id)) {
         Some(state) => {
-            eprintln!("\n  {} {}", "🤖 Agent".cyan().bold(), state.agent_id.as_str().white().bold());
+            eprintln!(
+                "\n  {} {}",
+                "🤖 Agent".cyan().bold(),
+                state.agent_id.as_str().white().bold()
+            );
             eprintln!("  {}", "─".repeat(50).dim());
             eprintln!("  {} {}", "Type:".white().bold(), state.agent_type);
-            eprintln!("  {} {}", "Description:".white().bold(), state.description.as_str().cyan());
-            eprintln!("  {} {}", "Status:".white().bold(), format_status(&state.status));
-            eprintln!("  {} {}", "Run ID:".white().bold(), state.run_id.as_str().dim());
-            eprintln!("  {} {}", "Parent:".white().bold(), state.parent_run_id.as_str().dim());
+            eprintln!(
+                "  {} {}",
+                "Description:".white().bold(),
+                state.description.as_str().cyan()
+            );
+            eprintln!(
+                "  {} {}",
+                "Status:".white().bold(),
+                format_status(&state.status)
+            );
+            eprintln!(
+                "  {} {}",
+                "Run ID:".white().bold(),
+                state.run_id.as_str().dim()
+            );
+            eprintln!(
+                "  {} {}",
+                "Parent:".white().bold(),
+                state.parent_run_id.as_str().dim()
+            );
 
             if let Some(ref addr) = state.messaging_address {
-                eprintln!("  {} {}", "Address:".white().bold(), addr.to_string().green());
+                eprintln!(
+                    "  {} {}",
+                    "Address:".white().bold(),
+                    addr.to_string().green()
+                );
             }
 
             if let Some(ref path) = state.worktree_path {
-                eprintln!("  {} {}", "Worktree:".white().bold(), path.display().to_string().dim());
+                eprintln!(
+                    "  {} {}",
+                    "Worktree:".white().bold(),
+                    path.display().to_string().dim()
+                );
             }
 
-            let elapsed = state.started_at.elapsed()
+            let elapsed = state
+                .started_at
+                .elapsed()
                 .map(|d| format_duration(d))
                 .unwrap_or_else(|_| "?".to_string());
             eprintln!("  {} {}", "Running for:".white().bold(), elapsed);
 
             eprintln!("\n  {}", "📊 Metrics".cyan().bold());
             eprintln!("  {}", "─".repeat(30).dim());
-            eprintln!("  {} {}", "Turns:".white().bold(), state.metrics.turns_completed);
-            eprintln!("  {} {}", "Tool calls:".white().bold(), state.metrics.tool_calls);
+            eprintln!(
+                "  {} {}",
+                "Turns:".white().bold(),
+                state.metrics.turns_completed
+            );
+            eprintln!(
+                "  {} {}",
+                "Tool calls:".white().bold(),
+                state.metrics.tool_calls
+            );
             eprintln!(
                 "  {} {} prompt, {} completion",
                 "Tokens:".white().bold(),
@@ -221,8 +276,13 @@ fn show_permissions(ctx: &AgentCommandContext, agent_id: &str) {
                 eprintln!(
                     "    Sent: {}, Approved: {}, Denied: {}",
                     state.metrics.permission_requests.to_string().cyan(),
-                    state.metrics.permission_requests_approved.to_string().green(),
-                    (state.metrics.permission_requests - state.metrics.permission_requests_approved)
+                    state
+                        .metrics
+                        .permission_requests_approved
+                        .to_string()
+                        .green(),
+                    (state.metrics.permission_requests
+                        - state.metrics.permission_requests_approved)
                         .to_string()
                         .red()
                 );
@@ -244,7 +304,10 @@ fn show_permissions(ctx: &AgentCommandContext, agent_id: &str) {
     }
 }
 
-fn print_permission_summary(summary: &PermissionSummary, metrics: &astra_runtime::orchestration::SpawnedAgentMetrics) {
+fn print_permission_summary(
+    summary: &PermissionSummary,
+    metrics: &astra_runtime::orchestration::SpawnedAgentMetrics,
+) {
     let mode_styled = match summary.mode.as_str() {
         "auto" => "auto".green(),
         "prompt" => "prompt".yellow(),
@@ -261,7 +324,11 @@ fn print_permission_summary(summary: &PermissionSummary, metrics: &astra_runtime
     eprintln!(
         "  {} {}",
         "Parent escalation:".white().bold(),
-        if summary.has_parent { "enabled".green() } else { "disabled".dim() }
+        if summary.has_parent {
+            "enabled".green()
+        } else {
+            "disabled".dim()
+        }
     );
     if metrics.tools_blocked > 0 {
         eprintln!(
@@ -295,7 +362,7 @@ fn stop_agent(ctx: &AgentCommandContext, agent_id: &str) {
 
     // Update status to cancelled
     rt.block_on(spawner.update_status(agent_id, AgentStatus::Cancelled));
-    
+
     eprintln!(
         "  {} Shutdown request sent to {}",
         "✓".green(),
@@ -371,8 +438,8 @@ fn print_progress_event(event: &astra_runtime::orchestration::AgentProgressEvent
     use astra_runtime::orchestration::ProgressEventType;
     use crossterm::style::Stylize;
 
-    let timestamp = std::time::UNIX_EPOCH
-        + std::time::Duration::from_millis(event.timestamp_epoch_ms);
+    let timestamp =
+        std::time::UNIX_EPOCH + std::time::Duration::from_millis(event.timestamp_epoch_ms);
     let time_str = timestamp
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| {
@@ -417,7 +484,9 @@ fn print_progress_event(event: &astra_runtime::orchestration::AgentProgressEvent
             )
         }
         ProgressEventType::Failed { error } => format!("{} {}", "✗ Failed:".red(), error),
-        ProgressEventType::Cancelled { reason } => format!("{} {}", "⊘ Cancelled:".yellow(), reason),
+        ProgressEventType::Cancelled { reason } => {
+            format!("{} {}", "⊘ Cancelled:".yellow(), reason)
+        }
     };
 
     eprintln!("  [{}] {}", time_str.as_str().dim(), msg);
@@ -428,8 +497,14 @@ fn show_help() {
     eprintln!("  {}", "─".repeat(50).dim());
     eprintln!("  {}  List all active agents", "/agent".white().bold());
     eprintln!("  {}  List all active agents", "/agent list".white().bold());
-    eprintln!("  {}  Show agent status", "/agent status <id>".white().bold());
-    eprintln!("  {}  Show permission details", "/agent permissions <id>".white().bold());
+    eprintln!(
+        "  {}  Show agent status",
+        "/agent status <id>".white().bold()
+    );
+    eprintln!(
+        "  {}  Show permission details",
+        "/agent permissions <id>".white().bold()
+    );
     eprintln!("  {}  Stop an agent", "/agent stop <id>".white().bold());
     eprintln!("  {}  Show agent logs", "/agent logs <id>".white().bold());
     eprintln!("  {}  Show this help", "/agent help".white().bold());
@@ -494,13 +569,21 @@ mod tests {
     #[test]
     fn test_format_duration() {
         assert_eq!(format_duration(std::time::Duration::from_secs(30)), "30s");
-        assert_eq!(format_duration(std::time::Duration::from_secs(90)), "1m 30s");
-        assert_eq!(format_duration(std::time::Duration::from_secs(3700)), "1h 1m");
+        assert_eq!(
+            format_duration(std::time::Duration::from_secs(90)),
+            "1m 30s"
+        );
+        assert_eq!(
+            format_duration(std::time::Duration::from_secs(3700)),
+            "1h 1m"
+        );
     }
 
     #[test]
     fn test_format_status() {
-        let status = AgentStatus::Running { activity: "reading files".to_string() };
+        let status = AgentStatus::Running {
+            activity: "reading files".to_string(),
+        };
         let formatted = format_status(&status);
         assert!(formatted.to_string().contains("running"));
     }

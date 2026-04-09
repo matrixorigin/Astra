@@ -112,11 +112,9 @@ pub(crate) struct ChatTurnParams<'a> {
     /// Session-scoped discover cache so surfaced skills survive across user turns.
     pub(crate) discovered_skills: Option<&'a mut HashSet<String>>,
     /// Shared messaging metrics for inter-agent communication observability.
-    pub(crate) messaging_metrics:
-        Option<Arc<astra_runtime::messaging::MessagingMetrics>>,
+    pub(crate) messaging_metrics: Option<Arc<astra_runtime::messaging::MessagingMetrics>>,
     /// Optional agent spawner for dynamic sub-agent creation via spawn_agent tool.
-    pub(crate) agent_spawner:
-        Option<Arc<astra_runtime::orchestration::DynamicAgentSpawner>>,
+    pub(crate) agent_spawner: Option<Arc<astra_runtime::orchestration::DynamicAgentSpawner>>,
     /// Optional logical root agent ID for this top-level turn when agent spawning is enabled.
     pub(crate) root_agent_id: Option<&'a str>,
     /// Optional persistent top-level mailbox slot for cross-turn reply handling.

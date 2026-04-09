@@ -628,7 +628,9 @@ impl ToolExecutor {
         }
 
         // Journal: snapshot before-state for undo
-        let turn_idx = self.journal_turn_index.load(std::sync::atomic::Ordering::Relaxed);
+        let turn_idx = self
+            .journal_turn_index
+            .load(std::sync::atomic::Ordering::Relaxed);
         let journal_call_id = format!("write_file:{}", path.display());
         if let Ok(mut journal) = self.file_journal.lock() {
             journal.record_before(&path, &journal_call_id, turn_idx);
@@ -783,7 +785,9 @@ impl ToolExecutor {
         }
 
         // Journal: snapshot before-state for undo
-        let turn_idx = self.journal_turn_index.load(std::sync::atomic::Ordering::Relaxed);
+        let turn_idx = self
+            .journal_turn_index
+            .load(std::sync::atomic::Ordering::Relaxed);
         let journal_call_id = format!("str_replace:{}", path.display());
         if let Ok(mut journal) = self.file_journal.lock() {
             journal.record_before_patch(&path, &journal_call_id, turn_idx);

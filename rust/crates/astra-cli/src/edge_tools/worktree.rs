@@ -75,7 +75,12 @@ pub(super) fn extract_github_owner_repo(remote_line: &str) -> Option<String> {
 fn count_worktree_changes(worktree_path: &Path, original_head: Option<&str>) -> (usize, usize) {
     // Count uncommitted files
     let status = Command::new("git")
-        .args(["-C", &worktree_path.display().to_string(), "status", "--porcelain"])
+        .args([
+            "-C",
+            &worktree_path.display().to_string(),
+            "status",
+            "--porcelain",
+        ])
         .output();
     let changed_files = status
         .ok()
@@ -92,7 +97,13 @@ fn count_worktree_changes(worktree_path: &Path, original_head: Option<&str>) -> 
     let commits = original_head
         .and_then(|base| {
             Command::new("git")
-                .args(["-C", &worktree_path.display().to_string(), "rev-list", "--count", &format!("{base}..HEAD")])
+                .args([
+                    "-C",
+                    &worktree_path.display().to_string(),
+                    "rev-list",
+                    "--count",
+                    &format!("{base}..HEAD"),
+                ])
                 .output()
                 .ok()
                 .filter(|o| o.status.success())
@@ -141,7 +152,10 @@ impl ToolExecutor {
         if branch.is_empty() {
             return Err("Branch name is required".to_string());
         }
-        if branch.chars().any(|c| matches!(c, ';' | '|' | '&' | '`' | '$' | '(' | ')' | '{' | '}')) {
+        if branch
+            .chars()
+            .any(|c| matches!(c, ';' | '|' | '&' | '`' | '$' | '(' | ')' | '{' | '}'))
+        {
             return Err("Invalid branch name".to_string());
         }
 
@@ -149,18 +163,23 @@ impl ToolExecutor {
         let original_head = super::git_gix::head_short(&self.project_root);
 
         // Generate worktree path as sibling directory
-        let repo_name = self.project_root
+        let repo_name = self
+            .project_root
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("repo");
         let sanitized_branch = branch.replace('/', "-");
-        let worktree_path = self.project_root
+        let worktree_path = self
+            .project_root
             .parent()
             .unwrap_or(&self.project_root)
             .join(format!("{repo_name}-wt-{sanitized_branch}"));
 
         if worktree_path.exists() {
-            return Err(format!("Worktree path already exists: {}", worktree_path.display()));
+            return Err(format!(
+                "Worktree path already exists: {}",
+                worktree_path.display()
+            ));
         }
 
         // Create the worktree with a new branch
@@ -180,7 +199,11 @@ impl ToolExecutor {
             worktree_path: worktree_path.clone(),
             branch_name: branch.to_string(),
             original_root: self.project_root.clone(),
-            original_head_commit: if original_head.is_empty() { None } else { Some(original_head) },
+            original_head_commit: if original_head.is_empty() {
+                None
+            } else {
+                Some(original_head)
+            },
         };
 
         // Update session state
@@ -206,7 +229,10 @@ impl ToolExecutor {
         };
 
         // Count uncommitted changes and commits
-        let (changed_files, commits) = count_worktree_changes(&session.worktree_path, session.original_head_commit.as_deref());
+        let (changed_files, commits) = count_worktree_changes(
+            &session.worktree_path,
+            session.original_head_commit.as_deref(),
+        );
 
         if action == "remove" && (changed_files > 0 || commits > 0) && !discard_changes {
             let mut parts = Vec::new();
@@ -251,20 +277,27 @@ impl ToolExecutor {
                 .output();
 
             let discard_note = if changed_files > 0 || commits > 0 {
-                format!(" Discarded {} file(s) and {} commit(s).", changed_files, commits)
+                format!(
+                    " Discarded {} file(s) and {} commit(s).",
+                    changed_files, commits
+                )
             } else {
                 String::new()
             };
 
             Ok(format!(
                 "✓ Exited and removed worktree at {}.{} Session restored to {}",
-                worktree_path_str, discard_note, original_root.display()
+                worktree_path_str,
+                discard_note,
+                original_root.display()
             ))
         } else {
             // Keep the worktree
             Ok(format!(
                 "✓ Exited worktree. Work preserved at {} on branch {}. Session restored to {}",
-                worktree_path_str, branch_name, original_root.display()
+                worktree_path_str,
+                branch_name,
+                original_root.display()
             ))
         }
     }
@@ -273,7 +306,9 @@ impl ToolExecutor {
     pub(super) fn git_worktree(&self, args: &Value) -> String {
         let action = match args.get("action").and_then(Value::as_str) {
             Some(a) => a,
-            None => return "Error: 'action' is required (enter, exit, add, list, remove)".to_string(),
+            None => {
+                return "Error: 'action' is required (enter, exit, add, list, remove)".to_string();
+            }
         };
 
         match action {
@@ -285,14 +320,21 @@ impl ToolExecutor {
                 match self.enter_worktree(branch) {
                     Ok(session) => format!(
                         "✓ Entered worktree\n  Branch: {}\n  Path: {}\n  Session is now working in the worktree. Use `git_worktree exit` to leave.",
-                        session.branch_name, session.worktree_path.display()
+                        session.branch_name,
+                        session.worktree_path.display()
                     ),
                     Err(e) => format!("Error: {e}"),
                 }
             }
             "exit" => {
-                let exit_action = args.get("exit_action").and_then(Value::as_str).unwrap_or("keep");
-                let discard = args.get("discard_changes").and_then(Value::as_bool).unwrap_or(false);
+                let exit_action = args
+                    .get("exit_action")
+                    .and_then(Value::as_str)
+                    .unwrap_or("keep");
+                let discard = args
+                    .get("discard_changes")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
                 match self.exit_worktree(exit_action, discard) {
                     Ok(msg) => msg,
                     Err(e) => format!("Error: {e}"),
@@ -301,7 +343,9 @@ impl ToolExecutor {
             "add" | "create" => super::git_gix::worktree_add(&self.project_root, args),
             "list" | "ls" => super::git_gix::worktree_list(&self.project_root),
             "remove" | "rm" | "delete" => super::git_gix::worktree_remove(&self.project_root, args),
-            _ => format!("Error: unknown worktree action '{action}'. Use: enter, exit, add, list, remove"),
+            _ => format!(
+                "Error: unknown worktree action '{action}'. Use: enter, exit, add, list, remove"
+            ),
         }
     }
 }

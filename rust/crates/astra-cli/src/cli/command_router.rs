@@ -52,7 +52,12 @@ pub(super) async fn execute_cli_command(
             let addr: std::net::SocketAddr = format!("{}:{}", args.host, args.port)
                 .parse()
                 .map_err(|e| format!("Invalid listen address: {e}"))?;
-            eprintln!("  {} {} on {}", "▸".bold().cyan(), "Starting API server".bold(), addr.to_string().cyan());
+            eprintln!(
+                "  {} {} on {}",
+                "▸".bold().cyan(),
+                "Starting API server".bold(),
+                addr.to_string().cyan()
+            );
             astra_runtime::serve(addr)
                 .await
                 .map_err(|e| format!("API server failed to start: {e}"))?;
@@ -1005,9 +1010,19 @@ async fn run_doctor(api: &astra_thin_client::ThinClient, profile: Option<&str>) 
     println!("{}", "API Server".bold().cyan());
     println!("  {} {}", "URL:".dim(), api.api_origin());
     match api.get_health_text().await {
-        Ok(body) => println!("  {} {} {}", "Status:".dim(), "✓".green(), format!("Healthy ({})", body.trim()).green()),
+        Ok(body) => println!(
+            "  {} {} {}",
+            "Status:".dim(),
+            "✓".green(),
+            format!("Healthy ({})", body.trim()).green()
+        ),
         Err(e) => {
-            println!("  {} {} {}", "Status:".dim(), "✗".red(), "Unreachable".red());
+            println!(
+                "  {} {} {}",
+                "Status:".dim(),
+                "✗".red(),
+                "Unreachable".red()
+            );
             issues.push(format!("API server unreachable: {e}"));
         }
     }
@@ -1029,13 +1044,28 @@ async fn run_doctor(api: &astra_thin_client::ThinClient, profile: Option<&str>) 
                             .or_else(|| val.get("name"))
                             .and_then(|v| v.as_str())
                             .unwrap_or("authenticated");
-                        println!("  {} {} {}", "Status:".dim(), "✓".green(), format!("Logged in as {user}").green());
+                        println!(
+                            "  {} {} {}",
+                            "Status:".dim(),
+                            "✓".green(),
+                            format!("Logged in as {user}").green()
+                        );
                     } else {
-                        println!("  {} {} {}", "Status:".dim(), "✓".green(), "Authenticated".green());
+                        println!(
+                            "  {} {} {}",
+                            "Status:".dim(),
+                            "✓".green(),
+                            "Authenticated".green()
+                        );
                     }
                 }
                 Err(_) => {
-                    println!("  {} {} {}", "Status:".dim(), "⚠".yellow(), "Token may be expired".yellow());
+                    println!(
+                        "  {} {} {}",
+                        "Status:".dim(),
+                        "⚠".yellow(),
+                        "Token may be expired".yellow()
+                    );
                     issues.push(
                         "Auth token may be expired — try `astra refresh` or `astra login`".into(),
                     );
@@ -1043,7 +1073,12 @@ async fn run_doctor(api: &astra_thin_client::ThinClient, profile: Option<&str>) 
             }
         }
         Err(e) => {
-            println!("  {} {} {}", "Status:".dim(), "✗".red(), "Not logged in".red());
+            println!(
+                "  {} {} {}",
+                "Status:".dim(),
+                "✗".red(),
+                "Not logged in".red()
+            );
             issues.push(format!("Not authenticated: {e}"));
         }
     }
@@ -1083,15 +1118,31 @@ async fn run_doctor(api: &astra_thin_client::ThinClient, profile: Option<&str>) 
                                 .and_then(|v| v.as_object())
                                 .map(|m| m.len())
                                 .unwrap_or(0);
-                            println!("  {} {} {} in {}", scope, "✓".green(), format!("{count} server(s)").green(), path.display().to_string().dim());
+                            println!(
+                                "  {} {} {} in {}",
+                                scope,
+                                "✓".green(),
+                                format!("{count} server(s)").green(),
+                                path.display().to_string().dim()
+                            );
                         }
                         Err(e) => {
-                            println!("  {} {} {}", scope, "✗".red(), format!("Invalid JSON in {}", path.display()).red());
+                            println!(
+                                "  {} {} {}",
+                                scope,
+                                "✗".red(),
+                                format!("Invalid JSON in {}", path.display()).red()
+                            );
                             issues.push(format!("MCP {scope} config parse error: {e}"));
                         }
                     },
                     Err(e) => {
-                        println!("  {} {} {}", scope, "✗".red(), format!("Cannot read {}", path.display()).red());
+                        println!(
+                            "  {} {} {}",
+                            scope,
+                            "✗".red(),
+                            format!("Cannot read {}", path.display()).red()
+                        );
                         issues.push(format!("MCP {scope} config read error: {e}"));
                     }
                 }
@@ -1118,7 +1169,11 @@ async fn run_doctor(api: &astra_thin_client::ThinClient, profile: Option<&str>) 
     if issues.is_empty() {
         println!("{} {}", "✓".green().bold(), "No issues found".green());
     } else {
-        println!("{} {}:", "Found".yellow(), format!("{} issue(s)", issues.len()).yellow().bold());
+        println!(
+            "{} {}:",
+            "Found".yellow(),
+            format!("{} issue(s)", issues.len()).yellow().bold()
+        );
         for issue in &issues {
             println!("  {} {}", "⚠".yellow(), issue);
         }
@@ -1266,9 +1321,18 @@ fn mcp_list(scope: &str) -> Result<(), String> {
                 }
             }
         };
-        println!("  {:<20} {:<8} {}", name.as_str().cyan(), server_type.dim(), detail);
+        println!(
+            "  {:<20} {:<8} {}",
+            name.as_str().cyan(),
+            server_type.dim(),
+            detail
+        );
     }
-    println!("\n  {} {}", "Config:".dim(), path.display().to_string().dim());
+    println!(
+        "\n  {} {}",
+        "Config:".dim(),
+        path.display().to_string().dim()
+    );
     Ok(())
 }
 
@@ -1299,7 +1363,12 @@ fn mcp_add(name: &str, command: &str, args: &[String], scope: &str) -> Result<()
         .insert(name.to_string(), entry);
 
     write_mcp_config(&path, &config)?;
-    println!("  {} Added '{}' to {}", "✓".green(), name.cyan(), path.display().to_string().dim());
+    println!(
+        "  {} Added '{}' to {}",
+        "✓".green(),
+        name.cyan(),
+        path.display().to_string().dim()
+    );
     Ok(())
 }
 
@@ -1331,7 +1400,12 @@ fn mcp_add_json(name: &str, json: &str, scope: &str) -> Result<(), String> {
         .insert(name.to_string(), entry);
 
     write_mcp_config(&path, &config)?;
-    println!("  {} Added '{}' to {}", "✓".green(), name.cyan(), path.display().to_string().dim());
+    println!(
+        "  {} Added '{}' to {}",
+        "✓".green(),
+        name.cyan(),
+        path.display().to_string().dim()
+    );
     Ok(())
 }
 
@@ -1353,7 +1427,12 @@ fn mcp_remove(name: &str, scope: &str) -> Result<(), String> {
     }
 
     write_mcp_config(&path, &config)?;
-    println!("  {} Removed '{}' from {}", "✓".green(), name.cyan(), path.display().to_string().dim());
+    println!(
+        "  {} Removed '{}' from {}",
+        "✓".green(),
+        name.cyan(),
+        path.display().to_string().dim()
+    );
     Ok(())
 }
 
@@ -1400,10 +1479,18 @@ fn mcp_get(name: &str) -> Result<(), String> {
             if let Some(env) = entry.get("env").and_then(|v| v.as_object()) {
                 println!("    {}:", "Environment".dim());
                 for (k, v) in env {
-                    println!("      {}={}", k.as_str().cyan(), v.as_str().unwrap_or(&v.to_string()));
+                    println!(
+                        "      {}={}",
+                        k.as_str().cyan(),
+                        v.as_str().unwrap_or(&v.to_string())
+                    );
                 }
             }
-            println!("\n  {} astra mcp remove \"{}\" -s {scope}", "To remove:".dim(), name);
+            println!(
+                "\n  {} astra mcp remove \"{}\" -s {scope}",
+                "To remove:".dim(),
+                name
+            );
             return Ok(());
         }
     }
@@ -1483,7 +1570,10 @@ fn config_list() -> Result<(), String> {
 
     if settings.is_empty() {
         println!("  {}", "No settings configured.".dim());
-        println!("  Use {} to set a value.", "astra config set <key> <value>".cyan());
+        println!(
+            "  Use {} to set a value.",
+            "astra config set <key> <value>".cyan()
+        );
         println!("\n  {}:", "Available keys".bold());
         for (key, desc) in KNOWN_SETTINGS {
             println!("    {}  {}", key.cyan(), desc.dim());
@@ -1501,7 +1591,11 @@ fn config_list() -> Result<(), String> {
         };
         println!("  {:<20} {display}", key.as_str().cyan());
     }
-    println!("\n  {} {}", "Config:".dim(), path.display().to_string().dim());
+    println!(
+        "\n  {} {}",
+        "Config:".dim(),
+        path.display().to_string().dim()
+    );
     Ok(())
 }
 

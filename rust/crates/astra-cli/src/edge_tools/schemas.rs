@@ -3,7 +3,7 @@
 //! Each schema is a JSON object following the OpenAI function-calling format:
 //! `{ "type": "function", "function": { "name": ..., "description": ..., "parameters": ... } }`
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 pub fn all_tool_schemas() -> Vec<Value> {
     vec![

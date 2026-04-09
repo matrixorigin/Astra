@@ -1,8 +1,8 @@
 //! Config tool: get/set CLI configuration settings.
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
-use super::{global_output_limit, tool_output_limit, ToolExecutor};
+use super::{ToolExecutor, global_output_limit, tool_output_limit};
 
 impl ToolExecutor {
     // ── Config tool: get/set CLI configuration ────────────────────────────────
@@ -14,31 +14,47 @@ impl ToolExecutor {
             None => return json!({ "error": "Missing required parameter: setting" }).to_string(),
         };
         let value = args.get("value").and_then(|v| v.as_str());
-        
+
         // Available settings
         let available = [
             ("model", "Current model (env: MO_MODEL)"),
-            ("api_key", "API key status (env: MO_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY)"),
-            ("output_limit", "Global output limit in bytes (env: MO_GLOBAL_OUTPUT_LIMIT)"),
-            ("tool_output_limit", "Per-tool output limit (env: MO_TOOL_OUTPUT_LIMIT)"),
-            ("sandbox_mode", "Sandbox mode: off, permissive, strict (env: MO_SANDBOX_MODE)"),
+            (
+                "api_key",
+                "API key status (env: MO_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY)",
+            ),
+            (
+                "output_limit",
+                "Global output limit in bytes (env: MO_GLOBAL_OUTPUT_LIMIT)",
+            ),
+            (
+                "tool_output_limit",
+                "Per-tool output limit (env: MO_TOOL_OUTPUT_LIMIT)",
+            ),
+            (
+                "sandbox_mode",
+                "Sandbox mode: off, permissive, strict (env: MO_SANDBOX_MODE)",
+            ),
             ("auto_approve", "Auto-approve tools (env: MO_AUTO_APPROVE)"),
-            ("turn_limit", "Max turns per conversation (env: MO_MAX_TURNS)"),
+            (
+                "turn_limit",
+                "Max turns per conversation (env: MO_MAX_TURNS)",
+            ),
             ("list", "Show all available settings"),
         ];
-        
+
         if setting == "list" {
             // Skip the "list" entry itself when displaying available settings
             let settings: Vec<Value> = available
                 .iter()
-                .take(available.len() - 1)  // Exclude the "list" entry
+                .take(available.len() - 1) // Exclude the "list" entry
                 .map(|(k, desc)| json!({ "setting": k, "description": desc }))
                 .collect();
             return json!({
                 "available_settings": settings
-            }).to_string();
+            })
+            .to_string();
         }
-        
+
         match setting {
             "model" => {
                 if let Some(v) = value {
@@ -131,5 +147,4 @@ impl ToolExecutor {
             }).to_string(),
         }
     }
-
 }

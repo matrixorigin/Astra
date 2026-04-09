@@ -73,7 +73,8 @@ impl ToolExecutor {
             serde_json::json!({
                 "answer": answer,
                 "question": question
-            }).to_string()
+            })
+            .to_string()
         } else {
             // Multiple choice
             eprintln!();
@@ -88,11 +89,7 @@ impl ToolExecutor {
                         choice.bold()
                     );
                 } else {
-                    eprintln!(
-                        "    {} {}",
-                        format!("[{num}]").dim(),
-                        choice.dim()
-                    );
+                    eprintln!("    {} {}", format!("[{num}]").dim(), choice.dim());
                 }
             }
             eprintln!();
@@ -119,7 +116,9 @@ impl ToolExecutor {
                                 Ok(Event::Key(KeyEvent { code, .. })) => {
                                     consecutive_errors = 0;
                                     match code {
-                                        KeyCode::Char(c) if c.is_ascii_digit() && input.is_empty() => {
+                                        KeyCode::Char(c)
+                                            if c.is_ascii_digit() && input.is_empty() =>
+                                        {
                                             let idx = c.to_digit(10).unwrap() as usize;
                                             if idx >= 1 && idx <= choices.len() {
                                                 drop(_guard);
@@ -211,8 +210,8 @@ impl ToolExecutor {
                 "answer": answer,
                 "question": question,
                 "was_custom": !choices.contains(&answer.as_str())
-            }).to_string()
+            })
+            .to_string()
         }
     }
-
 }

@@ -661,12 +661,7 @@ pub(super) fn handle_session_command(arg: &str, state: &mut ReplState) {
                                     .and_then(|m| m.get("summary"))
                                     .and_then(|v| v.as_str())
                                     .unwrap_or("lifecycle");
-                                eprintln!(
-                                    "  {} {} plan: {}",
-                                    ts_short.dim(),
-                                    "📋".cyan(),
-                                    summary,
-                                );
+                                eprintln!("  {} {} plan: {}", ts_short.dim(), "📋".cyan(), summary,);
                             }
                             session_journal::JournalEventType::SessionFork => {
                                 let parent = evt

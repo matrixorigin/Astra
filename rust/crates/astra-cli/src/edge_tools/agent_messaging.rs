@@ -31,15 +31,15 @@
 //! }
 //! ```
 
-use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use astra_runtime::messaging::{
     AgentMessage, MessagingMetrics,
-    types::{AgentAddress, MessageTarget, MessagePayload},
     router::AgentMailboxRouter,
+    types::{AgentAddress, MessagePayload, MessageTarget},
 };
 
 // ─── Message Types ─────────────────────────────────────────────────────────
@@ -160,13 +160,13 @@ pub async fn execute_send_message(
     ctx: &SendMessageRuntimeContext,
 ) -> SendMessageOutput {
     let is_broadcast = input.to == "*";
-    
+
     // Build the content string
     let content = match &input.message {
         Value::String(s) => s.clone(),
         other => serde_json::to_string(other).unwrap_or_else(|_| other.to_string()),
     };
-    
+
     if is_broadcast {
         // Broadcast to all peers in delegation
         match broadcast_message(ctx, &content, &input).await {
@@ -226,40 +226,40 @@ async fn send_direct_message(
     let run_id = ctx.delegation_id.as_deref().unwrap_or(&ctx.agent_id);
     let from_addr = AgentAddress::new(run_id, &ctx.agent_id);
     let to_addr = AgentAddress::new("", recipient);
-    
+
     // Build payload based on message_type
     let payload = MessagePayload::Text {
         content: content.to_string(),
         summary: input.summary.clone(),
     };
-    
+
     // Create the agent message
     let msg = AgentMessage::new(
         from_addr,
         MessageTarget::Direct { address: to_addr },
         payload,
     );
-    
+
     // Add correlation ID if request_id provided
     let msg = if let Some(ref request_id) = input.request_id {
         msg.with_correlation(request_id)
     } else {
         msg
     };
-    
+
     let msg_id = msg.id.clone();
-    
+
     // Send via router
     ctx.router
         .send(msg)
         .await
         .map_err(|e| format!("Router error: {:?}", e))?;
-    
+
     // Update metrics
     if let Some(metrics) = &ctx.metrics {
         metrics.messages_sent.fetch_add(1, Ordering::Relaxed);
     }
-    
+
     Ok(msg_id)
 }
 
@@ -269,51 +269,56 @@ async fn broadcast_message(
     input: &SendMessageInput,
 ) -> Result<Vec<String>, String> {
     // Get delegation_id for broadcast
-    let delegation_id = ctx.delegation_id.as_ref()
+    let delegation_id = ctx
+        .delegation_id
+        .as_ref()
         .ok_or("Broadcast requires active delegation context")?;
-    
+
     // Create sender address
     let from_addr = AgentAddress::new(delegation_id, &ctx.agent_id);
-    
+
     // Build payload
     let payload = MessagePayload::Text {
         content: content.to_string(),
         summary: input.summary.clone(),
     };
-    
+
     // Create broadcast message
     let msg = AgentMessage::new(
         from_addr,
-        MessageTarget::Broadcast { delegation_id: delegation_id.clone() },
+        MessageTarget::Broadcast {
+            delegation_id: delegation_id.clone(),
+        },
         payload,
     );
-    
+
     // Add correlation ID if provided
     let msg = if let Some(ref request_id) = input.request_id {
         msg.with_correlation(request_id)
     } else {
         msg
     };
-    
+
     // Send via router (router handles broadcast distribution)
     ctx.router
         .send(msg)
         .await
         .map_err(|e| format!("Broadcast error: {:?}", e))?;
-    
+
     // Get list of recipients from router (excluding self)
-    let recipients = ctx.router
+    let recipients = ctx
+        .router
         .list_registered_agents()
         .await
         .into_iter()
         .filter(|a| a != &ctx.agent_id)
         .collect();
-    
+
     // Update metrics
     if let Some(metrics) = &ctx.metrics {
         metrics.messages_sent.fetch_add(1, Ordering::Relaxed);
     }
-    
+
     Ok(recipients)
 }
 
@@ -381,7 +386,8 @@ pub async fn handle_send_message_tool(
             return serde_json::json!({
                 "success": false,
                 "message": format!("Invalid input: {}", e)
-            }).to_string();
+            })
+            .to_string();
         }
     };
 
@@ -399,7 +405,8 @@ pub async fn handle_send_message_tool(
         serde_json::json!({
             "success": false,
             "message": "Failed to serialize output"
-        }).to_string()
+        })
+        .to_string()
     })
 }
 
@@ -408,10 +415,7 @@ pub async fn handle_send_message_tool(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use astra_runtime::messaging::{
-        AgentMailboxRouter, InProcessTransport,
-        types::AgentAddress,
-    };
+    use astra_runtime::messaging::{AgentMailboxRouter, InProcessTransport, types::AgentAddress};
     use astra_runtime::server::delegation_engine::DelegationTracker;
     use std::sync::Arc;
 
@@ -429,8 +433,10 @@ mod tests {
         assert_eq!(schema["function"]["name"], "send_message");
         assert!(schema["function"]["parameters"]["properties"]["to"].is_object());
         assert!(schema["function"]["parameters"]["properties"]["message"].is_object());
-        
-        let required = schema["function"]["parameters"]["required"].as_array().unwrap();
+
+        let required = schema["function"]["parameters"]["required"]
+            .as_array()
+            .unwrap();
         assert!(required.contains(&serde_json::json!("to")));
         assert!(required.contains(&serde_json::json!("message")));
     }
@@ -443,7 +449,7 @@ mod tests {
             "message_type": "instruction",
             "priority": "high"
         });
-        
+
         let input: SendMessageInput = serde_json::from_value(json).unwrap();
         assert_eq!(input.to, "reviewer");
         assert_eq!(input.message_type, MessageType::Instruction);
@@ -457,7 +463,7 @@ mod tests {
             "message": {"status": "in_progress", "percent": 50},
             "message_type": "progress"
         });
-        
+
         let input: SendMessageInput = serde_json::from_value(json).unwrap();
         assert_eq!(input.to, "*");
         assert_eq!(input.message_type, MessageType::Progress);
@@ -494,7 +500,9 @@ mod tests {
         .await;
 
         assert!(output.success, "{output:?}");
-        let msg = recipient.try_recv().expect("recipient should receive message");
+        let msg = recipient
+            .try_recv()
+            .expect("recipient should receive message");
         assert_eq!(msg.from.agent_id, "main");
         match &msg.to {
             MessageTarget::Direct { address } => {
