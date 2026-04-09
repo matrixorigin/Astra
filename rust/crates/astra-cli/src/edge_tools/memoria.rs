@@ -187,4 +187,56 @@ impl ToolExecutor {
             Err(e) => json!({"error": format!("build client: {e}")}).to_string(),
         }
     }
+
+    pub async fn memory_boost_search(&self, query: &str, top_k: u64) -> Vec<String> {
+        if query.trim().is_empty() {
+            return vec![];
+        }
+        // Direct Memoria call (skip cloud proxy — server has no /memory/* route).
+        // This is best-effort on the critical path; circuit breaker prevents
+        // repeated timeouts if Memoria is down.
+        if self
+            .memoria_fail_count
+            .load(std::sync::atomic::Ordering::Relaxed)
+            >= 2
+        {
+            return vec![];
+        }
+        let base = std::env::var("MEMORIA_BASE_URL")
+            .unwrap_or_else(|_| astra_core::config::DEFAULT_MEMORIA_URL.to_string());
+        let key = match std::env::var("MEMORIA_API_KEY")
+            .ok()
+            .or_else(|| std::env::var("MEMORIA_MASTER_KEY").ok())
+        {
+            Some(k) => k,
+            None => return vec![], // No key = no Memoria
+        };
+        let client = match reqwest::Client::builder()
+            .timeout(Duration::from_millis(800))
+            .no_proxy()
+            .build()
+        {
+            Ok(c) => c,
+            Err(_) => return vec![],
+        };
+        match client
+            .post(format!("{base}/v1/memories/search"))
+            .header("Authorization", format!("Bearer {key}"))
+            .json(&json!({"query": query, "top_k": top_k}))
+            .send()
+            .await
+        {
+            Ok(resp) => {
+                self.memoria_fail_count
+                    .store(0, std::sync::atomic::Ordering::Relaxed);
+                let text = resp.text().await.unwrap_or_default();
+                parse_memory_search_contents(&text)
+            }
+            Err(_) => {
+                self.memoria_fail_count
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                vec![]
+            }
+        }
+    }
 }
