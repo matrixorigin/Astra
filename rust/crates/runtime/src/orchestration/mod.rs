@@ -5,6 +5,7 @@
 
 mod builtin_agents;
 pub mod context_cache;
+pub mod permission_sync;
 mod progress;
 mod spawner;
 mod spawn_tool;
@@ -15,6 +16,11 @@ pub use builtin_agents::{
 pub use context_cache::{
     SharedContextCache, CachedFile, Knowledge, AgentFindings, Finding, FindingCategory,
     CacheStats, share_context_schema, query_context_schema,
+};
+pub use permission_sync::{
+    PermissionMode, PermissionRule, InheritedPermissions,
+    PermissionRequest, PermissionResponse, PermissionUpdate, PermissionAction,
+    PermissionSyncContext,
 };
 pub use progress::{AgentProgressEvent, ProgressEventType, ProgressBroadcaster, AgentProgressEmitter};
 pub use spawner::{

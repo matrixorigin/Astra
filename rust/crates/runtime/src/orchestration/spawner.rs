@@ -130,6 +130,8 @@ pub struct SpawnRunConfig {
     pub progress_emitter: Option<super::progress::AgentProgressEmitter>,
     /// Optional shared context cache for cross-agent knowledge sharing.
     pub context_cache: Option<Arc<SharedContextCache>>,
+    /// Inherited permissions from parent agent.
+    pub inherited_permissions: Option<super::permission_sync::InheritedPermissions>,
 }
 
 impl std::fmt::Debug for SpawnRunConfig {
@@ -314,6 +316,8 @@ impl DynamicAgentSpawner {
             mailbox,
             progress_emitter: Some(emitter.clone()),
             context_cache: Some(Arc::clone(&self.context_cache)),
+            // TODO: Populate from parent's permission context when available
+            inherited_permissions: None,
         };
 
         // 8. Execute or launch
