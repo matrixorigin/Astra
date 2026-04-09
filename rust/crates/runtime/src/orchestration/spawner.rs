@@ -390,6 +390,20 @@ impl DynamicAgentSpawner {
         // 5. Build permission summary
         let permission_summary = build_permission_summary(context);
 
+        // 5b. Create isolated worktree if requested
+        let worktree_path = if input.isolated {
+            match create_agent_worktree(&context.working_dir, &run_id) {
+                Ok(path) => Some(path),
+                Err(e) => {
+                    return Err(SpawnError::WorktreeCreation(format!(
+                        "failed to create worktree for {agent_id}: {e}"
+                    )));
+                }
+            }
+        } else {
+            None
+        };
+
         // 6. Register state
         let state = SpawnedAgentState {
             agent_id: agent_id.clone(),
@@ -399,7 +413,7 @@ impl DynamicAgentSpawner {
             description: input.description.clone(),
             status: AgentStatus::Initializing,
             messaging_address: messaging_address.clone(),
-            worktree_path: None, // TODO: worktree isolation
+            worktree_path: worktree_path.clone(),
             started_at: SystemTime::now(),
             metrics: Default::default(),
             permission_summary,
@@ -437,7 +451,7 @@ impl DynamicAgentSpawner {
             max_turns,
             allowed_tools: agent_def.allowed_tools.iter().cloned().collect(),
             read_only: agent_def.read_only,
-            working_dir: context.working_dir.clone(),
+            working_dir: worktree_path.unwrap_or_else(|| context.working_dir.clone()),
             mailbox,
             progress_emitter: Some(emitter.clone()),
             context_cache: Some(Arc::clone(&self.context_cache)),
@@ -849,6 +863,40 @@ fn build_permission_summary(context: &SpawnContext) -> PermissionSummary {
     }
 
     summary
+}
+
+/// Create an isolated git worktree for a spawned agent.
+///
+/// Creates `<parent_dir>/.agent-worktrees/<run_id>` via `git worktree add`.
+/// Returns the path on success. Falls back to a simple directory copy if
+/// the parent directory is not a git repo.
+fn create_agent_worktree(
+    parent_dir: &std::path::Path,
+    run_id: &str,
+) -> Result<PathBuf, String> {
+    let worktree_base = parent_dir.join(".agent-worktrees");
+    std::fs::create_dir_all(&worktree_base)
+        .map_err(|e| format!("cannot create worktree base: {e}"))?;
+
+    let worktree_path = worktree_base.join(run_id);
+
+    // Try git worktree first
+    let output = std::process::Command::new("git")
+        .args(["worktree", "add", "--detach"])
+        .arg(&worktree_path)
+        .arg("HEAD")
+        .current_dir(parent_dir)
+        .output()
+        .map_err(|e| format!("git worktree exec failed: {e}"))?;
+
+    if output.status.success() {
+        return Ok(worktree_path);
+    }
+
+    // Fallback: create an empty working directory (non-git isolation)
+    std::fs::create_dir_all(&worktree_path)
+        .map_err(|e| format!("cannot create worktree dir: {e}"))?;
+    Ok(worktree_path)
 }
 
 #[cfg(test)]

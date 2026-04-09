@@ -162,6 +162,7 @@ impl MessageTransport for InProcessTransport {
         Ok(Box::new(InProcessStream {
             direct: rx,
             broadcast: broadcast_rx,
+            metrics: Arc::clone(&self.metrics),
         }))
     }
 
@@ -225,6 +226,7 @@ impl MessageTransport for InProcessTransport {
 struct InProcessStream {
     direct: mpsc::Receiver<Arc<AgentMessage>>,
     broadcast: Option<broadcast::Receiver<Arc<AgentMessage>>>,
+    metrics: Arc<InProcessMetrics>,
 }
 
 #[async_trait]
@@ -240,7 +242,8 @@ impl MessageStream for InProcessStream {
                         match rx.recv().await {
                             Ok(m) => break Some(m),
                             Err(broadcast::error::RecvError::Lagged(n)) => {
-                                eprintln!("  ⚠ messaging: broadcast receiver lagged by {n} messages (some dropped)");
+                                let total = self.metrics.broadcast_lag_events.fetch_add(1, Ordering::Relaxed) + 1;
+                                eprintln!("  ⚠ messaging: broadcast receiver lagged by {n} messages (total lag events: {total})");
                                 continue;
                             }
                             Err(broadcast::error::RecvError::Closed) => break None,

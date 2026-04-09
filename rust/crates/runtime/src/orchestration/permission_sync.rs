@@ -560,6 +560,10 @@ use crate::messaging::types::{
 impl PermissionRequest {
     /// Build an AgentMessage to send this permission request to a parent.
     pub fn to_message(&self, from: &AgentAddress, to: &AgentAddress) -> AgentMessage {
+        let data = serde_json::to_value(self).unwrap_or_else(|e| {
+            eprintln!("  ⚠ permission: failed to serialize request: {e}");
+            serde_json::Value::Null
+        });
         AgentMessage::new(
             from.clone(),
             MessageTarget::Direct {
@@ -567,7 +571,7 @@ impl PermissionRequest {
             },
             MessagePayload::Request {
                 request_type: RequestType::ToolPermission,
-                data: serde_json::to_value(self).unwrap_or_default(),
+                data,
             },
         )
     }
@@ -586,6 +590,10 @@ impl PermissionResponse {
         to: &AgentAddress,
         correlation_id: &str,
     ) -> AgentMessage {
+        let data = serde_json::to_value(self).unwrap_or_else(|e| {
+            eprintln!("  ⚠ permission: failed to serialize response: {e}");
+            serde_json::Value::Null
+        });
         AgentMessage::new(
             from.clone(),
             MessageTarget::Direct {
@@ -594,7 +602,7 @@ impl PermissionResponse {
             MessagePayload::Response {
                 request_id: correlation_id.to_string(),
                 accepted: self.approved,
-                data: Some(serde_json::to_value(self).unwrap_or_default()),
+                data: Some(data),
             },
         )
         .with_correlation(correlation_id)

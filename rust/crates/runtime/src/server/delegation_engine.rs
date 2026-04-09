@@ -681,6 +681,8 @@ impl DelegationEngine {
         run_engine: Arc<RunEngine>,
         tracker: Arc<DelegationTracker>,
     ) -> Self {
+        #[cfg(debug_assertions)]
+        eprintln!("  ⚠ DelegationEngine: using StubSubRunExecutor — call with_executor() for production");
         Self {
             registry,
             run_engine,
@@ -993,10 +995,16 @@ impl DelegationEngine {
                     run_id: sub_run_id.clone(),
                     agent_id: agent_id.clone(),
                 };
-                router
+                match router
                     .register(addr, Some(request.delegation_id.clone()))
                     .await
-                    .ok()
+                {
+                    Ok(mb) => Some(mb),
+                    Err(e) => {
+                        eprintln!("  ⚠ delegation: mailbox registration failed for {agent_id}: {e}");
+                        None
+                    }
+                }
             } else {
                 None
             };
@@ -1190,10 +1198,16 @@ impl DelegationEngine {
                     run_id: sub_run_id.clone(),
                     agent_id: agent_id.clone(),
                 };
-                router
+                match router
                     .register(addr, Some(request.delegation_id.clone()))
                     .await
-                    .ok()
+                {
+                    Ok(mb) => Some(mb),
+                    Err(e) => {
+                        eprintln!("  ⚠ delegation: mailbox registration failed for {agent_id}: {e}");
+                        None
+                    }
+                }
             } else {
                 None
             };
@@ -1375,10 +1389,16 @@ impl DelegationEngine {
                     run_id: prod_run_id.clone(),
                     agent_id: producer_id.to_string(),
                 };
-                router
+                match router
                     .register(addr, Some(request.delegation_id.clone()))
                     .await
-                    .ok()
+                {
+                    Ok(mb) => Some(mb),
+                    Err(e) => {
+                        eprintln!("  ⚠ delegation: mailbox registration failed for {producer_id}: {e}");
+                        None
+                    }
+                }
             } else {
                 None
             };
@@ -1505,10 +1525,16 @@ impl DelegationEngine {
                     run_id: rev_run_id.clone(),
                     agent_id: reviewer_id.to_string(),
                 };
-                router
+                match router
                     .register(addr, Some(request.delegation_id.clone()))
                     .await
-                    .ok()
+                {
+                    Ok(mb) => Some(mb),
+                    Err(e) => {
+                        eprintln!("  ⚠ delegation: mailbox registration failed for {reviewer_id}: {e}");
+                        None
+                    }
+                }
             } else {
                 None
             };
@@ -1647,10 +1673,16 @@ impl DelegationEngine {
                     run_id: run_id.clone(),
                     agent_id: agent_id.to_string(),
                 };
-                router
+                match router
                     .register(addr, Some(request.delegation_id.clone()))
                     .await
-                    .ok()
+                {
+                    Ok(mb) => Some(mb),
+                    Err(e) => {
+                        eprintln!("  ⚠ delegation: mailbox registration failed for {agent_id}: {e}");
+                        None
+                    }
+                }
             } else {
                 None
             };
