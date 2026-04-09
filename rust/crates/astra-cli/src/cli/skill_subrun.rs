@@ -66,20 +66,64 @@ pub(crate) struct SubRunHost {
     pub(crate) skill_resolver: Option<Arc<dyn astra_runtime::turn::skill_tool::SkillResolver>>,
 }
 
+pub(crate) fn persist_failed_subrun(state: &mut AgenticLoopState, error: &str) -> String {
+    let failure_output = if state.final_text.trim().is_empty() {
+        format!("[sub-run failed] {error}")
+    } else {
+        format!(
+            "[sub-run failed] {error}\n\nPartial output:\n{}",
+            state.final_text
+        )
+    };
+    state.final_text = failure_output.clone();
+    state.messages.push(json!({
+        "role": "assistant",
+        "content": failure_output.clone(),
+    }));
+    state.step_recorder.end_turn(false);
+
+    let summary = state.step_recorder.summary();
+    let blocked_tools = state
+        .turn_guard
+        .health
+        .deprioritized_tools()
+        .iter()
+        .map(|tool| tool.to_string())
+        .collect::<Vec<_>>();
+    if let Some(heavy) = state.step_recorder.build_heavy_checkpoint(
+        &state.messages,
+        state.max_turn_input_tokens,
+        state.remaining_turns as u32,
+        &blocked_tools,
+        &state.recent_tools,
+    ) {
+        let checkpoint =
+            astra_runtime::pipeline::step_protocol::StepCheckpoint::Heavy(Box::new(heavy));
+        let _ = astra_runtime::pipeline::step_checkpoint::write_step_checkpoint(
+            &summary.session_id,
+            summary.checkpoints,
+            &checkpoint,
+        );
+    }
+
+    failure_output
+}
+
 #[async_trait]
 impl AgenticLoopHost for SubRunHost {
     async fn execute_turn(
         &mut self,
         state: &mut AgenticLoopState,
     ) -> Result<HostTurnResult, String> {
-        self.executor.set_send_message_context(state.mailbox.as_ref().map(|mailbox| {
-            crate::edge_tools::agent_messaging::SendMessageRuntimeContext {
-                agent_id: mailbox.address.agent_id.clone(),
-                router: mailbox.router(),
-                metrics: state.messaging_metrics.clone(),
-                delegation_id: mailbox.delegation_id.clone(),
-            }
-        }));
+        self.executor
+            .set_send_message_context(state.mailbox.as_ref().map(|mailbox| {
+                crate::edge_tools::agent_messaging::SendMessageRuntimeContext {
+                    agent_id: mailbox.address.agent_id.clone(),
+                    router: mailbox.router(),
+                    metrics: state.messaging_metrics.clone(),
+                    delegation_id: mailbox.delegation_id.clone(),
+                }
+            }));
 
         let effective_model = state
             .skill_model_override
@@ -455,7 +499,10 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             permission_handler: None,
         };
 
-        run_agentic_loop_with_host(&mut host, &mut state).await?;
+        if let Err(err) = run_agentic_loop_with_host(&mut host, &mut state).await {
+            let failure_output = persist_failed_subrun(&mut state, &err);
+            return Err(failure_output);
+        }
 
         let turns = (SUBRUN_MAX_TURNS - state.remaining_turns) as u32;
         let tokens_used = (state.total_prompt + state.total_completion) as u32;

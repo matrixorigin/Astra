@@ -27,7 +27,7 @@ use serde_json::json;
 
 use super::edge_tools;
 use super::permission_manager::PermissionMode;
-use super::skill_subrun::SubRunHost;
+use super::skill_subrun::{SubRunHost, persist_failed_subrun};
 
 const DELEGATE_MAX_TURNS: usize = 25;
 
@@ -70,9 +70,7 @@ fn resolve_worktree_path(
             // Canonicalize both paths to resolve symlinks before comparison.
             // Return the canonicalized path to prevent TOCTOU races.
             match (p.canonicalize(), worktree_base.canonicalize()) {
-                (Ok(canon_p), Ok(canon_base)) if canon_p.starts_with(&canon_base) => {
-                    Some(canon_p)
-                }
+                (Ok(canon_p), Ok(canon_base)) if canon_p.starts_with(&canon_base) => Some(canon_p),
                 _ => {
                     eprintln!(
                         "[delegate] ignoring untrusted worktree_path for {}: {}",
@@ -293,9 +291,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             skill_search: self.skill_search.clone(),
             // Use effective_root (agent's worktree) for hooks, not shared project_root.
             // This ensures each agent loads hooks from its own isolated workspace.
-            tool_event_hooks: astra_runtime::skills::hooks::load_tool_event_hooks(
-                &effective_root,
-            ),
+            tool_event_hooks: astra_runtime::skills::hooks::load_tool_event_hooks(&effective_root),
             session_event_hooks: astra_runtime::skills::hooks::load_session_event_hooks(
                 &effective_root,
             ),
@@ -381,16 +377,19 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
                 })
             }
             Ok(astra_runtime::turn::agentic_loop_host::AgenticLoopOutcome::Error(err))
-            | Err(err) => Ok(AgentResult {
-                agent_id,
-                run_id,
-                status: "failed".to_string(),
-                output: partial_output(),
-                error: Some(err),
-                prompt_tokens,
-                completion_tokens,
-                tool_calls,
-            }),
+            | Err(err) => {
+                let failure_output = persist_failed_subrun(&mut state, &err);
+                Ok(AgentResult {
+                    agent_id,
+                    run_id,
+                    status: "failed".to_string(),
+                    output: Some(failure_output),
+                    error: Some(err),
+                    prompt_tokens,
+                    completion_tokens,
+                    tool_calls,
+                })
+            }
         }
     }
 }
@@ -565,7 +564,11 @@ mod tests {
         std::fs::create_dir_all(&agent_wt).unwrap();
 
         // Provide a path with redundant components
-        let non_canonical = base.join("nested").join("..").join("nested").join("agent-wt");
+        let non_canonical = base
+            .join("nested")
+            .join("..")
+            .join("nested")
+            .join("agent-wt");
 
         let mut ctx = HashMap::new();
         ctx.insert(
