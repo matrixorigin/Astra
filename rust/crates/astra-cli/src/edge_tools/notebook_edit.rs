@@ -198,7 +198,7 @@ impl ToolExecutor {
         if let Err(e) = std::fs::write(&file_path, &updated_content) {
             return json!({ "error": format!("Failed to write notebook: {}", e) }).to_string();
         }
-        self.record_write(&file_path);
+        self.record_write_with_content(&file_path, &updated_content);
 
         json!({
             "success": true,

@@ -639,7 +639,7 @@ impl ToolExecutor {
         match fs::write(&path, content) {
             Ok(_) => {
                 // Record write state so subsequent reads/edits know the mtime
-                self.record_write(&path);
+                self.record_write_with_content(&path, content);
                 // Journal: record after-state
                 if let Ok(mut journal) = self.file_journal.lock() {
                     journal.record_after(&path, &journal_call_id, content.as_bytes());
@@ -724,7 +724,7 @@ impl ToolExecutor {
                     }
                     match fs::write(&path, &new_content) {
                         Ok(_) => {
-                            self.record_write(&path);
+                            self.record_write_with_content(&path, &new_content);
                             let format_result = auto_format_file(&path, &self.project_root);
                             if format_result.is_some() {
                                 self.record_write(&path);
@@ -796,7 +796,7 @@ impl ToolExecutor {
         match fs::write(&path, &new_content) {
             Ok(_) => {
                 // Record write state for staleness tracking
-                self.record_write(&path);
+                self.record_write_with_content(&path, &new_content);
                 // Journal: record after-state
                 if let Ok(mut journal) = self.file_journal.lock() {
                     journal.record_after(&path, &journal_call_id, new_content.as_bytes());
@@ -964,7 +964,7 @@ impl ToolExecutor {
         // Apply
         match fs::write(&path, &working) {
             Ok(_) => {
-                self.record_write(&path);
+                self.record_write_with_content(&path, &working);
                 let format_result = auto_format_file(&path, &self.project_root);
                 if format_result.is_some() {
                     self.record_write(&path);

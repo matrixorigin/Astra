@@ -9,6 +9,7 @@ fn fake_lsp_server_script(dir: &std::path::Path) -> std::path::PathBuf {
         &script,
         r#"#!/usr/bin/env python3
 import json
+import os
 import sys
 
 def read_frame():
@@ -30,6 +31,14 @@ def write_frame(payload):
     sys.stdout.buffer.write(f"Content-Length: {len(body)}\r\n\r\n".encode("utf-8"))
     sys.stdout.buffer.write(body)
     sys.stdout.buffer.flush()
+
+LOG_PATH = os.environ.get("FAKE_LSP_LOG")
+
+def log_event(name):
+    if not LOG_PATH:
+        return
+    with open(LOG_PATH, "a", encoding="utf-8") as fh:
+        fh.write(name + "\n")
 
 while True:
     message = read_frame()
@@ -80,6 +89,8 @@ while True:
                 }
             }]
         })
+    elif method in ("textDocument/didOpen", "textDocument/didChange", "textDocument/didSave"):
+        log_event(method)
     elif msg_id is not None:
         write_frame({"jsonrpc": "2.0", "id": msg_id, "result": None})
 "#,
@@ -122,6 +133,11 @@ impl Drop for EnvGuard {
     }
 }
 
+#[cfg(unix)]
+fn count_occurrences(haystack: &str, needle: &str) -> usize {
+    haystack.lines().filter(|line| *line == needle).count()
+}
+
 // ─── lsp tests ────────────────────────────────────────────────────────────────
 
 #[test]
@@ -154,7 +170,11 @@ fn lsp_diagnostics_returns_capabilities() {
 
     assert!(parsed["capabilities"]["goto_definition"].as_bool().unwrap());
     assert!(parsed["capabilities"]["find_references"].as_bool().unwrap());
-    assert!(parsed["supported_languages"]["active_lsp"].as_array().is_some());
+    assert!(
+        parsed["supported_languages"]["active_lsp"]
+            .as_array()
+            .is_some()
+    );
     assert!(parsed["active_backends"]["rust"]["workspace_detected"].is_boolean());
 }
 
@@ -247,6 +267,7 @@ impl Config {
 
 #[cfg(unix)]
 #[test]
+#[serial_test::serial]
 fn lsp_document_symbols_prefers_real_lsp_when_available() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
@@ -276,4 +297,75 @@ fn lsp_document_symbols_prefers_real_lsp_when_available() {
         Some("textDocument/documentSymbol")
     );
     assert_eq!(parsed["result"][0]["name"].as_str(), Some("hello_from_lsp"));
+}
+
+#[cfg(unix)]
+#[test]
+#[serial_test::serial]
+fn lsp_repeated_query_skips_redundant_resync_for_unchanged_file() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname=\"demo\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(
+        dir.path().join("src/lib.rs"),
+        "pub fn hello_from_lsp() {}\n",
+    )
+    .unwrap();
+    let log_path = dir.path().join("fake-lsp.log");
+    let script = fake_lsp_server_script(dir.path());
+    let _cmd_guard = EnvGuard::set("ASTRA_RUST_ANALYZER_CMD", script.to_str().unwrap());
+    let _log_guard = EnvGuard::set("FAKE_LSP_LOG", log_path.to_str().unwrap());
+    let exe = ToolExecutor::new(dir.path());
+
+    let _ = exe.lsp(&json!({
+        "operation": "document_symbols",
+        "file": "src/lib.rs"
+    }));
+    let _ = exe.lsp(&json!({
+        "operation": "document_symbols",
+        "file": "src/lib.rs"
+    }));
+
+    let log = std::fs::read_to_string(log_path).unwrap_or_default();
+    assert_eq!(count_occurrences(&log, "textDocument/didOpen"), 1);
+    assert_eq!(count_occurrences(&log, "textDocument/didSave"), 1);
+    assert_eq!(count_occurrences(&log, "textDocument/didChange"), 0);
+}
+
+#[cfg(unix)]
+#[test]
+#[serial_test::serial]
+fn write_file_syncs_lsp_once_before_followup_query() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname=\"demo\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    let log_path = dir.path().join("fake-lsp.log");
+    let script = fake_lsp_server_script(dir.path());
+    let _cmd_guard = EnvGuard::set("ASTRA_RUST_ANALYZER_CMD", script.to_str().unwrap());
+    let _log_guard = EnvGuard::set("FAKE_LSP_LOG", log_path.to_str().unwrap());
+    let exe = ToolExecutor::new(dir.path());
+
+    let write_result = exe.write_file(&json!({
+        "path": "src/lib.rs",
+        "content": "pub fn hello_from_lsp() {}\n"
+    }));
+    assert!(write_result.contains("\"success\":true"));
+
+    let _ = exe.lsp(&json!({
+        "operation": "document_symbols",
+        "file": "src/lib.rs"
+    }));
+
+    let log = std::fs::read_to_string(log_path).unwrap_or_default();
+    assert_eq!(count_occurrences(&log, "textDocument/didOpen"), 1);
+    assert_eq!(count_occurrences(&log, "textDocument/didSave"), 1);
+    assert_eq!(count_occurrences(&log, "textDocument/didChange"), 0);
 }

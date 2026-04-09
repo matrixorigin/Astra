@@ -155,6 +155,20 @@ impl PassiveLspManager {
         }
     }
 
+    pub fn sync_after_write_with_content(&self, root: &Path, path: &Path, content: &str) {
+        let root_buf = root.to_path_buf();
+        if should_use_rust_lsp(root, path)
+            && let Some(s) = ensure_session(&self.rust, root_buf.clone(), rust_spawn_spec())
+        {
+            let _ = s.sync_document_text(path, content);
+        }
+        if should_use_typescript_lsp(root, path)
+            && let Some(s) = ensure_session(&self.typescript, root_buf, typescript_spawn_spec())
+        {
+            let _ = s.sync_document_text(path, content);
+        }
+    }
+
     pub fn request_for_file(
         &self,
         root: &Path,

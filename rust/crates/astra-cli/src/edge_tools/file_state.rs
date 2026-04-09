@@ -102,16 +102,20 @@ impl ToolExecutor {
         }
     }
 
-    /// Record file state after a write/edit (full content known).
-    /// Uses from_read=false to distinguish from reads — dedup won't fire after writes.
-    pub(super) fn record_write(&self, path: &Path) {
+    fn record_write_impl(&self, path: &Path, content: Option<&str>) {
         if passive_cargo_check::should_schedule_passive_cargo(&self.project_root, path) {
             self.passive_cargo_pending.store(true, Ordering::SeqCst);
         }
         if passive_tsc_check::should_schedule_passive_tsc(&self.project_root, path) {
             self.passive_tsc_pending.store(true, Ordering::SeqCst);
         }
-        self.passive_lsp.sync_after_write(&self.project_root, path);
+        match content {
+            Some(text) => {
+                self.passive_lsp
+                    .sync_after_write_with_content(&self.project_root, path, text)
+            }
+            None => self.passive_lsp.sync_after_write(&self.project_root, path),
+        }
         let ts = Self::file_mtime_ms(path);
         if let Ok(mut state) = self.file_state.lock() {
             state.insert(
@@ -135,6 +139,17 @@ impl ToolExecutor {
                 state.remove(&oldest_key);
             }
         }
+    }
+
+    /// Record file state after a write/edit when only the path is known.
+    /// Uses from_read=false to distinguish from reads — dedup won't fire after writes.
+    pub(super) fn record_write(&self, path: &Path) {
+        self.record_write_impl(path, None);
+    }
+
+    /// Record file state after a write/edit when the new content is already known.
+    pub(super) fn record_write_with_content(&self, path: &Path, content: &str) {
+        self.record_write_impl(path, Some(content));
     }
 
     /// Check if a file has been modified since we last read/wrote it.

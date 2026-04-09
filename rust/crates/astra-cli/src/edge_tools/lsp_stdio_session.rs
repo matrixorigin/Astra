@@ -2,6 +2,8 @@
 //! background reader for `textDocument/publishDiagnostics` and minimal server requests.
 
 use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -48,6 +50,13 @@ pub(crate) struct LspSpawnSpec {
 
 type StdinShared = Arc<Mutex<BufWriter<std::process::ChildStdin>>>;
 
+#[derive(Clone, Debug)]
+struct SyncedDocumentState {
+    version: i32,
+    last_mtime_ms: u128,
+    last_text_hash: u64,
+}
+
 pub(crate) struct LspStdioSession {
     diagnostic_title: &'static str,
     attachment_source: &'static str,
@@ -55,7 +64,7 @@ pub(crate) struct LspStdioSession {
     _root: PathBuf,
     _child: Mutex<Option<Child>>,
     stdin: StdinShared,
-    versions: Mutex<HashMap<String, i32>>,
+    documents: Mutex<HashMap<String, SyncedDocumentState>>,
     pending_diags: Arc<Mutex<Vec<Value>>>,
     next_request_id: AtomicU64,
     pending_requests: Arc<Mutex<HashMap<u64, Sender<io::Result<Value>>>>>,
@@ -110,6 +119,21 @@ fn workspace_uri(root: &Path) -> String {
         .ok()
         .map(|u| u.as_str().to_string())
         .unwrap_or_else(|| format!("file://{}", abs.display()))
+}
+
+fn file_mtime_ms(path: &Path) -> u128 {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+}
+
+fn text_hash(text: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    text.hash(&mut hasher);
+    hasher.finish()
 }
 
 fn send_lsp_response(stdin: &StdinShared, id: &Value, result: Value) -> io::Result<()> {
@@ -285,7 +309,7 @@ impl LspStdioSession {
             _root: root,
             _child: Mutex::new(Some(child)),
             stdin,
-            versions: Mutex::new(HashMap::new()),
+            documents: Mutex::new(HashMap::new()),
             pending_diags,
             next_request_id: AtomicU64::new(2),
             pending_requests,
@@ -350,51 +374,100 @@ impl LspStdioSession {
         }
     }
 
-    pub fn sync_document_from_disk(&self, path: &Path) -> io::Result<()> {
+    fn sync_document(&self, path: &Path, text: &str, mtime_ms: u128) -> io::Result<()> {
         let Some(lang) = self.language_policy.language_id(path) else {
             return Ok(());
         };
         let Some(uri) = path_to_uri(path) else {
             return Ok(());
         };
-        let text = std::fs::read_to_string(path)?;
-        let mut versions = self
-            .versions
-            .lock()
-            .map_err(|_| io::Error::other("versions mutex poisoned"))?;
-        let is_open = versions.contains_key(&uri);
-        if !is_open {
-            versions.insert(uri.clone(), 1);
-            drop(versions);
-            self.send_notification(
-                "textDocument/didOpen",
-                json!({
-                    "textDocument": {
-                        "uri": uri.clone(),
-                        "languageId": lang,
-                        "version": 1,
-                        "text": text
-                    }
-                }),
-            )?;
-        } else {
-            let v = versions.get_mut(&uri).expect("uri present");
-            *v += 1;
-            let version = *v;
-            drop(versions);
-            self.send_notification(
-                "textDocument/didChange",
-                json!({
-                    "textDocument": { "uri": uri.clone(), "version": version },
-                    "contentChanges": [{ "text": text }]
-                }),
-            )?;
+        let hash = text_hash(text);
+        enum SyncAction {
+            Open { version: i32, language_id: String },
+            Change { version: i32 },
+            Noop,
         }
-        self.send_notification(
-            "textDocument/didSave",
-            json!({ "textDocument": { "uri": uri } }),
-        )?;
+        let action = {
+            let mut documents = self
+                .documents
+                .lock()
+                .map_err(|_| io::Error::other("documents mutex poisoned"))?;
+            match documents.get_mut(&uri) {
+                Some(doc) => {
+                    if doc.last_mtime_ms == mtime_ms || doc.last_text_hash == hash {
+                        doc.last_mtime_ms = mtime_ms;
+                        SyncAction::Noop
+                    } else {
+                        doc.version += 1;
+                        doc.last_mtime_ms = mtime_ms;
+                        doc.last_text_hash = hash;
+                        SyncAction::Change {
+                            version: doc.version,
+                        }
+                    }
+                }
+                None => {
+                    documents.insert(
+                        uri.clone(),
+                        SyncedDocumentState {
+                            version: 1,
+                            last_mtime_ms: mtime_ms,
+                            last_text_hash: hash,
+                        },
+                    );
+                    SyncAction::Open {
+                        version: 1,
+                        language_id: lang,
+                    }
+                }
+            }
+        };
+        match action {
+            SyncAction::Open {
+                version,
+                language_id,
+            } => {
+                self.send_notification(
+                    "textDocument/didOpen",
+                    json!({
+                        "textDocument": {
+                            "uri": uri.clone(),
+                            "languageId": language_id,
+                            "version": version,
+                            "text": text
+                        }
+                    }),
+                )?;
+                self.send_notification(
+                    "textDocument/didSave",
+                    json!({ "textDocument": { "uri": uri } }),
+                )?;
+            }
+            SyncAction::Change { version } => {
+                self.send_notification(
+                    "textDocument/didChange",
+                    json!({
+                        "textDocument": { "uri": uri.clone(), "version": version },
+                        "contentChanges": [{ "text": text }]
+                    }),
+                )?;
+                self.send_notification(
+                    "textDocument/didSave",
+                    json!({ "textDocument": { "uri": uri } }),
+                )?;
+            }
+            SyncAction::Noop => {}
+        }
         Ok(())
+    }
+
+    pub fn sync_document_text(&self, path: &Path, text: &str) -> io::Result<()> {
+        self.sync_document(path, text, file_mtime_ms(path))
+    }
+
+    pub fn sync_document_from_disk(&self, path: &Path) -> io::Result<()> {
+        let text = std::fs::read_to_string(path)?;
+        self.sync_document(path, &text, file_mtime_ms(path))
     }
 
     pub fn take_formatted_diagnostic_messages(&self) -> Vec<Value> {
