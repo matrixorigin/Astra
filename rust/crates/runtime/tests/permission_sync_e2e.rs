@@ -75,7 +75,7 @@ async fn e2e_child_requests_permission_parent_approves() {
     let child_router = router.clone();
     let child_handle = tokio::spawn(async move {
         // Register child mailbox
-        let child_mailbox = child_router
+        let mut child_mailbox = child_router
             .register(child_addr.clone(), None)
             .await
             .unwrap();
@@ -148,7 +148,7 @@ async fn e2e_parent_denies_based_on_rules() {
     // Child sends dangerous request
     let child_router = router.clone();
     let child_handle = tokio::spawn(async move {
-        let child_mailbox = child_router
+        let mut child_mailbox = child_router
             .register(child_addr.clone(), None)
             .await
             .unwrap();
@@ -220,7 +220,7 @@ async fn e2e_callback_controls_permission() {
     // Test: allowed tool (view)
     let child_router = router.clone();
     let child_handle = tokio::spawn(async move {
-        let child_mailbox = child_router
+        let mut child_mailbox = child_router
             .register(child_addr.clone(), None)
             .await
             .unwrap();
@@ -372,7 +372,7 @@ async fn e2e_timeout_no_response() {
 
     // Register both but don't process parent's messages
     let _parent_mailbox = router.register(parent_addr.clone(), None).await.unwrap();
-    let child_mailbox = router.register(child_addr.clone(), None).await.unwrap();
+    let mut child_mailbox = router.register(child_addr.clone(), None).await.unwrap();
 
     dt.record_sub_run(SubRunRecord {
         run_id: "child-run".into(),

@@ -1,4 +1,4 @@
-//! `ToolCallRecord` rows for headless early-exit paths (duplicate, cache hit, unknown tool).
+//! `ToolCallRecord` rows for headless early-exit paths.
 
 use astra_services::session_journal::ToolCallRecord;
 
@@ -47,6 +47,24 @@ pub fn journal_record_unknown_tool(name: String) -> ToolCallRecord {
         input_bytes: None,
         output_bytes: None,
         args_preview: None,
+        result_preview: None,
+    }
+}
+
+#[must_use]
+pub fn journal_record_blocked_tool(
+    name: String,
+    reason: String,
+    args_preview: Option<String>,
+) -> ToolCallRecord {
+    ToolCallRecord {
+        name,
+        ok: false,
+        ms: 0,
+        error: Some(format!("blocked_tool: {reason}")),
+        input_bytes: None,
+        output_bytes: None,
+        args_preview,
         result_preview: None,
     }
 }
@@ -111,6 +129,18 @@ mod tests {
         let r = journal_record_unknown_tool("nope".into());
         assert!(!r.ok);
         assert_eq!(r.error.as_deref(), Some("unknown_tool: nope"));
+    }
+
+    #[test]
+    fn blocked_tool_error_tag() {
+        let r = journal_record_blocked_tool(
+            "bash".into(),
+            "denied by policy".into(),
+            Some(r#"{"command":"echo hi"}"#.into()),
+        );
+        assert!(!r.ok);
+        assert_eq!(r.error.as_deref(), Some("blocked_tool: denied by policy"));
+        assert_eq!(r.args_preview.as_deref(), Some(r#"{"command":"echo hi"}"#));
     }
 
     #[test]

@@ -9,7 +9,9 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 
 use crate::messaging::router::AgentMailbox;
-use crate::orchestration::permission_sync::{PermissionMode, PermissionRequest, PermissionSyncContext, PermissionUpdate};
+use crate::orchestration::permission_sync::{
+    PermissionMode, PermissionRequest, PermissionSyncContext, PermissionUpdate,
+};
 
 /// Result of a permission check.
 #[derive(Debug, Clone)]
@@ -30,13 +32,13 @@ pub enum PermissionCheckResult {
 /// Flow:
 /// 1. If no permission_context, always allow (legacy mode)
 /// 2. Check PermissionSyncContext.is_allowed()
-/// 3. If denied and have mailbox + parent_address, request permission
+/// 3. If denied and have mailbox, request permission from the parent
 /// 4. Return result
 pub async fn check_tool_permission(
     tool_name: &str,
     args: Option<&str>,
     permission_context: Option<&Arc<RwLock<PermissionSyncContext>>>,
-    mailbox: Option<&AgentMailbox>,
+    mailbox: Option<&mut AgentMailbox>,
     timeout: Duration,
 ) -> PermissionCheckResult {
     // No permission context = legacy mode, always allow
@@ -120,7 +122,9 @@ mod tests {
 
     #[tokio::test]
     async fn no_context_always_allowed() {
-        let result = check_tool_permission("edit", Some("src/main.rs"), None, None, Duration::from_secs(5)).await;
+        let result =
+            check_tool_permission("edit", Some("src/main.rs"), None, None, Duration::from_secs(5))
+                .await;
         assert!(matches!(result, PermissionCheckResult::Allowed));
     }
 
@@ -136,7 +140,8 @@ mod tests {
         };
         let ctx = Arc::new(RwLock::new(PermissionSyncContext::new(inherited)));
 
-        let result = check_tool_permission("edit", None, Some(&ctx), None, Duration::from_secs(5)).await;
+        let result =
+            check_tool_permission("edit", None, Some(&ctx), None, Duration::from_secs(5)).await;
         assert!(matches!(result, PermissionCheckResult::Allowed));
     }
 
@@ -152,7 +157,8 @@ mod tests {
         };
         let ctx = Arc::new(RwLock::new(PermissionSyncContext::new(inherited)));
 
-        let result = check_tool_permission("edit", None, Some(&ctx), None, Duration::from_secs(5)).await;
+        let result =
+            check_tool_permission("edit", None, Some(&ctx), None, Duration::from_secs(5)).await;
         assert!(matches!(result, PermissionCheckResult::Denied { .. }));
     }
 
@@ -168,7 +174,88 @@ mod tests {
         };
         let ctx = Arc::new(RwLock::new(PermissionSyncContext::new(inherited)));
 
-        let result = check_tool_permission("edit", None, Some(&ctx), None, Duration::from_secs(5)).await;
+        let result =
+            check_tool_permission("edit", None, Some(&ctx), None, Duration::from_secs(5)).await;
         assert!(matches!(result, PermissionCheckResult::Denied { .. }));
+    }
+
+    #[tokio::test]
+    async fn requests_parent_and_applies_updates() {
+        use crate::messaging::in_process::InProcessTransport;
+        use crate::messaging::router::AgentMailboxRouter;
+        use crate::messaging::types::AgentAddress;
+        use crate::server::delegation_engine::{DelegationTracker, SubRunRecord};
+
+        let transport = Arc::new(InProcessTransport::new());
+        let tracker = Arc::new(DelegationTracker::new());
+        let router = Arc::new(AgentMailboxRouter::new(transport, tracker.clone()));
+
+        let parent_addr = AgentAddress::new("run-parent", "orchestrator");
+        let child_addr = AgentAddress::new("run-child", "worker");
+        let mut parent_mailbox = router.register(parent_addr.clone(), None).await.unwrap();
+        let mut child_mailbox = router.register(child_addr.clone(), None).await.unwrap();
+
+        tracker
+            .record_sub_run(SubRunRecord {
+                run_id: "run-child".into(),
+                parent_run_id: "run-parent".into(),
+                delegation_id: "del-perm".into(),
+                agent_id: "worker".into(),
+                depth: 1,
+            })
+            .await;
+
+        let inherited = InheritedPermissions {
+            mode: PermissionMode::Prompt,
+            allow_rules: vec![],
+            deny_rules: vec![],
+            ask_rules: vec![],
+            allowed_tools: Some(HashSet::from(["view".to_string()])),
+            is_background: false,
+        };
+        let ctx = Arc::new(RwLock::new(PermissionSyncContext::new(inherited)));
+
+        let router_clone = router.clone();
+        let parent_addr_clone = parent_addr.clone();
+        let child_addr_clone = child_addr.clone();
+        let responder = tokio::spawn(async move {
+            loop {
+                if let Some(msg) = parent_mailbox.try_recv() {
+                    let correlation_id = msg.correlation_id.clone().unwrap();
+                    let response = crate::orchestration::permission_sync::PermissionResponse::approve()
+                        .with_update(PermissionUpdate::allow(PermissionRule::parse("bash")));
+                    router_clone
+                        .send(response.to_message(
+                            &parent_addr_clone,
+                            &child_addr_clone,
+                            &correlation_id,
+                        ))
+                        .await
+                        .unwrap();
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+
+        let result = check_tool_permission(
+            "bash",
+            Some(r#"{"command":"echo hi"}"#),
+            Some(&ctx),
+            Some(&mut child_mailbox),
+            Duration::from_secs(1),
+        )
+        .await;
+        responder.await.unwrap();
+
+        match result {
+            PermissionCheckResult::AllowedViaRequest { new_rules } => {
+                assert_eq!(new_rules.len(), 1);
+            }
+            other => panic!("expected AllowedViaRequest, got {other:?}"),
+        }
+
+        let ctx_guard = ctx.read().await;
+        assert!(ctx_guard.is_allowed("bash", Some(r#"{"command":"echo hi"}"#)));
     }
 }

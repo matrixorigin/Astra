@@ -3,6 +3,7 @@
 //! Resolves high-level targets (`Parent`, `Broadcast`) into concrete delivery
 //! actions using the delegation tracker and the pluggable transport.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use super::transport::{MessageStream, MessageTransport};
@@ -25,6 +26,8 @@ pub struct AgentMailbox {
     pub delegation_id: Option<String>,
     /// Message receive stream (direct + broadcast), mutex-guarded for Sync.
     stream: tokio::sync::Mutex<Box<dyn MessageStream>>,
+    /// Messages buffered while waiting for a correlated response.
+    buffered: std::sync::Mutex<VecDeque<Arc<AgentMessage>>>,
     /// Router reference for sending.
     router: Arc<AgentMailboxRouter>,
 }
@@ -37,22 +40,44 @@ impl AgentMailbox {
 
     /// Non-blocking: get the next available message, if any.
     pub fn try_recv(&mut self) -> Option<Arc<AgentMessage>> {
+        if let Some(msg) = self.buffered.lock().unwrap().pop_front() {
+            return Some(msg);
+        }
         self.stream.get_mut().try_recv()
     }
 
     /// Blocking: wait for the next message.
     pub async fn recv(&self) -> Option<Arc<AgentMessage>> {
+        if let Some(msg) = self.buffered.lock().unwrap().pop_front() {
+            return Some(msg);
+        }
         self.stream.lock().await.recv().await
     }
 
     /// Drain all currently buffered messages.
     pub fn drain(&mut self) -> Vec<Arc<AgentMessage>> {
-        self.stream.get_mut().drain()
+        let mut buffered: Vec<_> = self.buffered.lock().unwrap().drain(..).collect();
+        buffered.extend(self.stream.get_mut().drain());
+        buffered
     }
 
     /// Drain up to `limit` messages. Returns `true` if more remain.
     pub fn drain_bounded(&mut self, limit: usize) -> (Vec<Arc<AgentMessage>>, bool) {
-        self.stream.get_mut().drain_bounded(limit)
+        let mut msgs = Vec::with_capacity(limit);
+        while msgs.len() < limit {
+            match self.try_recv() {
+                Some(msg) => msgs.push(msg),
+                None => return (msgs, false),
+            }
+        }
+
+        match self.try_recv() {
+            Some(extra) => {
+                self.buffered.lock().unwrap().push_back(extra);
+                (msgs, true)
+            }
+            None => (msgs, false),
+        }
     }
 
     /// Send a message through the router (handles target resolution).
@@ -101,12 +126,14 @@ impl AgentMailbox {
     ///
     /// Returns `Ok(response)` if approved, `Err` with reason if denied or timeout.
     pub async fn request_permission(
-        &self,
+        &mut self,
         request: crate::orchestration::permission_sync::PermissionRequest,
         timeout: std::time::Duration,
     ) -> Result<crate::orchestration::permission_sync::PermissionResponse, MailboxError> {
         use crate::messaging::types::{MessagePayload, RequestType};
         use crate::orchestration::permission_sync::PermissionResponse;
+
+        let mut skipped = VecDeque::new();
 
         // Build and send the request message
         let request_id = uuid::Uuid::new_v4().to_string();
@@ -127,16 +154,24 @@ impl AgentMailbox {
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
+                self.buffered.lock().unwrap().extend(skipped.drain(..));
                 return Err(MailboxError::Timeout(format!(
                     "Permission request timed out after {:?}",
                     timeout
                 )));
             }
 
-            match tokio::time::timeout(remaining, self.recv()).await {
+            let next_message = if let Some(msg) = self.buffered.lock().unwrap().pop_front() {
+                Ok(Some(msg))
+            } else {
+                tokio::time::timeout(remaining, self.stream.lock().await.recv()).await
+            };
+
+            match next_message {
                 Ok(Some(msg)) => {
                     // Check if this is our response
                     if msg.correlation_id.as_deref() == Some(&request_id) {
+                        self.buffered.lock().unwrap().extend(skipped.drain(..));
                         if let MessagePayload::Response { data, accepted, .. } = &msg.payload {
                             if let Some(data) = data {
                                 if let Some(response) = PermissionResponse::from_message_payload(data) {
@@ -151,12 +186,14 @@ impl AgentMailbox {
                             };
                         }
                     }
-                    // Not our response, continue waiting
+                    skipped.push_back(msg);
                 }
                 Ok(None) => {
+                    self.buffered.lock().unwrap().extend(skipped.drain(..));
                     return Err(MailboxError::Disconnected);
                 }
                 Err(_) => {
+                    self.buffered.lock().unwrap().extend(skipped.drain(..));
                     return Err(MailboxError::Timeout(format!(
                         "Permission request timed out after {:?}",
                         timeout
@@ -228,6 +265,7 @@ impl AgentMailboxRouter {
             address: addr,
             delegation_id,
             stream: tokio::sync::Mutex::new(stream),
+            buffered: std::sync::Mutex::new(VecDeque::new()),
             router: Arc::clone(self),
         })
     }
@@ -443,7 +481,7 @@ mod tests {
 
         let child_handle = tokio::spawn(async move {
             // Create a new mailbox for the child in this task
-            let child_mb = child_router.register(child_addr, None).await.unwrap();
+            let mut child_mb = child_router.register(child_addr, None).await.unwrap();
             child_mb.request_permission(request, timeout).await
         });
 
@@ -485,7 +523,7 @@ mod tests {
         let child = addr("r1", "worker");
 
         let _parent_mailbox = router.register(parent.clone(), None).await.unwrap();
-        let child_mailbox = router.register(child.clone(), None).await.unwrap();
+        let mut child_mailbox = router.register(child.clone(), None).await.unwrap();
 
         // Set up parent relationship
         use crate::server::delegation_engine::SubRunRecord;
@@ -507,6 +545,82 @@ mod tests {
         match result.unwrap_err() {
             MailboxError::Timeout(_) => {} // expected
             other => panic!("expected Timeout, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn request_permission_preserves_unrelated_messages() {
+        use crate::orchestration::permission_sync::{PermissionRequest, PermissionResponse};
+
+        let transport = Arc::new(InProcessTransport::new());
+        let dt = tracker();
+        let router = Arc::new(AgentMailboxRouter::new(transport, dt.clone()));
+
+        let parent = addr("r0", "orchestrator");
+        let child = addr("r1", "worker");
+
+        let mut parent_mailbox = router.register(parent.clone(), None).await.unwrap();
+        let mut child_mailbox = router.register(child.clone(), None).await.unwrap();
+
+        dt.record_sub_run(SubRunRecord {
+            run_id: "r1".into(),
+            parent_run_id: "r0".into(),
+            delegation_id: "del-buffer".into(),
+            agent_id: "worker".into(),
+            depth: 1,
+        })
+        .await;
+
+        let router_clone = router.clone();
+        let parent_clone = parent.clone();
+        let child_clone = child.clone();
+        let responder = tokio::spawn(async move {
+            loop {
+                if let Some(msg) = parent_mailbox.try_recv() {
+                    let correlation_id = msg.correlation_id.clone().unwrap();
+                    router_clone
+                        .send(AgentMessage::new(
+                            parent_clone.clone(),
+                            MessageTarget::Direct {
+                                address: child_clone.clone(),
+                            },
+                            MessagePayload::Text {
+                                content: "keep this message".into(),
+                                summary: None,
+                            },
+                        ))
+                        .await
+                        .unwrap();
+                    router_clone
+                        .send(
+                            PermissionResponse::approve()
+                                .to_message(&parent_clone, &child_clone, &correlation_id),
+                        )
+                        .await
+                        .unwrap();
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        });
+
+        let response = child_mailbox
+            .request_permission(
+                PermissionRequest::new("bash", serde_json::json!({"command": "echo hi"})),
+                std::time::Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        responder.await.unwrap();
+
+        assert!(response.approved);
+
+        let preserved = child_mailbox
+            .try_recv()
+            .expect("unrelated message should remain buffered");
+        match &preserved.payload {
+            MessagePayload::Text { content, .. } => assert_eq!(content, "keep this message"),
+            other => panic!("expected preserved text message, got {other:?}"),
         }
     }
 }

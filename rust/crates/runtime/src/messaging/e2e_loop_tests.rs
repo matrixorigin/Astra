@@ -17,12 +17,18 @@ mod tests {
     use crate::messaging::in_process::InProcessTransport;
     use crate::messaging::router::AgentMailboxRouter;
     use crate::messaging::types::*;
+    use crate::orchestration::permission_sync::{
+        InheritedPermissions, PermissionMode, PermissionRequest, PermissionResponse,
+        PermissionSyncContext,
+    };
     use crate::server::delegation_engine::{DelegationTracker, SubRunRecord};
     use crate::turn::agentic_loop_host::{
         AgenticLoopHost, AgenticLoopState, HostTurnResult,
         run_agentic_loop_with_host,
     };
-    use crate::turn::agentic_headless_round::HeadlessStderrStyle;
+    use crate::turn::agentic_headless_round::{
+        HeadlessStderrStyle, NoopHeadlessTerminal, run_agentic_headless_tool_round,
+    };
     use crate::turn::chat_turn_sse_dispatch::ChatTurnSseAccum;
     use crate::turn::sse_stream_host::EdgeToolExecResult;
     use crate::turn::turn_guard::TurnGuard;
@@ -547,5 +553,116 @@ mod tests {
             }
             other => panic!("expected Progress, got: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn parent_loop_handles_permission_request_before_llm_injection() {
+        let (_router, parent_mb, mut child_mb, _dt) = setup_two_agents().await;
+
+        let request = PermissionRequest::new("bash", json!({"command": "echo hi"}))
+            .to_message(&child_mb.address, &parent_mb.address)
+            .with_correlation("perm-1");
+        child_mb.send(request).await.unwrap();
+
+        let mut host = MockHost::new(vec![text_result("Handled request.")]);
+        let mut state = make_state();
+        state.mailbox = Some(parent_mb);
+        state.permission_context = Some(Arc::new(tokio::sync::RwLock::new(
+            PermissionSyncContext::root(PermissionMode::Auto),
+        )));
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+        assert!(outcome.is_ok());
+
+        let response = child_mb
+            .try_recv()
+            .expect("child should receive permission response");
+        match &response.payload {
+            MessagePayload::Response { accepted, data, .. } => {
+                assert!(*accepted);
+                let parsed = PermissionResponse::from_message_payload(
+                    data.as_ref().expect("response should include payload"),
+                )
+                .expect("response payload should parse");
+                assert!(parsed.approved);
+            }
+            other => panic!("expected permission response, got {other:?}"),
+        }
+
+        let leaked_request = state.messages.iter().any(|m| {
+            m.get("content")
+                .and_then(Value::as_str)
+                .is_some_and(|c| c.contains("ToolPermission"))
+        });
+        assert!(
+            !leaked_request,
+            "permission requests should be handled before LLM context injection"
+        );
+    }
+
+    #[tokio::test]
+    async fn child_tool_round_records_blocked_permission_denial() {
+        let tool_calls = vec![json!({
+            "id": "call-bash-perm",
+            "name": "bash",
+            "arguments": r#"{"command": "echo hi"}"#
+        })];
+
+        let permission_context = Arc::new(tokio::sync::RwLock::new(PermissionSyncContext::new(
+            InheritedPermissions {
+                mode: PermissionMode::Prompt,
+                allow_rules: vec![],
+                deny_rules: vec![],
+                ask_rules: vec![],
+                allowed_tools: Some(HashSet::from(["view".to_string()])),
+                is_background: false,
+            },
+        )));
+        let mut messages = Vec::new();
+        let mut tool_results = Vec::new();
+        let valid_tool_names = HashSet::from(["bash".to_string()]);
+        let mut restricted_tools = HashSet::new();
+        let mut turn_guard = TurnGuard::new();
+        let mut step_recorder = StepRecorder::new("test-session", "perm-headless");
+        let mut idempotency_cache = InMemoryIdempotencyCache::new();
+        let mut semantic_dedup = SemanticDedup::new(0.95);
+        let mut tool_call_records = Vec::new();
+        let tool_event_hooks = crate::skills::hooks::ToolEventHookRegistry::default();
+        let mut term = NoopHeadlessTerminal;
+        let edge_callback_outputs = std::collections::HashMap::new();
+        let edge_tool_round: Vec<EdgeToolExecResult> = Vec::new();
+
+        run_agentic_headless_tool_round(
+            0,
+            true,
+            &astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
+            "",
+            None,
+            &tool_calls,
+            &edge_tool_round,
+            "",
+            &edge_callback_outputs,
+            &mut messages,
+            &mut tool_results,
+            &valid_tool_names,
+            &mut restricted_tools,
+            &mut turn_guard,
+            &mut step_recorder,
+            &mut idempotency_cache,
+            &mut semantic_dedup,
+            &mut tool_call_records,
+            &tool_event_hooks,
+            &mut term,
+            None,
+            Some(&permission_context),
+        )
+        .await;
+
+        assert_eq!(tool_results.len(), 1);
+        assert_eq!(tool_call_records.len(), 1);
+        assert_eq!(
+            tool_call_records[0].error.as_deref(),
+            Some("blocked_tool: Tool 'bash' requires permission but no parent available"),
+        );
     }
 }

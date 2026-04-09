@@ -925,6 +925,12 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
         state.remaining_turns = state.remaining_turns.saturating_sub(1);
         state.step_recorder.begin_turn(turn_index as u32);
 
+        if state.permission_handler.is_none()
+            && let Some(ctx) = state.permission_context.clone()
+        {
+            state.permission_handler = Some(crate::orchestration::PermissionRequestHandler::new(ctx));
+        }
+
         // ─── Drain inter-agent mailbox ──────────────────────────────────
         // Inject pending messages from peer/parent agents as a system
         // message so the LLM is aware of coordination context.
@@ -975,6 +981,15 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
                         if let Some(ref metrics) = state.messaging_metrics {
                             metrics.acks_sent.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         }
+                    }
+
+                    if let Some(ref handler) = state.permission_handler
+                        && let Some((correlation_id, response)) = handler.process_message(msg).await
+                    {
+                        let response_msg =
+                            response.to_message(&mailbox.address, &msg.from, &correlation_id);
+                        let _ = mailbox.send(response_msg).await;
+                        continue;
                     }
 
                     match &msg.payload {
@@ -1707,6 +1722,7 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
                 &mut state.tool_call_records,
                 &state.tool_event_hooks,
                 &mut term_adapter,
+                state.mailbox.as_mut(),
                 state.permission_context.as_ref(),
                 state.mailbox.as_ref(),
             )
