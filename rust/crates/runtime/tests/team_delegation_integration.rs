@@ -232,10 +232,10 @@ async fn orchestrator_delegation_failure_propagates() {
     let (orch, _, _) = setup_orchestrator_with_executor(store, Arc::new(ErrorExecutor)).await;
     let report = orch.execute_team("fail", "task", None).await;
 
-    // Pipeline with error executor: the delegation still completes but with failed results
-    // (DelegationEngine catches executor errors and wraps them as failed AgentResults)
-    assert_eq!(report.status, TeamExecutionStatus::Completed);
+    // When all agents fail, delegation status is "failed" and team status is Failed
+    assert_eq!(report.status, TeamExecutionStatus::Failed);
     let dr = report.delegation_result.unwrap();
+    assert_eq!(dr.status, "failed");
     assert_eq!(dr.agent_results[0].status, "failed");
     assert!(dr.agent_results[0].error.as_ref().unwrap().contains("crashed"));
 }
