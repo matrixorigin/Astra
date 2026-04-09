@@ -971,6 +971,14 @@ mod tests {
         ToolExecutor::new(std::env::temp_dir())
     }
 
+    /// Create a ToolExecutor rooted in a fresh temp directory.
+    /// Returns both the TempDir (to keep it alive) and the executor.
+    pub(super) fn temp_executor() -> (tempfile::TempDir, ToolExecutor) {
+        let dir = tempfile::tempdir().unwrap();
+        let executor = ToolExecutor::new(dir.path());
+        (dir, executor)
+    }
+
     mod schema_tests;
     mod executor_core_tests;
     mod fs_tests;
@@ -980,7 +988,9 @@ mod tests {
     mod code_intel_tests;
     mod code_intel_integration_tests;
     mod build_test_tests;
-    mod code_intel_enhanced_tests;
+    mod code_intel_enhancement_tests;
+    mod cross_file_caller_tests;
+    mod code_intel_api_tests;
     mod aggregate_tests;
     mod sandbox_tests;
     mod task_tests;

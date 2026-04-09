@@ -8,6 +8,14 @@ use std::time::Duration;
 
 use tokio::sync::RwLock;
 
+/// Timeout for permission request calls in tests.
+/// Increase if CI environments are slow.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+/// Timeout for receiving messages from mailbox.
+const RECV_TIMEOUT: Duration = Duration::from_secs(2);
+/// Short timeout for testing timeout behavior itself.
+const SHORT_TIMEOUT: Duration = Duration::from_millis(100);
+
 use astra_runtime::messaging::in_process::InProcessTransport;
 use astra_runtime::messaging::router::AgentMailboxRouter;
 use astra_runtime::messaging::types::AgentAddress;
@@ -79,12 +87,12 @@ async fn e2e_child_requests_permission_parent_approves() {
 
         // Send and wait for response
         child_mailbox
-            .request_permission(request, Duration::from_secs(5))
+            .request_permission(request, REQUEST_TIMEOUT)
             .await
     });
 
     // Parent waits for message using recv()
-    let msg = tokio::time::timeout(Duration::from_secs(2), parent_mailbox.recv())
+    let msg = tokio::time::timeout(RECV_TIMEOUT, parent_mailbox.recv())
         .await
         .expect("should receive within timeout")
         .expect("should have a message");
@@ -150,12 +158,12 @@ async fn e2e_parent_denies_based_on_rules() {
                 .with_hint("rm -rf /important");
 
         child_mailbox
-            .request_permission(request, Duration::from_secs(5))
+            .request_permission(request, REQUEST_TIMEOUT)
             .await
     });
 
     // Parent processes
-    let msg = tokio::time::timeout(Duration::from_secs(2), parent_mailbox.recv())
+    let msg = tokio::time::timeout(RECV_TIMEOUT, parent_mailbox.recv())
         .await
         .expect("should receive request")
         .expect("should have message");
@@ -220,11 +228,11 @@ async fn e2e_callback_controls_permission() {
         let request = PermissionRequest::new("view", serde_json::json!({"path": "/etc/passwd"}));
 
         child_mailbox
-            .request_permission(request, Duration::from_secs(5))
+            .request_permission(request, REQUEST_TIMEOUT)
             .await
     });
 
-    let msg = tokio::time::timeout(Duration::from_secs(2), parent_mailbox.recv())
+    let msg = tokio::time::timeout(RECV_TIMEOUT, parent_mailbox.recv())
         .await
         .unwrap()
         .unwrap();
@@ -378,7 +386,7 @@ async fn e2e_timeout_no_response() {
     // Child sends request with short timeout
     let request = PermissionRequest::new("bash", serde_json::json!({"command": "test"}));
     let result = child_mailbox
-        .request_permission(request, Duration::from_millis(100))
+        .request_permission(request, SHORT_TIMEOUT)
         .await;
 
     assert!(result.is_err());
