@@ -9,6 +9,17 @@ pub(super) fn clear_profile_last_session(profile: Option<&str>) -> Result<(), St
     save_credentials(&creds)
 }
 
+pub(super) fn clear_profile_auth(profile: Option<&str>) -> Result<(), String> {
+    let mut creds = load_credentials();
+    let name = profile_name(profile, &creds);
+    if let Some(entry) = creds.profiles.get_mut(&name) {
+        entry.access_token = None;
+        entry.refresh_token = None;
+        entry.last_session_id = None;
+    }
+    save_credentials(&creds)
+}
+
 pub(super) async fn do_login(
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
@@ -33,16 +44,12 @@ pub(super) async fn do_login(
     let mut creds = load_credentials();
     let name = profile_name(profile, &creds);
     creds.current_profile = Some(name.clone());
-    creds.profiles.insert(
-        name,
-        Profile {
-            username: Some(username.to_string()),
-            access_token: Some(access.clone()),
-            refresh_token: Some(refresh),
-            last_session_id: None,
-            memoria_api_key: None,
-        },
-    );
+    let mut updated = creds.profiles.get(&name).cloned().unwrap_or_default();
+    updated.username = Some(username.to_string());
+    updated.access_token = Some(access.clone());
+    updated.refresh_token = Some(refresh);
+    updated.last_session_id = None;
+    creds.profiles.insert(name, updated);
     save_credentials(&creds)?;
     Ok(access)
 }
