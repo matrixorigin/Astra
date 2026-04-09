@@ -99,6 +99,7 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
     tool_call_records: &mut Vec<ToolCallRecord>,
     tool_event_hooks: &crate::skills::hooks::ToolEventHookRegistry,
     term: &mut dyn HeadlessRoundTerminal,
+    permission_context: Option<&std::sync::Arc<tokio::sync::RwLock<crate::orchestration::permission_sync::PermissionSyncContext>>>,
 ) {
     tool_results.clear();
 
@@ -254,6 +255,30 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
             tool_results.push(err_tr);
             tool_call_records.push(journal_record_unknown_tool(name.clone()));
             continue;
+        }
+
+        // ── Permission gate check ──
+        // If permission_context is set, check if this tool is allowed before execution.
+        if let Some(ctx) = permission_context {
+            let ctx_guard = ctx.read().await;
+            let args_str = serde_json::to_string(&args).ok();
+            if !ctx_guard.is_allowed(&name, args_str.as_deref()) {
+                let err_msg = super::permission_gate::permission_denied_error_result(
+                    &name,
+                    "Tool not allowed by permission rules"
+                );
+                if !quiet {
+                    term.emit_line(
+                        HeadlessStderrStyle::Yellow,
+                        format!("  🔒 Permission denied: {name}"),
+                    );
+                }
+                let (tool_msg, err_tr) = openai_tool_roundtrip_values(&id, &name, &err_msg);
+                messages.push(tool_msg);
+                tool_results.push(err_tr);
+                tool_call_records.push(journal_record_unknown_tool(name.clone()));
+                continue;
+            }
         }
 
         // ── PreToolUse hook evaluation ──

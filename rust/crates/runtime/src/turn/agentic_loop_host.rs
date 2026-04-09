@@ -1707,6 +1707,7 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
                 &mut state.tool_call_records,
                 &state.tool_event_hooks,
                 &mut term_adapter,
+                state.permission_context.as_ref(),
             )
             .await;
         }

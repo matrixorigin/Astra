@@ -788,7 +788,6 @@ mod tests {
             parent_agent_id: "main".to_string(),
             inherited_permissions: None,
             working_dir: PathBuf::from("/tmp"),
-            inherited_permissions: None,
         };
         let input = SpawnAgentInput {
             description: "Named agent".to_string(),
@@ -860,7 +859,6 @@ mod tests {
             parent_agent_id: "main".to_string(),
             inherited_permissions: None,
             working_dir: PathBuf::from("/tmp"),
-            inherited_permissions: None,
         };
         let input = SpawnAgentInput {
             description: "Background agent".to_string(),

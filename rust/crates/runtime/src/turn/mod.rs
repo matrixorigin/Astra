@@ -57,6 +57,7 @@ pub mod llm_request_dump;
 pub mod loop_dispatcher;
 pub mod observer;
 pub mod parallel_tool_exec;
+pub mod permission_gate;
 pub mod persist;
 pub mod persist_inputs;
 pub mod prepare_turn_explain_text;
