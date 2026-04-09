@@ -9,11 +9,11 @@ use std::sync::Arc;
 
 use astra_core::SkillSearchSettings;
 use astra_runtime::{
-    orchestration::{SpawnAgentExecutor, SpawnRunConfig, SpawnRunResult},
+    orchestration::{PermissionSummary, SpawnAgentExecutor, SpawnRunConfig, SpawnRunResult},
     pipeline::step_protocol::InMemoryIdempotencyCache,
     pipeline::step_recorder::StepRecorder,
     semantic_dedup::SemanticDedup,
-    turn::agentic_loop_host::{AgenticLoopState, run_agentic_loop_with_host, AgenticLoopOutcome},
+    turn::agentic_loop_host::{AgenticLoopOutcome, AgenticLoopState, run_agentic_loop_with_host},
     turn::chat_turn_heuristics::infer_task_execution_profile,
     turn::tool_schema_prune::openai_tool_names_from_schemas,
     turn::turn_guard::TurnGuard,
@@ -164,6 +164,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
 
         let start_time = std::time::Instant::now();
         let progress_emitter = config.progress_emitter.clone();
+        let has_parent_permissions = config.parent_address.is_some();
 
         let max_turns = config.max_turns as usize;
 
@@ -226,12 +227,15 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             skill_allowed_tools: None,
             skill_sandbox_policy: None,
             skill_quality_tracker: astra_runtime::skills::quality::SkillQualityTracker::new(),
-            skill_improvement_tracker: astra_runtime::skills::improvement::ImprovementTracker::new(),
+            skill_improvement_tracker: astra_runtime::skills::improvement::ImprovementTracker::new(
+            ),
             pinned_skills: HashSet::new(),
             discovered_skills: HashSet::new(),
             skill_search: self.skill_search.clone(),
             tool_event_hooks: astra_runtime::skills::hooks::load_tool_event_hooks(&effective_root),
-            session_event_hooks: astra_runtime::skills::hooks::load_session_event_hooks(&effective_root),
+            session_event_hooks: astra_runtime::skills::hooks::load_session_event_hooks(
+                &effective_root,
+            ),
             stop_hooks: Vec::new(),
             stop_hook_runs: 0,
             teammate_idle_hooks: Vec::new(),
@@ -267,6 +271,30 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
         let prompt_tokens = state.total_prompt;
         let completion_tokens = state.total_completion;
         let duration_ms = start_time.elapsed().as_millis() as u64;
+        let (permission_summary, permission_requests, permission_requests_approved, tools_blocked) =
+            if let Some(ctx) = state.permission_context.as_ref() {
+                let ctx_guard = ctx.read().await;
+                let telemetry = ctx_guard.telemetry();
+                let mode = match ctx_guard.mode() {
+                    astra_runtime::orchestration::PermissionMode::Auto => "auto".to_string(),
+                    astra_runtime::orchestration::PermissionMode::Prompt => "prompt".to_string(),
+                    astra_runtime::orchestration::PermissionMode::Deny => "deny".to_string(),
+                };
+                (
+                    Some(PermissionSummary {
+                        mode,
+                        allow_rules: ctx_guard.effective_allow_rule_count(),
+                        deny_rules: ctx_guard.effective_deny_rule_count(),
+                        has_parent: has_parent_permissions,
+                        recent_denials: telemetry.recent_denials.clone(),
+                    }),
+                    telemetry.permission_requests,
+                    telemetry.permission_requests_approved,
+                    telemetry.tools_blocked,
+                )
+            } else {
+                (None, 0, 0, 0)
+            };
 
         match loop_result {
             Ok(AgenticLoopOutcome::Completed) => {
@@ -277,7 +305,12 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
                     } else {
                         state.final_text.clone()
                     };
-                    emitter.completed(summary, tool_calls, (prompt_tokens, completion_tokens), duration_ms);
+                    emitter.completed(
+                        summary,
+                        tool_calls,
+                        (prompt_tokens, completion_tokens),
+                        duration_ms,
+                    );
                 }
                 Ok(SpawnRunResult {
                     agent_id,
@@ -288,6 +321,10 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
                     prompt_tokens,
                     completion_tokens,
                     tool_calls,
+                    permission_summary,
+                    permission_requests,
+                    permission_requests_approved,
+                    tools_blocked,
                 })
             }
             Ok(AgenticLoopOutcome::Cancelled) => {
@@ -308,6 +345,10 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
                     prompt_tokens,
                     completion_tokens,
                     tool_calls,
+                    permission_summary,
+                    permission_requests,
+                    permission_requests_approved,
+                    tools_blocked,
                 })
             }
             Ok(AgenticLoopOutcome::Error(error)) => {
@@ -328,6 +369,10 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
                     prompt_tokens,
                     completion_tokens,
                     tool_calls,
+                    permission_summary,
+                    permission_requests,
+                    permission_requests_approved,
+                    tools_blocked,
                 })
             }
             Ok(AgenticLoopOutcome::Waiting(reason)) => {
@@ -344,6 +389,10 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
                     prompt_tokens,
                     completion_tokens,
                     tool_calls,
+                    permission_summary,
+                    permission_requests,
+                    permission_requests_approved,
+                    tools_blocked,
                 })
             }
             Err(e) => {

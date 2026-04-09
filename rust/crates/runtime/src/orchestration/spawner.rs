@@ -205,6 +205,14 @@ pub struct SpawnRunResult {
     pub completion_tokens: u64,
     /// Total tool calls.
     pub tool_calls: u32,
+    /// Final permission summary for UI/status surfaces.
+    pub permission_summary: Option<PermissionSummary>,
+    /// Number of permission requests sent to parent.
+    pub permission_requests: u32,
+    /// Number of permission requests approved by parent.
+    pub permission_requests_approved: u32,
+    /// Number of tools blocked by permission.
+    pub tools_blocked: u32,
 }
 
 /// Trait for executing spawned agent runs.
@@ -451,14 +459,33 @@ impl DynamicAgentSpawner {
 
                 match result {
                     Ok(run_result) => {
-                        // Update final status
-                        self.update_status(
-                            &agent_id,
-                            AgentStatus::Completed {
+                        if let Some(state) = self.active_agents.write().await.get_mut(&agent_id) {
+                            state.metrics.tool_calls = run_result.tool_calls;
+                            state.metrics.prompt_tokens = run_result.prompt_tokens;
+                            state.metrics.completion_tokens = run_result.completion_tokens;
+                            state.metrics.permission_requests = run_result.permission_requests;
+                            state.metrics.permission_requests_approved =
+                                run_result.permission_requests_approved;
+                            state.metrics.tools_blocked = run_result.tools_blocked;
+                            if let Some(summary) = run_result.permission_summary.clone() {
+                                state.permission_summary = summary;
+                            }
+                        }
+
+                        let status = match run_result.status.as_str() {
+                            "cancelled" => AgentStatus::Cancelled,
+                            "failed" => AgentStatus::Failed {
+                                error: run_result
+                                    .error
+                                    .clone()
+                                    .unwrap_or_else(|| "agent run failed".to_string()),
+                            },
+                            "waiting" => AgentStatus::Idle,
+                            _ => AgentStatus::Completed {
                                 result: run_result.output.clone().unwrap_or_default(),
                             },
-                        )
-                        .await;
+                        };
+                        self.update_status(&agent_id, status).await;
                         self.unregister_mailbox(&agent_id).await;
 
                         let duration_ms = started_at
@@ -496,20 +523,33 @@ impl DynamicAgentSpawner {
     async fn handle_completion(&self, agent_id: &str, result: Result<SpawnRunResult, String>) {
         match result {
             Ok(run_result) => {
-                self.update_status(
-                    agent_id,
-                    AgentStatus::Completed {
-                        result: run_result.output.unwrap_or_default(),
-                    },
-                )
-                .await;
-
-                // Update metrics
                 if let Some(state) = self.active_agents.write().await.get_mut(agent_id) {
                     state.metrics.tool_calls = run_result.tool_calls;
                     state.metrics.prompt_tokens = run_result.prompt_tokens;
                     state.metrics.completion_tokens = run_result.completion_tokens;
+                    state.metrics.permission_requests = run_result.permission_requests;
+                    state.metrics.permission_requests_approved =
+                        run_result.permission_requests_approved;
+                    state.metrics.tools_blocked = run_result.tools_blocked;
+                    if let Some(summary) = run_result.permission_summary.clone() {
+                        state.permission_summary = summary;
+                    }
                 }
+
+                let status = match run_result.status.as_str() {
+                    "cancelled" => AgentStatus::Cancelled,
+                    "failed" => AgentStatus::Failed {
+                        error: run_result
+                            .error
+                            .clone()
+                            .unwrap_or_else(|| "agent run failed".to_string()),
+                    },
+                    "waiting" => AgentStatus::Idle,
+                    _ => AgentStatus::Completed {
+                        result: run_result.output.unwrap_or_default(),
+                    },
+                };
+                self.update_status(agent_id, status).await;
                 self.unregister_mailbox(agent_id).await;
             }
             Err(e) => {
@@ -657,7 +697,7 @@ pub enum SpawnError {
 /// Build permission summary from spawn context.
 fn build_permission_summary(context: &SpawnContext) -> PermissionSummary {
     let mut summary = PermissionSummary::default();
-    
+
     if let Some(ref inherited) = context.inherited_permissions {
         summary.mode = match inherited.mode {
             super::permission_sync::PermissionMode::Auto => "auto".to_string(),
@@ -672,7 +712,7 @@ fn build_permission_summary(context: &SpawnContext) -> PermissionSummary {
         summary.mode = "auto".to_string();
         summary.has_parent = !context.parent_run_id.is_empty() && context.parent_run_id != "root";
     }
-    
+
     summary
 }
 
@@ -899,6 +939,10 @@ mod tests {
                 prompt_tokens: 1,
                 completion_tokens: 1,
                 tool_calls: 0,
+                permission_summary: None,
+                permission_requests: 0,
+                permission_requests_approved: 0,
+                tools_blocked: 0,
             })
         }
     }

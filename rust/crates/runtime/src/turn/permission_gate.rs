@@ -55,6 +55,8 @@ pub async fn check_tool_permission(
 
         // If mode is Deny, don't even try to request
         if ctx_guard.mode() == PermissionMode::Deny {
+            drop(ctx_guard);
+            ctx.write().await.record_blocked_tool(tool_name);
             return PermissionCheckResult::Denied {
                 reason: format!("Tool '{}' denied by permission mode", tool_name),
             };
@@ -63,6 +65,7 @@ pub async fn check_tool_permission(
 
     // Try to request permission from parent
     let Some(mailbox) = mailbox else {
+        ctx.write().await.record_blocked_tool(tool_name);
         return PermissionCheckResult::Denied {
             reason: format!(
                 "Tool '{}' requires permission but no parent available",
@@ -80,19 +83,22 @@ pub async fn check_tool_permission(
         .with_reason(format!("Requesting permission to use tool: {}", tool_name));
 
     // Send request and wait for response
+    ctx.write().await.record_permission_request();
     match mailbox.request_permission(request, timeout).await {
         Ok(response) => {
             if response.approved {
                 // Apply any new rules to our context
                 let new_rules = response.updates.clone();
-                if !new_rules.is_empty() {
+                {
                     let mut ctx_guard = ctx.write().await;
+                    ctx_guard.record_permission_approved();
                     for update in &new_rules {
                         ctx_guard.apply_update(update);
                     }
                 }
                 PermissionCheckResult::AllowedViaRequest { new_rules }
             } else {
+                ctx.write().await.record_blocked_tool(tool_name);
                 PermissionCheckResult::Denied {
                     reason: response
                         .reason
@@ -100,9 +106,12 @@ pub async fn check_tool_permission(
                 }
             }
         }
-        Err(e) => PermissionCheckResult::Denied {
-            reason: format!("Permission request failed: {}", e),
-        },
+        Err(e) => {
+            ctx.write().await.record_blocked_tool(tool_name);
+            PermissionCheckResult::Denied {
+                reason: format!("Permission request failed: {}", e),
+            }
+        }
     }
 }
 
@@ -122,9 +131,14 @@ mod tests {
 
     #[tokio::test]
     async fn no_context_always_allowed() {
-        let result =
-            check_tool_permission("edit", Some("src/main.rs"), None, None, Duration::from_secs(5))
-                .await;
+        let result = check_tool_permission(
+            "edit",
+            Some("src/main.rs"),
+            None,
+            None,
+            Duration::from_secs(5),
+        )
+        .await;
         assert!(matches!(result, PermissionCheckResult::Allowed));
     }
 
@@ -177,6 +191,13 @@ mod tests {
         let result =
             check_tool_permission("edit", None, Some(&ctx), None, Duration::from_secs(5)).await;
         assert!(matches!(result, PermissionCheckResult::Denied { .. }));
+
+        let ctx_guard = ctx.read().await;
+        let telemetry = ctx_guard.telemetry();
+        assert_eq!(telemetry.permission_requests, 0);
+        assert_eq!(telemetry.permission_requests_approved, 0);
+        assert_eq!(telemetry.tools_blocked, 1);
+        assert_eq!(telemetry.recent_denials, vec!["edit".to_string()]);
     }
 
     #[tokio::test]
@@ -222,8 +243,9 @@ mod tests {
             loop {
                 if let Some(msg) = parent_mailbox.try_recv() {
                     let correlation_id = msg.correlation_id.clone().unwrap();
-                    let response = crate::orchestration::permission_sync::PermissionResponse::approve()
-                        .with_update(PermissionUpdate::allow(PermissionRule::parse("bash")));
+                    let response =
+                        crate::orchestration::permission_sync::PermissionResponse::approve()
+                            .with_update(PermissionUpdate::allow(PermissionRule::parse("bash")));
                     router_clone
                         .send(response.to_message(
                             &parent_addr_clone,
@@ -257,5 +279,9 @@ mod tests {
 
         let ctx_guard = ctx.read().await;
         assert!(ctx_guard.is_allowed("bash", Some(r#"{"command":"echo hi"}"#)));
+        let telemetry = ctx_guard.telemetry();
+        assert_eq!(telemetry.permission_requests, 1);
+        assert_eq!(telemetry.permission_requests_approved, 1);
+        assert_eq!(telemetry.tools_blocked, 0);
     }
 }

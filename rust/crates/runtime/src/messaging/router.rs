@@ -174,7 +174,9 @@ impl AgentMailbox {
                         self.buffered.lock().unwrap().extend(skipped.drain(..));
                         if let MessagePayload::Response { data, accepted, .. } = &msg.payload {
                             if let Some(data) = data {
-                                if let Some(response) = PermissionResponse::from_message_payload(data) {
+                                if let Some(response) =
+                                    PermissionResponse::from_message_payload(data)
+                                {
                                     return Ok(response);
                                 }
                             }
@@ -476,7 +478,8 @@ mod tests {
         .await;
 
         // Child sends permission request in background, parent responds
-        let request = PermissionRequest::new("bash", serde_json::json!({"command": "rm -rf /tmp/test"}));
+        let request =
+            PermissionRequest::new("bash", serde_json::json!({"command": "rm -rf /tmp/test"}));
         let timeout = std::time::Duration::from_millis(500);
 
         // Clone the components needed for the spawned task
@@ -596,10 +599,11 @@ mod tests {
                         .await
                         .unwrap();
                     router_clone
-                        .send(
-                            PermissionResponse::approve()
-                                .to_message(&parent_clone, &child_clone, &correlation_id),
-                        )
+                        .send(PermissionResponse::approve().to_message(
+                            &parent_clone,
+                            &child_clone,
+                            &correlation_id,
+                        ))
                         .await
                         .unwrap();
                     return;
@@ -694,5 +698,10 @@ mod tests {
             }
             other => panic!("expected protocol error, got {other:?}"),
         }
+
+        assert!(
+            child_mailbox.try_recv().is_none(),
+            "protocol-error response should not leak into the mailbox buffer"
+        );
     }
 }

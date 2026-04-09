@@ -389,13 +389,22 @@ impl PermissionUpdate {
 /// Tracks:
 /// - Inherited permissions from parent
 /// - Session-level overrides
-/// - Pending permission requests
+/// - Permission request telemetry for UI/status reporting
+#[derive(Debug, Clone, Default)]
+pub struct PermissionTelemetry {
+    pub permission_requests: u32,
+    pub permission_requests_approved: u32,
+    pub tools_blocked: u32,
+    pub recent_denials: Vec<String>,
+}
+
 pub struct PermissionSyncContext {
     /// Permissions inherited from parent agent.
     pub inherited: InheritedPermissions,
     /// Session-level overrides (approved/denied during this run).
     session_allow: Vec<PermissionRule>,
     session_deny: Vec<PermissionRule>,
+    telemetry: PermissionTelemetry,
 }
 
 impl PermissionSyncContext {
@@ -405,6 +414,7 @@ impl PermissionSyncContext {
             inherited,
             session_allow: Vec::new(),
             session_deny: Vec::new(),
+            telemetry: PermissionTelemetry::default(),
         }
     }
 
@@ -503,22 +513,58 @@ impl PermissionSyncContext {
         }
         inherited
     }
+
+    pub fn effective_allow_rule_count(&self) -> u32 {
+        (self.inherited.allow_rules.len() + self.session_allow.len()) as u32
+    }
+
+    pub fn effective_deny_rule_count(&self) -> u32 {
+        (self.inherited.deny_rules.len() + self.session_deny.len()) as u32
+    }
+
+    pub fn telemetry(&self) -> PermissionTelemetry {
+        self.telemetry.clone()
+    }
+
+    pub fn record_permission_request(&mut self) {
+        self.telemetry.permission_requests = self.telemetry.permission_requests.saturating_add(1);
+    }
+
+    pub fn record_permission_approved(&mut self) {
+        self.telemetry.permission_requests_approved = self
+            .telemetry
+            .permission_requests_approved
+            .saturating_add(1);
+    }
+
+    pub fn record_blocked_tool(&mut self, tool_name: &str) {
+        self.telemetry.tools_blocked = self.telemetry.tools_blocked.saturating_add(1);
+        self.telemetry
+            .recent_denials
+            .retain(|name| name != tool_name);
+        self.telemetry.recent_denials.push(tool_name.to_string());
+        const MAX_RECENT_DENIALS: usize = 5;
+        if self.telemetry.recent_denials.len() > MAX_RECENT_DENIALS {
+            let drop_count = self.telemetry.recent_denials.len() - MAX_RECENT_DENIALS;
+            self.telemetry.recent_denials.drain(0..drop_count);
+        }
+    }
 }
 
 // ─── Permission Request/Response Messaging ─────────────────────────────────
 
-use crate::messaging::types::{AgentAddress, AgentMessage, MessagePayload, MessageTarget, RequestType};
+use crate::messaging::types::{
+    AgentAddress, AgentMessage, MessagePayload, MessageTarget, RequestType,
+};
 
 impl PermissionRequest {
     /// Build an AgentMessage to send this permission request to a parent.
-    pub fn to_message(
-        &self,
-        from: &AgentAddress,
-        to: &AgentAddress,
-    ) -> AgentMessage {
+    pub fn to_message(&self, from: &AgentAddress, to: &AgentAddress) -> AgentMessage {
         AgentMessage::new(
             from.clone(),
-            MessageTarget::Direct { address: to.clone() },
+            MessageTarget::Direct {
+                address: to.clone(),
+            },
             MessagePayload::Request {
                 request_type: RequestType::ToolPermission,
                 data: serde_json::to_value(self).unwrap_or_default(),
@@ -542,7 +588,9 @@ impl PermissionResponse {
     ) -> AgentMessage {
         AgentMessage::new(
             from.clone(),
-            MessageTarget::Direct { address: to.clone() },
+            MessageTarget::Direct {
+                address: to.clone(),
+            },
             MessagePayload::Response {
                 request_id: correlation_id.to_string(),
                 accepted: self.approved,
@@ -637,7 +685,12 @@ mod tests {
     #[test]
     fn test_tool_allowlist() {
         let inherited = InheritedPermissions {
-            allowed_tools: Some(["view", "grep", "glob"].iter().map(|s| s.to_string()).collect()),
+            allowed_tools: Some(
+                ["view", "grep", "glob"]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+            ),
             ..Default::default()
         };
 
@@ -652,16 +705,16 @@ mod tests {
         let request = PermissionRequest::new("bash", serde_json::json!({"command": "git status"}));
         let from = AgentAddress::new("child-run", "child-agent");
         let to = AgentAddress::new("parent-run", "parent-agent");
-        
+
         let msg = request.to_message(&from, &to);
-        
+
         assert_eq!(&msg.from, &from);
         if let MessageTarget::Direct { address } = &msg.to {
             assert_eq!(address, &to);
         } else {
             panic!("Expected Direct target");
         }
-        
+
         if let MessagePayload::Request { request_type, data } = &msg.payload {
             assert!(matches!(request_type, RequestType::ToolPermission));
             let parsed = PermissionRequest::from_message_payload(data).unwrap();
@@ -673,17 +726,23 @@ mod tests {
 
     #[test]
     fn test_permission_response_to_message() {
-        let response = PermissionResponse::approve()
-            .with_update(PermissionUpdate::allow(PermissionRule::parse("bash(git:*)")));
+        let response = PermissionResponse::approve().with_update(PermissionUpdate::allow(
+            PermissionRule::parse("bash(git:*)"),
+        ));
         let from = AgentAddress::new("parent-run", "parent-agent");
         let to = AgentAddress::new("child-run", "child-agent");
-        
+
         let msg = response.to_message(&from, &to, "req-123");
-        
+
         assert_eq!(&msg.from, &from);
         assert_eq!(msg.correlation_id.as_deref(), Some("req-123"));
-        
-        if let MessagePayload::Response { request_id, accepted, data } = &msg.payload {
+
+        if let MessagePayload::Response {
+            request_id,
+            accepted,
+            data,
+        } = &msg.payload
+        {
             assert_eq!(request_id, "req-123");
             assert!(accepted);
             let data_ref = data.as_ref().expect("Should have data");
@@ -705,13 +764,9 @@ use tokio::sync::RwLock;
 #[derive(Clone, Debug)]
 pub enum PermissionDecision {
     /// Approve the request, optionally with rules to propagate.
-    Approve {
-        updates: Vec<PermissionUpdate>,
-    },
+    Approve { updates: Vec<PermissionUpdate> },
     /// Deny the request with a reason.
-    Deny {
-        reason: String,
-    },
+    Deny { reason: String },
     /// Escalate to user interaction (only valid for non-background agents).
     Escalate,
 }
@@ -719,30 +774,33 @@ pub enum PermissionDecision {
 impl PermissionDecision {
     /// Create an approval decision.
     pub fn approve() -> Self {
-        Self::Approve { updates: Vec::new() }
+        Self::Approve {
+            updates: Vec::new(),
+        }
     }
-    
+
     /// Create an approval decision with a persistent allow rule.
     pub fn approve_with_rule(rule: PermissionRule) -> Self {
         Self::Approve {
             updates: vec![PermissionUpdate::allow(rule)],
         }
     }
-    
+
     /// Create a denial decision.
     pub fn deny(reason: impl Into<String>) -> Self {
-        Self::Deny { reason: reason.into() }
+        Self::Deny {
+            reason: reason.into(),
+        }
     }
 }
 
 /// Callback type for permission decision.
-/// 
+///
 /// The callback receives the request and sync context, and should return
 /// a decision. If the callback returns `Escalate`, the handler will
 /// attempt user interaction (if allowed by mode).
-pub type PermissionCallback = Box<
-    dyn Fn(&PermissionRequest, &PermissionSyncContext) -> PermissionDecision + Send + Sync
->;
+pub type PermissionCallback =
+    Box<dyn Fn(&PermissionRequest, &PermissionSyncContext) -> PermissionDecision + Send + Sync>;
 
 /// Handler for incoming permission requests from child agents.
 ///
@@ -764,30 +822,30 @@ impl PermissionRequestHandler {
             callback: None,
         }
     }
-    
+
     /// Set the permission decision callback.
     pub fn with_callback(mut self, callback: PermissionCallback) -> Self {
         self.callback = Some(callback);
         self
     }
-    
+
     /// Handle an incoming permission request.
     ///
     /// Returns the response to send back to the child agent.
     pub async fn handle_request(&self, request: &PermissionRequest) -> PermissionResponse {
         let ctx = self.sync_context.read().await;
-        
+
         // First check if already allowed by inherited or session rules
         let command = request.hint.as_deref();
         if ctx.is_allowed(&request.tool_name, command) {
             return PermissionResponse::approve();
         }
-        
+
         // Check if denied
         if ctx.is_denied(&request.tool_name, command) {
             return PermissionResponse::deny("denied by permission rules");
         }
-        
+
         // Check mode
         match ctx.mode() {
             PermissionMode::Auto => {
@@ -798,14 +856,14 @@ impl PermissionRequestHandler {
                 } else {
                     PermissionResponse::approve()
                 };
-                
+
                 // Apply updates to our context
                 drop(ctx);
                 if !response.updates.is_empty() {
                     let mut ctx_mut = self.sync_context.write().await;
                     ctx_mut.apply_response(&response);
                 }
-                
+
                 response
             }
             PermissionMode::Deny => {
@@ -815,7 +873,7 @@ impl PermissionRequestHandler {
             PermissionMode::Prompt => {
                 // Prompt mode: use callback or default logic
                 drop(ctx);
-                
+
                 if let Some(ref callback) = self.callback {
                     let ctx = self.sync_context.read().await;
                     match callback(request, &ctx) {
@@ -825,19 +883,17 @@ impl PermissionRequestHandler {
                                 reason: None,
                                 updates: updates.clone(),
                             };
-                            
+
                             // Apply updates
                             drop(ctx);
                             if !updates.is_empty() {
                                 let mut ctx_mut = self.sync_context.write().await;
                                 ctx_mut.apply_response(&response);
                             }
-                            
+
                             response
                         }
-                        PermissionDecision::Deny { reason } => {
-                            PermissionResponse::deny(reason)
-                        }
+                        PermissionDecision::Deny { reason } => PermissionResponse::deny(reason),
                         PermissionDecision::Escalate => {
                             // For now, treat escalate as deny for background agents
                             let ctx = self.sync_context.read().await;
@@ -862,13 +918,20 @@ impl PermissionRequestHandler {
             }
         }
     }
-    
+
     /// Process a message and return a response if it's a permission request.
     ///
     /// Returns `Some((correlation_id, response))` if the message was a permission request,
     /// or `None` if it wasn't.
-    pub async fn process_message(&self, msg: &AgentMessage) -> Option<(String, PermissionResponse)> {
-        if let MessagePayload::Request { request_type: RequestType::ToolPermission, data } = &msg.payload {
+    pub async fn process_message(
+        &self,
+        msg: &AgentMessage,
+    ) -> Option<(String, PermissionResponse)> {
+        if let MessagePayload::Request {
+            request_type: RequestType::ToolPermission,
+            data,
+        } = &msg.payload
+        {
             if let Some(request) = PermissionRequest::from_message_payload(data) {
                 let correlation_id = msg.correlation_id.clone().unwrap_or_default();
                 let response = self.handle_request(&request).await;
@@ -877,7 +940,7 @@ impl PermissionRequestHandler {
         }
         None
     }
-    
+
     /// Get the sync context.
     pub fn sync_context(&self) -> Arc<RwLock<PermissionSyncContext>> {
         Arc::clone(&self.sync_context)
@@ -894,104 +957,105 @@ mod handler_tests {
     async fn handler_auto_mode_approves() {
         let ctx = PermissionSyncContext::root(PermissionMode::Auto);
         let handler = PermissionRequestHandler::new(Arc::new(RwLock::new(ctx)));
-        
+
         let request = PermissionRequest::new("bash", serde_json::json!({"command": "echo hello"}));
         let response = handler.handle_request(&request).await;
-        
+
         assert!(response.approved);
     }
-    
+
     #[tokio::test]
     async fn handler_deny_mode_denies() {
         let ctx = PermissionSyncContext::root(PermissionMode::Deny);
         let handler = PermissionRequestHandler::new(Arc::new(RwLock::new(ctx)));
-        
+
         let request = PermissionRequest::new("bash", serde_json::json!({"command": "rm -rf /"}));
         let response = handler.handle_request(&request).await;
-        
+
         assert!(!response.approved);
         assert!(response.reason.as_ref().unwrap().contains("deny"));
     }
-    
+
     #[tokio::test]
     async fn handler_respects_inherited_allow() {
         let mut inherited = InheritedPermissions::new(PermissionMode::Prompt);
         inherited.add_allow(PermissionRule::parse("bash(git:*)"));
         let ctx = PermissionSyncContext::new(inherited);
         let handler = PermissionRequestHandler::new(Arc::new(RwLock::new(ctx)));
-        
+
         let request = PermissionRequest::new("bash", serde_json::json!({"command": "git status"}))
             .with_hint("git status");
         let response = handler.handle_request(&request).await;
-        
+
         assert!(response.approved);
     }
-    
+
     #[tokio::test]
     async fn handler_respects_inherited_deny() {
         let mut inherited = InheritedPermissions::new(PermissionMode::Auto);
         inherited.add_deny(PermissionRule::parse("bash(rm -rf:*)"));
         let ctx = PermissionSyncContext::new(inherited);
         let handler = PermissionRequestHandler::new(Arc::new(RwLock::new(ctx)));
-        
+
         let request = PermissionRequest::new("bash", serde_json::json!({"command": "rm -rf /"}))
             .with_hint("rm -rf /");
         let response = handler.handle_request(&request).await;
-        
+
         assert!(!response.approved);
     }
-    
+
     #[tokio::test]
     async fn handler_uses_callback() {
         let ctx = PermissionSyncContext::root(PermissionMode::Prompt);
-        let handler = PermissionRequestHandler::new(Arc::new(RwLock::new(ctx)))
-            .with_callback(Box::new(|req, _ctx| {
+        let handler = PermissionRequestHandler::new(Arc::new(RwLock::new(ctx))).with_callback(
+            Box::new(|req, _ctx| {
                 if req.tool_name == "bash" {
                     PermissionDecision::approve_with_rule(PermissionRule::parse("bash(git:*)"))
                 } else {
                     PermissionDecision::deny("unknown tool")
                 }
-            }));
-        
+            }),
+        );
+
         let request = PermissionRequest::new("bash", serde_json::json!({"command": "git status"}));
         let response = handler.handle_request(&request).await;
-        
+
         assert!(response.approved);
         assert_eq!(response.updates.len(), 1);
         assert_eq!(response.updates[0].rule.tool, "bash");
     }
-    
+
     #[tokio::test]
     async fn handler_applies_suggested_rule_in_auto() {
         let ctx = PermissionSyncContext::root(PermissionMode::Auto);
         let handler = PermissionRequestHandler::new(Arc::new(RwLock::new(ctx)));
-        
+
         let request = PermissionRequest::new("bash", serde_json::json!({"command": "git status"}))
             .with_suggested_rule("bash(git:*)");
         let response = handler.handle_request(&request).await;
-        
+
         assert!(response.approved);
         assert_eq!(response.updates.len(), 1);
-        
+
         // Verify rule was applied to context
         let sync_ctx = handler.sync_context();
         let ctx = sync_ctx.read().await;
         assert!(ctx.is_allowed("bash", Some("git push")));
     }
-    
+
     #[tokio::test]
     async fn handler_process_message() {
         let ctx = PermissionSyncContext::root(PermissionMode::Auto);
         let handler = PermissionRequestHandler::new(Arc::new(RwLock::new(ctx)));
-        
+
         let request = PermissionRequest::new("bash", serde_json::json!({"command": "ls"}));
         let from = AgentAddress::new("child-run", "child");
         let to = AgentAddress::new("parent-run", "parent");
         let msg = request.to_message(&from, &to).with_correlation("req-456");
-        
+
         let result = handler.process_message(&msg).await;
         assert!(result.is_some());
-        
+
         let (correlation_id, response) = result.unwrap();
         assert_eq!(correlation_id, "req-456");
         assert!(response.approved);
