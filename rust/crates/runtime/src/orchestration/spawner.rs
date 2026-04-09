@@ -17,6 +17,11 @@ use uuid::Uuid;
 
 use async_trait::async_trait;
 
+// ─── Constants ──────────────────────────────────────────────────────────────
+
+/// Sentinel run ID for the top-level (root) agent.
+pub const ROOT_RUN_ID: &str = "root";
+
 // ─── Spawn Context ──────────────────────────────────────────────────────────
 
 /// Context provided by the parent agent when spawning a child.
@@ -728,10 +733,10 @@ fn build_permission_summary(context: &SpawnContext) -> PermissionSummary {
         summary.allow_rules = inherited.allow_rules.len() as u32;
         summary.deny_rules = inherited.deny_rules.len() as u32;
         // Has parent if parent_run_id is not empty and not "root"
-        summary.has_parent = !context.parent_run_id.is_empty() && context.parent_run_id != "root";
+        summary.has_parent = !context.parent_run_id.is_empty() && context.parent_run_id != ROOT_RUN_ID;
     } else {
         summary.mode = "auto".to_string();
-        summary.has_parent = !context.parent_run_id.is_empty() && context.parent_run_id != "root";
+        summary.has_parent = !context.parent_run_id.is_empty() && context.parent_run_id != ROOT_RUN_ID;
     }
 
     summary

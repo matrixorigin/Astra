@@ -44,6 +44,9 @@ use std::time::Duration;
 
 const MIN_LEARNED_ENTITY_CONFIDENCE: f64 = 0.30;
 
+/// Timeout for LLM-based tool selection requests.
+const TOOL_SELECT_TIMEOUT: Duration = Duration::from_secs(8);
+
 // ─── Public types ────────────────────────────────────────────────────────────
 
 /// Context provided to tool selectors. Open for extension without
@@ -847,7 +850,7 @@ impl LlmToolSelector {
 
         let resp = self
             .api
-            .post_chat_turn_timeout(&self.token, &payload, Duration::from_secs(8))
+            .post_chat_turn_timeout(&self.token, &payload, TOOL_SELECT_TIMEOUT)
             .await
             .map_err(|e| format!("tool-select LLM call failed: {e}"))?;
 

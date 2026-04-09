@@ -37,6 +37,16 @@ pub enum PermissionCheckResult {
 /// 2. Check PermissionSyncContext.is_allowed()
 /// 3. If denied and have mailbox, request permission from the parent
 /// 4. Return result
+///
+/// # Parameters
+///
+/// * `tool_name` — Name of the tool being invoked (e.g. `"bash"`, `"edit_file"`).
+/// * `args` — Optional JSON string of tool arguments, used for rule matching.
+/// * `permission_context` — Shared permission rules for this agent. `None` means
+///   legacy/unrestricted mode (all tools allowed).
+/// * `mailbox` — Agent's mailbox for requesting permission from the parent.
+///   `None` when no parent is available (root agent or standalone mode).
+/// * `timeout` — Maximum time to wait for a parent permission response.
 pub async fn check_tool_permission(
     tool_name: &str,
     args: Option<&str>,

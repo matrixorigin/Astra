@@ -27,7 +27,7 @@ pub struct AgentMailbox {
     /// Message receive stream (direct + broadcast), mutex-guarded for Sync.
     stream: tokio::sync::Mutex<Box<dyn MessageStream>>,
     /// Messages buffered while waiting for a correlated response.
-    buffered: std::sync::Mutex<VecDeque<Arc<AgentMessage>>>,
+    buffered: tokio::sync::Mutex<VecDeque<Arc<AgentMessage>>>,
     /// Router reference for sending.
     router: Arc<AgentMailboxRouter>,
 }
@@ -40,7 +40,7 @@ impl AgentMailbox {
 
     /// Non-blocking: get the next available message, if any.
     pub fn try_recv(&mut self) -> Option<Arc<AgentMessage>> {
-        if let Some(msg) = self.buffered.lock().unwrap().pop_front() {
+        if let Some(msg) = self.buffered.get_mut().pop_front() {
             return Some(msg);
         }
         self.stream.get_mut().try_recv()
@@ -48,7 +48,7 @@ impl AgentMailbox {
 
     /// Blocking: wait for the next message.
     pub async fn recv(&self) -> Option<Arc<AgentMessage>> {
-        if let Some(msg) = self.buffered.lock().unwrap().pop_front() {
+        if let Some(msg) = self.buffered.lock().await.pop_front() {
             return Some(msg);
         }
         self.stream.lock().await.recv().await
@@ -56,7 +56,7 @@ impl AgentMailbox {
 
     /// Drain all currently buffered messages.
     pub fn drain(&mut self) -> Vec<Arc<AgentMessage>> {
-        let mut buffered: Vec<_> = self.buffered.lock().unwrap().drain(..).collect();
+        let mut buffered: Vec<_> = self.buffered.get_mut().drain(..).collect();
         buffered.extend(self.stream.get_mut().drain());
         buffered
     }
@@ -73,7 +73,7 @@ impl AgentMailbox {
 
         match self.try_recv() {
             Some(extra) => {
-                self.buffered.lock().unwrap().push_back(extra);
+                self.buffered.get_mut().push_back(extra);
                 (msgs, true)
             }
             None => (msgs, false),
@@ -154,14 +154,14 @@ impl AgentMailbox {
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
-                self.buffered.lock().unwrap().extend(skipped.drain(..));
+                self.buffered.get_mut().extend(skipped.drain(..));
                 return Err(MailboxError::Timeout(format!(
                     "Permission request timed out after {:?}",
                     timeout
                 )));
             }
 
-            let next_message = if let Some(msg) = self.buffered.lock().unwrap().pop_front() {
+            let next_message = if let Some(msg) = self.buffered.get_mut().pop_front() {
                 Ok(Some(msg))
             } else {
                 tokio::time::timeout(remaining, self.stream.lock().await.recv()).await
@@ -171,7 +171,7 @@ impl AgentMailbox {
                 Ok(Some(msg)) => {
                     // Check if this is our response
                     if msg.correlation_id.as_deref() == Some(&request_id) {
-                        self.buffered.lock().unwrap().extend(skipped.drain(..));
+                        self.buffered.get_mut().extend(skipped.drain(..));
                         if let MessagePayload::Response { data, accepted, .. } = &msg.payload {
                             if let Some(data) = data {
                                 if let Some(response) =
@@ -195,11 +195,11 @@ impl AgentMailbox {
                     skipped.push_back(msg);
                 }
                 Ok(None) => {
-                    self.buffered.lock().unwrap().extend(skipped.drain(..));
+                    self.buffered.get_mut().extend(skipped.drain(..));
                     return Err(MailboxError::Disconnected);
                 }
                 Err(_) => {
-                    self.buffered.lock().unwrap().extend(skipped.drain(..));
+                    self.buffered.get_mut().extend(skipped.drain(..));
                     return Err(MailboxError::Timeout(format!(
                         "Permission request timed out after {:?}",
                         timeout
@@ -271,7 +271,7 @@ impl AgentMailboxRouter {
             address: addr,
             delegation_id,
             stream: tokio::sync::Mutex::new(stream),
-            buffered: std::sync::Mutex::new(VecDeque::new()),
+            buffered: tokio::sync::Mutex::new(VecDeque::new()),
             router: Arc::clone(self),
         })
     }
