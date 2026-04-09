@@ -370,6 +370,17 @@ impl ToolExecutor {
             })
     }
 
+    fn try_active_file_diagnostics(&self, file: &str) -> Result<Option<String>, String> {
+        let (file_path, _) = self.ensure_lsp_file_ready(file)?;
+        self.passive_lsp
+            .diagnostics_for_file(&self.project_root, &file_path)
+            .map(|result| {
+                result.map(|value| {
+                    Self::active_lsp_response("diagnostics", "publishDiagnostics", value)
+                })
+            })
+    }
+
     fn try_active_call_hierarchy(
         &self,
         operation: &str,
@@ -669,23 +680,34 @@ impl ToolExecutor {
             }
 
             "diagnostics" => {
-                json!({
-                    "capabilities": {
-                        "goto_definition": true,
-                        "find_references": true,
-                        "hover": true,
-                        "document_symbols": true,
-                        "workspace_symbols": true,
-                        "call_hierarchy": true,
-                        "rename": true
-                    },
-                    "active_backends": self.passive_lsp.active_status(&self.project_root),
-                    "supported_languages": {
-                        "active_lsp": ["rust", "typescript", "typescriptreact"],
-                        "fallback_tools": ["rust", "python", "typescript", "javascript", "go", "java", "c", "cpp", "ruby"]
-                    },
-                    "note": "The lsp tool now prefers a real stdio LSP backend when a matching workspace/server is available, and falls back to the existing AST/symbol tools otherwise."
-                }).to_string()
+                if let Some(f) = file {
+                    match self.try_active_file_diagnostics(f) {
+                        Ok(Some(result)) => result,
+                        Ok(None) => json!({
+                            "error": "diagnostics for a specific file require an active LSP backend for that workspace",
+                            "active_backends": self.passive_lsp.active_status(&self.project_root),
+                        }).to_string(),
+                        Err(error) => json!({ "error": error }).to_string(),
+                    }
+                } else {
+                    json!({
+                        "capabilities": {
+                            "goto_definition": true,
+                            "find_references": true,
+                            "hover": true,
+                            "document_symbols": true,
+                            "workspace_symbols": true,
+                            "call_hierarchy": true,
+                            "rename": true
+                        },
+                        "active_backends": self.passive_lsp.active_status(&self.project_root),
+                        "supported_languages": {
+                            "active_lsp": ["rust", "typescript", "typescriptreact"],
+                            "fallback_tools": ["rust", "python", "typescript", "javascript", "go", "java", "c", "cpp", "ruby"]
+                        },
+                        "note": "Without a file, diagnostics reports LSP backend availability. With a file, it returns the latest publishDiagnostics snapshot after syncing that file into the active backend."
+                    }).to_string()
+                }
             }
 
             _ => json!({

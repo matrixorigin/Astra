@@ -1140,7 +1140,7 @@ pub fn all_tool_schemas() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "lsp",
-                "description": "Interact with Language Server Protocol for code intelligence. Unified interface for definition, references, hover, symbols, and call hierarchy. More powerful than individual tools with consistent interface.",
+                "description": "Interact with Language Server Protocol for code intelligence. Unified interface for definition, references, hover, symbols, call hierarchy, rename, and diagnostics. Without a file, diagnostics reports backend availability; with a file, diagnostics returns the latest publishDiagnostics snapshot.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -1186,7 +1186,7 @@ pub fn all_tool_schemas() -> Vec<Value> {
                         },
                         "dry_run": {
                             "type": "boolean",
-                            "description": "For rename, preview by default. Set false only when falling back to symbol-based application."
+                            "description": "For rename, preview by default. Set false to apply the rename when the active LSP backend or fallback rename path supports it."
                         },
                         "scope": {
                             "type": "string",

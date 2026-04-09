@@ -227,6 +227,28 @@ impl PassiveLspManager {
             .map_err(|e| format!("LSP request {method} failed: {e}"))
     }
 
+    pub fn diagnostics_for_file(&self, root: &Path, path: &Path) -> Result<Option<Value>, String> {
+        let root_buf = root.to_path_buf();
+        let session = if rust_active_supported(root, Some(path)) {
+            ensure_session(&self.rust, root_buf.clone(), rust_spawn_spec())
+        } else if typescript_active_supported(root, Some(path)) {
+            ensure_session(&self.typescript, root_buf, typescript_spawn_spec())
+        } else {
+            None
+        };
+        let Some(session) = session else {
+            return Ok(None);
+        };
+        session
+            .sync_document_from_disk(path)
+            .map_err(|e| format!("failed to sync file into LSP: {e}"))?;
+        std::thread::sleep(Duration::from_millis(POST_SYNC_DRAIN_MS));
+        session
+            .latest_diagnostics_for_path(path)
+            .map(Some)
+            .map_err(|e| format!("failed to read LSP diagnostics: {e}"))
+    }
+
     pub fn active_status(&self, root: &Path) -> Value {
         serde_json::json!({
             "rust": {

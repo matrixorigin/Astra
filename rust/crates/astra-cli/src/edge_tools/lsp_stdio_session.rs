@@ -66,6 +66,7 @@ pub(crate) struct LspStdioSession {
     stdin: StdinShared,
     documents: Mutex<HashMap<String, SyncedDocumentState>>,
     pending_diags: Arc<Mutex<Vec<Value>>>,
+    latest_diags: Arc<Mutex<HashMap<String, Value>>>,
     next_request_id: AtomicU64,
     pending_requests: Arc<Mutex<HashMap<u64, Sender<io::Result<Value>>>>>,
 }
@@ -159,6 +160,7 @@ fn reader_loop(
     mut reader: BufReader<std::process::ChildStdout>,
     stdin: StdinShared,
     pending: Arc<Mutex<Vec<Value>>>,
+    latest_diags: Arc<Mutex<HashMap<String, Value>>>,
     pending_requests: Arc<Mutex<HashMap<u64, Sender<io::Result<Value>>>>>,
 ) {
     while let Ok(msg) = read_frame(&mut reader) {
@@ -179,13 +181,18 @@ fn reader_loop(
         }
         if let Some(method) = msg.get("method").and_then(|m| m.as_str()) {
             if method == "textDocument/publishDiagnostics" {
-                if let Some(p) = msg.get("params").cloned()
-                    && let Ok(mut g) = pending.lock()
-                {
-                    g.push(p);
-                    if g.len() > MAX_LSP_DIAG_BATCHES * 2 {
-                        let drain = g.len() - MAX_LSP_DIAG_BATCHES;
-                        g.drain(0..drain);
+                if let Some(p) = msg.get("params").cloned() {
+                    if let Some(uri) = p.get("uri").and_then(Value::as_str)
+                        && let Ok(mut latest) = latest_diags.lock()
+                    {
+                        latest.insert(uri.to_string(), p.clone());
+                    }
+                    if let Ok(mut g) = pending.lock() {
+                        g.push(p);
+                        if g.len() > MAX_LSP_DIAG_BATCHES * 2 {
+                            let drain = g.len() - MAX_LSP_DIAG_BATCHES;
+                            g.drain(0..drain);
+                        }
                     }
                 }
                 continue;
@@ -306,11 +313,19 @@ impl LspStdioSession {
 
         let pending_diags = Arc::new(Mutex::new(Vec::new()));
         let pending_clone = Arc::clone(&pending_diags);
+        let latest_diags = Arc::new(Mutex::new(HashMap::new()));
+        let latest_diags_reader = Arc::clone(&latest_diags);
         let stdin_reader = Arc::clone(&stdin);
         let pending_requests = Arc::new(Mutex::new(HashMap::new()));
         let pending_requests_reader = Arc::clone(&pending_requests);
         thread::spawn(move || {
-            reader_loop(reader, stdin_reader, pending_clone, pending_requests_reader);
+            reader_loop(
+                reader,
+                stdin_reader,
+                pending_clone,
+                latest_diags_reader,
+                pending_requests_reader,
+            );
         });
 
         Ok(Some(Arc::new(Self {
@@ -322,6 +337,7 @@ impl LspStdioSession {
             stdin,
             documents: Mutex::new(HashMap::new()),
             pending_diags,
+            latest_diags,
             next_request_id: AtomicU64::new(2),
             pending_requests,
         })))
@@ -497,6 +513,23 @@ impl LspStdioSession {
     pub fn sync_document_from_disk(&self, path: &Path) -> io::Result<()> {
         let text = std::fs::read_to_string(path)?;
         self.sync_document(path, &text, file_mtime_ms(path))
+    }
+
+    pub fn latest_diagnostics_for_path(&self, path: &Path) -> io::Result<Value> {
+        let Some(uri) = path_to_uri(path) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Failed to create file URI for {}", path.display()),
+            ));
+        };
+        let latest = self
+            .latest_diags
+            .lock()
+            .map_err(|_| io::Error::other("latest_diags mutex poisoned"))?;
+        Ok(latest
+            .get(&uri)
+            .cloned()
+            .unwrap_or_else(|| json!({ "uri": uri, "diagnostics": [] })))
     }
 
     pub fn take_formatted_diagnostic_messages(&self) -> Vec<Value> {
