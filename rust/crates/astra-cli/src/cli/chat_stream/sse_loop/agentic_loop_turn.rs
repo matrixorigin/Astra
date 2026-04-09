@@ -96,6 +96,8 @@ pub(crate) struct PrepareTurnTelemetry<'a> {
     pub first_budget_pressure: &'a mut f64,
     pub first_context_assembly_ms: &'a mut Option<u64>,
     pub all_selected_skills: &'a mut Vec<String>,
+    /// Optional trace collector for observability (M1).
+    pub trace_collector: Option<&'a astra_runtime::turn::turn_trace_collector::TurnTraceCollector>,
 }
 
 struct PrepareChatTurnRequest<'a> {
@@ -194,6 +196,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
     {
         let mem_start = Instant::now();
         let memory_contents = ctx.executor.memory_boost_search(ctx.message, 5).await;
+        let mem_latency_ms = mem_start.elapsed().as_millis() as u64;
         record_first_latency_ms_since(ctx.telem.first_memoria_ms, mem_start);
         if !memory_contents.is_empty() {
             for content in &memory_contents {
@@ -203,6 +206,17 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
             }
             let ranked =
                 astra_runtime::turn::retrieval::rank_memory_results(ctx.message, &memory_contents);
+            
+            // Record memory retrieval trace (M1 observability)
+            if let Some(collector) = ctx.telem.trace_collector {
+                collector.record_memory_retrieval(
+                    ctx.message,
+                    memory_contents.len() as u32,
+                    &ranked,
+                    mem_latency_ms,
+                );
+            }
+            
             astra_runtime::turn::retrieval::append_boost_terms_from_ranked_memory(
                 &mut boost_terms,
                 ctx.message,
@@ -254,6 +268,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
             .selector
             .select_with_learned_context(&sel_ctx, &learned_context)
             .await;
+        let sel_latency_ms = sel_start.elapsed().as_millis() as u64;
         touch_prep_ui_phase(&ctx.prep_ui_phase, "Loading schemas…");
         record_first_selector_latency_and_strategy(
             ctx.telem.first_selector_ms,
@@ -272,6 +287,21 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
             sel_result.selector_tokens_in,
             sel_result.selector_tokens_out,
         );
+        
+        // Record tool selection trace (M1 observability)
+        if let Some(collector) = ctx.telem.trace_collector {
+            collector.record_tool_selection(
+                &sel_result.tool_names,
+                sel_result.strategy,
+                sel_result.confidence,
+                sel_result.budget_used,
+                sel_result.selector_tokens_in,
+                sel_result.selector_tokens_out,
+                ctx.registry.total_tool_count() as u32,
+                sel_latency_ms,
+            );
+        }
+        
         let conf = sel_result.confidence;
         let (schemas, report) = tool_selector::resolve_schemas_with_pressure(
             ctx.registry,

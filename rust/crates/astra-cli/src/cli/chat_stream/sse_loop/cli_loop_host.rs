@@ -160,6 +160,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
                 first_budget_pressure: &mut state.first_budget_pressure,
                 first_context_assembly_ms: &mut state.first_context_assembly_ms,
                 all_selected_skills: &mut state.all_selected_skills,
+                trace_collector: None, // TODO: wire from session config when enabled
             },
             perm_manager: self.perm_manager,
             skill_search: &state.skill_search,
