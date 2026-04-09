@@ -243,6 +243,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             ack_tracker: None,
             dead_letter_queue: None,
             messaging_metrics: None,
+            progress_emitter: None,
         };
 
         let loop_result = run_agentic_loop_with_host(&mut host, &mut state).await;

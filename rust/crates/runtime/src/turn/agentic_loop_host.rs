@@ -359,6 +359,11 @@ pub struct AgenticLoopState {
 
     /// Unified messaging metrics (optional, shared across agents in a delegation).
     pub messaging_metrics: Option<std::sync::Arc<crate::messaging::metrics::MessagingMetrics>>,
+
+    // ── Progress reporting ──
+    /// Optional progress emitter for broadcasting turn events to UI/subscribers.
+    /// When set, the loop emits `TurnCompleted` events after each turn.
+    pub progress_emitter: Option<crate::orchestration::AgentProgressEmitter>,
 }
 
 /// Consecutive same-category error turns before forcing a strategy change.
@@ -1881,6 +1886,22 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
                 state.tool_results.clear();
             }
             AgenticPostToolIterationControl::ProceedEndTurn => {
+                // Emit progress event for subscribers (UI, monitors).
+                if let Some(ref emitter) = state.progress_emitter {
+                    let tool_calls_this_turn = state.total_tool_calls.saturating_sub(
+                        if turn_index > 0 { state.total_tool_calls } else { 0 }
+                    );
+                    let last_tool = turn_result.edge_tool_round
+                        .last()
+                        .map(|r| r.tool.clone())
+                        .unwrap_or_else(|| "thinking".to_string());
+                    emitter.turn_completed(
+                        turn_index as u32 + 1,
+                        tool_calls_this_turn,
+                        last_tool,
+                    );
+                }
+
                 // Send progress update to parent agent (best-effort).
                 if let Some(ref mailbox) = state.mailbox {
                     let _ = mailbox
@@ -2196,6 +2217,7 @@ mod tests {
             ack_tracker: None,
             dead_letter_queue: None,
             messaging_metrics: None,
+            progress_emitter: None,
         }
     }
 

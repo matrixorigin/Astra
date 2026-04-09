@@ -339,6 +339,7 @@ mod tests {
             ack_tracker: None,
             dead_letter_queue: None,
             messaging_metrics: None,
+            progress_emitter: None,
         }
     }
 

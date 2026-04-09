@@ -11,7 +11,7 @@ mod spawn_tool;
 pub use builtin_agents::{
     AgentTypeDefinition, BuiltinAgentType, get_builtin_agent_types, get_agent_type_definition,
 };
-pub use progress::{AgentProgressEvent, ProgressEventType, ProgressBroadcaster};
+pub use progress::{AgentProgressEvent, ProgressEventType, ProgressBroadcaster, AgentProgressEmitter};
 pub use spawner::{
     DynamicAgentSpawner, SpawnContext, SpawnedAgentState, SpawnedAgentInfo, AgentStatus,
     SpawnedAgentMetrics, SpawnError, SpawnAgentExecutor, SpawnRunConfig, SpawnRunResult,
