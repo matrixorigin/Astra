@@ -268,7 +268,11 @@ struct Cli {
     #[arg(short = 'p', long = "print")]
     print: bool,
     /// Output format for --print mode
-    #[arg(long = "output-format", default_value = "text")]
+    #[arg(
+        long = "output-format",
+        default_value = "text",
+        value_parser = ["text", "json", "stream-json"]
+    )]
     output_format: String,
     /// Continue the most recent conversation
     #[arg(short = 'c', long = "continue")]
@@ -480,7 +484,7 @@ struct ChatArgs {
     #[arg(short = 'y', long = "auto-approve", default_value_t = false)]
     auto_approve: bool,
     /// Permission mode: auto (approve all), prompt (interactive, default), deny (reject all writes)
-    #[arg(long = "permission-mode")]
+    #[arg(long = "permission-mode", value_parser = ["auto", "prompt", "deny"])]
     permission_mode: Option<String>,
     /// Suppress spinner and progress output (result still printed)
     #[arg(long, default_value_t = false)]
@@ -10769,7 +10773,6 @@ total_tokens_out: 500
 
     #[test]
     fn cli_permission_mode_invalid_value() {
-        // Parser accepts any string; runtime validates
         let cli = Cli::try_parse_from([
             "astra",
             "chat",
@@ -10777,14 +10780,14 @@ total_tokens_out: 500
             "invalid",
             "-m",
             "test",
-        ])
-        .unwrap();
-        match &cli.command {
-            Some(Command::Chat(args)) => {
-                assert_eq!(args.permission_mode.as_deref(), Some("invalid"));
-            }
-            _ => panic!("expected Chat command"),
-        }
+        ]);
+        assert!(cli.is_err());
+    }
+
+    #[test]
+    fn cli_output_format_invalid_value() {
+        let cli = Cli::try_parse_from(["astra", "--output-format", "yaml", "-p"]);
+        assert!(cli.is_err());
     }
 
     #[test]
