@@ -650,6 +650,8 @@ pub enum JournalEventType {
     DelegationSubRunCompleted,
     /// Delegation completed (all sub-runs done, results aggregated).
     DelegationCompleted,
+    /// A spawned agent terminated (completed, failed, or cancelled).
+    AgentTerminated,
     /// Subtask or plan verification completed (acceptance-criteria gate result).
     VerificationCompleted,
     /// A composite snapshot was taken — captures references to session state,

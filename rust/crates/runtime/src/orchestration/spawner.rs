@@ -254,6 +254,8 @@ pub struct DynamicAgentSpawner {
     session_id: Option<String>,
     /// Agent type registry (builtins + user-defined).
     agent_registry: super::team_config::AgentRegistry,
+    /// Completed agents archive for history queries.
+    completed_agents: Arc<RwLock<Vec<SpawnedAgentState>>>,
 }
 
 impl DynamicAgentSpawner {
@@ -267,6 +269,7 @@ impl DynamicAgentSpawner {
             executor: None,
             session_id: None,
             agent_registry: super::team_config::AgentRegistry::builtins_only(),
+            completed_agents: Arc::new(RwLock::new(Vec::new())),
         }
     }
 
@@ -283,6 +286,7 @@ impl DynamicAgentSpawner {
             executor: None,
             session_id: None,
             agent_registry: super::team_config::AgentRegistry::builtins_only(),
+            completed_agents: Arc::new(RwLock::new(Vec::new())),
         }
     }
 
@@ -622,12 +626,15 @@ impl DynamicAgentSpawner {
                 // Persist to journal before updating status
                 self.persist_agent_terminated(agent_id, &run_result.status).await;
                 self.update_status(agent_id, status).await;
+                self.write_agent_terminated_event(agent_id, &run_result.status, run_result.error.as_deref()).await;
+                self.archive_agent(agent_id).await;
                 self.unregister_mailbox(agent_id).await;
             }
             Err(e) => {
                 self.persist_agent_terminated(agent_id, "failed").await;
                 self.update_status(agent_id, AgentStatus::Failed { error: e })
                     .await;
+                self.archive_agent(agent_id).await;
                 self.unregister_mailbox(agent_id).await;
             }
         }
@@ -658,6 +665,14 @@ impl DynamicAgentSpawner {
         let _ = writer.append(&event);
     }
 
+    /// Archive a completed agent state for history queries.
+    async fn archive_agent(&self, agent_id: &str) {
+        if let Some(state) = self.active_agents.read().await.get(agent_id) {
+            self.completed_agents.write().await.push(state.clone());
+        }
+    }
+    }
+
     async fn unregister_mailbox(&self, agent_id: &str) {
         let messaging_address = self
             .active_agents
@@ -686,6 +701,7 @@ impl DynamicAgentSpawner {
             executor: self.executor.clone(),
             session_id: self.session_id.clone(),
             agent_registry: self.agent_registry.clone(),
+            completed_agents: Arc::clone(&self.completed_agents),
         }
     }
 
@@ -713,6 +729,27 @@ impl DynamicAgentSpawner {
     /// Get state of a specific agent.
     pub async fn get_agent_state(&self, agent_id: &str) -> Option<SpawnedAgentState> {
         self.active_agents.read().await.get(agent_id).cloned()
+    }
+
+    /// Get history of completed agents (both active and archived).
+    pub async fn get_agent_history(&self, parent_run_id: Option<&str>) -> Vec<SpawnedAgentInfo> {
+        let mut history: Vec<SpawnedAgentInfo> = self
+            .completed_agents
+            .read()
+            .await
+            .iter()
+            .filter(|s| parent_run_id.is_none_or(|pid| s.parent_run_id == pid))
+            .map(SpawnedAgentInfo::from)
+            .collect();
+        // Also include still-active agents.
+        for state in self.active_agents.read().await.values() {
+            if parent_run_id.is_none_or(|pid| state.parent_run_id == pid) {
+                if !history.iter().any(|h| h.agent_id == state.agent_id) {
+                    history.push(SpawnedAgentInfo::from(state));
+                }
+            }
+        }
+        history
     }
 
     /// Update agent status.
