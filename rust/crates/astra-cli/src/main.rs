@@ -90,6 +90,8 @@ mod repl_turn;
 mod repl_ui;
 #[path = "cli/skill_subrun.rs"]
 mod skill_subrun;
+#[path = "cli/spawn_subrun.rs"]
+mod spawn_subrun;
 #[path = "cli/sse_utils.rs"]
 mod sse_utils;
 #[path = "cli/slash_account.rs"]
@@ -990,6 +992,8 @@ struct ReplState {
         Option<std::sync::Arc<astra_runtime::messaging::dead_letter::DeadLetterQueue>>,
     /// Dynamic agent spawner for runtime agent creation.
     agent_spawner: Option<std::sync::Arc<astra_runtime::orchestration::DynamicAgentSpawner>>,
+    /// Persistent top-level mailbox so spawned agents can reply across turns.
+    root_mailbox: Option<astra_runtime::messaging::router::AgentMailbox>,
 }
 
 impl Default for ReplState {
@@ -1083,6 +1087,7 @@ impl Default for ReplState {
                 astra_runtime::messaging::dead_letter::DeadLetterQueue::new(),
             )),
             agent_spawner: None, // Created lazily when spawn_agent is first used
+            root_mailbox: None,
         }
     }
 }
@@ -3093,6 +3098,91 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
+async fn build_turn_skill_resolver(
+    unified_skill_registry: std::sync::Arc<astra_runtime::skills::UnifiedSkillRegistry>,
+) -> Option<std::sync::Arc<dyn astra_runtime::turn::skill_tool::SkillResolver>> {
+    if unified_skill_registry.is_empty() {
+        let _ = unified_skill_registry.discover_all().await;
+    }
+
+    let inner_resolver = std::sync::Arc::new(astra_runtime::skills::UnifiedSkillResolver::new(
+        unified_skill_registry,
+    ));
+    let adapter = astra_runtime::skills::registry::LegacySkillResolverAdapter::new(inner_resolver);
+    let skills =
+        astra_runtime::turn::skill_tool::SkillResolver::available_skills(&adapter);
+    if skills.is_empty() {
+        None
+    } else {
+        Some(
+            std::sync::Arc::new(adapter)
+                as std::sync::Arc<dyn astra_runtime::turn::skill_tool::SkillResolver>,
+        )
+    }
+}
+
+async fn initialize_multi_agent_runtime(
+    state: &mut ReplState,
+    api: &astra_thin_client::ThinClient,
+    token: String,
+) {
+    let project_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let skill_resolver = build_turn_skill_resolver(state.unified_skill_registry.clone()).await;
+
+    let mut registry = astra_services::AgentProfileRegistry::new();
+    delegate_subrun::register_default_agents(&mut registry);
+    let custom_count = agent_loader::load_and_merge(&project_root, &mut registry);
+    if custom_count > 0 {
+        eprintln!("  loaded {custom_count} custom agent(s) from .astra/agents/");
+    }
+    let registry = std::sync::Arc::new(tokio::sync::RwLock::new(registry));
+
+    let run_store = std::sync::Arc::new(astra_services::runs::InMemoryRunStateStore::default());
+    let tracker = std::sync::Arc::new(
+        astra_runtime::server::delegation_engine::DelegationTracker::new(),
+    );
+    let transport = std::sync::Arc::new(astra_runtime::messaging::InProcessTransport::new());
+    let mailbox_router = std::sync::Arc::new(astra_runtime::messaging::AgentMailboxRouter::new(
+        transport,
+        tracker.clone(),
+    ));
+
+    let delegate_executor = delegate_subrun::CliDelegateSubRunExecutor::new(
+        api.clone(),
+        token.clone(),
+        state.model.clone(),
+        project_root.clone(),
+        state.perm_manager.mode(),
+        None,
+    )
+    .with_skill_resolver(skill_resolver.clone())
+    .with_skill_search(state.skill_search.clone());
+
+    let engine = astra_runtime::server::delegation_engine::DelegationEngine::with_executor(
+        registry,
+        std::sync::Arc::new(astra_runtime::server::run_engine::RunEngine::new(run_store)),
+        tracker,
+        std::sync::Arc::new(delegate_executor),
+    )
+    .with_mailbox_router(mailbox_router.clone());
+    state.delegation_engine = Some(std::sync::Arc::new(engine));
+
+    let spawn_executor = spawn_subrun::CliSpawnAgentExecutor::new(
+        api.clone(),
+        token,
+        project_root,
+        state.perm_manager.mode(),
+        None,
+    )
+    .with_skill_resolver(skill_resolver)
+    .with_skill_search(state.skill_search.clone());
+
+    state.agent_spawner = Some(std::sync::Arc::new(
+        astra_runtime::orchestration::DynamicAgentSpawner::new(mailbox_router)
+            .with_executor(std::sync::Arc::new(spawn_executor)),
+    ));
+}
+
 // ═══════════════════════════════════════════════ Plan Auto-Execution ═════
 
 /// Build a [`TaskLearningBridge`] from ReplState's shared pipeline components.
@@ -5007,6 +5097,7 @@ async fn handle_task_command(
                     discovered_skills: None,
                     messaging_metrics: None,
                     agent_spawner: None,
+                    root_mailbox_slot: None,
                 })
                 .await;
 
@@ -5856,33 +5947,9 @@ async fn run_chat_repl(
     // Seed dynamic Tab-completion with available skills / MCP servers.
     refresh_dynamic_completions(&state).await;
 
-    // ── Wire Delegation Engine (real sub-agent execution) ─────────────────────
-    if let Some(ref token) = current_access_token(profile) {
-        let project_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let executor = delegate_subrun::CliDelegateSubRunExecutor::new(
-            api.clone(),
-            token.clone(),
-            state.model.clone(),
-            project_root.clone(),
-            state.perm_manager.mode(),
-            None, // cancel_token set per-turn
-        );
-        let mut registry = astra_services::AgentProfileRegistry::new();
-        delegate_subrun::register_default_agents(&mut registry);
-        // Load custom agent definitions from .astra/agents/*.md (project + user level)
-        let custom_count = agent_loader::load_and_merge(&project_root, &mut registry);
-        if custom_count > 0 {
-            eprintln!("  loaded {custom_count} custom agent(s) from .astra/agents/");
-        }
-        let registry = std::sync::Arc::new(tokio::sync::RwLock::new(registry));
-        let run_store = std::sync::Arc::new(astra_services::runs::InMemoryRunStateStore::default());
-        let engine = astra_runtime::server::delegation_engine::DelegationEngine::with_executor(
-            registry,
-            std::sync::Arc::new(astra_runtime::server::run_engine::RunEngine::new(run_store)),
-            std::sync::Arc::new(astra_runtime::server::delegation_engine::DelegationTracker::new()),
-            std::sync::Arc::new(executor),
-        );
-        state.delegation_engine = Some(std::sync::Arc::new(engine));
+    // ── Wire multi-agent runtime (delegation + dynamic spawning) ──────────────
+    if let Some(token) = current_access_token(profile) {
+        initialize_multi_agent_runtime(&mut state, api, token).await;
     }
 
     // ── Main loop ─────────────────────────────────────────────────────────────
@@ -7031,6 +7098,19 @@ mod tests {
         assert_eq!(result.full_text, "hello world");
     }
 
+    #[tokio::test]
+    async fn initialize_multi_agent_runtime_wires_spawner_and_engine() {
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:8000", None)
+            .expect("test API URL");
+        let mut state = ReplState::default();
+
+        initialize_multi_agent_runtime(&mut state, &api, "fake-token".to_string()).await;
+
+        assert!(state.delegation_engine.is_some());
+        let spawner = state.agent_spawner.expect("agent spawner should be wired");
+        assert!(spawner.has_executor());
+    }
+
     #[test]
     fn compacted_history_skips_empty_user_messages() {
         // When user message is empty (compacted context), only the assistant message
@@ -7313,6 +7393,7 @@ mod tests {
             discovered_skills: None,
             messaging_metrics: None,
             agent_spawner: None,
+            root_mailbox_slot: None,
         })
         .await
         .unwrap();
@@ -7320,6 +7401,89 @@ mod tests {
         assert_eq!(result.session_id.as_deref(), Some("sess-001"));
         assert_eq!(result.prompt_tokens, 10);
         assert_eq!(result.completion_tokens, 5);
+    }
+
+    #[tokio::test]
+    async fn stream_chat_sse_reuses_persistent_root_mailbox_across_turns() {
+        let app = Router::new().route(
+            "/chat/turn",
+            post(|| async {
+                (
+                    [("content-type", "text/event-stream")],
+                    sse_text_response("Hello!", "sess-001"),
+                )
+            }),
+        );
+        let base = spawn_mock(app).await;
+        let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
+        let registry = tool_registry::ToolRegistry::new(edge_tools::all_tool_schemas());
+        let selector = tool_selector::TfIdfSelector::new(registry);
+        let transport = std::sync::Arc::new(astra_runtime::messaging::InProcessTransport::new());
+        let tracker = std::sync::Arc::new(
+            astra_runtime::server::delegation_engine::DelegationTracker::new(),
+        );
+        let router = std::sync::Arc::new(astra_runtime::messaging::AgentMailboxRouter::new(
+            transport, tracker,
+        ));
+        let spawner = std::sync::Arc::new(
+            astra_runtime::orchestration::DynamicAgentSpawner::new(router.clone()),
+        );
+        let mut root_mailbox = Some(
+            router
+                .register(
+                    astra_runtime::messaging::AgentAddress::new("persisted-run", "main"),
+                    None,
+                )
+                .await
+                .unwrap(),
+        );
+        let skill_search = astra_core::SkillSearchSettings::default();
+
+        for session_id in [None, Some("sess-override")] {
+            let mut pm = PermissionManager::new(true);
+            let mut skill_qt = astra_runtime::skills::quality::SkillQualityTracker::new();
+            let result = stream_chat_sse(ChatTurnParams {
+                api: &api,
+                token: "fake-token",
+                message: "hi",
+                session_id,
+                model: None,
+                explain: ExplainMode::Off,
+                render_md: false,
+                history: &[],
+                perm_manager: &mut pm,
+                verbose_mode: false,
+                quiet: true,
+                suppress_intermediate_output: false,
+                selector: &selector,
+                recent_tools: &[],
+                tool_health_entries: &[],
+                unified_skill_registry: astra_runtime::skills::empty_unified_registry(),
+                plan_only_chat: false,
+                hide_streaming_assistant_text: false,
+                is_plan_subtask: false,
+                plan_subtask_id: None,
+                delegation_engine: None,
+                cancel_token: None,
+                plan_assemble_line_release: None,
+                stream_event_tx: None,
+                approval_request_tx: None,
+                mcp_manager: None,
+                skill_search: &skill_search,
+                skill_quality_tracker: &mut skill_qt,
+                discovered_skills: None,
+                messaging_metrics: None,
+                agent_spawner: Some(spawner.clone()),
+                root_mailbox_slot: Some(&mut root_mailbox),
+            })
+            .await
+            .unwrap();
+            assert_eq!(result.full_text, "Hello!");
+            assert_eq!(
+                root_mailbox.as_ref().map(|mailbox| mailbox.address.run_id.as_str()),
+                Some("persisted-run")
+            );
+        }
     }
 
     #[tokio::test]
@@ -7372,6 +7536,7 @@ mod tests {
             discovered_skills: None,
             messaging_metrics: None,
             agent_spawner: None,
+            root_mailbox_slot: None,
         })
         .await;
         assert!(result.is_err());
@@ -7447,6 +7612,7 @@ mod tests {
             discovered_skills: None,
             messaging_metrics: None,
             agent_spawner: None,
+            root_mailbox_slot: None,
         })
         .await
         .unwrap();

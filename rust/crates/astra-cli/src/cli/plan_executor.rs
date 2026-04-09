@@ -998,6 +998,7 @@ async fn plan_executor_task(
                     discovered_skills: None,
                     messaging_metrics: None,
                     agent_spawner: None,
+                    root_mailbox_slot: None,
                 })
                 .await;
 

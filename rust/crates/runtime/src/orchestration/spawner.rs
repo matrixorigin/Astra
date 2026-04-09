@@ -235,6 +235,11 @@ impl DynamicAgentSpawner {
         self.executor.is_some()
     }
 
+    /// Expose the shared mailbox router for top-level coordination tools.
+    pub fn mailbox_router(&self) -> Arc<AgentMailboxRouter> {
+        self.mailbox_router.clone()
+    }
+
     /// Spawn a new agent from the given specification.
     ///
     /// This is called by the `spawn_agent` tool handler.

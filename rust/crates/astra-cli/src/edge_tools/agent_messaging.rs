@@ -139,14 +139,15 @@ pub struct MessageRouting {
 
 // ─── Tool Execution Context ────────────────────────────────────────────────
 
-/// Context for send_message tool execution.
-pub struct SendMessageContext {
+/// Runtime context for send_message tool execution.
+#[derive(Clone)]
+pub struct SendMessageRuntimeContext {
     /// Current agent's ID
     pub agent_id: String,
     /// Mailbox router for message delivery
     pub router: Arc<AgentMailboxRouter>,
     /// Metrics for observability
-    pub metrics: Arc<MessagingMetrics>,
+    pub metrics: Option<Arc<MessagingMetrics>>,
     /// Current delegation ID (if in delegation context)
     pub delegation_id: Option<String>,
 }
@@ -156,7 +157,7 @@ pub struct SendMessageContext {
 /// Execute the send_message tool.
 pub async fn execute_send_message(
     input: SendMessageInput,
-    ctx: &SendMessageContext,
+    ctx: &SendMessageRuntimeContext,
 ) -> SendMessageOutput {
     let is_broadcast = input.to == "*";
     
@@ -216,7 +217,7 @@ pub async fn execute_send_message(
 }
 
 async fn send_direct_message(
-    ctx: &SendMessageContext,
+    ctx: &SendMessageRuntimeContext,
     recipient: &str,
     content: &str,
     input: &SendMessageInput,
@@ -224,7 +225,7 @@ async fn send_direct_message(
     // Create AgentAddress for sender (use run_id if available, else agent_id as pseudo-run)
     let run_id = ctx.delegation_id.as_deref().unwrap_or(&ctx.agent_id);
     let from_addr = AgentAddress::new(run_id, &ctx.agent_id);
-    let to_addr = AgentAddress::new(run_id, recipient);
+    let to_addr = AgentAddress::new("", recipient);
     
     // Build payload based on message_type
     let payload = MessagePayload::Text {
@@ -255,13 +256,15 @@ async fn send_direct_message(
         .map_err(|e| format!("Router error: {:?}", e))?;
     
     // Update metrics
-    ctx.metrics.messages_sent.fetch_add(1, Ordering::Relaxed);
+    if let Some(metrics) = &ctx.metrics {
+        metrics.messages_sent.fetch_add(1, Ordering::Relaxed);
+    }
     
     Ok(msg_id)
 }
 
 async fn broadcast_message(
-    ctx: &SendMessageContext,
+    ctx: &SendMessageRuntimeContext,
     content: &str,
     input: &SendMessageInput,
 ) -> Result<Vec<String>, String> {
@@ -307,7 +310,9 @@ async fn broadcast_message(
         .collect();
     
     // Update metrics
-    ctx.metrics.messages_sent.fetch_add(1, Ordering::Relaxed);
+    if let Some(metrics) = &ctx.metrics {
+        metrics.messages_sent.fetch_add(1, Ordering::Relaxed);
+    }
     
     Ok(recipients)
 }
@@ -317,59 +322,57 @@ async fn broadcast_message(
 /// Generate the JSON schema for send_message tool.
 pub fn send_message_schema() -> serde_json::Value {
     serde_json::json!({
-        "name": "send_message",
-        "description": "Send a message to another agent in the current delegation or team. Use for coordination, asking questions, reporting progress, or requesting approvals.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "to": {
-                    "type": "string",
-                    "description": "Recipient: agent_id of the target agent, or \"*\" for broadcast to all peers in the current delegation"
+        "type": "function",
+        "function": {
+            "name": "send_message",
+            "description": "Send a message to another agent in the current delegation or team. Use for coordination, asking questions, reporting progress, or requesting approvals.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "to": {
+                        "type": "string",
+                        "description": "Recipient: agent_id of the target agent, or \"*\" for broadcast to all peers in the current delegation"
+                    },
+                    "message": {
+                        "oneOf": [
+                            { "type": "string", "description": "Plain text message" },
+                            { "type": "object", "description": "Structured JSON message" }
+                        ],
+                        "description": "Message content"
+                    },
+                    "summary": {
+                        "type": "string",
+                        "description": "A 5-10 word summary shown as preview (recommended for long messages)"
+                    },
+                    "message_type": {
+                        "type": "string",
+                        "enum": ["text", "question", "answer", "instruction", "progress", "result", "shutdown_request", "shutdown_response"],
+                        "default": "text",
+                        "description": "Message type for structured handling"
+                    },
+                    "priority": {
+                        "type": "string",
+                        "enum": ["low", "normal", "high"],
+                        "default": "normal",
+                        "description": "Message priority"
+                    },
+                    "request_id": {
+                        "type": "string",
+                        "description": "Optional ID for request/response correlation"
+                    }
                 },
-                "message": {
-                    "oneOf": [
-                        { "type": "string", "description": "Plain text message" },
-                        { "type": "object", "description": "Structured JSON message" }
-                    ],
-                    "description": "Message content"
-                },
-                "summary": {
-                    "type": "string",
-                    "description": "A 5-10 word summary shown as preview (recommended for long messages)"
-                },
-                "message_type": {
-                    "type": "string",
-                    "enum": ["text", "question", "answer", "instruction", "progress", "result", "shutdown_request", "shutdown_response"],
-                    "default": "text",
-                    "description": "Message type for structured handling"
-                },
-                "priority": {
-                    "type": "string",
-                    "enum": ["low", "normal", "high"],
-                    "default": "normal",
-                    "description": "Message priority"
-                },
-                "request_id": {
-                    "type": "string",
-                    "description": "Optional ID for request/response correlation"
-                }
-            },
-            "required": ["to", "message"]
+                "required": ["to", "message"]
+            }
         }
     })
 }
-
-// ─── Tool Handler Integration ──────────────────────────────────────────────
 
 /// Handle send_message tool call from agentic loop.
 ///
 /// This is called by the tool executor when the LLM invokes send_message.
 pub async fn handle_send_message_tool(
     args: &serde_json::Value,
-    agent_id: &str,
-    router: Option<Arc<AgentMailboxRouter>>,
-    metrics: Option<Arc<MessagingMetrics>>,
-    delegation_id: Option<String>,
+    ctx: Option<&SendMessageRuntimeContext>,
 ) -> String {
     // Parse input
     let input: SendMessageInput = match serde_json::from_value(args.clone()) {
@@ -381,29 +384,17 @@ pub async fn handle_send_message_tool(
             }).to_string();
         }
     };
-    
-    // Check if messaging is available
-    let (router, metrics) = match (router, metrics) {
-        (Some(r), Some(m)) => (r, m),
-        _ => {
-            return serde_json::json!({
-                "success": false,
-                "message": "Messaging not available. send_message requires active delegation context."
-            }).to_string();
-        }
+
+    let Some(ctx) = ctx else {
+        return serde_json::json!({
+            "success": false,
+            "message": "Messaging not available in this context. send_message requires an active agent mailbox."
+        }).to_string();
     };
-    
-    // Build context
-    let ctx = SendMessageContext {
-        agent_id: agent_id.to_string(),
-        router,
-        metrics,
-        delegation_id,
-    };
-    
+
     // Execute
-    let output = execute_send_message(input, &ctx).await;
-    
+    let output = execute_send_message(input, ctx).await;
+
     serde_json::to_string(&output).unwrap_or_else(|_| {
         serde_json::json!({
             "success": false,
@@ -417,6 +408,12 @@ pub async fn handle_send_message_tool(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use astra_runtime::messaging::{
+        AgentMailboxRouter, InProcessTransport,
+        types::AgentAddress,
+    };
+    use astra_runtime::server::delegation_engine::DelegationTracker;
+    use std::sync::Arc;
 
     #[test]
     fn message_type_display() {
@@ -428,11 +425,12 @@ mod tests {
     #[test]
     fn schema_has_required_fields() {
         let schema = send_message_schema();
-        assert_eq!(schema["name"], "send_message");
-        assert!(schema["inputSchema"]["properties"]["to"].is_object());
-        assert!(schema["inputSchema"]["properties"]["message"].is_object());
+        assert_eq!(schema["type"], "function");
+        assert_eq!(schema["function"]["name"], "send_message");
+        assert!(schema["function"]["parameters"]["properties"]["to"].is_object());
+        assert!(schema["function"]["parameters"]["properties"]["message"].is_object());
         
-        let required = schema["inputSchema"]["required"].as_array().unwrap();
+        let required = schema["function"]["parameters"]["required"].as_array().unwrap();
         assert!(required.contains(&serde_json::json!("to")));
         assert!(required.contains(&serde_json::json!("message")));
     }
@@ -464,5 +462,46 @@ mod tests {
         assert_eq!(input.to, "*");
         assert_eq!(input.message_type, MessageType::Progress);
         assert!(input.message.is_object());
+    }
+
+    #[tokio::test]
+    async fn direct_message_resolves_recipient_by_agent_id() {
+        let transport = Arc::new(InProcessTransport::new());
+        let tracker = Arc::new(DelegationTracker::new());
+        let router = Arc::new(AgentMailboxRouter::new(transport, tracker));
+        let mut recipient = router
+            .register(AgentAddress::new("run-123", "worker"), None)
+            .await
+            .expect("recipient mailbox");
+
+        let ctx = SendMessageRuntimeContext {
+            agent_id: "main".to_string(),
+            router: router.clone(),
+            metrics: None,
+            delegation_id: None,
+        };
+        let output = execute_send_message(
+            SendMessageInput {
+                to: "worker".to_string(),
+                message: Value::String("hello".to_string()),
+                summary: None,
+                message_type: MessageType::Text,
+                priority: None,
+                request_id: None,
+            },
+            &ctx,
+        )
+        .await;
+
+        assert!(output.success, "{output:?}");
+        let msg = recipient.try_recv().expect("recipient should receive message");
+        assert_eq!(msg.from.agent_id, "main");
+        match &msg.to {
+            MessageTarget::Direct { address } => {
+                assert_eq!(address.agent_id, "worker");
+                assert_eq!(address.run_id, "run-123");
+            }
+            other => panic!("unexpected target: {other:?}"),
+        }
     }
 }

@@ -399,6 +399,8 @@ pub struct ToolExecutor {
     pub context_cache: Option<std::sync::Arc<astra_runtime::orchestration::SharedContextCache>>,
     /// Agent ID for context sharing attribution.
     pub agent_id: Option<String>,
+    /// Optional messaging context for the `send_message` tool.
+    pub send_message_context: Option<agent_messaging::SendMessageRuntimeContext>,
 }
 
 /// State for an active worktree session created by `git_worktree enter`.
@@ -533,6 +535,7 @@ impl ToolExecutor {
             spawn_context: None,
             context_cache: None,
             agent_id: None,
+            send_message_context: None,
         }
     }
 
@@ -551,6 +554,14 @@ impl ToolExecutor {
         self.context_cache = Some(cache);
         self.agent_id = Some(agent_id.into());
         self
+    }
+
+    /// Set or clear the messaging context for inter-agent communication.
+    pub fn set_send_message_context(
+        &mut self,
+        ctx: Option<agent_messaging::SendMessageRuntimeContext>,
+    ) {
+        self.send_message_context = ctx;
     }
 
     /// Configure cloud proxy for memory tool calls.
@@ -2769,9 +2780,19 @@ impl ToolExecutor {
             "sleep" => self.sleep_tool(args).await,
             "tool_search" => self.tool_search(args),
             "web_search" => self.web_search(args),
-            "spawn_agent" => agent_spawning::handle_spawn_agent_tool(args, self.spawn_context.as_ref()).await,
+            "send_message" => {
+                agent_messaging::handle_send_message_tool(args, self.send_message_context.as_ref())
+                    .await
+            }
+            "spawn_agent" => {
+                agent_spawning::handle_spawn_agent_tool(args, self.spawn_context.as_ref()).await
+            }
             "share_context" => self.share_context(args),
             "query_context" => self.query_context(args),
+            "delegate" => "Error: Tool 'delegate' is not available in this context. Use \
+                'spawn_agent' for public sub-agent work. The internal 'delegate' tool is only \
+                injected into agentic-loop turns when delegation is enabled."
+                .to_string(),
             "diagnose" => self.diagnose(args).await,
             "lsp" => self.lsp(args),
             "env" => self.env_tool(args),
@@ -2784,8 +2805,9 @@ impl ToolExecutor {
                  list_dir, grep, glob, symbols, find_definition, find_references, git_status, \
                  git_diff, git_log, git_show, git_blame, call_graph, run_build_test, web_fetch, \
                  mo_query, memory_search, memory_profile, ask_user, task_create, task_list, \
-                 task_get, task_update, task_stop, sleep, tool_search, web_search, spawn_agent, \
-                 share_context, query_context, diagnose, lsp, env, notebook_edit, config, powershell, brief"
+                 task_get, task_update, task_stop, sleep, tool_search, web_search, send_message, \
+                 spawn_agent, share_context, query_context, \
+                 diagnose, lsp, env, notebook_edit, config, powershell, brief"
             ),
         };
         // Normalize empty output, then apply global safety net
@@ -5639,6 +5661,14 @@ mod tests {
         let executor = test_executor();
         let result = executor.execute("nonexistent_tool", &json!({})).await;
         assert!(result.contains("Unknown tool"), "got: {result}");
+    }
+
+    #[tokio::test]
+    async fn execute_delegate_without_runtime_returns_guidance() {
+        let executor = test_executor();
+        let result = executor.execute("delegate", &json!({})).await;
+        assert!(result.contains("spawn_agent"), "got: {result}");
+        assert!(result.contains("not available in this context"), "got: {result}");
     }
 
     #[tokio::test]

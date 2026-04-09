@@ -117,4 +117,7 @@ pub(crate) struct ChatTurnParams<'a> {
     /// Optional agent spawner for dynamic sub-agent creation via spawn_agent tool.
     pub(crate) agent_spawner:
         Option<Arc<astra_runtime::orchestration::DynamicAgentSpawner>>,
+    /// Optional persistent top-level mailbox slot for cross-turn reply handling.
+    pub(crate) root_mailbox_slot:
+        Option<&'a mut Option<astra_runtime::messaging::router::AgentMailbox>>,
 }

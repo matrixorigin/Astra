@@ -179,6 +179,8 @@ fn tool_conditional_section(tool_names: &[&str], selection_confidence: f64) -> S
     let has_memory = tool_names.iter().any(|n| n.starts_with("memory"));
     let has_github = tool_names.iter().any(|n| n.starts_with("github"));
     let has_git = tool_names.iter().any(|n| n.starts_with("git_"));
+    let has_spawn_agent = tool_names.contains(&"spawn_agent");
+    let has_delegate = tool_names.contains(&"delegate");
     let has_code_nav =
         tool_names.contains(&"find_definition") || tool_names.contains(&"find_references");
     let has_call_graph = tool_names.contains(&"call_graph");
@@ -196,6 +198,13 @@ fn tool_conditional_section(tool_names: &[&str], selection_confidence: f64) -> S
     if has_github {
         s.push_str(
             "8. For GitHub data: use github_list_prs / github_list_issues / github_repo_stats directly.\n",
+        );
+    }
+    if has_spawn_agent && !has_delegate {
+        s.push_str(
+            "\n## Sub-agents\n\
+             - Use `spawn_agent` for sub-agent work.\n\
+             - Do NOT call `delegate` unless it appears in the current tool list — it is an internal, conditional tool in some runtimes.\n",
         );
     }
     if has_code_nav {
@@ -1214,6 +1223,13 @@ mod tests {
         let p = build_main_system_prompt(&["git_diff", "git_log", "bash"], "", 0.5, None);
         assert!(p.contains("git_status, git_diff"));
         assert!(p.contains("NOT bash"));
+    }
+
+    #[test]
+    fn prompt_prefers_spawn_agent_over_internal_delegate_when_delegate_absent() {
+        let p = build_main_system_prompt(&["spawn_agent", "bash"], "", 0.5, None);
+        assert!(p.contains("Use `spawn_agent`"));
+        assert!(p.contains("Do NOT call `delegate`"));
     }
 
     #[test]

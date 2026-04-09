@@ -1107,6 +1107,8 @@ pub fn all_tool_schemas() -> Vec<Value> {
                 }
             }
         }),
+        // ── send_message: Inter-agent messaging ────────────────────────────────
+        super::agent_messaging::send_message_schema(),
         // ── spawn_agent: Dynamic agent spawning ─────────────────────────────────
         astra_runtime::orchestration::spawn_agent_schema(),
         // ─── Diagnose tool ────────────────────────────────────────────────────────

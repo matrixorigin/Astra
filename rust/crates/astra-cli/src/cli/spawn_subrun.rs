@@ -154,7 +154,6 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
         let step_recorder =
             StepRecorder::with_persistence(&subrun_session_id, &format!("{}-run", config.run_id));
 
-        let max_turns = config.max_turns as usize;
         let start_time = std::time::Instant::now();
         let progress_emitter = config.progress_emitter.clone();
 
@@ -354,12 +353,12 @@ mod tests {
 
     #[test]
     fn test_executor_creation() {
-        let api = astra_thin_client::ThinClient::new("http://test", None);
+        let api = astra_thin_client::ThinClient::new("http://test", None).expect("test api");
         let executor = CliSpawnAgentExecutor::new(
             api,
             "token".to_string(),
             PathBuf::from("/tmp"),
-            PermissionMode::Ask,
+            PermissionMode::Prompt,
             None,
         );
         assert!(executor.skill_resolver.is_none());

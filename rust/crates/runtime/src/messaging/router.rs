@@ -30,6 +30,11 @@ pub struct AgentMailbox {
 }
 
 impl AgentMailbox {
+    /// Clone the shared router so tools can send additional messages in-turn.
+    pub fn router(&self) -> Arc<AgentMailboxRouter> {
+        self.router.clone()
+    }
+
     /// Non-blocking: get the next available message, if any.
     pub fn try_recv(&mut self) -> Option<Arc<AgentMessage>> {
         self.stream.get_mut().try_recv()

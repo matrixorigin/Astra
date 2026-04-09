@@ -84,6 +84,14 @@ pub(crate) async fn stream_chat_sse(
             ex
         }
     };
+    let root_send_message_context = p.agent_spawner.as_ref().map(|spawner| {
+        edge_tools::agent_messaging::SendMessageRuntimeContext {
+            agent_id: "main".to_string(),
+            router: spawner.mailbox_router(),
+            metrics: p.messaging_metrics.clone(),
+            delegation_id: None,
+        }
+    });
 
     // --add-dir: expand sandbox to include additional directories
     if let Ok(dirs) = std::env::var("ASTRA_ADD_DIRS") {
@@ -153,6 +161,28 @@ pub(crate) async fn stream_chat_sse(
     }
 
     let current_session_id = p.session_id.map(|s| s.to_string());
+    let existing_root_mailbox = if let Some(slot) = p.root_mailbox_slot.as_deref_mut() {
+        slot.take()
+    } else {
+        None
+    };
+    let root_mailbox = if let Some(mailbox) = existing_root_mailbox {
+        Some(mailbox)
+    } else if let Some(ref root_ctx) = root_send_message_context {
+        let run_id = current_session_id
+            .clone()
+            .unwrap_or_else(|| "ephemeral".to_string());
+        root_ctx
+            .router
+            .register(
+                astra_runtime::messaging::types::AgentAddress::new(run_id, &root_ctx.agent_id),
+                None,
+            )
+            .await
+            .ok()
+    } else {
+        None
+    };
     let mut task_profile = infer_task_execution_profile(p.message);
     // Plan-only turns have no tools; factual retry would inject a useless "call tools" nudge and
     // spurious "↻ … corrective retry" when the decomposition prompt mentions repo/context words.
@@ -210,6 +240,7 @@ pub(crate) async fn stream_chat_sse(
         plan_assemble_line_release: p.plan_assemble_line_release.clone(),
         stream_event_tx: p.stream_event_tx,
         approval_request_tx: p.approval_request_tx,
+        root_send_message_context,
     };
 
     let bare_mode = std::env::var("ASTRA_BARE")
@@ -353,7 +384,7 @@ pub(crate) async fn stream_chat_sse(
         skill_listing_message: None,
         invoked_skills: std::collections::HashMap::new(),
         recent_file_reads: Vec::new(),
-        mailbox: None,
+        mailbox: root_mailbox,
         ack_tracker: None,
         dead_letter_queue: None,
         messaging_metrics: p.messaging_metrics.clone(),
@@ -366,6 +397,9 @@ pub(crate) async fn stream_chat_sse(
         s.stop_clear();
     }
     if let Err(e) = run_agentic_loop_with_host(&mut host, &mut state).await {
+        if let Some(slot) = p.root_mailbox_slot {
+            *slot = state.mailbox.take();
+        }
         if let Some(shared) = p.discovered_skills {
             *shared = state.discovered_skills;
         }
@@ -392,6 +426,9 @@ pub(crate) async fn stream_chat_sse(
     *p.skill_quality_tracker = state.skill_quality_tracker.clone();
     if let Some(shared) = p.discovered_skills {
         *shared = state.discovered_skills.clone();
+    }
+    if let Some(slot) = p.root_mailbox_slot {
+        *slot = state.mailbox.take();
     }
 
     eprint_stream_loop_sidecars(StreamLoopSidecarEprint {

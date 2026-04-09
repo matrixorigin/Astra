@@ -61,6 +61,9 @@ pub(crate) struct CliAgenticLoopHost<'a> {
     pub stream_event_tx: Option<super::super::StreamEventTx>,
     /// Optional channel for async tool approval requests during plan execution.
     pub approval_request_tx: Option<super::super::ApprovalRequestTx>,
+    /// Root-level messaging context used when the current turn has no mailbox.
+    pub root_send_message_context:
+        Option<crate::edge_tools::agent_messaging::SendMessageRuntimeContext>,
 }
 
 #[async_trait]
@@ -104,6 +107,20 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
         } else {
             self.executor.sandbox_policy = prev_sandbox.clone();
         }
+        self.executor.set_send_message_context(
+            state
+                .mailbox
+                .as_ref()
+                .map(|mailbox| {
+                    crate::edge_tools::agent_messaging::SendMessageRuntimeContext {
+                        agent_id: mailbox.address.agent_id.clone(),
+                        router: mailbox.router(),
+                        metrics: state.messaging_metrics.clone(),
+                        delegation_id: mailbox.delegation_id.clone(),
+                    }
+                })
+                .or_else(|| self.root_send_message_context.clone()),
+        );
 
         let turn_result = fetch_chat_turn_sse(ChatTurnSseFetchRequest {
             api: self.api,

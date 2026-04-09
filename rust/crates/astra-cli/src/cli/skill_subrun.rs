@@ -72,6 +72,15 @@ impl AgenticLoopHost for SubRunHost {
         &mut self,
         state: &mut AgenticLoopState,
     ) -> Result<HostTurnResult, String> {
+        self.executor.set_send_message_context(state.mailbox.as_ref().map(|mailbox| {
+            crate::edge_tools::agent_messaging::SendMessageRuntimeContext {
+                agent_id: mailbox.address.agent_id.clone(),
+                router: mailbox.router(),
+                metrics: state.messaging_metrics.clone(),
+                delegation_id: mailbox.delegation_id.clone(),
+            }
+        }));
+
         let effective_model = state
             .skill_model_override
             .as_deref()
