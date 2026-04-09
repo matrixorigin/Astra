@@ -32,6 +32,272 @@ fn apply_system_prompt(message: &str, system_prompt: Option<&str>) -> String {
     }
 }
 
+fn forwarded_args(args: &ForwardArgs) -> String {
+    args.args.join(" ")
+}
+
+fn join_words(words: &[String]) -> String {
+    words.join(" ")
+}
+
+fn render_team_args(args: &TeamArgs) -> String {
+    match &args.command {
+        None | Some(TeamSubcommand::List) => String::new(),
+        Some(TeamSubcommand::Create(cmd)) => {
+            let suffix = join_words(&cmd.description);
+            if suffix.is_empty() {
+                format!("create {}", cmd.name)
+            } else {
+                format!("create {} {}", cmd.name, suffix)
+            }
+        }
+        Some(TeamSubcommand::AddMember(cmd)) => {
+            let suffix = join_words(&cmd.description);
+            if suffix.is_empty() {
+                format!("add-member {} {}", cmd.team, cmd.role)
+            } else {
+                format!("add-member {} {} {}", cmd.team, cmd.role, suffix)
+            }
+        }
+        Some(TeamSubcommand::Info(cmd)) => format!("info {}", cmd.name),
+        Some(TeamSubcommand::Delete(cmd)) => format!("delete {}", cmd.name),
+        Some(TeamSubcommand::Context(cmd)) => {
+            format!(
+                "context {} {} {}",
+                cmd.team,
+                cmd.key,
+                join_words(&cmd.value)
+            )
+        }
+        Some(TeamSubcommand::Run(cmd)) => format!("run {} {}", cmd.team, join_words(&cmd.task)),
+        Some(TeamSubcommand::History(cmd)) => format!("history {}", cmd.name),
+        Some(TeamSubcommand::Snapshot(cmd)) => {
+            let suffix = join_words(&cmd.label);
+            if suffix.is_empty() {
+                format!("snapshot {}", cmd.team)
+            } else {
+                format!("snapshot {} {}", cmd.team, suffix)
+            }
+        }
+        Some(TeamSubcommand::Restore(cmd)) => format!("restore {} {}", cmd.team, cmd.snapshot_id),
+    }
+}
+
+fn render_task_args(args: &TaskArgs) -> String {
+    match &args.command {
+        None | Some(TaskSubcommand::List) => String::new(),
+        Some(TaskSubcommand::Add(cmd)) => format!("add {}", join_words(&cmd.text)),
+        Some(TaskSubcommand::Done(cmd)) => format!("done {}", join_words(&cmd.query)),
+        Some(TaskSubcommand::Status(cmd)) => format!("status {}", join_words(&cmd.query)),
+        Some(TaskSubcommand::Run(cmd)) => format!("run {}", join_words(&cmd.text)),
+        Some(TaskSubcommand::Result(cmd)) => format!("result {}", join_words(&cmd.query)),
+    }
+}
+
+fn render_memory_args(args: &MemoryArgs) -> String {
+    match &args.command {
+        None | Some(MemorySubcommand::List) => String::new(),
+        Some(MemorySubcommand::Search(cmd)) => format!("search {}", join_words(&cmd.query)),
+    }
+}
+
+fn render_review_args(args: &ReviewArgs) -> String {
+    match &args.command {
+        Some(ReviewSubcommand::Head) => String::new(),
+        Some(ReviewSubcommand::Working) => "working".to_string(),
+        Some(ReviewSubcommand::Rev(cmd)) => join_words(&cmd.target),
+        None => join_words(&args.target),
+    }
+}
+
+fn render_grep_args(args: &GrepArgs) -> String {
+    match &args.command {
+        Some(GrepSubcommand::Content(cmd)) => join_words(&cmd.pattern),
+        Some(GrepSubcommand::Files(cmd)) => format!("files {}", join_words(&cmd.pattern)),
+        Some(GrepSubcommand::Review(cmd)) => format!("review {}", join_words(&cmd.pattern)),
+        None => join_words(&args.pattern),
+    }
+}
+
+fn render_permissions_args(args: &PermissionsArgs) -> String {
+    match &args.command {
+        None | Some(PermissionsSubcommand::Status) => "status".to_string(),
+        Some(PermissionsSubcommand::Auto) => "auto".to_string(),
+        Some(PermissionsSubcommand::Prompt) => "prompt".to_string(),
+        Some(PermissionsSubcommand::Deny) => "deny".to_string(),
+        Some(PermissionsSubcommand::All) => "all".to_string(),
+        Some(PermissionsSubcommand::Rules) => "rules".to_string(),
+    }
+}
+
+fn render_debug_args(args: &DebugArgs) -> String {
+    args.session_id.clone().unwrap_or_default()
+}
+
+fn render_agent_args(args: &AgentArgs) -> String {
+    match &args.command {
+        None | Some(AgentSubcommand::List) => String::new(),
+        Some(AgentSubcommand::Status(cmd)) => format!("status {}", cmd.agent_id),
+        Some(AgentSubcommand::Stop(cmd)) => format!("stop {}", cmd.agent_id),
+        Some(AgentSubcommand::Logs(cmd)) => format!("logs {}", cmd.agent_id),
+    }
+}
+
+fn render_messaging_args(args: &MessagingArgs) -> String {
+    match &args.command {
+        None | Some(MessagingSubcommand::Metrics) => String::new(),
+        Some(MessagingSubcommand::Dlq) => "dlq".to_string(),
+        Some(MessagingSubcommand::Status) => "status".to_string(),
+    }
+}
+
+fn maybe_load_project_instructions(state: &mut ReplState) {
+    let no_instructions = std::env::var("ASTRA_NO_INSTRUCTIONS")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    if !no_instructions {
+        state.project_instructions = discover_project_instructions();
+    }
+}
+
+fn maybe_wire_delegation_engine(
+    state: &mut ReplState,
+    api: &astra_thin_client::ThinClient,
+    token: &str,
+) {
+    let project_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let executor = delegate_subrun::CliDelegateSubRunExecutor::new(
+        api.clone(),
+        token.to_string(),
+        state.model.clone(),
+        project_root.clone(),
+        state.perm_manager.mode(),
+        None,
+    );
+    let mut registry = astra_services::AgentProfileRegistry::new();
+    delegate_subrun::register_default_agents(&mut registry);
+    let _ = agent_loader::load_and_merge(&project_root, &mut registry);
+    let registry = std::sync::Arc::new(tokio::sync::RwLock::new(registry));
+    let run_store = std::sync::Arc::new(astra_services::runs::InMemoryRunStateStore::default());
+    let engine = astra_runtime::server::delegation_engine::DelegationEngine::with_executor(
+        registry,
+        std::sync::Arc::new(astra_runtime::server::run_engine::RunEngine::new(run_store)),
+        std::sync::Arc::new(astra_runtime::server::delegation_engine::DelegationTracker::new()),
+        std::sync::Arc::new(executor),
+    );
+    state.delegation_engine = Some(std::sync::Arc::new(engine));
+}
+
+async fn execute_repl_bridge_command(
+    slash_cmd: &str,
+    arg: &str,
+    profile: Option<&str>,
+    global_model: Option<&str>,
+    api: &astra_thin_client::ThinClient,
+) -> Result<ExitCode, String> {
+    try_silent_auth(api, profile).await;
+
+    let mut state = initialize_repl_state(profile, global_model);
+    if let Ok(sid) = std::env::var("ASTRA_SESSION_ID") {
+        state.session_id = Some(sid);
+    }
+    if let Ok(name) = std::env::var("ASTRA_SESSION_NAME") {
+        state.session_name = Some(name);
+    }
+    maybe_load_project_instructions(&mut state);
+
+    let (_selector, pipeline_modules) = create_tool_selector(api, profile);
+    state.pattern_library = Some(pipeline_modules.pattern_library.clone());
+    state.entity_graph = Some(pipeline_modules.entity_graph.clone());
+    state.calibrator = Some(pipeline_modules.calibrator.clone());
+    state.unified_skill_registry = pipeline_modules.unified_skill_registry.clone();
+    state.mcp_manager = pipeline_modules.mcp_manager.clone();
+
+    let token = current_access_token(profile);
+    if let Some(ref tok) = token {
+        maybe_wire_delegation_engine(&mut state, api, tok);
+    }
+
+    match slash_cmd {
+        "/team" => slash_team::handle_team_command(arg, &mut state).await,
+        "/task" => handle_task_command(arg, &mut state, api, token.as_deref()).await,
+        "/memory" => {
+            handle_memory_domain_command("/memory", arg, api, &mut state, token.as_deref()).await?
+        }
+        "/review" | "/grep" => {
+            handle_info_command(slash_cmd, arg, api, &mut state, token.as_deref()).await?
+        }
+        "/diff" => {
+            let root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            diff_presenter::run_diff_command(&root, arg, cli_utils::terminal_width_usize());
+        }
+        "/allow" => {
+            handle_permission_command(arg, &mut state);
+        }
+        "/debug" => handle_debug_command(arg, &state),
+        "/bug" => handle_bug_command(arg, &state),
+        "/agent" => {
+            let ctx = slash_agent::AgentCommandContext {
+                spawner: state.agent_spawner.clone(),
+            };
+            slash_agent::handle_agent_command(arg, &ctx);
+        }
+        "/messaging" => handle_messaging_command(arg, &state),
+        _ => return Err(format!("unsupported bridged command: {slash_cmd}")),
+    }
+
+    Ok(ExitCode::Success)
+}
+
+fn handle_permission_command(arg: &str, state: &mut ReplState) {
+    use permission_manager::PermissionMode;
+
+    match arg {
+        "" => {
+            let next = match state.perm_manager.mode() {
+                PermissionMode::Prompt => PermissionMode::Auto,
+                PermissionMode::Auto => PermissionMode::Deny,
+                PermissionMode::Deny => PermissionMode::Prompt,
+            };
+            state.perm_manager.set_mode(next);
+            eprintln!(
+                "  {} Permission mode → {}",
+                theme::icon_info(),
+                next.to_string().cyan()
+            );
+        }
+        "all" => {
+            state.perm_manager.set_mode(PermissionMode::Auto);
+            eprintln!(
+                "  {} Permission mode → {} (all tools auto-approved)",
+                "⚡".yellow(),
+                "auto".cyan()
+            );
+        }
+        "rules" | "status" => {
+            let summary = state.perm_manager.rules_summary();
+            eprint!("{summary}");
+        }
+        _ => match arg.parse::<PermissionMode>() {
+            Ok(mode) => {
+                state.perm_manager.set_mode(mode);
+                eprintln!(
+                    "  {} Permission mode → {}",
+                    theme::icon_info(),
+                    mode.to_string().cyan()
+                );
+            }
+            Err(_) => {
+                eprintln!(
+                    "  {} Unknown mode '{}'. Use: auto, prompt, deny, all, rules",
+                    theme::icon_warn(),
+                    arg
+                );
+            }
+        },
+    }
+}
+
 pub(super) async fn execute_cli_command(
     command: Option<Command>,
     profile: Option<String>,
@@ -305,6 +571,127 @@ pub(super) async fn execute_cli_command(
                 Ok(ExitCode::Success)
             }
         },
+
+        Some(Command::Team(args)) => {
+            execute_repl_bridge_command(
+                "/team",
+                &render_team_args(&args),
+                profile.as_deref(),
+                global_model.as_deref(),
+                api,
+            )
+            .await
+        }
+
+        Some(Command::Task(args)) => {
+            execute_repl_bridge_command(
+                "/task",
+                &render_task_args(&args),
+                profile.as_deref(),
+                global_model.as_deref(),
+                api,
+            )
+            .await
+        }
+
+        Some(Command::Memory(args)) => {
+            execute_repl_bridge_command(
+                "/memory",
+                &render_memory_args(&args),
+                profile.as_deref(),
+                global_model.as_deref(),
+                api,
+            )
+            .await
+        }
+
+        Some(Command::Review(args)) => {
+            execute_repl_bridge_command(
+                "/review",
+                &render_review_args(&args),
+                profile.as_deref(),
+                global_model.as_deref(),
+                api,
+            )
+            .await
+        }
+
+        Some(Command::Grep(args)) => {
+            execute_repl_bridge_command(
+                "/grep",
+                &render_grep_args(&args),
+                profile.as_deref(),
+                global_model.as_deref(),
+                api,
+            )
+            .await
+        }
+
+        Some(Command::Diff(args)) => {
+            execute_repl_bridge_command(
+                "/diff",
+                &forwarded_args(&args),
+                profile.as_deref(),
+                global_model.as_deref(),
+                api,
+            )
+            .await
+        }
+
+        Some(Command::Permissions(args)) => {
+            execute_repl_bridge_command(
+                "/allow",
+                &render_permissions_args(&args),
+                profile.as_deref(),
+                global_model.as_deref(),
+                api,
+            )
+            .await
+        }
+
+        Some(Command::Debug(args)) => {
+            execute_repl_bridge_command(
+                "/debug",
+                &render_debug_args(&args),
+                profile.as_deref(),
+                global_model.as_deref(),
+                api,
+            )
+            .await
+        }
+
+        Some(Command::Bug(args)) => {
+            execute_repl_bridge_command(
+                "/bug",
+                &forwarded_args(&args),
+                profile.as_deref(),
+                global_model.as_deref(),
+                api,
+            )
+            .await
+        }
+
+        Some(Command::Agent(args)) => {
+            execute_repl_bridge_command(
+                "/agent",
+                &render_agent_args(&args),
+                profile.as_deref(),
+                global_model.as_deref(),
+                api,
+            )
+            .await
+        }
+
+        Some(Command::Messaging(args)) => {
+            execute_repl_bridge_command(
+                "/messaging",
+                &render_messaging_args(&args),
+                profile.as_deref(),
+                global_model.as_deref(),
+                api,
+            )
+            .await
+        }
 
         Some(Command::Chat(args)) => {
             // Handle --no-color or non-terminal stderr: disable ANSI colors via NO_COLOR env.
