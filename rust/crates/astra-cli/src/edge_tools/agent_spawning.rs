@@ -20,14 +20,13 @@
 //! }
 //! ```
 
+use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::sync::Arc;
-use serde_json::{Value, json};
 
 use astra_runtime::messaging::router::AgentMailboxRouter;
 use astra_runtime::orchestration::{
-    DynamicAgentSpawner, SpawnAgentInput, SpawnContext,
-    spawn_agent_schema,
+    DynamicAgentSpawner, InheritedPermissions, SpawnAgentInput, SpawnContext, spawn_agent_schema,
 };
 
 // ─── Tool Execution Context ────────────────────────────────────────────────
@@ -42,6 +41,8 @@ pub struct SpawnAgentContext {
     pub working_dir: PathBuf,
     /// The spawner instance
     pub spawner: Arc<DynamicAgentSpawner>,
+    /// Effective permissions inherited by children spawned from this agent.
+    pub inherited_permissions: InheritedPermissions,
 }
 
 // ─── Tool Handler ──────────────────────────────────────────────────────────
@@ -49,10 +50,7 @@ pub struct SpawnAgentContext {
 /// Handle spawn_agent tool call from agentic loop.
 ///
 /// This is called by the tool executor when the LLM invokes spawn_agent.
-pub async fn handle_spawn_agent_tool(
-    args: &Value,
-    ctx: Option<&SpawnAgentContext>,
-) -> String {
+pub async fn handle_spawn_agent_tool(args: &Value, ctx: Option<&SpawnAgentContext>) -> String {
     // Parse input
     let input: SpawnAgentInput = match serde_json::from_value(args.clone()) {
         Ok(i) => i,
@@ -60,7 +58,8 @@ pub async fn handle_spawn_agent_tool(
             return json!({
                 "status": "failed",
                 "error": format!("Invalid input: {}", e)
-            }).to_string();
+            })
+            .to_string();
         }
     };
 
@@ -71,35 +70,35 @@ pub async fn handle_spawn_agent_tool(
             return json!({
                 "status": "failed",
                 "error": "Agent spawning not available in this context."
-            }).to_string();
+            })
+            .to_string();
         }
     };
 
     // Build spawn context
+    let mut inherited_permissions = ctx.inherited_permissions.clone();
+    inherited_permissions.is_background = input.background;
     let spawn_ctx = SpawnContext {
         parent_run_id: ctx.run_id.clone(),
         parent_agent_id: ctx.agent_id.clone(),
         working_dir: ctx.working_dir.clone(),
-        // TODO: Get inherited permissions from parent context when available
-        inherited_permissions: None,
+        inherited_permissions: Some(inherited_permissions),
     };
 
     // Execute spawn
     match ctx.spawner.spawn(input, &spawn_ctx).await {
-        Ok(output) => {
-            serde_json::to_string(&output).unwrap_or_else(|_| {
-                json!({
-                    "status": "failed",
-                    "error": "Failed to serialize output"
-                }).to_string()
-            })
-        }
-        Err(e) => {
+        Ok(output) => serde_json::to_string(&output).unwrap_or_else(|_| {
             json!({
                 "status": "failed",
-                "error": e.to_string()
-            }).to_string()
-        }
+                "error": "Failed to serialize output"
+            })
+            .to_string()
+        }),
+        Err(e) => json!({
+            "status": "failed",
+            "error": e.to_string()
+        })
+        .to_string(),
     }
 }
 
@@ -120,6 +119,7 @@ pub fn create_spawn_context(
     agent_id: String,
     working_dir: PathBuf,
     router: Arc<AgentMailboxRouter>,
+    inherited_permissions: InheritedPermissions,
 ) -> SpawnAgentContext {
     let spawner = Arc::new(DynamicAgentSpawner::new(router));
     SpawnAgentContext {
@@ -127,6 +127,7 @@ pub fn create_spawn_context(
         agent_id,
         working_dir,
         spawner,
+        inherited_permissions,
     }
 }
 

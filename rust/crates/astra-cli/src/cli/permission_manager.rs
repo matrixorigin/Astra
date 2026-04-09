@@ -360,6 +360,53 @@ impl PermissionManager {
         self.inherited.as_ref().map_or(false, |i| i.is_background)
     }
 
+    /// Export the current effective permission envelope for a spawned child agent.
+    pub(super) fn inherited_permissions_for_child(
+        &self,
+        is_background: bool,
+    ) -> astra_runtime::orchestration::InheritedPermissions {
+        use astra_runtime::orchestration::{
+            InheritedPermissions, PermissionMode as RuntimePermissionMode,
+            PermissionRule as RuntimePermissionRule,
+        };
+
+        let mode = match self.mode {
+            PermissionMode::Auto => RuntimePermissionMode::Auto,
+            PermissionMode::Prompt => RuntimePermissionMode::Prompt,
+            PermissionMode::Deny => RuntimePermissionMode::Deny,
+        };
+
+        let mut inherited = self
+            .inherited
+            .clone()
+            .unwrap_or_else(|| InheritedPermissions::new(mode));
+        inherited.mode = mode;
+        inherited.is_background = is_background;
+
+        for rule in self
+            .cached_user_allow
+            .iter()
+            .chain(self.cached_allow.iter())
+        {
+            inherited.add_allow(RuntimePermissionRule::parse(&rule.to_string()));
+        }
+        for rule in self.cached_user_deny.iter().chain(self.cached_deny.iter()) {
+            inherited.add_deny(RuntimePermissionRule::parse(&rule.to_string()));
+        }
+        for (tool, allowed) in &self.session_overrides {
+            let runtime_rule = RuntimePermissionRule::parse(tool);
+            if *allowed {
+                inherited.deny_rules.retain(|rule| rule != &runtime_rule);
+                inherited.add_allow(runtime_rule);
+            } else {
+                inherited.allow_rules.retain(|rule| rule != &runtime_rule);
+                inherited.add_deny(runtime_rule);
+            }
+        }
+
+        inherited
+    }
+
     /// Resolve §5.5 `approval_required` for cloud-orchestrated tools (posts to `/approval/respond`).
     pub(super) fn resolve_cloud_approval(
         &mut self,
@@ -399,10 +446,7 @@ impl PermissionManager {
             'y' => ApprovalDecision::Allow,
             'a' => {
                 self.session_overrides.insert(tool.to_string(), true);
-                eprintln!(
-                    "{}",
-                    format!("  ✓ {tool}: allowed for this session").dim()
-                );
+                eprintln!("{}", format!("  ✓ {tool}: allowed for this session").dim());
                 ApprovalDecision::AllowSession
             }
             's' => {
@@ -710,18 +754,14 @@ impl PermissionManager {
                 }
                 // In deny mode, reject git safety violations outright.
                 if self.mode == PermissionMode::Deny {
-                    eprintln!(
-                        "  {}",
-                        "  Git safety violation — blocked".red()
-                    );
+                    eprintln!("  {}", "  Git safety violation — blocked".red());
                     return false;
                 }
                 // Git safety violations require explicit approval (not auto-approved).
                 if self.mode == PermissionMode::Auto {
                     eprintln!(
                         "  {}",
-                        "  Git safety violation — requires your approval"
-                            .yellow()
+                        "  Git safety violation — requires your approval".yellow()
                     );
                 }
                 let (header, detail) = Self::format_tool_display(name, args);
@@ -741,17 +781,11 @@ impl PermissionManager {
         if let Some(warning) = Self::check_dangerous_path(name, args) {
             eprintln!("  {}", warning.yellow());
             if self.mode == PermissionMode::Deny {
-                eprintln!(
-                    "  {}",
-                    "  Sensitive path — blocked".red()
-                );
+                eprintln!("  {}", "  Sensitive path — blocked".red());
                 return false;
             }
             if self.mode == PermissionMode::Auto {
-                eprintln!(
-                    "  {}",
-                    "  Sensitive path — requires your approval".yellow()
-                );
+                eprintln!("  {}", "  Sensitive path — requires your approval".yellow());
             }
             let (header, detail) = Self::format_tool_display(name, args);
             eprintln!("  {}", format!("⚠  {header}").yellow());
@@ -797,10 +831,7 @@ impl PermissionManager {
             PermissionMode::Auto => return true,
             PermissionMode::Deny => {
                 let (header, _) = Self::format_tool_display(name, args);
-                eprintln!(
-                    "  {}",
-                    format!("  ✗ {header} — blocked").red()
-                );
+                eprintln!("  {}", format!("  ✗ {header} — blocked").red());
                 return false;
             }
             PermissionMode::Prompt => {} // fall through to interactive prompt
@@ -1794,12 +1825,9 @@ mod tests {
     #[test]
     fn with_inherited_uses_parent_mode() {
         use astra_runtime::orchestration::{InheritedPermissions, PermissionMode as RuntimeMode};
-        
+
         let inherited = InheritedPermissions::new(RuntimeMode::Auto);
-        let pm = PermissionManager::with_inherited(
-            std::path::Path::new("/tmp"),
-            inherited,
-        );
+        let pm = PermissionManager::with_inherited(std::path::Path::new("/tmp"), inherited);
         assert_eq!(pm.mode, PermissionMode::Auto);
     }
 
@@ -1808,15 +1836,12 @@ mod tests {
         use astra_runtime::orchestration::{
             InheritedPermissions, PermissionMode as RuntimeMode, PermissionRule as RuntimeRule,
         };
-        
+
         let mut inherited = InheritedPermissions::new(RuntimeMode::Prompt);
         inherited.add_allow(RuntimeRule::parse("bash(git commit:*)"));
-        
-        let pm = PermissionManager::with_inherited(
-            std::path::Path::new("/tmp"),
-            inherited,
-        );
-        
+
+        let pm = PermissionManager::with_inherited(std::path::Path::new("/tmp"), inherited);
+
         // Should be allowed by inherited rules
         let args = serde_json::json!({"command": "git commit -m 'test'"});
         assert!(pm.is_inherited_allowed("bash", Some("git commit -m 'test'")));
@@ -1828,31 +1853,48 @@ mod tests {
         use astra_runtime::orchestration::{
             InheritedPermissions, PermissionMode as RuntimeMode, PermissionRule as RuntimeRule,
         };
-        
+
         let mut inherited = InheritedPermissions::new(RuntimeMode::Prompt);
         inherited.add_deny(RuntimeRule::parse("bash(rm -rf:*)"));
-        
-        let pm = PermissionManager::with_inherited(
-            std::path::Path::new("/tmp"),
-            inherited,
-        );
-        
+
+        let pm = PermissionManager::with_inherited(std::path::Path::new("/tmp"), inherited);
+
         // Should be denied by inherited rules
         assert!(pm.is_inherited_denied("bash", Some("rm -rf /tmp")));
     }
 
     #[test]
+    fn inherited_permissions_for_child_includes_session_overrides() {
+        use astra_runtime::orchestration::{
+            PermissionMode as RuntimeMode, PermissionRule as RuntimeRule,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
+        pm.session_overrides.insert("bash".to_string(), true);
+        pm.session_overrides.insert("edit".to_string(), false);
+
+        let inherited = pm.inherited_permissions_for_child(true);
+
+        assert_eq!(inherited.mode, RuntimeMode::Prompt);
+        assert!(inherited.is_background);
+        assert!(inherited.allow_rules.contains(&RuntimeRule::parse("bash")));
+        assert!(inherited.deny_rules.contains(&RuntimeRule::parse("edit")));
+    }
+
+    #[test]
     fn with_inherited_tool_allowlist() {
         use astra_runtime::orchestration::{InheritedPermissions, PermissionMode as RuntimeMode};
-        
+
         let mut inherited = InheritedPermissions::new(RuntimeMode::Auto);
-        inherited.allowed_tools = Some(["view".to_string(), "grep".to_string()].into_iter().collect());
-        
-        let pm = PermissionManager::with_inherited(
-            std::path::Path::new("/tmp"),
-            inherited,
+        inherited.allowed_tools = Some(
+            ["view".to_string(), "grep".to_string()]
+                .into_iter()
+                .collect(),
         );
-        
+
+        let pm = PermissionManager::with_inherited(std::path::Path::new("/tmp"), inherited);
+
         // Only allowed tools should pass
         assert!(pm.is_tool_in_inherited_allowlist("view"));
         assert!(pm.is_tool_in_inherited_allowlist("grep"));
@@ -1863,15 +1905,12 @@ mod tests {
     #[test]
     fn with_inherited_background_agent_flag() {
         use astra_runtime::orchestration::{InheritedPermissions, PermissionMode as RuntimeMode};
-        
+
         let mut inherited = InheritedPermissions::new(RuntimeMode::Auto);
         inherited.is_background = true;
-        
-        let pm = PermissionManager::with_inherited(
-            std::path::Path::new("/tmp"),
-            inherited,
-        );
-        
+
+        let pm = PermissionManager::with_inherited(std::path::Path::new("/tmp"), inherited);
+
         assert!(pm.is_background_agent());
     }
 }
