@@ -440,7 +440,7 @@ impl PermissionManager {
             format!("  ☁  Cloud approval required: {tool}").yellow()
         );
         if let Some(detail) = detail.filter(|s| !s.is_empty()) {
-            eprintln!("{}", format!("     {detail}").dim());
+            eprintln!("{}", Self::format_prompt_detail(detail).dim());
         }
         self.apply_cloud_approval_choice(
             tool,
@@ -619,12 +619,16 @@ impl PermissionManager {
         };
         let brief = permission_prompt_primary_detail(name, args).unwrap_or_else(|| "…".into());
         let header = format!("{icon} {name}");
-        let detail = if brief.len() > 120 {
-            Some(format!("  {}", truncate_str(&brief, 120)))
-        } else {
-            Some(format!("  {brief}"))
-        };
+        let detail = Some(Self::format_prompt_detail(&brief));
         (header, detail)
+    }
+
+    fn format_prompt_detail(detail: &str) -> String {
+        if detail.len() > 120 {
+            format!("  {}", truncate_str(detail, 120))
+        } else {
+            format!("  {detail}")
+        }
     }
 
     pub(crate) fn prompt_approval(kind: ApprovalPromptKind) -> char {
