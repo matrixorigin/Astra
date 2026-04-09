@@ -52,6 +52,8 @@ use rustyline::{
 };
 use serde::{Deserialize, Serialize};
 
+#[path = "cli/agent_loader.rs"]
+mod agent_loader;
 #[path = "cli/auth_flow.rs"]
 mod auth_flow;
 #[path = "cli/chat_stream/mod.rs"]
@@ -62,8 +64,6 @@ mod cli_formatting;
 mod cli_utils;
 #[path = "cli/command_router.rs"]
 mod command_router;
-#[path = "cli/agent_loader.rs"]
-mod agent_loader;
 #[path = "cli/delegate_subrun.rs"]
 mod delegate_subrun;
 #[path = "cli/diff_presenter.rs"]
@@ -80,6 +80,8 @@ mod journal_digest;
 mod permission_manager;
 #[path = "cli/plan_executor.rs"]
 mod plan_executor;
+#[path = "cli/plan_interaction.rs"]
+mod plan_interaction;
 #[path = "cli/readline_actor.rs"]
 mod readline_actor;
 #[path = "cli/repl_runtime.rs"]
@@ -90,12 +92,10 @@ mod repl_turn;
 mod repl_ui;
 #[path = "cli/skill_subrun.rs"]
 mod skill_subrun;
-#[path = "cli/spawn_subrun.rs"]
-mod spawn_subrun;
-#[path = "cli/sse_utils.rs"]
-mod sse_utils;
 #[path = "cli/slash_account.rs"]
 mod slash_account;
+#[path = "cli/slash_agent.rs"]
+mod slash_agent;
 #[path = "cli/slash_bug.rs"]
 mod slash_bug;
 #[path = "cli/slash_debug.rs"]
@@ -104,8 +104,6 @@ mod slash_debug;
 mod slash_info;
 #[path = "cli/slash_mcp.rs"]
 mod slash_mcp;
-#[path = "cli/plan_interaction.rs"]
-mod plan_interaction;
 #[path = "cli/slash_memory.rs"]
 mod slash_memory;
 #[path = "cli/slash_messaging.rs"]
@@ -118,8 +116,10 @@ mod slash_skill;
 mod slash_state;
 #[path = "cli/slash_team.rs"]
 mod slash_team;
-#[path = "cli/slash_agent.rs"]
-mod slash_agent;
+#[path = "cli/spawn_subrun.rs"]
+mod spawn_subrun;
+#[path = "cli/sse_utils.rs"]
+mod sse_utils;
 #[path = "cli/stream_render.rs"]
 mod stream_render;
 #[path = "cli/streaming_md.rs"]
@@ -145,6 +145,7 @@ use permission_manager::PermissionManager;
 #[cfg(test)]
 use stream_render::{StreamRenderState, TurnResult, dispatch_turn_event_block};
 
+use plan_interaction::{handle_plan_mode_input, plan_execution_ui_active};
 use repl_runtime::{
     build_repl_editor, check_server_has_models, create_background_plan_selector,
     create_tool_selector, create_tool_selector_quiet, create_tool_selector_with_quality,
@@ -160,7 +161,6 @@ use slash_account::handle_account_command;
 use slash_bug::handle_bug_command;
 use slash_debug::handle_debug_command;
 use slash_info::handle_info_command;
-use plan_interaction::{handle_plan_mode_input, plan_execution_ui_active};
 use slash_memory::handle_memory_domain_command;
 use slash_messaging::handle_messaging_command;
 use slash_session::handle_session_command;
@@ -994,6 +994,8 @@ struct ReplState {
     agent_spawner: Option<std::sync::Arc<astra_runtime::orchestration::DynamicAgentSpawner>>,
     /// Persistent top-level mailbox so spawned agents can reply across turns.
     root_mailbox: Option<astra_runtime::messaging::router::AgentMailbox>,
+    /// Replies received while the REPL is idle at the prompt. Flushed only at safe redraw points.
+    pending_idle_agent_messages: Vec<std::sync::Arc<astra_runtime::messaging::AgentMessage>>,
 }
 
 impl Default for ReplState {
@@ -1088,6 +1090,7 @@ impl Default for ReplState {
             )),
             agent_spawner: None, // Created lazily when spawn_agent is first used
             root_mailbox: None,
+            pending_idle_agent_messages: Vec::new(),
         }
     }
 }
@@ -3109,15 +3112,14 @@ async fn build_turn_skill_resolver(
         unified_skill_registry,
     ));
     let adapter = astra_runtime::skills::registry::LegacySkillResolverAdapter::new(inner_resolver);
-    let skills =
-        astra_runtime::turn::skill_tool::SkillResolver::available_skills(&adapter);
+    let skills = astra_runtime::turn::skill_tool::SkillResolver::available_skills(&adapter);
     if skills.is_empty() {
         None
     } else {
-        Some(
-            std::sync::Arc::new(adapter)
-                as std::sync::Arc<dyn astra_runtime::turn::skill_tool::SkillResolver>,
-        )
+        Some(std::sync::Arc::new(adapter)
+            as std::sync::Arc<
+                dyn astra_runtime::turn::skill_tool::SkillResolver,
+            >)
     }
 }
 
@@ -3138,9 +3140,8 @@ async fn initialize_multi_agent_runtime(
     let registry = std::sync::Arc::new(tokio::sync::RwLock::new(registry));
 
     let run_store = std::sync::Arc::new(astra_services::runs::InMemoryRunStateStore::default());
-    let tracker = std::sync::Arc::new(
-        astra_runtime::server::delegation_engine::DelegationTracker::new(),
-    );
+    let tracker =
+        std::sync::Arc::new(astra_runtime::server::delegation_engine::DelegationTracker::new());
     let transport = std::sync::Arc::new(astra_runtime::messaging::InProcessTransport::new());
     let mailbox_router = std::sync::Arc::new(astra_runtime::messaging::AgentMailboxRouter::new(
         transport,
@@ -3653,9 +3654,27 @@ fn display_plan_updates_live(
                     .map(|d| format!(" ({})", format_duration_short(d)))
                     .unwrap_or_default();
                 if verification_passed {
-                    (format!("  {} {} {}{}", theme::icon_ok(), "done".bold(), id.dim(), dur.dim()), PostSpinner::Activity("Next subtask".to_string()))
+                    (
+                        format!(
+                            "  {} {} {}{}",
+                            theme::icon_ok(),
+                            "done".bold(),
+                            id.dim(),
+                            dur.dim()
+                        ),
+                        PostSpinner::Activity("Next subtask".to_string()),
+                    )
                 } else {
-                    (format!("  {} {} — {}{}", theme::icon_warn(), id, "verification failed".yellow(), dur.dim()), PostSpinner::Activity("Next subtask".to_string()))
+                    (
+                        format!(
+                            "  {} {} — {}{}",
+                            theme::icon_warn(),
+                            id,
+                            "verification failed".yellow(),
+                            dur.dim()
+                        ),
+                        PostSpinner::Activity("Next subtask".to_string()),
+                    )
                 }
             }
             PlanUpdate::SubtaskTurnResult {
@@ -3682,8 +3701,7 @@ fn display_plan_updates_live(
                     } else {
                         0
                     };
-                    state.plan_run_task_last_progress =
-                        Some((pct, done as u32, total as u32));
+                    state.plan_run_task_last_progress = Some((pct, done as u32, total as u32));
                 }
                 // Feed ETA into the active spinner (only PlanActivitySpinner supports it)
                 if let Some(PlanSpinner::Activity(spinner)) = plan_spinner.as_ref() {
@@ -3715,7 +3733,13 @@ fn display_plan_updates_live(
                 if let Some(tx) = state.pending_approval.take() {
                     let _ = tx.send(false);
                 }
-                print_plan_monitor_line(plan_spinner, &mut state.plan_in_token_stream, &mut state.plan_md_renderer, &mut state.plan_thinking_pane, msg);
+                print_plan_monitor_line(
+                    plan_spinner,
+                    &mut state.plan_in_token_stream,
+                    &mut state.plan_md_renderer,
+                    &mut state.plan_thinking_pane,
+                    msg,
+                );
                 // Auto-display delivery report if available
                 if let Some(ref report) = state.last_delivery_report {
                     eprintln!();
@@ -3747,7 +3771,13 @@ fn display_plan_updates_live(
                 if let Some(tx) = state.pending_approval.take() {
                     let _ = tx.send(false);
                 }
-                print_plan_monitor_line(plan_spinner, &mut state.plan_in_token_stream, &mut state.plan_md_renderer, &mut state.plan_thinking_pane, msg);
+                print_plan_monitor_line(
+                    plan_spinner,
+                    &mut state.plan_in_token_stream,
+                    &mut state.plan_md_renderer,
+                    &mut state.plan_thinking_pane,
+                    msg,
+                );
                 if state.plan_mode.is_some() {
                     eprintln!(
                         "{}",
@@ -3770,9 +3800,10 @@ fn display_plan_updates_live(
                     PostSpinner::None,
                 )
             }
-            PlanUpdate::GlobalVerificationFailed => {
-                ("  ⚠ Global verification failed".to_string(), PostSpinner::None)
-            }
+            PlanUpdate::GlobalVerificationFailed => (
+                "  ⚠ Global verification failed".to_string(),
+                PostSpinner::None,
+            ),
             PlanUpdate::JournalEvent(event) => {
                 // Write journal event to the REPL-owned journal writer
                 if let Some(ref journal) = state.journal {
@@ -3793,15 +3824,21 @@ fn display_plan_updates_live(
                 continue;
             }
             PlanUpdate::VerificationReport(report) => {
-                finalize_plan_stream(&mut state.plan_in_token_stream, plan_spinner, &mut state.plan_md_renderer, &mut state.plan_thinking_pane);
+                finalize_plan_stream(
+                    &mut state.plan_in_token_stream,
+                    plan_spinner,
+                    &mut state.plan_md_renderer,
+                    &mut state.plan_thinking_pane,
+                );
                 if let Some(s) = plan_spinner.take() {
                     s.stop_clear();
                 }
                 durable_bridge::display_verification_report(&report);
                 // Start a spinner so the user sees activity between verification and next event
-                *plan_spinner = Some(PlanSpinner::Activity(
-                    effects::PlanActivitySpinner::start(current_subtask_tag, "Continuing"),
-                ));
+                *plan_spinner = Some(PlanSpinner::Activity(effects::PlanActivitySpinner::start(
+                    current_subtask_tag,
+                    "Continuing",
+                )));
                 continue;
             }
             PlanUpdate::SubtaskRetry {
@@ -3848,48 +3885,71 @@ fn display_plan_updates_live(
                         output_summary,
                     } => {
                         let dur = cli_formatting::format_duration_suffix(duration_ms);
-                        let icon = if status == "error" { theme::icon_err() } else { theme::icon_ok() };
+                        let icon = if status == "error" {
+                            theme::icon_err()
+                        } else {
+                            theme::icon_ok()
+                        };
                         let styled = stream_render::style_tool_description(&name, &description);
                         let summary = output_summary
                             .map(|s| format!("\n    {}", s.dim()))
                             .unwrap_or_default();
-                        (format!("  {icon} {styled}{}{summary}", dur.dim()), PostSpinner::None)
+                        (
+                            format!("  {icon} {styled}{}{summary}", dur.dim()),
+                            PostSpinner::None,
+                        )
                     }
                     StreamEvent::WaitingForModel => {
-                        finalize_plan_stream(&mut state.plan_in_token_stream, plan_spinner, &mut state.plan_md_renderer, &mut state.plan_thinking_pane);
+                        finalize_plan_stream(
+                            &mut state.plan_in_token_stream,
+                            plan_spinner,
+                            &mut state.plan_md_renderer,
+                            &mut state.plan_thinking_pane,
+                        );
                         if let Some(s) = plan_spinner.take() {
                             s.stop_clear();
                         }
-                        *plan_spinner = Some(PlanSpinner::Ttft(
-                            effects::TtftWaitLineSpinner::start(),
-                        ));
+                        *plan_spinner =
+                            Some(PlanSpinner::Ttft(effects::TtftWaitLineSpinner::start()));
                         continue;
                     }
                     StreamEvent::ModelResponding => {
-                        finalize_plan_stream(&mut state.plan_in_token_stream, plan_spinner, &mut state.plan_md_renderer, &mut state.plan_thinking_pane);
+                        finalize_plan_stream(
+                            &mut state.plan_in_token_stream,
+                            plan_spinner,
+                            &mut state.plan_md_renderer,
+                            &mut state.plan_thinking_pane,
+                        );
                         if let Some(s) = plan_spinner.take() {
                             s.stop_clear();
                         }
-                        *plan_spinner = Some(PlanSpinner::Activity(
-                            effects::PlanActivitySpinner::start(
+                        *plan_spinner =
+                            Some(PlanSpinner::Activity(effects::PlanActivitySpinner::start(
                                 current_subtask_tag,
                                 "Model responding",
-                            ),
-                        ));
+                            )));
                         continue;
                     }
                     StreamEvent::Thinking(true) => {
                         // Reuse existing pane if model sends multiple thinking blocks
                         if state.plan_thinking_pane.is_none() {
-                            finalize_plan_stream(&mut state.plan_in_token_stream, plan_spinner, &mut state.plan_md_renderer, &mut state.plan_thinking_pane);
+                            finalize_plan_stream(
+                                &mut state.plan_in_token_stream,
+                                plan_spinner,
+                                &mut state.plan_md_renderer,
+                                &mut state.plan_thinking_pane,
+                            );
                             if let Some(s) = plan_spinner.take() {
                                 s.stop_clear();
                             }
                             use std::io::IsTerminal;
                             let rows = effects::thinking_viewport_rows();
-                            let tw = crossterm::terminal::size().map(|(w, _)| w as usize).unwrap_or(80);
+                            let tw = crossterm::terminal::size()
+                                .map(|(w, _)| w as usize)
+                                .unwrap_or(80);
                             if rows > 0 && std::io::stdout().is_terminal() {
-                                state.plan_thinking_pane = Some(effects::ThinkingPreviewPane::new(rows, tw));
+                                state.plan_thinking_pane =
+                                    Some(effects::ThinkingPreviewPane::new(rows, tw));
                             } else {
                                 *plan_spinner = Some(PlanSpinner::Activity(
                                     effects::PlanActivitySpinner::start(
@@ -3924,7 +3984,9 @@ fn display_plan_updates_live(
                                 s.stop_clear();
                             }
                             state.plan_in_token_stream = true;
-                            let tw = crossterm::terminal::size().map(|(w, _)| w as usize).unwrap_or(80);
+                            let tw = crossterm::terminal::size()
+                                .map(|(w, _)| w as usize)
+                                .unwrap_or(80);
                             state.plan_md_renderer = Some(streaming_md::StreamingMarkdown::new(tw));
                         }
                         if let Some(ref mut md) = state.plan_md_renderer {
@@ -3933,7 +3995,12 @@ fn display_plan_updates_live(
                         continue;
                     }
                     StreamEvent::StatusLine(line) => {
-                        finalize_plan_stream(&mut state.plan_in_token_stream, plan_spinner, &mut state.plan_md_renderer, &mut state.plan_thinking_pane);
+                        finalize_plan_stream(
+                            &mut state.plan_in_token_stream,
+                            plan_spinner,
+                            &mut state.plan_md_renderer,
+                            &mut state.plan_thinking_pane,
+                        );
                         if let Some(s) = plan_spinner.take() {
                             s.stop_clear();
                         }
@@ -3961,7 +4028,13 @@ fn display_plan_updates_live(
                     detail.as_deref().unwrap_or(""),
                     reason,
                 );
-                print_plan_monitor_line(plan_spinner, &mut state.plan_in_token_stream, &mut state.plan_md_renderer, &mut state.plan_thinking_pane, msg);
+                print_plan_monitor_line(
+                    plan_spinner,
+                    &mut state.plan_in_token_stream,
+                    &mut state.plan_md_renderer,
+                    &mut state.plan_thinking_pane,
+                    msg,
+                );
                 // Store the response channel for the REPL to resolve
                 state.pending_approval = Some(response_tx);
                 continue;
@@ -3970,24 +4043,29 @@ fn display_plan_updates_live(
         };
 
         // Print the message (stops spinner internally)
-        print_plan_monitor_line(plan_spinner, &mut state.plan_in_token_stream, &mut state.plan_md_renderer, &mut state.plan_thinking_pane, msg);
+        print_plan_monitor_line(
+            plan_spinner,
+            &mut state.plan_in_token_stream,
+            &mut state.plan_md_renderer,
+            &mut state.plan_thinking_pane,
+            msg,
+        );
 
         // Optionally start a new spinner after the printed line
         match post_spinner {
             PostSpinner::Ttft => {
-                *plan_spinner = Some(PlanSpinner::Ttft(
-                    effects::TtftWaitLineSpinner::start(),
-                ));
+                *plan_spinner = Some(PlanSpinner::Ttft(effects::TtftWaitLineSpinner::start()));
             }
             PostSpinner::Tool(desc) => {
-                *plan_spinner = Some(PlanSpinner::Tool(
-                    effects::ToolRunningLineSpinner::start(desc),
-                ));
+                *plan_spinner = Some(PlanSpinner::Tool(effects::ToolRunningLineSpinner::start(
+                    desc,
+                )));
             }
             PostSpinner::Activity(label) => {
-                *plan_spinner = Some(PlanSpinner::Activity(
-                    effects::PlanActivitySpinner::start(current_subtask_tag, &label),
-                ));
+                *plan_spinner = Some(PlanSpinner::Activity(effects::PlanActivitySpinner::start(
+                    current_subtask_tag,
+                    &label,
+                )));
             }
             PostSpinner::None => {}
         }
@@ -4076,9 +4154,7 @@ async fn finalize_plan_run_task_after_executor(state: &mut ReplState) {
     } else if let Some(ref report) = state.last_delivery_report {
         let (outcome, pct, done, total) =
             durable_bridge::plan_run_finish_from_delivery_report(report);
-        let _ = svc
-            .complete_plan_run(&tid, pct, done, total, outcome)
-            .await;
+        let _ = svc.complete_plan_run(&tid, pct, done, total, outcome).await;
     } else if let Some((pct, done, total)) = state.plan_run_task_last_progress {
         let _ = svc
             .complete_plan_run(&tid, pct, done, total, TaskOutcome::Success)
@@ -4104,6 +4180,97 @@ fn flush_plan_updates_between_prompts(state: &mut ReplState) -> bool {
         spinner.stop_clear();
     }
     outcome == PlanMonitorOutcome::Finished
+}
+
+fn drain_root_mailbox_into_idle_queue(state: &mut ReplState) {
+    let Some(mailbox) = state.root_mailbox.as_mut() else {
+        return;
+    };
+    while let Some(message) = mailbox.try_recv() {
+        state.pending_idle_agent_messages.push(message);
+    }
+}
+
+fn format_idle_agent_message_payload(payload: &astra_runtime::messaging::MessagePayload) -> String {
+    use astra_runtime::messaging::{AgentSignal, MessagePayload, RequestType};
+
+    match payload {
+        MessagePayload::Text { content, summary } => {
+            summary.clone().unwrap_or_else(|| content.clone())
+        }
+        MessagePayload::Progress {
+            turn_index,
+            tool_calls,
+            status,
+            detail,
+        } => {
+            let detail = detail
+                .as_ref()
+                .map(|text| format!(" — {text}"))
+                .unwrap_or_default();
+            format!("progress turn {turn_index}, {tool_calls} tool calls: {status}{detail}")
+        }
+        MessagePayload::Request { request_type, data } => {
+            let request = match request_type {
+                RequestType::Shutdown => "shutdown".to_string(),
+                RequestType::ToolPermission => "tool_permission".to_string(),
+                RequestType::ContextShare => "context_share".to_string(),
+                RequestType::Custom(name) => format!("custom:{name}"),
+            };
+            if data.is_null() {
+                format!("request {request}")
+            } else {
+                format!("request {request}: {data}")
+            }
+        }
+        MessagePayload::Response {
+            request_id,
+            accepted,
+            data,
+        } => {
+            let data = data
+                .as_ref()
+                .map(|value| format!(": {value}"))
+                .unwrap_or_default();
+            format!(
+                "response to {request_id}: {}{data}",
+                if *accepted { "accepted" } else { "rejected" }
+            )
+        }
+        MessagePayload::Signal(signal) => match signal {
+            AgentSignal::Heartbeat => "heartbeat".to_string(),
+            AgentSignal::Idle => "idle".to_string(),
+            AgentSignal::Stalled { reason } => format!("stalled: {reason}"),
+            AgentSignal::Completed { output } => format!("completed: {output}"),
+            AgentSignal::Failed { error } => format!("failed: {error}"),
+        },
+        MessagePayload::Ack { message_id } => format!("acknowledged {message_id}"),
+        MessagePayload::Nack { message_id, reason } => {
+            let reason = reason
+                .as_ref()
+                .map(|text| format!(": {text}"))
+                .unwrap_or_default();
+            format!("rejected {message_id}{reason}")
+        }
+    }
+}
+
+fn flush_idle_agent_messages_between_prompts(state: &mut ReplState) {
+    drain_root_mailbox_into_idle_queue(state);
+    if state.pending_idle_agent_messages.is_empty() {
+        return;
+    }
+
+    let pending = std::mem::take(&mut state.pending_idle_agent_messages);
+    for message in pending {
+        let payload = format_idle_agent_message_payload(&message.payload);
+        eprintln!(
+            "\n  {} {} {}",
+            "mail".cyan(),
+            format!("{} -> main", message.from.agent_id).bold(),
+            payload
+        );
+    }
 }
 
 /// Clear REPL state when the plan update channel closed without `PlanCompleted` / `PlanError`.
@@ -4141,8 +4308,7 @@ async fn run_blocking_plan_monitor(state: &mut ReplState) {
 
     loop {
         // Drain all currently available updates (non-blocking).
-        let outcome =
-            display_plan_updates_live(state, &mut plan_spinner, &mut current_subtask_tag);
+        let outcome = display_plan_updates_live(state, &mut plan_spinner, &mut current_subtask_tag);
 
         sync_plan_run_task_progress(state).await;
 
@@ -4158,11 +4324,7 @@ async fn run_blocking_plan_monitor(state: &mut ReplState) {
         }
 
         // Executor exited without sending PlanCompleted / PlanError (e.g. task panic).
-        if state
-            .plan_handle
-            .as_ref()
-            .is_some_and(|h| h.is_finished())
-        {
+        if state.plan_handle.as_ref().is_some_and(|h| h.is_finished()) {
             cleanup_orphan_plan_executor(state, &mut plan_spinner);
             sync_plan_run_task_progress(state).await;
             if state.plan_run_task_id.is_some() {
@@ -4854,7 +5016,11 @@ async fn handle_task_command(
                 );
                 for t in &tasks {
                     let icon = match t.status {
-                        TaskStatus::Completed if t.items_total > 0 && t.items_done < t.items_total => "△",
+                        TaskStatus::Completed
+                            if t.items_total > 0 && t.items_done < t.items_total =>
+                        {
+                            "△"
+                        }
                         TaskStatus::Completed => "✓",
                         TaskStatus::Failed => "✗",
                         TaskStatus::InProgress => "▶",
@@ -4863,8 +5029,11 @@ async fn handle_task_command(
                     };
                     let short_id = &t.task_id[..8.min(t.task_id.len())];
                     let status_label = match t.status {
-                        TaskStatus::Completed if t.items_total > 0 && t.items_done < t.items_total =>
-                            "partial".to_string(),
+                        TaskStatus::Completed
+                            if t.items_total > 0 && t.items_done < t.items_total =>
+                        {
+                            "partial".to_string()
+                        }
                         _ => t.status.as_str().to_string(),
                     };
                     let progress = if t.items_total > 0 {
@@ -4938,8 +5107,11 @@ async fn handle_task_command(
                         eprintln!("  {:<12} {}", "id:".dim(), t.task_id.cyan());
                         eprintln!("  {:<12} {}", "title:".dim(), t.title);
                         let detail_status_label = match t.status {
-                            TaskStatus::Completed if t.items_total > 0 && t.items_done < t.items_total =>
-                                "partial",
+                            TaskStatus::Completed
+                                if t.items_total > 0 && t.items_done < t.items_total =>
+                            {
+                                "partial"
+                            }
                             _ => t.status.as_str(),
                         };
                         eprintln!("  {:<12} {}", "status:".dim(), detail_status_label.cyan());
@@ -5954,6 +6126,7 @@ async fn run_chat_repl(
 
     // ── Main loop ─────────────────────────────────────────────────────────────
     loop {
+        flush_idle_agent_messages_between_prompts(&mut state);
         let plan_terminal = flush_plan_updates_between_prompts(&mut state);
         sync_plan_run_task_progress(&mut state).await;
         if plan_terminal {
@@ -6005,14 +6178,44 @@ async fn run_chat_repl(
         // to stderr (\r\x1b[2K) while rustyline owns the terminal disrupts cursor tracking
         // for wide (CJK) characters, causing the last character to visually disappear.
         // Plan updates are buffered and flushed between prompts instead.
-        let (readline_result, pending_execute): (Result<String, ReadlineError>, Option<String>) =
-            match readline.recv().await {
-                Some(readline_actor::ReadlineResponse::Line {
-                    result,
-                    pending_execute,
-                }) => (result, pending_execute),
-                None => (Err(ReadlineError::Eof), None),
+        enum PromptWaitOutcome {
+            Readline(Result<String, ReadlineError>, Option<String>),
+            IdleAgentMessage(Option<std::sync::Arc<astra_runtime::messaging::AgentMessage>>),
+        }
+        let (readline_result, pending_execute): (Result<String, ReadlineError>, Option<String>) = loop {
+            let outcome = if let Some(mailbox) = state.root_mailbox.as_ref() {
+                tokio::select! {
+                    result = readline.recv() => match result {
+                        Some(readline_actor::ReadlineResponse::Line { result, pending_execute }) => {
+                            PromptWaitOutcome::Readline(result, pending_execute)
+                        }
+                        None => PromptWaitOutcome::Readline(Err(ReadlineError::Eof), None),
+                    },
+                    message = mailbox.recv() => PromptWaitOutcome::IdleAgentMessage(message),
+                }
+            } else {
+                match readline.recv().await {
+                    Some(readline_actor::ReadlineResponse::Line {
+                        result,
+                        pending_execute,
+                    }) => PromptWaitOutcome::Readline(result, pending_execute),
+                    None => PromptWaitOutcome::Readline(Err(ReadlineError::Eof), None),
+                }
             };
+
+            match outcome {
+                PromptWaitOutcome::Readline(result, pending_execute) => {
+                    break (result, pending_execute);
+                }
+                PromptWaitOutcome::IdleAgentMessage(Some(message)) => {
+                    state.pending_idle_agent_messages.push(message);
+                }
+                PromptWaitOutcome::IdleAgentMessage(None) => {
+                    state.root_mailbox = None;
+                }
+            }
+        };
+        flush_idle_agent_messages_between_prompts(&mut state);
 
         // ── Process readline result ──────────────────────────────────
         match readline_result {
@@ -6098,13 +6301,8 @@ async fn run_chat_repl(
 
                     // If /plan auto triggered execution, start the background executor
                     if state.executing_plan.is_some() && state.plan_mode.is_none() {
-                        start_and_monitor_plan(
-                            &mut state,
-                            current_token.as_deref(),
-                            api,
-                            profile,
-                        )
-                        .await?;
+                        start_and_monitor_plan(&mut state, current_token.as_deref(), api, profile)
+                            .await?;
                     }
                 } else if state.plan_mode.is_some() {
                     // Plan mode: handle input as plan editing
@@ -6122,13 +6320,8 @@ async fn run_chat_repl(
 
                     // If plan execution was just triggered, start the executor (blocking).
                     if state.executing_plan.is_some() {
-                        start_and_monitor_plan(
-                            &mut state,
-                            current_token.as_deref(),
-                            api,
-                            profile,
-                        )
-                        .await?;
+                        start_and_monitor_plan(&mut state, current_token.as_deref(), api, profile)
+                            .await?;
                     } else if state.plan_resume_pending {
                         // Resume was sent to a paused executor — re-enter blocking monitor.
                         state.plan_resume_pending = false;
@@ -6151,13 +6344,8 @@ async fn run_chat_repl(
                         // Re-enter blocking monitor until done/paused/error
                         run_blocking_plan_monitor(&mut state).await;
                     } else {
-                        start_and_monitor_plan(
-                            &mut state,
-                            current_token.as_deref(),
-                            api,
-                            profile,
-                        )
-                        .await?;
+                        start_and_monitor_plan(&mut state, current_token.as_deref(), api, profile)
+                            .await?;
                     }
                 } else {
                     let has_paused_plan =
@@ -7419,15 +7607,14 @@ mod tests {
         let registry = tool_registry::ToolRegistry::new(edge_tools::all_tool_schemas());
         let selector = tool_selector::TfIdfSelector::new(registry);
         let transport = std::sync::Arc::new(astra_runtime::messaging::InProcessTransport::new());
-        let tracker = std::sync::Arc::new(
-            astra_runtime::server::delegation_engine::DelegationTracker::new(),
-        );
+        let tracker =
+            std::sync::Arc::new(astra_runtime::server::delegation_engine::DelegationTracker::new());
         let router = std::sync::Arc::new(astra_runtime::messaging::AgentMailboxRouter::new(
             transport, tracker,
         ));
-        let spawner = std::sync::Arc::new(
-            astra_runtime::orchestration::DynamicAgentSpawner::new(router.clone()),
-        );
+        let spawner = std::sync::Arc::new(astra_runtime::orchestration::DynamicAgentSpawner::new(
+            router.clone(),
+        ));
         let mut root_mailbox = Some(
             router
                 .register(
@@ -7480,10 +7667,52 @@ mod tests {
             .unwrap();
             assert_eq!(result.full_text, "Hello!");
             assert_eq!(
-                root_mailbox.as_ref().map(|mailbox| mailbox.address.run_id.as_str()),
+                root_mailbox
+                    .as_ref()
+                    .map(|mailbox| mailbox.address.run_id.as_str()),
                 Some("persisted-run")
             );
         }
+    }
+
+    #[tokio::test]
+    async fn drain_root_mailbox_into_idle_queue_collects_pending_messages() {
+        let transport = std::sync::Arc::new(astra_runtime::messaging::InProcessTransport::new());
+        let tracker =
+            std::sync::Arc::new(astra_runtime::server::delegation_engine::DelegationTracker::new());
+        let router = std::sync::Arc::new(astra_runtime::messaging::AgentMailboxRouter::new(
+            transport, tracker,
+        ));
+        let root_addr = astra_runtime::messaging::AgentAddress::new("root-run", "main");
+        let worker_addr = astra_runtime::messaging::AgentAddress::new("worker-run", "worker");
+        let root_mailbox = router.register(root_addr.clone(), None).await.unwrap();
+        let worker_mailbox = router.register(worker_addr.clone(), None).await.unwrap();
+        worker_mailbox
+            .send(astra_runtime::messaging::AgentMessage::new(
+                worker_addr,
+                astra_runtime::messaging::MessageTarget::Direct { address: root_addr },
+                astra_runtime::messaging::MessagePayload::Text {
+                    content: "done".to_string(),
+                    summary: Some("worker finished".to_string()),
+                },
+            ))
+            .await
+            .unwrap();
+
+        let mut state = ReplState::default();
+        state.root_mailbox = Some(root_mailbox);
+
+        drain_root_mailbox_into_idle_queue(&mut state);
+
+        assert_eq!(state.pending_idle_agent_messages.len(), 1);
+        assert_eq!(state.pending_idle_agent_messages[0].from.agent_id, "worker");
+        assert!(
+            state
+                .root_mailbox
+                .as_mut()
+                .and_then(|mailbox| mailbox.try_recv())
+                .is_none()
+        );
     }
 
     #[tokio::test]
