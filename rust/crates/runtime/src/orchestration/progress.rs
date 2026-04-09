@@ -163,4 +163,81 @@ mod tests {
         assert_eq!(event.agent_id, "test-agent");
         assert!(matches!(event.event_type, ProgressEventType::Started { .. }));
     }
+
+    #[tokio::test]
+    async fn test_all_event_types() {
+        let broadcaster = Arc::new(ProgressBroadcaster::default());
+        let mut rx = broadcaster.subscribe();
+
+        let emitter = broadcaster.for_agent("agent-1".to_string());
+
+        // Emit all event types
+        emitter.started("task description");
+        emitter.turn_completed(1, 3, "reading files");
+        emitter.busy("processing data");
+        emitter.idle();
+        emitter.completed("done", 10, (1000, 500), 5000);
+
+        // Verify all events received
+        let e1 = rx.recv().await.unwrap();
+        assert!(matches!(e1.event_type, ProgressEventType::Started { description } if description == "task description"));
+
+        let e2 = rx.recv().await.unwrap();
+        assert!(matches!(e2.event_type, ProgressEventType::TurnCompleted { turn: 1, tool_calls_this_turn: 3, .. }));
+
+        let e3 = rx.recv().await.unwrap();
+        assert!(matches!(e3.event_type, ProgressEventType::Busy { .. }));
+
+        let e4 = rx.recv().await.unwrap();
+        assert!(matches!(e4.event_type, ProgressEventType::Idle));
+
+        let e5 = rx.recv().await.unwrap();
+        assert!(matches!(e5.event_type, ProgressEventType::Completed { total_tool_calls: 10, duration_ms: 5000, .. }));
+    }
+
+    #[tokio::test]
+    async fn test_failed_and_cancelled_events() {
+        let broadcaster = Arc::new(ProgressBroadcaster::default());
+        let mut rx = broadcaster.subscribe();
+
+        let emitter = broadcaster.for_agent("agent-2".to_string());
+
+        emitter.failed("connection timeout");
+        let e1 = rx.recv().await.unwrap();
+        assert!(matches!(e1.event_type, ProgressEventType::Failed { error } if error == "connection timeout"));
+
+        let emitter2 = broadcaster.for_agent("agent-3".to_string());
+        emitter2.cancelled("user request");
+        let e2 = rx.recv().await.unwrap();
+        assert_eq!(e2.agent_id, "agent-3");
+        assert!(matches!(e2.event_type, ProgressEventType::Cancelled { reason } if reason == "user request"));
+    }
+
+    #[tokio::test]
+    async fn test_multiple_subscribers() {
+        let broadcaster = Arc::new(ProgressBroadcaster::default());
+        let mut rx1 = broadcaster.subscribe();
+        let mut rx2 = broadcaster.subscribe();
+
+        let emitter = broadcaster.for_agent("shared-agent".to_string());
+        emitter.started("shared task");
+
+        // Both subscribers receive the event
+        let e1 = rx1.recv().await.unwrap();
+        let e2 = rx2.recv().await.unwrap();
+
+        assert_eq!(e1.agent_id, e2.agent_id);
+        assert_eq!(e1.timestamp_epoch_ms, e2.timestamp_epoch_ms);
+    }
+
+    #[test]
+    fn test_no_panic_when_no_subscribers() {
+        let broadcaster = Arc::new(ProgressBroadcaster::default());
+        let emitter = broadcaster.for_agent("orphan-agent".to_string());
+
+        // Should not panic even without subscribers
+        emitter.started("no one listening");
+        emitter.turn_completed(1, 5, "working");
+        emitter.completed("finished", 5, (100, 50), 1000);
+    }
 }
