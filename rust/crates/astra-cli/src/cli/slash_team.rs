@@ -708,14 +708,24 @@ pub(super) async fn handle_team_command(
             let cancel_token = Arc::new(tokio_util::sync::CancellationToken::new());
             let project_root =
                 std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            let token = match crate::current_access_token(profile) {
+                Some(t) => t,
+                None => {
+                    eprintln!("  {} Not logged in", theme::icon_err());
+                    return;
+                }
+            };
+            let (progress_tx, mut progress_rx) =
+                tokio::sync::mpsc::unbounded_channel::<super::skill_subrun::SubRunProgressEvent>();
             let executor = super::delegate_subrun::CliDelegateSubRunExecutor::new(
                 api.clone(),
-                crate::current_access_token(profile).unwrap_or_default(),
+                token,
                 state.model.clone(),
                 project_root.clone(),
                 state.perm_manager.mode(),
                 Some(cancel_token.clone()),
-            );
+            )
+            .with_progress_tx(progress_tx);
             let mut profile_registry =
                 astra_services::coordination::AgentProfileRegistry::new();
             super::delegate_subrun::register_default_agents(&mut profile_registry);
@@ -824,13 +834,32 @@ pub(super) async fn handle_team_command(
             let started_at = chrono::Utc::now().to_rfc3339();
             let timer = Instant::now();
 
-            // Elapsed-time ticker so the user sees activity during long phases
-            let ticker_cancel = cancel_token.clone();
-            let ticker = tokio::spawn(async move {
-                let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+            // Progress renderer: shows elapsed time + live sub-agent tool events
+            let render_cancel = cancel_token.clone();
+            let progress_renderer = tokio::spawn(async move {
+                use astra_runtime::turn::agentic_headless_round::HeadlessStderrStyle;
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
                 interval.tick().await; // skip first immediate tick
                 loop {
                     tokio::select! {
+                        biased;
+                        Some(evt) = progress_rx.recv() => {
+                            let prefix = if evt.agent_id.is_empty() {
+                                String::new()
+                            } else {
+                                format!("  {} ", evt.agent_id.cyan())
+                            };
+                            match evt.style {
+                                HeadlessStderrStyle::Green =>
+                                    eprintln!("{}{}", prefix, evt.line.green()),
+                                HeadlessStderrStyle::Red =>
+                                    eprintln!("{}{}", prefix, evt.line.red()),
+                                HeadlessStderrStyle::Yellow =>
+                                    eprintln!("{}{}", prefix, evt.line.yellow()),
+                                _ =>
+                                    eprintln!("{}{}", prefix, evt.line.dim()),
+                            }
+                        }
                         _ = interval.tick() => {
                             let elapsed = timer.elapsed();
                             eprint!(
@@ -839,28 +868,26 @@ pub(super) async fn handle_team_command(
                                 format!("running… {}", format_duration(elapsed)).dim()
                             );
                         }
-                        _ = ticker_cancel.cancelled() => break,
+                        _ = render_cancel.cancelled() => break,
                     }
                 }
             });
 
             let repo_root = std::env::current_dir().ok();
-            let cancel_for_signal = cancel_token.clone();
             let report = tokio::select! {
                 report = orchestrator.execute_team(team_name, task, repo_root) => report,
                 _ = tokio::signal::ctrl_c() => {
-                    cancel_for_signal.cancel();
+                    cancel_token.cancel();
                     eprintln!("\n  {} Interrupting team run...", "⚠️ ".yellow());
                     // Give sub-runs a moment to notice cancellation
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                     eprintln!("  {} Team run interrupted.", theme::icon_err());
-                    cancel_token.cancel();
-                    ticker.abort();
+                    progress_renderer.abort();
                     return;
                 }
             };
             cancel_token.cancel();
-            ticker.abort();
+            progress_renderer.abort();
             // Clear the ticker line
             eprint!("\r{}\r", " ".repeat(60));
             let elapsed = timer.elapsed();

@@ -64,6 +64,20 @@ pub(crate) struct SubRunHost {
     /// Same resolver as the parent loop so `skill` tool calls during the SSE edge
     /// round resolve (nested skills run inline — sub-run has no `skill_executor`).
     pub(crate) skill_resolver: Option<Arc<dyn astra_runtime::turn::skill_tool::SkillResolver>>,
+    /// When set, headless tool-round status lines are forwarded through this
+    /// channel instead of being silently dropped. The receiver (e.g. `/team run`)
+    /// renders them with an agent-id prefix.
+    pub(crate) progress_tx: Option<tokio::sync::mpsc::UnboundedSender<SubRunProgressEvent>>,
+    /// Agent identifier used to tag progress events.
+    pub(crate) agent_id: String,
+}
+
+/// A progress event emitted by a sub-run agent.
+#[derive(Debug, Clone)]
+pub(crate) struct SubRunProgressEvent {
+    pub agent_id: String,
+    pub style: HeadlessStderrStyle,
+    pub line: String,
 }
 
 pub(crate) fn persist_failed_subrun(state: &mut AgenticLoopState, error: &str) -> String {
@@ -220,12 +234,18 @@ impl AgenticLoopHost for SubRunHost {
         })
     }
 
-    fn emit_headless_line(&mut self, _style: HeadlessStderrStyle, _line: String) {
-        // Sub-runs are completely silent.
+    fn emit_headless_line(&mut self, style: HeadlessStderrStyle, line: String) {
+        if let Some(ref tx) = self.progress_tx {
+            let _ = tx.send(SubRunProgressEvent {
+                agent_id: self.agent_id.clone(),
+                style,
+                line,
+            });
+        }
     }
 
     fn is_quiet(&self) -> bool {
-        true
+        self.progress_tx.is_none()
     }
 
     fn valid_tool_names(&self) -> &HashSet<String> {
@@ -352,6 +372,8 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             agent_type: agent_type.map(String::from),
             cancel_token: self.cancel_token.clone(),
             skill_resolver: self.skill_resolver.clone(),
+            progress_tx: None,
+            agent_id: String::new(),
         };
 
         let messages = vec![
@@ -521,7 +543,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn subrun_host_is_quiet() {
+    fn subrun_host_is_quiet_without_progress() {
         let root = PathBuf::from(".");
         let host = SubRunHost {
             api: astra_thin_client::ThinClient::new("http://unused", None).unwrap(),
@@ -537,8 +559,34 @@ mod tests {
             agent_type: None,
             cancel_token: None,
             skill_resolver: None,
+            progress_tx: None,
+            agent_id: String::new(),
         };
         assert!(host.is_quiet());
+    }
+
+    #[test]
+    fn subrun_host_not_quiet_with_progress() {
+        let root = PathBuf::from(".");
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let host = SubRunHost {
+            api: astra_thin_client::ThinClient::new("http://unused", None).unwrap(),
+            token: String::new(),
+            model: None,
+            project_root: root.clone(),
+            executor: edge_tools::ToolExecutor::new(&root),
+            all_schemas: Vec::new(),
+            valid_tool_names: HashSet::new(),
+            perm_manager: PermissionManager::with_project(true, &root),
+            max_completion_tokens: None,
+            effort: None,
+            agent_type: None,
+            cancel_token: None,
+            skill_resolver: None,
+            progress_tx: Some(tx),
+            agent_id: "test-agent".to_string(),
+        };
+        assert!(!host.is_quiet());
     }
 
     #[test]
@@ -558,6 +606,8 @@ mod tests {
             agent_type: None,
             cancel_token: None,
             skill_resolver: None,
+            progress_tx: None,
+            agent_id: String::new(),
         };
         let schema = json!({
             "type": "function",

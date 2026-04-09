@@ -101,6 +101,7 @@ pub(crate) struct CliDelegateSubRunExecutor {
     cancel_token: Option<Arc<tokio_util::sync::CancellationToken>>,
     skill_resolver: Option<Arc<dyn astra_runtime::turn::skill_tool::SkillResolver>>,
     skill_search: SkillSearchSettings,
+    progress_tx: Option<tokio::sync::mpsc::UnboundedSender<super::skill_subrun::SubRunProgressEvent>>,
 }
 
 impl CliDelegateSubRunExecutor {
@@ -121,6 +122,7 @@ impl CliDelegateSubRunExecutor {
             cancel_token,
             skill_resolver: None,
             skill_search: SkillSearchSettings::default(),
+            progress_tx: None,
         }
     }
 
@@ -134,6 +136,14 @@ impl CliDelegateSubRunExecutor {
 
     pub fn with_skill_search(mut self, skill_search: SkillSearchSettings) -> Self {
         self.skill_search = skill_search;
+        self
+    }
+
+    pub fn with_progress_tx(
+        mut self,
+        tx: tokio::sync::mpsc::UnboundedSender<super::skill_subrun::SubRunProgressEvent>,
+    ) -> Self {
+        self.progress_tx = Some(tx);
         self
     }
 }
@@ -181,6 +191,8 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             agent_type: None,
             cancel_token: self.cancel_token.clone(),
             skill_resolver: self.skill_resolver.clone(),
+            progress_tx: self.progress_tx.clone(),
+            agent_id: profile.agent_id.clone(),
         };
 
         // Build system message from agent profile

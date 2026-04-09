@@ -111,6 +111,8 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             agent_type: Some(config.agent_type.clone()),
             cancel_token: self.cancel_token.clone(),
             skill_resolver: self.skill_resolver.clone(),
+            progress_tx: None,
+            agent_id: config.agent_id.clone(),
         };
 
         // Build system message from agent type definition
