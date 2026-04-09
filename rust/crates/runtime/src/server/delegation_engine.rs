@@ -2964,4 +2964,158 @@ mod tests {
         assert!(outputs.iter().any(|o| o.contains("is_fork=true,idx=0")));
         assert!(outputs.iter().any(|o| o.contains("is_fork=true,idx=1")));
     }
+
+    // ── Tracker: get_children ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn tracker_get_children_returns_child_run_ids() {
+        let tracker = DelegationTracker::new();
+        tracker
+            .record_sub_run(SubRunRecord {
+                run_id: "child-1".into(),
+                parent_run_id: "parent-X".into(),
+                delegation_id: "del-1".into(),
+                agent_id: "coder".into(),
+                depth: 1,
+            })
+            .await;
+        tracker
+            .record_sub_run(SubRunRecord {
+                run_id: "child-2".into(),
+                parent_run_id: "parent-X".into(),
+                delegation_id: "del-1".into(),
+                agent_id: "reviewer".into(),
+                depth: 1,
+            })
+            .await;
+        tracker
+            .record_sub_run(SubRunRecord {
+                run_id: "other-child".into(),
+                parent_run_id: "parent-Y".into(),
+                delegation_id: "del-2".into(),
+                agent_id: "writer".into(),
+                depth: 1,
+            })
+            .await;
+
+        let mut children = tracker.get_children("parent-X").await;
+        children.sort();
+        assert_eq!(children, vec!["child-1", "child-2"]);
+
+        let children_y = tracker.get_children("parent-Y").await;
+        assert_eq!(children_y, vec!["other-child"]);
+
+        let none = tracker.get_children("nonexistent").await;
+        assert!(none.is_empty());
+    }
+
+    // ── Tracker: individual pause_sub_run / resume_sub_run ──────────────────
+
+    #[tokio::test]
+    async fn pause_and_resume_individual_sub_run() {
+        let tracker = DelegationTracker::new();
+        let flag = tracker.register_pause_flag("run-1").await;
+
+        assert!(!flag.load(Ordering::Relaxed));
+        assert!(!tracker.is_paused("run-1").await);
+
+        // Pause individual sub-run
+        assert!(tracker.pause_sub_run("run-1").await);
+        assert!(flag.load(Ordering::Relaxed));
+        assert!(tracker.is_paused("run-1").await);
+
+        // Resume individual sub-run
+        assert!(tracker.resume_sub_run("run-1").await);
+        assert!(!flag.load(Ordering::Relaxed));
+        assert!(!tracker.is_paused("run-1").await);
+
+        // Pause/resume unknown run returns false
+        assert!(!tracker.pause_sub_run("unknown").await);
+        assert!(!tracker.resume_sub_run("unknown").await);
+    }
+
+    // ── Fan-out: all agents fail ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn fan_out_all_agents_fail() {
+        let (reg, engine, tracker) = setup();
+        let failing = Arc::new(FailingExecutor {
+            fail_agents: vec!["coder".into(), "reviewer".into()],
+        });
+        let de = DelegationEngine::with_executor(reg, engine, tracker, failing);
+
+        let req = fan_out_request(vec!["coder", "reviewer"]);
+        let result = de.execute(req, "orch").await.unwrap();
+
+        // All results should be failed
+        assert_eq!(result.agent_results.len(), 2);
+        for r in &result.agent_results {
+            assert_eq!(r.status, "failed");
+            assert!(r.error.is_some());
+        }
+    }
+
+    // ── Executor hard error (Err) vs soft fail (Ok with failed status) ──────
+
+    #[tokio::test]
+    async fn executor_hard_error_captured_as_failed_result() {
+        /// Executor that returns Err (panic-like failure, not just failed status).
+        struct HardErrorExecutor;
+
+        #[async_trait]
+        impl SubRunExecutor for HardErrorExecutor {
+            async fn execute(&self, config: SubRunConfig) -> Result<AgentResult, String> {
+                Err(format!("executor crashed for {}", config.agent_profile.agent_id))
+            }
+        }
+
+        let (reg, engine, tracker) = setup();
+        let de = DelegationEngine::with_executor(
+            reg, engine, tracker, Arc::new(HardErrorExecutor),
+        );
+
+        let req = fan_out_request(vec!["coder"]);
+        let result = de.execute(req, "orch").await.unwrap();
+
+        // Hard errors should be captured as failed agent results, not propagated
+        assert_eq!(result.agent_results.len(), 1);
+        assert_eq!(result.agent_results[0].status, "failed");
+        assert!(result.agent_results[0].error.as_ref().unwrap().contains("crashed"));
+    }
+
+    // ── Sequential: output chaining across stages ───────────────────────────
+
+    #[tokio::test]
+    async fn sequential_output_chaining_verified() {
+        let (reg, engine, tracker) = setup();
+        let de = DelegationEngine::with_executor(
+            reg, engine, tracker, Arc::new(EchoExecutor),
+        );
+
+        let req = DelegationRequest {
+            delegation_id: "del-seq-chain".into(),
+            parent_run_id: "p1".into(),
+            task: "chained task".into(),
+            pattern: CoordinationPattern::Sequential {
+                agent_ids: vec!["coder".into(), "reviewer".into(), "writer".into()],
+                stop_on_success: false,
+            },
+            user_id: "u".into(),
+            depth: 0,
+            context: HashMap::new(),
+        };
+
+        let result = de.execute(req, "orch").await.unwrap();
+        assert_eq!(result.agent_results.len(), 3);
+
+        // Each stage receives previous output
+        let out0 = result.agent_results[0].output.as_ref().unwrap();
+        assert!(out0.contains("[coder]"), "first stage should run");
+
+        let out1 = result.agent_results[1].output.as_ref().unwrap();
+        assert!(out1.contains("prev="), "second stage should receive prev output");
+
+        let out2 = result.agent_results[2].output.as_ref().unwrap();
+        assert!(out2.contains("prev="), "third stage should receive prev output");
+    }
 }
