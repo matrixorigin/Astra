@@ -9,6 +9,7 @@ pub mod permission_sync;
 mod progress;
 mod spawner;
 mod spawn_tool;
+pub mod team_config;
 
 pub use builtin_agents::{
     AgentTypeDefinition, BuiltinAgentType, get_builtin_agent_types, get_agent_type_definition,
@@ -26,7 +27,8 @@ pub use progress::{AgentProgressEvent, ProgressEventType, ProgressBroadcaster, A
 pub use spawner::{
     DynamicAgentSpawner, SpawnContext, SpawnedAgentState, SpawnedAgentInfo, AgentStatus,
     SpawnedAgentMetrics, SpawnError, SpawnAgentExecutor, SpawnRunConfig, SpawnRunResult,
-    PermissionSummary,
+    PermissionSummary, AgentHistoryRecord,
 };
 pub use spawn_tool::{SpawnAgentInput, SpawnAgentOutput, spawn_agent_schema};
+pub use team_config::AgentRegistry;
 

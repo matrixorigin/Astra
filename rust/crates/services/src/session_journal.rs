@@ -659,6 +659,9 @@ pub enum JournalEventType {
     PlanEdit,
     /// Plan lifecycle event (created, completed, abandoned, replanned).
     PlanLifecycle,
+    /// Agent terminated — spawned agent completed, failed, or was cancelled.
+    /// Persists final metrics and state for historical queries.
+    AgentTerminated,
 }
 
 /// Writer that appends events to a session journal file.
@@ -1217,6 +1220,12 @@ impl JournalEvent {
         }
     }
 
+    /// Create a minimal event with just event type and session ID.
+    /// Public variant of `base()` for use by external crates.
+    pub fn base_public(event_type: JournalEventType, session_id: Option<&str>) -> Self {
+        Self::base(event_type, session_id)
+    }
+
     /// Session start event.
     pub fn session_start(session_id: Option<&str>, model: Option<&str>) -> Self {
         let mut evt = Self::base(JournalEventType::SessionStart, session_id);
@@ -1703,6 +1712,34 @@ impl JournalEvent {
             "succeeded": succeeded,
             "failed": failed,
             "aggregated_status": aggregated_status,
+        }));
+        evt
+    }
+
+    /// Agent terminated event — persists final state of a spawned agent.
+    pub fn agent_terminated(
+        session_id: Option<&str>,
+        agent_id: &str,
+        run_id: &str,
+        agent_type: &str,
+        status: &str,
+        turns_completed: u32,
+        tool_calls: u32,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+        duration_ms: u64,
+    ) -> Self {
+        let mut evt = Self::base(JournalEventType::AgentTerminated, session_id);
+        evt.metadata = Some(serde_json::json!({
+            "agent_id": agent_id,
+            "run_id": run_id,
+            "agent_type": agent_type,
+            "status": status,
+            "turns_completed": turns_completed,
+            "tool_calls": tool_calls,
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "duration_ms": duration_ms,
         }));
         evt
     }

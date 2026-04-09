@@ -219,11 +219,16 @@ pub use introspection::{
 // ── Re-exports: server ───────────────────────────────────────────────────────
 
 pub use server::delegation_engine::{
-    CheckpointGate, DelegationEngine, DelegationTracker, GateVerdict, VerificationGate,
+    CheckpointGate, DefaultQualityGate, DelegationEngine, DelegationTracker, GateVerdict,
+    QualityThresholds, VerificationGate,
 };
 pub use server::run_engine::RunEngine;
 pub use server::run_lifecycle::AgenticRunLifecycleService;
 pub use server::{build_app, build_server_state, serve};
+
+// ── Re-exports: orchestration ────────────────────────────────────────────────
+
+pub use orchestration::{AgentHistoryRecord, AgentRegistry};
 
 // ── Re-exports: turn engine ──────────────────────────────────────────────────
 

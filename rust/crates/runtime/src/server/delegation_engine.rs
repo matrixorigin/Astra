@@ -150,6 +150,155 @@ pub trait VerificationGate: Send + Sync {
     }
 }
 
+// ─── Default Quality Gate ────────────────────────────────────────────────────
+
+/// Configurable thresholds for [`DefaultQualityGate`].
+#[derive(Debug, Clone)]
+pub struct QualityThresholds {
+    /// Minimum output length (chars). Default: 10.
+    pub min_output_len: usize,
+    /// Maximum output length (chars). Default: 50_000.
+    pub max_output_len: usize,
+    /// Maximum ratio of repeated lines to total lines (0.0–1.0). Default: 0.5.
+    pub max_repetition_ratio: f64,
+    /// Maximum number of retries. Default: 2.
+    pub max_retries: u32,
+}
+
+impl Default for QualityThresholds {
+    fn default() -> Self {
+        Self {
+            min_output_len: 10,
+            max_output_len: 50_000,
+            max_repetition_ratio: 0.5,
+            max_retries: 2,
+        }
+    }
+}
+
+/// Production-ready verification gate with configurable heuristic checks.
+///
+/// Validates sub-run output quality:
+/// - **Length bounds**: rejects empty/trivial or excessively long output
+/// - **Repetition detection**: rejects output with >50% repeated lines (loop/garbage)
+/// - **Error pattern detection**: rejects output dominated by error messages
+pub struct DefaultQualityGate {
+    thresholds: QualityThresholds,
+}
+
+impl DefaultQualityGate {
+    pub fn new() -> Self {
+        Self {
+            thresholds: QualityThresholds::default(),
+        }
+    }
+
+    pub fn with_thresholds(thresholds: QualityThresholds) -> Self {
+        Self { thresholds }
+    }
+}
+
+impl Default for DefaultQualityGate {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl VerificationGate for DefaultQualityGate {
+    async fn verify(
+        &self,
+        result: &AgentResult,
+        _delegation_id: &str,
+        _attempt: u32,
+    ) -> GateVerdict {
+        let output: &str = result.output.as_deref().unwrap_or("");
+
+        // Check minimum length
+        let trimmed_len = output.trim().len();
+        if trimmed_len < self.thresholds.min_output_len {
+            return GateVerdict::Fail {
+                reason: format!(
+                    "output too short ({} chars, minimum {})",
+                    trimmed_len, self.thresholds.min_output_len
+                ),
+                details: Some(serde_json::json!({
+                    "check": "min_length",
+                    "actual": trimmed_len,
+                    "threshold": self.thresholds.min_output_len
+                })),
+            };
+        }
+
+        // Check maximum length
+        if output.len() > self.thresholds.max_output_len {
+            return GateVerdict::Fail {
+                reason: format!(
+                    "output too long ({} chars, maximum {})",
+                    output.len(),
+                    self.thresholds.max_output_len
+                ),
+                details: Some(serde_json::json!({
+                    "check": "max_length",
+                    "actual": output.len(),
+                    "threshold": self.thresholds.max_output_len
+                })),
+            };
+        }
+
+        // Repetition detection: count unique vs total non-empty lines
+        let lines: Vec<&str> = output.lines().filter(|l| !l.trim().is_empty()).collect();
+        if lines.len() >= 4 {
+            let unique: std::collections::HashSet<&str> = lines.iter().copied().collect();
+            let repetition_ratio = 1.0 - (unique.len() as f64 / lines.len() as f64);
+            if repetition_ratio > self.thresholds.max_repetition_ratio {
+                return GateVerdict::Fail {
+                    reason: format!(
+                        "excessive repetition ({:.0}% repeated lines)",
+                        repetition_ratio * 100.0
+                    ),
+                    details: Some(serde_json::json!({
+                        "check": "repetition",
+                        "total_lines": lines.len(),
+                        "unique_lines": unique.len(),
+                        "ratio": repetition_ratio
+                    })),
+                };
+            }
+        }
+
+        // Error pattern detection: if >60% of lines are error-like, flag it
+        if lines.len() >= 3 {
+            let error_patterns = ["error:", "Error:", "ERROR", "panic", "FAILED", "fatal:"];
+            let error_lines = lines
+                .iter()
+                .filter(|l| error_patterns.iter().any(|p| l.contains(p)))
+                .count();
+            let error_ratio = error_lines as f64 / lines.len() as f64;
+            if error_ratio > 0.6 {
+                return GateVerdict::Fail {
+                    reason: format!(
+                        "output dominated by errors ({:.0}% error lines)",
+                        error_ratio * 100.0
+                    ),
+                    details: Some(serde_json::json!({
+                        "check": "error_dominated",
+                        "error_lines": error_lines,
+                        "total_lines": lines.len(),
+                        "ratio": error_ratio
+                    })),
+                };
+            }
+        }
+
+        GateVerdict::Pass
+    }
+
+    fn max_retries(&self) -> u32 {
+        self.thresholds.max_retries
+    }
+}
+
 // ─── Checkpoint Gate (Mid-Execution Fail-Fast) ──────────────────────────────
 
 /// Mid-execution checkpoint gate — checked between turns during a sub-run.
@@ -199,7 +348,7 @@ pub struct SubRunRecord {
 
 /// In-memory tracker for delegation hierarchies and pause state.
 ///
-/// Hierarchy is currently tracked in-memory only.
+/// Optionally persists state changes to a session journal for crash recovery.
 pub struct DelegationTracker {
     /// delegation_id → sub-run records
     delegations: RwLock<HashMap<String, Vec<SubRunRecord>>>,
@@ -207,6 +356,8 @@ pub struct DelegationTracker {
     parents: RwLock<HashMap<String, String>>,
     /// run_id → cooperative pause flag (shared with the sub-run's loop)
     pause_flags: RwLock<HashMap<String, Arc<AtomicBool>>>,
+    /// Optional session ID for journal persistence.
+    session_id: Option<String>,
 }
 
 impl DelegationTracker {
@@ -215,7 +366,33 @@ impl DelegationTracker {
             delegations: RwLock::new(HashMap::new()),
             parents: RwLock::new(HashMap::new()),
             pause_flags: RwLock::new(HashMap::new()),
+            session_id: None,
         }
+    }
+
+    /// Create a tracker with journal persistence enabled.
+    pub fn with_session(session_id: String) -> Self {
+        Self {
+            delegations: RwLock::new(HashMap::new()),
+            parents: RwLock::new(HashMap::new()),
+            pause_flags: RwLock::new(HashMap::new()),
+            session_id: Some(session_id),
+        }
+    }
+
+    /// Persist a delegation event to the session journal (best-effort).
+    fn persist_event(&self, event_type: astra_services::session_journal::JournalEventType, metadata: serde_json::Value) {
+        let Some(ref sid) = self.session_id else { return };
+        let writer = match astra_services::session_journal::JournalWriter::new(sid) {
+            Ok(w) => w,
+            Err(_) => return,
+        };
+        let mut event = astra_services::session_journal::JournalEvent::base_public(
+            event_type,
+            Some(sid.as_str()),
+        );
+        event.metadata = Some(metadata);
+        let _ = writer.append(&event);
     }
 
     /// Rebuild in-memory hierarchy from durable run records.
@@ -256,11 +433,23 @@ impl DelegationTracker {
         }
     }
 
-    /// Record a sub-run spawned by a delegation.
+    /// Record a sub-run spawned by a delegation, persisting to journal if configured.
     pub async fn record_sub_run(&self, record: SubRunRecord) {
         let run_id = record.run_id.clone();
         let parent_id = record.parent_run_id.clone();
         let delegation_id = record.delegation_id.clone();
+
+        // Persist to journal before updating in-memory state
+        self.persist_event(
+            astra_services::session_journal::JournalEventType::DelegationStarted,
+            serde_json::json!({
+                "delegation_id": &delegation_id,
+                "run_id": &run_id,
+                "parent_run_id": &parent_id,
+                "agent_id": &record.agent_id,
+                "depth": record.depth,
+            }),
+        );
 
         self.delegations
             .write()
@@ -363,6 +552,10 @@ impl DelegationTracker {
     pub async fn pause_sub_run(&self, run_id: &str) -> bool {
         if let Some(flag) = self.pause_flags.read().await.get(run_id) {
             flag.store(true, Ordering::SeqCst);
+            self.persist_event(
+                astra_services::session_journal::JournalEventType::SyncMarker,
+                serde_json::json!({ "action": "pause", "run_id": run_id }),
+            );
             true
         } else {
             false
@@ -374,6 +567,10 @@ impl DelegationTracker {
     pub async fn resume_sub_run(&self, run_id: &str) -> bool {
         if let Some(flag) = self.pause_flags.read().await.get(run_id) {
             flag.store(false, Ordering::SeqCst);
+            self.persist_event(
+                astra_services::session_journal::JournalEventType::SyncMarker,
+                serde_json::json!({ "action": "resume", "run_id": run_id }),
+            );
             true
         } else {
             false

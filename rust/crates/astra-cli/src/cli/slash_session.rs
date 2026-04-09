@@ -768,6 +768,34 @@ pub(super) fn handle_session_command(arg: &str, state: &mut ReplState) {
                                     failed,
                                 );
                             }
+                            session_journal::JournalEventType::AgentTerminated => {
+                                let m = evt.metadata.as_ref();
+                                let agent = m
+                                    .and_then(|x| x.get("agent_id"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("?");
+                                let run = m
+                                    .and_then(|x| x.get("run_id"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("?");
+                                let status = m
+                                    .and_then(|x| x.get("status"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("?");
+                                let turns = m
+                                    .and_then(|x| x.get("turns_completed"))
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0);
+                                eprintln!(
+                                    "  {} {} agent {} run {} → {} ({} turns)",
+                                    ts_short.dim(),
+                                    "⌁".dim(),
+                                    agent.dim(),
+                                    run.dim(),
+                                    status.cyan(),
+                                    turns,
+                                );
+                            }
                             session_journal::JournalEventType::VerificationCompleted => {
                                 let scope = evt
                                     .metadata

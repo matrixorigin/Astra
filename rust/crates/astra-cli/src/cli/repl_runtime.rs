@@ -362,9 +362,28 @@ pub(super) async fn check_server_has_models(
     true
 }
 
+/// Outcome of `try_refresh_token` for deciding whether on-disk credentials may still be valid.
+enum SilentRefreshError {
+    Thin(astra_thin_client::ThinClientError),
+    /// HTTP 200 body was not usable; keep existing tokens.
+    BadResponse(&'static str),
+    /// New tokens could not be written; do not clear the file.
+    SaveFailed(String),
+}
+
+impl SilentRefreshError {
+    fn keep_credentials(&self) -> bool {
+        match self {
+            SilentRefreshError::Thin(e) => should_keep_credentials_on_refresh_error(e),
+            SilentRefreshError::BadResponse(_) | SilentRefreshError::SaveFailed(_) => true,
+        }
+    }
+}
+
 /// Best-effort silent auth: validate existing token or try refresh.
 /// Never blocks or prompts — just ensures credentials are fresh if possible.
-/// Clears stale credentials when the server rejects them.
+/// Clears credentials only when the server definitively rejects auth (after handling
+/// refresh-token rotation races — see `recover_credentials_after_refresh_race`).
 pub(super) async fn try_silent_auth(api: &astra_thin_client::ThinClient, profile: Option<&str>) {
     let creds = load_credentials();
     let name = profile_name(profile, &creds);
@@ -386,15 +405,29 @@ pub(super) async fn try_silent_auth(api: &astra_thin_client::ThinClient, profile
         return;
     }
 
-    // Try refresh_token first
-    if let Some(refresh) = prof.and_then(|p| p.refresh_token.as_ref())
-        && try_refresh_token(api, profile, refresh).await.is_ok()
-    {
-        eprintln!("  {} Token refreshed", theme::icon_ok());
+    let Some(refresh) = prof.and_then(|p| p.refresh_token.as_ref()) else {
         return;
+    };
+    let refresh_str = refresh.as_str();
+
+    match try_refresh_token(api, profile, refresh_str).await {
+        Ok(()) => {
+            eprintln!("  {} Token refreshed", theme::icon_ok());
+            return;
+        }
+        Err(err) => {
+            // Do not wipe local creds on transport failures, 5xx, or malformed JSON —
+            // the access/refresh pair on disk may still be valid.
+            if err.keep_credentials() {
+                return;
+            }
+            // Another CLI may have won refresh first (server revokes old refresh on success).
+            if recover_credentials_after_refresh_race(api, profile, refresh_str).await {
+                return;
+            }
+        }
     }
 
-    // Refresh failed or no refresh token — clear stale credentials
     let mut creds = load_credentials();
     let name = profile_name(profile, &creds);
     if let Some(p) = creds.profiles.get_mut(&name) {
@@ -404,31 +437,76 @@ pub(super) async fn try_silent_auth(api: &astra_thin_client::ThinClient, profile
     let _ = save_credentials(&creds);
 }
 
+fn should_keep_credentials_on_refresh_error(err: &astra_thin_client::ThinClientError) -> bool {
+    match err {
+        astra_thin_client::ThinClientError::Http(_) => true,
+        astra_thin_client::ThinClientError::Json(_) => true,
+        astra_thin_client::ThinClientError::Api { status, .. } => status.is_server_error(),
+        _ => false,
+    }
+}
+
+/// After `POST /auth/refresh` fails with 4xx, re-read credentials: another process may have
+/// rotated the refresh token and saved new tokens while we still held the old refresh value.
+async fn recover_credentials_after_refresh_race(
+    api: &astra_thin_client::ThinClient,
+    profile: Option<&str>,
+    attempted_refresh: &str,
+) -> bool {
+    let creds = load_credentials();
+    let name = profile_name(profile, &creds);
+    let Some(prof) = creds.profiles.get(&name) else {
+        return false;
+    };
+    if let Some(tok) = prof.access_token.as_ref() {
+        if let Ok(resp) = api
+            .get_auth_me_text_timeout(tok, std::time::Duration::from_secs(3))
+            .await
+            && resp.status().is_success()
+        {
+            return true;
+        }
+    }
+    if let Some(r) = prof.refresh_token.as_ref()
+        && r.as_str() != attempted_refresh
+        && try_refresh_token(api, profile, r.as_str()).await.is_ok()
+    {
+        eprintln!("  {} Token refreshed", theme::icon_ok());
+        return true;
+    }
+    false
+}
+
 /// Try to refresh an expired access token using the stored refresh_token.
 async fn try_refresh_token(
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
     refresh_token: &str,
-) -> Result<(), String> {
+) -> Result<(), SilentRefreshError> {
     let body = api
         .post_auth_refresh_json(&serde_json::json!({ "refresh_token": refresh_token }))
         .await
-        .map_err(|e| e.to_string())?;
-    let value: serde_json::Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
+        .map_err(SilentRefreshError::Thin)?;
+    let value: serde_json::Value =
+        serde_json::from_str(&body).map_err(|e| SilentRefreshError::Thin(e.into()))?;
     let new_access = value
         .get("access_token")
         .and_then(|v| v.as_str())
-        .ok_or("missing access_token")?;
+        .ok_or(SilentRefreshError::BadResponse(
+            "refresh response: missing access_token",
+        ))?;
     let new_refresh = value
         .get("refresh_token")
         .and_then(|v| v.as_str())
-        .ok_or("missing refresh_token")?;
+        .ok_or(SilentRefreshError::BadResponse(
+            "refresh response: missing refresh_token",
+        ))?;
     let mut creds = load_credentials();
     let name = profile_name(profile, &creds);
     let entry = creds.profiles.entry(name).or_default();
     entry.access_token = Some(new_access.to_string());
     entry.refresh_token = Some(new_refresh.to_string());
-    save_credentials(&creds)?;
+    save_credentials(&creds).map_err(SilentRefreshError::SaveFailed)?;
     Ok(())
 }
 

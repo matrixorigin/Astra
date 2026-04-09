@@ -2,7 +2,6 @@
 
 use crate::messaging::router::AgentMailboxRouter;
 use crate::messaging::types::AgentAddress;
-use crate::orchestration::builtin_agents::get_agent_type_definition;
 use crate::orchestration::context_cache::SharedContextCache;
 use crate::orchestration::progress::{AgentProgressEvent, ProgressBroadcaster, ProgressEventType};
 use crate::orchestration::spawn_tool::{SpawnAgentInput, SpawnAgentOutput};
@@ -35,6 +34,8 @@ pub struct SpawnContext {
     pub working_dir: PathBuf,
     /// Permissions inherited from the parent agent.
     pub inherited_permissions: Option<super::permission_sync::InheritedPermissions>,
+    /// Skills inherited from the parent agent (subset of parent's active skills).
+    pub inherited_skills: Vec<String>,
 }
 
 // ─── Agent Status ───────────────────────────────────────────────────────────
@@ -175,6 +176,8 @@ pub struct SpawnRunConfig {
     /// Created from inherited_permissions or as a fresh root context.
     pub permission_context:
         Option<std::sync::Arc<tokio::sync::RwLock<super::permission_sync::PermissionSyncContext>>>,
+    /// Skills inherited from parent agent.
+    pub inherited_skills: Vec<String>,
 }
 
 impl std::fmt::Debug for SpawnRunConfig {
@@ -247,6 +250,10 @@ pub struct DynamicAgentSpawner {
     context_cache: Arc<SharedContextCache>,
     /// Optional executor for running agents (provided by CLI layer).
     executor: Option<Arc<dyn SpawnAgentExecutor>>,
+    /// Optional session ID for persisting agent state to journal.
+    session_id: Option<String>,
+    /// Agent type registry (builtins + user-defined).
+    agent_registry: super::team_config::AgentRegistry,
 }
 
 impl DynamicAgentSpawner {
@@ -258,6 +265,8 @@ impl DynamicAgentSpawner {
             progress_broadcaster: Arc::new(ProgressBroadcaster::default()),
             context_cache: Arc::new(SharedContextCache::default()),
             executor: None,
+            session_id: None,
+            agent_registry: super::team_config::AgentRegistry::builtins_only(),
         }
     }
 
@@ -272,6 +281,8 @@ impl DynamicAgentSpawner {
             progress_broadcaster: Arc::new(ProgressBroadcaster::default()),
             context_cache,
             executor: None,
+            session_id: None,
+            agent_registry: super::team_config::AgentRegistry::builtins_only(),
         }
     }
 
@@ -279,6 +290,23 @@ impl DynamicAgentSpawner {
     pub fn with_executor(mut self, executor: Arc<dyn SpawnAgentExecutor>) -> Self {
         self.executor = Some(executor);
         self
+    }
+
+    /// Enable journal persistence for agent lifecycle events.
+    pub fn with_session(mut self, session_id: String) -> Self {
+        self.session_id = Some(session_id);
+        self
+    }
+
+    /// Set a custom agent registry (builtins + user-defined types).
+    pub fn with_agent_registry(mut self, registry: super::team_config::AgentRegistry) -> Self {
+        self.agent_registry = registry;
+        self
+    }
+
+    /// Get a reference to the agent registry.
+    pub fn agent_registry(&self) -> &super::team_config::AgentRegistry {
+        &self.agent_registry
     }
 
     /// Get the shared context cache.
@@ -305,7 +333,7 @@ impl DynamicAgentSpawner {
         context: &SpawnContext,
     ) -> Result<SpawnAgentOutput, SpawnError> {
         // 1. Validate agent type
-        let agent_def = get_agent_type_definition(&input.agent_type)
+        let agent_def = self.agent_registry.get(&input.agent_type)
             .ok_or_else(|| SpawnError::UnknownAgentType(input.agent_type.clone()))?;
 
         // 2. Generate IDs
@@ -419,6 +447,8 @@ impl DynamicAgentSpawner {
             parent_address: Some(parent_address),
             // Permission context for runtime permission management
             permission_context,
+            // Skills inherited from parent
+            inherited_skills: context.inherited_skills.clone(),
         };
 
         // 8. Execute or launch
@@ -575,15 +605,43 @@ impl DynamicAgentSpawner {
                         result: run_result.output.unwrap_or_default(),
                     },
                 };
+                // Persist to journal before updating status
+                self.persist_agent_terminated(agent_id, &run_result.status).await;
                 self.update_status(agent_id, status).await;
                 self.unregister_mailbox(agent_id).await;
             }
             Err(e) => {
+                self.persist_agent_terminated(agent_id, "failed").await;
                 self.update_status(agent_id, AgentStatus::Failed { error: e })
                     .await;
                 self.unregister_mailbox(agent_id).await;
             }
         }
+    }
+
+    /// Persist final agent state to session journal (best-effort).
+    async fn persist_agent_terminated(&self, agent_id: &str, status: &str) {
+        let Some(ref sid) = self.session_id else { return };
+        let state = self.active_agents.read().await.get(agent_id).cloned();
+        let Some(state) = state else { return };
+        let writer = match astra_services::session_journal::JournalWriter::new(sid) {
+            Ok(w) => w,
+            Err(_) => return,
+        };
+        let duration_ms = state.started_at.elapsed().map(|d| d.as_millis() as u64).unwrap_or(0);
+        let event = astra_services::session_journal::JournalEvent::agent_terminated(
+            Some(sid.as_str()),
+            agent_id,
+            &state.run_id,
+            &state.agent_type,
+            status,
+            state.metrics.turns_completed,
+            state.metrics.tool_calls,
+            state.metrics.prompt_tokens,
+            state.metrics.completion_tokens,
+            duration_ms,
+        );
+        let _ = writer.append(&event);
     }
 
     async fn unregister_mailbox(&self, agent_id: &str) {
@@ -612,6 +670,8 @@ impl DynamicAgentSpawner {
             progress_broadcaster: Arc::clone(&self.progress_broadcaster),
             context_cache: Arc::clone(&self.context_cache),
             executor: self.executor.clone(),
+            session_id: self.session_id.clone(),
+            agent_registry: self.agent_registry.clone(),
         }
     }
 
@@ -698,6 +758,55 @@ impl DynamicAgentSpawner {
     pub fn progress_broadcaster(&self) -> Arc<ProgressBroadcaster> {
         Arc::clone(&self.progress_broadcaster)
     }
+
+    /// Query historical agent records from the session journal.
+    ///
+    /// Returns agent metadata from `AgentTerminated` events recorded in this session's journal.
+    pub fn get_agent_history(&self) -> Vec<AgentHistoryRecord> {
+        let Some(ref sid) = self.session_id else {
+            return Vec::new();
+        };
+        let events = match astra_services::session_journal::read_journal(sid) {
+            Ok(e) => e,
+            Err(_) => return Vec::new(),
+        };
+        events
+            .into_iter()
+            .filter(|e| {
+                e.event_type == astra_services::session_journal::JournalEventType::AgentTerminated
+            })
+            .filter_map(|e| {
+                let m = e.metadata.as_ref()?;
+                Some(AgentHistoryRecord {
+                    agent_id: m.get("agent_id")?.as_str()?.to_string(),
+                    run_id: m.get("run_id")?.as_str()?.to_string(),
+                    agent_type: m.get("agent_type")?.as_str()?.to_string(),
+                    status: m.get("status")?.as_str()?.to_string(),
+                    turns_completed: m.get("turns_completed")?.as_u64()? as u32,
+                    tool_calls: m.get("tool_calls")?.as_u64()? as u32,
+                    prompt_tokens: m.get("prompt_tokens")?.as_u64()?,
+                    completion_tokens: m.get("completion_tokens")?.as_u64()?,
+                    duration_ms: m.get("duration_ms")?.as_u64()?,
+                    timestamp: e.ts,
+                })
+            })
+            .collect()
+    }
+}
+
+/// Historical record of a terminated agent, reconstructed from journal.
+#[derive(Debug, Clone)]
+pub struct AgentHistoryRecord {
+    pub agent_id: String,
+    pub run_id: String,
+    pub agent_type: String,
+    pub status: String,
+    pub turns_completed: u32,
+    pub tool_calls: u32,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub duration_ms: u64,
+    pub timestamp: String,
 }
 
 // ─── Errors ─────────────────────────────────────────────────────────────────

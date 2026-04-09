@@ -83,6 +83,7 @@ pub async fn handle_spawn_agent_tool(args: &Value, ctx: Option<&SpawnAgentContex
         parent_agent_id: ctx.agent_id.clone(),
         working_dir: ctx.working_dir.clone(),
         inherited_permissions: Some(inherited_permissions),
+        inherited_skills: Vec::new(), // TODO: capture parent's active skills
     };
 
     // Execute spawn
