@@ -665,4 +665,249 @@ mod tests {
             Some("blocked_tool: Tool 'bash' requires permission but no parent available"),
         );
     }
+
+    /// Test: child requests permission via mailbox, parent approves, tool executes
+    #[tokio::test]
+    async fn child_permission_request_via_mailbox_approved() {
+        use crate::orchestration::permission_sync::{
+            PermissionRequestHandler, PermissionRule, PermissionUpdate,
+        };
+
+        let (router, parent_mb, mut child_mb, _dt) = setup_two_agents().await;
+
+        // Parent has a handler that approves bash(git:*) requests
+        let parent_ctx = Arc::new(tokio::sync::RwLock::new(
+            PermissionSyncContext::root(PermissionMode::Prompt),
+        ));
+        let handler = PermissionRequestHandler::new(parent_ctx.clone());
+
+        // Child has permission context that requires asking parent for bash
+        let child_inherited = InheritedPermissions {
+            mode: PermissionMode::Prompt,
+            allow_rules: vec![],
+            deny_rules: vec![],
+            ask_rules: vec![PermissionRule::parse("bash(*)")],
+            allowed_tools: None,
+            is_background: false,
+        };
+        let child_permission_ctx = Arc::new(tokio::sync::RwLock::new(
+            PermissionSyncContext::new(child_inherited),
+        ));
+
+        // Spawn parent handler task
+        let parent_router = router.clone();
+        let parent_handler = tokio::spawn(async move {
+            // Wait for permission request
+            let msg = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                parent_mb.recv(),
+            )
+            .await
+            .expect("should receive within timeout")
+            .expect("should have message");
+
+            // Process and respond
+            if let Some((correlation_id, mut response)) = handler.process_message(&msg).await {
+                // Approve with suggested rule
+                response.approved = true;
+                response.updates.push(PermissionUpdate::allow(
+                    PermissionRule::parse("bash(git:*)"),
+                ));
+
+                // Extract the target address from the Direct variant
+                let target_addr = match &msg.to {
+                    MessageTarget::Direct { address } => address.clone(),
+                    _ => panic!("expected Direct target"),
+                };
+
+                let response_msg = response.to_message(
+                    &target_addr,
+                    &msg.from,
+                    &correlation_id,
+                );
+                parent_router.send(response_msg).await.unwrap();
+            }
+        });
+
+        // Child sends tool call that requires permission
+        let tool_calls = vec![json!({
+            "id": "call-bash-git",
+            "name": "bash",
+            "arguments": r#"{"command": "git status"}"#
+        })];
+
+        let mut messages = Vec::new();
+        let mut tool_results = Vec::new();
+        let valid_tool_names = HashSet::from(["bash".to_string()]);
+        let mut restricted_tools = HashSet::new();
+        let mut turn_guard = TurnGuard::new();
+        let mut step_recorder = StepRecorder::new("test-session", "perm-request");
+        let mut idempotency_cache = InMemoryIdempotencyCache::new();
+        let mut semantic_dedup = SemanticDedup::new(0.95);
+        let mut tool_call_records = Vec::new();
+        let tool_event_hooks = crate::skills::hooks::ToolEventHookRegistry::default();
+        let mut term = NoopHeadlessTerminal;
+        let edge_callback_outputs = std::collections::HashMap::new();
+        let edge_tool_round: Vec<EdgeToolExecResult> = Vec::new();
+
+        run_agentic_headless_tool_round(
+            0,
+            true,
+            &astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
+            "",
+            None,
+            &tool_calls,
+            &edge_tool_round,
+            "",
+            &edge_callback_outputs,
+            &mut messages,
+            &mut tool_results,
+            &valid_tool_names,
+            &mut restricted_tools,
+            &mut turn_guard,
+            &mut step_recorder,
+            &mut idempotency_cache,
+            &mut semantic_dedup,
+            &mut tool_call_records,
+            &tool_event_hooks,
+            &mut term,
+            Some(&mut child_mb),
+            Some(&child_permission_ctx),
+        )
+        .await;
+
+        // Wait for parent handler to complete
+        parent_handler.await.unwrap();
+
+        // Tool should have been processed (not blocked)
+        // Since bash is an edge tool and we're in test context, it will have an unknown_tool error
+        // but importantly it should NOT have a permission denied error
+        assert_eq!(tool_results.len(), 1);
+        assert_eq!(tool_call_records.len(), 1);
+
+        // Check that permission was NOT denied (the error should be something else like unknown_tool)
+        let error = tool_call_records[0].error.as_deref();
+        assert!(
+            error.is_none() || !error.unwrap().contains("Permission denied"),
+            "tool should not be blocked by permission: {:?}",
+            error
+        );
+    }
+
+    /// Test: child requests permission but parent denies
+    #[tokio::test]
+    async fn child_permission_request_via_mailbox_denied() {
+        use crate::orchestration::permission_sync::PermissionRequestHandler;
+
+        let (router, parent_mb, mut child_mb, _dt) = setup_two_agents().await;
+
+        // Parent has deny mode - rejects all requests
+        let parent_ctx = Arc::new(tokio::sync::RwLock::new(
+            PermissionSyncContext::root(PermissionMode::Deny),
+        ));
+        let handler = PermissionRequestHandler::new(parent_ctx.clone());
+
+        // Child requires asking parent for all tools
+        let child_inherited = InheritedPermissions {
+            mode: PermissionMode::Prompt,
+            allow_rules: vec![],
+            deny_rules: vec![],
+            ask_rules: vec![],
+            allowed_tools: Some(HashSet::new()), // Empty = nothing allowed locally
+            is_background: false,
+        };
+        let child_permission_ctx = Arc::new(tokio::sync::RwLock::new(
+            PermissionSyncContext::new(child_inherited),
+        ));
+
+        // Spawn parent handler that denies
+        let parent_router = router.clone();
+        let parent_handler = tokio::spawn(async move {
+            let msg = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                parent_mb.recv(),
+            )
+            .await
+            .expect("should receive within timeout")
+            .expect("should have message");
+
+            if let Some((correlation_id, response)) = handler.process_message(&msg).await {
+                // Response should already be denied due to Deny mode
+                assert!(!response.approved);
+
+                // Extract the target address from the Direct variant
+                let target_addr = match &msg.to {
+                    MessageTarget::Direct { address } => address.clone(),
+                    _ => panic!("expected Direct target"),
+                };
+
+                let response_msg = response.to_message(
+                    &target_addr,
+                    &msg.from,
+                    &correlation_id,
+                );
+                parent_router.send(response_msg).await.unwrap();
+            }
+        });
+
+        let tool_calls = vec![json!({
+            "id": "call-bash-denied",
+            "name": "bash",
+            "arguments": r#"{"command": "rm -rf /"}"#
+        })];
+
+        let mut messages = Vec::new();
+        let mut tool_results = Vec::new();
+        let valid_tool_names = HashSet::from(["bash".to_string()]);
+        let mut restricted_tools = HashSet::new();
+        let mut turn_guard = TurnGuard::new();
+        let mut step_recorder = StepRecorder::new("test-session", "perm-denied");
+        let mut idempotency_cache = InMemoryIdempotencyCache::new();
+        let mut semantic_dedup = SemanticDedup::new(0.95);
+        let mut tool_call_records = Vec::new();
+        let tool_event_hooks = crate::skills::hooks::ToolEventHookRegistry::default();
+        let mut term = NoopHeadlessTerminal;
+        let edge_callback_outputs = std::collections::HashMap::new();
+        let edge_tool_round: Vec<EdgeToolExecResult> = Vec::new();
+
+        run_agentic_headless_tool_round(
+            0,
+            true,
+            &astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
+            "",
+            None,
+            &tool_calls,
+            &edge_tool_round,
+            "",
+            &edge_callback_outputs,
+            &mut messages,
+            &mut tool_results,
+            &valid_tool_names,
+            &mut restricted_tools,
+            &mut turn_guard,
+            &mut step_recorder,
+            &mut idempotency_cache,
+            &mut semantic_dedup,
+            &mut tool_call_records,
+            &tool_event_hooks,
+            &mut term,
+            Some(&mut child_mb),
+            Some(&child_permission_ctx),
+        )
+        .await;
+
+        parent_handler.await.unwrap();
+
+        // Tool should be blocked
+        assert_eq!(tool_results.len(), 1);
+        assert_eq!(tool_call_records.len(), 1);
+
+        // Check that permission WAS denied
+        let error = tool_call_records[0].error.as_deref();
+        assert!(
+            error.is_some() && error.unwrap().contains("blocked_tool"),
+            "tool should be blocked by permission denial: {:?}",
+            error
+        );
+    }
 }
