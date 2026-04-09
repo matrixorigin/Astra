@@ -3,13 +3,14 @@
 //! Subcommands:
 //! - `/agent` or `/agent list`: List all active spawned agents
 //! - `/agent status <id>`: Show detailed status of an agent
+//! - `/agent permissions <id>`: Show permission details of an agent
 //! - `/agent stop <id>`: Send shutdown request to an agent
 //! - `/agent logs <id>`: Show recent progress events from an agent
 //! - `/agent help`: Show help
 
 use super::*;
 use astra_runtime::orchestration::{
-    AgentStatus, DynamicAgentSpawner,
+    AgentStatus, DynamicAgentSpawner, PermissionSummary,
 };
 use std::sync::Arc;
 
@@ -30,6 +31,13 @@ pub fn handle_agent_command(arg: &str, ctx: &AgentCommandContext) {
                 show_status(ctx, id);
             } else {
                 eprintln!("  {}", "Usage: /agent status <agent_id>".yellow());
+            }
+        }
+        "permissions" | "perms" => {
+            if let Some(id) = parts.get(1) {
+                show_permissions(ctx, id);
+            } else {
+                eprintln!("  {}", "Usage: /agent permissions <agent_id>".yellow());
             }
         }
         "stop" => {
@@ -91,21 +99,30 @@ fn show_list(ctx: &AgentCommandContext) {
             .map(|d| format_duration(d))
             .unwrap_or_else(|_| "?".to_string());
 
+        // Permission indicator
+        let perm_icon = if agent.has_permission_issues { "🔒" } else { "" };
+
         eprintln!(
-            "  {} {} {} ({})",
+            "  {} {} {} ({}){}",
             status_icon(&agent.status),
             agent.agent_id.as_str().white().bold(),
             format!("[{}]", agent.agent_type).dim(),
-            elapsed.dim()
+            elapsed.dim(),
+            if agent.has_permission_issues { format!(" {}", perm_icon.red()) } else { String::new() }
         );
         eprintln!("    {}", agent.description.as_str().cyan());
-        if agent.metrics.tool_calls > 0 {
-            eprintln!(
-                "    {} tools: {}, turns: {}",
-                "📊".dim(),
-                agent.metrics.tool_calls.to_string().green(),
-                agent.metrics.turns_completed.to_string().green()
-            );
+        if agent.metrics.tool_calls > 0 || agent.metrics.tools_blocked > 0 {
+            let mut metrics_parts = vec![];
+            if agent.metrics.tool_calls > 0 {
+                metrics_parts.push(format!("tools: {}", agent.metrics.tool_calls.to_string().green()));
+            }
+            if agent.metrics.turns_completed > 0 {
+                metrics_parts.push(format!("turns: {}", agent.metrics.turns_completed.to_string().green()));
+            }
+            if agent.metrics.tools_blocked > 0 {
+                metrics_parts.push(format!("blocked: {}", agent.metrics.tools_blocked.to_string().red()));
+            }
+            eprintln!("    {} {}", "📊".dim(), metrics_parts.join(", "));
         }
     }
     eprintln!();
@@ -158,11 +175,100 @@ fn show_status(ctx: &AgentCommandContext, agent_id: &str) {
                 state.metrics.prompt_tokens,
                 state.metrics.completion_tokens
             );
+
+            // Permission summary in status
+            eprintln!("\n  {}", "🔐 Permissions".cyan().bold());
+            eprintln!("  {}", "─".repeat(30).dim());
+            print_permission_summary(&state.permission_summary, &state.metrics);
+
             eprintln!();
         }
         None => {
             eprintln!("  {}", format!("Agent not found: {agent_id}").yellow());
         }
+    }
+}
+
+fn show_permissions(ctx: &AgentCommandContext, agent_id: &str) {
+    let Some(ref spawner) = ctx.spawner else {
+        eprintln!("  {}", "No agent spawner available.".dim());
+        return;
+    };
+
+    let rt = match tokio::runtime::Handle::try_current() {
+        Ok(rt) => rt,
+        Err(_) => {
+            eprintln!("  {}", "No tokio runtime available.".red());
+            return;
+        }
+    };
+
+    match rt.block_on(spawner.get_agent_state(agent_id)) {
+        Some(state) => {
+            eprintln!(
+                "\n  {} {} {}",
+                "🔐 Permissions for".cyan().bold(),
+                state.agent_id.as_str().white().bold(),
+                format!("[{}]", state.agent_type).dim()
+            );
+            eprintln!("  {}", "─".repeat(50).dim());
+
+            print_permission_summary(&state.permission_summary, &state.metrics);
+
+            // Permission request stats
+            if state.metrics.permission_requests > 0 {
+                eprintln!("\n  {}", "📮 Permission Requests".white().bold());
+                eprintln!(
+                    "    Sent: {}, Approved: {}, Denied: {}",
+                    state.metrics.permission_requests.to_string().cyan(),
+                    state.metrics.permission_requests_approved.to_string().green(),
+                    (state.metrics.permission_requests - state.metrics.permission_requests_approved)
+                        .to_string()
+                        .red()
+                );
+            }
+
+            // Recent denials
+            if !state.permission_summary.recent_denials.is_empty() {
+                eprintln!("\n  {}", "🚫 Recent Denials".white().bold());
+                for tool in &state.permission_summary.recent_denials {
+                    eprintln!("    {} {}", "•".red(), tool);
+                }
+            }
+
+            eprintln!();
+        }
+        None => {
+            eprintln!("  {}", format!("Agent not found: {agent_id}").yellow());
+        }
+    }
+}
+
+fn print_permission_summary(summary: &PermissionSummary, metrics: &astra_runtime::orchestration::SpawnedAgentMetrics) {
+    let mode_styled = match summary.mode.as_str() {
+        "auto" => "auto".green(),
+        "prompt" => "prompt".yellow(),
+        "deny" => "deny".red(),
+        _ => summary.mode.as_str().dim(),
+    };
+    eprintln!("  {} {}", "Mode:".white().bold(), mode_styled);
+    eprintln!(
+        "  {} {} allow, {} deny",
+        "Rules:".white().bold(),
+        summary.allow_rules.to_string().green(),
+        summary.deny_rules.to_string().red()
+    );
+    eprintln!(
+        "  {} {}",
+        "Parent escalation:".white().bold(),
+        if summary.has_parent { "enabled".green() } else { "disabled".dim() }
+    );
+    if metrics.tools_blocked > 0 {
+        eprintln!(
+            "  {} {}",
+            "Tools blocked:".white().bold(),
+            metrics.tools_blocked.to_string().red()
+        );
     }
 }
 
@@ -323,6 +429,7 @@ fn show_help() {
     eprintln!("  {}  List all active agents", "/agent".white().bold());
     eprintln!("  {}  List all active agents", "/agent list".white().bold());
     eprintln!("  {}  Show agent status", "/agent status <id>".white().bold());
+    eprintln!("  {}  Show permission details", "/agent permissions <id>".white().bold());
     eprintln!("  {}  Stop an agent", "/agent stop <id>".white().bold());
     eprintln!("  {}  Show agent logs", "/agent logs <id>".white().bold());
     eprintln!("  {}  Show this help", "/agent help".white().bold());
@@ -330,6 +437,10 @@ fn show_help() {
     eprintln!(
         "  {}",
         "Agents are created via the spawn_agent tool during chat.".dim()
+    );
+    eprintln!(
+        "  {}",
+        "Permission issues are indicated by 🔒 in the agent list.".dim()
     );
     eprintln!();
 }

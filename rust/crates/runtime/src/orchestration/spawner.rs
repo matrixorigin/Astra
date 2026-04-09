@@ -63,6 +63,27 @@ pub struct SpawnedAgentMetrics {
     pub tool_calls: u32,
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
+    /// Number of permission requests sent to parent.
+    pub permission_requests: u32,
+    /// Number of permission requests approved by parent.
+    pub permission_requests_approved: u32,
+    /// Number of tools blocked by permission.
+    pub tools_blocked: u32,
+}
+
+/// Permission summary for display purposes.
+#[derive(Debug, Clone, Default)]
+pub struct PermissionSummary {
+    /// Permission mode (auto, prompt, deny).
+    pub mode: String,
+    /// Number of explicit allow rules.
+    pub allow_rules: u32,
+    /// Number of explicit deny rules.
+    pub deny_rules: u32,
+    /// Whether this agent has a parent for permission escalation.
+    pub has_parent: bool,
+    /// Recent permission denials (tool names).
+    pub recent_denials: Vec<String>,
 }
 
 // ─── Spawned Agent State ────────────────────────────────────────────────────
@@ -80,6 +101,8 @@ pub struct SpawnedAgentState {
     pub worktree_path: Option<PathBuf>,
     pub started_at: SystemTime,
     pub metrics: SpawnedAgentMetrics,
+    /// Permission summary for this agent.
+    pub permission_summary: PermissionSummary,
 }
 
 /// Summary info for listing agents (lighter than full state).
@@ -91,6 +114,8 @@ pub struct SpawnedAgentInfo {
     pub status: AgentStatus,
     pub started_at: SystemTime,
     pub metrics: SpawnedAgentMetrics,
+    /// Whether there are any permission denials.
+    pub has_permission_issues: bool,
 }
 
 impl From<&SpawnedAgentState> for SpawnedAgentInfo {
@@ -102,6 +127,7 @@ impl From<&SpawnedAgentState> for SpawnedAgentInfo {
             status: state.status.clone(),
             started_at: state.started_at,
             metrics: state.metrics.clone(),
+            has_permission_issues: state.metrics.tools_blocked > 0,
         }
     }
 }
@@ -320,7 +346,10 @@ impl DynamicAgentSpawner {
                 .await;
         }
 
-        // 5. Register state
+        // 5. Build permission summary
+        let permission_summary = build_permission_summary(context);
+
+        // 6. Register state
         let state = SpawnedAgentState {
             agent_id: agent_id.clone(),
             run_id: run_id.clone(),
@@ -332,6 +361,7 @@ impl DynamicAgentSpawner {
             worktree_path: None, // TODO: worktree isolation
             started_at: SystemTime::now(),
             metrics: Default::default(),
+            permission_summary,
         };
 
         self.active_agents
@@ -339,7 +369,7 @@ impl DynamicAgentSpawner {
             .await
             .insert(agent_id.clone(), state);
 
-        // 6. Emit started event
+        // 7. Emit started event
         let emitter = self.progress_broadcaster.for_agent(agent_id.clone());
         emitter.started(&input.description);
 
@@ -620,6 +650,30 @@ pub enum SpawnError {
 
     #[error("Delegation failed: {0}")]
     DelegationFailed(String),
+}
+
+// ─── Helpers ────────────────────────────────────────────────────────────────
+
+/// Build permission summary from spawn context.
+fn build_permission_summary(context: &SpawnContext) -> PermissionSummary {
+    let mut summary = PermissionSummary::default();
+    
+    if let Some(ref inherited) = context.inherited_permissions {
+        summary.mode = match inherited.mode {
+            super::permission_sync::PermissionMode::Auto => "auto".to_string(),
+            super::permission_sync::PermissionMode::Prompt => "prompt".to_string(),
+            super::permission_sync::PermissionMode::Deny => "deny".to_string(),
+        };
+        summary.allow_rules = inherited.allow_rules.len() as u32;
+        summary.deny_rules = inherited.deny_rules.len() as u32;
+        // Has parent if parent_run_id is not empty and not "root"
+        summary.has_parent = !context.parent_run_id.is_empty() && context.parent_run_id != "root";
+    } else {
+        summary.mode = "auto".to_string();
+        summary.has_parent = !context.parent_run_id.is_empty() && context.parent_run_id != "root";
+    }
+    
+    summary
 }
 
 #[cfg(test)]

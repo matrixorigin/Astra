@@ -26,6 +26,7 @@ pub use progress::{AgentProgressEvent, ProgressEventType, ProgressBroadcaster, A
 pub use spawner::{
     DynamicAgentSpawner, SpawnContext, SpawnedAgentState, SpawnedAgentInfo, AgentStatus,
     SpawnedAgentMetrics, SpawnError, SpawnAgentExecutor, SpawnRunConfig, SpawnRunResult,
+    PermissionSummary,
 };
 pub use spawn_tool::{SpawnAgentInput, SpawnAgentOutput, spawn_agent_schema};
 
