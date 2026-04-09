@@ -626,6 +626,89 @@ pub fn sections_to_string(sections: &[PromptSection]) -> String {
         .join("")
 }
 
+// ── System Prompt Tracing ─────────────────────────────────────────────────────
+
+use crate::turn::context_assembly_trace::{MemoryInjection, SkillInjection, SystemPromptBreakdown};
+
+/// Build a trace breakdown from prompt sections.
+///
+/// This function analyzes the assembled prompt sections and produces
+/// a detailed breakdown for observability. Call this after
+/// `build_system_prompt_sections_with_style()` to capture what went
+/// into the system prompt.
+pub fn build_system_prompt_trace(
+    sections: &[PromptSection],
+    skills_injected: Vec<SkillInjection>,
+    repository_memories: Vec<MemoryInjection>,
+) -> SystemPromptBreakdown {
+    let mut base_persona_tokens = 0u32;
+    let mut environment_tokens = 0u32;
+    let mut user_preferences_tokens = 0u32;
+    let mut total_tokens = 0u32;
+
+    for section in sections {
+        let tokens = estimate_section_tokens(&section.text);
+        total_tokens += tokens;
+
+        match section.scope {
+            CacheScope::Global => {
+                // Global sections = base persona + core rules
+                base_persona_tokens += tokens;
+            }
+            CacheScope::Session => {
+                // Session sections = tool list, task-type guidance
+                // Count as base persona (structural)
+                base_persona_tokens += tokens;
+            }
+            CacheScope::None => {
+                // Dynamic sections = profile, environment, preferences
+                // Try to categorize based on content markers
+                let text = &section.text;
+                if text.contains("cwd:")
+                    || text.contains("git_branch:")
+                    || text.contains("## Environment")
+                    || text.contains("Working directory")
+                {
+                    environment_tokens += tokens;
+                } else if text.contains("## User Preferences")
+                    || text.contains("## Learned")
+                    || text.contains("Output Style")
+                {
+                    user_preferences_tokens += tokens;
+                } else {
+                    // Generic dynamic content
+                    environment_tokens += tokens;
+                }
+            }
+        }
+    }
+
+    // Add skill tokens
+    let skill_tokens: u32 = skills_injected.iter().map(|s| s.tokens).sum();
+    total_tokens += skill_tokens;
+
+    // Add memory tokens
+    let memory_tokens: u32 = repository_memories.iter().map(|m| m.tokens).sum();
+    total_tokens += memory_tokens;
+
+    SystemPromptBreakdown {
+        base_persona_tokens,
+        skills_injected,
+        environment_tokens,
+        repository_memories,
+        user_preferences_tokens,
+        total_tokens,
+    }
+}
+
+/// Rough token estimate for a text section.
+/// Uses ~4 chars per token as a heuristic (reasonable for mixed English/code).
+fn estimate_section_tokens(text: &str) -> u32 {
+    // More accurate: count words + punctuation, but 4 chars/token is fast
+    let char_count = text.chars().count();
+    ((char_count + 3) / 4) as u32
+}
+
 /// Keywords per task type for lightweight classification.
 /// Each entry: (task_type_label, keywords).
 /// CJK keywords are matched with contains(); Latin keywords use word-boundary matching.

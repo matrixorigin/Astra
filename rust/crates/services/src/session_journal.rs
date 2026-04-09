@@ -603,6 +603,10 @@ pub struct JournalEvent {
     /// Tool selection decision trace for post-hoc analysis.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selection_trace: Option<SelectionTrace>,
+    /// Full context assembly trace for deep observability (M1 telemetry).
+    /// Stores the serialized ContextAssemblyTrace from runtime.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_assembly_trace: Option<serde_json::Value>,
     /// Selector confidence from the first tool-selection pass (0.0–1.0).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selector_confidence: Option<f64>,
@@ -661,6 +665,8 @@ pub enum JournalEventType {
     PlanEdit,
     /// Plan lifecycle event (created, completed, abandoned, replanned).
     PlanLifecycle,
+    /// Context assembly trace recorded (observability: prompt building details).
+    ContextAssemblyRecorded,
 }
 
 /// Writer that appends events to a session journal file.
@@ -1213,6 +1219,7 @@ impl JournalEvent {
             coordination: None,
             edge_policy: None,
             selection_trace: None,
+            context_assembly_trace: None,
             selector_confidence: None,
             routing_domain_hint: None,
             entity_learn_skipped_no_domain: false,
@@ -1759,6 +1766,27 @@ impl JournalEvent {
             "duration_ms": duration_ms,
         }));
         evt
+    }
+
+    /// Context assembly recorded event — deep observability for turn context composition.
+    ///
+    /// The `trace` should be a serialized `ContextAssemblyTrace` from runtime.
+    /// Stores full context breakdown: system prompt, history, memory, tools, token budget.
+    pub fn context_assembly_recorded(
+        session_id: Option<&str>,
+        turn: u32,
+        trace: serde_json::Value,
+    ) -> Self {
+        let mut evt = Self::base(JournalEventType::ContextAssemblyRecorded, session_id);
+        evt.turn = Some(turn);
+        evt.context_assembly_trace = Some(trace);
+        evt
+    }
+
+    /// Builder to attach a context assembly trace to an existing turn event.
+    pub fn with_context_assembly_trace(mut self, trace: serde_json::Value) -> Self {
+        self.context_assembly_trace = Some(trace);
+        self
     }
 }
 
