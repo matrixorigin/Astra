@@ -7687,6 +7687,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stream_chat_sse_unregisters_ephemeral_root_mailbox() {
+        let app = Router::new().route(
+            "/chat/turn",
+            post(|| async {
+                (
+                    [("content-type", "text/event-stream")],
+                    sse_text_response("Hello!", "sess-001"),
+                )
+            }),
+        );
+        let base = spawn_mock(app).await;
+        let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
+        let registry = tool_registry::ToolRegistry::new(edge_tools::all_tool_schemas());
+        let selector = tool_selector::TfIdfSelector::new(registry);
+        let transport = std::sync::Arc::new(astra_runtime::messaging::InProcessTransport::new());
+        let tracker =
+            std::sync::Arc::new(astra_runtime::server::delegation_engine::DelegationTracker::new());
+        let router = std::sync::Arc::new(astra_runtime::messaging::AgentMailboxRouter::new(
+            transport, tracker,
+        ));
+        let spawner = std::sync::Arc::new(astra_runtime::orchestration::DynamicAgentSpawner::new(
+            router.clone(),
+        ));
+        let skill_search = astra_core::SkillSearchSettings::default();
+        let mut pm = PermissionManager::new(true);
+        let mut skill_qt = astra_runtime::skills::quality::SkillQualityTracker::new();
+
+        let result = stream_chat_sse(ChatTurnParams {
+            api: &api,
+            token: "fake-token",
+            message: "hi",
+            session_id: None,
+            model: None,
+            explain: ExplainMode::Off,
+            render_md: false,
+            history: &[],
+            perm_manager: &mut pm,
+            verbose_mode: false,
+            quiet: true,
+            suppress_intermediate_output: false,
+            selector: &selector,
+            recent_tools: &[],
+            tool_health_entries: &[],
+            unified_skill_registry: astra_runtime::skills::empty_unified_registry(),
+            plan_only_chat: false,
+            hide_streaming_assistant_text: false,
+            is_plan_subtask: false,
+            plan_subtask_id: None,
+            delegation_engine: None,
+            cancel_token: None,
+            plan_assemble_line_release: None,
+            stream_event_tx: None,
+            approval_request_tx: None,
+            mcp_manager: None,
+            skill_search: &skill_search,
+            skill_quality_tracker: &mut skill_qt,
+            discovered_skills: None,
+            messaging_metrics: None,
+            agent_spawner: Some(spawner),
+            root_agent_id: Some("bg-root"),
+            root_mailbox_slot: None,
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(result.full_text, "Hello!");
+        assert!(
+            router.list_registered_agents().await.is_empty(),
+            "ephemeral root mailbox should be unregistered after the turn"
+        );
+    }
+
+    #[tokio::test]
     async fn drain_root_mailbox_into_idle_queue_collects_pending_messages() {
         let transport = std::sync::Arc::new(astra_runtime::messaging::InProcessTransport::new());
         let tracker =

@@ -6,6 +6,7 @@ use crate::orchestration::builtin_agents::get_agent_type_definition;
 use crate::orchestration::context_cache::SharedContextCache;
 use crate::orchestration::progress::{AgentProgressEvent, ProgressBroadcaster, ProgressEventType};
 use crate::orchestration::spawn_tool::{SpawnAgentInput, SpawnAgentOutput};
+use crate::server::delegation_engine::SubRunRecord;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -46,7 +47,10 @@ pub enum AgentStatus {
 
 impl AgentStatus {
     pub fn is_terminal(&self) -> bool {
-        matches!(self, Self::Completed { .. } | Self::Failed { .. } | Self::Cancelled)
+        matches!(
+            self,
+            Self::Completed { .. } | Self::Failed { .. } | Self::Cancelled
+        )
     }
 }
 
@@ -215,7 +219,10 @@ impl DynamicAgentSpawner {
     }
 
     /// Create a new spawner with a custom context cache.
-    pub fn with_context_cache(mailbox_router: Arc<AgentMailboxRouter>, context_cache: Arc<SharedContextCache>) -> Self {
+    pub fn with_context_cache(
+        mailbox_router: Arc<AgentMailboxRouter>,
+        context_cache: Arc<SharedContextCache>,
+    ) -> Self {
         Self {
             mailbox_router,
             active_agents: Arc::new(RwLock::new(HashMap::new())),
@@ -266,14 +273,21 @@ impl DynamicAgentSpawner {
         let agent_id = format!("{}@{}", agent_name, &run_id[..8]);
 
         // 3. Determine model and turns
-        let model = input.model.clone().unwrap_or_else(|| agent_def.default_model.clone());
+        let model = input
+            .model
+            .clone()
+            .unwrap_or_else(|| agent_def.default_model.clone());
         let max_turns = input.max_turns.unwrap_or(agent_def.max_turns);
 
         // 4. Register mailbox if named
         let mailbox = if input.name.is_some() {
             let addr = AgentAddress::new(&run_id, &agent_id);
             let delegation_id = Some(context.parent_run_id.clone());
-            match self.mailbox_router.register(addr.clone(), delegation_id).await {
+            match self
+                .mailbox_router
+                .register(addr.clone(), delegation_id)
+                .await
+            {
                 Ok(mb) => Some(mb),
                 Err(e) => {
                     return Err(SpawnError::MailboxRegistration(e.to_string()));
@@ -284,6 +298,23 @@ impl DynamicAgentSpawner {
         };
 
         let messaging_address = mailbox.as_ref().map(|mb| mb.address.clone());
+        if messaging_address.is_some() {
+            let depth = self
+                .mailbox_router
+                .run_depth(&context.parent_run_id)
+                .await
+                .unwrap_or(0)
+                + 1;
+            self.mailbox_router
+                .record_sub_run(SubRunRecord {
+                    run_id: run_id.clone(),
+                    parent_run_id: context.parent_run_id.clone(),
+                    delegation_id: context.parent_run_id.clone(),
+                    agent_id: agent_id.clone(),
+                    depth,
+                })
+                .await;
+        }
 
         // 5. Register state
         let state = SpawnedAgentState {
@@ -299,7 +330,10 @@ impl DynamicAgentSpawner {
             metrics: Default::default(),
         };
 
-        self.active_agents.write().await.insert(agent_id.clone(), state);
+        self.active_agents
+            .write()
+            .await
+            .insert(agent_id.clone(), state);
 
         // 6. Emit started event
         let emitter = self.progress_broadcaster.for_agent(agent_id.clone());
@@ -340,13 +374,13 @@ impl DynamicAgentSpawner {
                 let spawner = self.clone_for_task();
                 let agent_id_clone = agent_id.clone();
                 let _description = input.description.clone();
-                
+
                 tokio::spawn(async move {
                     let result = executor.execute(run_config).await;
                     spawner.handle_completion(&agent_id_clone, result).await;
                 });
             }
-            
+
             Ok(SpawnAgentOutput::Launched {
                 agent_id,
                 description: input.description,
@@ -356,12 +390,19 @@ impl DynamicAgentSpawner {
             // Sync mode: wait for completion
             if let Some(ref executor) = self.executor {
                 // Update status to running
-                self.update_status(&agent_id, AgentStatus::Running { 
-                    activity: "executing".to_string() 
-                }).await;
+                self.update_status(
+                    &agent_id,
+                    AgentStatus::Running {
+                        activity: "executing".to_string(),
+                    },
+                )
+                .await;
 
                 let result = executor.execute(run_config).await;
-                let started_at = self.active_agents.read().await
+                let started_at = self
+                    .active_agents
+                    .read()
+                    .await
                     .get(&agent_id)
                     .map(|s| s.started_at)
                     .unwrap_or_else(SystemTime::now);
@@ -369,11 +410,17 @@ impl DynamicAgentSpawner {
                 match result {
                     Ok(run_result) => {
                         // Update final status
-                        self.update_status(&agent_id, AgentStatus::Completed {
-                            result: run_result.output.clone().unwrap_or_default(),
-                        }).await;
+                        self.update_status(
+                            &agent_id,
+                            AgentStatus::Completed {
+                                result: run_result.output.clone().unwrap_or_default(),
+                            },
+                        )
+                        .await;
+                        self.unregister_mailbox(&agent_id).await;
 
-                        let duration_ms = started_at.elapsed()
+                        let duration_ms = started_at
+                            .elapsed()
                             .map(|d| d.as_millis() as u64)
                             .unwrap_or(0);
 
@@ -385,9 +432,9 @@ impl DynamicAgentSpawner {
                         })
                     }
                     Err(e) => {
-                        self.update_status(&agent_id, AgentStatus::Failed {
-                            error: e.clone(),
-                        }).await;
+                        self.update_status(&agent_id, AgentStatus::Failed { error: e.clone() })
+                            .await;
+                        self.unregister_mailbox(&agent_id).await;
 
                         Ok(SpawnAgentOutput::Failed { error: e })
                     }
@@ -407,20 +454,45 @@ impl DynamicAgentSpawner {
     async fn handle_completion(&self, agent_id: &str, result: Result<SpawnRunResult, String>) {
         match result {
             Ok(run_result) => {
-                self.update_status(agent_id, AgentStatus::Completed {
-                    result: run_result.output.unwrap_or_default(),
-                }).await;
-                
+                self.update_status(
+                    agent_id,
+                    AgentStatus::Completed {
+                        result: run_result.output.unwrap_or_default(),
+                    },
+                )
+                .await;
+
                 // Update metrics
                 if let Some(state) = self.active_agents.write().await.get_mut(agent_id) {
                     state.metrics.tool_calls = run_result.tool_calls;
                     state.metrics.prompt_tokens = run_result.prompt_tokens;
                     state.metrics.completion_tokens = run_result.completion_tokens;
                 }
+                self.unregister_mailbox(agent_id).await;
             }
             Err(e) => {
-                self.update_status(agent_id, AgentStatus::Failed { error: e }).await;
+                self.update_status(agent_id, AgentStatus::Failed { error: e })
+                    .await;
+                self.unregister_mailbox(agent_id).await;
             }
+        }
+    }
+
+    async fn unregister_mailbox(&self, agent_id: &str) {
+        let messaging_address = self
+            .active_agents
+            .write()
+            .await
+            .get_mut(agent_id)
+            .and_then(|state| state.messaging_address.take());
+
+        if let Some(addr) = messaging_address
+            && let Err(err) = self.mailbox_router.unregister(&addr).await
+        {
+            eprintln!(
+                "  ⚠ messaging: failed to unregister mailbox for '{}': {}",
+                agent_id, err
+            );
         }
     }
 
@@ -473,13 +545,18 @@ impl DynamicAgentSpawner {
                 },
                 AgentStatus::Idle => ProgressEventType::Idle,
                 AgentStatus::Completed { result } => {
-                    let duration_ms = state.started_at.elapsed()
+                    let duration_ms = state
+                        .started_at
+                        .elapsed()
                         .map(|d| d.as_millis() as u64)
                         .unwrap_or(0);
                     ProgressEventType::Completed {
                         result_summary: result.clone(),
                         total_tool_calls: state.metrics.tool_calls,
-                        total_tokens: (state.metrics.prompt_tokens, state.metrics.completion_tokens),
+                        total_tokens: (
+                            state.metrics.prompt_tokens,
+                            state.metrics.completion_tokens,
+                        ),
                         duration_ms,
                     }
                 }
@@ -538,7 +615,9 @@ mod tests {
     use super::*;
     use crate::messaging::in_process::InProcessTransport;
     use crate::messaging::router::AgentMailboxRouter;
+    use crate::messaging::types::{AgentMessage, MessagePayload, MessageTarget};
     use crate::server::delegation_engine::DelegationTracker;
+    use tokio::time::{Duration, sleep};
 
     fn mock_router() -> Arc<AgentMailboxRouter> {
         let transport = Arc::new(InProcessTransport::new());
@@ -629,26 +708,30 @@ mod tests {
     #[tokio::test]
     async fn test_context_cache_shared_across_spawns() {
         use crate::orchestration::context_cache::SharedContextCache;
-        
+
         // Create a shared context cache
         let cache = Arc::new(SharedContextCache::default());
-        
+
         // Create spawner with custom cache
         let spawner = DynamicAgentSpawner::with_context_cache(mock_router(), Arc::clone(&cache));
-        
+
         // Verify spawner has the same cache
         assert!(Arc::ptr_eq(&cache, spawner.context_cache()));
-        
+
         // Parent agent stores some knowledge
-        cache.share_knowledge("project/tech-stack", serde_json::json!({"db": "postgres"}), "parent-agent");
-        
+        cache.share_knowledge(
+            "project/tech-stack",
+            serde_json::json!({"db": "postgres"}),
+            "parent-agent",
+        );
+
         let context = SpawnContext {
             parent_run_id: "parent-123".to_string(),
             parent_agent_id: "parent".to_string(),
             working_dir: PathBuf::from("/tmp"),
             inherited_permissions: None,
         };
-        
+
         // Spawn an agent
         let input = SpawnAgentInput {
             description: "Explore codebase".to_string(),
@@ -663,16 +746,136 @@ mod tests {
         };
         let result = spawner.spawn(input, &context).await.unwrap();
         assert!(matches!(result, SpawnAgentOutput::Launched { .. }));
-        
+
         // The cache still has the knowledge from parent
         let knowledge = cache.get_knowledge("project/tech-stack");
         assert!(knowledge.is_some());
         assert_eq!(knowledge.unwrap()["db"], "postgres");
-        
+
         // Spawned agent can also add knowledge (simulated)
-        cache.share_knowledge("project/auth", serde_json::json!({"type": "jwt"}), "spawned-agent");
-        
+        cache.share_knowledge(
+            "project/auth",
+            serde_json::json!({"type": "jwt"}),
+            "spawned-agent",
+        );
+
         // All knowledge is accessible
         assert_eq!(cache.knowledge_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_named_spawn_records_parent_routing() {
+        let router = mock_router();
+        let spawner = DynamicAgentSpawner::new(router.clone());
+        let mut parent_mailbox = router
+            .register(AgentAddress::new("parent-123", "main"), None)
+            .await
+            .unwrap();
+        let context = SpawnContext {
+            parent_run_id: "parent-123".to_string(),
+            parent_agent_id: "main".to_string(),
+            working_dir: PathBuf::from("/tmp"),
+        };
+        let input = SpawnAgentInput {
+            description: "Named agent".to_string(),
+            prompt: "Send a message".to_string(),
+            agent_type: "explore".to_string(),
+            model: None,
+            background: true,
+            name: Some("named".to_string()),
+            max_turns: None,
+            isolated: false,
+            allowed_tools: None,
+        };
+
+        let agent_id = match spawner.spawn(input, &context).await.unwrap() {
+            SpawnAgentOutput::Launched { agent_id, .. } => agent_id,
+            other => panic!("expected launched output, got {other:?}"),
+        };
+        let state = spawner.get_agent_state(&agent_id).await.unwrap();
+        let child_addr = state
+            .messaging_address
+            .expect("named agent should have mailbox");
+
+        router
+            .send(AgentMessage::new(
+                child_addr,
+                MessageTarget::Parent,
+                MessagePayload::Text {
+                    content: "done".into(),
+                    summary: None,
+                },
+            ))
+            .await
+            .unwrap();
+
+        let received = parent_mailbox
+            .try_recv()
+            .expect("parent should receive message");
+        match &received.payload {
+            MessagePayload::Text { content, .. } => assert_eq!(content, "done"),
+            other => panic!("expected text payload, got {other:?}"),
+        }
+    }
+
+    struct ImmediateSuccessExecutor;
+
+    #[async_trait]
+    impl SpawnAgentExecutor for ImmediateSuccessExecutor {
+        async fn execute(&self, config: SpawnRunConfig) -> Result<SpawnRunResult, String> {
+            Ok(SpawnRunResult {
+                agent_id: config.agent_id,
+                run_id: config.run_id,
+                status: "completed".into(),
+                output: Some("ok".into()),
+                error: None,
+                prompt_tokens: 1,
+                completion_tokens: 1,
+                tool_calls: 0,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_background_completion_unregisters_mailbox() {
+        let router = mock_router();
+        let spawner = DynamicAgentSpawner::new(router.clone())
+            .with_executor(Arc::new(ImmediateSuccessExecutor));
+        let context = SpawnContext {
+            parent_run_id: "parent-123".to_string(),
+            parent_agent_id: "main".to_string(),
+            working_dir: PathBuf::from("/tmp"),
+        };
+        let input = SpawnAgentInput {
+            description: "Background agent".to_string(),
+            prompt: "Finish immediately".to_string(),
+            agent_type: "explore".to_string(),
+            model: None,
+            background: true,
+            name: Some("bg".to_string()),
+            max_turns: None,
+            isolated: false,
+            allowed_tools: None,
+        };
+
+        let agent_id = match spawner.spawn(input, &context).await.unwrap() {
+            SpawnAgentOutput::Launched { agent_id, .. } => agent_id,
+            other => panic!("expected launched output, got {other:?}"),
+        };
+
+        for _ in 0..20 {
+            if router.list_registered_agents().await.is_empty() {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+
+        assert!(
+            router.list_registered_agents().await.is_empty(),
+            "background completion should unregister mailbox"
+        );
+        let state = spawner.get_agent_state(&agent_id).await.unwrap();
+        assert!(matches!(state.status, AgentStatus::Completed { .. }));
+        assert!(state.messaging_address.is_none());
     }
 }

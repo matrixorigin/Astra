@@ -28,8 +28,7 @@ use astra_services::coordination::{
 };
 
 use astra_core::{
-    STATUS_COMPLETED, STATUS_FAILED, STATUS_PAUSED, STATUS_RUNNING,
-    STATUS_VERIFICATION_FAILED,
+    STATUS_COMPLETED, STATUS_FAILED, STATUS_PAUSED, STATUS_RUNNING, STATUS_VERIFICATION_FAILED,
 };
 
 use super::run_engine::RunEngine;
@@ -291,6 +290,18 @@ impl DelegationTracker {
     /// Check if a run is a sub-run (has a parent).
     pub async fn is_sub_run(&self, run_id: &str) -> bool {
         self.parents.read().await.contains_key(run_id)
+    }
+
+    /// Get the recorded delegation depth for a run, if known.
+    pub async fn get_depth(&self, run_id: &str) -> Option<u32> {
+        for records in self.delegations.read().await.values() {
+            for record in records {
+                if record.run_id == run_id {
+                    return Some(record.depth);
+                }
+            }
+        }
+        None
     }
 
     /// Get all sub-run IDs for a given parent run across all delegations.
@@ -594,36 +605,48 @@ impl DelegationEngine {
                 GateVerdict::Fail { reason, details } => {
                     // Persist retry count to durable store for crash recovery
                     astra_core::log_persist!(
-                        self.run_engine.persist_retry_count(&current.run_id, attempt).await,
-                        "delegation", &current.run_id, "retry_count"
+                        self.run_engine
+                            .persist_retry_count(&current.run_id, attempt)
+                            .await,
+                        "delegation",
+                        &current.run_id,
+                        "retry_count"
                     );
 
                     // Record the gate failure in run events
                     astra_core::log_persist!(
-                        self.run_engine.append_event(
-                            &current.run_id,
-                            serde_json::json!({
-                                "event_type": "verification_gate_failed",
-                                "data": {
-                                    "attempt": attempt,
-                                    "reason": reason,
-                                    "details": details,
-                                }
-                            }),
-                        ).await,
-                        "delegation", &current.run_id, "gate_failed_event"
+                        self.run_engine
+                            .append_event(
+                                &current.run_id,
+                                serde_json::json!({
+                                    "event_type": "verification_gate_failed",
+                                    "data": {
+                                        "attempt": attempt,
+                                        "reason": reason,
+                                        "details": details,
+                                    }
+                                }),
+                            )
+                            .await,
+                        "delegation",
+                        &current.run_id,
+                        "gate_failed_event"
                     );
 
                     if attempt >= max_retries {
                         // Exhausted retries — mark as verification failure
                         astra_core::log_persist!(
-                            self.run_engine.persist_status(
-                                &current.run_id,
-                                STATUS_VERIFICATION_FAILED,
-                                None,
-                                Some(&reason),
-                            ).await,
-                            "delegation", &current.run_id, "verification_failed"
+                            self.run_engine
+                                .persist_status(
+                                    &current.run_id,
+                                    STATUS_VERIFICATION_FAILED,
+                                    None,
+                                    Some(&reason),
+                                )
+                                .await,
+                            "delegation",
+                            &current.run_id,
+                            "verification_failed"
                         );
                         return AgentResult {
                             status: STATUS_VERIFICATION_FAILED.to_string(),
@@ -640,8 +663,12 @@ impl DelegationEngine {
                     match self.executor.execute(retry_config).await {
                         Ok(r) => {
                             astra_core::log_persist!(
-                                self.run_engine.persist_status(&r.run_id, &r.status, None, r.error.as_deref()).await,
-                                "delegation", &r.run_id, "status"
+                                self.run_engine
+                                    .persist_status(&r.run_id, &r.status, None, r.error.as_deref())
+                                    .await,
+                                "delegation",
+                                &r.run_id,
+                                "status"
                             );
                             current = r;
                         }
@@ -809,14 +836,22 @@ impl DelegationEngine {
                 match &result {
                     Ok(r) => {
                         astra_core::log_persist!(
-                            run_engine.persist_status(&run_id, &r.status, None, r.error.as_deref()).await,
-                            "delegation", &run_id, "status"
+                            run_engine
+                                .persist_status(&run_id, &r.status, None, r.error.as_deref())
+                                .await,
+                            "delegation",
+                            &run_id,
+                            "status"
                         );
                     }
                     Err(e) => {
                         astra_core::log_persist!(
-                            run_engine.persist_status(&run_id, STATUS_FAILED, None, Some(e.as_str())).await,
-                            "delegation", &run_id, "status"
+                            run_engine
+                                .persist_status(&run_id, STATUS_FAILED, None, Some(e.as_str()))
+                                .await,
+                            "delegation",
+                            &run_id,
+                            "status"
                         );
                     }
                 }
@@ -987,15 +1022,23 @@ impl DelegationEngine {
             let result = match self.executor.execute(config).await {
                 Ok(r) => {
                     astra_core::log_persist!(
-                        self.run_engine.persist_status(&sub_run_id, &r.status, None, r.error.as_deref()).await,
-                        "delegation", &sub_run_id, "status"
+                        self.run_engine
+                            .persist_status(&sub_run_id, &r.status, None, r.error.as_deref())
+                            .await,
+                        "delegation",
+                        &sub_run_id,
+                        "status"
                     );
                     r
                 }
                 Err(e) => {
                     astra_core::log_persist!(
-                        self.run_engine.persist_status(&sub_run_id, STATUS_FAILED, None, Some(e.as_str())).await,
-                        "delegation", &sub_run_id, "status"
+                        self.run_engine
+                            .persist_status(&sub_run_id, STATUS_FAILED, None, Some(e.as_str()))
+                            .await,
+                        "delegation",
+                        &sub_run_id,
+                        "status"
                     );
                     AgentResult {
                         agent_id: agent_id.clone(),
@@ -1163,15 +1206,23 @@ impl DelegationEngine {
             let prod_result = match self.executor.execute(prod_config).await {
                 Ok(r) => {
                     astra_core::log_persist!(
-                        self.run_engine.persist_status(&prod_run_id, &r.status, None, r.error.as_deref()).await,
-                        "delegation", &prod_run_id, "status"
+                        self.run_engine
+                            .persist_status(&prod_run_id, &r.status, None, r.error.as_deref())
+                            .await,
+                        "delegation",
+                        &prod_run_id,
+                        "status"
                     );
                     r
                 }
                 Err(e) => {
                     astra_core::log_persist!(
-                        self.run_engine.persist_status(&prod_run_id, STATUS_FAILED, None, Some(e.as_str())).await,
-                        "delegation", &prod_run_id, "status"
+                        self.run_engine
+                            .persist_status(&prod_run_id, STATUS_FAILED, None, Some(e.as_str()))
+                            .await,
+                        "delegation",
+                        &prod_run_id,
+                        "status"
                     );
                     AgentResult {
                         agent_id: producer_id.to_string(),
@@ -1288,15 +1339,23 @@ impl DelegationEngine {
             let rev_result = match self.executor.execute(rev_config).await {
                 Ok(r) => {
                     astra_core::log_persist!(
-                        self.run_engine.persist_status(&rev_run_id, &r.status, None, r.error.as_deref()).await,
-                        "delegation", &rev_run_id, "status"
+                        self.run_engine
+                            .persist_status(&rev_run_id, &r.status, None, r.error.as_deref())
+                            .await,
+                        "delegation",
+                        &rev_run_id,
+                        "status"
                     );
                     r
                 }
                 Err(e) => {
                     astra_core::log_persist!(
-                        self.run_engine.persist_status(&rev_run_id, STATUS_FAILED, None, Some(e.as_str())).await,
-                        "delegation", &rev_run_id, "status"
+                        self.run_engine
+                            .persist_status(&rev_run_id, STATUS_FAILED, None, Some(e.as_str()))
+                            .await,
+                        "delegation",
+                        &rev_run_id,
+                        "status"
                     );
                     AgentResult {
                         agent_id: reviewer_id.to_string(),
@@ -1401,18 +1460,9 @@ impl DelegationEngine {
 
             // Build fork-specific context: parent messages + fork instruction
             let mut fork_context = request.context.clone();
-            fork_context.insert(
-                "fork_index".to_string(),
-                serde_json::json!(i),
-            );
-            fork_context.insert(
-                "parent_messages".to_string(),
-                parent_messages.clone(),
-            );
-            fork_context.insert(
-                "is_fork_child".to_string(),
-                serde_json::json!(true),
-            );
+            fork_context.insert("fork_index".to_string(), serde_json::json!(i));
+            fork_context.insert("parent_messages".to_string(), parent_messages.clone());
+            fork_context.insert("is_fork_child".to_string(), serde_json::json!(true));
 
             let fork_task = format!(
                 "You are fork child #{i} of {total}.\n\
@@ -1524,8 +1574,17 @@ impl DelegationEngine {
         // Persist pause status for each sub-run
         for record in self.tracker.get_sub_runs(delegation_id).await {
             astra_core::log_persist!(
-                self.run_engine.persist_status(&record.run_id, STATUS_PAUSED, Some("delegation_pause"), None).await,
-                "delegation", &record.run_id, "pause"
+                self.run_engine
+                    .persist_status(
+                        &record.run_id,
+                        STATUS_PAUSED,
+                        Some("delegation_pause"),
+                        None
+                    )
+                    .await,
+                "delegation",
+                &record.run_id,
+                "pause"
             );
         }
         count
@@ -1538,8 +1597,17 @@ impl DelegationEngine {
         let count = self.tracker.resume_delegation(delegation_id).await;
         for record in self.tracker.get_sub_runs(delegation_id).await {
             astra_core::log_persist!(
-                self.run_engine.persist_status(&record.run_id, STATUS_RUNNING, Some("delegation_resume"), None).await,
-                "delegation", &record.run_id, "resume"
+                self.run_engine
+                    .persist_status(
+                        &record.run_id,
+                        STATUS_RUNNING,
+                        Some("delegation_resume"),
+                        None
+                    )
+                    .await,
+                "delegation",
+                &record.run_id,
+                "resume"
             );
         }
         count
@@ -1550,8 +1618,12 @@ impl DelegationEngine {
         let count = self.tracker.pause_children_of(parent_run_id).await;
         for child_id in self.tracker.get_children(parent_run_id).await {
             astra_core::log_persist!(
-                self.run_engine.persist_status(&child_id, STATUS_PAUSED, Some("parent_pause"), None).await,
-                "delegation", &child_id, "pause"
+                self.run_engine
+                    .persist_status(&child_id, STATUS_PAUSED, Some("parent_pause"), None)
+                    .await,
+                "delegation",
+                &child_id,
+                "pause"
             );
         }
         count
@@ -1562,8 +1634,12 @@ impl DelegationEngine {
         let count = self.tracker.resume_children_of(parent_run_id).await;
         for child_id in self.tracker.get_children(parent_run_id).await {
             astra_core::log_persist!(
-                self.run_engine.persist_status(&child_id, STATUS_RUNNING, Some("parent_resume"), None).await,
-                "delegation", &child_id, "resume"
+                self.run_engine
+                    .persist_status(&child_id, STATUS_RUNNING, Some("parent_resume"), None)
+                    .await,
+                "delegation",
+                &child_id,
+                "resume"
             );
         }
         count
@@ -2244,12 +2320,8 @@ mod tests {
             let _ = r.register(AgentProfile::new("agent-a", "Agent A", AgentTier::User));
             let _ = r.register(AgentProfile::new("agent-b", "Agent B", AgentTier::User));
         }
-        let de = DelegationEngine::with_executor(
-            reg,
-            engine,
-            tracker,
-            Arc::new(WorktreeCheckExecutor),
-        );
+        let de =
+            DelegationEngine::with_executor(reg, engine, tracker, Arc::new(WorktreeCheckExecutor));
 
         let mut ctx = HashMap::new();
         ctx.insert(
@@ -2840,7 +2912,11 @@ mod tests {
     async fn fork_spawns_parallel_children() {
         let (_, _engine, tracker, de) = setup_with_executor(Arc::new(EchoExecutor));
 
-        let req = fork_request("del-fork-spawn", vec!["task-a", "task-b", "task-c"], "writer");
+        let req = fork_request(
+            "del-fork-spawn",
+            vec!["task-a", "task-b", "task-c"],
+            "writer",
+        );
         let result = de.execute(req, "orch").await.unwrap();
 
         assert_eq!(result.agent_results.len(), 3);
@@ -2884,14 +2960,16 @@ mod tests {
         }
 
         let (reg, engine, tracker) = setup();
-        let de = DelegationEngine::with_executor(
-            reg, engine, tracker, Arc::new(DelegateCheckExecutor),
-        );
+        let de =
+            DelegationEngine::with_executor(reg, engine, tracker, Arc::new(DelegateCheckExecutor));
 
         let req = fork_request("del-fork-deleg", vec!["task-a"], "writer");
         let result = de.execute(req, "orch").await.unwrap();
 
-        assert_eq!(result.agent_results[0].output.as_deref(), Some("can_delegate=false,depth=0"));
+        assert_eq!(
+            result.agent_results[0].output.as_deref(),
+            Some("can_delegate=false,depth=0")
+        );
     }
 
     #[tokio::test]
@@ -2932,10 +3010,16 @@ mod tests {
         #[async_trait]
         impl SubRunExecutor for ForkContextCheckExecutor {
             async fn execute(&self, config: SubRunConfig) -> Result<AgentResult, String> {
-                let is_fork = config.context.get("is_fork_child")
-                    .and_then(|v| v.as_bool()).unwrap_or(false);
-                let idx = config.context.get("fork_index")
-                    .and_then(|v| v.as_u64()).unwrap_or(999);
+                let is_fork = config
+                    .context
+                    .get("is_fork_child")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let idx = config
+                    .context
+                    .get("fork_index")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(999);
                 Ok(AgentResult {
                     agent_id: config.agent_profile.agent_id,
                     run_id: config.run_id,
@@ -2951,14 +3035,19 @@ mod tests {
 
         let (reg, engine, tracker) = setup();
         let de = DelegationEngine::with_executor(
-            reg, engine, tracker, Arc::new(ForkContextCheckExecutor),
+            reg,
+            engine,
+            tracker,
+            Arc::new(ForkContextCheckExecutor),
         );
 
         let req = fork_request("del-fork-ctx", vec!["a", "b"], "writer");
         let result = de.execute(req, "orch").await.unwrap();
 
         // Both children should have fork metadata
-        let outputs: Vec<String> = result.agent_results.iter()
+        let outputs: Vec<String> = result
+            .agent_results
+            .iter()
             .filter_map(|r| r.output.clone())
             .collect();
         assert!(outputs.iter().any(|o| o.contains("is_fork=true,idx=0")));
@@ -3065,14 +3154,15 @@ mod tests {
         #[async_trait]
         impl SubRunExecutor for HardErrorExecutor {
             async fn execute(&self, config: SubRunConfig) -> Result<AgentResult, String> {
-                Err(format!("executor crashed for {}", config.agent_profile.agent_id))
+                Err(format!(
+                    "executor crashed for {}",
+                    config.agent_profile.agent_id
+                ))
             }
         }
 
         let (reg, engine, tracker) = setup();
-        let de = DelegationEngine::with_executor(
-            reg, engine, tracker, Arc::new(HardErrorExecutor),
-        );
+        let de = DelegationEngine::with_executor(reg, engine, tracker, Arc::new(HardErrorExecutor));
 
         let req = fan_out_request(vec!["coder"]);
         let result = de.execute(req, "orch").await.unwrap();
@@ -3080,7 +3170,13 @@ mod tests {
         // Hard errors should be captured as failed agent results, not propagated
         assert_eq!(result.agent_results.len(), 1);
         assert_eq!(result.agent_results[0].status, "failed");
-        assert!(result.agent_results[0].error.as_ref().unwrap().contains("crashed"));
+        assert!(
+            result.agent_results[0]
+                .error
+                .as_ref()
+                .unwrap()
+                .contains("crashed")
+        );
     }
 
     // ── Sequential: output chaining across stages ───────────────────────────
@@ -3088,9 +3184,7 @@ mod tests {
     #[tokio::test]
     async fn sequential_output_chaining_verified() {
         let (reg, engine, tracker) = setup();
-        let de = DelegationEngine::with_executor(
-            reg, engine, tracker, Arc::new(EchoExecutor),
-        );
+        let de = DelegationEngine::with_executor(reg, engine, tracker, Arc::new(EchoExecutor));
 
         let req = DelegationRequest {
             delegation_id: "del-seq-chain".into(),
@@ -3113,9 +3207,15 @@ mod tests {
         assert!(out0.contains("[coder]"), "first stage should run");
 
         let out1 = result.agent_results[1].output.as_ref().unwrap();
-        assert!(out1.contains("prev="), "second stage should receive prev output");
+        assert!(
+            out1.contains("prev="),
+            "second stage should receive prev output"
+        );
 
         let out2 = result.agent_results[2].output.as_ref().unwrap();
-        assert!(out2.contains("prev="), "third stage should receive prev output");
+        assert!(
+            out2.contains("prev="),
+            "third stage should receive prev output"
+        );
     }
 }

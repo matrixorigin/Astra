@@ -563,10 +563,20 @@ pub(super) fn spawn_plan_executor(
     let (handle, update_tx, cmd_rx) = create_plan_channels();
 
     tokio::spawn(async move {
-        plan_executor_task(ctx, selector, update_tx, cmd_rx).await;
+        let mut ctx = ctx;
+        plan_executor_task(&mut ctx, selector, update_tx, cmd_rx).await;
+        cleanup_plan_root_mailbox(&mut ctx).await;
     });
 
     handle
+}
+
+async fn cleanup_plan_root_mailbox(ctx: &mut BackgroundPlanContext) {
+    if let Some(mailbox) = ctx.root_mailbox.take() {
+        let addr = mailbox.address.clone();
+        let router = mailbox.router();
+        let _ = router.unregister(&addr).await;
+    }
 }
 
 /// The background plan executor task body.
@@ -582,7 +592,7 @@ pub(super) fn spawn_plan_executor(
 /// On completion, sends `PlanUpdate::PlanCompleted`. On error, sends
 /// `PlanUpdate::PlanError`.
 async fn plan_executor_task(
-    mut ctx: BackgroundPlanContext,
+    ctx: &mut BackgroundPlanContext,
     selector: Box<dyn ToolSelector>,
     update_tx: tokio::sync::mpsc::UnboundedSender<PlanUpdate>,
     mut cmd_rx: tokio::sync::mpsc::UnboundedReceiver<PlanCommand>,
@@ -1214,24 +1224,19 @@ async fn plan_executor_task(
                         .or_insert(1);
 
                     if *retry_count > MAX_TURN_RETRIES {
-                        if let Some(st) =
-                            ctx.plan.subtasks.iter_mut().find(|s| s.id == *next_id)
-                        {
+                        if let Some(st) = ctx.plan.subtasks.iter_mut().find(|s| s.id == *next_id) {
                             st.status = TaskStatus::Failed;
                         }
                         let _ = update_tx.send(PlanUpdate::PlanError {
                             error: format!(
                                 "Subtask '{}' failed after {} attempts: {}",
-                                next_id,
-                                *retry_count,
-                                failure.error
+                                next_id, *retry_count, failure.error
                             ),
                         });
                         return;
                     }
 
-                    if let Some(st) = ctx.plan.subtasks.iter_mut().find(|s| s.id == *next_id)
-                    {
+                    if let Some(st) = ctx.plan.subtasks.iter_mut().find(|s| s.id == *next_id) {
                         st.status = TaskStatus::Pending;
                     }
                     sink.subtask_verification_failed(
@@ -1533,16 +1538,24 @@ mod tests {
 
     #[test]
     fn turn_retry_counts_increments_correctly() {
-        let mut counts: std::collections::HashMap<String, u32> =
-            std::collections::HashMap::new();
+        let mut counts: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
         // First failure for "s1" → count becomes 1
-        let c = counts.entry("s1".into()).and_modify(|c| *c += 1).or_insert(1);
+        let c = counts
+            .entry("s1".into())
+            .and_modify(|c| *c += 1)
+            .or_insert(1);
         assert_eq!(*c, 1);
         // Second failure for "s1" → count becomes 2
-        let c = counts.entry("s1".into()).and_modify(|c| *c += 1).or_insert(1);
+        let c = counts
+            .entry("s1".into())
+            .and_modify(|c| *c += 1)
+            .or_insert(1);
         assert_eq!(*c, 2);
         // "s10" is distinct from "s1" (no substring confusion)
-        let c = counts.entry("s10".into()).and_modify(|c| *c += 1).or_insert(1);
+        let c = counts
+            .entry("s10".into())
+            .and_modify(|c| *c += 1)
+            .or_insert(1);
         assert_eq!(*c, 1);
         // "s1" is still at 2
         assert_eq!(counts["s1"], 2);
@@ -1627,7 +1640,10 @@ mod tests {
         let update = handle2.try_recv().unwrap();
         assert!(matches!(update, PlanUpdate::PlanError { .. }));
         let mut handle1 = handle1;
-        assert!(handle1.try_recv().is_none(), "handle1 should have no updates");
+        assert!(
+            handle1.try_recv().is_none(),
+            "handle1 should have no updates"
+        );
 
         drop(tx1);
         drop(tx2);

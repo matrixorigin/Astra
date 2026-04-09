@@ -41,6 +41,22 @@ use agentic_sse_loop::{
 use cli_loop_host::CliAgenticLoopHost;
 use serde_json::json;
 
+async fn finalize_root_mailbox(
+    slot: Option<&mut Option<astra_runtime::messaging::router::AgentMailbox>>,
+    mailbox: &mut Option<astra_runtime::messaging::router::AgentMailbox>,
+) {
+    if let Some(slot) = slot {
+        *slot = mailbox.take();
+        return;
+    }
+
+    if let Some(mailbox) = mailbox.take() {
+        let addr = mailbox.address.clone();
+        let router = mailbox.router();
+        let _ = router.unregister(&addr).await;
+    }
+}
+
 pub(crate) async fn stream_chat_sse(
     mut p: ChatTurnParams<'_>,
 ) -> Result<StreamResult, crate::TurnFailure> {
@@ -398,9 +414,7 @@ pub(crate) async fn stream_chat_sse(
         s.stop_clear();
     }
     if let Err(e) = run_agentic_loop_with_host(&mut host, &mut state).await {
-        if let Some(slot) = p.root_mailbox_slot {
-            *slot = state.mailbox.take();
-        }
+        finalize_root_mailbox(p.root_mailbox_slot, &mut state.mailbox).await;
         if let Some(shared) = p.discovered_skills {
             *shared = state.discovered_skills;
         }
@@ -428,9 +442,7 @@ pub(crate) async fn stream_chat_sse(
     if let Some(shared) = p.discovered_skills {
         *shared = state.discovered_skills.clone();
     }
-    if let Some(slot) = p.root_mailbox_slot {
-        *slot = state.mailbox.take();
-    }
+    finalize_root_mailbox(p.root_mailbox_slot, &mut state.mailbox).await;
 
     eprint_stream_loop_sidecars(StreamLoopSidecarEprint {
         explain: p.explain,

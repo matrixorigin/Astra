@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use super::transport::{MessageStream, MessageTransport};
 use super::types::{AgentAddress, AgentMessage, MailboxError, MessageTarget};
-use crate::server::delegation_engine::DelegationTracker;
+use crate::server::delegation_engine::{DelegationTracker, SubRunRecord};
 
 // ─── AgentMailbox ───────────────────────────────────────────────────────────
 
@@ -61,10 +61,7 @@ impl AgentMailbox {
     }
 
     /// Convenience: send a text message to the parent agent.
-    pub async fn send_to_parent(
-        &self,
-        content: impl Into<String>,
-    ) -> Result<(), MailboxError> {
+    pub async fn send_to_parent(&self, content: impl Into<String>) -> Result<(), MailboxError> {
         let msg = AgentMessage::new(
             self.address.clone(),
             MessageTarget::Parent,
@@ -242,16 +239,21 @@ impl AgentMailboxRouter {
         self.transport.unregister(addr).await
     }
 
+    /// Record a sub-run relationship for parent-target resolution.
+    pub async fn record_sub_run(&self, record: SubRunRecord) {
+        self.delegation_tracker.record_sub_run(record).await;
+    }
+
+    /// Get the known delegation depth for a run.
+    pub async fn run_depth(&self, run_id: &str) -> Option<u32> {
+        self.delegation_tracker.get_depth(run_id).await
+    }
+
     /// List all registered agent IDs.
     ///
     /// Used by the send_message tool to display broadcast recipients.
     pub async fn list_registered_agents(&self) -> Vec<String> {
-        self.agent_id_index
-            .read()
-            .await
-            .keys()
-            .cloned()
-            .collect()
+        self.agent_id_index.read().await.keys().cloned().collect()
     }
 
     /// Resolve the address of a parent run.
