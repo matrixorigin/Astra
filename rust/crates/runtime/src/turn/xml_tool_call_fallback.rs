@@ -5,15 +5,28 @@
 //! protocol (`delta.tool_calls`).  When the structured `tool_calls` array is empty
 //! but the text contains `<invoke>` XML, this module extracts them into the same
 //! `Vec<Value>` shape the rest of the pipeline expects.
+//!
+//! **False-positive guard**: if the non-XML portion of the text exceeds 20% of
+//! the total length, the content is likely a normal response that *mentions*
+//! `<invoke>` (e.g. explaining the XML format) rather than a degraded tool call.
+//! In that case `parse_xml_tool_calls` returns `None`.
 
 use serde_json::{Value, json};
 use uuid::Uuid;
 
+/// Maximum ratio of non-XML text to total text before we refuse to treat the
+/// content as degraded tool calls.  0.20 = if more than 20% of the content is
+/// plain prose surrounding the `<invoke>` blocks, it's probably a normal
+/// response that happens to contain XML examples.
+const MAX_NON_XML_RATIO: f64 = 0.20;
+
 /// Try to extract tool calls from XML `<invoke>` blocks in `text`.
 ///
 /// Returns `Some(tool_calls)` (non-empty) on success, `None` if no valid
-/// invocations were found.  Each returned value matches the OpenAI
-/// `tool_calls` element shape:
+/// invocations were found or if the text looks like a normal response that
+/// merely *mentions* `<invoke>` XML.
+///
+/// Each returned value matches the OpenAI `tool_calls` element shape:
 ///
 /// ```json
 /// { "id": "...", "type": "function", "function": { "name": "...", "arguments": "{...}" } }
@@ -24,6 +37,7 @@ pub fn parse_xml_tool_calls(text: &str) -> Option<Vec<Value>> {
     }
 
     let mut calls = Vec::new();
+    let mut xml_bytes: usize = 0;
     let mut search_from = 0;
 
     while let Some(start) = text[search_from..].find("<invoke") {
@@ -41,11 +55,28 @@ pub fn parse_xml_tool_calls(text: &str) -> Option<Vec<Value>> {
         let block = &text[abs_start..block_end];
         if let Some(tc) = parse_single_invoke(block) {
             calls.push(tc);
+            xml_bytes += block_end - abs_start;
         }
         search_from = block_end;
     }
 
-    if calls.is_empty() { None } else { Some(calls) }
+    if calls.is_empty() {
+        return None;
+    }
+
+    // False-positive guard: if the surrounding prose is substantial relative
+    // to the XML blocks, this is likely a normal response discussing the
+    // format rather than a degraded tool call.
+    let total = text.trim().len();
+    if total > 0 {
+        let non_xml = total.saturating_sub(xml_bytes);
+        let ratio = non_xml as f64 / total as f64;
+        if ratio > MAX_NON_XML_RATIO {
+            return None;
+        }
+    }
+
+    Some(calls)
 }
 
 /// Strip successfully-parsed `<invoke>` blocks from text, returning the
@@ -197,17 +228,39 @@ mod tests {
     }
 
     #[test]
-    fn mixed_text_and_invokes() {
-        let xml = r#"Let me read the file first.
+    fn mixed_text_and_invokes_with_little_prose() {
+        // Short transitional text between invokes — still treated as degraded tool calls
+        let xml = r#"
 <invoke name="read_file">
 <parameter name="path">src/lib.rs</parameter>
 </invoke>
-And also search for errors.
 <invoke name="grep">
 <parameter name="pattern">error</parameter>
 </invoke>"#;
         let calls = parse_xml_tool_calls(xml).unwrap();
         assert_eq!(calls.len(), 2);
+    }
+
+    #[test]
+    fn rejects_invoke_embedded_in_prose() {
+        // Normal response that discusses the XML format — should NOT trigger fallback
+        let text = r#"The system uses XML tool calls like this:
+<invoke name="read_file">
+<parameter name="path">src/lib.rs</parameter>
+</invoke>
+This format is used when the model degrades under context pressure.
+You can see the invoke block contains parameter elements."#;
+        assert!(parse_xml_tool_calls(text).is_none());
+    }
+
+    #[test]
+    fn rejects_single_invoke_in_explanation() {
+        let text = r#"Here is an example of the invoke format:
+<invoke name="bash">
+<parameter name="command">echo hello</parameter>
+</invoke>
+As you can see, the name attribute specifies the tool."#;
+        assert!(parse_xml_tool_calls(text).is_none());
     }
 
     #[test]
