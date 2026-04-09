@@ -525,6 +525,10 @@ pub(super) struct BackgroundPlanContext {
     pub unified_skill_registry: Arc<astra_runtime::skills::UnifiedSkillRegistry>,
     pub skill_search: astra_core::SkillSearchSettings,
     pub delegation_engine: Option<Arc<astra_runtime::server::delegation_engine::DelegationEngine>>,
+    pub messaging_metrics: Option<Arc<astra_runtime::messaging::MessagingMetrics>>,
+    pub agent_spawner: Option<Arc<astra_runtime::orchestration::DynamicAgentSpawner>>,
+    pub root_mailbox: Option<astra_runtime::messaging::router::AgentMailbox>,
+    pub root_agent_id: String,
     pub durable_task_state: Option<durable_bridge::DurableTaskState>,
     pub workspace_root: PathBuf,
 
@@ -996,9 +1000,10 @@ async fn plan_executor_task(
                     skill_search: &ctx.skill_search,
                     skill_quality_tracker: &mut skill_qt,
                     discovered_skills: None,
-                    messaging_metrics: None,
-                    agent_spawner: None,
-                    root_mailbox_slot: None,
+                    messaging_metrics: ctx.messaging_metrics.clone(),
+                    agent_spawner: ctx.agent_spawner.clone(),
+                    root_agent_id: Some(ctx.root_agent_id.as_str()),
+                    root_mailbox_slot: Some(&mut ctx.root_mailbox),
                 })
                 .await;
 
@@ -1327,6 +1332,10 @@ mod tests {
             unified_skill_registry: Arc::new(reg),
             skill_search: astra_core::SkillSearchSettings::default(),
             delegation_engine: None,
+            messaging_metrics: None,
+            agent_spawner: None,
+            root_mailbox: None,
+            root_agent_id: "plan-test".into(),
             durable_task_state: None,
             workspace_root: std::env::temp_dir(),
             ingestion_user_id: None,

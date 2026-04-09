@@ -45,6 +45,7 @@ pub(crate) async fn stream_chat_sse(
     mut p: ChatTurnParams<'_>,
 ) -> Result<StreamResult, crate::TurnFailure> {
     let start = Instant::now();
+    let root_agent_id = p.root_agent_id.unwrap_or("main");
     let term_width = terminal_width_usize();
 
     // Paint an immediate spinner so the user sees feedback during init (executor, schemas,
@@ -75,7 +76,7 @@ pub(crate) async fn stream_chat_sse(
         if let Some(ref spawner) = p.agent_spawner {
             let spawn_ctx = edge_tools::agent_spawning::SpawnAgentContext {
                 run_id: p.session_id.unwrap_or("ephemeral").to_string(),
-                agent_id: "main".to_string(),  // TODO: support nested agents
+                agent_id: root_agent_id.to_string(),
                 working_dir: project_root.clone(),
                 spawner: spawner.clone(),
             };
@@ -86,7 +87,7 @@ pub(crate) async fn stream_chat_sse(
     };
     let root_send_message_context = p.agent_spawner.as_ref().map(|spawner| {
         edge_tools::agent_messaging::SendMessageRuntimeContext {
-            agent_id: "main".to_string(),
+            agent_id: root_agent_id.to_string(),
             router: spawner.mailbox_router(),
             metrics: p.messaging_metrics.clone(),
             delegation_id: None,

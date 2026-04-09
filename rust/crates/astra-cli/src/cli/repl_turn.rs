@@ -498,6 +498,7 @@ async fn maybe_auto_compact(
         discovered_skills: None,
         messaging_metrics: state.messaging_metrics.clone(),
         agent_spawner: state.agent_spawner.clone(),
+        root_agent_id: Some("main"),
         root_mailbox_slot: Some(&mut state.root_mailbox),
     })
     .await;
@@ -671,6 +672,7 @@ async fn run_chat_turn(
             discovered_skills: Some(&mut state.discovered_skills),
             messaging_metrics: state.messaging_metrics.clone(),
             agent_spawner: state.agent_spawner.clone(),
+            root_agent_id: Some("main"),
             root_mailbox_slot: Some(&mut state.root_mailbox),
         }) => TurnAttempt::Completed(Box::new(result)),
         _ = tokio::signal::ctrl_c() => {

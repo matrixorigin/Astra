@@ -229,6 +229,7 @@ pub(super) async fn handle_state_command(
                     discovered_skills: None,
                     messaging_metrics: state.messaging_metrics.clone(),
                     agent_spawner: state.agent_spawner.clone(),
+                    root_agent_id: Some("main"),
                     root_mailbox_slot: Some(&mut state.root_mailbox),
                 }) => r,
                 _ = tokio::signal::ctrl_c() => {
@@ -323,6 +324,7 @@ pub(super) async fn handle_state_command(
                             discovered_skills: None,
                             messaging_metrics: state.messaging_metrics.clone(),
                             agent_spawner: state.agent_spawner.clone(),
+                            root_agent_id: Some("main"),
                             root_mailbox_slot: Some(&mut state.root_mailbox),
                         })
                         .await;
@@ -397,6 +399,7 @@ pub(super) async fn handle_state_command(
                                     discovered_skills: None,
                                     messaging_metrics: state.messaging_metrics.clone(),
                                     agent_spawner: state.agent_spawner.clone(),
+                                    root_agent_id: Some("main"),
                                     root_mailbox_slot: Some(&mut state.root_mailbox),
                                 })
                                 .await;

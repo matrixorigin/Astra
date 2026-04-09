@@ -104,6 +104,7 @@ pub(super) async fn execute_cli_command(
                 discovered_skills: None,
                 messaging_metrics: None,
                 agent_spawner: None,
+                root_agent_id: None,
                 root_mailbox_slot: None,
             })
             .await
@@ -143,6 +144,7 @@ pub(super) async fn execute_cli_command(
                         discovered_skills: None,
                         messaging_metrics: None,
                         agent_spawner: None,
+                        root_agent_id: None,
                         root_mailbox_slot: None,
                     })
                     .await
@@ -402,6 +404,7 @@ pub(super) async fn execute_cli_command(
                 discovered_skills: None,
                 messaging_metrics: None,
                 agent_spawner: None,
+                root_agent_id: None,
                 root_mailbox_slot: None,
             })
             .await
@@ -441,6 +444,7 @@ pub(super) async fn execute_cli_command(
                         discovered_skills: None,
                         messaging_metrics: None,
                         agent_spawner: None,
+                        root_agent_id: None,
                         root_mailbox_slot: None,
                     })
                     .await
@@ -893,6 +897,7 @@ pub(super) async fn run_print_mode(
         discovered_skills: None,
         messaging_metrics: None,
         agent_spawner: None,
+        root_agent_id: None,
         root_mailbox_slot: None,
     })
     .await
@@ -934,6 +939,7 @@ pub(super) async fn run_print_mode(
                 discovered_skills: None,
                 messaging_metrics: None,
                 agent_spawner: None,
+                root_agent_id: None,
                 root_mailbox_slot: None,
             })
             .await

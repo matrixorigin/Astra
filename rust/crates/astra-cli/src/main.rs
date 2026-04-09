@@ -3351,6 +3351,10 @@ fn take_plan_context(
         unified_skill_registry: state.unified_skill_registry.clone(),
         skill_search: state.skill_search.clone(),
         delegation_engine: state.delegation_engine.clone(),
+        messaging_metrics: state.messaging_metrics.clone(),
+        agent_spawner: state.agent_spawner.clone(),
+        root_mailbox: None,
+        root_agent_id: format!("plan-{}", uuid::Uuid::new_v4()),
         durable_task_state: state.durable_task_state.take(),
         workspace_root: std::env::current_dir().unwrap_or_default(),
         // Cloud + learning integration
@@ -5204,8 +5208,12 @@ async fn handle_task_command(
             let bg_history = state.history.clone();
             let bg_unified_skill_registry = state.unified_skill_registry.clone();
             let bg_skill_search = state.skill_search.clone();
+            let bg_messaging_metrics = state.messaging_metrics.clone();
+            let bg_agent_spawner = state.agent_spawner.clone();
+            let bg_delegation_engine = state.delegation_engine.clone();
             let svc_clone = svc.clone();
             let workspace_root = std::env::current_dir().unwrap_or_default();
+            let bg_root_agent_id = format!("task-{task_id}");
 
             eprintln!(
                 "  {} Background task started: {} ({})",
@@ -5258,7 +5266,7 @@ async fn handle_task_command(
                     hide_streaming_assistant_text: true,
                     is_plan_subtask: false,
                     plan_subtask_id: None,
-                    delegation_engine: None,
+                    delegation_engine: bg_delegation_engine.clone(),
                     cancel_token: None,
                     plan_assemble_line_release: None,
                     stream_event_tx: None,
@@ -5267,8 +5275,9 @@ async fn handle_task_command(
                     skill_search: &bg_skill_search,
                     skill_quality_tracker: &mut skill_qt,
                     discovered_skills: None,
-                    messaging_metrics: None,
-                    agent_spawner: None,
+                    messaging_metrics: bg_messaging_metrics.clone(),
+                    agent_spawner: bg_agent_spawner.clone(),
+                    root_agent_id: Some(bg_root_agent_id.as_str()),
                     root_mailbox_slot: None,
                 })
                 .await;
@@ -7581,6 +7590,7 @@ mod tests {
             discovered_skills: None,
             messaging_metrics: None,
             agent_spawner: None,
+            root_agent_id: None,
             root_mailbox_slot: None,
         })
         .await
@@ -7661,6 +7671,7 @@ mod tests {
                 discovered_skills: None,
                 messaging_metrics: None,
                 agent_spawner: Some(spawner.clone()),
+                root_agent_id: Some("main"),
                 root_mailbox_slot: Some(&mut root_mailbox),
             })
             .await
@@ -7765,6 +7776,7 @@ mod tests {
             discovered_skills: None,
             messaging_metrics: None,
             agent_spawner: None,
+            root_agent_id: None,
             root_mailbox_slot: None,
         })
         .await;
@@ -7841,6 +7853,7 @@ mod tests {
             discovered_skills: None,
             messaging_metrics: None,
             agent_spawner: None,
+            root_agent_id: None,
             root_mailbox_slot: None,
         })
         .await
