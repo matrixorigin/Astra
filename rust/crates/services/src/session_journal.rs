@@ -1717,6 +1717,7 @@ impl JournalEvent {
     }
 
     /// Agent terminated event — persists final state of a spawned agent.
+    #[allow(clippy::too_many_arguments)]
     pub fn agent_terminated(
         session_id: Option<&str>,
         agent_id: &str,
