@@ -25,11 +25,13 @@ use super::*;
     }
 
     #[tokio::test]
-    async fn execute_delegate_without_runtime_returns_guidance() {
+    async fn execute_delegate_returns_deferred_acknowledgment() {
         let executor = test_executor();
         let result = executor.execute("delegate", &json!({})).await;
-        assert!(result.contains("spawn_agent"), "got: {result}");
-        assert!(result.contains("not available in this context"), "got: {result}");
+        assert!(
+            result.contains("Delegation request acknowledged"),
+            "got: {result}"
+        );
     }
 
     #[tokio::test]

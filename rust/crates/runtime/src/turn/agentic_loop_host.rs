@@ -401,7 +401,7 @@ pub enum AgenticLoopOutcome {
 
 // ─── Delegation support ──────────────────────────────────────────────────────
 
-const DELEGATE_TOOL_NAME: &str = "delegate";
+pub const DELEGATE_TOOL_NAME: &str = "delegate";
 
 /// Check if a tool call is a delegation call.
 fn is_delegation_call(tool_call: &Value) -> bool {
@@ -1307,15 +1307,58 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
                 (Vec::new(), turn_result.accum.tool_calls.clone())
             };
 
-        // Inject delegation results into messages + tool_results
-        for (call_id, result_text) in &delegation_results {
-            let tool_msg = serde_json::json!({
-                "role": "tool",
-                "tool_call_id": call_id,
-                "content": result_text,
-            });
-            state.messages.push(tool_msg.clone());
-            state.tool_results.push(tool_msg);
+        // Inject delegation results into messages + tool_results.
+        // Build a proper assistant message with the delegate tool_calls so
+        // downstream tool-result messages have a matching assistant entry
+        // (required by OpenAI conversation format).
+        if !delegation_results.is_empty() {
+            let delegate_tool_calls: Vec<&Value> = turn_result
+                .accum
+                .tool_calls
+                .iter()
+                .filter(|tc| is_delegation_call(tc))
+                .collect();
+            if !delegate_tool_calls.is_empty() {
+                let tc_entries: Vec<Value> = delegate_tool_calls
+                    .iter()
+                    .map(|tc| {
+                        let id = tc.get("id").and_then(Value::as_str).unwrap_or("");
+                        let name = tc.get("name").and_then(Value::as_str).unwrap_or("delegate");
+                        let args = tc.get("arguments").cloned().unwrap_or(serde_json::json!({}));
+                        serde_json::json!({
+                            "id": id,
+                            "type": "function",
+                            "function": {
+                                "name": name,
+                                "arguments": serde_json::to_string(&args)
+                                    .unwrap_or_else(|_| "{}".to_string()),
+                            }
+                        })
+                    })
+                    .collect();
+                let mut assistant_msg = serde_json::json!({
+                    "role": "assistant",
+                    "content": Value::Null,
+                    "tool_calls": tc_entries,
+                });
+                // Preserve reasoning_content for thinking-model sessions.
+                let rc = &turn_result.accum.reasoning_content;
+                if !rc.is_empty() {
+                    assistant_msg["reasoning_content"] = Value::String(rc.clone());
+                } else if super::edge_ledger::history_has_reasoning(&state.messages) {
+                    assistant_msg["reasoning_content"] = Value::String(String::new());
+                }
+                state.messages.push(assistant_msg);
+            }
+            for (call_id, result_text) in &delegation_results {
+                let tool_msg = serde_json::json!({
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "content": result_text,
+                });
+                state.messages.push(tool_msg.clone());
+                state.tool_results.push(tool_msg);
+            }
         }
 
         if !delegation_results.is_empty()
@@ -1698,6 +1741,23 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
             .map(|r| (tool_dedup_signature(&r.tool, &r.args), r.output.clone()))
             .collect();
 
+        // When delegations were handled by step 3b, filter delegate results
+        // out of edge_tool_round so the headless round's fallback path
+        // (used when effective_tool_calls is empty) doesn't reconstruct
+        // duplicate delegate tool_calls from edge results.
+        let filtered_edge_round: Vec<_>;
+        let edge_round_for_headless: &[EdgeToolExecResult] = if !delegation_results.is_empty() {
+            filtered_edge_round = turn_result
+                .edge_tool_round
+                .iter()
+                .filter(|r| r.tool != DELEGATE_TOOL_NAME)
+                .cloned()
+                .collect();
+            &filtered_edge_round
+        } else {
+            turn_result.edge_tool_round.as_slice()
+        };
+
         {
             let valid_tool_names = host.valid_tool_names().clone();
             let mut term_adapter = HostTerminalAdapter(host);
@@ -1708,7 +1768,7 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
                 &state.api_token,
                 state.current_session_id.as_ref(),
                 effective_tool_calls,
-                turn_result.edge_tool_round.as_slice(),
+                edge_round_for_headless,
                 turn_result.accum.reasoning_content.as_str(),
                 &edge_callback_outputs,
                 &mut state.messages,

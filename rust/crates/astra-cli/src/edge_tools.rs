@@ -774,10 +774,11 @@ impl ToolExecutor {
             }
             "share_context" => self.share_context(args),
             "query_context" => self.query_context(args),
-            "delegate" => "Error: Tool 'delegate' is not available in this context. Use \
-                'spawn_agent' for public sub-agent work. The internal 'delegate' tool is only \
-                injected into agentic-loop turns when delegation is enabled."
-                .to_string(),
+            astra_runtime::turn::agentic_loop_host::DELEGATE_TOOL_NAME => {
+                "Delegation request acknowledged. The delegation engine will execute \
+                this request and provide results in the next round."
+                    .to_string()
+            }
             "diagnose" => self.diagnose(args).await,
             "lsp" => self.lsp(args),
             "env" => self.env_tool(args),

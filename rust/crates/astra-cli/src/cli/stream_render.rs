@@ -532,6 +532,14 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 } else {
                     "Error: skill resolver not available".to_string()
                 }
+            } else if tool == astra_runtime::turn::agentic_loop_host::DELEGATE_TOOL_NAME {
+                // Delegate calls are intercepted at Step 3b of the agentic loop
+                // (partition_and_execute_delegations) where the delegation engine
+                // runs sub-agents. Return a deferred acknowledgment so the server
+                // sees a success (not an error) and the model doesn't give up.
+                "Delegation request acknowledged. The delegation engine will execute \
+                 this request and provide results in the next round."
+                    .to_string()
             } else {
                 let result = self.executor.execute(tool, args).await;
                 // If the sandbox denied the operation, prompt the user for
