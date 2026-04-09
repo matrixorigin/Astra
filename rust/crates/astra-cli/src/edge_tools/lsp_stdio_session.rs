@@ -136,6 +136,17 @@ fn text_hash(text: &str) -> u64 {
     hasher.finish()
 }
 
+fn sync_existing_document(doc: &mut SyncedDocumentState, mtime_ms: u128, hash: u64) -> Option<i32> {
+    if doc.last_text_hash == hash {
+        doc.last_mtime_ms = mtime_ms;
+        return None;
+    }
+    doc.version += 1;
+    doc.last_mtime_ms = mtime_ms;
+    doc.last_text_hash = hash;
+    Some(doc.version)
+}
+
 fn send_lsp_response(stdin: &StdinShared, id: &Value, result: Value) -> io::Result<()> {
     let msg = json!({ "jsonrpc": "2.0", "id": id, "result": result });
     let mut w = stdin
@@ -393,19 +404,10 @@ impl LspStdioSession {
                 .lock()
                 .map_err(|_| io::Error::other("documents mutex poisoned"))?;
             match documents.get_mut(&uri) {
-                Some(doc) => {
-                    if doc.last_mtime_ms == mtime_ms || doc.last_text_hash == hash {
-                        doc.last_mtime_ms = mtime_ms;
-                        SyncAction::Noop
-                    } else {
-                        doc.version += 1;
-                        doc.last_mtime_ms = mtime_ms;
-                        doc.last_text_hash = hash;
-                        SyncAction::Change {
-                            version: doc.version,
-                        }
-                    }
-                }
+                Some(doc) => match sync_existing_document(doc, mtime_ms, hash) {
+                    Some(version) => SyncAction::Change { version },
+                    None => SyncAction::Noop,
+                },
                 None => {
                     documents.insert(
                         uri.clone(),
@@ -543,5 +545,42 @@ impl Drop for LspStdioSession {
             let _ = ch.kill();
             let _ = ch.wait();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lsp_sync_existing_document_resyncs_when_hash_changes_but_mtime_does_not() {
+        let mut doc = SyncedDocumentState {
+            version: 1,
+            last_mtime_ms: 1000,
+            last_text_hash: 11,
+        };
+
+        let result = sync_existing_document(&mut doc, 1000, 22);
+
+        assert_eq!(result, Some(2));
+        assert_eq!(doc.version, 2);
+        assert_eq!(doc.last_mtime_ms, 1000);
+        assert_eq!(doc.last_text_hash, 22);
+    }
+
+    #[test]
+    fn lsp_sync_existing_document_skips_resync_when_hash_matches_even_if_mtime_changes() {
+        let mut doc = SyncedDocumentState {
+            version: 3,
+            last_mtime_ms: 1000,
+            last_text_hash: 33,
+        };
+
+        let result = sync_existing_document(&mut doc, 2000, 33);
+
+        assert_eq!(result, None);
+        assert_eq!(doc.version, 3);
+        assert_eq!(doc.last_mtime_ms, 2000);
+        assert_eq!(doc.last_text_hash, 33);
     }
 }
