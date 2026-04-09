@@ -20,7 +20,7 @@ pub use context_cache::{
 pub use permission_sync::{
     PermissionMode, PermissionRule, InheritedPermissions,
     PermissionRequest, PermissionResponse, PermissionUpdate, PermissionAction,
-    PermissionSyncContext,
+    PermissionSyncContext, PermissionRequestHandler, PermissionDecision, PermissionCallback,
 };
 pub use progress::{AgentProgressEvent, ProgressEventType, ProgressBroadcaster, AgentProgressEmitter};
 pub use spawner::{

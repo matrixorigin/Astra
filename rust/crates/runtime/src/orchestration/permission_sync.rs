@@ -695,3 +695,308 @@ mod tests {
         }
     }
 }
+
+// ─── Permission Request Handler ─────────────────────────────────────────────
+
+use std::sync::Arc;
+use tokio::sync::{RwLock, oneshot};
+
+/// Result of permission decision.
+#[derive(Clone, Debug)]
+pub enum PermissionDecision {
+    /// Approve the request, optionally with rules to propagate.
+    Approve {
+        updates: Vec<PermissionUpdate>,
+    },
+    /// Deny the request with a reason.
+    Deny {
+        reason: String,
+    },
+    /// Escalate to user interaction (only valid for non-background agents).
+    Escalate,
+}
+
+impl PermissionDecision {
+    /// Create an approval decision.
+    pub fn approve() -> Self {
+        Self::Approve { updates: Vec::new() }
+    }
+    
+    /// Create an approval decision with a persistent allow rule.
+    pub fn approve_with_rule(rule: PermissionRule) -> Self {
+        Self::Approve {
+            updates: vec![PermissionUpdate::allow(rule)],
+        }
+    }
+    
+    /// Create a denial decision.
+    pub fn deny(reason: impl Into<String>) -> Self {
+        Self::Deny { reason: reason.into() }
+    }
+}
+
+/// Callback type for permission decision.
+/// 
+/// The callback receives the request and sync context, and should return
+/// a decision. If the callback returns `Escalate`, the handler will
+/// attempt user interaction (if allowed by mode).
+pub type PermissionCallback = Box<
+    dyn Fn(&PermissionRequest, &PermissionSyncContext) -> PermissionDecision + Send + Sync
+>;
+
+/// Handler for incoming permission requests from child agents.
+///
+/// The parent agent creates a handler and registers a callback to make
+/// permission decisions. The handler processes incoming requests and
+/// sends responses back to the child.
+pub struct PermissionRequestHandler {
+    /// The parent's permission context.
+    sync_context: Arc<RwLock<PermissionSyncContext>>,
+    /// Callback for making permission decisions.
+    callback: Option<PermissionCallback>,
+    /// Pending requests waiting for user interaction (request_id -> response channel).
+    pending_interactive: Arc<RwLock<std::collections::HashMap<String, oneshot::Sender<PermissionResponse>>>>,
+}
+
+impl PermissionRequestHandler {
+    /// Create a new handler with the given sync context.
+    pub fn new(sync_context: Arc<RwLock<PermissionSyncContext>>) -> Self {
+        Self {
+            sync_context,
+            callback: None,
+            pending_interactive: Arc::new(RwLock::new(std::collections::HashMap::new())),
+        }
+    }
+    
+    /// Set the permission decision callback.
+    pub fn with_callback(mut self, callback: PermissionCallback) -> Self {
+        self.callback = Some(callback);
+        self
+    }
+    
+    /// Handle an incoming permission request.
+    ///
+    /// Returns the response to send back to the child agent.
+    pub async fn handle_request(&self, request: &PermissionRequest) -> PermissionResponse {
+        let ctx = self.sync_context.read().await;
+        
+        // First check if already allowed by inherited or session rules
+        let command = request.hint.as_deref();
+        if ctx.is_allowed(&request.tool_name, command) {
+            return PermissionResponse::approve();
+        }
+        
+        // Check if denied
+        if ctx.is_denied(&request.tool_name, command) {
+            return PermissionResponse::deny("denied by permission rules");
+        }
+        
+        // Check mode
+        match ctx.mode() {
+            PermissionMode::Auto => {
+                // Auto-approve and optionally add rule
+                let response = if let Some(ref rule_str) = request.suggested_rule {
+                    PermissionResponse::approve()
+                        .with_update(PermissionUpdate::allow(PermissionRule::parse(rule_str)))
+                } else {
+                    PermissionResponse::approve()
+                };
+                
+                // Apply updates to our context
+                drop(ctx);
+                if !response.updates.is_empty() {
+                    let mut ctx_mut = self.sync_context.write().await;
+                    ctx_mut.apply_response(&response);
+                }
+                
+                response
+            }
+            PermissionMode::Deny => {
+                // Deny mode: reject without escalation
+                PermissionResponse::deny("permission mode is deny")
+            }
+            PermissionMode::Prompt => {
+                // Prompt mode: use callback or default logic
+                drop(ctx);
+                
+                if let Some(ref callback) = self.callback {
+                    let ctx = self.sync_context.read().await;
+                    match callback(request, &ctx) {
+                        PermissionDecision::Approve { updates } => {
+                            let response = PermissionResponse {
+                                approved: true,
+                                reason: None,
+                                updates: updates.clone(),
+                            };
+                            
+                            // Apply updates
+                            drop(ctx);
+                            if !updates.is_empty() {
+                                let mut ctx_mut = self.sync_context.write().await;
+                                ctx_mut.apply_response(&response);
+                            }
+                            
+                            response
+                        }
+                        PermissionDecision::Deny { reason } => {
+                            PermissionResponse::deny(reason)
+                        }
+                        PermissionDecision::Escalate => {
+                            // For now, treat escalate as deny for background agents
+                            let ctx = self.sync_context.read().await;
+                            if ctx.inherited.is_background {
+                                PermissionResponse::deny("cannot escalate in background mode")
+                            } else {
+                                // Mark as pending for interactive resolution
+                                // In real implementation, this would wait for user input
+                                PermissionResponse::deny("interactive permission pending")
+                            }
+                        }
+                    }
+                } else {
+                    // No callback: auto-approve for non-background, deny for background
+                    let ctx = self.sync_context.read().await;
+                    if ctx.inherited.is_background {
+                        PermissionResponse::deny("no permission handler configured")
+                    } else {
+                        PermissionResponse::approve()
+                    }
+                }
+            }
+        }
+    }
+    
+    /// Process a message and return a response if it's a permission request.
+    ///
+    /// Returns `Some((correlation_id, response))` if the message was a permission request,
+    /// or `None` if it wasn't.
+    pub async fn process_message(&self, msg: &AgentMessage) -> Option<(String, PermissionResponse)> {
+        if let MessagePayload::Request { request_type: RequestType::ToolPermission, data } = &msg.payload {
+            if let Some(request) = PermissionRequest::from_message_payload(data) {
+                let correlation_id = msg.correlation_id.clone().unwrap_or_default();
+                let response = self.handle_request(&request).await;
+                return Some((correlation_id, response));
+            }
+        }
+        None
+    }
+    
+    /// Get the sync context.
+    pub fn sync_context(&self) -> Arc<RwLock<PermissionSyncContext>> {
+        Arc::clone(&self.sync_context)
+    }
+}
+
+// ─── Tests for Handler ─────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod handler_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn handler_auto_mode_approves() {
+        let ctx = PermissionSyncContext::root(PermissionMode::Auto);
+        let handler = PermissionRequestHandler::new(Arc::new(RwLock::new(ctx)));
+        
+        let request = PermissionRequest::new("bash", serde_json::json!({"command": "echo hello"}));
+        let response = handler.handle_request(&request).await;
+        
+        assert!(response.approved);
+    }
+    
+    #[tokio::test]
+    async fn handler_deny_mode_denies() {
+        let ctx = PermissionSyncContext::root(PermissionMode::Deny);
+        let handler = PermissionRequestHandler::new(Arc::new(RwLock::new(ctx)));
+        
+        let request = PermissionRequest::new("bash", serde_json::json!({"command": "rm -rf /"}));
+        let response = handler.handle_request(&request).await;
+        
+        assert!(!response.approved);
+        assert!(response.reason.as_ref().unwrap().contains("deny"));
+    }
+    
+    #[tokio::test]
+    async fn handler_respects_inherited_allow() {
+        let mut inherited = InheritedPermissions::new(PermissionMode::Prompt);
+        inherited.add_allow(PermissionRule::parse("bash(git:*)"));
+        let ctx = PermissionSyncContext::new(inherited);
+        let handler = PermissionRequestHandler::new(Arc::new(RwLock::new(ctx)));
+        
+        let request = PermissionRequest::new("bash", serde_json::json!({"command": "git status"}))
+            .with_hint("git status");
+        let response = handler.handle_request(&request).await;
+        
+        assert!(response.approved);
+    }
+    
+    #[tokio::test]
+    async fn handler_respects_inherited_deny() {
+        let mut inherited = InheritedPermissions::new(PermissionMode::Auto);
+        inherited.add_deny(PermissionRule::parse("bash(rm -rf:*)"));
+        let ctx = PermissionSyncContext::new(inherited);
+        let handler = PermissionRequestHandler::new(Arc::new(RwLock::new(ctx)));
+        
+        let request = PermissionRequest::new("bash", serde_json::json!({"command": "rm -rf /"}))
+            .with_hint("rm -rf /");
+        let response = handler.handle_request(&request).await;
+        
+        assert!(!response.approved);
+    }
+    
+    #[tokio::test]
+    async fn handler_uses_callback() {
+        let ctx = PermissionSyncContext::root(PermissionMode::Prompt);
+        let handler = PermissionRequestHandler::new(Arc::new(RwLock::new(ctx)))
+            .with_callback(Box::new(|req, _ctx| {
+                if req.tool_name == "bash" {
+                    PermissionDecision::approve_with_rule(PermissionRule::parse("bash(git:*)"))
+                } else {
+                    PermissionDecision::deny("unknown tool")
+                }
+            }));
+        
+        let request = PermissionRequest::new("bash", serde_json::json!({"command": "git status"}));
+        let response = handler.handle_request(&request).await;
+        
+        assert!(response.approved);
+        assert_eq!(response.updates.len(), 1);
+        assert_eq!(response.updates[0].rule.tool, "bash");
+    }
+    
+    #[tokio::test]
+    async fn handler_applies_suggested_rule_in_auto() {
+        let ctx = PermissionSyncContext::root(PermissionMode::Auto);
+        let handler = PermissionRequestHandler::new(Arc::new(RwLock::new(ctx)));
+        
+        let request = PermissionRequest::new("bash", serde_json::json!({"command": "git status"}))
+            .with_suggested_rule("bash(git:*)");
+        let response = handler.handle_request(&request).await;
+        
+        assert!(response.approved);
+        assert_eq!(response.updates.len(), 1);
+        
+        // Verify rule was applied to context
+        let sync_ctx = handler.sync_context();
+        let ctx = sync_ctx.read().await;
+        assert!(ctx.is_allowed("bash", Some("git push")));
+    }
+    
+    #[tokio::test]
+    async fn handler_process_message() {
+        let ctx = PermissionSyncContext::root(PermissionMode::Auto);
+        let handler = PermissionRequestHandler::new(Arc::new(RwLock::new(ctx)));
+        
+        let request = PermissionRequest::new("bash", serde_json::json!({"command": "ls"}));
+        let from = AgentAddress::new("child-run", "child");
+        let to = AgentAddress::new("parent-run", "parent");
+        let msg = request.to_message(&from, &to).with_correlation("req-456");
+        
+        let result = handler.process_message(&msg).await;
+        assert!(result.is_some());
+        
+        let (correlation_id, response) = result.unwrap();
+        assert_eq!(correlation_id, "req-456");
+        assert!(response.approved);
+    }
+}
