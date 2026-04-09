@@ -493,12 +493,33 @@ impl DynamicAgentSpawner {
                             .map(|d| d.as_millis() as u64)
                             .unwrap_or(0);
 
-                        Ok(SpawnAgentOutput::Completed {
-                            agent_id,
-                            result: run_result.output.unwrap_or_default(),
-                            tool_calls: run_result.tool_calls,
-                            duration_ms,
-                        })
+                        match run_result.status.as_str() {
+                            "cancelled" => Ok(SpawnAgentOutput::Cancelled {
+                                agent_id,
+                                reason: run_result
+                                    .output
+                                    .unwrap_or_else(|| "cancelled".to_string()),
+                                tool_calls: run_result.tool_calls,
+                                duration_ms,
+                            }),
+                            "waiting" => Ok(SpawnAgentOutput::Waiting {
+                                agent_id,
+                                reason: run_result.output.unwrap_or_default(),
+                                tool_calls: run_result.tool_calls,
+                                duration_ms,
+                            }),
+                            "failed" => Ok(SpawnAgentOutput::Failed {
+                                error: run_result
+                                    .error
+                                    .unwrap_or_else(|| "agent run failed".to_string()),
+                            }),
+                            _ => Ok(SpawnAgentOutput::Completed {
+                                agent_id,
+                                result: run_result.output.unwrap_or_default(),
+                                tool_calls: run_result.tool_calls,
+                                duration_ms,
+                            }),
+                        }
                     }
                     Err(e) => {
                         self.update_status(&agent_id, AgentStatus::Failed { error: e.clone() })
@@ -927,6 +948,12 @@ mod tests {
 
     struct ImmediateSuccessExecutor;
 
+    struct ImmediateStatusExecutor {
+        status: &'static str,
+        output: Option<&'static str>,
+        error: Option<&'static str>,
+    }
+
     #[async_trait]
     impl SpawnAgentExecutor for ImmediateSuccessExecutor {
         async fn execute(&self, config: SpawnRunConfig) -> Result<SpawnRunResult, String> {
@@ -938,6 +965,26 @@ mod tests {
                 error: None,
                 prompt_tokens: 1,
                 completion_tokens: 1,
+                tool_calls: 0,
+                permission_summary: None,
+                permission_requests: 0,
+                permission_requests_approved: 0,
+                tools_blocked: 0,
+            })
+        }
+    }
+
+    #[async_trait]
+    impl SpawnAgentExecutor for ImmediateStatusExecutor {
+        async fn execute(&self, config: SpawnRunConfig) -> Result<SpawnRunResult, String> {
+            Ok(SpawnRunResult {
+                agent_id: config.agent_id,
+                run_id: config.run_id,
+                status: self.status.into(),
+                output: self.output.map(str::to_string),
+                error: self.error.map(str::to_string),
+                prompt_tokens: 0,
+                completion_tokens: 0,
                 tool_calls: 0,
                 permission_summary: None,
                 permission_requests: 0,
@@ -989,5 +1036,39 @@ mod tests {
         let state = spawner.get_agent_state(&agent_id).await.unwrap();
         assert!(matches!(state.status, AgentStatus::Completed { .. }));
         assert!(state.messaging_address.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_sync_spawn_returns_failed_output_for_failed_run() {
+        let spawner = DynamicAgentSpawner::new(mock_router()).with_executor(Arc::new(
+            ImmediateStatusExecutor {
+                status: "failed",
+                output: None,
+                error: Some("boom"),
+            },
+        ));
+        let context = SpawnContext {
+            parent_run_id: "parent-123".to_string(),
+            parent_agent_id: "main".to_string(),
+            inherited_permissions: None,
+            working_dir: PathBuf::from("/tmp"),
+        };
+        let input = SpawnAgentInput {
+            description: "Sync agent".to_string(),
+            prompt: "Fail immediately".to_string(),
+            agent_type: "explore".to_string(),
+            model: None,
+            background: false,
+            name: None,
+            max_turns: None,
+            isolated: false,
+            allowed_tools: None,
+        };
+
+        let result = spawner.spawn(input, &context).await.unwrap();
+        assert!(matches!(
+            result,
+            SpawnAgentOutput::Failed { ref error } if error == "boom"
+        ));
     }
 }

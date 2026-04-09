@@ -56,6 +56,20 @@ pub enum SpawnAgentOutput {
         tool_calls: u32,
         duration_ms: u64,
     },
+    /// Agent was cancelled synchronously.
+    Cancelled {
+        agent_id: String,
+        reason: String,
+        tool_calls: u32,
+        duration_ms: u64,
+    },
+    /// Agent is waiting for external input synchronously.
+    Waiting {
+        agent_id: String,
+        reason: String,
+        tool_calls: u32,
+        duration_ms: u64,
+    },
     /// Agent launched in background.
     Launched {
         agent_id: String,
@@ -77,7 +91,11 @@ impl SpawnAgentOutput {
 
     pub fn with_address(self, address: Option<String>) -> Self {
         match self {
-            Self::Launched { agent_id, description, .. } => Self::Launched {
+            Self::Launched {
+                agent_id,
+                description,
+                ..
+            } => Self::Launched {
                 agent_id,
                 description,
                 messaging_address: address,
