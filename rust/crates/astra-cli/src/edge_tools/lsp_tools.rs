@@ -1,15 +1,268 @@
 //! LSP tool: unified language server interface for code intelligence.
 //! Also includes find_definition_at_position for LSP-based goto-definition.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use serde_json::{Value, json};
+use url::Url;
 
 use super::lsp_stdio_session::path_to_uri;
 use super::{MAX_LSP_FILE_SIZE, ToolExecutor, utf16_col_to_char_idx};
 
 impl ToolExecutor {
     // ─── LSP tool: unified language server interface ─────────────────────────────
+
+    fn try_active_rename_workspace_edit(
+        &self,
+        file: &str,
+        line: usize,
+        column: usize,
+        new_name: &str,
+    ) -> Result<Option<Value>, String> {
+        let (file_path, mut params) = self.lsp_position_params(file, line, column)?;
+        if let Some(root) = params.as_object_mut() {
+            root.insert("newName".to_string(), Value::String(new_name.to_string()));
+        }
+        self.passive_lsp.request_for_file(
+            &self.project_root,
+            &file_path,
+            "textDocument/rename",
+            params,
+        )
+    }
+
+    fn workspace_path_from_uri(&self, uri: &str) -> Result<PathBuf, String> {
+        let path = Url::parse(uri)
+            .map_err(|e| format!("Invalid file URI in WorkspaceEdit: {uri}: {e}"))?
+            .to_file_path()
+            .map_err(|_| format!("WorkspaceEdit URI is not a local file path: {uri}"))?;
+        let project_root = self
+            .project_root
+            .canonicalize()
+            .unwrap_or_else(|_| self.project_root.clone());
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
+        if !canonical.starts_with(&project_root) && !path.starts_with(&project_root) {
+            return Err(format!(
+                "WorkspaceEdit attempted to modify a file outside the project: {}",
+                path.display()
+            ));
+        }
+        Ok(path)
+    }
+
+    fn parse_lsp_text_edit(edit: &Value) -> Result<(usize, usize, usize, usize, String), String> {
+        let range = edit
+            .get("range")
+            .ok_or_else(|| "WorkspaceEdit text edit is missing range".to_string())?;
+        let start = range
+            .get("start")
+            .ok_or_else(|| "WorkspaceEdit text edit is missing range.start".to_string())?;
+        let end = range
+            .get("end")
+            .ok_or_else(|| "WorkspaceEdit text edit is missing range.end".to_string())?;
+        let start_line = start
+            .get("line")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| "WorkspaceEdit start.line must be an integer".to_string())?
+            as usize;
+        let start_char = start
+            .get("character")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| "WorkspaceEdit start.character must be an integer".to_string())?
+            as usize;
+        let end_line = end
+            .get("line")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| "WorkspaceEdit end.line must be an integer".to_string())?
+            as usize;
+        let end_char = end
+            .get("character")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| "WorkspaceEdit end.character must be an integer".to_string())?
+            as usize;
+        let new_text = edit
+            .get("newText")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "WorkspaceEdit text edit is missing newText".to_string())?
+            .to_string();
+        Ok((start_line, start_char, end_line, end_char, new_text))
+    }
+
+    fn collect_workspace_edit_changes(
+        &self,
+        workspace_edit: &Value,
+    ) -> Result<BTreeMap<PathBuf, Vec<(usize, usize, usize, usize, String)>>, String> {
+        let mut edits_by_path = BTreeMap::new();
+        if let Some(changes) = workspace_edit.get("changes").and_then(Value::as_object) {
+            for (uri, edits) in changes {
+                let path = self.workspace_path_from_uri(uri)?;
+                let edit_array = edits
+                    .as_array()
+                    .ok_or_else(|| format!("WorkspaceEdit changes for {uri} must be an array"))?;
+                let parsed = edit_array
+                    .iter()
+                    .map(Self::parse_lsp_text_edit)
+                    .collect::<Result<Vec<_>, _>>()?;
+                edits_by_path.insert(path, parsed);
+            }
+        }
+        if let Some(document_changes) = workspace_edit
+            .get("documentChanges")
+            .and_then(Value::as_array)
+        {
+            for change in document_changes {
+                let text_document = change
+                    .get("textDocument")
+                    .ok_or_else(|| {
+                        "Unsupported WorkspaceEdit documentChanges entry (resource operations are not supported yet)".to_string()
+                    })?;
+                let uri = text_document
+                    .get("uri")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        "WorkspaceEdit documentChanges entry is missing textDocument.uri"
+                            .to_string()
+                    })?;
+                let path = self.workspace_path_from_uri(uri)?;
+                let edits = change
+                    .get("edits")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| {
+                        "WorkspaceEdit documentChanges entry is missing edits".to_string()
+                    })?;
+                let parsed = edits
+                    .iter()
+                    .map(Self::parse_lsp_text_edit)
+                    .collect::<Result<Vec<_>, _>>()?;
+                edits_by_path.entry(path).or_default().extend(parsed);
+            }
+        }
+        Ok(edits_by_path)
+    }
+
+    fn lsp_position_to_byte_offset(
+        content: &str,
+        line: usize,
+        character_utf16: usize,
+    ) -> Result<usize, String> {
+        let mut line_starts = vec![0usize];
+        for (idx, byte) in content.bytes().enumerate() {
+            if byte == b'\n' {
+                line_starts.push(idx + 1);
+            }
+        }
+        let Some(&line_start) = line_starts.get(line) else {
+            return Err(format!(
+                "WorkspaceEdit line {} out of range (file has {} lines)",
+                line + 1,
+                line_starts.len()
+            ));
+        };
+        let line_end = line_starts
+            .get(line + 1)
+            .map(|start| start.saturating_sub(1))
+            .unwrap_or(content.len());
+        let line_content = &content[line_start..line_end];
+        let char_idx = utf16_col_to_char_idx(line_content, character_utf16);
+        let byte_in_line = line_content
+            .char_indices()
+            .nth(char_idx)
+            .map(|(idx, _)| idx)
+            .unwrap_or(line_content.len());
+        Ok(line_start + byte_in_line)
+    }
+
+    fn apply_lsp_workspace_edit(&self, workspace_edit: &Value) -> Result<String, String> {
+        let edits_by_path = self.collect_workspace_edit_changes(workspace_edit)?;
+        if edits_by_path.is_empty() {
+            return Ok(json!({
+                "backend": "lsp",
+                "operation": "rename",
+                "method": "textDocument/rename",
+                "applied": true,
+                "files_changed": 0,
+                "edits_applied": 0,
+            })
+            .to_string());
+        }
+
+        let turn_idx = self
+            .journal_turn_index
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let mut files_changed = 0usize;
+        let mut edits_applied = 0usize;
+        let mut updated_files = Vec::new();
+
+        for (path, edits) in edits_by_path {
+            let mut content = std::fs::read_to_string(&path).map_err(|e| {
+                format!(
+                    "Failed to read {} for WorkspaceEdit apply: {e}",
+                    path.display()
+                )
+            })?;
+            let mut resolved = Vec::new();
+            for (start_line, start_char, end_line, end_char, new_text) in edits {
+                let start = Self::lsp_position_to_byte_offset(&content, start_line, start_char)?;
+                let end = Self::lsp_position_to_byte_offset(&content, end_line, end_char)?;
+                if start > end {
+                    return Err(format!(
+                        "WorkspaceEdit produced an invalid range for {}: start {} > end {}",
+                        path.display(),
+                        start,
+                        end
+                    ));
+                }
+                resolved.push((start, end, new_text));
+            }
+            resolved.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
+            let mut last_start = usize::MAX;
+            for (start, end, replacement) in &resolved {
+                if *end > last_start {
+                    return Err(format!(
+                        "WorkspaceEdit contains overlapping edits for {}",
+                        path.display()
+                    ));
+                }
+                content.replace_range(*start..*end, replacement);
+                last_start = *start;
+            }
+
+            let journal_call_id = format!("lsp_workspace_edit:{}", path.display());
+            if let Ok(mut journal) = self.file_journal.lock() {
+                journal.record_before(&path, &journal_call_id, turn_idx);
+            }
+            std::fs::write(&path, &content).map_err(|e| {
+                format!(
+                    "Failed to write {} for WorkspaceEdit apply: {e}",
+                    path.display()
+                )
+            })?;
+            self.record_write_with_content(&path, &content);
+            if let Ok(mut journal) = self.file_journal.lock() {
+                journal.record_after(&path, &journal_call_id, content.as_bytes());
+            }
+            files_changed += 1;
+            edits_applied += resolved.len();
+            updated_files.push(
+                path.strip_prefix(&self.project_root)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .to_string(),
+            );
+        }
+
+        Ok(json!({
+            "backend": "lsp",
+            "operation": "rename",
+            "method": "textDocument/rename",
+            "applied": true,
+            "files_changed": files_changed,
+            "edits_applied": edits_applied,
+            "updated_files": updated_files,
+        })
+        .to_string())
+    }
 
     fn active_lsp_response(operation: &str, method: &str, result: Value) -> String {
         json!({
@@ -379,20 +632,14 @@ impl ToolExecutor {
                     }).to_string();
                 };
                 if let (Some(f), Some(l), Some(c)) = (file, line, column) {
-                    if !dry_run && symbol.is_none() {
-                        return json!({
-                            "error": "position-based rename currently applies as a preview first. For an immediate apply fallback, also provide 'symbol' with dry_run=false."
-                        }).to_string();
-                    }
-                    match self.try_active_position_request(
-                        operation,
-                        f,
-                        l,
-                        c,
-                        "textDocument/rename",
-                        Some(json!({ "newName": next_name })),
-                    ) {
-                        Ok(Some(result)) => result,
+                    match self.try_active_rename_workspace_edit(f, l, c, next_name) {
+                        Ok(Some(result)) if dry_run => {
+                            Self::active_lsp_response(operation, "textDocument/rename", result)
+                        }
+                        Ok(Some(result)) => match self.apply_lsp_workspace_edit(&result) {
+                            Ok(applied) => applied,
+                            Err(error) => json!({ "error": error }).to_string(),
+                        },
                         Ok(None) => {
                             if let Some(sym) = symbol {
                                 self.rename_symbol(&json!({
