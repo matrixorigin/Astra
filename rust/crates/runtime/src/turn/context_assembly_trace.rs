@@ -577,3 +577,84 @@ pub fn build_history_trace_from_compression(
         tokens_after: final_tokens,
     }
 }
+
+/// Build ToolSelectionTrace from SelectionResult.
+///
+/// This function converts the tool selector's result into the telemetry
+/// trace format for observability.
+pub fn build_tool_trace_from_selection(
+    tools_available: u32,
+    selected_tools: &[String],
+    strategy: &str,
+    confidence: f64,
+    budget_used: u32,
+    _selector_tokens_in: u64,
+    _selector_tokens_out: u64,
+    selection_latency_ms: u64,
+) -> ToolSelectionTrace {
+    let tools_selected: Vec<ToolSelected> = selected_tools
+        .iter()
+        .enumerate()
+        .map(|(idx, name)| ToolSelected {
+            tool_name: name.clone(),
+            score: 1.0 - (idx as f64 * 0.1), // Approximate ranking score
+            tokens: budget_used / selected_tools.len().max(1) as u32, // Distribute evenly
+            selection_factors: vec![SelectionFactor {
+                factor_name: "selector".to_string(),
+                weight: 1.0,
+                contribution: confidence,
+            }],
+        })
+        .collect();
+
+    ToolSelectionTrace {
+        tools_available,
+        tools_selected,
+        tools_rejected: Vec::new(), // Would need scorer internals
+        selection_strategy: strategy.to_string(),
+        selection_confidence: confidence,
+        selection_latency_ms,
+    }
+}
+
+/// Build MemoryRetrievalTrace from ranked memory results.
+///
+/// This function converts the memory retrieval results into the telemetry
+/// trace format for observability.
+pub fn build_memory_trace_from_retrieval(
+    query: &str,
+    candidates_count: u32,
+    ranked_results: &[(String, f64)], // (content, score)
+    retrieval_latency_ms: u64,
+) -> MemoryRetrievalTrace {
+    let memories_selected: Vec<MemorySelection> = ranked_results
+        .iter()
+        .enumerate()
+        .map(|(idx, (content, score))| {
+            let preview = if content.len() > 100 {
+                format!("{}...", &content[..100])
+            } else {
+                content.clone()
+            };
+            MemorySelection {
+                memory_id: format!("mem-{}", idx),
+                memory_type: "semantic".to_string(),
+                content_preview: preview,
+                relevance_score: *score,
+                tokens: (content.len() / 4) as u32, // Rough estimate
+                source: MemorySource::Session,
+            }
+        })
+        .collect();
+
+    let total_tokens: u32 = memories_selected.iter().map(|m| m.tokens).sum();
+
+    MemoryRetrievalTrace {
+        query: query.to_string(),
+        candidates_considered: candidates_count,
+        memories_selected,
+        memories_rejected: Vec::new(), // Would need scoring internals
+        total_tokens,
+        retrieval_latency_ms,
+    }
+}
