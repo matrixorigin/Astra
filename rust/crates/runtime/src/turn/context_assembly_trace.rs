@@ -532,3 +532,48 @@ mod tests {
         assert!((agg.compression_trigger_rate - 0.5).abs() < 0.001);
     }
 }
+
+// ─── Integration with Context Compression ────────────────────────────────────
+
+/// Build HistorySelectionTrace from compression pipeline results.
+///
+/// This function converts the compression pipeline's internal metrics into
+/// the telemetry trace format for observability.
+pub fn build_history_trace_from_compression(
+    initial_messages: usize,
+    _final_messages: usize,
+    initial_tokens: u32,
+    final_tokens: u32,
+    layer_results: &[(String, CompressionMethod, u32)], // (layer_name, method, tokens_freed)
+) -> HistorySelectionTrace {
+    let mut turns_compressed = Vec::new();
+
+    for (idx, (layer_name, method, tokens_freed)) in layer_results.iter().enumerate() {
+        if *tokens_freed > 0 {
+            turns_compressed.push(TurnCompression {
+                turn_index: idx as u32,
+                role: layer_name.clone(),
+                original_tokens: *tokens_freed, // Approximate - actual is unknown
+                compressed_tokens: 0,
+                compression_method: method.clone(),
+                information_lost: vec![format!("~{} tokens freed by {}", tokens_freed, layer_name)],
+            });
+        }
+    }
+
+    let compression_ratio = if initial_tokens > 0 {
+        final_tokens as f64 / initial_tokens as f64
+    } else {
+        1.0
+    };
+
+    HistorySelectionTrace {
+        total_turns_available: initial_messages as u32,
+        turns_retained: Vec::new(), // Would need message-level tracking
+        turns_compressed,
+        turns_dropped: Vec::new(), // Would need message-level tracking
+        compression_ratio,
+        tokens_before: initial_tokens,
+        tokens_after: final_tokens,
+    }
+}

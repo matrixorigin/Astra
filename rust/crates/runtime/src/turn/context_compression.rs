@@ -69,6 +69,27 @@ pub struct PipelineOutcome {
     pub budget_satisfied: bool,
 }
 
+impl PipelineOutcome {
+    /// Convert to telemetry trace format.
+    pub fn to_compression_trace(&self) -> Vec<(String, super::context_assembly_trace::CompressionMethod, u32)> {
+        use super::context_assembly_trace::CompressionMethod;
+        
+        self.layer_results
+            .iter()
+            .map(|(name, result)| {
+                let method = match name.as_str() {
+                    "ToolResultTruncation" => CompressionMethod::ToolResultTruncation,
+                    "DuplicateReadElimination" => CompressionMethod::DuplicateReadElimination,
+                    "TieredCompaction" => CompressionMethod::TieredCompaction,
+                    "ReactiveCompact" => CompressionMethod::ReactiveCompact,
+                    _ => CompressionMethod::TieredCompaction, // fallback
+                };
+                (name.clone(), method, result.estimated_tokens_freed as u32)
+            })
+            .collect()
+    }
+}
+
 // ───────────────────────────── Layer trait ────────────────────────────────
 
 /// A single compression layer.
