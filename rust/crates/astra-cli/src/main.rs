@@ -344,12 +344,15 @@ enum Command {
     /// Replay a recorded session
     Replay(ReplayArgs),
     /// Inspect and manage sessions
+    #[command(alias = "sessions")]
     #[command(subcommand)]
     Session(SessionCmd),
     /// Inspect available models
+    #[command(alias = "models")]
     #[command(subcommand)]
     Model(ModelCmd),
     /// Inspect and manage skills
+    #[command(alias = "skills")]
     #[command(subcommand)]
     Skill(SkillCmd),
     /// Session audit: astra audit list/show/turns/tools
@@ -372,10 +375,12 @@ enum Command {
     #[command(subcommand)]
     Plan(PlanCmd),
     /// Team orchestration and shared context management
+    #[command(alias = "teams")]
     Team(TeamArgs),
     /// Local/cloud task management
     Task(TaskArgs),
     /// Memory search and inspection
+    #[command(alias = "memories")]
     Memory(MemoryArgs),
     /// Review git changes with the agent
     Review(ReviewArgs),
@@ -384,12 +389,14 @@ enum Command {
     /// Show git diffs
     Diff(DiffArgs),
     /// Permission mode and rule inspection
+    #[command(visible_alias = "allow")]
     Permissions(PermissionsArgs),
     /// Inspect session checkpoints and turn payloads
     Debug(DebugArgs),
     /// Generate a bug report from current local state
     Bug(BugArgs),
     /// Inspect spawned agents
+    #[command(alias = "agents")]
     Agent(AgentArgs),
     /// Inspect inter-agent messaging state
     Messaging(MessagingArgs),
@@ -10393,6 +10400,27 @@ total_tokens_out: 500
                 Some(PermissionsSubcommand::Auto) => {}
                 other => panic!("unexpected permissions subcommand: {other:?}"),
             },
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_allow_alias_parses_permissions_command() {
+        let cli = Cli::try_parse_from(["astra", "allow", "prompt"]).unwrap();
+        match cli.command {
+            Some(Command::Permissions(args)) => match args.command {
+                Some(PermissionsSubcommand::Prompt) => {}
+                other => panic!("unexpected permissions subcommand: {other:?}"),
+            },
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_sessions_alias_parses_session_command() {
+        let cli = Cli::try_parse_from(["astra", "sessions", "list"]).unwrap();
+        match cli.command {
+            Some(Command::Session(SessionCmd::List(_))) => {}
             other => panic!("unexpected command: {other:?}"),
         }
     }
