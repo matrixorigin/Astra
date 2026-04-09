@@ -3440,12 +3440,12 @@ impl ToolExecutor {
             Some(n) => n,
             None => return json!({ "error": "Missing required parameter: name" }).to_string(),
         };
-        
+
         let existed = env_overlay_get(name).is_some();
-        
+
         // Mark as removed in thread-safe overlay (no unsafe remove_var needed).
         env_overlay_remove(name);
-        
+
         json!({
             "success": true,
             "name": name,
@@ -3555,11 +3555,10 @@ impl ToolExecutor {
             Some(p) => p,
             None => return json!({ "error": "Missing required parameter: notebook_path" }).to_string(),
         };
-        
-        let file_path = if notebook_path.starts_with('/') {
-            PathBuf::from(notebook_path)
-        } else {
-            self.project_root.join(notebook_path)
+
+        let file_path = match self.resolve_checked(notebook_path) {
+            Ok(path) => path,
+            Err(e) => return json!({ "error": e }).to_string(),
         };
         
         // Validate file extension
@@ -3567,6 +3566,38 @@ impl ToolExecutor {
             return json!({ 
                 "error": "File must be a Jupyter notebook (.ipynb). For other files, use str_replace or write_file."
             }).to_string();
+        }
+
+        let edit_mode = args.get("edit_mode").and_then(|v| v.as_str()).unwrap_or("replace");
+        if !matches!(edit_mode, "replace" | "insert" | "delete") {
+            return json!({ "error": format!("Unknown edit_mode: {}. Use replace, insert, or delete", edit_mode) }).to_string();
+        }
+
+        let cell_id = args.get("cell_id").and_then(|v| v.as_str());
+        let new_source = args.get("new_source").and_then(|v| v.as_str());
+        let cell_type = args.get("cell_type").and_then(|v| v.as_str()).unwrap_or("code");
+
+        let rel = file_path.strip_prefix(&self.project_root).unwrap_or(&file_path);
+        let rel_str = rel.to_string_lossy();
+        if let Some(warning) = fs_tools::is_dangerous_write_target(&rel_str) {
+            return json!({
+                "error": format!("⚠️ Warning: writing to sensitive file '{}' — {}. If intentional, use bash to bypass this guard.", rel_str, warning)
+            }).to_string();
+        }
+
+        if file_path.exists() {
+            if let Err(e) = self.check_staleness(&file_path) {
+                return json!({ "error": e }).to_string();
+            }
+            if !self.was_fully_read(&file_path) {
+                return json!({
+                    "error": format!(
+                        "File was only partially read (outline or line range). Read the full file before editing.\n\
+                         → Action required: call read_file(\"{}\") (without start_line/end_line) first, then retry.",
+                        rel_str
+                    )
+                }).to_string();
+            }
         }
         
         // Read existing notebook
@@ -3593,11 +3624,6 @@ impl ToolExecutor {
             Some(c) => c,
             None => return json!({ "error": "Notebook has no cells array" }).to_string(),
         };
-        
-        let cell_id = args.get("cell_id").and_then(|v| v.as_str());
-        let new_source = args.get("new_source").and_then(|v| v.as_str());
-        let cell_type = args.get("cell_type").and_then(|v| v.as_str()).unwrap_or("code");
-        let edit_mode = args.get("edit_mode").and_then(|v| v.as_str()).unwrap_or("replace");
         
         // Find cell index if cell_id provided
         let cell_index = if let Some(id) = cell_id {
@@ -3682,12 +3708,19 @@ impl ToolExecutor {
             .and_then(|n| n.as_str())
             .unwrap_or("python")
             .to_string();
-        
+
+        if file_path.exists() {
+            if let Err(e) = self.check_staleness(&file_path) {
+                return json!({ "error": format!("Pre-write staleness check failed: {e}") }).to_string();
+            }
+        }
+
         // Write back
         let updated_content = serde_json::to_string_pretty(&notebook).unwrap_or_default();
         if let Err(e) = std::fs::write(&file_path, &updated_content) {
             return json!({ "error": format!("Failed to write notebook: {}", e) }).to_string();
         }
+        self.record_write(&file_path);
         
         json!({
             "success": true,
@@ -12355,6 +12388,43 @@ impl Config {
         
         assert!(result.contains("error"), "Expected error in result: {}", result);
         assert!(result.contains("Unknown edit_mode"), "Expected 'Unknown edit_mode' in result: {}", result);
+    }
+
+    #[test]
+    fn notebook_edit_requires_full_read_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = ToolExecutor::new(dir.path());
+        let notebook_path = dir.path().join("needs_read.ipynb");
+        std::fs::write(&notebook_path, r#"{"cells":[{"cell_type":"code","id":"cell-1","source":"x=1","metadata":{},"outputs":[],"execution_count":null}],"metadata":{"language_info":{"name":"python"}},"nbformat":4,"nbformat_minor":5}"#).unwrap();
+
+        let result = exe.notebook_edit(&json!({
+            "notebook_path": "needs_read.ipynb",
+            "edit_mode": "replace",
+            "cell_id": "cell-1",
+            "new_source": "x=2"
+        }));
+
+        assert!(result.contains("read"), "Expected read-before-write error, got: {result}");
+    }
+
+    #[test]
+    fn notebook_edit_succeeds_after_full_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = ToolExecutor::new(dir.path());
+        let notebook_path = dir.path().join("edit_ok.ipynb");
+        std::fs::write(&notebook_path, r#"{"cells":[{"cell_type":"code","id":"cell-1","source":"x=1","metadata":{},"outputs":[],"execution_count":null}],"metadata":{"language_info":{"name":"python"}},"nbformat":4,"nbformat_minor":5}"#).unwrap();
+
+        let _ = exe.read_file(&json!({ "path": "edit_ok.ipynb" }));
+        let result = exe.notebook_edit(&json!({
+            "notebook_path": "edit_ok.ipynb",
+            "edit_mode": "replace",
+            "cell_id": "cell-1",
+            "new_source": "x=2"
+        }));
+
+        assert!(result.contains("\"success\":true"), "Expected success, got: {result}");
+        let updated = std::fs::read_to_string(&notebook_path).unwrap();
+        assert!(updated.contains("x=2"), "Expected notebook update, got: {updated}");
     }
 
     // ── Config tool tests ─────────────────────────────────────────────────────

@@ -7,7 +7,7 @@ fn is_unc_path(path: &str) -> bool {
 }
 
 /// Check if a path is a dangerous/sensitive file that should warn the user.
-fn is_dangerous_write_target(rel_path: &str) -> Option<&'static str> {
+pub(crate) fn is_dangerous_write_target(rel_path: &str) -> Option<&'static str> {
     const DANGEROUS_FILES: &[(&str, &str)] = &[
         (
             ".gitconfig",
