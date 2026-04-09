@@ -1,6 +1,7 @@
 //! Built-in agent type definitions.
 
 use std::collections::HashSet;
+use std::str::FromStr;
 
 /// A built-in agent type identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -11,19 +12,23 @@ pub enum BuiltinAgentType {
     GeneralPurpose,
 }
 
-impl BuiltinAgentType {
-    pub fn from_str(s: &str) -> Option<Self> {
+impl FromStr for BuiltinAgentType {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
-            "explore" => Some(Self::Explore),
-            "code-review" | "code_review" | "codereview" => Some(Self::CodeReview),
-            "task" => Some(Self::Task),
+            "explore" => Ok(Self::Explore),
+            "code-review" | "code_review" | "codereview" => Ok(Self::CodeReview),
+            "task" => Ok(Self::Task),
             "general-purpose" | "general_purpose" | "generalpurpose" | "general" => {
-                Some(Self::GeneralPurpose)
+                Ok(Self::GeneralPurpose)
             }
-            _ => None,
+            _ => Err(()),
         }
     }
+}
 
+impl BuiltinAgentType {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Explore => "explore",
@@ -137,9 +142,9 @@ mod tests {
 
     #[test]
     fn test_builtin_agent_type_from_str() {
-        assert_eq!(BuiltinAgentType::from_str("explore"), Some(BuiltinAgentType::Explore));
-        assert_eq!(BuiltinAgentType::from_str("code-review"), Some(BuiltinAgentType::CodeReview));
-        assert_eq!(BuiltinAgentType::from_str("unknown"), None);
+        assert_eq!("explore".parse::<BuiltinAgentType>(), Ok(BuiltinAgentType::Explore));
+        assert_eq!("code-review".parse::<BuiltinAgentType>(), Ok(BuiltinAgentType::CodeReview));
+        assert!("unknown".parse::<BuiltinAgentType>().is_err());
     }
 
     #[test]

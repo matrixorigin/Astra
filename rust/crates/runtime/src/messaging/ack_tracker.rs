@@ -104,6 +104,12 @@ pub struct PendingAckTracker {
     failed: RwLock<Vec<AckOutcome>>,
 }
 
+impl Default for PendingAckTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PendingAckTracker {
     /// Create a new tracker with default configuration.
     pub fn new() -> Self {

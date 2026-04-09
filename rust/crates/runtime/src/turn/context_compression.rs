@@ -101,6 +101,12 @@ pub struct CompressionPipeline {
     layers: Vec<Box<dyn CompressionLayer>>,
 }
 
+impl Default for CompressionPipeline {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CompressionPipeline {
     pub fn new() -> Self {
         Self { layers: Vec::new() }

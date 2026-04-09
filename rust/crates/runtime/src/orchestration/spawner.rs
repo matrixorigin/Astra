@@ -885,6 +885,7 @@ mod tests {
             parent_agent_id: "parent".to_string(),
             working_dir: PathBuf::from("/tmp"),
             inherited_permissions: None,
+            inherited_skills: vec![],
         };
 
         let result = spawner.spawn(input, &context).await.unwrap();
@@ -910,6 +911,7 @@ mod tests {
             parent_agent_id: "parent".to_string(),
             working_dir: PathBuf::from("/tmp"),
             inherited_permissions: None,
+            inherited_skills: vec![],
         };
 
         let result = spawner.spawn(input, &context).await;
@@ -924,6 +926,7 @@ mod tests {
             parent_agent_id: "parent".to_string(),
             working_dir: PathBuf::from("/tmp"),
             inherited_permissions: None,
+            inherited_skills: vec![],
         };
 
         // Spawn two agents
@@ -971,6 +974,7 @@ mod tests {
             parent_agent_id: "parent".to_string(),
             working_dir: PathBuf::from("/tmp"),
             inherited_permissions: None,
+            inherited_skills: vec![],
         };
 
         // Spawn an agent
@@ -1016,6 +1020,7 @@ mod tests {
             parent_run_id: "parent-123".to_string(),
             parent_agent_id: "main".to_string(),
             inherited_permissions: None,
+            inherited_skills: vec![],
             working_dir: PathBuf::from("/tmp"),
         };
         let input = SpawnAgentInput {
@@ -1117,6 +1122,7 @@ mod tests {
             parent_run_id: "parent-123".to_string(),
             parent_agent_id: "main".to_string(),
             inherited_permissions: None,
+            inherited_skills: vec![],
             working_dir: PathBuf::from("/tmp"),
         };
         let input = SpawnAgentInput {
@@ -1165,6 +1171,7 @@ mod tests {
             parent_run_id: "parent-123".to_string(),
             parent_agent_id: "main".to_string(),
             inherited_permissions: None,
+            inherited_skills: vec![],
             working_dir: PathBuf::from("/tmp"),
         };
         let input = SpawnAgentInput {
