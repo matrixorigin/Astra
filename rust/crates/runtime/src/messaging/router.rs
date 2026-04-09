@@ -96,6 +96,78 @@ impl AgentMailbox {
         );
         self.router.send(msg).await
     }
+
+    /// Send a permission request to the parent agent and wait for response.
+    ///
+    /// This is used by child agents running in background mode to request
+    /// approval for tools that would normally require user interaction.
+    ///
+    /// Returns `Ok(response)` if approved, `Err` with reason if denied or timeout.
+    pub async fn request_permission(
+        &self,
+        request: crate::orchestration::permission_sync::PermissionRequest,
+        timeout: std::time::Duration,
+    ) -> Result<crate::orchestration::permission_sync::PermissionResponse, MailboxError> {
+        use crate::messaging::types::{MessagePayload, RequestType};
+        use crate::orchestration::permission_sync::PermissionResponse;
+
+        // Build and send the request message
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let msg = AgentMessage::new(
+            self.address.clone(),
+            MessageTarget::Parent,
+            MessagePayload::Request {
+                request_type: RequestType::ToolPermission,
+                data: serde_json::to_value(&request).unwrap_or_default(),
+            },
+        )
+        .with_correlation(&request_id);
+
+        self.router.send(msg).await?;
+
+        // Wait for response with timeout
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(MailboxError::Timeout(format!(
+                    "Permission request timed out after {:?}",
+                    timeout
+                )));
+            }
+
+            match tokio::time::timeout(remaining, self.recv()).await {
+                Ok(Some(msg)) => {
+                    // Check if this is our response
+                    if msg.correlation_id.as_deref() == Some(&request_id) {
+                        if let MessagePayload::Response { data, accepted, .. } = &msg.payload {
+                            if let Some(data) = data {
+                                if let Some(response) = PermissionResponse::from_message_payload(data) {
+                                    return Ok(response);
+                                }
+                            }
+                            // Fallback: construct response from accepted flag
+                            return if *accepted {
+                                Ok(PermissionResponse::approve())
+                            } else {
+                                Ok(PermissionResponse::deny("denied by parent"))
+                            };
+                        }
+                    }
+                    // Not our response, continue waiting
+                }
+                Ok(None) => {
+                    return Err(MailboxError::Disconnected);
+                }
+                Err(_) => {
+                    return Err(MailboxError::Timeout(format!(
+                        "Permission request timed out after {:?}",
+                        timeout
+                    )));
+                }
+            }
+        }
+    }
 }
 
 // ─── AgentMailboxRouter ─────────────────────────────────────────────────────
@@ -331,6 +403,108 @@ mod tests {
         match &received.payload {
             MessagePayload::Text { content, .. } => assert_eq!(content, "done!"),
             _ => panic!("expected text"),
+        }
+    }
+
+    #[tokio::test]
+    async fn request_permission_approved() {
+        use crate::orchestration::permission_sync::{PermissionRequest, PermissionResponse};
+
+        let transport = Arc::new(InProcessTransport::new());
+        let dt = tracker();
+        let router = Arc::new(AgentMailboxRouter::new(transport, dt.clone()));
+
+        let parent = addr("r0", "orchestrator");
+        let child = addr("r1", "worker");
+
+        let mut parent_mailbox = router.register(parent.clone(), None).await.unwrap();
+        // Child mailbox will be created in the spawned task
+
+        // Set up parent relationship
+        use crate::server::delegation_engine::SubRunRecord;
+        dt.record_sub_run(SubRunRecord {
+            run_id: "r1".into(),
+            parent_run_id: "r0".into(),
+            delegation_id: "del-perm".into(),
+            agent_id: "worker".into(),
+            depth: 1,
+        })
+        .await;
+
+        // Child sends permission request in background, parent responds
+        let request = PermissionRequest::new("bash", serde_json::json!({"command": "rm -rf /tmp/test"}));
+        let timeout = std::time::Duration::from_millis(500);
+
+        // Clone the components needed for the spawned task
+        let child_addr = child.clone();
+        let child_router = router.clone();
+
+        let child_handle = tokio::spawn(async move {
+            // Create a new mailbox for the child in this task
+            let child_mb = child_router.register(child_addr, None).await.unwrap();
+            child_mb.request_permission(request, timeout).await
+        });
+
+        // Parent receives request and sends approval
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let received = parent_mailbox.try_recv().expect("should receive request");
+        let correlation_id = received.correlation_id.clone().unwrap();
+
+        let response = PermissionResponse::approve();
+        let response_msg = AgentMessage::new(
+            parent.clone(),
+            MessageTarget::Direct {
+                address: child.clone(),
+            },
+            MessagePayload::Response {
+                request_id: correlation_id.clone(),
+                accepted: true,
+                data: Some(serde_json::to_value(&response).unwrap()),
+            },
+        )
+        .with_correlation(&correlation_id);
+        router.send(response_msg).await.unwrap();
+
+        // Child should receive approved response
+        let result: Result<PermissionResponse, MailboxError> = child_handle.await.unwrap();
+        assert!(result.is_ok());
+        assert!(result.unwrap().approved);
+    }
+
+    #[tokio::test]
+    async fn request_permission_timeout() {
+        use crate::orchestration::permission_sync::PermissionRequest;
+
+        let transport = Arc::new(InProcessTransport::new());
+        let dt = tracker();
+        let router = Arc::new(AgentMailboxRouter::new(transport, dt.clone()));
+
+        let parent = addr("r0", "orchestrator");
+        let child = addr("r1", "worker");
+
+        let _parent_mailbox = router.register(parent.clone(), None).await.unwrap();
+        let child_mailbox = router.register(child.clone(), None).await.unwrap();
+
+        // Set up parent relationship
+        use crate::server::delegation_engine::SubRunRecord;
+        dt.record_sub_run(SubRunRecord {
+            run_id: "r1".into(),
+            parent_run_id: "r0".into(),
+            delegation_id: "del-timeout".into(),
+            agent_id: "worker".into(),
+            depth: 1,
+        })
+        .await;
+
+        // Child requests permission but parent never responds
+        let request = PermissionRequest::new("bash", serde_json::json!({"command": "dangerous"}));
+        let timeout = std::time::Duration::from_millis(50);
+
+        let result = child_mailbox.request_permission(request, timeout).await;
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            MailboxError::Timeout(_) => {} // expected
+            other => panic!("expected Timeout, got {:?}", other),
         }
     }
 }

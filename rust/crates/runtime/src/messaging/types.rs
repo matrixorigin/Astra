@@ -270,6 +270,10 @@ pub enum MailboxError {
         message_id: String,
         reason: Option<String>,
     },
+    /// Request/response timeout (e.g., permission request).
+    Timeout(String),
+    /// The mailbox was disconnected while waiting.
+    Disconnected,
 }
 
 impl std::fmt::Display for MailboxError {
@@ -286,6 +290,8 @@ impl std::fmt::Display for MailboxError {
                 let r = reason.as_deref().unwrap_or("no reason");
                 write!(f, "message {message_id} rejected: {r}")
             }
+            Self::Timeout(msg) => write!(f, "request timeout: {msg}"),
+            Self::Disconnected => write!(f, "mailbox disconnected"),
         }
     }
 }
