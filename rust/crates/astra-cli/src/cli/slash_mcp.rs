@@ -3,7 +3,7 @@ use crate::manifest_loader::project_mcp_json_path;
 use crate::mcp_client::{ConnectionState, McpClientManager};
 
 fn eprint_server_not_found(name: &str) {
-    eprintln!("  {} Server '{}' not found", "⚠".yellow(), name);
+    eprintln!("  {} Server '{}' not found", theme::icon_warn(), name);
     eprintln!("  {}", "Use /mcp servers to see connected servers".dim());
 }
 
@@ -75,7 +75,7 @@ pub(super) async fn handle_mcp_command(arg: &str, state: &mut ReplState) -> Resu
         _ => {
             eprintln!(
                 "  {} Unknown subcommand: {}",
-                "⚠".yellow(),
+                theme::icon_warn(),
                 sub.yellow()
             );
             eprintln!(

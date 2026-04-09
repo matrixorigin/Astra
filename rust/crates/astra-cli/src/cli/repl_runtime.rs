@@ -171,7 +171,7 @@ fn create_tool_selector_with_quality_internal(
                                 Err(e) => {
                                     eprintln!(
                                         "  {} MCP server '{}' failed to connect: {}",
-                                        crossterm::style::Stylize::yellow("⚠"),
+                                        theme::icon_warn(),
                                         name,
                                         e
                                     );

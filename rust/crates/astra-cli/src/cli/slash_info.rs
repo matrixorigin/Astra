@@ -548,7 +548,7 @@ fn resolve_turn_pick(
 fn print_turn_journal_list(turns: &[session_journal::JournalEvent]) {
     eprintln!(
         "\n  {}",
-        "─── Journal turns (seq = chronological index) ───────────────".cyan()
+        "─── Journal turns (seq = chronological index) ───────────────".bold().cyan()
     );
     eprintln!(
         "  {:>4} {:>6} {:>8}  {}",
@@ -617,11 +617,11 @@ fn print_turn_trace(ev: &session_journal::JournalEvent, journal_seq: Option<u32>
     };
     eprintln!(
         "\n  {}",
-        format!("─── Turn id {id} trace{seq_note}{err_tag} {sep}").cyan()
+        format!("─── Turn id {id} trace{seq_note}{err_tag} {sep}").bold().cyan()
     );
 
     if let Some(ref err) = ev.error {
-        eprintln!("  {} {}", "Error:".red().bold(), err.as_str().red());
+        eprintln!("  {} {}", theme::icon_err(), err.as_str().red());
     }
 
     // Calculate tool time
@@ -984,7 +984,7 @@ pub(super) async fn handle_info_command(
             } else {
                 eprintln!(
                     "\n{}",
-                    "─── Conversation History ─────────────────────────────────────".bold()
+                    "─── Conversation History ─────────────────────────────────────".bold().cyan()
                 );
                 for (i, (user, asst)) in state.history.iter().enumerate() {
                     let turn_n = i + 1;
@@ -1030,7 +1030,7 @@ pub(super) async fn handle_info_command(
 
             eprintln!(
                 "\n{}",
-                format!("─── {title} ─────────────────────────────────────────────").bold()
+                format!("─── {title} ─────────────────────────────────────────────").bold().cyan()
             );
             for line in result.lines() {
                 eprintln!("  {line}");
@@ -1052,7 +1052,7 @@ pub(super) async fn handle_info_command(
             };
             eprintln!(
                 "\n{}",
-                format!("─── Review · {review_label} ─────────────────────────────────────").bold()
+                format!("─── Review · {review_label} ─────────────────────────────────────").bold().cyan()
             );
             let selector = crate::repl_runtime::create_tool_selector_quiet(api, None);
             let mut pm = PermissionManager::with_project(false, &project_root);
@@ -1166,7 +1166,7 @@ pub(super) async fn handle_info_command(
         "/diagnostics" => {
             eprintln!(
                 "\n{}",
-                "─── Diagnostics ──────────────────────────────────────────────".bold()
+                "─── Diagnostics ──────────────────────────────────────────────".bold().cyan()
             );
 
             // Accumulate rows: (ok: bool, label: &str, detail: String)
@@ -1295,7 +1295,7 @@ pub(super) async fn handle_info_command(
 
         "/context" => {
             let sep = "─".repeat(38);
-            eprintln!("\n  {}", format!("─── Context Window {sep}").cyan());
+            eprintln!("\n  {}", format!("─── Context Window {sep}").bold().cyan());
 
             // ── Identity ──
             let model_display = state.model.clone().unwrap_or_else(|| "default".to_string());

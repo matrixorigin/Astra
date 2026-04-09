@@ -1610,10 +1610,10 @@ async fn handle_resume_command(arg: &str, profile: Option<&str>, state: &mut Rep
                     pct,
                 );
                 if let Some(ref goal) = state.executing_plan_goal {
-                    eprintln!("     Goal: {}", goal.as_str().dim());
+                    eprintln!("    {} {}", "Goal:".dim(), goal.as_str().dim());
                 }
                 eprintln!(
-                    "     {}",
+                    "    {}",
                     "Say continue / resume / next / go to pick up; correct … / rewind N to adjust; slash lines keep the plan; any other line abandons it."
                         .dim()
                 );

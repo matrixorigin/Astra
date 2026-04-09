@@ -33,6 +33,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use crossterm::style::Stylize;
+use crate::theme;
 use rmcp::{
     ClientHandler, Peer, RoleClient,
     model::{
@@ -999,7 +1000,7 @@ impl McpClientManager {
             {
                 Ok(_) => registered += 1,
                 Err(e) => {
-                    eprintln!("  {} {}", "⚠".yellow(), format!("Failed to register MCP skill from {server_name}: {e}").dim());
+                    eprintln!("  {} {}", theme::icon_warn(), format!("Failed to register MCP skill from {server_name}: {e}").dim());
                 }
             }
         }
@@ -1102,7 +1103,7 @@ impl McpClientManager {
                     }
                 }
                 Err(e) => {
-                    eprintln!("  {} {}", "⚠".yellow(), format!("Failed to list prompts from {name}: {e}").dim());
+                    eprintln!("  {} {}", theme::icon_warn(), format!("Failed to list prompts from {name}: {e}").dim());
                 }
             }
         }
@@ -1121,7 +1122,7 @@ impl McpClientManager {
                     }
                 }
                 Err(e) => {
-                    eprintln!("  {} {}", "⚠".yellow(), format!("Failed to list resources from {name}: {e}").dim());
+                    eprintln!("  {} {}", theme::icon_warn(), format!("Failed to list resources from {name}: {e}").dim());
                 }
             }
         }
@@ -1371,7 +1372,7 @@ impl McpClientManager {
             match skill_registry.register_mcp_skill(name, content).await {
                 Ok(_) => registered += 1,
                 Err(e) => {
-                    eprintln!("  {} {}", "⚠".yellow(), format!("Failed to register MCP skill from {name}: {e}").dim());
+                    eprintln!("  {} {}", theme::icon_warn(), format!("Failed to register MCP skill from {name}: {e}").dim());
                 }
             }
         }
@@ -1388,7 +1389,7 @@ impl McpClientManager {
                     match inner.refresh_tools_if_changed().await {
                         Ok(true) => refreshed.push(name.clone()),
                         Ok(false) => {}
-                        Err(e) => eprintln!("  {} {}", "⚠".yellow(), format!("Failed to refresh tools for {name}: {e}").dim()),
+                        Err(e) => eprintln!("  {} {}", theme::icon_warn(), format!("Failed to refresh tools for {name}: {e}").dim()),
                     }
                 }
             }
@@ -1561,7 +1562,7 @@ async fn connect_stdio(
     // escalation or library injection attacks.
     for (key, value) in env {
         if is_dangerous_env_var(key) {
-            eprintln!("  {} MCP server '{}': blocked dangerous env var '{}'", "⚠".yellow(), name.cyan(), key.as_str().yellow());
+            eprintln!("  {} MCP server '{}': blocked dangerous env var '{}'", theme::icon_warn(), name.cyan(), key.as_str().yellow());
             continue;
         }
         cmd.env(key, value);
@@ -1739,7 +1740,7 @@ async fn connect_ws(
                 Some(Ok(tungstenite::Message::Close(_))) => break,
                 Some(Ok(_)) => {} // ignore binary, ping, pong
                 Some(Err(e)) => {
-                    eprintln!("  {} {}", "⚠".yellow(), format!("MCP WebSocket read error [{reader_name}]: {e}").dim());
+                    eprintln!("  {} {}", theme::icon_warn(), format!("MCP WebSocket read error [{reader_name}]: {e}").dim());
                     break;
                 }
                 None => break,
@@ -1770,7 +1771,7 @@ async fn connect_ws(
                     line.clear();
                 }
                 Err(e) => {
-                    eprintln!("  {} {}", "⚠".yellow(), format!("MCP WebSocket write-bridge error [{writer_name}]: {e}").dim());
+                    eprintln!("  {} {}", theme::icon_warn(), format!("MCP WebSocket write-bridge error [{writer_name}]: {e}").dim());
                     break;
                 }
             }

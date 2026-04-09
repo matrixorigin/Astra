@@ -146,7 +146,7 @@ pub(super) async fn handle_skill_command(
 
             eprintln!(
                 "\n{}",
-                "─── Skills ──────────────────────────────────────".bold()
+                "─── Skills ──────────────────────────────────────".bold().cyan()
             );
             eprintln!("  {:<16} {}", "total:".dim(), all.len().to_string().cyan());
             eprintln!("  {:<16} {}", "local:".dim(), local.to_string().cyan());
@@ -492,7 +492,7 @@ pub(super) async fn handle_skill_command(
                     }
                 }
                 Some(m) => {
-                    eprintln!("\n{}", format!("── {} ──", m.name).bold());
+                    eprintln!("\n{}", format!("── {} ──", m.name).bold().cyan());
                     eprintln!("  {:<16} {}", "Description:".dim(), m.description);
                     eprintln!("  {:<16} {}", "Version:".dim(), m.version);
                     eprintln!("  {:<16} {}", "Source:".dim(), source_label(&m.source));
@@ -651,7 +651,7 @@ Follow these steps:
             }
             eprintln!(
                 "\n{}",
-                format!("─── Skill test: {name} ───────────────────────────────────────").bold()
+                format!("─── Skill test: {name} ───────────────────────────────────────").bold().cyan()
             );
             if !json_args.is_empty() {
                 eprintln!("  Input: {}", json_args.cyan());
@@ -876,7 +876,7 @@ Follow these steps:
         "health" => {
             eprintln!(
                 "\n{}",
-                "─── Skill catalog health ─────────────────────────────────────".bold()
+                "─── Skill catalog health ─────────────────────────────────────".bold().cyan()
             );
             // Try API first
             let api_ok = if let Some(tok) = token {
@@ -942,6 +942,7 @@ Follow these steps:
                 let mut manifests = registry.all_manifests();
                 if manifests.is_empty() {
                     eprintln!("  {}", "No skills discovered in catalog.".dim());
+                    eprintln!("  {}", "Use /skill new <name> to create one, or add SKILL.md files to .astra/skills/.".dim());
                     eprintln!();
                     return Ok(());
                 }
@@ -1469,7 +1470,7 @@ fn print_skill_directory_raw(name: &str, skill_dir: &std::path::Path) -> Result<
                 let yaml_block = &raw[3..3 + end];
                 eprintln!(
                     "\n{}",
-                    format!("─── {name}/SKILL.md frontmatter ────────────────────────────").bold()
+                    format!("─── {name}/SKILL.md frontmatter ────────────────────────────").bold().cyan()
                 );
                 for line in yaml_block.lines() {
                     eprintln!("  {line}");
@@ -1488,7 +1489,7 @@ fn print_skill_directory_raw(name: &str, skill_dir: &std::path::Path) -> Result<
         let pretty = serde_json::to_string_pretty(&value).unwrap_or(raw);
         eprintln!(
             "\n{}",
-            format!("─── {name}/skill.json (legacy) ─────────────────────────────").bold()
+            format!("─── {name}/skill.json (legacy) ─────────────────────────────").bold().cyan()
         );
         for line in pretty.lines() {
             eprintln!("  {line}");
@@ -2807,7 +2808,7 @@ fn install_skill_recursive<'a>(
         if depth > MAX_DEP_INSTALL_DEPTH {
             eprintln!(
                 "  {} Dependency depth limit ({}) reached for '{}'",
-                "⚠".yellow(),
+                theme::icon_warn(),
                 MAX_DEP_INSTALL_DEPTH,
                 name.cyan()
             );
@@ -2836,7 +2837,7 @@ fn install_skill_recursive<'a>(
                 // Version constraint not satisfied — will re-install
                 eprintln!(
                     "  {} '{}' v{} does not satisfy {}, upgrading…",
-                    "⚠".yellow(),
+                    theme::icon_warn(),
                     skill_name.cyan(),
                     existing.version.to_string().dim(),
                     constraint.to_string().yellow()
@@ -2885,7 +2886,7 @@ fn install_skill_recursive<'a>(
                     if !constraint.matches(&m.version) {
                         eprintln!(
                             "  {} Installed '{}' v{} does not satisfy constraint {}",
-                            "⚠".yellow(),
+                            theme::icon_warn(),
                             skill_name.cyan(),
                             m.version.to_string().dim(),
                             constraint.to_string().yellow()
@@ -3251,6 +3252,24 @@ async fn uninstall_local_skill(name: &str, state: &mut ReplState) {
 
     match found_dir {
         Some(dir) => {
+            use std::io::IsTerminal;
+            if !std::io::stdin().is_terminal() {
+                eprintln!("  {} {}", theme::icon_warn(), "Cannot confirm in non-interactive mode.".yellow());
+                return;
+            }
+            eprintln!(
+                "  {} Remove skill '{}' from {}?",
+                theme::icon_warn(),
+                name.cyan(),
+                dir.display().to_string().dim()
+            );
+            eprint!("  Confirm [y/N]: ");
+            let _ = std::io::stderr().flush();
+            let mut answer = String::new();
+            if std::io::stdin().read_line(&mut answer).is_err() || !answer.trim().eq_ignore_ascii_case("y") {
+                eprintln!("  {}", "Cancelled.".dim());
+                return;
+            }
             match std::fs::remove_dir_all(&dir) {
                 Ok(()) => {
                     eprintln!(

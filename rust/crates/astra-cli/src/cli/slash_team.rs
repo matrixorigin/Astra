@@ -355,7 +355,7 @@ pub(super) async fn handle_team_command(arg: &str, state: &mut super::ReplState)
         "" | "help" => {
             eprintln!(
                 "\n{}",
-                "─── Team ───────────────────────────────────────".bold()
+                "─── Team ───────────────────────────────────────".bold().cyan()
             );
             let teams = state.team_registry.list();
             let names = teams
@@ -397,7 +397,7 @@ pub(super) async fn handle_team_command(arg: &str, state: &mut super::ReplState)
             }
             eprintln!(
                 "\n{}",
-                "─── Teams ───────────────────────────────────────────────".bold()
+                "─── Teams ───────────────────────────────────────────────".bold().cyan()
             );
             for t in &teams {
                 let member_names: Vec<_> = t.members.iter().map(|m| m.role.as_str()).collect();
@@ -718,7 +718,7 @@ pub(super) async fn handle_team_command(arg: &str, state: &mut super::ReplState)
                 );
 
             // Print header
-            eprintln!("\n{}", format!("─── Team Run: {} ───", team_name).bold());
+            eprintln!("\n{}", format!("─── Team Run: {} ───", team_name).bold().cyan());
             for m in &cli_team.members {
                 eprintln!(
                     "    {} {} {}",
@@ -763,17 +763,17 @@ pub(super) async fn handle_team_command(arg: &str, state: &mut super::ReplState)
                         format!("({})", format_duration(elapsed)).dim()
                     );
                     if let Some(ref err) = report.error {
-                        eprintln!("    {} {}", "Warning:".yellow().bold(), err);
+                        eprintln!("    {} {}", theme::icon_warn(), err.as_str().yellow());
                     }
                 }
                 astra_runtime::server::team_orchestrator::TeamExecutionStatus::CompletedWithConflicts => {
                     eprintln!(
-                        "  ⚠️  Team '{}' completed with merge conflicts {}",
-                        team_name.yellow().bold(),
+                        "  {}  Team '{}' completed with merge conflicts {}",
+                        theme::icon_warn(), team_name.yellow().bold(),
                         format!("({})", format_duration(elapsed)).dim()
                     );
                     if let Some(ref err) = report.error {
-                        eprintln!("    {} {}", "Warning:".yellow().bold(), err);
+                        eprintln!("    {} {}", theme::icon_warn(), err.as_str().yellow());
                     }
                 }
                 astra_runtime::server::team_orchestrator::TeamExecutionStatus::Failed => {
@@ -783,7 +783,7 @@ pub(super) async fn handle_team_command(arg: &str, state: &mut super::ReplState)
                         format!("({})", format_duration(elapsed)).dim()
                     );
                     if let Some(ref err) = report.error {
-                        eprintln!("    {} {}", "Error:".red().bold(), err);
+                        eprintln!("    {} {}", theme::icon_err(), err);
                     }
                 }
             }
@@ -1048,7 +1048,7 @@ pub(super) async fn handle_team_command(arg: &str, state: &mut super::ReplState)
                     e.delegation_id.get(..8).unwrap_or(&e.delegation_id),
                 );
                 if let Some(ref err) = e.error {
-                    eprintln!("    {} {}", "Error:".red(), truncate_str(err, 60));
+                    eprintln!("    {} {}", theme::icon_err(), truncate_str(err, 60));
                 }
             }
             eprintln!();
@@ -1301,7 +1301,7 @@ pub(super) async fn handle_team_command(arg: &str, state: &mut super::ReplState)
 
             eprintln!(
                 "\n{}",
-                "─── Agent Types ─────────────────────────────────────────".bold()
+                "─── Agent Types ─────────────────────────────────────────".bold().cyan()
             );
             for def in all.iter() {
                 let tag = if registry.is_custom(&def.agent_type) {

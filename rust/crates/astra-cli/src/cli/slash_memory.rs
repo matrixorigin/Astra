@@ -664,7 +664,7 @@ pub(super) async fn handle_memory_domain_command(
                         plan_decompose::PlanModeState::clear_saved_state();
                         eprintln!("  {} Exited plan mode", theme::icon_ok());
                     } else {
-                        eprintln!("  ⚠️ Not in plan mode");
+                        eprintln!("  {} {}", theme::icon_warn(), "Not in plan mode".yellow());
                     }
                 }
                 "cloud" => {
@@ -818,7 +818,7 @@ pub(super) async fn handle_memory_domain_command(
                             t.languages.join(", ")
                         );
                     }
-                    eprintln!("  Use /plan template <name> <goal> to instantiate");
+                    eprintln!("  {}", "Use /plan template <name> <goal> to instantiate".dim());
                     // Also hint about cloud if available
                     if state.task_service.is_some() {
                         eprintln!(
@@ -1468,8 +1468,8 @@ pub(super) async fn handle_memory_domain_command(
                     }
                 }
                 _ => {
-                    eprintln!("  Usage: /plan [on | off | list | history | …]");
-                    eprintln!("  In plan mode, just describe your goal - no commands needed.");
+                    eprintln!("  {}", "Usage: /plan [on | off | list | history | …]".dim());
+                    eprintln!("  {}", "In plan mode, just describe your goal - no commands needed.".dim());
                 }
             }
         }
@@ -1500,7 +1500,7 @@ async fn _old_handle_plan_mode_input(
     let plan_state = match state.plan_mode.as_mut() {
         Some(ps) => ps,
         None => {
-            eprintln!("  ⚠️ Not in plan mode");
+            eprintln!("  {} {}", theme::icon_warn(), "Not in plan mode".yellow());
             return Ok(());
         }
     };
@@ -1770,7 +1770,7 @@ async fn _old_handle_plan_mode_input(
                         eprintln!("    {} [{}] {}", "○".dim(), st.id, st.title);
                     }
                 } else if plan_state.plan.progress_pct() == 100 {
-                    eprintln!("  {} All tasks complete!", "🎉".green());
+                    eprintln!("  {} All tasks complete!", "✓".green());
                     // Complete the cloud task
                     if let Some(ref svc) = state.task_service {
                         use astra_services::TaskService;
@@ -2153,7 +2153,7 @@ fn handle_plan_status(state: &ReplState) {
                 ps.plan.progress_pct()
             );
         } else {
-            eprintln!("  No plan generated yet");
+            eprintln!("  {}", "No plan generated yet".dim());
         }
     } else {
         eprintln!(

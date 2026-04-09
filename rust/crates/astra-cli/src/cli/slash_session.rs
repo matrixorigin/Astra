@@ -255,11 +255,11 @@ pub(super) fn resolve_journal_target_session(
         // No active session — list local journals and let user pick
         let sessions = session_journal::list_sessions_by_time(10).unwrap_or_default();
         if sessions.is_empty() {
-            return Err("  No sessions found.".to_string());
+            return Err("  No sessions found. Start a conversation to create one.".to_string());
         }
         eprintln!(
             "\n{}",
-            "─── Available Sessions ──────────────────────────".bold()
+            "─── Available Sessions ──────────────────────────".bold().cyan()
         );
         eprintln!(
             "  {}",
@@ -302,7 +302,7 @@ pub(super) fn handle_session_command(arg: &str, state: &mut ReplState) {
             let mdl = state.model.as_deref().unwrap_or("default");
             eprintln!(
                 "\n{}",
-                "─── Session ─────────────────────────────────────".bold()
+                "─── Session ─────────────────────────────────────".bold().cyan()
             );
             eprintln!("  {:<16} {}", "session_id:".dim(), sid.cyan());
             let persisted_ws = (sid != "none")
@@ -490,7 +490,7 @@ pub(super) fn handle_session_command(arg: &str, state: &mut ReplState) {
                                         let err_preview = tc
                                             .error
                                             .as_deref()
-                                            .unwrap_or("unknown")
+                                            .unwrap_or("(no details)")
                                             .chars()
                                             .take(80)
                                             .collect::<String>();
@@ -510,7 +510,7 @@ pub(super) fn handle_session_command(arg: &str, state: &mut ReplState) {
                                     ts_short.dim(),
                                     theme::icon_err(),
                                     evt.turn.unwrap_or(0),
-                                    evt.error.as_deref().unwrap_or("unknown").red(),
+                                    evt.error.as_deref().unwrap_or("(no details)").red(),
                                 );
                             }
                             session_journal::JournalEventType::Compact => {
@@ -536,7 +536,7 @@ pub(super) fn handle_session_command(arg: &str, state: &mut ReplState) {
                                     "  {} {} {}",
                                     ts_short.dim(),
                                     theme::icon_err(),
-                                    evt.error.as_deref().unwrap_or("unknown error").red(),
+                                    evt.error.as_deref().unwrap_or("(no details)").red(),
                                 );
                             }
                             session_journal::JournalEventType::SessionEnd => {
@@ -553,7 +553,7 @@ pub(super) fn handle_session_command(arg: &str, state: &mut ReplState) {
                                     ts_short.dim(),
                                     theme::icon_warn(),
                                     evt.turn.unwrap_or(0),
-                                    evt.stall_type.as_deref().unwrap_or("unknown").yellow(),
+                                    evt.stall_type.as_deref().unwrap_or("(no details)").yellow(),
                                 );
                             }
                             session_journal::JournalEventType::Checkpoint => {
@@ -625,7 +625,7 @@ pub(super) fn handle_session_command(arg: &str, state: &mut ReplState) {
                                 let icon = match action {
                                     "started" => "▶",
                                     "completed" => "✓",
-                                    "plan_complete" => "🎉",
+                                    "plan_complete" => "✓",
                                     "plan_paused" => "⏸",
                                     "skipped" => "⏭",
                                     _ => "·",
@@ -893,7 +893,7 @@ pub(super) fn handle_session_command(arg: &str, state: &mut ReplState) {
             Ok(sessions) => {
                 eprintln!(
                     "\n{}",
-                    "─── Session Journals ────────────────────────────".bold()
+                    "─── Session Journals ────────────────────────────".bold().cyan()
                 );
                 eprintln!(
                     "  {}",
@@ -953,7 +953,7 @@ pub(super) fn handle_session_command(arg: &str, state: &mut ReplState) {
                         })
                         .collect();
                     if errors.is_empty() {
-                        eprintln!("{}", "  No errors in this session. 🎉".green());
+                        eprintln!("  {} {}", theme::icon_ok(), "No errors in this session.".green());
                     } else {
                         eprintln!(
                             "\n{}",
@@ -1092,7 +1092,7 @@ fn build_export_markdown(session_id: &str, events: &[session_journal::JournalEve
                 md.push_str(&format!(
                     "### Turn {} ❌ Error\n- **Time:** {ts_short}\n- **Error:** {}\n\n---\n\n",
                     evt.turn.unwrap_or(0),
-                    evt.error.as_deref().unwrap_or("unknown"),
+                    evt.error.as_deref().unwrap_or("(no details)"),
                 ));
             }
             session_journal::JournalEventType::Compact => {
@@ -1269,7 +1269,7 @@ fn handle_session_cleanup(arg: &str, state: &ReplState) {
         );
     }
     if stale.len() > show_count {
-        eprintln!("    … and {} more", stale.len() - show_count);
+        eprintln!("    {}", format!("… and {} more", stale.len() - show_count).dim());
     }
     eprintln!();
 
@@ -1280,7 +1280,7 @@ fn handle_session_cleanup(arg: &str, state: &ReplState) {
         if std::io::stdin().read_line(&mut input).is_err()
             || !input.trim().eq_ignore_ascii_case("y")
         {
-            eprintln!("  Cancelled.");
+            eprintln!("  {}", "Cancelled.".dim());
             return;
         }
     }
@@ -1351,7 +1351,7 @@ fn handle_compress(state: &ReplState, force: bool) {
         if std::io::stdin().read_line(&mut input).is_err()
             || !input.trim().eq_ignore_ascii_case("y")
         {
-            eprintln!("  Cancelled.");
+            eprintln!("  {}", "Cancelled.".dim());
             return;
         }
     }
@@ -1422,7 +1422,7 @@ fn handle_session_verify(state: &ReplState) {
     let sid = state.session_id.as_deref().unwrap_or("none");
     eprintln!(
         "\n{}",
-        "─── Sync Health ─────────────────────────────────".bold()
+        "─── Sync Health ─────────────────────────────────".bold().cyan()
     );
 
     // Local journal stats
@@ -1511,7 +1511,7 @@ fn handle_session_verify(state: &ReplState) {
         }
     } else {
         eprintln!();
-        eprintln!("  {} Cloud not connected", "⚠".yellow());
+        eprintln!("  {} Cloud not connected", theme::icon_warn());
     }
 
     // Session disk usage summary
