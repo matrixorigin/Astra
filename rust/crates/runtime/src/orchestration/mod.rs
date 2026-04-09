@@ -4,7 +4,7 @@
 //! at runtime without pre-defined team configurations.
 
 mod builtin_agents;
-mod context_cache;
+pub mod context_cache;
 mod progress;
 mod spawner;
 mod spawn_tool;
@@ -22,3 +22,4 @@ pub use spawner::{
     SpawnedAgentMetrics, SpawnError, SpawnAgentExecutor, SpawnRunConfig, SpawnRunResult,
 };
 pub use spawn_tool::{SpawnAgentInput, SpawnAgentOutput, spawn_agent_schema};
+

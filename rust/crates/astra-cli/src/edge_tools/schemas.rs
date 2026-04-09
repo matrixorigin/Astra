@@ -1305,5 +1305,59 @@ pub fn all_tool_schemas() -> Vec<Value> {
                 }
             }
         }),
+        // ── Shared context tools for cross-agent knowledge sharing ─────────────────
+        json!({
+            "type": "function",
+            "function": {
+                "name": "share_context",
+                "description": "Share knowledge with other agents in the same session. Use this to communicate findings, patterns, or insights that sibling agents might need. Knowledge is stored with a semantic key for retrieval.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "key": {
+                            "type": "string",
+                            "description": "Semantic key for the knowledge (e.g., 'auth/jwt-config', 'db/schema-version', 'api/endpoints'). Use slashes for namespacing."
+                        },
+                        "value": {
+                            "description": "The knowledge to share (any JSON-serializable value)"
+                        },
+                        "category": {
+                            "type": "string",
+                            "enum": ["code_pattern", "dependency", "architecture", "security", "performance", "documentation", "custom"],
+                            "description": "Category of knowledge for filtering. Default: custom"
+                        }
+                    },
+                    "required": ["key", "value"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "query_context",
+                "description": "Query knowledge shared by other agents or this agent. Use to check if information has already been discovered by sibling agents to avoid redundant work.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "key": {
+                            "type": "string",
+                            "description": "Exact key to lookup (e.g., 'auth/jwt-config')"
+                        },
+                        "prefix": {
+                            "type": "string",
+                            "description": "Key prefix to search (e.g., 'auth/' returns all auth-related knowledge). Cannot be used with 'key'."
+                        },
+                        "list_keys": {
+                            "type": "boolean",
+                            "description": "If true, returns only the list of available keys without values. Useful for discovering what knowledge exists."
+                        },
+                        "include_findings": {
+                            "type": "boolean",
+                            "description": "If true, also returns structured findings from completed agents."
+                        }
+                    }
+                }
+            }
+        }),
     ]
 }

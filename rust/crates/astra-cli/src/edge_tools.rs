@@ -144,6 +144,8 @@ mod shell;
 pub mod agent_messaging;
 #[path = "edge_tools/agent_spawning.rs"]
 pub mod agent_spawning;
+#[path = "edge_tools/context_sharing.rs"]
+pub mod context_sharing;
 #[path = "edge_tools/schemas.rs"]
 mod schemas;
 pub use schemas::all_tool_schemas;
