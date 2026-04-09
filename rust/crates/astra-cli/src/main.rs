@@ -710,7 +710,7 @@ struct GrepArgs {
     #[command(subcommand)]
     command: Option<GrepSubcommand>,
     /// Workspace content search pattern when not using a named subcommand
-    #[arg(num_args = 1.., trailing_var_arg = true)]
+    #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
     pattern: Vec<String>,
 }
 
@@ -10466,6 +10466,11 @@ total_tokens_out: 500
     }
 
     #[test]
+    fn cli_grep_command_rejects_missing_pattern() {
+        assert!(Cli::try_parse_from(["astra", "grep"]).is_err());
+    }
+
+    #[test]
     fn cli_agent_command_parses_status_subcommand() {
         let cli = Cli::try_parse_from(["astra", "agent", "status", "agent-123"]).unwrap();
         match cli.command {
@@ -10506,8 +10511,8 @@ total_tokens_out: 500
 
     #[test]
     fn cli_diff_command_accepts_plain_path_filter() {
-        let cli = Cli::try_parse_from(["astra", "diff", "rust/crates/astra-cli/src/main.rs"])
-            .unwrap();
+        let cli =
+            Cli::try_parse_from(["astra", "diff", "rust/crates/astra-cli/src/main.rs"]).unwrap();
         match cli.command {
             Some(Command::Diff(args)) => {
                 assert!(args.command.is_none());

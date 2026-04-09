@@ -121,7 +121,8 @@ fn render_grep_args(args: &GrepArgs) -> String {
 
 fn render_permissions_args(args: &PermissionsArgs) -> String {
     match &args.command {
-        None | Some(PermissionsSubcommand::Status) => "status".to_string(),
+        None => String::new(),
+        Some(PermissionsSubcommand::Status) => "status".to_string(),
         Some(PermissionsSubcommand::Auto) => "auto".to_string(),
         Some(PermissionsSubcommand::Prompt) => "prompt".to_string(),
         Some(PermissionsSubcommand::Deny) => "deny".to_string(),
@@ -2622,6 +2623,17 @@ mod exit_code_tests {
             flaky_count: 0,
         });
         assert_eq!(compute_exit_code(&sr), ExitCode::Success);
+    }
+}
+
+#[cfg(test)]
+mod arg_render_tests {
+    use super::*;
+
+    #[test]
+    fn bare_permissions_command_renders_empty_arg_for_mode_cycle() {
+        let args = PermissionsArgs { command: None };
+        assert_eq!(render_permissions_args(&args), "");
     }
 }
 
