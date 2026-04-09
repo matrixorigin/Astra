@@ -263,6 +263,13 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             permission_handler: None, // Child agents don't handle permission requests
         };
 
+        // Inherit skills from parent: pre-populate discovered skills
+        if !config.inherited_skills.is_empty() {
+            for skill_name in &config.inherited_skills {
+                state.discovered_skills.insert(skill_name.clone());
+            }
+        }
+
         let loop_result = run_agentic_loop_with_host(&mut host, &mut state).await;
 
         let tool_calls = state.total_tool_calls as u32;

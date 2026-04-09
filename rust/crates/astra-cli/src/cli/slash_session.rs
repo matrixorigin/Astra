@@ -850,39 +850,6 @@ pub(super) fn handle_session_command(arg: &str, state: &mut ReplState) {
                                     components,
                                 );
                             }
-                            session_journal::JournalEventType::AgentTerminated => {
-                                let agent_id = evt
-                                    .metadata
-                                    .as_ref()
-                                    .and_then(|m| m.get("agent_id"))
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("?");
-                                let status = evt
-                                    .metadata
-                                    .as_ref()
-                                    .and_then(|m| m.get("status"))
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("?");
-                                let duration = evt
-                                    .metadata
-                                    .as_ref()
-                                    .and_then(|m| m.get("duration_secs"))
-                                    .and_then(|v| v.as_f64())
-                                    .unwrap_or(0.0);
-                                let icon = if status == "completed" {
-                                    theme::icon_ok()
-                                } else {
-                                    theme::icon_err()
-                                };
-                                eprintln!(
-                                    "  {} {} agent {} {} ({:.1}s)",
-                                    ts_short.dim(),
-                                    icon,
-                                    agent_id,
-                                    status,
-                                    duration,
-                                );
-                            }
                         }
                     }
                     // Summary stats

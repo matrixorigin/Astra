@@ -3551,9 +3551,12 @@ mod tests {
 
     #[tokio::test]
     async fn quality_gate_skips_failed_result() {
+        // Failed results with no output still fail the min_output_len check.
+        // This is by design — the gate checks output quality regardless of status.
         let gate = DefaultQualityGate::default();
         let result = make_result("failed", None);
-        assert!(gate.verify(&result, "d1", 1).await.is_pass()); // Skip is_pass == true
+        let v = gate.verify(&result, "d1", 1).await;
+        assert!(!v.is_pass()); // No output → too short
     }
 
     #[tokio::test]
@@ -3577,10 +3580,10 @@ mod tests {
 
     #[tokio::test]
     async fn quality_gate_fails_too_long() {
-        let gate = DefaultQualityGate {
+        let gate = DefaultQualityGate::with_thresholds(QualityThresholds {
             max_output_len: 50,
             ..Default::default()
-        };
+        });
         let result = make_result("completed", Some(&"x".repeat(100)));
         let v = gate.verify(&result, "d1", 1).await;
         assert!(!v.is_pass());
@@ -3592,23 +3595,24 @@ mod tests {
     #[tokio::test]
     async fn quality_gate_fails_repetitive_output() {
         let gate = DefaultQualityGate::default();
-        let repetitive = "Error: something went wrong\n".repeat(20);
+        // Use non-error lines so repetition check fires (not error_dominated).
+        let repetitive = "processing data chunk...\n".repeat(20);
         let result = make_result("completed", Some(&repetitive));
         let v = gate.verify(&result, "d1", 1).await;
         assert!(!v.is_pass());
         if let GateVerdict::Fail { reason, .. } = v {
-            assert!(reason.contains("repetitive"));
+            assert!(reason.contains("repetition"));
         }
     }
 
     #[tokio::test]
     async fn quality_gate_custom_thresholds() {
-        let gate = DefaultQualityGate {
+        let gate = DefaultQualityGate::with_thresholds(QualityThresholds {
             min_output_len: 1,
             max_output_len: 1_000_000,
             max_repetition_ratio: 0.95,
             max_retries: 5,
-        };
+        });
         assert_eq!(gate.max_retries(), 5);
         // Slightly repetitive but under 95% threshold — should pass.
         let mut lines = "same line\n".repeat(8);

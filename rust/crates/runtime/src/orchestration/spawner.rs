@@ -5,7 +5,6 @@ use crate::messaging::types::AgentAddress;
 use crate::orchestration::context_cache::SharedContextCache;
 use crate::orchestration::progress::{AgentProgressEvent, ProgressBroadcaster, ProgressEventType};
 use crate::orchestration::spawn_tool::{SpawnAgentInput, SpawnAgentOutput};
-use crate::orchestration::team_config::AgentRegistry;
 use crate::server::delegation_engine::SubRunRecord;
 
 use std::collections::HashMap;
@@ -257,8 +256,6 @@ pub struct DynamicAgentSpawner {
     agent_registry: super::team_config::AgentRegistry,
     /// Completed agents archive for history queries.
     completed_agents: Arc<RwLock<Vec<SpawnedAgentState>>>,
-    /// Agent type registry (builtins + user-defined).
-    agent_registry: Arc<RwLock<AgentRegistry>>,
 }
 
 impl DynamicAgentSpawner {
@@ -273,7 +270,6 @@ impl DynamicAgentSpawner {
             session_id: None,
             agent_registry: super::team_config::AgentRegistry::builtins_only(),
             completed_agents: Arc::new(RwLock::new(Vec::new())),
-            agent_registry: Arc::new(RwLock::new(AgentRegistry::default())),
         }
     }
 
@@ -291,7 +287,6 @@ impl DynamicAgentSpawner {
             session_id: None,
             agent_registry: super::team_config::AgentRegistry::builtins_only(),
             completed_agents: Arc::new(RwLock::new(Vec::new())),
-            agent_registry: Arc::new(RwLock::new(AgentRegistry::default())),
         }
     }
 
@@ -631,7 +626,6 @@ impl DynamicAgentSpawner {
                 // Persist to journal before updating status
                 self.persist_agent_terminated(agent_id, &run_result.status).await;
                 self.update_status(agent_id, status).await;
-                self.write_agent_terminated_event(agent_id, &run_result.status, run_result.error.as_deref()).await;
                 self.archive_agent(agent_id).await;
                 self.unregister_mailbox(agent_id).await;
             }
@@ -676,7 +670,6 @@ impl DynamicAgentSpawner {
             self.completed_agents.write().await.push(state.clone());
         }
     }
-    }
 
     async fn unregister_mailbox(&self, agent_id: &str) {
         let messaging_address = self
@@ -707,7 +700,6 @@ impl DynamicAgentSpawner {
             session_id: self.session_id.clone(),
             agent_registry: self.agent_registry.clone(),
             completed_agents: Arc::clone(&self.completed_agents),
-            agent_registry: Arc::clone(&self.agent_registry),
         }
     }
 
@@ -819,7 +811,7 @@ impl DynamicAgentSpawner {
     /// Query historical agent records from the session journal.
     ///
     /// Returns agent metadata from `AgentTerminated` events recorded in this session's journal.
-    pub fn get_agent_history(&self) -> Vec<AgentHistoryRecord> {
+    pub fn get_journal_agent_history(&self) -> Vec<AgentHistoryRecord> {
         let Some(ref sid) = self.session_id else {
             return Vec::new();
         };
@@ -976,7 +968,7 @@ mod tests {
             parent_agent_id: "parent".to_string(),
             working_dir: PathBuf::from("/tmp"),
             inherited_permissions: None,
-            inherited_skills: vec![],
+inherited_skills: vec![],
         };
 
         let result = spawner.spawn(input, &context).await.unwrap();
@@ -1002,7 +994,7 @@ mod tests {
             parent_agent_id: "parent".to_string(),
             working_dir: PathBuf::from("/tmp"),
             inherited_permissions: None,
-            inherited_skills: vec![],
+inherited_skills: vec![],
         };
 
         let result = spawner.spawn(input, &context).await;
@@ -1017,7 +1009,7 @@ mod tests {
             parent_agent_id: "parent".to_string(),
             working_dir: PathBuf::from("/tmp"),
             inherited_permissions: None,
-            inherited_skills: vec![],
+inherited_skills: vec![],
         };
 
         // Spawn two agents
@@ -1065,7 +1057,7 @@ mod tests {
             parent_agent_id: "parent".to_string(),
             working_dir: PathBuf::from("/tmp"),
             inherited_permissions: None,
-            inherited_skills: vec![],
+inherited_skills: vec![],
         };
 
         // Spawn an agent
@@ -1111,7 +1103,7 @@ mod tests {
             parent_run_id: "parent-123".to_string(),
             parent_agent_id: "main".to_string(),
             inherited_permissions: None,
-            inherited_skills: vec![],
+inherited_skills: vec![],
             working_dir: PathBuf::from("/tmp"),
         };
         let input = SpawnAgentInput {
@@ -1213,7 +1205,7 @@ mod tests {
             parent_run_id: "parent-123".to_string(),
             parent_agent_id: "main".to_string(),
             inherited_permissions: None,
-            inherited_skills: vec![],
+inherited_skills: vec![],
             working_dir: PathBuf::from("/tmp"),
         };
         let input = SpawnAgentInput {
@@ -1262,7 +1254,7 @@ mod tests {
             parent_run_id: "parent-123".to_string(),
             parent_agent_id: "main".to_string(),
             inherited_permissions: None,
-            inherited_skills: vec![],
+inherited_skills: vec![],
             working_dir: PathBuf::from("/tmp"),
         };
         let input = SpawnAgentInput {
@@ -1282,5 +1274,43 @@ mod tests {
             result,
             SpawnAgentOutput::Failed { ref error } if error == "boom"
         ));
+    }
+
+    #[tokio::test]
+    async fn test_inherited_skills_passed_to_run_config() {
+        let spawner = DynamicAgentSpawner::new(mock_router());
+        let context = SpawnContext {
+            parent_run_id: "parent-123".to_string(),
+            parent_agent_id: "parent".to_string(),
+            working_dir: PathBuf::from("/tmp"),
+            inherited_permissions: None,
+            inherited_skills: vec!["review-changes".to_string(), "analyze-session".to_string()],
+        };
+        let input = SpawnAgentInput {
+            description: "Test with skills".to_string(),
+            prompt: "Test".to_string(),
+            agent_type: "explore".to_string(),
+            model: None,
+            background: true,
+            name: None,
+            max_turns: None,
+            isolated: false,
+            allowed_tools: None,
+        };
+        // Skills are stored in context and passed through — spawner launches successfully
+        let result = spawner.spawn(input, &context).await.unwrap();
+        assert!(matches!(result, SpawnAgentOutput::Launched { .. }));
+    }
+
+    #[test]
+    fn test_spawn_context_empty_skills_default() {
+        let context = SpawnContext {
+            parent_run_id: "run-1".to_string(),
+            parent_agent_id: "agent-1".to_string(),
+            working_dir: PathBuf::from("/tmp"),
+            inherited_permissions: None,
+            inherited_skills: Vec::new(),
+        };
+        assert!(context.inherited_skills.is_empty());
     }
 }

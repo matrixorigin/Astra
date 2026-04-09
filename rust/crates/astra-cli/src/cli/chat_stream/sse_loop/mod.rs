@@ -96,6 +96,7 @@ pub(crate) async fn stream_chat_sse(
                 working_dir: project_root.clone(),
                 spawner: spawner.clone(),
                 inherited_permissions: p.perm_manager.inherited_permissions_for_child(false),
+                active_skills: Vec::new(), // root agent — no inherited skills
             };
             ex.with_spawn_context(spawn_ctx)
         } else {

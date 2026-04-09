@@ -43,6 +43,8 @@ pub struct SpawnAgentContext {
     pub spawner: Arc<DynamicAgentSpawner>,
     /// Effective permissions inherited by children spawned from this agent.
     pub inherited_permissions: InheritedPermissions,
+    /// Skills available to this agent (inherited by children).
+    pub active_skills: Vec<String>,
 }
 
 // ─── Tool Handler ──────────────────────────────────────────────────────────
@@ -83,7 +85,7 @@ pub async fn handle_spawn_agent_tool(args: &Value, ctx: Option<&SpawnAgentContex
         parent_agent_id: ctx.agent_id.clone(),
         working_dir: ctx.working_dir.clone(),
         inherited_permissions: Some(inherited_permissions),
-        inherited_skills: Vec::new(), // TODO: capture parent's active skills
+        inherited_skills: ctx.active_skills.clone(),
     };
 
     // Execute spawn
@@ -129,6 +131,7 @@ pub fn create_spawn_context(
         working_dir,
         spawner,
         inherited_permissions,
+        active_skills: Vec::new(),
     }
 }
 

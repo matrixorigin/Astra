@@ -1295,17 +1295,16 @@ pub(super) async fn handle_team_command(arg: &str, state: &mut super::ReplState)
                     return;
                 }
             };
-            let registry = spawner.agent_registry().read().await;
+            let registry = spawner.agent_registry();
             let all = registry.list_all();
-            let custom_count = registry.custom_count();
-            drop(registry);
+            let builtin_count = 4; // explore, task, code-review, general-purpose
 
             eprintln!(
                 "\n{}",
                 "─── Agent Types ─────────────────────────────────────────".bold()
             );
-            for (i, def) in all.iter().enumerate() {
-                let tag = if i < custom_count {
+            for def in all.iter() {
+                let tag = if registry.is_custom(&def.agent_type) {
                     " (custom)".yellow().to_string()
                 } else {
                     " (builtin)".dim().to_string()
@@ -1329,9 +1328,10 @@ pub(super) async fn handle_team_command(arg: &str, state: &mut super::ReplState)
                     }
                 );
             }
+            let custom_count = all.len().saturating_sub(builtin_count);
             eprintln!(
                 "\n  {} builtin, {} custom\n",
-                all.len() - custom_count,
+                builtin_count.min(all.len()),
                 custom_count
             );
         }

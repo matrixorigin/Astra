@@ -661,9 +661,6 @@ pub enum JournalEventType {
     PlanEdit,
     /// Plan lifecycle event (created, completed, abandoned, replanned).
     PlanLifecycle,
-    /// Agent terminated — spawned agent completed, failed, or was cancelled.
-    /// Persists final metrics and state for historical queries.
-    AgentTerminated,
 }
 
 /// Writer that appends events to a session journal file.
