@@ -12,6 +12,9 @@ use crate::messaging::router::AgentMailbox;
 use crate::orchestration::permission_sync::{
     PermissionMode, PermissionRequest, PermissionSyncContext, PermissionUpdate,
 };
+use crate::turn::tool_argument_hints::{
+    normalize_llm_function_arguments, permission_prompt_primary_detail,
+};
 
 /// Result of a permission check.
 #[derive(Debug, Clone)]
@@ -46,11 +49,26 @@ pub async fn check_tool_permission(
         return PermissionCheckResult::Allowed;
     };
 
+    let normalized_args = args
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .map(|parsed| normalize_llm_function_arguments(&parsed))
+        .unwrap_or_else(|| serde_json::json!({}));
+    let permission_hint = permission_prompt_primary_detail(tool_name, &normalized_args);
+    let rule_match_hint = permission_hint.as_deref();
+
     // Check local permission rules
     {
         let ctx_guard = ctx.read().await;
-        if ctx_guard.is_allowed(tool_name, args) {
+        if ctx_guard.is_allowed(tool_name, rule_match_hint) {
             return PermissionCheckResult::Allowed;
+        }
+
+        if ctx_guard.is_denied(tool_name, rule_match_hint) {
+            drop(ctx_guard);
+            ctx.write().await.record_blocked_tool(tool_name);
+            return PermissionCheckResult::Denied {
+                reason: format!("Tool '{}' denied by permission rules", tool_name),
+            };
         }
 
         // If mode is Deny, don't even try to request
@@ -75,12 +93,11 @@ pub async fn check_tool_permission(
     };
 
     // Build permission request
-    let args_json = args
-        .map(|a| serde_json::from_str(a).unwrap_or_else(|_| serde_json::json!({"raw": a})))
-        .unwrap_or(serde_json::json!({}));
-
-    let request = PermissionRequest::new(tool_name, args_json)
+    let mut request = PermissionRequest::new(tool_name, normalized_args)
         .with_reason(format!("Requesting permission to use tool: {}", tool_name));
+    if let Some(ref hint) = permission_hint {
+        request = request.with_hint(hint.clone());
+    }
 
     // Send request and wait for response
     ctx.write().await.record_permission_request();
@@ -283,5 +300,65 @@ mod tests {
         assert_eq!(telemetry.permission_requests, 1);
         assert_eq!(telemetry.permission_requests_approved, 1);
         assert_eq!(telemetry.tools_blocked, 0);
+    }
+
+    #[tokio::test]
+    async fn denied_rules_do_not_request_parent() {
+        use crate::messaging::in_process::InProcessTransport;
+        use crate::messaging::router::AgentMailboxRouter;
+        use crate::messaging::types::AgentAddress;
+        use crate::server::delegation_engine::{DelegationTracker, SubRunRecord};
+
+        let transport = Arc::new(InProcessTransport::new());
+        let tracker = Arc::new(DelegationTracker::new());
+        let router = Arc::new(AgentMailboxRouter::new(transport, tracker.clone()));
+
+        let parent_addr = AgentAddress::new("run-parent", "orchestrator");
+        let child_addr = AgentAddress::new("run-child", "worker");
+        let mut parent_mailbox = router.register(parent_addr.clone(), None).await.unwrap();
+        let mut child_mailbox = router.register(child_addr.clone(), None).await.unwrap();
+
+        tracker
+            .record_sub_run(SubRunRecord {
+                run_id: "run-child".into(),
+                parent_run_id: "run-parent".into(),
+                delegation_id: "del-deny".into(),
+                agent_id: "worker".into(),
+                depth: 1,
+            })
+            .await;
+
+        let inherited = InheritedPermissions {
+            mode: PermissionMode::Prompt,
+            allow_rules: vec![],
+            deny_rules: vec![PermissionRule::parse("bash(rm -rf:*)")],
+            ask_rules: vec![],
+            allowed_tools: None,
+            is_background: false,
+        };
+        let ctx = Arc::new(RwLock::new(PermissionSyncContext::new(inherited)));
+
+        let result = check_tool_permission(
+            "bash",
+            Some(r#"{"command":"rm -rf /tmp/nope"}"#),
+            Some(&ctx),
+            Some(&mut child_mailbox),
+            Duration::from_secs(1),
+        )
+        .await;
+
+        assert!(matches!(result, PermissionCheckResult::Denied { .. }));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            parent_mailbox.try_recv().is_none(),
+            "explicit deny should not send a permission request to the parent"
+        );
+
+        let ctx_guard = ctx.read().await;
+        let telemetry = ctx_guard.telemetry();
+        assert_eq!(telemetry.permission_requests, 0);
+        assert_eq!(telemetry.permission_requests_approved, 0);
+        assert_eq!(telemetry.tools_blocked, 1);
+        assert_eq!(telemetry.recent_denials, vec!["bash".to_string()]);
     }
 }
