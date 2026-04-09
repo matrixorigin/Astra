@@ -146,7 +146,9 @@ pub(super) async fn handle_skill_command(
 
             eprintln!(
                 "\n{}",
-                "─── Skills ──────────────────────────────────────".bold().cyan()
+                "─── Skills ──────────────────────────────────────"
+                    .bold()
+                    .cyan()
             );
             eprintln!("  {:<16} {}", "total:".dim(), all.len().to_string().cyan());
             eprintln!("  {:<16} {}", "local:".dim(), local.to_string().cyan());
@@ -664,7 +666,9 @@ Follow these steps:
             }
             eprintln!(
                 "\n{}",
-                format!("─── Skill test: {name} ───────────────────────────────────────").bold().cyan()
+                format!("─── Skill test: {name} ───────────────────────────────────────")
+                    .bold()
+                    .cyan()
             );
             if !json_args.is_empty() {
                 eprintln!("  Input: {}", json_args.cyan());
@@ -893,7 +897,9 @@ Follow these steps:
         "health" => {
             eprintln!(
                 "\n{}",
-                "─── Skill catalog health ─────────────────────────────────────".bold().cyan()
+                "─── Skill catalog health ─────────────────────────────────────"
+                    .bold()
+                    .cyan()
             );
             // Try API first
             let api_ok = if let Some(tok) = token {
@@ -1487,7 +1493,9 @@ fn print_skill_directory_raw(name: &str, skill_dir: &std::path::Path) -> Result<
                 let yaml_block = &raw[3..3 + end];
                 eprintln!(
                     "\n{}",
-                    format!("─── {name}/SKILL.md frontmatter ────────────────────────────").bold().cyan()
+                    format!("─── {name}/SKILL.md frontmatter ────────────────────────────")
+                        .bold()
+                        .cyan()
                 );
                 for line in yaml_block.lines() {
                     eprintln!("  {line}");
@@ -1506,7 +1514,9 @@ fn print_skill_directory_raw(name: &str, skill_dir: &std::path::Path) -> Result<
         let pretty = serde_json::to_string_pretty(&value).unwrap_or(raw);
         eprintln!(
             "\n{}",
-            format!("─── {name}/skill.json (legacy) ─────────────────────────────").bold().cyan()
+            format!("─── {name}/skill.json (legacy) ─────────────────────────────")
+                .bold()
+                .cyan()
         );
         for line in pretty.lines() {
             eprintln!("  {line}");
@@ -3271,7 +3281,11 @@ async fn uninstall_local_skill(name: &str, state: &mut ReplState) {
         Some(dir) => {
             use std::io::IsTerminal;
             if !std::io::stdin().is_terminal() {
-                eprintln!("  {} {}", theme::icon_warn(), "Cannot confirm in non-interactive mode.".yellow());
+                eprintln!(
+                    "  {} {}",
+                    theme::icon_warn(),
+                    "Cannot confirm in non-interactive mode.".yellow()
+                );
                 return;
             }
             eprintln!(
@@ -3283,7 +3297,9 @@ async fn uninstall_local_skill(name: &str, state: &mut ReplState) {
             eprint!("  Confirm [y/N]: ");
             let _ = std::io::stderr().flush();
             let mut answer = String::new();
-            if std::io::stdin().read_line(&mut answer).is_err() || !answer.trim().eq_ignore_ascii_case("y") {
+            if std::io::stdin().read_line(&mut answer).is_err()
+                || !answer.trim().eq_ignore_ascii_case("y")
+            {
                 eprintln!("  {}", "Cancelled.".dim());
                 return;
             }

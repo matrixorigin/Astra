@@ -819,7 +819,10 @@ pub(super) async fn handle_memory_domain_command(
                             t.languages.join(", ")
                         );
                     }
-                    eprintln!("  {}", "Use /plan template <name> <goal> to instantiate".dim());
+                    eprintln!(
+                        "  {}",
+                        "Use /plan template <name> <goal> to instantiate".dim()
+                    );
                     // Also hint about cloud if available
                     if state.task_service.is_some() {
                         eprintln!(
@@ -1470,7 +1473,10 @@ pub(super) async fn handle_memory_domain_command(
                 }
                 _ => {
                     eprintln!("  {}", "Usage: /plan [on | off | list | history | …]".dim());
-                    eprintln!("  {}", "In plan mode, just describe your goal - no commands needed.".dim());
+                    eprintln!(
+                        "  {}",
+                        "In plan mode, just describe your goal - no commands needed.".dim()
+                    );
                 }
             }
         }

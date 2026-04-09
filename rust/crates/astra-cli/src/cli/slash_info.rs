@@ -548,7 +548,9 @@ fn resolve_turn_pick(
 fn print_turn_journal_list(turns: &[session_journal::JournalEvent]) {
     eprintln!(
         "\n  {}",
-        "─── Journal turns (seq = chronological index) ───────────────".bold().cyan()
+        "─── Journal turns (seq = chronological index) ───────────────"
+            .bold()
+            .cyan()
     );
     eprintln!(
         "  {:>4} {:>6} {:>8}  {}",
@@ -617,7 +619,9 @@ fn print_turn_trace(ev: &session_journal::JournalEvent, journal_seq: Option<u32>
     };
     eprintln!(
         "\n  {}",
-        format!("─── Turn id {id} trace{seq_note}{err_tag} {sep}").bold().cyan()
+        format!("─── Turn id {id} trace{seq_note}{err_tag} {sep}")
+            .bold()
+            .cyan()
     );
 
     if let Some(ref err) = ev.error {
@@ -984,7 +988,9 @@ pub(super) async fn handle_info_command(
             } else {
                 eprintln!(
                     "\n{}",
-                    "─── Conversation History ─────────────────────────────────────".bold().cyan()
+                    "─── Conversation History ─────────────────────────────────────"
+                        .bold()
+                        .cyan()
                 );
                 for (i, (user, asst)) in state.history.iter().enumerate() {
                     let turn_n = i + 1;
@@ -1030,7 +1036,9 @@ pub(super) async fn handle_info_command(
 
             eprintln!(
                 "\n{}",
-                format!("─── {title} ─────────────────────────────────────────────").bold().cyan()
+                format!("─── {title} ─────────────────────────────────────────────")
+                    .bold()
+                    .cyan()
             );
             for line in result.lines() {
                 eprintln!("  {line}");
@@ -1052,7 +1060,9 @@ pub(super) async fn handle_info_command(
             };
             eprintln!(
                 "\n{}",
-                format!("─── Review · {review_label} ─────────────────────────────────────").bold().cyan()
+                format!("─── Review · {review_label} ─────────────────────────────────────")
+                    .bold()
+                    .cyan()
             );
             let selector = crate::repl_runtime::create_tool_selector_quiet(api, None);
             let mut pm = PermissionManager::with_project(false, &project_root);
@@ -1166,7 +1176,9 @@ pub(super) async fn handle_info_command(
         "/diagnostics" => {
             eprintln!(
                 "\n{}",
-                "─── Diagnostics ──────────────────────────────────────────────".bold().cyan()
+                "─── Diagnostics ──────────────────────────────────────────────"
+                    .bold()
+                    .cyan()
             );
 
             // Accumulate rows: (ok: bool, label: &str, detail: String)

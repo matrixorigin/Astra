@@ -781,7 +781,9 @@ fn show_composite_snapshots(session_id: &str) {
 
     eprintln!(
         "\n  {}",
-        format!("─── Composite Snapshots ({}) ───", index.snapshots.len()).bold().cyan()
+        format!("─── Composite Snapshots ({}) ───", index.snapshots.len())
+            .bold()
+            .cyan()
     );
 
     for snap in &index.snapshots {

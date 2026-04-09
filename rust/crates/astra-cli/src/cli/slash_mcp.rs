@@ -18,7 +18,10 @@ pub(super) async fn handle_mcp_command(arg: &str, state: &mut ReplState) -> Resu
         s if s.starts_with("add ") => handle_mcp_add(&s[4..]).await,
         "add" => {
             eprintln!("{}", "  Usage: /mcp add <name> <command> [args...]".dim());
-            eprintln!("{}", "  Example: /mcp add github npx @modelcontextprotocol/server-github".dim());
+            eprintln!(
+                "{}",
+                "  Example: /mcp add github npx @modelcontextprotocol/server-github".dim()
+            );
         }
         s if s.starts_with("remove ") => handle_mcp_remove(&s[7..]).await,
         "remove" => {
@@ -81,7 +84,12 @@ pub(super) async fn handle_mcp_command(arg: &str, state: &mut ReplState) -> Resu
             eprintln!(
                 "  {} status {} add {} remove {} servers {} prompts {} resources {} ping",
                 "Use:".dim(),
-                "│".dim(), "│".dim(), "│".dim(), "│".dim(), "│".dim(), "│".dim()
+                "│".dim(),
+                "│".dim(),
+                "│".dim(),
+                "│".dim(),
+                "│".dim(),
+                "│".dim()
             );
         }
     }
@@ -143,9 +151,19 @@ async fn show_servers(state: &ReplState) {
                 .unwrap_or_else(|| "n/a".to_string());
 
             eprintln!("{}", format!("  ┌─ {name}").bold().cyan());
-            eprintln!("  {} {:<8} {}", "│".dim(), "State:".dim(), format_state(state));
+            eprintln!(
+                "  {} {:<8} {}",
+                "│".dim(),
+                "State:".dim(),
+                format_state(state)
+            );
             eprintln!("  {} {:<8} {uptime}", "│".dim(), "Uptime:".dim());
-            eprintln!("  {} {:<8} {}", "│".dim(), "Tools:".dim(), tools.len().to_string().cyan());
+            eprintln!(
+                "  {} {:<8} {}",
+                "│".dim(),
+                "Tools:".dim(),
+                tools.len().to_string().cyan()
+            );
 
             if !tools.is_empty() {
                 for tool in tools.iter().take(10) {
@@ -155,10 +173,19 @@ async fn show_servers(state: &ReplState) {
                     } else {
                         desc.to_string()
                     };
-                    eprintln!("  {}   {} {}", "│".dim(), tool.name.clone().cyan(), short_desc.dim());
+                    eprintln!(
+                        "  {}   {} {}",
+                        "│".dim(),
+                        tool.name.clone().cyan(),
+                        short_desc.dim()
+                    );
                 }
                 if tools.len() > 10 {
-                    eprintln!("  {}   {}", "│".dim(), format!("… and {} more", tools.len() - 10).dim());
+                    eprintln!(
+                        "  {}   {}",
+                        "│".dim(),
+                        format!("… and {} more", tools.len() - 10).dim()
+                    );
                 }
             }
             eprintln!("  {}", "└─".dim());
@@ -186,7 +213,9 @@ async fn show_prompts(state: &ReplState) {
 
     eprintln!(
         "{}",
-        format!("  Prompts: {} available", prompts.len()).bold().cyan()
+        format!("  Prompts: {} available", prompts.len())
+            .bold()
+            .cyan()
     );
     eprintln!();
 
@@ -244,7 +273,9 @@ async fn show_resources(state: &ReplState) {
 
     eprintln!(
         "{}",
-        format!("  Resources: {} available", resources.len()).bold().cyan()
+        format!("  Resources: {} available", resources.len())
+            .bold()
+            .cyan()
     );
     eprintln!();
 
@@ -846,7 +877,11 @@ async fn handle_mcp_remove(arg: &str) {
 fn print_server_table(manager: &McpClientManager) {
     eprintln!(
         "  {}",
-        format!("{:<20} {:<12} {:<8} {:<10}", "Server", "State", "Tools", "Uptime").dim()
+        format!(
+            "{:<20} {:<12} {:<8} {:<10}",
+            "Server", "State", "Tools", "Uptime"
+        )
+        .dim()
     );
     eprintln!("  {}", "─".repeat(52).dim());
 

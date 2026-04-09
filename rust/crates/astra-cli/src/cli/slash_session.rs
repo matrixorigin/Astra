@@ -259,7 +259,9 @@ pub(super) fn resolve_journal_target_session(
         }
         eprintln!(
             "\n{}",
-            "─── Available Sessions ──────────────────────────".bold().cyan()
+            "─── Available Sessions ──────────────────────────"
+                .bold()
+                .cyan()
         );
         eprintln!(
             "  {}",
@@ -302,7 +304,9 @@ pub(super) fn handle_session_command(arg: &str, state: &mut ReplState) {
             let mdl = state.model.as_deref().unwrap_or("default");
             eprintln!(
                 "\n{}",
-                "─── Session ─────────────────────────────────────".bold().cyan()
+                "─── Session ─────────────────────────────────────"
+                    .bold()
+                    .cyan()
             );
             eprintln!("  {:<16} {}", "session_id:".dim(), sid.cyan());
             let persisted_ws = (sid != "none")
@@ -888,7 +892,9 @@ pub(super) fn handle_session_command(arg: &str, state: &mut ReplState) {
             Ok(sessions) => {
                 eprintln!(
                     "\n{}",
-                    "─── Session Journals ────────────────────────────".bold().cyan()
+                    "─── Session Journals ────────────────────────────"
+                        .bold()
+                        .cyan()
                 );
                 eprintln!(
                     "  {}",
@@ -948,7 +954,11 @@ pub(super) fn handle_session_command(arg: &str, state: &mut ReplState) {
                         })
                         .collect();
                     if errors.is_empty() {
-                        eprintln!("  {} {}", theme::icon_ok(), "No errors in this session.".green());
+                        eprintln!(
+                            "  {} {}",
+                            theme::icon_ok(),
+                            "No errors in this session.".green()
+                        );
                     } else {
                         eprintln!(
                             "\n{}",
@@ -1264,7 +1274,10 @@ fn handle_session_cleanup(arg: &str, state: &ReplState) {
         );
     }
     if stale.len() > show_count {
-        eprintln!("    {}", format!("… and {} more", stale.len() - show_count).dim());
+        eprintln!(
+            "    {}",
+            format!("… and {} more", stale.len() - show_count).dim()
+        );
     }
     eprintln!();
 
@@ -1417,7 +1430,9 @@ fn handle_session_verify(state: &ReplState) {
     let sid = state.session_id.as_deref().unwrap_or("none");
     eprintln!(
         "\n{}",
-        "─── Sync Health ─────────────────────────────────".bold().cyan()
+        "─── Sync Health ─────────────────────────────────"
+            .bold()
+            .cyan()
     );
 
     // Local journal stats

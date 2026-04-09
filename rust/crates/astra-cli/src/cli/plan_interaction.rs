@@ -6,8 +6,8 @@
 
 use super::*;
 use crate::sse_utils::collect_sse_with_preview;
-use astra_runtime::plan::PlanCommand;
 use astra_runtime::plan;
+use astra_runtime::plan::PlanCommand;
 use astra_runtime::plan::progress_bar_segments;
 use astra_services::session_journal;
 use crossterm::style::Stylize;
@@ -54,7 +54,11 @@ pub(super) async fn enrich_with_templates(
     let uid = user_id.unwrap_or("anonymous");
 
     if verbose {
-        eprintln!("  {} {}", "⋯".cyan(), "Searching for similar plan templates…".dim());
+        eprintln!(
+            "  {} {}",
+            "⋯".cyan(),
+            "Searching for similar plan templates…".dim()
+        );
     }
 
     let templates = plan::query_similar_templates(pool, uid, goal, 3).await;
@@ -89,8 +93,7 @@ pub(super) fn eprint_plan_json_parse_failed(full_text: &str, _err: &str) {
 
     eprintln!(
         "  {}",
-        "Tip: try rephrasing, or type `exit` to leave plan mode and use normal chat."
-            .dim()
+        "Tip: try rephrasing, or type `exit` to leave plan mode and use normal chat.".dim()
     );
 }
 
@@ -109,14 +112,16 @@ pub(super) fn eprint_plan_commands_help() {
 
 /// Branded `inquire` theme: cyan prompt, bold+cyan highlight, dim unselected.
 fn plan_select_theme() -> inquire::ui::RenderConfig<'static> {
-    use inquire::ui::{RenderConfig, Color, StyleSheet, Attributes};
-    let cyan = Color::Rgb { r: 0, g: 200, b: 200 };
+    use inquire::ui::{Attributes, Color, RenderConfig, StyleSheet};
+    let cyan = Color::Rgb {
+        r: 0,
+        g: 200,
+        b: 200,
+    };
     let mut rc = RenderConfig::default_colored();
     rc.prompt_prefix = inquire::ui::Styled::new("▸").with_fg(cyan);
     rc.highlighted_option_prefix = inquire::ui::Styled::new("▸").with_fg(cyan);
-    rc.selected_option = Some(
-        StyleSheet::new().with_fg(cyan).with_attr(Attributes::BOLD),
-    );
+    rc.selected_option = Some(StyleSheet::new().with_fg(cyan).with_attr(Attributes::BOLD));
     rc.answer = StyleSheet::new().with_fg(cyan).with_attr(Attributes::BOLD);
     rc
 }
@@ -124,7 +129,9 @@ fn plan_select_theme() -> inquire::ui::RenderConfig<'static> {
 /// Display a clarification question with modern styled formatting.
 ///
 /// Category icons are kept, options use `▸` prefix for default, dim `·` for others.
-pub(super) fn eprint_clarification_question(q: &astra_runtime::plan_decompose::ClarificationQuestion) {
+pub(super) fn eprint_clarification_question(
+    q: &astra_runtime::plan_decompose::ClarificationQuestion,
+) {
     let icon = match q.category {
         astra_runtime::plan_decompose::ClarificationCategory::Scope => "📦",
         astra_runtime::plan_decompose::ClarificationCategory::Approach => "🛤️ ",
@@ -147,11 +154,7 @@ pub(super) fn eprint_clarification_question(q: &astra_runtime::plan_decompose::C
                 format!("{opt} (default)").bold()
             );
         } else {
-            eprintln!(
-                "    {} {}",
-                format!("[{num}]").dim(),
-                opt.as_str().dim()
-            );
+            eprintln!("    {} {}", format!("[{num}]").dim(), opt.as_str().dim());
         }
     }
 
@@ -218,22 +221,42 @@ fn eprint_styled_execution_preview(plan: &astra_runtime::plan::TaskPlan) {
 
     if analysis.groups.len() > 1 || analysis.groups.first().map(|g| g.len()).unwrap_or(0) > 1 {
         for (i, group) in analysis.groups.iter().enumerate() {
-            let ids: Vec<_> = group.iter().map(|id| format!("{}", id.as_str().cyan())).collect();
+            let ids: Vec<_> = group
+                .iter()
+                .map(|id| format!("{}", id.as_str().cyan()))
+                .collect();
             let parallel = if group.len() > 1 {
                 format!(" {}", "(parallel)".dim())
             } else {
                 String::new()
             };
-            eprintln!("    {} {}{}: {}", "›".dim(), format!("Round {}", i + 1).dim(), parallel, ids.join(", "));
+            eprintln!(
+                "    {} {}{}: {}",
+                "›".dim(),
+                format!("Round {}", i + 1).dim(),
+                parallel,
+                ids.join(", ")
+            );
         }
     }
 
     if !analysis.conflicts.is_empty() {
-        eprint!("    {} {} file conflict(s): ", theme::icon_warn(), analysis.conflicts.len());
+        eprint!(
+            "    {} {} file conflict(s): ",
+            theme::icon_warn(),
+            analysis.conflicts.len()
+        );
         let strs: Vec<_> = analysis
             .conflicts
             .iter()
-            .map(|c| format!("{} ↔ {} ({})", c.subtask_a, c.subtask_b, c.shared_files.join(", ")))
+            .map(|c| {
+                format!(
+                    "{} ↔ {} ({})",
+                    c.subtask_a,
+                    c.subtask_b,
+                    c.shared_files.join(", ")
+                )
+            })
             .collect();
         eprintln!("{}", strs.join(", ").yellow());
     }
@@ -264,11 +287,7 @@ fn eprint_styled_execution_preview(plan: &astra_runtime::plan::TaskPlan) {
 /// is clamped to `width` (avoids panic on edge `pct` values).
 fn format_progress_bar(pct: u32, width: usize) -> String {
     let (filled, empty) = progress_bar_segments(pct, width);
-    format!(
-        "{}{}",
-        "█".repeat(filled).green(),
-        "░".repeat(empty).dim()
-    )
+    format!("{}{}", "█".repeat(filled).green(), "░".repeat(empty).dim())
 }
 
 /// Print the full plan mode banner (shown on entry and on `help` command).
@@ -306,7 +325,9 @@ fn eprint_plan_markdown_streaming(plan: &astra_runtime::plan::TaskPlan, goal: Op
         eprintln!("{}", astra_runtime::plan::format_plan_markdown(plan, goal));
         return;
     }
-    let tw = crossterm::terminal::size().map(|(w, _)| w as usize).unwrap_or(80);
+    let tw = crossterm::terminal::size()
+        .map(|(w, _)| w as usize)
+        .unwrap_or(80);
     let mut md = streaming_md::StreamingMarkdown::new(tw);
 
     // Header block
@@ -371,18 +392,26 @@ fn format_subtask_block(index: usize, st: &astra_runtime::plan::SubtaskPlan) -> 
     }
 
     if !st.acceptance_checks.is_empty() {
-        let checks: Vec<_> = st.acceptance_checks.iter().map(|vk| {
-            use astra_services::durable_task::VerifierKind;
-            match vk {
-                VerifierKind::FileExists { paths } => format!("`file_exists: {}`", paths.join(", ")),
-                VerifierKind::ReadFileContains { path, .. } => format!("`read_file: {path}`"),
-                VerifierKind::GrepCheck { file, pattern, .. } => format!("`grep '{pattern}' {file}`"),
-                VerifierKind::Command { cmd, .. } => format!("`{cmd}`"),
-                VerifierKind::BuildPass { cmd } => format!("`build: {cmd}`"),
-                VerifierKind::TestPass { cmd, .. } => format!("`test: {cmd}`"),
-                _ => "`check`".into(),
-            }
-        }).collect();
+        let checks: Vec<_> = st
+            .acceptance_checks
+            .iter()
+            .map(|vk| {
+                use astra_services::durable_task::VerifierKind;
+                match vk {
+                    VerifierKind::FileExists { paths } => {
+                        format!("`file_exists: {}`", paths.join(", "))
+                    }
+                    VerifierKind::ReadFileContains { path, .. } => format!("`read_file: {path}`"),
+                    VerifierKind::GrepCheck { file, pattern, .. } => {
+                        format!("`grep '{pattern}' {file}`")
+                    }
+                    VerifierKind::Command { cmd, .. } => format!("`{cmd}`"),
+                    VerifierKind::BuildPass { cmd } => format!("`build: {cmd}`"),
+                    VerifierKind::TestPass { cmd, .. } => format!("`test: {cmd}`"),
+                    _ => "`check`".into(),
+                }
+            })
+            .collect();
         block.push_str(&format!("   Verify: {}\n", checks.join(", ")));
     }
 
@@ -400,14 +429,32 @@ fn format_subtask_block(index: usize, st: &astra_runtime::plan::SubtaskPlan) -> 
 /// Build the summary line (effort counts + progress) for plan footer.
 fn format_plan_summary_line(plan: &astra_runtime::plan::TaskPlan) -> String {
     let mut parts = Vec::new();
-    let small = plan.subtasks.iter().filter(|s| s.effort.as_deref() == Some("small")).count();
-    let medium = plan.subtasks.iter().filter(|s| s.effort.as_deref() == Some("medium")).count();
-    let large = plan.subtasks.iter().filter(|s| s.effort.as_deref() == Some("large")).count();
+    let small = plan
+        .subtasks
+        .iter()
+        .filter(|s| s.effort.as_deref() == Some("small"))
+        .count();
+    let medium = plan
+        .subtasks
+        .iter()
+        .filter(|s| s.effort.as_deref() == Some("medium"))
+        .count();
+    let large = plan
+        .subtasks
+        .iter()
+        .filter(|s| s.effort.as_deref() == Some("large"))
+        .count();
     if small + medium + large > 0 {
         let mut effort = Vec::new();
-        if small > 0 { effort.push(format!("{small} small")); }
-        if medium > 0 { effort.push(format!("{medium} medium")); }
-        if large > 0 { effort.push(format!("{large} large")); }
+        if small > 0 {
+            effort.push(format!("{small} small"));
+        }
+        if medium > 0 {
+            effort.push(format!("{medium} medium"));
+        }
+        if large > 0 {
+            effort.push(format!("{large} large"));
+        }
         parts.push(effort.join(", "));
     }
     parts.push(format!(
@@ -436,9 +483,7 @@ fn journal_plan_event(
         session_journal::JournalEventType::PlanLifecycle => {
             session_journal::JournalEvent::plan_lifecycle(None, summary, metadata)
         }
-        _ => {
-            session_journal::JournalEvent::plan_lifecycle(None, summary, metadata)
-        }
+        _ => session_journal::JournalEvent::plan_lifecycle(None, summary, metadata),
     };
     let _ = writer.append(&event);
 }
@@ -487,10 +532,8 @@ pub async fn handle_plan_mode_input(
     api: &astra_thin_client::ThinClient,
 ) -> Result<(), String> {
     use plan::{
-        ClarificationAnswer, PlanEntryChoice, PlanModeState,
-        decomposition_prompt,
-        parse_clarification_response, parse_plan_entry_choice,
-        parse_plan_response,
+        ClarificationAnswer, PlanEntryChoice, PlanModeState, decomposition_prompt,
+        parse_clarification_response, parse_plan_entry_choice, parse_plan_response,
     };
 
     let plan_state = match state.plan_mode.as_mut() {
@@ -510,7 +553,11 @@ pub async fn handle_plan_mode_input(
             ClarificationAnswer::Selected(idx) => {
                 let selected = &question.options[idx];
                 pending.record_answer(selected.clone());
-                eprintln!("  {} Selected: {}", theme::icon_ok(), selected.as_str().cyan());
+                eprintln!(
+                    "  {} Selected: {}",
+                    theme::icon_ok(),
+                    selected.as_str().cyan()
+                );
             }
             ClarificationAnswer::Freeform(text) => {
                 pending.record_answer(text.clone());
@@ -547,7 +594,11 @@ pub async fn handle_plan_mode_input(
         plan_state.pending_clarifications = None;
 
         let Some(tok) = token else {
-            eprintln!("  {} {}", theme::icon_err(), "Not logged in. Run /login first.".red());
+            eprintln!(
+                "  {} {}",
+                theme::icon_err(),
+                "Not logged in. Run /login first.".red()
+            );
             return Ok(());
         };
 
@@ -592,10 +643,22 @@ pub async fn handle_plan_mode_input(
                         if let Some(choice) = prompt_plan_confirmation(subtask_count) {
                             match choice {
                                 PlanConfirmChoice::ExecuteAll => {
-                                    return Box::pin(handle_plan_mode_input("go".into(), token, state, api)).await;
+                                    return Box::pin(handle_plan_mode_input(
+                                        "go".into(),
+                                        token,
+                                        state,
+                                        api,
+                                    ))
+                                    .await;
                                 }
                                 PlanConfirmChoice::StepByStep => {
-                                    return Box::pin(handle_plan_mode_input("step".into(), token, state, api)).await;
+                                    return Box::pin(handle_plan_mode_input(
+                                        "step".into(),
+                                        token,
+                                        state,
+                                        api,
+                                    ))
+                                    .await;
                                 }
                                 PlanConfirmChoice::Edit | PlanConfirmChoice::Cancel => {}
                             }
@@ -607,7 +670,11 @@ pub async fn handle_plan_mode_input(
                 }
             }
             Ok(r) => {
-                eprintln!("  {} LLM call failed ({})", theme::icon_err(), r.status().to_string().red());
+                eprintln!(
+                    "  {} LLM call failed ({})",
+                    theme::icon_err(),
+                    r.status().to_string().red()
+                );
             }
             Err(e) => {
                 eprintln!("  {} Request failed: {}", theme::icon_err(), e);
@@ -688,7 +755,12 @@ pub async fn handle_plan_mode_input(
                 let pct = plan_state.plan.progress_pct();
                 let done_count = plan_state.plan.items_done();
                 let total_count = plan_state.plan.subtasks.len();
-                eprintln!("  {} Completed: {} ({}%)", theme::icon_ok(), title.as_str().cyan(), pct);
+                eprintln!(
+                    "  {} Completed: {} ({}%)",
+                    theme::icon_ok(),
+                    title.as_str().cyan(),
+                    pct
+                );
                 let _ = plan_state.save_to_file(&PlanModeState::state_path());
 
                 journal_plan_event(
@@ -814,7 +886,10 @@ pub async fn handle_plan_mode_input(
                         journal_plan_event(
                             &mut state.journal,
                             session_journal::JournalEventType::PlanEdit,
-                            &format!("Plan edited: {}", input.chars().take(80).collect::<String>()),
+                            &format!(
+                                "Plan edited: {}",
+                                input.chars().take(80).collect::<String>()
+                            ),
                             Some(serde_json::json!({
                                 "instruction": input.chars().take(200).collect::<String>(),
                                 "subtask_count": plan_state.plan.subtasks.len(),
@@ -861,9 +936,7 @@ async fn handle_plan_command(
     state: &mut ReplState,
     api: &astra_thin_client::ThinClient,
 ) -> Result<(), String> {
-    use plan::{
-        PlanExecutionConfig, PlanModeState,
-    };
+    use plan::{PlanExecutionConfig, PlanModeState};
 
     match cmd {
         PlanCommand::Cancel => {
@@ -898,9 +971,11 @@ async fn handle_plan_command(
 
                     eprintln!("  {} {}", "Plan:".bold().cyan(), goal_display);
                     let bar = format_progress_bar(pct, 20);
-                    eprintln!("  {} {bar} {}/{} {}  {}",
+                    eprintln!(
+                        "  {} {bar} {}/{} {}  {}",
                         "Progress:".dim(),
-                        format!("{done}").cyan(), format!("{total}").dim(),
+                        format!("{done}").cyan(),
+                        format!("{total}").dim(),
                         format!("({pct}%)").bold(),
                         format!("round {round}").dim(),
                     );
@@ -931,9 +1006,11 @@ async fn handle_plan_command(
                     eprintln!("  {} {phase}", "Phase:".dim());
 
                     let bar = format_progress_bar(pct, 20);
-                    eprintln!("  {} {bar} {}/{} {}  {} {}",
+                    eprintln!(
+                        "  {} {bar} {}/{} {}  {} {}",
                         "Progress:".dim(),
-                        format!("{done}").cyan(), format!("{total}").dim(),
+                        format!("{done}").cyan(),
+                        format!("{total}").dim(),
                         format!("({pct}%)").bold(),
                         format!("v{versions}").dim(),
                         format!("({edits} edits)").dim(),
@@ -955,7 +1032,12 @@ async fn handle_plan_command(
                     if !blocked.is_empty() {
                         for st in &blocked {
                             let deps: Vec<_> = st.depends_on.iter().map(|d| d.as_str()).collect();
-                            eprintln!("  {} {} {}", "●".dim(), st.id.clone().yellow(), format!("(waiting on: {})", deps.join(", ")).dim());
+                            eprintln!(
+                                "  {} {} {}",
+                                "●".dim(),
+                                st.id.clone().yellow(),
+                                format!("(waiting on: {})", deps.join(", ")).dim()
+                            );
                         }
                     }
 
@@ -970,9 +1052,11 @@ async fn handle_plan_command(
 
                 eprintln!("  {} {goal}", "Plan:".bold().cyan());
                 let bar = format_progress_bar(pct, 20);
-                eprintln!("  {} {bar} {}/{} {}  {}",
+                eprintln!(
+                    "  {} {bar} {}/{} {}  {}",
                     "Progress:".dim(),
-                    format!("{done}").cyan(), format!("{total}").dim(),
+                    format!("{done}").cyan(),
+                    format!("{total}").dim(),
                     format!("({pct}%)").bold(),
                     format!("round {round}").dim(),
                 );
@@ -983,7 +1067,11 @@ async fn handle_plan_command(
 
                 let corrections = &state.plan_execution_corrections;
                 if !corrections.is_empty() {
-                    eprintln!("  {} {} queued", "Corrections:".dim(), format!("{}", corrections.len()).yellow());
+                    eprintln!(
+                        "  {} {} queued",
+                        "Corrections:".dim(),
+                        format!("{}", corrections.len()).yellow()
+                    );
                 }
                 eprintln!("{}", "  pause | correct <…> | cancel".dim());
             } else {
@@ -1073,7 +1161,11 @@ async fn handle_plan_command(
                         );
                     }
                     Err(e) => {
-                        eprintln!("  {} Could not persist task: {}", theme::icon_warn(), e.to_string().yellow());
+                        eprintln!(
+                            "  {} Could not persist task: {}",
+                            theme::icon_warn(),
+                            e.to_string().yellow()
+                        );
                     }
                 }
             }
@@ -1130,7 +1222,11 @@ async fn handle_plan_command(
             } else if state.executing_plan.is_some() {
                 eprintln!("  {} Resuming plan execution...", "▶".cyan());
             } else {
-                eprintln!("  {} {}", theme::icon_warn(), "No paused plan to resume".yellow());
+                eprintln!(
+                    "  {} {}",
+                    theme::icon_warn(),
+                    "No paused plan to resume".yellow()
+                );
             }
         }
 
@@ -1166,7 +1262,8 @@ async fn handle_plan_command(
                 eprintln!(
                     "  {} {}/{} {}  {} {}  {} events",
                     "Progress:".dim(),
-                    format!("{done}").cyan(), format!("{total}").dim(),
+                    format!("{done}").cyan(),
+                    format!("{total}").dim(),
                     format!("({pct}%)").bold(),
                     format!("v{versions}").dim(),
                     format!("({edits} edits)").dim(),
@@ -1176,9 +1273,15 @@ async fn handle_plan_command(
                 if !ps.plan.subtasks.is_empty() {
                     for st in &ps.plan.subtasks {
                         let icon = match st.status {
-                            astra_services::task_orchestrator::TaskStatus::Completed => "✓".green().to_string(),
-                            astra_services::task_orchestrator::TaskStatus::Failed => "✗".red().to_string(),
-                            astra_services::task_orchestrator::TaskStatus::InProgress => "▶".cyan().to_string(),
+                            astra_services::task_orchestrator::TaskStatus::Completed => {
+                                "✓".green().to_string()
+                            }
+                            astra_services::task_orchestrator::TaskStatus::Failed => {
+                                "✗".red().to_string()
+                            }
+                            astra_services::task_orchestrator::TaskStatus::InProgress => {
+                                "▶".cyan().to_string()
+                            }
                             _ => "○".dim().to_string(),
                         };
                         let deps = if st.depends_on.is_empty() {
@@ -1295,22 +1398,36 @@ async fn handle_plan_command(
                     "pause".cyan()
                 );
             } else if state.plan_mode.is_some() {
-                eprintln!("  {} {}", theme::icon_warn(), "Rewind is only available during execution".yellow());
+                eprintln!(
+                    "  {} {}",
+                    theme::icon_warn(),
+                    "Rewind is only available during execution".yellow()
+                );
             }
         }
 
         PlanCommand::EnablePlanOnly => {
             state.chat_plan_only = true;
-            eprintln!("  {} Plan-only chat enabled (tools disabled)", theme::icon_ok());
+            eprintln!(
+                "  {} Plan-only chat enabled (tools disabled)",
+                theme::icon_ok()
+            );
         }
 
         PlanCommand::DisablePlanOnly => {
             state.chat_plan_only = false;
-            eprintln!("  {} Plan-only chat disabled (tools re-enabled)", theme::icon_ok());
+            eprintln!(
+                "  {} Plan-only chat disabled (tools re-enabled)",
+                theme::icon_ok()
+            );
         }
 
         PlanCommand::Help => {
-            let goal = state.plan_mode.as_ref().map(|ps| ps.goal.as_str()).unwrap_or("");
+            let goal = state
+                .plan_mode
+                .as_ref()
+                .map(|ps| ps.goal.as_str())
+                .unwrap_or("");
             eprint_plan_mode_banner(goal);
         }
 
@@ -1341,8 +1458,7 @@ async fn handle_goal_submission(
     api: &astra_thin_client::ThinClient,
 ) -> Result<(), String> {
     use plan::{
-        PendingClarifications, PlanModeState, decomposition_prompt,
-        detect_clarification_questions,
+        PendingClarifications, PlanModeState, decomposition_prompt, detect_clarification_questions,
         format_project_context, parse_plan_response,
     };
 
@@ -1357,7 +1473,10 @@ async fn handle_goal_submission(
     journal_plan_event(
         &mut state.journal,
         session_journal::JournalEventType::PlanLifecycle,
-        &format!("Plan mode started: {}", goal.chars().take(80).collect::<String>()),
+        &format!(
+            "Plan mode started: {}",
+            goal.chars().take(80).collect::<String>()
+        ),
         Some(serde_json::json!({
             "goal": goal,
         })),
@@ -1395,7 +1514,13 @@ async fn handle_goal_submission(
                 eprintln!(
                     "  {} {}",
                     "▸".cyan(),
-                    format!("{} question{} before planning:", questions.len(), if questions.len() == 1 { "" } else { "s" }).bold().cyan()
+                    format!(
+                        "{} question{} before planning:",
+                        questions.len(),
+                        if questions.len() == 1 { "" } else { "s" }
+                    )
+                    .bold()
+                    .cyan()
                 );
                 eprintln!();
 
@@ -1418,7 +1543,10 @@ async fn handle_goal_submission(
                         journal_plan_event(
                             &mut state.journal,
                             session_journal::JournalEventType::PlanLifecycle,
-                            &format!("Plan generated: {} subtasks", plan_state.plan.subtasks.len()),
+                            &format!(
+                                "Plan generated: {} subtasks",
+                                plan_state.plan.subtasks.len()
+                            ),
                             Some(serde_json::json!({
                                 "subtask_count": plan_state.plan.subtasks.len(),
                             })),
@@ -1431,10 +1559,22 @@ async fn handle_goal_submission(
                         if let Some(choice) = prompt_plan_confirmation(subtask_count) {
                             match choice {
                                 PlanConfirmChoice::ExecuteAll => {
-                                    return Box::pin(handle_plan_mode_input("go".into(), token, state, api)).await;
+                                    return Box::pin(handle_plan_mode_input(
+                                        "go".into(),
+                                        token,
+                                        state,
+                                        api,
+                                    ))
+                                    .await;
                                 }
                                 PlanConfirmChoice::StepByStep => {
-                                    return Box::pin(handle_plan_mode_input("step".into(), token, state, api)).await;
+                                    return Box::pin(handle_plan_mode_input(
+                                        "step".into(),
+                                        token,
+                                        state,
+                                        api,
+                                    ))
+                                    .await;
                                 }
                                 PlanConfirmChoice::Edit | PlanConfirmChoice::Cancel => {}
                             }
@@ -1529,18 +1669,12 @@ mod tests {
     #[test]
     fn plan_execution_ui_active_follows_handle() {
         let state = ReplState::default();
-        assert!(
-            !plan_execution_ui_active(&state),
-            "no handle => inactive"
-        );
+        assert!(!plan_execution_ui_active(&state), "no handle => inactive");
 
         let mut state = ReplState::default();
         let (handle, _update_tx, _cmd_rx) = plan_executor::create_plan_channels();
         state.plan_handle = Some(handle);
-        assert!(
-            plan_execution_ui_active(&state),
-            "handle present => active"
-        );
+        assert!(plan_execution_ui_active(&state), "handle present => active");
     }
 
     #[test]
@@ -1583,10 +1717,7 @@ mod tests {
     #[test]
     fn try_replace_plan_from_llm_json_empty_text_no_op() {
         let mut ps = plan::PlanModeState::new("g".into(), plan::ProjectContext::default());
-        assert_eq!(
-            try_replace_plan_from_llm_json("", &mut ps).unwrap(),
-            false
-        );
+        assert_eq!(try_replace_plan_from_llm_json("", &mut ps).unwrap(), false);
         assert_eq!(
             try_replace_plan_from_llm_json("   \n\t  ", &mut ps).unwrap(),
             false
@@ -1596,7 +1727,8 @@ mod tests {
     #[test]
     fn try_replace_plan_from_llm_json_prose_returns_err() {
         let mut ps = plan::PlanModeState::new("g".into(), plan::ProjectContext::default());
-        let err = try_replace_plan_from_llm_json("Just use natural language.", &mut ps).unwrap_err();
+        let err =
+            try_replace_plan_from_llm_json("Just use natural language.", &mut ps).unwrap_err();
         assert!(!err.is_empty(), "expected parse error message: {err}");
     }
 
