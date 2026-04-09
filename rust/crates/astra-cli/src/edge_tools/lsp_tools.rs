@@ -381,6 +381,56 @@ impl ToolExecutor {
             })
     }
 
+    fn try_active_code_actions(
+        &self,
+        file: &str,
+        line: usize,
+        column: usize,
+    ) -> Result<Option<String>, String> {
+        let (file_path, position_params) = self.lsp_position_params(file, line, column)?;
+        let uri = position_params
+            .get("textDocument")
+            .and_then(|doc| doc.get("uri"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| "failed to build textDocument URI for code_actions".to_string())?
+            .to_string();
+        let position = position_params
+            .get("position")
+            .cloned()
+            .ok_or_else(|| "failed to build LSP position for code_actions".to_string())?;
+        let diagnostics = match self
+            .passive_lsp
+            .diagnostics_for_file(&self.project_root, &file_path)?
+        {
+            Some(snapshot) => snapshot
+                .get("diagnostics")
+                .cloned()
+                .unwrap_or_else(|| Value::Array(Vec::new())),
+            None => return Ok(None),
+        };
+        self.passive_lsp
+            .request_for_file(
+                &self.project_root,
+                &file_path,
+                "textDocument/codeAction",
+                json!({
+                    "textDocument": { "uri": uri },
+                    "range": {
+                        "start": position.clone(),
+                        "end": position,
+                    },
+                    "context": {
+                        "diagnostics": diagnostics,
+                    }
+                }),
+            )
+            .map(|result| {
+                result.map(|value| {
+                    Self::active_lsp_response("code_actions", "textDocument/codeAction", value)
+                })
+            })
+    }
+
     fn try_active_call_hierarchy(
         &self,
         operation: &str,
@@ -434,7 +484,7 @@ impl ToolExecutor {
                 "error": "Missing required 'operation' parameter",
                 "valid_operations": [
                     "goto_definition", "find_references", "hover", "document_symbols",
-                    "workspace_symbols", "call_hierarchy", "incoming_calls", "outgoing_calls", "rename", "diagnostics"
+                    "workspace_symbols", "call_hierarchy", "incoming_calls", "outgoing_calls", "rename", "code_actions", "diagnostics"
                 ]
             }).to_string(),
         };
@@ -679,6 +729,22 @@ impl ToolExecutor {
                 }
             }
 
+            "code_actions" => {
+                if let (Some(f), Some(l), Some(c)) = (file, line, column) {
+                    match self.try_active_code_actions(f, l, c) {
+                        Ok(Some(result)) => result,
+                        Ok(None) => json!({
+                            "error": "code_actions requires an active LSP backend for that file"
+                        }).to_string(),
+                        Err(error) => json!({ "error": error }).to_string(),
+                    }
+                } else {
+                    json!({
+                        "error": "code_actions requires 'file'+'line'+'column'"
+                    }).to_string()
+                }
+            }
+
             "diagnostics" => {
                 if let Some(f) = file {
                     match self.try_active_file_diagnostics(f) {
@@ -698,7 +764,8 @@ impl ToolExecutor {
                             "document_symbols": true,
                             "workspace_symbols": true,
                             "call_hierarchy": true,
-                            "rename": true
+                            "rename": true,
+                            "code_actions": true
                         },
                         "active_backends": self.passive_lsp.active_status(&self.project_root),
                         "supported_languages": {
@@ -714,7 +781,7 @@ impl ToolExecutor {
                 "error": format!("Unknown operation: {}", operation),
                 "valid_operations": [
                     "goto_definition", "find_references", "hover", "document_symbols",
-                    "workspace_symbols", "call_hierarchy", "incoming_calls", "outgoing_calls", "rename", "diagnostics"
+                    "workspace_symbols", "call_hierarchy", "incoming_calls", "outgoing_calls", "rename", "code_actions", "diagnostics"
                 ]
             }).to_string()
         }

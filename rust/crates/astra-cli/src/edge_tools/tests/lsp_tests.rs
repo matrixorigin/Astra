@@ -53,7 +53,8 @@ while True:
             "result": {
                 "capabilities": {
                     "definitionProvider": True,
-                    "documentSymbolProvider": True
+                    "documentSymbolProvider": True,
+                    "codeActionProvider": True
                 }
             }
         })
@@ -106,6 +107,28 @@ while True:
                     }]
                 }
             }
+        })
+    elif method == "textDocument/codeAction":
+        uri = message["params"]["textDocument"]["uri"]
+        write_frame({
+            "jsonrpc": "2.0",
+            "id": msg_id,
+            "result": [{
+                "title": "Apply fake quick fix",
+                "kind": "quickfix",
+                "diagnostics": message["params"]["context"]["diagnostics"],
+                "edit": {
+                    "changes": {
+                        uri: [{
+                            "range": {
+                                "start": {"line": 0, "character": 7},
+                                "end": {"line": 0, "character": 21}
+                            },
+                            "newText": "hello_from_fix"
+                        }]
+                    }
+                }
+            }]
         })
     elif method in ("textDocument/didOpen", "textDocument/didChange", "textDocument/didSave"):
         log_event(method)
@@ -204,6 +227,7 @@ fn lsp_diagnostics_returns_capabilities() {
 
     assert!(parsed["capabilities"]["goto_definition"].as_bool().unwrap());
     assert!(parsed["capabilities"]["find_references"].as_bool().unwrap());
+    assert!(parsed["capabilities"]["code_actions"].as_bool().unwrap());
     assert!(
         parsed["supported_languages"]["active_lsp"]
             .as_array()
@@ -242,6 +266,46 @@ fn lsp_diagnostics_returns_file_snapshot_when_available() {
     assert_eq!(parsed["method"].as_str(), Some("publishDiagnostics"));
     assert_eq!(
         parsed["result"]["diagnostics"][0]["message"].as_str(),
+        Some("fake LSP diagnostic")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+#[serial_test::serial]
+fn lsp_code_actions_use_real_lsp_when_available() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname=\"demo\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(
+        dir.path().join("src/lib.rs"),
+        "pub fn hello_from_lsp() {}\n",
+    )
+    .unwrap();
+    let script = fake_lsp_server_script(dir.path());
+    let _guard = EnvGuard::set("ASTRA_RUST_ANALYZER_CMD", script.to_str().unwrap());
+    let exe = ToolExecutor::new(dir.path());
+
+    let result = exe.lsp(&json!({
+        "operation": "code_actions",
+        "file": "src/lib.rs",
+        "line": 1,
+        "column": 8
+    }));
+    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+
+    assert_eq!(parsed["backend"].as_str(), Some("lsp"));
+    assert_eq!(parsed["method"].as_str(), Some("textDocument/codeAction"));
+    assert_eq!(
+        parsed["result"][0]["title"].as_str(),
+        Some("Apply fake quick fix")
+    );
+    assert_eq!(
+        parsed["result"][0]["diagnostics"][0]["message"].as_str(),
         Some("fake LSP diagnostic")
     );
 }

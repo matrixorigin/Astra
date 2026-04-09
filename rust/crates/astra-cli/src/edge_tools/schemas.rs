@@ -1156,6 +1156,7 @@ pub fn all_tool_schemas() -> Vec<Value> {
                                 "incoming_calls",
                                 "outgoing_calls",
                                 "rename",
+                                "code_actions",
                                 "diagnostics"
                             ],
                             "description": "LSP operation to perform"
