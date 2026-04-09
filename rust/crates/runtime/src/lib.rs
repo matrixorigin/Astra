@@ -85,6 +85,7 @@ pub mod evaluation;
 pub mod introspection;
 pub mod matrix_cloud_runtime;
 pub mod output_style;
+pub mod ab_testing;
 pub mod pipeline;
 pub mod plan;
 pub mod plan_decompose;
