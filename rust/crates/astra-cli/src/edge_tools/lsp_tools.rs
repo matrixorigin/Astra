@@ -82,11 +82,16 @@ impl ToolExecutor {
             .and_then(Value::as_u64)
             .ok_or_else(|| "WorkspaceEdit end.character must be an integer".to_string())?
             as usize;
-        let new_text = edit
+        let raw_new_text = edit
             .get("newText")
             .and_then(Value::as_str)
             .ok_or_else(|| "WorkspaceEdit text edit is missing newText".to_string())?
             .to_string();
+        let new_text = if edit.get("insertTextFormat").and_then(Value::as_u64) == Some(2) {
+            Self::lsp_snippet_to_plain_text(&raw_new_text)
+        } else {
+            raw_new_text
+        };
         Ok((start_line, start_char, end_line, end_char, new_text))
     }
 
