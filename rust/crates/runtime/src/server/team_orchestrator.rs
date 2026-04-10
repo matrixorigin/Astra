@@ -407,20 +407,18 @@ impl TeamExecutionOrchestrator {
 
         // Check token budget (post-execution — tokens are only known after completion)
         let total_tokens = total_prompt + total_completion;
-        let budget_exceeded = team
+        let exceeded_budget = team
             .budget
             .as_ref()
-            .filter(|b| b.max_tokens > 0 && total_tokens > b.max_tokens)
-            .is_some();
-        if budget_exceeded {
-            let max = team.budget.as_ref().unwrap().max_tokens;
+            .filter(|b| b.max_tokens > 0 && total_tokens > b.max_tokens);
+        if let Some(b) = exceeded_budget {
             let _ = self
                 .run_engine
                 .append_event(
                     &parent_run_id,
                     serde_json::json!({
                         "event_type": "team_budget_exceeded",
-                        "budget_max_tokens": max,
+                        "budget_max_tokens": b.max_tokens,
                         "actual_tokens": total_tokens,
                     }),
                 )
@@ -482,10 +480,12 @@ impl TeamExecutionOrchestrator {
         let has_conflicts = conflict_count > 0;
 
         let (status, error) = derive_team_status(&delegation_result, conflict_count);
-        let error = if budget_exceeded {
-            let max = team.budget.as_ref().unwrap().max_tokens;
-            let msg = format!("token budget exceeded: {total_tokens}/{max} tokens");
-            Some(error.map_or(msg.clone(), |e| format!("{e}; {msg}")))
+        let error = if let Some(b) = exceeded_budget {
+            let msg = format!("token budget exceeded: {total_tokens}/{} tokens", b.max_tokens);
+            Some(match error {
+                Some(e) => format!("{e}; {msg}"),
+                None => msg,
+            })
         } else {
             error
         };
