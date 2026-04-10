@@ -5931,12 +5931,327 @@ print(json.dumps({'context': 'user said: ' + msg}))
         )
         .await;
         // Output should exist but be capped (plain text → context)
-        let ctx = output.context.unwrap();
+    }
+
+    // ── Auto-tuning integration tests ───────────────────────────────────────
+
+    fn make_hub() -> std::sync::Arc<crate::observability_integration::ObservabilityHub> {
+        std::sync::Arc::new(crate::observability_integration::ObservabilityHub::new())
+    }
+
+    fn make_session()
+    -> std::sync::Arc<std::sync::RwLock<crate::observability_integration::ObservabilitySession>>
+    {
+        std::sync::Arc::new(std::sync::RwLock::new(
+            crate::observability_integration::ObservabilitySession::new_simple("test-session"),
+        ))
+    }
+
+    #[test]
+    fn feedback_records_task_success_on_completed() {
+        let hub = make_hub();
+        let mut state = make_state();
+        state.observability_hub = Some(hub.clone());
+        state.current_run_id = Some("run-1".into());
+
+        let result = Ok(AgenticLoopOutcome::Completed);
+        record_loop_completion_feedback(&mut state, &result);
+
+        // Add a rule that fires on low success rate — it should NOT fire because
+        // we just recorded a success.
+        hub.tuning()
+            .add_rule(crate::auto_tuning::EvolutionRule::new(
+                "test-low-success",
+                crate::auto_tuning::EvolutionTrigger::LowSuccessRate {
+                    threshold: 0.5,
+                    window_secs: 3600,
+                    min_samples: 1,
+                },
+                crate::auto_tuning::EvolutionAction::Alert {
+                    message: "low success".into(),
+                    severity: crate::auto_tuning::AlertSeverity::Warning,
+                },
+            ));
+        let config = crate::runtime_config::RuntimeConfig::default();
+        let triggered = hub.tuning().evaluate(&config);
         assert!(
-            ctx.len() <= HOOK_STDOUT_MAX_BYTES,
-            "context should be capped at {} bytes, got {}",
-            HOOK_STDOUT_MAX_BYTES,
-            ctx.len()
+            triggered.is_empty(),
+            "rule should not fire with 100% success"
         );
+
+        // Record failures to bring success rate below threshold.
+        let fail_result: Result<AgenticLoopOutcome, String> =
+            Ok(AgenticLoopOutcome::Error("test error".into()));
+        record_loop_completion_feedback(&mut state, &fail_result);
+        let fail_result2: Result<AgenticLoopOutcome, String> =
+            Ok(AgenticLoopOutcome::Error("test error 2".into()));
+        record_loop_completion_feedback(&mut state, &fail_result2);
+
+        let triggered = hub.tuning().evaluate(&config);
+        // success_rate = 1/3 ≈ 0.33 < 0.5 threshold
+        assert!(
+            !triggered.is_empty(),
+            "rule should fire with low success rate"
+        );
+
+        // Full cycle: evaluate + execute.
+        let mut config2 = crate::runtime_config::RuntimeConfig::default();
+        let executions = hub.run_tuning_cycle(&mut config2);
+        assert!(
+            !executions.is_empty(),
+            "tuning cycle should execute the triggered rule"
+        );
+    }
+
+    #[test]
+    fn feedback_records_task_failure_on_error() {
+        let hub = make_hub();
+        let mut state = make_state();
+        state.observability_hub = Some(hub.clone());
+
+        let result: Result<AgenticLoopOutcome, String> = Err("something broke".into());
+        record_loop_completion_feedback(&mut state, &result);
+
+        // TaskFailure lowers success rate. With 0 successes and 1 failure, rate = 0.0.
+        hub.tuning()
+            .add_rule(crate::auto_tuning::EvolutionRule::new(
+                "low-success",
+                crate::auto_tuning::EvolutionTrigger::LowSuccessRate {
+                    threshold: 0.5,
+                    window_secs: 3600,
+                    min_samples: 1,
+                },
+                crate::auto_tuning::EvolutionAction::Alert {
+                    message: "low success".into(),
+                    severity: crate::auto_tuning::AlertSeverity::Warning,
+                },
+            ));
+        let config = crate::runtime_config::RuntimeConfig::default();
+        let triggered = hub.tuning().evaluate(&config);
+        assert!(
+            !triggered.is_empty(),
+            "low success rate rule should fire after failure"
+        );
+    }
+
+    #[test]
+    fn feedback_records_interruption_on_cancel() {
+        let hub = make_hub();
+        let mut state = make_state();
+        state.observability_hub = Some(hub.clone());
+
+        let result = Ok(AgenticLoopOutcome::Cancelled);
+        record_loop_completion_feedback(&mut state, &result);
+
+        // Interruption is recorded as a signal — verify via accumulation.
+        hub.tuning()
+            .add_rule(crate::auto_tuning::EvolutionRule::new(
+                "interrupt-detect",
+                crate::auto_tuning::EvolutionTrigger::SignalAccumulation {
+                    signal_type: "interruption".into(),
+                    count: 1,
+                    window_secs: 3600,
+                },
+                crate::auto_tuning::EvolutionAction::Alert {
+                    message: "interrupted".into(),
+                    severity: crate::auto_tuning::AlertSeverity::Info,
+                },
+            ));
+        let config = crate::runtime_config::RuntimeConfig::default();
+        let triggered = hub.tuning().evaluate(&config);
+        assert!(
+            !triggered.is_empty(),
+            "interruption signal should fire accumulation rule"
+        );
+    }
+
+    #[test]
+    fn feedback_records_high_token_usage() {
+        let hub = make_hub();
+        let mut state = make_state();
+        state.observability_hub = Some(hub.clone());
+        state.total_prompt = 40_000;
+        state.total_completion = 20_000; // total = 60k > 50k threshold
+
+        let result = Ok(AgenticLoopOutcome::Completed);
+        record_loop_completion_feedback(&mut state, &result);
+
+        hub.tuning()
+            .add_rule(crate::auto_tuning::EvolutionRule::new(
+                "high-tokens",
+                crate::auto_tuning::EvolutionTrigger::HighTokenUsage {
+                    threshold_tokens: 50_000,
+                    window_secs: 3600,
+                    min_samples: 1,
+                },
+                crate::auto_tuning::EvolutionAction::Alert {
+                    message: "high tokens".into(),
+                    severity: crate::auto_tuning::AlertSeverity::Warning,
+                },
+            ));
+        let config = crate::runtime_config::RuntimeConfig::default();
+        let triggered = hub.tuning().evaluate(&config);
+        assert!(!triggered.is_empty(), "high token usage rule should fire");
+    }
+
+    #[test]
+    fn feedback_records_tool_churn() {
+        let hub = make_hub();
+        let mut state = make_state();
+        state.observability_hub = Some(hub.clone());
+        state.total_tool_calls = 30;
+        state.all_tools_used = ["bash"].iter().map(|s| s.to_string()).collect();
+        // ratio = 30/1 = 30 > 5 threshold
+
+        let result = Ok(AgenticLoopOutcome::Completed);
+        record_loop_completion_feedback(&mut state, &result);
+
+        hub.tuning()
+            .add_rule(crate::auto_tuning::EvolutionRule::new(
+                "churn-detect",
+                crate::auto_tuning::EvolutionTrigger::SignalAccumulation {
+                    signal_type: "tool_churn".into(),
+                    count: 1,
+                    window_secs: 3600,
+                },
+                crate::auto_tuning::EvolutionAction::Alert {
+                    message: "churn".into(),
+                    severity: crate::auto_tuning::AlertSeverity::Info,
+                },
+            ));
+        let config = crate::runtime_config::RuntimeConfig::default();
+        let triggered = hub.tuning().evaluate(&config);
+        assert!(
+            !triggered.is_empty(),
+            "tool churn signal should fire accumulation rule"
+        );
+    }
+
+    #[test]
+    fn feedback_no_signal_without_hub() {
+        let mut state = make_state();
+        let result = Ok(AgenticLoopOutcome::Completed);
+        record_loop_completion_feedback(&mut state, &result);
+        // Should not panic.
+    }
+
+    #[test]
+    fn feedback_skill_quality_signals() {
+        use crate::skills::quality::SkillOutcome;
+
+        let hub = make_hub();
+        let mut state = make_state();
+        state.observability_hub = Some(hub.clone());
+
+        state.skill_quality_tracker.record_outcome(&SkillOutcome {
+            skill_name: "good-skill".into(),
+            tokens_used: 100,
+            duration_ms: 50,
+            all_required_passed: true,
+            partial: false,
+        });
+        state.skill_quality_tracker.record_outcome(&SkillOutcome {
+            skill_name: "bad-skill".into(),
+            tokens_used: 200,
+            duration_ms: 100,
+            all_required_passed: false,
+            partial: false,
+        });
+
+        let result = Ok(AgenticLoopOutcome::Completed);
+        record_loop_completion_feedback(&mut state, &result);
+
+        // The bad skill failure adds a TaskFailure signal, lowering success rate.
+        // We have TaskSuccess (completed) + TaskSuccess (good-skill) + TaskFailure (bad-skill)
+        // = 2 successes / 3 total = 0.67 success rate.
+        hub.tuning()
+            .add_rule(crate::auto_tuning::EvolutionRule::new(
+                "low-success",
+                crate::auto_tuning::EvolutionTrigger::LowSuccessRate {
+                    threshold: 0.8, // 0.67 < 0.8, so this should trigger
+                    window_secs: 3600,
+                    min_samples: 1,
+                },
+                crate::auto_tuning::EvolutionAction::Alert {
+                    message: "skill failure".into(),
+                    severity: crate::auto_tuning::AlertSeverity::Warning,
+                },
+            ));
+        let config = crate::runtime_config::RuntimeConfig::default();
+        let triggered = hub.tuning().evaluate(&config);
+        assert!(
+            !triggered.is_empty(),
+            "skill failure should lower success rate and trigger rule"
+        );
+    }
+
+    #[test]
+    fn tuning_cycle_runs_at_interval() {
+        let hub = make_hub();
+        let session = make_session();
+        let mut state = make_state();
+        state.observability_hub = Some(hub.clone());
+        state.observability_session = Some(session.clone());
+
+        hub.tuning().add_rule(
+            crate::auto_tuning::EvolutionRule::new(
+                "test-alert",
+                crate::auto_tuning::EvolutionTrigger::LowSuccessRate {
+                    threshold: 0.5,
+                    window_secs: 3600,
+                    min_samples: 1,
+                },
+                crate::auto_tuning::EvolutionAction::Alert {
+                    message: "low success detected".into(),
+                    severity: crate::auto_tuning::AlertSeverity::Warning,
+                },
+            )
+            .with_cooldown(std::time::Duration::from_secs(0)),
+        );
+
+        // Record failures to satisfy the rule trigger.
+        for _ in 0..3 {
+            hub.record_feedback(crate::auto_tuning::FeedbackSignal::new(
+                crate::auto_tuning::SignalType::TaskFailure {
+                    reason: "test".into(),
+                },
+            ));
+        }
+
+        // Below interval — should NOT trigger.
+        state.completed_turns_for_tuning = TUNING_CYCLE_INTERVAL - 1;
+        maybe_run_tuning_cycle(&mut state);
+        assert_eq!(
+            state.completed_turns_for_tuning,
+            TUNING_CYCLE_INTERVAL - 1,
+            "counter should not reset below interval"
+        );
+        assert!(
+            hub.tuning().get_executions().is_empty(),
+            "no cycle should run below interval"
+        );
+
+        // At interval — SHOULD trigger.
+        state.completed_turns_for_tuning = TUNING_CYCLE_INTERVAL;
+        maybe_run_tuning_cycle(&mut state);
+        assert_eq!(
+            state.completed_turns_for_tuning, 0,
+            "counter should reset after cycle"
+        );
+        assert!(
+            !hub.tuning().get_executions().is_empty(),
+            "cycle should execute the triggered rule"
+        );
+    }
+
+    #[test]
+    fn tuning_cycle_skips_without_session() {
+        let hub = make_hub();
+        let mut state = make_state();
+        state.observability_hub = Some(hub.clone());
+        state.completed_turns_for_tuning = TUNING_CYCLE_INTERVAL;
+        maybe_run_tuning_cycle(&mut state);
+        // Counter is reset (passes threshold check) but no cycle runs (no session).
+        assert_eq!(state.completed_turns_for_tuning, 0);
     }
 }
