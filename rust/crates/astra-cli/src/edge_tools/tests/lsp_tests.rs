@@ -617,6 +617,14 @@ impl EnvGuard {
         }
         Self { key, old }
     }
+
+    fn unset(key: &'static str) -> Self {
+        let old = std::env::var(key).ok();
+        unsafe {
+            std::env::remove_var(key);
+        }
+        Self { key, old }
+    }
 }
 
 #[cfg(unix)]
@@ -636,6 +644,38 @@ impl Drop for EnvGuard {
 #[cfg(unix)]
 fn count_occurrences(haystack: &str, needle: &str) -> usize {
     haystack.lines().filter(|line| *line == needle).count()
+}
+
+#[cfg(unix)]
+fn real_rust_analyzer_available() -> bool {
+    let dir = tempfile::tempdir().unwrap();
+    let _cmd_guard = EnvGuard::unset("ASTRA_RUST_ANALYZER_CMD");
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname=\"demo\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(
+        dir.path().join("src/lib.rs"),
+        "pub fn hello_from_lsp() {}\n",
+    )
+    .unwrap();
+    let exe = ToolExecutor::new(dir.path());
+    let result = exe.lsp(&json!({
+        "operation": "document_symbols",
+        "file": "src/lib.rs"
+    }));
+    serde_json::from_str::<Value>(&result)
+        .ok()
+        .and_then(|parsed| {
+            parsed
+                .get("backend")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .as_deref()
+        == Some("lsp")
 }
 
 // ─── lsp tests ────────────────────────────────────────────────────────────────
@@ -748,6 +788,39 @@ fn lsp_diagnostics_returns_file_snapshot_when_available() {
         parsed["result"]["diagnostics"][0]["message"].as_str(),
         Some("fake LSP diagnostic")
     );
+}
+
+#[cfg(unix)]
+#[test]
+#[serial_test::serial]
+fn lsp_surfaces_rust_lsp_startup_errors_for_supported_workspaces() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname=\"demo\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(
+        dir.path().join("src/lib.rs"),
+        "pub fn hello_from_lsp() {}\n",
+    )
+    .unwrap();
+    let _guard = EnvGuard::set(
+        "ASTRA_RUST_ANALYZER_CMD",
+        "/definitely/missing/rust-analyzer",
+    );
+    let exe = ToolExecutor::new(dir.path());
+
+    let result = exe.lsp(&json!({
+        "operation": "document_symbols",
+        "file": "src/lib.rs"
+    }));
+    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+    let error = parsed["error"].as_str().unwrap();
+
+    assert!(error.contains("failed to start rust-analyzer LSP session"));
+    assert!(error.contains("/definitely/missing/rust-analyzer"));
 }
 
 #[cfg(unix)]
@@ -2168,6 +2241,116 @@ fn lsp_rename_applies_real_lsp_workspace_edit_when_dry_run_false() {
             .unwrap()
             .contains("renamed_from_lsp")
     );
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "manual validation with real rust-analyzer"]
+#[serial_test::serial]
+fn lsp_completions_apply_selected_item_with_real_rust_analyzer() {
+    if !real_rust_analyzer_available() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let _cmd_guard = EnvGuard::unset("ASTRA_RUST_ANALYZER_CMD");
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname=\"demo\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    let file_path = dir.path().join("src/lib.rs");
+    std::fs::write(
+        &file_path,
+        "pub fn hello_from_lsp() {}\n\npub fn demo() {\n    hel\n}\n",
+    )
+    .unwrap();
+    let exe = ToolExecutor::new(dir.path());
+
+    let preview = exe.lsp(&json!({
+        "operation": "completions",
+        "file": "src/lib.rs",
+        "line": 4,
+        "column": 8
+    }));
+    let parsed: serde_json::Value = serde_json::from_str(&preview).unwrap();
+    let items = parsed["result"]
+        .get("items")
+        .and_then(Value::as_array)
+        .or_else(|| parsed["result"].as_array())
+        .unwrap_or_else(|| panic!("unexpected completions preview: {preview}"));
+    let idx = items
+        .iter()
+        .position(|item| {
+            item.get("label")
+                .and_then(Value::as_str)
+                .is_some_and(|label| label.contains("hello_from_lsp"))
+        })
+        .expect("real rust-analyzer should offer hello_from_lsp completion");
+
+    let applied = exe.lsp(&json!({
+        "operation": "completions",
+        "file": "src/lib.rs",
+        "line": 4,
+        "column": 8,
+        "item_index": idx,
+        "dry_run": false
+    }));
+    let parsed: serde_json::Value = serde_json::from_str(&applied).unwrap();
+    assert_eq!(parsed["applied"].as_bool(), Some(true));
+
+    let updated = std::fs::read_to_string(file_path).unwrap();
+    assert!(
+        updated.matches("hello_from_lsp").count() >= 2,
+        "expected completion apply to insert hello_from_lsp, got: {updated}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "manual validation with real rust-analyzer"]
+#[serial_test::serial]
+fn lsp_code_lenses_execute_selected_item_with_real_rust_analyzer() {
+    if !real_rust_analyzer_available() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let _cmd_guard = EnvGuard::unset("ASTRA_RUST_ANALYZER_CMD");
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname=\"demo\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(
+        dir.path().join("src/lib.rs"),
+        "pub fn hello_from_lsp() {}\n\npub fn demo() {\n    hello_from_lsp();\n}\n",
+    )
+    .unwrap();
+    let exe = ToolExecutor::new(dir.path());
+
+    let preview = exe.lsp(&json!({
+        "operation": "code_lenses",
+        "file": "src/lib.rs"
+    }));
+    let parsed: serde_json::Value = serde_json::from_str(&preview).unwrap();
+    let lenses = parsed["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("unexpected code_lenses preview: {preview}"));
+    let idx = lenses
+        .iter()
+        .position(|lens| lens.get("command").is_none())
+        .unwrap_or(0);
+
+    let executed = exe.lsp(&json!({
+        "operation": "code_lenses",
+        "file": "src/lib.rs",
+        "item_index": idx,
+        "dry_run": false
+    }));
+    let parsed: serde_json::Value = serde_json::from_str(&executed).unwrap();
+    assert_eq!(parsed["method"].as_str(), Some("workspace/executeCommand"));
+    assert_eq!(parsed["executed"].as_bool(), Some(true));
 }
 
 #[test]

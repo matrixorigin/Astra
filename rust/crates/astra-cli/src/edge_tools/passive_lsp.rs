@@ -98,15 +98,30 @@ fn ensure_session(
     slot: &Mutex<Option<Arc<LspStdioSession>>>,
     root: PathBuf,
     spec: LspSpawnSpec,
-) -> Option<Arc<LspStdioSession>> {
-    let mut g = slot.lock().ok()?;
+) -> Result<Arc<LspStdioSession>, String> {
+    let command = spec.command.clone();
+    let diagnostic_title = spec.diagnostic_title;
+    let mut g = slot
+        .lock()
+        .map_err(|_| format!("{diagnostic_title} LSP session mutex poisoned"))?;
     if g.is_none() {
         match LspStdioSession::try_spawn(root, spec) {
             Ok(Some(s)) => *g = Some(Arc::clone(&s)),
-            Ok(None) | Err(_) => return None,
+            Ok(None) => {
+                return Err(format!(
+                    "failed to start {diagnostic_title} LSP session: command `{command}` was not found"
+                ));
+            }
+            Err(error) => {
+                return Err(format!(
+                    "failed to start {diagnostic_title} LSP session: {error}"
+                ));
+            }
         }
     }
-    g.as_ref().map(Arc::clone)
+    g.as_ref()
+        .map(Arc::clone)
+        .ok_or_else(|| format!("{diagnostic_title} LSP session was not created"))
 }
 
 fn rust_active_supported(project_root: &Path, path: Option<&Path>) -> bool {
@@ -143,12 +158,12 @@ impl PassiveLspManager {
     pub fn sync_after_write(&self, root: &Path, path: &Path) {
         let root_buf = root.to_path_buf();
         if should_use_rust_lsp(root, path)
-            && let Some(s) = ensure_session(&self.rust, root_buf.clone(), rust_spawn_spec())
+            && let Ok(s) = ensure_session(&self.rust, root_buf.clone(), rust_spawn_spec())
         {
             let _ = s.sync_document_from_disk(path);
         }
         if should_use_typescript_lsp(root, path)
-            && let Some(s) = ensure_session(&self.typescript, root_buf, typescript_spawn_spec())
+            && let Ok(s) = ensure_session(&self.typescript, root_buf, typescript_spawn_spec())
         {
             let _ = s.sync_document_from_disk(path);
         }
@@ -157,12 +172,12 @@ impl PassiveLspManager {
     pub fn sync_after_write_with_content(&self, root: &Path, path: &Path, content: &str) {
         let root_buf = root.to_path_buf();
         if should_use_rust_lsp(root, path)
-            && let Some(s) = ensure_session(&self.rust, root_buf.clone(), rust_spawn_spec())
+            && let Ok(s) = ensure_session(&self.rust, root_buf.clone(), rust_spawn_spec())
         {
             let _ = s.sync_document_text(path, content);
         }
         if should_use_typescript_lsp(root, path)
-            && let Some(s) = ensure_session(&self.typescript, root_buf, typescript_spawn_spec())
+            && let Ok(s) = ensure_session(&self.typescript, root_buf, typescript_spawn_spec())
         {
             let _ = s.sync_document_text(path, content);
         }
@@ -177,9 +192,17 @@ impl PassiveLspManager {
     ) -> Result<Option<Value>, String> {
         let root_buf = root.to_path_buf();
         let session = if rust_active_supported(root, Some(path)) {
-            ensure_session(&self.rust, root_buf.clone(), rust_spawn_spec())
+            Some(ensure_session(
+                &self.rust,
+                root_buf.clone(),
+                rust_spawn_spec(),
+            )?)
         } else if typescript_active_supported(root, Some(path)) {
-            ensure_session(&self.typescript, root_buf, typescript_spawn_spec())
+            Some(ensure_session(
+                &self.typescript,
+                root_buf,
+                typescript_spawn_spec(),
+            )?)
         } else {
             None
         };
@@ -207,9 +230,17 @@ impl PassiveLspManager {
     ) -> Result<Option<Value>, String> {
         let root_buf = root.to_path_buf();
         let session = if rust_active_supported(root, None) {
-            ensure_session(&self.rust, root_buf.clone(), rust_spawn_spec())
+            Some(ensure_session(
+                &self.rust,
+                root_buf.clone(),
+                rust_spawn_spec(),
+            )?)
         } else if typescript_active_supported(root, None) {
-            ensure_session(&self.typescript, root_buf, typescript_spawn_spec())
+            Some(ensure_session(
+                &self.typescript,
+                root_buf,
+                typescript_spawn_spec(),
+            )?)
         } else {
             None
         };
@@ -229,9 +260,17 @@ impl PassiveLspManager {
     pub fn diagnostics_for_file(&self, root: &Path, path: &Path) -> Result<Option<Value>, String> {
         let root_buf = root.to_path_buf();
         let session = if rust_active_supported(root, Some(path)) {
-            ensure_session(&self.rust, root_buf.clone(), rust_spawn_spec())
+            Some(ensure_session(
+                &self.rust,
+                root_buf.clone(),
+                rust_spawn_spec(),
+            )?)
         } else if typescript_active_supported(root, Some(path)) {
-            ensure_session(&self.typescript, root_buf, typescript_spawn_spec())
+            Some(ensure_session(
+                &self.typescript,
+                root_buf,
+                typescript_spawn_spec(),
+            )?)
         } else {
             None
         };

@@ -8,7 +8,7 @@ use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, Sender};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -217,6 +217,14 @@ fn reader_loop(
     }
 }
 
+fn startup_stderr(stderr_rx: &Receiver<String>) -> Option<String> {
+    stderr_rx
+        .recv_timeout(Duration::from_millis(200))
+        .ok()
+        .map(|stderr| stderr.trim().to_string())
+        .filter(|stderr| !stderr.is_empty())
+}
+
 impl LspStdioSession {
     pub fn try_spawn(root: PathBuf, spec: LspSpawnSpec) -> io::Result<Option<Arc<Self>>> {
         let LspSpawnSpec {
@@ -239,11 +247,15 @@ impl LspStdioSession {
             Err(e) => return Err(e),
         };
 
+        let mut stderr_rx = None;
         if let Some(stderr) = child.stderr.take() {
+            let (tx, rx) = mpsc::channel();
+            stderr_rx = Some(rx);
             thread::spawn(move || {
                 let mut r = BufReader::new(stderr);
                 let mut buf = Vec::new();
                 let _ = r.read_to_end(&mut buf);
+                let _ = tx.send(String::from_utf8_lossy(&buf).into_owned());
             });
         }
 
@@ -291,7 +303,17 @@ impl LspStdioSession {
         }
 
         loop {
-            let msg = read_frame(&mut reader)?;
+            let msg = match read_frame(&mut reader) {
+                Ok(msg) => msg,
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    if let Some(stderr) = stderr_rx.as_ref().and_then(startup_stderr) {
+                        return Err(io::Error::other(format!("{error}; stderr: {stderr}")));
+                    }
+                    return Err(error);
+                }
+            };
             let id_ok = msg.get("id").and_then(|v| v.as_u64()) == Some(1)
                 || msg.get("id").and_then(|v| v.as_i64()) == Some(1);
             if id_ok && (msg.get("result").is_some() || msg.get("error").is_some()) {
