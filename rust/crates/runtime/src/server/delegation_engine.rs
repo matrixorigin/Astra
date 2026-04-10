@@ -1973,6 +1973,7 @@ impl DelegationEngine {
             );
             let enhanced_task =
                 team_prompts::wrap_task_with_coordination(&coordination_prompt, &request.task);
+            let retry_task = enhanced_task.clone();
 
             let config = SubRunConfig {
                 run_id: sub_run_id.clone(),
@@ -2050,7 +2051,6 @@ impl DelegationEngine {
             // ── Verification gate with retry for sequential sub-runs ──
             let result = if self.gate.is_some() {
                 let delegation_id = request.delegation_id.clone();
-                let task = request.task.clone();
                 let sess = request
                     .context
                     .get("session_id")
@@ -2076,7 +2076,7 @@ impl DelegationEngine {
                     || SubRunConfig {
                         run_id: uuid::Uuid::new_v4().to_string(),
                         agent_profile: profile_for_retry.clone(),
-                        task: task.clone(),
+                        task: retry_task.clone(),
                         session_id: sess.clone(),
                         user_id: uid.clone(),
                         previous_output: prev.clone(),
@@ -2234,6 +2234,7 @@ impl DelegationEngine {
             );
             let prod_enhanced_task =
                 team_prompts::wrap_task_with_coordination(&prod_coordination, &request.task);
+            let prod_retry_task = prod_enhanced_task.clone();
 
             let prod_config = SubRunConfig {
                 run_id: prod_run_id.clone(),
@@ -2311,7 +2312,6 @@ impl DelegationEngine {
             // ── Gate on producer output before reviewer sees it ──
             let prod_result = if self.gate.is_some() {
                 let did = request.delegation_id.clone();
-                let task = request.task.clone();
                 let sess = request
                     .context
                     .get("session_id")
@@ -2331,7 +2331,7 @@ impl DelegationEngine {
                     || SubRunConfig {
                         run_id: uuid::Uuid::new_v4().to_string(),
                         agent_profile: pp.clone(),
-                        task: task.clone(),
+                        task: prod_retry_task.clone(),
                         session_id: sess.clone(),
                         user_id: uid.clone(),
                         previous_output: prev.clone(),
@@ -3848,6 +3848,62 @@ mod tests {
         // Should eventually pass after retry
         assert_eq!(result.agent_results.len(), 1);
         assert_eq!(result.agent_results[0].status, "completed");
+    }
+
+    #[tokio::test]
+    async fn gate_retry_preserves_sequential_coordination_prompt() {
+        let (reg, engine, tracker, _) = setup_with_executor(Arc::new(EchoExecutor));
+        let gate = Arc::new(FailThenPassGate::new(1));
+        let de = DelegationEngine::with_executor(reg, engine, tracker, Arc::new(EchoExecutor))
+            .with_gate(gate);
+
+        let req = DelegationRequest {
+            delegation_id: "del-seq-gate-prompt".into(),
+            parent_run_id: "parent-1".into(),
+            task: "sequential gate test".into(),
+            pattern: CoordinationPattern::Sequential {
+                agent_ids: vec!["coder".into()],
+                stop_on_success: false,
+                timeout_sec: 0,
+            },
+            user_id: "user-1".into(),
+            depth: 0,
+            context: HashMap::new(),
+        };
+        let result = de.execute(req, "orch", None).await.unwrap();
+
+        let output = result.agent_results[0].output.as_deref().unwrap_or("");
+        assert!(output.contains("## Team Coordination: Pipeline"));
+        assert!(output.contains("Quality gate active"));
+    }
+
+    #[tokio::test]
+    async fn gate_retry_preserves_adversarial_coordination_prompt() {
+        let (reg, engine, tracker, _) = setup_with_executor(Arc::new(EchoExecutor));
+        let gate = Arc::new(FailThenPassGate::new(1));
+        let de = DelegationEngine::with_executor(reg, engine, tracker, Arc::new(EchoExecutor))
+            .with_gate(gate);
+
+        let req = DelegationRequest {
+            delegation_id: "del-adv-gate-prompt".into(),
+            parent_run_id: "parent-1".into(),
+            task: "adversarial gate test".into(),
+            pattern: CoordinationPattern::AdversarialReview {
+                producer_id: "coder".into(),
+                reviewer_id: "reviewer".into(),
+                max_rounds: 1,
+                timeout_sec: 0,
+                acceptance_threshold: 0.8,
+            },
+            user_id: "user-1".into(),
+            depth: 0,
+            context: HashMap::new(),
+        };
+        let result = de.execute(req, "orch", None).await.unwrap();
+
+        let producer_output = result.agent_results[0].output.as_deref().unwrap_or("");
+        assert!(producer_output.contains("## Team Coordination: Adversarial Review (Producer)"));
+        assert!(producer_output.contains("Quality gate active"));
     }
 
     #[tokio::test]
