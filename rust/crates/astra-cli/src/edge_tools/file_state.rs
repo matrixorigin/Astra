@@ -500,3 +500,37 @@ fn enforce_limits(state: &mut HashMap<PathBuf, FileState>) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn merge_range_u64_max_no_overflow() {
+        // Full read sets (1, u64::MAX). Merging a new range must not overflow.
+        let mut ranges = vec![(1, u64::MAX)];
+        merge_range(&mut ranges, 50, 100);
+        assert_eq!(ranges, vec![(1, u64::MAX)]);
+    }
+
+    #[test]
+    fn ranges_cover_after_full_read() {
+        let ranges = vec![(1, u64::MAX)];
+        assert!(ranges_cover(&ranges, 1, 500));
+        assert!(ranges_cover(&ranges, 100, u64::MAX));
+    }
+
+    #[test]
+    fn merge_range_adjacent_coalesces() {
+        let mut ranges = vec![(1, 100)];
+        merge_range(&mut ranges, 101, 200);
+        assert_eq!(ranges, vec![(1, 200)]);
+    }
+
+    #[test]
+    fn merge_range_gap_stays_separate() {
+        let mut ranges = vec![(1, 100)];
+        merge_range(&mut ranges, 103, 200);
+        assert_eq!(ranges, vec![(1, 100), (103, 200)]);
+    }
+}

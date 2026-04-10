@@ -510,7 +510,10 @@ pub(super) fn handle_session_command(arg: &str, state: &mut ReplState) {
                                         eprintln!(
                                             "    {} {} ({}ms) {}",
                                             theme::icon_err(),
-                                            tc.name,
+                                            super::stream_render::format_tool_display_from_preview(
+                                                &tc.name,
+                                                tc.args_preview.as_deref(),
+                                            ),
                                             tc.ms,
                                             err_preview.dim(),
                                         );
@@ -1549,10 +1552,11 @@ fn format_tool_calls_md(calls: &[session_journal::ToolCallRecord]) -> String {
     out.push_str("\n<details>\n<summary>Tool calls</summary>\n\n");
     for tc in calls {
         let status = if tc.ok { "✓" } else { "✗" };
-        out.push_str(&format!("- `{}` {status} ({}ms)", tc.name, tc.ms));
-        if let Some(ref args) = tc.args_preview {
-            out.push_str(&format!(" — {args}"));
-        }
+        let display = super::stream_render::format_tool_display_from_preview(
+            &tc.name,
+            tc.args_preview.as_deref(),
+        );
+        out.push_str(&format!("- `{display}` {status} ({}ms)", tc.ms));
         out.push('\n');
         if let Some(ref err) = tc.error {
             out.push_str(&format!("  > Error: {err}\n"));
@@ -2384,8 +2388,8 @@ mod export_tests {
         assert!(md.contains("**User:**"));
         assert!(md.contains("Hello"));
         assert!(md.contains("<details>"));
-        assert!(md.contains("`read_file` ✓"));
-        assert!(md.contains("`bash` ✗"));
+        assert!(md.contains("`Reading: src/main.rs` ✓"));
+        assert!(md.contains("`$ cargo test` ✗"));
         assert!(md.contains("exit code 1"));
         assert!(md.contains("**Assistant:**"));
         assert!(md.contains("Hi there"));
@@ -2421,7 +2425,7 @@ mod export_tests {
         let block = format_tool_calls_md(&calls);
         assert!(block.contains("<details>"));
         assert!(block.contains("</details>"));
-        assert!(block.contains("`grep` ✓ (10ms) — pattern in src/"));
+        assert!(block.contains("`Grep: pattern in src/` ✓ (10ms)"));
     }
 
     // ── /export edge case tests ──

@@ -2119,6 +2119,53 @@ pub(crate) fn style_tool_description(tool: &str, description: &str) -> String {
     description.to_string()
 }
 
+/// Human-friendly tool description from a `ToolCallRecord`'s name + args_preview.
+/// Mirrors `format_tool_description_with_output` but works without full args JSON.
+pub(crate) fn format_tool_display_from_preview(name: &str, args_preview: Option<&str>) -> String {
+    let preview = args_preview.unwrap_or("");
+    match name {
+        "bash" | "shell_exec" | "run_build_test" => format!("$ {preview}"),
+        "read_file" | "view_file" => format!("Reading: {preview}"),
+        "write_file" => format!("Writing: {preview}"),
+        "str_replace" | "multi_edit" => format!("Editing: {preview}"),
+        "delete_file" => format!("Deleting: {preview}"),
+        "list_dir" => format!("Listing: {preview}"),
+        "grep" => format!("Grep: {preview}"),
+        "glob" => format!("Glob: {preview}"),
+        "git_status" => "Git status".to_string(),
+        "git_log" => format!("Git log {preview}"),
+        "git_show" => format!("Git show {preview}"),
+        "git_diff" => format!("Git diff {preview}"),
+        "git_blame" => format!("Git blame {preview}"),
+        "git_commit" => format!("Git commit {preview}"),
+        "find_definition" => format!("Find definition of {preview}"),
+        "find_references" => format!("Find references to {preview}"),
+        "symbol_search" => format!("Search symbol {preview}"),
+        "symbols" => format!("Get symbols in {preview}"),
+        "call_graph" => format!("Call graph for {preview}"),
+        "web_fetch" => format!("Fetching: {preview}"),
+        "memory_retrieve" => format!("Recalling: \"{preview}\""),
+        "memory_store" => format!("Storing: \"{preview}\""),
+        "memory_search" => format!("Searching memory: \"{preview}\""),
+        "skill" => format!("Running skill: {preview}"),
+        other if other.starts_with("mcp_") => {
+            let rest = &other[4..];
+            if let Some(sep) = rest.find('_') {
+                format!("MCP {} {preview}", &rest[..sep])
+            } else {
+                format!("MCP {rest}")
+            }
+        }
+        _ => {
+            if preview.is_empty() {
+                name.to_string()
+            } else {
+                format!("{name}: {preview}")
+            }
+        }
+    }
+}
+
 fn apply_sse_render_effects(
     effects: Vec<SseRenderEffect>,
     render: &mut StreamRenderState,
