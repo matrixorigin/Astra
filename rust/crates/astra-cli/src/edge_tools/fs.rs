@@ -662,13 +662,17 @@ impl ToolExecutor {
                 }
                 let old_slice = prior_for_diff.as_deref().unwrap_or("");
                 let cli_diff = cap_cli_unified_diff(unified_diff_raw(old_slice, content, &path));
-                json!({
+                let lsp_diag = self.inline_lsp_diagnostics(&path);
+                let mut obj = json!({
                     "success": true,
                     "bytes_written": content.len(),
                     "path": path.to_string_lossy().to_string(),
                     "_cli_unified_diff": cli_diff,
-                })
-                .to_string()
+                });
+                if let Some(diag) = lsp_diag {
+                    obj["lsp_diagnostics"] = Value::String(diag);
+                }
+                obj.to_string()
             }
             Err(e) => json!({ "success": false, "error": e.to_string() }).to_string(),
         }
@@ -767,6 +771,9 @@ impl ToolExecutor {
                                 &new_content,
                                 &path,
                             );
+                            if let Some(diag) = self.inline_lsp_diagnostics(&path) {
+                                result.push_str(&diag);
+                            }
                             return result;
                         }
                         Err(e) => return format!("Error writing file: {e}"),
@@ -823,6 +830,9 @@ impl ToolExecutor {
                             &new_content,
                             &path,
                         );
+                        if let Some(diag) = self.inline_lsp_diagnostics(&path) {
+                            result.push_str(&diag);
+                        }
                         return result;
                     }
                     Err(e) => return format!("Error writing file: {e}"),
@@ -915,6 +925,9 @@ impl ToolExecutor {
                 }
 
                 append_str_replace_cli_unified_diff(&mut result, &content, &new_content, &path);
+                if let Some(diag) = self.inline_lsp_diagnostics(&path) {
+                    result.push_str(&diag);
+                }
                 result
             }
             Err(e) => format!("Error writing file: {e}"),
@@ -1283,6 +1296,79 @@ impl ToolExecutor {
         }
 
         walk(root, target_name, project_root, candidates, 0);
+    }
+
+    /// Query LSP diagnostics for a file after a write/edit and return a compact
+    /// inline summary. Returns None if LSP is not available or has no diagnostics.
+    fn inline_lsp_diagnostics(&self, path: &std::path::Path) -> Option<String> {
+        let diag_value = self
+            .passive_lsp
+            .diagnostics_for_file(&self.project_root, path)
+            .ok()??;
+        let items = diag_value.get("diagnostics")?.as_array()?;
+        if items.is_empty() {
+            return None;
+        }
+        let mut errors = 0u32;
+        let mut warnings = 0u32;
+        let mut details: Vec<String> = Vec::new();
+        for item in items {
+            let severity = item.get("severity").and_then(Value::as_u64).unwrap_or(4);
+            let message = item.get("message").and_then(Value::as_str).unwrap_or("");
+            let line = item
+                .get("range")
+                .and_then(|r| r.get("start"))
+                .and_then(|s| s.get("line"))
+                .and_then(Value::as_u64)
+                .map(|l| l + 1) // LSP lines are 0-based
+                .unwrap_or(0);
+            match severity {
+                1 => {
+                    errors += 1;
+                    if details.len() < 5 {
+                        details.push(format!("  L{line} [error] {message}"));
+                    }
+                }
+                2 => {
+                    warnings += 1;
+                    if details.len() < 5 {
+                        details.push(format!("  L{line} [warn] {message}"));
+                    }
+                }
+                _ => {} // info/hint — not surfaced inline
+            }
+        }
+        if errors == 0 && warnings == 0 {
+            return None;
+        }
+        let file_name = path
+            .file_name()
+            .and_then(|f| f.to_str())
+            .unwrap_or("file");
+        let mut summary = format!("\n🔍 LSP diagnostics ({file_name}):");
+        if errors > 0 {
+            summary.push_str(&format!(" {errors} error{}", if errors > 1 { "s" } else { "" }));
+        }
+        if warnings > 0 {
+            if errors > 0 {
+                summary.push(',');
+            }
+            summary.push_str(&format!(
+                " {warnings} warning{}",
+                if warnings > 1 { "s" } else { "" }
+            ));
+        }
+        for d in &details {
+            summary.push('\n');
+            summary.push_str(d);
+        }
+        if (errors + warnings) as usize > details.len() {
+            summary.push_str(&format!(
+                "\n  ... and {} more",
+                (errors + warnings) as usize - details.len()
+            ));
+        }
+        Some(summary)
     }
 }
 
