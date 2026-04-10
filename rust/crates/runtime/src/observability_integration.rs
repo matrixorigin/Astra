@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use crate::ab_testing::{ExperimentOutcome, ExperimentStore, ExperimentStatus};
+use crate::ab_testing::{ExperimentOutcome, ExperimentStatus, ExperimentStore};
 use crate::auto_tuning::{AutoTuningEngine, FeedbackSignal, SignalType};
 use crate::runtime_config::RuntimeConfig;
 use crate::turn::context_assembly_trace::ContextAssemblyTrace;
@@ -238,7 +238,8 @@ impl ObservabilityHub {
         session_id: &str,
     ) -> Arc<RwLock<ObservabilitySession>> {
         let store = self.experiment_store.read().unwrap();
-        let session = ObservabilitySession::new(user_id, session_id, &self.profile_manager, Some(&store));
+        let session =
+            ObservabilitySession::new(user_id, session_id, &self.profile_manager, Some(&store));
         let session = Arc::new(RwLock::new(session));
         self.sessions
             .write()
@@ -430,7 +431,12 @@ pub fn on_turn_end(session: &mut ObservabilitySession, timing: TurnTiming) {
 }
 
 /// Hook called on task completion.
-pub fn on_task_complete(hub: &ObservabilityHub, session_id: &str, success: bool, reason: Option<&str>) {
+pub fn on_task_complete(
+    hub: &ObservabilityHub,
+    session_id: &str,
+    success: bool,
+    reason: Option<&str>,
+) {
     if success {
         hub.record_success(session_id);
     } else {
