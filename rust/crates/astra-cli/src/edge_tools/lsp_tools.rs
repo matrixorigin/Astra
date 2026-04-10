@@ -523,6 +523,38 @@ impl ToolExecutor {
         )
     }
 
+    fn try_active_on_type_formatting(
+        &self,
+        file: &str,
+        line: usize,
+        column: usize,
+        trigger_character: &str,
+    ) -> Result<Option<Value>, String> {
+        if trigger_character.is_empty() {
+            return Err("trigger_character must be a non-empty string".to_string());
+        }
+        let (file_path, mut params) = self.lsp_position_params(file, line, column)?;
+        if let Some(root) = params.as_object_mut() {
+            root.insert(
+                "ch".to_string(),
+                Value::String(trigger_character.to_string()),
+            );
+            root.insert(
+                "options".to_string(),
+                json!({
+                    "tabSize": 4,
+                    "insertSpaces": true,
+                }),
+            );
+        }
+        self.passive_lsp.request_for_file(
+            &self.project_root,
+            &file_path,
+            "textDocument/onTypeFormatting",
+            params,
+        )
+    }
+
     fn try_active_selection_ranges(
         &self,
         file: &str,
@@ -604,7 +636,7 @@ impl ToolExecutor {
                 "error": "Missing required 'operation' parameter",
                 "valid_operations": [
                     "goto_definition", "find_references", "hover", "document_symbols",
-                    "workspace_symbols", "call_hierarchy", "incoming_calls", "outgoing_calls", "declaration", "type_definition", "implementation", "prepare_rename", "rename", "code_actions", "completions", "signature_help", "document_highlight", "document_links", "selection_ranges", "linked_editing_range", "format_document", "format_range", "diagnostics"
+                    "workspace_symbols", "call_hierarchy", "incoming_calls", "outgoing_calls", "declaration", "type_definition", "implementation", "prepare_rename", "rename", "code_actions", "completions", "signature_help", "document_highlight", "document_links", "selection_ranges", "linked_editing_range", "format_document", "format_range", "format_on_type", "diagnostics"
                 ]
             }).to_string(),
         };
@@ -626,6 +658,7 @@ impl ToolExecutor {
         let symbol = args.get("symbol").and_then(Value::as_str);
         let query = args.get("query").and_then(Value::as_str);
         let new_name = args.get("new_name").and_then(Value::as_str);
+        let trigger_character = args.get("trigger_character").and_then(Value::as_str);
         let dry_run = args.get("dry_run").and_then(Value::as_bool).unwrap_or(true);
         let action_index = args
             .get("action_index")
@@ -1234,6 +1267,42 @@ impl ToolExecutor {
                 }
             }
 
+            "format_on_type" => {
+                if let (Some(f), Some(l), Some(c), Some(ch)) =
+                    (file, line, column, trigger_character)
+                {
+                    match self.try_active_on_type_formatting(f, l, c, ch) {
+                        Ok(Some(result)) if dry_run => Self::active_lsp_response(
+                            "format_on_type",
+                            "textDocument/onTypeFormatting",
+                            result,
+                        ),
+                        Ok(Some(result)) => match self.ensure_lsp_file_ready(f) {
+                            Ok((_, uri)) => {
+                                match Self::lsp_text_edits_to_workspace_edit(&uri, result) {
+                                    Ok(workspace_edit) => self.apply_lsp_workspace_edit(
+                                        "format_on_type",
+                                        "textDocument/onTypeFormatting",
+                                        &workspace_edit,
+                                    ),
+                                    Err(error) => Err(error),
+                                }
+                                .unwrap_or_else(|error| json!({ "error": error }).to_string())
+                            }
+                            Err(error) => json!({ "error": error }).to_string(),
+                        },
+                        Ok(None) => json!({
+                            "error": "format_on_type requires an active LSP backend for that file"
+                        }).to_string(),
+                        Err(error) => json!({ "error": error }).to_string(),
+                    }
+                } else {
+                    json!({
+                        "error": "format_on_type requires 'file'+'line'+'column'+'trigger_character'"
+                    }).to_string()
+                }
+            }
+
             "diagnostics" => {
                 if let Some(f) = file {
                     match self.try_active_file_diagnostics(f) {
@@ -1266,7 +1335,8 @@ impl ToolExecutor {
                             "selection_ranges": true,
                             "linked_editing_range": true,
                             "format_document": true,
-                            "format_range": true
+                            "format_range": true,
+                            "format_on_type": true
                         },
                         "active_backends": self.passive_lsp.active_status(&self.project_root),
                         "supported_languages": {
@@ -1282,7 +1352,7 @@ impl ToolExecutor {
                 "error": format!("Unknown operation: {}", operation),
                 "valid_operations": [
                     "goto_definition", "find_references", "hover", "document_symbols",
-                    "workspace_symbols", "call_hierarchy", "incoming_calls", "outgoing_calls", "declaration", "type_definition", "implementation", "prepare_rename", "rename", "code_actions", "completions", "signature_help", "document_highlight", "document_links", "selection_ranges", "linked_editing_range", "format_document", "format_range", "diagnostics"
+                    "workspace_symbols", "call_hierarchy", "incoming_calls", "outgoing_calls", "declaration", "type_definition", "implementation", "prepare_rename", "rename", "code_actions", "completions", "signature_help", "document_highlight", "document_links", "selection_ranges", "linked_editing_range", "format_document", "format_range", "format_on_type", "diagnostics"
                 ]
             }).to_string()
         }

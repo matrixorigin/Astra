@@ -1143,7 +1143,7 @@ pub fn all_tool_schemas() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "lsp",
-                "description": "Interact with Language Server Protocol for code intelligence. Unified interface for declaration, definition, type definition, references, hover, symbols, call hierarchy, completions, signature help, document highlights, document links, selection ranges, linked editing, document and range formatting, rename preparation, rename, code actions, and diagnostics. Without a file, diagnostics reports backend availability; with a file, diagnostics returns the latest publishDiagnostics snapshot.",
+                "description": "Interact with Language Server Protocol for code intelligence. Unified interface for declaration, definition, type definition, references, hover, symbols, call hierarchy, completions, signature help, document highlights, document links, selection ranges, linked editing, document/range/on-type formatting, rename preparation, rename, code actions, and diagnostics. Without a file, diagnostics reports backend availability; with a file, diagnostics returns the latest publishDiagnostics snapshot.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -1172,6 +1172,7 @@ pub fn all_tool_schemas() -> Vec<Value> {
                                 "linked_editing_range",
                                 "format_document",
                                 "format_range",
+                                "format_on_type",
                                 "diagnostics"
                             ],
                             "description": "LSP operation to perform"
@@ -1196,6 +1197,10 @@ pub fn all_tool_schemas() -> Vec<Value> {
                             "type": "integer",
                             "description": "End column/character offset (1-based). Required for range-based operations like format_range."
                         },
+                        "trigger_character": {
+                            "type": "string",
+                            "description": "Typed character that triggered on-type formatting. Required for format_on_type."
+                        },
                         "symbol": {
                             "type": "string",
                             "description": "Symbol name for symbol-based operations (alternative to line/column)"
@@ -1210,7 +1215,7 @@ pub fn all_tool_schemas() -> Vec<Value> {
                         },
                         "dry_run": {
                             "type": "boolean",
-                            "description": "Preview by default. Set false to apply a supported rename, document/range format, or code action edit."
+                            "description": "Preview by default. Set false to apply a supported rename, document/range/on-type format, or code action edit."
                         },
                         "action_index": {
                             "type": "integer",
