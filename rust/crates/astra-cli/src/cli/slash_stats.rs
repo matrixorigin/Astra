@@ -3,10 +3,24 @@ use super::*;
 
 // ═══════════════════════════════════════════════════════ Stats ════════════
 
-pub(super) fn handle_stats_command(arg: &str, state: &ReplState) {
+pub(super) async fn handle_stats_command(arg: &str, state: &ReplState) {
     use astra_services::session_analytics;
 
     match arg {
+        // Consolidated subcommands from former standalone commands
+        "tools" => super::slash_tools::handle_tools_command(state),
+        sub if sub.starts_with("health") => {
+            let rest = sub.strip_prefix("health").unwrap_or("").trim();
+            super::slash_health::handle_health_command(rest, state).await;
+        }
+        sub if sub.starts_with("learn") => {
+            let rest = sub.strip_prefix("learn").unwrap_or("").trim();
+            super::slash_learn::handle_learn_command(rest, state);
+        }
+        sub if sub.starts_with("cost") => {
+            let rest = sub.strip_prefix("cost").unwrap_or("").trim();
+            handle_cost_command(rest, state);
+        }
         "history" => {
             // Show stats across recent sessions
             let sessions = match session_journal::list_sessions() {
@@ -126,12 +140,14 @@ pub(super) fn handle_stats_command(arg: &str, state: &ReplState) {
             if stats.checkpoint_count > 0 {
                 eprintln!("  {:<14} {}", "checkpoints:".dim(), stats.checkpoint_count);
             }
+            eprintln!(
+                "\n  {}",
+                "Subcommands: /stats history | tools | cost [detail|history] | health [detail] | learn [drift|explore]".dim()
+            );
             eprintln!();
         }
     }
 }
-
-// ═══════════════════════════════════════════════ Cost Tracking ═════════════
 
 /// Per-turn cost record for granular cost breakdown.
 #[derive(Clone, Debug)]

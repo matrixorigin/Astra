@@ -3589,7 +3589,13 @@ async fn handle_slash_command(
     }
 
     match cmd {
-        "/" | "/?" | "/commands" | "/help" => print_slash_commands(Some(arg)),
+        "/" | "/?" | "/commands" | "/help" => {
+            if arg.trim() == "keys" {
+                print_keyboard_shortcuts()
+            } else {
+                print_slash_commands(Some(arg))
+            }
+        }
 
         "/keys" => print_keyboard_shortcuts(),
 
@@ -3911,11 +3917,12 @@ async fn handle_slash_command(
         }
 
         "/stats" => {
-            slash_stats::handle_stats_command(arg, state);
+            slash_stats::handle_stats_command(arg, state).await;
         }
 
+        // Aliases: consolidated into /stats subcommands
         "/cost" => {
-            slash_stats::handle_cost_command(arg, state);
+            slash_stats::handle_stats_command(&format!("cost {arg}").trim(), state).await;
         }
 
         "/bug" => {
@@ -3923,11 +3930,11 @@ async fn handle_slash_command(
         }
 
         "/tools" => {
-            slash_tools::handle_tools_command(state);
+            slash_stats::handle_stats_command("tools", state).await;
         }
 
         "/health" => {
-            slash_health::handle_health_command(arg, state).await;
+            slash_stats::handle_stats_command(&format!("health {arg}").trim(), state).await;
         }
 
         "/sync" => {
@@ -3940,7 +3947,7 @@ async fn handle_slash_command(
         }
 
         "/learn" => {
-            slash_learn::handle_learn_command(arg, state);
+            slash_stats::handle_stats_command(&format!("learn {arg}").trim(), state).await;
         }
 
         "/exit" | "/quit" => {
