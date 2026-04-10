@@ -139,10 +139,12 @@ impl CompressionPipeline {
     /// Build a pipeline with the default layer stack.
     pub fn default_pipeline() -> Self {
         let mut p = Self::new();
-        p.add_layer(Box::new(ToolResultTruncation::new(Duration::from_secs(
-            3600,
-        ))));
-        p.add_layer(Box::new(DuplicateReadElimination));
+        p.add_layer(Box::new(ToolResultTruncation::new(
+            Duration::from_secs(3600),
+            4000,
+            0.7,
+        )));
+        p.add_layer(Box::new(DuplicateReadElimination::new(0.5)));
         p.add_layer(Box::new(TieredCompaction::default()));
         p.add_layer(Box::new(ReactiveCompact));
         p
@@ -195,13 +197,16 @@ pub struct ToolResultTruncation {
     age_threshold: Duration,
     /// Maximum chars to keep per old result (0 = clear entirely).
     max_keep_chars: usize,
+    /// Budget pressure threshold to trigger this layer.
+    trigger_pressure: f64,
 }
 
 impl ToolResultTruncation {
-    pub fn new(age_threshold: Duration) -> Self {
+    pub fn new(age_threshold: Duration, max_keep_chars: usize, trigger_pressure: f64) -> Self {
         Self {
             age_threshold,
-            max_keep_chars: 200,
+            max_keep_chars,
+            trigger_pressure,
         }
     }
 }
@@ -240,7 +245,7 @@ impl CompressionLayer for ToolResultTruncation {
     }
 
     fn should_trigger(&self, messages: &[Value], budget: &TokenBudget) -> bool {
-        budget.pressure() > 0.6 && self.estimate_savings(messages, budget) > 100
+        budget.pressure() > self.trigger_pressure && self.estimate_savings(messages, budget) > 100
     }
 
     fn compress(&self, messages: &mut Vec<Value>, _budget: &TokenBudget) -> CompressionResult {
@@ -298,7 +303,16 @@ impl CompressionLayer for ToolResultTruncation {
 
 /// Stubs out duplicate file reads: if the same path was read multiple times,
 /// replace earlier occurrences with a short stub.
-pub struct DuplicateReadElimination;
+pub struct DuplicateReadElimination {
+    /// Budget pressure threshold to trigger this layer.
+    trigger_pressure: f64,
+}
+
+impl DuplicateReadElimination {
+    pub fn new(trigger_pressure: f64) -> Self {
+        Self { trigger_pressure }
+    }
+}
 
 impl CompressionLayer for DuplicateReadElimination {
     fn name(&self) -> &str {
@@ -311,7 +325,7 @@ impl CompressionLayer for DuplicateReadElimination {
     }
 
     fn should_trigger(&self, messages: &[Value], budget: &TokenBudget) -> bool {
-        budget.pressure() > 0.5 && self.estimate_savings(messages, budget) > 50
+        budget.pressure() > self.trigger_pressure && self.estimate_savings(messages, budget) > 50
     }
 
     fn compress(&self, messages: &mut Vec<Value>, _budget: &TokenBudget) -> CompressionResult {
@@ -408,6 +422,18 @@ pub struct TieredCompaction {
     pub keep_recent_turns: usize,
     /// Budget chars target (set from token budget).
     pub budget_chars_multiplier: f64,
+    /// Budget pressure threshold to trigger this layer.
+    trigger_pressure: f64,
+}
+
+impl TieredCompaction {
+    pub fn new(keep_recent_turns: usize, trigger_pressure: f64) -> Self {
+        Self {
+            keep_recent_turns,
+            budget_chars_multiplier: 4.0,
+            trigger_pressure,
+        }
+    }
 }
 
 impl Default for TieredCompaction {
@@ -415,6 +441,7 @@ impl Default for TieredCompaction {
         Self {
             keep_recent_turns: 6,
             budget_chars_multiplier: 4.0, // chars_per_token estimate
+            trigger_pressure: 0.75,
         }
     }
 }
@@ -437,7 +464,7 @@ impl CompressionLayer for TieredCompaction {
     }
 
     fn should_trigger(&self, messages: &[Value], budget: &TokenBudget) -> bool {
-        budget.pressure() > 0.75 && messages.len() > self.keep_recent_turns * 2 + 4
+        budget.pressure() > self.trigger_pressure && messages.len() > self.keep_recent_turns * 2 + 4
     }
 
     fn compress(&self, messages: &mut Vec<Value>, _budget: &TokenBudget) -> CompressionResult {
@@ -653,7 +680,7 @@ mod tests {
 
     #[test]
     fn tool_result_truncation_fires() {
-        let layer = ToolResultTruncation::new(Duration::from_secs(0)); // 0s = all are "old"
+        let layer = ToolResultTruncation::new(Duration::from_secs(0), 200, 0.6); // 0s = all are "old"
         let long_content = "x".repeat(1000);
         let mut msgs = vec![
             json!({"role": "system", "content": "sys"}),
@@ -671,7 +698,7 @@ mod tests {
 
     #[test]
     fn duplicate_read_elimination() {
-        let layer = DuplicateReadElimination;
+        let layer = DuplicateReadElimination::new(0.5);
         let mut msgs = vec![
             json!({"role": "system", "content": "sys"}),
             json!({"role": "tool", "content": "file content v1 ".repeat(100), "_tool_name": "read_file", "_path": "src/main.rs"}),
@@ -693,10 +720,7 @@ mod tests {
 
     #[test]
     fn tiered_compaction_removes_middle() {
-        let layer = TieredCompaction {
-            keep_recent_turns: 2,
-            ..Default::default()
-        };
+        let layer = TieredCompaction::new(2, 0.75);
         let mut msgs = make_messages(10); // 1 system + 20 user/assistant = 21
         let b = budget(80000, 65000); // 81% pressure
         assert!(layer.should_trigger(&msgs, &b));
@@ -729,11 +753,12 @@ mod tests {
     #[test]
     fn pipeline_progressive_compression() {
         let mut pipeline = CompressionPipeline::new();
-        pipeline.add_layer(Box::new(ToolResultTruncation::new(Duration::from_secs(0))));
-        pipeline.add_layer(Box::new(TieredCompaction {
-            keep_recent_turns: 2,
-            ..Default::default()
-        }));
+        pipeline.add_layer(Box::new(ToolResultTruncation::new(
+            Duration::from_secs(0),
+            200,
+            0.6,
+        )));
+        pipeline.add_layer(Box::new(TieredCompaction::new(2, 0.75)));
 
         // Build messages with old tool results + many turns
         let mut msgs = vec![json!({"role": "system", "content": "sys"})];
@@ -776,10 +801,7 @@ mod tests {
 
     #[test]
     fn tiered_does_not_remove_system_messages() {
-        let layer = TieredCompaction {
-            keep_recent_turns: 1,
-            ..Default::default()
-        };
+        let layer = TieredCompaction::new(1, 0.75);
         let mut msgs = vec![
             json!({"role": "system", "content": "System prompt 1"}),
             json!({"role": "system", "content": "System prompt 2"}),

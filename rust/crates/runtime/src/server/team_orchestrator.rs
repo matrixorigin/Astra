@@ -407,20 +407,24 @@ impl TeamExecutionOrchestrator {
 
         // Check token budget (post-execution — tokens are only known after completion)
         let total_tokens = total_prompt + total_completion;
-        if let Some(ref budget) = team.budget {
-            if budget.max_tokens > 0 && total_tokens > budget.max_tokens {
-                let _ = self
-                    .run_engine
-                    .append_event(
-                        &parent_run_id,
-                        serde_json::json!({
-                            "event_type": "team_budget_exceeded",
-                            "budget_max_tokens": budget.max_tokens,
-                            "actual_tokens": total_tokens,
-                        }),
-                    )
-                    .await;
-            }
+        let budget_exceeded = team
+            .budget
+            .as_ref()
+            .filter(|b| b.max_tokens > 0 && total_tokens > b.max_tokens)
+            .is_some();
+        if budget_exceeded {
+            let max = team.budget.as_ref().unwrap().max_tokens;
+            let _ = self
+                .run_engine
+                .append_event(
+                    &parent_run_id,
+                    serde_json::json!({
+                        "event_type": "team_budget_exceeded",
+                        "budget_max_tokens": max,
+                        "actual_tokens": total_tokens,
+                    }),
+                )
+                .await;
         }
 
         let _ = self
@@ -478,6 +482,13 @@ impl TeamExecutionOrchestrator {
         let has_conflicts = conflict_count > 0;
 
         let (status, error) = derive_team_status(&delegation_result, conflict_count);
+        let error = if budget_exceeded {
+            let max = team.budget.as_ref().unwrap().max_tokens;
+            let msg = format!("token budget exceeded: {total_tokens}/{max} tokens");
+            Some(error.map_or(msg.clone(), |e| format!("{e}; {msg}")))
+        } else {
+            error
+        };
 
         self.emit_progress(ExecutionPhase::Reporting {
             status: status.clone(),

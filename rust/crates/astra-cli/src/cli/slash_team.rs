@@ -589,7 +589,9 @@ pub(super) async fn handle_team_command(
                     let user_id = state.ingestion_user_id.clone().unwrap_or_else(|| "local".into());
                     if let Some(t) = state.team_registry.get(name) {
                         let def = cli_team_to_definition(t, &user_id);
-                        let _ = state.team_store.save_team(&def).await;
+                        if let Err(e) = state.team_store.save_team(&def).await {
+                            eprintln!("  {} persist warning: {e}", theme::icon_warn());
+                        }
                     }
                     eprintln!(
                         "  {} Team '{}' created. Add members with /team add-member {} <role> <description>",
@@ -631,7 +633,9 @@ pub(super) async fn handle_team_command(
                     let user_id = state.ingestion_user_id.clone().unwrap_or_else(|| "local".into());
                     if let Some(t) = state.team_registry.get(team) {
                         let def = cli_team_to_definition(t, &user_id);
-                        let _ = state.team_store.save_team(&def).await;
+                        if let Err(e) = state.team_store.save_team(&def).await {
+                            eprintln!("  {} persist warning: {e}", theme::icon_warn());
+                        }
                     }
                     eprintln!(
                         "  {} Added role '{}' to team '{}'",
@@ -655,6 +659,9 @@ pub(super) async fn handle_team_command(
                     eprintln!("\n  {} {}", "Team:".bold(), t.name.as_str().cyan().bold());
                     eprintln!("  {} {}", "Description:".dim(), t.description);
                     eprintln!("  {} {}", "Created:".dim(), t.created_at);
+                    if let Some(ref coord) = t.coordination {
+                        eprintln!("  {} {:?}", "Coordination:".dim(), coord);
+                    }
                     eprintln!("\n  {}", "Members:".bold());
                     for m in &t.members {
                         eprintln!(
