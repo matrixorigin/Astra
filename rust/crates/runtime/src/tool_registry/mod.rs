@@ -205,16 +205,23 @@ mod tests {
     fn prefilter_ranks_lsp_for_code_intel_query() {
         let state = ConversationState::from_message("帮我查这个符号的定义和引用", 1);
         let ranked = pre_filter_dynamic(&state, "帮我查这个符号的定义和引用");
+        let first_name = TOOL_CATALOG[ranked[0].0].name;
+        assert_eq!(
+            first_name, "lsp",
+            "lsp should be top-ranked for code-intel query, got: {}",
+            first_name
+        );
+    }
 
-        let top_names: Vec<&str> = ranked
-            .iter()
-            .take(6)
-            .map(|&(idx, _)| TOOL_CATALOG[idx].name)
-            .collect();
-        assert!(
-            top_names.contains(&"lsp"),
-            "lsp should appear near the top for code-intel query, got: {:?}",
-            top_names
+    #[test]
+    fn prefilter_ranks_lsp_for_semantic_tokens_query() {
+        let state = ConversationState::from_message("show semantic tokens for this file", 1);
+        let ranked = pre_filter_dynamic(&state, "show semantic tokens for this file");
+        let first_name = TOOL_CATALOG[ranked[0].0].name;
+        assert_eq!(
+            first_name, "lsp",
+            "lsp should be top-ranked for semantic token query, got: {}",
+            first_name
         );
     }
 

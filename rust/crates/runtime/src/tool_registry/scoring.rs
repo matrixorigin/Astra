@@ -207,6 +207,65 @@ fn file_context_tool_boost(tool_name: &str, file_context: &[String]) -> f64 {
     if boost { 0.05 } else { 0.0 }
 }
 
+fn explicit_lsp_signal(query_lower: &str, query_chars: &[char]) -> bool {
+    use super::state::word_boundary_match;
+
+    const LSP_SIGNALS: &[&str] = &[
+        "lsp",
+        "language server",
+        "go to definition",
+        "definition",
+        "find references",
+        "references",
+        "hover",
+        "implementation",
+        "type definition",
+        "declaration",
+        "rename symbol",
+        "prepare rename",
+        "code action",
+        "diagnostics",
+        "document highlight",
+        "document link",
+        "selection range",
+        "inlay hint",
+        "folding range",
+        "document color",
+        "color presentation",
+        "semantic token",
+        "code lens",
+        "call hierarchy",
+        "incoming calls",
+        "outgoing calls",
+        "document symbol",
+        "workspace symbol",
+        "语义跳转",
+        "定义",
+        "引用",
+        "悬停",
+        "实现",
+        "类型定义",
+        "声明",
+        "重命名",
+        "代码动作",
+        "诊断",
+        "高亮",
+        "文档链接",
+        "选择范围",
+        "内联提示",
+        "折叠范围",
+        "文档颜色",
+        "颜色表示",
+        "语义令牌",
+        "代码透镜",
+        "调用层次",
+    ];
+
+    LSP_SIGNALS
+        .iter()
+        .any(|signal| word_boundary_match(query_lower, query_chars, signal))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn tool_relevance_score(
     tool: &ToolMeta,
@@ -289,6 +348,13 @@ fn tool_relevance_score(
         Scope::External if state.is_fetch && !state.is_mutate => score += 0.1,
         Scope::CrossSession if state.references_history => score += 0.1,
         _ => {}
+    }
+
+    // ── Phase 3b: Explicit code-intel boost ──
+    // Queries that explicitly ask for LSP-style editor intelligence should
+    // prefer the unified lsp tool over generic file/text tools.
+    if tool.name == "lsp" && explicit_lsp_signal(query_lower, query_chars) {
+        score += 0.30;
     }
 
     // ── Phase 4: Content-gated recency ──
