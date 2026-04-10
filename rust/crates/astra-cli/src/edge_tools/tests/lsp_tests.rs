@@ -68,6 +68,7 @@ while True:
                     "documentHighlightProvider": True,
                     "documentLinkProvider": {"resolveProvider": False},
                     "inlayHintProvider": True,
+                    "foldingRangeProvider": True,
                     "selectionRangeProvider": True,
                     "linkedEditingRangeProvider": True,
                     "signatureHelpProvider": {
@@ -277,6 +278,16 @@ while True:
                 "paddingLeft": True
             }]
         })
+    elif method == "textDocument/foldingRange":
+        write_frame({
+            "jsonrpc": "2.0",
+            "id": msg_id,
+            "result": [{
+                "startLine": 0,
+                "endLine": 2,
+                "kind": "region"
+            }]
+        })
     elif method == "textDocument/selectionRange":
         write_frame({
             "jsonrpc": "2.0",
@@ -453,6 +464,7 @@ fn lsp_diagnostics_returns_capabilities() {
     );
     assert!(parsed["capabilities"]["document_links"].as_bool().unwrap());
     assert!(parsed["capabilities"]["inlay_hints"].as_bool().unwrap());
+    assert!(parsed["capabilities"]["folding_ranges"].as_bool().unwrap());
     assert!(
         parsed["capabilities"]["selection_ranges"]
             .as_bool()
@@ -763,6 +775,37 @@ fn lsp_inlay_hints_use_real_lsp_when_available() {
     assert_eq!(parsed["backend"].as_str(), Some("lsp"));
     assert_eq!(parsed["method"].as_str(), Some("textDocument/inlayHint"));
     assert_eq!(parsed["result"][0]["label"].as_str(), Some(": ()"));
+}
+
+#[cfg(unix)]
+#[test]
+#[serial_test::serial]
+fn lsp_folding_ranges_use_real_lsp_when_available() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname=\"demo\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(
+        dir.path().join("src/lib.rs"),
+        "pub fn hello_from_lsp() {\n    println!(\"hi\");\n}\n",
+    )
+    .unwrap();
+    let script = fake_lsp_server_script(dir.path());
+    let _guard = EnvGuard::set("ASTRA_RUST_ANALYZER_CMD", script.to_str().unwrap());
+    let exe = ToolExecutor::new(dir.path());
+
+    let result = exe.lsp(&json!({
+        "operation": "folding_ranges",
+        "file": "src/lib.rs"
+    }));
+    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+
+    assert_eq!(parsed["backend"].as_str(), Some("lsp"));
+    assert_eq!(parsed["method"].as_str(), Some("textDocument/foldingRange"));
+    assert_eq!(parsed["result"][0]["endLine"].as_u64(), Some(2));
 }
 
 #[cfg(unix)]
