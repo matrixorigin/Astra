@@ -12,8 +12,9 @@ import type { ChatConfig } from '@/lib/workspace/types';
 import type { SessionSummary, EventSummary } from '@/lib/models/platform';
 import { ConnectionStatus } from '@/components/streaming/connection-status';
 import { EventLogViewer } from '@/components/events/event-log-viewer';
+import { AgentTree } from '@/components/agents/agent-tree';
 
-type SidePanel = 'tools' | 'plan' | 'events' | 'context';
+type SidePanel = 'tools' | 'plan' | 'agents' | 'events' | 'context';
 
 export function WorkspaceShell({
   config,
@@ -53,11 +54,13 @@ export function WorkspaceShell({
     window.history.pushState({}, '', url.toString());
   }, [chat]);
 
-  // Auto-switch to plan tab when plan appears
+  // Auto-switch to plan tab when plan appears, or agents tab when agent events arrive
   const effectiveSidePanel =
     sidePanel === 'tools' && chat.plan && chat.toolCalls.length === 0
       ? 'plan'
-      : sidePanel;
+      : sidePanel === 'tools' && chat.agentEvents.length > 0 && chat.toolCalls.length === 0
+        ? 'agents'
+        : sidePanel;
 
   return (
     <div className="flex h-[calc(100vh-8rem)] overflow-hidden rounded-2xl border border-slate-800">
@@ -149,6 +152,7 @@ export function WorkspaceShell({
             [
               { key: 'tools' as const, label: 'Tools', count: chat.toolCalls.length },
               { key: 'plan' as const, label: 'Plan', count: chat.plan?.subtasks.length ?? 0 },
+              { key: 'agents' as const, label: 'Agents', count: chat.agentEvents.filter((e) => e.type === 'agent_spawned').length },
               { key: 'events' as const, label: 'Events', count: events?.length ?? 0 },
               { key: 'context' as const, label: 'Context' },
             ]
@@ -187,6 +191,18 @@ export function WorkspaceShell({
                 </p>
               </div>
             )
+          ) : effectiveSidePanel === 'agents' ? (
+            <div className="p-4">
+              {chat.agentEvents.length > 0 ? (
+                <AgentTree events={chat.agentEvents} />
+              ) : (
+                <div className="flex flex-col items-center justify-center p-6 text-center">
+                  <p className="text-xs text-slate-500">
+                    No agents spawned yet. Multi-agent activity will appear here.
+                  </p>
+                </div>
+              )}
+            </div>
           ) : effectiveSidePanel === 'events' ? (
             <div className="p-4">
               {events && events.length > 0 ? (

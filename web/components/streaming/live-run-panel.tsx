@@ -16,6 +16,10 @@ function EventBadge({ type }: { type: string }) {
     error: 'bg-red-500/20 text-red-300',
     warning: 'bg-amber-500/20 text-amber-300',
     explain: 'bg-slate-500/20 text-slate-400',
+    agent_spawned: 'bg-teal-500/20 text-teal-300',
+    agent_delegated: 'bg-teal-500/20 text-teal-300',
+    agent_progress: 'bg-cyan-500/20 text-cyan-300',
+    agent_completed: 'bg-emerald-500/20 text-emerald-300',
   };
 
   return (
@@ -65,10 +69,12 @@ function eventSummary(event: StreamEvent): string {
       return `Step done: ${event.step}`;
     case 'agent_delegated':
       return `Delegated to ${event.agent_id}: ${event.task}`;
+    case 'agent_spawned':
+      return `▶ Agent ${event.agent_id} spawned (${event.agent_type}) ← ${event.parent_run_id.slice(0, 8)}`;
     case 'agent_progress':
-      return `Agent ${event.agent_id}: ${event.progress}`;
+      return `Agent ${event.agent_id}: ${event.status}${event.tool_name ? ` [${event.tool_name}]` : ''}${event.description ? ` — ${event.description}` : ''}`;
     case 'agent_completed':
-      return `Agent ${event.agent_id} completed`;
+      return `Agent ${event.agent_id} ${event.status}${event.result_summary ? `: ${event.result_summary}` : ''}${event.error ? ` — ${event.error}` : ''}`;
   }
 }
 

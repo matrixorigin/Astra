@@ -383,6 +383,8 @@ pub struct DelegationTracker {
     session_id: Option<String>,
     /// Real-time progress per delegation.
     progress: RwLock<HashMap<String, DelegationProgress>>,
+    /// Optional progress broadcaster for SSE events.
+    progress_broadcaster: Option<Arc<crate::orchestration::ProgressBroadcaster>>,
 }
 
 impl DelegationTracker {
@@ -393,6 +395,7 @@ impl DelegationTracker {
             pause_flags: RwLock::new(HashMap::new()),
             session_id: None,
             progress: RwLock::new(HashMap::new()),
+            progress_broadcaster: None,
         }
     }
 
@@ -404,7 +407,22 @@ impl DelegationTracker {
             pause_flags: RwLock::new(HashMap::new()),
             session_id: Some(session_id),
             progress: RwLock::new(HashMap::new()),
+            progress_broadcaster: None,
         }
+    }
+
+    /// Attach a progress broadcaster for SSE event emission.
+    pub fn with_progress_broadcaster(
+        mut self,
+        broadcaster: Arc<crate::orchestration::ProgressBroadcaster>,
+    ) -> Self {
+        self.progress_broadcaster = Some(broadcaster);
+        self
+    }
+
+    /// Get the progress broadcaster, if configured.
+    pub fn progress_broadcaster(&self) -> Option<&Arc<crate::orchestration::ProgressBroadcaster>> {
+        self.progress_broadcaster.as_ref()
     }
 
     /// Persist a delegation event to the session journal (best-effort).
@@ -479,6 +497,7 @@ impl DelegationTracker {
         let run_id = record.run_id.clone();
         let parent_id = record.parent_run_id.clone();
         let delegation_id = record.delegation_id.clone();
+        let agent_id = record.agent_id.clone();
 
         // Persist to journal before updating in-memory state
         self.persist_event(
@@ -487,10 +506,28 @@ impl DelegationTracker {
                 "delegation_id": &delegation_id,
                 "run_id": &run_id,
                 "parent_run_id": &parent_id,
-                "agent_id": &record.agent_id,
+                "agent_id": &agent_id,
                 "depth": record.depth,
             }),
         );
+
+        // Emit SSE event for web clients
+        if let Some(ref broadcaster) = self.progress_broadcaster {
+            use crate::orchestration::{AgentProgressEvent, ProgressEventType};
+            broadcaster.emit(AgentProgressEvent {
+                agent_id: agent_id.clone(),
+                event_type: ProgressEventType::AgentSpawned {
+                    run_id: run_id.clone(),
+                    parent_run_id: parent_id.clone(),
+                    agent_type: "delegated".to_string(),
+                    description: format!("Sub-run for delegation {}", &delegation_id),
+                },
+                timestamp_epoch_ms: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64,
+            });
+        }
 
         self.delegations
             .write()
@@ -765,9 +802,35 @@ impl DelegationTracker {
         // Note: pause flags are NOT removed here — they are cleaned up
         // in cleanup_delegation() when the entire delegation completes.
 
-        // Update progress
+        // Update progress + emit SSE event
         if let (Some(did), Some(aid)) = (delegation_id, agent_id) {
             self.update_progress(&did, &aid, terminal_state).await;
+
+            // Emit completion SSE event for web clients
+            if let Some(ref broadcaster) = self.progress_broadcaster {
+                use crate::orchestration::{AgentProgressEvent, ProgressEventType};
+                let status_str = format!("{:?}", terminal_state);
+                let event_type = if terminal_state == SubRunState::Completed {
+                    ProgressEventType::Completed {
+                        result_summary: format!("Sub-run {} finished", run_id),
+                        total_tool_calls: 0,
+                        total_tokens: (0, 0),
+                        duration_ms: 0,
+                    }
+                } else {
+                    ProgressEventType::Failed {
+                        error: format!("Sub-run terminal state: {}", status_str),
+                    }
+                };
+                broadcaster.emit(AgentProgressEvent {
+                    agent_id: aid,
+                    event_type,
+                    timestamp_epoch_ms: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64,
+                });
+            }
         }
     }
 
@@ -968,6 +1031,13 @@ impl DelegationEngine {
     pub fn with_mailbox_router(mut self, router: Arc<AgentMailboxRouter>) -> Self {
         self.mailbox_router = Some(router);
         self
+    }
+
+    /// Get the progress broadcaster from the underlying tracker, if configured.
+    pub fn progress_broadcaster(
+        &self,
+    ) -> Option<&Arc<crate::orchestration::ProgressBroadcaster>> {
+        self.tracker.progress_broadcaster()
     }
 
     /// Dynamically set the verification gate (e.g., per-subtask criteria during plan execution).

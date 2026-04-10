@@ -207,6 +207,12 @@ impl AgenticRunLifecycleService {
         if let Some(pool) = &self.shared_pool {
             builder = builder.with_pool(pool.clone());
         }
+        // Wire progress broadcaster from delegation engine for SSE agent tree events
+        if let Some(ref de) = self.delegation_engine {
+            if let Some(broadcaster) = de.progress_broadcaster() {
+                builder = builder.with_progress_broadcaster(Arc::clone(broadcaster));
+            }
+        }
         builder.build()
     }
 

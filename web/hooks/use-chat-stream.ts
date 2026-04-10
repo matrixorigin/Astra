@@ -48,6 +48,7 @@ export function useChatStream(config: ChatConfig): UseChatStreamReturn {
   const [plan, setPlan] = useState<PlanState | null>(null);
   const [usage, setUsage] = useState<TokenUsage>(EMPTY_USAGE);
   const [connectionState, setConnectionState] = useState<ConnectionState>('idle');
+  const [agentEvents, setAgentEvents] = useState<StreamEvent[]>([]);
 
   // Refs for mutable state during stream processing
   const controllerRef = useRef<AbortController | null>(null);
@@ -75,6 +76,7 @@ export function useChatStream(config: ChatConfig): UseChatStreamReturn {
       setPlan(null);
       setUsage(EMPTY_USAGE);
       setConnectionState('idle');
+      setAgentEvents([]);
       accumulatedTextRef.current = '';
       accumulatedThinkingRef.current = '';
       toolCallMapRef.current.clear();
@@ -259,6 +261,8 @@ export function useChatStream(config: ChatConfig): UseChatStreamReturn {
         case 'agent_spawned':
         case 'agent_progress':
         case 'agent_completed':
+          setAgentEvents((prev) => [...prev, event]);
+          break;
         case 'warning':
         case 'explain':
           break;
@@ -401,6 +405,7 @@ export function useChatStream(config: ChatConfig): UseChatStreamReturn {
     setPlan(null);
     setUsage(EMPTY_USAGE);
     setConnectionState('idle');
+    setAgentEvents([]);
     accumulatedTextRef.current = '';
     accumulatedThinkingRef.current = '';
     toolCallMapRef.current.clear();
@@ -415,6 +420,7 @@ export function useChatStream(config: ChatConfig): UseChatStreamReturn {
     error,
     plan,
     usage,
+    agentEvents,
     connectionState,
     sendMessage,
     stop,

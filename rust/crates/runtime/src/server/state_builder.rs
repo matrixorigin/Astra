@@ -234,7 +234,11 @@ pub async fn build_server_state(
         let _ = profile_registry.register(writer);
     }
     let profile_registry = Arc::new(profile_registry);
-    let delegation_tracker = Arc::new(crate::server::delegation_engine::DelegationTracker::new());
+    let progress_broadcaster = Arc::new(crate::orchestration::ProgressBroadcaster::default());
+    let delegation_tracker = Arc::new(
+        crate::server::delegation_engine::DelegationTracker::new()
+            .with_progress_broadcaster(Arc::clone(&progress_broadcaster)),
+    );
     // Wire a real sub-run executor backed by ServerAgenticLoopHost.
     let sub_run_executor: Arc<dyn crate::server::delegation_engine::SubRunExecutor> = Arc::new(
         super::run_lifecycle::ServerSubRunExecutor::new(

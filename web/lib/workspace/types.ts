@@ -56,6 +56,7 @@ export type WorkspaceState = {
   error: string | null;
   plan: PlanState | null;
   usage: TokenUsage;
+  agentEvents: import('@/lib/streaming/types').StreamEvent[];
 };
 
 export type ChatConfig = {
