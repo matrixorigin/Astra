@@ -1958,8 +1958,6 @@ async fn run_chat_repl(
 // ---------------------------------------------------------------------------
 
 // Session cleanup moved to session_cleanup.rs
-#[cfg(test)]
-use project_instructions::discover_instructions_from_paths;
 use project_instructions::{
     discover_project_instructions, format_project_instructions, resolve_system_prompt,
 };
@@ -2269,7 +2267,7 @@ mod tests {
     /// the guard ensures they execute sequentially.
     use std::sync::{Mutex, MutexGuard, OnceLock};
 
-    struct CredentialsGuard {
+    pub(crate) struct CredentialsGuard {
         _lock: MutexGuard<'static, ()>,
         _dir: tempfile::TempDir,
     }
@@ -2292,7 +2290,7 @@ mod tests {
 
     /// Set credentials dir to a temp path so tests don't pollute ~/.astra/credentials.json.
     /// Returns a guard that holds a mutex — tests using this are serialized.
-    fn isolate_credentials() -> CredentialsGuard {
+    pub(crate) fn isolate_credentials() -> CredentialsGuard {
         let lock = creds_lock();
         let dir = tempfile::tempdir().unwrap();
         // SAFETY: protected by CREDS_LOCK; no concurrent set_var.

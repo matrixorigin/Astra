@@ -116,14 +116,10 @@ pub(super) async fn handle_account_command(
 mod tests {
     use super::*;
     use crate::cli_utils::{CredentialsFile, Profile};
-    use tempfile::tempdir;
 
     #[tokio::test]
     async fn refresh_auth_runtime_replaces_stale_mailbox_state() {
-        let creds_dir = tempdir().unwrap();
-        unsafe {
-            std::env::set_var("ASTRA_CREDENTIALS_DIR", creds_dir.path());
-        }
+        let _creds_dir = crate::tests::isolate_credentials();
 
         let mut creds = CredentialsFile::default();
         creds.profiles.insert(
@@ -164,10 +160,6 @@ mod tests {
         assert!(state.agent_spawner.is_some());
         assert!(state.root_mailbox.is_none());
         assert!(state.pending_idle_agent_messages.is_empty());
-
-        unsafe {
-            std::env::remove_var("ASTRA_CREDENTIALS_DIR");
-        }
     }
 
     #[tokio::test]
@@ -224,10 +216,7 @@ mod tests {
 
     #[tokio::test]
     async fn clear_local_auth_state_clears_credentials_and_runtime() {
-        let creds_dir = tempdir().unwrap();
-        unsafe {
-            std::env::set_var("ASTRA_CREDENTIALS_DIR", creds_dir.path());
-        }
+        let _creds_dir = crate::tests::isolate_credentials();
 
         let mut creds = CredentialsFile::default();
         creds.profiles.insert(
@@ -278,9 +267,5 @@ mod tests {
         assert_eq!(profile.memoria_api_key.as_deref(), Some("mem-key"));
         assert!(state.delegation_engine.is_none());
         assert!(state.agent_spawner.is_none());
-
-        unsafe {
-            std::env::remove_var("ASTRA_CREDENTIALS_DIR");
-        }
     }
 }
