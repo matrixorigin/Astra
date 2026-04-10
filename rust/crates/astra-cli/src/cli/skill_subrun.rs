@@ -513,6 +513,7 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             skill_listing_message: None,
             invoked_skills: std::collections::HashMap::new(),
             recent_file_reads: Vec::new(),
+            turn_trace_collector: None,
             mailbox: None,
             ack_tracker: None,
             dead_letter_queue: None,

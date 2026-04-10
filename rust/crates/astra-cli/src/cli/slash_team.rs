@@ -47,6 +47,8 @@ pub(super) struct Team {
     pub members: Vec<TeamMember>,
     pub shared_context: HashMap<String, String>,
     pub worktree_mode: WorktreeMode,
+    /// Explicit coordination mode (None = auto-infer from roles).
+    pub coordination: Option<astra_services::team_persistence::TeamCoordination>,
     pub created_at: String,
 }
 
@@ -60,11 +62,19 @@ pub(super) struct TeamMember {
 }
 
 /// Registry of all defined teams (stored in ReplState).
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub(super) struct TeamRegistry {
     teams: HashMap<String, Team>,
-    history: Vec<TeamHistoryEntry>,
+    pub history: Vec<TeamHistoryEntry>,
     snapshots: Vec<TeamSnapshotEntry>,
+    /// Whether we've loaded teams from the persistence store yet.
+    pub store_loaded: bool,
+}
+
+impl Default for TeamRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl TeamRegistry {
@@ -73,6 +83,7 @@ impl TeamRegistry {
             teams: HashMap::new(),
             history: Vec::new(),
             snapshots: Vec::new(),
+            store_loaded: false,
         };
         // Register built-in team templates
         reg.register_builtins();
@@ -103,6 +114,7 @@ impl TeamRegistry {
                 ],
                 shared_context: HashMap::new(),
                 worktree_mode: WorktreeMode::Shared,
+                coordination: None,
                 created_at: chrono::Utc::now().to_rfc3339(),
             },
         );
@@ -131,6 +143,7 @@ impl TeamRegistry {
                 ],
                 shared_context: HashMap::new(),
                 worktree_mode: WorktreeMode::Shared,
+                coordination: None,
                 created_at: chrono::Utc::now().to_rfc3339(),
             },
         );
@@ -167,9 +180,37 @@ impl TeamRegistry {
                 ],
                 shared_context: HashMap::new(),
                 worktree_mode: WorktreeMode::Isolated,
+                coordination: None,
                 created_at: chrono::Utc::now().to_rfc3339(),
             },
         );
+    }
+
+    /// Merge teams from persistence store into the registry (idempotent).
+    pub fn merge_from_store(&mut self, teams: Vec<astra_services::team_persistence::TeamDefinition>) {
+        for def in teams {
+            if self.teams.contains_key(&def.name) {
+                continue; // don't overwrite in-memory edits
+            }
+            self.teams.insert(
+                def.name.clone(),
+                Team {
+                    team_id: def.team_id,
+                    name: def.name,
+                    description: def.description,
+                    members: def.members.iter().map(|m| TeamMember {
+                        role: m.role.clone(),
+                        description: m.system_prompt.clone().unwrap_or_else(|| format!("{} agent", m.role)),
+                        skills: m.skills.clone(),
+                        model_override: m.model_override.clone(),
+                    }).collect(),
+                    shared_context: def.context,
+                    worktree_mode: def.worktree_mode,
+                    coordination: Some(def.coordination),
+                    created_at: def.created_at,
+                },
+            );
+        }
     }
 
     pub fn get(&self, name: &str) -> Option<&Team> {
@@ -182,7 +223,12 @@ impl TeamRegistry {
         teams
     }
 
-    pub fn create(&mut self, name: String, description: String) -> Result<(), String> {
+    pub fn create(
+        &mut self,
+        name: String,
+        description: String,
+        coordination: Option<astra_services::team_persistence::TeamCoordination>,
+    ) -> Result<(), String> {
         if self.teams.contains_key(&name) {
             return Err(format!("Team '{name}' already exists"));
         }
@@ -195,6 +241,7 @@ impl TeamRegistry {
                 members: Vec::new(),
                 shared_context: HashMap::new(),
                 worktree_mode: WorktreeMode::Shared,
+                coordination,
                 created_at: chrono::Utc::now().to_rfc3339(),
             },
         );
@@ -281,7 +328,7 @@ fn cli_team_to_definition(
 ) -> astra_services::team_persistence::TeamDefinition {
     use astra_services::team_persistence::*;
 
-    let coordination = infer_coordination(team);
+    let coordination = team.coordination.clone().unwrap_or_else(|| infer_coordination(team));
     let now = chrono::Utc::now().to_rfc3339();
     TeamDefinition {
         team_id: team.team_id.clone(),
@@ -403,6 +450,15 @@ pub(super) async fn handle_team_command(
     profile: Option<&str>,
     state: &mut super::ReplState,
 ) {
+    // Hydrate registry from persistence store on first command
+    if !state.team_registry.store_loaded {
+        let user_id = state.ingestion_user_id.clone().unwrap_or_else(|| "local".into());
+        if let Ok(teams) = state.team_store.list_teams(&user_id).await {
+            state.team_registry.merge_from_store(teams);
+        }
+        state.team_registry.store_loaded = true;
+    }
+
     let mut parts = arg.splitn(2, ' ');
     let sub = parts.next().unwrap_or("").trim();
     let sub_arg = parts.next().unwrap_or("").trim();
@@ -495,19 +551,39 @@ pub(super) async fn handle_team_command(
         }
 
         "create" => {
+            // /team create <name> [--mode pipeline|adversarial|fanout|sequential] [description]
             let mut parts = sub_arg.splitn(2, ' ');
             let name = parts.next().unwrap_or("").trim();
-            let desc = parts.next().unwrap_or("").trim();
+            let rest = parts.next().unwrap_or("").trim();
             if name.is_empty() {
-                eprintln!("{}", "  Usage: /team create <name> [description]".yellow());
+                eprintln!("{}", "  Usage: /team create <name> [--mode pipeline|adversarial|fanout|sequential] [description]".yellow());
                 return;
             }
+            let (coordination, desc) = if rest.starts_with("--mode ") {
+                let after_flag = &rest[7..];
+                let mut mode_parts = after_flag.splitn(2, ' ');
+                let mode_str = mode_parts.next().unwrap_or("");
+                let d = mode_parts.next().unwrap_or("").trim();
+                let coord = match mode_str {
+                    "pipeline" => Some(astra_services::team_persistence::TeamCoordination::Pipeline),
+                    "adversarial" => Some(astra_services::team_persistence::TeamCoordination::Adversarial { max_rounds: 3, threshold: 0.8 }),
+                    "fanout" | "fan-out" => Some(astra_services::team_persistence::TeamCoordination::FanOut { aggregation: "merge".to_string() }),
+                    "sequential" => Some(astra_services::team_persistence::TeamCoordination::Sequential { stop_on_success: false }),
+                    other => {
+                        eprintln!("  {} Unknown mode '{}'. Options: pipeline, adversarial, fanout, sequential", theme::icon_err(), other);
+                        return;
+                    }
+                };
+                (coord, d)
+            } else {
+                (None, rest)
+            };
             let description = if desc.is_empty() {
                 format!("Custom team: {name}")
             } else {
                 desc.to_string()
             };
-            match state.team_registry.create(name.to_string(), description) {
+            match state.team_registry.create(name.to_string(), description, coordination) {
                 Ok(()) => {
                     eprintln!(
                         "  {} Team '{}' created. Add members with /team add-member {} <role> <description>",
@@ -1576,7 +1652,7 @@ mod tests {
     #[test]
     fn create_and_delete_team() {
         let mut reg = TeamRegistry::new();
-        reg.create("my-team".into(), "test team".into()).unwrap();
+        reg.create("my-team".into(), "test team".into(), None).unwrap();
         assert!(reg.get("my-team").is_some());
         assert_eq!(reg.list().len(), 4);
 
@@ -1587,13 +1663,13 @@ mod tests {
     #[test]
     fn create_duplicate_fails() {
         let mut reg = TeamRegistry::new();
-        assert!(reg.create("review".into(), "dup".into()).is_err());
+        assert!(reg.create("review".into(), "dup".into(), None).is_err());
     }
 
     #[test]
     fn add_member_to_team() {
         let mut reg = TeamRegistry::new();
-        reg.create("test".into(), "test".into()).unwrap();
+        reg.create("test".into(), "test".into(), None).unwrap();
         reg.add_member(
             "test",
             TeamMember {
@@ -1612,7 +1688,7 @@ mod tests {
     #[test]
     fn add_duplicate_role_fails() {
         let mut reg = TeamRegistry::new();
-        reg.create("test".into(), "test".into()).unwrap();
+        reg.create("test".into(), "test".into(), None).unwrap();
         let member = TeamMember {
             role: "coder".into(),
             description: "v1".into(),
@@ -1656,6 +1732,7 @@ mod tests {
                 .collect(),
             shared_context: HashMap::new(),
             worktree_mode: WorktreeMode::Shared,
+            coordination: None,
             created_at: "2024-01-01T00:00:00Z".into(),
         }
     }
@@ -1728,7 +1805,7 @@ mod tests {
         let def = cli_team_to_definition(&dev, "u");
         assert_eq!(def.worktree_mode, WorktreeMode::Isolated);
 
-        reg.create("custom".into(), "custom".into()).unwrap();
+        reg.create("custom".into(), "custom".into(), None).unwrap();
         let custom = reg.get("custom").unwrap().clone();
         let custom_def = cli_team_to_definition(&custom, "u");
         assert_eq!(custom_def.worktree_mode, WorktreeMode::Shared);
@@ -1992,5 +2069,104 @@ mod tests {
             delegation_id: "abc123".into(),
         };
         assert!(matches!(p, ExecutionPhase::Executing { .. }));
+    }
+
+    // ── New feature tests ───────────────────────────────────────
+
+    #[test]
+    fn create_with_explicit_coordination() {
+        use astra_services::team_persistence::TeamCoordination;
+        let mut reg = TeamRegistry::new();
+        let coord = Some(TeamCoordination::Pipeline);
+        reg.create("pipe-team".into(), "pipeline team".into(), coord)
+            .unwrap();
+        let team = reg.get("pipe-team").unwrap();
+        assert!(matches!(
+            team.coordination,
+            Some(TeamCoordination::Pipeline)
+        ));
+    }
+
+    #[test]
+    fn explicit_coordination_overrides_inference() {
+        use astra_services::team_persistence::TeamCoordination;
+        let mut team = make_team(&["producer", "reviewer"]);
+        // Without explicit coordination, infer_coordination returns Adversarial
+        assert!(matches!(
+            infer_coordination(&team),
+            TeamCoordination::Adversarial { .. }
+        ));
+        // With explicit Pipeline, cli_team_to_definition should use Pipeline
+        team.coordination = Some(TeamCoordination::Pipeline);
+        let def = cli_team_to_definition(&team, "u");
+        assert!(matches!(
+            def.coordination,
+            TeamCoordination::Pipeline
+        ));
+    }
+
+    #[test]
+    fn merge_from_store_skips_existing() {
+        use astra_services::team_persistence::*;
+        let mut reg = TeamRegistry::new();
+        assert!(reg.get("review").is_some()); // builtin
+
+        let foreign = TeamDefinition {
+            team_id: "foreign-id".into(),
+            user_id: "u".into(),
+            name: "review".into(), // same name as builtin
+            description: "foreign review".into(),
+            coordination: TeamCoordination::Pipeline,
+            members: vec![],
+            context: HashMap::new(),
+            worktree_mode: WorktreeMode::Shared,
+            budget: None,
+            max_parallel: 0,
+            created_at: "2025-01-01T00:00:00Z".into(),
+            updated_at: "2025-01-01T00:00:00Z".into(),
+        };
+        let custom = TeamDefinition {
+            team_id: "custom-id".into(),
+            user_id: "u".into(),
+            name: "from-store".into(),
+            description: "loaded from store".into(),
+            coordination: TeamCoordination::FanOut {
+                aggregation: "merge".into(),
+            },
+            members: vec![TeamMemberDef {
+                role: "worker".into(),
+                agent_id: None,
+                system_prompt: Some("does work".into()),
+                skills: vec![],
+                model_override: None,
+                mcp_servers: vec![],
+                can_delegate: false,
+                max_delegation_depth: 0,
+            }],
+            context: HashMap::new(),
+            worktree_mode: WorktreeMode::Shared,
+            budget: None,
+            max_parallel: 0,
+            created_at: "2025-01-01T00:00:00Z".into(),
+            updated_at: "2025-01-01T00:00:00Z".into(),
+        };
+
+        reg.merge_from_store(vec![foreign, custom]);
+
+        // "review" should NOT be overwritten
+        let review = reg.get("review").unwrap();
+        assert_ne!(review.team_id, "foreign-id");
+
+        // "from-store" should be loaded
+        let loaded = reg.get("from-store").unwrap();
+        assert_eq!(loaded.team_id, "custom-id");
+        assert_eq!(loaded.members.len(), 1);
+        assert_eq!(loaded.members[0].description, "does work");
+    }
+
+    #[test]
+    fn store_loaded_flag_default_false() {
+        let reg = TeamRegistry::new();
+        assert!(!reg.store_loaded);
     }
 }

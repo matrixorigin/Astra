@@ -328,6 +328,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             skill_listing_message: None,
             invoked_skills: HashMap::new(),
             recent_file_reads: Vec::new(),
+            turn_trace_collector: None,
             mailbox: config.mailbox,
             ack_tracker: None,
             dead_letter_queue: None,

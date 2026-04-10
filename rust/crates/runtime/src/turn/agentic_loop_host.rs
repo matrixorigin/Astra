@@ -391,6 +391,11 @@ pub struct AgenticLoopState {
     /// Typically set at session init and shared across agents.
     pub observability_hub:
         Option<std::sync::Arc<crate::observability_integration::ObservabilityHub>>,
+
+    /// Optional turn trace collector for detailed context assembly observability.
+    /// When set, records system prompt, history, memory, and tool selection traces.
+    /// Created at turn start, finalized at turn end.
+    pub turn_trace_collector: Option<crate::turn::turn_trace_collector::TurnTraceCollector>,
 }
 
 /// Consecutive same-category error turns before forcing a strategy change.
@@ -967,6 +972,16 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
             crate::observability_integration::on_turn_start(hub, session_id, &user_id, &state.message);
         }
 
+        // ─── Turn trace collector ──────────────────────────────────────────
+        // Create a collector for detailed context assembly traces.
+        // Observability session presence enables trace collection.
+        if state.observability_session.is_some() && state.turn_trace_collector.is_none() {
+            let turn_id = format!("turn-{}", turn_index);
+            let session_id = state.current_session_id.clone().unwrap_or_default();
+            state.turn_trace_collector =
+                Some(crate::turn::turn_trace_collector::TurnTraceCollector::new(turn_id, session_id));
+        }
+
         if state.permission_handler.is_none()
             && let Some(ctx) = state.permission_context.clone()
         {
@@ -1376,6 +1391,25 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
                 let mut session_guard = session.write().unwrap();
                 crate::observability_integration::on_tool_selection(&mut session_guard, explanation);
             }
+        }
+
+        // ─── Trace collector: record tool selection ──────────────────────
+        if let Some(ref collector) = state.turn_trace_collector {
+            let selected_tools: Vec<String> = turn_result
+                .edge_tool_round
+                .iter()
+                .map(|r| r.tool.clone())
+                .collect();
+            collector.record_tool_selection(
+                &selected_tools,
+                state.first_selector_strategy.as_deref().unwrap_or("unknown"),
+                state.first_selector_confidence.unwrap_or(0.0),
+                state.total_prompt as u32, // budget approximation
+                state.selector_tokens_in,
+                state.selector_tokens_out,
+                state.all_tools_used.len() as u32,
+                state.first_selector_ms.unwrap_or(0),
+            );
         }
 
         // ─── Step 3: Stall preflight ────────────────────────────────────
@@ -2147,6 +2181,31 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
                     crate::observability_integration::on_turn_end(&mut session_guard, timing);
                 }
 
+                // ─── Finalize turn trace collector ────────────────────────
+                // Persist context assembly trace to session journal (best-effort).
+                if let Some(ref collector) = state.turn_trace_collector {
+                    // Record token budget before finalizing.
+                    collector.record_token_budget(
+                        crate::turn::context_assembly_trace::TokenBudgetTrace {
+                            max_tokens: state.max_turn_input_tokens as u32,
+                            system_prompt_tokens: 0, // TODO: measure from host
+                            history_tokens: 0,       // TODO: measure from host  
+                            memory_tokens: 0,        // TODO: measure from host
+                            tool_schema_tokens: 0,   // TODO: measure from host
+                            user_message_tokens: 0,  // TODO: measure from host
+                            total_used: state.total_prompt as u32,
+                            budget_pressure: state.first_budget_pressure,
+                            compression_triggered: false, // TODO: track from host
+                        }
+                    );
+                    // Finalize and persist (errors logged but not propagated).
+                    if let Err(e) = collector.finalize_and_persist(turn_index as u32) {
+                        eprintln!("trace persist: {e}");
+                    }
+                }
+                // Clear collector for next turn.
+                state.turn_trace_collector = None;
+
                 state.step_recorder.end_turn(false);
             }
         }
@@ -2447,6 +2506,7 @@ mod tests {
             skill_listing_message: None,
             invoked_skills: std::collections::HashMap::new(),
             recent_file_reads: Vec::new(),
+            turn_trace_collector: None,
             project_context: None,
             mailbox: None,
             ack_tracker: None,

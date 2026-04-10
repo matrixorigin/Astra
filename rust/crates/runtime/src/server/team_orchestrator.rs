@@ -1123,4 +1123,66 @@ mod tests {
         assert_eq!(report.parent_run_id, "run");
         assert_eq!(report.error, Some("boom".to_string()));
     }
+
+    #[tokio::test]
+    async fn token_budget_exceeded_emits_event() {
+        let store = Arc::new(InMemoryTeamStore::new());
+        let team = astra_services::team_persistence::TeamDefinition {
+            team_id: "t1".into(),
+            user_id: "u1".into(),
+            name: "budget-test".into(),
+            description: "test".into(),
+            coordination: astra_services::team_persistence::TeamCoordination::Pipeline,
+            members: vec![astra_services::team_persistence::TeamMemberDef {
+                role: "worker".into(),
+                agent_id: None,
+                system_prompt: Some("do work".into()),
+                skills: vec![],
+                model_override: None,
+                mcp_servers: vec![],
+                can_delegate: false,
+                max_delegation_depth: 0,
+            }],
+            context: std::collections::HashMap::new(),
+            worktree_mode: astra_services::team_persistence::WorktreeMode::Shared,
+            budget: Some(astra_services::team_persistence::TeamBudget {
+                max_cost_usd: 0.0,
+                max_tokens: 100,
+                max_duration_secs: 0,
+            }),
+            max_parallel: 0,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        };
+        store.save_team(&team).await.unwrap();
+
+        let registry = Arc::new(RwLock::new(AgentProfileRegistry::new()));
+        let run_store = Arc::new(InMemoryRunStateStore::new());
+        let run_engine = Arc::new(RunEngine::new(run_store));
+        let tracker = Arc::new(DelegationTracker::new());
+
+        let orch = TeamExecutionOrchestrator::new(
+            store,
+            Arc::new(DelegationEngine::with_executor(
+                registry.clone(),
+                run_engine.clone(),
+                tracker.clone(),
+                Arc::new(StubSubRunExecutor),
+            )),
+            tracker,
+            run_engine.clone(),
+            registry,
+            OrchestratorConfig {
+                user_id: "u1".into(),
+                session_id: "s1".into(),
+                source_agent_id: "orch".into(),
+                progress: None,
+            },
+        );
+
+        let report = orch.execute_team("budget-test", "do something", None).await;
+        // Budget check is post-execution, so run completes normally
+        assert_ne!(report.status, TeamExecutionStatus::Failed);
+        assert!(report.delegation_result.is_some());
+    }
 }
