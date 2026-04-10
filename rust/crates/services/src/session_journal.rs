@@ -1831,6 +1831,7 @@ impl JournalEvent {
     }
 
     /// Delegation completed event — emitted when all sub-runs finish and results aggregate.
+    #[allow(clippy::too_many_arguments)]
     pub fn delegation_completed(
         session_id: Option<&str>,
         delegation_id: &str,

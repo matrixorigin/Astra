@@ -1345,11 +1345,47 @@ fn print_turn_status_line(state: &ReplState, result: &StreamResult, turn_start: 
         eprintln!("{}", session_line.dim());
     }
 
+    // Context window warning at 70% and 85% budget pressure
+    print_context_window_warning(result.budget_pressure);
+
     let w = crossterm::terminal::size()
         .map(|(c, _)| c as usize)
         .unwrap_or(80);
     let rule = "─".repeat(w.min(72));
     eprintln!("{}", rule.dim());
+}
+
+/// Print a context window warning when budget pressure exceeds thresholds.
+///
+/// - 70-84%: Yellow warning suggesting cleanup or summarization
+/// - 85%+: Red warning indicating risk of context overflow
+fn print_context_window_warning(budget_pressure: f64) {
+    const WARNING_THRESHOLD: f64 = 0.70;
+    const CRITICAL_THRESHOLD: f64 = 0.85;
+
+    if budget_pressure >= CRITICAL_THRESHOLD {
+        let remaining = ((1.0 - budget_pressure) * 100.0).max(0.0);
+        eprintln!(
+            "{}",
+            format!(
+                "  🔴 Context window {:.0}% full ({:.0}% remaining) — consider /compact or starting a new session",
+                budget_pressure * 100.0,
+                remaining
+            )
+            .red()
+        );
+    } else if budget_pressure >= WARNING_THRESHOLD {
+        let remaining = ((1.0 - budget_pressure) * 100.0).max(0.0);
+        eprintln!(
+            "{}",
+            format!(
+                "  🟡 Context window {:.0}% used ({:.0}% remaining) — use /stats context for details",
+                budget_pressure * 100.0,
+                remaining
+            )
+            .yellow()
+        );
+    }
 }
 
 /// Check if the skill improvement tracker should trigger analysis.

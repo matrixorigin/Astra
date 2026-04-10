@@ -325,6 +325,7 @@ fn install_session_panic_hook() {
 /// Install a SIGTERM handler that writes `session_end` and flushes ingestion before exit.
 /// Must be called inside a tokio runtime.
 fn install_sigterm_handler() {
+    // SIGTERM: graceful shutdown (e.g. `kill <pid>`)
     tokio::spawn(async {
         #[cfg(unix)]
         {
@@ -332,12 +333,21 @@ fn install_sigterm_handler() {
             if let Ok(mut sigterm) = signal(SignalKind::terminate()) {
                 sigterm.recv().await;
                 emergency_session_end();
-                // Flush cloud ingestion before exit (best-effort, 15s timeout)
                 if let Some(mc) = SIGTERM_RUNTIME.get() {
                     mc.shutdown_ingestion_and_wait().await;
                 }
                 std::process::exit(0);
             }
+        }
+    });
+    // SIGHUP: terminal closed — write session_end before process dies.
+    #[cfg(unix)]
+    tokio::spawn(async {
+        use tokio::signal::unix::{SignalKind, signal};
+        if let Ok(mut sighup) = signal(SignalKind::hangup()) {
+            sighup.recv().await;
+            emergency_session_end();
+            std::process::exit(0);
         }
     });
 }

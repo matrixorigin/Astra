@@ -33,7 +33,8 @@ pub(crate) fn fuzzy_find_replacement<'a>(
 ) -> Option<FuzzyMatch<'a>> {
     // Cascade through strategies in priority order.
     // Each returns Vec of actual content substrings that match.
-    let strategies: &[(&str, fn(&str, &str) -> Vec<String>)] = &[
+    type Strategy = (&'static str, fn(&str, &str) -> Vec<String>);
+    let strategies: &[Strategy] = &[
         ("line-trimmed", |c, s| line_trimmed_find(c, s)),
         ("block-anchor", |c, s| block_anchor_find(c, s)),
         ("whitespace-normalized", |c, s| {
@@ -91,7 +92,7 @@ fn line_trimmed_find(content: &str, old_str: &str) -> Vec<String> {
     }
 
     // Remove trailing empty line (common in LLM output)
-    if search_lines.last().map_or(false, |l| l.trim().is_empty()) {
+    if search_lines.last().is_some_and(|l| l.trim().is_empty()) {
         search_lines.pop();
     }
     if search_lines.is_empty() {
@@ -134,7 +135,7 @@ fn block_anchor_find(content: &str, old_str: &str) -> Vec<String> {
     }
 
     // Remove trailing empty line
-    if search_lines.last().map_or(false, |l| l.trim().is_empty()) {
+    if search_lines.last().is_some_and(|l| l.trim().is_empty()) {
         search_lines.pop();
     }
     if search_lines.len() < 3 {

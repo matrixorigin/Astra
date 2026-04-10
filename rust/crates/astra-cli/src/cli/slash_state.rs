@@ -155,8 +155,7 @@ pub(super) async fn handle_state_command(
             }
             if !file_reverts.is_empty() {
                 eprintln!(
-                    "  {} Reverted {} file{}:",
-                    "↩",
+                    "  ↩ Reverted {} file{}:",
                     file_reverts.len(),
                     if file_reverts.len() == 1 { "" } else { "s" },
                 );

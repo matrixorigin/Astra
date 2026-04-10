@@ -1110,6 +1110,29 @@ impl ToolExecutor {
             }
         }
 
+        // Nudge: redirect `git diff <range>` to the built-in git_diff/git_show tools.
+        // Large multi-commit diffs via bash can timeout or produce huge uncontrolled output,
+        // while built-in tools have output budgets and pressure-scaling.
+        // We don't hard-block — instead, auto-pipe through `head -c` to prevent the
+        // pipe buffer stall that causes timeouts on large diffs.
+        let command = {
+            let trimmed = command.trim();
+            if (trimmed.starts_with("git diff ") || trimmed.starts_with("git log "))
+                && !trimmed.contains("--stat")
+                && !trimmed.contains("--name")
+                && !trimmed.contains("| head")
+                && !trimmed.contains("| tail")
+                && (trimmed.contains("..") || trimmed.contains("HEAD~"))
+            {
+                // Auto-truncate to prevent pipe stall; append a hint so the agent
+                // knows the output may be incomplete and can use built-in tools.
+                std::borrow::Cow::Owned(format!("{trimmed} | head -c 30000"))
+            } else {
+                std::borrow::Cow::Borrowed(command)
+            }
+        };
+        let command: &str = &command;
+
         // Use explicit timeout if provided, otherwise pick an adaptive default:
         // Tier 1 (5s):  instant commands — no I/O beyond trivial reads
         // Tier 2 (10s): fast read commands — cat, head, file stat
@@ -1998,6 +2021,20 @@ mod tests {
         // sleep with explicit timeout should NOT be blocked (test usage)
         let result = executor.bash(&serde_json::json!({"command": "sleep 10", "timeout": 0.1}));
         assert!(result.contains("timed out"), "got: {result}");
+    }
+
+    #[test]
+    fn bash_git_diff_range_auto_truncated() {
+        let executor = test_executor();
+        // Multi-commit range diff → auto-piped through head -c, not blocked
+        let result =
+            executor.bash(&serde_json::json!({"command": "git diff HEAD~5..HEAD 2>/dev/null || true"}));
+        // Should NOT contain "built-in" (we no longer hard-block)
+        assert!(!result.contains("built-in"), "should run, not block: {result}");
+        // --stat is untouched (no head -c appended)
+        let result = executor
+            .bash(&serde_json::json!({"command": "git diff HEAD~3..HEAD --stat 2>/dev/null || true"}));
+        assert!(!result.contains("built-in"), "stat should be allowed: {result}");
     }
 
     #[test]

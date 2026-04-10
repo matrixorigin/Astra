@@ -59,6 +59,34 @@ pub(super) struct FileState {
     /// reads without disk I/O when mtime is unchanged. Inspired by Claude Code's
     /// FileStateCache content caching.
     pub(super) cached_content: Option<String>,
+    /// Merged line ranges already read (sorted, non-overlapping).
+    /// Used to detect when a new ranged read is fully covered by prior reads.
+    /// Reset on write or mtime change.
+    pub(super) read_ranges: Vec<(u64, u64)>,
+}
+
+/// Merge a new `(start, end)` into a sorted, non-overlapping range list.
+/// Adjacent ranges (e.g. `1..100` + `101..200`) are coalesced.
+fn merge_range(ranges: &mut Vec<(u64, u64)>, start: u64, end: u64) {
+    ranges.push((start, end));
+    ranges.sort_unstable();
+    let mut merged = Vec::with_capacity(ranges.len());
+    for &(s, e) in ranges.iter() {
+        if let Some(last) = merged.last_mut() {
+            let (_, le): &mut (u64, u64) = last;
+            if s <= *le + 1 {
+                *le = (*le).max(e);
+                continue;
+            }
+        }
+        merged.push((s, e));
+    }
+    *ranges = merged;
+}
+
+/// Check if `(start, end)` is fully covered by the merged range list.
+fn ranges_cover(ranges: &[(u64, u64)], start: u64, end: u64) -> bool {
+    ranges.iter().any(|&(s, e)| s <= start && end <= e)
 }
 
 impl ToolExecutor {
@@ -105,9 +133,24 @@ impl ToolExecutor {
             let prev = state.get(path);
             let prev_count = prev.map(|fs| fs.read_count).unwrap_or(0);
             let prev_ranged = prev.map(|fs| fs.ranged_read_count).unwrap_or(0);
-            // Only increment read_count for full (non-partial) reads.
-            // Ranged reads of different sections are expected behavior
-            // (guided by the size gate), not wasteful repetition.
+            // Carry forward read_ranges if mtime unchanged, else reset.
+            let mut ranges = prev
+                .filter(|fs| fs.timestamp_ms == ts)
+                .map(|fs| fs.read_ranges.clone())
+                .unwrap_or_default();
+            // Merge the new range into the list.
+            if let ReadDedupKey::Range {
+                start_line,
+                end_line,
+            } = &last_dedup_key
+            {
+                let s = start_line.unwrap_or(1);
+                let e = end_line.unwrap_or(u64::MAX);
+                merge_range(&mut ranges, s, e);
+            } else if matches!(last_dedup_key, ReadDedupKey::Full) {
+                // Full read covers everything.
+                ranges = vec![(1, u64::MAX)];
+            }
             let new_count = if is_partial {
                 prev_count
             } else {
@@ -128,6 +171,7 @@ impl ToolExecutor {
                     ranged_read_count: new_ranged,
                     last_dedup_key,
                     cached_content,
+                    read_ranges: ranges,
                 },
             );
             enforce_limits(&mut state);
@@ -163,6 +207,7 @@ impl ToolExecutor {
                     ranged_read_count: 0,
                     last_dedup_key: ReadDedupKey::Full,
                     cached_content,
+                    read_ranges: vec![],
                 },
             );
             enforce_limits(&mut state);
@@ -287,6 +332,37 @@ impl ToolExecutor {
                     .map(|fs| fs.from_read && !fs.is_partial && fs.timestamp_ms == current_ts)
             })
             .unwrap_or(false)
+    }
+
+    /// Check if a ranged read is fully covered by previously read ranges
+    /// (file unchanged). Returns true when the requested `start..end` is a
+    /// subset of the union of all prior reads — the content is already in
+    /// the conversation context.
+    pub(super) fn is_range_already_read(
+        &self,
+        path: &Path,
+        start: u64,
+        end: u64,
+    ) -> bool {
+        if std::env::var("MO_DEDUP_DISABLED").is_ok_and(|v| v == "1" || v == "true") {
+            return false;
+        }
+        let current_ts = Self::file_mtime_ms(path);
+        if current_ts == 0 {
+            return false;
+        }
+        self.file_state
+            .lock()
+            .ok()
+            .and_then(|s| {
+                s.get(path).and_then(|fs| {
+                    (fs.from_read
+                        && fs.timestamp_ms == current_ts
+                        && ranges_cover(&fs.read_ranges, start, end))
+                    .then_some(())
+                })
+            })
+            .is_some()
     }
 
     /// How many times this file has been read in the current session.

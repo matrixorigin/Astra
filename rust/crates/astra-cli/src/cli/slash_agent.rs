@@ -1282,9 +1282,7 @@ fn load_delegation_events(
     session_id: Option<&str>,
     query: &str,
 ) -> Option<(String, Vec<session_journal::JournalEvent>)> {
-    let Some(session_id) = session_id else {
-        return None;
-    };
+    let session_id = session_id?;
     let delegation_id = find_delegation_entry(Some(session_id), query)?.delegation_id;
     let Ok(events) = session_journal::read_journal(session_id) else {
         return None;

@@ -250,6 +250,22 @@ impl ToolExecutor {
             );
         }
 
+        // Range-overlap dedup: if the requested line range is fully covered by
+        // the union of all prior reads (and file is unchanged), return a stub.
+        // This catches the pattern where the agent pages through a large file
+        // in different ranges — once all lines have been seen, re-reads are pure waste.
+        if has_range {
+            let s = start_raw.unwrap_or(1);
+            let e = end_raw.unwrap_or(u64::MAX);
+            if self.is_range_already_read(&path, s, e) {
+                return format!(
+                    "[Lines {s}–{e} of {path_str} were already read in earlier requests \
+                     and the file is unchanged. Refer to those earlier read_file results \
+                     instead of re-reading.]"
+                );
+            }
+        }
+
         // Pre-read size gate: check file size before reading.
         // Large files without a line range should use outline or start_line/end_line.
         // Inspired by Claude Code's maxSizeBytes (256KB) pre-read check.
@@ -801,10 +817,11 @@ impl ToolExecutor {
             if let Some(fuzzy_match) =
                 super::fuzzy_replacer::fuzzy_find_replacement(&content, old_str, replace_all)
             {
+                let actual: &str = &fuzzy_match.actual;
                 let new_content = if replace_all {
-                    content.replace(&fuzzy_match.actual, new_str)
+                    content.replace(actual, new_str)
                 } else {
-                    content.replacen(&fuzzy_match.actual, new_str, 1)
+                    content.replacen(actual, new_str, 1)
                 };
                 if dry_run {
                     return unified_diff(&content, &new_content, &path);
@@ -2819,9 +2836,9 @@ type Handler interface {
     }
 
     #[test]
-    fn read_file_nonconsecutive_same_range_not_deduped() {
-        // > AUTO_EXPAND_MAX_BYTES so the second ranged read does not upgrade to a full read
-        // (which would make a third ranged read hit can_dedup_read instead of this scenario).
+    fn read_file_nonconsecutive_same_range_deduped_by_overlap() {
+        // When lines 1-2 and 3-4 have both been read, re-reading 1-2 should
+        // be caught by range-overlap dedup (the content is already in context).
         let dir = tempfile::tempdir().unwrap();
         let file_path = dir.path().join("ab.txt");
         let mut f = std::fs::File::create(&file_path).unwrap();
@@ -2854,10 +2871,37 @@ type Handler interface {
             "end_line": 2
         }));
         assert!(
-            !r_a_again.contains("Same read_file request"),
-            "last read was a different range — should re-fetch lines: {r_a_again}"
+            r_a_again.contains("already read"),
+            "range 1-2 was already read — should stub: {r_a_again}"
         );
-        assert!(r_a_again.contains("MARK_A"));
+    }
+
+    #[test]
+    fn read_file_range_overlap_partial_not_deduped() {
+        // Lines 1-5 read, then request 3-10 — only partially covered, should NOT dedup.
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("partial.txt");
+        let mut f = std::fs::File::create(&file_path).unwrap();
+        for i in 1..=20 {
+            writeln!(f, "line {i}").unwrap();
+        }
+        drop(f);
+
+        let executor = test_executor_in(dir.path());
+        let _ = executor.read_file(&serde_json::json!({
+            "path": "partial.txt",
+            "start_line": 1,
+            "end_line": 5
+        }));
+        let r2 = executor.read_file(&serde_json::json!({
+            "path": "partial.txt",
+            "start_line": 3,
+            "end_line": 10
+        }));
+        assert!(
+            r2.contains("line 6"),
+            "partially overlapping range should return content: {r2}"
+        );
     }
 
     // ── read_file not-found hints ────────────────────────────────────────────
