@@ -113,6 +113,50 @@ pub(super) fn compact_assistant_message(
     out
 }
 
+// ─── User Correction Detection ──────────────────────────────────────────────
+
+/// Correction phrase patterns that indicate user is redirecting/correcting.
+const CORRECTION_PATTERNS: &[&str] = &[
+    "no,",
+    "no i",
+    "that's wrong",
+    "that's not",
+    "i meant",
+    "i mean",
+    "not that",
+    "wrong,",
+    "wrong.",
+    "incorrect",
+    "actually,",
+    "actually i",
+    "instead,",
+    "forget that",
+    "ignore that",
+    "let me clarify",
+    "to clarify",
+    "what i want",
+    "wait,",
+    "hold on",
+    "stop,",
+    "不对",
+    "错了",
+    "不是这样",
+    "我的意思是",
+    "我是说",
+    "等等",
+    "停一下",
+];
+
+/// Detect if a user message appears to be a correction/redirection.
+///
+/// Returns true if the message contains common correction phrases.
+pub(super) fn detect_correction_signal(message: &str) -> bool {
+    let msg_lower = message.to_lowercase();
+    CORRECTION_PATTERNS
+        .iter()
+        .any(|p| msg_lower.contains(p))
+}
+
 // ─── Relevance-scored history pruning ───────────────────────────────────────
 
 /// Lightweight tokenizer for relevance scoring: lowercase, split on
@@ -572,6 +616,15 @@ async fn apply_auto_compact_result(
     for &idx in &kept_indices {
         new_history.push(state.history[idx].clone());
     }
+
+    // Record which turns were compacted for drift detection.
+    // Turns not in kept_indices were compacted.
+    for i in 0..total {
+        if !kept_indices.contains(&i) {
+            state.drift_compressed_turns.push(i as u32);
+        }
+    }
+
     state.history = new_history;
     state.recent_tools.clear();
 
@@ -652,6 +705,18 @@ async fn run_chat_turn(
 ) -> TurnAttempt {
     // Skill selection is handled by the `skill` tool in the agentic loop.
     // The unified_skill_registry provides all skill resolution.
+
+    // ─── Drift Tracking: Record original query on first turn ────────────────
+    if state.drift_original_query.is_none() {
+        state.drift_original_query = Some(message.to_string());
+    }
+
+    // ─── Drift Tracking: Detect user corrections ────────────────────────────
+    // If this message looks like a correction, record the current turn index.
+    if detect_correction_signal(message) {
+        let correction_turn = (state.history.len() / 2) as u32;
+        state.drift_user_corrections.push(correction_turn);
+    }
 
     // Create a cancellation token that can interrupt SSE streaming mid-flight.
     let cancel_token = std::sync::Arc::new(tokio_util::sync::CancellationToken::new());

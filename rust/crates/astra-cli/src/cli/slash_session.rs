@@ -1,5 +1,6 @@
 use std::io::Write;
 
+use astra_runtime::turn::decision_explainer::{DriftCause, DriftDetector, FocusDriftAnalysis};
 use astra_services::{ForkSessionOptions, fork_local_session, session_journal, session_workspace};
 use chrono::{DateTime, Utc};
 
@@ -365,7 +366,7 @@ pub(super) fn handle_session_command(arg: &str, state: &mut ReplState) {
             eprintln!();
             eprintln!(
                 "  {}",
-                "Subcommands: /session history · context · errors · export · list · fork · cleanup · verify"
+                "Subcommands: /session history · context · errors · export · list · fork · cleanup · verify · drift"
                     .dim()
             );
             eprintln!();
@@ -1170,11 +1171,14 @@ pub(super) fn handle_session_command(arg: &str, state: &mut ReplState) {
         "verify" | "sync" | "status" => {
             handle_session_verify(state);
         }
+        "drift" => {
+            handle_session_drift(sub_arg, state);
+        }
         other => {
             eprintln!("{}", format!("  Unknown subcommand: {other}").red());
             eprintln!(
                 "  {}",
-                "Usage: /session [history|context|list|errors|export|fork|cleanup|verify] …".dim()
+                "Usage: /session [history|context|list|errors|export|fork|cleanup|verify|drift] …".dim()
             );
         }
     }
@@ -1859,6 +1863,158 @@ fn format_age_days(d: std::time::Duration) -> String {
 }
 
 // ── Session verify / sync status ────────────────────────────────────────────
+
+/// Analyze and display focus drift in the current session.
+///
+/// Usage: /session drift [--verbose]
+///
+/// Uses the DriftDetector to analyze the conversation history for signs of
+/// focus drift caused by compression, topic shifts, or user corrections.
+fn handle_session_drift(arg: &str, state: &ReplState) {
+    let verbose = arg.contains("--verbose") || arg.contains("-v");
+
+    eprintln!(
+        "\n{}",
+        "─── Focus Drift Analysis ─────────────────────────"
+            .bold()
+            .cyan()
+    );
+
+    // Collect recent user queries from history (first element of each tuple)
+    let user_queries: Vec<String> = state
+        .history
+        .iter()
+        .map(|(user_msg, _assistant_msg)| user_msg.clone())
+        .collect();
+
+    if user_queries.is_empty() {
+        eprintln!("  {} No conversation history yet.", theme::icon_ok());
+        eprintln!();
+        return;
+    }
+
+    // Build detector inputs
+    let original_query = state
+        .drift_original_query
+        .as_deref()
+        .unwrap_or_else(|| user_queries.first().map(|s| s.as_str()).unwrap_or(""));
+    let compressed_turns: Vec<u32> = state.drift_compressed_turns.clone();
+    let user_corrections: Vec<u32> = state.drift_user_corrections.clone();
+
+    // Run analysis
+    let detector = DriftDetector::default();
+    let analysis: FocusDriftAnalysis =
+        detector.analyze(original_query, &user_queries, &compressed_turns, &user_corrections);
+
+    // Display results
+    if analysis.drift_detected {
+        eprintln!(
+            "  {} Focus drift detected (severity: {:.0}%)",
+            theme::icon_warn(),
+            analysis.drift_severity * 100.0
+        );
+
+        if let Some(turn) = analysis.drift_turn {
+            eprintln!("    Likely drift began at turn {}", turn.to_string().yellow());
+        }
+
+        // Show cause
+        let cause_str = match &analysis.likely_cause {
+            DriftCause::HistoryCompression { lost_context, .. } => {
+                let ctx = if lost_context.is_empty() {
+                    "history".to_string()
+                } else if lost_context.len() <= 3 {
+                    lost_context.join(", ")
+                } else {
+                    format!("{} and {} more", lost_context[..3].join(", "), lost_context.len() - 3)
+                };
+                format!("History compression (lost: {})", ctx)
+            }
+            DriftCause::MemoryMiss { expected_but_not_retrieved, .. } => {
+                if expected_but_not_retrieved.is_empty() {
+                    "Memory miss (expected memories not retrieved)".to_string()
+                } else {
+                    format!("Memory miss (expected: {})", expected_but_not_retrieved.join(", "))
+                }
+            }
+            DriftCause::TopicShift { original_topic, new_topic, .. } => {
+                format!("Topic shift ('{}' → '{}')", original_topic, new_topic)
+            }
+            DriftCause::TokenBudgetPressure { budget_available, budget_needed, .. } => {
+                format!("Token budget pressure ({} needed vs {} budget)", budget_needed, budget_available)
+            }
+            DriftCause::AmbiguousInstruction { instruction, .. } => {
+                format!("Ambiguous instruction: {}", instruction)
+            }
+            DriftCause::Unknown => "Unknown cause".to_string(),
+        };
+        eprintln!("    Cause: {}", cause_str.yellow());
+
+        // Show recovery suggestion
+        if !analysis.recovery_suggestion.is_empty() {
+            eprintln!("\n  💡 {}", analysis.recovery_suggestion.green());
+        }
+    } else {
+        eprintln!(
+            "  {} No significant focus drift detected.",
+            theme::icon_ok()
+        );
+    }
+
+    // Show tracked data if verbose
+    if verbose {
+        eprintln!("\n  {}", "Tracked Data".dim());
+        eprintln!("    {:<22} {}", "History turns:".dim(), user_queries.len());
+        eprintln!(
+            "    {:<22} {}",
+            "Compressed turns:".dim(),
+            if compressed_turns.is_empty() {
+                "none".to_string()
+            } else {
+                format!("{:?}", compressed_turns)
+            }
+        );
+        eprintln!(
+            "    {:<22} {}",
+            "User corrections:".dim(),
+            if user_corrections.is_empty() {
+                "none".to_string()
+            } else {
+                format!("{:?}", user_corrections)
+            }
+        );
+        eprintln!(
+            "    {:<22} \"{}\"",
+            "Original query:".dim(),
+            ellipsize(original_query, 50)
+        );
+
+        // Show evidence
+        if !analysis.evidence.is_empty() {
+            eprintln!("\n  {}", "Evidence".dim());
+            for ev in &analysis.evidence {
+                // ev is DriftEvidence { turn, evidence_type, description, confidence }
+                let type_str = match &ev.evidence_type {
+                    astra_runtime::turn::decision_explainer::EvidenceType::ToolCallTopicChange => "topic change",
+                    astra_runtime::turn::decision_explainer::EvidenceType::UserCorrection => "user correction",
+                    astra_runtime::turn::decision_explainer::EvidenceType::ClarificationRequest => "clarification",
+                    astra_runtime::turn::decision_explainer::EvidenceType::TermDisappearance => "term lost",
+                    astra_runtime::turn::decision_explainer::EvidenceType::CompressionLoss => "compression",
+                    astra_runtime::turn::decision_explainer::EvidenceType::MemoryMismatch => "memory miss",
+                };
+                eprintln!(
+                    "    • Turn {}: [{}] {} ({:.0}%)",
+                    ev.turn,
+                    type_str,
+                    ellipsize(&ev.description, 50),
+                    ev.confidence * 100.0
+                );
+            }
+        }
+    }
+
+    eprintln!();
+}
 
 /// Show local journal vs cloud ingestion sync health.
 fn handle_session_verify(state: &ReplState) {

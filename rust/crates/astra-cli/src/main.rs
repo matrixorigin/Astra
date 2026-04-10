@@ -1454,6 +1454,14 @@ struct ReplState {
     root_mailbox: Option<astra_runtime::messaging::router::AgentMailbox>,
     /// Replies received while the REPL is idle at the prompt. Flushed only at safe redraw points.
     pending_idle_agent_messages: Vec<std::sync::Arc<astra_runtime::messaging::AgentMessage>>,
+
+    // ── Drift tracking ──
+    /// Turns where history compaction occurred (for drift detection).
+    drift_compressed_turns: Vec<u32>,
+    /// Turns where user provided correction/redirection (for drift detection).
+    drift_user_corrections: Vec<u32>,
+    /// Original user query at session start (for drift baseline comparison).
+    drift_original_query: Option<String>,
 }
 
 impl Default for ReplState {
@@ -1549,6 +1557,9 @@ impl Default for ReplState {
             agent_spawner: None, // Created lazily when spawn_agent is first used
             root_mailbox: None,
             pending_idle_agent_messages: Vec::new(),
+            drift_compressed_turns: Vec::new(),
+            drift_user_corrections: Vec::new(),
+            drift_original_query: None,
         }
     }
 }
