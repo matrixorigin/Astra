@@ -118,6 +118,8 @@ mod slash_skill;
 mod slash_state;
 #[path = "cli/slash_team.rs"]
 mod slash_team;
+#[path = "cli/slash_experiment.rs"]
+mod slash_experiment;
 #[path = "cli/mock_llm.rs"]
 mod mock_llm;
 #[path = "cli/spawn_subrun.rs"]
@@ -1469,6 +1471,14 @@ struct ReplState {
     /// Session-scoped observability for context tracing (M1).
     observability_session:
         Option<std::sync::Arc<std::sync::RwLock<astra_runtime::observability_integration::ObservabilitySession>>>,
+
+    // ── A/B Testing (M4) ──
+    /// Shared experiment store for A/B testing.
+    experiment_store: std::sync::Arc<std::sync::RwLock<astra_runtime::ab_testing::ExperimentStore>>,
+    /// Active experiment ID for this session (if enrolled).
+    active_experiment_id: Option<String>,
+    /// Active variant ID for this session (if enrolled).
+    active_variant_id: Option<String>,
 }
 
 impl Default for ReplState {
@@ -1575,6 +1585,11 @@ impl Default for ReplState {
             drift_user_corrections: Vec::new(),
             drift_original_query: None,
             observability_session: None, // Created when session starts
+            experiment_store: std::sync::Arc::new(std::sync::RwLock::new(
+                astra_runtime::ab_testing::ExperimentStore::new(),
+            )),
+            active_experiment_id: None,
+            active_variant_id: None,
         }
     }
 }
@@ -6104,6 +6119,16 @@ async fn handle_slash_command(
                 spawner: state.agent_spawner.clone(),
             };
             slash_agent::handle_agent_command(arg, &ctx);
+        }
+
+        "/experiment" => {
+            let ctx = slash_experiment::ExperimentCommandContext {
+                experiment_store: &state.experiment_store,
+                session_id: state.session_id.as_deref(),
+                active_experiment_id: state.active_experiment_id.as_deref(),
+                active_variant_id: state.active_variant_id.as_deref(),
+            };
+            slash_experiment::handle_experiment_command(arg, &ctx);
         }
 
         "/register" | "/login" | "/logout" | "/memory-setup" => {
