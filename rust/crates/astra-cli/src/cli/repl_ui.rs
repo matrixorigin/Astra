@@ -2,8 +2,7 @@ use super::*;
 
 const SLASH_COMMANDS: &[(&str, &str)] = &[
     // ── Core ──────────────────────────────────────────────────────────────
-    ("/help", "Show available commands"),
-    ("/keys", "Keyboard shortcuts"),
+    ("/help", "Show available commands; /help keys for shortcuts"),
     ("/model", "List models or set active: /model <name>"),
     ("/clear", "Start a new session"),
     ("/undo", "Undo last turn(s): /undo [N]"),
@@ -1307,21 +1306,9 @@ pub(super) fn render_slash_overlay(filter: Option<&str>) {
 }
 
 pub(super) fn resolve_slash_command(input: &str) -> Result<&'static str, Vec<&'static str>> {
-    // Canonical aliases: old standalone commands that now route through parent commands
-    const ALIASES: &[(&str, &str)] = &[
-        ("/cost", "/stats"),
-        ("/tools", "/stats"),
-        ("/health", "/stats"),
-        ("/learn", "/stats"),
-    ];
-
     // Direct match in SLASH_COMMANDS
     if let Some((cmd, _)) = SLASH_COMMANDS.iter().find(|(cmd, _)| *cmd == input) {
         return Ok(*cmd);
-    }
-    // Alias match — return the original input so dispatch can route it
-    if let Some((alias, _)) = ALIASES.iter().find(|(alias, _)| *alias == input) {
-        return Ok(*alias);
     }
     let mut matches: Vec<&'static str> = SLASH_COMMANDS
         .iter()
@@ -1383,7 +1370,7 @@ pub(super) fn print_slash_commands(query: Option<&str>) {
             "⚡",
             "Core",
             &[
-                "/help", "/keys", "/model", "/clear", "/undo", "/history", "/copy", "/resume",
+                "/help", "/model", "/clear", "/undo", "/history", "/copy", "/resume",
                 "/exit",
             ],
         ),
@@ -2176,23 +2163,17 @@ mod tests {
         assert_eq!(result.unwrap(), "/stats");
     }
 
-    // ── /tools alias resolves ──────────────────────────────────────────
+    // ── /tools removed from SLASH_COMMANDS ─────────────────────────────
 
     #[test]
-    fn tools_command_is_alias() {
-        // /tools is now an alias for /stats tools, resolved via ALIASES
-        let result = resolve_slash_command("/tools");
-        assert!(result.is_ok(), "/tools should resolve as alias");
-        assert_eq!(result.unwrap(), "/tools");
+    fn tools_command_not_standalone() {
+        // /tools is no longer a standalone command — use /stats tools
+        assert!(!SLASH_COMMANDS.iter().any(|(cmd, _)| *cmd == "/tools"));
     }
 
     #[test]
-    fn tools_resolves_from_prefix() {
-        // /tool prefix no longer uniquely resolves (not in SLASH_COMMANDS)
-        // but /tools still resolves via alias
-        let result = resolve_slash_command("/tools");
-        assert!(result.is_ok(), "got: {result:?}");
-        assert_eq!(result.unwrap(), "/tools");
+    fn stats_command_is_registered() {
+        assert!(SLASH_COMMANDS.iter().any(|(cmd, _)| *cmd == "/stats"));
     }
 
     // ── filtered_slash_rows behavior ──────────────────────────────────────
@@ -2563,13 +2544,24 @@ mod tests {
         // in SLASH_COMMANDS.
         let groups: &[&[&str]] = &[
             &[
-                "/help", "/keys", "/model", "/clear", "/undo", "/history", "/copy", "/resume",
+                "/help", "/model", "/clear", "/undo", "/history", "/copy", "/resume",
                 "/exit",
             ],
             &["/grep", "/diff", "/review"],
             &[
-                "/explain", "/verbose", "/compact", "/reflect", "/turn", "/debug", "/stats",
-                "/telemetry", "/tuning", "/sync", "/context", "/rewind", "/version",
+                "/explain",
+                "/verbose",
+                "/compact",
+                "/reflect",
+                "/turn",
+                "/debug",
+                "/stats",
+                "/telemetry",
+                "/tuning",
+                "/sync",
+                "/context",
+                "/rewind",
+                "/version",
             ],
             &[
                 "/session",

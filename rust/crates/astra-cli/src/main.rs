@@ -3597,8 +3597,6 @@ async fn handle_slash_command(
             }
         }
 
-        "/keys" => print_keyboard_shortcuts(),
-
         "/model" if arg.is_empty() => {
             let Some(tok) = token else {
                 eprintln!("{}", "  Not logged in. Use /login.".yellow());
@@ -3920,21 +3918,8 @@ async fn handle_slash_command(
             slash_stats::handle_stats_command(arg, state).await;
         }
 
-        // Aliases: consolidated into /stats subcommands
-        "/cost" => {
-            slash_stats::handle_stats_command(&format!("cost {arg}").trim(), state).await;
-        }
-
         "/bug" => {
             handle_bug_command(arg, state);
-        }
-
-        "/tools" => {
-            slash_stats::handle_stats_command("tools", state).await;
-        }
-
-        "/health" => {
-            slash_stats::handle_stats_command(&format!("health {arg}").trim(), state).await;
         }
 
         "/sync" => {
@@ -3944,10 +3929,6 @@ async fn handle_slash_command(
         "/diff" => {
             let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
             diff_presenter::run_diff_command(&root, arg, cli_utils::terminal_width_usize());
-        }
-
-        "/learn" => {
-            slash_stats::handle_stats_command(&format!("learn {arg}").trim(), state).await;
         }
 
         "/exit" | "/quit" => {
