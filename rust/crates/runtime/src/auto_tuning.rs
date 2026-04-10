@@ -196,9 +196,15 @@ pub enum EvolutionAction {
         max: Option<f64>,
     },
     /// Set a config value to a specific value.
-    SetConfig { path: String, value: serde_json::Value },
+    SetConfig {
+        path: String,
+        value: serde_json::Value,
+    },
     /// Switch to a different strategy.
-    SwitchStrategy { strategy_key: String, new_value: String },
+    SwitchStrategy {
+        strategy_key: String,
+        new_value: String,
+    },
     /// Enable an A/B experiment.
     EnableExperiment { experiment_id: String },
     /// Disable an A/B experiment.
@@ -206,7 +212,10 @@ pub enum EvolutionAction {
     /// Reset config to default.
     ResetConfig { path: String },
     /// Log an alert (no config change).
-    Alert { message: String, severity: AlertSeverity },
+    Alert {
+        message: String,
+        severity: AlertSeverity,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -289,7 +298,12 @@ impl FeedbackAggregator {
         let signals = self.signals_in_window(window);
         let successes = signals
             .iter()
-            .filter(|s| matches!(s.signal_type, SignalType::TaskSuccess | SignalType::Acceptance))
+            .filter(|s| {
+                matches!(
+                    s.signal_type,
+                    SignalType::TaskSuccess | SignalType::Acceptance
+                )
+            })
             .count();
         let failures = signals
             .iter()
@@ -334,8 +348,22 @@ impl FeedbackAggregator {
 
     /// Check for negative feedback streak.
     pub fn negative_streak(&self) -> u32 {
+        self.negative_streak_since(None)
+    }
+
+    /// Check for negative feedback streak within a time window.
+    pub fn negative_streak_in_window(&self, window: Duration) -> u32 {
+        self.negative_streak_since(Some(SystemTime::now() - window))
+    }
+
+    fn negative_streak_since(&self, cutoff: Option<SystemTime>) -> u32 {
         let mut streak = 0;
         for signal in self.signals.iter().rev() {
+            if let Some(cutoff) = cutoff
+                && signal.timestamp < cutoff
+            {
+                break;
+            }
             let is_negative = matches!(
                 signal.signal_type,
                 SignalType::ThumbsRating { positive: false }
@@ -450,7 +478,13 @@ impl AutoTuningEngine {
 
     /// Enable or disable a rule.
     pub fn set_rule_enabled(&self, rule_id: &str, enabled: bool) -> bool {
-        if let Some(rule) = self.rules.write().unwrap().iter_mut().find(|r| r.id == rule_id) {
+        if let Some(rule) = self
+            .rules
+            .write()
+            .unwrap()
+            .iter_mut()
+            .find(|r| r.id == rule_id)
+        {
             rule.enabled = enabled;
             true
         } else {
@@ -667,7 +701,10 @@ impl AutoTuningEngine {
         let now = SystemTime::now();
 
         match condition {
-            RollbackCondition::SuccessRateDrops { threshold, window_secs } => {
+            RollbackCondition::SuccessRateDrops {
+                threshold,
+                window_secs,
+            } => {
                 let window = Duration::from_secs(*window_secs);
                 // Only evaluate signals after the execution
                 if let Some(rate) = aggregator.success_rate(window) {
@@ -679,7 +716,7 @@ impl AutoTuningEngine {
 
             RollbackCondition::NegativeFeedbackIncreases { count, window_secs } => {
                 let window = Duration::from_secs(*window_secs);
-                aggregator.negative_streak() >= *count
+                aggregator.negative_streak_in_window(window) >= *count
             }
 
             RollbackCondition::TimeLimit { secs } => {
@@ -698,7 +735,12 @@ impl AutoTuningEngine {
         action: &EvolutionAction,
     ) -> (Option<serde_json::Value>, Option<serde_json::Value>) {
         match action {
-            EvolutionAction::AdjustConfig { path, delta, min, max } => {
+            EvolutionAction::AdjustConfig {
+                path,
+                delta,
+                min,
+                max,
+            } => {
                 let prev = get_config_value(config, path);
                 if let Some(prev_val) = prev.as_ref().and_then(|v| v.as_f64()) {
                     let mut new_val = prev_val + delta;
@@ -727,7 +769,8 @@ impl AutoTuningEngine {
                 (None, None)
             }
 
-            EvolutionAction::EnableExperiment { .. } | EvolutionAction::DisableExperiment { .. } => {
+            EvolutionAction::EnableExperiment { .. }
+            | EvolutionAction::DisableExperiment { .. } => {
                 // Would need experiment store integration
                 (None, None)
             }
@@ -752,9 +795,9 @@ impl AutoTuningEngine {
 
 fn get_config_value(config: &RuntimeConfig, path: &str) -> Option<serde_json::Value> {
     match path {
-        "tool_selection.confidence_threshold" => {
-            Some(serde_json::json!(config.tool_selection.confidence_threshold))
-        }
+        "tool_selection.confidence_threshold" => Some(serde_json::json!(
+            config.tool_selection.confidence_threshold
+        )),
         "tool_selection.max_tools" => Some(serde_json::json!(config.tool_selection.max_tools)),
         "token_budget.max_prompt_tokens" => {
             Some(serde_json::json!(config.token_budget.max_prompt_tokens))
@@ -883,11 +926,43 @@ mod tests {
         let mut agg = FeedbackAggregator::new();
 
         agg.record(FeedbackSignal::new(SignalType::TaskSuccess));
-        agg.record(FeedbackSignal::new(SignalType::ThumbsRating { positive: false }));
+        agg.record(FeedbackSignal::new(SignalType::ThumbsRating {
+            positive: false,
+        }));
         agg.record(FeedbackSignal::new(SignalType::Correction));
         agg.record(FeedbackSignal::new(SignalType::Retry { count: 1 }));
 
         assert_eq!(agg.negative_streak(), 3);
+    }
+
+    #[test]
+    fn test_negative_streak_in_window_ignores_older_negatives() {
+        let mut agg = FeedbackAggregator::new();
+
+        let mut old_negative = FeedbackSignal::new(SignalType::Correction);
+        old_negative.timestamp = SystemTime::now() - Duration::from_secs(120);
+        agg.record(old_negative);
+
+        agg.record(FeedbackSignal::new(SignalType::ThumbsRating {
+            positive: false,
+        }));
+        agg.record(FeedbackSignal::new(SignalType::Retry { count: 1 }));
+
+        assert_eq!(agg.negative_streak(), 3);
+        assert_eq!(agg.negative_streak_in_window(Duration::from_secs(30)), 2);
+    }
+
+    #[test]
+    fn test_negative_streak_in_window_stops_at_positive_signal() {
+        let mut agg = FeedbackAggregator::new();
+
+        agg.record(FeedbackSignal::new(SignalType::ThumbsRating {
+            positive: false,
+        }));
+        agg.record(FeedbackSignal::new(SignalType::TaskSuccess));
+        agg.record(FeedbackSignal::new(SignalType::Correction));
+
+        assert_eq!(agg.negative_streak_in_window(Duration::from_secs(60)), 1);
     }
 
     #[test]
@@ -929,10 +1004,12 @@ mod tests {
         ));
 
         // Record negative feedback
-        engine.record_feedback(FeedbackSignal::new(SignalType::ThumbsRating { positive: false }));
+        engine.record_feedback(FeedbackSignal::new(SignalType::ThumbsRating {
+            positive: false,
+        }));
         engine.record_feedback(FeedbackSignal::new(SignalType::Correction));
 
-        let mut config = RuntimeConfig::default();
+        let config = RuntimeConfig::default();
         let triggered = engine.evaluate(&config);
 
         assert_eq!(triggered.len(), 1);
@@ -952,12 +1029,16 @@ mod tests {
             max: Some(0.95),
         };
 
-        let rule = EvolutionRule::new("test", EvolutionTrigger::NegativeFeedbackStreak { count: 1 }, action.clone());
+        let rule = EvolutionRule::new(
+            "test",
+            EvolutionTrigger::NegativeFeedbackStreak { count: 1 },
+            action.clone(),
+        );
         let executions = engine.execute_actions(&mut config, vec![(rule, action)]);
 
         // Verify execution was recorded
         assert_eq!(executions.len(), 1);
-        
+
         // Check the threshold was adjusted
         // Since initial is 0.3, delta is 0.1, but min is 0.5, result should be clamped to 0.5
         let expected = (initial_threshold + 0.1).max(0.5).min(0.95);
@@ -979,8 +1060,14 @@ mod tests {
 
     #[test]
     fn test_signal_type_matching() {
-        assert!(signal_type_matches(&SignalType::Retry { count: 2 }, "retry"));
-        assert!(signal_type_matches(&SignalType::TaskSuccess, "task_success"));
+        assert!(signal_type_matches(
+            &SignalType::Retry { count: 2 },
+            "retry"
+        ));
+        assert!(signal_type_matches(
+            &SignalType::TaskSuccess,
+            "task_success"
+        ));
         assert!(!signal_type_matches(&SignalType::TaskSuccess, "retry"));
     }
 
