@@ -1099,6 +1099,7 @@ impl DelegationEngine {
         result: AgentResult,
         delegation_id: &str,
         parent_run_id: &str,
+        retry_timeout: Option<std::time::Duration>,
         config_builder: impl Fn() -> SubRunConfig,
     ) -> AgentResult {
         let gate = match &self.gate {
@@ -1239,7 +1240,34 @@ impl DelegationEngine {
                         .transition_state(&retry_run_id, SubRunState::Running)
                         .await;
 
-                    match self.executor.execute(retry_config).await {
+                    let retry_cancel = retry_config.cancel_token.clone();
+                    let retry_agent_id = retry_config.agent_profile.agent_id.clone();
+                    let retry_exec = async {
+                        match retry_timeout {
+                            Some(dur) => {
+                                match tokio::time::timeout(dur, self.executor.execute(retry_config))
+                                    .await
+                                {
+                                    Ok(r) => r,
+                                    Err(_) => Err(format!(
+                                        "agent {} exceeded retry timeout of {}s",
+                                        retry_agent_id,
+                                        dur.as_secs()
+                                    )),
+                                }
+                            }
+                            None => self.executor.execute(retry_config).await,
+                        }
+                    };
+
+                    match if let Some(token) = retry_cancel {
+                        tokio::select! {
+                            r = retry_exec => r,
+                            _ = token.cancelled() => Err("cancelled by budget timeout".to_string()),
+                        }
+                    } else {
+                        retry_exec.await
+                    } {
                         Ok(r) => {
                             // Transition retry to Running→Completed/Failed
                             self.tracker
@@ -1778,35 +1806,41 @@ impl DelegationEngine {
                 // Build retry config from stored template
                 let template = retry_templates.get(&result.agent_id).cloned();
                 let gated = self
-                    .apply_gate(result, &did, &request.parent_run_id, || {
-                        let (profile, task, sess, uid, ctx) =
-                            template.clone().unwrap_or_else(|| {
-                                (
-                                    AgentProfile::new(
-                                        "stub",
-                                        "stub",
-                                        astra_services::coordination::AgentTier::User,
-                                    ),
-                                    String::new(),
-                                    String::new(),
-                                    String::new(),
-                                    HashMap::new(),
-                                )
-                            });
-                        SubRunConfig {
-                            run_id: uuid::Uuid::new_v4().to_string(),
-                            agent_profile: profile,
-                            task,
-                            session_id: sess,
-                            user_id: uid,
-                            previous_output: None,
-                            context: ctx,
-                            pause_flag: None,
-                            checkpoint_gate: None,
-                            mailbox: None,
-                            cancel_token: cancel_for_retry.clone(),
-                        }
-                    })
+                    .apply_gate(
+                        result,
+                        &did,
+                        &request.parent_run_id,
+                        per_agent_timeout,
+                        || {
+                            let (profile, task, sess, uid, ctx) =
+                                template.clone().unwrap_or_else(|| {
+                                    (
+                                        AgentProfile::new(
+                                            "stub",
+                                            "stub",
+                                            astra_services::coordination::AgentTier::User,
+                                        ),
+                                        String::new(),
+                                        String::new(),
+                                        String::new(),
+                                        HashMap::new(),
+                                    )
+                                });
+                            SubRunConfig {
+                                run_id: uuid::Uuid::new_v4().to_string(),
+                                agent_profile: profile,
+                                task,
+                                session_id: sess,
+                                user_id: uid,
+                                previous_output: None,
+                                context: ctx,
+                                pause_flag: None,
+                                checkpoint_gate: None,
+                                mailbox: None,
+                                cancel_token: cancel_for_retry.clone(),
+                            }
+                        },
+                    )
                     .await;
                 gated_results.push(gated);
             }
@@ -2026,6 +2060,7 @@ impl DelegationEngine {
                 let uid = request.user_id.clone();
                 let ctx = request.context.clone();
                 let prev = previous_output.clone();
+                let cancel_for_retry = cancel_token.cloned();
                 let profile_for_retry = reg.get(agent_id).cloned().unwrap_or_else(|| {
                     AgentProfile::new(
                         agent_id,
@@ -2033,8 +2068,12 @@ impl DelegationEngine {
                         astra_services::coordination::AgentTier::User,
                     )
                 });
-                self.apply_gate(result, &delegation_id, &request.parent_run_id, || {
-                    SubRunConfig {
+                self.apply_gate(
+                    result,
+                    &delegation_id,
+                    &request.parent_run_id,
+                    per_stage_timeout,
+                    || SubRunConfig {
                         run_id: uuid::Uuid::new_v4().to_string(),
                         agent_profile: profile_for_retry.clone(),
                         task: task.clone(),
@@ -2045,9 +2084,9 @@ impl DelegationEngine {
                         pause_flag: None,
                         checkpoint_gate: None,
                         mailbox: None,
-                        cancel_token: None,
-                    }
-                })
+                        cancel_token: cancel_for_retry.clone(),
+                    },
+                )
                 .await
             } else {
                 result
@@ -2282,20 +2321,27 @@ impl DelegationEngine {
                 let uid = request.user_id.clone();
                 let ctx = request.context.clone();
                 let prev = last_producer_output.clone();
+                let cancel_for_retry = cancel_token.cloned();
                 let pp = producer_profile.clone();
-                self.apply_gate(prod_result, &did, &request.parent_run_id, || SubRunConfig {
-                    run_id: uuid::Uuid::new_v4().to_string(),
-                    agent_profile: pp.clone(),
-                    task: task.clone(),
-                    session_id: sess.clone(),
-                    user_id: uid.clone(),
-                    previous_output: prev.clone(),
-                    context: ctx.clone(),
-                    pause_flag: None,
-                    checkpoint_gate: None,
-                    mailbox: None,
-                    cancel_token: None,
-                })
+                self.apply_gate(
+                    prod_result,
+                    &did,
+                    &request.parent_run_id,
+                    per_round_timeout,
+                    || SubRunConfig {
+                        run_id: uuid::Uuid::new_v4().to_string(),
+                        agent_profile: pp.clone(),
+                        task: task.clone(),
+                        session_id: sess.clone(),
+                        user_id: uid.clone(),
+                        previous_output: prev.clone(),
+                        context: ctx.clone(),
+                        pause_flag: None,
+                        checkpoint_gate: None,
+                        mailbox: None,
+                        cancel_token: cancel_for_retry.clone(),
+                    },
+                )
                 .await
             } else {
                 prod_result
@@ -4878,6 +4924,33 @@ mod tests {
         }
     }
 
+    /// Executor that succeeds immediately on the first call, then sleeps on retry.
+    #[derive(Clone)]
+    struct RetrySlowExecutor {
+        retry_delay: std::time::Duration,
+        calls: Arc<std::sync::atomic::AtomicU32>,
+    }
+
+    #[async_trait::async_trait]
+    impl SubRunExecutor for RetrySlowExecutor {
+        async fn execute(&self, config: SubRunConfig) -> Result<AgentResult, String> {
+            let call = self.calls.fetch_add(1, Ordering::Relaxed);
+            if call > 0 {
+                tokio::time::sleep(self.retry_delay).await;
+            }
+            Ok(AgentResult {
+                agent_id: config.agent_profile.agent_id.clone(),
+                run_id: config.run_id.clone(),
+                status: "completed".into(),
+                output: Some(format!("retry-slow output for {}", config.task)),
+                error: None,
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                tool_calls: 0,
+            })
+        }
+    }
+
     #[tokio::test]
     async fn fan_out_per_agent_timeout_enforced() {
         let slow = Arc::new(SlowExecutor {
@@ -4919,6 +4992,52 @@ mod tests {
         assert!(
             elapsed.as_secs() < 3,
             "timeout should cut execution short, took {}s",
+            elapsed.as_secs()
+        );
+    }
+
+    #[tokio::test]
+    async fn gate_retry_timeout_enforced() {
+        let retry_slow = Arc::new(RetrySlowExecutor {
+            retry_delay: std::time::Duration::from_secs(5),
+            calls: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        });
+        let (reg, engine, tracker, _) = setup_with_executor(retry_slow.clone());
+        let de = DelegationEngine::with_executor(reg, engine, tracker, retry_slow)
+            .with_gate(Arc::new(FailThenPassGate::new(1)));
+
+        let req = DelegationRequest {
+            delegation_id: "gate-timeout".into(),
+            parent_run_id: "p".into(),
+            task: "gated slow retry".into(),
+            pattern: CoordinationPattern::Sequential {
+                agent_ids: vec!["coder".into()],
+                stop_on_success: false,
+                timeout_sec: 1,
+            },
+            user_id: "u".into(),
+            depth: 0,
+            context: HashMap::new(),
+        };
+
+        let start = std::time::Instant::now();
+        let result = de.execute(req, "orch", None).await.unwrap();
+        let elapsed = start.elapsed();
+
+        assert_eq!(result.agent_results.len(), 1);
+        assert_eq!(result.agent_results[0].status, "failed");
+        assert!(
+            result.agent_results[0]
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("timeout"),
+            "expected retry timeout error, got: {:?}",
+            result.agent_results[0].error
+        );
+        assert!(
+            elapsed.as_secs() < 3,
+            "retry timeout should cut execution short, took {}s",
             elapsed.as_secs()
         );
     }
