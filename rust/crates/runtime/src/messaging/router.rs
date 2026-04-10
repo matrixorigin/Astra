@@ -582,6 +582,7 @@ mod tests {
     #[tokio::test]
     async fn request_permission_preserves_unrelated_messages() {
         use crate::orchestration::permission_sync::{PermissionRequest, PermissionResponse};
+        use crate::server::delegation_engine::SubRunState;
 
         let transport = Arc::new(InProcessTransport::new());
         let dt = tracker();

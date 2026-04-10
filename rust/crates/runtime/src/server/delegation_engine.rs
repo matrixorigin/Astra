@@ -450,7 +450,13 @@ impl DelegationTracker {
                 delegation_id: delegation_id.clone(),
                 agent_id: rec.agent_id.clone().unwrap_or_default(),
                 depth: 0, // Depth not stored in DB; 0 is safe for recovered records
-                state: SubRunState::from_str(&rec.status).unwrap_or(SubRunState::Failed),
+                state: SubRunState::from_str(&rec.status).unwrap_or_else(|| {
+                    eprintln!(
+                        "[delegation-tracker] unknown status '{}' for run '{}', defaulting to Failed",
+                        rec.status, rec.run_id
+                    );
+                    SubRunState::Failed
+                }),
                 retry_of: None,
             };
 
@@ -545,6 +551,18 @@ impl DelegationTracker {
             for record in records {
                 if record.run_id == run_id {
                     return Some(record.agent_id.clone());
+                }
+            }
+        }
+        None
+    }
+
+    /// Get the current state of a sub-run by its run_id.
+    pub async fn get_sub_run_state(&self, run_id: &str) -> Option<SubRunState> {
+        for records in self.delegations.read().await.values() {
+            for record in records {
+                if record.run_id == run_id {
+                    return Some(record.state);
                 }
             }
         }
@@ -755,10 +773,32 @@ impl DelegationTracker {
 
     /// Bulk cleanup after a full delegation completes.
     ///
-    /// Removes progress tracking entry for a completed delegation.
-    /// Pause flags are intentionally retained — they are cheap (AtomicBool)
-    /// and may be inspected after execution completes.
+    /// Cleans up all tracking state for a completed delegation:
+    /// progress entries, pause flags, parent mappings, and delegation records.
+    /// Call after the delegation lifecycle is fully complete.
     pub async fn cleanup_delegation(&self, delegation_id: &str) {
+        // Gather run_ids before cleanup
+        let records = self.get_sub_runs(delegation_id).await;
+        let run_ids: Vec<String> = records.iter().map(|r| r.run_id.clone()).collect();
+
+        // Remove pause flags
+        let mut flags = self.pause_flags.write().await;
+        for rid in &run_ids {
+            flags.remove(rid);
+        }
+        drop(flags);
+
+        // Remove parent mappings
+        let mut parents = self.parents.write().await;
+        for rid in &run_ids {
+            parents.remove(rid);
+        }
+        drop(parents);
+
+        // Remove delegation records
+        self.delegations.write().await.remove(delegation_id);
+
+        // Remove progress
         self.progress.write().await.remove(delegation_id);
     }
 
@@ -1043,6 +1083,9 @@ impl DelegationEngine {
 
                     if attempt >= max_retries {
                         // Exhausted retries — mark as verification failure
+                        self.tracker
+                            .complete_sub_run(&current.run_id, SubRunState::VerificationFailed)
+                            .await;
                         astra_core::log_persist!(
                             self.run_engine
                                 .persist_status(
@@ -2360,8 +2403,7 @@ impl DelegationEngine {
         )> = Vec::with_capacity(tasks.len());
         for (i, task) in tasks.iter().enumerate() {
             let run_id = uuid::Uuid::new_v4().to_string();
-            let _ = self
-                .run_engine
+            self.run_engine
                 .start_run_ext(
                     &run_id,
                     &request.user_id,
@@ -2370,7 +2412,7 @@ impl DelegationEngine {
                     Some(&request.delegation_id),
                     Some(agent_id),
                 )
-                .await;
+                .await?;
             self.tracker
                 .record_sub_run(SubRunRecord {
                     run_id: run_id.clone(),
@@ -2585,8 +2627,11 @@ impl DelegationEngine {
     /// yield with status "paused" at the next turn boundary.
     pub async fn pause_delegation(&self, delegation_id: &str) -> usize {
         let count = self.tracker.pause_delegation(delegation_id).await;
-        // Persist pause status for each sub-run
+        // Persist pause status only for non-terminal sub-runs
         for record in self.tracker.get_sub_runs(delegation_id).await {
+            if record.state.is_terminal() {
+                continue;
+            }
             astra_core::log_persist!(
                 self.run_engine
                     .persist_status(
@@ -2610,6 +2655,9 @@ impl DelegationEngine {
     pub async fn resume_delegation(&self, delegation_id: &str) -> usize {
         let count = self.tracker.resume_delegation(delegation_id).await;
         for record in self.tracker.get_sub_runs(delegation_id).await {
+            if record.state.is_terminal() {
+                continue;
+            }
             astra_core::log_persist!(
                 self.run_engine
                     .persist_status(
@@ -2631,6 +2679,14 @@ impl DelegationEngine {
     pub async fn pause_children_of(&self, parent_run_id: &str) -> usize {
         let count = self.tracker.pause_children_of(parent_run_id).await;
         for child_id in self.tracker.get_children(parent_run_id).await {
+            if self
+                .tracker
+                .get_sub_run_state(&child_id)
+                .await
+                .map_or(false, |s| s.is_terminal())
+            {
+                continue;
+            }
             astra_core::log_persist!(
                 self.run_engine
                     .persist_status(&child_id, STATUS_PAUSED, Some("parent_pause"), None)
@@ -2647,6 +2703,14 @@ impl DelegationEngine {
     pub async fn resume_children_of(&self, parent_run_id: &str) -> usize {
         let count = self.tracker.resume_children_of(parent_run_id).await;
         for child_id in self.tracker.get_children(parent_run_id).await {
+            if self
+                .tracker
+                .get_sub_run_state(&child_id)
+                .await
+                .map_or(false, |s| s.is_terminal())
+            {
+                continue;
+            }
             astra_core::log_persist!(
                 self.run_engine
                     .persist_status(&child_id, STATUS_RUNNING, Some("parent_resume"), None)
@@ -3436,37 +3500,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pause_children_of_sets_flags_and_persists() {
+    async fn pause_children_of_sets_flags_but_preserves_terminal_status() {
         let (_, engine, tracker, de) = setup_with_executor(Arc::new(EchoExecutor));
 
         let req = fan_out_request(vec!["coder", "reviewer"]);
         let result = de.execute(req, "orch", None).await.unwrap();
         assert_eq!(result.agent_results.len(), 2);
 
-        // Pause all children of parent-1
+        // Pause all children of parent-1 (sub-runs are already completed)
         let paused = de.pause_children_of("parent-1").await;
         assert_eq!(paused, 2);
 
-        // Verify flags are set
+        // Cooperative flags are set (for use if sub-runs were still running)
         for ar in &result.agent_results {
             assert!(tracker.is_paused(&ar.run_id).await);
-            let run = engine.load_run(&ar.run_id).await.unwrap().unwrap();
-            assert_eq!(run.status, "paused");
         }
 
-        // Resume all children
+        // Durable status is NOT overwritten for terminal sub-runs
+        for ar in &result.agent_results {
+            let run = engine.load_run(&ar.run_id).await.unwrap().unwrap();
+            assert_eq!(run.status, "completed");
+        }
+
+        // Resume clears flags
         let resumed = de.resume_children_of("parent-1").await;
         assert_eq!(resumed, 2);
-
         for ar in &result.agent_results {
             assert!(!tracker.is_paused(&ar.run_id).await);
-            let run = engine.load_run(&ar.run_id).await.unwrap().unwrap();
-            assert_eq!(run.status, "running");
         }
     }
 
     #[tokio::test]
-    async fn pause_delegation_by_id_sets_flags() {
+    async fn pause_delegation_by_id_sets_flags_preserves_terminal_status() {
         let (_, engine, tracker, de) = setup_with_executor(Arc::new(EchoExecutor));
 
         let req = fan_out_request(vec!["coder", "reviewer"]);
@@ -3478,17 +3543,15 @@ mod tests {
         let subs = tracker.get_sub_runs("del-1").await;
         for sub in &subs {
             assert!(tracker.is_paused(&sub.run_id).await);
+            // Durable status preserved — terminal sub-runs not overwritten
             let run = engine.load_run(&sub.run_id).await.unwrap().unwrap();
-            assert_eq!(run.status, "paused");
+            assert_eq!(run.status, "completed");
         }
 
         let resumed = de.resume_delegation("del-1").await;
         assert_eq!(resumed, 2);
-
         for sub in &subs {
             assert!(!tracker.is_paused(&sub.run_id).await);
-            let run = engine.load_run(&sub.run_id).await.unwrap().unwrap();
-            assert_eq!(run.status, "running");
         }
     }
 
@@ -4503,7 +4566,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tracker_cleanup_delegation_removes_progress() {
+    async fn tracker_cleanup_delegation_removes_all_state() {
         let tracker = DelegationTracker::new();
         tracker
             .record_sub_run(SubRunRecord {
@@ -4519,15 +4582,15 @@ mod tests {
 
         let _f1 = tracker.register_pause_flag("r1").await;
         assert!(tracker.get_pause_flag("r1").await.is_some());
-
-        // Init progress
         tracker.init_progress("d1", &["a1".into()]).await;
         assert!(tracker.get_progress("d1").await.is_some());
+        assert_eq!(tracker.get_sub_runs("d1").await.len(), 1);
 
-        // Cleanup removes progress but retains pause flags
         tracker.cleanup_delegation("d1").await;
-        assert!(tracker.get_pause_flag("r1").await.is_some()); // retained
-        assert!(tracker.get_progress("d1").await.is_none()); // cleaned
+        assert!(tracker.get_pause_flag("r1").await.is_none());
+        assert!(tracker.get_progress("d1").await.is_none());
+        assert_eq!(tracker.get_sub_runs("d1").await.len(), 0);
+        assert!(tracker.get_children("parent").await.is_empty());
     }
 
     #[tokio::test]
