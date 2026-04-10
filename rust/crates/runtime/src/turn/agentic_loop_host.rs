@@ -1000,9 +1000,37 @@ fn record_loop_completion_feedback(
             );
         }
     }
-}
 
-/// Run one auto-tuning evaluation cycle if enough turns have elapsed.
+    // ── 5. Skill quality signals ──
+    for (name, entry) in state.skill_quality_tracker.all_entries() {
+        if entry.invocations == 0 {
+            continue;
+        }
+        if entry.failures > 0 {
+            hub.record_feedback(
+                FeedbackSignal::new(SignalType::TaskFailure {
+                    reason: format!(
+                        "skill '{}' failed {}/{} invocations",
+                        name, entry.failures, entry.invocations
+                    ),
+                })
+                .with_turn(&turn_id)
+                .with_context("skill_name", serde_json::json!(name))
+                .with_context(
+                    "skill_success_rate",
+                    serde_json::json!(entry.success_rate()),
+                ),
+            );
+        } else {
+            hub.record_feedback(
+                FeedbackSignal::new(SignalType::TaskSuccess)
+                    .with_turn(&turn_id)
+                    .with_context("skill_name", serde_json::json!(name))
+                    .with_context("skill_invocations", serde_json::json!(entry.invocations)),
+            );
+        }
+    }
+}
 ///
 /// Every `TUNING_CYCLE_INTERVAL` turns, evaluates all registered evolution rules
 /// and applies any triggered actions to the session's RuntimeConfig.
