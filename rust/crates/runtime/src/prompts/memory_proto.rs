@@ -66,6 +66,16 @@ pub const SRC_EXTRACTED: &str = "extracted";
 pub const SRC_SYNTHESIS: &str = "synthesis";
 pub const SRC_SYSTEM: &str = "system";
 
+// ── Memoria trust tiers ──────────────────────────────────────
+/// Verified: direct user-stated/confirmed facts (365-day half-life).
+pub const TIER_VERIFIED: &str = "T1";
+/// Curated: manually curated/corrected memories (180-day half-life).
+pub const TIER_CURATED: &str = "T2";
+/// Inferred: extracted summaries, soft conclusions (60-day half-life).
+pub const TIER_INFERRED: &str = "T3";
+/// Unverified: speculative/reflective hypotheses (30-day half-life).
+pub const TIER_UNVERIFIED: &str = "T4";
+
 /// Provenance metadata attached to memory entries.
 ///
 /// Tracks when, where, and how a memory was created so that sessions
@@ -80,6 +90,8 @@ pub struct EntryMeta {
     pub source: Option<String>,
     /// ISO 8601 timestamp.
     pub created_at: Option<String>,
+    /// Memoria trust tier (T1–T4). Controls confidence decay half-life.
+    pub trust_tier: Option<String>,
 }
 
 impl EntryMeta {
@@ -90,6 +102,23 @@ impl EntryMeta {
             turn: Some(turn),
             source: Some(source.to_string()),
             created_at: Some(chrono::Utc::now().to_rfc3339()),
+            trust_tier: None,
+        }
+    }
+
+    /// Build metadata with an explicit trust tier.
+    pub fn from_session_with_tier(
+        session_id: Option<&str>,
+        turn: u32,
+        source: &str,
+        trust_tier: &str,
+    ) -> Self {
+        Self {
+            session_id: session_id.map(|s| s.to_string()),
+            turn: Some(turn),
+            source: Some(source.to_string()),
+            created_at: Some(chrono::Utc::now().to_rfc3339()),
+            trust_tier: Some(trust_tier.to_string()),
         }
     }
 
@@ -158,12 +187,21 @@ impl MemoryEntry {
     ///
     /// The `metadata` field carries session_id, turn, source, and timestamp
     /// so entries can be traced back to their origin for auditing.
+    /// If the metadata includes a trust_tier, it is emitted as a top-level
+    /// field for Memoria's confidence decay system.
     pub fn to_store_payload_with_meta(&self, meta: &EntryMeta) -> serde_json::Value {
-        serde_json::json!({
+        let mut payload = serde_json::json!({
             "content": self.encode(),
             "memory_type": self.memory_type(),
             "metadata": meta.to_json(),
-        })
+        });
+        if let Some(ref tier) = meta.trust_tier {
+            payload["trust_tier"] = serde_json::Value::String(tier.clone());
+        }
+        if let Some(ref sid) = meta.session_id {
+            payload["session_id"] = serde_json::Value::String(sid.clone());
+        }
+        payload
     }
 
     /// Build a JSON payload for purging entries by namespace tag.
@@ -405,6 +443,7 @@ mod tests {
             turn: Some(2),
             source: Some("user".into()),
             created_at: Some("2025-01-01T00:00:00Z".into()),
+            trust_tier: None,
         };
         let j = m.to_json();
         assert_eq!(j["session_id"], "s1");
@@ -514,10 +553,44 @@ mod tests {
             turn: Some(1),
             source: Some("user".into()),
             created_at: None,
+            trust_tier: None,
         };
         let p = e.to_store_payload_with_meta(&meta);
         assert_eq!(p["metadata"]["session_id"], "s1");
         assert_eq!(p["metadata"]["turn"], 1);
+    }
+
+    #[test]
+    fn to_store_payload_with_meta_includes_trust_tier() {
+        let e = MemoryEntry::new("fact", "semantic", "Rust is fast");
+        let meta = EntryMeta::from_session_with_tier(
+            Some("s1"),
+            3,
+            SRC_USER,
+            TIER_VERIFIED,
+        );
+        let p = e.to_store_payload_with_meta(&meta);
+        assert_eq!(p["trust_tier"], "T1");
+        assert_eq!(p["session_id"], "s1");
+        assert_eq!(p["metadata"]["source"], "user");
+    }
+
+    #[test]
+    fn to_store_payload_with_meta_omits_trust_tier_when_none() {
+        let e = MemoryEntry::new("task", "pending", "do thing");
+        let meta = EntryMeta::from_session(Some("s1"), 1, SRC_COMPACT);
+        let p = e.to_store_payload_with_meta(&meta);
+        assert!(p.get("trust_tier").is_none());
+        // session_id still emitted from meta
+        assert_eq!(p["session_id"], "s1");
+    }
+
+    #[test]
+    fn tier_constants_are_valid() {
+        assert_eq!(TIER_VERIFIED, "T1");
+        assert_eq!(TIER_CURATED, "T2");
+        assert_eq!(TIER_INFERRED, "T3");
+        assert_eq!(TIER_UNVERIFIED, "T4");
     }
 
     // ──────────────────────────────────────────────────────────

@@ -576,10 +576,11 @@ async fn apply_auto_compact_result(
         prompts::memory_proto::ST_AUTO,
         &summary,
     );
-    let meta = prompts::memory_proto::EntryMeta::from_session(
+    let meta = prompts::memory_proto::EntryMeta::from_session_with_tier(
         state.session_id.as_deref(),
         state.turn,
         prompts::memory_proto::SRC_AUTO_COMPACT,
+        prompts::memory_proto::TIER_INFERRED,
     );
     if let Err(e) = ctx
         .api

@@ -726,7 +726,9 @@ pub fn all_tool_schemas() -> Vec<Value> {
                     "type": "object",
                     "properties": {
                         "content": {"type": "string", "description": "Memory content to store"},
-                        "memory_type": {"type": "string", "description": "Type: semantic (default), profile, procedural, working"}
+                        "memory_type": {"type": "string", "description": "Type: semantic (default), profile, procedural, working"},
+                        "trust_tier": {"type": "string", "description": "Confidence tier: T1 (user-verified, 365d), T2 (curated, 180d), T3 (inferred, 60d), T4 (speculative, 30d). Default T3."},
+                        "session_id": {"type": "string", "description": "Session ID for grouping. Omit to use current session."}
                     },
                     "required": ["content"]
                 }
@@ -741,7 +743,8 @@ pub fn all_tool_schemas() -> Vec<Value> {
                     "type": "object",
                     "properties": {
                         "query": {"type": "string", "description": "Search query"},
-                        "top_k": {"type": "integer", "description": "Max results (default 10)"}
+                        "top_k": {"type": "integer", "description": "Max results (default 10)"},
+                        "min_confidence": {"type": "number", "description": "Minimum confidence threshold 0.0-1.0 (default 0.3). Filters low-quality results."}
                     },
                     "required": ["query"]
                 }

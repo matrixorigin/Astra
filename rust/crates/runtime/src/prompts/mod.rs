@@ -652,6 +652,7 @@ mod tests {
             turn: Some(3),
             source: Some("compact".into()),
             created_at: Some("2025-01-01T00:00:00Z".into()),
+            trust_tier: None,
         };
         let j = meta.to_json();
         assert_eq!(j["session_id"], "s1");
@@ -677,6 +678,7 @@ mod tests {
             turn: Some(7),
             source: Some(SRC_USER.into()),
             created_at: Some("2025-06-01T12:00:00Z".into()),
+            trust_tier: None,
         };
         let payload = entry.to_store_payload_with_meta(&meta);
         assert_eq!(payload["content"], "[@task/pending] Review PR");
@@ -692,6 +694,26 @@ mod tests {
         let entry = MemoryEntry::new(NS_FACT, ST_ACTIVE, "Rust is fast");
         let payload = entry.to_store_payload();
         assert!(payload.get("metadata").is_none());
+        assert!(payload.get("trust_tier").is_none());
+    }
+
+    #[test]
+    fn store_payload_with_trust_tier_emits_top_level_field() {
+        use memory_proto::*;
+        let entry = MemoryEntry::new(NS_FACT, ST_ACTIVE, "User prefers Rust");
+        let meta = EntryMeta::from_session_with_tier(
+            Some("sess-1"),
+            1,
+            SRC_USER,
+            TIER_VERIFIED,
+        );
+        let payload = entry.to_store_payload_with_meta(&meta);
+        // trust_tier is top-level for Memoria API
+        assert_eq!(payload["trust_tier"], "T1");
+        // session_id also top-level
+        assert_eq!(payload["session_id"], "sess-1");
+        // metadata still has provenance
+        assert_eq!(payload["metadata"]["source"], "user");
     }
 
     // ── Task type detection tests ──
