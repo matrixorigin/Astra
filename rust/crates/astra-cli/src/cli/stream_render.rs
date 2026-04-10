@@ -1130,30 +1130,30 @@ impl StreamRenderState {
                     .unwrap_or(false);
 
                 if auto_expanded {
-                    format!("Read {short_path} (full)")
+                    format!("Reading: {short_path} (full)")
                 } else {
                     match (start, end) {
-                        (Some(s), Some(e)) => format!("Read {short_path} lines {s}-{e}"),
-                        (Some(s), None) => format!("Read {short_path} from line {s}"),
-                        _ => format!("Read {short_path}"),
+                        (Some(s), Some(e)) => format!("Reading: {short_path}:{s}-{e}"),
+                        (Some(s), None) => format!("Reading: {short_path}:{s}-"),
+                        _ => format!("Reading: {short_path}"),
                     }
                 }
             }
             "write_file" => {
                 let path = args.get("path").and_then(Value::as_str).unwrap_or("");
-                format!("Write {}", shorten_path(path, 50))
+                format!("Writing: {}", shorten_path(path, 50))
             }
             "str_replace" | "multi_edit" => {
                 let path = args.get("path").and_then(Value::as_str).unwrap_or("");
-                format!("Edit {}", shorten_path(path, 50))
+                format!("Editing: {}", shorten_path(path, 50))
             }
             "delete_file" => {
                 let path = args.get("path").and_then(Value::as_str).unwrap_or("");
-                format!("Delete {}", shorten_path(path, 50))
+                format!("Deleting: {}", shorten_path(path, 50))
             }
             "list_dir" => {
                 let path = args.get("path").and_then(Value::as_str).unwrap_or(".");
-                format!("List {}", shorten_path(path, 50))
+                format!("Listing: {}", shorten_path(path, 50))
             }
             "grep" => {
                 let pattern = args.get("pattern").and_then(Value::as_str).unwrap_or("");
@@ -1161,16 +1161,16 @@ impl StreamRenderState {
                 let path = args.get("path").and_then(Value::as_str);
                 let short_pattern = truncate_line(pattern, 25);
                 match (glob_filter, path) {
-                    (Some(g), _) => format!("Grep \"{short_pattern}\" in {g}"),
+                    (Some(g), _) => format!("Grep: \"{short_pattern}\" in {g}"),
                     (None, Some(p)) => {
-                        format!("Grep \"{short_pattern}\" in {}", shorten_path(p, 25))
+                        format!("Grep: \"{short_pattern}\" in {}", shorten_path(p, 25))
                     }
-                    _ => format!("Grep \"{short_pattern}\""),
+                    _ => format!("Grep: \"{short_pattern}\""),
                 }
             }
             "glob" => {
                 let pattern = args.get("pattern").and_then(Value::as_str).unwrap_or("");
-                format!("Glob {}", truncate_line(pattern, 50))
+                format!("Glob: {}", truncate_line(pattern, 50))
             }
             "git_status" => "Git status".to_string(),
             "git_log" => {
@@ -1235,42 +1235,42 @@ impl StreamRenderState {
             }
             "web_fetch" => {
                 let url = args.get("url").and_then(Value::as_str).unwrap_or("");
-                format!("Fetch {}", truncate_line(url, 50))
+                format!("Fetching: {}", truncate_line(url, 50))
             }
             "github_get_pr" => {
                 let owner = args.get("owner").and_then(Value::as_str).unwrap_or("");
                 let repo = args.get("repo").and_then(Value::as_str).unwrap_or("");
                 let num = args.get("pr_number").and_then(Value::as_u64).unwrap_or(0);
-                format!("Get PR {owner}/{repo}#{num}")
+                format!("Getting PR: {owner}/{repo}#{num}")
             }
             "github_list_prs" => {
                 let owner = args.get("owner").and_then(Value::as_str).unwrap_or("");
                 let repo = args.get("repo").and_then(Value::as_str).unwrap_or("");
-                format!("List PRs in {owner}/{repo}")
+                format!("Listing PRs: {owner}/{repo}")
             }
             // Memory tools with natural verbs
             "memory_retrieve" => {
                 let query = args.get("query").and_then(Value::as_str).unwrap_or("");
-                format!("Recall \"{}\"", truncate_line(query, 45))
+                format!("Recalling: \"{}\"", truncate_line(query, 45))
             }
             "memory_store" => {
                 let content = args.get("content").and_then(Value::as_str).unwrap_or("");
-                format!("Remember \"{}\"", truncate_line(content, 40))
+                format!("Storing: \"{}\"", truncate_line(content, 40))
             }
             "memory_search" => {
                 let query = args.get("query").and_then(Value::as_str).unwrap_or("");
-                format!("Search memory \"{}\"", truncate_line(query, 40))
+                format!("Searching memory: \"{}\"", truncate_line(query, 40))
             }
-            "memory_purge" => "Forget memory".to_string(),
-            "memory_correct" => "Update memory".to_string(),
-            "memory_profile" => "Check profile".to_string(),
+            "memory_purge" => "Purging memory".to_string(),
+            "memory_correct" => "Correcting memory".to_string(),
+            "memory_profile" => "Checking profile".to_string(),
             // Skill tool — show specific skill name
             "skill" => {
                 let skill_name = args
                     .get("skill_name")
                     .and_then(Value::as_str)
                     .unwrap_or("unknown");
-                format!("Skill {}", truncate_line(skill_name, 45))
+                format!("Running skill: {}", truncate_line(skill_name, 45))
             }
             other if other.starts_with("mcp_") => {
                 // MCP tool names are "mcp_{server}_{tool}" — show as "MCP {server} {tool}"
@@ -1813,9 +1813,9 @@ impl StreamRenderState {
 /// matching the visual weight of built-in tools like Read/Edit/Write.
 pub(crate) fn style_tool_description(tool: &str, description: &str) -> String {
     if tool == "skill" {
-        // "Skill code-review" → bold magenta "Skill" + rest
-        if let Some(rest) = description.strip_prefix("Skill") {
-            return format!("{}{}", "Skill".magenta().bold(), rest);
+        // "Running skill: code-review" → bold magenta "Running skill:" + rest
+        if let Some(rest) = description.strip_prefix("Running skill:") {
+            return format!("{}{}", "Running skill:".magenta().bold(), rest);
         }
     } else if tool.starts_with("mcp_") {
         // "MCP server tool" → bold magenta "MCP" + rest
@@ -2265,12 +2265,12 @@ mod tests {
 
     #[test]
     fn style_skill_description_has_bold_prefix() {
-        let styled = style_tool_description("skill", "Skill code-review");
+        let styled = style_tool_description("skill", "Running skill: code-review");
         // Should contain ANSI codes (bold+magenta) and the skill name
         assert!(styled.contains("code-review"));
-        assert!(styled.contains("Skill"));
+        assert!(styled.contains("Running skill"));
         // Plain text without ANSI should NOT match (it has escape sequences)
-        assert_ne!(styled, "Skill code-review");
+        assert_ne!(styled, "Running skill: code-review");
     }
 
     #[test]
@@ -2283,8 +2283,8 @@ mod tests {
 
     #[test]
     fn style_regular_tool_unchanged() {
-        let styled = style_tool_description("read_file", "Read src/main.rs");
-        assert_eq!(styled, "Read src/main.rs");
+        let styled = style_tool_description("read_file", "Reading: src/main.rs");
+        assert_eq!(styled, "Reading: src/main.rs");
     }
 
     #[test]
@@ -2300,7 +2300,7 @@ mod tests {
         let r = StreamRenderState::new();
         let args = serde_json::json!({"skill_name": "code-review"});
         let desc = r.format_tool_description("skill", &args);
-        assert_eq!(desc, "Skill code-review");
+        assert_eq!(desc, "Running skill: code-review");
     }
 
     #[test]
