@@ -11,6 +11,7 @@
 //! 3. **TieredCompaction** — Delegate to the existing tier-based compactor.
 //! 4. **ReactiveCompact** — Emergency compression triggered by API 413 errors.
 
+use crate::runtime_config::CompressionConfig;
 use serde_json::Value;
 use std::time::{Duration, SystemTime};
 
@@ -136,17 +137,37 @@ impl CompressionPipeline {
         Self { layers: Vec::new() }
     }
 
-    /// Build a pipeline with the default layer stack.
+    /// Build a pipeline with the default layer stack (hardcoded defaults).
     pub fn default_pipeline() -> Self {
+        Self::from_config(&CompressionConfig::default())
+    }
+
+    /// Build a pipeline configured from RuntimeConfig's CompressionConfig.
+    pub fn from_config(config: &CompressionConfig) -> Self {
         let mut p = Self::new();
+
+        // Layer 1: ToolResultTruncation — truncate old tool results
+        // Default age threshold: 1 hour
         p.add_layer(Box::new(ToolResultTruncation::new(
             Duration::from_secs(3600),
-            4000,
-            0.7,
+            config.max_tool_result_length as usize,
+            config.compression_threshold * 0.75, // trigger earlier than main threshold
         )));
-        p.add_layer(Box::new(DuplicateReadElimination::new(0.5)));
-        p.add_layer(Box::new(TieredCompaction::default()));
-        p.add_layer(Box::new(ReactiveCompact));
+
+        // Layer 2: DuplicateReadElimination — stub duplicate file reads
+        p.add_layer(Box::new(DuplicateReadElimination::new(
+            config.compression_threshold * 0.625, // trigger even earlier (0.5 default)
+        )));
+
+        // Layer 3: TieredCompaction — remove/summarize old messages
+        p.add_layer(Box::new(TieredCompaction::new(
+            config.preserve_recent_turns as usize * 2, // turn pairs
+            config.compression_threshold * 0.9375,     // 0.75 default
+        )));
+
+        // Layer 4: ReactiveCompact — emergency compression
+        p.add_layer(Box::new(ReactiveCompact::new(0.95))); // fixed high threshold
+
         p
     }
 
@@ -539,7 +560,24 @@ impl CompressionLayer for TieredCompaction {
 
 /// Emergency compression triggered after API 413 (prompt too long) errors.
 /// More aggressive than tiered: keeps only system + last 4 messages.
-pub struct ReactiveCompact;
+pub struct ReactiveCompact {
+    /// Budget pressure threshold to trigger (very high, ~0.95).
+    trigger_pressure: f64,
+}
+
+impl ReactiveCompact {
+    pub fn new(trigger_pressure: f64) -> Self {
+        Self { trigger_pressure }
+    }
+}
+
+impl Default for ReactiveCompact {
+    fn default() -> Self {
+        Self {
+            trigger_pressure: 0.95,
+        }
+    }
+}
 
 impl CompressionLayer for ReactiveCompact {
     fn name(&self) -> &str {
@@ -559,7 +597,7 @@ impl CompressionLayer for ReactiveCompact {
 
     fn should_trigger(&self, _messages: &[Value], budget: &TokenBudget) -> bool {
         // Only fire under extreme pressure (>95% or explicitly over budget)
-        budget.pressure() > 0.95
+        budget.pressure() > self.trigger_pressure
     }
 
     fn compress(&self, messages: &mut Vec<Value>, _budget: &TokenBudget) -> CompressionResult {
@@ -738,7 +776,7 @@ mod tests {
 
     #[test]
     fn reactive_compact_extreme_pressure() {
-        let layer = ReactiveCompact;
+        let layer = ReactiveCompact::new(0.95);
         let mut msgs = make_messages(20); // 41 messages
         let b = budget(80000, 85000); // 106% pressure
         assert!(layer.should_trigger(&msgs, &b));
