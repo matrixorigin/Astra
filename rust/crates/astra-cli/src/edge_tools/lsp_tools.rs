@@ -508,6 +508,46 @@ impl ToolExecutor {
             .map_err(|e| e.to_string())
     }
 
+    fn execute_lsp_command(&self, operation: &str, command: &Value) -> Result<String, String> {
+        let title = command
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let command_name = command
+            .get("command")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                "selected code action command is missing command identifier".to_string()
+            })?
+            .to_string();
+        let arguments = command
+            .get("arguments")
+            .cloned()
+            .unwrap_or_else(|| Value::Array(Vec::new()));
+        let result = self
+            .passive_lsp
+            .request_workspace(
+                &self.project_root,
+                "workspace/executeCommand",
+                json!({
+                    "command": command_name,
+                    "arguments": arguments,
+                }),
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(json!({
+            "backend": "lsp",
+            "operation": operation,
+            "method": "workspace/executeCommand",
+            "executed": true,
+            "command": command_name,
+            "title": title,
+            "result": result.unwrap_or(Value::Null),
+        })
+        .to_string())
+    }
+
     fn try_active_document_formatting(&self, file: &str) -> Result<Option<Value>, String> {
         let (file_path, uri) = self.ensure_lsp_file_ready(file)?;
         self.passive_lsp.request_for_file(
@@ -1221,18 +1261,24 @@ impl ToolExecutor {
                                     )
                                 }).to_string();
                             };
-                            let Some(workspace_edit) = action.get("edit") else {
-                                return json!({
-                                    "error": "selected code action does not include an editable WorkspaceEdit"
-                                }).to_string();
-                            };
-                            match self.apply_lsp_workspace_edit(
-                                "code_actions",
-                                "textDocument/codeAction",
-                                workspace_edit,
-                            ) {
-                                Ok(applied) => applied,
-                                Err(error) => json!({ "error": error }).to_string(),
+                            if let Some(workspace_edit) = action.get("edit") {
+                                match self.apply_lsp_workspace_edit(
+                                    "code_actions",
+                                    "textDocument/codeAction",
+                                    workspace_edit,
+                                ) {
+                                    Ok(applied) => applied,
+                                    Err(error) => json!({ "error": error }).to_string(),
+                                }
+                            } else if let Some(command) = action.get("command") {
+                                match self.execute_lsp_command("code_actions", command) {
+                                    Ok(executed) => executed,
+                                    Err(error) => json!({ "error": error }).to_string(),
+                                }
+                            } else {
+                                json!({
+                                    "error": "selected code action does not include an editable WorkspaceEdit or executable command"
+                                }).to_string()
                             }
                         }
                         Ok(None) => json!({

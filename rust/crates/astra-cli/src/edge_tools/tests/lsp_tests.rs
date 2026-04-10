@@ -222,7 +222,25 @@ while True:
                         }]
                     }
                 }
+            }, {
+                "title": "Run fake command fix",
+                "kind": "quickfix",
+                "diagnostics": message["params"]["context"]["diagnostics"],
+                "command": {
+                    "title": "Run fake command fix",
+                    "command": "fake.applyCommandFix",
+                    "arguments": [uri]
+                }
             }]
+        })
+    elif method == "workspace/executeCommand":
+        write_frame({
+            "jsonrpc": "2.0",
+            "id": msg_id,
+            "result": {
+                "executedCommand": message["params"]["command"],
+                "arguments": message["params"].get("arguments", [])
+            }
         })
     elif method == "textDocument/completion":
         write_frame({
@@ -1375,6 +1393,45 @@ fn lsp_code_actions_apply_selected_workspace_edit_when_dry_run_false() {
         std::fs::read_to_string(file_path)
             .unwrap()
             .contains("hello_from_second_fix")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+#[serial_test::serial]
+fn lsp_code_actions_execute_selected_command_when_dry_run_false() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname=\"demo\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(
+        dir.path().join("src/lib.rs"),
+        "pub fn hello_from_lsp() {}\n",
+    )
+    .unwrap();
+    let script = fake_lsp_server_script(dir.path());
+    let _guard = EnvGuard::set("ASTRA_RUST_ANALYZER_CMD", script.to_str().unwrap());
+    let exe = ToolExecutor::new(dir.path());
+
+    let result = exe.lsp(&json!({
+        "operation": "code_actions",
+        "file": "src/lib.rs",
+        "line": 1,
+        "column": 8,
+        "action_index": 2,
+        "dry_run": false
+    }));
+    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+
+    assert_eq!(parsed["backend"].as_str(), Some("lsp"));
+    assert_eq!(parsed["method"].as_str(), Some("workspace/executeCommand"));
+    assert_eq!(parsed["executed"].as_bool(), Some(true));
+    assert_eq!(
+        parsed["result"]["executedCommand"].as_str(),
+        Some("fake.applyCommandFix")
     );
 }
 
