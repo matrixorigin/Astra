@@ -197,6 +197,61 @@ use slash_session::resolve_journal_target_session;
 use slash_skill::handle_skill_command;
 use slash_state::{StateCommandContext, handle_state_command};
 
+// ── Startup tracer for --startup-trace ────────────────────────────────────────
+
+/// Simple tracer for measuring startup phase durations.
+struct StartupTracer {
+    enabled: bool,
+    start: std::time::Instant,
+    last: std::time::Instant,
+    phases: Vec<(&'static str, std::time::Duration)>,
+}
+
+impl StartupTracer {
+    fn new() -> Self {
+        let enabled = std::env::var("ASTRA_STARTUP_TRACE")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        let now = std::time::Instant::now();
+        Self {
+            enabled,
+            start: now,
+            last: now,
+            phases: Vec::new(),
+        }
+    }
+
+    fn phase(&mut self, name: &'static str) {
+        if !self.enabled {
+            return;
+        }
+        let now = std::time::Instant::now();
+        let dur = now.duration_since(self.last);
+        self.phases.push((name, dur));
+        self.last = now;
+    }
+
+    fn finish(&self) {
+        if !self.enabled {
+            return;
+        }
+        let total = self.start.elapsed();
+        eprintln!();
+        eprintln!("  {} {}", "⏱".cyan(), "Startup Timing".bold().cyan());
+        eprintln!("  {}", "─".repeat(50).dim());
+        for (name, dur) in &self.phases {
+            let ms = dur.as_millis();
+            let bar = if ms > 100 { "█".repeat((ms / 20) as usize).yellow() } else { "█".repeat((ms / 20).max(1) as usize).dim() };
+            eprintln!("  {:30} {:>6}ms {}", name, ms, bar);
+        }
+        eprintln!("  {}", "─".repeat(50).dim());
+        let total_ms = total.as_millis();
+        let status = if total_ms < 200 { "✓".green() } else if total_ms < 500 { "⚠".yellow() } else { "✗".red() };
+        eprintln!("  {:30} {:>6}ms {}", "Total".bold(), total_ms, status);
+        eprintln!();
+    }
+}
+
 // ── Panic-safe & signal-safe session guard ────────────────────────────────────
 // On panic or SIGTERM, writes a `session_end` event to the local journal
 // so the session file is properly closed even on unexpected crashes.
@@ -348,6 +403,9 @@ struct Cli {
     /// Disable auto-loading of .astra/instructions.md project instructions
     #[arg(long = "no-instructions")]
     no_instructions: bool,
+    /// Print startup timing for each initialization phase
+    #[arg(long = "startup-trace")]
+    startup_trace: bool,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -3985,14 +4043,20 @@ async fn run_chat_repl(
     initial_model: Option<&str>,
     resume_session_id: Option<&str>,
 ) -> Result<(), String> {
+    let mut tracer = StartupTracer::new();
+
     // Try silent auth (validate/refresh token) but don't block entry.
     // If not authenticated, user can still explore — operations that need
     // auth will prompt "Not logged in. Use /login."
     try_silent_auth(api, profile).await;
+    tracer.phase("auth");
 
     let (editor, hist_path) = build_repl_editor()?;
     let mut readline = readline_actor::ReadlineActor::spawn(editor)?;
+    tracer.phase("editor");
+
     let mut state = initialize_repl_state(profile, initial_model);
+    tracer.phase("state_init");
 
     // Install panic hook to write session_end on unexpected crashes.
     install_session_panic_hook();
@@ -4092,6 +4156,7 @@ async fn run_chat_repl(
             Err(e) => eprintln!("⚠ Failed to parse pinned_skills.json: {e}"),
         }
     }
+    tracer.phase("config_load");
 
     // Session-scoped quality tracker: tools that work well get boosted over time
     let quality_tracker = std::sync::Arc::new(std::sync::Mutex::new(
@@ -4106,6 +4171,7 @@ async fn run_chat_repl(
         Some(quality_tracker),
         Some(confidence_calibrator),
     );
+    tracer.phase("tool_selector");
 
     // Load cross-session learning state (entity graph, patterns, calibration, tool health)
     let profile_name = profile.unwrap_or("default");
@@ -4174,6 +4240,8 @@ async fn run_chat_repl(
         let pref_keys = try_cloud_pull_preferences(&mut state).await;
         (cross_session_health_entries, cloud_pull_result, pref_keys)
     };
+    tracer.phase("learning_state");
+
     state.tool_health_entries = cross_session_health_entries.clone();
     if state.synced_tool_health_entries.is_empty() {
         state.synced_tool_health_entries = cross_session_health_entries;
@@ -4220,6 +4288,7 @@ async fn run_chat_repl(
             state.team_store = std::sync::Arc::new(mo_team_store);
         }
     }
+    tracer.phase("matrix_pool");
 
     // Store pipeline learning modules for /learn command and learning feedback loop
     state.pattern_library = Some(pipeline_modules.pattern_library.clone());
@@ -4246,6 +4315,7 @@ async fn run_chat_repl(
             state.model = Some("⚠ none".to_string());
         }
     }
+    tracer.phase("model_check");
 
     print_repl_banner(profile, &state);
 
@@ -4283,11 +4353,16 @@ async fn run_chat_repl(
 
     // Seed dynamic Tab-completion with available skills / MCP servers.
     refresh_dynamic_completions(&state).await;
+    tracer.phase("completions");
 
     // ── Wire multi-agent runtime (delegation + dynamic spawning) ──────────────
     if let Some(token) = current_access_token(profile) {
         initialize_multi_agent_runtime(&mut state, api, token).await;
     }
+    tracer.phase("multi_agent_runtime");
+
+    // Print startup trace summary if enabled
+    tracer.finish();
 
     // ── Main loop ─────────────────────────────────────────────────────────────
     loop {
@@ -5249,8 +5324,16 @@ async fn main() {
         session_name,
         bare,
         no_instructions,
+        startup_trace,
         command,
     } = cli;
+
+    // --startup-trace: enable startup timing
+    if startup_trace {
+        unsafe {
+            std::env::set_var("ASTRA_STARTUP_TRACE", "1");
+        }
+    }
 
     // --bare: set env var for minimal mode
     if bare {
