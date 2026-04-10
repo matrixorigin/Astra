@@ -94,8 +94,8 @@ impl ObservabilitySession {
         let user_id = user_id.into();
         let profile = manager.get_profile(&user_id);
 
-        // Load config with possible A/B variant
-        let mut config = RuntimeConfig::default();
+        // Load config from defaults + file hierarchy + env vars
+        let mut config = RuntimeConfig::load();
         let mut active_variant = None;
         let mut active_experiment_id = None;
 
