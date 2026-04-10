@@ -1931,12 +1931,28 @@ fn spawn_manual_checkpoint_cloud_uploads(
 
 /// User-initiated checkpoint: heavy JSON + composite index first, then session markdown,
 /// journal, and workspace — avoids workspace/checkpoint markdown ahead of failed heavy writes.
-///
-/// Cloud uploads are asynchronous; success line includes **pending cloud sync** when Matrix is enabled.
+#[derive(Debug, Clone)]
+pub(super) struct ManualCheckpointSummary {
+    pub checkpoint_number: u32,
+    pub turn: u32,
+    pub checkpoint_path: std::path::PathBuf,
+    pub heavy_path: std::path::PathBuf,
+    pub cloud_sync_queued: bool,
+}
+
+impl ManualCheckpointSummary {
+    pub fn headline(&self) -> String {
+        format!(
+            "Checkpoint #{} saved (turn {})",
+            self.checkpoint_number, self.turn
+        )
+    }
+}
+
 pub(super) fn create_manual_repl_checkpoint(
     state: &mut ReplState,
     label_arg: &str,
-) -> Result<String, String> {
+) -> Result<ManualCheckpointSummary, String> {
     let sid = state
         .session_id
         .as_deref()
@@ -1970,21 +1986,15 @@ pub(super) fn create_manual_repl_checkpoint(
     let (cp_path, cp_number, cp) =
         persist_manual_session_checkpoint_layer(state, journal, sid, &mut ws, &title)?;
 
-    let cloud_note = if state.matrix_runtime.is_some() {
-        " Pending cloud sync — not awaited in the REPL; success is not printed here (errors are logged)."
-    } else {
-        ""
-    };
-
     spawn_manual_checkpoint_cloud_uploads(state, sid, &cp, next_step, turn, &title, &step_cp);
 
-    Ok(format!(
-        "Saved checkpoint #{} (turn {}) — {}; heavy: {}{cloud_note}",
-        cp_number,
+    Ok(ManualCheckpointSummary {
+        checkpoint_number: cp_number,
         turn,
-        cp_path.display(),
-        heavy_path.display(),
-    ))
+        checkpoint_path: cp_path,
+        heavy_path,
+        cloud_sync_queued: state.matrix_runtime.is_some(),
+    })
 }
 
 #[cfg(test)]
@@ -2429,6 +2439,31 @@ mod tests {
         };
         let step_cp = build_manual_heavy_step_checkpoint(&state, "noop");
         spawn_manual_checkpoint_cloud_uploads(&state, "noop", &cp, 1, 1, "t", &step_cp);
+    }
+
+    #[test]
+    fn create_manual_repl_checkpoint_returns_compact_summary() {
+        let (_tmp, _g) = isolated_sessions_dir();
+        let sid = uuid::Uuid::new_v4().to_string();
+        let journal = session_journal::JournalWriter::new(&sid).unwrap();
+
+        let mut ws = astra_services::session_workspace::WorkspaceMetadata::new(&sid, "test-model");
+        ws.turn_count = 3;
+        astra_services::session_workspace::write_workspace(&ws).unwrap();
+
+        let mut state = ReplState {
+            session_id: Some(sid.clone()),
+            journal: Some(journal),
+            model: Some("test-model".to_string()),
+            ..Default::default()
+        };
+        state.history.push(("hi".into(), "hello".into()));
+
+        let summary = create_manual_repl_checkpoint(&mut state, "").unwrap();
+        assert_eq!(summary.headline(), "Checkpoint #1 saved (turn 3)");
+        assert!(summary.checkpoint_path.exists());
+        assert!(summary.heavy_path.exists());
+        assert!(!summary.cloud_sync_queued);
     }
 
     #[test]

@@ -6146,8 +6146,19 @@ async fn handle_slash_command(
         "/config" => slash_config::handle_config_command(arg),
 
         "/checkpoint" => match create_manual_repl_checkpoint(state, arg) {
-            Ok(msg) => {
-                eprintln!("  {} {}", theme::icon_ok(), msg.green());
+            Ok(summary) => {
+                eprintln!("  {} {}", theme::icon_ok(), summary.headline().green());
+                eprintln!(
+                    "    {}",
+                    format!("session: {}", summary.checkpoint_path.display()).dim()
+                );
+                eprintln!(
+                    "    {}",
+                    format!("heavy:   {}", summary.heavy_path.display()).dim()
+                );
+                if summary.cloud_sync_queued {
+                    eprintln!("    {}", theme::warning("Cloud sync queued in background."));
+                }
             }
             Err(e) => {
                 eprintln!("  {}", e.yellow());
@@ -6438,6 +6449,15 @@ async fn handle_slash_command(
     }
 
     Ok(false)
+}
+
+fn should_clear_picker_submission_echo(line: &str, pending_execute: Option<&str>) -> bool {
+    pending_execute.is_some_and(|cmd| cmd != line)
+}
+
+fn clear_picker_submission_echo() {
+    eprint!("{}\r", theme::CURSOR_UP_CLEAR);
+    let _ = std::io::Write::flush(&mut std::io::stderr());
 }
 
 // ═══════════════════════════════════════════════════════════════ REPL ════
@@ -6901,6 +6921,9 @@ async fn run_chat_repl(
                 }
 
                 if line.starts_with('/') {
+                    if should_clear_picker_submission_echo(&line, pending_execute.as_deref()) {
+                        clear_picker_submission_echo();
+                    }
                     // If Enter was pressed in the picker, the selected command is
                     // stored in pending-execute (captured by readline actor thread).
                     let dispatch_line_owned = pending_execute.unwrap_or_else(|| line.clone());
@@ -8554,6 +8577,23 @@ mod tests {
     }
 
     // ── repl_turn pure functions ──────────────────────────────────────────
+
+    #[test]
+    fn picker_submission_echo_is_cleared_only_when_picker_rewrites_input() {
+        assert!(should_clear_picker_submission_echo(
+            "/",
+            Some("/checkpoint")
+        ));
+        assert!(should_clear_picker_submission_echo(
+            "/chec",
+            Some("/checkpoint")
+        ));
+        assert!(!should_clear_picker_submission_echo("/", None));
+        assert!(!should_clear_picker_submission_echo(
+            "/checkpoint",
+            Some("/checkpoint")
+        ));
+    }
 
     #[test]
     fn build_effective_line_plain() {
