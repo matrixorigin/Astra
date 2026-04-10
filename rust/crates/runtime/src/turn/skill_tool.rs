@@ -721,21 +721,35 @@ pub fn skill_listing_system_message(
         pinned_skills,
     );
 
+    // Build a name→category lookup for skills that have categories
+    let category_by_name: std::collections::HashMap<&str, &str> = skills
+        .iter()
+        .filter_map(|s| s.category.as_ref().map(|c| (s.name.as_str(), c.as_str())))
+        .collect();
+
     let mut lines = Vec::with_capacity(entries.len() + 4);
     lines.push("<available_skills>".to_string());
     for entry in &entries {
-        // Convert "- **name**: desc" to XML format
+        // Convert "- **name**: desc" to XML format with optional category
         let trimmed = entry.trim_start_matches("- ");
         if let Some(colon_pos) = trimmed.find(": ") {
             let name = trimmed[..colon_pos].trim_matches('*');
             let desc = &trimmed[colon_pos + 2..];
+            let category_line = category_by_name
+                .get(name)
+                .map(|c| format!("\n  <category>{c}</category>"))
+                .unwrap_or_default();
             lines.push(format!(
-                "<skill>\n  <name>{name}</name>\n  <description>{desc}</description>\n</skill>"
+                "<skill>\n  <name>{name}</name>{category_line}\n  <description>{desc}</description>\n</skill>"
             ));
         } else {
             // Names-only fallback
             let name = trimmed.trim_matches('*');
-            lines.push(format!("<skill>\n  <name>{name}</name>\n</skill>"));
+            let category_line = category_by_name
+                .get(name)
+                .map(|c| format!("\n  <category>{c}</category>"))
+                .unwrap_or_default();
+            lines.push(format!("<skill>\n  <name>{name}</name>{category_line}\n</skill>"));
         }
     }
     lines.push("</available_skills>".to_string());
@@ -2187,6 +2201,45 @@ mod tests {
         // Should not panic even with CJK content exceeding MAX_LISTING_DESC_CHARS
         let desc = format_skill_description(&skill);
         assert!(desc.ends_with('…'));
+    }
+
+    #[test]
+    fn skill_listing_includes_category_in_xml() {
+        let skills = vec![
+            SkillToolInfo {
+                name: "code-review".into(),
+                description: "Reviews code changes".into(),
+                when_to_use: None,
+                source: SkillSourceKind::Local,
+                aliases: Vec::new(),
+                category: Some("review".into()),
+                tags: Vec::new(),
+                triggers: Vec::new(),
+            },
+            SkillToolInfo {
+                name: "deploy".into(),
+                description: "Deploys to production".into(),
+                when_to_use: None,
+                source: SkillSourceKind::Local,
+                aliases: Vec::new(),
+                category: None, // no category
+                tags: Vec::new(),
+                triggers: Vec::new(),
+            },
+        ];
+        let msg = skill_listing_system_message(&skills, None, None, false);
+        let content = msg["content"].as_str().unwrap();
+        // code-review should have <category>review</category>
+        assert!(content.contains("<name>code-review</name>"));
+        assert!(content.contains("<category>review</category>"));
+        // deploy should NOT have a category tag
+        assert!(content.contains("<name>deploy</name>"));
+        // But the overall content shouldn't have category for deploy
+        let deploy_section = content
+            .split("<skill>")
+            .find(|s| s.contains("deploy"))
+            .unwrap();
+        assert!(!deploy_section.contains("<category>"));
     }
 
     #[tokio::test]
