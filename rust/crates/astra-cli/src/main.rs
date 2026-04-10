@@ -4318,6 +4318,7 @@ async fn run_chat_repl(
     tracer.phase("model_check");
 
     print_repl_banner(profile, &state);
+    tracer.phase("banner");
 
     // Warn if HTTP proxy is set — local service calls bypass it, but users
     // may see confusing 502s when testing with curl/wget.
@@ -4340,6 +4341,7 @@ async fn run_chat_repl(
     if let Some(ref tok) = current_access_token(profile) {
         edge_heartbeat_task = register_and_start_heartbeat(api, tok).await;
     }
+    tracer.phase("edge_heartbeat");
 
     if state.model.as_deref() == Some("⚠ none") {
         eprintln!(
@@ -4351,9 +4353,9 @@ async fn run_chat_repl(
         state.model = None; // reset so chat uses "auto" for actual requests
     }
 
-    // Seed dynamic Tab-completion with available skills / MCP servers.
-    refresh_dynamic_completions(&state).await;
-    tracer.phase("completions");
+    // Skip initial dynamic completion seeding — deferred to first REPL iteration.
+    // This saves ~200ms+ startup time; the completions are seeded lazily on first prompt.
+    tracer.phase("completions_deferred");
 
     // ── Wire multi-agent runtime (delegation + dynamic spawning) ──────────────
     if let Some(token) = current_access_token(profile) {
@@ -4373,6 +4375,7 @@ async fn run_chat_repl(
             finalize_plan_run_task_after_executor(&mut state).await;
         }
         // Refresh Tab-completion data (skills/MCP may change mid-session).
+        // On first iteration, this seeds the initial completions lazily.
         refresh_dynamic_completions(&state).await;
         let current_token = current_access_token(profile);
 

@@ -821,9 +821,12 @@ fn print_startup_logo() {
     use std::time::Duration;
 
     let logo_lines = startup_logo_lines();
+    // Skip animation if ASTRA_STARTUP_TRACE or ASTRA_FAST_STARTUP is set
     let animated = crossterm::terminal::size().is_ok()
         && std::env::var("NO_COLOR").is_err()
-        && std::env::var("CI").is_err();
+        && std::env::var("CI").is_err()
+        && std::env::var("ASTRA_STARTUP_TRACE").is_err()
+        && std::env::var("ASTRA_FAST_STARTUP").is_err();
 
     if animated {
         let delay = Duration::from_millis(28);
