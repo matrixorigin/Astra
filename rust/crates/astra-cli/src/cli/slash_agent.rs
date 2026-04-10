@@ -3,6 +3,7 @@
 //! Subcommands:
 //! - `/agent` or `/agent list`: List all active spawned agents
 //! - `/agent tree`: Show agent delegation tree (parent-child hierarchy)
+//! - `/agent watch`: Watch tree with real-time updates on spawn/complete
 //! - `/agent status <id>`: Show detailed status of an agent
 //! - `/agent permissions <id>`: Show permission details of an agent
 //! - `/agent stop <id>`: Send shutdown request to an agent
@@ -55,6 +56,7 @@ pub fn handle_agent_command(arg: &str, ctx: &AgentCommandContext) {
                 eprintln!("  {}", "Usage: /agent logs <agent_id>".yellow());
             }
         }
+        "watch" => show_watch(ctx),
         "help" | "?" => show_help(),
         _ => {
             eprintln!(
@@ -404,6 +406,111 @@ fn stop_agent(ctx: &AgentCommandContext, agent_id: &str) {
     );
 }
 
+/// Watch agent tree with real-time updates on spawn/complete events.
+/// Throttles rendering to max once per 500ms.
+fn show_watch(ctx: &AgentCommandContext) {
+    use astra_runtime::orchestration::ProgressEventType;
+    use std::time::{Duration, Instant};
+
+    let Some(ref spawner) = ctx.spawner else {
+        eprintln!(
+            "  {}",
+            "No agent spawner available. Use spawn_agent tool to create agents.".dim()
+        );
+        return;
+    };
+
+    let rt = match tokio::runtime::Handle::try_current() {
+        Ok(rt) => rt,
+        Err(_) => {
+            eprintln!("  {}", "No tokio runtime available.".red());
+            return;
+        }
+    };
+
+    eprintln!(
+        "\n  {} Watching agent tree (Ctrl+C to stop)\n",
+        "👁".cyan()
+    );
+
+    // Subscribe to progress events
+    let mut rx = spawner.subscribe_progress();
+    let spawner_clone = spawner.clone();
+
+    rt.block_on(async {
+        let mut last_render = Instant::now() - Duration::from_secs(10); // Allow immediate first render
+        let mut last_agent_count = 0usize;
+        let throttle_interval = Duration::from_millis(500);
+
+        // Render initial tree
+        let agents = spawner_clone.list_all_agents().await;
+        if !agents.is_empty() {
+            let forest = AgentTreeNode::build_forest(&agents);
+            let rendered = render_agent_forest(&forest);
+            eprintln!("  {}", "🌲 Agent Delegation Tree".cyan().bold());
+            eprintln!("  {}", "─".repeat(60).dim());
+            for line in rendered.lines() {
+                eprintln!("  {}", line);
+            }
+            last_agent_count = agents.len();
+            last_render = Instant::now();
+        } else {
+            eprintln!("  {}", "No agents spawned yet. Waiting...".dim());
+        }
+
+        loop {
+            match rx.recv().await {
+                Ok(event) => {
+                    // Only re-render on tree-relevant events
+                    let is_tree_event = matches!(
+                        event.event_type,
+                        ProgressEventType::AgentSpawned { .. }
+                            | ProgressEventType::Completed { .. }
+                            | ProgressEventType::Failed { .. }
+                            | ProgressEventType::Cancelled { .. }
+                    );
+
+                    if is_tree_event {
+                        // Throttle: only render every 500ms
+                        if last_render.elapsed() >= throttle_interval {
+                            let agents = spawner_clone.list_all_agents().await;
+
+                            // Only render if agent count changed (quick check)
+                            if agents.len() != last_agent_count || agents.is_empty() {
+                                // Clear and re-render
+                                eprintln!("\n  {}", "🌲 Agent Delegation Tree".cyan().bold());
+                                eprintln!("  {}", "─".repeat(60).dim());
+
+                                if agents.is_empty() {
+                                    eprintln!("  {}", "(no agents)".dim());
+                                } else {
+                                    let forest = AgentTreeNode::build_forest(&agents);
+                                    let rendered = render_agent_forest(&forest);
+                                    for line in rendered.lines() {
+                                        eprintln!("  {}", line);
+                                    }
+                                }
+
+                                last_agent_count = agents.len();
+                                last_render = Instant::now();
+                            }
+                        }
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    eprintln!("  {}", format!("(skipped {n} events)").dim());
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    eprintln!("  {}", "Event stream closed.".dim());
+                    break;
+                }
+            }
+        }
+    });
+
+    eprintln!();
+}
+
 fn show_logs(ctx: &AgentCommandContext, agent_id: &str) {
     let Some(ref spawner) = ctx.spawner else {
         eprintln!("  {}", "No agent spawner available.".dim());
@@ -597,6 +704,10 @@ fn show_help() {
     eprintln!(
         "  {}  Show delegation tree (hierarchy)",
         "/agent tree".white().bold()
+    );
+    eprintln!(
+        "  {}  Watch tree with real-time updates",
+        "/agent watch".white().bold()
     );
     eprintln!(
         "  {}  Show agent status",
