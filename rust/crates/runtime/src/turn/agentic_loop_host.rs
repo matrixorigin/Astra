@@ -1338,6 +1338,41 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
             }
         }
 
+        // ─── Observability: tool selection hook ──────────────────────────
+        // Record which tools the LLM chose for this turn (before execution).
+        if let Some(session) = &state.observability_session {
+            let selected_tools: Vec<String> = turn_result
+                .edge_tool_round
+                .iter()
+                .map(|r| r.tool.clone())
+                .collect();
+            if !selected_tools.is_empty() {
+                let explanation = crate::turn::decision_explainer::DecisionExplanation {
+                    id: format!("tool-sel-{}-{}", 
+                        state.current_session_id.as_deref().unwrap_or("?"), 
+                        turn_index),
+                    timestamp: std::time::SystemTime::now(),
+                    decision_type: crate::turn::decision_explainer::DecisionType::ToolSelection {
+                        selected_tools: selected_tools.clone(),
+                        total_available: state.all_tools_used.len() as u32,
+                    },
+                    inputs: vec![
+                        crate::turn::decision_explainer::ExplainableInput {
+                            name: "user_query".to_string(),
+                            value: state.message.clone(),
+                            influence: 1.0,
+                            explanation: Some("Primary input driving tool selection".to_string()),
+                        },
+                    ],
+                    reasoning: format!("LLM selected {} tool(s) for this turn", selected_tools.len()),
+                    alternatives: vec![],
+                    confidence: 0.8, // placeholder
+                };
+                let mut session_guard = session.write().unwrap();
+                crate::observability_integration::on_tool_selection(&mut session_guard, explanation);
+            }
+        }
+
         // ─── Step 3: Stall preflight ────────────────────────────────────
         let tool_calls_for_guard = agentic_round_stall_preflight_with_tool_calls(
             turn_index,
@@ -1890,6 +1925,19 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
                         state.recent_file_reads.remove(0);
                     }
                 }
+            }
+        }
+
+        // ─── Observability: tool executed hook ───────────────────────────
+        // Feed tool usage into user profile for pattern learning.
+        if let Some(hub) = &state.observability_hub {
+            let user_id = state
+                .observability_session
+                .as_ref()
+                .map(|s| s.read().unwrap().user_id.clone())
+                .unwrap_or_default();
+            for edge_result in &turn_result.edge_tool_round {
+                crate::observability_integration::on_tool_executed(hub, &user_id, &edge_result.tool);
             }
         }
 
