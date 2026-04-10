@@ -59,6 +59,8 @@ pub struct SubRunConfig {
     pub checkpoint_gate: Option<Arc<dyn CheckpointGate>>,
     /// Optional mailbox for inter-agent messaging during the sub-run.
     pub mailbox: Option<crate::messaging::router::AgentMailbox>,
+    /// Cancellation token — when cancelled, the sub-run should stop gracefully.
+    pub cancel_token: Option<Arc<tokio_util::sync::CancellationToken>>,
 }
 
 impl std::fmt::Debug for SubRunConfig {
@@ -679,6 +681,10 @@ pub struct DelegationEngine {
     gate: Option<Arc<dyn VerificationGate>>,
     /// Optional mailbox router for inter-agent messaging.
     mailbox_router: Option<Arc<AgentMailboxRouter>>,
+    /// Optional cancellation token — when cancelled, spawned sub-runs stop gracefully.
+    /// Uses std::sync::RwLock for interior mutability so the orchestrator can set
+    /// a fresh token per team execution even through an Arc<DelegationEngine>.
+    cancel_token: std::sync::RwLock<Option<Arc<tokio_util::sync::CancellationToken>>>,
 }
 
 impl DelegationEngine {
@@ -698,6 +704,7 @@ impl DelegationEngine {
             executor: Arc::new(StubSubRunExecutor),
             gate: None,
             mailbox_router: None,
+            cancel_token: std::sync::RwLock::new(None),
         }
     }
 
@@ -715,6 +722,7 @@ impl DelegationEngine {
             executor,
             gate: None,
             mailbox_router: None,
+            cancel_token: std::sync::RwLock::new(None),
         }
     }
 
@@ -730,12 +738,26 @@ impl DelegationEngine {
         self
     }
 
+    /// Attach a cancellation token for cooperative shutdown of spawned sub-runs.
+    pub fn with_cancel_token(self, token: Arc<tokio_util::sync::CancellationToken>) -> Self {
+        *self.cancel_token.write().unwrap() = Some(token);
+        self
+    }
+
     /// Dynamically set the verification gate (e.g., per-subtask criteria during plan execution).
     ///
     /// Unlike [`with_gate`] (builder pattern), this mutates the engine in place so callers
     /// can swap gates between delegation calls without rebuilding the engine.
     pub fn set_gate(&mut self, gate: Arc<dyn VerificationGate>) {
         self.gate = Some(gate);
+    }
+
+    /// Dynamically set the cancellation token for cooperative shutdown of spawned sub-runs.
+    ///
+    /// Works through `Arc<DelegationEngine>` (no `&mut self` needed) so the orchestrator
+    /// can create a fresh token per team execution.
+    pub fn set_cancel_token(&self, token: Arc<tokio_util::sync::CancellationToken>) {
+        *self.cancel_token.write().unwrap() = Some(token);
     }
 
     /// Remove the current verification gate (sub-runs will bypass verification).
@@ -756,6 +778,7 @@ impl DelegationEngine {
             executor: self.executor.clone(),
             gate: Some(gate),
             mailbox_router: self.mailbox_router.clone(),
+            cancel_token: std::sync::RwLock::new(self.cancel_token.read().unwrap().clone()),
         }
     }
 
@@ -769,7 +792,13 @@ impl DelegationEngine {
             executor: self.executor.clone(),
             gate: None,
             mailbox_router: self.mailbox_router.clone(),
+            cancel_token: std::sync::RwLock::new(self.cancel_token.read().unwrap().clone()),
         }
+    }
+
+    /// Read the current cancel token snapshot.
+    fn current_cancel_token(&self) -> Option<Arc<tokio_util::sync::CancellationToken>> {
+        self.cancel_token.read().unwrap().clone()
     }
 
     /// Validate a delegation request without executing it.
@@ -1114,6 +1143,7 @@ impl DelegationEngine {
                 pause_flag: Some(pause_flag),
                 checkpoint_gate: None,
                 mailbox,
+                cancel_token: self.current_cancel_token(),
             });
         }
         drop(reg);
@@ -1135,13 +1165,21 @@ impl DelegationEngine {
             let executor = self.executor.clone();
             let run_engine = self.run_engine.clone();
             let sem = semaphore.clone();
+            let cancel = self.current_cancel_token();
             handles.push(tokio::spawn(async move {
                 let _permit = match sem {
                     Some(ref s) => Some(s.acquire().await.expect("semaphore closed")),
                     None => None,
                 };
                 let run_id = config.run_id.clone();
-                let result = executor.execute(config).await;
+                let result = if let Some(ref token) = cancel {
+                    tokio::select! {
+                        r = executor.execute(config) => r,
+                        _ = token.cancelled() => Err("cancelled by budget timeout".to_string()),
+                    }
+                } else {
+                    executor.execute(config).await
+                };
                 // Persist final status
                 match &result {
                     Ok(r) => {
@@ -1227,6 +1265,7 @@ impl DelegationEngine {
                             pause_flag: None,
                             checkpoint_gate: None,
                             mailbox: None,
+                            cancel_token: None,
                         }
                     })
                     .await;
@@ -1256,6 +1295,13 @@ impl DelegationEngine {
         let mut previous_output: Option<String> = None;
 
         for agent_id in agent_ids {
+            // Check cancellation before starting next sequential agent
+            if let Some(ref token) = self.current_cancel_token() {
+                if token.is_cancelled() {
+                    break;
+                }
+            }
+
             let sub_run_id = uuid::Uuid::new_v4().to_string();
             let session_id = request
                 .context
@@ -1335,6 +1381,7 @@ impl DelegationEngine {
                 pause_flag: Some(pause_flag),
                 checkpoint_gate: None,
                 mailbox,
+                cancel_token: self.current_cancel_token(),
             };
 
             let result = match self.executor.execute(config).await {
@@ -1402,6 +1449,7 @@ impl DelegationEngine {
                     pause_flag: None,
                     checkpoint_gate: None,
                     mailbox: None,
+                    cancel_token: None,
                 })
                 .await
             } else {
@@ -1454,6 +1502,13 @@ impl DelegationEngine {
         drop(reg);
 
         for round in 0..max_rounds {
+            // Check cancellation before starting next adversarial round
+            if let Some(ref token) = self.current_cancel_token() {
+                if token.is_cancelled() {
+                    break;
+                }
+            }
+
             // ── Producer sub-run ──
             let prod_run_id = uuid::Uuid::new_v4().to_string();
             let session_id = request
@@ -1528,6 +1583,7 @@ impl DelegationEngine {
                 pause_flag: Some(prod_pause.clone()),
                 checkpoint_gate: None,
                 mailbox: prod_mailbox,
+                cancel_token: self.current_cancel_token(),
             };
             let prod_result = match self.executor.execute(prod_config).await {
                 Ok(r) => {
@@ -1588,6 +1644,7 @@ impl DelegationEngine {
                     pause_flag: None,
                     checkpoint_gate: None,
                     mailbox: None,
+                    cancel_token: None,
                 })
                 .await
             } else {
@@ -1669,6 +1726,7 @@ impl DelegationEngine {
                 pause_flag: Some(rev_pause),
                 checkpoint_gate: None,
                 mailbox: rev_mailbox,
+                cancel_token: self.current_cancel_token(),
             };
             let rev_result = match self.executor.execute(rev_config).await {
                 Ok(r) => {
@@ -1843,17 +1901,28 @@ impl DelegationEngine {
                 pause_flag: Some(pause_flag),
                 checkpoint_gate: None,
                 mailbox: fork_mailbox,
+                cancel_token: self.current_cancel_token(),
             };
 
             let executor = self.executor.clone();
             let run_engine = self.run_engine.clone();
             let sem = fork_semaphore.clone();
+            let cancel_token = config.cancel_token.clone();
             handles.push(tokio::spawn(async move {
                 let _permit = match sem {
                     Some(ref s) => Some(s.acquire().await.expect("semaphore closed")),
                     None => None,
                 };
-                let result = executor.execute(config).await;
+                let result = if let Some(token) = cancel_token {
+                    tokio::select! {
+                        r = executor.execute(config) => r,
+                        _ = token.cancelled() => {
+                            Err("cancelled by budget timeout".to_string())
+                        }
+                    }
+                } else {
+                    executor.execute(config).await
+                };
                 match &result {
                     Ok(r) => {
                         let _ = run_engine
@@ -2733,6 +2802,7 @@ mod tests {
             pause_flag: None,
             checkpoint_gate: None,
             mailbox: None,
+            cancel_token: None,
         };
 
         let result = executor.execute(config).await.unwrap();

@@ -356,21 +356,27 @@ impl TeamExecutionOrchestrator {
             .filter(|b| b.max_duration_secs > 0)
             .map(|b| std::time::Duration::from_secs(b.max_duration_secs));
 
+        // Create a cancellation token for cooperative shutdown of spawned sub-runs.
+        // On budget timeout, we cancel this token so fan-out/fork tasks stop promptly
+        // instead of being orphaned when the delegation future is dropped.
+        let cancel_token = Arc::new(tokio_util::sync::CancellationToken::new());
+        self.delegation_engine
+            .set_cancel_token(cancel_token.clone());
+
         let delegation_future = self
             .delegation_engine
             .execute(effective_request, &self.config.source_agent_id);
 
         let delegation_outcome = match budget_timeout {
-            // TODO: On timeout, tokio::time::timeout drops the future but does NOT cancel
-            // tasks spawned by execute_fan_out / execute_fork via tokio::spawn. Thread a
-            // CancellationToken through OrchestratorConfig → DelegationEngine so sub-agent
-            // tasks can be signaled to stop on budget timeout.
             Some(dur) => match tokio::time::timeout(dur, delegation_future).await {
                 Ok(r) => r,
-                Err(_) => Err(format!(
-                    "team execution exceeded budget timeout of {}s",
-                    dur.as_secs()
-                )),
+                Err(_) => {
+                    cancel_token.cancel();
+                    Err(format!(
+                        "team execution exceeded budget timeout of {}s",
+                        dur.as_secs()
+                    ))
+                }
             },
             None => delegation_future.await,
         };
