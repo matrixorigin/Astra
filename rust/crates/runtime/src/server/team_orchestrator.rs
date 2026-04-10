@@ -274,10 +274,9 @@ impl TeamExecutionOrchestrator {
         );
 
         // Inject budget and max_parallel into request context for downstream consumers.
-        // WARNING: Only `max_duration_secs` is enforced (via tokio::time::timeout below).
-        // `max_tokens` and `max_cost_usd` are serialized here but never read back —
-        // no code extracts "team_budget" from context. TODO: implement token/cost tracking
-        // or remove these fields from TeamBudget to avoid misleading users.
+        // `max_duration_secs` is enforced via tokio::time::timeout + CancellationToken.
+        // `max_tokens` is enforced post-execution (see token budget check below).
+        // `max_cost_usd` is not enforced — no per-model pricing data available yet.
         if let Some(ref budget) = team.budget {
             if let Ok(budget_json) = serde_json::to_value(budget) {
                 effective_request
@@ -486,14 +485,20 @@ impl TeamExecutionOrchestrator {
         let has_conflicts = conflict_count > 0;
 
         let (status, error) = derive_team_status(&delegation_result, conflict_count);
-        let error = if let Some(b) = exceeded_budget {
+        let (status, error) = if let Some(b) = exceeded_budget {
             let msg = format!("token budget exceeded: {total_tokens}/{} tokens", b.max_tokens);
-            Some(match error {
+            let error = Some(match error {
                 Some(e) => format!("{e}; {msg}"),
                 None => msg,
-            })
+            });
+            // Upgrade status: budget exceeded is a partial failure even if agents succeeded
+            let status = match status {
+                TeamExecutionStatus::Completed => TeamExecutionStatus::CompletedWithConflicts,
+                other => other,
+            };
+            (status, error)
         } else {
-            error
+            (status, error)
         };
 
         self.emit_progress(ExecutionPhase::Reporting {

@@ -313,16 +313,18 @@ pub(crate) async fn stream_chat_sse(
     };
 
     // Pre-compute project-level cross-session context (knowledge backflow P2).
-    // TODO: This runs per-turn (stream_chat_sse is called from repl_turn for each message).
-    // Cache in ReplState or ChatTurnParams to avoid redundant git + directory scans per turn.
-    let project_context: Option<String> = {
-        let p2_enabled = std::env::var("MO_SESSION_PROJECT_CONTEXT")
-            .map(|v| v != "0" && v.to_lowercase() != "false")
-            .unwrap_or(true);
-        if !p2_enabled {
-            None
-        } else {
-            // Resolve git root from project_root
+    // Cached per-process via OnceLock since git_root is constant for a session.
+    use std::sync::OnceLock;
+    static PROJECT_CONTEXT_CACHE: OnceLock<Option<String>> = OnceLock::new();
+
+    let project_context: Option<String> = PROJECT_CONTEXT_CACHE
+        .get_or_init(|| {
+            let p2_enabled = std::env::var("MO_SESSION_PROJECT_CONTEXT")
+                .map(|v| v != "0" && v.to_lowercase() != "false")
+                .unwrap_or(true);
+            if !p2_enabled {
+                return None;
+            }
             let git_root = std::process::Command::new("git")
                 .args(["rev-parse", "--show-toplevel"])
                 .current_dir(&project_root)
@@ -345,8 +347,8 @@ pub(crate) async fn stream_chat_sse(
                     if ctx.is_empty() { None } else { Some(ctx) }
                 }
             })
-        }
-    };
+        })
+        .clone();
 
     let mut state = AgenticLoopState {
         messages,

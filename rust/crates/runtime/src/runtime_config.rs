@@ -379,9 +379,10 @@ pub struct TelemetryConfig {
     #[serde(default)]
     pub capture_explanations: bool,
 
-    /// Maximum traces to keep in memory.
-    /// NOTE: Not yet enforced — there is no in-memory trace buffer with a cap.
-    /// Each TurnTraceCollector is per-turn and cleared after persist.
+    /// Maximum traces to keep in memory (reserved for future use).
+    /// Currently traces are per-turn and cleared after persist to journal,
+    /// so no in-memory buffer accumulates. This config will apply if/when
+    /// a diagnostic trace buffer is added for streaming or `/debug traces`.
     #[serde(default = "default_max_traces_in_memory")]
     pub max_traces_in_memory: u32,
 

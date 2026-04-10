@@ -629,9 +629,30 @@ impl TeamPersistenceService for InMemoryTeamStore {
         task: &str,
     ) -> Result<(), String> {
         let mut execs = self.executions.write().map_err(|e| e.to_string())?;
-        // TODO: Add retention limit (e.g., keep last N per team) to prevent unbounded growth.
-        // The in-memory store is session-scoped so impact is limited, but the MatrixOne-backed
-        // store has the same INSERT-only pattern and will grow without bound across restarts.
+
+        // Retain at most 100 completed records per team to prevent unbounded growth.
+        const MAX_COMPLETED_PER_TEAM: usize = 100;
+        let completed_count = execs
+            .iter()
+            .filter(|e| e.team_id == team_id && e.completed_at.is_some())
+            .count();
+        if completed_count >= MAX_COMPLETED_PER_TEAM {
+            // Remove oldest completed records for this team (keep running ones)
+            let mut removed = 0;
+            let to_remove = completed_count - MAX_COMPLETED_PER_TEAM + 1;
+            execs.retain(|e| {
+                if removed < to_remove
+                    && e.team_id == team_id
+                    && e.completed_at.is_some()
+                {
+                    removed += 1;
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+
         execs.push(TeamExecutionRecord {
             execution_id: execution_id.to_string(),
             team_id: team_id.to_string(),
