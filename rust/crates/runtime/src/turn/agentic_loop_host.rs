@@ -1306,6 +1306,20 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
                          Error: {}",
                         state.total_tool_calls, e,
                     );
+                    // ─── Observability: turn end hook (rate limit path) ───
+                    if let Some(ref session) = state.observability_session {
+                        let total_ms = turn_start_time.elapsed().as_millis() as u64;
+                        let timing = crate::observability_integration::TurnTiming {
+                            turn: turn_index as u32,
+                            context_assembly_ms: 0,
+                            ttft_ms: turn_result.ttft_ms.unwrap_or(0) as u64,
+                            llm_total_ms: total_ms,
+                            tool_execution_ms: 0,
+                            total_ms,
+                        };
+                        let mut session_guard = session.write().unwrap();
+                        crate::observability_integration::on_turn_end(&mut session_guard, timing);
+                    }
                     try_write_heavy_checkpoint(state);
                     return Ok(AgenticLoopOutcome::Completed);
                 }
@@ -1335,6 +1349,20 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
                     state.messages.push(prompt);
                     try_write_heavy_checkpoint(state);
                     continue;
+                }
+                // ─── Observability: turn end hook (no tool calls path) ───
+                if let Some(ref session) = state.observability_session {
+                    let total_ms = turn_start_time.elapsed().as_millis() as u64;
+                    let timing = crate::observability_integration::TurnTiming {
+                        turn: turn_index as u32,
+                        context_assembly_ms: 0,
+                        ttft_ms: turn_result.ttft_ms.unwrap_or(0) as u64,
+                        llm_total_ms: total_ms,
+                        tool_execution_ms: 0,
+                        total_ms,
+                    };
+                    let mut session_guard = session.write().unwrap();
+                    crate::observability_integration::on_turn_end(&mut session_guard, timing);
                 }
                 try_write_heavy_checkpoint(state);
                 return Ok(AgenticLoopOutcome::Completed);
@@ -1374,6 +1402,23 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
                             host.emit_headless_line(
                                 HeadlessStderrStyle::Yellow,
                                 "⚠ Token budget exceeded — completing turn.".to_string(),
+                            );
+                        }
+                        // ─── Observability: turn end hook (budget exceeded) ───
+                        if let Some(ref session) = state.observability_session {
+                            let total_ms = turn_start_time.elapsed().as_millis() as u64;
+                            let timing = crate::observability_integration::TurnTiming {
+                                turn: turn_index as u32,
+                                context_assembly_ms: 0,
+                                ttft_ms: turn_result.ttft_ms.unwrap_or(0) as u64,
+                                llm_total_ms: total_ms,
+                                tool_execution_ms: 0,
+                                total_ms,
+                            };
+                            let mut session_guard = session.write().unwrap();
+                            crate::observability_integration::on_turn_end(
+                                &mut session_guard,
+                                timing,
                             );
                         }
                         try_write_heavy_checkpoint(state);
@@ -2172,6 +2217,23 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
                 {
                     Ok(true) => { /* continue */ }
                     Ok(false) => {
+                        // ─── Observability: turn end hook (gate cancelled) ───
+                        if let Some(ref session) = state.observability_session {
+                            let total_ms = turn_start_time.elapsed().as_millis() as u64;
+                            let timing = crate::observability_integration::TurnTiming {
+                                turn: turn_index as u32,
+                                context_assembly_ms: 0,
+                                ttft_ms: turn_result.ttft_ms.unwrap_or(0) as u64,
+                                llm_total_ms: total_ms,
+                                tool_execution_ms: 0,
+                                total_ms,
+                            };
+                            let mut session_guard = session.write().unwrap();
+                            crate::observability_integration::on_turn_end(
+                                &mut session_guard,
+                                timing,
+                            );
+                        }
                         state.step_recorder.end_turn(true);
                         return Ok(AgenticLoopOutcome::Cancelled);
                     }
@@ -2245,7 +2307,7 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
                         turn: turn_index as u32,
                         context_assembly_ms: 0, // TODO: measure separately
                         ttft_ms: turn_result.ttft_ms.unwrap_or(0) as u64,
-                        llm_total_ms,
+                        llm_total_ms: total_ms,
                         tool_execution_ms: 0, // TODO: measure separately
                         total_ms,
                     };

@@ -122,11 +122,7 @@ fn show_summary(
     if !session_guard.turn_timings.is_empty() {
         let total_ms: u64 = session_guard.turn_timings.iter().map(|t| t.total_ms).sum();
         let avg_ms = total_ms / session_guard.turn_timings.len() as u64;
-        let llm_ms: u64 = session_guard
-            .turn_timings
-            .iter()
-            .map(|t| t.llm_latency_ms)
-            .sum();
+        let llm_ms: u64 = session_guard.turn_timings.iter().map(|t| t.ttft_ms).sum();
         let tool_ms: u64 = session_guard
             .turn_timings
             .iter()
@@ -254,7 +250,7 @@ fn show_turn_timings(
         } else {
             "—".to_string()
         };
-        let llm_str = format!("{}ms", timing.llm_latency_ms);
+        let llm_str = format!("{}ms", timing.ttft_ms);
         let tool_str = if timing.tool_execution_ms > 0 {
             format!("{}ms", timing.tool_execution_ms)
         } else {
@@ -316,7 +312,7 @@ fn show_drift_analysis(
 
     // Analyze drift from session goal
     if let Some(ref goal) = state.session_goal {
-        let analysis = session_guard.check_drift(goal);
+        let analysis = session_guard.check_drift();
         let severity_color = if analysis.drift_severity > 0.7 {
             "red"
         } else if analysis.drift_severity > 0.4 {

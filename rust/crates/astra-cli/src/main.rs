@@ -1482,8 +1482,11 @@ struct ReplState {
         Option<std::sync::Arc<astra_runtime::observability_integration::ObservabilityHub>>,
     /// Per-session observability context for tracing, drift detection, and timing.
     /// Created when a session starts, reset on `/session new`.
-    observability_session:
-        Option<std::sync::Arc<std::sync::RwLock<astra_runtime::observability_integration::ObservabilitySession>>>,
+    observability_session: Option<
+        std::sync::Arc<
+            std::sync::RwLock<astra_runtime::observability_integration::ObservabilitySession>,
+        >,
+    >,
 
     // ── A/B Testing (M4) ──
     /// Shared experiment store for A/B testing.
