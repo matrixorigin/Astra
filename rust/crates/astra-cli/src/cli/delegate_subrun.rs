@@ -285,7 +285,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             task_profile,
             api: self.api.clone(),
             api_token: self.token.clone(),
-            cancel_flag: None,
+            cancel_flag: config.pause_flag.clone(),
             cancel_token: self.cancel_token.clone(),
             delegation_engine: None, // no recursive delegation from sub-agents
             skill_registry_for_activation: None,

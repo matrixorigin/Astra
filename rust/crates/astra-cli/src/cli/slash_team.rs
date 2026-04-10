@@ -838,13 +838,22 @@ pub(super) async fn handle_team_command(
             let run_engine = Arc::new(astra_runtime::server::run_engine::RunEngine::new(run_store));
             let tracker =
                 Arc::new(astra_runtime::server::delegation_engine::DelegationTracker::new());
+            let transport = Arc::new(astra_runtime::messaging::InProcessTransport::new());
+            let mailbox_router = Arc::new(astra_runtime::messaging::AgentMailboxRouter::new(
+                transport,
+                tracker.clone(),
+            ));
             let delegation_engine = Arc::new(
                 astra_runtime::server::delegation_engine::DelegationEngine::with_executor(
                     profile_registry.clone(),
                     run_engine.clone(),
                     tracker.clone(),
                     Arc::new(executor),
-                ),
+                )
+                .with_gate(Arc::new(
+                    astra_runtime::server::delegation_engine::DefaultQualityGate::default(),
+                ))
+                .with_mailbox_router(mailbox_router),
             );
 
             // Wire live progress callback for phase updates
