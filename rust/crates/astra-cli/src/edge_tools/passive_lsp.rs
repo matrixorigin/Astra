@@ -241,10 +241,13 @@ fn rust_spawn_spec(project_root: &Path) -> LspSpawnSpec {
         })),
         experimental_capabilities: Some(serde_json::json!({
             "snippetTextEdit": true,
+            "hoverActions": true,
             "commands": {
                 "commands": [
                     "rust-analyzer.runSingle",
-                    "rust-analyzer.debugSingle"
+                    "rust-analyzer.debugSingle",
+                    "rust-analyzer.showReferences",
+                    "rust-analyzer.gotoLocation"
                 ]
             }
         })),

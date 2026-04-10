@@ -1023,6 +1023,14 @@ fn lsp_rust_session_sends_rust_analyzer_init_and_configuration() {
         Some("rust-analyzer.runSingle")
     );
     assert_eq!(
+        initialize["payload"]["capabilities"]["experimental"]["commands"]["commands"][2].as_str(),
+        Some("rust-analyzer.showReferences")
+    );
+    assert_eq!(
+        initialize["payload"]["capabilities"]["experimental"]["hoverActions"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(
         initialize["payload"]["capabilities"]["textDocument"]["codeAction"]
             ["codeActionLiteralSupport"]["codeActionKind"]["valueSet"][0]
             .as_str(),
@@ -2863,6 +2871,63 @@ fn lsp_hover_returns_markdown_with_real_rust_analyzer() {
     assert_eq!(
         parsed["result"]["contents"]["kind"].as_str(),
         Some("markdown"),
+        "{hover}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "manual validation with real rust-analyzer"]
+#[serial_test::serial]
+fn lsp_hover_actions_return_runnable_commands_with_real_rust_analyzer() {
+    if !real_rust_analyzer_available() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let _cmd_guard = EnvGuard::unset("ASTRA_RUST_ANALYZER_CMD");
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname=\"demo\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(
+        dir.path().join("src/lib.rs"),
+        "fn helper() {}\n\n#[test]\nfn smoke() { helper(); }\n",
+    )
+    .unwrap();
+    let exe = ToolExecutor::new(dir.path());
+
+    let mut hover = None;
+    for _ in 0..12 {
+        let candidate = exe.lsp(&json!({
+            "operation": "hover",
+            "file": "src/lib.rs",
+            "line": 4,
+            "column": 5
+        }));
+        let parsed: serde_json::Value = serde_json::from_str(&candidate).unwrap();
+        if parsed["result"]["actions"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty())
+        {
+            hover = Some((candidate, parsed));
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    let (hover, parsed) =
+        hover.unwrap_or_else(|| panic!("real rust-analyzer never returned hover actions"));
+    let actions = parsed["result"]["actions"]
+        .as_array()
+        .unwrap_or_else(|| panic!("unexpected hover action payload: {hover}"));
+    let commands = actions[0]["commands"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected hover action commands: {hover}"));
+    assert!(
+        commands
+            .iter()
+            .any(|command| { command["command"].as_str() == Some("rust-analyzer.runSingle") }),
         "{hover}"
     );
 }
