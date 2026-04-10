@@ -308,7 +308,21 @@ impl LspStdioSession {
                     "willSaveWaitUntil": false,
                     "didSave": true
                 },
-                "publishDiagnostics": {}
+                "publishDiagnostics": {},
+                "codeAction": {
+                    "codeActionLiteralSupport": {
+                        "codeActionKind": {
+                            "valueSet": [
+                                "quickfix",
+                                "refactor",
+                                "refactor.extract",
+                                "refactor.inline",
+                                "refactor.rewrite",
+                                "source"
+                            ]
+                        }
+                    }
+                }
             }
         });
         if let Some(experimental) = experimental_capabilities

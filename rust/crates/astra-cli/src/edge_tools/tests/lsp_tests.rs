@@ -956,6 +956,12 @@ fn lsp_rust_session_sends_rust_analyzer_init_and_configuration() {
         initialize["payload"]["capabilities"]["experimental"]["commands"]["commands"][0].as_str(),
         Some("rust-analyzer.runSingle")
     );
+    assert_eq!(
+        initialize["payload"]["capabilities"]["textDocument"]["codeAction"]
+            ["codeActionLiteralSupport"]["codeActionKind"]["valueSet"][0]
+            .as_str(),
+        Some("quickfix")
+    );
 
     let did_change_configuration = entries
         .iter()
@@ -2689,6 +2695,90 @@ fn lsp_completions_apply_selected_item_with_real_rust_analyzer() {
     assert!(
         !updated.contains("${"),
         "snippet placeholders should be stripped: {updated}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "manual validation with real rust-analyzer"]
+#[serial_test::serial]
+fn lsp_code_actions_apply_selected_item_with_real_rust_analyzer() {
+    if !real_rust_analyzer_available() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let _cmd_guard = EnvGuard::unset("ASTRA_RUST_ANALYZER_CMD");
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname=\"demo\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    let file_path = dir.path().join("src/lib.rs");
+    let original = "pub fn demo() {\n    let _ = HashMap::<i32, i32>::new();\n}\n";
+    std::fs::write(&file_path, original).unwrap();
+    let exe = ToolExecutor::new(dir.path());
+
+    let mut preview = None;
+    for _ in 0..12 {
+        let candidate = exe.lsp(&json!({
+            "operation": "code_actions",
+            "file": "src/lib.rs",
+            "line": 2,
+            "column": 14
+        }));
+        let parsed: serde_json::Value = serde_json::from_str(&candidate).unwrap();
+        if let Some(actions) = parsed["result"].as_array()
+            && !actions.is_empty()
+        {
+            preview = Some((candidate, parsed));
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    let (preview, parsed) =
+        preview.unwrap_or_else(|| panic!("real rust-analyzer never returned code actions"));
+    assert_eq!(
+        parsed["method"].as_str(),
+        Some("textDocument/codeAction"),
+        "{preview}"
+    );
+    let actions = parsed["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("unexpected code action preview: {preview}"));
+    let idx = actions
+        .iter()
+        .position(|action| {
+            action
+                .get("title")
+                .and_then(Value::as_str)
+                .is_some_and(|title| title.contains("Import `std::collections::HashMap`"))
+        })
+        .unwrap_or_else(|| panic!("expected HashMap import quick fix, got: {preview}"));
+
+    let applied = exe.lsp(&json!({
+        "operation": "code_actions",
+        "file": "src/lib.rs",
+        "line": 2,
+        "column": 14,
+        "action_index": idx,
+        "dry_run": false
+    }));
+    let parsed: serde_json::Value = serde_json::from_str(&applied).unwrap();
+    assert_eq!(
+        parsed["applied"].as_bool(),
+        Some(true),
+        "unexpected apply result: {applied}"
+    );
+
+    let updated = std::fs::read_to_string(file_path).unwrap();
+    assert!(
+        updated.contains("use std::collections::HashMap;"),
+        "expected import quick fix to update file, got: {updated}"
+    );
+    assert_ne!(
+        updated, original,
+        "expected code action apply to modify the file"
     );
 }
 
