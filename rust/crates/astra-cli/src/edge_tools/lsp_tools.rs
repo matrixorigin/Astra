@@ -929,22 +929,24 @@ impl ToolExecutor {
         let cargo_args = Self::rust_analyzer_runnable_strings(runnable)
             .map(|(_, _, cargo_args, _)| cargo_args.join(" ").to_ascii_lowercase())
             .unwrap_or_default();
-        if label.starts_with("run ") || cargo_args.contains(" run") || cargo_args.starts_with("run")
-        {
+
+        // Check cargo subcommand — must be a whole word (followed by space or end)
+        let cargo_cmd_is = |cmd: &str| -> bool {
+            cargo_args == cmd
+                || cargo_args.starts_with(&format!("{cmd} "))
+                || cargo_args.contains(&format!(" {cmd} "))
+                || cargo_args.ends_with(&format!(" {cmd}"))
+        };
+
+        if label.starts_with("run ") || cargo_cmd_is("run") {
             0
-        } else if label.starts_with("test ")
-            || cargo_args.contains(" test")
-            || cargo_args.starts_with("test")
-        {
+        } else if label.starts_with("test ") || cargo_cmd_is("test") {
             1
-        } else if label.starts_with("bench ")
-            || cargo_args.contains(" bench")
-            || cargo_args.starts_with("bench")
-        {
+        } else if label.starts_with("bench ") || cargo_cmd_is("bench") {
             2
-        } else if cargo_args.contains("check") || label.contains("check") {
+        } else if label.contains("check") || cargo_cmd_is("check") {
             3
-        } else if cargo_args.contains("build") || label.contains("build") {
+        } else if label.contains("build") || cargo_cmd_is("build") {
             4
         } else {
             5

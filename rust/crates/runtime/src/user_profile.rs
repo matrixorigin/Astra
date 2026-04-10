@@ -840,6 +840,11 @@ impl UserProfileManager {
         self.store.get_or_create(user_id)
     }
 
+    /// Update (and persist) a user profile.
+    pub fn update_profile(&self, profile: UserProfile) {
+        self.store.update(profile);
+    }
+
     /// Record a user query and update scenario detection.
     pub fn observe_query(&self, user_id: &str, query: &str) {
         let mut detectors = self.detectors.write().unwrap();

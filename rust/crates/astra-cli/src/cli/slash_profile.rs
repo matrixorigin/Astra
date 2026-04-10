@@ -295,12 +295,8 @@ fn edit_preference(ctx: &ProfileCommandContext<'_>, key: &str, value: &str) {
     }
 
     profile.touch();
-    // Note: We need to update through the store, but ProfileManager doesn't expose update directly.
-    // This is a limitation - for now the change is in memory only.
-    eprintln!(
-        "  {}",
-        "Note: Profile changes are session-scoped until persistence is added.".dim()
-    );
+    ctx.profile_manager.update_profile(profile);
+    eprintln!("  {}", "✓ Profile updated.".green());
 }
 
 fn show_scenario(ctx: &ProfileCommandContext<'_>) {
@@ -449,19 +445,10 @@ fn show_experiments(ctx: &ProfileCommandContext<'_>) {
 }
 
 fn reset_profile(ctx: &ProfileCommandContext<'_>) {
-    // Create a fresh profile
-    let _new_profile = UserProfile::new(ctx.user_id);
-    // Note: We can't directly update through ProfileManager's store
-    // This is a limitation for now
+    let new_profile = UserProfile::new(ctx.user_id);
+    ctx.profile_manager.update_profile(new_profile);
 
-    eprintln!(
-        "  {} Profile reset to defaults (session-scoped).",
-        "✓".green()
-    );
-    eprintln!(
-        "  {}",
-        "Note: Full reset requires profile persistence support.".dim()
-    );
+    eprintln!("  {} Profile reset to defaults.", "✓".green());
 }
 
 fn show_help() {
