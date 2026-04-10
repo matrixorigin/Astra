@@ -617,7 +617,9 @@ fn restore_session_state_from_journal(session_id: &str) -> RestoredSessionState 
             event.user_input.unwrap_or_default(),
             event.assistant_output.unwrap_or_default(),
         ));
-        restored.turn += 1;
+        restored.turn = restored
+            .turn
+            .max(event.turn.unwrap_or(restored.turn.saturating_add(1)));
         restored.total_prompt_tokens += event.tokens_in.unwrap_or(0);
         restored.total_completion_tokens += event.tokens_out.unwrap_or(0);
         if let Some(tools_used) = event.tools_used {
@@ -995,7 +997,7 @@ mod tests {
             .append(
                 &session_journal::JournalEvent::turn(
                     Some(&sid),
-                    1,
+                    2,
                     None,
                     "pr呢？",
                     "ok",
@@ -1096,6 +1098,80 @@ mod tests {
         assert_eq!(restored.turn, 1);
         assert_eq!(restored.total_prompt_tokens, 80);
         assert_eq!(restored.total_completion_tokens, 20);
+        assert_eq!(restored.recent_tools, vec!["github_ci_status".to_string()]);
+    }
+
+    #[test]
+    fn restore_session_state_keeps_recorded_turn_after_stray_session_start() {
+        let (_tmp, _g) = isolated_sessions_dir();
+        let sid = format!("test-stray-start-{}", uuid::Uuid::new_v4());
+        let writer = session_journal::JournalWriter::new(&sid).unwrap();
+
+        writer
+            .append(&session_journal::JournalEvent::session_start(
+                Some(&sid),
+                Some("gpt-5"),
+            ))
+            .unwrap();
+        writer
+            .append(&session_journal::JournalEvent::turn(
+                Some(&sid),
+                1,
+                None,
+                "first",
+                "one",
+                0,
+                10,
+                4,
+                10,
+            ))
+            .unwrap();
+        writer
+            .append(&session_journal::JournalEvent::turn(
+                Some(&sid),
+                2,
+                None,
+                "second",
+                "two",
+                0,
+                20,
+                6,
+                10,
+            ))
+            .unwrap();
+        writer
+            .append(&session_journal::JournalEvent::session_start(
+                Some(&sid),
+                Some("gpt-5"),
+            ))
+            .unwrap();
+        writer
+            .append(
+                &session_journal::JournalEvent::turn(
+                    Some(&sid),
+                    3,
+                    None,
+                    "latest",
+                    "three",
+                    0,
+                    30,
+                    8,
+                    10,
+                )
+                .with_tool_selection(
+                    vec!["github_ci_status".into()],
+                    vec![],
+                    vec!["github_ci_status".into()],
+                    20,
+                ),
+            )
+            .unwrap();
+
+        let restored = restore_session_state_from_journal(&sid);
+        assert_eq!(restored.history, vec![("latest".into(), "three".into())]);
+        assert_eq!(restored.turn, 3);
+        assert_eq!(restored.total_prompt_tokens, 30);
+        assert_eq!(restored.total_completion_tokens, 8);
         assert_eq!(restored.recent_tools, vec!["github_ci_status".to_string()]);
     }
 

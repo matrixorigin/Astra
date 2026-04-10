@@ -1,6 +1,7 @@
 use std::io::Write;
 
-use astra_runtime::turn::decision_explainer::{DriftCause, DriftDetector, FocusDriftAnalysis};
+use astra_core::{DriftCause, EvidenceType};
+use astra_runtime::turn::decision_explainer::{DriftDetector, FocusDriftAnalysis};
 use astra_services::{ForkSessionOptions, fork_local_session, session_journal, session_workspace};
 use chrono::{DateTime, Utc};
 
@@ -887,6 +888,28 @@ pub(super) fn handle_session_command(arg: &str, state: &mut ReplState) {
                                     "📊".cyan(),
                                     evt.turn.unwrap_or(0),
                                     tokens,
+                                );
+                            }
+                            session_journal::JournalEventType::DriftDetected => {
+                                let severity = evt
+                                    .metadata
+                                    .as_ref()
+                                    .and_then(|m| m.get("severity"))
+                                    .and_then(|v| v.as_f64())
+                                    .unwrap_or(0.0);
+                                let evidence_count = evt
+                                    .metadata
+                                    .as_ref()
+                                    .and_then(|m| m.get("evidence_count"))
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0);
+                                eprintln!(
+                                    "  {} {} T{} drift detected (severity {:.2}, {} evidence)",
+                                    ts_short.dim(),
+                                    "↯".yellow(),
+                                    evt.turn.unwrap_or(0),
+                                    severity,
+                                    evidence_count,
                                 );
                             }
                         }
@@ -1989,7 +2012,7 @@ fn handle_session_drift(arg: &str, state: &ReplState) {
                 ..
             } => {
                 format!(
-                    "Token budget pressure ({} needed vs {} budget)",
+                    "Token budget pressure ({} needed vs {} available)",
                     budget_needed, budget_available
                 )
             }
@@ -2045,24 +2068,12 @@ fn handle_session_drift(arg: &str, state: &ReplState) {
             for ev in &analysis.evidence {
                 // ev is DriftEvidence { turn, evidence_type, description, confidence }
                 let type_str = match &ev.evidence_type {
-                    astra_runtime::turn::decision_explainer::EvidenceType::ToolCallTopicChange => {
-                        "topic change"
-                    }
-                    astra_runtime::turn::decision_explainer::EvidenceType::UserCorrection => {
-                        "user correction"
-                    }
-                    astra_runtime::turn::decision_explainer::EvidenceType::ClarificationRequest => {
-                        "clarification"
-                    }
-                    astra_runtime::turn::decision_explainer::EvidenceType::TermDisappearance => {
-                        "term lost"
-                    }
-                    astra_runtime::turn::decision_explainer::EvidenceType::CompressionLoss => {
-                        "compression"
-                    }
-                    astra_runtime::turn::decision_explainer::EvidenceType::MemoryMismatch => {
-                        "memory miss"
-                    }
+                    EvidenceType::ToolCallTopicChange => "topic change",
+                    EvidenceType::UserCorrection => "user correction",
+                    EvidenceType::ClarificationRequest => "clarification",
+                    EvidenceType::TermDisappearance => "term lost",
+                    EvidenceType::CompressionLoss => "compression",
+                    EvidenceType::MemoryMismatch => "memory miss",
                 };
                 eprintln!(
                     "    • Turn {}: [{}] {} ({:.0}%)",

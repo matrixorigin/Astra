@@ -404,6 +404,41 @@ const CONSECUTIVE_ERROR_BUDGET: u32 = 3;
 /// Maximum number of recent file reads to track for post-compact restoration.
 const MAX_TRACKED_FILE_READS: usize = 20;
 
+fn edge_tool_status_exit_code(status: &str) -> Option<i32> {
+    match status.trim().to_ascii_lowercase().as_str() {
+        "ok" | "success" | "succeeded" | "completed" | "complete" | "passed" => Some(0),
+        "error" | "failed" | "failure" | "partial_failure" | "denied" | "cancelled"
+        | "canceled" | "timeout" | "timed_out" => Some(1),
+        _ => None,
+    }
+}
+
+fn record_edge_tool_observability(
+    state: &mut AgenticLoopState,
+    edge_tool_round: &[EdgeToolExecResult],
+) {
+    if let Some(session) = &state.observability_session {
+        for edge_result in edge_tool_round {
+            session.write().unwrap().record_tool_result(
+                &edge_result.tool,
+                &edge_result.output,
+                edge_tool_status_exit_code(&edge_result.status),
+            );
+        }
+    }
+
+    if let Some(hub) = &state.observability_hub {
+        let user_id = state
+            .observability_session
+            .as_ref()
+            .map(|s| s.read().unwrap().user_id.clone())
+            .unwrap_or_default();
+        for edge_result in edge_tool_round {
+            crate::observability_integration::on_tool_executed(hub, &user_id, &edge_result.tool);
+        }
+    }
+}
+
 // ─── Loop exit ───────────────────────────────────────────────────────────────
 
 /// Result of running the agentic loop to completion.
@@ -2086,21 +2121,8 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
         }
 
         // ─── Observability: tool executed hook ───────────────────────────
-        // Feed tool usage into user profile for pattern learning.
-        if let Some(hub) = &state.observability_hub {
-            let user_id = state
-                .observability_session
-                .as_ref()
-                .map(|s| s.read().unwrap().user_id.clone())
-                .unwrap_or_default();
-            for edge_result in &turn_result.edge_tool_round {
-                crate::observability_integration::on_tool_executed(
-                    hub,
-                    &user_id,
-                    &edge_result.tool,
-                );
-            }
-        }
+        // Feed tool usage into both the user profile and the goal tracker.
+        record_edge_tool_observability(state, &turn_result.edge_tool_round);
 
         // ─── Step 4b: Conditional skill activation ──────────────────────
         // Record file paths from edge tool executions so path-conditional
@@ -2573,6 +2595,17 @@ mod tests {
         }
     }
 
+    fn make_edge_tool_with_status(name: &str, status: &str, output: &str) -> EdgeToolExecResult {
+        EdgeToolExecResult {
+            request_id: format!("req-{name}"),
+            tool: name.to_string(),
+            args: json!({}),
+            output: output.to_string(),
+            status: status.to_string(),
+            duration_ms: 10,
+        }
+    }
+
     // ── State builder ───────────────────────────────────────────────────────
 
     fn make_state() -> AgenticLoopState {
@@ -2683,6 +2716,42 @@ mod tests {
         assert_eq!(state.total_prompt, 10);
         assert_eq!(state.total_completion, 5);
         assert!(state.has_any_usage);
+    }
+
+    #[test]
+    fn edge_tool_status_exit_code_maps_common_statuses() {
+        assert_eq!(edge_tool_status_exit_code("ok"), Some(0));
+        assert_eq!(edge_tool_status_exit_code("completed"), Some(0));
+        assert_eq!(edge_tool_status_exit_code("error"), Some(1));
+        assert_eq!(edge_tool_status_exit_code("partial_failure"), Some(1));
+        assert_eq!(edge_tool_status_exit_code("unknown"), None);
+    }
+
+    #[test]
+    fn edge_tool_observability_records_goal_tracker_without_hub() {
+        let mut state = make_state();
+        let session = std::sync::Arc::new(std::sync::RwLock::new(
+            crate::observability_integration::ObservabilitySession::new_simple("sess-1"),
+        ));
+        {
+            let mut guard = session.write().unwrap();
+            guard.turn_number = 1;
+            guard.record_query("run tests for authentication flow");
+        }
+        state.observability_session = Some(session.clone());
+
+        let edge_tools = vec![
+            make_edge_tool_with_status("bash", "ok", "test result: ok. 24 passed; 0 failed"),
+            make_edge_tool_with_status("bash", "error", "test result: FAILED. 1 passed; 2 failed"),
+        ];
+        record_edge_tool_observability(&mut state, &edge_tools);
+
+        let progress = session
+            .read()
+            .unwrap()
+            .goal_progress()
+            .expect("goal progress");
+        assert_eq!(progress.milestone_count, 2);
     }
 
     #[tokio::test]

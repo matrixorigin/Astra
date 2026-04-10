@@ -10,9 +10,11 @@ use sqlx::{MySql, Pool, mysql::MySqlPoolOptions};
 
 pub mod composite_snapshot;
 pub mod config;
+pub mod drift;
 pub mod log;
 pub mod runtime_limits;
 pub use config::*;
+pub use drift::{DriftCause, DriftEvidence, EvidenceType};
 pub use runtime_limits::{DEV_MATRIXONE_PASSWORD, RuntimeLimits, warn_default_credentials_once};
 pub use sqlx;
 

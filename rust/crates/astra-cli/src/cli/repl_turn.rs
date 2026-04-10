@@ -1424,12 +1424,29 @@ pub(super) fn persist_last_session_id(profile: Option<&str>, session_id: &str) {
 }
 
 fn initialize_journal(state: &mut ReplState, session_id: &str) {
-    if state.journal.is_some() {
-        return;
+    let target_path = session_journal::journal_file_path(session_id);
+    let already_attached = state
+        .journal
+        .as_ref()
+        .map(|journal| journal.path() == &target_path)
+        .unwrap_or(false);
+
+    if !already_attached {
+        state.journal = session_journal::JournalWriter::new(session_id).ok();
     }
 
-    state.journal = session_journal::JournalWriter::new(session_id).ok();
-    if let Some(journal) = state.journal.as_ref() {
+    let needs_start_event = match session_journal::read_journal(session_id) {
+        Ok(events) => matches!(
+            events.last().map(|event| &event.event_type),
+            None | Some(session_journal::JournalEventType::SessionEnd)
+        ),
+        Err(_) => true,
+    };
+
+    if !already_attached && needs_start_event {
+        let Some(journal) = state.journal.as_ref() else {
+            return;
+        };
         let start_event =
             session_journal::JournalEvent::session_start(Some(session_id), state.model.as_deref());
         let _ = journal.append(&start_event);
@@ -1437,13 +1454,29 @@ fn initialize_journal(state: &mut ReplState, session_id: &str) {
         enqueue_ingestion(state, &start_event);
     }
 
-    // Initialize workspace metadata alongside journal, but preserve existing
-    // persisted session state when resuming an existing session.
-    if astra_services::session_workspace::read_workspace(session_id).is_err() {
-        let ws = astra_services::session_workspace::WorkspaceMetadata::new(
-            session_id,
-            state.model.as_deref().unwrap_or("default"),
-        );
+    // Keep workspace metadata in sync without resetting accumulated counters.
+    let (mut ws, mut dirty) = match astra_services::session_workspace::read_workspace(session_id) {
+        Ok(ws) => (ws, false),
+        Err(_) => (
+            astra_services::session_workspace::WorkspaceMetadata::new(
+                session_id,
+                state.model.as_deref().unwrap_or("default"),
+            ),
+            true,
+        ),
+    };
+    if ws.status != "active" {
+        ws.status = "active".to_string();
+        dirty = true;
+    }
+    if let Some(model) = state.model.as_deref()
+        && ws.model != model
+    {
+        ws.model = model.to_string();
+        dirty = true;
+    }
+    if dirty {
+        ws.updated_at = chrono::Utc::now().to_rfc3339();
         let _ = astra_services::session_workspace::write_workspace(&ws);
     }
 
@@ -1960,6 +1993,111 @@ mod tests {
         std::fs::create_dir_all(&sessions).unwrap();
         let guard = session_journal::JournalDirGuard::new(&sessions);
         (tmp, guard)
+    }
+
+    #[test]
+    fn initialize_journal_attaches_without_duplicate_start_or_workspace_reset() {
+        let (_tmp, _g) = isolated_sessions_dir();
+        let sid = format!("test-attach-{}", uuid::Uuid::new_v4());
+        let writer = session_journal::JournalWriter::new(&sid).unwrap();
+        writer
+            .append(&session_journal::JournalEvent::session_start(
+                Some(&sid),
+                Some("gpt-5"),
+            ))
+            .unwrap();
+        writer
+            .append(&session_journal::JournalEvent::turn(
+                Some(&sid),
+                3,
+                None,
+                "hello",
+                "world",
+                0,
+                10,
+                5,
+                20,
+            ))
+            .unwrap();
+
+        let mut ws = astra_services::session_workspace::WorkspaceMetadata::new(&sid, "gpt-5");
+        ws.turn_count = 3;
+        ws.total_tokens_in = 10;
+        ws.total_tokens_out = 5;
+        astra_services::session_workspace::write_workspace(&ws).unwrap();
+
+        let mut state = ReplState {
+            model: Some("gpt-5".to_string()),
+            ..Default::default()
+        };
+        initialize_journal(&mut state, &sid);
+
+        let events = session_journal::read_journal(&sid).unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| {
+                    event.event_type == session_journal::JournalEventType::SessionStart
+                })
+                .count(),
+            1,
+        );
+
+        let restored_ws = astra_services::session_workspace::read_workspace(&sid).unwrap();
+        assert_eq!(restored_ws.turn_count, 3);
+        assert_eq!(restored_ws.total_tokens_in, 10);
+        assert_eq!(restored_ws.total_tokens_out, 5);
+        assert_eq!(restored_ws.status, "active");
+    }
+
+    #[test]
+    fn initialize_journal_reopens_completed_session_without_resetting_workspace() {
+        let (_tmp, _g) = isolated_sessions_dir();
+        let sid = format!("test-reopen-{}", uuid::Uuid::new_v4());
+        let writer = session_journal::JournalWriter::new(&sid).unwrap();
+        writer
+            .append(&session_journal::JournalEvent::session_start(
+                Some(&sid),
+                Some("gpt-5"),
+            ))
+            .unwrap();
+        writer
+            .append(&session_journal::JournalEvent::session_end(Some(&sid), 3))
+            .unwrap();
+
+        let mut ws = astra_services::session_workspace::WorkspaceMetadata::new(&sid, "gpt-5");
+        ws.turn_count = 3;
+        ws.total_tokens_in = 120;
+        ws.total_tokens_out = 45;
+        ws.status = "completed".to_string();
+        astra_services::session_workspace::write_workspace(&ws).unwrap();
+
+        let mut state = ReplState {
+            model: Some("gpt-5".to_string()),
+            ..Default::default()
+        };
+        initialize_journal(&mut state, &sid);
+
+        let events = session_journal::read_journal(&sid).unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| {
+                    event.event_type == session_journal::JournalEventType::SessionStart
+                })
+                .count(),
+            2,
+        );
+        assert_eq!(
+            events.last().map(|event| &event.event_type),
+            Some(&session_journal::JournalEventType::SessionStart)
+        );
+
+        let restored_ws = astra_services::session_workspace::read_workspace(&sid).unwrap();
+        assert_eq!(restored_ws.turn_count, 3);
+        assert_eq!(restored_ws.total_tokens_in, 120);
+        assert_eq!(restored_ws.total_tokens_out, 45);
+        assert_eq!(restored_ws.status, "active");
     }
 
     #[test]

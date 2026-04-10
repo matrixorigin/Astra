@@ -667,6 +667,8 @@ pub enum JournalEventType {
     PlanLifecycle,
     /// Context assembly trace recorded (observability: prompt building details).
     ContextAssemblyRecorded,
+    /// Focus drift detected during a turn (severity, cause, evidence).
+    DriftDetected,
 }
 
 /// Writer that appends events to a session journal file.
@@ -1788,6 +1790,27 @@ impl JournalEvent {
         self.context_assembly_trace = Some(trace);
         self
     }
+
+    /// Focus drift detected — emitted when drift analysis finds significant drift.
+    pub fn drift_detected(
+        session_id: Option<&str>,
+        turn: u32,
+        severity: f64,
+        cause: astra_core::DriftCause,
+        evidence: Vec<astra_core::DriftEvidence>,
+        recovery_suggestion: &str,
+    ) -> Self {
+        let mut evt = Self::base(JournalEventType::DriftDetected, session_id);
+        evt.turn = Some(turn);
+        evt.metadata = Some(serde_json::json!({
+            "severity": severity,
+            "cause": cause,
+            "evidence_count": evidence.len(),
+            "evidence": evidence,
+            "recovery_suggestion": recovery_suggestion,
+        }));
+        evt
+    }
 }
 
 /// Truncate a string to max chars (for journal size control).
@@ -1994,6 +2017,7 @@ fn dir_size(path: &Path) -> std::io::Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use astra_core::{DriftCause, DriftEvidence, EvidenceType};
     use tempfile::tempdir;
 
     #[test]
@@ -2056,6 +2080,55 @@ mod tests {
         assert_eq!(
             m.get("summary").and_then(|v| v.as_str()),
             Some("Plan execution started")
+        );
+    }
+
+    #[test]
+    fn journal_event_drift_detected_round_trips_structured_cause_and_evidence() {
+        let evt = JournalEvent::drift_detected(
+            Some("sid-drift"),
+            7,
+            0.75,
+            DriftCause::MemoryMiss {
+                expected_but_not_retrieved: vec!["session history".into(), "repo context".into()],
+                query_used: "debug repeated session start".into(),
+            },
+            vec![DriftEvidence {
+                turn: 6,
+                evidence_type: EvidenceType::MemoryMismatch,
+                description: "Retrieved unrelated CI memories instead of resume context".into(),
+                confidence: 0.9,
+            }],
+            "Re-query with explicit session-resume terms",
+        );
+
+        assert_eq!(evt.event_type, JournalEventType::DriftDetected);
+        assert_eq!(evt.turn, Some(7));
+        let json = serde_json::to_string(&evt).unwrap();
+        let parsed: JournalEvent = serde_json::from_str(&json).unwrap();
+        let meta = parsed.metadata.expect("metadata");
+
+        assert_eq!(meta.get("severity").and_then(|v| v.as_f64()), Some(0.75));
+        assert_eq!(meta.get("evidence_count").and_then(|v| v.as_u64()), Some(1));
+        assert_eq!(
+            meta.get("recovery_suggestion").and_then(|v| v.as_str()),
+            Some("Re-query with explicit session-resume terms")
+        );
+        assert_eq!(
+            meta.get("cause")
+                .and_then(|v| v.get("type"))
+                .and_then(|v| v.as_str()),
+            Some("MemoryMiss")
+        );
+        let evidence = meta
+            .get("evidence")
+            .and_then(|v| v.as_array())
+            .expect("evidence array");
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence[0].get("turn").and_then(|v| v.as_u64()), Some(6));
+        assert_eq!(
+            evidence[0].get("evidence_type").and_then(|v| v.as_str()),
+            Some("MemoryMismatch")
         );
     }
 

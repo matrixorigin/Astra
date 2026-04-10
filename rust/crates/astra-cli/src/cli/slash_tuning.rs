@@ -541,7 +541,7 @@ fn cmd_record<W: Write>(args: &[&str], ctx: TuningCommandContext<'_, W>) -> std:
         writeln!(w)?;
         writeln!(w, "Signal types:")?;
         writeln!(w, "  success, failure, retry, correction")?;
-        writeln!(w, "  thumbs_up, thumbs_down, accept, reject")?;
+        writeln!(w, "  thumbs_up, thumbs_down, accept")?;
         return Ok(());
     }
 
@@ -647,4 +647,30 @@ fn cmd_help<W: Write>(ctx: TuningCommandContext<'_, W>) -> std::io::Result<()> {
     writeln!(w)?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tuning_record_help_lists_only_supported_signals() {
+        let engine = Arc::new(AutoTuningEngine::new());
+        let mut runtime_config = RuntimeConfig::default();
+        let mut output = Vec::new();
+
+        handle_tuning_command(
+            "record",
+            TuningCommandContext {
+                engine: &engine,
+                runtime_config: &mut runtime_config,
+                writer: &mut output,
+            },
+        )
+        .unwrap();
+
+        let rendered = String::from_utf8(output).unwrap();
+        assert!(rendered.contains("accept"));
+        assert!(!rendered.contains("reject"));
+    }
 }
