@@ -46,6 +46,16 @@ pub enum ProgressEventType {
         reason: String,
         turn: u32,
     },
+    /// A tool is about to execute (emitted before invocation so UI can show activity).
+    ToolExecuting { tool_name: String, turn: u32 },
+    /// LLM call started (waiting for model response).
+    LlmCallStarted { turn: u32 },
+    /// LLM call completed.
+    LlmCallCompleted {
+        turn: u32,
+        ttft_ms: Option<u64>,
+        duration_ms: u64,
+    },
 }
 
 /// Broadcasts progress events to multiple subscribers.
@@ -156,6 +166,25 @@ impl AgentProgressEmitter {
             tool_name: tool_name.into(),
             reason: reason.into(),
             turn,
+        });
+    }
+
+    pub fn tool_executing(&self, tool_name: impl Into<String>, turn: u32) {
+        self.emit(ProgressEventType::ToolExecuting {
+            tool_name: tool_name.into(),
+            turn,
+        });
+    }
+
+    pub fn llm_call_started(&self, turn: u32) {
+        self.emit(ProgressEventType::LlmCallStarted { turn });
+    }
+
+    pub fn llm_call_completed(&self, turn: u32, ttft_ms: Option<u64>, duration_ms: u64) {
+        self.emit(ProgressEventType::LlmCallCompleted {
+            turn,
+            ttft_ms,
+            duration_ms,
         });
     }
 

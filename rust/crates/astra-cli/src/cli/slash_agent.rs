@@ -500,6 +500,22 @@ fn print_progress_event(event: &astra_runtime::orchestration::AgentProgressEvent
                 reason
             )
         }
+        ProgressEventType::ToolExecuting { tool_name, turn } => {
+            format!("🔧 turn={} → {}", turn, tool_name.as_str().cyan())
+        }
+        ProgressEventType::LlmCallStarted { turn } => {
+            format!("🧠 turn={} {}", turn, "thinking…".dim())
+        }
+        ProgressEventType::LlmCallCompleted {
+            turn,
+            ttft_ms,
+            duration_ms,
+        } => {
+            let ttft = ttft_ms
+                .map(|t| format!(" ttft={}ms", t))
+                .unwrap_or_default();
+            format!("🧠 turn={} done {}ms{}", turn, duration_ms, ttft)
+        }
     };
 
     eprintln!("  [{}] {}", time_str.as_str().dim(), msg);

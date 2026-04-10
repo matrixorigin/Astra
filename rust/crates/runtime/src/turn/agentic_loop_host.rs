@@ -1278,7 +1278,18 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
         }
 
         // ─── Step 1: Host executes the turn (payload → HTTP → SSE) ──────
+        if let Some(ref emitter) = state.progress_emitter {
+            emitter.llm_call_started(turn_index as u32);
+        }
+        let llm_wall_start = std::time::Instant::now();
         let turn_result = host.execute_turn(state).await?;
+        if let Some(ref emitter) = state.progress_emitter {
+            emitter.llm_call_completed(
+                turn_index as u32,
+                turn_result.ttft_ms,
+                llm_wall_start.elapsed().as_millis() as u64,
+            );
+        }
 
         // ─── Step 2: Ingest turn stream into loop state ─────────────────
         let snap =
@@ -2087,6 +2098,7 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
                 &mut term_adapter,
                 state.mailbox.as_mut(),
                 state.permission_context.as_ref(),
+                state.progress_emitter.as_ref(),
             )
             .await;
         }

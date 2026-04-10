@@ -150,10 +150,39 @@ impl ProgressDisplay {
             }
 
             ProgressEventType::PermissionDenied { tool_name, .. } => {
-                // Track as a warning on the running agent; don't change status.
                 if let Some(agent) = self.agents.get_mut(agent_id) {
                     agent.display_name = format!("{} (🔒 denied: {tool_name})", agent.display_name);
                 }
+            }
+
+            ProgressEventType::ToolExecuting {
+                tool_name, turn, ..
+            } => {
+                if let Some(agent) = self.agents.get_mut(agent_id) {
+                    let current_turn = match &agent.status {
+                        AgentStatus::Running { current_turn, .. } => *current_turn,
+                        _ => *turn,
+                    };
+                    agent.status = AgentStatus::Running {
+                        current_turn,
+                        max_turns: 30,
+                        last_tool: Some(tool_name.clone()),
+                    };
+                }
+            }
+
+            ProgressEventType::LlmCallStarted { turn, .. } => {
+                if let Some(agent) = self.agents.get_mut(agent_id) {
+                    agent.status = AgentStatus::Running {
+                        current_turn: *turn,
+                        max_turns: 30,
+                        last_tool: Some("thinking…".into()),
+                    };
+                }
+            }
+
+            ProgressEventType::LlmCallCompleted { .. } => {
+                // Status stays Running; next event (ToolExecuting or TurnCompleted) will update.
             }
         }
     }

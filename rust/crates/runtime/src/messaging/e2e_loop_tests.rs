@@ -664,6 +664,7 @@ mod tests {
             &mut term,
             None,
             Some(&permission_context),
+            None,
         )
         .await;
 
@@ -777,6 +778,7 @@ mod tests {
             &mut term,
             Some(&mut child_mb),
             Some(&child_permission_ctx),
+            None,
         )
         .await;
 
@@ -890,6 +892,7 @@ mod tests {
             &mut term,
             Some(&mut child_mb),
             Some(&child_permission_ctx),
+            None,
         )
         .await;
 

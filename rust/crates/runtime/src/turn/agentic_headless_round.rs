@@ -106,6 +106,7 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
             tokio::sync::RwLock<crate::orchestration::permission_sync::PermissionSyncContext>,
         >,
     >,
+    progress_emitter: Option<&crate::orchestration::AgentProgressEmitter>,
 ) {
     const PERMISSION_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
     const PERMISSION_REQUEST_TIMEOUT_BACKGROUND: Duration = Duration::from_secs(5);
@@ -384,6 +385,10 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
             None
         };
         step_recorder.begin_tool_with_key(&name, &id, tool_idem_key.as_deref());
+
+        if let Some(emitter) = progress_emitter {
+            emitter.tool_executing(&name, turn_index as u32);
+        }
 
         let mut is_err = is_tool_error(&result_str);
         let tool_already_restricted = restricted_tools.contains(&name);
