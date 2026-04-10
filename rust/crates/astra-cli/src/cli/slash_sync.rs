@@ -1,4 +1,5 @@
 #![allow(unused_imports)]
+use crate::{cli_dim, cli_err, cli_info, cli_ok, cli_section, cli_warn};
 use super::*;
 
 /// Handle `/sync` command — show unified sync state across all domains.
@@ -18,21 +19,11 @@ pub(super) async fn handle_sync_command(arg: &str, state: &ReplState) {
 
     let show_log = sub == "log";
 
-    eprintln!(
-        "\n{}",
-        "─── Sync Engine Status ─────────────────────────".bold()
-    );
+    cli_section!("Sync Engine Status");
+    eprintln!();
 
     let Some(mc) = state.matrix_runtime.as_ref() else {
-        eprintln!(
-            "  {} {}",
-            "○".dim(),
-            "Sync orchestrator not initialized (no cloud connection)".dim()
-        );
-        eprintln!(
-            "{}",
-            "────────────────────────────────────────────────".dim()
-        );
+        cli_dim!("Sync orchestrator not initialized (no cloud connection)");
         eprintln!();
         return;
     };
@@ -86,12 +77,11 @@ pub(super) async fn handle_sync_command(arg: &str, state: &ReplState) {
     if show_log {
         let events = orch.event_log();
         if events.is_empty() {
-            eprintln!("\n  {}", "No sync events yet.".dim());
+            eprintln!();
+            cli_dim!("No sync events yet.");
         } else {
-            eprintln!(
-                "\n{}",
-                "─── Sync Event Log ─────────────────────────────".bold()
-            );
+            cli_section!("Sync Event Log");
+            eprintln!();
             eprintln!(
                 "  {:<10} {:<12} {:<8} {:>8} {:>10}",
                 "Domain".bold(),
@@ -122,33 +112,19 @@ pub(super) async fn handle_sync_command(arg: &str, state: &ReplState) {
             }
         }
     } else {
-        eprintln!("\n  {}", "Use /sync log | push | pull".dim());
+        eprintln!();
+        cli_dim!("Use /sync log | push | pull");
     }
-
-    eprintln!(
-        "{}",
-        "────────────────────────────────────────────────".dim()
-    );
     eprintln!();
 }
 
 /// Force-push all dirty sync domains to cloud.
 async fn handle_sync_push(state: &ReplState) {
-    eprintln!(
-        "\n{}",
-        "─── Sync Push ──────────────────────────────────".bold()
-    );
+    cli_section!("Sync Push");
+    eprintln!();
 
     let Some(mc) = state.matrix_runtime.as_ref() else {
-        eprintln!(
-            "  {} {}",
-            "○".dim(),
-            "No cloud connection — nothing to push.".dim()
-        );
-        eprintln!(
-            "{}",
-            "────────────────────────────────────────────────".dim()
-        );
+        cli_dim!("No cloud connection — nothing to push.");
         eprintln!();
         return;
     };
@@ -162,23 +138,13 @@ async fn handle_sync_push(state: &ReplState) {
         .filter(|(_, s)| s.is_dirty())
         .count();
     if dirty_count == 0 {
-        eprintln!(
-            "  {} All domains clean — nothing to push.",
-            theme::icon_ok()
-        );
-        eprintln!(
-            "{}",
-            "────────────────────────────────────────────────".dim()
-        );
+        cli_ok!("All domains clean — nothing to push.");
         eprintln!();
         return;
     }
 
-    eprintln!(
-        "  Pushing {} dirty domain{}...\n",
-        dirty_count,
-        if dirty_count == 1 { "" } else { "s" }
-    );
+    cli_info!("Pushing {} dirty domain{}...", dirty_count, if dirty_count == 1 { "" } else { "s" });
+    eprintln!();
 
     let results = orch.push_dirty().await;
     drop(orch); // release lock before printing
@@ -213,12 +179,7 @@ async fn handle_sync_push(state: &ReplState) {
 
     eprintln!();
     if fail_count == 0 {
-        eprintln!(
-            "  {} {} domain{} pushed successfully.",
-            "✓".green().bold(),
-            ok_count,
-            if ok_count == 1 { "" } else { "s" }
-        );
+        cli_ok!("{} domain{} pushed successfully.", ok_count, if ok_count == 1 { "" } else { "s" });
     } else {
         eprintln!(
             "  {} pushed, {} failed.",
@@ -226,47 +187,29 @@ async fn handle_sync_push(state: &ReplState) {
             format!("{fail_count} ✗").red(),
         );
     }
-
-    eprintln!(
-        "{}",
-        "────────────────────────────────────────────────".dim()
-    );
     eprintln!();
 }
 
 /// Force-pull all pullable domains from cloud (skips write-only domains like Events).
 async fn handle_sync_pull(state: &ReplState) {
-    eprintln!(
-        "\n{}",
-        "─── Sync Pull ──────────────────────────────────".bold()
-    );
+    cli_section!("Sync Pull");
+    eprintln!();
 
     let Some(mc) = state.matrix_runtime.as_ref() else {
-        eprintln!(
-            "  {} {}",
-            "○".dim(),
-            "No cloud connection — nothing to pull.".dim()
-        );
-        eprintln!(
-            "{}",
-            "────────────────────────────────────────────────".dim()
-        );
+        cli_dim!("No cloud connection — nothing to pull.");
         eprintln!();
         return;
     };
 
     let mut orch = mc.sync_orchestrator_lock().await;
-    eprintln!("  Pulling from cloud...\n");
+    cli_info!("Pulling from cloud...");
+    eprintln!();
 
     let results = orch.pull_all().await;
     drop(orch);
 
     if results.is_empty() {
-        eprintln!("  {} No pullable domains configured.", "○".dim());
-        eprintln!(
-            "{}",
-            "────────────────────────────────────────────────".dim()
-        );
+        cli_dim!("No pullable domains configured.");
         eprintln!();
         return;
     }
@@ -314,12 +257,7 @@ async fn handle_sync_pull(state: &ReplState) {
 
     eprintln!();
     if fail_count == 0 {
-        eprintln!(
-            "  {} {} domain{} pulled successfully.",
-            "✓".green().bold(),
-            ok_count,
-            if ok_count == 1 { "" } else { "s" }
-        );
+        cli_ok!("{} domain{} pulled successfully.", ok_count, if ok_count == 1 { "" } else { "s" });
     } else {
         eprintln!(
             "  {} pulled, {} failed.",
@@ -327,11 +265,6 @@ async fn handle_sync_pull(state: &ReplState) {
             format!("{fail_count} ✗").red(),
         );
     }
-
-    eprintln!(
-        "{}",
-        "────────────────────────────────────────────────".dim()
-    );
     eprintln!();
 }
 

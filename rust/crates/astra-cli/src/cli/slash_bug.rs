@@ -1,3 +1,4 @@
+use crate::{cli_dim, cli_err, cli_ok, cli_warn};
 use super::*;
 use std::io::Write;
 use std::process::{Command as SysCommand, Stdio};
@@ -14,12 +15,9 @@ pub(super) fn handle_bug_command(arg: &str, state: &ReplState) {
     match arg.trim() {
         "copy" => {
             if copy_to_clipboard(&report) {
-                eprintln!("  {} Bug report copied to clipboard.", "✓".green().bold());
+                cli_ok!("Bug report copied to clipboard.");
             } else {
-                eprintln!(
-                    "  {} Could not copy to clipboard — printing instead:",
-                    theme::icon_warn()
-                );
+                cli_warn!("Could not copy to clipboard — printing instead:");
                 eprintln!("{report}");
             }
         }
@@ -30,27 +28,20 @@ pub(super) fn handle_bug_command(arg: &str, state: &ReplState) {
             );
             match std::fs::write(&filename, &report) {
                 Ok(()) => {
-                    eprintln!("  {} Saved to {}", "✓".green().bold(), filename.green());
+                    cli_ok!("Saved to {}", filename);
                 }
                 Err(e) => {
-                    eprintln!("  {} Could not save: {e}", "✗".red());
+                    cli_err!("Could not save: {}", e);
                     eprintln!("{report}");
                 }
             }
         }
         "" => {
             eprintln!("{report}");
-            eprintln!(
-                "  💡  {}",
-                "Use /bug copy to clipboard, /bug save to file.".dim()
-            );
+            cli_dim!("Use /bug copy to clipboard, /bug save to file.");
         }
         other => {
-            eprintln!(
-                "  {} Unknown sub-command '{}'. Usage: /bug [copy|save]",
-                "?".yellow(),
-                other
-            );
+            cli_warn!("Unknown sub-command '{}'. Usage: /bug [copy|save]", other);
         }
     }
 }

@@ -1,3 +1,4 @@
+use crate::{cli_dim, cli_err, cli_ok, cli_section, cli_warn};
 use super::*;
 use crate::{current_access_token, initialize_multi_agent_runtime, post_auth_cloud_resync};
 
@@ -33,34 +34,28 @@ pub(super) async fn handle_account_command(
 ) -> Result<(), String> {
     match cmd {
         "/register" => {
-            eprintln!(
-                "{}",
-                "  ── Register a new account ─────────────────────".cyan()
-            );
+            cli_section!("Register a new account");
+            eprintln!();
             let username = prompt_or("Username", None)?;
             let email = prompt_or("Email   ", None)?;
             let password = prompt_password_masked("Password", None)?;
             match do_register(api, &username, &email, &password).await {
                 Ok(_) => {
-                    eprintln!("{}", "  \u{2713}  Registered! Logging in…".green());
+                    cli_ok!("Registered! Logging in…");
                     match do_login(api, profile, &username, &password).await {
                         Ok(_) => {
-                            eprintln!("{}", "  \u{2713}  Logged in".green());
+                            cli_ok!("Logged in");
                             post_auth_cloud_resync(profile, state).await;
                             refresh_auth_runtime(api, profile, state).await;
                         }
                         Err(e) => {
                             clear_local_auth_state(profile, state);
-                            eprintln!("{}", format!("  \u{2717}  Login failed: {}", e).red());
-                            eprintln!(
-                                "{}",
-                                "  ! Registration succeeded, but no user is logged in now."
-                                    .yellow()
-                            );
+                            cli_err!("Login failed: {}", e);
+                            cli_warn!("Registration succeeded, but no user is logged in now.");
                         }
                     }
                 }
-                Err(e) => eprintln!("{}", format!("  \u{2717}  Register failed: {}", e).red()),
+                Err(e) => cli_err!("Register failed: {}", e),
             }
         }
 
@@ -69,11 +64,11 @@ pub(super) async fn handle_account_command(
             let password = prompt_password_masked("Password", None)?;
             match do_login(api, profile, &username, &password).await {
                 Ok(_) => {
-                    eprintln!("{}", "  \u{2713}  Logged in".green());
+                    cli_ok!("Logged in");
                     post_auth_cloud_resync(profile, state).await;
                     refresh_auth_runtime(api, profile, state).await;
                 }
-                Err(e) => eprintln!("{}", format!("  \u{2717}  Login failed: {}", e).red()),
+                Err(e) => cli_err!("Login failed: {}", e),
             }
         }
 
@@ -88,15 +83,13 @@ pub(super) async fn handle_account_command(
                     .await;
             }
             clear_local_auth_state(profile, state);
-            eprintln!("{}", "  \u{2713}  Logged out".green());
+            cli_ok!("Logged out");
         }
 
         "/memory-setup" => {
             if arg.is_empty() {
-                eprintln!("  Usage: /memory-setup <api_key>");
-                eprintln!(
-                    "  Get a key from Memoria: curl -X POST http://localhost:8100/auth/keys -H 'Authorization: Bearer <master_key>' -H 'Content-Type: application/json' -d '{{\"user_id\":\"<user>\",\"name\":\"astra\"}}'"
-                );
+                cli_dim!("Usage: /memory-setup <api_key>");
+                cli_dim!("Get a key from Memoria: curl -X POST http://localhost:8100/auth/keys -H 'Authorization: Bearer <master_key>' -H 'Content-Type: application/json' -d '{{\"user_id\":\"<user>\",\"name\":\"astra\"}}'");
             } else {
                 let mut creds = load_credentials();
                 let pname = profile_name(profile, &creds);
@@ -108,7 +101,7 @@ pub(super) async fn handle_account_command(
                 unsafe {
                     std::env::set_var("MEMORIA_API_KEY", arg);
                 }
-                eprintln!("{}", "  \u{2713}  Memoria API key saved".green());
+                cli_ok!("Memoria API key saved");
             }
         }
         _ => unreachable!("unexpected account command: {cmd}"),
