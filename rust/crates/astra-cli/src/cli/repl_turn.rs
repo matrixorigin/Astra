@@ -1068,11 +1068,13 @@ fn commit_turn_journal_workspace_and_sidecars(
                 &ve.severity,
                 &ve.injections,
                 &ve.avoid_tools,
+                &ve.deprioritized_tools,
                 ve.force_stop,
                 ve.nudge_count,
                 ve.total_errors,
                 ve.deprioritized_count,
                 ve.total_timeouts,
+                &ve.timeout_dominant_tools,
                 ve.total_cache_hits,
                 ve.flaky_count,
             );
@@ -1455,22 +1457,26 @@ fn initialize_journal(state: &mut ReplState, session_id: &str) {
     }
 
     // Keep workspace metadata in sync without resetting accumulated counters.
-    let (mut ws, mut dirty) = match astra_services::session_workspace::read_workspace(session_id) {
-        Ok(ws) => (ws, false),
-        Err(_) => (
-            astra_services::session_workspace::WorkspaceMetadata::new(
-                session_id,
-                state.model.as_deref().unwrap_or("default"),
+    let (mut ws, mut dirty, workspace_existed) =
+        match astra_services::session_workspace::read_workspace(session_id) {
+            Ok(ws) => (ws, false, true),
+            Err(_) => (
+                astra_services::session_workspace::WorkspaceMetadata::new(
+                    session_id,
+                    state.model.as_deref().unwrap_or("default"),
+                ),
+                true,
+                false,
             ),
-            true,
-        ),
-    };
+        };
     if ws.status != "active" {
         ws.status = "active".to_string();
         dirty = true;
     }
+    // Preserve the workspace model for existing sessions so `/session` can report
+    // what the session originally started as even if the live model changes later.
     if let Some(model) = state.model.as_deref()
-        && ws.model != model
+        && (ws.model.is_empty() || (!workspace_existed && ws.model != model))
     {
         ws.model = model.to_string();
         dirty = true;
@@ -2098,6 +2104,65 @@ mod tests {
         assert_eq!(restored_ws.total_tokens_in, 120);
         assert_eq!(restored_ws.total_tokens_out, 45);
         assert_eq!(restored_ws.status, "active");
+    }
+
+    #[test]
+    fn initialize_journal_does_not_duplicate_start_after_sync_marker() {
+        let (_tmp, _g) = isolated_sessions_dir();
+        let sid = format!("test-sync-marker-{}", uuid::Uuid::new_v4());
+        let writer = session_journal::JournalWriter::new(&sid).unwrap();
+        writer
+            .append(&session_journal::JournalEvent::session_start(
+                Some(&sid),
+                Some("gpt-5"),
+            ))
+            .unwrap();
+        writer
+            .append(&session_journal::JournalEvent::turn(
+                Some(&sid),
+                1,
+                None,
+                "hello",
+                "world",
+                0,
+                10,
+                5,
+                20,
+            ))
+            .unwrap();
+        writer
+            .append(&session_journal::JournalEvent::cloud_pull_sync_marker(
+                Some(&sid),
+                "default",
+                "repl_startup",
+                Some(3),
+                true,
+                2,
+                &["blocked_tools".to_string()],
+                false,
+            ))
+            .unwrap();
+
+        let mut state = ReplState {
+            model: Some("gpt-5".to_string()),
+            ..Default::default()
+        };
+        initialize_journal(&mut state, &sid);
+
+        let events = session_journal::read_journal(&sid).unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| {
+                    event.event_type == session_journal::JournalEventType::SessionStart
+                })
+                .count(),
+            1,
+        );
+        assert_eq!(
+            events.last().map(|event| &event.event_type),
+            Some(&session_journal::JournalEventType::SyncMarker)
+        );
     }
 
     #[test]

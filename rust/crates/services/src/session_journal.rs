@@ -1555,6 +1555,68 @@ impl JournalEvent {
     ///
     /// Only emitted for non-Healthy verdicts (Info, Warning, Critical).
     /// Captures severity, injected messages, avoided tools, and force_stop.
+    fn turn_guard_avoid_reason_codes(
+        avoid_tools: &[String],
+        deprioritized_tools: &[String],
+        timeout_dominant_tools: &[String],
+        nudge_count: usize,
+        non_timeout_errors: usize,
+    ) -> Vec<&'static str> {
+        let mut codes = Vec::new();
+        if !avoid_tools.is_empty() && !deprioritized_tools.is_empty() {
+            codes.push("tool_health_deprioritized");
+        }
+        if non_timeout_errors > 0 {
+            codes.push("session_failures");
+        }
+        if !timeout_dominant_tools.is_empty() {
+            codes.push("timeout_dominant");
+        }
+        if nudge_count > 0 {
+            codes.push("stall_recovery");
+        }
+        codes
+    }
+
+    fn turn_guard_avoid_reason_summary(
+        deprioritized_tools: &[String],
+        timeout_dominant_tools: &[String],
+        nudge_count: usize,
+        non_timeout_errors: usize,
+        total_timeouts: usize,
+    ) -> Option<String> {
+        let mut parts = Vec::new();
+        if !deprioritized_tools.is_empty() {
+            parts.push(format!(
+                "deprioritized by tool health: {}",
+                deprioritized_tools.join(", ")
+            ));
+        }
+        if non_timeout_errors > 0 {
+            parts.push(format!(
+                "{non_timeout_errors} non-timeout failure(s) recorded"
+            ));
+        }
+        if total_timeouts > 0 {
+            if timeout_dominant_tools.is_empty() {
+                parts.push(format!("{total_timeouts} timeout failure(s) recorded"));
+            } else {
+                parts.push(format!(
+                    "timeout-dominant tools: {}",
+                    timeout_dominant_tools.join(", ")
+                ));
+            }
+        }
+        if nudge_count > 0 {
+            parts.push(format!("{nudge_count} stall/divergence nudge(s) issued"));
+        }
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join("; "))
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn turn_guard_verdict(
         session_id: Option<&str>,
@@ -1562,14 +1624,31 @@ impl JournalEvent {
         severity: &str,
         injections: &[String],
         avoid_tools: &[String],
+        deprioritized_tools: &[String],
         force_stop: bool,
         nudge_count: usize,
         total_errors: usize,
         deprioritized_count: usize,
         total_timeouts: usize,
+        timeout_dominant_tools: &[String],
         total_cache_hits: usize,
         flaky_count: usize,
     ) -> Self {
+        let non_timeout_errors = total_errors.saturating_sub(total_timeouts);
+        let avoid_reason_codes = Self::turn_guard_avoid_reason_codes(
+            avoid_tools,
+            deprioritized_tools,
+            timeout_dominant_tools,
+            nudge_count,
+            non_timeout_errors,
+        );
+        let avoid_reason_summary = Self::turn_guard_avoid_reason_summary(
+            deprioritized_tools,
+            timeout_dominant_tools,
+            nudge_count,
+            non_timeout_errors,
+            total_timeouts,
+        );
         let mut evt = Self::base(JournalEventType::TurnGuardVerdict, session_id);
         evt.turn = Some(turn);
         evt.stall_type = Some(severity.to_string());
@@ -1578,9 +1657,15 @@ impl JournalEvent {
             "injections": injections.len(),
             "injection_preview": injections.first().map(|s| truncate(s, 200)),
             "avoid_tools": avoid_tools,
+            "avoid_tools_count": avoid_tools.len(),
+            "deprioritized_tool_names": deprioritized_tools,
+            "timeout_dominant_tools": timeout_dominant_tools,
+            "avoid_reason_codes": avoid_reason_codes,
+            "avoid_reason_summary": avoid_reason_summary,
             "force_stop": force_stop,
             "nudge_count": nudge_count,
             "total_errors": total_errors,
+            "non_timeout_errors": non_timeout_errors,
             "deprioritized_tools": deprioritized_count,
             "total_timeouts": total_timeouts,
             "total_cache_hits": total_cache_hits,
@@ -2726,11 +2811,13 @@ mod tests {
             "warning",
             &["Stall detected: repeated bash calls".to_string()],
             &["bash".to_string()],
+            &["bash".to_string()],
             false,
             1,
             2,
             1,
             0, // total_timeouts
+            &[],
             0, // total_cache_hits
             0, // flaky_count
         );
@@ -2747,9 +2834,19 @@ mod tests {
         assert_eq!(meta["severity"], "warning");
         assert_eq!(meta["injections"], 1);
         assert_eq!(meta["avoid_tools"][0], "bash");
+        assert_eq!(meta["avoid_tools_count"], 1);
+        assert_eq!(meta["deprioritized_tool_names"][0], "bash");
+        assert_eq!(meta["avoid_reason_codes"][0], "tool_health_deprioritized");
+        assert_eq!(meta["avoid_reason_codes"][1], "session_failures");
+        assert_eq!(meta["avoid_reason_codes"][2], "stall_recovery");
+        assert_eq!(
+            meta["avoid_reason_summary"],
+            "deprioritized by tool health: bash; 2 non-timeout failure(s) recorded; 1 stall/divergence nudge(s) issued"
+        );
         assert_eq!(meta["force_stop"], false);
         assert_eq!(meta["nudge_count"], 1);
         assert_eq!(meta["total_errors"], 2);
+        assert_eq!(meta["non_timeout_errors"], 2);
         assert_eq!(meta["deprioritized_tools"], 1);
         assert_eq!(meta["total_timeouts"], 0);
         assert_eq!(meta["total_cache_hits"], 0);
@@ -2767,11 +2864,13 @@ mod tests {
                 "Tool health degraded".to_string(),
             ],
             &["bash".to_string(), "grep".to_string()],
+            &["bash".to_string(), "grep".to_string()],
             true,
             3,
             5,
             2,
             2, // total_timeouts
+            &["bash".to_string()],
             1, // total_cache_hits
             1, // flaky_count
         );
@@ -2782,6 +2881,8 @@ mod tests {
         assert_eq!(meta["force_stop"], true);
         assert_eq!(meta["injections"], 2);
         assert_eq!(meta["nudge_count"], 3);
+        assert_eq!(meta["non_timeout_errors"], 3);
+        assert_eq!(meta["timeout_dominant_tools"][0], "bash");
         assert_eq!(meta["total_timeouts"], 2);
         assert_eq!(meta["total_cache_hits"], 1);
         assert_eq!(meta["flaky_tools"], 1);
@@ -2796,8 +2897,22 @@ mod tests {
 
     #[test]
     fn turn_guard_verdict_info_minimal() {
-        let evt =
-            JournalEvent::turn_guard_verdict(None, 1, "info", &[], &[], false, 0, 1, 0, 0, 0, 0);
+        let evt = JournalEvent::turn_guard_verdict(
+            None,
+            1,
+            "info",
+            &[],
+            &[],
+            &[],
+            false,
+            0,
+            1,
+            0,
+            0,
+            &[],
+            0,
+            0,
+        );
         let json = serde_json::to_string(&evt).unwrap();
         let parsed: JournalEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.event_type, JournalEventType::TurnGuardVerdict);
@@ -2805,6 +2920,8 @@ mod tests {
         assert_eq!(meta["injections"], 0);
         assert!(meta["injection_preview"].is_null());
         assert_eq!(meta["force_stop"], false);
+        assert_eq!(meta["non_timeout_errors"], 1);
+        assert_eq!(meta["avoid_tools_count"], 0);
     }
 
     // ── stall_detected event ──

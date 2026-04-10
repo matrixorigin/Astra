@@ -619,7 +619,17 @@ pub(super) fn handle_session_command(arg: &str, state: &mut ReplState) {
                                             .get("injections")
                                             .and_then(|v| v.as_u64())
                                             .unwrap_or(0);
-                                        format!("{inj} nudges, {avoid} tools restricted")
+                                        let reason = m
+                                            .get("avoid_reason_summary")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("");
+                                        if reason.is_empty() {
+                                            format!("{inj} nudges, {avoid} tools restricted")
+                                        } else {
+                                            format!(
+                                                "{inj} nudges, {avoid} tools restricted ({reason})"
+                                            )
+                                        }
                                     })
                                     .unwrap_or_default();
                                 eprintln!(

@@ -851,6 +851,10 @@ fn show_correction_timeline(session_id: &str) {
             .and_then(|m| m.get("force_stop"))
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        let avoid_reason = meta
+            .and_then(|m| m.get("avoid_reason_summary"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
 
         let severity_colored = match severity {
             "critical" => severity.red().to_string(),
@@ -869,14 +873,20 @@ fn show_correction_timeline(session_id: &str) {
         } else {
             String::new()
         };
+        let reason_str = if avoid_reason.is_empty() {
+            String::new()
+        } else {
+            format!("\n      {}", avoid_reason.dim())
+        };
 
         eprintln!(
-            "  T{} {} — {} injection(s){}{}",
+            "  T{} {} — {} injection(s){}{}{}",
             turn.bold(),
             severity_colored,
             injections,
             avoid_str,
             stop_str,
+            reason_str,
         );
     }
     eprintln!();

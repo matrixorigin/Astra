@@ -122,16 +122,30 @@ pub fn apply_agentic_post_tool_policy(
                 VerdictSeverity::Healthy => unreachable!(),
             };
             let health_summary = turn_guard.health.summary();
+            let deprioritized_tools = turn_guard
+                .health
+                .deprioritized_tools()
+                .iter()
+                .map(|tool| (*tool).to_string())
+                .collect::<Vec<_>>();
+            let timeout_dominant_tools = turn_guard
+                .health
+                .timeout_dominant_tools()
+                .iter()
+                .map(|tool| (*tool).to_string())
+                .collect::<Vec<_>>();
             verdict_events.push(AgenticVerdictAuditEvent {
                 turn: turn_index,
                 severity: severity_str.to_string(),
                 injections: verdict.injections.clone(),
                 avoid_tools: verdict.avoid_tools.clone(),
+                deprioritized_tools,
                 force_stop: verdict.force_stop,
                 nudge_count: turn_guard.nudge_count,
                 total_errors: turn_guard.errors.total_errors,
                 deprioritized_count: health_summary.deprioritized_count,
                 total_timeouts: health_summary.total_timeouts,
+                timeout_dominant_tools,
                 total_cache_hits: health_summary.total_cache_hits,
                 flaky_count: health_summary.flaky_count,
             });
