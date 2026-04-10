@@ -1,8 +1,8 @@
 //! Generic stdio LSP client: Content-Length framing, `initialize` / `initialized`,
 //! background reader for `textDocument/publishDiagnostics` and minimal server requests.
 
-use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -17,6 +17,8 @@ use serde_json::{Value, json};
 use url::Url;
 
 pub(crate) const MAX_LSP_DIAG_BATCHES: usize = 32;
+pub(crate) const MAX_LSP_DIAG_FILES_PER_MESSAGE: usize = 8;
+pub(crate) const MAX_LSP_DIAGS_PER_FILE: usize = 12;
 pub(crate) const MAX_LSP_LINES_PER_MESSAGE: usize = 120;
 
 #[derive(Clone, Copy, Debug)]
@@ -72,6 +74,7 @@ pub(crate) struct LspStdioSession {
     documents: Mutex<HashMap<String, SyncedDocumentState>>,
     pending_diags: Arc<Mutex<Vec<Value>>>,
     latest_diags: Arc<Mutex<HashMap<String, Value>>>,
+    emitted_diag_hashes: Mutex<HashMap<String, u64>>,
     next_request_id: AtomicU64,
     pending_requests: Arc<Mutex<HashMap<u64, Sender<io::Result<Value>>>>>,
 }
@@ -140,6 +143,228 @@ fn text_hash(text: &str) -> u64 {
     let mut hasher = DefaultHasher::new();
     text.hash(&mut hasher);
     hasher.finish()
+}
+
+fn diagnostic_payload_hash(value: &Value) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    serde_json::to_string(value)
+        .unwrap_or_default()
+        .hash(&mut hasher);
+    hasher.finish()
+}
+
+fn pluralize(count: usize, singular: &str, plural: &str) -> String {
+    if count == 1 {
+        format!("1 {singular}")
+    } else {
+        format!("{count} {plural}")
+    }
+}
+
+fn diagnostic_severity_label(severity: Option<u64>) -> &'static str {
+    match severity {
+        Some(1) => "error",
+        Some(2) => "warning",
+        Some(3) => "info",
+        Some(4) => "hint",
+        _ => "diag",
+    }
+}
+
+fn collect_diagnostic_entries(diags: &[Value]) -> Vec<(String, String, String)> {
+    let mut seen = HashSet::new();
+    let mut entries = Vec::new();
+    for d in diags {
+        let severity = diagnostic_severity_label(d.get("severity").and_then(Value::as_u64));
+        let message = d
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let location = d
+            .get("range")
+            .and_then(|r| r.get("start"))
+            .map(|s| {
+                let line = s.get("line").and_then(Value::as_u64).unwrap_or(0);
+                let character = s.get("character").and_then(Value::as_u64).unwrap_or(0);
+                format!("{}:{}", line + 1, character + 1)
+            })
+            .unwrap_or_else(|| "?".to_string());
+        let fingerprint = format!("{severity}|{location}|{message}");
+        if seen.insert(fingerprint) {
+            entries.push((severity.to_string(), location, message));
+        }
+    }
+    entries
+}
+
+fn summarize_diagnostic_entries(entries: &[(String, String, String)]) -> String {
+    if entries.is_empty() {
+        return "cleared".to_string();
+    }
+
+    let mut errors = 0usize;
+    let mut warnings = 0usize;
+    let mut infos = 0usize;
+    let mut hints = 0usize;
+    let mut others = 0usize;
+    for (severity, _, _) in entries {
+        match severity.as_str() {
+            "error" => errors += 1,
+            "warning" => warnings += 1,
+            "info" => infos += 1,
+            "hint" => hints += 1,
+            _ => others += 1,
+        }
+    }
+
+    let mut parts = Vec::new();
+    if errors > 0 {
+        parts.push(pluralize(errors, "error", "errors"));
+    }
+    if warnings > 0 {
+        parts.push(pluralize(warnings, "warning", "warnings"));
+    }
+    if infos > 0 {
+        parts.push(pluralize(infos, "info", "infos"));
+    }
+    if hints > 0 {
+        parts.push(pluralize(hints, "hint", "hints"));
+    }
+    if others > 0 {
+        parts.push(pluralize(others, "diagnostic", "diagnostics"));
+    }
+
+    if parts.is_empty() {
+        pluralize(entries.len(), "diagnostic", "diagnostics")
+    } else {
+        format!(
+            "{}: {}",
+            pluralize(entries.len(), "diagnostic", "diagnostics"),
+            parts.join(", ")
+        )
+    }
+}
+
+fn coalesce_diagnostic_batches(batches: Vec<Value>) -> Vec<Value> {
+    let mut by_uri: HashMap<String, (usize, Value)> = HashMap::new();
+    let mut without_uri = Vec::new();
+    for (idx, batch) in batches.into_iter().enumerate() {
+        if let Some(uri) = batch.get("uri").and_then(Value::as_str) {
+            by_uri.insert(uri.to_string(), (idx, batch));
+        } else {
+            without_uri.push((idx, batch));
+        }
+    }
+    let mut merged: Vec<(usize, Value)> = by_uri.into_values().collect();
+    merged.extend(without_uri);
+    merged.sort_by_key(|(idx, _)| *idx);
+    merged.into_iter().map(|(_, batch)| batch).collect()
+}
+
+fn render_diagnostic_messages(
+    title: &str,
+    source: &str,
+    batches: Vec<Value>,
+    emitted_hashes: &mut HashMap<String, u64>,
+) -> Vec<Value> {
+    let mut lines: Vec<String> = Vec::new();
+    let mut rendered_files = 0usize;
+    let mut omitted_files = 0usize;
+
+    for params in coalesce_diagnostic_batches(batches) {
+        let Some(uri) = params.get("uri").and_then(Value::as_str) else {
+            continue;
+        };
+        let diagnostics = params
+            .get("diagnostics")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let entries = collect_diagnostic_entries(&diagnostics);
+        let signature = diagnostic_payload_hash(&json!(
+            entries
+                .iter()
+                .map(|(severity, location, message)| {
+                    json!({
+                        "severity": severity,
+                        "location": location,
+                        "message": message,
+                    })
+                })
+                .collect::<Vec<_>>()
+        ));
+        let previous_signature = emitted_hashes.get(uri).copied();
+        if previous_signature == Some(signature) {
+            continue;
+        }
+        emitted_hashes.insert(uri.to_string(), signature);
+
+        let path_hint = uri.strip_prefix("file://").unwrap_or(uri);
+        if diagnostics.is_empty() {
+            if previous_signature.is_none() {
+                continue;
+            }
+            lines.push(format!("── {path_hint} (cleared) ──"));
+            lines.push("  diagnostics cleared".to_string());
+            lines.push(String::new());
+            continue;
+        }
+
+        if rendered_files >= MAX_LSP_DIAG_FILES_PER_MESSAGE {
+            omitted_files += 1;
+            continue;
+        }
+        rendered_files += 1;
+        lines.push(format!(
+            "── {path_hint} ({}) ──",
+            summarize_diagnostic_entries(&entries)
+        ));
+
+        let mut omitted_entries = 0usize;
+        for (idx, (severity, location, message)) in entries.iter().enumerate() {
+            if idx >= MAX_LSP_DIAGS_PER_FILE {
+                omitted_entries += 1;
+                continue;
+            }
+            lines.push(format!("  [{severity}] {location}  {message}"));
+        }
+        if omitted_entries > 0 {
+            lines.push(format!("  … {} more diagnostics omitted", omitted_entries));
+        }
+        lines.push(String::new());
+    }
+
+    if omitted_files > 0 {
+        lines.push(format!(
+            "[{} additional files with changed diagnostics omitted]",
+            omitted_files
+        ));
+        lines.push(String::new());
+    }
+
+    if lines.len() > MAX_LSP_LINES_PER_MESSAGE {
+        let keep = MAX_LSP_LINES_PER_MESSAGE.saturating_sub(1);
+        lines.truncate(keep);
+        lines.push(format!(
+            "[truncated LSP diagnostics at {MAX_LSP_LINES_PER_MESSAGE} lines]"
+        ));
+    }
+
+    let body = lines.join("\n").trim().to_string();
+    if body.is_empty() {
+        return Vec::new();
+    }
+
+    vec![json!({
+        "role": "user",
+        "content": format!("<new-diagnostics>\n{title} (LSP) diagnostics:\n\n{body}\n</new-diagnostics>"),
+        "attachment_metadata": {
+            "kind": "passive_workspace_diagnostics",
+            "source": source,
+        }
+    })]
 }
 
 fn sync_existing_document(doc: &mut SyncedDocumentState, mtime_ms: u128, hash: u64) -> Option<i32> {
@@ -443,6 +668,7 @@ impl LspStdioSession {
             documents: Mutex::new(HashMap::new()),
             pending_diags,
             latest_diags,
+            emitted_diag_hashes: Mutex::new(HashMap::new()),
             next_request_id: AtomicU64::new(2),
             pending_requests,
         })))
@@ -648,57 +874,16 @@ impl LspStdioSession {
         if batches.len() > MAX_LSP_DIAG_BATCHES {
             batches.truncate(MAX_LSP_DIAG_BATCHES);
         }
-        let title = self.diagnostic_title;
-        let source = self.attachment_source;
-        let mut lines: Vec<String> = Vec::new();
-        for params in batches {
-            if let Some(uri) = params.get("uri").and_then(|u| u.as_str()) {
-                let path_hint = uri.strip_prefix("file://").unwrap_or(uri);
-                lines.push(format!("── {path_hint} ──"));
-            }
-            if let Some(diags) = params.get("diagnostics").and_then(|d| d.as_array()) {
-                for d in diags.iter().take(40) {
-                    let sev = d
-                        .get("severity")
-                        .and_then(|x| x.as_u64())
-                        .map(|n| match n {
-                            1 => "error",
-                            2 => "warning",
-                            3 => "info",
-                            4 => "hint",
-                            _ => "?",
-                        })
-                        .unwrap_or("diag");
-                    let msg = d.get("message").and_then(|m| m.as_str()).unwrap_or("");
-                    let range = d.get("range");
-                    let loc = range
-                        .and_then(|r| r.get("start"))
-                        .map(|s| {
-                            let l = s.get("line").and_then(|x| x.as_u64()).unwrap_or(0);
-                            let c = s.get("character").and_then(|x| x.as_u64()).unwrap_or(0);
-                            format!("{}:{}", l + 1, c + 1)
-                        })
-                        .unwrap_or_else(|| "?".into());
-                    lines.push(format!("  [{sev}] {loc}  {msg}"));
-                }
-            }
-            lines.push(String::new());
-        }
-        while lines.len() > MAX_LSP_LINES_PER_MESSAGE {
-            lines.pop();
-        }
-        let body = lines.join("\n").trim().to_string();
-        if body.is_empty() {
-            return Vec::new();
-        }
-        vec![json!({
-            "role": "user",
-            "content": format!("<new-diagnostics>\n{title} (LSP) diagnostics:\n\n{body}\n</new-diagnostics>"),
-            "attachment_metadata": {
-                "kind": "passive_workspace_diagnostics",
-                "source": source,
-            }
-        })]
+        let mut emitted_hashes = match self.emitted_diag_hashes.lock() {
+            Ok(g) => g,
+            Err(_) => return Vec::new(),
+        };
+        render_diagnostic_messages(
+            self.diagnostic_title,
+            self.attachment_source,
+            batches,
+            &mut emitted_hashes,
+        )
     }
 }
 
@@ -716,6 +901,125 @@ impl Drop for LspStdioSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn count_match(haystack: &str, needle: &str) -> usize {
+        haystack.match_indices(needle).count()
+    }
+
+    #[test]
+    fn lsp_render_diagnostic_messages_coalesces_latest_and_skips_repeats() {
+        let mut emitted = HashMap::new();
+        let messages = render_diagnostic_messages(
+            "rust-analyzer",
+            "rust_analyzer_lsp",
+            vec![
+                json!({
+                    "uri": "file:///demo.rs",
+                    "diagnostics": [{
+                        "range": {
+                            "start": {"line": 0, "character": 0},
+                            "end": {"line": 0, "character": 1}
+                        },
+                        "severity": 2,
+                        "message": "old warning"
+                    }]
+                }),
+                json!({
+                    "uri": "file:///demo.rs",
+                    "diagnostics": [
+                        {
+                            "range": {
+                                "start": {"line": 0, "character": 0},
+                                "end": {"line": 0, "character": 1}
+                            },
+                            "severity": 1,
+                            "message": "new error"
+                        },
+                        {
+                            "range": {
+                                "start": {"line": 0, "character": 0},
+                                "end": {"line": 0, "character": 1}
+                            },
+                            "severity": 1,
+                            "message": "new error"
+                        }
+                    ]
+                }),
+            ],
+            &mut emitted,
+        );
+        assert_eq!(messages.len(), 1);
+        let content = messages[0]["content"].as_str().unwrap();
+        assert!(content.contains("demo.rs (1 diagnostic: 1 error)"));
+        assert!(content.contains("[error] 1:1  new error"));
+        assert!(!content.contains("old warning"));
+        assert_eq!(count_match(content, "new error"), 1);
+
+        let repeated = render_diagnostic_messages(
+            "rust-analyzer",
+            "rust_analyzer_lsp",
+            vec![json!({
+                "uri": "file:///demo.rs",
+                "diagnostics": [{
+                    "range": {
+                        "start": {"line": 0, "character": 0},
+                        "end": {"line": 0, "character": 1}
+                    },
+                    "severity": 1,
+                    "message": "new error"
+                }]
+            })],
+            &mut emitted,
+        );
+        assert!(repeated.is_empty());
+    }
+
+    #[test]
+    fn lsp_render_diagnostic_messages_reports_clears_once() {
+        let mut emitted = HashMap::new();
+        let first = render_diagnostic_messages(
+            "rust-analyzer",
+            "rust_analyzer_lsp",
+            vec![json!({
+                "uri": "file:///demo.rs",
+                "diagnostics": [{
+                    "range": {
+                        "start": {"line": 1, "character": 2},
+                        "end": {"line": 1, "character": 3}
+                    },
+                    "severity": 2,
+                    "message": "warn"
+                }]
+            })],
+            &mut emitted,
+        );
+        assert_eq!(first.len(), 1);
+
+        let cleared = render_diagnostic_messages(
+            "rust-analyzer",
+            "rust_analyzer_lsp",
+            vec![json!({
+                "uri": "file:///demo.rs",
+                "diagnostics": []
+            })],
+            &mut emitted,
+        );
+        assert_eq!(cleared.len(), 1);
+        let content = cleared[0]["content"].as_str().unwrap();
+        assert!(content.contains("demo.rs (cleared)"));
+        assert!(content.contains("diagnostics cleared"));
+
+        let repeated_clear = render_diagnostic_messages(
+            "rust-analyzer",
+            "rust_analyzer_lsp",
+            vec![json!({
+                "uri": "file:///demo.rs",
+                "diagnostics": []
+            })],
+            &mut emitted,
+        );
+        assert!(repeated_clear.is_empty());
+    }
 
     #[test]
     fn lsp_sync_existing_document_resyncs_when_hash_changes_but_mtime_does_not() {
