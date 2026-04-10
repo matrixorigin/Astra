@@ -494,8 +494,7 @@ async fn stop_agent(ctx: &AgentCommandContext, agent_id: &str) {
 /// Watch agent tree with real-time updates on spawn/complete events.
 /// Throttles rendering to max once per 500ms.
 async fn show_watch(ctx: &AgentCommandContext) {
-    use astra_runtime::orchestration::ProgressEventType;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     eprintln!("\n  {} Watching agent tree (Ctrl+C to stop)\n", "👁".cyan());
     eprintln!(
@@ -510,8 +509,6 @@ async fn show_watch(ctx: &AgentCommandContext) {
         .as_ref()
         .map(|spawner| spawner.subscribe_progress());
     let throttle_interval = Duration::from_millis(500);
-    let mut interval = tokio::time::interval(throttle_interval);
-    let mut last_render = Instant::now() - Duration::from_secs(10);
     let mut last_snapshot = build_watch_snapshot(
         &load_watch_agents(spawner_clone.as_ref()).await,
         &load_recent_delegations(ctx.session_id.as_deref()),
@@ -519,44 +516,16 @@ async fn show_watch(ctx: &AgentCommandContext) {
     print_watch_snapshot(&last_snapshot);
 
     loop {
-        let should_refresh = tokio::select! {
-            _ = interval.tick() => {
-                true
-            }
-            maybe_event = async {
-                if let Some(rx) = &mut rx {
-                    rx.recv().await.ok()
-                } else {
-                    std::future::pending().await
-                }
-            } => {
-                match maybe_event {
-                    Some(event) => {
-                        let is_tree_event = matches!(
-                            event.event_type,
-                            ProgressEventType::AgentSpawned { .. }
-                                | ProgressEventType::Completed { .. }
-                                | ProgressEventType::Failed { .. }
-                                | ProgressEventType::Cancelled { .. }
-                        );
-                        is_tree_event
-                    }
-                    None => true,
-                }
-            }
-        };
-        if !should_refresh || last_render.elapsed() < throttle_interval {
-            continue;
-        }
-        let snapshot = build_watch_snapshot(
-            &load_watch_agents(spawner_clone.as_ref()).await,
-            &load_recent_delegations(ctx.session_id.as_deref()),
-        );
-        if snapshot != last_snapshot {
-            print_watch_snapshot(&snapshot);
-            last_snapshot = snapshot;
-            last_render = Instant::now();
-        }
+        let snapshot = wait_for_watch_snapshot_change(
+            spawner_clone.as_ref(),
+            &mut rx,
+            ctx.session_id.as_deref(),
+            &last_snapshot,
+            throttle_interval,
+        )
+        .await;
+        print_watch_snapshot(&snapshot);
+        last_snapshot = snapshot;
     }
 }
 
@@ -1064,6 +1033,73 @@ async fn load_watch_agents(
     }
 }
 
+async fn recv_watch_event(
+    rx: &mut Option<
+        tokio::sync::broadcast::Receiver<astra_runtime::orchestration::AgentProgressEvent>,
+    >,
+) -> Result<
+    astra_runtime::orchestration::AgentProgressEvent,
+    tokio::sync::broadcast::error::RecvError,
+> {
+    if let Some(rx) = rx {
+        rx.recv().await
+    } else {
+        std::future::pending::<
+            Result<
+                astra_runtime::orchestration::AgentProgressEvent,
+                tokio::sync::broadcast::error::RecvError,
+            >,
+        >()
+        .await
+    }
+}
+
+async fn wait_for_watch_snapshot_change(
+    spawner: Option<&Arc<DynamicAgentSpawner>>,
+    rx: &mut Option<
+        tokio::sync::broadcast::Receiver<astra_runtime::orchestration::AgentProgressEvent>,
+    >,
+    session_id: Option<&str>,
+    last_snapshot: &str,
+    poll_interval: std::time::Duration,
+) -> String {
+    use astra_runtime::orchestration::ProgressEventType;
+    use tokio::sync::broadcast::error::RecvError;
+
+    let mut interval = tokio::time::interval(poll_interval);
+    loop {
+        let should_refresh = tokio::select! {
+            _ = interval.tick() => true,
+            event = recv_watch_event(rx) => {
+                match event {
+                    Ok(event) => matches!(
+                        event.event_type,
+                        ProgressEventType::AgentSpawned { .. }
+                            | ProgressEventType::Completed { .. }
+                            | ProgressEventType::Failed { .. }
+                            | ProgressEventType::Cancelled { .. }
+                    ),
+                    Err(RecvError::Lagged(_)) => true,
+                    Err(RecvError::Closed) => {
+                        *rx = None;
+                        true
+                    }
+                }
+            }
+        };
+        if !should_refresh {
+            continue;
+        }
+        let snapshot = build_watch_snapshot(
+            &load_watch_agents(spawner).await,
+            &load_recent_delegations(session_id),
+        );
+        if snapshot != last_snapshot {
+            return snapshot;
+        }
+    }
+}
+
 fn build_watch_snapshot(
     agents: &[astra_runtime::orchestration::SpawnedAgentInfo],
     delegations: &[DelegationHistoryEntry],
@@ -1271,9 +1307,12 @@ fn load_delegation_events(
 mod tests {
     use super::*;
     use astra_runtime::messaging::{AgentMailboxRouter, InProcessTransport};
-    use astra_runtime::orchestration::{SpawnedAgentInfo, SpawnedAgentMetrics};
+    use astra_runtime::orchestration::{
+        SpawnAgentInput, SpawnContext, SpawnedAgentInfo, SpawnedAgentMetrics,
+    };
     use astra_runtime::server::delegation_engine::DelegationTracker;
     use astra_services::session_journal::JournalEvent;
+    use std::path::PathBuf;
     use std::sync::Arc;
     use std::time::SystemTime;
 
@@ -1495,5 +1534,92 @@ mod tests {
     fn build_watch_snapshot_shows_empty_state() {
         let snapshot = build_watch_snapshot(&[], &[]);
         assert!(snapshot.contains("no agents or delegations yet"));
+    }
+
+    #[tokio::test]
+    async fn wait_for_watch_snapshot_change_detects_spawned_agent_events() {
+        let transport = Arc::new(InProcessTransport::new());
+        let tracker = Arc::new(DelegationTracker::new());
+        let router = Arc::new(AgentMailboxRouter::new(transport, tracker));
+        let spawner = Arc::new(DynamicAgentSpawner::new(router));
+        let mut rx = Some(spawner.subscribe_progress());
+        let last_snapshot = build_watch_snapshot(&[], &[]);
+        let context = SpawnContext {
+            parent_run_id: "root-run".to_string(),
+            parent_agent_id: "main".to_string(),
+            inherited_permissions: None,
+            inherited_skills: vec![],
+            working_dir: PathBuf::from("/tmp"),
+        };
+        let input = SpawnAgentInput {
+            description: "watch test agent".to_string(),
+            prompt: "do nothing".to_string(),
+            agent_type: "task".to_string(),
+            model: None,
+            background: true,
+            name: None,
+            max_turns: None,
+            isolated: false,
+            allowed_tools: None,
+        };
+
+        let output = spawner.spawn(input, &context).await.unwrap();
+        let agent_id = match output {
+            astra_runtime::orchestration::SpawnAgentOutput::Launched { agent_id, .. } => agent_id,
+            other => panic!("expected launched output, got {other:?}"),
+        };
+
+        let snapshot = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            wait_for_watch_snapshot_change(
+                Some(&spawner),
+                &mut rx,
+                None,
+                &last_snapshot,
+                std::time::Duration::from_millis(10),
+            ),
+        )
+        .await
+        .unwrap();
+
+        assert!(snapshot.contains("Spawned agents (1)"));
+        assert!(snapshot.contains(agent_id.split('@').next().unwrap_or("watch")));
+    }
+
+    #[tokio::test]
+    async fn wait_for_watch_snapshot_change_detects_journal_updates() {
+        let sid = format!("slash-agent-watch-test-{}", uuid::Uuid::new_v4());
+        let last_snapshot = build_watch_snapshot(&[], &[]);
+        let mut rx = None;
+        let sid_for_writer = sid.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            let writer = session_journal::JournalWriter::new(&sid_for_writer).unwrap();
+            writer
+                .append(&JournalEvent::delegation_started(
+                    Some(&sid_for_writer),
+                    "del-watch",
+                    "run-parent",
+                    "fan_out",
+                    &["coder".to_string()],
+                ))
+                .unwrap();
+        });
+
+        let snapshot = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            wait_for_watch_snapshot_change(
+                None,
+                &mut rx,
+                Some(&sid),
+                &last_snapshot,
+                std::time::Duration::from_millis(10),
+            ),
+        )
+        .await
+        .unwrap();
+
+        assert!(snapshot.contains("Journal-backed delegations (1)"));
+        assert!(snapshot.contains("del-watch"));
     }
 }
