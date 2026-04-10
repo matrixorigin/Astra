@@ -627,6 +627,18 @@ impl ToolExecutor {
         )
     }
 
+    fn try_active_semantic_tokens(&self, file: &str) -> Result<Option<Value>, String> {
+        let (file_path, uri) = self.ensure_lsp_file_ready(file)?;
+        self.passive_lsp.request_for_file(
+            &self.project_root,
+            &file_path,
+            "textDocument/semanticTokens/full",
+            json!({
+                "textDocument": { "uri": uri },
+            }),
+        )
+    }
+
     fn lsp_range_contains_position(range: &Value, line: usize, column: usize) -> bool {
         if line == 0 || column == 0 {
             return false;
@@ -777,7 +789,7 @@ impl ToolExecutor {
                 "error": "Missing required 'operation' parameter",
                 "valid_operations": [
                     "goto_definition", "find_references", "hover", "document_symbols",
-                    "workspace_symbols", "call_hierarchy", "incoming_calls", "outgoing_calls", "declaration", "type_definition", "implementation", "prepare_rename", "rename", "code_actions", "completions", "signature_help", "document_highlight", "document_links", "inlay_hints", "folding_ranges", "document_colors", "color_presentations", "selection_ranges", "linked_editing_range", "format_document", "format_range", "format_on_type", "diagnostics"
+                    "workspace_symbols", "call_hierarchy", "incoming_calls", "outgoing_calls", "declaration", "type_definition", "implementation", "prepare_rename", "rename", "code_actions", "completions", "signature_help", "document_highlight", "document_links", "inlay_hints", "folding_ranges", "document_colors", "color_presentations", "semantic_tokens", "selection_ranges", "linked_editing_range", "format_document", "format_range", "format_on_type", "diagnostics"
                 ]
             }).to_string(),
         };
@@ -1379,6 +1391,26 @@ impl ToolExecutor {
                 }
             }
 
+            "semantic_tokens" => {
+                if let Some(f) = file {
+                    match self.try_active_semantic_tokens(f) {
+                        Ok(Some(result)) => Self::active_lsp_response(
+                            "semantic_tokens",
+                            "textDocument/semanticTokens/full",
+                            result,
+                        ),
+                        Ok(None) => json!({
+                            "error": "semantic_tokens requires an active LSP backend for that file"
+                        }).to_string(),
+                        Err(error) => json!({ "error": error }).to_string(),
+                    }
+                } else {
+                    json!({
+                        "error": "semantic_tokens requires 'file'"
+                    }).to_string()
+                }
+            }
+
             "selection_ranges" => {
                 if let (Some(f), Some(l), Some(c)) = (file, line, column) {
                     match self.try_active_selection_ranges(f, l, c) {
@@ -1564,6 +1596,7 @@ impl ToolExecutor {
                             "folding_ranges": true,
                             "document_colors": true,
                             "color_presentations": true,
+                            "semantic_tokens": true,
                             "selection_ranges": true,
                             "linked_editing_range": true,
                             "format_document": true,
@@ -1584,7 +1617,7 @@ impl ToolExecutor {
                 "error": format!("Unknown operation: {}", operation),
                 "valid_operations": [
                     "goto_definition", "find_references", "hover", "document_symbols",
-                    "workspace_symbols", "call_hierarchy", "incoming_calls", "outgoing_calls", "declaration", "type_definition", "implementation", "prepare_rename", "rename", "code_actions", "completions", "signature_help", "document_highlight", "document_links", "inlay_hints", "folding_ranges", "document_colors", "color_presentations", "selection_ranges", "linked_editing_range", "format_document", "format_range", "format_on_type", "diagnostics"
+                    "workspace_symbols", "call_hierarchy", "incoming_calls", "outgoing_calls", "declaration", "type_definition", "implementation", "prepare_rename", "rename", "code_actions", "completions", "signature_help", "document_highlight", "document_links", "inlay_hints", "folding_ranges", "document_colors", "color_presentations", "semantic_tokens", "selection_ranges", "linked_editing_range", "format_document", "format_range", "format_on_type", "diagnostics"
                 ]
             }).to_string()
         }
