@@ -1212,6 +1212,19 @@ impl DelegationEngine {
                         })
                         .await;
 
+                    Self::write_journal_event(
+                        &retry_config.session_id,
+                        astra_services::session_journal::JournalEvent::delegation_retry(
+                            Some(&retry_config.session_id),
+                            delegation_id,
+                            &original_run_id,
+                            &retry_run_id,
+                            &retry_config.agent_profile.agent_id,
+                            attempt,
+                            &reason,
+                        ),
+                    );
+
                     // Mark the original as verification-failed before retrying
                     self.tracker
                         .complete_sub_run(&original_run_id, SubRunState::VerificationFailed)
@@ -3786,6 +3799,63 @@ mod tests {
         // Should eventually pass after retry
         assert_eq!(result.agent_results.len(), 1);
         assert_eq!(result.agent_results[0].status, "completed");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn gate_retry_writes_journal_linkage_event() {
+        let sessions_dir = std::env::temp_dir().join(format!(
+            "delegation-engine-journal-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(&sessions_dir);
+
+        let (reg, engine, tracker, _) = setup_with_executor(Arc::new(EchoExecutor));
+        let gate = Arc::new(FailThenPassGate::new(1));
+        let de =
+            DelegationEngine::with_executor(reg, engine, tracker.clone(), Arc::new(EchoExecutor))
+                .with_gate(gate);
+
+        let mut req = fan_out_request(vec!["coder"]);
+        req.delegation_id = "del-journal-retry".into();
+        req.parent_run_id = "parent-journal-retry".into();
+        req.context.insert(
+            "session_id".into(),
+            serde_json::Value::String("sess-journal-retry".into()),
+        );
+
+        let result = de.execute(req, "orch", None).await.unwrap();
+        assert_eq!(result.agent_results.len(), 1);
+        assert_eq!(result.agent_results[0].status, "completed");
+
+        let chain = tracker
+            .get_retry_chain(&result.agent_results[0].run_id)
+            .await;
+        assert_eq!(chain.len(), 2);
+
+        let journal_path = sessions_dir.join("sess-journal-retry.jsonl");
+        let content = std::fs::read_to_string(&journal_path).unwrap();
+        let retry_events: Vec<astra_services::session_journal::JournalEvent> = content
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<astra_services::session_journal::JournalEvent>(line).unwrap()
+            })
+            .filter(|evt| {
+                evt.event_type == astra_services::session_journal::JournalEventType::DelegationRetry
+            })
+            .collect();
+
+        assert_eq!(retry_events.len(), 1);
+        let meta = retry_events[0].metadata.as_ref().unwrap();
+        assert_eq!(meta["delegation_id"], "del-journal-retry");
+        assert_eq!(meta["original_run_id"], chain[0]);
+        assert_eq!(meta["retry_run_id"], chain[1]);
+        assert_eq!(meta["agent_id"], "coder");
+        assert_eq!(meta["attempt"], 2);
+        assert_eq!(meta["reason"], "fail #1");
+
+        let _ = std::fs::remove_file(journal_path);
+        let _ = std::fs::remove_dir_all(sessions_dir);
     }
 
     #[tokio::test]

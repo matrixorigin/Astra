@@ -652,6 +652,8 @@ pub enum JournalEventType {
     DelegationStarted,
     /// A single sub-run within a delegation completed.
     DelegationSubRunCompleted,
+    /// A sub-run was retried, linking the original run to the new retry run.
+    DelegationRetry,
     /// Delegation completed (all sub-runs done, results aggregated).
     DelegationCompleted,
     /// A spawned agent terminated (completed, failed, or cancelled).
@@ -1800,6 +1802,28 @@ impl JournalEvent {
             "agent_id": agent_id,
             "status": status,
             "error": error,
+        }));
+        evt
+    }
+
+    /// Delegation retry event - emitted when a verification-gated sub-run spawns a retry.
+    pub fn delegation_retry(
+        session_id: Option<&str>,
+        delegation_id: &str,
+        original_run_id: &str,
+        retry_run_id: &str,
+        agent_id: &str,
+        attempt: u32,
+        reason: &str,
+    ) -> Self {
+        let mut evt = Self::base(JournalEventType::DelegationRetry, session_id);
+        evt.metadata = Some(serde_json::json!({
+            "delegation_id": delegation_id,
+            "original_run_id": original_run_id,
+            "retry_run_id": retry_run_id,
+            "agent_id": agent_id,
+            "attempt": attempt,
+            "reason": reason,
         }));
         evt
     }
@@ -3272,6 +3296,25 @@ mod tests {
         assert_eq!(meta["agent_id"], "agent-a");
         assert_eq!(meta["status"], "completed");
         assert!(meta["error"].is_null());
+    }
+
+    #[test]
+    fn delegation_retry_event_builder() {
+        let evt = JournalEvent::delegation_retry(
+            Some("s1"),
+            "del-1",
+            "run-sub-1",
+            "run-sub-2",
+            "agent-a",
+            2,
+            "quality too low",
+        );
+        assert_eq!(evt.event_type, JournalEventType::DelegationRetry);
+        let meta = evt.metadata.as_ref().unwrap();
+        assert_eq!(meta["original_run_id"], "run-sub-1");
+        assert_eq!(meta["retry_run_id"], "run-sub-2");
+        assert_eq!(meta["attempt"], 2);
+        assert_eq!(meta["reason"], "quality too low");
     }
 
     #[test]
