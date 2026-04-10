@@ -875,7 +875,10 @@ pub async fn compact_with_memoria(
                 "[session:{}] Recent conversation:\n{}",
                 sid, working_content
             );
-            if let Err(e) = client.store(&store_content, "working", Some(sid), None).await {
+            if let Err(e) = client
+                .store(&store_content, "working", Some(sid), None)
+                .await
+            {
                 eprintln!("[compact] Failed to store working memory: {e}");
             }
         }
@@ -919,7 +922,15 @@ pub async fn compact_with_memoria(
                 if config.store_on_compact {
                     let tag = format!("[compaction:{}]", sid);
                     let semantic_content = format!("{} {}", tag, summary);
-                    if let Err(e) = client.store(&semantic_content, "semantic", Some(sid), Some(crate::prompts::memory_proto::TIER_INFERRED)).await {
+                    if let Err(e) = client
+                        .store(
+                            &semantic_content,
+                            "semantic",
+                            Some(sid),
+                            Some(crate::prompts::memory_proto::TIER_INFERRED),
+                        )
+                        .await
+                    {
                         eprintln!("[compact] Failed to store compaction summary as semantic: {e}");
                     }
                 }

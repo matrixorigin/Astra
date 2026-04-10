@@ -23,7 +23,7 @@ use astra_runtime::orchestration::{
     InheritedPermissions, PermissionDecision, PermissionMode, PermissionRequest,
     PermissionRequestHandler, PermissionRule, PermissionSyncContext, PermissionUpdate,
 };
-use astra_runtime::server::delegation_engine::{DelegationTracker, SubRunRecord};
+use astra_runtime::server::delegation_engine::{DelegationTracker, SubRunRecord, SubRunState};
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -63,6 +63,8 @@ async fn e2e_child_requests_permission_parent_approves() {
         delegation_id: "del-1".into(),
         agent_id: "explorer".into(),
         depth: 1,
+        state: SubRunState::Created,
+        retry_of: None,
     })
     .await;
 
@@ -135,6 +137,8 @@ async fn e2e_parent_denies_based_on_rules() {
         delegation_id: "del-2".into(),
         agent_id: "worker".into(),
         depth: 1,
+        state: SubRunState::Created,
+        retry_of: None,
     })
     .await;
 
@@ -200,6 +204,8 @@ async fn e2e_callback_controls_permission() {
         delegation_id: "del-3".into(),
         agent_id: "analyzer".into(),
         depth: 1,
+        state: SubRunState::Created,
+        retry_of: None,
     })
     .await;
 
@@ -383,6 +389,8 @@ async fn e2e_timeout_no_response() {
         delegation_id: "del-timeout".into(),
         agent_id: "worker".into(),
         depth: 1,
+        state: SubRunState::Created,
+        retry_of: None,
     })
     .await;
 

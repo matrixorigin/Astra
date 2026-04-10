@@ -336,12 +336,13 @@ pub(super) async fn handle_state_command(
 
                         if let Ok(sr) = extract_result {
                             let facts = prompts::parse_extracted_facts(&sr.full_text);
-                            let fact_meta = prompts::memory_proto::EntryMeta::from_session_with_tier(
-                                state.session_id.as_deref(),
-                                state.turn,
-                                prompts::memory_proto::SRC_EXTRACTED,
-                                prompts::memory_proto::TIER_INFERRED,
-                            );
+                            let fact_meta =
+                                prompts::memory_proto::EntryMeta::from_session_with_tier(
+                                    state.session_id.as_deref(),
+                                    state.turn,
+                                    prompts::memory_proto::SRC_EXTRACTED,
+                                    prompts::memory_proto::TIER_INFERRED,
+                                );
                             for (fact, mem_type) in &facts {
                                 let fact_entry = prompts::memory_proto::MemoryEntry::new(
                                     prompts::memory_proto::NS_FACT,

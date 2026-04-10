@@ -166,7 +166,7 @@ mod tests {
         .with_mailbox_router(router.clone());
 
         let request = fan_out_request(vec!["coder", "reviewer"]);
-        let result = engine.execute(request, "orch").await;
+        let result = engine.execute(request, "orch", None).await;
 
         assert!(result.is_ok(), "delegation should succeed: {result:?}");
         let delegation_result = result.unwrap();
@@ -207,7 +207,7 @@ mod tests {
         .with_mailbox_router(router.clone());
 
         let request = fan_out_request(vec!["coder", "reviewer"]);
-        let result = engine.execute(request, "orch").await;
+        let result = engine.execute(request, "orch", None).await;
         assert!(result.is_ok());
 
         // Parent should have received messages from both agents.
@@ -268,7 +268,7 @@ mod tests {
         .with_mailbox_router(router.clone());
 
         let request = fan_out_request(vec!["coder", "reviewer", "tester"]);
-        let result = engine.execute(request, "orch").await;
+        let result = engine.execute(request, "orch", None).await;
         assert!(result.is_ok());
 
         let delegation_result = result.unwrap();
@@ -318,7 +318,7 @@ mod tests {
         // Intentionally NOT calling .with_mailbox_router()
 
         let request = fan_out_request(vec!["coder"]);
-        let result = engine.execute(request, "orch").await;
+        let result = engine.execute(request, "orch", None).await;
         assert!(result.is_ok());
 
         let delegation_result = result.unwrap();
@@ -350,7 +350,7 @@ mod tests {
         .with_mailbox_router(router);
 
         let request = fan_out_request(vec!["coder", "reviewer"]);
-        let _ = engine.execute(request, "orch").await;
+        let _ = engine.execute(request, "orch", None).await;
 
         // DelegationTracker should have records for both sub-runs.
         let sub_runs = tracker.get_sub_runs("del-mailbox-test").await;

@@ -646,10 +646,7 @@ impl TeamPersistenceService for InMemoryTeamStore {
             let mut removed = 0;
             let to_remove = completed_count - MAX_COMPLETED_PER_TEAM + 1;
             execs.retain(|e| {
-                if removed < to_remove
-                    && e.team_id == team_id
-                    && e.completed_at.is_some()
-                {
+                if removed < to_remove && e.team_id == team_id && e.completed_at.is_some() {
                     removed += 1;
                     false
                 } else {

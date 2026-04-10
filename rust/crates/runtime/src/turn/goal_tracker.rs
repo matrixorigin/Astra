@@ -288,7 +288,11 @@ fn cosine_sim(a: &HashMap<String, f64>, b: &HashMap<String, f64>) -> f64 {
 /// Heuristic: detect milestone signals from a tool call result.
 ///
 /// Examines tool name + output text to classify the result.
-pub fn detect_signal(tool_name: &str, output: &str, exit_code: Option<i32>) -> Option<MilestoneSignal> {
+pub fn detect_signal(
+    tool_name: &str,
+    output: &str,
+    exit_code: Option<i32>,
+) -> Option<MilestoneSignal> {
     let name_lower = tool_name.to_ascii_lowercase();
     let output_lower = output.to_ascii_lowercase();
 
@@ -332,13 +336,26 @@ pub fn detect_user_sentiment(query: &str) -> Option<MilestoneSignal> {
     let q = query.to_ascii_lowercase();
 
     let approval_phrases = [
-        "good", "great", "perfect", "thanks", "thank you", "nice",
-        "awesome", "lgtm", "looks good", "well done", "correct",
-        "好的", "不错", "很好", "正确", "谢谢", "可以",
+        "good",
+        "great",
+        "perfect",
+        "thanks",
+        "thank you",
+        "nice",
+        "awesome",
+        "lgtm",
+        "looks good",
+        "well done",
+        "correct",
+        "好的",
+        "不错",
+        "很好",
+        "正确",
+        "谢谢",
+        "可以",
     ];
     let disapproval_phrases = [
-        "wrong", "no", "revert", "undo", "bad", "broken", "不对",
-        "错了", "不行", "回退", "撤销",
+        "wrong", "no", "revert", "undo", "bad", "broken", "不对", "错了", "不行", "回退", "撤销",
     ];
 
     for phrase in &approval_phrases {
@@ -375,7 +392,10 @@ fn detect_git_commit(output_lower: &str, output: &str) -> Option<String> {
     None
 }
 
-fn detect_test_result(output_lower: &str, exit_code: Option<i32>) -> Option<Option<MilestoneSignal>> {
+fn detect_test_result(
+    output_lower: &str,
+    exit_code: Option<i32>,
+) -> Option<Option<MilestoneSignal>> {
     // Rust test result pattern: "test result: ok. N passed"
     if output_lower.contains("test result:") {
         if let Some(count) = extract_test_count(output_lower, "passed") {
@@ -403,7 +423,11 @@ fn extract_test_count(text: &str, label: &str) -> Option<u32> {
     // Use rfind to skip labels that appear earlier (e.g., "test result: FAILED").
     let idx = text.rfind(label)?;
     let before = text[..idx].trim_end();
-    let num_str: String = before.chars().rev().take_while(|c| c.is_ascii_digit()).collect();
+    let num_str: String = before
+        .chars()
+        .rev()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
     let num_str: String = num_str.chars().rev().collect();
     num_str.parse().ok()
 }
@@ -413,14 +437,19 @@ fn detect_build_result(
     output_lower: &str,
     exit_code: Option<i32>,
 ) -> Option<MilestoneSignal> {
-    let is_build_context = name_lower.contains("bash")
-        || name_lower.contains("shell")
-        || name_lower.contains("build");
+    let is_build_context =
+        name_lower.contains("bash") || name_lower.contains("shell") || name_lower.contains("build");
     if !is_build_context {
         return None;
     }
 
-    let build_keywords = ["cargo build", "cargo check", "npm run build", "make", "go build"];
+    let build_keywords = [
+        "cargo build",
+        "cargo check",
+        "npm run build",
+        "make",
+        "go build",
+    ];
     let is_build = build_keywords.iter().any(|kw| output_lower.contains(kw));
     if !is_build {
         return None;
@@ -447,12 +476,22 @@ mod tests {
 
         // Simulate a session working on auth
         tracker.record(0, MilestoneSignal::FileChanged("src/auth.rs".to_string()));
-        tracker.record(1, MilestoneSignal::ToolSuccess("bash".to_string(), "cargo check".to_string()));
+        tracker.record(
+            1,
+            MilestoneSignal::ToolSuccess("bash".to_string(), "cargo check".to_string()),
+        );
         tracker.record(2, MilestoneSignal::TestPass(5));
-        tracker.record(3, MilestoneSignal::CommitMade("add JWT authentication module".to_string()));
+        tracker.record(
+            3,
+            MilestoneSignal::CommitMade("add JWT authentication module".to_string()),
+        );
 
         let progress = tracker.progress();
-        assert!(progress.completion_score > 0.0, "should have positive completion: {}", progress.completion_score);
+        assert!(
+            progress.completion_score > 0.0,
+            "should have positive completion: {}",
+            progress.completion_score
+        );
         assert!(progress.momentum > 0.0, "should have positive momentum");
         assert_eq!(progress.milestone_count, 4);
     }
@@ -475,7 +514,11 @@ mod tests {
         tracker.record(2, MilestoneSignal::UserDisapproval);
 
         let progress = tracker.progress();
-        assert!(progress.momentum < 0.0, "should have negative momentum: {}", progress.momentum);
+        assert!(
+            progress.momentum < 0.0,
+            "should have negative momentum: {}",
+            progress.momentum
+        );
     }
 
     #[test]
@@ -490,8 +533,14 @@ mod tests {
         tracker.record(4, MilestoneSignal::UserApproval);
 
         let progress = tracker.progress();
-        assert!(progress.completion_score > 0.1, "recovery should show progress");
-        assert!(progress.momentum > 0.0, "momentum should be positive after recovery");
+        assert!(
+            progress.completion_score > 0.1,
+            "recovery should show progress"
+        );
+        assert!(
+            progress.momentum > 0.0,
+            "momentum should be positive after recovery"
+        );
     }
 
     #[test]
@@ -533,15 +582,27 @@ mod tests {
 
     #[test]
     fn test_detect_user_sentiment() {
-        assert!(matches!(detect_user_sentiment("looks good, thanks!"), Some(MilestoneSignal::UserApproval)));
-        assert!(matches!(detect_user_sentiment("这个不对，回退"), Some(MilestoneSignal::UserDisapproval)));
+        assert!(matches!(
+            detect_user_sentiment("looks good, thanks!"),
+            Some(MilestoneSignal::UserApproval)
+        ));
+        assert!(matches!(
+            detect_user_sentiment("这个不对，回退"),
+            Some(MilestoneSignal::UserDisapproval)
+        ));
         assert!(detect_user_sentiment("implement auth").is_none());
     }
 
     #[test]
     fn test_extract_test_count() {
-        assert_eq!(extract_test_count("985 passed; 0 failed", "passed"), Some(985));
-        assert_eq!(extract_test_count("985 passed; 0 failed", "failed"), Some(0));
+        assert_eq!(
+            extract_test_count("985 passed; 0 failed", "passed"),
+            Some(985)
+        );
+        assert_eq!(
+            extract_test_count("985 passed; 0 failed", "failed"),
+            Some(0)
+        );
         assert_eq!(extract_test_count("no match here", "passed"), None);
     }
 
@@ -550,7 +611,10 @@ mod tests {
         let tracker = GoalTracker::new("implement user authentication with JWT");
         let high = tracker.compute_relevance("add JWT authentication module");
         let low = tracker.compute_relevance("configure kubernetes deployment");
-        assert!(high > low, "auth milestone should be more relevant than k8s: {high} vs {low}");
+        assert!(
+            high > low,
+            "auth milestone should be more relevant than k8s: {high} vs {low}"
+        );
     }
 
     #[test]

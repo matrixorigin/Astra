@@ -451,13 +451,15 @@ mod tests {
         let child_mailbox = router.register(child.clone(), None).await.unwrap();
 
         // Set up parent relationship via SubRunRecord.
-        use crate::server::delegation_engine::SubRunRecord;
+        use crate::server::delegation_engine::{SubRunRecord, SubRunState};
         dt.record_sub_run(SubRunRecord {
             run_id: "r1".into(),
             parent_run_id: "r0".into(),
             delegation_id: "del-test".into(),
             agent_id: "worker".into(),
             depth: 1,
+            state: SubRunState::Created,
+            retry_of: None,
         })
         .await;
 
@@ -485,13 +487,15 @@ mod tests {
         // Child mailbox will be created in the spawned task
 
         // Set up parent relationship
-        use crate::server::delegation_engine::SubRunRecord;
+        use crate::server::delegation_engine::{SubRunRecord, SubRunState};
         dt.record_sub_run(SubRunRecord {
             run_id: "r1".into(),
             parent_run_id: "r0".into(),
             delegation_id: "del-perm".into(),
             agent_id: "worker".into(),
             depth: 1,
+            state: SubRunState::Created,
+            retry_of: None,
         })
         .await;
 
@@ -551,13 +555,15 @@ mod tests {
         let mut child_mailbox = router.register(child.clone(), None).await.unwrap();
 
         // Set up parent relationship
-        use crate::server::delegation_engine::SubRunRecord;
+        use crate::server::delegation_engine::{SubRunRecord, SubRunState};
         dt.record_sub_run(SubRunRecord {
             run_id: "r1".into(),
             parent_run_id: "r0".into(),
             delegation_id: "del-timeout".into(),
             agent_id: "worker".into(),
             depth: 1,
+            state: SubRunState::Created,
+            retry_of: None,
         })
         .await;
 
@@ -593,6 +599,8 @@ mod tests {
             delegation_id: "del-buffer".into(),
             agent_id: "worker".into(),
             depth: 1,
+            state: SubRunState::Created,
+            retry_of: None,
         })
         .await;
 
@@ -670,6 +678,8 @@ mod tests {
             delegation_id: "del-protocol".into(),
             agent_id: "worker".into(),
             depth: 1,
+            state: SubRunState::Created,
+            retry_of: None,
         })
         .await;
 

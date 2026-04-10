@@ -152,9 +152,7 @@ const CORRECTION_PATTERNS: &[&str] = &[
 /// Returns true if the message contains common correction phrases.
 pub(super) fn detect_correction_signal(message: &str) -> bool {
     let msg_lower = message.to_lowercase();
-    CORRECTION_PATTERNS
-        .iter()
-        .any(|p| msg_lower.contains(p))
+    CORRECTION_PATTERNS.iter().any(|p| msg_lower.contains(p))
 }
 
 // ─── Relevance-scored history pruning ───────────────────────────────────────

@@ -348,8 +348,8 @@ impl ContextBudget {
         let ratio = estimated_tokens as f64 / limit;
 
         // Scale tier boundaries based on compact_threshold
-        let trim_start = self.compact_threshold * 0.80;        // ~60% for default 0.75
-        let compact_start = self.compact_threshold;            // 75% for default 0.75
+        let trim_start = self.compact_threshold * 0.80; // ~60% for default 0.75
+        let compact_start = self.compact_threshold; // 75% for default 0.75
         let aggressive_start = self.compact_threshold * 1.133; // ~85% for default 0.75
 
         if ratio > aggressive_start {
@@ -1426,10 +1426,22 @@ mod tests {
         // CompactHistory starts at 0.75 (75%)
         // AggressivePrune starts at 0.75 * 1.133 ≈ 0.85 (85%)
         let limit = default_budget.effective_input_limit(); // 85000
-        assert_eq!(default_budget.compaction_tier((0.59 * limit as f64) as usize), CompactionTier::Normal);
-        assert_eq!(default_budget.compaction_tier((0.61 * limit as f64) as usize), CompactionTier::TrimSchemas);
-        assert_eq!(default_budget.compaction_tier((0.76 * limit as f64) as usize), CompactionTier::CompactHistory);
-        assert_eq!(default_budget.compaction_tier((0.86 * limit as f64) as usize), CompactionTier::AggressivePrune);
+        assert_eq!(
+            default_budget.compaction_tier((0.59 * limit as f64) as usize),
+            CompactionTier::Normal
+        );
+        assert_eq!(
+            default_budget.compaction_tier((0.61 * limit as f64) as usize),
+            CompactionTier::TrimSchemas
+        );
+        assert_eq!(
+            default_budget.compaction_tier((0.76 * limit as f64) as usize),
+            CompactionTier::CompactHistory
+        );
+        assert_eq!(
+            default_budget.compaction_tier((0.86 * limit as f64) as usize),
+            CompactionTier::AggressivePrune
+        );
 
         // Aggressive threshold 0.60: tiers scale proportionally
         // TrimSchemas starts at 0.60 * 0.80 = 0.48 (48%)
@@ -1440,9 +1452,21 @@ mod tests {
             ..default_budget.clone()
         };
 
-        assert_eq!(aggressive_budget.compaction_tier((0.47 * limit as f64) as usize), CompactionTier::Normal);
-        assert_eq!(aggressive_budget.compaction_tier((0.49 * limit as f64) as usize), CompactionTier::TrimSchemas);
-        assert_eq!(aggressive_budget.compaction_tier((0.61 * limit as f64) as usize), CompactionTier::CompactHistory);
-        assert_eq!(aggressive_budget.compaction_tier((0.69 * limit as f64) as usize), CompactionTier::AggressivePrune);
+        assert_eq!(
+            aggressive_budget.compaction_tier((0.47 * limit as f64) as usize),
+            CompactionTier::Normal
+        );
+        assert_eq!(
+            aggressive_budget.compaction_tier((0.49 * limit as f64) as usize),
+            CompactionTier::TrimSchemas
+        );
+        assert_eq!(
+            aggressive_budget.compaction_tier((0.61 * limit as f64) as usize),
+            CompactionTier::CompactHistory
+        );
+        assert_eq!(
+            aggressive_budget.compaction_tier((0.69 * limit as f64) as usize),
+            CompactionTier::AggressivePrune
+        );
     }
 }

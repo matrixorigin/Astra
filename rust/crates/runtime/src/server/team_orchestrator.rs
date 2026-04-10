@@ -361,12 +361,12 @@ impl TeamExecutionOrchestrator {
         // On budget timeout, we cancel this token so fan-out/fork tasks stop promptly
         // instead of being orphaned when the delegation future is dropped.
         let cancel_token = Arc::new(tokio_util::sync::CancellationToken::new());
-        self.delegation_engine
-            .set_cancel_token(cancel_token.clone());
 
-        let delegation_future = self
-            .delegation_engine
-            .execute(effective_request, &self.config.source_agent_id);
+        let delegation_future = self.delegation_engine.execute(
+            effective_request,
+            &self.config.source_agent_id,
+            Some(cancel_token.clone()),
+        );
 
         let delegation_outcome = match budget_timeout {
             Some(dur) => match tokio::time::timeout(dur, delegation_future).await {
@@ -489,7 +489,10 @@ impl TeamExecutionOrchestrator {
 
         let (status, error) = derive_team_status(&delegation_result, conflict_count);
         let (status, error) = if let Some(b) = exceeded_budget {
-            let msg = format!("token budget exceeded: {total_tokens}/{} tokens", b.max_tokens);
+            let msg = format!(
+                "token budget exceeded: {total_tokens}/{} tokens",
+                b.max_tokens
+            );
             let error = Some(match error {
                 Some(e) => format!("{e}; {msg}"),
                 None => msg,
@@ -755,10 +758,10 @@ mod tests {
         DelegationTracker, StubSubRunExecutor, SubRunConfig, SubRunExecutor,
     };
     use super::*;
-    use async_trait::async_trait;
     use astra_services::coordination::{AgentResult, AgentTier};
     use astra_services::runs::InMemoryRunStateStore;
     use astra_services::team_persistence::InMemoryTeamStore;
+    use async_trait::async_trait;
 
     async fn setup_orchestrator(team_store: Arc<InMemoryTeamStore>) -> TeamExecutionOrchestrator {
         let registry = Arc::new(RwLock::new(AgentProfileRegistry::new()));
@@ -1259,7 +1262,13 @@ mod tests {
         let report = orch.execute_team("budget-test", "do something", None).await;
         // Budget check is post-execution: run completes but status is upgraded
         assert_eq!(report.status, TeamExecutionStatus::CompletedOverBudget);
-        assert!(report.error.as_ref().unwrap().contains("token budget exceeded"));
+        assert!(
+            report
+                .error
+                .as_ref()
+                .unwrap()
+                .contains("token budget exceeded")
+        );
         assert!(report.delegation_result.is_some());
     }
 

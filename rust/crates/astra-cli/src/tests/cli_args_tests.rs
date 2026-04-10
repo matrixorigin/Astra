@@ -852,7 +852,10 @@ fn cli_permission_mode_invalid_value() {
         "-m",
         "test",
     ]);
-    assert!(result.is_err(), "invalid permission mode should be rejected by parser");
+    assert!(
+        result.is_err(),
+        "invalid permission mode should be rejected by parser"
+    );
 }
 
 #[test]

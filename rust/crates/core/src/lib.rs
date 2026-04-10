@@ -37,6 +37,126 @@ pub const STATUS_CANCELLED: &str = "cancelled";
 pub const STATUS_WAITING: &str = "waiting";
 pub const STATUS_VERIFICATION_FAILED: &str = "verification_failed";
 
+// ─── Sub-Run State Machine ──────────────────────────────────────────────────
+
+/// Compile-time-enforced lifecycle states for delegation sub-runs.
+///
+/// ```text
+/// Created ──► Running ──┬──► Completed
+///                       ├──► Failed
+///                       ├──► Paused ──► Running (resume)
+///                       ├──► Cancelled
+///                       └──► VerificationFailed
+/// ```
+///
+/// All transitions are validated via [`SubRunState::try_transition`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubRunState {
+    Created,
+    Running,
+    Completed,
+    Failed,
+    Paused,
+    Cancelled,
+    VerificationFailed,
+}
+
+impl SubRunState {
+    /// Attempt a state transition.  Returns `Ok(to)` on a legal transition,
+    /// `Err(InvalidTransition)` if the transition is not allowed.
+    pub fn try_transition(self, to: SubRunState) -> Result<SubRunState, InvalidTransition> {
+        if self.can_transition_to(to) {
+            Ok(to)
+        } else {
+            Err(InvalidTransition { from: self, to })
+        }
+    }
+
+    /// Check whether transitioning from `self` → `to` is legal.
+    pub fn can_transition_to(self, to: SubRunState) -> bool {
+        matches!(
+            (self, to),
+            (SubRunState::Created, SubRunState::Running)
+                | (SubRunState::Running, SubRunState::Completed)
+                | (SubRunState::Running, SubRunState::Failed)
+                | (SubRunState::Running, SubRunState::Paused)
+                | (SubRunState::Running, SubRunState::Cancelled)
+                | (SubRunState::Running, SubRunState::VerificationFailed)
+                | (SubRunState::Paused, SubRunState::Running)
+                | (SubRunState::Paused, SubRunState::Cancelled)
+        )
+    }
+
+    /// Whether the state is terminal (no further transitions possible).
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            SubRunState::Completed
+                | SubRunState::Failed
+                | SubRunState::Cancelled
+                | SubRunState::VerificationFailed
+        )
+    }
+
+    /// Whether the sub-run completed successfully.
+    pub fn is_success(self) -> bool {
+        self == SubRunState::Completed
+    }
+
+    /// Convert to the canonical string constant (backward-compatible).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SubRunState::Created => "created",
+            SubRunState::Running => STATUS_RUNNING,
+            SubRunState::Completed => STATUS_COMPLETED,
+            SubRunState::Failed => STATUS_FAILED,
+            SubRunState::Paused => STATUS_PAUSED,
+            SubRunState::Cancelled => STATUS_CANCELLED,
+            SubRunState::VerificationFailed => STATUS_VERIFICATION_FAILED,
+        }
+    }
+
+    /// Parse from a status string (backward-compatible).
+    pub fn from_str(s: &str) -> Option<SubRunState> {
+        match s {
+            "created" => Some(SubRunState::Created),
+            "running" => Some(SubRunState::Running),
+            "completed" => Some(SubRunState::Completed),
+            "failed" => Some(SubRunState::Failed),
+            "paused" => Some(SubRunState::Paused),
+            "cancelled" => Some(SubRunState::Cancelled),
+            "verification_failed" => Some(SubRunState::VerificationFailed),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for SubRunState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Error returned when an illegal state transition is attempted.
+#[derive(Debug, Clone)]
+pub struct InvalidTransition {
+    pub from: SubRunState,
+    pub to: SubRunState,
+}
+
+impl std::fmt::Display for InvalidTransition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "invalid sub-run state transition: {} → {}",
+            self.from, self.to
+        )
+    }
+}
+
+impl std::error::Error for InvalidTransition {}
+
 /// Create a one-shot connection pool (legacy — prefer `SharedPool` for production).
 pub async fn connect_matrixone(settings: &MatrixOneSettings) -> Result<Pool<MySql>, sqlx::Error> {
     MySqlPoolOptions::new()

@@ -1178,7 +1178,8 @@ pub(super) fn handle_session_command(arg: &str, state: &mut ReplState) {
             eprintln!("{}", format!("  Unknown subcommand: {other}").red());
             eprintln!(
                 "  {}",
-                "Usage: /session [history|context|list|errors|export|fork|cleanup|verify|drift] …".dim()
+                "Usage: /session [history|context|list|errors|export|fork|cleanup|verify|drift] …"
+                    .dim()
             );
         }
     }
@@ -1907,11 +1908,21 @@ fn handle_session_drift(arg: &str, state: &ReplState) {
             session.check_drift_against(original_query)
         } else {
             let detector = DriftDetector::default();
-            detector.analyze(original_query, &user_queries, &compressed_turns, &user_corrections)
+            detector.analyze(
+                original_query,
+                &user_queries,
+                &compressed_turns,
+                &user_corrections,
+            )
         }
     } else {
         let detector = DriftDetector::default();
-        detector.analyze(original_query, &user_queries, &compressed_turns, &user_corrections)
+        detector.analyze(
+            original_query,
+            &user_queries,
+            &compressed_turns,
+            &user_corrections,
+        )
     };
 
     // Display results
@@ -1923,7 +1934,10 @@ fn handle_session_drift(arg: &str, state: &ReplState) {
         );
 
         if let Some(turn) = analysis.drift_turn {
-            eprintln!("    Likely drift began at turn {}", turn.to_string().yellow());
+            eprintln!(
+                "    Likely drift began at turn {}",
+                turn.to_string().yellow()
+            );
         }
 
         // Show cause
@@ -1934,22 +1948,43 @@ fn handle_session_drift(arg: &str, state: &ReplState) {
                 } else if lost_context.len() <= 3 {
                     lost_context.join(", ")
                 } else {
-                    format!("{} and {} more", lost_context[..3].join(", "), lost_context.len() - 3)
+                    format!(
+                        "{} and {} more",
+                        lost_context[..3].join(", "),
+                        lost_context.len() - 3
+                    )
                 };
                 format!("History compression (lost: {})", ctx)
             }
-            DriftCause::MemoryMiss { expected_but_not_retrieved, .. } => {
+            DriftCause::MemoryMiss {
+                expected_but_not_retrieved,
+                ..
+            } => {
                 if expected_but_not_retrieved.is_empty() {
                     "Memory miss (expected memories not retrieved)".to_string()
                 } else {
-                    format!("Memory miss (expected: {})", expected_but_not_retrieved.join(", "))
+                    format!(
+                        "Memory miss (expected: {})",
+                        expected_but_not_retrieved.join(", ")
+                    )
                 }
             }
-            DriftCause::TopicShift { original_topic, new_topic, .. } => {
+            DriftCause::TopicShift {
+                original_topic,
+                new_topic,
+                ..
+            } => {
                 format!("Topic shift ('{}' → '{}')", original_topic, new_topic)
             }
-            DriftCause::TokenBudgetPressure { budget_available, budget_needed, .. } => {
-                format!("Token budget pressure ({} needed vs {} budget)", budget_needed, budget_available)
+            DriftCause::TokenBudgetPressure {
+                budget_available,
+                budget_needed,
+                ..
+            } => {
+                format!(
+                    "Token budget pressure ({} needed vs {} budget)",
+                    budget_needed, budget_available
+                )
             }
             DriftCause::AmbiguousInstruction { instruction, .. } => {
                 format!("Ambiguous instruction: {}", instruction)
@@ -2003,12 +2038,24 @@ fn handle_session_drift(arg: &str, state: &ReplState) {
             for ev in &analysis.evidence {
                 // ev is DriftEvidence { turn, evidence_type, description, confidence }
                 let type_str = match &ev.evidence_type {
-                    astra_runtime::turn::decision_explainer::EvidenceType::ToolCallTopicChange => "topic change",
-                    astra_runtime::turn::decision_explainer::EvidenceType::UserCorrection => "user correction",
-                    astra_runtime::turn::decision_explainer::EvidenceType::ClarificationRequest => "clarification",
-                    astra_runtime::turn::decision_explainer::EvidenceType::TermDisappearance => "term lost",
-                    astra_runtime::turn::decision_explainer::EvidenceType::CompressionLoss => "compression",
-                    astra_runtime::turn::decision_explainer::EvidenceType::MemoryMismatch => "memory miss",
+                    astra_runtime::turn::decision_explainer::EvidenceType::ToolCallTopicChange => {
+                        "topic change"
+                    }
+                    astra_runtime::turn::decision_explainer::EvidenceType::UserCorrection => {
+                        "user correction"
+                    }
+                    astra_runtime::turn::decision_explainer::EvidenceType::ClarificationRequest => {
+                        "clarification"
+                    }
+                    astra_runtime::turn::decision_explainer::EvidenceType::TermDisappearance => {
+                        "term lost"
+                    }
+                    astra_runtime::turn::decision_explainer::EvidenceType::CompressionLoss => {
+                        "compression"
+                    }
+                    astra_runtime::turn::decision_explainer::EvidenceType::MemoryMismatch => {
+                        "memory miss"
+                    }
                 };
                 eprintln!(
                     "    • Turn {}: [{}] {} ({:.0}%)",

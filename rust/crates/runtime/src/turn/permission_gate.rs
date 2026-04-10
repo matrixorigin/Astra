@@ -232,7 +232,7 @@ mod tests {
         use crate::messaging::in_process::InProcessTransport;
         use crate::messaging::router::AgentMailboxRouter;
         use crate::messaging::types::AgentAddress;
-        use crate::server::delegation_engine::{DelegationTracker, SubRunRecord};
+        use crate::server::delegation_engine::{DelegationTracker, SubRunRecord, SubRunState};
 
         let transport = Arc::new(InProcessTransport::new());
         let tracker = Arc::new(DelegationTracker::new());
@@ -250,6 +250,8 @@ mod tests {
                 delegation_id: "del-perm".into(),
                 agent_id: "worker".into(),
                 depth: 1,
+                state: SubRunState::Created,
+                retry_of: None,
             })
             .await;
 
@@ -317,7 +319,7 @@ mod tests {
         use crate::messaging::in_process::InProcessTransport;
         use crate::messaging::router::AgentMailboxRouter;
         use crate::messaging::types::AgentAddress;
-        use crate::server::delegation_engine::{DelegationTracker, SubRunRecord};
+        use crate::server::delegation_engine::{DelegationTracker, SubRunRecord, SubRunState};
 
         let transport = Arc::new(InProcessTransport::new());
         let tracker = Arc::new(DelegationTracker::new());
@@ -335,6 +337,8 @@ mod tests {
                 delegation_id: "del-deny".into(),
                 agent_id: "worker".into(),
                 depth: 1,
+                state: SubRunState::Created,
+                retry_of: None,
             })
             .await;
 

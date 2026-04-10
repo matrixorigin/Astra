@@ -76,6 +76,8 @@ mod edge_lifecycle;
 mod effects;
 #[path = "cli/journal_digest.rs"]
 mod journal_digest;
+#[path = "cli/mock_llm.rs"]
+mod mock_llm;
 #[path = "cli/permission_manager.rs"]
 mod permission_manager;
 #[path = "cli/plan_executor.rs"]
@@ -102,6 +104,8 @@ mod slash_bug;
 mod slash_config;
 #[path = "cli/slash_debug.rs"]
 mod slash_debug;
+#[path = "cli/slash_experiment.rs"]
+mod slash_experiment;
 #[path = "cli/slash_info.rs"]
 mod slash_info;
 #[path = "cli/slash_mcp.rs"]
@@ -110,6 +114,8 @@ mod slash_mcp;
 mod slash_memory;
 #[path = "cli/slash_messaging.rs"]
 mod slash_messaging;
+#[path = "cli/slash_profile.rs"]
+mod slash_profile;
 #[path = "cli/slash_session.rs"]
 mod slash_session;
 #[path = "cli/slash_skill.rs"]
@@ -118,14 +124,8 @@ mod slash_skill;
 mod slash_state;
 #[path = "cli/slash_team.rs"]
 mod slash_team;
-#[path = "cli/slash_experiment.rs"]
-mod slash_experiment;
-#[path = "cli/slash_profile.rs"]
-mod slash_profile;
 #[path = "cli/slash_tuning.rs"]
 mod slash_tuning;
-#[path = "cli/mock_llm.rs"]
-mod mock_llm;
 #[path = "cli/spawn_subrun.rs"]
 mod spawn_subrun;
 #[path = "cli/sse_utils.rs"]
@@ -1473,8 +1473,11 @@ struct ReplState {
     /// Original user query at session start (for drift baseline comparison).
     drift_original_query: Option<String>,
     /// Session-scoped observability for context tracing (M1).
-    observability_session:
-        Option<std::sync::Arc<std::sync::RwLock<astra_runtime::observability_integration::ObservabilitySession>>>,
+    observability_session: Option<
+        std::sync::Arc<
+            std::sync::RwLock<astra_runtime::observability_integration::ObservabilitySession>,
+        >,
+    >,
 
     // ── A/B Testing (M4) ──
     /// Shared experiment store for A/B testing.
@@ -1603,7 +1606,8 @@ impl Default for ReplState {
             active_experiment_id: None,
             active_variant_id: None,
             user_profile_manager: {
-                let store = std::sync::Arc::new(astra_runtime::user_profile::UserProfileStore::new());
+                let store =
+                    std::sync::Arc::new(astra_runtime::user_profile::UserProfileStore::new());
                 std::sync::Arc::new(astra_runtime::user_profile::UserProfileManager::new(store))
             },
             auto_tuning_engine: {
@@ -5813,8 +5817,8 @@ async fn handle_task_command(
                     agent_spawner: bg_agent_spawner.clone(),
                     root_agent_id: Some(bg_root_agent_id.as_str()),
                     root_mailbox_slot: None,
-                observability_hub: None,
-                observability_session: None,
+                    observability_hub: None,
+                    observability_session: None,
                 })
                 .await;
 
@@ -6069,8 +6073,10 @@ async fn handle_slash_command(
                     state.cached_pricing = extract_pricing_for_model(&models, &chosen)
                         .unwrap_or_else(|| fallback_pricing(&chosen));
                     // M3: Use RuntimeConfig-driven context budget
-                    state.context_budget =
-                        prompts::ContextBudget::from_runtime_config(&state.runtime_config, Some(&chosen));
+                    state.context_budget = prompts::ContextBudget::from_runtime_config(
+                        &state.runtime_config,
+                        Some(&chosen),
+                    );
                     eprintln!(
                         "  {} {}",
                         theme::icon_ok(),
@@ -6157,9 +6163,8 @@ async fn handle_slash_command(
 
         "/profile" => {
             // Use profile name or session_id as user identifier
-            let user_id = profile.unwrap_or_else(|| {
-                state.session_id.as_deref().unwrap_or("default")
-            });
+            let user_id =
+                profile.unwrap_or_else(|| state.session_id.as_deref().unwrap_or("default"));
             let ctx = slash_profile::ProfileCommandContext {
                 profile_manager: &state.user_profile_manager,
                 user_id,
@@ -8083,8 +8088,8 @@ mod tests {
             agent_spawner: None,
             root_agent_id: None,
             root_mailbox_slot: None,
-                observability_hub: None,
-                observability_session: None,
+            observability_hub: None,
+            observability_session: None,
         })
         .await
         .unwrap();
@@ -8146,8 +8151,8 @@ mod tests {
             agent_spawner: None,
             root_agent_id: None,
             root_mailbox_slot: None,
-                observability_hub: None,
-                observability_session: None,
+            observability_hub: None,
+            observability_session: None,
         })
         .await;
         assert!(result.is_err());
@@ -8225,8 +8230,8 @@ mod tests {
             agent_spawner: None,
             root_agent_id: None,
             root_mailbox_slot: None,
-                observability_hub: None,
-                observability_session: None,
+            observability_hub: None,
+            observability_session: None,
         })
         .await
         .unwrap();

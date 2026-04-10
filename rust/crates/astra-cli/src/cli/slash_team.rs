@@ -187,7 +187,10 @@ impl TeamRegistry {
     }
 
     /// Merge teams from persistence store into the registry (idempotent).
-    pub fn merge_from_store(&mut self, teams: Vec<astra_services::team_persistence::TeamDefinition>) {
+    pub fn merge_from_store(
+        &mut self,
+        teams: Vec<astra_services::team_persistence::TeamDefinition>,
+    ) {
         for def in teams {
             if self.teams.contains_key(&def.name) {
                 continue; // don't overwrite in-memory edits
@@ -198,12 +201,19 @@ impl TeamRegistry {
                     team_id: def.team_id,
                     name: def.name,
                     description: def.description,
-                    members: def.members.iter().map(|m| TeamMember {
-                        role: m.role.clone(),
-                        description: m.system_prompt.clone().unwrap_or_else(|| format!("{} agent", m.role)),
-                        skills: m.skills.clone(),
-                        model_override: m.model_override.clone(),
-                    }).collect(),
+                    members: def
+                        .members
+                        .iter()
+                        .map(|m| TeamMember {
+                            role: m.role.clone(),
+                            description: m
+                                .system_prompt
+                                .clone()
+                                .unwrap_or_else(|| format!("{} agent", m.role)),
+                            skills: m.skills.clone(),
+                            model_override: m.model_override.clone(),
+                        })
+                        .collect(),
                     shared_context: def.context,
                     worktree_mode: def.worktree_mode,
                     coordination: Some(def.coordination),
@@ -328,7 +338,10 @@ fn cli_team_to_definition(
 ) -> astra_services::team_persistence::TeamDefinition {
     use astra_services::team_persistence::*;
 
-    let coordination = team.coordination.clone().unwrap_or_else(|| infer_coordination(team));
+    let coordination = team
+        .coordination
+        .clone()
+        .unwrap_or_else(|| infer_coordination(team));
     let now = chrono::Utc::now().to_rfc3339();
     TeamDefinition {
         team_id: team.team_id.clone(),
@@ -452,7 +465,10 @@ pub(super) async fn handle_team_command(
 ) {
     // Hydrate registry from persistence store on first command
     if !state.team_registry.store_loaded {
-        let user_id = state.ingestion_user_id.clone().unwrap_or_else(|| "local".into());
+        let user_id = state
+            .ingestion_user_id
+            .clone()
+            .unwrap_or_else(|| "local".into());
         if let Ok(teams) = state.team_store.list_teams(&user_id).await {
             state.team_registry.merge_from_store(teams);
         }
@@ -565,12 +581,31 @@ pub(super) async fn handle_team_command(
                 let mode_str = mode_parts.next().unwrap_or("");
                 let d = mode_parts.next().unwrap_or("").trim();
                 let coord = match mode_str {
-                    "pipeline" => Some(astra_services::team_persistence::TeamCoordination::Pipeline),
-                    "adversarial" => Some(astra_services::team_persistence::TeamCoordination::Adversarial { max_rounds: 3, threshold: 0.8 }),
-                    "fanout" | "fan-out" => Some(astra_services::team_persistence::TeamCoordination::FanOut { aggregation: "merge".to_string() }),
-                    "sequential" => Some(astra_services::team_persistence::TeamCoordination::Sequential { stop_on_success: false }),
+                    "pipeline" => {
+                        Some(astra_services::team_persistence::TeamCoordination::Pipeline)
+                    }
+                    "adversarial" => Some(
+                        astra_services::team_persistence::TeamCoordination::Adversarial {
+                            max_rounds: 3,
+                            threshold: 0.8,
+                        },
+                    ),
+                    "fanout" | "fan-out" => {
+                        Some(astra_services::team_persistence::TeamCoordination::FanOut {
+                            aggregation: "merge".to_string(),
+                        })
+                    }
+                    "sequential" => Some(
+                        astra_services::team_persistence::TeamCoordination::Sequential {
+                            stop_on_success: false,
+                        },
+                    ),
                     other => {
-                        eprintln!("  {} Unknown mode '{}'. Options: pipeline, adversarial, fanout, sequential", theme::icon_err(), other);
+                        eprintln!(
+                            "  {} Unknown mode '{}'. Options: pipeline, adversarial, fanout, sequential",
+                            theme::icon_err(),
+                            other
+                        );
                         return;
                     }
                 };
@@ -583,10 +618,16 @@ pub(super) async fn handle_team_command(
             } else {
                 desc.to_string()
             };
-            match state.team_registry.create(name.to_string(), description, coordination) {
+            match state
+                .team_registry
+                .create(name.to_string(), description, coordination)
+            {
                 Ok(()) => {
                     // Persist so team survives restart
-                    let user_id = state.ingestion_user_id.clone().unwrap_or_else(|| "local".into());
+                    let user_id = state
+                        .ingestion_user_id
+                        .clone()
+                        .unwrap_or_else(|| "local".into());
                     if let Some(t) = state.team_registry.get(name) {
                         let def = cli_team_to_definition(t, &user_id);
                         if let Err(e) = state.team_store.save_team(&def).await {
@@ -630,7 +671,10 @@ pub(super) async fn handle_team_command(
             match state.team_registry.add_member(team, member) {
                 Ok(()) => {
                     // Sync to persistence store
-                    let user_id = state.ingestion_user_id.clone().unwrap_or_else(|| "local".into());
+                    let user_id = state
+                        .ingestion_user_id
+                        .clone()
+                        .unwrap_or_else(|| "local".into());
                     if let Some(t) = state.team_registry.get(team) {
                         let def = cli_team_to_definition(t, &user_id);
                         if let Err(e) = state.team_store.save_team(&def).await {
@@ -859,10 +903,14 @@ pub(super) async fn handle_team_command(
             let effective_api = if let Some(scenario) = mock_scenario {
                 match super::mock_llm::MockLlmServer::start(scenario).await {
                     Ok(srv) => {
-                        let mock_api = match astra_thin_client::ThinClient::new(&srv.base_url, None) {
+                        let mock_api = match astra_thin_client::ThinClient::new(&srv.base_url, None)
+                        {
                             Ok(a) => a,
                             Err(e) => {
-                                eprintln!("  {} Failed to create mock API client: {e}", theme::icon_err());
+                                eprintln!(
+                                    "  {} Failed to create mock API client: {e}",
+                                    theme::icon_err()
+                                );
                                 return;
                             }
                         };
@@ -1650,7 +1698,10 @@ pub(super) async fn handle_team_command(
                     "  {} Working tree has uncommitted changes. Commit or stash first.",
                     theme::icon_err()
                 );
-                eprintln!("  {}", "  Run `git stash` to save changes, then retry.".dim());
+                eprintln!(
+                    "  {}",
+                    "  Run `git stash` to save changes, then retry.".dim()
+                );
                 return;
             }
 
@@ -1708,7 +1759,14 @@ pub(super) async fn handle_team_command(
                 all.sort_by(|a, b| b.started_at.cmp(&a.started_at));
                 all.into_iter().take(5).collect()
             } else {
-                state.team_registry.get_history(name).into_iter().rev().take(3).cloned().collect()
+                state
+                    .team_registry
+                    .get_history(name)
+                    .into_iter()
+                    .rev()
+                    .take(3)
+                    .cloned()
+                    .collect()
             };
             if entries.is_empty() {
                 eprintln!("  {} No recent team executions.", "ℹ️ ".dim());
@@ -1723,12 +1781,18 @@ pub(super) async fn handle_team_command(
                 };
                 eprintln!(
                     "  {} {} {} — {} ({} agents, {}tok)",
-                    icon, e.team_name.as_str().cyan(), e.status.as_str().dim(),
+                    icon,
+                    e.team_name.as_str().cyan(),
+                    e.status.as_str().dim(),
                     truncate_str(&e.task, 50),
                     e.agent_count,
                     format_tokens(e.total_prompt_tokens + e.total_completion_tokens),
                 );
-                eprintln!("    {} delegation: {}", "→".dim(), e.delegation_id.get(..12).unwrap_or(&e.delegation_id).dim());
+                eprintln!(
+                    "    {} delegation: {}",
+                    "→".dim(),
+                    e.delegation_id.get(..12).unwrap_or(&e.delegation_id).dim()
+                );
             }
             eprintln!();
         }
@@ -1866,7 +1930,8 @@ mod tests {
     #[test]
     fn create_and_delete_team() {
         let mut reg = TeamRegistry::new();
-        reg.create("my-team".into(), "test team".into(), None).unwrap();
+        reg.create("my-team".into(), "test team".into(), None)
+            .unwrap();
         assert!(reg.get("my-team").is_some());
         assert_eq!(reg.list().len(), 4);
 
@@ -2313,10 +2378,7 @@ mod tests {
         // With explicit Pipeline, cli_team_to_definition should use Pipeline
         team.coordination = Some(TeamCoordination::Pipeline);
         let def = cli_team_to_definition(&team, "u");
-        assert!(matches!(
-            def.coordination,
-            TeamCoordination::Pipeline
-        ));
+        assert!(matches!(def.coordination, TeamCoordination::Pipeline));
     }
 
     #[test]

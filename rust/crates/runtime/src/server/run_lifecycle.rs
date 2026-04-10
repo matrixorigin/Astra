@@ -1786,7 +1786,7 @@ mod tests {
 
     #[tokio::test]
     async fn delegation_tracker_get_children() {
-        use crate::server::delegation_engine::{DelegationTracker, SubRunRecord};
+        use crate::server::delegation_engine::{DelegationTracker, SubRunRecord, SubRunState};
 
         let tracker = DelegationTracker::new();
         tracker
@@ -1796,6 +1796,8 @@ mod tests {
                 parent_run_id: "parent-1".into(),
                 agent_id: "agent-a".into(),
                 depth: 1,
+                state: SubRunState::Created,
+                retry_of: None,
             })
             .await;
         tracker
@@ -1805,6 +1807,8 @@ mod tests {
                 parent_run_id: "parent-1".into(),
                 agent_id: "agent-b".into(),
                 depth: 1,
+                state: SubRunState::Created,
+                retry_of: None,
             })
             .await;
         tracker
@@ -1814,6 +1818,8 @@ mod tests {
                 parent_run_id: "parent-2".into(),
                 agent_id: "agent-c".into(),
                 depth: 1,
+                state: SubRunState::Created,
+                retry_of: None,
             })
             .await;
 

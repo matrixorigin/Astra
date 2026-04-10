@@ -141,10 +141,7 @@ impl ToolExecutor {
                     if let Some(mc) = args.get("min_confidence").and_then(Value::as_f64) {
                         pl["min_confidence"] = json!(mc);
                     }
-                    (
-                        format!("{base}/v1/memories/retrieve"),
-                        pl,
-                    )
+                    (format!("{base}/v1/memories/retrieve"), pl)
                 }
                 "store" => {
                     let content = args.get("content").and_then(Value::as_str).unwrap_or("");
@@ -169,10 +166,7 @@ impl ToolExecutor {
                     if let Some(mc) = args.get("min_confidence").and_then(Value::as_f64) {
                         pl["min_confidence"] = json!(mc);
                     }
-                    (
-                        format!("{base}/v1/memories/search"),
-                        pl,
-                    )
+                    (format!("{base}/v1/memories/search"), pl)
                 }
                 "purge" => {
                     let topic = args.get("topic").and_then(Value::as_str).unwrap_or("");
@@ -368,7 +362,9 @@ fn memoria_oneshot_client(timeout_secs: u64) -> Option<(reqwest::Client, String,
 /// Fire-and-forget: trigger Memoria governance (quarantine low-confidence,
 /// clean stale data). Called at session end. Server has 1-hour cooldown.
 pub async fn memoria_governance_fire_and_forget() {
-    let Some((client, base, key)) = memoria_oneshot_client(10) else { return };
+    let Some((client, base, key)) = memoria_oneshot_client(10) else {
+        return;
+    };
     if let Err(e) = client
         .post(format!("{base}/v1/memories/governance"))
         .header("Authorization", format!("Bearer {key}"))
@@ -384,7 +380,9 @@ pub async fn memoria_governance_fire_and_forget() {
 /// detect contradictions, fix orphaned nodes, promote trust tiers).
 /// Called at session end. Server has 30-minute cooldown.
 pub async fn memoria_consolidate_fire_and_forget() {
-    let Some((client, base, key)) = memoria_oneshot_client(15) else { return };
+    let Some((client, base, key)) = memoria_oneshot_client(15) else {
+        return;
+    };
     if let Err(e) = client
         .post(format!("{base}/v1/memories/consolidate"))
         .header("Authorization", format!("Bearer {key}"))
