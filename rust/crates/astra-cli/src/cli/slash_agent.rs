@@ -516,11 +516,7 @@ async fn show_watch(ctx: &AgentCommandContext) {
         &load_watch_agents(spawner_clone.as_ref()).await,
         &load_recent_delegations(ctx.session_id.as_deref()),
     );
-    if last_snapshot.is_empty() {
-        eprintln!("  {}", "No agents or delegations yet. Waiting...".dim());
-    } else {
-        print_watch_snapshot(&last_snapshot);
-    }
+    print_watch_snapshot(&last_snapshot);
 
     loop {
         let should_refresh = tokio::select! {
@@ -1074,7 +1070,7 @@ fn build_watch_snapshot(
 ) -> String {
     let mut lines = Vec::new();
     if !agents.is_empty() {
-        lines.push(format!("  {}", "Spawned agents"));
+        lines.push(format!("  Spawned agents ({})", agents.len()));
         let forest = AgentTreeNode::build_forest(agents);
         let rendered = render_agent_forest(&forest);
         lines.extend(rendered.lines().map(|line| format!("  {line}")));
@@ -1083,19 +1079,31 @@ fn build_watch_snapshot(
         if !lines.is_empty() {
             lines.push(String::new());
         }
-        lines.push("  Journal-backed delegations".to_string());
+        lines.push(format!(
+            "  Journal-backed delegations ({})",
+            delegations.len()
+        ));
         lines.extend(
             render_delegation_tree(delegations)
                 .into_iter()
                 .map(|line| format!("  {line}")),
         );
     }
+    if lines.is_empty() {
+        lines.push("  (no agents or delegations yet)".to_string());
+    }
     lines.join("\n")
 }
 
 fn print_watch_snapshot(snapshot: &str) {
-    eprintln!("\n  {}", "🌲 Agent Delegation Tree".cyan().bold());
+    eprint!("\x1b[2J\x1b[H");
+    eprintln!("  {}", "🌲 Agent Delegation Tree".cyan().bold());
     eprintln!("  {}", "─".repeat(60).dim());
+    eprintln!(
+        "  {}",
+        "Refreshing every 500ms; redrawing only when the snapshot changes.".dim()
+    );
+    eprintln!();
     for line in snapshot.lines() {
         eprintln!("  {}", line);
     }
@@ -1455,7 +1463,7 @@ mod tests {
                 ..DelegationHistoryEntry::default()
             }],
         );
-        assert!(snapshot.contains("Journal-backed delegations"));
+        assert!(snapshot.contains("Journal-backed delegations (1)"));
         assert!(snapshot.contains("del-1"));
     }
 
@@ -1476,10 +1484,16 @@ mod tests {
                 ..DelegationHistoryEntry::default()
             }],
         );
-        assert!(snapshot.contains("Spawned agents"));
+        assert!(snapshot.contains("Spawned agents (1)"));
         assert!(snapshot.contains("coder"));
         assert!(snapshot.contains("Summary: 1 running, 0 completed, 0 failed"));
-        assert!(snapshot.contains("Journal-backed delegations"));
+        assert!(snapshot.contains("Journal-backed delegations (1)"));
         assert!(snapshot.contains("del-1"));
+    }
+
+    #[test]
+    fn build_watch_snapshot_shows_empty_state() {
+        let snapshot = build_watch_snapshot(&[], &[]);
+        assert!(snapshot.contains("no agents or delegations yet"));
     }
 }
