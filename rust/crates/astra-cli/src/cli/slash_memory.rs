@@ -416,10 +416,11 @@ pub(super) async fn handle_memory_domain_command(
                         prompts::memory_proto::ST_ACTIVE,
                         sub_arg,
                     );
-                    let meta = prompts::memory_proto::EntryMeta::from_session(
+                    let meta = prompts::memory_proto::EntryMeta::from_session_with_tier(
                         state.session_id.as_deref(),
                         state.turn,
                         prompts::memory_proto::SRC_USER,
+                        prompts::memory_proto::TIER_VERIFIED,
                     );
                     match api
                         .post_memory_store_json(tok, &entry.to_store_payload_with_meta(&meta))
@@ -478,7 +479,13 @@ pub(super) async fn handle_memory_domain_command(
                         prompts::memory_proto::ST_ACTIVE,
                         sub_arg,
                     );
-                    let store_payload = entry.to_store_payload();
+                    let store_meta = prompts::memory_proto::EntryMeta::from_session_with_tier(
+                        state.session_id.as_deref(),
+                        state.turn,
+                        prompts::memory_proto::SRC_USER,
+                        prompts::memory_proto::TIER_VERIFIED,
+                    );
+                    let store_payload = entry.to_store_payload_with_meta(&store_meta);
                     let _ = api.post_memory_store_json(tok, &store_payload).await;
 
                     // Call LLM via /chat/turn SSE endpoint

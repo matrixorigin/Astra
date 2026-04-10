@@ -259,10 +259,11 @@ pub(super) async fn handle_state_command(
             let mut facts_stored = 0usize;
             if let Some(tok) = token {
                 if !compact_no_memoria {
-                    let meta = prompts::memory_proto::EntryMeta::from_session(
+                    let meta = prompts::memory_proto::EntryMeta::from_session_with_tier(
                         state.session_id.as_deref(),
                         state.turn,
                         prompts::memory_proto::SRC_COMPACT,
+                        prompts::memory_proto::TIER_INFERRED,
                     );
                     let entry = prompts::memory_proto::MemoryEntry::new(
                         prompts::memory_proto::NS_EPISODE,
@@ -331,10 +332,11 @@ pub(super) async fn handle_state_command(
 
                         if let Ok(sr) = extract_result {
                             let facts = prompts::parse_extracted_facts(&sr.full_text);
-                            let fact_meta = prompts::memory_proto::EntryMeta::from_session(
+                            let fact_meta = prompts::memory_proto::EntryMeta::from_session_with_tier(
                                 state.session_id.as_deref(),
                                 state.turn,
                                 prompts::memory_proto::SRC_EXTRACTED,
+                                prompts::memory_proto::TIER_INFERRED,
                             );
                             for (fact, mem_type) in &facts {
                                 let fact_entry = prompts::memory_proto::MemoryEntry::new(
@@ -416,10 +418,11 @@ pub(super) async fn handle_state_command(
                                             &insight,
                                         );
                                         let synth_meta =
-                                            prompts::memory_proto::EntryMeta::from_session(
+                                            prompts::memory_proto::EntryMeta::from_session_with_tier(
                                                 state.session_id.as_deref(),
                                                 state.turn,
                                                 prompts::memory_proto::SRC_SYNTHESIS,
+                                                prompts::memory_proto::TIER_UNVERIFIED,
                                             );
                                         let _ = api
                                             .post_memory_store_json(
@@ -469,6 +472,7 @@ pub(super) async fn handle_state_command(
                                 prompts::memory_proto::ST_ARCHIVED,
                                 &capped,
                             );
+                            // No trust_tier: swap is "working" memory (transient, session-scoped)
                             let swap_meta = prompts::memory_proto::EntryMeta::from_session(
                                 state.session_id.as_deref(),
                                 state.turn,

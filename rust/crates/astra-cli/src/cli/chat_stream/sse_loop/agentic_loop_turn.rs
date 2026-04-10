@@ -195,10 +195,12 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
         astra_runtime::turn::retrieval::extract_boost_terms_from_pairs(ctx.history, ctx.message);
     {
         let mem_start = Instant::now();
-        let memory_contents = ctx.executor.memory_boost_search(ctx.message, 5).await;
+        let memory_hits = ctx.executor.memory_boost_search(ctx.message, 5).await;
         let mem_latency_ms = mem_start.elapsed().as_millis() as u64;
         record_first_latency_ms_since(ctx.telem.first_memoria_ms, mem_start);
-        if !memory_contents.is_empty() {
+        if !memory_hits.is_empty() {
+            let memory_contents: Vec<String> =
+                memory_hits.iter().map(|h| h.content.clone()).collect();
             for content in &memory_contents {
                 for repo in extract_repos_from_memory(content) {
                     ctx.executor.add_preferred_repo(&repo);
@@ -222,6 +224,12 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
                 ctx.message,
                 &ranked,
             );
+            // Send "useful" feedback for retrieved memories (fire-and-forget)
+            let feedback_ids: Vec<String> = memory_hits
+                .iter()
+                .filter_map(|h| h.memory_id.clone())
+                .collect();
+            ctx.executor.memory_feedback_useful(feedback_ids);
         }
     }
     log_chat_turn_timing_phase(timing, "memory_boost_search", &mut mark);

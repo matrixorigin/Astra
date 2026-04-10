@@ -238,12 +238,13 @@ pub trait MemoriaClient: Send + Sync {
         top_k: usize,
     ) -> Result<Vec<MemoriaMemory>, String>;
 
-    /// Store a memory.
+    /// Store a memory with optional trust tier for confidence decay.
     async fn store(
         &self,
         content: &str,
         memory_type: &str,
         session_id: Option<&str>,
+        trust_tier: Option<&str>,
     ) -> Result<String, String>;
 
     /// Purge working memories for a session.
@@ -350,6 +351,7 @@ impl MemoriaClient for HttpMemoriaClient {
         content: &str,
         memory_type: &str,
         session_id: Option<&str>,
+        trust_tier: Option<&str>,
     ) -> Result<String, String> {
         let url = format!("{}/v1/memories", self.base_url.trim_end_matches('/'));
         let mut body = json!({
@@ -358,6 +360,9 @@ impl MemoriaClient for HttpMemoriaClient {
         });
         if let Some(sid) = session_id {
             body["session_id"] = json!(sid);
+        }
+        if let Some(tier) = trust_tier {
+            body["trust_tier"] = json!(tier);
         }
 
         let resp = self
@@ -870,7 +875,7 @@ pub async fn compact_with_memoria(
                 "[session:{}] Recent conversation:\n{}",
                 sid, working_content
             );
-            if let Err(e) = client.store(&store_content, "working", Some(sid)).await {
+            if let Err(e) = client.store(&store_content, "working", Some(sid), None).await {
                 eprintln!("[compact] Failed to store working memory: {e}");
             }
         }
@@ -914,7 +919,7 @@ pub async fn compact_with_memoria(
                 if config.store_on_compact {
                     let tag = format!("[compaction:{}]", sid);
                     let semantic_content = format!("{} {}", tag, summary);
-                    if let Err(e) = client.store(&semantic_content, "semantic", Some(sid)).await {
+                    if let Err(e) = client.store(&semantic_content, "semantic", Some(sid), Some(crate::prompts::memory_proto::TIER_INFERRED)).await {
                         eprintln!("[compact] Failed to store compaction summary as semantic: {e}");
                     }
                 }
@@ -987,6 +992,7 @@ mod tests {
             content: &str,
             memory_type: &str,
             _session_id: Option<&str>,
+            _trust_tier: Option<&str>,
         ) -> Result<String, String> {
             self.stored
                 .lock()
