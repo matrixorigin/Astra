@@ -465,12 +465,12 @@ impl AutoTuningEngine {
 
     /// Add an evolution rule.
     pub fn add_rule(&self, rule: EvolutionRule) {
-        self.rules.write().unwrap().push(rule);
+        self.rules.write().unwrap_or_else(|e| e.into_inner()).push(rule);
     }
 
     /// Remove a rule by ID.
     pub fn remove_rule(&self, rule_id: &str) -> bool {
-        let mut rules = self.rules.write().unwrap();
+        let mut rules = self.rules.write().unwrap_or_else(|e| e.into_inner());
         let len_before = rules.len();
         rules.retain(|r| r.id != rule_id);
         rules.len() < len_before
@@ -481,7 +481,7 @@ impl AutoTuningEngine {
         if let Some(rule) = self
             .rules
             .write()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .iter_mut()
             .find(|r| r.id == rule_id)
         {
@@ -494,18 +494,18 @@ impl AutoTuningEngine {
 
     /// Record a feedback signal.
     pub fn record_feedback(&self, signal: FeedbackSignal) {
-        self.aggregator.write().unwrap().record(signal);
+        self.aggregator.write().unwrap_or_else(|e| e.into_inner()).record(signal);
     }
 
     /// Evaluate all rules and return triggered actions.
     pub fn evaluate(&self, config: &RuntimeConfig) -> Vec<(EvolutionRule, EvolutionAction)> {
-        if !*self.enabled.read().unwrap() {
+        if !*self.enabled.read().unwrap_or_else(|e| e.into_inner()) {
             return Vec::new();
         }
 
-        let rules = self.rules.read().unwrap();
-        let aggregator = self.aggregator.read().unwrap();
-        let last_triggered = self.last_triggered.read().unwrap();
+        let rules = self.rules.read().unwrap_or_else(|e| e.into_inner());
+        let aggregator = self.aggregator.read().unwrap_or_else(|e| e.into_inner());
+        let last_triggered = self.last_triggered.read().unwrap_or_else(|e| e.into_inner());
         let now = SystemTime::now();
 
         let mut triggered = Vec::new();
@@ -555,8 +555,8 @@ impl AutoTuningEngine {
             };
 
             executions.push(execution.clone());
-            self.executions.write().unwrap().push(execution);
-            self.last_triggered.write().unwrap().insert(rule.id, now);
+            self.executions.write().unwrap_or_else(|e| e.into_inner()).push(execution);
+            self.last_triggered.write().unwrap_or_else(|e| e.into_inner()).insert(rule.id, now);
         }
 
         executions
@@ -571,9 +571,9 @@ impl AutoTuningEngine {
     /// Check if any rollback conditions are met and perform rollbacks.
     pub fn check_rollbacks(&self, config: &mut RuntimeConfig) -> Vec<String> {
         let mut rolled_back = Vec::new();
-        let aggregator = self.aggregator.read().unwrap();
-        let rules = self.rules.read().unwrap();
-        let mut executions = self.executions.write().unwrap();
+        let aggregator = self.aggregator.read().unwrap_or_else(|e| e.into_inner());
+        let rules = self.rules.read().unwrap_or_else(|e| e.into_inner());
+        let mut executions = self.executions.write().unwrap_or_else(|e| e.into_inner());
 
         for execution in executions.iter_mut() {
             if execution.rolled_back {
@@ -603,22 +603,22 @@ impl AutoTuningEngine {
 
     /// Enable or disable the entire auto-tuning system.
     pub fn set_enabled(&self, enabled: bool) {
-        *self.enabled.write().unwrap() = enabled;
+        *self.enabled.write().unwrap_or_else(|e| e.into_inner()) = enabled;
     }
 
     /// Check if auto-tuning is enabled.
     pub fn is_enabled(&self) -> bool {
-        *self.enabled.read().unwrap()
+        *self.enabled.read().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Get execution history.
     pub fn get_executions(&self) -> Vec<RuleExecution> {
-        self.executions.read().unwrap().clone()
+        self.executions.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// Get all rules.
     pub fn get_rules(&self) -> Vec<EvolutionRule> {
-        self.rules.read().unwrap().clone()
+        self.rules.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     fn evaluate_trigger(
@@ -799,7 +799,7 @@ impl AutoTuningEngine {
 
     /// Serialize the feedback aggregator state for persistence.
     pub fn save_aggregator(&self) -> Result<Vec<u8>, String> {
-        let agg = self.aggregator.read().unwrap();
+        let agg = self.aggregator.read().unwrap_or_else(|e| e.into_inner());
         serde_json::to_vec_pretty(&*agg).map_err(|e| format!("serialize aggregator: {e}"))
     }
 
@@ -807,7 +807,7 @@ impl AutoTuningEngine {
     pub fn load_aggregator(&self, data: &[u8]) -> Result<(), String> {
         let loaded: FeedbackAggregator =
             serde_json::from_slice(data).map_err(|e| format!("deserialize aggregator: {e}"))?;
-        *self.aggregator.write().unwrap() = loaded;
+        *self.aggregator.write().unwrap_or_else(|e| e.into_inner()) = loaded;
         Ok(())
     }
 }

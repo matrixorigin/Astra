@@ -930,7 +930,7 @@ pub(super) async fn execute_cli_command(
                     "exit_code": i32::from(exit_code),
                     "success": exit_code == ExitCode::Success,
                 });
-                println!("{}", serde_json::to_string_pretty(&json_output).unwrap());
+                println!("{}", serde_json::to_string_pretty(&json_output).unwrap_or_default());
                 return Ok(exit_code);
             } else if quiet {
                 // Quiet mode: just print the text without formatting
@@ -1425,7 +1425,7 @@ pub(super) async fn run_print_mode(
                 "exit_code": i32::from(exit_code),
                 "success": exit_code == ExitCode::Success,
             });
-            println!("{}", serde_json::to_string_pretty(&json_output).unwrap());
+            println!("{}", serde_json::to_string_pretty(&json_output).unwrap_or_default());
         }
         _ => {
             // text mode: just the response
@@ -1653,11 +1653,11 @@ pub(super) fn load_mcp_configs(sources: &[String]) -> Result<(), String> {
         if let Some(servers) = parsed.get("mcpServers").and_then(|v| v.as_object()) {
             let target = config
                 .as_object_mut()
-                .unwrap()
+                .ok_or("MCP config must be a JSON object")?
                 .entry("mcpServers")
                 .or_insert_with(|| serde_json::json!({}))
                 .as_object_mut()
-                .unwrap();
+                .ok_or("mcpServers value must be a JSON object")?;
             for (name, entry) in servers {
                 target.insert(name.clone(), entry.clone());
             }
@@ -1805,11 +1805,11 @@ fn mcp_add(name: &str, command: &str, args: &[String], scope: &str) -> Result<()
     });
     config
         .as_object_mut()
-        .unwrap()
+        .ok_or("MCP config must be a JSON object")?
         .entry("mcpServers")
         .or_insert_with(|| serde_json::json!({}))
         .as_object_mut()
-        .unwrap()
+        .ok_or("mcpServers value must be a JSON object")?
         .insert(name.to_string(), entry);
 
     write_mcp_config(&path, &config)?;
@@ -1842,11 +1842,11 @@ fn mcp_add_json(name: &str, json: &str, scope: &str) -> Result<(), String> {
 
     config
         .as_object_mut()
-        .unwrap()
+        .ok_or("MCP config must be a JSON object")?
         .entry("mcpServers")
         .or_insert_with(|| serde_json::json!({}))
         .as_object_mut()
-        .unwrap()
+        .ok_or("mcpServers value must be a JSON object")?
         .insert(name.to_string(), entry);
 
     write_mcp_config(&path, &config)?;

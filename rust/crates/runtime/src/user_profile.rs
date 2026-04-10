@@ -750,7 +750,7 @@ impl UserProfileStore {
         if path.exists() {
             if let Ok(data) = std::fs::read_to_string(&path) {
                 if let Ok(profiles) = serde_json::from_str::<HashMap<String, UserProfile>>(&data) {
-                    *store.profiles.write().unwrap() = profiles;
+                    *store.profiles.write().unwrap_or_else(|e| e.into_inner()) = profiles;
                 }
             }
         }
@@ -760,7 +760,7 @@ impl UserProfileStore {
 
     /// Get or create a user profile.
     pub fn get_or_create(&self, user_id: &str) -> UserProfile {
-        let mut profiles = self.profiles.write().unwrap();
+        let mut profiles = self.profiles.write().unwrap_or_else(|e| e.into_inner());
         if let Some(profile) = profiles.get(user_id) {
             return profile.clone();
         }
@@ -776,24 +776,24 @@ impl UserProfileStore {
     pub fn update(&self, profile: UserProfile) {
         self.profiles
             .write()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .insert(profile.user_id.clone(), profile);
         self.persist();
     }
 
     /// Get a profile if it exists.
     pub fn get(&self, user_id: &str) -> Option<UserProfile> {
-        self.profiles.read().unwrap().get(user_id).cloned()
+        self.profiles.read().unwrap_or_else(|e| e.into_inner()).get(user_id).cloned()
     }
 
     /// List all user IDs.
     pub fn list_users(&self) -> Vec<String> {
-        self.profiles.read().unwrap().keys().cloned().collect()
+        self.profiles.read().unwrap_or_else(|e| e.into_inner()).keys().cloned().collect()
     }
 
     /// Delete a profile.
     pub fn delete(&self, user_id: &str) -> bool {
-        let removed = self.profiles.write().unwrap().remove(user_id).is_some();
+        let removed = self.profiles.write().unwrap_or_else(|e| e.into_inner()).remove(user_id).is_some();
         if removed {
             self.persist();
         }
@@ -804,7 +804,7 @@ impl UserProfileStore {
     /// to avoid data loss on crash.
     fn persist(&self) {
         if let Some(ref path) = self.storage_path {
-            let profiles = self.profiles.read().unwrap();
+            let profiles = self.profiles.read().unwrap_or_else(|e| e.into_inner());
             if let Ok(data) = serde_json::to_string_pretty(&*profiles) {
                 let tmp = path.with_extension("tmp");
                 if let Err(e) = std::fs::write(&tmp, &data) {
@@ -847,7 +847,7 @@ impl UserProfileManager {
 
     /// Record a user query and update scenario detection.
     pub fn observe_query(&self, user_id: &str, query: &str) {
-        let mut detectors = self.detectors.write().unwrap();
+        let mut detectors = self.detectors.write().unwrap_or_else(|e| e.into_inner());
         let detector = detectors.entry(user_id.to_string()).or_default();
         detector.observe_query(query);
 
@@ -866,7 +866,7 @@ impl UserProfileManager {
 
     /// Record a tool call.
     pub fn observe_tool(&self, user_id: &str, tool_name: &str) {
-        let mut detectors = self.detectors.write().unwrap();
+        let mut detectors = self.detectors.write().unwrap_or_else(|e| e.into_inner());
         let detector = detectors.entry(user_id.to_string()).or_default();
         detector.observe_tool(tool_name);
 
@@ -931,7 +931,7 @@ impl UserProfileManager {
 
     /// Clear scenario detection history for a user.
     pub fn clear_detection(&self, user_id: &str) {
-        if let Some(detector) = self.detectors.write().unwrap().get_mut(user_id) {
+        if let Some(detector) = self.detectors.write().unwrap_or_else(|e| e.into_inner()).get_mut(user_id) {
             detector.clear();
         }
     }

@@ -423,7 +423,7 @@ fn record_edge_tool_observability(
 ) {
     if let Some(session) = &state.observability_session {
         for edge_result in edge_tool_round {
-            session.write().unwrap().record_tool_result(
+            session.write().unwrap_or_else(|e| e.into_inner()).record_tool_result(
                 &edge_result.tool,
                 &edge_result.output,
                 edge_tool_status_exit_code(&edge_result.status),
@@ -435,7 +435,7 @@ fn record_edge_tool_observability(
         let user_id = state
             .observability_session
             .as_ref()
-            .map(|s| s.read().unwrap().user_id.clone())
+            .map(|s| s.read().unwrap_or_else(|e| e.into_inner()).user_id.clone())
             .unwrap_or_default();
         for edge_result in edge_tool_round {
             crate::observability_integration::on_tool_executed(hub, &user_id, &edge_result.tool);
@@ -1302,7 +1302,7 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
         {
             let session_id = state.current_session_id.as_deref().unwrap_or("");
             let user_id = {
-                let s = session.read().unwrap();
+                let s = session.read().unwrap_or_else(|e| e.into_inner());
                 s.user_id.clone()
             };
             crate::observability_integration::on_turn_start(
@@ -1664,7 +1664,7 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                             tool_execution_ms: 0,
                             total_ms,
                         };
-                        let mut session_guard = session.write().unwrap();
+                        let mut session_guard = session.write().unwrap_or_else(|e| e.into_inner());
                         crate::observability_integration::on_turn_end(&mut session_guard, timing);
                     }
                     try_write_heavy_checkpoint(state);
@@ -1708,7 +1708,7 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                         tool_execution_ms: 0,
                         total_ms,
                     };
-                    let mut session_guard = session.write().unwrap();
+                    let mut session_guard = session.write().unwrap_or_else(|e| e.into_inner());
                     crate::observability_integration::on_turn_end(&mut session_guard, timing);
                 }
                 try_write_heavy_checkpoint(state);
@@ -1762,7 +1762,7 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                                 tool_execution_ms: 0,
                                 total_ms,
                             };
-                            let mut session_guard = session.write().unwrap();
+                            let mut session_guard = session.write().unwrap_or_else(|e| e.into_inner());
                             crate::observability_integration::on_turn_end(
                                 &mut session_guard,
                                 timing,
@@ -1828,7 +1828,7 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                     alternatives: vec![],
                     confidence: 0.8, // placeholder
                 };
-                let mut session_guard = session.write().unwrap();
+                let mut session_guard = session.write().unwrap_or_else(|e| e.into_inner());
                 crate::observability_integration::on_tool_selection(
                     &mut session_guard,
                     explanation,
@@ -2580,7 +2580,7 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                                 tool_execution_ms: 0,
                                 total_ms,
                             };
-                            let mut session_guard = session.write().unwrap();
+                            let mut session_guard = session.write().unwrap_or_else(|e| e.into_inner());
                             crate::observability_integration::on_turn_end(
                                 &mut session_guard,
                                 timing,
@@ -2672,7 +2672,7 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                         tool_execution_ms: 0, // TODO: measure separately
                         total_ms,
                     };
-                    let mut session_guard = session.write().unwrap();
+                    let mut session_guard = session.write().unwrap_or_else(|e| e.into_inner());
                     crate::observability_integration::on_turn_end(&mut session_guard, timing);
                 }
 
@@ -3073,7 +3073,7 @@ mod tests {
             crate::observability_integration::ObservabilitySession::new_simple("sess-1"),
         ));
         {
-            let mut guard = session.write().unwrap();
+            let mut guard = session.write().unwrap_or_else(|e| e.into_inner());
             guard.turn_number = 1;
             guard.record_query("run tests for authentication flow");
         }
@@ -6391,7 +6391,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
         state.recent_tools = vec!["bash".into(), "view".into()];
 
         {
-            let mut guard = session.write().unwrap();
+            let mut guard = session.write().unwrap_or_else(|e| e.into_inner());
             for _ in 0..5 {
                 guard.record_query("fix the bug in the parser");
             }
@@ -6399,7 +6399,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
 
         apply_adaptive_execution_profile(&mut state);
 
-        let guard = session.read().unwrap();
+        let guard = session.read().unwrap_or_else(|e| e.into_inner());
         assert_eq!(
             guard.profile.current_scenario,
             Some(crate::user_profile::Scenario::Debugging)
@@ -6431,7 +6431,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
 
         apply_adaptive_execution_profile(&mut state);
 
-        let guard = session.read().unwrap();
+        let guard = session.read().unwrap_or_else(|e| e.into_inner());
         assert_eq!(guard.active_experiment_id.as_deref(), Some("exp-router"));
         assert!(guard.active_variant.is_some());
         assert!(

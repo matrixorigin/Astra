@@ -1416,13 +1416,13 @@ fn detect_framework(output: &str) -> String {
 // ─── Cargo Parser ────────────────────────────────────────────────────────────
 
 static CARGO_ERROR_CODE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"error\[(E\d+)\]: (.+)").unwrap());
+    LazyLock::new(|| Regex::new(r"error\[(E\d+)\]: (.+)").expect("valid regex"));
 
 static CARGO_LOCATION_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^\s*--> (.+):(\d+):(\d+)").unwrap());
+    LazyLock::new(|| Regex::new(r"^\s*--> (.+):(\d+):(\d+)").expect("valid regex"));
 
 static CARGO_TEST_RESULT_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"test result: (ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored").unwrap()
+    Regex::new(r"test result: (ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored").expect("valid regex")
 });
 
 fn parse_cargo_output(output: &str, exit_code: Option<i32>, truncated: bool) -> BuildTestResult {
@@ -1563,7 +1563,7 @@ fn parse_cargo_output(output: &str, exit_code: Option<i32>, truncated: bool) -> 
 }
 
 static PANIC_LOCATION_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r#"panicked at .+,?\s+(.+):(\d+):(\d+)"#).unwrap());
+    LazyLock::new(|| Regex::new(r#"panicked at .+,?\s+(.+):(\d+):(\d+)"#).expect("valid regex"));
 
 fn extract_cargo_failed_tests(output: &str, locations: &mut Vec<ErrorLocation>) -> Vec<String> {
     let mut failed = Vec::new();
@@ -1620,11 +1620,11 @@ fn extract_cargo_failed_tests(output: &str, locations: &mut Vec<ErrorLocation>) 
 // ─── Pytest Parser ───────────────────────────────────────────────────────────
 
 static PYTEST_SUMMARY_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(\d+) passed.*?(\d+) failed|(\d+) passed").unwrap());
+    LazyLock::new(|| Regex::new(r"(\d+) passed.*?(\d+) failed|(\d+) passed").expect("valid regex"));
 
 // Matches Python tracebacks: "  File "path.py", line 42, in func"
 static PYTHON_TRACEBACK_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r#"File "(.+?)", line (\d+)(?:, in (.+))?"#).unwrap());
+    LazyLock::new(|| Regex::new(r#"File "(.+?)", line (\d+)(?:, in (.+))?"#).expect("valid regex"));
 
 fn parse_pytest_output(output: &str, exit_code: Option<i32>, truncated: bool) -> BuildTestResult {
     let mut result = BuildTestResult {
@@ -1705,7 +1705,7 @@ fn parse_pytest_output(output: &str, exit_code: Option<i32>, truncated: bool) ->
 // ─── Jest/Vitest Parser ──────────────────────────────────────────────────────
 
 static JEST_SUMMARY_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"Tests:\s+(\d+) failed.*?(\d+) passed|Tests:\s+(\d+) passed").unwrap()
+    Regex::new(r"Tests:\s+(\d+) failed.*?(\d+) passed|Tests:\s+(\d+) passed").expect("valid regex")
 });
 
 fn parse_jest_output(output: &str, exit_code: Option<i32>, truncated: bool) -> BuildTestResult {
@@ -1756,7 +1756,7 @@ fn parse_jest_output(output: &str, exit_code: Option<i32>, truncated: bool) -> B
 
 // Matches go test failure locations: "    main_test.go:25: expected true, got false"
 static GO_TEST_LOCATION_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^\s+(\S+\.go):(\d+): (.+)").unwrap());
+    LazyLock::new(|| Regex::new(r"^\s+(\S+\.go):(\d+): (.+)").expect("valid regex"));
 
 fn parse_go_output(output: &str, exit_code: Option<i32>, truncated: bool) -> BuildTestResult {
     let mut result = BuildTestResult {
@@ -1822,11 +1822,11 @@ fn parse_go_output(output: &str, exit_code: Option<i32>, truncated: bool) -> Bui
 
 // Matches TypeScript errors: "src/app.ts(10,5): error TS2304: Cannot find name 'foo'"
 static TS_ERROR_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(.+)\((\d+),(\d+)\): error (TS\d+): (.+)").unwrap());
+    LazyLock::new(|| Regex::new(r"(.+)\((\d+),(\d+)\): error (TS\d+): (.+)").expect("valid regex"));
 
 // Matches generic file:line:col: error patterns
 static GENERIC_LOCATION_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^(.+?):(\d+):(\d+):\s*(error|warning):\s*(.+)").unwrap());
+    LazyLock::new(|| Regex::new(r"^(.+?):(\d+):(\d+):\s*(error|warning):\s*(.+)").expect("valid regex"));
 
 fn count_generic_errors(lower: &str) -> usize {
     let mut count = 0;
