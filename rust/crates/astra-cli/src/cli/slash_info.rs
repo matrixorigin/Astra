@@ -135,6 +135,7 @@ fn lsp_session_state_summary(session_state: &str) -> String {
         "workspace_not_detected" => format!("{} {}", "·".dim(), "no workspace".dim()),
         "disabled" => format!("{} {}", "·".dim(), "disabled".dim()),
         "command_missing" => format!("{} {}", "✗".yellow(), "command missing".yellow()),
+        "config_error" => format!("{} {}", "✗".red(), "config error".red()),
         "error" => format!("{} {}", "✗".red(), "startup error".red()),
         other => format!("{} {other}", "?".yellow()),
     }
@@ -171,6 +172,8 @@ fn print_lsp_status_report(parsed: &serde_json::Value) {
             let command_available = status["command_available"].as_bool().unwrap_or(false);
             let session_started = status["session_started"].as_bool().unwrap_or(false);
             let session_state = status["session_state"].as_str().unwrap_or("unknown");
+            let enabled_source = status["enabled_source"].as_str().unwrap_or("default");
+            let command_source = status["command_source"].as_str().unwrap_or("default");
 
             eprintln!(
                 "  {} {}",
@@ -195,6 +198,24 @@ fn print_lsp_status_report(parsed: &serde_json::Value) {
                     command,
                     " (not found on PATH)".yellow()
                 );
+            }
+            if let Some(config_file) = status["config_file"].as_str() {
+                eprintln!(
+                    "     config: {}   enabled via: {}   command via: {}",
+                    config_file,
+                    enabled_source.dim(),
+                    command_source.dim()
+                );
+            } else {
+                eprintln!(
+                    "     config: {}   enabled via: {}   command via: {}",
+                    "(none)".dim(),
+                    enabled_source.dim(),
+                    command_source.dim()
+                );
+            }
+            if let Some(error) = status["config_error"].as_str() {
+                eprintln!("     config error: {}", truncate_str(error, 140).yellow());
             }
             if let Some(error) = status["last_start_error"].as_str() {
                 eprintln!("     last error: {}", truncate_str(error, 140).yellow());

@@ -1,9 +1,9 @@
 //! Passive stdio LSP: **rust-analyzer** and **typescript-language-server** (opt-in).
 //!
-//! Currently enabled through env flags until a future `astra-lsp.json` config exists.
+//! Configuration can come from project-local `astra-lsp.json` and/or env overrides.
 //!
-//! - Rust: `ASTRA_LSP_RUST=1`, `ASTRA_RUST_ANALYZER_CMD` (default `rust-analyzer`)
-//! - TS: `ASTRA_LSP_TYPESCRIPT=1`, `ASTRA_TYPESCRIPT_SERVER_CMD` (default `typescript-language-server`)
+//! - Rust env overrides: `ASTRA_LSP_RUST`, `ASTRA_RUST_ANALYZER_CMD`
+//! - TS env overrides: `ASTRA_LSP_TYPESCRIPT`, `ASTRA_TYPESCRIPT_SERVER_CMD`
 //!
 //! Drain order: rust LSP, then TypeScript LSP (before `cargo` / `tsc` in the payload).
 
@@ -18,41 +18,171 @@ use super::lsp_stdio_session::{LanguageIdPolicy, LspSpawnSpec, LspStdioSession};
 
 pub(crate) const POST_SYNC_DRAIN_MS: u64 = 80;
 pub(crate) const ACTIVE_LSP_REQUEST_TIMEOUT_MS: u64 = 3_000;
+const ASTRA_LSP_CONFIG_FILE: &str = "astra-lsp.json";
 
-fn env_truthy(name: &str) -> bool {
-    match std::env::var(name) {
-        Ok(v) => {
-            let v = v.trim().to_lowercase();
-            v == "1" || v == "true" || v == "on" || v == "yes"
-        }
-        Err(_) => false,
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+struct ProjectLanguageLspConfig {
+    enabled: Option<bool>,
+    command: Option<String>,
+    #[serde(default)]
+    args: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+struct ProjectLspConfig {
+    #[serde(default)]
+    rust: ProjectLanguageLspConfig,
+    #[serde(default, alias = "ts")]
+    typescript: ProjectLanguageLspConfig,
+}
+
+#[derive(Clone, Debug)]
+struct ResolvedLspConfig {
+    enabled: bool,
+    command: String,
+    args: Vec<String>,
+    config_file: Option<String>,
+    config_error: Option<String>,
+    enabled_source: &'static str,
+    command_source: &'static str,
+}
+
+fn env_bool(name: &str) -> Option<bool> {
+    let value = std::env::var(name).ok()?;
+    let value = value.trim().to_lowercase();
+    match value.as_str() {
+        "1" | "true" | "on" | "yes" => Some(true),
+        "0" | "false" | "off" | "no" => Some(false),
+        _ => None,
     }
 }
 
-pub(crate) fn lsp_rust_enabled() -> bool {
-    env_truthy("ASTRA_LSP_RUST")
-}
-
-pub(crate) fn lsp_typescript_enabled() -> bool {
-    env_truthy("ASTRA_LSP_TYPESCRIPT")
-}
-
-fn lsp_any_enabled() -> bool {
-    lsp_rust_enabled() || lsp_typescript_enabled()
-}
-
-fn rust_analyzer_cmd() -> String {
-    std::env::var("ASTRA_RUST_ANALYZER_CMD")
+fn env_nonempty(name: &str) -> Option<String> {
+    std::env::var(name)
         .ok()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "rust-analyzer".to_string())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
-fn typescript_server_cmd() -> String {
-    std::env::var("ASTRA_TYPESCRIPT_SERVER_CMD")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "typescript-language-server".to_string())
+fn astra_lsp_config_path(project_root: &Path) -> PathBuf {
+    project_root.join(ASTRA_LSP_CONFIG_FILE)
+}
+
+fn read_project_lsp_config(project_root: &Path) -> Result<Option<ProjectLspConfig>, String> {
+    let path = astra_lsp_config_path(project_root);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+    serde_json::from_str(&raw)
+        .map(Some)
+        .map_err(|error| format!("failed to parse {}: {error}", path.display()))
+}
+
+fn resolve_lsp_config(
+    project_root: &Path,
+    env_enabled_name: &str,
+    env_command_name: &str,
+    default_command: &str,
+    default_args: &[&str],
+    select_project: impl FnOnce(&ProjectLspConfig) -> ProjectLanguageLspConfig,
+) -> ResolvedLspConfig {
+    let config_path = astra_lsp_config_path(project_root);
+    let (project_config, config_file, config_error) = match read_project_lsp_config(project_root) {
+        Ok(Some(config)) => (
+            select_project(&config),
+            Some(config_path.display().to_string()),
+            None,
+        ),
+        Ok(None) => (ProjectLanguageLspConfig::default(), None, None),
+        Err(error) => (
+            ProjectLanguageLspConfig::default(),
+            Some(config_path.display().to_string()),
+            Some(error),
+        ),
+    };
+
+    let (enabled, enabled_source) = if let Some(value) = env_bool(env_enabled_name) {
+        (value, "env")
+    } else if let Some(value) = project_config.enabled {
+        (value, "project")
+    } else {
+        (false, "default")
+    };
+
+    let (command, command_source) = if let Some(command) = env_nonempty(env_command_name) {
+        (command, "env")
+    } else if let Some(command) = project_config
+        .command
+        .filter(|value| !value.trim().is_empty())
+    {
+        (command, "project")
+    } else {
+        (default_command.to_string(), "default")
+    };
+
+    let args = if project_config.args.is_empty() {
+        default_args.iter().map(|arg| (*arg).to_string()).collect()
+    } else {
+        project_config.args
+    };
+
+    ResolvedLspConfig {
+        enabled,
+        command,
+        args,
+        config_file,
+        config_error,
+        enabled_source,
+        command_source,
+    }
+}
+
+pub(crate) fn lsp_rust_enabled(project_root: &Path) -> bool {
+    resolve_lsp_config(
+        project_root,
+        "ASTRA_LSP_RUST",
+        "ASTRA_RUST_ANALYZER_CMD",
+        "rust-analyzer",
+        &[],
+        |config| config.rust.clone(),
+    )
+    .enabled
+}
+
+pub(crate) fn lsp_typescript_enabled(project_root: &Path) -> bool {
+    resolve_lsp_config(
+        project_root,
+        "ASTRA_LSP_TYPESCRIPT",
+        "ASTRA_TYPESCRIPT_SERVER_CMD",
+        "typescript-language-server",
+        &["--stdio"],
+        |config| config.typescript.clone(),
+    )
+    .enabled
+}
+
+fn rust_lsp_config(project_root: &Path) -> ResolvedLspConfig {
+    resolve_lsp_config(
+        project_root,
+        "ASTRA_LSP_RUST",
+        "ASTRA_RUST_ANALYZER_CMD",
+        "rust-analyzer",
+        &[],
+        |config| config.rust.clone(),
+    )
+}
+
+fn typescript_lsp_config(project_root: &Path) -> ResolvedLspConfig {
+    resolve_lsp_config(
+        project_root,
+        "ASTRA_LSP_TYPESCRIPT",
+        "ASTRA_TYPESCRIPT_SERVER_CMD",
+        "typescript-language-server",
+        &["--stdio"],
+        |config| config.typescript.clone(),
+    )
 }
 
 fn command_available(command: &str) -> bool {
@@ -70,7 +200,8 @@ fn command_available(command: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn rust_spawn_spec() -> LspSpawnSpec {
+fn rust_spawn_spec(project_root: &Path) -> LspSpawnSpec {
+    let resolved = rust_lsp_config(project_root);
     let configuration = serde_json::json!({
         "lens": {
             "enable": true,
@@ -85,8 +216,8 @@ fn rust_spawn_spec() -> LspSpawnSpec {
         }
     });
     LspSpawnSpec {
-        command: rust_analyzer_cmd(),
-        args: Vec::new(),
+        command: resolved.command,
+        args: resolved.args,
         diagnostic_title: "rust-analyzer",
         attachment_source: "rust_analyzer_lsp",
         language_policy: LanguageIdPolicy::Fixed("rust"),
@@ -120,10 +251,11 @@ fn rust_spawn_spec() -> LspSpawnSpec {
     }
 }
 
-fn typescript_spawn_spec() -> LspSpawnSpec {
+fn typescript_spawn_spec(project_root: &Path) -> LspSpawnSpec {
+    let resolved = typescript_lsp_config(project_root);
     LspSpawnSpec {
-        command: typescript_server_cmd(),
-        args: vec!["--stdio".to_string()],
+        command: resolved.command,
+        args: resolved.args,
         diagnostic_title: "typescript-language-server",
         attachment_source: "typescript_lsp",
         language_policy: LanguageIdPolicy::TypeScript,
@@ -137,14 +269,14 @@ fn typescript_spawn_spec() -> LspSpawnSpec {
 
 #[must_use]
 pub(crate) fn should_use_rust_lsp(project_root: &Path, edited: &Path) -> bool {
-    lsp_rust_enabled()
+    lsp_rust_enabled(project_root)
         && edited.extension().and_then(|e| e.to_str()) == Some("rs")
         && project_root.join("Cargo.toml").is_file()
 }
 
 #[must_use]
 pub(crate) fn should_use_typescript_lsp(project_root: &Path, edited: &Path) -> bool {
-    if !lsp_typescript_enabled() {
+    if !lsp_typescript_enabled(project_root) {
         return false;
     }
     let ext = edited.extension().and_then(|e| e.to_str());
@@ -241,7 +373,7 @@ impl PassiveLspManager {
                 &self.rust,
                 &self.rust_last_error,
                 root_buf.clone(),
-                rust_spawn_spec(),
+                rust_spawn_spec(root),
             )
         {
             let _ = s.sync_document_from_disk(path);
@@ -251,7 +383,7 @@ impl PassiveLspManager {
                 &self.typescript,
                 &self.typescript_last_error,
                 root_buf,
-                typescript_spawn_spec(),
+                typescript_spawn_spec(root),
             )
         {
             let _ = s.sync_document_from_disk(path);
@@ -265,7 +397,7 @@ impl PassiveLspManager {
                 &self.rust,
                 &self.rust_last_error,
                 root_buf.clone(),
-                rust_spawn_spec(),
+                rust_spawn_spec(root),
             )
         {
             let _ = s.sync_document_text(path, content);
@@ -275,7 +407,7 @@ impl PassiveLspManager {
                 &self.typescript,
                 &self.typescript_last_error,
                 root_buf,
-                typescript_spawn_spec(),
+                typescript_spawn_spec(root),
             )
         {
             let _ = s.sync_document_text(path, content);
@@ -295,14 +427,14 @@ impl PassiveLspManager {
                 &self.rust,
                 &self.rust_last_error,
                 root_buf.clone(),
-                rust_spawn_spec(),
+                rust_spawn_spec(root),
             )?)
         } else if typescript_active_supported(root, Some(path)) {
             Some(ensure_session(
                 &self.typescript,
                 &self.typescript_last_error,
                 root_buf,
-                typescript_spawn_spec(),
+                typescript_spawn_spec(root),
             )?)
         } else {
             None
@@ -335,14 +467,14 @@ impl PassiveLspManager {
                 &self.rust,
                 &self.rust_last_error,
                 root_buf.clone(),
-                rust_spawn_spec(),
+                rust_spawn_spec(root),
             )?)
         } else if typescript_active_supported(root, None) {
             Some(ensure_session(
                 &self.typescript,
                 &self.typescript_last_error,
                 root_buf,
-                typescript_spawn_spec(),
+                typescript_spawn_spec(root),
             )?)
         } else {
             None
@@ -367,14 +499,14 @@ impl PassiveLspManager {
                 &self.rust,
                 &self.rust_last_error,
                 root_buf.clone(),
-                rust_spawn_spec(),
+                rust_spawn_spec(root),
             )?)
         } else if typescript_active_supported(root, Some(path)) {
             Some(ensure_session(
                 &self.typescript,
                 &self.typescript_last_error,
                 root_buf,
-                typescript_spawn_spec(),
+                typescript_spawn_spec(root),
             )?)
         } else {
             None
@@ -393,9 +525,10 @@ impl PassiveLspManager {
     }
 
     pub fn active_status(&self, root: &Path) -> Value {
-        let rust_enabled = lsp_rust_enabled();
+        let rust_config = rust_lsp_config(root);
+        let rust_enabled = rust_config.enabled;
         let rust_workspace_detected = rust_active_supported(root, None);
-        let rust_command = rust_analyzer_cmd();
+        let rust_command = rust_config.command.clone();
         let rust_command_available = command_available(&rust_command);
         let rust_session_started = self
             .rust
@@ -404,7 +537,9 @@ impl PassiveLspManager {
             .and_then(|g| g.as_ref().cloned())
             .is_some();
         let rust_last_error = self.rust_last_error.lock().ok().and_then(|g| g.clone());
-        let rust_session_state = if !rust_enabled {
+        let rust_session_state = if rust_config.config_error.is_some() {
+            "config_error"
+        } else if !rust_enabled {
             "disabled"
         } else if !rust_workspace_detected {
             "workspace_not_detected"
@@ -418,9 +553,10 @@ impl PassiveLspManager {
             "idle"
         };
 
-        let typescript_enabled = lsp_typescript_enabled();
+        let typescript_config = typescript_lsp_config(root);
+        let typescript_enabled = typescript_config.enabled;
         let typescript_workspace_detected = typescript_active_supported(root, None);
-        let typescript_command = typescript_server_cmd();
+        let typescript_command = typescript_config.command.clone();
         let typescript_command_available = command_available(&typescript_command);
         let typescript_session_started = self
             .typescript
@@ -433,7 +569,9 @@ impl PassiveLspManager {
             .lock()
             .ok()
             .and_then(|g| g.clone());
-        let typescript_session_state = if !typescript_enabled {
+        let typescript_session_state = if typescript_config.config_error.is_some() {
+            "config_error"
+        } else if !typescript_enabled {
             "disabled"
         } else if !typescript_workspace_detected {
             "workspace_not_detected"
@@ -456,6 +594,10 @@ impl PassiveLspManager {
                 "command_available": rust_command_available,
                 "session_started": rust_session_started,
                 "session_state": rust_session_state,
+                "config_file": rust_config.config_file,
+                "config_error": rust_config.config_error,
+                "enabled_source": rust_config.enabled_source,
+                "command_source": rust_config.command_source,
                 "last_start_error": rust_last_error,
             },
             "typescript": {
@@ -466,25 +608,27 @@ impl PassiveLspManager {
                 "command_available": typescript_command_available,
                 "session_started": typescript_session_started,
                 "session_state": typescript_session_state,
+                "config_file": typescript_config.config_file,
+                "config_error": typescript_config.config_error,
+                "enabled_source": typescript_config.enabled_source,
+                "command_source": typescript_config.command_source,
                 "last_start_error": typescript_last_error,
             }
         })
     }
 
     pub async fn take_diagnostic_messages(&self, tool_results_nonempty: bool) -> Vec<Value> {
-        if !tool_results_nonempty || !lsp_any_enabled() {
+        if !tool_results_nonempty {
             return Vec::new();
         }
         sleep(Duration::from_millis(POST_SYNC_DRAIN_MS)).await;
         let mut out = Vec::new();
-        if lsp_rust_enabled()
-            && let Ok(g) = self.rust.lock()
+        if let Ok(g) = self.rust.lock()
             && let Some(s) = g.as_ref()
         {
             out.extend(s.take_formatted_diagnostic_messages());
         }
-        if lsp_typescript_enabled()
-            && let Ok(g) = self.typescript.lock()
+        if let Ok(g) = self.typescript.lock()
             && let Some(s) = g.as_ref()
         {
             out.extend(s.take_formatted_diagnostic_messages());
@@ -498,6 +642,42 @@ mod tests {
     use super::*;
     use std::process::{Command, Stdio};
 
+    struct EnvGuard {
+        key: &'static str,
+        old: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let old = std::env::var(key).ok();
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, old }
+        }
+
+        fn unset(key: &'static str) -> Self {
+            let old = std::env::var(key).ok();
+            unsafe {
+                std::env::remove_var(key);
+            }
+            Self { key, old }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.old {
+                Some(value) => unsafe {
+                    std::env::set_var(self.key, value);
+                },
+                None => unsafe {
+                    std::env::remove_var(self.key);
+                },
+            }
+        }
+    }
+
     #[test]
     fn should_use_rust_requires_env_rs_and_cargo() {
         let dir = tempfile::tempdir().unwrap();
@@ -508,18 +688,7 @@ mod tests {
         )
         .unwrap();
         assert!(!should_use_rust_lsp(root, Path::new("src/a.rs")));
-        struct SetEnv;
-        impl Drop for SetEnv {
-            fn drop(&mut self) {
-                unsafe {
-                    std::env::remove_var("ASTRA_LSP_RUST");
-                }
-            }
-        }
-        unsafe {
-            std::env::set_var("ASTRA_LSP_RUST", "1");
-        }
-        let _g = SetEnv;
+        let _g = EnvGuard::set("ASTRA_LSP_RUST", "1");
         assert!(should_use_rust_lsp(root, Path::new("src/a.rs")));
         assert!(!should_use_rust_lsp(root, Path::new("src/a.ts")));
     }
@@ -529,22 +698,58 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         assert!(!should_use_typescript_lsp(root, Path::new("a.ts")));
-        struct SetEnv;
-        impl Drop for SetEnv {
-            fn drop(&mut self) {
-                unsafe {
-                    std::env::remove_var("ASTRA_LSP_TYPESCRIPT");
-                }
-            }
-        }
-        unsafe {
-            std::env::set_var("ASTRA_LSP_TYPESCRIPT", "1");
-        }
-        let _g = SetEnv;
+        let _g = EnvGuard::set("ASTRA_LSP_TYPESCRIPT", "1");
         std::fs::write(root.join("tsconfig.json"), "{}").unwrap();
         assert!(should_use_typescript_lsp(root, Path::new("a.ts")));
         assert!(should_use_typescript_lsp(root, Path::new("b.tsx")));
         assert!(!should_use_typescript_lsp(root, Path::new("c.js")));
+    }
+
+    #[test]
+    fn should_use_rust_accepts_project_config_without_env() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let _rust_env = EnvGuard::unset("ASTRA_LSP_RUST");
+        let _cmd_env = EnvGuard::unset("ASTRA_RUST_ANALYZER_CMD");
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname=\"x\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join(ASTRA_LSP_CONFIG_FILE),
+            r#"{"rust":{"enabled":true,"command":"custom-ra","args":["--flag"]}}"#,
+        )
+        .unwrap();
+
+        assert!(should_use_rust_lsp(root, Path::new("src/a.rs")));
+        let resolved = rust_lsp_config(root);
+        assert_eq!(resolved.command, "custom-ra");
+        assert_eq!(resolved.args, vec!["--flag"]);
+        assert_eq!(resolved.enabled_source, "project");
+        assert_eq!(resolved.command_source, "project");
+    }
+
+    #[test]
+    fn active_status_reports_project_config_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let _rust_env = EnvGuard::unset("ASTRA_LSP_RUST");
+        let _ts_env = EnvGuard::unset("ASTRA_LSP_TYPESCRIPT");
+        std::fs::write(root.join(ASTRA_LSP_CONFIG_FILE), "{ invalid json").unwrap();
+
+        let manager = PassiveLspManager::new();
+        let status = manager.active_status(root);
+        assert_eq!(
+            status["rust"]["session_state"].as_str(),
+            Some("config_error")
+        );
+        assert!(
+            status["rust"]["config_error"]
+                .as_str()
+                .unwrap_or("")
+                .contains(ASTRA_LSP_CONFIG_FILE)
+        );
     }
 
     #[tokio::test]
@@ -557,7 +762,11 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn rust_spawn_sync_smoke() {
-        let Ok(status) = Command::new(rust_analyzer_cmd())
+        let _g = EnvGuard::set("ASTRA_LSP_RUST", "1");
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let Ok(status) = Command::new(rust_lsp_config(&root).command)
             .arg("--version")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -568,21 +777,6 @@ mod tests {
         if !status.success() {
             return;
         }
-        struct SetEnv;
-        impl Drop for SetEnv {
-            fn drop(&mut self) {
-                unsafe {
-                    std::env::remove_var("ASTRA_LSP_RUST");
-                }
-            }
-        }
-        unsafe {
-            std::env::set_var("ASTRA_LSP_RUST", "1");
-        }
-        let _g = SetEnv;
-
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().to_path_buf();
         std::fs::write(
             root.join("Cargo.toml"),
             "[package]\nname=\"ra_smoke\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
@@ -591,7 +785,7 @@ mod tests {
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("src/lib.rs"), "pub fn f() -> i32 { 1 }\n").unwrap();
 
-        let sess = match LspStdioSession::try_spawn(root.clone(), rust_spawn_spec()) {
+        let sess = match LspStdioSession::try_spawn(root.clone(), rust_spawn_spec(&root)) {
             Ok(Some(s)) => s,
             Ok(None) | Err(_) => return,
         };
@@ -607,7 +801,9 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn typescript_server_spawn_sync_smoke() {
-        let cmd = typescript_server_cmd();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let cmd = typescript_lsp_config(&root).command;
         let Ok(status) = Command::new(&cmd)
             .arg("--version")
             .stdout(Stdio::null())
@@ -619,8 +815,6 @@ mod tests {
         if !status.success() {
             return;
         }
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().to_path_buf();
         std::fs::write(
             root.join("tsconfig.json"),
             r#"{"compilerOptions":{"strict":true},"include":["*.ts"]}"#,
@@ -628,7 +822,7 @@ mod tests {
         .unwrap();
         std::fs::write(root.join("ok.ts"), "export const x = 1;\n").unwrap();
 
-        let sess = match LspStdioSession::try_spawn(root.clone(), typescript_spawn_spec()) {
+        let sess = match LspStdioSession::try_spawn(root.clone(), typescript_spawn_spec(&root)) {
             Ok(Some(s)) => s,
             Ok(None) | Err(_) => return,
         };
