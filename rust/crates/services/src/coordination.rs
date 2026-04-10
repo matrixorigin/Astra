@@ -169,7 +169,7 @@ pub enum CoordinationPattern {
         agent_ids: Vec<String>,
         /// How to aggregate results.
         aggregation: AggregationStrategy,
-        /// Maximum time per agent (seconds).
+        /// Maximum time per agent (seconds). 0 = no per-agent timeout.
         timeout_sec: u64,
     },
 
@@ -177,6 +177,9 @@ pub enum CoordinationPattern {
     Pipeline {
         /// Ordered list of agent IDs forming the pipeline.
         stages: Vec<PipelineStage>,
+        /// Maximum time per pipeline stage (seconds). 0 = no per-stage timeout.
+        #[serde(default)]
+        timeout_sec: u64,
     },
 
     /// One agent produces, another reviews.
@@ -189,6 +192,9 @@ pub enum CoordinationPattern {
         max_rounds: u32,
         /// Minimum acceptance confidence (0.0-1.0).
         acceptance_threshold: f64,
+        /// Maximum time per round (seconds). 0 = no per-round timeout.
+        #[serde(default)]
+        timeout_sec: u64,
     },
 
     /// Simple sequential delegation.
@@ -197,6 +203,9 @@ pub enum CoordinationPattern {
         agent_ids: Vec<String>,
         /// Stop on first success?
         stop_on_success: bool,
+        /// Maximum time per agent (seconds). 0 = no per-agent timeout.
+        #[serde(default)]
+        timeout_sec: u64,
     },
 
     /// Fork: dispatch N tasks sharing the parent's full conversation context.
@@ -211,6 +220,9 @@ pub enum CoordinationPattern {
         max_turns: u32,
         /// How to aggregate fork results.
         aggregation: AggregationStrategy,
+        /// Maximum time per fork child (seconds). 0 = no per-child timeout.
+        #[serde(default)]
+        timeout_sec: u64,
     },
 }
 
@@ -411,7 +423,7 @@ impl AgentProfileRegistry {
 
         let agent_ids = match &request.pattern {
             CoordinationPattern::FanOut { agent_ids, .. } => agent_ids.clone(),
-            CoordinationPattern::Pipeline { stages } => {
+            CoordinationPattern::Pipeline { stages, .. } => {
                 stages.iter().map(|s| s.agent_id.clone()).collect()
             }
             CoordinationPattern::AdversarialReview {

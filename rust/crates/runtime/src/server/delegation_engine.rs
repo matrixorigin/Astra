@@ -1148,7 +1148,7 @@ impl DelegationEngine {
         // Extract pattern name and agent_ids for journal event.
         let (pattern_name, agent_ids_for_journal): (&str, Vec<String>) = match &request.pattern {
             CoordinationPattern::FanOut { agent_ids, .. } => ("fan_out", agent_ids.clone()),
-            CoordinationPattern::Pipeline { stages } => (
+            CoordinationPattern::Pipeline { stages, .. } => (
                 "pipeline",
                 stages.iter().map(|s| s.agent_id.clone()).collect(),
             ),
@@ -1187,24 +1187,41 @@ impl DelegationEngine {
             CoordinationPattern::FanOut {
                 agent_ids,
                 aggregation,
-                ..
+                timeout_sec,
             } => {
-                self.execute_fan_out(&request, agent_ids, aggregation, cancel_token.as_ref())
-                    .await
+                self.execute_fan_out(
+                    &request,
+                    agent_ids,
+                    aggregation,
+                    *timeout_sec,
+                    cancel_token.as_ref(),
+                )
+                .await
             }
-            CoordinationPattern::Pipeline { stages } => {
+            CoordinationPattern::Pipeline {
+                stages,
+                timeout_sec,
+            } => {
                 let agent_ids: Vec<String> = stages.iter().map(|s| s.agent_id.clone()).collect();
-                self.execute_sequential(&request, &agent_ids, false, cancel_token.as_ref())
-                    .await
+                self.execute_sequential(
+                    &request,
+                    &agent_ids,
+                    false,
+                    *timeout_sec,
+                    cancel_token.as_ref(),
+                )
+                .await
             }
             CoordinationPattern::Sequential {
                 agent_ids,
                 stop_on_success,
+                timeout_sec,
             } => {
                 self.execute_sequential(
                     &request,
                     agent_ids,
                     *stop_on_success,
+                    *timeout_sec,
                     cancel_token.as_ref(),
                 )
                 .await
@@ -1213,6 +1230,7 @@ impl DelegationEngine {
                 producer_id,
                 reviewer_id,
                 max_rounds,
+                timeout_sec,
                 ..
             } => {
                 self.execute_adversarial(
@@ -1220,6 +1238,7 @@ impl DelegationEngine {
                     producer_id,
                     reviewer_id,
                     *max_rounds,
+                    *timeout_sec,
                     cancel_token.as_ref(),
                 )
                 .await
@@ -1229,6 +1248,7 @@ impl DelegationEngine {
                 agent_id,
                 max_turns,
                 aggregation,
+                timeout_sec,
             } => {
                 self.execute_fork(
                     &request,
@@ -1236,6 +1256,7 @@ impl DelegationEngine {
                     agent_id,
                     *max_turns,
                     aggregation,
+                    *timeout_sec,
                     cancel_token.as_ref(),
                 )
                 .await
@@ -1289,6 +1310,7 @@ impl DelegationEngine {
         request: &DelegationRequest,
         agent_ids: &[String],
         aggregation: &AggregationStrategy,
+        timeout_sec: u64,
         cancel_token: Option<&Arc<tokio_util::sync::CancellationToken>>,
     ) -> Result<DelegationResult, String> {
         let reg = self.registry.read().await;
@@ -1451,6 +1473,12 @@ impl DelegationEngine {
             );
         }
 
+        let per_agent_timeout = if timeout_sec > 0 {
+            Some(std::time::Duration::from_secs(timeout_sec))
+        } else {
+            None
+        };
+
         let mut handles: Vec<(
             tokio::task::JoinHandle<(Result<AgentResult, String>, String, String)>,
             String,
@@ -1462,6 +1490,7 @@ impl DelegationEngine {
             let tracker = self.tracker.clone();
             let sem = semaphore.clone();
             let cancel = cancel_token.cloned();
+            let agent_timeout = per_agent_timeout;
             // Capture identity before moving config into the closure (panic context)
             let captured_agent_id = config.agent_profile.agent_id.clone();
             let captured_run_id = config.run_id.clone();
@@ -1472,13 +1501,31 @@ impl DelegationEngine {
                 };
                 let run_id = config.run_id.clone();
                 let agent_id = config.agent_profile.agent_id.clone();
+
+                // Layer timeouts: per-agent timeout wraps execution,
+                // cancellation token wraps that.
+                let exec_future = async {
+                    match agent_timeout {
+                        Some(dur) => {
+                            match tokio::time::timeout(dur, executor.execute(config)).await {
+                                Ok(r) => r,
+                                Err(_) => Err(format!(
+                                    "agent execution exceeded per-agent timeout of {}s",
+                                    dur.as_secs()
+                                )),
+                            }
+                        }
+                        None => executor.execute(config).await,
+                    }
+                };
+
                 let result = if let Some(ref token) = cancel {
                     tokio::select! {
-                        r = executor.execute(config) => r,
+                        r = exec_future => r,
                         _ = token.cancelled() => Err("cancelled by budget timeout".to_string()),
                     }
                 } else {
-                    executor.execute(config).await
+                    exec_future.await
                 };
                 // Determine final state and persist
                 let final_state = match &result {
@@ -1619,6 +1666,7 @@ impl DelegationEngine {
         request: &DelegationRequest,
         agent_ids: &[String],
         stop_on_success: bool,
+        timeout_sec: u64,
         cancel_token: Option<&Arc<tokio_util::sync::CancellationToken>>,
     ) -> Result<DelegationResult, String> {
         let reg = self.registry.read().await;
@@ -1627,6 +1675,11 @@ impl DelegationEngine {
         let has_gate = self.gate.is_some();
         let total_stages = agent_ids.len();
         let budget_prompt = Self::extract_budget_prompt(&request.context);
+        let per_stage_timeout = if timeout_sec > 0 {
+            Some(std::time::Duration::from_secs(timeout_sec))
+        } else {
+            None
+        };
 
         for (stage_index, agent_id) in agent_ids.iter().enumerate() {
             // Check cancellation before starting next sequential agent
@@ -1743,7 +1796,19 @@ impl DelegationEngine {
                 cancel_token: cancel_token.cloned(),
             };
 
-            let result = match self.executor.execute(config).await {
+            let exec_result = match per_stage_timeout {
+                Some(dur) => match tokio::time::timeout(dur, self.executor.execute(config)).await {
+                    Ok(r) => r,
+                    Err(_) => Err(format!(
+                        "agent {} exceeded per-stage timeout of {}s",
+                        agent_id,
+                        dur.as_secs()
+                    )),
+                },
+                None => self.executor.execute(config).await,
+            };
+
+            let result = match exec_result {
                 Ok(r) => {
                     astra_core::log_persist!(
                         self.run_engine
@@ -1849,12 +1914,18 @@ impl DelegationEngine {
         producer_id: &str,
         reviewer_id: &str,
         max_rounds: u32,
+        timeout_sec: u64,
         cancel_token: Option<&Arc<tokio_util::sync::CancellationToken>>,
     ) -> Result<DelegationResult, String> {
         let reg = self.registry.read().await;
         let mut results = Vec::new();
         let mut last_producer_output: Option<String> = None;
         let budget_prompt = Self::extract_budget_prompt(&request.context);
+        let per_round_timeout = if timeout_sec > 0 {
+            Some(std::time::Duration::from_secs(timeout_sec))
+        } else {
+            None
+        };
 
         let producer_profile = reg.get(producer_id).cloned().unwrap_or_else(|| {
             AgentProfile::new(
@@ -1979,7 +2050,20 @@ impl DelegationEngine {
                 mailbox: prod_mailbox,
                 cancel_token: cancel_token.cloned(),
             };
-            let prod_result = match self.executor.execute(prod_config).await {
+            let prod_exec = match per_round_timeout {
+                Some(dur) => {
+                    match tokio::time::timeout(dur, self.executor.execute(prod_config)).await {
+                        Ok(r) => r,
+                        Err(_) => Err(format!(
+                            "producer {} exceeded per-round timeout of {}s",
+                            producer_id,
+                            dur.as_secs()
+                        )),
+                    }
+                }
+                None => self.executor.execute(prod_config).await,
+            };
+            let prod_result = match prod_exec {
                 Ok(r) => {
                     astra_core::log_persist!(
                         self.run_engine
@@ -2139,7 +2223,20 @@ impl DelegationEngine {
                 mailbox: rev_mailbox,
                 cancel_token: cancel_token.cloned(),
             };
-            let rev_result = match self.executor.execute(rev_config).await {
+            let rev_exec = match per_round_timeout {
+                Some(dur) => {
+                    match tokio::time::timeout(dur, self.executor.execute(rev_config)).await {
+                        Ok(r) => r,
+                        Err(_) => Err(format!(
+                            "reviewer {} exceeded per-round timeout of {}s",
+                            reviewer_id,
+                            dur.as_secs()
+                        )),
+                    }
+                }
+                None => self.executor.execute(rev_config).await,
+            };
+            let rev_result = match rev_exec {
                 Ok(r) => {
                     astra_core::log_persist!(
                         self.run_engine
@@ -2202,6 +2299,7 @@ impl DelegationEngine {
         agent_id: &str,
         _max_turns: u32,
         _aggregation: &AggregationStrategy,
+        timeout_sec: u64,
         cancel_token: Option<&Arc<tokio_util::sync::CancellationToken>>,
     ) -> Result<DelegationResult, String> {
         let reg = self.registry.read().await;
@@ -2336,6 +2434,11 @@ impl DelegationEngine {
             let tracker = self.tracker.clone();
             let sem = fork_semaphore.clone();
             let cancel_for_spawn = cancel_token.cloned();
+            let per_child_timeout = if timeout_sec > 0 {
+                Some(std::time::Duration::from_secs(timeout_sec))
+            } else {
+                None
+            };
             // Capture identity before moving config (panic context)
             let captured_agent_id = config.agent_profile.agent_id.clone();
             let captured_run_id = config.run_id.clone();
@@ -2346,15 +2449,31 @@ impl DelegationEngine {
                 };
                 let run_id = config.run_id.clone();
                 let agent_id = config.agent_profile.agent_id.clone();
+
+                let exec_future = async {
+                    match per_child_timeout {
+                        Some(dur) => {
+                            match tokio::time::timeout(dur, executor.execute(config)).await {
+                                Ok(r) => r,
+                                Err(_) => Err(format!(
+                                    "fork child exceeded per-child timeout of {}s",
+                                    dur.as_secs()
+                                )),
+                            }
+                        }
+                        None => executor.execute(config).await,
+                    }
+                };
+
                 let result = if let Some(token) = cancel_for_spawn {
                     tokio::select! {
-                        r = executor.execute(config) => r,
+                        r = exec_future => r,
                         _ = token.cancelled() => {
                             Err("cancelled by budget timeout".to_string())
                         }
                     }
                 } else {
-                    executor.execute(config).await
+                    exec_future.await
                 };
                 let final_state = match &result {
                     Ok(r) => {
@@ -2698,6 +2817,7 @@ mod tests {
             pattern: CoordinationPattern::Sequential {
                 agent_ids: vec!["coder".into(), "reviewer".into()],
                 stop_on_success: false,
+                timeout_sec: 0,
             },
             user_id: "user-1".into(),
             depth: 0,
@@ -2730,6 +2850,7 @@ mod tests {
                         output_transform: Some("extract_issues".into()),
                     },
                 ],
+                timeout_sec: 0,
             },
             user_id: "user-1".into(),
             depth: 0,
@@ -2757,6 +2878,7 @@ mod tests {
                 reviewer_id: "reviewer".into(),
                 max_rounds: 2,
                 acceptance_threshold: 0.8,
+                timeout_sec: 0,
             },
             user_id: "user-1".into(),
             depth: 0,
@@ -2790,6 +2912,7 @@ mod tests {
             pattern: CoordinationPattern::Sequential {
                 agent_ids: vec!["coder".into()],
                 stop_on_success: true,
+                timeout_sec: 0,
             },
             user_id: "u".into(),
             depth: 0,
@@ -2812,6 +2935,7 @@ mod tests {
             pattern: CoordinationPattern::Sequential {
                 agent_ids: vec!["coder".into()],
                 stop_on_success: true,
+                timeout_sec: 0,
             },
             user_id: "u".into(),
             depth: 5,
@@ -2996,6 +3120,7 @@ mod tests {
                         output_transform: None,
                     },
                 ],
+                timeout_sec: 0,
             },
             user_id: "u".into(),
             depth: 0,
@@ -3028,6 +3153,7 @@ mod tests {
             pattern: CoordinationPattern::Sequential {
                 agent_ids: vec!["coder".into(), "reviewer".into(), "writer".into()],
                 stop_on_success: true,
+                timeout_sec: 0,
             },
             user_id: "u".into(),
             depth: 0,
@@ -3083,6 +3209,7 @@ mod tests {
                 reviewer_id: "reviewer".into(),
                 max_rounds: 2,
                 acceptance_threshold: 0.8,
+                timeout_sec: 0,
             },
             user_id: "u".into(),
             depth: 0,
@@ -3178,6 +3305,7 @@ mod tests {
             pattern: CoordinationPattern::Sequential {
                 agent_ids: vec!["coder".into()],
                 stop_on_success: false,
+                timeout_sec: 0,
             },
             user_id: "u".into(),
             depth: 0,
@@ -3477,6 +3605,7 @@ mod tests {
             pattern: CoordinationPattern::Sequential {
                 agent_ids: vec!["coder".into()],
                 stop_on_success: false,
+                timeout_sec: 0,
             },
             user_id: "user-1".into(),
             depth: 0,
@@ -3502,6 +3631,7 @@ mod tests {
             pattern: CoordinationPattern::Sequential {
                 agent_ids: vec!["coder".into()],
                 stop_on_success: false,
+                timeout_sec: 0,
             },
             user_id: "user-1".into(),
             depth: 0,
@@ -3808,6 +3938,7 @@ mod tests {
                 agent_id: agent_id.into(),
                 max_turns: 5,
                 aggregation: AggregationStrategy::AllResults,
+                timeout_sec: 0,
             },
             user_id: "user-1".into(),
             depth: 0,
@@ -4106,6 +4237,7 @@ mod tests {
             pattern: CoordinationPattern::Sequential {
                 agent_ids: vec!["coder".into(), "reviewer".into(), "writer".into()],
                 stop_on_success: false,
+                timeout_sec: 0,
             },
             user_id: "u".into(),
             depth: 0,
@@ -4449,5 +4581,143 @@ mod tests {
         // Both should succeed since neither token was cancelled
         assert!(r1.is_ok(), "r1 failed: {:?}", r1.err());
         assert!(r2.is_ok(), "r2 failed: {:?}", r2.err());
+    }
+
+    /// Executor that sleeps for a configured duration before returning.
+    #[derive(Clone)]
+    struct SlowExecutor {
+        delay: std::time::Duration,
+    }
+
+    #[async_trait::async_trait]
+    impl SubRunExecutor for SlowExecutor {
+        async fn execute(&self, config: SubRunConfig) -> Result<AgentResult, String> {
+            tokio::time::sleep(self.delay).await;
+            Ok(AgentResult {
+                agent_id: config.agent_profile.agent_id.clone(),
+                run_id: config.run_id.clone(),
+                status: "completed".into(),
+                output: Some(format!("slow output for {}", config.task)),
+                error: None,
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                tool_calls: 0,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn fan_out_per_agent_timeout_enforced() {
+        let slow = Arc::new(SlowExecutor {
+            delay: std::time::Duration::from_secs(5),
+        });
+        let (_, _engine, _tracker, de) = setup_with_executor(slow);
+
+        let req = DelegationRequest {
+            delegation_id: "timeout-test".into(),
+            parent_run_id: "p".into(),
+            task: "slow task".into(),
+            pattern: CoordinationPattern::FanOut {
+                agent_ids: vec!["coder".into()],
+                aggregation: AggregationStrategy::AllResults,
+                timeout_sec: 1, // 1 second timeout, executor sleeps 5s
+            },
+            user_id: "u".into(),
+            depth: 0,
+            context: HashMap::new(),
+        };
+
+        let start = std::time::Instant::now();
+        let result = de.execute(req, "orch", None).await.unwrap();
+        let elapsed = start.elapsed();
+
+        // Should fail due to timeout
+        assert_eq!(result.agent_results.len(), 1);
+        assert_eq!(result.agent_results[0].status, "failed");
+        assert!(
+            result.agent_results[0]
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("timeout"),
+            "expected timeout error, got: {:?}",
+            result.agent_results[0].error
+        );
+        // Should complete well before 5 seconds
+        assert!(
+            elapsed.as_secs() < 3,
+            "timeout should cut execution short, took {}s",
+            elapsed.as_secs()
+        );
+    }
+
+    #[tokio::test]
+    async fn sequential_per_stage_timeout_enforced() {
+        let slow = Arc::new(SlowExecutor {
+            delay: std::time::Duration::from_secs(5),
+        });
+        let (_, _engine, _tracker, de) = setup_with_executor(slow);
+
+        let req = DelegationRequest {
+            delegation_id: "seq-timeout".into(),
+            parent_run_id: "p".into(),
+            task: "slow pipeline".into(),
+            pattern: CoordinationPattern::Sequential {
+                agent_ids: vec!["coder".into(), "reviewer".into()],
+                stop_on_success: false,
+                timeout_sec: 1,
+            },
+            user_id: "u".into(),
+            depth: 0,
+            context: HashMap::new(),
+        };
+
+        let start = std::time::Instant::now();
+        let result = de.execute(req, "orch", None).await.unwrap();
+        let elapsed = start.elapsed();
+
+        // Both agents should fail due to timeout
+        assert_eq!(result.agent_results.len(), 2);
+        for ar in &result.agent_results {
+            assert_eq!(ar.status, "failed");
+            assert!(
+                ar.error.as_deref().unwrap_or("").contains("timeout"),
+                "expected timeout error for {}, got: {:?}",
+                ar.agent_id,
+                ar.error
+            );
+        }
+        // Total should be ~2s (1s per stage), not 10s
+        assert!(
+            elapsed.as_secs() < 5,
+            "timeouts should cut execution short, took {}s",
+            elapsed.as_secs()
+        );
+    }
+
+    #[tokio::test]
+    async fn zero_timeout_means_no_timeout() {
+        let slow = Arc::new(SlowExecutor {
+            delay: std::time::Duration::from_millis(50),
+        });
+        let (_, _engine, _tracker, de) = setup_with_executor(slow);
+
+        let req = DelegationRequest {
+            delegation_id: "no-timeout".into(),
+            parent_run_id: "p".into(),
+            task: "quick task".into(),
+            pattern: CoordinationPattern::FanOut {
+                agent_ids: vec!["coder".into()],
+                aggregation: AggregationStrategy::AllResults,
+                timeout_sec: 0, // no timeout
+            },
+            user_id: "u".into(),
+            depth: 0,
+            context: HashMap::new(),
+        };
+
+        let result = de.execute(req, "orch", None).await.unwrap();
+        assert_eq!(result.agent_results.len(), 1);
+        assert_eq!(result.agent_results[0].status, "completed");
     }
 }

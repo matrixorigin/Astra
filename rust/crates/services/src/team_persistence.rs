@@ -405,6 +405,7 @@ fn build_coordination_pattern(
                 reviewer_id,
                 max_rounds: *max_rounds,
                 acceptance_threshold: *threshold,
+                timeout_sec: 0,
             }
         }
         TeamCoordination::FanOut { aggregation } => CoordinationPattern::FanOut {
@@ -420,10 +421,12 @@ fn build_coordination_pattern(
                     output_transform: None,
                 })
                 .collect(),
+            timeout_sec: 0,
         },
         TeamCoordination::Sequential { stop_on_success } => CoordinationPattern::Sequential {
             agent_ids: profiles.iter().map(|p| p.agent_id.clone()).collect(),
             stop_on_success: *stop_on_success,
+            timeout_sec: 0,
         },
     }
 }
