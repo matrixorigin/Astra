@@ -2072,7 +2072,7 @@ mod mo_convergence {
     fn catalog_has_33_tools_after_git_show_and_web_fetch() {
         assert_eq!(
             TOOL_CATALOG.len(),
-            34,
+            35,
             "Added git_show + web_fetch + run_chain to the built-in catalog"
         );
     }
