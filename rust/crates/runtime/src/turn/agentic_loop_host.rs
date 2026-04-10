@@ -1146,6 +1146,16 @@ fn maybe_run_tuning_cycle(state: &mut AgenticLoopState) {
         );
     }
 
+    // Check if any previously applied rules should be rolled back
+    let rollbacks = hub.check_rollbacks(&mut session_guard.config);
+    if !rollbacks.is_empty() {
+        eprintln!(
+            "[auto-tuning] rolled back {} rule(s): {:?}",
+            rollbacks.len(),
+            rollbacks
+        );
+    }
+
     // Persist feedback state after each tuning cycle
     if let Err(e) = crate::auto_tuning::save_feedback("default", hub.tuning()) {
         eprintln!("[auto-tuning] failed to persist feedback: {e}");
