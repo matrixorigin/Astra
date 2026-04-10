@@ -843,22 +843,16 @@ fn cli_yes_with_permission_mode_auto_is_redundant() {
 
 #[test]
 fn cli_permission_mode_invalid_value() {
-    // Parser accepts any string; runtime validates
-    let cli = Cli::try_parse_from([
+    // value_parser constraint rejects invalid values at parse time
+    let result = Cli::try_parse_from([
         "astra",
         "chat",
         "--permission-mode",
         "invalid",
         "-m",
         "test",
-    ])
-    .unwrap();
-    match &cli.command {
-        Some(Command::Chat(args)) => {
-            assert_eq!(args.permission_mode.as_deref(), Some("invalid"));
-        }
-        _ => panic!("expected Chat command"),
-    }
+    ]);
+    assert!(result.is_err(), "invalid permission mode should be rejected by parser");
 }
 
 #[test]
