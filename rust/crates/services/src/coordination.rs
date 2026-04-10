@@ -526,6 +526,103 @@ pub fn aggregate_results(
     }
 }
 
+// ─── Coordination Pattern Auto-Selection ────────────────────────────────────
+
+/// Hints for automatic coordination pattern selection.
+#[derive(Debug, Clone, Default)]
+pub struct CoordinationHints {
+    /// Agent IDs available for this delegation.
+    pub agent_ids: Vec<String>,
+    /// Task description (used for keyword heuristics).
+    pub task: String,
+    /// Whether the task involves review/verification.
+    pub needs_review: bool,
+    /// Whether sub-tasks have ordering dependencies.
+    pub has_dependencies: bool,
+    /// Default timeout per agent (seconds). 0 = no timeout.
+    pub timeout_sec: u64,
+}
+
+/// Suggest a coordination pattern based on heuristics.
+///
+/// Rules (in priority order):
+/// 1. `needs_review` + exactly 2 agents → AdversarialReview
+/// 2. `has_dependencies` → Sequential (ordered)
+/// 3. 1 agent + multi-task keywords → Fork (single agent, multiple tasks)
+/// 4. 2+ independent agents → FanOut
+/// 5. Fallback → Sequential { stop_on_success: true }
+pub fn suggest_pattern(hints: &CoordinationHints) -> CoordinationPattern {
+    let n = hints.agent_ids.len();
+    let timeout = hints.timeout_sec;
+
+    // Check for review keywords in task
+    let review_keywords = ["review", "审查", "check", "verify", "验证", "critique"];
+    let task_lower = hints.task.to_lowercase();
+    let task_needs_review =
+        hints.needs_review || review_keywords.iter().any(|kw| task_lower.contains(kw));
+
+    // Rule 1: Review pattern
+    if task_needs_review && n == 2 {
+        return CoordinationPattern::AdversarialReview {
+            producer_id: hints.agent_ids[0].clone(),
+            reviewer_id: hints.agent_ids[1].clone(),
+            max_rounds: 3,
+            acceptance_threshold: 0.8,
+            timeout_sec: timeout,
+        };
+    }
+
+    // Rule 2: Dependency chain → Sequential
+    if hints.has_dependencies && n >= 2 {
+        return CoordinationPattern::Sequential {
+            agent_ids: hints.agent_ids.clone(),
+            stop_on_success: false,
+            timeout_sec: timeout,
+        };
+    }
+
+    // Rule 3: Single agent with "and" / multiple sub-tasks → Fork
+    let fork_keywords = [" and ", "并且", "同时", "然后", "以及"];
+    let task_is_compound = fork_keywords.iter().any(|kw| task_lower.contains(kw));
+    if n == 1 && task_is_compound {
+        // Split task into sub-tasks (simple heuristic: split on conjunctions)
+        let tasks: Vec<String> = hints
+            .task
+            .split(&[',', '，'][..])
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let tasks = if tasks.len() < 2 {
+            vec![hints.task.clone()]
+        } else {
+            tasks
+        };
+        return CoordinationPattern::Fork {
+            tasks,
+            agent_id: hints.agent_ids[0].clone(),
+            max_turns: 10,
+            aggregation: AggregationStrategy::AllResults,
+            timeout_sec: timeout,
+        };
+    }
+
+    // Rule 4: Multiple independent agents → FanOut
+    if n >= 2 {
+        return CoordinationPattern::FanOut {
+            agent_ids: hints.agent_ids.clone(),
+            aggregation: AggregationStrategy::AllResults,
+            timeout_sec: timeout,
+        };
+    }
+
+    // Fallback: Sequential
+    CoordinationPattern::Sequential {
+        agent_ids: hints.agent_ids.clone(),
+        stop_on_success: true,
+        timeout_sec: timeout,
+    }
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1045,5 +1142,98 @@ mod tests {
         let restored: DelegationRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(restored.delegation_id, "d1");
         assert_eq!(restored.depth, 1);
+    }
+
+    // ── suggest_pattern tests ──
+
+    #[test]
+    fn suggest_review_with_two_agents() {
+        let hints = CoordinationHints {
+            agent_ids: vec!["a1".into(), "a2".into()],
+            task: "review the code changes".into(),
+            timeout_sec: 60,
+            ..Default::default()
+        };
+        let pattern = suggest_pattern(&hints);
+        assert!(
+            matches!(pattern, CoordinationPattern::AdversarialReview { .. }),
+            "review + 2 agents should yield AdversarialReview"
+        );
+    }
+
+    #[test]
+    fn suggest_sequential_with_dependencies() {
+        let hints = CoordinationHints {
+            agent_ids: vec!["a1".into(), "a2".into(), "a3".into()],
+            task: "build then deploy".into(),
+            has_dependencies: true,
+            timeout_sec: 30,
+            ..Default::default()
+        };
+        let pattern = suggest_pattern(&hints);
+        assert!(
+            matches!(pattern, CoordinationPattern::Sequential { .. }),
+            "dependencies should yield Sequential"
+        );
+    }
+
+    #[test]
+    fn suggest_fanout_for_independent_agents() {
+        let hints = CoordinationHints {
+            agent_ids: vec!["a1".into(), "a2".into()],
+            task: "search for information".into(),
+            timeout_sec: 60,
+            ..Default::default()
+        };
+        let pattern = suggest_pattern(&hints);
+        assert!(
+            matches!(pattern, CoordinationPattern::FanOut { .. }),
+            "2+ independent agents should yield FanOut"
+        );
+    }
+
+    #[test]
+    fn suggest_fork_for_compound_single_agent() {
+        let hints = CoordinationHints {
+            agent_ids: vec!["a1".into()],
+            task: "fix the bug, and update the docs".into(),
+            timeout_sec: 60,
+            ..Default::default()
+        };
+        let pattern = suggest_pattern(&hints);
+        assert!(
+            matches!(pattern, CoordinationPattern::Fork { .. }),
+            "single agent + compound task should yield Fork"
+        );
+    }
+
+    #[test]
+    fn suggest_fallback_sequential_for_single_agent() {
+        let hints = CoordinationHints {
+            agent_ids: vec!["a1".into()],
+            task: "do something simple".into(),
+            timeout_sec: 0,
+            ..Default::default()
+        };
+        let pattern = suggest_pattern(&hints);
+        assert!(
+            matches!(pattern, CoordinationPattern::Sequential { .. }),
+            "single agent + simple task should yield Sequential"
+        );
+    }
+
+    #[test]
+    fn suggest_review_via_chinese_keyword() {
+        let hints = CoordinationHints {
+            agent_ids: vec!["a1".into(), "a2".into()],
+            task: "审查这段代码".into(),
+            timeout_sec: 30,
+            ..Default::default()
+        };
+        let pattern = suggest_pattern(&hints);
+        assert!(
+            matches!(pattern, CoordinationPattern::AdversarialReview { .. }),
+            "Chinese review keyword should yield AdversarialReview"
+        );
     }
 }
