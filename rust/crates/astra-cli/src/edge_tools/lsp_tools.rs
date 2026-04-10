@@ -604,7 +604,7 @@ impl ToolExecutor {
                 "error": "Missing required 'operation' parameter",
                 "valid_operations": [
                     "goto_definition", "find_references", "hover", "document_symbols",
-                    "workspace_symbols", "call_hierarchy", "incoming_calls", "outgoing_calls", "declaration", "type_definition", "implementation", "prepare_rename", "rename", "code_actions", "completions", "signature_help", "document_highlight", "selection_ranges", "linked_editing_range", "format_document", "format_range", "diagnostics"
+                    "workspace_symbols", "call_hierarchy", "incoming_calls", "outgoing_calls", "declaration", "type_definition", "implementation", "prepare_rename", "rename", "code_actions", "completions", "signature_help", "document_highlight", "document_links", "selection_ranges", "linked_editing_range", "format_document", "format_range", "diagnostics"
                 ]
             }).to_string(),
         };
@@ -853,6 +853,30 @@ impl ToolExecutor {
                 } else {
                     json!({
                         "error": "document_symbols requires 'file' parameter"
+                    }).to_string()
+                }
+            }
+
+            "document_links" => {
+                if let Some(f) = file {
+                    match self.try_active_file_request(
+                        "document_links",
+                        f,
+                        "textDocument/documentLink",
+                        match self.ensure_lsp_file_ready(f) {
+                            Ok((_, uri)) => json!({ "textDocument": { "uri": uri } }),
+                            Err(error) => return json!({ "error": error }).to_string(),
+                        },
+                    ) {
+                        Ok(Some(result)) => result,
+                        Ok(None) => json!({
+                            "error": "document_links requires an active LSP backend for that file"
+                        }).to_string(),
+                        Err(error) => json!({ "error": error }).to_string(),
+                    }
+                } else {
+                    json!({
+                        "error": "document_links requires 'file' parameter"
                     }).to_string()
                 }
             }
@@ -1238,6 +1262,7 @@ impl ToolExecutor {
                             "completions": true,
                             "signature_help": true,
                             "document_highlight": true,
+                            "document_links": true,
                             "selection_ranges": true,
                             "linked_editing_range": true,
                             "format_document": true,
@@ -1257,7 +1282,7 @@ impl ToolExecutor {
                 "error": format!("Unknown operation: {}", operation),
                 "valid_operations": [
                     "goto_definition", "find_references", "hover", "document_symbols",
-                    "workspace_symbols", "call_hierarchy", "incoming_calls", "outgoing_calls", "declaration", "type_definition", "implementation", "prepare_rename", "rename", "code_actions", "completions", "signature_help", "document_highlight", "selection_ranges", "linked_editing_range", "format_document", "format_range", "diagnostics"
+                    "workspace_symbols", "call_hierarchy", "incoming_calls", "outgoing_calls", "declaration", "type_definition", "implementation", "prepare_rename", "rename", "code_actions", "completions", "signature_help", "document_highlight", "document_links", "selection_ranges", "linked_editing_range", "format_document", "format_range", "diagnostics"
                 ]
             }).to_string()
         }
