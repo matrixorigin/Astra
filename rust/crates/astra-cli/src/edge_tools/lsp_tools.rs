@@ -11,6 +11,9 @@ use super::lsp_stdio_session::path_to_uri;
 use super::shell::shell_escape;
 use super::{MAX_LSP_FILE_SIZE, ToolExecutor, utf16_col_to_char_idx};
 
+/// (start_line, start_char, end_line, end_char, new_text)
+type LspTextEdit = (usize, usize, usize, usize, String);
+
 impl ToolExecutor {
     // ─── LSP tool: unified language server interface ─────────────────────────────
 
@@ -52,7 +55,7 @@ impl ToolExecutor {
         Ok(path)
     }
 
-    fn parse_lsp_text_edit(edit: &Value) -> Result<(usize, usize, usize, usize, String), String> {
+    fn parse_lsp_text_edit(edit: &Value) -> Result<LspTextEdit, String> {
         let range = edit
             .get("range")
             .ok_or_else(|| "WorkspaceEdit text edit is missing range".to_string())?;
@@ -98,7 +101,7 @@ impl ToolExecutor {
     fn collect_workspace_edit_changes(
         &self,
         workspace_edit: &Value,
-    ) -> Result<BTreeMap<PathBuf, Vec<(usize, usize, usize, usize, String)>>, String> {
+    ) -> Result<BTreeMap<PathBuf, Vec<LspTextEdit>>, String> {
         let mut edits_by_path = BTreeMap::new();
         if let Some(changes) = workspace_edit.get("changes").and_then(Value::as_object) {
             for (uri, edits) in changes {

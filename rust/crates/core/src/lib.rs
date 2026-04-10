@@ -120,6 +120,7 @@ impl SubRunState {
     }
 
     /// Parse from a status string (backward-compatible).
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<SubRunState> {
         match s {
             "created" => Some(SubRunState::Created),

@@ -1773,7 +1773,7 @@ pub(super) async fn handle_team_command(
         "status" => {
             let name = sub_arg.trim();
             let entries: Vec<TeamHistoryEntry> = if name.is_empty() {
-                let mut all: Vec<_> = state.team_registry.history.iter().cloned().collect();
+                let mut all: Vec<_> = state.team_registry.history.to_vec();
                 all.sort_by(|a, b| b.started_at.cmp(&a.started_at));
                 all.into_iter().take(5).collect()
             } else {

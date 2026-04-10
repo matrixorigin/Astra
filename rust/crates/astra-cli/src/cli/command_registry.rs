@@ -693,11 +693,11 @@ pub fn completion_candidates(prefix: &str) -> Vec<(&'static str, &'static str)> 
         let a_alias = COMMANDS
             .iter()
             .find(|m| m.name == *a_name)
-            .map_or(false, |m| m.is_alias);
+            .is_some_and(|m| m.is_alias);
         let b_alias = COMMANDS
             .iter()
             .find(|m| m.name == *b_name)
-            .map_or(false, |m| m.is_alias);
+            .is_some_and(|m| m.is_alias);
         a_alias.cmp(&b_alias).then_with(|| a_name.cmp(b_name))
     });
     rows

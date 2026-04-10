@@ -258,7 +258,7 @@ fn signal_description(signal: &MilestoneSignal) -> String {
 /// f(x) = 1 - e^(-kx), k chosen so f(2.0) ≈ 0.8.
 fn soft_ceiling(x: f64) -> f64 {
     let k = 0.8; // f(2.0) ≈ 0.80
-    (1.0 - (-k * x).exp()).max(0.0).min(1.0)
+    (1.0 - (-k * x).exp()).clamp(0.0, 1.0)
 }
 
 /// Cosine similarity between two TF vectors.

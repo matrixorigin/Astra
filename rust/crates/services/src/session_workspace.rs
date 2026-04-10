@@ -132,16 +132,14 @@ impl ContextTraceSignal {
         if let Some(memory) = self.memory.as_ref()
             && !memory.selected_memory_ids.is_empty()
         {
-            let detail = (!memory.query.is_empty())
-                .then(|| {
+            let detail = if !memory.query.is_empty() { {
                     let preview: String = memory.query.chars().take(64).collect();
                     if memory.query.chars().count() > 64 {
                         format!(" for \"{preview}...\"")
                     } else {
                         format!(" for \"{preview}\"")
                     }
-                })
-                .unwrap_or_default();
+                } } else { Default::default() };
             parts.push(format!(
                 "memory: {} selected{}",
                 memory.selected_memory_ids.len(),
@@ -161,12 +159,11 @@ impl ContextTraceSignal {
                 parts.push(format!("history: {} compressed", history.compressed_turns));
             }
         }
-        if let Some(budget) = self.budget.as_ref() {
-            if budget.max_tokens > 0 || budget.total_used > 0 {
+        if let Some(budget) = self.budget.as_ref()
+            && (budget.max_tokens > 0 || budget.total_used > 0) {
                 parts.push(format!("budget: {:.2}", budget.budget_pressure));
                 parts.push(format!("tokens: {}", budget.total_used));
             }
-        }
         if let Some(timing) = self.timing.as_ref()
             && timing.total_ms > 0
         {
@@ -495,14 +492,13 @@ pub fn list_sessions_by_git_root(
 
     let mut results = Vec::new();
     for sid in &session_ids {
-        if let Some(exclude) = exclude_session {
-            if sid == exclude {
+        if let Some(exclude) = exclude_session
+            && sid == exclude {
                 continue;
             }
-        }
         // Try reading workspace metadata; skip if unavailable
-        if let Ok(ws) = read_workspace(sid) {
-            if ws.git_root.as_deref() == Some(git_root) {
+        if let Ok(ws) = read_workspace(sid)
+            && ws.git_root.as_deref() == Some(git_root) {
                 results.push(ProjectSessionSummary {
                     session_id: sid.clone(),
                     summary: ws.summary,
@@ -516,7 +512,6 @@ pub fn list_sessions_by_git_root(
                     break;
                 }
             }
-        }
     }
     results
 }

@@ -790,7 +790,7 @@ pub fn build_system_prompt_trace(
 fn estimate_section_tokens(text: &str) -> u32 {
     // More accurate: count words + punctuation, but 4 chars/token is fast
     let char_count = text.chars().count();
-    ((char_count + 3) / 4) as u32
+    char_count.div_ceil(4) as u32
 }
 
 /// Keywords per task type for lightweight classification.

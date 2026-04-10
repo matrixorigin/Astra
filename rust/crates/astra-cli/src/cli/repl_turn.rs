@@ -1651,7 +1651,7 @@ fn latest_context_trace_signal(state: &ReplState) -> Option<ContextTraceSignal> 
         || !trace.history.turns_retained.is_empty()
         || !trace.history.turns_compressed.is_empty()
         || !trace.history.turns_dropped.is_empty())
-    .then(|| ContextTraceHistorySignal {
+    .then_some(ContextTraceHistorySignal {
         total_turns_available: trace.history.total_turns_available,
         retained_turns: trace.history.turns_retained.len(),
         compressed_turns: trace.history.turns_compressed.len(),
@@ -1661,7 +1661,7 @@ fn latest_context_trace_signal(state: &ReplState) -> Option<ContextTraceSignal> 
         tokens_after: trace.history.tokens_after,
     });
     let budget =
-        (trace.token_budget.max_tokens > 0 || trace.token_budget.total_used > 0).then(|| {
+        (trace.token_budget.max_tokens > 0 || trace.token_budget.total_used > 0).then_some({
             ContextTraceBudgetSignal {
                 max_tokens: trace.token_budget.max_tokens,
                 total_used: trace.token_budget.total_used,

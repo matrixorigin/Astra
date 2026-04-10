@@ -850,7 +850,7 @@ impl UserProfileManager {
         let mut detectors = self.detectors.write().unwrap();
         let detector = detectors
             .entry(user_id.to_string())
-            .or_insert_with(ScenarioDetector::new);
+            .or_default();
         detector.observe_query(query);
 
         // Update profile with new query count
@@ -871,7 +871,7 @@ impl UserProfileManager {
         let mut detectors = self.detectors.write().unwrap();
         let detector = detectors
             .entry(user_id.to_string())
-            .or_insert_with(ScenarioDetector::new);
+            .or_default();
         detector.observe_tool(tool_name);
 
         // Update profile stats

@@ -1811,7 +1811,7 @@ impl DelegationEngine {
 
         for (stage_index, agent_id) in agent_ids.iter().enumerate() {
             // Check cancellation before starting next sequential agent
-            if let Some(ref token) = cancel_token {
+            if let Some(token) = cancel_token {
                 if token.is_cancelled() {
                     break;
                 }
@@ -2073,7 +2073,7 @@ impl DelegationEngine {
 
         for round in 0..max_rounds {
             // Check cancellation before starting next adversarial round
-            if let Some(ref token) = cancel_token {
+            if let Some(token) = cancel_token {
                 if token.is_cancelled() {
                     break;
                 }

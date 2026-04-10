@@ -348,9 +348,9 @@ impl FocusDriftAnalysis {
             lines.push("### Evidence".to_string());
             for ev in &self.evidence {
                 lines.push(format!(
-                    "- Turn {}: [{}] {} ({:.0}% confidence)",
+                    "- Turn {}: [{:?}] {} ({:.0}% confidence)",
                     ev.turn,
-                    format!("{:?}", ev.evidence_type),
+                    ev.evidence_type,
                     ev.description,
                     ev.confidence * 100.0
                 ));

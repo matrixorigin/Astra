@@ -55,7 +55,7 @@ fn is_command_alias(command: &str) -> bool {
     COMMANDS
         .iter()
         .find(|m| m.name == command)
-        .map_or(false, |m| m.is_alias)
+        .is_some_and(|m| m.is_alias)
 }
 
 /// A sub-command contains a space (e.g. "/skill list", "/grep files …").

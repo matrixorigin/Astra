@@ -1388,11 +1388,10 @@ impl JournalEvent {
         summary: Option<&str>,
     ) -> Self {
         let mut evt = Self::compact(session_id, turn, turns_compacted, facts_stored);
-        if let Some(s) = summary {
-            if !s.is_empty() {
+        if let Some(s) = summary
+            && !s.is_empty() {
                 evt.metadata = Some(serde_json::json!({ "compact_summary": s }));
             }
-        }
         evt
     }
 

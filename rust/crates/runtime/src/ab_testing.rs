@@ -346,6 +346,7 @@ impl Default for ExperimentStatus {
 
 impl Experiment {
     /// Create a new experiment.
+    #[allow(clippy::new_ret_no_self)]
     pub fn new(id: impl Into<String>) -> ExperimentBuilder {
         ExperimentBuilder::new(id)
     }
@@ -878,7 +879,7 @@ impl ExperimentAnalyzer {
         };
         let std_dev = variance.sqrt();
 
-        let median = if n % 2 == 0 {
+        let median = if n.is_multiple_of(2) {
             (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0
         } else {
             sorted[n / 2]

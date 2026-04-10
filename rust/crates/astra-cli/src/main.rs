@@ -713,8 +713,7 @@ impl Default for ReplState {
             // Load RuntimeConfig from config files + env vars, then create
             // ContextBudget using the loaded config (M3 wiring).
             runtime_config: {
-                let cfg = astra_runtime::runtime_config::RuntimeConfig::load();
-                cfg
+                astra_runtime::runtime_config::RuntimeConfig::load()
             },
             // Temporary: will be replaced with from_runtime_config when model is known
             context_budget: prompts::ContextBudget::default(),

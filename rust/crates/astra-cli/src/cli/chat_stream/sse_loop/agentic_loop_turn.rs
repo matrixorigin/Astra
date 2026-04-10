@@ -413,7 +413,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
 
     // ─── Record token budget estimate to trace collector (M1 observability) ───
     if let Some(collector) = ctx.telem.trace_collector {
-        let schema_tokens = ctx.selector.registry().total_pinned_token_cost() as u32;
+        let schema_tokens = ctx.selector.registry().total_pinned_token_cost();
         let budget = prompts::budget_for_model(ctx.model);
         let max_tokens = budget.model_limit as u32;
 

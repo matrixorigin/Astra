@@ -33,7 +33,7 @@ pub fn handle_tuning_command<W: Write>(
     ctx: TuningCommandContext<'_, W>,
 ) -> std::io::Result<()> {
     let parts: Vec<&str> = args.split_whitespace().collect();
-    let subcommand = parts.first().map(|s| *s).unwrap_or("status");
+    let subcommand = parts.first().copied().unwrap_or("status");
 
     match subcommand {
         "status" => cmd_status(ctx),

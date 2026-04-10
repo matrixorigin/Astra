@@ -1055,7 +1055,25 @@ pub(super) fn handle_session_command(arg: &str, state: &mut ReplState) {
                     // If no turn specified, show summary of all traces
                     let turn_filter: Option<u32> = turn_str.and_then(|s| s.parse().ok());
 
-                    if turn_filter.is_none() {
+                    if let Some(turn) = turn_filter {
+                        // Show detailed trace for specific turn
+                        let trace_evt = traces.iter().find(|e| e.turn == Some(turn));
+
+                        match trace_evt {
+                            Some(evt) => {
+                                print_context_trace_detail(evt, turn);
+                            }
+                            None => {
+                                eprintln!("  {} No context trace for turn {}", "✗".red(), turn);
+                                let available: Vec<_> =
+                                    traces.iter().filter_map(|e| e.turn).collect();
+                                if !available.is_empty() {
+                                    eprintln!("  {} Available turns: {:?}", "ℹ".cyan(), available);
+                                }
+                            }
+                        }
+                    } else {
+                        // No turn specified — show summary of all traces
                         eprintln!(
                             "\n{}",
                             format!(
@@ -1067,10 +1085,9 @@ pub(super) fn handle_session_command(arg: &str, state: &mut ReplState) {
                         );
                         for evt in &traces {
                             let ts_short = evt.ts.get(11..19).unwrap_or(&evt.ts);
-                            let turn = evt.turn.unwrap_or(0);
+                            let t = evt.turn.unwrap_or(0);
                             let trace = evt.context_assembly_trace.as_ref();
 
-                            // Extract summary from trace
                             let tokens_used = trace
                                 .and_then(|t| t.get("token_budget"))
                                 .and_then(|tb| tb.get("total_tokens_used"))
@@ -1092,7 +1109,7 @@ pub(super) fn handle_session_command(arg: &str, state: &mut ReplState) {
                             eprintln!(
                                 "  {} T{:<3} {} tokens · {} tools · {} memories",
                                 ts_short.dim(),
-                                turn,
+                                t,
                                 format_u64_grouped(tokens_used).cyan(),
                                 tools_count,
                                 memory_count,
@@ -1104,24 +1121,6 @@ pub(super) fn handle_session_command(arg: &str, state: &mut ReplState) {
                             "Use /session context <turn> to see full trace".dim()
                         );
                         eprintln!();
-                    } else {
-                        // Show detailed trace for specific turn
-                        let turn = turn_filter.unwrap();
-                        let trace_evt = traces.iter().find(|e| e.turn == Some(turn));
-
-                        match trace_evt {
-                            Some(evt) => {
-                                print_context_trace_detail(evt, turn);
-                            }
-                            None => {
-                                eprintln!("  {} No context trace for turn {}", "✗".red(), turn);
-                                let available: Vec<_> =
-                                    traces.iter().filter_map(|e| e.turn).collect();
-                                if !available.is_empty() {
-                                    eprintln!("  {} Available turns: {:?}", "ℹ".cyan(), available);
-                                }
-                            }
-                        }
                     }
                 }
                 Err(e) => eprintln!("{}", format!("  ✗ {e}").red()),
