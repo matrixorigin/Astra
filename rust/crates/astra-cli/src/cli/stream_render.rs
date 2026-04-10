@@ -7,7 +7,7 @@ use astra_runtime::turn::sse_edge_stderr_lines::{
 };
 use astra_runtime::turn::sse_stream_host::{
     EdgeApprovalResult, EdgeToolExecResult, NoopSseStreamHost, STREAM_IDLE_TIMEOUT_MS,
-    SseStreamHost, consume_sse_stream_cancellable,
+    SseStreamHost, ToolBatchRequest, consume_sse_stream_cancellable, is_tool_concurrency_safe,
 };
 use astra_runtime::turn::tool_result_semantics::cloud_tool_result_status_label;
 use crossterm::style::Stylize;
@@ -816,6 +816,230 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             decision: decision_str.to_string(),
             reason: None,
         }
+    }
+
+    /// Parallel batch execution for concurrent-safe tools.
+    ///
+    /// Sequential (side-effect) tools run first via [`execute_tool`](Self::execute_tool).
+    /// Then all concurrent-safe tools execute in parallel via `join_all`, overlapping
+    /// network I/O for async tools (GitHub, Memoria, MCP).
+    async fn execute_tools_batch(
+        &mut self,
+        requests: Vec<ToolBatchRequest>,
+    ) -> Vec<EdgeToolExecResult> {
+        let n = requests.len();
+
+        // Fast path: ≤1 tool — use existing sequential code.
+        if n <= 1 {
+            let mut out = Vec::with_capacity(n);
+            for req in requests {
+                out.push(
+                    self.execute_tool(&req.request_id, &req.tool, &req.args)
+                        .await,
+                );
+            }
+            return out;
+        }
+
+        // Classify by concurrency safety.
+        let conc_flags: Vec<bool> = requests
+            .iter()
+            .map(|req| is_tool_concurrency_safe(&req.tool))
+            .collect();
+        let conc_count = conc_flags.iter().filter(|&&f| f).count();
+
+        // < 2 concurrent-safe tools: no parallelism benefit.
+        if conc_count < 2 {
+            let mut out = Vec::with_capacity(n);
+            for req in requests {
+                out.push(
+                    self.execute_tool(&req.request_id, &req.tool, &req.args)
+                        .await,
+                );
+            }
+            return out;
+        }
+
+        let mut results: Vec<Option<EdgeToolExecResult>> = (0..n).map(|_| None).collect();
+
+        // Collect concurrent-safe requests (preserving order) and run sequential ones first.
+        let mut conc_reqs: Vec<(usize, &ToolBatchRequest)> = Vec::with_capacity(conc_count);
+        for (i, req) in requests.iter().enumerate() {
+            if conc_flags[i] {
+                conc_reqs.push((i, req));
+            } else {
+                // Side-effect tools execute eagerly in original order.
+                results[i] = Some(
+                    self.execute_tool(&req.request_id, &req.tool, &req.args)
+                        .await,
+                );
+            }
+        }
+
+        // Pre-check: can all concurrent tools auto-proceed?
+        // Read-only tools hit the fast-path in check_nonblocking (SideEffect::Read → Allow).
+        let mut all_allowed = true;
+        for (_, req) in &conc_reqs {
+            let ok = match &mut self.perm_manager {
+                Some(pm) => matches!(
+                    pm.check_nonblocking(&req.tool, &req.args),
+                    crate::permission_manager::PermissionDecision::Allow
+                ),
+                None => true,
+            };
+            if !ok {
+                all_allowed = false;
+                break;
+            }
+        }
+
+        if !all_allowed {
+            // Rare for read-only tools. Fall back to sequential.
+            for (i, req) in conc_reqs {
+                results[i] = Some(
+                    self.execute_tool(&req.request_id, &req.tool, &req.args)
+                        .await,
+                );
+            }
+            return results.into_iter().map(|r| r.unwrap()).collect();
+        }
+
+        // ── Phase 1: Pre-execution UI setup (sequential, &mut self) ──
+        let mut ui_indices: Vec<Option<usize>> = Vec::with_capacity(conc_reqs.len());
+        for (_, req) in &conc_reqs {
+            // Forward tool-started event.
+            let desc = self.render.format_tool_description(&req.tool, &req.args);
+            if let Some(tx) = &self.stream_event_tx {
+                let _ = tx.send(super::chat_stream::StreamEvent::ToolStarted {
+                    name: req.tool.clone(),
+                    description: desc,
+                });
+            }
+            // First-tool clearing (once per turn).
+            if !self.tool_work_detected {
+                self.tool_work_detected = true;
+                self.xml_tag_buffer.clear();
+                if let Some(md) = &mut self.render.md {
+                    md.discard_and_reset();
+                } else if self.render.lines_written > 0 && io::stdout().is_terminal() {
+                    execute!(
+                        io::stdout(),
+                        cursor::MoveUp(self.render.lines_written as u16),
+                        cursor::MoveToColumn(0),
+                        terminal::Clear(terminal::ClearType::FromCursorDown)
+                    )
+                    .ok();
+                    self.render.lines_written = 0;
+                    self.render.col = 0;
+                }
+            }
+            self.render.stop_thinking();
+            let tool_idx = if !self.quiet && !self.suppress_intermediate_output {
+                Some(self.render.tool_start(&req.tool, &req.args))
+            } else {
+                None
+            };
+            ui_indices.push(tool_idx);
+        }
+
+        // ── Phase 2: Parallel execution ──
+        // Reborrow the executor as a shared reference so multiple futures
+        // can run concurrently within the same task (no Sync required for
+        // single-task join_all — the futures are polled cooperatively).
+        let executor: &crate::edge_tools::ToolExecutor = &*self.executor;
+        let futs: Vec<_> = conc_reqs
+            .iter()
+            .map(|(_, req)| {
+                let tool = req.tool.as_str();
+                let args = &req.args;
+                async move {
+                    let t0 = Instant::now();
+                    let output = executor.execute(tool, args).await;
+                    let ms = t0.elapsed().as_millis() as u64;
+                    (output, ms)
+                }
+            })
+            .collect();
+        let outputs: Vec<(String, u64)> = futures_util::future::join_all(futs).await;
+
+        // ── Phase 3: Post-execution (sequential, &mut self) ──
+        for (pos, (output, duration_ms)) in outputs.into_iter().enumerate() {
+            let (orig_idx, req) = conc_reqs[pos];
+            let status = cloud_tool_result_status_label(&output);
+
+            // Forward tool-completed event.
+            if let Some(tx) = &self.stream_event_tx {
+                let output_summary = self
+                    .render
+                    .format_output_summary(&req.tool, &output, status)
+                    .unwrap_or_default();
+                let desc = self.render.format_tool_description(&req.tool, &req.args);
+                let _ = tx.send(super::chat_stream::StreamEvent::ToolCompleted {
+                    name: req.tool.clone(),
+                    description: desc,
+                    status: status.to_string(),
+                    duration_ms,
+                    output_summary: if output_summary.is_empty() {
+                        None
+                    } else {
+                        Some(output_summary)
+                    },
+                });
+            }
+
+            // Tool-done UI.
+            if let Some(idx) = ui_indices[pos] {
+                self.render
+                    .tool_done(idx, &req.tool, &req.args, status, duration_ms, &output);
+            }
+
+            let result = EdgeToolExecResult {
+                request_id: req.request_id.clone(),
+                tool: req.tool.clone(),
+                args: req.args.clone(),
+                output: output.clone(),
+                status: status.to_string(),
+                duration_ms,
+            };
+            self.edge_tool_round.push(result.clone());
+            results[orig_idx] = Some(result);
+
+            // Post tool result to cloud API.
+            let body = astra_thin_client::ToolResultRequest {
+                request_id: req.request_id.clone(),
+                status: status.to_string(),
+                output: Some(output),
+                duration_ms: Some(duration_ms),
+            };
+            let post_result = self
+                .api
+                .post_tool_result(Some(self.token), Some(self.executor_id), &body)
+                .await;
+            if let Err(ref e) = post_result {
+                let is_auth = matches!(
+                    e,
+                    astra_thin_client::ThinClientError::Api { status, .. }
+                        if status.as_u16() == 401
+                );
+                if is_auth {
+                    if let Some(token) = self.cancel_token {
+                        token.cancel();
+                    }
+                    if !self.quiet {
+                        eprintln!(
+                            "{}",
+                            "Session expired. Please re-authenticate with `astra auth login`."
+                                .red()
+                        );
+                    }
+                    break;
+                } else if !self.quiet && !self.suppress_intermediate_output {
+                    eprintln!("{}", edge_sse_post_tool_result_fail_line(e).yellow());
+                }
+            }
+        }
+
+        results.into_iter().map(|r| r.unwrap()).collect()
     }
 }
 

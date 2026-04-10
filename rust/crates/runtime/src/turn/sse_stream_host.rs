@@ -70,6 +70,70 @@ pub struct EdgeApprovalResult {
     pub reason: Option<String>,
 }
 
+/// A tool request bundled for batch execution.
+#[derive(Debug, Clone)]
+pub struct ToolBatchRequest {
+    pub request_id: String,
+    pub tool: String,
+    pub args: Value,
+}
+
+/// Returns `true` if the named tool is safe for concurrent execution.
+///
+/// Concurrent-safe tools are read-only operations without observable side effects,
+/// making them safe to execute in parallel via `futures::future::join_all`.
+/// This includes both sync tools (fast local I/O) and async tools (network I/O
+/// that benefits most from parallel execution).
+pub fn is_tool_concurrency_safe(tool: &str) -> bool {
+    matches!(
+        tool,
+        // ── Local read-only (sync) ───────────────────────────────────
+        "read_file"
+            | "list_dir"
+            | "grep"
+            | "glob"
+            | "git_status"
+            | "git_diff"
+            | "git_log"
+            | "git_show"
+            | "git_blame"
+            | "git_file_history"
+            | "git_contributors"
+            | "git_log_search"
+            | "find_definition"
+            | "find_references"
+            | "call_graph"
+            | "extract_members"
+            | "type_hierarchy"
+            | "hover_info"
+            | "symbol_search"
+            | "dead_code"
+            | "symbols"
+            | "lsp"
+            | "env"
+            | "brief"
+            | "tool_search"
+            | "get_agent_info"
+            | "reflect"
+            | "web_fetch"
+            | "web_search"
+            | "mo_query"
+            | "share_context"
+            | "query_context"
+            // ── GitHub read-only (async — benefits from join_all) ─────
+            | "github_list_prs"
+            | "github_get_pr"
+            | "github_ci_status"
+            | "github_list_issues"
+            | "github_get_issue"
+            | "github_repo_stats"
+            // ── Memoria read-only (async) ────────────────────────────
+            | "memory_retrieve"
+            | "memory_search"
+            | "memory_profile"
+    )
+}
+
 /// Aggregated result from consuming one SSE stream.
 #[derive(Debug)]
 pub struct SseConsumeResult {
@@ -143,6 +207,28 @@ pub trait SseStreamHost: Send {
         tool: &str,
         detail: Option<&str>,
     ) -> EdgeApprovalResult;
+
+    /// Execute a batch of tool requests, potentially in parallel.
+    ///
+    /// The default implementation calls [`execute_tool`](Self::execute_tool)
+    /// sequentially.  CLI hosts override this to run concurrent-safe tools
+    /// via `futures::future::join_all`, overlapping network I/O for async
+    /// tools (GitHub, Memoria, MCP).
+    ///
+    /// Results are returned in the same order as the input `requests`.
+    async fn execute_tools_batch(
+        &mut self,
+        requests: Vec<ToolBatchRequest>,
+    ) -> Vec<EdgeToolExecResult> {
+        let mut results = Vec::with_capacity(requests.len());
+        for req in requests {
+            let r = self
+                .execute_tool(&req.request_id, &req.tool, &req.args)
+                .await;
+            results.push(r);
+        }
+        results
+    }
 }
 
 // ─── Generic SSE consumer ────────────────────────────────────────────────────
@@ -329,7 +415,11 @@ async fn flush_pending_via_host<H: SseStreamHost>(
     tool_results: &mut Vec<EdgeToolExecResult>,
     approval_results: &mut Vec<EdgeApprovalResult>,
 ) {
-    for item in std::mem::take(pending) {
+    let items = std::mem::take(pending);
+    let mut tool_batch: Vec<ToolBatchRequest> = Vec::new();
+    let mut approvals: Vec<ChatTurnEdgePending> = Vec::new();
+
+    for item in items {
         match item {
             ChatTurnEdgePending::ToolRequest {
                 request_id,
@@ -339,22 +429,37 @@ async fn flush_pending_via_host<H: SseStreamHost>(
                 if request_id.is_empty() || tool.is_empty() {
                     continue;
                 }
-                let result = host.execute_tool(&request_id, &tool, &args).await;
-                tool_results.push(result);
+                tool_batch.push(ToolBatchRequest {
+                    request_id,
+                    tool,
+                    args,
+                });
             }
-            ChatTurnEdgePending::ApprovalRequired {
-                request_id,
-                tool,
-                detail,
-            } => {
-                if request_id.is_empty() {
-                    continue;
-                }
-                let result = host
-                    .resolve_approval(&request_id, &tool, detail.as_deref())
-                    .await;
-                approval_results.push(result);
+            approval => approvals.push(approval),
+        }
+    }
+
+    // Execute tools — the host decides whether to parallelize.
+    if !tool_batch.is_empty() {
+        let results = host.execute_tools_batch(tool_batch).await;
+        tool_results.extend(results);
+    }
+
+    // Approvals are always sequential (interactive prompts).
+    for item in approvals {
+        if let ChatTurnEdgePending::ApprovalRequired {
+            request_id,
+            tool,
+            detail,
+        } = item
+        {
+            if request_id.is_empty() {
+                continue;
             }
+            let result = host
+                .resolve_approval(&request_id, &tool, detail.as_deref())
+                .await;
+            approval_results.push(result);
         }
     }
 }
