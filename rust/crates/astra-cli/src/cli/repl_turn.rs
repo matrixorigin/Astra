@@ -547,7 +547,7 @@ async fn maybe_auto_compact(
         root_agent_id: Some("main"),
         root_mailbox_slot: Some(&mut state.root_mailbox),
         observability_hub: None,
-        observability_session: None,
+        observability_session: state.observability_session.clone(),
     })
     .await;
 
@@ -758,7 +758,7 @@ async fn run_chat_turn(
             root_agent_id: Some("main"),
             root_mailbox_slot: Some(&mut state.root_mailbox),
             observability_hub: None,
-            observability_session: None,
+            observability_session: state.observability_session.clone(),
         }) => TurnAttempt::Completed(Box::new(result)),
         _ = tokio::signal::ctrl_c() => {
             // Trigger cancellation to interrupt any in-flight SSE streaming.
@@ -1365,6 +1365,14 @@ fn initialize_journal(state: &mut ReplState, session_id: &str) {
         state.model.as_deref().unwrap_or("default"),
     );
     let _ = astra_services::session_workspace::write_workspace(&ws);
+
+    // Initialize observability session for context tracing (M1).
+    // This enables TurnTraceCollector creation in the agentic loop.
+    if state.observability_session.is_none() {
+        state.observability_session = Some(std::sync::Arc::new(std::sync::RwLock::new(
+            astra_runtime::observability_integration::ObservabilitySession::new_simple(session_id),
+        )));
+    }
 }
 
 /// Report a turn failure with enriched partial data from the agentic loop.

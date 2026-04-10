@@ -1462,6 +1462,9 @@ struct ReplState {
     drift_user_corrections: Vec<u32>,
     /// Original user query at session start (for drift baseline comparison).
     drift_original_query: Option<String>,
+    /// Session-scoped observability for context tracing (M1).
+    observability_session:
+        Option<std::sync::Arc<std::sync::RwLock<astra_runtime::observability_integration::ObservabilitySession>>>,
 }
 
 impl Default for ReplState {
@@ -1560,6 +1563,7 @@ impl Default for ReplState {
             drift_compressed_turns: Vec::new(),
             drift_user_corrections: Vec::new(),
             drift_original_query: None,
+            observability_session: None, // Created when session starts
         }
     }
 }

@@ -147,6 +147,31 @@ impl ObservabilitySession {
         }
     }
 
+    /// Create a simple session without full profile infrastructure.
+    ///
+    /// This is useful for CLI contexts where we don't have access to the
+    /// full UserProfileManager/ExperimentStore.
+    pub fn new_simple(session_id: impl Into<String>) -> Self {
+        Self {
+            user_id: "anonymous".to_string(),
+            session_id: session_id.into(),
+            turn_number: 0,
+            profile: UserProfile::new("anonymous"),
+            config: RuntimeConfig::load(),
+            active_variant: None,
+            active_experiment_id: None,
+            context_traces: Vec::new(),
+            decision_explanations: Vec::new(),
+            drift_detector: DriftDetector::default(),
+            recent_queries: Vec::new(),
+            compressed_turns: Vec::new(),
+            user_corrections: Vec::new(),
+            original_query: None,
+            started_at: Instant::now(),
+            turn_timings: Vec::new(),
+        }
+    }
+
     /// Get the current scenario (if detected).
     pub fn current_scenario(&self) -> Option<Scenario> {
         self.profile.current_scenario
