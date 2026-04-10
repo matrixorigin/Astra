@@ -765,6 +765,38 @@ struct DelegationExecutionResult {
     preview_lines: Vec<(HeadlessStderrStyle, String)>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DelegationFinalOutputSource {
+    Aggregated,
+    SingleSuccessfulSubRun,
+}
+
+fn delegation_final_output_preview(
+    result: &astra_services::coordination::DelegationResult,
+    limit: usize,
+) -> Option<(String, DelegationFinalOutputSource)> {
+    if let Some(agg) = &result.aggregated_output {
+        return Some((
+            truncate_str(agg, limit),
+            DelegationFinalOutputSource::Aggregated,
+        ));
+    }
+    let successful_outputs: Vec<_> = result
+        .agent_results
+        .iter()
+        .filter(|ar| ar.is_success())
+        .filter_map(|ar| ar.output.as_deref())
+        .collect();
+    if successful_outputs.len() == 1 {
+        Some((
+            truncate_str(successful_outputs[0], limit.min(500)),
+            DelegationFinalOutputSource::SingleSuccessfulSubRun,
+        ))
+    } else {
+        None
+    }
+}
+
 /// Format a DelegationResult as a human-readable summary for the LLM.
 fn format_delegation_result(result: &astra_services::coordination::DelegationResult) -> String {
     let succeeded = result
@@ -779,21 +811,27 @@ fn format_delegation_result(result: &astra_services::coordination::DelegationRes
         result.delegation_id, result.status, succeeded, failed
     ));
 
-    if let Some(agg) = &result.aggregated_output {
-        parts.push(format!(
-            "\n📋 Final aggregated result:\n{}",
-            truncate_str(agg, 1_500)
-        ));
+    let final_output = delegation_final_output_preview(result, 1_500);
+    if let Some((final_output, _)) = &final_output {
+        parts.push(format!("\n📋 Final aggregated result:\n{final_output}"));
     }
 
     parts.push("\nSub-agent results:".to_string());
+    let single_successful_sub_run_fallback = matches!(
+        final_output.as_ref().map(|(_, source)| *source),
+        Some(DelegationFinalOutputSource::SingleSuccessfulSubRun)
+    );
     for ar in &result.agent_results {
         let status_icon = if ar.is_success() { "✅" } else { "❌" };
-        let output_preview = ar
-            .output
-            .as_deref()
-            .map(|o| truncate_str(o, 500))
-            .unwrap_or_else(|| "[no output]".to_string());
+        let output_preview =
+            if single_successful_sub_run_fallback && ar.is_success() && ar.output.is_some() {
+                "[same as final result above]".to_string()
+            } else {
+                ar.output
+                    .as_deref()
+                    .map(|o| truncate_str(o, 500))
+                    .unwrap_or_else(|| "[no output]".to_string())
+            };
         parts.push(format!(
             "\n{status_icon} Agent '{}' ({}): {output_preview}",
             ar.agent_id, ar.status
@@ -832,8 +870,8 @@ fn format_delegation_terminal_preview(
             result.delegation_id, succeeded, failed
         ),
     )];
-    if let Some(agg) = &result.aggregated_output {
-        let preview = agg.lines().next().unwrap_or(agg.as_str());
+    if let Some((final_output, _)) = delegation_final_output_preview(result, 200) {
+        let preview = final_output.lines().next().unwrap_or(final_output.as_str());
         lines.push((
             HeadlessStderrStyle::Dim,
             format!("   {}", truncate_str(preview, 200)),
@@ -1951,31 +1989,39 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
         // ─── Step 3b: Delegation interception ───────────────────────────
         // If a delegation engine is wired, intercept "delegate" tool calls
         // and execute them as multi-agent coordination runs.
-        let (delegation_results, remaining_tool_calls) =
-            if let Some(engine) = &state.delegation_engine {
-                // Fire SubagentStart hooks before delegation.
-                if turn_result.accum.tool_calls.iter().any(is_delegation_call) {
-                    let _ = crate::skills::hooks::evaluate_session_hooks(
-                        &state.session_event_hooks,
-                        crate::skills::hooks::SessionEvent::SubagentStart,
-                        state.current_session_id.as_deref().unwrap_or(""),
-                        None,
-                    )
-                    .await;
+        let (delegation_results, remaining_tool_calls) = if let Some(engine) =
+            &state.delegation_engine
+        {
+            // Fire SubagentStart hooks before delegation.
+            if turn_result.accum.tool_calls.iter().any(is_delegation_call) {
+                if !quiet {
+                    host.emit_headless_line(
+                            HeadlessStderrStyle::Yellow,
+                            "🤝 Delegating to sub-agents — parent agent is paused until results are aggregated."
+                                .to_string(),
+                        );
                 }
-                partition_and_execute_delegations(
-                    &turn_result.accum.tool_calls,
-                    engine,
-                    state.current_run_id.as_deref().unwrap_or("unknown"),
-                    state.current_session_id.as_deref().unwrap_or("unknown"),
-                    "orchestrator",
-                    state.workspace_root_hint.as_deref(),
-                    &state.skill_search,
+                let _ = crate::skills::hooks::evaluate_session_hooks(
+                    &state.session_event_hooks,
+                    crate::skills::hooks::SessionEvent::SubagentStart,
+                    state.current_session_id.as_deref().unwrap_or(""),
+                    None,
                 )
-                .await
-            } else {
-                (Vec::new(), turn_result.accum.tool_calls.clone())
-            };
+                .await;
+            }
+            partition_and_execute_delegations(
+                &turn_result.accum.tool_calls,
+                engine,
+                state.current_run_id.as_deref().unwrap_or("unknown"),
+                state.current_session_id.as_deref().unwrap_or("unknown"),
+                "orchestrator",
+                state.workspace_root_hint.as_deref(),
+                &state.skill_search,
+            )
+            .await
+        } else {
+            (Vec::new(), turn_result.accum.tool_calls.clone())
+        };
 
         // Inject delegation results into messages + tool_results.
         // Build a proper assistant message with the delegate tool_calls so
@@ -2052,6 +2098,13 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                     args_preview: Some(result.call_id.clone()),
                     result_preview: Some(result.summary.chars().take(500).collect::<String>()),
                 });
+            }
+            if !quiet {
+                host.emit_headless_line(
+                    HeadlessStderrStyle::Dim,
+                    "🧠 Parent agent is incorporating delegated results into the final response…"
+                        .to_string(),
+                );
             }
         }
 
@@ -3887,6 +3940,31 @@ mod tests {
     }
 
     #[test]
+    fn format_delegation_result_falls_back_to_single_success_output() {
+        let result = astra_services::coordination::DelegationResult {
+            delegation_id: "del-fallback".to_string(),
+            status: "completed".to_string(),
+            agent_results: vec![astra_services::coordination::AgentResult {
+                agent_id: "coder".to_string(),
+                run_id: "run-1".to_string(),
+                status: "completed".to_string(),
+                output: Some("single-agent final answer".to_string()),
+                error: None,
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                tool_calls: 0,
+            }],
+            aggregated_output: None,
+            total_prompt_tokens: 0,
+            total_completion_tokens: 0,
+            total_tool_calls: 0,
+        };
+        let formatted = super::format_delegation_result(&result);
+        assert!(formatted.contains("Final aggregated result"));
+        assert!(formatted.contains("single-agent final answer"));
+    }
+
+    #[test]
     fn format_delegation_terminal_preview_surfaces_summary_first() {
         let result = astra_services::coordination::DelegationResult {
             delegation_id: "del-preview".to_string(),
@@ -4217,6 +4295,19 @@ mod tests {
             delegation_content.contains("Delegation") || delegation_content.contains("completed"),
             "delegation result should contain status info, got: {delegation_content}"
         );
+        assert!(
+            delegation_content.contains("Final aggregated result"),
+            "delegation result should prioritize the final aggregate: {delegation_content}"
+        );
+        assert!(
+            delegation_content
+                .find("Final aggregated result")
+                .unwrap_or(usize::MAX)
+                < delegation_content
+                    .find("Sub-agent results")
+                    .unwrap_or(usize::MAX),
+            "aggregate should appear before per-agent details: {delegation_content}"
+        );
 
         // Verify token accounting includes both turns
         assert!(state.total_prompt >= 180, "should accumulate prompt tokens");
@@ -4227,8 +4318,20 @@ mod tests {
         assert!(
             host.emitted_lines
                 .iter()
+                .any(|line| line.contains("parent agent is paused")),
+            "delegation wait state should be emitted"
+        );
+        assert!(
+            host.emitted_lines
+                .iter()
                 .any(|line| line.contains("🤝 Delegation")),
             "delegation completion preview should be emitted"
+        );
+        assert!(
+            host.emitted_lines
+                .iter()
+                .any(|line| line.contains("incorporating delegated results")),
+            "parent incorporation phase should be emitted"
         );
     }
 

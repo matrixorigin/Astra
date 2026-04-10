@@ -540,8 +540,9 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 // runs sub-agents. Return a deferred acknowledgment so the server
                 // sees a success (not an error) and the model doesn't give up.
                 "Delegation request acknowledged. The delegation engine will execute \
-                 this request now and inject the summarized results before the \
-                 parent agent finishes."
+                 this request now, the parent agent will pause while sub-agents \
+                 run and aggregate, and the summarized results will be injected \
+                 before the parent agent finishes."
                     .to_string()
             } else {
                 let result = self.executor.execute(tool, args).await;
