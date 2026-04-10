@@ -2426,12 +2426,24 @@ impl ToolExecutor {
                             "format_range": true,
                             "format_on_type": true
                         },
+                        "recommended_operations": [
+                            "goto_definition", "find_references", "hover", "document_symbols",
+                            "workspace_symbols", "call_hierarchy", "incoming_calls", "outgoing_calls",
+                            "declaration", "type_definition", "implementation", "supertypes", "subtypes",
+                            "prepare_rename", "rename", "code_actions", "completions", "signature_help",
+                            "code_lenses", "format_document", "format_range", "format_on_type", "diagnostics"
+                        ],
+                        "advanced_editor_operations": [
+                            "document_highlight", "document_links", "inlay_hints", "folding_ranges",
+                            "document_colors", "color_presentations", "semantic_tokens", "selection_ranges",
+                            "linked_editing_range"
+                        ],
                         "active_backends": self.passive_lsp.active_status(&self.project_root),
                         "supported_languages": {
                             "active_lsp": ["rust", "typescript", "typescriptreact"],
                             "fallback_tools": ["rust", "python", "typescript", "javascript", "go", "java", "c", "cpp", "ruby"]
                         },
-                        "note": "Without a file, diagnostics reports LSP backend availability. With a file, it first tries textDocument/diagnostic and falls back to the latest publishDiagnostics snapshot after syncing that file into the active backend."
+                        "note": "Without a file, diagnostics reports backend availability plus recommended-vs-advanced LSP operations. With a file, diagnostics first tries textDocument/diagnostic and falls back to the latest publishDiagnostics snapshot after syncing that file into the active backend."
                     }).to_string()
                 }
             }

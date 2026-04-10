@@ -939,6 +939,26 @@ fn lsp_diagnostics_returns_capabilities() {
     assert!(parsed["capabilities"]["subtypes"].as_bool().unwrap());
     assert!(parsed["capabilities"]["prepare_rename"].as_bool().unwrap());
     assert!(
+        parsed["recommended_operations"]
+            .as_array()
+            .is_some_and(|ops| ops.iter().any(|op| op.as_str() == Some("code_actions")))
+    );
+    assert!(
+        parsed["recommended_operations"]
+            .as_array()
+            .is_some_and(|ops| ops.iter().any(|op| op.as_str() == Some("diagnostics")))
+    );
+    assert!(
+        parsed["advanced_editor_operations"]
+            .as_array()
+            .is_some_and(|ops| ops.iter().any(|op| op.as_str() == Some("semantic_tokens")))
+    );
+    assert!(
+        parsed["advanced_editor_operations"]
+            .as_array()
+            .is_some_and(|ops| ops.iter().any(|op| op.as_str() == Some("document_colors")))
+    );
+    assert!(
         parsed["supported_languages"]["active_lsp"]
             .as_array()
             .is_some()
