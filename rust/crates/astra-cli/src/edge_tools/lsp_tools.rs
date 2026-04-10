@@ -576,7 +576,7 @@ impl ToolExecutor {
                 "error": "Missing required 'operation' parameter",
                 "valid_operations": [
                     "goto_definition", "find_references", "hover", "document_symbols",
-                    "workspace_symbols", "call_hierarchy", "incoming_calls", "outgoing_calls", "declaration", "type_definition", "implementation", "rename", "code_actions", "completions", "signature_help", "document_highlight", "format_document", "format_range", "diagnostics"
+                    "workspace_symbols", "call_hierarchy", "incoming_calls", "outgoing_calls", "declaration", "type_definition", "implementation", "prepare_rename", "rename", "code_actions", "completions", "signature_help", "document_highlight", "format_document", "format_range", "diagnostics"
                 ]
             }).to_string(),
         };
@@ -746,6 +746,29 @@ impl ToolExecutor {
                 } else {
                     json!({
                         "error": "implementation requires either 'file'+'line'+'column' or 'symbol'"
+                    }).to_string()
+                }
+            }
+
+            "prepare_rename" => {
+                if let (Some(f), Some(l), Some(c)) = (file, line, column) {
+                    match self.try_active_position_request(
+                        "prepare_rename",
+                        f,
+                        l,
+                        c,
+                        "textDocument/prepareRename",
+                        None,
+                    ) {
+                        Ok(Some(result)) => result,
+                        Ok(None) => json!({
+                            "error": "prepare_rename requires an active LSP backend for that file"
+                        }).to_string(),
+                        Err(error) => json!({ "error": error }).to_string(),
+                    }
+                } else {
+                    json!({
+                        "error": "prepare_rename requires 'file'+'line'+'column'"
                     }).to_string()
                 }
             }
@@ -1138,6 +1161,7 @@ impl ToolExecutor {
                             "declaration": true,
                             "type_definition": true,
                             "implementation": true,
+                            "prepare_rename": true,
                             "rename": true,
                             "code_actions": true,
                             "completions": true,
@@ -1160,7 +1184,7 @@ impl ToolExecutor {
                 "error": format!("Unknown operation: {}", operation),
                 "valid_operations": [
                     "goto_definition", "find_references", "hover", "document_symbols",
-                    "workspace_symbols", "call_hierarchy", "incoming_calls", "outgoing_calls", "declaration", "type_definition", "implementation", "rename", "code_actions", "completions", "signature_help", "document_highlight", "format_document", "format_range", "diagnostics"
+                    "workspace_symbols", "call_hierarchy", "incoming_calls", "outgoing_calls", "declaration", "type_definition", "implementation", "prepare_rename", "rename", "code_actions", "completions", "signature_help", "document_highlight", "format_document", "format_range", "diagnostics"
                 ]
             }).to_string()
         }
