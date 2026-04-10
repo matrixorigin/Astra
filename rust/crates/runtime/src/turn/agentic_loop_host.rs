@@ -950,6 +950,20 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
         state.remaining_turns = state.remaining_turns.saturating_sub(1);
         state.step_recorder.begin_turn(turn_index as u32);
 
+        // ─── Observability: turn start hook ──────────────────────────────
+        // Record query for scenario detection and drift analysis.
+        let turn_start_time = std::time::Instant::now();
+        if let (Some(hub), Some(session)) =
+            (&state.observability_hub, &state.observability_session)
+        {
+            let session_id = state.current_session_id.as_deref().unwrap_or("");
+            let user_id = {
+                let s = session.read().unwrap();
+                s.user_id.clone()
+            };
+            crate::observability_integration::on_turn_start(hub, session_id, &user_id, &state.message);
+        }
+
         if state.permission_handler.is_none()
             && let Some(ctx) = state.permission_context.clone()
         {
@@ -2063,6 +2077,22 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
                         )
                         .await;
                 }
+
+                // ─── Observability: turn end hook ────────────────────────
+                // Capture timing and feed to auto-tuning.
+                if let Some(ref session) = state.observability_session {
+                    let total_ms = turn_start_time.elapsed().as_millis() as u64;
+                    let timing = crate::observability_integration::TurnTiming {
+                        turn: turn_index as u32,
+                        context_assembly_ms: 0,  // TODO: measure separately
+                        llm_latency_ms: turn_result.ttft_ms.unwrap_or(0) as u64,
+                        tool_execution_ms: 0,    // TODO: measure separately
+                        total_ms,
+                    };
+                    let mut session_guard = session.write().unwrap();
+                    crate::observability_integration::on_turn_end(&mut session_guard, timing);
+                }
+
                 state.step_recorder.end_turn(false);
             }
         }
