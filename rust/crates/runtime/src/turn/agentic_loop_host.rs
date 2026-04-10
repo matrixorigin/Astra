@@ -2184,18 +2184,30 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
                 // ─── Finalize turn trace collector ────────────────────────
                 // Persist context assembly trace to session journal (best-effort).
                 if let Some(ref collector) = state.turn_trace_collector {
+                    // Compute budget pressure from last measured tokens.
+                    let measured = state.last_measured_prompt_tokens.unwrap_or(0);
+                    let max = state.max_turn_input_tokens;
+                    let budget_pressure = if max > 0 {
+                        measured as f64 / max as f64
+                    } else {
+                        state.first_budget_pressure
+                    };
+                    
                     // Record token budget before finalizing.
+                    // NOTE: Fine-grained breakdown (system_prompt, history, memory, etc.)
+                    // is not available at runtime layer — would require CLI to pass it down.
+                    // For now, we capture what we have: total_used and budget_pressure.
                     collector.record_token_budget(
                         crate::turn::context_assembly_trace::TokenBudgetTrace {
-                            max_tokens: state.max_turn_input_tokens as u32,
-                            system_prompt_tokens: 0, // TODO: measure from host
-                            history_tokens: 0,       // TODO: measure from host  
-                            memory_tokens: 0,        // TODO: measure from host
-                            tool_schema_tokens: 0,   // TODO: measure from host
-                            user_message_tokens: 0,  // TODO: measure from host
-                            total_used: state.total_prompt as u32,
-                            budget_pressure: state.first_budget_pressure,
-                            compression_triggered: false, // TODO: track from host
+                            max_tokens: max as u32,
+                            system_prompt_tokens: 0, // Future: measure from CLI host
+                            history_tokens: 0,       // Future: measure from CLI host
+                            memory_tokens: 0,        // Future: measure from CLI host
+                            tool_schema_tokens: 0,   // Future: measure from CLI host
+                            user_message_tokens: 0,  // Future: measure from CLI host
+                            total_used: measured as u32,
+                            budget_pressure,
+                            compression_triggered: state.budget_wrapup_injected,
                         }
                     );
                     // Finalize and persist (errors logged but not propagated).
