@@ -629,6 +629,9 @@ impl TeamPersistenceService for InMemoryTeamStore {
         task: &str,
     ) -> Result<(), String> {
         let mut execs = self.executions.write().map_err(|e| e.to_string())?;
+        // TODO: Add retention limit (e.g., keep last N per team) to prevent unbounded growth.
+        // The in-memory store is session-scoped so impact is limited, but the MatrixOne-backed
+        // store has the same INSERT-only pattern and will grow without bound across restarts.
         execs.push(TeamExecutionRecord {
             execution_id: execution_id.to_string(),
             team_id: team_id.to_string(),

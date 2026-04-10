@@ -313,8 +313,8 @@ pub(crate) async fn stream_chat_sse(
     };
 
     // Pre-compute project-level cross-session context (knowledge backflow P2).
-    // Resolved here at session init rather than per-turn to avoid inline I/O
-    // in the runtime agentic loop hot path.
+    // TODO: This runs per-turn (stream_chat_sse is called from repl_turn for each message).
+    // Cache in ReplState or ChatTurnParams to avoid redundant git + directory scans per turn.
     let project_context: Option<String> = {
         let p2_enabled = std::env::var("MO_SESSION_PROJECT_CONTEXT")
             .map(|v| v != "0" && v.to_lowercase() != "false")

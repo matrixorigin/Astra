@@ -795,8 +795,16 @@ pub(super) async fn handle_team_command(
             // Build a fresh delegation engine with a cancel token so Ctrl+C
             // propagates into sub-agent SSE streams.
             let cancel_token = Arc::new(tokio_util::sync::CancellationToken::new());
-            let project_root =
-                std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            let project_root = match std::env::current_dir() {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!(
+                        "  {} Cannot determine working directory: {e}",
+                        theme::icon_err()
+                    );
+                    return;
+                }
+            };
             let token = match crate::current_access_token(profile) {
                 Some(t) => t,
                 None => {

@@ -976,10 +976,18 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
         // Create a collector for detailed context assembly traces.
         // Observability session presence enables trace collection.
         if state.observability_session.is_some() && state.turn_trace_collector.is_none() {
-            let turn_id = format!("turn-{}", turn_index);
-            let session_id = state.current_session_id.clone().unwrap_or_default();
-            state.turn_trace_collector =
-                Some(crate::turn::turn_trace_collector::TurnTraceCollector::new(turn_id, session_id));
+            let capture = std::env::var("MO_CAPTURE_TRACES")
+                .map(|v| v == "1" || v.to_lowercase() == "true")
+                .unwrap_or(true);
+            if capture {
+                let turn_id = format!("turn-{}", turn_index);
+                let session_id = state.current_session_id.clone().unwrap_or_default();
+                state.turn_trace_collector = Some(
+                    crate::turn::turn_trace_collector::TurnTraceCollector::new(
+                        turn_id, session_id,
+                    ),
+                );
+            }
         }
 
         if state.permission_handler.is_none()

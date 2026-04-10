@@ -647,7 +647,7 @@ pub fn build_memory_trace_from_retrieval(
         .enumerate()
         .map(|(idx, (content, score))| {
             let preview = if content.len() > 100 {
-                format!("{}...", &content[..100])
+                format!("{}...", &content[..content.floor_char_boundary(100)])
             } else {
                 content.clone()
             };

@@ -273,7 +273,11 @@ impl TeamExecutionOrchestrator {
             serde_json::Value::String(self.config.session_id.clone()),
         );
 
-        // Inject budget and max_parallel into request context for downstream consumers
+        // Inject budget and max_parallel into request context for downstream consumers.
+        // WARNING: Only `max_duration_secs` is enforced (via tokio::time::timeout below).
+        // `max_tokens` and `max_cost_usd` are serialized here but never read back —
+        // no code extracts "team_budget" from context. TODO: implement token/cost tracking
+        // or remove these fields from TeamBudget to avoid misleading users.
         if let Some(ref budget) = team.budget {
             if let Ok(budget_json) = serde_json::to_value(budget) {
                 effective_request
@@ -357,6 +361,10 @@ impl TeamExecutionOrchestrator {
             .execute(effective_request, &self.config.source_agent_id);
 
         let delegation_outcome = match budget_timeout {
+            // TODO: On timeout, tokio::time::timeout drops the future but does NOT cancel
+            // tasks spawned by execute_fan_out / execute_fork via tokio::spawn. Thread a
+            // CancellationToken through OrchestratorConfig → DelegationEngine so sub-agent
+            // tasks can be signaled to stop on budget timeout.
             Some(dur) => match tokio::time::timeout(dur, delegation_future).await {
                 Ok(r) => r,
                 Err(_) => Err(format!(

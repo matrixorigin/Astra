@@ -380,6 +380,8 @@ pub struct TelemetryConfig {
     pub capture_explanations: bool,
 
     /// Maximum traces to keep in memory.
+    /// NOTE: Not yet enforced — there is no in-memory trace buffer with a cap.
+    /// Each TurnTraceCollector is per-turn and cleared after persist.
     #[serde(default = "default_max_traces_in_memory")]
     pub max_traces_in_memory: u32,
 
