@@ -15,6 +15,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::SystemTime;
 
+use super::context_assembly_trace::{MemoryRetrievalTrace, TokenBudgetTrace};
+
 // ─── Decision Explanation ────────────────────────────────────────────────────
 
 /// A structured explanation for an agent decision.
@@ -627,9 +629,197 @@ impl DriftDetector {
             FocusDriftAnalysis::no_drift()
         }
     }
+
+    /// Analyze with additional context from trace data.
+    ///
+    /// Extends `analyze()` with three additional heuristics that consume
+    /// `ContextAssemblyTrace` fields:
+    ///
+    /// - **MemoryMiss**: memory retrieval returned 0 results or all scores < 0.3
+    /// - **TokenBudgetPressure**: budget_pressure > 0.85
+    /// - **AmbiguousInstruction**: consecutive corrections on similar queries
+    pub fn analyze_with_context(
+        &self,
+        original_query: &str,
+        recent_queries: &[String],
+        compressed_turns: &[u32],
+        user_corrections: &[u32],
+        memory_traces: &[MemoryRetrievalTrace],
+        budget_traces: &[TokenBudgetTrace],
+    ) -> FocusDriftAnalysis {
+        // Start with the base analysis
+        let mut base = self.analyze(original_query, recent_queries, compressed_turns, user_corrections);
+
+        // Even if base says "no drift", the additional signals can push it over
+        let mut extra_severity = 0.0_f64;
+        let mut extra_evidence = Vec::new();
+        let mut memory_miss_detected = false;
+        let mut budget_pressure_detected = false;
+
+        // ── MemoryMiss: check if memory retrieval failed ────────────────
+        for (i, trace) in memory_traces.iter().enumerate() {
+            let no_candidates = trace.candidates_considered == 0;
+            let all_low_relevance = !trace.memories_selected.is_empty()
+                && trace
+                    .memories_selected
+                    .iter()
+                    .all(|m| m.relevance_score < 0.3);
+            let empty_selection =
+                trace.candidates_considered > 0 && trace.memories_selected.is_empty();
+
+            if no_candidates || all_low_relevance || empty_selection {
+                let desc = if no_candidates {
+                    format!(
+                        "Memory retrieval returned 0 candidates for \"{}\"",
+                        ellipsize_str(&trace.query, 40)
+                    )
+                } else if all_low_relevance {
+                    let max_score = trace
+                        .memories_selected
+                        .iter()
+                        .map(|m| m.relevance_score)
+                        .fold(0.0_f64, f64::max);
+                    format!(
+                        "All retrieved memories have low relevance (max {:.0}%)",
+                        max_score * 100.0
+                    )
+                } else {
+                    format!(
+                        "{} candidates considered, none selected",
+                        trace.candidates_considered
+                    )
+                };
+
+                extra_evidence.push(DriftEvidence {
+                    turn: i as u32,
+                    evidence_type: EvidenceType::MemoryMismatch,
+                    description: desc,
+                    confidence: 0.6,
+                });
+                if !memory_miss_detected {
+                    extra_severity += 0.2;
+                    memory_miss_detected = true;
+                }
+            }
+        }
+
+        // ── TokenBudgetPressure: check if budget is critically tight ────
+        for (i, trace) in budget_traces.iter().enumerate() {
+            if trace.budget_pressure > 0.85 {
+                let sacrificed = if trace.compression_triggered {
+                    "history compressed"
+                } else {
+                    "context may be truncated"
+                };
+                extra_evidence.push(DriftEvidence {
+                    turn: i as u32,
+                    evidence_type: EvidenceType::TermDisappearance,
+                    description: format!(
+                        "Token budget pressure {:.0}% — {sacrificed}",
+                        trace.budget_pressure * 100.0
+                    ),
+                    confidence: 0.7,
+                });
+                if !budget_pressure_detected {
+                    extra_severity += 0.25;
+                    budget_pressure_detected = true;
+                }
+            }
+        }
+
+        // ── AmbiguousInstruction: consecutive corrections on similar queries ─
+        if user_corrections.len() >= 2 {
+            let corrections_sorted = {
+                let mut v = user_corrections.to_vec();
+                v.sort();
+                v
+            };
+            for window in corrections_sorted.windows(2) {
+                let (t1, t2) = (window[0], window[1]);
+                // Consecutive or near-consecutive corrections
+                if t2 - t1 <= 2 {
+                    let q1 = recent_queries.get(t1 as usize);
+                    let q2 = recent_queries.get(t2 as usize);
+                    if let (Some(q1), Some(q2)) = (q1, q2) {
+                        let sim = query_similarity(q1, q2);
+                        if sim > 0.4 {
+                            extra_evidence.push(DriftEvidence {
+                                turn: t2,
+                                evidence_type: EvidenceType::ClarificationRequest,
+                                description: format!(
+                                    "Repeated corrections on similar queries (similarity {:.0}%)",
+                                    sim * 100.0
+                                ),
+                                confidence: 0.75,
+                            });
+                            extra_severity += 0.3;
+                            break; // One ambiguity signal is enough
+                        }
+                    }
+                }
+            }
+        }
+
+        // Merge extra evidence into base analysis
+        if !extra_evidence.is_empty() {
+            let total_severity = (base.drift_severity + extra_severity).min(1.0);
+            base.evidence.extend(extra_evidence);
+            base.drift_severity = total_severity;
+
+            // Re-evaluate drift detection with augmented severity
+            if !base.drift_detected && total_severity >= self.min_severity_threshold {
+                base.drift_detected = true;
+                base.drift_turn = base.evidence.first().map(|e| e.turn);
+
+                // Determine likely cause from new evidence
+                base.likely_cause = if memory_miss_detected {
+                    let query = memory_traces
+                        .iter()
+                        .find(|t| t.candidates_considered == 0 || t.memories_selected.is_empty())
+                        .map(|t| t.query.clone())
+                        .unwrap_or_default();
+                    DriftCause::MemoryMiss {
+                        expected_but_not_retrieved: vec![ellipsize_str(&query, 80)],
+                        query_used: query,
+                    }
+                } else if budget_pressure_detected {
+                    let trace = budget_traces
+                        .iter()
+                        .find(|t| t.budget_pressure > 0.85)
+                        .unwrap();
+                    DriftCause::TokenBudgetPressure {
+                        budget_available: trace.max_tokens.saturating_sub(trace.total_used),
+                        budget_needed: trace.total_used,
+                        sacrificed_context: if trace.compression_triggered {
+                            vec!["History compressed under budget pressure".to_string()]
+                        } else {
+                            vec![]
+                        },
+                    }
+                } else {
+                    DriftCause::AmbiguousInstruction {
+                        instruction: original_query.chars().take(80).collect(),
+                        interpretations: vec![
+                            "User corrected the same intent multiple times".to_string(),
+                        ],
+                    }
+                };
+                base.recovery_suggestion = suggest_recovery(&base.likely_cause);
+            }
+        }
+
+        base
+    }
 }
 
-/// TF-IDF cosine similarity between two queries.
+fn ellipsize_str(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let truncated: String = s.chars().take(max.saturating_sub(1)).collect();
+        format!("{truncated}…")
+    }
+}
 ///
 /// Uses the shared CJK-aware tokenizer (`text_tokenize`) which handles both
 /// English (with stemming) and Chinese (unigrams + bigrams).  Unlike the older
@@ -895,5 +1085,270 @@ mod tests {
             .filter(|e| matches!(e.evidence_type, EvidenceType::ToolCallTopicChange))
             .count();
         assert!(topic_changes >= 2, "should have evidence for both divergent queries, got {topic_changes}");
+    }
+
+    // ── analyze_with_context() tests ────────────────────────────────────
+
+    fn make_memory_trace(query: &str, candidates: u32, scores: &[f64]) -> MemoryRetrievalTrace {
+        use super::super::context_assembly_trace::*;
+        MemoryRetrievalTrace {
+            query: query.to_string(),
+            candidates_considered: candidates,
+            memories_selected: scores.iter().map(|&s| MemorySelection {
+                memory_id: "m1".to_string(),
+                memory_type: "semantic".to_string(),
+                content_preview: "test".to_string(),
+                relevance_score: s,
+                tokens: 50,
+                source: MemorySource::Memoria,
+            }).collect(),
+            memories_rejected: vec![],
+            total_tokens: 50 * scores.len() as u32,
+            retrieval_latency_ms: 10,
+        }
+    }
+
+    fn make_budget_trace(pressure: f64, compressed: bool) -> TokenBudgetTrace {
+        TokenBudgetTrace {
+            max_tokens: 100_000,
+            system_prompt_tokens: 5_000,
+            history_tokens: 20_000,
+            memory_tokens: 5_000,
+            tool_schema_tokens: 10_000,
+            user_message_tokens: 1_000,
+            total_used: (100_000.0 * pressure) as u32,
+            budget_pressure: pressure,
+            compression_triggered: compressed,
+        }
+    }
+
+    #[test]
+    fn test_analyze_with_context_memory_miss_no_candidates() {
+        let detector = DriftDetector::default();
+        // A related query (no base drift) + empty memory retrieval
+        let analysis = detector.analyze_with_context(
+            "implement user auth",
+            &["implement login flow".to_string()],
+            &[],
+            &[],
+            &[make_memory_trace("user auth", 0, &[])],
+            &[],
+        );
+        // MemoryMiss alone adds 0.2 severity — below 0.3 threshold
+        assert!(!analysis.drift_detected,
+            "memory miss alone (0.2) should not cross 0.3 threshold");
+        // But the evidence should be present
+        let mem_evidence = analysis.evidence.iter()
+            .any(|e| matches!(e.evidence_type, EvidenceType::MemoryMismatch));
+        assert!(mem_evidence, "should have MemoryMismatch evidence");
+    }
+
+    #[test]
+    fn test_analyze_with_context_memory_miss_low_relevance() {
+        let detector = DriftDetector::default();
+        let analysis = detector.analyze_with_context(
+            "implement user auth",
+            &["implement login flow".to_string()],
+            &[],
+            &[],
+            &[make_memory_trace("user auth", 5, &[0.1, 0.2])], // all < 0.3
+            &[],
+        );
+        let mem_evidence = analysis.evidence.iter()
+            .any(|e| matches!(e.evidence_type, EvidenceType::MemoryMismatch));
+        assert!(mem_evidence, "low relevance scores should trigger MemoryMismatch");
+    }
+
+    #[test]
+    fn test_analyze_with_context_memory_hit_no_evidence() {
+        let detector = DriftDetector::default();
+        let analysis = detector.analyze_with_context(
+            "implement user auth",
+            &["implement login flow".to_string()],
+            &[],
+            &[],
+            &[make_memory_trace("user auth", 5, &[0.8, 0.6])], // above 0.3
+            &[],
+        );
+        let mem_evidence = analysis.evidence.iter()
+            .any(|e| matches!(e.evidence_type, EvidenceType::MemoryMismatch));
+        assert!(!mem_evidence, "good relevance should not trigger MemoryMismatch");
+    }
+
+    #[test]
+    fn test_analyze_with_context_budget_pressure() {
+        let detector = DriftDetector::default();
+        let analysis = detector.analyze_with_context(
+            "implement user auth",
+            &["implement login flow".to_string()],
+            &[],
+            &[],
+            &[],
+            &[make_budget_trace(0.92, true)], // 92% pressure, compression triggered
+        );
+        // Budget pressure alone adds 0.25 severity — below 0.3 threshold
+        assert!(!analysis.drift_detected,
+            "budget pressure alone (0.25) should not cross 0.3 threshold");
+        let budget_evidence = analysis.evidence.iter()
+            .any(|e| e.description.contains("Token budget pressure"));
+        assert!(budget_evidence, "should have budget pressure evidence");
+    }
+
+    #[test]
+    fn test_analyze_with_context_budget_normal_no_evidence() {
+        let detector = DriftDetector::default();
+        let analysis = detector.analyze_with_context(
+            "implement user auth",
+            &["implement login flow".to_string()],
+            &[],
+            &[],
+            &[],
+            &[make_budget_trace(0.6, false)], // 60% — fine
+        );
+        let budget_evidence = analysis.evidence.iter()
+            .any(|e| e.description.contains("Token budget pressure"));
+        assert!(!budget_evidence, "normal budget should not trigger evidence");
+    }
+
+    #[test]
+    fn test_analyze_with_context_memory_miss_plus_budget_triggers_drift() {
+        let detector = DriftDetector::default();
+        // memory miss (0.2) + budget pressure (0.25) = 0.45 → above threshold
+        let analysis = detector.analyze_with_context(
+            "implement user auth",
+            &["implement login flow".to_string()],
+            &[],
+            &[],
+            &[make_memory_trace("user auth", 0, &[])],
+            &[make_budget_trace(0.92, true)],
+        );
+        assert!(analysis.drift_detected,
+            "memory miss + budget pressure should trigger drift (0.45 > 0.3)");
+        assert!(analysis.drift_severity >= 0.4,
+            "combined severity should be >= 0.4, got {:.2}", analysis.drift_severity);
+        // Cause should be MemoryMiss (detected first)
+        assert!(matches!(analysis.likely_cause, DriftCause::MemoryMiss { .. }),
+            "likely cause should be MemoryMiss when both are present");
+    }
+
+    #[test]
+    fn test_analyze_with_context_ambiguous_instruction() {
+        let detector = DriftDetector::default();
+        // Two corrections on similar queries (consecutive turns)
+        let analysis = detector.analyze_with_context(
+            "fix the build error",
+            &[
+                "fix the build error in main.rs".to_string(),
+                "fix the build error in lib.rs".to_string(),
+                "fix the build error please".to_string(),
+            ],
+            &[],
+            &[0, 1], // corrections at turns 0 and 1
+            &[],
+            &[],
+        );
+        // user corrections (0.4) + ambiguous instruction (0.3) = 0.7
+        assert!(analysis.drift_detected, "ambiguous instruction should be detected");
+        let clarification = analysis.evidence.iter()
+            .any(|e| matches!(e.evidence_type, EvidenceType::ClarificationRequest));
+        assert!(clarification, "should have ClarificationRequest evidence for ambiguity");
+    }
+
+    #[test]
+    fn test_analyze_with_context_non_consecutive_corrections_no_ambiguity() {
+        let detector = DriftDetector::default();
+        // Two corrections but far apart (turns 0 and 5)
+        let analysis = detector.analyze_with_context(
+            "fix the build error",
+            &[
+                "fix the build error".to_string(),
+                "something".to_string(),
+                "something".to_string(),
+                "something".to_string(),
+                "something".to_string(),
+                "fix the build error".to_string(),
+            ],
+            &[],
+            &[0, 5], // not consecutive
+            &[],
+            &[],
+        );
+        // Has user correction evidence (0.4) but NOT ambiguity
+        let clarification = analysis.evidence.iter()
+            .any(|e| matches!(e.evidence_type, EvidenceType::ClarificationRequest));
+        assert!(!clarification, "non-consecutive corrections should not trigger ambiguity");
+    }
+
+    #[test]
+    fn test_analyze_with_context_dissimilar_corrections_no_ambiguity() {
+        let detector = DriftDetector::default();
+        // Consecutive corrections but on completely different topics
+        let analysis = detector.analyze_with_context(
+            "help me code",
+            &[
+                "deploy kubernetes cluster".to_string(),
+                "write a haiku poem".to_string(),
+            ],
+            &[],
+            &[0, 1], // consecutive corrections
+            &[],
+            &[],
+        );
+        let clarification = analysis.evidence.iter()
+            .any(|e| matches!(e.evidence_type, EvidenceType::ClarificationRequest));
+        assert!(!clarification,
+            "dissimilar corrections should not trigger ambiguity (different topics)");
+    }
+
+    #[test]
+    fn test_analyze_with_context_base_drift_augmented() {
+        let detector = DriftDetector::default();
+        // Base: 2 unrelated queries (0.4) + extra: budget pressure (0.25) = 0.65
+        let analysis = detector.analyze_with_context(
+            "implement user auth",
+            &[
+                "configure kubernetes".to_string(),
+                "setup monitoring".to_string(),
+            ],
+            &[],
+            &[],
+            &[],
+            &[make_budget_trace(0.95, true)],
+        );
+        assert!(analysis.drift_detected);
+        assert!(analysis.drift_severity >= 0.6,
+            "severity should be >= 0.6, got {:.2}", analysis.drift_severity);
+    }
+
+    #[test]
+    fn test_analyze_with_context_empty_traces() {
+        let detector = DriftDetector::default();
+        // No traces — should behave exactly like base analyze()
+        let base = detector.analyze(
+            "implement user auth",
+            &["implement login flow".to_string()],
+            &[],
+            &[],
+        );
+        let enhanced = detector.analyze_with_context(
+            "implement user auth",
+            &["implement login flow".to_string()],
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        assert_eq!(base.drift_detected, enhanced.drift_detected);
+        assert!((base.drift_severity - enhanced.drift_severity).abs() < f64::EPSILON);
+        assert_eq!(base.evidence.len(), enhanced.evidence.len());
+    }
+
+    #[test]
+    fn test_ellipsize_str() {
+        assert_eq!(ellipsize_str("short", 10), "short");
+        assert_eq!(ellipsize_str("hello world this is long", 10), "hello wor…");
+        assert_eq!(ellipsize_str("", 5), "");
+        // CJK characters
+        assert_eq!(ellipsize_str("你好世界测试", 4), "你好世…");
     }
 }

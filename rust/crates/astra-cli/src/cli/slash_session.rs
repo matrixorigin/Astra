@@ -1901,10 +1901,18 @@ fn handle_session_drift(arg: &str, state: &ReplState) {
     let compressed_turns: Vec<u32> = state.drift_compressed_turns.clone();
     let user_corrections: Vec<u32> = state.drift_user_corrections.clone();
 
-    // Run analysis
-    let detector = DriftDetector::default();
-    let analysis: FocusDriftAnalysis =
-        detector.analyze(original_query, &user_queries, &compressed_turns, &user_corrections);
+    // Run analysis — prefer ObservabilitySession (has trace data for richer analysis)
+    let analysis: FocusDriftAnalysis = if let Some(ref obs) = state.observability_session {
+        if let Ok(session) = obs.read() {
+            session.check_drift_against(original_query)
+        } else {
+            let detector = DriftDetector::default();
+            detector.analyze(original_query, &user_queries, &compressed_turns, &user_corrections)
+        }
+    } else {
+        let detector = DriftDetector::default();
+        detector.analyze(original_query, &user_queries, &compressed_turns, &user_corrections)
+    };
 
     // Display results
     if analysis.drift_detected {

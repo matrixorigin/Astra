@@ -305,21 +305,32 @@ impl ObservabilitySession {
             .as_deref()
             .unwrap_or_else(|| self.recent_queries.first().map(|s| s.as_str()).unwrap_or(""));
 
-        self.drift_detector.analyze(
-            original,
-            &self.recent_queries,
-            &self.compressed_turns,
-            &self.user_corrections,
-        )
+        self.check_drift_against(original)
     }
 
     /// Check drift against a specific original query (override).
+    ///
+    /// Uses context traces (memory retrieval + token budget) for richer analysis
+    /// when trace data is available.
     pub fn check_drift_against(&self, original_query: &str) -> FocusDriftAnalysis {
-        self.drift_detector.analyze(
+        let memory_traces: Vec<_> = self
+            .context_traces
+            .iter()
+            .map(|t| t.memory.clone())
+            .collect();
+        let budget_traces: Vec<_> = self
+            .context_traces
+            .iter()
+            .map(|t| t.token_budget.clone())
+            .collect();
+
+        self.drift_detector.analyze_with_context(
             original_query,
             &self.recent_queries,
             &self.compressed_turns,
             &self.user_corrections,
+            &memory_traces,
+            &budget_traces,
         )
     }
 
