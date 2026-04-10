@@ -1448,7 +1448,7 @@ mod tests {
         assert_eq!(req.user_id, "user-1");
         assert_eq!(req.depth, 0);
         match &req.pattern {
-            CoordinationPattern::Pipeline { stages } => {
+            CoordinationPattern::Pipeline { stages, .. } => {
                 assert_eq!(stages.len(), 2);
                 assert_eq!(stages[0].agent_id, "coder-agent");
                 assert_eq!(stages[1].agent_id, "team-test-team-reviewer");
@@ -1471,6 +1471,7 @@ mod tests {
                 reviewer_id,
                 max_rounds,
                 acceptance_threshold,
+                ..
             } => {
                 assert_eq!(producer_id, "coder-agent");
                 assert_eq!(reviewer_id, "team-test-team-reviewer");
@@ -1513,6 +1514,7 @@ mod tests {
             CoordinationPattern::Sequential {
                 agent_ids,
                 stop_on_success,
+                ..
             } => {
                 assert_eq!(agent_ids.len(), 2);
                 assert!(*stop_on_success);
@@ -2163,7 +2165,7 @@ mod tests {
         let team = test_team(); // Pipeline coordination
         let (request, _) = resolve_team(&team, "task", "run-1", None).unwrap();
         match &request.pattern {
-            CoordinationPattern::Pipeline { stages } => {
+            CoordinationPattern::Pipeline { stages, .. } => {
                 assert_eq!(stages.len(), 2);
                 assert_eq!(stages[0].agent_id, "coder-agent");
                 assert_eq!(stages[1].agent_id, "team-test-team-reviewer");
@@ -2186,6 +2188,7 @@ mod tests {
                 reviewer_id,
                 max_rounds,
                 acceptance_threshold,
+                ..
             } => {
                 assert_eq!(producer_id, "coder-agent");
                 assert_eq!(reviewer_id, "team-test-team-reviewer");

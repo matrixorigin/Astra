@@ -718,6 +718,7 @@ mod tests {
             pattern: CoordinationPattern::Sequential {
                 agent_ids: vec!["s1".into()],
                 stop_on_success: true,
+                timeout_sec: 0,
             },
             user_id: "u1".into(),
             depth: 5, // exceeds max_delegation_depth=3
@@ -741,6 +742,7 @@ mod tests {
             pattern: CoordinationPattern::Sequential {
                 agent_ids: vec!["orch-1".into()],
                 stop_on_success: true,
+                timeout_sec: 0,
             },
             user_id: "u1".into(),
             depth: 0,
@@ -764,6 +766,7 @@ mod tests {
             pattern: CoordinationPattern::Sequential {
                 agent_ids: vec!["u2".into()],
                 stop_on_success: true,
+                timeout_sec: 0,
             },
             user_id: "u1".into(),
             depth: 0,
@@ -784,6 +787,7 @@ mod tests {
             pattern: CoordinationPattern::Sequential {
                 agent_ids: vec![],
                 stop_on_success: true,
+                timeout_sec: 0,
             },
             user_id: "u1".into(),
             depth: 0,
@@ -841,6 +845,7 @@ mod tests {
                         output_transform: Some("extract_issues".into()),
                     },
                 ],
+                timeout_sec: 0,
             },
             user_id: "u1".into(),
             depth: 0,
@@ -866,6 +871,7 @@ mod tests {
                 reviewer_id: "critic".into(),
                 max_rounds: 3,
                 acceptance_threshold: 0.8,
+                timeout_sec: 0,
             },
             user_id: "u1".into(),
             depth: 0,
@@ -1029,6 +1035,7 @@ mod tests {
                 reviewer_id: "r".into(),
                 max_rounds: 3,
                 acceptance_threshold: 0.8,
+                timeout_sec: 0,
             },
             user_id: "u1".into(),
             depth: 1,

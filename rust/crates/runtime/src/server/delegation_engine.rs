@@ -755,16 +755,10 @@ impl DelegationTracker {
 
     /// Bulk cleanup after a full delegation completes.
     ///
-    /// Removes all pause flags for the delegation's sub-runs and
-    /// cleans up the progress entry.
+    /// Removes progress tracking entry for a completed delegation.
+    /// Pause flags are intentionally retained — they are cheap (AtomicBool)
+    /// and may be inspected after execution completes.
     pub async fn cleanup_delegation(&self, delegation_id: &str) {
-        let records = self.get_sub_runs(delegation_id).await;
-        let mut flags = self.pause_flags.write().await;
-        for record in &records {
-            flags.remove(&record.run_id);
-        }
-        drop(flags);
-
         self.progress.write().await.remove(delegation_id);
     }
 
@@ -776,12 +770,20 @@ impl DelegationTracker {
         for records in delegations.values() {
             // First find the original (walk backward via retry_of)
             let mut original_id = run_id.to_string();
+            let mut visited = std::collections::HashSet::new();
             loop {
+                if !visited.insert(original_id.clone()) {
+                    break; // Cycle detected
+                }
                 let found = records
                     .iter()
                     .find(|r| r.run_id == original_id && r.retry_of.is_some());
                 match found {
-                    Some(r) => original_id = r.retry_of.clone().unwrap(),
+                    Some(r) => {
+                        original_id = r.retry_of.clone().unwrap_or_else(|| {
+                            unreachable!("guarded by retry_of.is_some() check above")
+                        })
+                    }
                     None => break,
                 }
             }
@@ -789,7 +791,11 @@ impl DelegationTracker {
             // Now collect forward: original → retries
             let mut chain = vec![original_id.clone()];
             let mut current = original_id;
+            visited.clear();
             loop {
+                if !visited.insert(current.clone()) {
+                    break; // Cycle detected
+                }
                 let next = records
                     .iter()
                     .find(|r| r.retry_of.as_deref() == Some(&current));
@@ -1083,6 +1089,12 @@ impl DelegationEngine {
                         .complete_sub_run(&original_run_id, SubRunState::VerificationFailed)
                         .await;
 
+                    // Transition retry to Running before execution
+                    let _ = self
+                        .tracker
+                        .transition_state(&retry_run_id, SubRunState::Running)
+                        .await;
+
                     match self.executor.execute(retry_config).await {
                         Ok(r) => {
                             // Transition retry to Running→Completed/Failed
@@ -1293,6 +1305,11 @@ impl DelegationEngine {
                 ),
             );
         }
+
+        // Note: cleanup_delegation() is intentionally NOT called here.
+        // The caller (e.g., TeamExecutionOrchestrator) should call
+        // tracker.cleanup_delegation() when the delegation lifecycle is
+        // fully complete, including any post-execution inspection.
 
         result
     }
@@ -4486,7 +4503,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tracker_cleanup_delegation_removes_pause_flags() {
+    async fn tracker_cleanup_delegation_removes_progress() {
         let tracker = DelegationTracker::new();
         tracker
             .record_sub_run(SubRunRecord {
@@ -4499,26 +4516,18 @@ mod tests {
                 retry_of: None,
             })
             .await;
-        tracker
-            .record_sub_run(SubRunRecord {
-                run_id: "r2".into(),
-                parent_run_id: "parent".into(),
-                delegation_id: "d1".into(),
-                agent_id: "a2".into(),
-                depth: 1,
-                state: SubRunState::Running,
-                retry_of: None,
-            })
-            .await;
 
         let _f1 = tracker.register_pause_flag("r1").await;
-        let _f2 = tracker.register_pause_flag("r2").await;
         assert!(tracker.get_pause_flag("r1").await.is_some());
-        assert!(tracker.get_pause_flag("r2").await.is_some());
 
+        // Init progress
+        tracker.init_progress("d1", &["a1".into()]).await;
+        assert!(tracker.get_progress("d1").await.is_some());
+
+        // Cleanup removes progress but retains pause flags
         tracker.cleanup_delegation("d1").await;
-        assert!(tracker.get_pause_flag("r1").await.is_none());
-        assert!(tracker.get_pause_flag("r2").await.is_none());
+        assert!(tracker.get_pause_flag("r1").await.is_some()); // retained
+        assert!(tracker.get_progress("d1").await.is_none()); // cleaned
     }
 
     #[tokio::test]
