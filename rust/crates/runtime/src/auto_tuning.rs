@@ -606,6 +606,11 @@ impl AutoTuningEngine {
         *self.enabled.write().unwrap() = enabled;
     }
 
+    /// Check if auto-tuning is enabled.
+    pub fn is_enabled(&self) -> bool {
+        *self.enabled.read().unwrap()
+    }
+
     /// Get execution history.
     pub fn get_executions(&self) -> Vec<RuleExecution> {
         self.executions.read().unwrap().clone()

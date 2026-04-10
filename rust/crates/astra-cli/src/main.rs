@@ -122,6 +122,8 @@ mod slash_team;
 mod slash_experiment;
 #[path = "cli/slash_profile.rs"]
 mod slash_profile;
+#[path = "cli/slash_tuning.rs"]
+mod slash_tuning;
 #[path = "cli/mock_llm.rs"]
 mod mock_llm;
 #[path = "cli/spawn_subrun.rs"]
@@ -1485,6 +1487,10 @@ struct ReplState {
     // ── User Profile (M5) ──
     /// User profile manager for preferences and scenario detection.
     user_profile_manager: std::sync::Arc<astra_runtime::user_profile::UserProfileManager>,
+
+    // ── Auto-Tuning (M6) ──
+    /// Auto-tuning engine for adaptive learning.
+    auto_tuning_engine: std::sync::Arc<astra_runtime::auto_tuning::AutoTuningEngine>,
 }
 
 impl Default for ReplState {
@@ -1599,6 +1605,14 @@ impl Default for ReplState {
             user_profile_manager: {
                 let store = std::sync::Arc::new(astra_runtime::user_profile::UserProfileStore::new());
                 std::sync::Arc::new(astra_runtime::user_profile::UserProfileManager::new(store))
+            },
+            auto_tuning_engine: {
+                let engine = astra_runtime::auto_tuning::AutoTuningEngine::new();
+                // Add default evolution rules
+                for rule in astra_runtime::auto_tuning::default_rules() {
+                    engine.add_rule(rule);
+                }
+                std::sync::Arc::new(engine)
             },
         }
     }
@@ -6151,6 +6165,15 @@ async fn handle_slash_command(
                 user_id,
             };
             slash_profile::handle_profile_command(arg, &ctx);
+        }
+
+        "/tuning" => {
+            let ctx = slash_tuning::TuningCommandContext {
+                engine: &state.auto_tuning_engine,
+                runtime_config: &mut state.runtime_config,
+                writer: &mut std::io::stderr(),
+            };
+            let _ = slash_tuning::handle_tuning_command(arg, ctx);
         }
 
         "/register" | "/login" | "/logout" | "/memory-setup" => {
