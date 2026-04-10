@@ -751,6 +751,19 @@ impl DynamicAgentSpawner {
         self.active_agents.read().await.get(agent_id).cloned()
     }
 
+    /// Get state of a specific agent, including archived completed agents.
+    pub async fn get_agent_state_any(&self, agent_id: &str) -> Option<SpawnedAgentState> {
+        if let Some(state) = self.active_agents.read().await.get(agent_id).cloned() {
+            return Some(state);
+        }
+        self.completed_agents
+            .read()
+            .await
+            .iter()
+            .find(|state| state.agent_id == agent_id)
+            .cloned()
+    }
+
     /// Get history of completed agents (both active and archived).
     pub async fn get_agent_history(&self, parent_run_id: Option<&str>) -> Vec<SpawnedAgentInfo> {
         let mut history: Vec<SpawnedAgentInfo> = self

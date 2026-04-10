@@ -1794,6 +1794,7 @@ impl JournalEvent {
         agent_id: &str,
         status: &str,
         error: Option<&str>,
+        output_preview: Option<&str>,
     ) -> Self {
         let mut evt = Self::base(JournalEventType::DelegationSubRunCompleted, session_id);
         evt.metadata = Some(serde_json::json!({
@@ -1801,7 +1802,8 @@ impl JournalEvent {
             "sub_run_id": sub_run_id,
             "agent_id": agent_id,
             "status": status,
-            "error": error,
+            "error": error.map(|msg| truncate(msg, 500)),
+            "output_preview": output_preview.map(|msg| truncate(msg, 500)),
         }));
         evt
     }
@@ -1837,6 +1839,7 @@ impl JournalEvent {
         succeeded: usize,
         failed: usize,
         aggregated_status: &str,
+        aggregated_output_preview: Option<&str>,
     ) -> Self {
         let mut evt = Self::base(JournalEventType::DelegationCompleted, session_id);
         evt.metadata = Some(serde_json::json!({
@@ -1846,6 +1849,7 @@ impl JournalEvent {
             "succeeded": succeeded,
             "failed": failed,
             "aggregated_status": aggregated_status,
+            "aggregated_output_preview": aggregated_output_preview.map(|msg| truncate(msg, 500)),
         }));
         evt
     }
@@ -3290,12 +3294,14 @@ mod tests {
             "agent-a",
             "completed",
             None,
+            Some("finished the review"),
         );
         assert_eq!(evt.event_type, JournalEventType::DelegationSubRunCompleted);
         let meta = evt.metadata.as_ref().unwrap();
         assert_eq!(meta["agent_id"], "agent-a");
         assert_eq!(meta["status"], "completed");
         assert!(meta["error"].is_null());
+        assert_eq!(meta["output_preview"], "finished the review");
     }
 
     #[test]
@@ -3319,13 +3325,22 @@ mod tests {
 
     #[test]
     fn delegation_completed_event_builder() {
-        let evt =
-            JournalEvent::delegation_completed(Some("s1"), "del-1", "fan_out", 3, 2, 1, "partial");
+        let evt = JournalEvent::delegation_completed(
+            Some("s1"),
+            "del-1",
+            "fan_out",
+            3,
+            2,
+            1,
+            "partial",
+            Some("merged result preview"),
+        );
         assert_eq!(evt.event_type, JournalEventType::DelegationCompleted);
         let meta = evt.metadata.as_ref().unwrap();
         assert_eq!(meta["succeeded"], 2);
         assert_eq!(meta["failed"], 1);
         assert_eq!(meta["aggregated_status"], "partial");
+        assert_eq!(meta["aggregated_output_preview"], "merged result preview");
     }
 
     #[test]

@@ -361,7 +361,6 @@ use cli_args::*;
 // SSE streaming types moved to cli/streaming_types.rs
 pub(crate) use streaming_types::{PartialTurnData, StreamResult, TurnFailure, VerdictEvent};
 
-
 // REPL state moved to cli/repl_state.rs
 pub(crate) use repl_state::{ExplainMode, ReplState, SkillDevState};
 
@@ -1929,6 +1928,7 @@ async fn handle_slash_command(
         "/agent" => {
             let ctx = slash_agent::AgentCommandContext {
                 spawner: state.agent_spawner.clone(),
+                session_id: state.session_id.clone(),
             };
             slash_agent::handle_agent_command(arg, &ctx).await;
         }
@@ -3091,11 +3091,11 @@ async fn run_chat_repl(
 // ---------------------------------------------------------------------------
 
 // Session cleanup moved to session_cleanup.rs
+#[cfg(test)]
+use project_instructions::discover_instructions_from_paths;
 use project_instructions::{
     discover_project_instructions, format_project_instructions, resolve_system_prompt,
 };
-#[cfg(test)]
-use project_instructions::discover_instructions_from_paths;
 use session_cleanup::finalize_session;
 
 // ════════════════════════════════════════════════════════════════ main ════

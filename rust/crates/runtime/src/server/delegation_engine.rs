@@ -1478,6 +1478,7 @@ impl DelegationEngine {
                         &ar.agent_id,
                         &ar.status,
                         ar.error.as_deref(),
+                        ar.output.as_deref(),
                     ),
                 );
             }
@@ -1493,6 +1494,7 @@ impl DelegationEngine {
                     succeeded,
                     failed,
                     &dr.status,
+                    dr.aggregated_output.as_deref(),
                 ),
             );
         }

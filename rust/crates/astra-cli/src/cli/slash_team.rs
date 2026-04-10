@@ -1178,6 +1178,7 @@ pub(super) async fn handle_team_command(
                                 0,
                                 0,
                                 "interrupted",
+                                None,
                             ),
                         );
                     }
@@ -1425,6 +1426,10 @@ pub(super) async fn handle_team_command(
                         succeeded,
                         failed,
                         &report.status.to_string(),
+                        report
+                            .delegation_result
+                            .as_ref()
+                            .and_then(|result| result.aggregated_output.as_deref()),
                     ),
                 );
             }

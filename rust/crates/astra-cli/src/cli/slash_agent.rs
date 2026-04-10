@@ -1,10 +1,10 @@
-//! `/agent` slash command — manage dynamically spawned agents.
+//! `/agent` slash command — inspect spawned agents and recent delegations.
 //!
 //! Subcommands:
-//! - `/agent` or `/agent list`: List all active spawned agents
+//! - `/agent` or `/agent list`: List active/recent spawned agents and delegations
 //! - `/agent tree`: Show agent delegation tree (parent-child hierarchy)
 //! - `/agent watch`: Watch tree with real-time updates on spawn/complete
-//! - `/agent status <id>`: Show detailed status of an agent
+//! - `/agent status <id>`: Show detailed status of an agent or delegation
 //! - `/agent permissions <id>`: Show permission details of an agent
 //! - `/agent stop <id>`: Send shutdown request to an agent
 //! - `/agent logs <id>`: Show recent progress events from an agent
@@ -13,11 +13,37 @@
 use super::*;
 use astra_runtime::orchestration::{AgentStatus, DynamicAgentSpawner, PermissionSummary};
 use astra_runtime::turn::delegation_tree::{AgentTreeNode, render_agent_forest};
+use astra_services::session_journal::{self, JournalEventType};
+use std::cmp::Reverse;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Agent command context — passed from main.
 pub struct AgentCommandContext {
     pub spawner: Option<Arc<DynamicAgentSpawner>>,
+    pub session_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct DelegationSubRunSummary {
+    sub_run_id: String,
+    agent_id: String,
+    status: String,
+    error: Option<String>,
+    output_preview: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct DelegationHistoryEntry {
+    delegation_id: String,
+    pattern: String,
+    total_sub_runs: usize,
+    succeeded: usize,
+    failed: usize,
+    status: String,
+    aggregated_output_preview: Option<String>,
+    sub_runs: Vec<DelegationSubRunSummary>,
+    last_seen_index: usize,
 }
 
 /// Handle `/agent [subcommand]` command.
@@ -68,76 +94,35 @@ pub async fn handle_agent_command(arg: &str, ctx: &AgentCommandContext) {
 }
 
 async fn show_list(ctx: &AgentCommandContext) {
-    let Some(ref spawner) = ctx.spawner else {
+    let mut recent_agents = if let Some(ref spawner) = ctx.spawner {
+        spawner.get_agent_history(None).await
+    } else {
+        Vec::new()
+    };
+    recent_agents.sort_by_key(|agent| Reverse(agent.started_at));
+    let (active_agents, completed_agents): (Vec<_>, Vec<_>) = recent_agents
+        .into_iter()
+        .partition(|agent| !is_terminal_agent_status(&agent.status));
+    let delegations = load_recent_delegations(ctx.session_id.as_deref());
+
+    if active_agents.is_empty() && completed_agents.is_empty() && delegations.is_empty() {
+        eprintln!("\n  {}", "🤖 No recent agents or delegations".cyan().bold());
         eprintln!(
             "  {}",
-            "No agent spawner available. Use spawn_agent tool to create agents.".dim()
+            "Use spawn_agent or delegate to start multi-agent work.".dim()
         );
-        return;
-    };
-
-    let agents = spawner.list_all_agents().await;
-
-    if agents.is_empty() {
-        eprintln!("\n  {}", "🤖 No active agents".cyan().bold());
-        eprintln!("  {}", "Use spawn_agent tool to create sub-agents.".dim());
         eprintln!();
         return;
     }
 
-    eprintln!("\n  {}", "🤖 Active Agents".cyan().bold());
-    eprintln!("  {}", "─".repeat(60).dim());
-
-    for agent in &agents {
-        let _status_str = format_status(&agent.status);
-        let elapsed = agent
-            .started_at
-            .elapsed()
-            .map(|d| format_duration(d))
-            .unwrap_or_else(|_| "?".to_string());
-
-        // Permission indicator
-        let perm_icon = if agent.has_permission_issues {
-            "🔒"
-        } else {
-            ""
-        };
-
-        eprintln!(
-            "  {} {} {} ({}){}",
-            status_icon(&agent.status),
-            agent.agent_id.as_str().white().bold(),
-            format!("[{}]", agent.agent_type).dim(),
-            elapsed.dim(),
-            if agent.has_permission_issues {
-                format!(" {}", perm_icon.red())
-            } else {
-                String::new()
-            }
-        );
-        eprintln!("    {}", agent.description.as_str().cyan());
-        if agent.metrics.tool_calls > 0 || agent.metrics.tools_blocked > 0 {
-            let mut metrics_parts = vec![];
-            if agent.metrics.tool_calls > 0 {
-                metrics_parts.push(format!(
-                    "tools: {}",
-                    agent.metrics.tool_calls.to_string().green()
-                ));
-            }
-            if agent.metrics.turns_completed > 0 {
-                metrics_parts.push(format!(
-                    "turns: {}",
-                    agent.metrics.turns_completed.to_string().green()
-                ));
-            }
-            if agent.metrics.tools_blocked > 0 {
-                metrics_parts.push(format!(
-                    "blocked: {}",
-                    agent.metrics.tools_blocked.to_string().red()
-                ));
-            }
-            eprintln!("    {} {}", "📊".dim(), metrics_parts.join(", "));
-        }
+    if !active_agents.is_empty() {
+        print_agent_section("🤖 Active Spawned Agents", &active_agents);
+    }
+    if !completed_agents.is_empty() {
+        print_agent_section("🕘 Recent Spawned Agents", &completed_agents);
+    }
+    if !delegations.is_empty() {
+        print_delegation_section(&delegations);
     }
     eprintln!();
 }
@@ -166,13 +151,10 @@ async fn show_tree(ctx: &AgentCommandContext) {
 }
 
 async fn show_status(ctx: &AgentCommandContext, agent_id: &str) {
-    let Some(ref spawner) = ctx.spawner else {
-        eprintln!("  {}", "No agent spawner available.".dim());
-        return;
-    };
-
-    match spawner.get_agent_state(agent_id).await {
-        Some(state) => {
+    if let Some(ref spawner) = ctx.spawner
+        && let Some(state) = spawner.get_agent_state_any(agent_id).await
+    {
+        {
             eprintln!(
                 "\n  {} {}",
                 "🤖 Agent".cyan().bold(),
@@ -250,10 +232,59 @@ async fn show_status(ctx: &AgentCommandContext, agent_id: &str) {
 
             eprintln!();
         }
-        None => {
-            eprintln!("  {}", format!("Agent not found: {agent_id}").yellow());
-        }
+        return;
     }
+
+    if let Some(entry) = find_delegation_entry(ctx.session_id.as_deref(), agent_id) {
+        eprintln!(
+            "\n  {} {}",
+            "🤝 Delegation".cyan().bold(),
+            entry.delegation_id.as_str().white().bold()
+        );
+        eprintln!("  {}", "─".repeat(50).dim());
+        eprintln!("  {} {}", "Pattern:".white().bold(), entry.pattern);
+        eprintln!("  {} {}", "Status:".white().bold(), entry.status.cyan());
+        eprintln!("  {} {}", "Sub-runs:".white().bold(), entry.total_sub_runs);
+        eprintln!(
+            "  {} {} ok, {} failed",
+            "Results:".white().bold(),
+            entry.succeeded.to_string().green(),
+            entry.failed.to_string().red()
+        );
+        if let Some(preview) = &entry.aggregated_output_preview {
+            eprintln!(
+                "  {} {}",
+                "Summary:".white().bold(),
+                preview.as_str().cyan()
+            );
+        }
+        if !entry.sub_runs.is_empty() {
+            eprintln!("\n  {}", "📦 Sub-runs".cyan().bold());
+            eprintln!("  {}", "─".repeat(30).dim());
+            for sub_run in &entry.sub_runs {
+                eprintln!(
+                    "  {} {} {}",
+                    sub_run_status_icon(&sub_run.status),
+                    sub_run.agent_id.as_str().white().bold(),
+                    format!("[{}]", sub_run.status).dim()
+                );
+                eprintln!("    {}", sub_run.sub_run_id.as_str().dim());
+                if let Some(preview) = &sub_run.output_preview {
+                    eprintln!("    {}", preview.as_str().cyan());
+                }
+                if let Some(error) = &sub_run.error {
+                    eprintln!("    {}", error.as_str().red());
+                }
+            }
+        }
+        eprintln!();
+        return;
+    }
+
+    eprintln!(
+        "  {}",
+        format!("Agent or delegation not found: {agent_id}").yellow()
+    );
 }
 
 async fn show_permissions(ctx: &AgentCommandContext, agent_id: &str) {
@@ -262,7 +293,7 @@ async fn show_permissions(ctx: &AgentCommandContext, agent_id: &str) {
         return;
     };
 
-    match spawner.get_agent_state(agent_id).await {
+    match spawner.get_agent_state_any(agent_id).await {
         Some(state) => {
             eprintln!(
                 "\n  {} {} {}",
@@ -350,7 +381,7 @@ async fn stop_agent(ctx: &AgentCommandContext, agent_id: &str) {
     };
 
     // First check if agent exists
-    let agent = spawner.get_agent_state(agent_id).await;
+    let agent = spawner.get_agent_state_any(agent_id).await;
     if agent.is_none() {
         eprintln!("  {}", format!("Agent not found: {agent_id}").yellow());
         return;
@@ -623,8 +654,14 @@ fn print_progress_event(event: &astra_runtime::orchestration::AgentProgressEvent
 fn show_help() {
     eprintln!("\n  {}", "🤖 Agent Commands".cyan().bold());
     eprintln!("  {}", "─".repeat(50).dim());
-    eprintln!("  {}  List all active agents", "/agent".white().bold());
-    eprintln!("  {}  List all active agents", "/agent list".white().bold());
+    eprintln!(
+        "  {}  List recent agents and delegations",
+        "/agent".white().bold()
+    );
+    eprintln!(
+        "  {}  List recent agents and delegations",
+        "/agent list".white().bold()
+    );
     eprintln!(
         "  {}  Show delegation tree (hierarchy)",
         "/agent tree".white().bold()
@@ -647,11 +684,11 @@ fn show_help() {
     eprintln!();
     eprintln!(
         "  {}",
-        "Agents are created via the spawn_agent tool during chat.".dim()
+        "Spawned agents come from spawn_agent; delegations come from the delegate tool.".dim()
     );
     eprintln!(
         "  {}",
-        "Permission issues are indicated by 🔒 in the agent list.".dim()
+        "Use /agent status <agent_id|delegation_id> to inspect a specific item.".dim()
     );
     eprintln!();
 }
@@ -698,11 +735,218 @@ fn format_duration(d: std::time::Duration) -> String {
     }
 }
 
+fn is_terminal_agent_status(status: &AgentStatus) -> bool {
+    matches!(
+        status,
+        AgentStatus::Completed { .. } | AgentStatus::Failed { .. } | AgentStatus::Cancelled
+    )
+}
+
+fn print_agent_section(title: &str, agents: &[astra_runtime::orchestration::SpawnedAgentInfo]) {
+    eprintln!("\n  {}", title.cyan().bold());
+    eprintln!("  {}", "─".repeat(60).dim());
+    for agent in agents {
+        let elapsed = agent
+            .started_at
+            .elapsed()
+            .map(|d| format_duration(d))
+            .unwrap_or_else(|_| "?".to_string());
+        eprintln!(
+            "  {} {} {} ({}){}",
+            status_icon(&agent.status),
+            agent.agent_id.as_str().white().bold(),
+            format!("[{}]", agent.agent_type).dim(),
+            elapsed.dim(),
+            if agent.has_permission_issues {
+                format!(" {}", "🔒".red())
+            } else {
+                String::new()
+            }
+        );
+        eprintln!("    {}", agent.description.as_str().cyan());
+        if agent.metrics.tool_calls > 0 || agent.metrics.tools_blocked > 0 {
+            let mut metrics_parts = vec![];
+            if agent.metrics.tool_calls > 0 {
+                metrics_parts.push(format!(
+                    "tools: {}",
+                    agent.metrics.tool_calls.to_string().green()
+                ));
+            }
+            if agent.metrics.turns_completed > 0 {
+                metrics_parts.push(format!(
+                    "turns: {}",
+                    agent.metrics.turns_completed.to_string().green()
+                ));
+            }
+            if agent.metrics.tools_blocked > 0 {
+                metrics_parts.push(format!(
+                    "blocked: {}",
+                    agent.metrics.tools_blocked.to_string().red()
+                ));
+            }
+            eprintln!("    {} {}", "📊".dim(), metrics_parts.join(", "));
+        }
+    }
+}
+
+fn print_delegation_section(entries: &[DelegationHistoryEntry]) {
+    eprintln!("\n  {}", "🤝 Recent Delegations".cyan().bold());
+    eprintln!("  {}", "─".repeat(60).dim());
+    for entry in entries {
+        eprintln!(
+            "  {} {} {} [{} ok / {} failed]",
+            sub_run_status_icon(&entry.status),
+            entry.delegation_id.as_str().white().bold(),
+            format!("[{}]", entry.pattern).dim(),
+            entry.succeeded.to_string().green(),
+            entry.failed.to_string().red()
+        );
+        eprintln!("    {}", format!("status: {}", entry.status).dim());
+        if let Some(preview) = &entry.aggregated_output_preview {
+            eprintln!("    {}", preview.as_str().cyan());
+        }
+    }
+}
+
+fn sub_run_status_icon(status: &str) -> &'static str {
+    match status {
+        "completed" => "✅",
+        "partial" => "🟡",
+        "failed" => "❌",
+        "cancelled" => "🛑",
+        _ => "⑂",
+    }
+}
+
+fn load_recent_delegations(session_id: Option<&str>) -> Vec<DelegationHistoryEntry> {
+    let Some(session_id) = session_id else {
+        return Vec::new();
+    };
+    let Ok(events) = session_journal::read_journal(session_id) else {
+        return Vec::new();
+    };
+    let mut delegations: HashMap<String, DelegationHistoryEntry> = HashMap::new();
+    for (idx, event) in events.into_iter().enumerate() {
+        let Some(metadata) = event.metadata else {
+            continue;
+        };
+        let Some(delegation_id) = metadata
+            .get("delegation_id")
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        let entry =
+            delegations
+                .entry(delegation_id.clone())
+                .or_insert_with(|| DelegationHistoryEntry {
+                    delegation_id,
+                    last_seen_index: idx,
+                    ..DelegationHistoryEntry::default()
+                });
+        entry.last_seen_index = idx;
+        match event.event_type {
+            JournalEventType::DelegationStarted => {
+                entry.pattern = metadata
+                    .get("pattern")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("?")
+                    .to_string();
+                entry.total_sub_runs = metadata
+                    .get("agent_count")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(0) as usize;
+                if entry.status.is_empty() {
+                    entry.status = "running".to_string();
+                }
+            }
+            JournalEventType::DelegationSubRunCompleted => {
+                let sub_run_id = metadata
+                    .get("sub_run_id")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let sub_run = DelegationSubRunSummary {
+                    sub_run_id: sub_run_id.clone(),
+                    agent_id: metadata
+                        .get("agent_id")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("?")
+                        .to_string(),
+                    status: metadata
+                        .get("status")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("?")
+                        .to_string(),
+                    error: metadata
+                        .get("error")
+                        .and_then(|value| value.as_str())
+                        .map(str::to_string),
+                    output_preview: metadata
+                        .get("output_preview")
+                        .and_then(|value| value.as_str())
+                        .map(str::to_string),
+                };
+                if let Some(existing) = entry
+                    .sub_runs
+                    .iter_mut()
+                    .find(|existing| existing.sub_run_id == sub_run_id)
+                {
+                    *existing = sub_run;
+                } else {
+                    entry.sub_runs.push(sub_run);
+                }
+            }
+            JournalEventType::DelegationCompleted => {
+                entry.pattern = metadata
+                    .get("pattern")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("?")
+                    .to_string();
+                entry.total_sub_runs = metadata
+                    .get("total_sub_runs")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(entry.total_sub_runs as u64)
+                    as usize;
+                entry.succeeded = metadata
+                    .get("succeeded")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(0) as usize;
+                entry.failed = metadata
+                    .get("failed")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(0) as usize;
+                entry.status = metadata
+                    .get("aggregated_status")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("?")
+                    .to_string();
+                entry.aggregated_output_preview = metadata
+                    .get("aggregated_output_preview")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string);
+            }
+            _ => {}
+        }
+    }
+    let mut entries: Vec<_> = delegations.into_values().collect();
+    entries.sort_by_key(|entry| Reverse(entry.last_seen_index));
+    entries
+}
+
+fn find_delegation_entry(session_id: Option<&str>, query: &str) -> Option<DelegationHistoryEntry> {
+    load_recent_delegations(session_id)
+        .into_iter()
+        .find(|entry| entry.delegation_id == query || entry.delegation_id.starts_with(query))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use astra_runtime::messaging::{AgentMailboxRouter, InProcessTransport};
     use astra_runtime::server::delegation_engine::DelegationTracker;
+    use astra_services::session_journal::JournalEvent;
     use std::sync::Arc;
 
     #[test]
@@ -735,8 +979,61 @@ mod tests {
         let spawner = Arc::new(DynamicAgentSpawner::new(router));
         let ctx = AgentCommandContext {
             spawner: Some(spawner),
+            session_id: None,
         };
 
         handle_agent_command("list", &ctx).await;
+    }
+
+    #[test]
+    fn load_recent_delegations_collects_summary_and_subruns() {
+        let sid = format!("slash-agent-test-{}", uuid::Uuid::new_v4());
+        let writer = session_journal::JournalWriter::new(&sid).unwrap();
+        writer
+            .append(&JournalEvent::delegation_started(
+                Some(&sid),
+                "del-1",
+                "run-parent",
+                "fan_out",
+                &["coder".to_string(), "reviewer".to_string()],
+            ))
+            .unwrap();
+        writer
+            .append(&JournalEvent::delegation_sub_run_completed(
+                Some(&sid),
+                "del-1",
+                "run-1",
+                "coder",
+                "completed",
+                None,
+                Some("implemented fix"),
+            ))
+            .unwrap();
+        writer
+            .append(&JournalEvent::delegation_completed(
+                Some(&sid),
+                "del-1",
+                "fan_out",
+                2,
+                2,
+                0,
+                "completed",
+                Some("merged final answer"),
+            ))
+            .unwrap();
+
+        let delegations = load_recent_delegations(Some(&sid));
+        assert_eq!(delegations.len(), 1);
+        assert_eq!(delegations[0].delegation_id, "del-1");
+        assert_eq!(delegations[0].status, "completed");
+        assert_eq!(
+            delegations[0].aggregated_output_preview.as_deref(),
+            Some("merged final answer")
+        );
+        assert_eq!(delegations[0].sub_runs.len(), 1);
+        assert_eq!(
+            delegations[0].sub_runs[0].output_preview.as_deref(),
+            Some("implemented fix")
+        );
     }
 }

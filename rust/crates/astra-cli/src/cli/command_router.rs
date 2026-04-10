@@ -290,6 +290,7 @@ async fn execute_repl_bridge_command(
         "/agent" => {
             let ctx = slash_agent::AgentCommandContext {
                 spawner: state.agent_spawner.clone(),
+                session_id: state.session_id.clone(),
             };
             slash_agent::handle_agent_command(arg, &ctx).await;
         }
@@ -930,7 +931,10 @@ pub(super) async fn execute_cli_command(
                     "exit_code": i32::from(exit_code),
                     "success": exit_code == ExitCode::Success,
                 });
-                println!("{}", serde_json::to_string_pretty(&json_output).unwrap_or_default());
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json_output).unwrap_or_default()
+                );
                 return Ok(exit_code);
             } else if quiet {
                 // Quiet mode: just print the text without formatting
@@ -1425,7 +1429,10 @@ pub(super) async fn run_print_mode(
                 "exit_code": i32::from(exit_code),
                 "success": exit_code == ExitCode::Success,
             });
-            println!("{}", serde_json::to_string_pretty(&json_output).unwrap_or_default());
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json_output).unwrap_or_default()
+            );
         }
         _ => {
             // text mode: just the response

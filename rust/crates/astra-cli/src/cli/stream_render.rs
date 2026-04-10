@@ -540,7 +540,8 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 // runs sub-agents. Return a deferred acknowledgment so the server
                 // sees a success (not an error) and the model doesn't give up.
                 "Delegation request acknowledged. The delegation engine will execute \
-                 this request and provide results in the next round."
+                 this request now and inject the summarized results before the \
+                 parent agent finishes."
                     .to_string()
             } else {
                 let result = self.executor.execute(tool, args).await;
@@ -752,14 +753,17 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 eprintln!("{}", edge_sse_post_tool_result_fail_line(e).yellow());
             }
         }
-        self.edge_tool_round.last().cloned().unwrap_or_else(|| EdgeToolExecResult {
-            request_id: String::new(),
-            tool: String::new(),
-            args: serde_json::Value::Null,
-            output: "Error: no tool result recorded".to_string(),
-            status: "error".to_string(),
-            duration_ms: 0,
-        })
+        self.edge_tool_round
+            .last()
+            .cloned()
+            .unwrap_or_else(|| EdgeToolExecResult {
+                request_id: String::new(),
+                tool: String::new(),
+                args: serde_json::Value::Null,
+                output: "Error: no tool result recorded".to_string(),
+                status: "error".to_string(),
+                duration_ms: 0,
+            })
     }
 
     async fn resolve_approval(
@@ -908,7 +912,10 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                         .await,
                 );
             }
-            return results.into_iter().map(|r| r.expect("all tool result slots filled")).collect();
+            return results
+                .into_iter()
+                .map(|r| r.expect("all tool result slots filled"))
+                .collect();
         }
 
         // ── Phase 1: Pre-execution UI setup (sequential, &mut self) ──
@@ -1080,7 +1087,10 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             }
         }
 
-        results.into_iter().map(|r| r.expect("all tool result slots filled")).collect()
+        results
+            .into_iter()
+            .map(|r| r.expect("all tool result slots filled"))
+            .collect()
     }
 }
 
