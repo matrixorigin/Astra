@@ -285,12 +285,22 @@ impl ToolExecutor {
                     let remaining = super::AGGREGATE_OUTPUT_BUDGET.saturating_sub(agg);
                     if size > remaining {
                         // Auto-downgrade: return outline instead of full content
-                        let content_for_outline = match read_to_string_lossy(&path) {
-                            Ok(c) => c,
-                            Err(e) => return format!("Error: {e}"),
-                        };
+                        let content_for_outline =
+                            if let Some(cached) = self.get_cached_content(&path) {
+                                cached
+                            } else {
+                                match read_to_string_lossy(&path) {
+                                    Ok(c) => c,
+                                    Err(e) => return format!("Error: {e}"),
+                                }
+                            };
                         let total_lines = content_for_outline.lines().count();
-                        self.record_read(&path, true, ReadDedupKey::Outline);
+                        self.record_read_cached(
+                            &path,
+                            true,
+                            ReadDedupKey::Outline,
+                            content_for_outline.clone(),
+                        );
 
                         if let Some(ts_lang) = super::code_intel::detect_language(&path) {
                             let outline =
@@ -337,31 +347,37 @@ impl ToolExecutor {
             }
         }
 
-        let content = match read_to_string_lossy(&path) {
-            Ok(c) => c,
-            Err(e) => {
-                let msg = format!("Error: {e}");
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    let suggestions = self.find_similar_files(path_str);
-                    let hint = if !suggestions.is_empty() {
-                        format!("\nDid you mean: {}?", suggestions.join(", "))
-                    } else {
-                        String::new()
-                    };
-                    let cwd = self.project_root.display();
-                    return format!(
-                        "{msg}. Note: current working directory is {cwd}. Use list_dir or glob to find the correct path first.{hint}"
-                    );
+        // Try in-memory content cache before disk I/O.
+        // Cache hit when file was previously read/written and mtime is unchanged.
+        let content = if let Some(cached) = self.get_cached_content(&path) {
+            cached
+        } else {
+            match read_to_string_lossy(&path) {
+                Ok(c) => c,
+                Err(e) => {
+                    let msg = format!("Error: {e}");
+                    if e.kind() == std::io::ErrorKind::NotFound {
+                        let suggestions = self.find_similar_files(path_str);
+                        let hint = if !suggestions.is_empty() {
+                            format!("\nDid you mean: {}?", suggestions.join(", "))
+                        } else {
+                            String::new()
+                        };
+                        let cwd = self.project_root.display();
+                        return format!(
+                            "{msg}. Note: current working directory is {cwd}. Use list_dir or glob to find the correct path first.{hint}"
+                        );
+                    }
+                    if e.kind() == std::io::ErrorKind::IsADirectory {
+                        return format!("{msg}. Use list_dir instead for directories.");
+                    }
+                    if e.kind() == std::io::ErrorKind::PermissionDenied {
+                        return format!(
+                            "{msg}. Check file permissions or use bash with `sudo cat` if appropriate."
+                        );
+                    }
+                    return msg;
                 }
-                if e.kind() == std::io::ErrorKind::IsADirectory {
-                    return format!("{msg}. Use list_dir instead for directories.");
-                }
-                if e.kind() == std::io::ErrorKind::PermissionDenied {
-                    return format!(
-                        "{msg}. Check file permissions or use bash with `sudo cat` if appropriate."
-                    );
-                }
-                return msg;
             }
         };
 
@@ -370,8 +386,8 @@ impl ToolExecutor {
             let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
             let total_lines = content.lines().count();
 
-            // Record as partial read (outline)
-            self.record_read(&path, true, ReadDedupKey::Outline);
+            // Record as partial read (outline), caching full content
+            self.record_read_cached(&path, true, ReadDedupKey::Outline, content.clone());
 
             // Try tree-sitter first for accurate AST-based extraction
             if let Some(ts_lang) = super::code_intel::detect_language(&path) {
@@ -439,7 +455,7 @@ impl ToolExecutor {
                 && content.len() <= max_chars
             {
                 // Upgrade to full read — future reads will hit can_dedup_read
-                self.record_read(&path, false, ReadDedupKey::Full);
+                self.record_read_cached(&path, false, ReadDedupKey::Full, content.clone());
                 let total_lines = content.lines().count();
                 let numbered = add_line_numbers(&content, 1);
                 return format!(
@@ -459,7 +475,7 @@ impl ToolExecutor {
         } else {
             ReadDedupKey::Full
         };
-        self.record_read(&path, is_ranged, record_key);
+        self.record_read_cached(&path, is_ranged, record_key, content.clone());
 
         // Escalating warning when the same file is read too many times.
         // Inspired by Claude Code's dedup stub behavior: train the model
