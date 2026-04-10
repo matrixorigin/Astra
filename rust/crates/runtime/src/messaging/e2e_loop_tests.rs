@@ -24,7 +24,7 @@ mod tests {
     use crate::pipeline::step_protocol::InMemoryIdempotencyCache;
     use crate::pipeline::step_recorder::StepRecorder;
     use crate::semantic_dedup::SemanticDedup;
-    use crate::server::delegation_engine::{DelegationTracker, SubRunRecord};
+    use crate::server::delegation_engine::{DelegationTracker, SubRunRecord, SubRunState};
     use crate::turn::agentic_headless_round::{
         HeadlessStderrStyle, NoopHeadlessTerminal, run_agentic_headless_tool_round,
     };
@@ -253,6 +253,8 @@ mod tests {
             delegation_id: "del-e2e".into(),
             agent_id: "worker".into(),
             depth: 1,
+            state: SubRunState::Created,
+            retry_of: None,
         })
         .await;
 

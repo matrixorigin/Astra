@@ -361,12 +361,12 @@ impl TeamExecutionOrchestrator {
         // On budget timeout, we cancel this token so fan-out/fork tasks stop promptly
         // instead of being orphaned when the delegation future is dropped.
         let cancel_token = Arc::new(tokio_util::sync::CancellationToken::new());
-        self.delegation_engine
-            .set_cancel_token(cancel_token.clone());
 
-        let delegation_future = self
-            .delegation_engine
-            .execute(effective_request, &self.config.source_agent_id);
+        let delegation_future = self.delegation_engine.execute(
+            effective_request,
+            &self.config.source_agent_id,
+            Some(cancel_token.clone()),
+        );
 
         let delegation_outcome = match budget_timeout {
             Some(dur) => match tokio::time::timeout(dur, delegation_future).await {

@@ -11,7 +11,7 @@ mod tests {
     use crate::messaging::router::{AgentMailbox, AgentMailboxRouter};
     use crate::messaging::send_tool;
     use crate::messaging::types::*;
-    use crate::server::delegation_engine::{DelegationTracker, SubRunRecord};
+    use crate::server::delegation_engine::{DelegationTracker, SubRunRecord, SubRunState};
 
     fn tracker() -> Arc<DelegationTracker> {
         Arc::new(DelegationTracker::new())
@@ -52,6 +52,8 @@ mod tests {
                 delegation_id: delegation_id.into(),
                 agent_id: child_id.clone(),
                 depth: 1,
+                state: SubRunState::Created,
+                retry_of: None,
             })
             .await;
 
@@ -901,6 +903,8 @@ mod tests {
                 delegation_id: "stress-test".into(),
                 agent_id: "sender".into(),
                 depth: 1,
+                state: SubRunState::Created,
+                retry_of: None,
             })
             .await;
 
@@ -911,6 +915,8 @@ mod tests {
                 delegation_id: "stress-test".into(),
                 agent_id: "receiver".into(),
                 depth: 1,
+                state: SubRunState::Created,
+                retry_of: None,
             })
             .await;
         }
@@ -1005,6 +1011,8 @@ mod tests {
                     delegation_id: "broadcast".into(),
                     agent_id: "receiver".into(),
                     depth: 1,
+                    state: SubRunState::Created,
+                    retry_of: None,
                 })
                 .await;
             }
@@ -1092,6 +1100,8 @@ mod tests {
                 delegation_id: "ring".into(),
                 agent_id: format!("agent-{next}"),
                 depth: 1,
+                state: SubRunState::Created,
+                retry_of: None,
             })
             .await;
         }

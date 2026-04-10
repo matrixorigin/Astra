@@ -27,8 +27,10 @@ use astra_services::coordination::{
     DelegationRequest, DelegationResult, aggregate_results,
 };
 
+pub use astra_core::SubRunState;
 use astra_core::{
-    STATUS_COMPLETED, STATUS_FAILED, STATUS_PAUSED, STATUS_RUNNING, STATUS_VERIFICATION_FAILED,
+    InvalidTransition, STATUS_COMPLETED, STATUS_FAILED, STATUS_PAUSED, STATUS_RUNNING,
+    STATUS_VERIFICATION_FAILED,
 };
 
 use super::run_engine::RunEngine;
@@ -346,6 +348,24 @@ pub struct SubRunRecord {
     pub agent_id: String,
     /// Current depth in the delegation tree.
     pub depth: u32,
+    /// Lifecycle state (enforced state machine).
+    pub state: SubRunState,
+    /// If this run is a gate-retry, links to the original run_id.
+    pub retry_of: Option<String>,
+}
+
+/// Real-time progress snapshot for an active delegation.
+#[derive(Debug, Clone)]
+pub struct DelegationProgress {
+    pub delegation_id: String,
+    /// Per-agent current state.
+    pub agent_states: HashMap<String, SubRunState>,
+    /// When execution started.
+    pub started_at: std::time::Instant,
+    /// Number of completed (terminal) sub-runs.
+    pub completed_count: usize,
+    /// Total sub-runs expected.
+    pub total_count: usize,
 }
 
 /// In-memory tracker for delegation hierarchies and pause state.
@@ -360,6 +380,8 @@ pub struct DelegationTracker {
     pause_flags: RwLock<HashMap<String, Arc<AtomicBool>>>,
     /// Optional session ID for journal persistence.
     session_id: Option<String>,
+    /// Real-time progress per delegation.
+    progress: RwLock<HashMap<String, DelegationProgress>>,
 }
 
 impl DelegationTracker {
@@ -369,6 +391,7 @@ impl DelegationTracker {
             parents: RwLock::new(HashMap::new()),
             pause_flags: RwLock::new(HashMap::new()),
             session_id: None,
+            progress: RwLock::new(HashMap::new()),
         }
     }
 
@@ -379,6 +402,7 @@ impl DelegationTracker {
             parents: RwLock::new(HashMap::new()),
             pause_flags: RwLock::new(HashMap::new()),
             session_id: Some(session_id),
+            progress: RwLock::new(HashMap::new()),
         }
     }
 
@@ -425,6 +449,8 @@ impl DelegationTracker {
                 delegation_id: delegation_id.clone(),
                 agent_id: rec.agent_id.clone().unwrap_or_default(),
                 depth: 0, // Depth not stored in DB; 0 is safe for recovered records
+                state: SubRunState::from_str(&rec.status).unwrap_or(SubRunState::Failed),
+                retry_of: None,
             };
 
             delegations
@@ -653,6 +679,171 @@ impl DelegationTracker {
             .get(run_id)
             .is_some_and(|f| f.load(Ordering::Relaxed))
     }
+
+    // ── State Machine + Lifecycle ───────────────────────────────────────────
+
+    /// Transition a sub-run's state, enforcing the state machine.
+    ///
+    /// Returns `Err` if the transition is illegal.
+    pub async fn transition_state(
+        &self,
+        run_id: &str,
+        to: SubRunState,
+    ) -> Result<SubRunState, InvalidTransition> {
+        let mut delegations = self.delegations.write().await;
+        for records in delegations.values_mut() {
+            for record in records.iter_mut() {
+                if record.run_id == run_id {
+                    let new_state = record.state.try_transition(to)?;
+                    record.state = new_state;
+
+                    // Capture values before releasing the lock
+                    let delegation_id = record.delegation_id.clone();
+                    let agent_id = record.agent_id.clone();
+                    drop(delegations);
+
+                    // Update progress tracking
+                    self.update_progress(&delegation_id, &agent_id, new_state)
+                        .await;
+                    return Ok(new_state);
+                }
+            }
+        }
+        // Run not tracked — allow the transition (e.g. root runs)
+        Ok(to)
+    }
+
+    /// Mark a sub-run as complete: transition state, remove pause flag.
+    ///
+    /// Cleans up resources and updates progress tracking.
+    pub async fn complete_sub_run(&self, run_id: &str, terminal_state: SubRunState) {
+        debug_assert!(terminal_state.is_terminal());
+
+        // Transition state in record
+        let mut delegation_id = None;
+        let mut agent_id = None;
+        {
+            let mut delegations = self.delegations.write().await;
+            for records in delegations.values_mut() {
+                for record in records.iter_mut() {
+                    if record.run_id == run_id {
+                        // Best-effort: if transition fails, force the terminal state
+                        record.state = record
+                            .state
+                            .try_transition(terminal_state)
+                            .unwrap_or(terminal_state);
+                        delegation_id = Some(record.delegation_id.clone());
+                        agent_id = Some(record.agent_id.clone());
+                        break;
+                    }
+                }
+                if delegation_id.is_some() {
+                    break;
+                }
+            }
+        }
+
+        // Note: pause flags are NOT removed here — they are cleaned up
+        // in cleanup_delegation() when the entire delegation completes.
+
+        // Update progress
+        if let (Some(did), Some(aid)) = (delegation_id, agent_id) {
+            self.update_progress(&did, &aid, terminal_state).await;
+        }
+    }
+
+    /// Bulk cleanup after a full delegation completes.
+    ///
+    /// Removes all pause flags for the delegation's sub-runs and
+    /// cleans up the progress entry.
+    pub async fn cleanup_delegation(&self, delegation_id: &str) {
+        let records = self.get_sub_runs(delegation_id).await;
+        let mut flags = self.pause_flags.write().await;
+        for record in &records {
+            flags.remove(&record.run_id);
+        }
+        drop(flags);
+
+        self.progress.write().await.remove(delegation_id);
+    }
+
+    /// Get the full retry chain for a run: [original, retry1, retry2, ...]
+    pub async fn get_retry_chain(&self, run_id: &str) -> Vec<String> {
+        let delegations = self.delegations.read().await;
+
+        // Find which delegation this run belongs to
+        for records in delegations.values() {
+            // First find the original (walk backward via retry_of)
+            let mut original_id = run_id.to_string();
+            loop {
+                let found = records
+                    .iter()
+                    .find(|r| r.run_id == original_id && r.retry_of.is_some());
+                match found {
+                    Some(r) => original_id = r.retry_of.clone().unwrap(),
+                    None => break,
+                }
+            }
+
+            // Now collect forward: original → retries
+            let mut chain = vec![original_id.clone()];
+            let mut current = original_id;
+            loop {
+                let next = records
+                    .iter()
+                    .find(|r| r.retry_of.as_deref() == Some(&current));
+                match next {
+                    Some(r) => {
+                        chain.push(r.run_id.clone());
+                        current = r.run_id.clone();
+                    }
+                    None => break,
+                }
+            }
+            if chain.len() > 1 || chain.first().map(|s| s.as_str()) == Some(run_id) {
+                return chain;
+            }
+        }
+        vec![run_id.to_string()]
+    }
+
+    // ── Progress Tracking ───────────────────────────────────────────────────
+
+    /// Initialize progress tracking for a new delegation.
+    pub async fn init_progress(&self, delegation_id: &str, agent_ids: &[String]) {
+        let mut states = HashMap::new();
+        for aid in agent_ids {
+            states.insert(aid.clone(), SubRunState::Created);
+        }
+        self.progress.write().await.insert(
+            delegation_id.to_string(),
+            DelegationProgress {
+                delegation_id: delegation_id.to_string(),
+                agent_states: states,
+                started_at: std::time::Instant::now(),
+                completed_count: 0,
+                total_count: agent_ids.len(),
+            },
+        );
+    }
+
+    /// Update an agent's state in the progress tracker.
+    async fn update_progress(&self, delegation_id: &str, agent_id: &str, state: SubRunState) {
+        let mut progress_map = self.progress.write().await;
+        if let Some(progress) = progress_map.get_mut(delegation_id) {
+            progress.agent_states.insert(agent_id.to_string(), state);
+            progress.completed_count = progress
+                .agent_states
+                .values()
+                .filter(|s| s.is_terminal())
+                .count();
+        }
+    }
+
+    /// Get a snapshot of delegation progress.
+    pub async fn get_progress(&self, delegation_id: &str) -> Option<DelegationProgress> {
+        self.progress.read().await.get(delegation_id).cloned()
+    }
 }
 
 impl Default for DelegationTracker {
@@ -681,25 +872,9 @@ pub struct DelegationEngine {
     gate: Option<Arc<dyn VerificationGate>>,
     /// Optional mailbox router for inter-agent messaging.
     mailbox_router: Option<Arc<AgentMailboxRouter>>,
-    /// Optional cancellation token — when cancelled, spawned sub-runs stop gracefully.
-    /// Uses std::sync::Mutex for interior mutability so the orchestrator can set
-    /// a fresh token per team execution even through an Arc<DelegationEngine>.
-    cancel_token: std::sync::Mutex<Option<Arc<tokio_util::sync::CancellationToken>>>,
 }
 
 impl DelegationEngine {
-    /// Lock `cancel_token` with poison recovery.  If a sub-task panicked
-    /// while holding the lock the Mutex is poisoned; we log and recover
-    /// so the orchestrator can continue.
-    fn lock_cancel_token(
-        &self,
-    ) -> std::sync::MutexGuard<'_, Option<Arc<tokio_util::sync::CancellationToken>>> {
-        self.cancel_token.lock().unwrap_or_else(|e| {
-            eprintln!("[delegation] cancel_token Mutex poisoned — recovering from sub-task panic");
-            e.into_inner()
-        })
-    }
-
     pub fn new(
         registry: Arc<RwLock<AgentProfileRegistry>>,
         run_engine: Arc<RunEngine>,
@@ -716,7 +891,6 @@ impl DelegationEngine {
             executor: Arc::new(StubSubRunExecutor),
             gate: None,
             mailbox_router: None,
-            cancel_token: std::sync::Mutex::new(None),
         }
     }
 
@@ -734,7 +908,6 @@ impl DelegationEngine {
             executor,
             gate: None,
             mailbox_router: None,
-            cancel_token: std::sync::Mutex::new(None),
         }
     }
 
@@ -750,26 +923,12 @@ impl DelegationEngine {
         self
     }
 
-    /// Attach a cancellation token for cooperative shutdown of spawned sub-runs.
-    pub fn with_cancel_token(self, token: Arc<tokio_util::sync::CancellationToken>) -> Self {
-        *self.lock_cancel_token() = Some(token);
-        self
-    }
-
     /// Dynamically set the verification gate (e.g., per-subtask criteria during plan execution).
     ///
     /// Unlike [`with_gate`] (builder pattern), this mutates the engine in place so callers
     /// can swap gates between delegation calls without rebuilding the engine.
     pub fn set_gate(&mut self, gate: Arc<dyn VerificationGate>) {
         self.gate = Some(gate);
-    }
-
-    /// Dynamically set the cancellation token for cooperative shutdown of spawned sub-runs.
-    ///
-    /// Works through `Arc<DelegationEngine>` (no `&mut self` needed) so the orchestrator
-    /// can create a fresh token per team execution.
-    pub fn set_cancel_token(&self, token: Arc<tokio_util::sync::CancellationToken>) {
-        *self.lock_cancel_token() = Some(token);
     }
 
     /// Remove the current verification gate (sub-runs will bypass verification).
@@ -790,7 +949,6 @@ impl DelegationEngine {
             executor: self.executor.clone(),
             gate: Some(gate),
             mailbox_router: self.mailbox_router.clone(),
-            cancel_token: std::sync::Mutex::new(self.lock_cancel_token().clone()),
         }
     }
 
@@ -804,13 +962,7 @@ impl DelegationEngine {
             executor: self.executor.clone(),
             gate: None,
             mailbox_router: self.mailbox_router.clone(),
-            cancel_token: std::sync::Mutex::new(self.lock_cancel_token().clone()),
         }
-    }
-
-    /// Read the current cancel token snapshot.
-    fn current_cancel_token(&self) -> Option<Arc<tokio_util::sync::CancellationToken>> {
-        self.lock_cancel_token().clone()
     }
 
     /// Validate a delegation request without executing it.
@@ -938,10 +1090,14 @@ impl DelegationEngine {
     /// Returns a `DelegationResult` with individual agent results and
     /// aggregated output. Sub-runs are created in the RunEngine and tracked
     /// in the DelegationTracker for hierarchy queries.
+    ///
+    /// `cancel_token` is scoped to this execution — no global state. When
+    /// cancelled, all spawned sub-runs receive the signal and stop gracefully.
     pub async fn execute(
         &self,
         request: DelegationRequest,
         source_agent_id: &str,
+        cancel_token: Option<Arc<tokio_util::sync::CancellationToken>>,
     ) -> Result<DelegationResult, String> {
         // Validate first
         self.validate(&request, source_agent_id).await?;
@@ -985,22 +1141,36 @@ impl DelegationEngine {
             ),
         );
 
+        // Initialize progress tracking
+        self.tracker
+            .init_progress(&request.delegation_id, &agent_ids_for_journal)
+            .await;
+
         let result = match &request.pattern {
             CoordinationPattern::FanOut {
                 agent_ids,
                 aggregation,
                 ..
-            } => self.execute_fan_out(&request, agent_ids, aggregation).await,
+            } => {
+                self.execute_fan_out(&request, agent_ids, aggregation, cancel_token.as_ref())
+                    .await
+            }
             CoordinationPattern::Pipeline { stages } => {
                 let agent_ids: Vec<String> = stages.iter().map(|s| s.agent_id.clone()).collect();
-                self.execute_sequential(&request, &agent_ids, false).await
+                self.execute_sequential(&request, &agent_ids, false, cancel_token.as_ref())
+                    .await
             }
             CoordinationPattern::Sequential {
                 agent_ids,
                 stop_on_success,
             } => {
-                self.execute_sequential(&request, agent_ids, *stop_on_success)
-                    .await
+                self.execute_sequential(
+                    &request,
+                    agent_ids,
+                    *stop_on_success,
+                    cancel_token.as_ref(),
+                )
+                .await
             }
             CoordinationPattern::AdversarialReview {
                 producer_id,
@@ -1008,8 +1178,14 @@ impl DelegationEngine {
                 max_rounds,
                 ..
             } => {
-                self.execute_adversarial(&request, producer_id, reviewer_id, *max_rounds)
-                    .await
+                self.execute_adversarial(
+                    &request,
+                    producer_id,
+                    reviewer_id,
+                    *max_rounds,
+                    cancel_token.as_ref(),
+                )
+                .await
             }
             CoordinationPattern::Fork {
                 tasks,
@@ -1017,8 +1193,15 @@ impl DelegationEngine {
                 max_turns,
                 aggregation,
             } => {
-                self.execute_fork(&request, tasks, agent_id, *max_turns, aggregation)
-                    .await
+                self.execute_fork(
+                    &request,
+                    tasks,
+                    agent_id,
+                    *max_turns,
+                    aggregation,
+                    cancel_token.as_ref(),
+                )
+                .await
             }
         };
 
@@ -1069,6 +1252,7 @@ impl DelegationEngine {
         request: &DelegationRequest,
         agent_ids: &[String],
         aggregation: &AggregationStrategy,
+        cancel_token: Option<&Arc<tokio_util::sync::CancellationToken>>,
     ) -> Result<DelegationResult, String> {
         let reg = self.registry.read().await;
 
@@ -1100,7 +1284,15 @@ impl DelegationEngine {
                     delegation_id: request.delegation_id.clone(),
                     agent_id: agent_id.clone(),
                     depth: request.depth + 1,
+                    state: SubRunState::Created,
+                    retry_of: None,
                 })
+                .await;
+
+            // Transition Created → Running
+            let _ = self
+                .tracker
+                .transition_state(&sub_run_id, SubRunState::Running)
                 .await;
 
             self.run_engine
@@ -1155,7 +1347,7 @@ impl DelegationEngine {
                 pause_flag: Some(pause_flag),
                 checkpoint_gate: None,
                 mailbox,
-                cancel_token: self.current_cancel_token(),
+                cancel_token: cancel_token.cloned(),
             });
         }
         drop(reg);
@@ -1172,18 +1364,27 @@ impl DelegationEngine {
             None
         };
 
-        let mut handles = Vec::new();
+        let mut handles: Vec<(
+            tokio::task::JoinHandle<(Result<AgentResult, String>, String, String)>,
+            String,
+            String,
+        )> = Vec::new();
         for config in configs {
             let executor = self.executor.clone();
             let run_engine = self.run_engine.clone();
+            let tracker = self.tracker.clone();
             let sem = semaphore.clone();
-            let cancel = self.current_cancel_token();
-            handles.push(tokio::spawn(async move {
+            let cancel = cancel_token.cloned();
+            // Capture identity before moving config into the closure (panic context)
+            let captured_agent_id = config.agent_profile.agent_id.clone();
+            let captured_run_id = config.run_id.clone();
+            let handle = tokio::spawn(async move {
                 let _permit = match sem {
                     Some(ref s) => Some(s.acquire().await.expect("semaphore closed")),
                     None => None,
                 };
                 let run_id = config.run_id.clone();
+                let agent_id = config.agent_profile.agent_id.clone();
                 let result = if let Some(ref token) = cancel {
                     tokio::select! {
                         r = executor.execute(config) => r,
@@ -1192,8 +1393,8 @@ impl DelegationEngine {
                 } else {
                     executor.execute(config).await
                 };
-                // Persist final status
-                match &result {
+                // Determine final state and persist
+                let final_state = match &result {
                     Ok(r) => {
                         astra_core::log_persist!(
                             run_engine
@@ -1203,6 +1404,7 @@ impl DelegationEngine {
                             &run_id,
                             "status"
                         );
+                        SubRunState::from_str(&r.status).unwrap_or(SubRunState::Failed)
                     }
                     Err(e) => {
                         astra_core::log_persist!(
@@ -1213,20 +1415,23 @@ impl DelegationEngine {
                             &run_id,
                             "status"
                         );
+                        SubRunState::Failed
                     }
-                }
-                result
-            }));
+                };
+                tracker.complete_sub_run(&run_id, final_state).await;
+                (result, agent_id, run_id)
+            });
+            handles.push((handle, captured_agent_id, captured_run_id));
         }
 
         let mut results = Vec::new();
-        for handle in handles {
+        for (handle, panic_agent_id, panic_run_id) in handles {
             match handle.await {
-                Ok(Ok(result)) => results.push(result),
-                Ok(Err(e)) => {
+                Ok((Ok(result), _, _)) => results.push(result),
+                Ok((Err(e), agent_id, run_id)) => {
                     results.push(AgentResult {
-                        agent_id: "unknown".to_string(),
-                        run_id: String::new(),
+                        agent_id,
+                        run_id,
                         status: STATUS_FAILED.to_string(),
                         output: None,
                         error: Some(e),
@@ -1236,12 +1441,29 @@ impl DelegationEngine {
                     });
                 }
                 Err(e) => {
+                    // JoinError (panic) — use captured identity instead of "unknown"
+                    astra_core::log_persist!(
+                        self.run_engine
+                            .persist_status(
+                                &panic_run_id,
+                                STATUS_FAILED,
+                                None,
+                                Some(&format!("task panicked: {e}"))
+                            )
+                            .await,
+                        "delegation",
+                        &panic_run_id,
+                        "status"
+                    );
+                    self.tracker
+                        .complete_sub_run(&panic_run_id, SubRunState::Failed)
+                        .await;
                     results.push(AgentResult {
-                        agent_id: "unknown".to_string(),
-                        run_id: String::new(),
+                        agent_id: panic_agent_id,
+                        run_id: panic_run_id,
                         status: STATUS_FAILED.to_string(),
                         output: None,
-                        error: Some(format!("task join error: {}", e)),
+                        error: Some(format!("task join error (panic): {}", e)),
                         prompt_tokens: 0,
                         completion_tokens: 0,
                         tool_calls: 0,
@@ -1301,6 +1523,7 @@ impl DelegationEngine {
         request: &DelegationRequest,
         agent_ids: &[String],
         stop_on_success: bool,
+        cancel_token: Option<&Arc<tokio_util::sync::CancellationToken>>,
     ) -> Result<DelegationResult, String> {
         let reg = self.registry.read().await;
         let mut results = Vec::new();
@@ -1308,7 +1531,7 @@ impl DelegationEngine {
 
         for agent_id in agent_ids {
             // Check cancellation before starting next sequential agent
-            if let Some(ref token) = self.current_cancel_token() {
+            if let Some(ref token) = cancel_token {
                 if token.is_cancelled() {
                     break;
                 }
@@ -1339,7 +1562,15 @@ impl DelegationEngine {
                     delegation_id: request.delegation_id.clone(),
                     agent_id: agent_id.clone(),
                     depth: request.depth + 1,
+                    state: SubRunState::Created,
+                    retry_of: None,
                 })
+                .await;
+
+            // Transition Created → Running
+            let _ = self
+                .tracker
+                .transition_state(&sub_run_id, SubRunState::Running)
                 .await;
 
             self.run_engine
@@ -1393,7 +1624,7 @@ impl DelegationEngine {
                 pause_flag: Some(pause_flag),
                 checkpoint_gate: None,
                 mailbox,
-                cancel_token: self.current_cancel_token(),
+                cancel_token: cancel_token.cloned(),
             };
 
             let result = match self.executor.execute(config).await {
@@ -1406,6 +1637,11 @@ impl DelegationEngine {
                         &sub_run_id,
                         "status"
                     );
+                    let final_state =
+                        SubRunState::from_str(&r.status).unwrap_or(SubRunState::Failed);
+                    self.tracker
+                        .complete_sub_run(&sub_run_id, final_state)
+                        .await;
                     r
                 }
                 Err(e) => {
@@ -1417,6 +1653,9 @@ impl DelegationEngine {
                         &sub_run_id,
                         "status"
                     );
+                    self.tracker
+                        .complete_sub_run(&sub_run_id, SubRunState::Failed)
+                        .await;
                     AgentResult {
                         agent_id: agent_id.clone(),
                         run_id: sub_run_id,
@@ -1492,6 +1731,7 @@ impl DelegationEngine {
         producer_id: &str,
         reviewer_id: &str,
         max_rounds: u32,
+        cancel_token: Option<&Arc<tokio_util::sync::CancellationToken>>,
     ) -> Result<DelegationResult, String> {
         let reg = self.registry.read().await;
         let mut results = Vec::new();
@@ -1515,7 +1755,7 @@ impl DelegationEngine {
 
         for round in 0..max_rounds {
             // Check cancellation before starting next adversarial round
-            if let Some(ref token) = self.current_cancel_token() {
+            if let Some(ref token) = cancel_token {
                 if token.is_cancelled() {
                     break;
                 }
@@ -1545,7 +1785,13 @@ impl DelegationEngine {
                     delegation_id: request.delegation_id.clone(),
                     agent_id: producer_id.to_string(),
                     depth: request.depth + 1,
+                    state: SubRunState::Created,
+                    retry_of: None,
                 })
+                .await;
+            let _ = self
+                .tracker
+                .transition_state(&prod_run_id, SubRunState::Running)
                 .await;
             self.run_engine
                 .persist_status(&prod_run_id, STATUS_RUNNING, Some("produce"), None)
@@ -1595,7 +1841,7 @@ impl DelegationEngine {
                 pause_flag: Some(prod_pause.clone()),
                 checkpoint_gate: None,
                 mailbox: prod_mailbox,
-                cancel_token: self.current_cancel_token(),
+                cancel_token: cancel_token.cloned(),
             };
             let prod_result = match self.executor.execute(prod_config).await {
                 Ok(r) => {
@@ -1607,6 +1853,11 @@ impl DelegationEngine {
                         &prod_run_id,
                         "status"
                     );
+                    let final_state =
+                        SubRunState::from_str(&r.status).unwrap_or(SubRunState::Failed);
+                    self.tracker
+                        .complete_sub_run(&prod_run_id, final_state)
+                        .await;
                     r
                 }
                 Err(e) => {
@@ -1618,6 +1869,9 @@ impl DelegationEngine {
                         &prod_run_id,
                         "status"
                     );
+                    self.tracker
+                        .complete_sub_run(&prod_run_id, SubRunState::Failed)
+                        .await;
                     AgentResult {
                         agent_id: producer_id.to_string(),
                         run_id: prod_run_id,
@@ -1685,7 +1939,13 @@ impl DelegationEngine {
                     delegation_id: request.delegation_id.clone(),
                     agent_id: reviewer_id.to_string(),
                     depth: request.depth + 1,
+                    state: SubRunState::Created,
+                    retry_of: None,
                 })
+                .await;
+            let _ = self
+                .tracker
+                .transition_state(&rev_run_id, SubRunState::Running)
                 .await;
             self.run_engine
                 .persist_status(&rev_run_id, STATUS_RUNNING, Some("review"), None)
@@ -1738,7 +1998,7 @@ impl DelegationEngine {
                 pause_flag: Some(rev_pause),
                 checkpoint_gate: None,
                 mailbox: rev_mailbox,
-                cancel_token: self.current_cancel_token(),
+                cancel_token: cancel_token.cloned(),
             };
             let rev_result = match self.executor.execute(rev_config).await {
                 Ok(r) => {
@@ -1750,6 +2010,11 @@ impl DelegationEngine {
                         &rev_run_id,
                         "status"
                     );
+                    let final_state =
+                        SubRunState::from_str(&r.status).unwrap_or(SubRunState::Failed);
+                    self.tracker
+                        .complete_sub_run(&rev_run_id, final_state)
+                        .await;
                     r
                 }
                 Err(e) => {
@@ -1761,6 +2026,9 @@ impl DelegationEngine {
                         &rev_run_id,
                         "status"
                     );
+                    self.tracker
+                        .complete_sub_run(&rev_run_id, SubRunState::Failed)
+                        .await;
                     AgentResult {
                         agent_id: reviewer_id.to_string(),
                         run_id: rev_run_id,
@@ -1795,6 +2063,7 @@ impl DelegationEngine {
         agent_id: &str,
         _max_turns: u32,
         _aggregation: &AggregationStrategy,
+        cancel_token: Option<&Arc<tokio_util::sync::CancellationToken>>,
     ) -> Result<DelegationResult, String> {
         let reg = self.registry.read().await;
         let profile = reg.get(agent_id).cloned().unwrap_or_else(|| {
@@ -1830,7 +2099,11 @@ impl DelegationEngine {
         } else {
             None
         };
-        let mut handles = Vec::with_capacity(tasks.len());
+        let mut handles: Vec<(
+            tokio::task::JoinHandle<(Result<AgentResult, String>, String, String)>,
+            String,
+            String,
+        )> = Vec::with_capacity(tasks.len());
         for (i, task) in tasks.iter().enumerate() {
             let run_id = uuid::Uuid::new_v4().to_string();
             let _ = self
@@ -1851,7 +2124,13 @@ impl DelegationEngine {
                     delegation_id: request.delegation_id.clone(),
                     agent_id: agent_id.to_string(),
                     depth: request.depth + 1,
+                    state: SubRunState::Created,
+                    retry_of: None,
                 })
+                .await;
+            let _ = self
+                .tracker
+                .transition_state(&run_id, SubRunState::Running)
                 .await;
             let _ = self
                 .run_engine
@@ -1913,19 +2192,25 @@ impl DelegationEngine {
                 pause_flag: Some(pause_flag),
                 checkpoint_gate: None,
                 mailbox: fork_mailbox,
-                cancel_token: self.current_cancel_token(),
+                cancel_token: cancel_token.cloned(),
             };
 
             let executor = self.executor.clone();
             let run_engine = self.run_engine.clone();
+            let tracker = self.tracker.clone();
             let sem = fork_semaphore.clone();
-            let cancel_token = config.cancel_token.clone();
-            handles.push(tokio::spawn(async move {
+            let cancel_for_spawn = cancel_token.cloned();
+            // Capture identity before moving config (panic context)
+            let captured_agent_id = config.agent_profile.agent_id.clone();
+            let captured_run_id = config.run_id.clone();
+            let handle = tokio::spawn(async move {
                 let _permit = match sem {
                     Some(ref s) => Some(s.acquire().await.expect("semaphore closed")),
                     None => None,
                 };
-                let result = if let Some(token) = cancel_token {
+                let run_id = config.run_id.clone();
+                let agent_id = config.agent_profile.agent_id.clone();
+                let result = if let Some(token) = cancel_for_spawn {
                     tokio::select! {
                         r = executor.execute(config) => r,
                         _ = token.cancelled() => {
@@ -1935,30 +2220,34 @@ impl DelegationEngine {
                 } else {
                     executor.execute(config).await
                 };
-                match &result {
+                let final_state = match &result {
                     Ok(r) => {
                         let _ = run_engine
                             .persist_status(&run_id, &r.status, None, r.error.as_deref())
                             .await;
+                        SubRunState::from_str(&r.status).unwrap_or(SubRunState::Failed)
                     }
                     Err(e) => {
                         let _ = run_engine
                             .persist_status(&run_id, "failed", None, Some(e))
                             .await;
+                        SubRunState::Failed
                     }
-                }
-                result
-            }));
+                };
+                tracker.complete_sub_run(&run_id, final_state).await;
+                (result, agent_id, run_id)
+            });
+            handles.push((handle, captured_agent_id, captured_run_id));
         }
 
         // Collect all results
         let mut results = Vec::with_capacity(handles.len());
-        for handle in handles {
+        for (handle, panic_agent_id, panic_run_id) in handles {
             match handle.await {
-                Ok(Ok(r)) => results.push(r),
-                Ok(Err(e)) => results.push(AgentResult {
-                    agent_id: agent_id.to_string(),
-                    run_id: uuid::Uuid::new_v4().to_string(),
+                Ok((Ok(r), _, _)) => results.push(r),
+                Ok((Err(e), agent_id_from_task, run_id_from_task)) => results.push(AgentResult {
+                    agent_id: agent_id_from_task,
+                    run_id: run_id_from_task,
                     status: "failed".to_string(),
                     output: None,
                     error: Some(e),
@@ -1966,16 +2255,31 @@ impl DelegationEngine {
                     completion_tokens: 0,
                     tool_calls: 0,
                 }),
-                Err(e) => results.push(AgentResult {
-                    agent_id: agent_id.to_string(),
-                    run_id: uuid::Uuid::new_v4().to_string(),
-                    status: "failed".to_string(),
-                    output: None,
-                    error: Some(format!("fork task panicked: {}", e)),
-                    prompt_tokens: 0,
-                    completion_tokens: 0,
-                    tool_calls: 0,
-                }),
+                Err(e) => {
+                    // JoinError (panic) — use captured identity
+                    let _ = self
+                        .run_engine
+                        .persist_status(
+                            &panic_run_id,
+                            STATUS_FAILED,
+                            None,
+                            Some(&format!("fork task panicked: {e}")),
+                        )
+                        .await;
+                    self.tracker
+                        .complete_sub_run(&panic_run_id, SubRunState::Failed)
+                        .await;
+                    results.push(AgentResult {
+                        agent_id: panic_agent_id,
+                        run_id: panic_run_id,
+                        status: "failed".to_string(),
+                        output: None,
+                        error: Some(format!("fork task panicked: {}", e)),
+                        prompt_tokens: 0,
+                        completion_tokens: 0,
+                        tool_calls: 0,
+                    });
+                }
             }
         }
 
@@ -2144,6 +2448,8 @@ mod tests {
                 delegation_id: "del-1".into(),
                 agent_id: "coder".into(),
                 depth: 1,
+                state: SubRunState::Created,
+                retry_of: None,
             })
             .await;
         tracker
@@ -2153,6 +2459,8 @@ mod tests {
                 delegation_id: "del-1".into(),
                 agent_id: "reviewer".into(),
                 depth: 1,
+                state: SubRunState::Created,
+                retry_of: None,
             })
             .await;
 
@@ -2176,6 +2484,8 @@ mod tests {
                 delegation_id: "d1".into(),
                 agent_id: "a".into(),
                 depth: 1,
+                state: SubRunState::Created,
+                retry_of: None,
             })
             .await;
         tracker
@@ -2185,6 +2495,8 @@ mod tests {
                 delegation_id: "d2".into(),
                 agent_id: "b".into(),
                 depth: 2,
+                state: SubRunState::Created,
+                retry_of: None,
             })
             .await;
 
@@ -2198,7 +2510,7 @@ mod tests {
         let de = DelegationEngine::new(reg, engine.clone(), tracker.clone());
 
         let req = fan_out_request(vec!["coder", "reviewer"]);
-        let result = de.execute(req, "orch").await.unwrap();
+        let result = de.execute(req, "orch", None).await.unwrap();
 
         assert_eq!(result.agent_results.len(), 2);
         assert_eq!(result.delegation_id, "del-1");
@@ -2238,7 +2550,7 @@ mod tests {
             context: HashMap::new(),
         };
 
-        let result = de.execute(req, "orch").await.unwrap();
+        let result = de.execute(req, "orch", None).await.unwrap();
         assert_eq!(result.agent_results.len(), 2);
         assert_eq!(result.agent_results[0].agent_id, "coder");
         assert_eq!(result.agent_results[1].agent_id, "reviewer");
@@ -2270,7 +2582,7 @@ mod tests {
             context: HashMap::new(),
         };
 
-        let result = de.execute(req, "orch").await.unwrap();
+        let result = de.execute(req, "orch", None).await.unwrap();
         assert_eq!(result.agent_results.len(), 2);
 
         let subs = tracker.get_sub_runs("del-pipe").await;
@@ -2297,7 +2609,7 @@ mod tests {
             context: HashMap::new(),
         };
 
-        let result = de.execute(req, "orch").await.unwrap();
+        let result = de.execute(req, "orch", None).await.unwrap();
         // 2 rounds × 2 agents = 4 sub-runs
         assert_eq!(result.agent_results.len(), 4);
 
@@ -2330,7 +2642,7 @@ mod tests {
             context: HashMap::new(),
         };
 
-        assert!(de.execute(req, "writer").await.is_err());
+        assert!(de.execute(req, "writer", None).await.is_err());
     }
 
     #[tokio::test]
@@ -2352,7 +2664,7 @@ mod tests {
             context: HashMap::new(),
         };
 
-        let err = de.execute(req, "orch").await.unwrap_err();
+        let err = de.execute(req, "orch", None).await.unwrap_err();
         assert!(err.contains("depth"));
     }
 
@@ -2388,8 +2700,8 @@ mod tests {
             context: HashMap::new(),
         };
 
-        de.execute(req1, "orch").await.unwrap();
-        de.execute(req2, "orch").await.unwrap();
+        de.execute(req1, "orch", None).await.unwrap();
+        de.execute(req2, "orch", None).await.unwrap();
 
         let subs_a = tracker.get_sub_runs("del-A").await;
         let subs_b = tracker.get_sub_runs("del-B").await;
@@ -2481,7 +2793,7 @@ mod tests {
         let (_, engine, tracker, de) = setup_with_executor(Arc::new(EchoExecutor));
 
         let req = fan_out_request(vec!["coder", "reviewer"]);
-        let result = de.execute(req, "orch").await.unwrap();
+        let result = de.execute(req, "orch", None).await.unwrap();
 
         assert_eq!(result.status, "completed");
         assert_eq!(result.agent_results.len(), 2);
@@ -2536,7 +2848,7 @@ mod tests {
             context: HashMap::new(),
         };
 
-        let result = de.execute(req, "orch").await.unwrap();
+        let result = de.execute(req, "orch", None).await.unwrap();
         assert_eq!(result.agent_results.len(), 2);
 
         // First stage has no previous_output
@@ -2568,7 +2880,7 @@ mod tests {
             context: HashMap::new(),
         };
 
-        let result = de.execute(req, "orch").await.unwrap();
+        let result = de.execute(req, "orch", None).await.unwrap();
         // First agent succeeds → stops
         assert_eq!(result.agent_results.len(), 1);
         assert_eq!(result.agent_results[0].agent_id, "coder");
@@ -2582,7 +2894,7 @@ mod tests {
         let (_, _, _, de) = setup_with_executor(executor);
 
         let req = fan_out_request(vec!["coder", "reviewer"]);
-        let result = de.execute(req, "orch").await.unwrap();
+        let result = de.execute(req, "orch", None).await.unwrap();
 
         assert_eq!(result.status, "partial");
         assert_eq!(result.agent_results.len(), 2);
@@ -2623,7 +2935,7 @@ mod tests {
             context: HashMap::new(),
         };
 
-        let result = de.execute(req, "orch").await.unwrap();
+        let result = de.execute(req, "orch", None).await.unwrap();
         // 2 rounds × (producer + reviewer) = 4
         assert_eq!(result.agent_results.len(), 4);
         assert_eq!(result.status, "completed");
@@ -2651,6 +2963,8 @@ mod tests {
                 delegation_id: "d1".into(),
                 agent_id: "coder".into(),
                 depth: 1,
+                state: SubRunState::Created,
+                retry_of: None,
             })
             .await;
 
@@ -2668,7 +2982,7 @@ mod tests {
         let de = DelegationEngine::with_executor(reg, engine, tracker, Arc::new(EchoExecutor));
 
         let req = fan_out_request(vec!["coder"]);
-        let result = de.execute(req, "orch").await.unwrap();
+        let result = de.execute(req, "orch", None).await.unwrap();
         assert_eq!(result.status, "completed");
         // EchoExecutor returns prompt_tokens=10
         assert_eq!(result.total_prompt_tokens, 10);
@@ -2716,7 +3030,7 @@ mod tests {
             context: ctx,
         };
 
-        let result = de.execute(req, "orch").await.unwrap();
+        let result = de.execute(req, "orch", None).await.unwrap();
         assert_eq!(
             result.agent_results[0].output.as_deref(),
             Some("context_present=true")
@@ -2785,7 +3099,7 @@ mod tests {
             context: ctx,
         };
 
-        let result = de.execute(req, "orch").await.unwrap();
+        let result = de.execute(req, "orch", None).await.unwrap();
         assert_eq!(result.agent_results.len(), 2);
 
         // Each agent should see its own worktree path
@@ -2827,7 +3141,7 @@ mod tests {
         let (_, engine, tracker, de) = setup_with_executor(Arc::new(EchoExecutor));
 
         let req = fan_out_request(vec!["coder", "reviewer"]);
-        let result = de.execute(req, "orch").await.unwrap();
+        let result = de.execute(req, "orch", None).await.unwrap();
         assert_eq!(result.agent_results.len(), 2);
 
         // Pause all children of parent-1
@@ -2857,7 +3171,7 @@ mod tests {
         let (_, engine, tracker, de) = setup_with_executor(Arc::new(EchoExecutor));
 
         let req = fan_out_request(vec!["coder", "reviewer"]);
-        de.execute(req, "orch").await.unwrap();
+        de.execute(req, "orch", None).await.unwrap();
 
         let paused = de.pause_delegation("del-1").await;
         assert_eq!(paused, 2);
@@ -2964,7 +3278,7 @@ mod tests {
             .with_gate(Arc::new(AlwaysPassGate));
 
         let req = fan_out_request(vec!["coder", "reviewer"]);
-        let result = de.execute(req, "orch").await.unwrap();
+        let result = de.execute(req, "orch", None).await.unwrap();
 
         assert_eq!(result.status, "completed");
         assert_eq!(result.agent_results.len(), 2);
@@ -2980,7 +3294,7 @@ mod tests {
             .with_gate(Arc::new(AlwaysFailGate));
 
         let req = fan_out_request(vec!["coder"]);
-        let result = de.execute(req, "orch").await.unwrap();
+        let result = de.execute(req, "orch", None).await.unwrap();
 
         // Fan-out with always-fail gate: result should be verification_failed
         assert_eq!(result.agent_results.len(), 1);
@@ -3014,7 +3328,7 @@ mod tests {
             depth: 0,
             context: HashMap::new(),
         };
-        let result = de.execute(req, "orch").await.unwrap();
+        let result = de.execute(req, "orch", None).await.unwrap();
 
         // Should eventually pass after retry
         assert_eq!(result.agent_results.len(), 1);
@@ -3039,7 +3353,7 @@ mod tests {
             depth: 0,
             context: HashMap::new(),
         };
-        let result = de.execute(req, "orch").await.unwrap();
+        let result = de.execute(req, "orch", None).await.unwrap();
 
         assert_eq!(result.agent_results.len(), 1);
         assert_eq!(result.agent_results[0].status, "verification_failed");
@@ -3052,7 +3366,7 @@ mod tests {
         // de has no gate
 
         let req = fan_out_request(vec!["coder", "reviewer"]);
-        let result = de.execute(req, "orch").await.unwrap();
+        let result = de.execute(req, "orch", None).await.unwrap();
 
         assert_eq!(result.status, "completed");
         assert_eq!(result.agent_results.len(), 2);
@@ -3078,7 +3392,7 @@ mod tests {
         .with_gate(Arc::new(AlwaysFailGate));
 
         let req = fan_out_request(vec!["coder"]);
-        let result = de.execute(req, "orch").await.unwrap();
+        let result = de.execute(req, "orch", None).await.unwrap();
 
         // Should be "failed" (from executor), NOT "verification_failed"
         assert_eq!(result.agent_results[0].status, "failed");
@@ -3356,7 +3670,7 @@ mod tests {
             vec!["task-a", "task-b", "task-c"],
             "writer",
         );
-        let result = de.execute(req, "orch").await.unwrap();
+        let result = de.execute(req, "orch", None).await.unwrap();
 
         assert_eq!(result.agent_results.len(), 3);
         assert_eq!(result.status, "completed");
@@ -3403,7 +3717,7 @@ mod tests {
             DelegationEngine::with_executor(reg, engine, tracker, Arc::new(DelegateCheckExecutor));
 
         let req = fork_request("del-fork-deleg", vec!["task-a"], "writer");
-        let result = de.execute(req, "orch").await.unwrap();
+        let result = de.execute(req, "orch", None).await.unwrap();
 
         assert_eq!(
             result.agent_results[0].output.as_deref(),
@@ -3420,7 +3734,7 @@ mod tests {
         let de = DelegationEngine::with_executor(reg, engine, tracker, executor);
 
         let req = fork_request("del-fork-fail", vec!["task-a", "task-b"], "writer");
-        let result = de.execute(req, "orch").await.unwrap();
+        let result = de.execute(req, "orch", None).await.unwrap();
 
         // All children use "writer" which fails → all failed
         assert_eq!(result.agent_results.len(), 2);
@@ -3435,7 +3749,7 @@ mod tests {
         let (_, _, _, de) = setup_with_executor(Arc::new(EchoExecutor));
 
         let req = fork_request("del-fork-single", vec!["only-task"], "writer");
-        let result = de.execute(req, "orch").await.unwrap();
+        let result = de.execute(req, "orch", None).await.unwrap();
 
         assert_eq!(result.agent_results.len(), 1);
         assert_eq!(result.status, "completed");
@@ -3481,7 +3795,7 @@ mod tests {
         );
 
         let req = fork_request("del-fork-ctx", vec!["a", "b"], "writer");
-        let result = de.execute(req, "orch").await.unwrap();
+        let result = de.execute(req, "orch", None).await.unwrap();
 
         // Both children should have fork metadata
         let outputs: Vec<String> = result
@@ -3505,6 +3819,8 @@ mod tests {
                 delegation_id: "del-1".into(),
                 agent_id: "coder".into(),
                 depth: 1,
+                state: SubRunState::Created,
+                retry_of: None,
             })
             .await;
         tracker
@@ -3514,6 +3830,8 @@ mod tests {
                 delegation_id: "del-1".into(),
                 agent_id: "reviewer".into(),
                 depth: 1,
+                state: SubRunState::Created,
+                retry_of: None,
             })
             .await;
         tracker
@@ -3523,6 +3841,8 @@ mod tests {
                 delegation_id: "del-2".into(),
                 agent_id: "writer".into(),
                 depth: 1,
+                state: SubRunState::Created,
+                retry_of: None,
             })
             .await;
 
@@ -3573,7 +3893,7 @@ mod tests {
         let de = DelegationEngine::with_executor(reg, engine, tracker, failing);
 
         let req = fan_out_request(vec!["coder", "reviewer"]);
-        let result = de.execute(req, "orch").await.unwrap();
+        let result = de.execute(req, "orch", None).await.unwrap();
 
         // All results should be failed
         assert_eq!(result.agent_results.len(), 2);
@@ -3604,7 +3924,7 @@ mod tests {
         let de = DelegationEngine::with_executor(reg, engine, tracker, Arc::new(HardErrorExecutor));
 
         let req = fan_out_request(vec!["coder"]);
-        let result = de.execute(req, "orch").await.unwrap();
+        let result = de.execute(req, "orch", None).await.unwrap();
 
         // Hard errors should be captured as failed agent results, not propagated
         assert_eq!(result.agent_results.len(), 1);
@@ -3638,7 +3958,7 @@ mod tests {
             context: HashMap::new(),
         };
 
-        let result = de.execute(req, "orch").await.unwrap();
+        let result = de.execute(req, "orch", None).await.unwrap();
         assert_eq!(result.agent_results.len(), 3);
 
         // Each stage receives previous output

@@ -36,7 +36,7 @@ pub(super) async fn delegate_run_handler(
 
     // Execute the delegation.
     let result = engine
-        .execute(request, &source_agent_id)
+        .execute(request, &source_agent_id, None)
         .await
         .map_err(|e| error_response(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 

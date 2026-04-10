@@ -588,7 +588,7 @@ async fn partition_and_execute_delegations(
             match parse_delegation_request(tc, parent_run_id, session_id, skill_search) {
                 Ok(mut request) => {
                     merge_workspace_hint_into_delegation_request(&mut request, workspace_hint);
-                    match engine.execute(request, source_agent_id).await {
+                    match engine.execute(request, source_agent_id, None).await {
                         Ok(result) => {
                             let summary = format_delegation_result(&result);
                             delegation_results.push((call_id, summary));
