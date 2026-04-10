@@ -116,6 +116,8 @@ pub struct SpawnedAgentState {
 #[derive(Debug, Clone)]
 pub struct SpawnedAgentInfo {
     pub agent_id: String,
+    pub run_id: String,
+    pub parent_run_id: String,
     pub agent_type: String,
     pub description: String,
     pub status: AgentStatus,
@@ -129,6 +131,8 @@ impl From<&SpawnedAgentState> for SpawnedAgentInfo {
     fn from(state: &SpawnedAgentState) -> Self {
         Self {
             agent_id: state.agent_id.clone(),
+            run_id: state.run_id.clone(),
+            parent_run_id: state.parent_run_id.clone(),
             agent_type: state.agent_type.clone(),
             description: state.description.clone(),
             status: state.status.clone(),

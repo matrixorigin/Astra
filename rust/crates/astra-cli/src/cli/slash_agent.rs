@@ -2,6 +2,7 @@
 //!
 //! Subcommands:
 //! - `/agent` or `/agent list`: List all active spawned agents
+//! - `/agent tree`: Show agent delegation tree (parent-child hierarchy)
 //! - `/agent status <id>`: Show detailed status of an agent
 //! - `/agent permissions <id>`: Show permission details of an agent
 //! - `/agent stop <id>`: Send shutdown request to an agent
@@ -10,6 +11,7 @@
 
 use super::*;
 use astra_runtime::orchestration::{AgentStatus, DynamicAgentSpawner, PermissionSummary};
+use astra_runtime::turn::delegation_tree::{AgentTreeNode, render_agent_forest};
 use std::sync::Arc;
 
 /// Agent command context — passed from main.
@@ -24,6 +26,7 @@ pub fn handle_agent_command(arg: &str, ctx: &AgentCommandContext) {
 
     match subcmd {
         "" | "list" => show_list(ctx),
+        "tree" => show_tree(ctx),
         "status" => {
             if let Some(id) = parts.get(1) {
                 show_status(ctx, id);
@@ -143,6 +146,37 @@ fn show_list(ctx: &AgentCommandContext) {
         }
     }
     eprintln!();
+}
+
+fn show_tree(ctx: &AgentCommandContext) {
+    let Some(ref spawner) = ctx.spawner else {
+        eprintln!(
+            "  {}",
+            "No agent spawner available. Use spawn_agent tool to create agents.".dim()
+        );
+        return;
+    };
+
+    let rt = match tokio::runtime::Handle::try_current() {
+        Ok(rt) => rt,
+        Err(_) => {
+            eprintln!("  {}", "No tokio runtime available.".red());
+            return;
+        }
+    };
+
+    let agents = rt.block_on(spawner.list_all_agents());
+
+    eprintln!("\n  {}", "🌲 Agent Delegation Tree".cyan().bold());
+    eprintln!("  {}", "─".repeat(60).dim());
+
+    let forest = AgentTreeNode::build_forest(&agents);
+    let rendered = render_agent_forest(&forest);
+
+    // Indent all output
+    for line in rendered.lines() {
+        eprintln!("  {}", line);
+    }
 }
 
 fn show_status(ctx: &AgentCommandContext, agent_id: &str) {
@@ -542,6 +576,10 @@ fn show_help() {
     eprintln!("  {}", "─".repeat(50).dim());
     eprintln!("  {}  List all active agents", "/agent".white().bold());
     eprintln!("  {}  List all active agents", "/agent list".white().bold());
+    eprintln!(
+        "  {}  Show delegation tree (hierarchy)",
+        "/agent tree".white().bold()
+    );
     eprintln!(
         "  {}  Show agent status",
         "/agent status <id>".white().bold()
