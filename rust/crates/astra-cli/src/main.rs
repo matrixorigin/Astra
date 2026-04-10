@@ -92,6 +92,8 @@ mod permission_manager;
 mod plan_executor;
 #[path = "cli/plan_interaction.rs"]
 mod plan_interaction;
+#[path = "cli/project_instructions.rs"]
+mod project_instructions;
 #[path = "cli/readline_actor.rs"]
 mod readline_actor;
 #[path = "cli/repl_runtime.rs"]
@@ -3553,120 +3555,10 @@ async fn run_chat_repl(
 
 // Session cleanup moved to session_cleanup.rs
 use session_cleanup::finalize_session;
-
-/// Resolve `--system-prompt` value: if it starts with `@`, read the file;
-/// otherwise return the string as-is.
-fn resolve_system_prompt(sp: String) -> Result<String, String> {
-    if let Some(path) = sp.strip_prefix('@') {
-        if path.is_empty() {
-            return Err("Error: @file syntax requires a file path (e.g. @prompt.txt)".to_string());
-        }
-        match std::fs::read_to_string(path) {
-            Ok(content) => Ok(content),
-            Err(e) => Err(format!(
-                "Error: cannot read system prompt file '{}': {}",
-                path, e
-            )),
-        }
-    } else {
-        Ok(sp)
-    }
-}
-
-/// Discover project-level instructions from `.astra/instructions.md` files.
-///
-/// Search order (first match per level wins):
-/// 1. `.astra/instructions.md` in the current working directory (project-level)
-/// 2. `~/.astra/instructions.md` in the user home (global/user-level)
-///
-/// Both levels are combined if present: project-level first, then global,
-/// separated by a newline.
-fn discover_project_instructions() -> Option<String> {
-    let project_root = std::env::current_dir().ok();
-    let home = dirs::home_dir();
-    discover_instructions_from_paths(project_root.as_deref(), home.as_deref())
-}
-
-/// Core logic: discover instructions from explicit paths (testable without cwd mutation).
-fn discover_instructions_from_paths(
-    project_root: Option<&std::path::Path>,
-    home: Option<&std::path::Path>,
-) -> Option<String> {
-    let mut parts = Vec::new();
-
-    // Project-level: .astra/instructions.md
-    if let Some(root) = project_root {
-        let project_path = root.join(".astra").join("instructions.md");
-        if let Ok(content) = std::fs::read_to_string(&project_path) {
-            let trimmed = content.trim();
-            if !trimmed.is_empty() {
-                parts.push((project_path.display().to_string(), trimmed.to_string()));
-            }
-        }
-        // Project-level: .astra/knowledge.md (auto-generated learnings)
-        // Gated by MO_SESSION_KNOWLEDGE_INJECT (default: true). Allows users to disable
-        // cross-session knowledge injection independently of MO_SESSION_PROJECT_CONTEXT.
-        // Cap at 8KB to prevent unbounded token cost per turn.
-        let knowledge_inject = std::env::var("MO_SESSION_KNOWLEDGE_INJECT")
-            .map(|v| v != "0" && v.to_lowercase() != "false")
-            .unwrap_or(true);
-        if knowledge_inject {
-            let knowledge_path = root.join(".astra").join("knowledge.md");
-            if let Ok(content) = std::fs::read_to_string(&knowledge_path) {
-                let trimmed = content.trim();
-                if !trimmed.is_empty() {
-                    const KNOWLEDGE_MAX_BYTES: usize = 8 * 1024;
-                    let capped = if trimmed.len() > KNOWLEDGE_MAX_BYTES {
-                        // Walk back to a valid UTF-8 char boundary before truncating
-                        let mut end = KNOWLEDGE_MAX_BYTES;
-                        while end > 0 && !trimmed.is_char_boundary(end) {
-                            end -= 1;
-                        }
-                        let slice = &trimmed[..end];
-                        // Then truncate at last newline to avoid cutting mid-line
-                        match slice.rfind('\n') {
-                            Some(pos) => &slice[..pos],
-                            None => slice,
-                        }
-                    } else {
-                        trimmed
-                    };
-                    parts.push((knowledge_path.display().to_string(), capped.to_string()));
-                }
-            }
-        } // knowledge_inject gate
-    }
-
-    // User-level: ~/.astra/instructions.md
-    if let Some(h) = home {
-        let user_path = h.join(".astra").join("instructions.md");
-        if let Ok(content) = std::fs::read_to_string(&user_path) {
-            let trimmed = content.trim();
-            if !trimmed.is_empty() {
-                parts.push((user_path.display().to_string(), trimmed.to_string()));
-            }
-        }
-    }
-
-    if parts.is_empty() {
-        return None;
-    }
-
-    let combined = parts
-        .iter()
-        .map(|(path, content)| format!("<!-- source: {} -->\n{}", path, content))
-        .collect::<Vec<_>>()
-        .join("\n\n");
-
-    Some(combined)
-}
-
-/// Format project instructions for injection into the effective message.
-fn format_project_instructions(instructions: &str) -> String {
-    format!(
-        "<project_instructions>\nThe following are project-level instructions that apply to all interactions in this workspace.\n\n{instructions}\n</project_instructions>"
-    )
-}
+use project_instructions::{
+    discover_instructions_from_paths, discover_project_instructions, format_project_instructions,
+    resolve_system_prompt,
+};
 
 // ════════════════════════════════════════════════════════════════ main ════
 
