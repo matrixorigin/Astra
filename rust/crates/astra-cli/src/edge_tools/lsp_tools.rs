@@ -604,7 +604,7 @@ impl ToolExecutor {
                 "error": "Missing required 'operation' parameter",
                 "valid_operations": [
                     "goto_definition", "find_references", "hover", "document_symbols",
-                    "workspace_symbols", "call_hierarchy", "incoming_calls", "outgoing_calls", "declaration", "type_definition", "implementation", "prepare_rename", "rename", "code_actions", "completions", "signature_help", "document_highlight", "selection_ranges", "format_document", "format_range", "diagnostics"
+                    "workspace_symbols", "call_hierarchy", "incoming_calls", "outgoing_calls", "declaration", "type_definition", "implementation", "prepare_rename", "rename", "code_actions", "completions", "signature_help", "document_highlight", "selection_ranges", "linked_editing_range", "format_document", "format_range", "diagnostics"
                 ]
             }).to_string(),
         };
@@ -1114,6 +1114,29 @@ impl ToolExecutor {
                 }
             }
 
+            "linked_editing_range" => {
+                if let (Some(f), Some(l), Some(c)) = (file, line, column) {
+                    match self.try_active_position_request(
+                        "linked_editing_range",
+                        f,
+                        l,
+                        c,
+                        "textDocument/linkedEditingRange",
+                        None,
+                    ) {
+                        Ok(Some(result)) => result,
+                        Ok(None) => json!({
+                            "error": "linked_editing_range requires an active LSP backend for that file"
+                        }).to_string(),
+                        Err(error) => json!({ "error": error }).to_string(),
+                    }
+                } else {
+                    json!({
+                        "error": "linked_editing_range requires 'file'+'line'+'column'"
+                    }).to_string()
+                }
+            }
+
             "format_document" => {
                 if let Some(f) = file {
                     match self.try_active_document_formatting(f) {
@@ -1216,6 +1239,7 @@ impl ToolExecutor {
                             "signature_help": true,
                             "document_highlight": true,
                             "selection_ranges": true,
+                            "linked_editing_range": true,
                             "format_document": true,
                             "format_range": true
                         },
@@ -1233,7 +1257,7 @@ impl ToolExecutor {
                 "error": format!("Unknown operation: {}", operation),
                 "valid_operations": [
                     "goto_definition", "find_references", "hover", "document_symbols",
-                    "workspace_symbols", "call_hierarchy", "incoming_calls", "outgoing_calls", "declaration", "type_definition", "implementation", "prepare_rename", "rename", "code_actions", "completions", "signature_help", "document_highlight", "selection_ranges", "format_document", "format_range", "diagnostics"
+                    "workspace_symbols", "call_hierarchy", "incoming_calls", "outgoing_calls", "declaration", "type_definition", "implementation", "prepare_rename", "rename", "code_actions", "completions", "signature_help", "document_highlight", "selection_ranges", "linked_editing_range", "format_document", "format_range", "diagnostics"
                 ]
             }).to_string()
         }
