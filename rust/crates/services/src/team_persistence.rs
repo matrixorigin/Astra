@@ -927,6 +927,8 @@ impl TeamPersistenceService for MatrixOneTeamStore {
     ) -> Result<(), String> {
         // Retention: prune oldest completed rows beyond limit.
         // Only completed records are pruned — running records are preserved.
+        // Uses a subquery instead of DELETE ... ORDER BY ... LIMIT because
+        // MatrixOne does not support ORDER BY in multi-table DELETE syntax.
         const MAX_COMPLETED_PER_TEAM: u32 = 100;
         sqlx::query(
             "DELETE FROM team_execution_history \

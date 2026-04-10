@@ -255,7 +255,9 @@ impl AgentMailboxRouter {
         {
             let mut idx = self.agent_id_index.write().await;
             if let Some(existing) = idx.get(&addr.agent_id) {
-                if existing != &addr {
+                if existing == &addr {
+                    // Already registered with same address — no-op.
+                } else {
                     eprintln!(
                         "  ⚠ messaging: agent_id '{}' already registered as {}; overwriting with {}",
                         addr.agent_id, existing, addr
@@ -268,18 +270,13 @@ impl AgentMailboxRouter {
                     // Re-acquire and re-verify: another thread may have registered
                     // a fresh entry for the same agent_id during the lock gap.
                     idx = self.agent_id_index.write().await;
-                    if let Some(current) = idx.get(&addr.agent_id) {
-                        if current.run_id != stale_run_id && current != &addr {
-                            // Another thread registered a new (non-stale) entry; don't overwrite.
-                            // Our caller will still get a working mailbox via address_registry below.
-                        } else {
-                            idx.insert(addr.agent_id.clone(), addr.clone());
-                        }
-                    } else {
+                    // Skip insert if a newer (non-stale) entry was registered concurrently.
+                    let superseded = idx
+                        .get(&addr.agent_id)
+                        .is_some_and(|c| c.run_id != stale_run_id && c != &addr);
+                    if !superseded {
                         idx.insert(addr.agent_id.clone(), addr.clone());
                     }
-                } else {
-                    idx.insert(addr.agent_id.clone(), addr.clone());
                 }
             } else {
                 idx.insert(addr.agent_id.clone(), addr.clone());

@@ -740,7 +740,10 @@ impl DelegationEngine {
 
     /// Attach a cancellation token for cooperative shutdown of spawned sub-runs.
     pub fn with_cancel_token(self, token: Arc<tokio_util::sync::CancellationToken>) -> Self {
-        *self.cancel_token.lock().unwrap_or_else(|e| e.into_inner()) = Some(token);
+        *self.cancel_token.lock().unwrap_or_else(|e| {
+                    eprintln!("[delegation] cancel_token Mutex poisoned — recovering from sub-task panic");
+                    e.into_inner()
+                }) = Some(token);
         self
     }
 
@@ -757,7 +760,10 @@ impl DelegationEngine {
     /// Works through `Arc<DelegationEngine>` (no `&mut self` needed) so the orchestrator
     /// can create a fresh token per team execution.
     pub fn set_cancel_token(&self, token: Arc<tokio_util::sync::CancellationToken>) {
-        *self.cancel_token.lock().unwrap_or_else(|e| e.into_inner()) = Some(token);
+        *self.cancel_token.lock().unwrap_or_else(|e| {
+                    eprintln!("[delegation] cancel_token Mutex poisoned — recovering from sub-task panic");
+                    e.into_inner()
+                }) = Some(token);
     }
 
     /// Remove the current verification gate (sub-runs will bypass verification).
@@ -778,7 +784,10 @@ impl DelegationEngine {
             executor: self.executor.clone(),
             gate: Some(gate),
             mailbox_router: self.mailbox_router.clone(),
-            cancel_token: std::sync::Mutex::new(self.cancel_token.lock().unwrap_or_else(|e| e.into_inner()).clone()),
+            cancel_token: std::sync::Mutex::new(self.cancel_token.lock().unwrap_or_else(|e| {
+                        eprintln!("[delegation] cancel_token Mutex poisoned — recovering from sub-task panic");
+                        e.into_inner()
+                    }).clone()),
         }
     }
 
@@ -792,13 +801,19 @@ impl DelegationEngine {
             executor: self.executor.clone(),
             gate: None,
             mailbox_router: self.mailbox_router.clone(),
-            cancel_token: std::sync::Mutex::new(self.cancel_token.lock().unwrap_or_else(|e| e.into_inner()).clone()),
+            cancel_token: std::sync::Mutex::new(self.cancel_token.lock().unwrap_or_else(|e| {
+                        eprintln!("[delegation] cancel_token Mutex poisoned — recovering from sub-task panic");
+                        e.into_inner()
+                    }).clone()),
         }
     }
 
     /// Read the current cancel token snapshot.
     fn current_cancel_token(&self) -> Option<Arc<tokio_util::sync::CancellationToken>> {
-        self.cancel_token.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.cancel_token.lock().unwrap_or_else(|e| {
+                    eprintln!("[delegation] cancel_token Mutex poisoned — recovering from sub-task panic");
+                    e.into_inner()
+                }).clone()
     }
 
     /// Validate a delegation request without executing it.
