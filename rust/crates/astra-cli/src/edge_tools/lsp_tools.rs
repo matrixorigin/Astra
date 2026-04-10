@@ -485,7 +485,7 @@ impl ToolExecutor {
                 "error": "Missing required 'operation' parameter",
                 "valid_operations": [
                     "goto_definition", "find_references", "hover", "document_symbols",
-                    "workspace_symbols", "call_hierarchy", "incoming_calls", "outgoing_calls", "implementation", "rename", "code_actions", "completions", "signature_help", "document_highlight", "diagnostics"
+                    "workspace_symbols", "call_hierarchy", "incoming_calls", "outgoing_calls", "type_definition", "implementation", "rename", "code_actions", "completions", "signature_help", "document_highlight", "diagnostics"
                 ]
             }).to_string(),
         };
@@ -564,6 +564,29 @@ impl ToolExecutor {
                 } else {
                     json!({
                         "error": "find_references requires 'symbol' parameter"
+                    }).to_string()
+                }
+            }
+
+            "type_definition" => {
+                if let (Some(f), Some(l), Some(c)) = (file, line, column) {
+                    match self.try_active_position_request(
+                        "type_definition",
+                        f,
+                        l,
+                        c,
+                        "textDocument/typeDefinition",
+                        None,
+                    ) {
+                        Ok(Some(result)) => result,
+                        Ok(None) => json!({
+                            "error": "type_definition requires an active LSP backend for that file"
+                        }).to_string(),
+                        Err(error) => json!({ "error": error }).to_string(),
+                    }
+                } else {
+                    json!({
+                        "error": "type_definition requires 'file'+'line'+'column'"
                     }).to_string()
                 }
             }
@@ -917,6 +940,7 @@ impl ToolExecutor {
                             "document_symbols": true,
                             "workspace_symbols": true,
                             "call_hierarchy": true,
+                            "type_definition": true,
                             "implementation": true,
                             "rename": true,
                             "code_actions": true,
@@ -938,7 +962,7 @@ impl ToolExecutor {
                 "error": format!("Unknown operation: {}", operation),
                 "valid_operations": [
                     "goto_definition", "find_references", "hover", "document_symbols",
-                    "workspace_symbols", "call_hierarchy", "incoming_calls", "outgoing_calls", "implementation", "rename", "code_actions", "completions", "signature_help", "document_highlight", "diagnostics"
+                    "workspace_symbols", "call_hierarchy", "incoming_calls", "outgoing_calls", "type_definition", "implementation", "rename", "code_actions", "completions", "signature_help", "document_highlight", "diagnostics"
                 ]
             }).to_string()
         }
