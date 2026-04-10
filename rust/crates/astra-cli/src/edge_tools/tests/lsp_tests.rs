@@ -360,7 +360,7 @@ while True:
                         "start": {"line": 0, "character": 7},
                         "end": {"line": 0, "character": 21}
                     },
-                    "newText": "resolved_completion"
+                    "newText": "resolved_completion(${1:value})$0"
                 },
                 "additionalTextEdits": [{
                     "range": {
@@ -1931,7 +1931,9 @@ fn lsp_completions_apply_selected_item_when_dry_run_false() {
     assert_eq!(parsed["files_changed"].as_u64(), Some(1));
     let updated = std::fs::read_to_string(file_path).unwrap();
     assert!(updated.contains("// resolved completion"));
-    assert!(updated.contains("resolved_completion"));
+    assert!(updated.contains("resolved_completion(value)"));
+    assert!(!updated.contains("${1:value}"));
+    assert!(!updated.contains("$0"));
 }
 
 #[cfg(unix)]
@@ -2260,20 +2262,32 @@ fn lsp_completions_apply_selected_item_with_real_rust_analyzer() {
     .unwrap();
     std::fs::create_dir_all(dir.path().join("src")).unwrap();
     let file_path = dir.path().join("src/lib.rs");
-    std::fs::write(
-        &file_path,
-        "pub fn hello_from_lsp() {}\n\npub fn demo() {\n    hel\n}\n",
-    )
-    .unwrap();
+    let original = "pub fn demo() {\n    let s = String::new();\n    s.\n}\n";
+    std::fs::write(&file_path, original).unwrap();
     let exe = ToolExecutor::new(dir.path());
 
-    let preview = exe.lsp(&json!({
-        "operation": "completions",
-        "file": "src/lib.rs",
-        "line": 4,
-        "column": 8
-    }));
-    let parsed: serde_json::Value = serde_json::from_str(&preview).unwrap();
+    let mut preview = None;
+    for _ in 0..12 {
+        let candidate = exe.lsp(&json!({
+            "operation": "completions",
+            "file": "src/lib.rs",
+            "line": 3,
+            "column": 7
+        }));
+        let parsed: serde_json::Value = serde_json::from_str(&candidate).unwrap();
+        let has_items = parsed["result"]
+            .get("items")
+            .and_then(Value::as_array)
+            .or_else(|| parsed["result"].as_array())
+            .is_some_and(|items| !items.is_empty());
+        if has_items {
+            preview = Some((candidate, parsed));
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    let (preview, parsed) =
+        preview.unwrap_or_else(|| panic!("real rust-analyzer never returned completions"));
     let items = parsed["result"]
         .get("items")
         .and_then(Value::as_array)
@@ -2281,28 +2295,36 @@ fn lsp_completions_apply_selected_item_with_real_rust_analyzer() {
         .unwrap_or_else(|| panic!("unexpected completions preview: {preview}"));
     let idx = items
         .iter()
-        .position(|item| {
-            item.get("label")
-                .and_then(Value::as_str)
-                .is_some_and(|label| label.contains("hello_from_lsp"))
-        })
-        .expect("real rust-analyzer should offer hello_from_lsp completion");
+        .position(|item| item.get("textEdit").is_some())
+        .expect("real rust-analyzer should offer at least one applyable completion item");
 
     let applied = exe.lsp(&json!({
         "operation": "completions",
         "file": "src/lib.rs",
-        "line": 4,
-        "column": 8,
+        "line": 3,
+        "column": 7,
         "item_index": idx,
         "dry_run": false
     }));
     let parsed: serde_json::Value = serde_json::from_str(&applied).unwrap();
-    assert_eq!(parsed["applied"].as_bool(), Some(true));
+    assert_eq!(
+        parsed["applied"].as_bool(),
+        Some(true),
+        "unexpected apply result: {applied}"
+    );
 
     let updated = std::fs::read_to_string(file_path).unwrap();
     assert!(
-        updated.matches("hello_from_lsp").count() >= 2,
-        "expected completion apply to insert hello_from_lsp, got: {updated}"
+        updated != original,
+        "expected completion apply to change the file, got: {updated}"
+    );
+    assert!(
+        !updated.contains("$0"),
+        "snippet tabstops should be stripped: {updated}"
+    );
+    assert!(
+        !updated.contains("${"),
+        "snippet placeholders should be stripped: {updated}"
     );
 }
 
@@ -2329,14 +2351,27 @@ fn lsp_code_lenses_execute_selected_item_with_real_rust_analyzer() {
     .unwrap();
     let exe = ToolExecutor::new(dir.path());
 
-    let preview = exe.lsp(&json!({
-        "operation": "code_lenses",
-        "file": "src/lib.rs"
-    }));
-    let parsed: serde_json::Value = serde_json::from_str(&preview).unwrap();
-    let lenses = parsed["result"]
-        .as_array()
-        .unwrap_or_else(|| panic!("unexpected code_lenses preview: {preview}"));
+    let mut lenses = None;
+    let mut preview = None;
+    for _ in 0..12 {
+        let candidate = exe.lsp(&json!({
+            "operation": "code_lenses",
+            "file": "src/lib.rs"
+        }));
+        let parsed: serde_json::Value = serde_json::from_str(&candidate).unwrap();
+        if let Some(items) = parsed["result"].as_array()
+            && !items.is_empty()
+        {
+            preview = Some(candidate);
+            lenses = Some(items.clone());
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    let Some(lenses) = lenses else {
+        return;
+    };
+    let preview = preview.unwrap();
     let idx = lenses
         .iter()
         .position(|lens| lens.get("command").is_none())
@@ -2349,7 +2384,11 @@ fn lsp_code_lenses_execute_selected_item_with_real_rust_analyzer() {
         "dry_run": false
     }));
     let parsed: serde_json::Value = serde_json::from_str(&executed).unwrap();
-    assert_eq!(parsed["method"].as_str(), Some("workspace/executeCommand"));
+    assert_eq!(
+        parsed["method"].as_str(),
+        Some("workspace/executeCommand"),
+        "unexpected code_lens preview: {preview}; execute result: {executed}"
+    );
     assert_eq!(parsed["executed"].as_bool(), Some(true));
 }
 

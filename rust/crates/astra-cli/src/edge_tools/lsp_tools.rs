@@ -732,11 +732,124 @@ impl ToolExecutor {
         )
     }
 
+    fn lsp_snippet_to_plain_text(snippet: &str) -> String {
+        fn parse_placeholder(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> String {
+            while chars.peek().is_some_and(|ch| ch.is_ascii_digit()) {
+                chars.next();
+            }
+            match chars.peek().copied() {
+                Some(':') => {
+                    chars.next();
+                    parse_until_brace(chars)
+                }
+                Some('|') => {
+                    chars.next();
+                    parse_choice(chars)
+                }
+                Some('}') => {
+                    chars.next();
+                    String::new()
+                }
+                _ => {
+                    while let Some(ch) = chars.next() {
+                        match ch {
+                            '\\' => {
+                                chars.next();
+                            }
+                            '}' => break,
+                            _ => {}
+                        }
+                    }
+                    String::new()
+                }
+            }
+        }
+
+        fn parse_until_brace(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> String {
+            let mut out = String::new();
+            while let Some(ch) = chars.next() {
+                match ch {
+                    '\\' => {
+                        if let Some(next) = chars.next() {
+                            out.push(next);
+                        }
+                    }
+                    '$' => match chars.peek().copied() {
+                        Some('{') => {
+                            chars.next();
+                            out.push_str(&parse_placeholder(chars));
+                        }
+                        Some(next) if next.is_ascii_digit() => {
+                            while chars.peek().is_some_and(|digit| digit.is_ascii_digit()) {
+                                chars.next();
+                            }
+                        }
+                        _ => out.push('$'),
+                    },
+                    '}' => break,
+                    _ => out.push(ch),
+                }
+            }
+            out
+        }
+
+        fn parse_choice(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> String {
+            let mut first = String::new();
+            let mut collecting_first = true;
+            while let Some(ch) = chars.next() {
+                match ch {
+                    '\\' => {
+                        if let Some(next) = chars.next()
+                            && collecting_first
+                        {
+                            first.push(next);
+                        }
+                    }
+                    ',' => collecting_first = false,
+                    '|' if chars.peek() == Some(&'}') => {
+                        chars.next();
+                        break;
+                    }
+                    _ if collecting_first => first.push(ch),
+                    _ => {}
+                }
+            }
+            first
+        }
+
+        let mut chars = snippet.chars().peekable();
+        let mut out = String::new();
+        while let Some(ch) = chars.next() {
+            match ch {
+                '\\' => {
+                    if let Some(next) = chars.next() {
+                        out.push(next);
+                    }
+                }
+                '$' => match chars.peek().copied() {
+                    Some('{') => {
+                        chars.next();
+                        out.push_str(&parse_placeholder(&mut chars));
+                    }
+                    Some(next) if next.is_ascii_digit() => {
+                        while chars.peek().is_some_and(|digit| digit.is_ascii_digit()) {
+                            chars.next();
+                        }
+                    }
+                    _ => out.push('$'),
+                },
+                _ => out.push(ch),
+            }
+        }
+        out
+    }
+
     fn normalize_completion_text_edit(edit: &Value) -> Result<Value, String> {
-        let new_text = edit
-            .get("newText")
-            .and_then(Value::as_str)
-            .ok_or_else(|| "CompletionItem textEdit is missing newText".to_string())?;
+        let new_text = Self::lsp_snippet_to_plain_text(
+            edit.get("newText")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "CompletionItem textEdit is missing newText".to_string())?,
+        );
         if let Some(range) = edit.get("range") {
             return Ok(json!({
                 "range": range,
@@ -762,7 +875,12 @@ impl ToolExecutor {
             let additional = additional
                 .as_array()
                 .ok_or_else(|| "CompletionItem additionalTextEdits must be an array".to_string())?;
-            edits.extend(additional.iter().cloned());
+            edits.extend(
+                additional
+                    .iter()
+                    .map(Self::normalize_completion_text_edit)
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
         }
         if edits.is_empty() {
             return Err(
