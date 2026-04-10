@@ -896,6 +896,7 @@ fn commit_turn_journal_workspace_and_sidecars(
             // Persist plan state to workspace for session resume
             sync_plan_fields_to_workspace(state, &mut ws);
             sync_context_trace_to_workspace(state, &mut ws);
+            sync_session_state_to_workspace(state, &mut ws);
 
             // Check if checkpoint is due
             if astra_services::session_checkpoint::should_checkpoint(
@@ -1648,6 +1649,16 @@ fn sync_plan_fields_to_workspace(
         .as_ref()
         .and_then(|d| serde_json::to_string(&d.contract).ok());
     ws.plan_corrections = state.plan_execution_corrections.clone();
+}
+
+/// Sync session state fields to workspace for resume capability.
+fn sync_session_state_to_workspace(
+    state: &ReplState,
+    ws: &mut astra_services::session_workspace::WorkspaceMetadata,
+) {
+    ws.session_goal = state.session_goal.clone();
+    ws.pinned_skills = state.pinned_skills.iter().cloned().collect();
+    ws.discovered_skills = state.discovered_skills.iter().cloned().collect();
 }
 
 fn latest_context_trace_signal(state: &ReplState) -> Option<ContextTraceSignal> {

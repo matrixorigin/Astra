@@ -550,6 +550,13 @@ pub(super) fn initialize_repl_state(
                 state.recent_tools = heavy.recent_tools;
             }
         }
+
+        // Restore session-level state from workspace.yaml (goal, pinned/discovered skills)
+        if let Ok(ws) = astra_services::session_workspace::read_workspace(sid) {
+            state.session_goal = ws.session_goal;
+            state.pinned_skills = ws.pinned_skills.into_iter().collect();
+            state.discovered_skills = ws.discovered_skills.into_iter().collect();
+        }
     }
     if let Some(m) = initial_model {
         state.model = Some(m.to_string());

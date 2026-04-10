@@ -256,6 +256,17 @@ pub struct WorkspaceMetadata {
     /// Compact summary of the most recent context-assembly trace.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_context_trace: Option<ContextTraceSignal>,
+
+    // ─── Session state persistence (for resume) ───
+    /// User-stated session goal (e.g. "implement auth module").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_goal: Option<String>,
+    /// Skills explicitly pinned by the user.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pinned_skills: Vec<String>,
+    /// Skills discovered during this session.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub discovered_skills: Vec<String>,
 }
 
 impl WorkspaceMetadata {
@@ -337,6 +348,9 @@ impl WorkspaceMetadata {
             correlation_id: None,
             agent_role: None,
             last_context_trace: None,
+            session_goal: None,
+            pinned_skills: Vec::new(),
+            discovered_skills: Vec::new(),
         }
     }
     pub fn with_context(
@@ -373,6 +387,9 @@ impl WorkspaceMetadata {
             correlation_id: None,
             agent_role: None,
             last_context_trace: None,
+            session_goal: None,
+            pinned_skills: Vec::new(),
+            discovered_skills: Vec::new(),
         }
     }
 
