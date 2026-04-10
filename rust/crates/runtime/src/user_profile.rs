@@ -139,12 +139,16 @@ impl UserPreferences {
 
     /// Check if a tool is preferred.
     pub fn is_preferred_tool(&self, tool_name: &str) -> bool {
-        self.preferred_tools.iter().any(|t| t == tool_name || tool_name.starts_with(t))
+        self.preferred_tools
+            .iter()
+            .any(|t| t == tool_name || tool_name.starts_with(t))
     }
 
     /// Check if a tool is blocked.
     pub fn is_blocked_tool(&self, tool_name: &str) -> bool {
-        self.blocked_tools.iter().any(|t| t == tool_name || tool_name.starts_with(t))
+        self.blocked_tools
+            .iter()
+            .any(|t| t == tool_name || tool_name.starts_with(t))
     }
 }
 
@@ -201,7 +205,9 @@ impl Verbosity {
             Verbosity::Quiet => "Be extremely concise. Output only essential information.",
             Verbosity::Normal => "Be concise but clear. Explain important decisions briefly.",
             Verbosity::Verbose => "Explain your reasoning in detail. Walk through each step.",
-            Verbosity::Debug => "Provide maximum detail including all reasoning, alternatives considered, and debugging information.",
+            Verbosity::Debug => {
+                "Provide maximum detail including all reasoning, alternatives considered, and debugging information."
+            }
         }
     }
 }
@@ -259,7 +265,9 @@ impl LanguageStyle {
         }
 
         match self.code_comments {
-            CodeCommentStyle::None => parts.push("Don't add comments to generated code".to_string()),
+            CodeCommentStyle::None => {
+                parts.push("Don't add comments to generated code".to_string())
+            }
             CodeCommentStyle::Minimal => {
                 parts.push("Only add comments for non-obvious code".to_string())
             }
@@ -580,27 +588,79 @@ impl ScenarioDetector {
 fn scenario_keywords(scenario: Scenario) -> Vec<&'static str> {
     match scenario {
         Scenario::CodeReview => vec![
-            "review", "pr", "pull request", "diff", "change", "feedback", "comment", "approve",
+            "review",
+            "pr",
+            "pull request",
+            "diff",
+            "change",
+            "feedback",
+            "comment",
+            "approve",
         ],
         Scenario::Debugging => vec![
             "bug", "fix", "error", "crash", "debug", "issue", "problem", "wrong", "fail", "broken",
         ],
         Scenario::Exploration => vec![
-            "find", "search", "where", "what", "how", "explore", "look", "understand", "show",
+            "find",
+            "search",
+            "where",
+            "what",
+            "how",
+            "explore",
+            "look",
+            "understand",
+            "show",
         ],
         Scenario::Planning => vec![
-            "plan", "design", "architect", "strategy", "approach", "think", "consider", "propose",
+            "plan",
+            "design",
+            "architect",
+            "strategy",
+            "approach",
+            "think",
+            "consider",
+            "propose",
         ],
         Scenario::Implementation => vec![
-            "create", "implement", "add", "build", "write", "new", "feature", "develop",
+            "create",
+            "implement",
+            "add",
+            "build",
+            "write",
+            "new",
+            "feature",
+            "develop",
         ],
         Scenario::Refactoring => vec![
-            "refactor", "restructure", "clean", "improve", "optimize", "reorganize", "simplify",
+            "refactor",
+            "restructure",
+            "clean",
+            "improve",
+            "optimize",
+            "reorganize",
+            "simplify",
         ],
-        Scenario::Testing => vec!["test", "spec", "assert", "verify", "coverage", "unit", "integration"],
-        Scenario::Documentation => vec!["doc", "comment", "readme", "explain", "describe", "document"],
+        Scenario::Testing => vec![
+            "test",
+            "spec",
+            "assert",
+            "verify",
+            "coverage",
+            "unit",
+            "integration",
+        ],
+        Scenario::Documentation => vec![
+            "doc", "comment", "readme", "explain", "describe", "document",
+        ],
         Scenario::DevOps => vec![
-            "deploy", "ci", "cd", "pipeline", "docker", "kubernetes", "config", "env",
+            "deploy",
+            "ci",
+            "cd",
+            "pipeline",
+            "docker",
+            "kubernetes",
+            "config",
+            "env",
         ],
         Scenario::Learning => vec![
             "learn", "tutorial", "example", "teach", "explain", "how does", "what is",
@@ -642,7 +702,11 @@ impl UserStats {
 
     /// Get top N most used tools.
     pub fn top_tools(&self, n: usize) -> Vec<(&str, u64)> {
-        let mut tools: Vec<_> = self.tool_usage.iter().map(|(k, v)| (k.as_str(), *v)).collect();
+        let mut tools: Vec<_> = self
+            .tool_usage
+            .iter()
+            .map(|(k, v)| (k.as_str(), *v))
+            .collect();
         tools.sort_by(|a, b| b.1.cmp(&a.1));
         tools.truncate(n);
         tools
@@ -705,14 +769,20 @@ impl UserProfileStore {
 
         // Create new profile
         let profile = UserProfile::new(user_id);
-        self.profiles.write().unwrap().insert(user_id.to_string(), profile.clone());
+        self.profiles
+            .write()
+            .unwrap()
+            .insert(user_id.to_string(), profile.clone());
         self.persist();
         profile
     }
 
     /// Update a user profile.
     pub fn update(&self, profile: UserProfile) {
-        self.profiles.write().unwrap().insert(profile.user_id.clone(), profile);
+        self.profiles
+            .write()
+            .unwrap()
+            .insert(profile.user_id.clone(), profile);
         self.persist();
     }
 
@@ -839,14 +909,19 @@ impl UserProfileManager {
         if let Some(scenario) = profile.current_scenario {
             let strategy = scenario.strategy_hints();
             if strategy.prefer_read_only {
-                instructions.push("Focus on reading and analysis, avoid modifications unless asked.".to_string());
+                instructions.push(
+                    "Focus on reading and analysis, avoid modifications unless asked.".to_string(),
+                );
             }
         }
 
         if instructions.is_empty() {
             String::new()
         } else {
-            format!("<user_preferences>\n{}\n</user_preferences>", instructions.join("\n"))
+            format!(
+                "<user_preferences>\n{}\n</user_preferences>",
+                instructions.join("\n")
+            )
         }
     }
 

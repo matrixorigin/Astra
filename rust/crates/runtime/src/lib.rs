@@ -79,14 +79,14 @@ pub(crate) use storage::{
 
 // ── Public modules: runtime core ─────────────────────────────────────────────
 
+pub mod ab_testing;
 mod app_state;
+pub mod auto_tuning;
 pub mod bridge;
 pub mod evaluation;
 pub mod introspection;
 pub mod matrix_cloud_runtime;
 pub mod output_style;
-pub mod ab_testing;
-pub mod auto_tuning;
 pub mod observability_integration;
 pub mod pipeline;
 pub mod plan;

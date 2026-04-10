@@ -516,7 +516,12 @@ impl ExperimentBuilder {
     /// Build the experiment.
     pub fn build(mut self) -> Experiment {
         // Normalize traffic percentages
-        let total: f64 = self.experiment.variants.iter().map(|v| v.traffic_percentage).sum();
+        let total: f64 = self
+            .experiment
+            .variants
+            .iter()
+            .map(|v| v.traffic_percentage)
+            .sum();
         if total > 0.0 && (total - 1.0).abs() > 0.01 {
             for variant in &mut self.experiment.variants {
                 variant.traffic_percentage /= total;
@@ -769,7 +774,8 @@ impl ExperimentAnalyzer {
         // Calculate stats per variant
         let mut variant_stats = HashMap::new();
         for (variant_id, variant_outcomes) in &by_variant {
-            let stats = Self::calculate_variant_stats(variant_id, variant_outcomes, &experiment.metrics);
+            let stats =
+                Self::calculate_variant_stats(variant_id, variant_outcomes, &experiment.metrics);
             variant_stats.insert(variant_id.clone(), stats);
         }
 
@@ -806,11 +812,8 @@ impl ExperimentAnalyzer {
         }
 
         // Determine recommendation
-        let recommendation = Self::determine_recommendation(
-            experiment,
-            &variant_stats,
-            &comparisons,
-        );
+        let recommendation =
+            Self::determine_recommendation(experiment, &variant_stats, &comparisons);
 
         ExperimentAnalysis {
             experiment_id: experiment.id.clone(),
@@ -835,7 +838,10 @@ impl ExperimentAnalyzer {
                 .collect();
 
             if !values.is_empty() {
-                metric_stats.insert(metric.name.clone(), Self::calculate_metric_stats(&metric.name, &values));
+                metric_stats.insert(
+                    metric.name.clone(),
+                    Self::calculate_metric_stats(&metric.name, &values),
+                );
             }
         }
 
@@ -959,7 +965,10 @@ impl ExperimentAnalyzer {
         comparisons: &[VariantComparison],
     ) -> Recommendation {
         // Check sample size
-        if stats.values().any(|s| s.sample_count < experiment.min_samples_per_variant as usize) {
+        if stats
+            .values()
+            .any(|s| s.sample_count < experiment.min_samples_per_variant as usize)
+        {
             return Recommendation::InsufficientData;
         }
 
@@ -1068,7 +1077,7 @@ mod tests {
     #[test]
     fn test_outcome_recording() {
         let store = ExperimentStore::new();
-        
+
         let outcome = ExperimentOutcome::new("user1", "control")
             .with_metric("token_usage", 1500.0)
             .with_metric("latency_ms", 250.0)
