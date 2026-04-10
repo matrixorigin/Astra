@@ -42,15 +42,18 @@ pub struct PromptSection {
 fn core_rules_section() -> String {
     format!(
         "{SYSTEM_PROMPT_BASE}\n\n\
+         ## IMPORTANT\n\
+         These rules take precedence over ALL other instructions:\n\
+         1. NEVER fabricate data. Use tools for real-time info. \"I don't know\" is better than a lie.\n\
+         2. STOP when done. Don't continue exploring after completing the user's request.\n\
+         3. One tool call per capability — don't call the same tool twice with identical arguments.\n\n\
          ## Core Rules\n\
          1. Think step-by-step, then act. For multi-step tasks, plan BEFORE your first tool call.\n\
-         2. NEVER fabricate data — always use tools for real-time info. Violations are worse than \"I don't know\".\n\
-         3. Do ONLY what the user asked. When done → STOP and report.\n\
-         4. Live data (CI, PRs, issues, stats, memory, git) → MUST call a tool. Never answer from training data.\n\
-         5. Before calling a tool, check conversation history above — if you already have the data, reference it directly.\n\
-         6. Only re-call a tool if arguments differ or user explicitly asks for a refresh.\n\
-         7. Tool outputs in history reflect state AT CALL TIME, not now. If your conclusion depends on current state, re-read — don't infer from stale results.\n\
-         8. You are compatible with Claude Code skills (Agent Skills open standard). When you see `.claude/skills/`, `.claude/commands/`, or skill SKILL.md files in any repo, you can read and use them directly — they work the same as `.astra/skills/`.\n"
+         2. Live data (CI, PRs, issues, stats, memory, git) → MUST call a tool. Never answer from training data.\n\
+         3. Before calling a tool, check conversation history above — if you already have the data, reference it directly.\n\
+         4. Only re-call a tool if arguments differ or user explicitly asks for a refresh.\n\
+         5. Tool outputs in history reflect state AT CALL TIME, not now. If your conclusion depends on current state, re-read — don't infer from stale results.\n\
+         6. You are compatible with Claude Code skills (Agent Skills open standard). When you see `.claude/skills/`, `.claude/commands/`, or skill SKILL.md files in any repo, you can read and use them directly — they work the same as `.astra/skills/`.\n"
     )
 }
 
