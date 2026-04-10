@@ -615,6 +615,87 @@ impl ToolExecutor {
         )
     }
 
+    fn try_active_document_colors(&self, file: &str) -> Result<Option<Value>, String> {
+        let (file_path, uri) = self.ensure_lsp_file_ready(file)?;
+        self.passive_lsp.request_for_file(
+            &self.project_root,
+            &file_path,
+            "textDocument/documentColor",
+            json!({
+                "textDocument": { "uri": uri },
+            }),
+        )
+    }
+
+    fn lsp_range_contains_position(range: &Value, line: usize, column: usize) -> bool {
+        if line == 0 || column == 0 {
+            return false;
+        }
+        let line = line.saturating_sub(1) as u64;
+        let column = column.saturating_sub(1) as u64;
+        let start_line = range
+            .get("start")
+            .and_then(|v| v.get("line"))
+            .and_then(Value::as_u64);
+        let start_character = range
+            .get("start")
+            .and_then(|v| v.get("character"))
+            .and_then(Value::as_u64);
+        let end_line = range
+            .get("end")
+            .and_then(|v| v.get("line"))
+            .and_then(Value::as_u64);
+        let end_character = range
+            .get("end")
+            .and_then(|v| v.get("character"))
+            .and_then(Value::as_u64);
+        match (start_line, start_character, end_line, end_character) {
+            (Some(sl), Some(sc), Some(el), Some(ec)) => {
+                (sl, sc) <= (line, column) && (line, column) < (el, ec)
+            }
+            _ => false,
+        }
+    }
+
+    fn try_active_color_presentations(
+        &self,
+        file: &str,
+        line: usize,
+        column: usize,
+    ) -> Result<Option<Value>, String> {
+        let Some(colors) = self.try_active_document_colors(file)? else {
+            return Ok(None);
+        };
+        let Some(color_entry) = colors.as_array().and_then(|items| {
+            items.iter().find(|item| {
+                item.get("range")
+                    .map(|range| Self::lsp_range_contains_position(range, line, column))
+                    .unwrap_or(false)
+            })
+        }) else {
+            return Err("No document color found at the requested position".to_string());
+        };
+        let color = color_entry
+            .get("color")
+            .cloned()
+            .ok_or_else(|| "documentColor entry missing color".to_string())?;
+        let range = color_entry
+            .get("range")
+            .cloned()
+            .ok_or_else(|| "documentColor entry missing range".to_string())?;
+        let (file_path, uri) = self.ensure_lsp_file_ready(file)?;
+        self.passive_lsp.request_for_file(
+            &self.project_root,
+            &file_path,
+            "textDocument/colorPresentation",
+            json!({
+                "textDocument": { "uri": uri },
+                "color": color,
+                "range": range,
+            }),
+        )
+    }
+
     fn try_active_selection_ranges(
         &self,
         file: &str,
@@ -696,7 +777,7 @@ impl ToolExecutor {
                 "error": "Missing required 'operation' parameter",
                 "valid_operations": [
                     "goto_definition", "find_references", "hover", "document_symbols",
-                    "workspace_symbols", "call_hierarchy", "incoming_calls", "outgoing_calls", "declaration", "type_definition", "implementation", "prepare_rename", "rename", "code_actions", "completions", "signature_help", "document_highlight", "document_links", "inlay_hints", "folding_ranges", "selection_ranges", "linked_editing_range", "format_document", "format_range", "format_on_type", "diagnostics"
+                    "workspace_symbols", "call_hierarchy", "incoming_calls", "outgoing_calls", "declaration", "type_definition", "implementation", "prepare_rename", "rename", "code_actions", "completions", "signature_help", "document_highlight", "document_links", "inlay_hints", "folding_ranges", "document_colors", "color_presentations", "selection_ranges", "linked_editing_range", "format_document", "format_range", "format_on_type", "diagnostics"
                 ]
             }).to_string(),
         };
@@ -1258,6 +1339,46 @@ impl ToolExecutor {
                 }
             }
 
+            "document_colors" => {
+                if let Some(f) = file {
+                    match self.try_active_document_colors(f) {
+                        Ok(Some(result)) => Self::active_lsp_response(
+                            "document_colors",
+                            "textDocument/documentColor",
+                            result,
+                        ),
+                        Ok(None) => json!({
+                            "error": "document_colors requires an active LSP backend for that file"
+                        }).to_string(),
+                        Err(error) => json!({ "error": error }).to_string(),
+                    }
+                } else {
+                    json!({
+                        "error": "document_colors requires 'file'"
+                    }).to_string()
+                }
+            }
+
+            "color_presentations" => {
+                if let (Some(f), Some(l), Some(c)) = (file, line, column) {
+                    match self.try_active_color_presentations(f, l, c) {
+                        Ok(Some(result)) => Self::active_lsp_response(
+                            "color_presentations",
+                            "textDocument/colorPresentation",
+                            result,
+                        ),
+                        Ok(None) => json!({
+                            "error": "color_presentations requires an active LSP backend for that file"
+                        }).to_string(),
+                        Err(error) => json!({ "error": error }).to_string(),
+                    }
+                } else {
+                    json!({
+                        "error": "color_presentations requires 'file'+'line'+'column'"
+                    }).to_string()
+                }
+            }
+
             "selection_ranges" => {
                 if let (Some(f), Some(l), Some(c)) = (file, line, column) {
                     match self.try_active_selection_ranges(f, l, c) {
@@ -1441,6 +1562,8 @@ impl ToolExecutor {
                             "document_links": true,
                             "inlay_hints": true,
                             "folding_ranges": true,
+                            "document_colors": true,
+                            "color_presentations": true,
                             "selection_ranges": true,
                             "linked_editing_range": true,
                             "format_document": true,
@@ -1461,7 +1584,7 @@ impl ToolExecutor {
                 "error": format!("Unknown operation: {}", operation),
                 "valid_operations": [
                     "goto_definition", "find_references", "hover", "document_symbols",
-                    "workspace_symbols", "call_hierarchy", "incoming_calls", "outgoing_calls", "declaration", "type_definition", "implementation", "prepare_rename", "rename", "code_actions", "completions", "signature_help", "document_highlight", "document_links", "inlay_hints", "folding_ranges", "selection_ranges", "linked_editing_range", "format_document", "format_range", "format_on_type", "diagnostics"
+                    "workspace_symbols", "call_hierarchy", "incoming_calls", "outgoing_calls", "declaration", "type_definition", "implementation", "prepare_rename", "rename", "code_actions", "completions", "signature_help", "document_highlight", "document_links", "inlay_hints", "folding_ranges", "document_colors", "color_presentations", "selection_ranges", "linked_editing_range", "format_document", "format_range", "format_on_type", "diagnostics"
                 ]
             }).to_string()
         }

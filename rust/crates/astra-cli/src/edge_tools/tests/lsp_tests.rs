@@ -7,7 +7,7 @@ fn fake_lsp_server_script(dir: &std::path::Path) -> std::path::PathBuf {
     let script = dir.join("fake-rust-analyzer");
     std::fs::write(
         &script,
-        r#"#!/usr/bin/env python3
+        r##"#!/usr/bin/env python3
 import json
 import os
 import sys
@@ -69,6 +69,7 @@ while True:
                     "documentLinkProvider": {"resolveProvider": False},
                     "inlayHintProvider": True,
                     "foldingRangeProvider": True,
+                    "colorProvider": True,
                     "selectionRangeProvider": True,
                     "linkedEditingRangeProvider": True,
                     "signatureHelpProvider": {
@@ -288,6 +289,35 @@ while True:
                 "kind": "region"
             }]
         })
+    elif method == "textDocument/documentColor":
+        write_frame({
+            "jsonrpc": "2.0",
+            "id": msg_id,
+            "result": [{
+                "range": {
+                    "start": {"line": 0, "character": 20},
+                    "end": {"line": 0, "character": 27}
+                },
+                "color": {
+                    "red": 1.0,
+                    "green": 0.0,
+                    "blue": 0.0,
+                    "alpha": 1.0
+                }
+            }]
+        })
+    elif method == "textDocument/colorPresentation":
+        write_frame({
+            "jsonrpc": "2.0",
+            "id": msg_id,
+            "result": [{
+                "label": "#ff0000",
+                "textEdit": {
+                    "range": message["params"]["range"],
+                    "newText": "#ff0000"
+                }
+            }]
+        })
     elif method == "textDocument/selectionRange":
         write_frame({
             "jsonrpc": "2.0",
@@ -376,7 +406,7 @@ while True:
         })
     elif msg_id is not None:
         write_frame({"jsonrpc": "2.0", "id": msg_id, "result": None})
-"#,
+"##,
     )
     .unwrap();
     let mut perms = std::fs::metadata(&script).unwrap().permissions();
@@ -465,6 +495,12 @@ fn lsp_diagnostics_returns_capabilities() {
     assert!(parsed["capabilities"]["document_links"].as_bool().unwrap());
     assert!(parsed["capabilities"]["inlay_hints"].as_bool().unwrap());
     assert!(parsed["capabilities"]["folding_ranges"].as_bool().unwrap());
+    assert!(parsed["capabilities"]["document_colors"].as_bool().unwrap());
+    assert!(
+        parsed["capabilities"]["color_presentations"]
+            .as_bool()
+            .unwrap()
+    );
     assert!(
         parsed["capabilities"]["selection_ranges"]
             .as_bool()
@@ -806,6 +842,76 @@ fn lsp_folding_ranges_use_real_lsp_when_available() {
     assert_eq!(parsed["backend"].as_str(), Some("lsp"));
     assert_eq!(parsed["method"].as_str(), Some("textDocument/foldingRange"));
     assert_eq!(parsed["result"][0]["endLine"].as_u64(), Some(2));
+}
+
+#[cfg(unix)]
+#[test]
+#[serial_test::serial]
+fn lsp_document_colors_use_real_lsp_when_available() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname=\"demo\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(
+        dir.path().join("src/lib.rs"),
+        "const RED: &str = \"#ff0000\";\n",
+    )
+    .unwrap();
+    let script = fake_lsp_server_script(dir.path());
+    let _guard = EnvGuard::set("ASTRA_RUST_ANALYZER_CMD", script.to_str().unwrap());
+    let exe = ToolExecutor::new(dir.path());
+
+    let result = exe.lsp(&json!({
+        "operation": "document_colors",
+        "file": "src/lib.rs"
+    }));
+    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+
+    assert_eq!(parsed["backend"].as_str(), Some("lsp"));
+    assert_eq!(
+        parsed["method"].as_str(),
+        Some("textDocument/documentColor")
+    );
+    assert_eq!(parsed["result"][0]["color"]["red"].as_f64(), Some(1.0));
+}
+
+#[cfg(unix)]
+#[test]
+#[serial_test::serial]
+fn lsp_color_presentations_use_real_lsp_when_available() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname=\"demo\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(
+        dir.path().join("src/lib.rs"),
+        "const RED: &str = \"#ff0000\";\n",
+    )
+    .unwrap();
+    let script = fake_lsp_server_script(dir.path());
+    let _guard = EnvGuard::set("ASTRA_RUST_ANALYZER_CMD", script.to_str().unwrap());
+    let exe = ToolExecutor::new(dir.path());
+
+    let result = exe.lsp(&json!({
+        "operation": "color_presentations",
+        "file": "src/lib.rs",
+        "line": 1,
+        "column": 22
+    }));
+    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+
+    assert_eq!(parsed["backend"].as_str(), Some("lsp"));
+    assert_eq!(
+        parsed["method"].as_str(),
+        Some("textDocument/colorPresentation")
+    );
+    assert_eq!(parsed["result"][0]["label"].as_str(), Some("#ff0000"));
 }
 
 #[cfg(unix)]
