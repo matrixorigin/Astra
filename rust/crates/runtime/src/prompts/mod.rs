@@ -11,6 +11,7 @@ pub mod memory_ns;
 pub mod memory_proto;
 mod skills;
 mod system;
+pub mod team_prompts;
 
 pub use context::{
     CacheAwareEstimate, CompactConfig, CompactionTier, ContextBudget, budget_for_model,

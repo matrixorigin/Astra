@@ -269,7 +269,16 @@ impl ServerAgenticLoopHost {
             String::new()
         };
 
-        format!("{base}{memory_signal_hint}")
+        // System prompt override from delegation coordination context
+        let system_override = self
+            .edge_profile
+            .get("system_prompt_override")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(|s| format!("\n\n{s}"))
+            .unwrap_or_default();
+
+        format!("{base}{memory_signal_hint}{system_override}")
     }
 
     /// Build the LLM message array from loop state.
