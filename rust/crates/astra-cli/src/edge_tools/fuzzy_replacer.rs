@@ -36,8 +36,12 @@ pub(crate) fn fuzzy_find_replacement<'a>(
     let strategies: &[(&str, fn(&str, &str) -> Vec<String>)] = &[
         ("line-trimmed", |c, s| line_trimmed_find(c, s)),
         ("block-anchor", |c, s| block_anchor_find(c, s)),
-        ("whitespace-normalized", |c, s| whitespace_normalized_find(c, s)),
-        ("indentation-flexible", |c, s| indentation_flexible_find(c, s)),
+        ("whitespace-normalized", |c, s| {
+            whitespace_normalized_find(c, s)
+        }),
+        ("indentation-flexible", |c, s| {
+            indentation_flexible_find(c, s)
+        }),
         ("escape-normalized", |c, s| escape_normalized_find(c, s)),
     ];
 
@@ -565,26 +569,17 @@ mod tests {
 
     #[test]
     fn remove_indent_basic() {
-        assert_eq!(
-            remove_common_indent("    a\n    b\n    c"),
-            "a\nb\nc"
-        );
+        assert_eq!(remove_common_indent("    a\n    b\n    c"), "a\nb\nc");
     }
 
     #[test]
     fn remove_indent_mixed() {
-        assert_eq!(
-            remove_common_indent("    a\n      b\n    c"),
-            "a\n  b\nc"
-        );
+        assert_eq!(remove_common_indent("    a\n      b\n    c"), "a\n  b\nc");
     }
 
     #[test]
     fn remove_indent_with_empty_lines() {
-        assert_eq!(
-            remove_common_indent("    a\n\n    c"),
-            "a\n\nc"
-        );
+        assert_eq!(remove_common_indent("    a\n\n    c"), "a\n\nc");
     }
 
     // ─── fuzzy_find_replacement (integration) ───────────────────────────────

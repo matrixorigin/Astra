@@ -158,12 +158,12 @@ mod slash_tuning;
 mod spawn_subrun;
 #[path = "cli/sse_utils.rs"]
 mod sse_utils;
-#[path = "cli/streaming_types.rs"]
-mod streaming_types;
 #[path = "cli/stream_render.rs"]
 mod stream_render;
 #[path = "cli/streaming_md.rs"]
 mod streaming_md;
+#[path = "cli/streaming_types.rs"]
+mod streaming_types;
 #[path = "cli/terminal_region.rs"]
 mod terminal_region;
 #[path = "cli/theme.rs"]

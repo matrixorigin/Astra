@@ -41,10 +41,10 @@ mod build_test;
 pub mod code_intel;
 #[path = "edge_tools/context_sharing.rs"]
 pub mod context_sharing;
-#[path = "edge_tools/fuzzy_replacer.rs"]
-pub(crate) mod fuzzy_replacer;
 #[path = "edge_tools/fs.rs"]
 mod fs_tools;
+#[path = "edge_tools/fuzzy_replacer.rs"]
+pub(crate) mod fuzzy_replacer;
 #[path = "edge_tools/git_gix.rs"]
 mod git_gix;
 #[path = "edge_tools/github.rs"]

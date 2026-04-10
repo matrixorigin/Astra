@@ -779,9 +779,9 @@ impl ToolExecutor {
                 );
             }
             // Fuzzy cascade: try progressively looser matching strategies
-            if let Some(fuzzy_match) = super::fuzzy_replacer::fuzzy_find_replacement(
-                &content, old_str, replace_all,
-            ) {
+            if let Some(fuzzy_match) =
+                super::fuzzy_replacer::fuzzy_find_replacement(&content, old_str, replace_all)
+            {
                 let new_content = if replace_all {
                     content.replace(&fuzzy_match.actual, new_str)
                 } else {
@@ -2249,7 +2249,10 @@ type Handler interface {
             "old_str": "fn totally_different() {\n  xyz();\n}",
             "new_str": "fn replaced() {}"
         }));
-        assert!(result2.contains("Error"), "truly different should be error: {result2}");
+        assert!(
+            result2.contains("Error"),
+            "truly different should be error: {result2}"
+        );
         assert!(result2.contains("Hint"), "should have hints: {result2}");
     }
 

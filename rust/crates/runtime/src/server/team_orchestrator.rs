@@ -380,7 +380,11 @@ impl TeamExecutionOrchestrator {
         // Poll progress during execution (every 500ms) so UI can show real-time updates.
         // This replaces the blocking await with a polling loop that emits AgentProgress.
         let poll_interval = std::time::Duration::from_millis(500);
-        let mut last_completed_count = 0usize;
+        let mut last_progress_snapshot: Option<(
+            std::collections::HashMap<String, String>,
+            usize,
+            usize,
+        )> = None;
 
         let delegation_future = Box::pin(delegation_future);
         tokio::pin!(delegation_future);
@@ -414,14 +418,25 @@ impl TeamExecutionOrchestrator {
                         .get_progress(&delegation_id)
                         .await
                     {
-                        // Only emit if something changed (avoid spamming)
-                        if progress.completed_count != last_completed_count {
-                            last_completed_count = progress.completed_count;
-                            let agent_states: std::collections::HashMap<String, String> = progress
-                                .agent_states
-                                .iter()
-                                .map(|(k, v)| (k.clone(), v.as_str().to_string()))
-                                .collect();
+                        let agent_states: std::collections::HashMap<String, String> = progress
+                            .agent_states
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v.as_str().to_string()))
+                            .collect();
+                        let changed = last_progress_snapshot
+                            .as_ref()
+                            .map(|(last_states, last_completed, last_total)| {
+                                last_states != &agent_states
+                                    || *last_completed != progress.completed_count
+                                    || *last_total != progress.total_count
+                            })
+                            .unwrap_or(true);
+                        if changed {
+                            last_progress_snapshot = Some((
+                                agent_states.clone(),
+                                progress.completed_count,
+                                progress.total_count,
+                            ));
                             self.emit_progress(ExecutionPhase::AgentProgress {
                                 delegation_id: delegation_id.clone(),
                                 agent_states,
@@ -1162,6 +1177,79 @@ mod tests {
         assert!(collected[0].contains("Preparing"));
         assert!(collected.iter().any(|p| p.contains("Executing")));
         assert!(collected.iter().any(|p| p.contains("Reporting")));
+    }
+
+    struct SlowSubRunExecutor;
+
+    #[async_trait]
+    impl SubRunExecutor for SlowSubRunExecutor {
+        async fn execute(&self, config: SubRunConfig) -> Result<AgentResult, String> {
+            tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+            Ok(AgentResult {
+                agent_id: config.agent_profile.agent_id.clone(),
+                run_id: config.run_id.clone(),
+                status: "completed".to_string(),
+                output: Some("done".to_string()),
+                error: None,
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                tool_calls: 0,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn progress_callback_emits_intermediate_agent_states() {
+        let store = Arc::new(InMemoryTeamStore::with_builtins("test-user"));
+        let phases = Arc::new(std::sync::Mutex::new(Vec::<ExecutionPhase>::new()));
+        let phases_clone = phases.clone();
+
+        let registry = Arc::new(RwLock::new(AgentProfileRegistry::new()));
+        {
+            let mut reg = registry.write().await;
+            let orch = AgentProfile::new("orchestrator", "orchestrator", AgentTier::Orchestrator);
+            let _ = reg.register(orch);
+        }
+        let run_store = Arc::new(InMemoryRunStateStore::new());
+        let run_engine = Arc::new(RunEngine::new(run_store));
+        let tracker = Arc::new(DelegationTracker::new());
+        let delegation = Arc::new(DelegationEngine::with_executor(
+            registry.clone(),
+            run_engine.clone(),
+            tracker.clone(),
+            Arc::new(SlowSubRunExecutor),
+        ));
+
+        let orch = TeamExecutionOrchestrator::new(
+            store,
+            delegation,
+            tracker,
+            run_engine,
+            registry,
+            OrchestratorConfig {
+                user_id: "test-user".to_string(),
+                session_id: "test-session".to_string(),
+                source_agent_id: "orchestrator".to_string(),
+                progress: Some(Arc::new(move |phase| {
+                    phases_clone.lock().unwrap().push(phase);
+                })),
+            },
+        );
+
+        let report = orch.execute_team("research", "task", None).await;
+        assert_eq!(report.status, TeamExecutionStatus::Completed);
+
+        let collected = phases.lock().unwrap();
+        assert!(collected.iter().any(|phase| {
+            matches!(
+                phase,
+                ExecutionPhase::AgentProgress {
+                    agent_states,
+                    completed_count: 0,
+                    ..
+                } if agent_states.values().any(|state| state == "running")
+            )
+        }));
     }
 
     #[tokio::test]
