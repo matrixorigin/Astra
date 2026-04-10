@@ -1,9 +1,9 @@
 //! Incremental markdown streaming renderer.
 //!
-//! Inspired by claudecode's `StreamingMarkdown` component: split accumulated
-//! text at the last complete top-level block boundary.  Everything before the
-//! boundary is "stable" — rendered once and never touched again.  Only the
-//! trailing "unstable" block is cleared and re-rendered on each delta.
+//! Split accumulated text at the last complete top-level block boundary.
+//! Everything before the boundary is "stable" — rendered once and never touched
+//! again. Only the trailing "unstable" block is cleared and re-rendered on each
+//! delta.
 //!
 //! Uses [`TerminalRegion`] for flicker-free diff-based updates.
 

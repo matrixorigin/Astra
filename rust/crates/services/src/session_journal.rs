@@ -854,7 +854,7 @@ pub fn count_turns(session_id: &str) -> u32 {
 /// Quick metadata peek from a journal file — reads only the first few lines.
 ///
 /// Returns `(first_user_input, model, timestamp)` without parsing the entire JSONL.
-/// Designed for fast session listing (like claudecode's head/tail extraction).
+/// Designed for fast session listing via partial journal reads.
 pub fn peek_session_meta(session_id: &str) -> Option<SessionPeek> {
     use std::io::BufRead;
     let path = journal_dir().join(format!("{session_id}.jsonl"));

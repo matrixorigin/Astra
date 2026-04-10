@@ -1,6 +1,6 @@
 //! Passive `cargo check` after Rust source edits: run once before the next LLM turn
-//! that carries `tool_results`, then inject a user message (claudecode-style
-//! `<new-diagnostics>`) when there are errors or the check fails.
+//! that carries `tool_results`, then inject a user message wrapped in
+//! `<new-diagnostics>` when there are errors or the check fails.
 //!
 //! Kill switch: `ASTRA_PASSIVE_CARGO_CHECK=0|false|off`
 //! Timeout: `ASTRA_PASSIVE_CARGO_TIMEOUT_SECS` (default 45, max 300)

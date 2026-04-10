@@ -4,9 +4,8 @@
 //! active skills, session plan) is re-injected into the conversation so the
 //! LLM doesn't lose access to it.
 //!
-//! Inspired by claudecode's post-compact attachment restoration, but adapted
-//! for astra's architecture: attachment selection uses ToolSelector's
-//! learned_context for file hotness rather than a separate read-cache.
+//! Attachment selection uses ToolSelector's learned_context for file hotness
+//! rather than a separate read-cache.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

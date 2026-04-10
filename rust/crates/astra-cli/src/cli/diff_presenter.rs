@@ -1,8 +1,8 @@
 //! Git diff presentation for the REPL — terminal renderer today, IDE sink later.
 //!
 //! Design: [`DiffSink`] is the extension point. [`TerminalDiffSink`] prints colored
-//! unified diffs (claudecode-style). A future `IdeDiffSink` can reuse
-//! [`summarize_unified_diff`] / parsed hunks for MCP / editor RPC.
+//! unified diffs. A future `IdeDiffSink` can reuse [`summarize_unified_diff`] /
+//! parsed hunks for MCP / editor RPC.
 
 use std::io::{self, Write};
 use std::path::Path;
@@ -30,7 +30,7 @@ pub(crate) enum DiffScope {
     StatHead,
 }
 
-/// Cheap stats for a banner line (claudecode-style summary).
+/// Cheap stats for a banner line.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct DiffStats {
     pub files: usize,

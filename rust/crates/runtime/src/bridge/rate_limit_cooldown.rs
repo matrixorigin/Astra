@@ -1,4 +1,4 @@
-//! Rate-limit cooldown mechanism inspired by claudecode.
+//! Rate-limit cooldown mechanism.
 //!
 //! When consecutive 429/529 errors occur, the system enters a cooldown period
 //! where it either:

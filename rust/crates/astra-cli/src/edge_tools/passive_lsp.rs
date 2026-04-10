@@ -1,7 +1,6 @@
 //! Passive stdio LSP: **rust-analyzer** and **typescript-language-server** (opt-in).
 //!
-//! claudecode merges arbitrary servers from **plugins**; here we use env flags until
-//! a `astra-lsp.json` config exists.
+//! Currently enabled through env flags until a future `astra-lsp.json` config exists.
 //!
 //! - Rust: `ASTRA_LSP_RUST=1`, `ASTRA_RUST_ANALYZER_CMD` (default `rust-analyzer`)
 //! - TS: `ASTRA_LSP_TYPESCRIPT=1`, `ASTRA_TYPESCRIPT_SERVER_CMD` (default `typescript-language-server`)
