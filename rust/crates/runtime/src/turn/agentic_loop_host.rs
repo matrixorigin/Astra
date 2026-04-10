@@ -383,11 +383,14 @@ pub struct AgenticLoopState {
     // ── Observability (M1-M6 integration) ──
     /// Optional observability session for context tracing, drift detection, and auto-tuning.
     /// When set, hooks are called at turn start/end, tool selection, etc.
-    pub observability_session: Option<std::sync::Arc<std::sync::RwLock<crate::observability_integration::ObservabilitySession>>>,
+    pub observability_session: Option<
+        std::sync::Arc<std::sync::RwLock<crate::observability_integration::ObservabilitySession>>,
+    >,
 
     /// Shared observability hub for profile/experiment management.
     /// Typically set at session init and shared across agents.
-    pub observability_hub: Option<std::sync::Arc<crate::observability_integration::ObservabilityHub>>,
+    pub observability_hub:
+        Option<std::sync::Arc<crate::observability_integration::ObservabilityHub>>,
 }
 
 /// Consecutive same-category error turns before forcing a strategy change.
