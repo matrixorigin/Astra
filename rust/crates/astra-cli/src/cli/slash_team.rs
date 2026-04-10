@@ -1472,6 +1472,22 @@ pub(super) async fn handle_team_command(
                 return;
             }
 
+            // Safety: check for uncommitted changes before restore
+            let git_dirty = std::process::Command::new("git")
+                .args(["status", "--porcelain"])
+                .output()
+                .ok()
+                .map(|o| !o.stdout.is_empty())
+                .unwrap_or(false);
+            if git_dirty {
+                eprintln!(
+                    "  {} Working tree has uncommitted changes. Commit or stash first.",
+                    theme::icon_err()
+                );
+                eprintln!("  {}", "  Run `git stash` to save changes, then retry.".dim());
+                return;
+            }
+
             eprintln!(
                 "\n  ⏪ Restoring team '{}' from snapshot '{}'...",
                 name.cyan(),
@@ -1517,6 +1533,38 @@ pub(super) async fn handle_team_command(
             }
 
             eprintln!("  {} Restore complete.\n", theme::icon_ok());
+        }
+
+        "status" => {
+            let name = sub_arg.trim();
+            let entries: Vec<TeamHistoryEntry> = if name.is_empty() {
+                let mut all: Vec<_> = state.team_registry.history.iter().cloned().collect();
+                all.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+                all.into_iter().take(5).collect()
+            } else {
+                state.team_registry.get_history(name).into_iter().rev().take(3).cloned().collect()
+            };
+            if entries.is_empty() {
+                eprintln!("  {} No recent team executions.", "ℹ️ ".dim());
+                return;
+            }
+            eprintln!("\n{}", "─── Recent Team Runs ───".bold().cyan());
+            for e in &entries {
+                let icon = match e.status.as_str() {
+                    "completed" => "✅",
+                    "partial" | "completed_with_conflicts" => "⚠️ ",
+                    _ => "❌",
+                };
+                eprintln!(
+                    "  {} {} {} — {} ({} agents, {}tok)",
+                    icon, e.team_name.as_str().cyan(), e.status.as_str().dim(),
+                    truncate_str(&e.task, 50),
+                    e.agent_count,
+                    format_tokens(e.total_prompt_tokens + e.total_completion_tokens),
+                );
+                eprintln!("    {} delegation: {}", "→".dim(), e.delegation_id.get(..12).unwrap_or(&e.delegation_id).dim());
+            }
+            eprintln!();
         }
 
         "agents" => {
@@ -1581,7 +1629,7 @@ pub(super) async fn handle_team_command(
 }
 
 fn team_subcommands_hint() -> &'static str {
-    "Subcommands: /team list · info · create · add-member · context · run · history · snapshot · restore · delete · help"
+    "Subcommands: /team list · info · create · add-member · context · run · status · history · snapshot · restore · delete · agents · help"
 }
 
 // ─── Formatting helpers ────────────────────────────────────────────────────
