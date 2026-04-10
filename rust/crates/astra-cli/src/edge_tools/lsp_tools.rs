@@ -843,6 +843,49 @@ impl ToolExecutor {
             .map(|result| result.map(|value| Self::active_lsp_response(operation, method, value)))
     }
 
+    fn try_active_type_hierarchy(
+        &self,
+        operation: &str,
+        file: &str,
+        line: usize,
+        column: usize,
+    ) -> Result<Option<String>, String> {
+        let (file_path, prepare_params) = self.lsp_position_params(file, line, column)?;
+        let prepared = self.passive_lsp.request_for_file(
+            &self.project_root,
+            &file_path,
+            "textDocument/prepareTypeHierarchy",
+            prepare_params,
+        )?;
+        let Some(prepared) = prepared else {
+            return Ok(None);
+        };
+        let Some(item) = prepared
+            .as_array()
+            .and_then(|items| items.first())
+            .cloned()
+            .or_else(|| prepared.as_object().map(|_| prepared.clone()))
+        else {
+            return Ok(Some(Self::active_lsp_response(
+                operation,
+                "textDocument/prepareTypeHierarchy",
+                prepared,
+            )));
+        };
+        let method = match operation {
+            "supertypes" => "typeHierarchy/supertypes",
+            _ => "typeHierarchy/subtypes",
+        };
+        self.passive_lsp
+            .request_for_file(
+                &self.project_root,
+                &file_path,
+                method,
+                json!({ "item": item }),
+            )
+            .map(|result| result.map(|value| Self::active_lsp_response(operation, method, value)))
+    }
+
     /// Unified LSP tool providing code intelligence operations.
     /// Prefers a real stdio LSP backend when one is available for the workspace/file,
     /// then falls back to the existing symbol/AST-based implementations.
@@ -853,7 +896,7 @@ impl ToolExecutor {
                 "error": "Missing required 'operation' parameter",
                 "valid_operations": [
                     "goto_definition", "find_references", "hover", "document_symbols",
-                    "workspace_symbols", "call_hierarchy", "incoming_calls", "outgoing_calls", "declaration", "type_definition", "implementation", "prepare_rename", "rename", "code_actions", "completions", "signature_help", "document_highlight", "document_links", "inlay_hints", "folding_ranges", "document_colors", "color_presentations", "semantic_tokens", "code_lenses", "selection_ranges", "linked_editing_range", "format_document", "format_range", "format_on_type", "diagnostics"
+                    "workspace_symbols", "call_hierarchy", "incoming_calls", "outgoing_calls", "declaration", "type_definition", "implementation", "supertypes", "subtypes", "prepare_rename", "rename", "code_actions", "completions", "signature_help", "document_highlight", "document_links", "inlay_hints", "folding_ranges", "document_colors", "color_presentations", "semantic_tokens", "code_lenses", "selection_ranges", "linked_editing_range", "format_document", "format_range", "format_on_type", "diagnostics"
                 ]
             }).to_string(),
         };
@@ -1196,6 +1239,27 @@ impl ToolExecutor {
                     json!({
                         "error": "incoming_calls requires 'file' parameter"
                     }).to_string()
+                }
+            }
+
+            "supertypes" | "subtypes" => {
+                if let (Some(f), Some(l), Some(c)) = (file, line, column) {
+                    match self.try_active_type_hierarchy(operation, f, l, c) {
+                        Ok(Some(result)) => result,
+                        Ok(None) => json!({
+                            "error": format!(
+                                "{} requires an active LSP backend for that file",
+                                operation
+                            )
+                        })
+                        .to_string(),
+                        Err(error) => json!({ "error": error }).to_string(),
+                    }
+                } else {
+                    json!({
+                        "error": format!("{} requires 'file'+'line'+'column'", operation)
+                    })
+                    .to_string()
                 }
             }
 
@@ -1684,6 +1748,8 @@ impl ToolExecutor {
                             "declaration": true,
                             "type_definition": true,
                             "implementation": true,
+                            "supertypes": true,
+                            "subtypes": true,
                             "prepare_rename": true,
                             "rename": true,
                             "code_actions": true,
@@ -1717,7 +1783,7 @@ impl ToolExecutor {
                 "error": format!("Unknown operation: {}", operation),
                 "valid_operations": [
                     "goto_definition", "find_references", "hover", "document_symbols",
-                    "workspace_symbols", "call_hierarchy", "incoming_calls", "outgoing_calls", "declaration", "type_definition", "implementation", "prepare_rename", "rename", "code_actions", "completions", "signature_help", "document_highlight", "document_links", "inlay_hints", "folding_ranges", "document_colors", "color_presentations", "semantic_tokens", "code_lenses", "selection_ranges", "linked_editing_range", "format_document", "format_range", "format_on_type", "diagnostics"
+                    "workspace_symbols", "call_hierarchy", "incoming_calls", "outgoing_calls", "declaration", "type_definition", "implementation", "supertypes", "subtypes", "prepare_rename", "rename", "code_actions", "completions", "signature_help", "document_highlight", "document_links", "inlay_hints", "folding_ranges", "document_colors", "color_presentations", "semantic_tokens", "code_lenses", "selection_ranges", "linked_editing_range", "format_document", "format_range", "format_on_type", "diagnostics"
                 ]
             }).to_string()
         }

@@ -225,7 +225,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
     // ── Dynamic tools (selected per-request) ────────────────────────
     ToolMeta {
         name: "lsp",
-        description: "Unified Language Server Protocol code intelligence and editor actions: definitions, references, hover, rename, code actions, diagnostics, formatting",
+        description: "Unified Language Server Protocol code intelligence and editor actions: definitions, references, hover, call/type hierarchy, rename, code actions, diagnostics, formatting",
         triggers: &[
             "lsp",
             "language server",
@@ -235,6 +235,10 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
             "references",
             "hover",
             "implementation",
+            "type hierarchy",
+            "supertypes",
+            "subtypes",
+            "inheritance",
             "type definition",
             "declaration",
             "rename symbol",
@@ -252,6 +256,9 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
             "引用",
             "悬停",
             "实现",
+            "类型层次",
+            "父类型",
+            "子类型",
             "类型定义",
             "声明",
             "重命名",

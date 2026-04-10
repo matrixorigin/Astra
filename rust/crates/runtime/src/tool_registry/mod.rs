@@ -226,6 +226,18 @@ mod tests {
     }
 
     #[test]
+    fn prefilter_ranks_lsp_for_type_hierarchy_query() {
+        let state = ConversationState::from_message("show supertypes of this symbol", 1);
+        let ranked = pre_filter_dynamic(&state, "show supertypes of this symbol");
+        let first_name = TOOL_CATALOG[ranked[0].0].name;
+        assert_eq!(
+            first_name, "lsp",
+            "lsp should be top-ranked for type hierarchy query, got: {}",
+            first_name
+        );
+    }
+
+    #[test]
     fn select_code_intel_query_includes_lsp() {
         let registry = ToolRegistry::new(mock_schemas());
         let selected = registry.select("find references for this symbol with lsp", 1);

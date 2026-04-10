@@ -55,6 +55,7 @@ while True:
                     "declarationProvider": True,
                     "definitionProvider": True,
                     "typeDefinitionProvider": True,
+                    "typeHierarchyProvider": True,
                     "documentSymbolProvider": True,
                     "documentFormattingProvider": True,
                     "documentRangeFormattingProvider": True,
@@ -154,6 +155,61 @@ while True:
                 "range": {
                     "start": {"line": 0, "character": 3},
                     "end": {"line": 0, "character": 17}
+                }
+            }]
+        })
+    elif method == "textDocument/prepareTypeHierarchy":
+        uri = message["params"]["textDocument"]["uri"]
+        write_frame({
+            "jsonrpc": "2.0",
+            "id": msg_id,
+            "result": [{
+                "name": "HelloType",
+                "kind": 5,
+                "uri": uri,
+                "range": {
+                    "start": {"line": 0, "character": 0},
+                    "end": {"line": 0, "character": 18}
+                },
+                "selectionRange": {
+                    "start": {"line": 0, "character": 7},
+                    "end": {"line": 0, "character": 12}
+                }
+            }]
+        })
+    elif method == "typeHierarchy/supertypes":
+        write_frame({
+            "jsonrpc": "2.0",
+            "id": msg_id,
+            "result": [{
+                "name": "Greeting",
+                "kind": 11,
+                "uri": message["params"]["item"]["uri"],
+                "range": {
+                    "start": {"line": 0, "character": 0},
+                    "end": {"line": 0, "character": 8}
+                },
+                "selectionRange": {
+                    "start": {"line": 0, "character": 0},
+                    "end": {"line": 0, "character": 8}
+                }
+            }]
+        })
+    elif method == "typeHierarchy/subtypes":
+        write_frame({
+            "jsonrpc": "2.0",
+            "id": msg_id,
+            "result": [{
+                "name": "FriendlyGreeting",
+                "kind": 5,
+                "uri": message["params"]["item"]["uri"],
+                "range": {
+                    "start": {"line": 1, "character": 0},
+                    "end": {"line": 1, "character": 16}
+                },
+                "selectionRange": {
+                    "start": {"line": 1, "character": 0},
+                    "end": {"line": 1, "character": 16}
                 }
             }]
         })
@@ -596,6 +652,8 @@ fn lsp_diagnostics_returns_capabilities() {
     assert!(parsed["capabilities"]["format_on_type"].as_bool().unwrap());
     assert!(parsed["capabilities"]["type_definition"].as_bool().unwrap());
     assert!(parsed["capabilities"]["implementation"].as_bool().unwrap());
+    assert!(parsed["capabilities"]["supertypes"].as_bool().unwrap());
+    assert!(parsed["capabilities"]["subtypes"].as_bool().unwrap());
     assert!(parsed["capabilities"]["prepare_rename"].as_bool().unwrap());
     assert!(
         parsed["supported_languages"]["active_lsp"]
@@ -1026,6 +1084,75 @@ fn lsp_semantic_tokens_use_real_lsp_when_available() {
         Some("textDocument/semanticTokens/full")
     );
     assert_eq!(parsed["result"]["data"][0].as_u64(), Some(0));
+}
+
+#[cfg(unix)]
+#[test]
+#[serial_test::serial]
+fn lsp_supertypes_use_real_lsp_when_available() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname=\"demo\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(
+        dir.path().join("src/lib.rs"),
+        "trait Greeting {}\nstruct HelloType;\nimpl Greeting for HelloType {}\n",
+    )
+    .unwrap();
+    let script = fake_lsp_server_script(dir.path());
+    let _guard = EnvGuard::set("ASTRA_RUST_ANALYZER_CMD", script.to_str().unwrap());
+    let exe = ToolExecutor::new(dir.path());
+
+    let result = exe.lsp(&json!({
+        "operation": "supertypes",
+        "file": "src/lib.rs",
+        "line": 2,
+        "column": 8
+    }));
+    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+
+    assert_eq!(parsed["backend"].as_str(), Some("lsp"));
+    assert_eq!(parsed["method"].as_str(), Some("typeHierarchy/supertypes"));
+    assert_eq!(parsed["result"][0]["name"].as_str(), Some("Greeting"));
+}
+
+#[cfg(unix)]
+#[test]
+#[serial_test::serial]
+fn lsp_subtypes_use_real_lsp_when_available() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname=\"demo\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(
+        dir.path().join("src/lib.rs"),
+        "trait Greeting {}\nstruct FriendlyGreeting;\nimpl Greeting for FriendlyGreeting {}\n",
+    )
+    .unwrap();
+    let script = fake_lsp_server_script(dir.path());
+    let _guard = EnvGuard::set("ASTRA_RUST_ANALYZER_CMD", script.to_str().unwrap());
+    let exe = ToolExecutor::new(dir.path());
+
+    let result = exe.lsp(&json!({
+        "operation": "subtypes",
+        "file": "src/lib.rs",
+        "line": 1,
+        "column": 8
+    }));
+    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+
+    assert_eq!(parsed["backend"].as_str(), Some("lsp"));
+    assert_eq!(parsed["method"].as_str(), Some("typeHierarchy/subtypes"));
+    assert_eq!(
+        parsed["result"][0]["name"].as_str(),
+        Some("FriendlyGreeting")
+    );
 }
 
 #[cfg(unix)]
