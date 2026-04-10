@@ -950,6 +950,28 @@ pub(super) fn handle_session_command(arg: &str, state: &mut ReplState) {
                                     evidence_count,
                                 );
                             }
+                            session_journal::JournalEventType::DelegationRetry => {
+                                let agent_id = evt
+                                    .metadata
+                                    .as_ref()
+                                    .and_then(|m| m.get("agent_id"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("unknown");
+                                let reason = evt
+                                    .metadata
+                                    .as_ref()
+                                    .and_then(|m| m.get("reason"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("");
+                                eprintln!(
+                                    "  {} {} T{} delegation retry: {} ({})",
+                                    ts_short.dim(),
+                                    "🔄".yellow(),
+                                    evt.turn.unwrap_or(0),
+                                    agent_id,
+                                    reason.dim(),
+                                );
+                            }
                         }
                     }
                     // Summary stats
