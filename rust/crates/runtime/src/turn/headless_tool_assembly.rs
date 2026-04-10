@@ -200,12 +200,21 @@ pub trait EdgeToolRoundRow {
     fn tool_name(&self) -> &str;
     fn tool_args(&self) -> &Value;
     fn tool_output(&self) -> &str;
+    fn tool_duration_ms(&self) -> u64 {
+        0
+    }
 
     /// OpenAI `tool_calls[].id` when synthesizing from an edge-only round (§5.5).
     /// Default `edge-{index}`; rows with a server `request_id` should override.
     fn assistant_tool_call_id(&self, index: usize) -> String {
         format!("edge-{index}")
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatchedEdgeToolOutput {
+    pub output: String,
+    pub duration_ms: u64,
 }
 
 /// Take output for a server-emitted `tool_call` by matching dedup signature against the edge round.
@@ -216,6 +225,16 @@ pub fn take_edge_output_for_tool_call<T: EdgeToolRoundRow>(
     consumed: &mut [bool],
     by_sig: &HashMap<String, String>,
 ) -> String {
+    take_edge_output_for_tool_call_with_duration(name, args, round, consumed, by_sig).output
+}
+
+pub fn take_edge_output_for_tool_call_with_duration<T: EdgeToolRoundRow>(
+    name: &str,
+    args: &Value,
+    round: &[T],
+    consumed: &mut [bool],
+    by_sig: &HashMap<String, String>,
+) -> MatchedEdgeToolOutput {
     let sig = tool_dedup_signature(name, args);
     for (i, e) in round.iter().enumerate() {
         if consumed.get(i).copied().unwrap_or(true) {
@@ -223,14 +242,20 @@ pub fn take_edge_output_for_tool_call<T: EdgeToolRoundRow>(
         }
         if tool_dedup_signature(e.tool_name(), e.tool_args()) == sig {
             consumed[i] = true;
-            return e.tool_output().to_string();
+            return MatchedEdgeToolOutput {
+                output: e.tool_output().to_string(),
+                duration_ms: e.tool_duration_ms(),
+            };
         }
     }
-    by_sig.get(&sig).cloned().unwrap_or_else(|| {
-        format!(
-            "Error: headless edge protocol — expected SSE `tool_request` before assistant `tool_call` for `{name}` (no matching edge execution in this turn)."
-        )
-    })
+    MatchedEdgeToolOutput {
+        output: by_sig.get(&sig).cloned().unwrap_or_else(|| {
+            format!(
+                "Error: headless edge protocol — expected SSE `tool_request` before assistant `tool_call` for `{name}` (no matching edge execution in this turn)."
+            )
+        }),
+        duration_ms: 0,
+    }
 }
 
 /// Normalize server `tool_calls` or synthetic edge-round rows for stall / TurnGuard signature tracking.
@@ -417,6 +442,7 @@ mod tests {
         tool: String,
         args: Value,
         output: String,
+        duration_ms: u64,
     }
 
     impl EdgeToolRoundRow for Row {
@@ -429,6 +455,9 @@ mod tests {
         fn tool_output(&self) -> &str {
             &self.output
         }
+        fn tool_duration_ms(&self) -> u64 {
+            self.duration_ms
+        }
     }
 
     #[test]
@@ -438,23 +467,26 @@ mod tests {
                 tool: "read_file".into(),
                 args: json!({"path": "x.rs"}),
                 output: "one".into(),
+                duration_ms: 7,
             },
             Row {
                 tool: "read_file".into(),
                 args: json!({"path": "y.rs"}),
                 output: "two".into(),
+                duration_ms: 13,
             },
         ];
         let mut consumed = vec![false; 2];
         let by_sig: HashMap<String, String> = HashMap::new();
-        let out = take_edge_output_for_tool_call(
+        let out = take_edge_output_for_tool_call_with_duration(
             "read_file",
             &json!({"path": "y.rs"}),
             &rows,
             &mut consumed,
             &by_sig,
         );
-        assert_eq!(out, "two");
+        assert_eq!(out.output, "two");
+        assert_eq!(out.duration_ms, 13);
         assert!(!consumed[0]);
         assert!(consumed[1]);
     }
@@ -466,14 +498,15 @@ mod tests {
         let mut by_sig = HashMap::new();
         let sig = tool_dedup_signature("grep", &json!({"pattern": "foo"}));
         by_sig.insert(sig, "from-map".into());
-        let out = take_edge_output_for_tool_call(
+        let out = take_edge_output_for_tool_call_with_duration(
             "grep",
             &json!({"pattern": "foo"}),
             &rows,
             &mut consumed,
             &by_sig,
         );
-        assert_eq!(out, "from-map");
+        assert_eq!(out.output, "from-map");
+        assert_eq!(out.duration_ms, 0);
     }
 
     #[test]
@@ -603,6 +636,7 @@ mod tests {
             tool: "read_file".into(),
             args: json!({}),
             output: "".into(),
+            duration_ms: 0,
         }];
         let g = tool_calls_for_stall_guard(&server, &edge);
         assert_eq!(g.len(), 1);
@@ -616,11 +650,13 @@ mod tests {
                 tool: "a".into(),
                 args: json!({}),
                 output: "".into(),
+                duration_ms: 0,
             },
             Row {
                 tool: "b".into(),
                 args: json!({"x":1}),
                 output: "".into(),
+                duration_ms: 0,
             },
         ];
         let g = tool_calls_for_stall_guard(&[], &edge);
@@ -703,6 +739,7 @@ mod tests {
             tool: "grep".into(),
             args: json!({"pattern": "x"}),
             output: "".into(),
+            duration_ms: 0,
         }];
         let msg = openai_assistant_with_tool_calls_message(&[], &edge, "");
         let tc = msg["tool_calls"].as_array().unwrap();
@@ -758,6 +795,7 @@ mod tests {
                 tool: "t".into(),
                 args: json!({}),
                 output: "".into(),
+                duration_ms: 0,
             }],
             "think",
         );

@@ -469,7 +469,7 @@ impl StepRecorder {
     /// Get the execution summary after all turns complete.
     pub fn summary(&self) -> RecorderSummary {
         let total_tools: usize = self.tool_timings.values().map(|v| v.len()).sum();
-        let total_time_ms: u64 = self.tool_timings.values().flatten().sum();
+        let total_tool_time_ms: u64 = self.tool_timings.values().flatten().sum();
 
         let mut slowest_tools: Vec<(String, u64)> = self
             .tool_timings
@@ -485,10 +485,14 @@ impl StepRecorder {
         RecorderSummary {
             session_id: self.session_id.clone(),
             task_id: self.task_id.clone(),
-            turns: self.turn_number + 1,
+            iterations: if self.events.is_empty() {
+                0
+            } else {
+                self.turn_number + 1
+            },
             total_events: self.events.len(),
             total_tools,
-            total_time_ms,
+            total_tool_time_ms,
             slowest_tools,
             checkpoints: self.checkpoint_count,
             phase_log: self.phase_log.clone(),
@@ -625,10 +629,10 @@ impl StepRecorder {
 pub struct RecorderSummary {
     pub session_id: String,
     pub task_id: String,
-    pub turns: u32,
+    pub iterations: u32,
     pub total_events: usize,
     pub total_tools: usize,
-    pub total_time_ms: u64,
+    pub total_tool_time_ms: u64,
     pub slowest_tools: Vec<(String, u64)>,
     pub checkpoints: u32,
     pub phase_log: Vec<(u32, StepAction, u64)>,
@@ -814,9 +818,9 @@ mod tests {
         rec.end_turn(true);
 
         let summary = rec.summary();
-        assert_eq!(summary.turns, 2);
+        assert_eq!(summary.iterations, 2);
         assert_eq!(summary.total_tools, 3);
-        assert_eq!(summary.total_time_ms, 210);
+        assert_eq!(summary.total_tool_time_ms, 210);
         assert!(!summary.slowest_tools.is_empty());
         assert_eq!(summary.slowest_tools[0].0, "grep"); // grep is slowest (avg 90ms)
     }

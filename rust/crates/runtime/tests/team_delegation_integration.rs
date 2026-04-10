@@ -150,7 +150,11 @@ async fn full_pipeline_team_execution() {
 
     // Verify sub-runs cleaned up after orchestrator completes
     let subs = tracker.get_sub_runs(&report.delegation_id).await;
-    assert_eq!(subs.len(), 0, "tracker should be cleaned up after orchestration");
+    assert_eq!(
+        subs.len(),
+        0,
+        "tracker should be cleaned up after orchestration"
+    );
 
     // Verify delegation results still accessible via the report
     assert_eq!(dr.agent_results.len(), 2);

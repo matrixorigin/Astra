@@ -12,8 +12,8 @@ use super::headless_tool_assembly::{
     CACHEABLE_TOOLS, EdgeToolRoundRow, HeadlessResolvedToolSlot,
     begin_headless_tool_round_opening_ext, headless_idempotency_hit_openai_pair,
     headless_openai_duplicate_within_turn_pair, headless_unknown_local_tool_openai_pair,
-    openai_tool_roundtrip_values, resolve_headless_tool_slot, take_edge_output_for_tool_call,
-    unknown_local_tool_error_message,
+    openai_tool_roundtrip_values, resolve_headless_tool_slot,
+    take_edge_output_for_tool_call_with_duration, unknown_local_tool_error_message,
 };
 use super::headless_tool_body_preview::emit_headless_tool_body_preview;
 use super::headless_tool_journal::{
@@ -206,21 +206,30 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
         // 2. take_edge_output_for_tool_call consumes an edge result - server tool matched to edge
         let consumed_before = consumed_edge.iter().filter(|&&c| c).count();
 
-        let mut result_str = if let Some(i) = synthetic_idx {
-            edge_tool_round[i].tool_output().to_string()
+        let (mut result_str, edge_duration_ms) = if let Some(i) = synthetic_idx {
+            (
+                edge_tool_round[i].tool_output().to_string(),
+                edge_tool_round[i].tool_duration_ms(),
+            )
         } else {
-            take_edge_output_for_tool_call(
+            let matched = take_edge_output_for_tool_call_with_duration(
                 &name,
                 &args,
                 edge_tool_round,
                 &mut consumed_edge,
                 by_sig,
-            )
+            );
+            (matched.output, matched.duration_ms)
         };
 
         let consumed_after = consumed_edge.iter().filter(|&&c| c).count();
         // If synthetic or if we just consumed an edge result, this was an edge tool
         let is_edge_tool = synthetic_idx.is_some() || consumed_after > consumed_before;
+        let early_exit_ms = if is_edge_tool && edge_duration_ms > 0 {
+            edge_duration_ms
+        } else {
+            0
+        };
 
         if !valid_tool_names.contains(&name) {
             let err_msg = unknown_local_tool_error_message(&name, valid_tool_names);
@@ -240,7 +249,7 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
                 headless_unknown_local_tool_openai_pair(&id, &name, valid_tool_names);
             messages.push(tool_msg);
             tool_results.push(err_tr);
-            tool_call_records.push(journal_record_unknown_tool(name.clone()));
+            tool_call_records.push(journal_record_unknown_tool(name.clone(), early_exit_ms));
             continue;
         }
 
@@ -265,6 +274,7 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
                 name.clone(),
                 err_msg,
                 make_args_preview(&name, &args),
+                early_exit_ms,
             ));
             continue;
         }
@@ -305,6 +315,7 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
                     name.clone(),
                     reason,
                     make_args_preview(&name, &args),
+                    early_exit_ms,
                 ));
                 continue;
             }
@@ -330,6 +341,7 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
                         name.clone(),
                         err_msg,
                         make_args_preview(&name, &args),
+                        early_exit_ms,
                     ));
                     continue;
                 }
@@ -395,26 +407,24 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
             turn_guard,
         );
 
+        let executed_ms = if is_edge_tool && edge_duration_ms > 0 {
+            edge_duration_ms
+        } else {
+            tool_start.elapsed().as_millis() as u64
+        };
         let args_size = serde_json::to_string(&args)
             .map(|s| s.len() as u32)
             .unwrap_or(0);
         let args_preview = make_args_preview(&name, &args);
-        let tool_elapsed = tool_start.elapsed();
         tool_call_records.push(journal_record_executed_tool_call(
             name.clone(),
             is_err,
-            tool_elapsed.as_millis() as u64,
+            executed_ms,
             args_size,
             result_str.as_str(),
             args_preview,
         ));
-        step_recorder.complete_tool_with_result(
-            &name,
-            is_err,
-            tool_elapsed.as_millis() as u64,
-            false,
-            &result_str,
-        );
+        step_recorder.complete_tool_with_result(&name, is_err, executed_ms, false, &result_str);
 
         if let Some(sid) = current_session_id {
             try_write_light_headless_step_checkpoint(sid, step_recorder);
@@ -439,7 +449,7 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
         // In sub-run mode (quiet=false but SSE stream is suppressed), edge tools
         // are the only tools executed, so we must emit them for progress visibility.
         if !quiet {
-            let duration_str = format_headless_tool_duration(tool_elapsed);
+            let duration_str = format_headless_tool_duration(Duration::from_millis(executed_ms));
             let detail = tool_call_detail(&name, &args);
             let summary = if !is_err {
                 tool_result_summary(&name, &result_str)

@@ -1083,11 +1083,11 @@ fn commit_turn_journal_workspace_and_sidecars(
         // Log Step Protocol recorder summary (audit trail for execution phases)
         if let Some(ref summary) = result.step_recorder_summary {
             let summary_text = format!(
-                "step_recorder: turns={} tools={} phases={} time={}ms",
-                summary.turns,
+                "step_recorder: iterations={} tools={} phases={} tool_time={}ms",
+                summary.iterations,
                 summary.total_tools,
                 summary.phase_log.len(),
-                summary.total_time_ms,
+                summary.total_tool_time_ms,
             );
             let recorder_event = session_journal::JournalEvent::checkpoint(
                 state.session_id.as_deref(),

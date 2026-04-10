@@ -38,11 +38,11 @@ pub fn journal_record_cross_turn_cache_hit(
 }
 
 #[must_use]
-pub fn journal_record_unknown_tool(name: String) -> ToolCallRecord {
+pub fn journal_record_unknown_tool(name: String, tool_elapsed_ms: u64) -> ToolCallRecord {
     ToolCallRecord {
         name: name.clone(),
         ok: false,
-        ms: 0,
+        ms: tool_elapsed_ms,
         error: Some(format!("unknown_tool: {name}")),
         input_bytes: None,
         output_bytes: None,
@@ -56,11 +56,12 @@ pub fn journal_record_blocked_tool(
     name: String,
     reason: String,
     args_preview: Option<String>,
+    tool_elapsed_ms: u64,
 ) -> ToolCallRecord {
     ToolCallRecord {
         name,
         ok: false,
-        ms: 0,
+        ms: tool_elapsed_ms,
         error: Some(format!("blocked_tool: {reason}")),
         input_bytes: None,
         output_bytes: None,
@@ -126,8 +127,9 @@ mod tests {
 
     #[test]
     fn unknown_tool_error_tag() {
-        let r = journal_record_unknown_tool("nope".into());
+        let r = journal_record_unknown_tool("nope".into(), 7);
         assert!(!r.ok);
+        assert_eq!(r.ms, 7);
         assert_eq!(r.error.as_deref(), Some("unknown_tool: nope"));
     }
 
@@ -137,8 +139,10 @@ mod tests {
             "bash".into(),
             "denied by policy".into(),
             Some(r#"{"command":"echo hi"}"#.into()),
+            9,
         );
         assert!(!r.ok);
+        assert_eq!(r.ms, 9);
         assert_eq!(r.error.as_deref(), Some("blocked_tool: denied by policy"));
         assert_eq!(r.args_preview.as_deref(), Some(r#"{"command":"echo hi"}"#));
     }

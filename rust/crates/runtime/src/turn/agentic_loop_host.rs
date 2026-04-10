@@ -3023,6 +3023,7 @@ mod tests {
         let _ = run_agentic_loop_with_host(&mut host, &mut state).await;
         // The headless round should record tool executions
         assert!(!state.tool_call_records.is_empty());
+        assert_eq!(state.tool_call_records[0].ms, 10);
     }
 
     #[tokio::test]

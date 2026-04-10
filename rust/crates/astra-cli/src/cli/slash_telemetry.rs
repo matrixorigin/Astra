@@ -311,7 +311,7 @@ fn show_drift_analysis(
     eprintln!();
 
     // Analyze drift from session goal
-    if let Some(ref goal) = state.session_goal {
+    if state.session_goal.is_some() {
         let analysis = session_guard.check_drift();
         let severity_color = if analysis.drift_severity > 0.7 {
             "red"

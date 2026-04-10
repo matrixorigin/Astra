@@ -49,6 +49,9 @@ impl crate::turn::headless_tool_assembly::EdgeToolRoundRow for EdgeToolExecResul
     fn tool_output(&self) -> &str {
         &self.output
     }
+    fn tool_duration_ms(&self) -> u64 {
+        self.duration_ms
+    }
     fn assistant_tool_call_id(&self, index: usize) -> String {
         if self.request_id.is_empty() {
             format!("edge-{index}")
