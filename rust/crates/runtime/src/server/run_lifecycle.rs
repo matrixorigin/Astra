@@ -342,6 +342,8 @@ impl AgenticRunLifecycleService {
             progress_emitter: None,
             permission_context: None,
             permission_handler: None,
+            observability_session: None,
+            observability_hub: None,
         }
     }
 
@@ -1085,6 +1087,8 @@ impl SubRunExecutor for ServerSubRunExecutor {
             progress_emitter: None,
             permission_context: None,
             permission_handler: None,
+            observability_session: None,
+            observability_hub: None,
         };
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut loop_state).await;

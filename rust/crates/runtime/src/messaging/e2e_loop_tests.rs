@@ -225,6 +225,8 @@ mod tests {
             progress_emitter: None,
             permission_context: None,
             permission_handler: None,
+            observability_session: None,
+            observability_hub: None,
         }
     }
 

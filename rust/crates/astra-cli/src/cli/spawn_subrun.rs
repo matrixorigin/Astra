@@ -264,6 +264,8 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             progress_emitter: config.progress_emitter,
             permission_context: config.permission_context,
             permission_handler: None, // Child agents don't handle permission requests
+            observability_session: None,
+            observability_hub: None,
         };
 
         // Inherit skills from parent: pre-populate discovered skills
