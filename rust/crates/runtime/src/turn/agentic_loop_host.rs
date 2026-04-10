@@ -1236,9 +1236,7 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
         }
 
         // ─── Step 1: Host executes the turn (payload → HTTP → SSE) ──────
-        let llm_start = std::time::Instant::now();
         let turn_result = host.execute_turn(state).await?;
-        let llm_total_ms = llm_start.elapsed().as_millis() as u64;
 
         // ─── Step 2: Ingest turn stream into loop state ─────────────────
         let snap =
