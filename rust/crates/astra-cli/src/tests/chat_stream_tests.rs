@@ -65,6 +65,8 @@ async fn stream_chat_sse_simple_text_response() {
         agent_spawner: None,
         root_agent_id: None,
         root_mailbox_slot: None,
+                observability_hub: None,
+                observability_session: None,
     })
     .await
     .unwrap();
@@ -146,6 +148,8 @@ async fn stream_chat_sse_reuses_persistent_root_mailbox_across_turns() {
             agent_spawner: Some(spawner.clone()),
             root_agent_id: Some("main"),
             root_mailbox_slot: Some(&mut root_mailbox),
+            observability_hub: None,
+            observability_session: None,
         })
         .await
         .unwrap();
@@ -221,6 +225,8 @@ async fn stream_chat_sse_unregisters_ephemeral_root_mailbox() {
         agent_spawner: Some(spawner),
         root_agent_id: Some("bg-root"),
         root_mailbox_slot: None,
+                observability_hub: None,
+                observability_session: None,
     })
     .await
     .unwrap();
@@ -324,6 +330,8 @@ async fn stream_chat_sse_api_error_propagated() {
         agent_spawner: None,
         root_agent_id: None,
         root_mailbox_slot: None,
+                observability_hub: None,
+                observability_session: None,
     })
     .await;
     assert!(result.is_err());
@@ -401,6 +409,8 @@ async fn stream_chat_sse_with_tool_call_loop() {
         agent_spawner: None,
         root_agent_id: None,
         root_mailbox_slot: None,
+                observability_hub: None,
+                observability_session: None,
     })
     .await
     .unwrap();

@@ -1014,6 +1014,8 @@ async fn plan_executor_task(
                     agent_spawner: ctx.agent_spawner.clone(),
                     root_agent_id: Some(ctx.root_agent_id.as_str()),
                     root_mailbox_slot: Some(&mut ctx.root_mailbox),
+                    observability_hub: None,
+                    observability_session: None,
                 })
                 .await;
 
