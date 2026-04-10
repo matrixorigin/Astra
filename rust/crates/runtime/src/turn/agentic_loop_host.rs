@@ -543,6 +543,12 @@ fn parse_coordination_pattern(
         })
         .unwrap_or_else(|| vec!["coder".to_string()]);
 
+    let task = args
+        .get("task")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+
     match pattern_type {
         "fan_out" => Ok(astra_services::coordination::CoordinationPattern::FanOut {
             agent_ids: agents,
@@ -583,6 +589,19 @@ fn parse_coordination_pattern(
                     timeout_sec: 0,
                 },
             )
+        }
+        "auto" => {
+            let hints = astra_services::coordination::CoordinationHints {
+                agent_ids: agents,
+                task,
+                needs_review: false,
+                has_dependencies: args
+                    .get("has_dependencies")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                timeout_sec: args.get("timeout").and_then(Value::as_u64).unwrap_or(0),
+            };
+            Ok(astra_services::coordination::suggest_pattern(&hints))
         }
         _ => Ok(
             astra_services::coordination::CoordinationPattern::Sequential {

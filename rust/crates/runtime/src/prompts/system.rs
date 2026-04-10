@@ -483,13 +483,16 @@ pub fn build_main_system_prompt_with_style(
     task_type: Option<&str>,
     output_style: Option<&OutputStyle>,
 ) -> String {
-    sections_to_string(&build_system_prompt_sections_with_style(
+    let mut sections = build_system_prompt_sections_with_style(
         tool_names,
         profile_desc,
         selection_confidence,
         task_type,
         output_style,
-    ))
+    );
+    let overrides = load_overrides(&default_overrides_dir());
+    apply_overrides(&mut sections, &overrides);
+    sections_to_string(&sections)
 }
 
 /// Build system prompt as structured sections with cache scope metadata.
