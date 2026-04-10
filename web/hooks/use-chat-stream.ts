@@ -256,6 +256,7 @@ export function useChatStream(config: ChatConfig): UseChatStreamReturn {
         }
 
         case 'agent_delegated':
+        case 'agent_spawned':
         case 'agent_progress':
         case 'agent_completed':
         case 'warning':

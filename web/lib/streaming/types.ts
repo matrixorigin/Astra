@@ -17,6 +17,7 @@ export type StreamEventType =
   | 'plan_step_start'
   | 'plan_step_done'
   | 'agent_delegated'
+  | 'agent_spawned'
   | 'agent_progress'
   | 'agent_completed';
 
@@ -124,16 +125,41 @@ export type AgentDelegatedEvent = {
   task: string;
 };
 
+export type AgentSpawnedEvent = {
+  type: 'agent_spawned';
+  agent_id: string;
+  run_id: string;
+  parent_run_id: string;
+  agent_type: string;
+  description: string;
+  timestamp?: number;
+};
+
 export type AgentProgressEvent = {
   type: 'agent_progress';
   agent_id: string;
-  progress: string;
+  status: string;
+  description?: string;
+  tool_name?: string;
+  turn?: number;
+  max_turns?: number;
+  total_prompt_tokens?: number;
+  total_completion_tokens?: number;
+  total_tool_calls?: number;
+  timestamp?: number;
 };
 
 export type AgentCompletedEvent = {
   type: 'agent_completed';
   agent_id: string;
-  result: string;
+  status: 'completed' | 'failed' | 'cancelled';
+  result_summary?: string;
+  error?: string;
+  reason?: string;
+  total_tool_calls?: number;
+  total_tokens?: { prompt: number; completion: number };
+  duration_ms?: number;
+  timestamp?: number;
 };
 
 export type StreamEvent =
@@ -153,6 +179,7 @@ export type StreamEvent =
   | PlanStepStartEvent
   | PlanStepDoneEvent
   | AgentDelegatedEvent
+  | AgentSpawnedEvent
   | AgentProgressEvent
   | AgentCompletedEvent;
 

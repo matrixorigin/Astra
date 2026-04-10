@@ -420,16 +420,33 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
             "agent_id": data.get("agent_id").cloned().unwrap_or(serde_json::Value::String(String::new())),
             "task": data.get("task").cloned().unwrap_or(serde_json::Value::String(String::new())),
         }),
-        "agent_progress" => serde_json::json!({
-            "type": "agent_progress",
-            "agent_id": data.get("agent_id").cloned().unwrap_or(serde_json::Value::String(String::new())),
-            "progress": data.get("progress").cloned().unwrap_or(serde_json::Value::String(String::new())),
-        }),
-        "agent_completed" => serde_json::json!({
-            "type": "agent_completed",
-            "agent_id": data.get("agent_id").cloned().unwrap_or(serde_json::Value::String(String::new())),
-            "result": data.get("result").cloned().unwrap_or(serde_json::Value::String(String::new())),
-        }),
+        "agent_spawned" => {
+            let mut out = serde_json::json!({ "type": "agent_spawned" });
+            if let Some(obj) = out.as_object_mut() {
+                for (k, v) in &data {
+                    obj.insert(k.clone(), v.clone());
+                }
+            }
+            out
+        }
+        "agent_progress" => {
+            let mut out = serde_json::json!({ "type": "agent_progress" });
+            if let Some(obj) = out.as_object_mut() {
+                for (k, v) in &data {
+                    obj.insert(k.clone(), v.clone());
+                }
+            }
+            out
+        }
+        "agent_completed" => {
+            let mut out = serde_json::json!({ "type": "agent_completed" });
+            if let Some(obj) = out.as_object_mut() {
+                for (k, v) in &data {
+                    obj.insert(k.clone(), v.clone());
+                }
+            }
+            out
+        }
         "keepalive" => serde_json::json!({ "type": "ping" }),
         _ => serde_json::json!({ "type": event_type }),
     }
