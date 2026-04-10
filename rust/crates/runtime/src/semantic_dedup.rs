@@ -342,10 +342,10 @@ impl SemanticDedup {
             self.check_and_record(tool_name, args, result_str.as_str(), turn_index)
         {
             result_str.push_str(&format!(
-                "\n⚠ Note: this result is similar to a previous {tool_name} call (turn {}, {}). \
-                 Avoid re-fetching the same information.",
+                "\n\n⚠️ DUPLICATE DETECTED: This {tool_name} result is identical/similar to turn {} ({reason}). \
+                 You already have this information in context. Do NOT call this tool again for the same data. \
+                 Use the information from the earlier call instead of making more redundant requests.",
                 prev_turn + 1,
-                reason
             ));
         }
     }
@@ -644,14 +644,14 @@ mod tests {
         let mut out1 = "fn main() {}".to_string();
         tracker.append_near_duplicate_hint_if_any(&mut out1, "read_file", &args, 1);
         assert!(
-            !out1.contains("similar to a previous"),
+            !out1.contains("DUPLICATE DETECTED"),
             "first recording should not append hint"
         );
 
         let mut out2 = "fn main() {}".to_string();
         tracker.append_near_duplicate_hint_if_any(&mut out2, "read_file", &args, 2);
-        assert!(out2.contains("similar to a previous read_file call"));
-        assert!(out2.contains("param_match"));
+        assert!(out2.contains("DUPLICATE DETECTED"));
+        assert!(out2.contains("read_file"));
     }
 
     #[test]

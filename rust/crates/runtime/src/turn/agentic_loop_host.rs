@@ -1210,6 +1210,29 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
             };
         }
 
+        // ─── Step 0.5: Inject context inventory to reduce redundant tool calls ──
+        // After the first turn, tell the LLM what files/searches are already in
+        // context so it avoids re-fetching the same data. Injected as an ephemeral
+        // system message — replaced each iteration (not accumulated).
+        if turn_index > 0 {
+            const INVENTORY_HEADER: &str = "## Already Fetched (do NOT re-read/re-grep these)\n";
+            // Remove previous inventory (may be anywhere after assistant/tool messages were appended).
+            state.messages.retain(|m| {
+                m.get("role").and_then(Value::as_str) != Some("system")
+                    || !m
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .is_some_and(|c| c.starts_with(INVENTORY_HEADER))
+            });
+            let inventory = state.semantic_dedup.context_inventory();
+            if !inventory.is_empty() {
+                state.messages.push(serde_json::json!({
+                    "role": "system",
+                    "content": format!("{INVENTORY_HEADER}{inventory}"),
+                }));
+            }
+        }
+
         // ─── Step 1: Host executes the turn (payload → HTTP → SSE) ──────
         let llm_start = std::time::Instant::now();
         let turn_result = host.execute_turn(state).await?;
@@ -1514,6 +1537,22 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
                 });
                 state.messages.push(tool_msg.clone());
                 state.tool_results.push(tool_msg);
+                // Record delegation results in journal so session analysis
+                // shows actual sub-agent output instead of the static
+                // "acknowledged" placeholder from the edge executor.
+                state.tool_call_records.push(ToolCallRecord {
+                    name: DELEGATE_TOOL_NAME.to_string(),
+                    ok: !result_text.starts_with("Delegation failed:")
+                        && !result_text.starts_with("Invalid delegation request:"),
+                    ms: 0, // delegation timing is inside the result text
+                    error: None,
+                    input_bytes: None,
+                    output_bytes: Some(result_text.len() as u32),
+                    args_preview: Some(call_id.clone()),
+                    result_preview: Some(
+                        result_text.chars().take(500).collect::<String>(),
+                    ),
+                });
             }
         }
 

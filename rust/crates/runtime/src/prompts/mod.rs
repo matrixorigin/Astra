@@ -239,9 +239,10 @@ mod tests {
         // Enhanced prompt adds: Planning Protocol, Context Strategy, Discovery Before Access,
         // Coding Discipline (including Executor rule), Parallel Tool Calls (with Limit/Anti-pattern),
         // Token Efficiency, Build/Test Guidance, Plan Execution, Search Strategy (with Simple vs Complex).
+        // Headroom: ~200 chars above measured size. Bump when adding new rules.
         assert!(
-            p.len() < 10600,
-            "compressed prompt should be under 10600 chars, got {}",
+            p.len() < 10800,
+            "compressed prompt should be under 10800 chars, got {}",
             p.len()
         );
     }
@@ -943,10 +944,11 @@ mod tests {
         assert!(p.contains("## Git Workflow"));
         assert!(p.contains("## Memory Rules"));
         // Budget: full prompt should still be reasonable (allows for Executor rule addition
-        // and Parallel Tool Calls Limit/Anti-pattern, Search Strategy Simple vs Complex)
+        // and Parallel Tool Calls Limit/Anti-pattern, Search Strategy Simple vs Complex).
+        // Headroom: ~200 chars above measured size. Bump when adding new rules.
         assert!(
-            p.len() < 16000,
-            "full toolset prompt should be under 16000 chars, got {}",
+            p.len() < 16200,
+            "full toolset prompt should be under 16200 chars, got {}",
             p.len()
         );
     }

@@ -136,6 +136,7 @@ fn output_format_section() -> &'static str {
          - **Explanations**: be direct. Lead with the answer, then give supporting details.\n\
          - **Multiple findings**: use a structured list or table. Don't bury results in prose.\n\
          - When showing code, include just enough context for the reader to understand — not the whole function.\n\
+         - **NEVER repeat a summary or report you already output.** If you produced a review/analysis, do NOT regenerate it. Proceed to the next action (fix, suggest, or ask).\n\
          \n\
          ## Tool Precedence (prefer earlier tools in each chain)\n\
          - **Understand code**: symbols(calls=true) → call_graph → read_file\n\
