@@ -56,6 +56,11 @@ pub struct TeamDefinition {
 }
 
 /// Budget constraints applied to a team execution.
+///
+/// `max_duration_secs` is enforced as a hard timeout (execution is cancelled).
+/// `max_tokens` and `max_cost_usd` are **post-execution checks** — the execution
+/// runs to completion and the budget violation is reported afterward, because
+/// token counts are only known after LLM responses arrive.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TeamBudget {
     /// Maximum cost in USD for the entire team execution.
@@ -920,6 +925,27 @@ impl TeamPersistenceService for MatrixOneTeamStore {
         user_id: &str,
         task: &str,
     ) -> Result<(), String> {
+        // Retention: prune oldest rows beyond MAX_EXECUTIONS_PER_TEAM.
+        // Uses a subquery to find the cutoff started_at, then deletes older rows.
+        const MAX_EXECUTIONS_PER_TEAM: u32 = 100;
+        sqlx::query(
+            "DELETE FROM team_execution_history \
+             WHERE team_id = ? AND execution_id NOT IN ( \
+                 SELECT execution_id FROM ( \
+                     SELECT execution_id FROM team_execution_history \
+                     WHERE team_id = ? \
+                     ORDER BY started_at DESC \
+                     LIMIT ? \
+                 ) AS recent \
+             )",
+        )
+        .bind(team_id)
+        .bind(team_id)
+        .bind(MAX_EXECUTIONS_PER_TEAM)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| format!("execution retention prune failed: {e}"))?;
+
         sqlx::query(
             "INSERT INTO team_execution_history \
              (execution_id, team_id, user_id, task, status, started_at) \
@@ -2239,6 +2265,119 @@ mod tests {
             .record_execution_complete("nonexistent", "completed", None)
             .await;
         assert!(result.is_ok());
+    }
+
+    // ── Execution Retention ──
+
+    #[tokio::test]
+    async fn execution_retention_prunes_oldest_when_limit_exceeded() {
+        let store = InMemoryTeamStore::new();
+        // Fill to exactly MAX (100) and complete them so they're eligible for pruning
+        for i in 0..100 {
+            store
+                .record_execution_start(
+                    &format!("exec-{i}"),
+                    "team-ret",
+                    "user-1",
+                    &format!("task {i}"),
+                )
+                .await
+                .unwrap();
+            store
+                .record_execution_complete(&format!("exec-{i}"), "completed", None)
+                .await
+                .unwrap();
+        }
+        let all = store.list_executions("team-ret", 200).await.unwrap();
+        assert_eq!(all.len(), 100);
+
+        // Adding one more triggers prune of oldest completed (exec-0)
+        store
+            .record_execution_start("exec-100", "team-ret", "user-1", "task 100")
+            .await
+            .unwrap();
+
+        let all = store.list_executions("team-ret", 200).await.unwrap();
+        // 100 completed - 1 pruned + 1 new running = 100
+        assert_eq!(all.len(), 100);
+        assert!(
+            all.iter().all(|r| r.execution_id != "exec-0"),
+            "oldest completed execution should have been pruned"
+        );
+        assert!(all.iter().any(|r| r.execution_id == "exec-1"));
+        assert!(all.iter().any(|r| r.execution_id == "exec-100"));
+    }
+
+    #[tokio::test]
+    async fn execution_retention_does_not_prune_other_teams() {
+        let store = InMemoryTeamStore::new();
+        // Fill team-a to 100 completed
+        for i in 0..100 {
+            store
+                .record_execution_start(
+                    &format!("a-exec-{i}"),
+                    "team-a",
+                    "user-1",
+                    &format!("task {i}"),
+                )
+                .await
+                .unwrap();
+            store
+                .record_execution_complete(&format!("a-exec-{i}"), "completed", None)
+                .await
+                .unwrap();
+        }
+        // Add 3 for team-b
+        for i in 0..3 {
+            store
+                .record_execution_start(
+                    &format!("b-exec-{i}"),
+                    "team-b",
+                    "user-1",
+                    &format!("task {i}"),
+                )
+                .await
+                .unwrap();
+        }
+
+        // Trigger prune on team-a
+        store
+            .record_execution_start("a-exec-100", "team-a", "user-1", "overflow")
+            .await
+            .unwrap();
+
+        // team-b should be untouched
+        let b_list = store.list_executions("team-b", 200).await.unwrap();
+        assert_eq!(b_list.len(), 3);
+
+        // team-a should be capped at 100
+        let a_list = store.list_executions("team-a", 200).await.unwrap();
+        assert_eq!(a_list.len(), 100);
+    }
+
+    #[tokio::test]
+    async fn execution_retention_preserves_running_records() {
+        let store = InMemoryTeamStore::new();
+        // Create 100 running (not completed) records
+        for i in 0..100 {
+            store
+                .record_execution_start(
+                    &format!("exec-{i}"),
+                    "team-run",
+                    "user-1",
+                    &format!("task {i}"),
+                )
+                .await
+                .unwrap();
+        }
+        // Add one more — running records should NOT be pruned
+        store
+            .record_execution_start("exec-100", "team-run", "user-1", "task 100")
+            .await
+            .unwrap();
+
+        let all = store.list_executions("team-run", 200).await.unwrap();
+        assert_eq!(all.len(), 101, "running records must not be pruned");
     }
 
     // ── Snapshot CRUD ──

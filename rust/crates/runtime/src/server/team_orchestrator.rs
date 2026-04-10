@@ -425,6 +425,7 @@ impl TeamExecutionOrchestrator {
                         "event_type": "team_budget_exceeded",
                         "budget_max_tokens": b.max_tokens,
                         "actual_tokens": total_tokens,
+                        "enforcement": "post_execution",
                     }),
                 )
                 .await;
@@ -557,7 +558,7 @@ impl TeamExecutionOrchestrator {
             merge_result,
             merged_learning,
             status,
-            error: None,
+            error,
         }
     }
 
@@ -748,9 +749,12 @@ fn extract_learning_from_result(result: &AgentResult) -> AgentLearning {
 
 #[cfg(test)]
 mod tests {
-    use super::super::delegation_engine::{DelegationTracker, StubSubRunExecutor};
+    use super::super::delegation_engine::{
+        DelegationTracker, StubSubRunExecutor, SubRunConfig, SubRunExecutor,
+    };
     use super::*;
-    use astra_services::coordination::AgentTier;
+    use async_trait::async_trait;
+    use astra_services::coordination::{AgentResult, AgentTier};
     use astra_services::runs::InMemoryRunStateStore;
     use astra_services::team_persistence::InMemoryTeamStore;
 
@@ -1232,5 +1236,130 @@ mod tests {
         // Budget check is post-execution, so run completes normally
         assert_ne!(report.status, TeamExecutionStatus::Failed);
         assert!(report.delegation_result.is_some());
+    }
+
+    /// Executor that returns configurable token counts to trigger budget checks.
+    struct TokenBudgetExecutor {
+        prompt_tokens: u64,
+        completion_tokens: u64,
+    }
+
+    #[async_trait]
+    #[async_trait]
+    impl SubRunExecutor for TokenBudgetExecutor {
+        async fn execute(&self, config: SubRunConfig) -> Result<AgentResult, String> {
+            Ok(AgentResult {
+                agent_id: config.agent_profile.agent_id,
+                run_id: config.run_id,
+                status: astra_core::STATUS_COMPLETED.to_string(),
+                output: Some("done".into()),
+                error: None,
+                prompt_tokens: self.prompt_tokens,
+                completion_tokens: self.completion_tokens,
+                tool_calls: 0,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn budget_exceeded_event_includes_enforcement_field() {
+        let store = Arc::new(InMemoryTeamStore::new());
+        let team = astra_services::team_persistence::TeamDefinition {
+            team_id: "t-enf".into(),
+            user_id: "u1".into(),
+            name: "enforce-test".into(),
+            description: "test".into(),
+            coordination: astra_services::team_persistence::TeamCoordination::Pipeline,
+            members: vec![astra_services::team_persistence::TeamMemberDef {
+                role: "worker".into(),
+                agent_id: None,
+                system_prompt: Some("do work".into()),
+                skills: vec![],
+                model_override: None,
+                mcp_servers: vec![],
+                can_delegate: false,
+                max_delegation_depth: 0,
+            }],
+            context: std::collections::HashMap::new(),
+            worktree_mode: astra_services::team_persistence::WorktreeMode::Shared,
+            budget: Some(astra_services::team_persistence::TeamBudget {
+                max_cost_usd: 0.0,
+                max_tokens: 100,
+                max_duration_secs: 0,
+            }),
+            max_parallel: 0,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        };
+        store.save_team(&team).await.unwrap();
+
+        let registry = Arc::new(RwLock::new(AgentProfileRegistry::new()));
+        let run_store = Arc::new(InMemoryRunStateStore::new());
+        let run_engine = Arc::new(RunEngine::new(run_store));
+        let tracker = Arc::new(DelegationTracker::new());
+
+        // Executor returns 500 tokens total, exceeding the 100 budget
+        let executor = Arc::new(TokenBudgetExecutor {
+            prompt_tokens: 300,
+            completion_tokens: 200,
+        });
+
+        let orch = TeamExecutionOrchestrator::new(
+            store,
+            Arc::new(DelegationEngine::with_executor(
+                registry.clone(),
+                run_engine.clone(),
+                tracker.clone(),
+                executor,
+            )),
+            tracker,
+            run_engine.clone(),
+            registry,
+            OrchestratorConfig {
+                user_id: "u1".into(),
+                session_id: "s1".into(),
+                source_agent_id: "orch".into(),
+                progress: None,
+            },
+        );
+
+        let report = orch
+            .execute_team("enforce-test", "do something", None)
+            .await;
+
+        // Run completes (post-execution check), but error mentions budget
+        assert!(
+            report
+                .error
+                .as_ref()
+                .map_or(false, |e| e.contains("token budget exceeded")),
+            "error should mention budget exceeded, got: {:?}",
+            report.error
+        );
+
+        // Verify the event carries enforcement=post_execution
+        let run = run_engine
+            .load_run(&report.parent_run_id)
+            .await
+            .unwrap()
+            .expect("run record should exist");
+        let budget_event = run
+            .events
+            .iter()
+            .find(|v| v.get("event_type").and_then(|t| t.as_str()) == Some("team_budget_exceeded"));
+        assert!(
+            budget_event.is_some(),
+            "budget_exceeded event should be emitted"
+        );
+        let ev = budget_event.unwrap();
+        assert_eq!(
+            ev.get("enforcement").and_then(|v| v.as_str()),
+            Some("post_execution"),
+        );
+        assert_eq!(ev.get("actual_tokens").and_then(|v| v.as_u64()), Some(500));
+        assert_eq!(
+            ev.get("budget_max_tokens").and_then(|v| v.as_u64()),
+            Some(100)
+        );
     }
 }
