@@ -1,6 +1,6 @@
 use super::*;
 
-// ── find_task_by_query ────────────────────────────────────────────────────
+// ── slash_task::find_task_by_query ────────────────────────────────────────────────────
 
 use astra_services::TaskService as _;
 
@@ -21,12 +21,16 @@ async fn find_task_by_id_prefix() {
         .unwrap();
 
     // Full ID match
-    let found = find_task_by_query(&svc, "u1", &tid).await.unwrap();
+    let found = slash_task::find_task_by_query(&svc, "u1", &tid)
+        .await
+        .unwrap();
     assert_eq!(found, Some(tid.clone()));
 
     // Prefix match (first 8 Unicode scalars)
     let prefix = prefix_chars(&tid, 8);
-    let found = find_task_by_query(&svc, "u1", &prefix).await.unwrap();
+    let found = slash_task::find_task_by_query(&svc, "u1", &prefix)
+        .await
+        .unwrap();
     assert_eq!(found, Some(tid));
 }
 
@@ -46,12 +50,14 @@ async fn find_task_by_title_substring() {
     .unwrap();
 
     // Case-insensitive title match
-    let found = find_task_by_query(&svc, "u1", "authentication")
+    let found = slash_task::find_task_by_query(&svc, "u1", "authentication")
         .await
         .unwrap();
     assert!(found.is_some());
 
-    let found = find_task_by_query(&svc, "u1", "AUTH").await.unwrap();
+    let found = slash_task::find_task_by_query(&svc, "u1", "AUTH")
+        .await
+        .unwrap();
     assert!(found.is_some());
 }
 
@@ -59,7 +65,9 @@ async fn find_task_by_title_substring() {
 async fn find_task_not_found() {
     let tmp = tempfile::TempDir::new().unwrap();
     let svc = astra_services::LocalTaskService::new(tmp.path().to_path_buf());
-    let found = find_task_by_query(&svc, "u1", "nonexistent").await.unwrap();
+    let found = slash_task::find_task_by_query(&svc, "u1", "nonexistent")
+        .await
+        .unwrap();
     assert!(found.is_none());
 }
 
@@ -79,7 +87,9 @@ async fn find_task_wrong_user() {
     .unwrap();
 
     // Different user can't find it
-    let found = find_task_by_query(&svc, "user-b", "Private").await.unwrap();
+    let found = slash_task::find_task_by_query(&svc, "user-b", "Private")
+        .await
+        .unwrap();
     assert!(found.is_none());
 }
 
@@ -356,7 +366,7 @@ async fn resume_full_flow_cloud_restore() {
         state.recent_tools = restored.recent_tools.clone();
         state.model = restored.model.clone();
         if let Some(ref m) = state.model {
-            state.cached_pricing = fallback_pricing(m);
+            state.cached_pricing = slash_stats::fallback_pricing(m);
         }
     }
 

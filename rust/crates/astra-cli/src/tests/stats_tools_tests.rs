@@ -1,18 +1,18 @@
 use super::*;
 
-// ── handle_stats_command ─────────────────────────────────────────────────
+// ── slash_stats::handle_stats_command ─────────────────────────────────────────────────
 
 #[test]
 fn stats_no_active_session_does_not_panic() {
     // state with no session_id → should not panic
     let state = super::ReplState::default();
-    handle_stats_command("", &state); // current session mode, no session
+    slash_stats::handle_stats_command("", &state); // current session mode, no session
 }
 
 #[test]
 fn stats_history_no_sessions_does_not_panic() {
     let state = super::ReplState::default();
-    handle_stats_command("history", &state);
+    slash_stats::handle_stats_command("history", &state);
 }
 
 #[test]
@@ -68,12 +68,12 @@ fn stats_current_session_reads_journal() {
     assert_eq!(stats.model, Some("gpt-4o".into()));
     assert_eq!(stats.avg_tokens_per_turn, 1350); // (1800+900)/2
 
-    // Now verify handle_stats_command doesn't panic with this session
+    // Now verify slash_stats::handle_stats_command doesn't panic with this session
     let state = super::ReplState {
         session_id: Some(sid),
         ..Default::default()
     };
-    handle_stats_command("", &state);
+    slash_stats::handle_stats_command("", &state);
 }
 
 #[test]
@@ -115,12 +115,12 @@ fn stats_history_aggregates_multiple_sessions() {
     assert_eq!(agg.total_tokens_out, 500);
 }
 
-// ── handle_tools_command ─────────────────────────────────────────────────
+// ── slash_tools::handle_tools_command ─────────────────────────────────────────────────
 
 #[test]
 fn tools_no_active_session_does_not_panic() {
     let state = super::ReplState::default();
-    handle_tools_command(&state);
+    slash_tools::handle_tools_command(&state);
 }
 
 #[test]
@@ -147,7 +147,7 @@ fn tools_session_with_no_tool_calls_does_not_panic() {
         session_id: Some(sid),
         ..Default::default()
     };
-    handle_tools_command(&state);
+    slash_tools::handle_tools_command(&state);
 }
 
 #[test]
@@ -224,10 +224,10 @@ fn tools_reads_tool_calls_from_journal() {
     assert_eq!(profiles[1].fail_count, 0);
     assert_eq!(profiles[1].error_rate, 0.0);
 
-    // Verify handle_tools_command doesn't panic with this data
+    // Verify slash_tools::handle_tools_command doesn't panic with this data
     let state = super::ReplState {
         session_id: Some(sid),
         ..Default::default()
     };
-    handle_tools_command(&state);
+    slash_tools::handle_tools_command(&state);
 }

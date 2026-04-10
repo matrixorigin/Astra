@@ -1201,7 +1201,7 @@ fn apply_turn_success(
     state.total_cache_creation_tokens += result.cache_creation_tokens;
 
     // Accumulate per-turn cost
-    let turn_cost = crate::cost_for_tokens(
+    let turn_cost = crate::slash_stats::cost_for_tokens(
         result.prompt_tokens,
         result.completion_tokens,
         result.cache_read_tokens,
@@ -1283,7 +1283,7 @@ fn print_turn_status_line(state: &ReplState, result: &StreamResult, turn_start: 
     };
 
     // Per-turn cost
-    let turn_cost = crate::cost_for_tokens(
+    let turn_cost = crate::slash_stats::cost_for_tokens(
         result.prompt_tokens,
         result.completion_tokens,
         result.cache_read_tokens,
@@ -1303,7 +1303,7 @@ fn print_turn_status_line(state: &ReplState, result: &StreamResult, turn_start: 
 
     // Show turn cost (skip if pricing not available)
     if turn_cost > 0.0 {
-        parts.push(crate::format_cost(turn_cost));
+        parts.push(crate::slash_stats::format_cost(turn_cost));
     }
 
     parts.push(elapsed_str);
@@ -1334,7 +1334,10 @@ fn print_turn_status_line(state: &ReplState, result: &StreamResult, turn_start: 
     // Session total on second line (only after first turn with pricing)
     let session_cost = state.total_session_cost + turn_cost;
     if session_cost > 0.0 && state.turn > 0 {
-        let session_line = format!("  session: {}", crate::format_cost(session_cost));
+        let session_line = format!(
+            "  session: {}",
+            crate::slash_stats::format_cost(session_cost)
+        );
         eprintln!("{}", session_line.dim());
     }
 
@@ -2766,12 +2769,12 @@ mod tests {
         };
 
         // First turn
-        let cost1 = crate::cost_for_tokens(1000, 500, 800, 100, &state.cached_pricing);
+        let cost1 = crate::slash_stats::cost_for_tokens(1000, 500, 800, 100, &state.cached_pricing);
         state.total_session_cost += cost1;
         assert!(cost1 > 0.0);
 
         // Second turn
-        let cost2 = crate::cost_for_tokens(2000, 1000, 1500, 0, &state.cached_pricing);
+        let cost2 = crate::slash_stats::cost_for_tokens(2000, 1000, 1500, 0, &state.cached_pricing);
         state.total_session_cost += cost2;
 
         assert!((state.total_session_cost - (cost1 + cost2)).abs() < 1e-10);

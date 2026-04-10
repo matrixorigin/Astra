@@ -129,7 +129,7 @@ fn build_bug_report(state: &ReplState) -> String {
     if state.total_session_cost > 0.0 {
         lines.push(format!(
             "- **Cost**: {}",
-            crate::format_cost(state.total_session_cost)
+            crate::slash_stats::format_cost(state.total_session_cost)
         ));
     }
     lines.push(String::new());

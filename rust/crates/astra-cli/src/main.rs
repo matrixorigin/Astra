@@ -106,8 +106,12 @@ mod slash_config;
 mod slash_debug;
 #[path = "cli/slash_experiment.rs"]
 mod slash_experiment;
+#[path = "cli/slash_health.rs"]
+mod slash_health;
 #[path = "cli/slash_info.rs"]
 mod slash_info;
+#[path = "cli/slash_learn.rs"]
+mod slash_learn;
 #[path = "cli/slash_mcp.rs"]
 mod slash_mcp;
 #[path = "cli/slash_memory.rs"]
@@ -122,10 +126,20 @@ mod slash_session;
 mod slash_skill;
 #[path = "cli/slash_state.rs"]
 mod slash_state;
+#[path = "cli/slash_stats.rs"]
+mod slash_stats;
+#[path = "cli/slash_style.rs"]
+mod slash_style;
+#[path = "cli/slash_sync.rs"]
+mod slash_sync;
+#[path = "cli/slash_task.rs"]
+mod slash_task;
 #[path = "cli/slash_team.rs"]
 mod slash_team;
 #[path = "cli/slash_telemetry.rs"]
 mod slash_telemetry;
+#[path = "cli/slash_tools.rs"]
+mod slash_tools;
 #[path = "cli/slash_tuning.rs"]
 mod slash_tuning;
 #[path = "cli/spawn_subrun.rs"]
@@ -1648,2036 +1662,7 @@ impl ReplState {
 
 // ═════════════════════════════════════════════════════════ Clipboard ══════
 
-// ═══════════════════════════════════════════════════════════ Resume ═══════
-
-async fn handle_resume_command(arg: &str, profile: Option<&str>, state: &mut ReplState) {
-    use astra_services::session_restore::{HybridRestoreService, SessionRestoreService};
-
-    let user_id = state.ingestion_user_id.as_deref().unwrap_or("local");
-    let svc = match &state.matrix_runtime {
-        Some(mc) => HybridRestoreService::new(mc.shared_pool().get().clone()),
-        None => HybridRestoreService::local_only(),
-    };
-
-    // If no session_id given, list and let user pick
-    let effective_arg;
-    if arg.is_empty() {
-        // Merge cloud + local sessions, deduplicate, sort by recency
-        let cloud_sessions = svc
-            .list_resumable_sessions(user_id)
-            .await
-            .unwrap_or_default();
-        let local_ids = session_journal::list_sessions_by_time(20).unwrap_or_default();
-
-        // Build merged map: session_id → RestoredSession (cloud wins on metadata)
-        let mut merged: std::collections::HashMap<
-            String,
-            astra_services::session_restore::RestoredSession,
-        > = std::collections::HashMap::new();
-
-        // Insert local sessions first (lower priority)
-        for sid in &local_ids {
-            merged.entry(sid.clone()).or_insert_with(|| {
-                astra_services::session_restore::RestoredSession {
-                    session_id: sid.clone(),
-                    turn_count: session_journal::count_turns(sid),
-                    last_status: "local".to_string(),
-                    ..Default::default()
-                }
-            });
-        }
-
-        // Cloud sessions override local (richer metadata: title, turn_count, status)
-        for s in cloud_sessions {
-            merged.insert(s.session_id.clone(), s);
-        }
-
-        // Sort by local file order (newest first), cloud-only sessions appended at front
-        let mut result: Vec<_> = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-
-        // Local order first (already sorted by mtime)
-        for sid in &local_ids {
-            if let Some(s) = merged.remove(sid) {
-                seen.insert(sid.clone());
-                result.push(s);
-            }
-        }
-        // Remaining cloud-only sessions at the front (they're newer if not local)
-        let mut cloud_only: Vec<_> = merged.into_values().collect();
-        cloud_only.sort_by(|a, b| b.turn_count.cmp(&a.turn_count));
-        result.splice(0..0, cloud_only);
-
-        // Filter out empty sessions (0 turns = nothing to resume)
-        result.retain(|s| s.turn_count > 0);
-
-        if result.is_empty() {
-            eprintln!("{}", "  No resumable sessions found.".dim());
-            return;
-        }
-
-        let sessions = &result[..result.len().min(10)];
-
-        // Enrich with local metadata (workspace + journal peek) — fast, no DB
-        struct SessionDisplay {
-            idx: usize,
-            session_id: String,
-            title: Option<String>,
-            first_prompt: Option<String>,
-            turn_count: u32,
-            model: Option<String>,
-            cwd_short: Option<String>,
-            git_branch: Option<String>,
-            source: String,
-            has_plan: bool,
-            age: String,
-        }
-
-        let mut items: Vec<SessionDisplay> = Vec::new();
-        for (i, s) in sessions.iter().enumerate() {
-            let peek = session_journal::peek_session_meta(&s.session_id);
-            let ws = astra_services::session_workspace::read_workspace(&s.session_id).ok();
-
-            // Title: cloud title > workspace summary > first prompt preview
-            let title = s
-                .title
-                .clone()
-                .or_else(|| ws.as_ref().and_then(|w| w.summary.clone()))
-                .or_else(|| peek.as_ref().and_then(|p| p.first_prompt.clone()));
-
-            let first_prompt = peek.as_ref().and_then(|p| p.first_prompt.clone());
-
-            // Model: cloud > workspace > journal peek
-            let model = s
-                .model
-                .clone()
-                .or_else(|| ws.as_ref().map(|w| w.model.clone()))
-                .or_else(|| peek.as_ref().and_then(|p| p.model.clone()));
-
-            // cwd: shorten to last 2 path components
-            let cwd_short = ws.as_ref().map(|w| {
-                let parts: Vec<&str> = w.cwd.split('/').filter(|s| !s.is_empty()).collect();
-                if parts.len() <= 2 {
-                    w.cwd.clone()
-                } else {
-                    format!("…/{}", parts[parts.len() - 2..].join("/"))
-                }
-            });
-
-            let git_branch = s
-                .git_branch
-                .clone()
-                .or_else(|| ws.as_ref().and_then(|w| w.git_branch.clone()));
-
-            let source = if s.restored_from_cloud {
-                "☁".to_string()
-            } else if s.last_status == "local" {
-                "⊙".to_string()
-            } else {
-                s.last_status.clone()
-            };
-
-            let has_plan = ws.as_ref().is_some_and(|w| w.executing_plan_json.is_some());
-
-            // Age: from workspace or journal timestamp
-            let age = ws
-                .as_ref()
-                .map(|w| &w.updated_at)
-                .or_else(|| peek.as_ref().and_then(|p| p.created_at.as_ref()))
-                .and_then(|ts| chrono::DateTime::parse_from_rfc3339(ts).ok())
-                .map(|dt| {
-                    let dur = chrono::Utc::now().signed_duration_since(dt);
-                    if dur.num_minutes() < 60 {
-                        format!("{}m ago", dur.num_minutes())
-                    } else if dur.num_hours() < 24 {
-                        format!("{}h ago", dur.num_hours())
-                    } else {
-                        format!("{}d ago", dur.num_days())
-                    }
-                })
-                .unwrap_or_default();
-
-            items.push(SessionDisplay {
-                idx: i + 1,
-                session_id: s.session_id.clone(),
-                title,
-                first_prompt,
-                turn_count: s.turn_count,
-                model,
-                cwd_short,
-                git_branch,
-                source,
-                has_plan,
-                age,
-            });
-        }
-
-        eprintln!(
-            "\n{}",
-            "─── Resumable Sessions ──────────────────────────".bold()
-        );
-        for s in &items {
-            // Line 1: [N]  title or first prompt  (age)
-            let display_text = s
-                .title
-                .as_deref()
-                .or(s.first_prompt.as_deref())
-                .unwrap_or("(no prompt)");
-            let display_truncated: String = display_text.chars().take(60).collect();
-            let plan_badge = if s.has_plan { " 📋" } else { "" };
-            eprintln!(
-                "  {}  {}{}  {}",
-                format!("[{}]", s.idx).cyan().bold(),
-                display_truncated,
-                plan_badge,
-                s.age.as_str().dim(),
-            );
-            // Line 2: context details
-            let short_id = &s.session_id[..8.min(s.session_id.len())];
-            let model_str = s.model.as_deref().unwrap_or("?");
-            let branch_str = s
-                .git_branch
-                .as_deref()
-                .map(|b| format!(" {b}"))
-                .unwrap_or_default();
-            let cwd_str = s.cwd_short.as_deref().unwrap_or("");
-            eprintln!(
-                "      {} {} {} turns · {}{} {}",
-                s.source.as_str().dim(),
-                short_id.dim(),
-                s.turn_count,
-                model_str.dim(),
-                branch_str.dim(),
-                cwd_str.dim(),
-            );
-        }
-        eprintln!();
-        eprint!("  {} ", "Select (number or Enter to cancel):".bold());
-        std::io::Write::flush(&mut std::io::stderr()).ok();
-        let mut input = String::new();
-        if std::io::stdin().read_line(&mut input).is_ok() {
-            if let Ok(n) = input.trim().parse::<usize>() {
-                if n >= 1 && n <= sessions.len() {
-                    effective_arg = sessions[n - 1].session_id.clone();
-                } else {
-                    eprintln!("{}", "  Cancelled.".dim());
-                    return;
-                }
-            } else {
-                eprintln!("{}", "  Cancelled.".dim());
-                return;
-            }
-        } else {
-            return;
-        }
-    } else {
-        effective_arg = arg.to_string();
-    }
-    let arg = effective_arg.as_str();
-
-    // Resolve prefix via local journal first
-    let session_id = match session_journal::resolve_session_id(arg) {
-        Ok(resolved) => {
-            if resolved != arg {
-                eprintln!(
-                    "  {} Resolved {} → {}",
-                    theme::icon_ok(),
-                    arg.cyan(),
-                    resolved.as_str().cyan()
-                );
-            }
-            resolved
-        }
-        Err(_) => arg.to_string(),
-    };
-
-    // Restore session
-    match svc.restore_session(&session_id).await {
-        Ok(Some(restored)) => {
-            // Issue 1: Verify session belongs to current user
-            // For cloud restore, the session should already have user_id check done in DB query
-            // For local restore, we verify the session exists in user's journal
-            if !restored.restored_from_cloud {
-                // Local restore: verify user owns this session by checking journal exists
-                if session_journal::read_journal(&session_id).is_err() {
-                    eprintln!(
-                        "{}",
-                        format!(
-                            "  {} Session {} not found or not owned by user",
-                            theme::icon_err(),
-                            arg
-                        )
-                        .red()
-                    );
-                    return;
-                }
-            }
-
-            // Apply restored state
-            state.session_id = Some(restored.session_id.clone());
-            state.turn = restored.turn_count;
-            state.total_prompt_tokens = restored.total_tokens_in;
-            state.total_completion_tokens = restored.total_tokens_out;
-            state.recent_tools = restored.recent_tools;
-
-            // Merge step checkpoint data when the on-disk checkpoint matches current protocol.
-            if let Ok(Some(step_restored)) =
-                astra_runtime::pipeline::step_restore::restore_session(&restored.session_id)
-            {
-                let summary =
-                    astra_runtime::pipeline::step_restore::restore_summary(&step_restored);
-                // Merge blocked tools from checkpoint into health entries
-                for tool in &step_restored.blocked_tools {
-                    if !state.tool_health_entries.iter().any(|e| e.name == *tool) {
-                        state.tool_health_entries.push(
-                            astra_runtime::pipeline::persistence::ToolHealthEntry {
-                                name: tool.clone(),
-                                total_calls: 3,
-                                total_failures: 3,
-                                failure_rate: 1.0,
-                                last_updated_epoch: 0, // synthetic — will be overridden by real data
-                            },
-                        );
-                    }
-                }
-                if state.recent_tools.is_empty() {
-                    state.recent_tools = step_restored.recent_tools;
-                }
-                eprintln!("  {} {}", "↻".cyan(), summary.dim());
-            } else if let Ok(Some(heavy)) =
-                astra_runtime::pipeline::step_checkpoint::read_latest_heavy_checkpoint(
-                    &restored.session_id,
-                )
-            {
-                // Fallback to raw local checkpoint if step_restore fails (e.g., version mismatch)
-                if state.recent_tools.is_empty() {
-                    state.recent_tools = heavy.recent_tools;
-                }
-            } else if let Some(ref mc) = state.matrix_runtime {
-                // Cloud fallback: pull heavy checkpoint from MatrixOne
-                // (different device, local files not available)
-                let pool = mc.shared_pool().get();
-                match astra_services::session_restore::pull_step_checkpoint_from_cloud(
-                    pool,
-                    &restored.session_id,
-                )
-                .await
-                {
-                    Ok(Some(state_json)) => {
-                        match serde_json::from_str::<
-                            astra_runtime::pipeline::step_protocol::StepCheckpoint,
-                        >(&state_json)
-                        {
-                            Ok(astra_runtime::pipeline::step_protocol::StepCheckpoint::Heavy(
-                                heavy,
-                            )) => {
-                                for tool in &heavy.blocked_tools {
-                                    if !state.tool_health_entries.iter().any(|e| e.name == *tool) {
-                                        state.tool_health_entries.push(
-                                            astra_runtime::pipeline::persistence::ToolHealthEntry {
-                                                name: tool.clone(),
-                                                total_calls: 3,
-                                                total_failures: 3,
-                                                failure_rate: 1.0,
-                                                last_updated_epoch: 0,
-                                            },
-                                        );
-                                    }
-                                }
-                                if state.recent_tools.is_empty() {
-                                    state.recent_tools = heavy.recent_tools;
-                                }
-                                // Restore conversation history from cloud checkpoint
-                                if state.history.is_empty() && !heavy.messages.is_empty() {
-                                    // Extract user/assistant pairs from messages for history
-                                    let mut pairs = Vec::new();
-                                    let mut last_user = String::new();
-                                    for msg in &heavy.messages {
-                                        let role =
-                                            msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
-                                        let content = msg
-                                            .get("content")
-                                            .and_then(|c| c.as_str())
-                                            .unwrap_or("");
-                                        match role {
-                                            "user" => last_user = content.to_string(),
-                                            "assistant" if !last_user.is_empty() => {
-                                                pairs
-                                                    .push((last_user.clone(), content.to_string()));
-                                                last_user.clear();
-                                            }
-                                            _ => {}
-                                        }
-                                    }
-                                    if !pairs.is_empty() {
-                                        state.history = pairs;
-                                    }
-                                }
-                                eprintln!("  {} Restored step checkpoint from cloud", "☁".cyan());
-                            }
-                            Ok(_) => {} // Light checkpoint — less useful, skip
-                            Err(e) => {
-                                eprintln!(
-                                    "  {} Cloud checkpoint corrupted, skipping",
-                                    theme::icon_warn()
-                                );
-                                eprintln!("{}", format!("     ({e})").dim());
-                            }
-                        }
-                    }
-                    Ok(None) => {} // No cloud checkpoint available
-                    Err(e) => {
-                        eprintln!("  {} Cloud checkpoint unavailable", theme::icon_warn());
-                        eprintln!("{}", format!("     ({e})").dim());
-                    }
-                }
-            }
-
-            if let Some(ref m) = restored.model {
-                state.model = Some(m.clone());
-                state.cached_pricing = fallback_pricing(m);
-                // M3: Use RuntimeConfig-driven context budget on session restore
-                state.context_budget =
-                    prompts::ContextBudget::from_runtime_config(&state.runtime_config, Some(m));
-            }
-
-            // Store learning snapshot for merge after handler returns
-            // (pipeline modules are only accessible in run_chat_repl)
-            if let Some(ref learning_json) = restored.learning_snapshot_json
-                && !learning_json.is_empty()
-            {
-                state.learning_snapshot = Some(learning_json.clone());
-            }
-
-            // Issue 3: Restore conversation history from local journal
-            // restore_history_from_journal already handles session segmentation (only reads after latest session_start)
-            state.history = repl_runtime::restore_history_from_journal(&session_id);
-
-            // Restore last turn event for /turn command
-            if let Ok(events) = session_journal::read_journal(&session_id) {
-                state.last_turn_event = events
-                    .iter()
-                    .rev()
-                    .find(|e| e.event_type == session_journal::JournalEventType::Turn)
-                    .cloned();
-            }
-
-            // Restore plan execution state from workspace snapshot
-            if let Some(ref json) = restored.executing_plan_json {
-                state.executing_plan = serde_json::from_str(json).ok();
-            }
-            if let Some(ref goal) = restored.plan_goal {
-                state.executing_plan_goal = Some(goal.clone());
-            }
-            if let Some(ref json) = restored.plan_config_json {
-                state.plan_execution_config = serde_json::from_str(json).ok();
-            }
-            state.plan_execution_rounds = restored.plan_execution_rounds;
-
-            // Restore operator corrections stacked during plan pause
-            state.plan_execution_corrections = restored.plan_corrections.clone();
-
-            // Restore durable task contract if present
-            if let Some(ref json) = restored.contract_json
-                && let Ok(contract) = serde_json::from_str::<astra_services::TaskContract>(json)
-            {
-                let work_dir = std::env::current_dir().unwrap_or_default();
-                let ingestion_sender = state
-                    .matrix_runtime
-                    .as_ref()
-                    .and_then(|mc| mc.clone_ingestion_sender());
-                let cloud_judge = state
-                    .matrix_runtime
-                    .as_ref()
-                    .and_then(|mc| mc.create_cloud_llm_judge())
-                    .map(|j| {
-                        std::sync::Arc::new(j) as std::sync::Arc<dyn astra_services::LlmJudge>
-                    });
-                let learning = build_learning_bridge(state);
-
-                let lifecycle = if let Some(pool) = state
-                    .matrix_runtime
-                    .as_ref()
-                    .map(|mc| mc.shared_pool().get().clone())
-                {
-                    durable_bridge::create_cloud_lifecycle_full(
-                        pool,
-                        &work_dir,
-                        ingestion_sender,
-                        Some(&session_id),
-                        state.ingestion_user_id.as_deref(),
-                        cloud_judge,
-                        learning,
-                        None, // no server proxy during session restore
-                    )
-                } else {
-                    let session_dir =
-                        astra_services::session_workspace::workspace_dir_for(&session_id);
-                    durable_bridge::create_local_lifecycle_full(
-                        &session_dir,
-                        &work_dir,
-                        ingestion_sender,
-                        Some(&session_id),
-                        state.ingestion_user_id.as_deref(),
-                        cloud_judge,
-                        learning,
-                        None, // no server proxy during session restore
-                    )
-                };
-                state.durable_task_state = Some(durable_bridge::DurableTaskState {
-                    contract,
-                    lifecycle,
-                    last_report: None,
-                });
-            }
-
-            // Re-initialize journal for the resumed session
-            repl_turn::initialize_journal_pub(state, &session_id);
-            repl_turn::persist_last_session_id(profile, &session_id);
-            if let Ok(mut ws) = astra_services::session_workspace::read_workspace(&session_id) {
-                ws.turn_count = restored.turn_count;
-                ws.total_tokens_in = restored.total_tokens_in;
-                ws.total_tokens_out = restored.total_tokens_out;
-                ws.status = restored.last_status.clone();
-                if let Some(ref branch) = restored.git_branch {
-                    ws.git_branch = Some(branch.clone());
-                }
-                if let Some(ref model) = restored.model {
-                    ws.model = model.clone();
-                }
-                ws.executing_plan_json = restored.executing_plan_json.clone();
-                ws.plan_goal = restored.plan_goal.clone();
-                ws.plan_config_json = restored.plan_config_json.clone();
-                ws.plan_execution_rounds = restored.plan_execution_rounds;
-                ws.contract_json = restored.contract_json.clone();
-                ws.plan_corrections = restored.plan_corrections.clone();
-                ws.last_context_trace = restored.last_context_trace.clone();
-                let _ = astra_services::session_workspace::write_workspace(&ws);
-            }
-
-            let source = if restored.restored_from_cloud {
-                "cloud"
-            } else {
-                "local"
-            };
-            eprintln!(
-                "  {} Resumed session {} ({}, {} turns, {} checkpoints)",
-                theme::icon_ok(),
-                &session_id[..8.min(session_id.len())].cyan(),
-                source,
-                restored.turn_count,
-                restored.checkpoint_count,
-            );
-            if let Some(ref trace) = restored.last_context_trace {
-                let preview = trace.preview();
-                if !preview.is_empty() {
-                    eprintln!("    {} {}", "Last trace:".dim(), preview.dim());
-                }
-            }
-
-            // Show paused plan banner
-            if let Some(ref plan) = state.executing_plan {
-                let done = plan.items_done();
-                let total = plan.subtasks.len();
-                let pct = plan.progress_pct();
-                eprintln!(
-                    "  {} Paused plan restored: {}/{} subtasks done ({}%)",
-                    "📋".cyan(),
-                    done,
-                    total,
-                    pct,
-                );
-                if let Some(ref goal) = state.executing_plan_goal {
-                    eprintln!("    {} {}", "Goal:".dim(), goal.as_str().dim());
-                }
-                eprintln!(
-                    "    {}",
-                    "Say continue / resume / next / go to pick up; correct … / rewind N to adjust; slash lines keep the plan; any other line abandons it."
-                        .dim()
-                );
-            }
-        }
-        Ok(None) => {
-            // Service didn't find workspace/cloud data, but journal may exist.
-            // Don't reuse the old session_id — server doesn't know it.
-            // Restore history as context for a new session.
-            match session_journal::read_journal(&session_id) {
-                Ok(events) if !events.is_empty() => {
-                    let turn_count = events
-                        .iter()
-                        .filter(|e| e.event_type == session_journal::JournalEventType::Turn)
-                        .count() as u32;
-                    // Restore last turn event for /turn command
-                    state.last_turn_event = events
-                        .iter()
-                        .rev()
-                        .find(|e| e.event_type == session_journal::JournalEventType::Turn)
-                        .cloned();
-                    state.session_id = None; // new session on next message
-                    state.turn = turn_count;
-                    state.history = repl_runtime::restore_history_from_journal(&session_id);
-                    eprintln!(
-                        "  {} Restored {} turns from journal {}. Next message starts a new session.",
-                        theme::icon_ok(),
-                        turn_count,
-                        &session_id[..8.min(session_id.len())].cyan(),
-                    );
-                }
-                _ => {
-                    eprintln!("{}", format!("  Session '{arg}' not found.").yellow());
-                    eprintln!("{}", "  Use /resume to see available sessions.".dim());
-                }
-            }
-        }
-        Err(e) => {
-            let hint = if e.to_string().contains("not found") {
-                "Use /resume to see available sessions."
-            } else {
-                "Check connection with /diagnostics, or try a different session."
-            };
-            eprintln!(
-                "  {} {}",
-                theme::icon_err(),
-                format!("Resume failed: {e}").red()
-            );
-            eprintln!("{}", format!("  {hint}").dim());
-        }
-    }
-}
-
-// ═══════════════════════════════════════════════════════ Stats ════════════
-
-fn handle_stats_command(arg: &str, state: &ReplState) {
-    use astra_services::session_analytics;
-
-    match arg {
-        "history" => {
-            // Show stats across recent sessions
-            let sessions = match session_journal::list_sessions() {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!(
-                        "{}",
-                        format!("  ⚠ Could not read session history: {e}").yellow()
-                    );
-                    return;
-                }
-            };
-            if sessions.is_empty() {
-                eprintln!("{}", "  No sessions found.".dim());
-                return;
-            }
-            let recent: Vec<_> = sessions.into_iter().take(10).collect();
-            let mut all_stats = Vec::new();
-            for sid in &recent {
-                if let Ok(events) = session_journal::read_journal(sid) {
-                    all_stats.push(session_analytics::compute_session_stats(sid, &events));
-                }
-            }
-            if all_stats.is_empty() {
-                eprintln!("{}", "  No session data.".dim());
-                return;
-            }
-            eprintln!(
-                "\n{}",
-                "─── Recent Sessions ─────────────────────────────".bold()
-            );
-            for s in &all_stats {
-                let short = &s.session_id[..8.min(s.session_id.len())];
-                let model = s.model.as_deref().unwrap_or("?");
-                eprintln!(
-                    "  {} {:>3} turns  {:>6}+{:<6} tok  {:>3} tools  {} err  {}",
-                    short.cyan(),
-                    s.turn_count,
-                    s.total_tokens_in,
-                    s.total_tokens_out,
-                    s.total_tool_calls,
-                    s.error_count,
-                    model.dim(),
-                );
-            }
-            let agg = session_analytics::aggregate_stats(&all_stats);
-            eprintln!(
-                "\n  {} {} sessions, {} turns, {}+{} tokens, {:.1}% tool errors",
-                "Summary:".bold(),
-                agg.session_count,
-                agg.total_turns,
-                agg.total_tokens_in,
-                agg.total_tokens_out,
-                agg.overall_tool_error_rate * 100.0,
-            );
-            eprintln!();
-        }
-        _ => {
-            // Show current session stats
-            let sid = match &state.session_id {
-                Some(s) => s.clone(),
-                None => {
-                    eprintln!("{}", "  No active session. Use /stats history.".dim());
-                    return;
-                }
-            };
-            let events = session_journal::read_journal(&sid).unwrap_or_default();
-            let stats = session_analytics::compute_session_stats(&sid, &events);
-
-            eprintln!(
-                "\n{}",
-                "─── Session Stats ───────────────────────────────".bold()
-            );
-            eprintln!(
-                "  {:<14} {}",
-                "session:".dim(),
-                sid[..8.min(sid.len())].cyan()
-            );
-            if let Some(ref m) = stats.model {
-                eprintln!("  {:<14} {}", "model:".dim(), m.as_str().cyan());
-            }
-            eprintln!("  {:<14} {}", "turns:".dim(), stats.turn_count);
-            eprintln!(
-                "  {:<14} {} in + {} out",
-                "tokens:".dim(),
-                stats.total_tokens_in,
-                stats.total_tokens_out
-            );
-            eprintln!(
-                "  {:<14} {:.1}s ({:.0}ms/turn)",
-                "duration:".dim(),
-                stats.total_duration_ms as f64 / 1000.0,
-                stats.avg_duration_ms as f64
-            );
-            eprintln!(
-                "  {:<14} {} ({} failed, {:.1}% error rate)",
-                "tool calls:".dim(),
-                stats.total_tool_calls,
-                stats.failed_tool_calls,
-                stats.tool_error_rate * 100.0
-            );
-            if !stats.unique_tools.is_empty() {
-                eprintln!(
-                    "  {:<14} {}",
-                    "tools used:".dim(),
-                    stats.unique_tools.join(", ")
-                );
-            }
-            if stats.error_count > 0 || stats.stall_count > 0 {
-                eprintln!(
-                    "  {:<14} {} errors, {} stalls",
-                    "issues:".dim(),
-                    stats.error_count,
-                    stats.stall_count
-                );
-            }
-            if stats.checkpoint_count > 0 {
-                eprintln!("  {:<14} {}", "checkpoints:".dim(), stats.checkpoint_count);
-            }
-            eprintln!();
-        }
-    }
-}
-
-// ═══════════════════════════════════════════════ Cost Tracking ═════════════
-
-/// Per-turn cost record for granular cost breakdown.
-#[derive(Clone, Debug)]
-struct TurnCostEntry {
-    turn: u32,
-    prompt_tokens: u64,
-    completion_tokens: u64,
-    model: String,
-}
-
-/// Handle the `/cost` slash command — display per-session API cost estimates.
-///
-/// Subcommands:
-///   /cost           — current session summary
-///   /cost detail    — per-turn breakdown
-///   /cost history   — across recent sessions
-fn handle_cost_command(arg: &str, state: &ReplState) {
-    use astra_services::session_analytics;
-
-    match arg {
-        "detail" | "breakdown" => {
-            // Per-turn breakdown from journal
-            let sid = match &state.session_id {
-                Some(s) => s.clone(),
-                None => {
-                    eprintln!("{}", "  No active session.".dim());
-                    return;
-                }
-            };
-            let events = session_journal::read_journal(&sid).unwrap_or_default();
-            let pricing = &state.cached_pricing;
-
-            eprintln!(
-                "\n{}",
-                "─── Per-Turn Cost Breakdown ─────────────────────".bold()
-            );
-            if let Some(ref m) = state.model {
-                eprintln!("  {:<14} {}", "model:".dim(), m.as_str().cyan());
-            }
-            eprintln!(
-                "  {:<14} ${:.4}/1k prompt, ${:.4}/1k completion",
-                "rates:".dim(),
-                pricing.prompt,
-                pricing.completion
-            );
-            eprintln!();
-
-            let mut total_in = 0u64;
-            let mut total_out = 0u64;
-            let mut total_cost = 0.0f64;
-            let mut turn_num = 0u32;
-
-            for ev in &events {
-                if ev.event_type == session_journal::JournalEventType::Turn {
-                    turn_num += 1;
-                    let p_tok = ev.tokens_in.unwrap_or(0);
-                    let c_tok = ev.tokens_out.unwrap_or(0);
-                    let cr = ev.cache_read_tokens.unwrap_or(0);
-                    let cw = ev.cache_creation_tokens.unwrap_or(0);
-                    let cost = cost_for_tokens(p_tok, c_tok, cr, cw, pricing);
-                    total_in += p_tok;
-                    total_out += c_tok;
-                    total_cost += cost;
-
-                    let cache_info = if cr > 0 {
-                        let pct = cr as f64 / (p_tok + cr).max(1) as f64 * 100.0;
-                        format!("  cache:{pct:.0}%")
-                    } else {
-                        String::new()
-                    };
-                    eprintln!(
-                        "  {} {:>6}+{:<6} tok  {}{}",
-                        format!("Turn {:>3}", turn_num).dim(),
-                        p_tok,
-                        c_tok,
-                        format_cost(cost),
-                        cache_info.dim()
-                    );
-                }
-            }
-
-            eprintln!(
-                "\n  {}",
-                "─────────────────────────────────────────────────".dim()
-            );
-            eprintln!(
-                "  {:<14} {}+{} tok  {}",
-                "total:".bold(),
-                total_in,
-                total_out,
-                format_cost(total_cost).bold(),
-            );
-            eprintln!();
-        }
-
-        "history" => {
-            // Across recent sessions
-            let sessions = match session_journal::list_sessions() {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!(
-                        "{}",
-                        format!("  ⚠ Could not read session history: {e}").yellow()
-                    );
-                    return;
-                }
-            };
-            if sessions.is_empty() {
-                eprintln!("{}", "  No sessions found.".dim());
-                return;
-            }
-
-            let pricing = &state.cached_pricing;
-
-            eprintln!(
-                "\n{}",
-                "─── Session Cost History ────────────────────────".bold()
-            );
-            eprintln!(
-                "  {:<14} ${:.4}/1k prompt, ${:.4}/1k completion",
-                "rates:".dim(),
-                pricing.prompt,
-                pricing.completion
-            );
-            eprintln!();
-
-            let recent: Vec<_> = sessions.into_iter().take(10).collect();
-            let mut grand_total = 0.0f64;
-
-            for sid in &recent {
-                if let Ok(events) = session_journal::read_journal(sid) {
-                    let stats = session_analytics::compute_session_stats(sid, &events);
-                    let cost = cost_for_tokens(
-                        stats.total_tokens_in,
-                        stats.total_tokens_out,
-                        stats.total_cache_read,
-                        stats.total_cache_creation,
-                        pricing,
-                    );
-                    grand_total += cost;
-
-                    let short = &sid[..8.min(sid.len())];
-                    let model = stats.model.as_deref().unwrap_or("?");
-                    eprintln!(
-                        "  {} {:>3} turns  {:>6}+{:<6} tok  {}  {}",
-                        short.cyan(),
-                        stats.turn_count,
-                        stats.total_tokens_in,
-                        stats.total_tokens_out,
-                        format_cost(cost),
-                        model.dim(),
-                    );
-                }
-            }
-
-            eprintln!(
-                "\n  {} across {} sessions",
-                format_cost(grand_total).bold(),
-                recent.len(),
-            );
-            eprintln!();
-        }
-
-        _ => {
-            // Current session summary
-            let pricing = &state.cached_pricing;
-            let cache_read_rate = pricing.cache_read.unwrap_or(pricing.prompt * 0.1);
-            let cache_write_rate = pricing.cache_write.unwrap_or(pricing.prompt * 1.25);
-            let cost = cost_for_tokens(
-                state.total_prompt_tokens,
-                state.total_completion_tokens,
-                state.total_cache_read_tokens,
-                state.total_cache_creation_tokens,
-                pricing,
-            );
-
-            eprintln!(
-                "\n{}",
-                "─── Session Cost ────────────────────────────────".bold()
-            );
-            if let Some(ref sid) = state.session_id {
-                eprintln!(
-                    "  {:<14} {}",
-                    "session:".dim(),
-                    sid[..8.min(sid.len())].cyan()
-                );
-            }
-            if let Some(ref m) = state.model {
-                eprintln!("  {:<14} {}", "model:".dim(), m.as_str().cyan());
-            }
-            eprintln!(
-                "  {:<14} ${:.4}/1k prompt, ${:.4}/1k completion",
-                "rates:".dim(),
-                pricing.prompt,
-                pricing.completion
-            );
-            eprintln!();
-            eprintln!(
-                "  {:<14} {} ({})",
-                "prompt:".dim(),
-                state.total_prompt_tokens,
-                format_cost(state.total_prompt_tokens as f64 * pricing.prompt / 1000.0),
-            );
-            eprintln!(
-                "  {:<14} {} ({})",
-                "completion:".dim(),
-                state.total_completion_tokens,
-                format_cost(state.total_completion_tokens as f64 * pricing.completion / 1000.0),
-            );
-            if state.total_cache_read_tokens > 0 {
-                eprintln!(
-                    "  {:<14} {} ({})",
-                    "cache read:".dim(),
-                    state.total_cache_read_tokens,
-                    format_cost(state.total_cache_read_tokens as f64 * cache_read_rate / 1000.0),
-                );
-            }
-            if state.total_cache_creation_tokens > 0 {
-                eprintln!(
-                    "  {:<14} {} ({})",
-                    "cache write:".dim(),
-                    state.total_cache_creation_tokens,
-                    format_cost(
-                        state.total_cache_creation_tokens as f64 * cache_write_rate / 1000.0
-                    ),
-                );
-            }
-            eprintln!("  {:<14} {}", "total:".bold(), format_cost(cost).bold());
-            if state.turn > 0 {
-                eprintln!(
-                    "  {:<14} {} per turn",
-                    "avg:".dim(),
-                    format_cost(cost / state.turn as f64)
-                );
-            }
-            if state.total_cache_read_tokens > 0 {
-                let total_input = state.total_prompt_tokens + state.total_cache_read_tokens;
-                let cache_pct =
-                    state.total_cache_read_tokens as f64 / total_input.max(1) as f64 * 100.0;
-                let saved = state.total_cache_read_tokens as f64
-                    * (pricing.prompt - cache_read_rate)
-                    / 1000.0;
-                eprintln!(
-                    "  {:<14} {:.0}% cache hit, {} saved",
-                    "savings:".dim(),
-                    cache_pct,
-                    format_cost(saved),
-                );
-            }
-            eprintln!(
-                "\n  {}",
-                "Use /cost detail for per-turn breakdown, /cost history for past sessions.".dim()
-            );
-            eprintln!();
-        }
-    }
-}
-
-/// Calculate cost in dollars for given token counts.
-pub(crate) fn cost_for_tokens(
-    prompt_tokens: u64,
-    completion_tokens: u64,
-    cache_read_tokens: u64,
-    cache_creation_tokens: u64,
-    pricing: &astra_services::models::PricingData,
-) -> f64 {
-    let cache_read_rate = pricing.cache_read.unwrap_or(pricing.prompt * 0.1);
-    let cache_write_rate = pricing.cache_write.unwrap_or(pricing.prompt * 1.25);
-    (prompt_tokens as f64 * pricing.prompt / 1000.0)
-        + (completion_tokens as f64 * pricing.completion / 1000.0)
-        + (cache_read_tokens as f64 * cache_read_rate / 1000.0)
-        + (cache_creation_tokens as f64 * cache_write_rate / 1000.0)
-}
-
-/// Format a dollar cost for display.
-pub(crate) fn format_cost(cost: f64) -> String {
-    if cost < 0.01 {
-        format!("${:.4}", cost)
-    } else if cost < 1.0 {
-        format!("${:.3}", cost)
-    } else {
-        format!("${:.2}", cost)
-    }
-}
-
-/// Extract pricing data for a model from the API models list.
-pub(crate) fn extract_pricing_for_model(
-    models: &[serde_json::Value],
-    model_name: &str,
-) -> Option<astra_services::models::PricingData> {
-    for m in models {
-        let name = m
-            .get("name")
-            .or_else(|| m.get("model_name"))
-            .and_then(|v| v.as_str())?;
-        if name != model_name {
-            continue;
-        }
-        if let Some(pricing) = m.get("pricing") {
-            return serde_json::from_value(pricing.clone()).ok();
-        }
-        // Fallback: top-level pricing_prompt / pricing_completion fields
-        let prompt = m
-            .get("pricing_prompt")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.0);
-        let completion = m
-            .get("pricing_completion")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.0);
-        if prompt > 0.0 || completion > 0.0 {
-            return Some(astra_services::models::PricingData {
-                prompt,
-                completion,
-                cache_read: None,
-                cache_write: None,
-            });
-        }
-        return None;
-    }
-    None
-}
-
-/// Built-in pricing table for known models ($/Ktok).
-/// Used when the API model list doesn't include pricing data.
-/// Pricing from https://platform.claude.com/docs/en/about-claude/pricing
-/// and https://openai.com/api/pricing/
-pub(crate) fn fallback_pricing(model_name: &str) -> astra_services::models::PricingData {
-    use astra_services::models::PricingData;
-    let name = model_name.to_lowercase();
-
-    // Claude Opus 4/4.1: $15/$75 per Mtok
-    if name.contains("opus-4") && !name.contains("4.5") && !name.contains("4.6") {
-        return PricingData {
-            prompt: 0.015,
-            completion: 0.075,
-            cache_read: Some(0.0015),
-            cache_write: Some(0.01875),
-        };
-    }
-    // Claude Opus 4.5/4.6: $5/$25 per Mtok
-    if name.contains("opus") {
-        return PricingData {
-            prompt: 0.005,
-            completion: 0.025,
-            cache_read: Some(0.0005),
-            cache_write: Some(0.00625),
-        };
-    }
-    // Claude Sonnet (3.5/3.7/4/4.5/4.6): $3/$15 per Mtok
-    if name.contains("sonnet") {
-        return PricingData {
-            prompt: 0.003,
-            completion: 0.015,
-            cache_read: Some(0.0003),
-            cache_write: Some(0.00375),
-        };
-    }
-    // Claude Haiku 4.5: $1/$5 per Mtok
-    if name.contains("haiku") && (name.contains("4.5") || name.contains("4-5")) {
-        return PricingData {
-            prompt: 0.001,
-            completion: 0.005,
-            cache_read: Some(0.0001),
-            cache_write: Some(0.00125),
-        };
-    }
-    // Claude Haiku 3.5: $0.80/$4 per Mtok
-    if name.contains("haiku") {
-        return PricingData {
-            prompt: 0.0008,
-            completion: 0.004,
-            cache_read: Some(0.00008),
-            cache_write: Some(0.001),
-        };
-    }
-    // GPT-4o / GPT-4.1: $2.5/$10 per Mtok
-    if name.contains("gpt-4o") || name.contains("gpt-4.1") {
-        return PricingData {
-            prompt: 0.0025,
-            completion: 0.01,
-            cache_read: Some(0.000625),
-            cache_write: None,
-        };
-    }
-    // GPT-4o-mini / GPT-4.1-mini: $0.15/$0.60 per Mtok
-    if name.contains("4o-mini")
-        || name.contains("4.1-mini")
-        || name.contains("5-mini")
-        || name.contains("5.4-mini")
-    {
-        return PricingData {
-            prompt: 0.00015,
-            completion: 0.0006,
-            cache_read: Some(0.0000375),
-            cache_write: None,
-        };
-    }
-    // DeepSeek V3/R1: $0.27/$1.10 per Mtok (cache read $0.07)
-    if name.contains("deepseek") {
-        return PricingData {
-            prompt: 0.00027,
-            completion: 0.0011,
-            cache_read: Some(0.00007),
-            cache_write: None,
-        };
-    }
-    // Default: Sonnet pricing as safe fallback
-    PricingData {
-        prompt: 0.003,
-        completion: 0.015,
-        cache_read: Some(0.0003),
-        cache_write: Some(0.00375),
-    }
-}
-
 // ═══════════════════════════════════════════════ Output Styles ═════════════
-
-fn handle_style_command(arg: &str) {
-    match arg {
-        "" | "list" => {
-            let current = theme::current_theme_name();
-            eprintln!(
-                "\n{}",
-                "─── Output Styles ───────────────────────────────".bold()
-            );
-            eprintln!("  {}\n", "Built-in:".dim());
-            for t in theme::builtin_themes() {
-                let marker = if t.name == current { " ◉" } else { "  " };
-                let name = &t.name;
-                eprintln!("  {marker} {}", name.as_str().cyan());
-            }
-            let user_themes = theme::load_user_themes();
-            if !user_themes.is_empty() {
-                eprintln!("\n  {}\n", "User (~/.astra/styles/):".dim());
-                for t in &user_themes {
-                    let marker = if t.name == current { " ◉" } else { "  " };
-                    let name = &t.name;
-                    eprintln!("  {marker} {}", name.as_str().cyan());
-                }
-            }
-            eprintln!(
-                "\n  {}",
-                "Use /style <name> to switch. Active theme marked with ◉.".dim()
-            );
-            eprintln!();
-        }
-        name => match theme::activate_theme_by_name(name) {
-            Ok(()) => {
-                eprintln!(
-                    "  {} {}",
-                    theme::icon_ok(),
-                    format!("Style set to: {name}").green()
-                );
-            }
-            Err(e) => {
-                eprintln!("  {} {e}", theme::icon_err());
-                let available: Vec<_> = theme::builtin_themes()
-                    .iter()
-                    .map(|t| t.name.clone())
-                    .chain(theme::load_user_themes().iter().map(|t| t.name.clone()))
-                    .collect();
-                eprintln!(
-                    "  {} Available: {}",
-                    theme::icon_info(),
-                    available.join(", ")
-                );
-            }
-        },
-    }
-}
-
-// ═══════════════════════════════════════════════ Tool Profile ═════════════
-
-fn handle_tools_command(state: &ReplState) {
-    use astra_services::session_analytics;
-
-    let sid = match &state.session_id {
-        Some(s) => s.clone(),
-        None => {
-            eprintln!("{}", "  No active session.".dim());
-            return;
-        }
-    };
-    let events = session_journal::read_journal(&sid).unwrap_or_default();
-    let profiles = session_analytics::compute_tool_profiles(&events);
-
-    if profiles.is_empty() {
-        eprintln!("{}", "  No tool calls recorded yet.".dim());
-        return;
-    }
-
-    eprintln!(
-        "\n{}",
-        "─── Tool Performance ────────────────────────────".bold()
-    );
-    eprintln!(
-        "  {:<20} {:>5} {:>5} {:>7} {:>7} {:>7} {:>6}",
-        "tool".bold(),
-        "calls".bold(),
-        "fail".bold(),
-        "avg ms".bold(),
-        "min ms".bold(),
-        "max ms".bold(),
-        "err%".bold(),
-    );
-    for p in &profiles {
-        let err_pct = format!("{:.0}%", p.error_rate * 100.0);
-        let err_display = if p.fail_count > 0 {
-            err_pct.red().to_string()
-        } else {
-            err_pct
-        };
-        eprintln!(
-            "  {:<20} {:>5} {:>5} {:>7} {:>7} {:>7} {:>6}",
-            p.name.as_str().cyan(),
-            p.call_count,
-            p.fail_count,
-            p.avg_ms,
-            p.min_ms,
-            p.max_ms,
-            err_display,
-        );
-    }
-    let total_ms: u64 = profiles.iter().map(|p| p.total_ms).sum();
-    let total_calls: u32 = profiles.iter().map(|p| p.call_count).sum();
-    eprintln!(
-        "\n  {} {} calls, {:.1}s total tool time",
-        "Summary:".bold(),
-        total_calls,
-        total_ms as f64 / 1000.0,
-    );
-    eprintln!();
-}
-
-async fn handle_health_command(arg: &str, state: &ReplState) {
-    use astra_runtime::turn::tool_health::ToolHealthTracker;
-
-    let detail = arg.trim() == "detail";
-
-    // Build a live tracker from persisted entries for rich analysis
-    let tracker = ToolHealthTracker::from_entries(&state.tool_health_entries);
-    let summary = tracker.summary();
-
-    // Header
-    eprintln!(
-        "\n{}",
-        "─── Tool Health Dashboard ──────────────────────".bold()
-    );
-
-    if summary.total_tools == 0 {
-        eprintln!(
-            "  {}",
-            "No tool health data yet (run some turns first).".dim()
-        );
-    } else {
-        // Overall status
-        let status = if summary.deprioritized_count > 0 || summary.flaky_count > 0 {
-            "⚠ Degraded".yellow().to_string()
-        } else if summary.total_errors > 0 {
-            "● Minor issues".to_string()
-        } else {
-            "✓ Healthy".green().to_string()
-        };
-        eprintln!("  Status: {status}");
-        eprintln!(
-            "  Tools: {}  Errors: {}  Timeouts: {}  Cache hits: {}",
-            summary.total_tools.to_string().cyan(),
-            if summary.total_errors > 0 {
-                summary.total_errors.to_string().red().to_string()
-            } else {
-                "0".to_string()
-            },
-            if summary.total_timeouts > 0 {
-                summary.total_timeouts.to_string().yellow().to_string()
-            } else {
-                "0".to_string()
-            },
-            summary.total_cache_hits,
-        );
-        if summary.deprioritized_count > 0 {
-            eprintln!(
-                "  {} deprioritized, {} flaky",
-                summary.deprioritized_count.to_string().red(),
-                summary.flaky_count,
-            );
-        }
-        eprintln!();
-
-        if detail {
-            // Per-tool breakdown
-            eprintln!(
-                "  {:<20} {:>5} {:>5} {:>4} {:>5} {:>5}  {}",
-                "tool".bold(),
-                "calls".bold(),
-                "fail".bold(),
-                "TO".bold(),
-                "cache".bold(),
-                "rehab".bold(),
-                "status".bold(),
-            );
-            let all = tracker.all();
-            let mut sorted: Vec<_> = all.iter().collect();
-            sorted.sort_by(|a, b| b.1.total_failures.cmp(&a.1.total_failures));
-            for (name, health) in &sorted {
-                let status_str = if health.deprioritized {
-                    "⛔ deprioritized".red().to_string()
-                } else if health.rehabilitation_count >= 2 {
-                    "⚠ flaky".yellow().to_string()
-                } else if health.total_failures > 0 {
-                    "● recovering".to_string()
-                } else {
-                    "✓ healthy".green().to_string()
-                };
-                eprintln!(
-                    "  {:<20} {:>5} {:>5} {:>4} {:>5} {:>5}  {}",
-                    name.as_str().cyan(),
-                    health.total_calls,
-                    health.total_failures,
-                    health.timeout_count,
-                    health.cache_hit_count,
-                    health.rehabilitation_count,
-                    status_str,
-                );
-            }
-            eprintln!();
-
-            // Timeout-dominant tools
-            let timeout_tools = tracker.timeout_dominant_tools();
-            if !timeout_tools.is_empty() {
-                eprintln!(
-                    "  {} Timeout-dominant (≥70% infra): {}",
-                    "⏱".bold(),
-                    timeout_tools.join(", ").yellow()
-                );
-            }
-            // Cache-wasteful tools
-            let cache_tools = tracker.cache_wasteful_tools(3);
-            if !cache_tools.is_empty() {
-                let names: Vec<String> = cache_tools
-                    .iter()
-                    .map(|(n, c)| format!("{n}({c}×)"))
-                    .collect();
-                eprintln!("  {} Duplicate calls: {}", "♻".bold(), names.join(", "));
-            }
-        } else {
-            // Compact view: only show problematic tools
-            let deprioritized = tracker.deprioritized_tools();
-            if !deprioritized.is_empty() {
-                eprintln!(
-                    "  {} {}",
-                    "Deprioritized:".red(),
-                    deprioritized.join(", ").red()
-                );
-            }
-            let all = tracker.all();
-            let recovering: Vec<&str> = all
-                .iter()
-                .filter(|(_, h)| h.total_failures > 0 && !h.deprioritized)
-                .map(|(n, _)| n.as_str())
-                .collect();
-            if !recovering.is_empty() {
-                eprintln!("  {} {}", "With errors:".yellow(), recovering.join(", "));
-            }
-            if !detail {
-                eprintln!("  {}", "Use /health detail for per-tool breakdown.".dim());
-            }
-        }
-    }
-
-    // ── Cloud Sync Status ──
-    eprintln!(
-        "\n{}",
-        "─── Cloud Sync ─────────────────────────────────".bold()
-    );
-    match &state.matrix_runtime {
-        None => {
-            eprintln!(
-                "  {} {}",
-                "○".dim(),
-                "Offline — no MatrixOne connection".dim()
-            );
-            eprintln!("  {}", "Set MATRIXONE_HOST to enable cloud sync.".dim());
-        }
-        Some(mc) => {
-            let svc = astra_services::state_sync::MatrixOneSyncService::new(
-                mc.shared_pool().get().clone(),
-            );
-            let sync_status = astra_services::state_sync::StateSyncService::status(&svc).await;
-            display_sync_status(&sync_status);
-        }
-    }
-
-    eprintln!(
-        "{}",
-        "────────────────────────────────────────────────".dim()
-    );
-    eprintln!();
-}
-
-/// Render cloud sync status section.
-fn display_sync_status(status: &astra_services::SyncStatus) {
-    // Connection confirmed — show details
-    let overall = if status.last_error.is_some() {
-        "⚠ Error".yellow().to_string()
-    } else if status.pending_pushes > 0 {
-        "● Pending".yellow().to_string()
-    } else if status.learning_last_push.is_some() || status.learning_last_pull.is_some() {
-        "✓ Connected".green().to_string()
-    } else {
-        "○ No sync history".to_string()
-    };
-    eprintln!("  Status: {overall}");
-
-    // Last push
-    match &status.learning_last_push {
-        Some(ts) => {
-            let age = format_sync_age(ts);
-            eprintln!("  Last push:  {} ({})", ts.as_str().cyan(), age);
-        }
-        None => eprintln!("  Last push:  {}", "never".dim()),
-    }
-
-    // Last pull
-    match &status.learning_last_pull {
-        Some(ts) => {
-            let age = format_sync_age(ts);
-            eprintln!("  Last pull:  {} ({})", ts.as_str().cyan(), age);
-        }
-        None => eprintln!("  Last pull:  {}", "never".dim()),
-    }
-
-    // Preferences
-    if let Some(ts) = &status.preferences_last_sync {
-        eprintln!("  Prefs sync: {}", ts.as_str().cyan());
-    }
-
-    // Pending pushes
-    if status.pending_pushes > 0 {
-        eprintln!(
-            "  Pending:    {}",
-            format!("{} operations queued", status.pending_pushes).yellow()
-        );
-    }
-
-    // Last error
-    if let Some(err) = &status.last_error {
-        let short = truncate_str(err, 80);
-        eprintln!("  Last error: {}", short.red());
-    }
-}
-
-/// Format an ISO 8601 timestamp as relative age (e.g., "3m ago", "2h ago").
-fn format_sync_age(ts: &str) -> String {
-    // Try to parse ISO 8601 timestamps in common formats
-    let now = chrono::Utc::now();
-    let parsed = chrono::DateTime::parse_from_rfc3339(ts)
-        .or_else(|_| chrono::DateTime::parse_from_str(ts, "%Y-%m-%d %H:%M:%S%.f%z"))
-        .or_else(|_| {
-            // MySQL DATETIME format (no timezone) — assume UTC
-            chrono::NaiveDateTime::parse_from_str(ts, "%Y-%m-%d %H:%M:%S")
-                .or_else(|_| chrono::NaiveDateTime::parse_from_str(ts, "%Y-%m-%d %H:%M:%S%.f"))
-                .map(|naive| {
-                    naive
-                        .and_utc()
-                        .with_timezone(&chrono::FixedOffset::east_opt(0).unwrap())
-                })
-        });
-    match parsed {
-        Ok(dt) => {
-            let dur = now.signed_duration_since(dt);
-            if dur.num_seconds() < 0 {
-                "just now".to_string()
-            } else if dur.num_seconds() < 60 {
-                format!("{}s ago", dur.num_seconds())
-            } else if dur.num_minutes() < 60 {
-                format!("{}m ago", dur.num_minutes())
-            } else if dur.num_hours() < 24 {
-                format!("{}h ago", dur.num_hours())
-            } else {
-                format!("{}d ago", dur.num_days())
-            }
-        }
-        Err(_) => ts.to_string(), // Fallback: show raw timestamp
-    }
-}
-
-/// Handle `/sync` command — show unified sync state across all domains.
-/// Subcommands: `/sync push`, `/sync pull`, `/sync log`.
-async fn handle_sync_command(arg: &str, state: &ReplState) {
-    let sub = arg.trim();
-
-    // /sync push — force-push all dirty domains
-    if sub == "push" {
-        return handle_sync_push(state).await;
-    }
-
-    // /sync pull — force-pull all pullable domains from cloud
-    if sub == "pull" {
-        return handle_sync_pull(state).await;
-    }
-
-    let show_log = sub == "log";
-
-    eprintln!(
-        "\n{}",
-        "─── Sync Engine Status ─────────────────────────".bold()
-    );
-
-    let Some(mc) = state.matrix_runtime.as_ref() else {
-        eprintln!(
-            "  {} {}",
-            "○".dim(),
-            "Sync orchestrator not initialized (no cloud connection)".dim()
-        );
-        eprintln!(
-            "{}",
-            "────────────────────────────────────────────────".dim()
-        );
-        eprintln!();
-        return;
-    };
-    let orch = mc.sync_orchestrator_lock().await;
-
-    // Cloud availability
-    let cloud_status = if orch.is_cloud_available() {
-        "● Connected".green().to_string()
-    } else {
-        "○ Offline".dim().to_string()
-    };
-    eprintln!("  Cloud: {cloud_status}");
-    eprintln!();
-
-    // Per-domain status
-    eprintln!(
-        "  {:<14} {:<12} {:>8} {:>8} {:>8} {:>8}",
-        "Domain".bold(),
-        "State".bold(),
-        "Pushes".bold(),
-        "Pulls".bold(),
-        "Conflicts".bold(),
-        "Errors".bold(),
-    );
-    let mut domains = orch.status_summary();
-    domains.sort_by_key(|(d, _)| format!("{d}"));
-    for (domain, sync_state) in &domains {
-        let state_str = match sync_state {
-            astra_services::SyncState::Clean => "✓ clean".green().to_string(),
-            astra_services::SyncState::Dirty => "● dirty".yellow().to_string(),
-            astra_services::SyncState::Syncing => "↻ syncing".cyan().to_string(),
-            astra_services::SyncState::Pulling => "↓ pulling".cyan().to_string(),
-            astra_services::SyncState::Conflict { .. } => "⚠ conflict".red().to_string(),
-            astra_services::SyncState::Error { retry_count, .. } => {
-                format!("✗ error({})", retry_count).red().to_string()
-            }
-        };
-        let stats = orch.domain_stats(*domain).unwrap_or_default();
-        eprintln!(
-            "  {:<14} {:<12} {:>8} {:>8} {:>8} {:>8}",
-            format!("{domain}").cyan(),
-            state_str,
-            stats.pushes,
-            stats.pulls,
-            stats.conflicts,
-            stats.errors,
-        );
-    }
-
-    // Sync event log
-    if show_log {
-        let events = orch.event_log();
-        if events.is_empty() {
-            eprintln!("\n  {}", "No sync events yet.".dim());
-        } else {
-            eprintln!(
-                "\n{}",
-                "─── Sync Event Log ─────────────────────────────".bold()
-            );
-            eprintln!(
-                "  {:<10} {:<12} {:<8} {:>8} {:>10}",
-                "Domain".bold(),
-                "Operation".bold(),
-                "Result".bold(),
-                "Duration".bold(),
-                "Bytes".bold(),
-            );
-            for event in events.iter().rev().take(20) {
-                let op_str = format!("{:?}", event.operation).to_lowercase();
-                let result = if event.success {
-                    "✓ ok".green().to_string()
-                } else {
-                    event.error.as_deref().unwrap_or("fail").red().to_string()
-                };
-                eprintln!(
-                    "  {:<10} {:<12} {:<8} {:>6}ms {:>10}",
-                    format!("{}", event.domain),
-                    op_str,
-                    result,
-                    event.duration_ms,
-                    if event.bytes_transferred > 0 {
-                        format_bytes(event.bytes_transferred)
-                    } else {
-                        "-".to_string()
-                    },
-                );
-            }
-        }
-    } else {
-        eprintln!("\n  {}", "Use /sync log | push | pull".dim());
-    }
-
-    eprintln!(
-        "{}",
-        "────────────────────────────────────────────────".dim()
-    );
-    eprintln!();
-}
-
-/// Force-push all dirty sync domains to cloud.
-async fn handle_sync_push(state: &ReplState) {
-    eprintln!(
-        "\n{}",
-        "─── Sync Push ──────────────────────────────────".bold()
-    );
-
-    let Some(mc) = state.matrix_runtime.as_ref() else {
-        eprintln!(
-            "  {} {}",
-            "○".dim(),
-            "No cloud connection — nothing to push.".dim()
-        );
-        eprintln!(
-            "{}",
-            "────────────────────────────────────────────────".dim()
-        );
-        eprintln!();
-        return;
-    };
-
-    let mut orch = mc.sync_orchestrator_lock().await;
-
-    // Check dirty count before push
-    let dirty_count = orch
-        .status_summary()
-        .iter()
-        .filter(|(_, s)| s.is_dirty())
-        .count();
-    if dirty_count == 0 {
-        eprintln!(
-            "  {} All domains clean — nothing to push.",
-            theme::icon_ok()
-        );
-        eprintln!(
-            "{}",
-            "────────────────────────────────────────────────".dim()
-        );
-        eprintln!();
-        return;
-    }
-
-    eprintln!(
-        "  Pushing {} dirty domain{}...\n",
-        dirty_count,
-        if dirty_count == 1 { "" } else { "s" }
-    );
-
-    let results = orch.push_dirty().await;
-    drop(orch); // release lock before printing
-
-    let mut ok_count = 0usize;
-    let mut fail_count = 0usize;
-    for r in &results {
-        if r.success {
-            ok_count += 1;
-            let version_str = r
-                .version
-                .map(|v| format!("v{v}"))
-                .unwrap_or_else(|| "-".into());
-            eprintln!(
-                "  {} {:<14} {} ({}ms)",
-                theme::icon_ok(),
-                format!("{}", r.domain).cyan(),
-                version_str.dim(),
-                r.duration_ms,
-            );
-        } else {
-            fail_count += 1;
-            let err = r.error.as_deref().unwrap_or("unknown error");
-            eprintln!(
-                "  {} {:<14} {}",
-                theme::icon_err(),
-                format!("{}", r.domain).cyan(),
-                err.red(),
-            );
-        }
-    }
-
-    eprintln!();
-    if fail_count == 0 {
-        eprintln!(
-            "  {} {} domain{} pushed successfully.",
-            "✓".green().bold(),
-            ok_count,
-            if ok_count == 1 { "" } else { "s" }
-        );
-    } else {
-        eprintln!(
-            "  {} pushed, {} failed.",
-            format!("{ok_count} ✓").green(),
-            format!("{fail_count} ✗").red(),
-        );
-    }
-
-    eprintln!(
-        "{}",
-        "────────────────────────────────────────────────".dim()
-    );
-    eprintln!();
-}
-
-/// Force-pull all pullable domains from cloud (skips write-only domains like Events).
-async fn handle_sync_pull(state: &ReplState) {
-    eprintln!(
-        "\n{}",
-        "─── Sync Pull ──────────────────────────────────".bold()
-    );
-
-    let Some(mc) = state.matrix_runtime.as_ref() else {
-        eprintln!(
-            "  {} {}",
-            "○".dim(),
-            "No cloud connection — nothing to pull.".dim()
-        );
-        eprintln!(
-            "{}",
-            "────────────────────────────────────────────────".dim()
-        );
-        eprintln!();
-        return;
-    };
-
-    let mut orch = mc.sync_orchestrator_lock().await;
-    eprintln!("  Pulling from cloud...\n");
-
-    let results = orch.pull_all().await;
-    drop(orch);
-
-    if results.is_empty() {
-        eprintln!("  {} No pullable domains configured.", "○".dim());
-        eprintln!(
-            "{}",
-            "────────────────────────────────────────────────".dim()
-        );
-        eprintln!();
-        return;
-    }
-
-    let mut ok_count = 0usize;
-    let mut fail_count = 0usize;
-    for r in &results {
-        if r.success {
-            ok_count += 1;
-            let version_str = r
-                .version
-                .map(|v| format!("v{v}"))
-                .unwrap_or_else(|| "-".into());
-            let merge_str = r
-                .merge
-                .as_ref()
-                .map(|m| {
-                    let total = m.items_added + m.items_updated;
-                    if total > 0 {
-                        format!(" (+{} added, ~{} updated)", m.items_added, m.items_updated)
-                    } else {
-                        String::new()
-                    }
-                })
-                .unwrap_or_default();
-            eprintln!(
-                "  {} {:<14} {}{} ({}ms)",
-                theme::icon_ok(),
-                format!("{}", r.domain).cyan(),
-                version_str.dim(),
-                merge_str.dim(),
-                r.duration_ms,
-            );
-        } else {
-            fail_count += 1;
-            let err = r.error.as_deref().unwrap_or("unknown error");
-            eprintln!(
-                "  {} {:<14} {}",
-                theme::icon_err(),
-                format!("{}", r.domain).cyan(),
-                err.red(),
-            );
-        }
-    }
-
-    eprintln!();
-    if fail_count == 0 {
-        eprintln!(
-            "  {} {} domain{} pulled successfully.",
-            "✓".green().bold(),
-            ok_count,
-            if ok_count == 1 { "" } else { "s" }
-        );
-    } else {
-        eprintln!(
-            "  {} pulled, {} failed.",
-            format!("{ok_count} ✓").green(),
-            format!("{fail_count} ✗").red(),
-        );
-    }
-
-    eprintln!(
-        "{}",
-        "────────────────────────────────────────────────".dim()
-    );
-    eprintln!();
-}
-
-/// Handle `/learn` command — show learning insights, drift detection, exploration.
-fn handle_learn_command(arg: &str, state: &ReplState) {
-    use astra_runtime::pipeline::pattern::ExplorationReason;
-
-    let lib = match &state.pattern_library {
-        Some(pl) => pl.lock().unwrap(),
-        None => {
-            eprintln!(
-                "  {} {}",
-                "○".dim(),
-                "Pattern library not initialized".dim()
-            );
-            return;
-        }
-    };
-
-    let sub = arg.trim();
-
-    match sub {
-        "" | "stats" => {
-            let summary = lib.learning_summary();
-            eprintln!(
-                "\n{}",
-                "─── Learning Stats ─────────────────────────────".bold()
-            );
-            eprintln!(
-                "  Patterns:     {} total, {} active, {} drifting",
-                summary.total_patterns.to_string().cyan(),
-                summary.active_patterns.to_string().green(),
-                if summary.drifting_patterns > 0 {
-                    summary.drifting_patterns.to_string().red().to_string()
-                } else {
-                    "0".green().to_string()
-                },
-            );
-            eprintln!(
-                "  Success rate: {}",
-                format!("{:.0}%", summary.avg_success_rate * 100.0).cyan()
-            );
-            eprintln!(
-                "  Exploration:  {} opportunities",
-                if summary.exploration_opportunities > 0 {
-                    summary
-                        .exploration_opportunities
-                        .to_string()
-                        .yellow()
-                        .to_string()
-                } else {
-                    "0".green().to_string()
-                }
-            );
-
-            if !summary.top_patterns.is_empty() {
-                eprintln!();
-                eprintln!("  {} Top Patterns:", "●".cyan());
-                for (sig, score) in &summary.top_patterns {
-                    let bar_len = (score * 20.0) as usize;
-                    let bar = "█".repeat(bar_len);
-                    let rest = "░".repeat(20 - bar_len);
-                    eprintln!(
-                        "    {}{} {:.2}  {}",
-                        bar.green(),
-                        rest.dim(),
-                        score,
-                        sig.as_str().dim()
-                    );
-                }
-            }
-            eprintln!(
-                "{}",
-                "────────────────────────────────────────────────".dim()
-            );
-            eprintln!();
-        }
-        "drift" => {
-            let reports = lib.detect_drift();
-            eprintln!(
-                "\n{}",
-                "─── Drift Detection ────────────────────────────".bold()
-            );
-            if reports.is_empty() {
-                eprintln!("  {} No drifting patterns detected", theme::icon_ok());
-            } else {
-                eprintln!(
-                    "  {} {} pattern(s) drifting:",
-                    theme::icon_warn(),
-                    reports.len()
-                );
-                eprintln!();
-                for r in &reports {
-                    let severity = if r.is_critical {
-                        "CRITICAL".red().to_string()
-                    } else {
-                        "WARNING".yellow().to_string()
-                    };
-                    eprintln!("  {} {}", severity, r.signature.as_str().cyan());
-                    eprintln!(
-                        "    Historical: {:.0}% → Recent: {:.0}%  (drift: {:.2})",
-                        r.historical_success_rate * 100.0,
-                        r.recent_success_rate * 100.0,
-                        r.drift_score
-                    );
-                    let domain_str = r
-                        .domain
-                        .map(|d| format!("{d:?}"))
-                        .unwrap_or_else(|| "—".to_string());
-                    eprintln!(
-                        "    Task: {:?}  Domain: {}  Obs: {}",
-                        r.task_type, domain_str, r.total_observations
-                    );
-                    eprintln!();
-                }
-            }
-            eprintln!(
-                "{}",
-                "────────────────────────────────────────────────".dim()
-            );
-            eprintln!();
-        }
-        "explore" => {
-            let opps = lib.exploration_opportunities();
-            eprintln!(
-                "\n{}",
-                "─── Exploration Opportunities ──────────────────".bold()
-            );
-            if opps.is_empty() {
-                eprintln!(
-                    "  {} All domains have sufficient confidence",
-                    theme::icon_ok()
-                );
-            } else {
-                for opp in &opps {
-                    let reason_str = match opp.reason {
-                        ExplorationReason::ColdStart => "Cold start".yellow().to_string(),
-                        ExplorationReason::Drift => "Drift".red().to_string(),
-                        ExplorationReason::LowSuccess => "Low success".yellow().to_string(),
-                    };
-                    let domain_str = opp
-                        .domain
-                        .map(|d| format!("{d:?}"))
-                        .unwrap_or_else(|| "—".to_string());
-                    eprintln!(
-                        "  {} {:?} / {}  (confidence: {:.0}%, {} patterns)",
-                        reason_str,
-                        opp.task_type,
-                        domain_str.cyan(),
-                        opp.confidence * 100.0,
-                        opp.pattern_count,
-                    );
-                    if !opp.known_tools.is_empty() {
-                        eprintln!("    Known tools: {}", opp.known_tools.join(", ").dim());
-                    }
-                }
-            }
-            eprintln!(
-                "{}",
-                "────────────────────────────────────────────────".dim()
-            );
-            eprintln!();
-        }
-        _ => {
-            eprintln!();
-            eprintln!("  {}", "Usage:".bold());
-            eprintln!("    /learn          Show learning summary (same as /learn stats)");
-            eprintln!("    /learn stats    Pattern library statistics");
-            eprintln!("    /learn drift    Detect drifting patterns");
-            eprintln!("    /learn explore  Show exploration opportunities");
-            eprintln!();
-        }
-    }
-}
-
-fn format_bytes(bytes: u64) -> String {
-    if bytes < 1024 {
-        format!("{}B", bytes)
-    } else if bytes < 1024 * 1024 {
-        format!("{:.1}KB", bytes as f64 / 1024.0)
-    } else {
-        format!("{:.1}MB", bytes as f64 / (1024.0 * 1024.0))
-    }
-}
 
 async fn build_turn_skill_resolver(
     unified_skill_registry: std::sync::Arc<astra_runtime::skills::UnifiedSkillRegistry>,
@@ -5554,464 +3539,6 @@ async fn try_connect_matrixone() -> Option<sqlx::Pool<sqlx::MySql>> {
 
 // ═══════════════════════════════════════════════════════ Task Commands ════
 
-async fn handle_task_command(
-    arg: &str,
-    state: &mut ReplState,
-    api: &astra_thin_client::ThinClient,
-    token: Option<&str>,
-) {
-    use astra_services::{TaskCreateRequest, TaskService, TaskStatus};
-
-    let svc = match &state.task_service {
-        Some(s) => s.clone(),
-        None => {
-            eprintln!(
-                "{}",
-                "  ⚠ Task service not available (local-only mode).".yellow()
-            );
-            eprintln!("{}", "  Use /login to enable cloud task tracking.".dim());
-            return;
-        }
-    };
-
-    let user_id = state.ingestion_user_id.as_deref().unwrap_or("local");
-    let session_id = state.session_id.as_deref().unwrap_or("no-session");
-
-    let subcmd = arg.split_whitespace().next().unwrap_or("list");
-    let sub_arg = arg.strip_prefix(subcmd).unwrap_or("").trim();
-
-    match subcmd {
-        "list" | "" => match svc.list_tasks(user_id, None).await {
-            Ok(tasks) if tasks.is_empty() => {
-                eprintln!(
-                    "  {}",
-                    "No tasks. Use /task add <title> to create one.".dim()
-                );
-            }
-            Ok(tasks) => {
-                eprintln!(
-                    "\n{}",
-                    "─── Tasks ───────────────────────────────────────".bold()
-                );
-                for t in &tasks {
-                    let icon = match t.status {
-                        TaskStatus::Completed
-                            if t.items_total > 0 && t.items_done < t.items_total =>
-                        {
-                            "△"
-                        }
-                        TaskStatus::Completed => "✓",
-                        TaskStatus::Failed => "✗",
-                        TaskStatus::InProgress => "▶",
-                        TaskStatus::Paused => "⏸",
-                        _ => "○",
-                    };
-                    let short_id = &t.task_id[..8.min(t.task_id.len())];
-                    let status_label = match t.status {
-                        TaskStatus::Completed
-                            if t.items_total > 0 && t.items_done < t.items_total =>
-                        {
-                            "partial".to_string()
-                        }
-                        _ => t.status.as_str().to_string(),
-                    };
-                    let progress = if t.items_total > 0 {
-                        format!(" ({}/{})", t.items_done, t.items_total)
-                    } else {
-                        String::new()
-                    };
-                    eprintln!(
-                        "  {} {} {} [{}]{}",
-                        short_id.dim(),
-                        icon,
-                        t.title,
-                        status_label.cyan(),
-                        progress,
-                    );
-                }
-                eprintln!();
-            }
-            Err(e) => eprintln!("{}", format!("  {} {e}", theme::icon_err()).red()),
-        },
-        "add" if !sub_arg.is_empty() => {
-            match svc
-                .create_task(
-                    user_id,
-                    session_id,
-                    TaskCreateRequest {
-                        title: sub_arg.to_string(),
-                        description: None,
-                        plan: None,
-                        parent_task_id: None,
-                        project_type: None,
-                        goal_pattern: None,
-                    },
-                )
-                .await
-            {
-                Ok(tid) => {
-                    let short = &tid[..8.min(tid.len())];
-                    eprintln!(
-                        "  {} Task created: {} ({})",
-                        theme::icon_ok(),
-                        sub_arg,
-                        short.dim()
-                    );
-                }
-                Err(e) => eprintln!("{}", format!("  {} {e}", theme::icon_err()).red()),
-            }
-        }
-        "done" if !sub_arg.is_empty() => {
-            // Find task by prefix match on task_id or title
-            match find_task_by_query(&*svc, user_id, sub_arg).await {
-                Ok(Some(tid)) => match svc.complete_task(&tid).await {
-                    Ok(()) => eprintln!("  {} Task completed: {}", theme::icon_ok(), sub_arg),
-                    Err(e) => eprintln!("{}", format!("  {} {e}", theme::icon_err()).red()),
-                },
-                Ok(None) => {
-                    eprintln!("{}", format!("  Task not found: '{sub_arg}'").yellow());
-                    eprintln!("{}", "  Use /task list to see available tasks.".dim());
-                }
-                Err(e) => eprintln!("{}", format!("  {} {e}", theme::icon_err()).red()),
-            }
-        }
-        "status" if !sub_arg.is_empty() => {
-            match find_task_by_query(&*svc, user_id, sub_arg).await {
-                Ok(Some(tid)) => match svc.get_task(&tid).await {
-                    Ok(Some(t)) => {
-                        eprintln!(
-                            "\n{}",
-                            "─── Task Detail ─────────────────────────────────".bold()
-                        );
-                        eprintln!("  {:<12} {}", "id:".dim(), t.task_id.cyan());
-                        eprintln!("  {:<12} {}", "title:".dim(), t.title);
-                        let detail_status_label = match t.status {
-                            TaskStatus::Completed
-                                if t.items_total > 0 && t.items_done < t.items_total =>
-                            {
-                                "partial"
-                            }
-                            _ => t.status.as_str(),
-                        };
-                        eprintln!("  {:<12} {}", "status:".dim(), detail_status_label.cyan());
-                        eprintln!("  {:<12} {}%", "progress:".dim(), t.progress_pct);
-                        if let Some(ref desc) = t.description {
-                            eprintln!("  {:<12} {}", "desc:".dim(), desc);
-                        }
-                        if let Some(ref plan) = t.plan {
-                            eprintln!(
-                                "  {:<12} {}/{}",
-                                "items:".dim(),
-                                t.items_done,
-                                t.items_total
-                            );
-                            for st in &plan.subtasks {
-                                let icon = match st.status {
-                                    TaskStatus::Completed => "✓",
-                                    TaskStatus::InProgress => "▶",
-                                    _ => "○",
-                                };
-                                eprintln!("    {} {}", icon, st.title);
-                            }
-                        }
-                        if let Some(ref err) = t.error_message {
-                            eprintln!("  {:<12} {}", "error:".dim(), err.as_str().red());
-                        }
-                        eprintln!();
-                    }
-                    Ok(None) => {
-                        eprintln!("{}", format!("  Task not found: '{sub_arg}'").yellow());
-                        eprintln!("{}", "  Use /task list to see available tasks.".dim());
-                    }
-                    Err(e) => eprintln!("{}", format!("  {} {e}", theme::icon_err()).red()),
-                },
-                Ok(None) => {
-                    eprintln!("{}", format!("  Task not found: '{sub_arg}'").yellow());
-                    eprintln!("{}", "  Use /task list to see available tasks.".dim());
-                }
-                Err(e) => eprintln!("{}", format!("  {} {e}", theme::icon_err()).red()),
-            }
-        }
-        "run" if !sub_arg.is_empty() => {
-            let token_str = match token {
-                Some(t) => t.to_string(),
-                None => {
-                    eprintln!(
-                        "{}",
-                        "  ⚠ No API token available. Use /login first.".yellow()
-                    );
-                    return;
-                }
-            };
-
-            // Create task record
-            let task_id = match svc
-                .create_task(
-                    user_id,
-                    session_id,
-                    TaskCreateRequest {
-                        title: format!(
-                            "run: {}",
-                            if sub_arg.len() > 60 {
-                                format!("{}…", &sub_arg[..60])
-                            } else {
-                                sub_arg.to_string()
-                            }
-                        ),
-                        description: Some(sub_arg.to_string()),
-                        plan: None,
-                        parent_task_id: None,
-                        project_type: None,
-                        goal_pattern: None,
-                    },
-                )
-                .await
-            {
-                Ok(tid) => tid,
-                Err(e) => {
-                    eprintln!("{}", format!("  {} {e}", theme::icon_err()).red());
-                    return;
-                }
-            };
-            let short_id = task_id[..8.min(task_id.len())].to_string();
-
-            // Clone owned values for the background task
-            let api_clone = api.clone();
-            let prompt = sub_arg.to_string();
-            let bg_session_id = state.session_id.clone();
-            let bg_model = state.model.clone();
-            let bg_history = state.history.clone();
-            let bg_unified_skill_registry = state.unified_skill_registry.clone();
-            let bg_skill_search = state.skill_search.clone();
-            let bg_messaging_metrics = state.messaging_metrics.clone();
-            let bg_agent_spawner = state.agent_spawner.clone();
-            let bg_delegation_engine = state.delegation_engine.clone();
-            let svc_clone = svc.clone();
-            let workspace_root = std::env::current_dir().unwrap_or_default();
-            let bg_root_agent_id = format!("task-{task_id}");
-
-            eprintln!(
-                "  {} Background task started: {} ({})",
-                "▶".cyan(),
-                if sub_arg.len() > 50 {
-                    format!("{}…", &sub_arg[..50])
-                } else {
-                    sub_arg.to_string()
-                },
-                short_id.dim()
-            );
-            eprintln!(
-                "  {}",
-                "Use /task status or /task result to check progress.".dim()
-            );
-
-            // Spawn background task
-            let bg_task_id = task_id.clone();
-            tokio::spawn(async move {
-                // Mark in-progress
-                let _ = svc_clone
-                    .update_status(&bg_task_id, TaskStatus::InProgress)
-                    .await;
-
-                // Create fresh auto-approve permission manager for background
-                let mut perm_manager = PermissionManager::with_project(true, &workspace_root);
-                let mut skill_qt = astra_runtime::skills::quality::SkillQualityTracker::new();
-
-                // Create a fresh tool selector for the background task
-                let (selector, _modules) = create_tool_selector_quiet(&api_clone, None);
-
-                let result = stream_chat_sse(ChatTurnParams {
-                    api: &api_clone,
-                    token: &token_str,
-                    message: &prompt,
-                    session_id: bg_session_id.as_deref(),
-                    model: bg_model.as_deref(),
-                    explain: ExplainMode::Off,
-                    render_md: false,
-                    history: &bg_history,
-                    perm_manager: &mut perm_manager,
-                    verbose_mode: false,
-                    quiet: true,
-                    suppress_intermediate_output: true,
-                    selector: &*selector,
-                    recent_tools: &[],
-                    tool_health_entries: &[],
-                    unified_skill_registry: &bg_unified_skill_registry,
-                    plan_only_chat: false,
-                    hide_streaming_assistant_text: true,
-                    is_plan_subtask: false,
-                    plan_subtask_id: None,
-                    delegation_engine: bg_delegation_engine.clone(),
-                    cancel_token: None,
-                    plan_assemble_line_release: None,
-                    stream_event_tx: None,
-                    approval_request_tx: None,
-                    mcp_manager: None,
-                    skill_search: &bg_skill_search,
-                    skill_quality_tracker: &mut skill_qt,
-                    discovered_skills: None,
-                    messaging_metrics: bg_messaging_metrics.clone(),
-                    agent_spawner: bg_agent_spawner.clone(),
-                    root_agent_id: Some(bg_root_agent_id.as_str()),
-                    root_mailbox_slot: None,
-                    observability_hub: None,
-                    observability_session: None,
-                })
-                .await;
-
-                let short = &bg_task_id[..8.min(bg_task_id.len())];
-                match result {
-                    Ok(sr) => {
-                        // Store result in checkpoint state map
-                        let mut state_map = serde_json::Map::new();
-                        state_map.insert(
-                            "full_text".to_string(),
-                            serde_json::Value::String(sr.full_text.clone()),
-                        );
-                        state_map.insert(
-                            "prompt_tokens".to_string(),
-                            serde_json::json!(sr.prompt_tokens),
-                        );
-                        state_map.insert(
-                            "completion_tokens".to_string(),
-                            serde_json::json!(sr.completion_tokens),
-                        );
-                        state_map.insert(
-                            "tool_calls_count".to_string(),
-                            serde_json::json!(sr.tool_calls_count),
-                        );
-                        let _ = svc_clone
-                            .save_checkpoint(
-                                &bg_task_id,
-                                &astra_services::task_orchestrator::TaskCheckpoint {
-                                    active_subtask_id: None,
-                                    turn: 0,
-                                    session_id: bg_session_id.clone(),
-                                    state: state_map,
-                                },
-                            )
-                            .await;
-                        let _ = svc_clone.complete_task(&bg_task_id).await;
-                        eprintln!(
-                            "\n  {} Background task {} completed. Use /task result {} to view.",
-                            theme::icon_ok(),
-                            short.cyan(),
-                            short.cyan()
-                        );
-                    }
-                    Err(e) => {
-                        let _ = svc_clone.fail_task(&bg_task_id, &e.error).await;
-                        eprintln!(
-                            "\n  {} Background task {} failed: {}",
-                            theme::icon_err(),
-                            short.cyan(),
-                            e.error.red()
-                        );
-                    }
-                }
-            });
-        }
-        "result" if !sub_arg.is_empty() => {
-            // Show the full result of a background task
-            match find_task_by_query(&*svc, user_id, sub_arg).await {
-                Ok(Some(tid)) => match svc.get_task(&tid).await {
-                    Ok(Some(t)) => {
-                        let short = &t.task_id[..8.min(t.task_id.len())];
-                        eprintln!(
-                            "\n{}",
-                            format!("─── Task Result ({short}) ─────────────────────────").bold()
-                        );
-                        eprintln!("  {:<12} {}", "title:".dim(), t.title);
-                        eprintln!("  {:<12} {}", "status:".dim(), t.status.as_str().cyan());
-                        if let Some(ref err) = t.error_message {
-                            eprintln!("  {:<12} {}", "error:".dim(), err.as_str().red());
-                        }
-                        // Print checkpoint data (the full_text from the agent)
-                        let mut found_result = false;
-                        if let Some(ref cp) = t.checkpoint {
-                            if let Some(full_text) =
-                                cp.state.get("full_text").and_then(|v| v.as_str())
-                            {
-                                found_result = true;
-                                eprintln!();
-                                eprintln!("{full_text}");
-                                if let Some(tokens) =
-                                    cp.state.get("prompt_tokens").and_then(|v| v.as_u64())
-                                {
-                                    let comp = cp
-                                        .state
-                                        .get("completion_tokens")
-                                        .and_then(|v| v.as_u64())
-                                        .unwrap_or(0);
-                                    let tools = cp
-                                        .state
-                                        .get("tool_calls_count")
-                                        .and_then(|v| v.as_u64())
-                                        .unwrap_or(0);
-                                    eprintln!(
-                                        "\n  {}",
-                                        format!("tokens: {tokens}→/{comp}← | tools: {tools}").dim()
-                                    );
-                                }
-                            }
-                        }
-                        if !found_result {
-                            match t.status {
-                                TaskStatus::InProgress | TaskStatus::Pending => {
-                                    eprintln!("  {}", "Task is still running…".yellow());
-                                }
-                                _ => {
-                                    eprintln!("  {}", "No result data available.".dim());
-                                }
-                            }
-                        }
-                        eprintln!();
-                    }
-                    Ok(None) => {
-                        eprintln!("{}", format!("  Task not found: '{sub_arg}'").yellow());
-                    }
-                    Err(e) => eprintln!("{}", format!("  {} {e}", theme::icon_err()).red()),
-                },
-                Ok(None) => {
-                    eprintln!("{}", format!("  Task not found: '{sub_arg}'").yellow());
-                    eprintln!("{}", "  Use /task list to see available tasks.".dim());
-                }
-                Err(e) => eprintln!("{}", format!("  {} {e}", theme::icon_err()).red()),
-            }
-        }
-        _ => {
-            eprintln!(
-                "  Usage: /task [list | add <title> | done <id> | status <id> | run <prompt> | result <id>]"
-            );
-        }
-    }
-}
-
-/// Find a task by prefix match on task_id or substring match on title.
-async fn find_task_by_query(
-    svc: &dyn astra_services::TaskService,
-    user_id: &str,
-    query: &str,
-) -> Result<Option<String>, String> {
-    let tasks = svc.list_tasks(user_id, None).await?;
-    // Exact or prefix match on task_id
-    if let Some(t) = tasks
-        .iter()
-        .find(|t| t.task_id == query || t.task_id.starts_with(query))
-    {
-        return Ok(Some(t.task_id.clone()));
-    }
-    // Substring match on title (case-insensitive)
-    let q_lower = query.to_lowercase();
-    if let Some(t) = tasks
-        .iter()
-        .find(|t| t.title.to_lowercase().contains(&q_lower))
-    {
-        return Ok(Some(t.task_id.clone()));
-    }
-    Ok(None)
-}
-
 // ══════════════════════════════════════════════════════ Slash Commands ════
 
 /// Returns `true` when the REPL should exit.
@@ -6107,8 +3634,8 @@ async fn handle_slash_command(
                 ) {
                     state.model = Some(chosen.clone());
                     // Cache pricing: prefer API-provided, fall back to built-in table
-                    state.cached_pricing = extract_pricing_for_model(&models, &chosen)
-                        .unwrap_or_else(|| fallback_pricing(&chosen));
+                    state.cached_pricing = slash_stats::extract_pricing_for_model(&models, &chosen)
+                        .unwrap_or_else(|| slash_stats::fallback_pricing(&chosen));
                     // M3: Use RuntimeConfig-driven context budget
                     state.context_budget = prompts::ContextBudget::from_runtime_config(
                         &state.runtime_config,
@@ -6127,7 +3654,7 @@ async fn handle_slash_command(
 
         "/model" => {
             state.model = Some(arg.to_string());
-            state.cached_pricing = fallback_pricing(arg);
+            state.cached_pricing = slash_stats::fallback_pricing(arg);
             // M3: Use RuntimeConfig-driven context budget
             state.context_budget =
                 prompts::ContextBudget::from_runtime_config(&state.runtime_config, Some(arg));
@@ -6168,7 +3695,7 @@ async fn handle_slash_command(
         "/debug" => handle_debug_command(arg, state),
 
         "/style" => {
-            handle_style_command(arg);
+            slash_style::handle_style_command(arg);
         }
 
         "/history" | "/grep" | "/review" | "/copy" | "/diagnostics" | "/lsp" | "/context"
@@ -6376,19 +3903,19 @@ async fn handle_slash_command(
         }
 
         "/task" => {
-            handle_task_command(arg, state, api, token).await;
+            slash_task::handle_task_command(arg, state, api, token).await;
         }
 
         "/resume" => {
-            handle_resume_command(arg, profile, state).await;
+            slash_session::handle_resume_command(arg, profile, state).await;
         }
 
         "/stats" => {
-            handle_stats_command(arg, state);
+            slash_stats::handle_stats_command(arg, state);
         }
 
         "/cost" => {
-            handle_cost_command(arg, state);
+            slash_stats::handle_cost_command(arg, state);
         }
 
         "/bug" => {
@@ -6396,15 +3923,15 @@ async fn handle_slash_command(
         }
 
         "/tools" => {
-            handle_tools_command(state);
+            slash_tools::handle_tools_command(state);
         }
 
         "/health" => {
-            handle_health_command(arg, state).await;
+            slash_health::handle_health_command(arg, state).await;
         }
 
         "/sync" => {
-            handle_sync_command(arg, state).await;
+            slash_sync::handle_sync_command(arg, state).await;
         }
 
         "/diff" => {
@@ -6413,7 +3940,7 @@ async fn handle_slash_command(
         }
 
         "/learn" => {
-            handle_learn_command(arg, state);
+            slash_learn::handle_learn_command(arg, state);
         }
 
         "/exit" | "/quit" => {
@@ -7187,7 +4714,7 @@ async fn run_chat_repl(
 
                     // --max-budget enforcement: check accumulated cost against budget limit
                     if state.max_budget_limit > 0.0 {
-                        let current_cost = cost_for_tokens(
+                        let current_cost = slash_stats::cost_for_tokens(
                             state.total_prompt_tokens,
                             state.total_completion_tokens,
                             state.total_cache_read_tokens,
@@ -7199,8 +4726,8 @@ async fn run_chat_repl(
                             eprintln!(
                                 "\n  {} Session budget reached: {} / {} limit. Exiting.",
                                 theme::icon_warn(),
-                                format_cost(current_cost).bold(),
-                                format_cost(state.max_budget_limit),
+                                slash_stats::format_cost(current_cost).bold(),
+                                slash_stats::format_cost(state.max_budget_limit),
                             );
                             break;
                         }
@@ -8687,12 +6214,16 @@ mod tests {
             .unwrap();
 
         // Full ID match
-        let found = find_task_by_query(&svc, "u1", &tid).await.unwrap();
+        let found = slash_task::find_task_by_query(&svc, "u1", &tid)
+            .await
+            .unwrap();
         assert_eq!(found, Some(tid.clone()));
 
         // Prefix match (first 8 Unicode scalars)
         let prefix = prefix_chars(&tid, 8);
-        let found = find_task_by_query(&svc, "u1", &prefix).await.unwrap();
+        let found = slash_task::find_task_by_query(&svc, "u1", &prefix)
+            .await
+            .unwrap();
         assert_eq!(found, Some(tid));
     }
 
@@ -8712,12 +6243,14 @@ mod tests {
         .unwrap();
 
         // Case-insensitive title match
-        let found = find_task_by_query(&svc, "u1", "authentication")
+        let found = slash_task::find_task_by_query(&svc, "u1", "authentication")
             .await
             .unwrap();
         assert!(found.is_some());
 
-        let found = find_task_by_query(&svc, "u1", "AUTH").await.unwrap();
+        let found = slash_task::find_task_by_query(&svc, "u1", "AUTH")
+            .await
+            .unwrap();
         assert!(found.is_some());
     }
 
@@ -8725,7 +6258,9 @@ mod tests {
     async fn find_task_not_found() {
         let tmp = tempfile::TempDir::new().unwrap();
         let svc = astra_services::LocalTaskService::new(tmp.path().to_path_buf());
-        let found = find_task_by_query(&svc, "u1", "nonexistent").await.unwrap();
+        let found = slash_task::find_task_by_query(&svc, "u1", "nonexistent")
+            .await
+            .unwrap();
         assert!(found.is_none());
     }
 
@@ -8745,7 +6280,9 @@ mod tests {
         .unwrap();
 
         // Different user can't find it
-        let found = find_task_by_query(&svc, "user-b", "Private").await.unwrap();
+        let found = slash_task::find_task_by_query(&svc, "user-b", "Private")
+            .await
+            .unwrap();
         assert!(found.is_none());
     }
 
@@ -9024,7 +6561,7 @@ total_tokens_out: 3
             state.recent_tools = restored.recent_tools.clone();
             state.model = restored.model.clone();
             if let Some(ref m) = state.model {
-                state.cached_pricing = fallback_pricing(m);
+                state.cached_pricing = slash_stats::fallback_pricing(m);
                 // M3: Use RuntimeConfig-driven context budget on session restore (test code)
                 state.context_budget =
                     prompts::ContextBudget::from_runtime_config(&state.runtime_config, Some(m));
@@ -9279,13 +6816,13 @@ total_tokens_out: 500
     fn stats_no_active_session_does_not_panic() {
         // state with no session_id → should not panic
         let state = super::ReplState::default();
-        handle_stats_command("", &state); // current session mode, no session
+        slash_stats::handle_stats_command("", &state); // current session mode, no session
     }
 
     #[test]
     fn stats_history_no_sessions_does_not_panic() {
         let state = super::ReplState::default();
-        handle_stats_command("history", &state);
+        slash_stats::handle_stats_command("history", &state);
     }
 
     #[test]
@@ -9346,7 +6883,7 @@ total_tokens_out: 500
             session_id: Some(sid),
             ..Default::default()
         };
-        handle_stats_command("", &state);
+        slash_stats::handle_stats_command("", &state);
     }
 
     #[test]
@@ -9393,7 +6930,7 @@ total_tokens_out: 500
     #[test]
     fn tools_no_active_session_does_not_panic() {
         let state = super::ReplState::default();
-        handle_tools_command(&state);
+        slash_tools::handle_tools_command(&state);
     }
 
     #[test]
@@ -9420,7 +6957,7 @@ total_tokens_out: 500
             session_id: Some(sid),
             ..Default::default()
         };
-        handle_tools_command(&state);
+        slash_tools::handle_tools_command(&state);
     }
 
     #[test]
@@ -9502,16 +7039,16 @@ total_tokens_out: 500
             session_id: Some(sid),
             ..Default::default()
         };
-        handle_tools_command(&state);
+        slash_tools::handle_tools_command(&state);
     }
 
-    // ── format_sync_age tests ────────────────────────────────────────────
+    // ── slash_health::format_sync_age tests ────────────────────────────────────────────
 
     #[test]
     fn format_sync_age_rfc3339() {
         let now = chrono::Utc::now();
         let ts = now.to_rfc3339();
-        let age = format_sync_age(&ts);
+        let age = slash_health::format_sync_age(&ts);
         // Should be "just now" or "0s ago" or "1s ago"
         assert!(
             age.contains("s ago") || age == "just now",
@@ -9524,7 +7061,7 @@ total_tokens_out: 500
         let now = chrono::Utc::now();
         let five_min_ago = now - chrono::Duration::minutes(5);
         let ts = five_min_ago.to_rfc3339();
-        let age = format_sync_age(&ts);
+        let age = slash_health::format_sync_age(&ts);
         assert!(
             age.contains("m ago"),
             "expected minutes-ago format, got: {age}"
@@ -9536,7 +7073,7 @@ total_tokens_out: 500
         let now = chrono::Utc::now();
         let two_hours_ago = now - chrono::Duration::hours(2);
         let ts = two_hours_ago.to_rfc3339();
-        let age = format_sync_age(&ts);
+        let age = slash_health::format_sync_age(&ts);
         assert!(
             age.contains("h ago"),
             "expected hours-ago format, got: {age}"
@@ -9548,7 +7085,7 @@ total_tokens_out: 500
         let now = chrono::Utc::now();
         let three_days_ago = now - chrono::Duration::days(3);
         let ts = three_days_ago.to_rfc3339();
-        let age = format_sync_age(&ts);
+        let age = slash_health::format_sync_age(&ts);
         assert!(
             age.contains("d ago"),
             "expected days-ago format, got: {age}"
@@ -9558,7 +7095,7 @@ total_tokens_out: 500
     #[test]
     fn format_sync_age_mysql_datetime() {
         // MySQL DATETIME without timezone — should parse as UTC
-        let age = format_sync_age("2020-01-01 00:00:00");
+        let age = slash_health::format_sync_age("2020-01-01 00:00:00");
         assert!(
             age.contains("d ago"),
             "expected days-ago for old mysql datetime, got: {age}"
@@ -9568,7 +7105,7 @@ total_tokens_out: 500
     #[test]
     fn format_sync_age_unparseable_returns_raw() {
         let raw = "not-a-timestamp";
-        let age = format_sync_age(raw);
+        let age = slash_health::format_sync_age(raw);
         assert_eq!(age, raw, "unparseable should return raw string");
     }
 
@@ -9576,7 +7113,7 @@ total_tokens_out: 500
     fn display_sync_status_no_crash_all_none() {
         let status = astra_services::SyncStatus::default();
         // Just verify no panic — output goes to stderr
-        display_sync_status(&status);
+        slash_health::display_sync_status(&status);
     }
 
     #[test]
@@ -9589,7 +7126,7 @@ total_tokens_out: 500
             last_error: Some("connection reset by peer".into()),
             cloud_version: None,
         };
-        display_sync_status(&status);
+        slash_health::display_sync_status(&status);
     }
 
     #[tokio::test]
@@ -9962,7 +7499,7 @@ total_tokens_out: 500
             cache_read: None,
             cache_write: None,
         };
-        let cost = cost_for_tokens(1000, 500, 0, 0, &pricing);
+        let cost = slash_stats::cost_for_tokens(1000, 500, 0, 0, &pricing);
         // 1000 * 0.003/1000 + 500 * 0.015/1000 = 0.003 + 0.0075 = 0.0105
         assert!(
             (cost - 0.0105).abs() < 1e-10,
@@ -9978,13 +7515,16 @@ total_tokens_out: 500
             cache_read: None,
             cache_write: None,
         };
-        assert_eq!(cost_for_tokens(0, 0, 0, 0, &pricing), 0.0);
+        assert_eq!(slash_stats::cost_for_tokens(0, 0, 0, 0, &pricing), 0.0);
     }
 
     #[test]
     fn cost_for_tokens_zero_pricing() {
         let pricing = astra_services::models::PricingData::default();
-        assert_eq!(cost_for_tokens(10000, 5000, 0, 0, &pricing), 0.0);
+        assert_eq!(
+            slash_stats::cost_for_tokens(10000, 5000, 0, 0, &pricing),
+            0.0
+        );
     }
 
     #[test]
@@ -9996,7 +7536,7 @@ total_tokens_out: 500
             cache_write: None,
         };
         // 1M prompt + 500K completion
-        let cost = cost_for_tokens(1_000_000, 500_000, 0, 0, &pricing);
+        let cost = slash_stats::cost_for_tokens(1_000_000, 500_000, 0, 0, &pricing);
         // 1M * 0.003/1K + 500K * 0.015/1K = 3.0 + 7.5 = 10.5
         assert!(
             (cost - 10.5).abs() < 1e-6,
@@ -10013,7 +7553,7 @@ total_tokens_out: 500
             cache_write: Some(0.00375), // 125% of prompt
         };
         // 500 prompt + 200 completion + 1000 cache_read + 100 cache_write
-        let cost = cost_for_tokens(500, 200, 1000, 100, &pricing);
+        let cost = slash_stats::cost_for_tokens(500, 200, 1000, 100, &pricing);
         let expected = (500.0 * 0.003 / 1000.0)
             + (200.0 * 0.015 / 1000.0)
             + (1000.0 * 0.0003 / 1000.0)
@@ -10033,7 +7573,7 @@ total_tokens_out: 500
             cache_read: None,
             cache_write: None,
         };
-        let cost = cost_for_tokens(0, 0, 1000, 1000, &pricing);
+        let cost = slash_stats::cost_for_tokens(0, 0, 1000, 1000, &pricing);
         let expected = (1000.0 * 0.003 * 0.1 / 1000.0) + (1000.0 * 0.003 * 1.25 / 1000.0);
         assert!(
             (cost - expected).abs() < 1e-10,
@@ -10043,27 +7583,27 @@ total_tokens_out: 500
 
     #[test]
     fn format_cost_sub_cent() {
-        assert_eq!(format_cost(0.0001), "$0.0001");
-        assert_eq!(format_cost(0.0099), "$0.0099");
+        assert_eq!(slash_stats::format_cost(0.0001), "$0.0001");
+        assert_eq!(slash_stats::format_cost(0.0099), "$0.0099");
     }
 
     #[test]
     fn format_cost_sub_dollar() {
-        assert_eq!(format_cost(0.01), "$0.010");
-        assert_eq!(format_cost(0.123), "$0.123");
-        assert_eq!(format_cost(0.999), "$0.999");
+        assert_eq!(slash_stats::format_cost(0.01), "$0.010");
+        assert_eq!(slash_stats::format_cost(0.123), "$0.123");
+        assert_eq!(slash_stats::format_cost(0.999), "$0.999");
     }
 
     #[test]
     fn format_cost_dollars() {
-        assert_eq!(format_cost(1.0), "$1.00");
-        assert_eq!(format_cost(12.345), "$12.35"); // rounds
-        assert_eq!(format_cost(100.0), "$100.00");
+        assert_eq!(slash_stats::format_cost(1.0), "$1.00");
+        assert_eq!(slash_stats::format_cost(12.345), "$12.35"); // rounds
+        assert_eq!(slash_stats::format_cost(100.0), "$100.00");
     }
 
     #[test]
     fn format_cost_zero() {
-        assert_eq!(format_cost(0.0), "$0.0000");
+        assert_eq!(slash_stats::format_cost(0.0), "$0.0000");
     }
 
     #[test]
@@ -10075,7 +7615,7 @@ total_tokens_out: 500
                 "completion": 0.06
             }
         })];
-        let p = extract_pricing_for_model(&models, "gpt-4").unwrap();
+        let p = slash_stats::extract_pricing_for_model(&models, "gpt-4").unwrap();
         assert!((p.prompt - 0.03).abs() < 1e-10);
         assert!((p.completion - 0.06).abs() < 1e-10);
     }
@@ -10087,7 +7627,7 @@ total_tokens_out: 500
             "pricing_prompt": 0.008,
             "pricing_completion": 0.024
         })];
-        let p = extract_pricing_for_model(&models, "claude-3").unwrap();
+        let p = slash_stats::extract_pricing_for_model(&models, "claude-3").unwrap();
         assert!((p.prompt - 0.008).abs() < 1e-10);
         assert!((p.completion - 0.024).abs() < 1e-10);
     }
@@ -10097,13 +7637,13 @@ total_tokens_out: 500
         let models = vec![
             serde_json::json!({"name": "gpt-4", "pricing_prompt": 0.03, "pricing_completion": 0.06}),
         ];
-        assert!(extract_pricing_for_model(&models, "nonexistent").is_none());
+        assert!(slash_stats::extract_pricing_for_model(&models, "nonexistent").is_none());
     }
 
     #[test]
     fn extract_pricing_empty_models() {
         let models: Vec<serde_json::Value> = vec![];
-        assert!(extract_pricing_for_model(&models, "any").is_none());
+        assert!(slash_stats::extract_pricing_for_model(&models, "any").is_none());
     }
 
     #[test]
@@ -10113,14 +7653,14 @@ total_tokens_out: 500
             "pricing_prompt": 0.0,
             "pricing_completion": 0.0
         })];
-        assert!(extract_pricing_for_model(&models, "test").is_none());
+        assert!(slash_stats::extract_pricing_for_model(&models, "test").is_none());
     }
 
-    // ── fallback_pricing tests ───────────────────────────────────────────
+    // ── slash_stats::fallback_pricing tests ───────────────────────────────────────────
 
     #[test]
     fn fallback_sonnet_pricing() {
-        let p = fallback_pricing("claude-sonnet-4-20250514");
+        let p = slash_stats::fallback_pricing("claude-sonnet-4-20250514");
         assert!((p.prompt - 0.003).abs() < 1e-6);
         assert!((p.completion - 0.015).abs() < 1e-6);
         assert!(p.cache_read.is_some());
@@ -10129,7 +7669,7 @@ total_tokens_out: 500
 
     #[test]
     fn fallback_opus_4_pricing() {
-        let p = fallback_pricing("claude-opus-4-20250514");
+        let p = slash_stats::fallback_pricing("claude-opus-4-20250514");
         assert!(
             (p.prompt - 0.015).abs() < 1e-6,
             "opus-4 prompt should be $15/Mtok"
@@ -10139,7 +7679,7 @@ total_tokens_out: 500
 
     #[test]
     fn fallback_opus_45_pricing() {
-        let p = fallback_pricing("claude-opus-4.5-20250415");
+        let p = slash_stats::fallback_pricing("claude-opus-4.5-20250415");
         assert!(
             (p.prompt - 0.005).abs() < 1e-6,
             "opus 4.5 should be $5/Mtok"
@@ -10148,7 +7688,7 @@ total_tokens_out: 500
 
     #[test]
     fn fallback_haiku_pricing() {
-        let p = fallback_pricing("claude-haiku-4.5-20250514");
+        let p = slash_stats::fallback_pricing("claude-haiku-4.5-20250514");
         assert!(
             (p.prompt - 0.001).abs() < 1e-6,
             "haiku 4.5 should be $1/Mtok"
@@ -10157,19 +7697,19 @@ total_tokens_out: 500
 
     #[test]
     fn fallback_gpt4o_pricing() {
-        let p = fallback_pricing("gpt-4o-2024-08-06");
+        let p = slash_stats::fallback_pricing("gpt-4o-2024-08-06");
         assert!((p.prompt - 0.0025).abs() < 1e-6);
     }
 
     #[test]
     fn fallback_deepseek_pricing() {
-        let p = fallback_pricing("deepseek-chat");
+        let p = slash_stats::fallback_pricing("deepseek-chat");
         assert!((p.prompt - 0.00027).abs() < 1e-8);
     }
 
     #[test]
     fn fallback_unknown_uses_sonnet() {
-        let p = fallback_pricing("some-unknown-model");
+        let p = slash_stats::fallback_pricing("some-unknown-model");
         assert!(
             (p.prompt - 0.003).abs() < 1e-6,
             "unknown model should default to sonnet pricing"
@@ -10179,8 +7719,8 @@ total_tokens_out: 500
     #[test]
     fn fallback_cost_calculation_with_cache() {
         // Sonnet: 1000 prompt + 500 completion + 2000 cache_read + 100 cache_creation
-        let p = fallback_pricing("claude-sonnet-4-20250514");
-        let cost = cost_for_tokens(1000, 500, 2000, 100, &p);
+        let p = slash_stats::fallback_pricing("claude-sonnet-4-20250514");
+        let cost = slash_stats::cost_for_tokens(1000, 500, 2000, 100, &p);
         // $0.003/Ktok * 1 + $0.015/Ktok * 0.5 + $0.0003/Ktok * 2 + $0.00375/Ktok * 0.1
         let expected = 0.003 + 0.0075 + 0.0006 + 0.000375;
         assert!(

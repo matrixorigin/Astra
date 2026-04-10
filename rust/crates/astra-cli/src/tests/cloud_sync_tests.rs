@@ -1,12 +1,12 @@
 use super::*;
 
-// ── format_sync_age tests ────────────────────────────────────────────
+// ── slash_health::format_sync_age tests ────────────────────────────────────────────
 
 #[test]
 fn format_sync_age_rfc3339() {
     let now = chrono::Utc::now();
     let ts = now.to_rfc3339();
-    let age = format_sync_age(&ts);
+    let age = slash_health::format_sync_age(&ts);
     // Should be "just now" or "0s ago" or "1s ago"
     assert!(
         age.contains("s ago") || age == "just now",
@@ -19,7 +19,7 @@ fn format_sync_age_minutes_ago() {
     let now = chrono::Utc::now();
     let five_min_ago = now - chrono::Duration::minutes(5);
     let ts = five_min_ago.to_rfc3339();
-    let age = format_sync_age(&ts);
+    let age = slash_health::format_sync_age(&ts);
     assert!(
         age.contains("m ago"),
         "expected minutes-ago format, got: {age}"
@@ -31,7 +31,7 @@ fn format_sync_age_hours_ago() {
     let now = chrono::Utc::now();
     let two_hours_ago = now - chrono::Duration::hours(2);
     let ts = two_hours_ago.to_rfc3339();
-    let age = format_sync_age(&ts);
+    let age = slash_health::format_sync_age(&ts);
     assert!(
         age.contains("h ago"),
         "expected hours-ago format, got: {age}"
@@ -43,7 +43,7 @@ fn format_sync_age_days_ago() {
     let now = chrono::Utc::now();
     let three_days_ago = now - chrono::Duration::days(3);
     let ts = three_days_ago.to_rfc3339();
-    let age = format_sync_age(&ts);
+    let age = slash_health::format_sync_age(&ts);
     assert!(
         age.contains("d ago"),
         "expected days-ago format, got: {age}"
@@ -53,7 +53,7 @@ fn format_sync_age_days_ago() {
 #[test]
 fn format_sync_age_mysql_datetime() {
     // MySQL DATETIME without timezone — should parse as UTC
-    let age = format_sync_age("2020-01-01 00:00:00");
+    let age = slash_health::format_sync_age("2020-01-01 00:00:00");
     assert!(
         age.contains("d ago"),
         "expected days-ago for old mysql datetime, got: {age}"
@@ -63,7 +63,7 @@ fn format_sync_age_mysql_datetime() {
 #[test]
 fn format_sync_age_unparseable_returns_raw() {
     let raw = "not-a-timestamp";
-    let age = format_sync_age(raw);
+    let age = slash_health::format_sync_age(raw);
     assert_eq!(age, raw, "unparseable should return raw string");
 }
 
@@ -71,7 +71,7 @@ fn format_sync_age_unparseable_returns_raw() {
 fn display_sync_status_no_crash_all_none() {
     let status = astra_services::SyncStatus::default();
     // Just verify no panic — output goes to stderr
-    display_sync_status(&status);
+    slash_health::display_sync_status(&status);
 }
 
 #[test]
@@ -84,7 +84,7 @@ fn display_sync_status_no_crash_full_data() {
         last_error: Some("connection reset by peer".into()),
         cloud_version: None,
     };
-    display_sync_status(&status);
+    slash_health::display_sync_status(&status);
 }
 
 #[tokio::test]
