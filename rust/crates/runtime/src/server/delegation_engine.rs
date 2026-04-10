@@ -983,6 +983,7 @@ impl DelegationEngine {
         &self,
         result: AgentResult,
         delegation_id: &str,
+        parent_run_id: &str,
         config_builder: impl Fn() -> SubRunConfig,
     ) -> AgentResult {
         let gate = match &self.gate {
@@ -1059,9 +1060,41 @@ impl DelegationEngine {
 
                     // Retry: re-execute with the same config
                     attempt += 1;
+                    let original_run_id = current.run_id.clone();
                     let retry_config = config_builder();
+                    let retry_run_id = retry_config.run_id.clone();
+
+                    // Record retry sub-run with linkage to original
+                    self.tracker
+                        .record_sub_run(SubRunRecord {
+                            run_id: retry_run_id.clone(),
+                            parent_run_id: parent_run_id.to_string(),
+                            delegation_id: delegation_id.to_string(),
+                            agent_id: retry_config.agent_profile.agent_id.clone(),
+                            depth: 0,
+                            state: SubRunState::Created,
+                            retry_of: Some(original_run_id.clone()),
+                        })
+                        .await;
+
+                    // Mark the original as verification-failed before retrying
+                    self.tracker
+                        .complete_sub_run(&original_run_id, SubRunState::VerificationFailed)
+                        .await;
+
                     match self.executor.execute(retry_config).await {
                         Ok(r) => {
+                            // Transition retry to Running→Completed/Failed
+                            self.tracker
+                                .complete_sub_run(
+                                    &r.run_id,
+                                    if r.is_success() {
+                                        SubRunState::Completed
+                                    } else {
+                                        SubRunState::Failed
+                                    },
+                                )
+                                .await;
                             astra_core::log_persist!(
                                 self.run_engine
                                     .persist_status(&r.run_id, &r.status, None, r.error.as_deref())
@@ -1073,6 +1106,9 @@ impl DelegationEngine {
                             current = r;
                         }
                         Err(e) => {
+                            self.tracker
+                                .complete_sub_run(&retry_run_id, SubRunState::Failed)
+                                .await;
                             return AgentResult {
                                 status: STATUS_FAILED.to_string(),
                                 error: Some(format!("retry execution failed: {e}")),
@@ -1364,6 +1400,31 @@ impl DelegationEngine {
             None
         };
 
+        // Store config templates for fan-out gate retry support.
+        // Maps agent_id → (AgentProfile, task, session_id, user_id, context)
+        let mut retry_templates: HashMap<
+            String,
+            (
+                AgentProfile,
+                String,
+                String,
+                String,
+                HashMap<String, serde_json::Value>,
+            ),
+        > = HashMap::new();
+        for config in &configs {
+            retry_templates.insert(
+                config.agent_profile.agent_id.clone(),
+                (
+                    config.agent_profile.clone(),
+                    config.task.clone(),
+                    config.session_id.clone(),
+                    config.user_id.clone(),
+                    config.context.clone(),
+                ),
+            );
+        }
+
         let mut handles: Vec<(
             tokio::task::JoinHandle<(Result<AgentResult, String>, String, String)>,
             String,
@@ -1478,28 +1539,37 @@ impl DelegationEngine {
             let mut gated_results = Vec::with_capacity(results.len());
             for result in results {
                 let did = delegation_id.clone();
-                // Fan-out gate is check-only (no retry — configs are consumed).
-                // For retry support, use Sequential pattern instead.
+                let cancel_for_retry = cancel_token.cloned();
+                // Build retry config from stored template
+                let template = retry_templates.get(&result.agent_id).cloned();
                 let gated = self
-                    .apply_gate(result, &did, || {
-                        // No-retry stub: return a dummy config that won't actually be called
-                        // because max_retries check fires first in the closure.
+                    .apply_gate(result, &did, &request.parent_run_id, || {
+                        let (profile, task, sess, uid, ctx) =
+                            template.clone().unwrap_or_else(|| {
+                                (
+                                    AgentProfile::new(
+                                        "stub",
+                                        "stub",
+                                        astra_services::coordination::AgentTier::User,
+                                    ),
+                                    String::new(),
+                                    String::new(),
+                                    String::new(),
+                                    HashMap::new(),
+                                )
+                            });
                         SubRunConfig {
-                            run_id: String::new(),
-                            agent_profile: AgentProfile::new(
-                                "stub",
-                                "stub",
-                                astra_services::coordination::AgentTier::User,
-                            ),
-                            task: String::new(),
-                            session_id: String::new(),
-                            user_id: String::new(),
+                            run_id: uuid::Uuid::new_v4().to_string(),
+                            agent_profile: profile,
+                            task,
+                            session_id: sess,
+                            user_id: uid,
                             previous_output: None,
-                            context: HashMap::new(),
+                            context: ctx,
                             pause_flag: None,
                             checkpoint_gate: None,
                             mailbox: None,
-                            cancel_token: None,
+                            cancel_token: cancel_for_retry.clone(),
                         }
                     })
                     .await;
@@ -1689,18 +1759,20 @@ impl DelegationEngine {
                         astra_services::coordination::AgentTier::User,
                     )
                 });
-                self.apply_gate(result, &delegation_id, || SubRunConfig {
-                    run_id: uuid::Uuid::new_v4().to_string(),
-                    agent_profile: profile_for_retry.clone(),
-                    task: task.clone(),
-                    session_id: sess.clone(),
-                    user_id: uid.clone(),
-                    previous_output: prev.clone(),
-                    context: ctx.clone(),
-                    pause_flag: None,
-                    checkpoint_gate: None,
-                    mailbox: None,
-                    cancel_token: None,
+                self.apply_gate(result, &delegation_id, &request.parent_run_id, || {
+                    SubRunConfig {
+                        run_id: uuid::Uuid::new_v4().to_string(),
+                        agent_profile: profile_for_retry.clone(),
+                        task: task.clone(),
+                        session_id: sess.clone(),
+                        user_id: uid.clone(),
+                        previous_output: prev.clone(),
+                        context: ctx.clone(),
+                        pause_flag: None,
+                        checkpoint_gate: None,
+                        mailbox: None,
+                        cancel_token: None,
+                    }
                 })
                 .await
             } else {
@@ -1899,7 +1971,7 @@ impl DelegationEngine {
                 let ctx = request.context.clone();
                 let prev = last_producer_output.clone();
                 let pp = producer_profile.clone();
-                self.apply_gate(prod_result, &did, || SubRunConfig {
+                self.apply_gate(prod_result, &did, &request.parent_run_id, || SubRunConfig {
                     run_id: uuid::Uuid::new_v4().to_string(),
                     agent_profile: pp.clone(),
                     task: task.clone(),
@@ -4075,5 +4147,225 @@ mod tests {
         lines.push_str("different line 2\n");
         let result = make_result("completed", Some(&lines));
         assert!(gate.verify(&result, "d1", 1).await.is_pass());
+    }
+
+    // ── State Machine + Lifecycle Tests ──────────────────────────────────
+
+    #[tokio::test]
+    async fn tracker_state_transitions() {
+        let tracker = DelegationTracker::new();
+        tracker
+            .record_sub_run(SubRunRecord {
+                run_id: "r1".into(),
+                parent_run_id: "parent".into(),
+                delegation_id: "d1".into(),
+                agent_id: "a1".into(),
+                depth: 1,
+                state: SubRunState::Created,
+                retry_of: None,
+            })
+            .await;
+
+        // Created → Running
+        let new = tracker
+            .transition_state("r1", SubRunState::Running)
+            .await
+            .unwrap();
+        assert_eq!(new, SubRunState::Running);
+
+        // Running → Completed
+        let new = tracker
+            .transition_state("r1", SubRunState::Completed)
+            .await
+            .unwrap();
+        assert_eq!(new, SubRunState::Completed);
+    }
+
+    #[tokio::test]
+    async fn tracker_invalid_transition_rejected() {
+        let tracker = DelegationTracker::new();
+        tracker
+            .record_sub_run(SubRunRecord {
+                run_id: "r1".into(),
+                parent_run_id: "parent".into(),
+                delegation_id: "d1".into(),
+                agent_id: "a1".into(),
+                depth: 1,
+                state: SubRunState::Created,
+                retry_of: None,
+            })
+            .await;
+
+        // Created → Completed should fail (must go through Running)
+        let err = tracker.transition_state("r1", SubRunState::Completed).await;
+        assert!(err.is_err());
+    }
+
+    #[tokio::test]
+    async fn tracker_complete_sub_run_updates_state() {
+        let tracker = DelegationTracker::new();
+        tracker
+            .record_sub_run(SubRunRecord {
+                run_id: "r1".into(),
+                parent_run_id: "parent".into(),
+                delegation_id: "d1".into(),
+                agent_id: "a1".into(),
+                depth: 1,
+                state: SubRunState::Running,
+                retry_of: None,
+            })
+            .await;
+
+        tracker.complete_sub_run("r1", SubRunState::Completed).await;
+
+        let subs = tracker.get_sub_runs("d1").await;
+        assert_eq!(subs.len(), 1);
+        assert_eq!(subs[0].state, SubRunState::Completed);
+    }
+
+    #[tokio::test]
+    async fn tracker_retry_chain() {
+        let tracker = DelegationTracker::new();
+        // Original run
+        tracker
+            .record_sub_run(SubRunRecord {
+                run_id: "r1".into(),
+                parent_run_id: "parent".into(),
+                delegation_id: "d1".into(),
+                agent_id: "a1".into(),
+                depth: 1,
+                state: SubRunState::Created,
+                retry_of: None,
+            })
+            .await;
+        // First retry
+        tracker
+            .record_sub_run(SubRunRecord {
+                run_id: "r2".into(),
+                parent_run_id: "parent".into(),
+                delegation_id: "d1".into(),
+                agent_id: "a1".into(),
+                depth: 1,
+                state: SubRunState::Created,
+                retry_of: Some("r1".into()),
+            })
+            .await;
+        // Second retry
+        tracker
+            .record_sub_run(SubRunRecord {
+                run_id: "r3".into(),
+                parent_run_id: "parent".into(),
+                delegation_id: "d1".into(),
+                agent_id: "a1".into(),
+                depth: 1,
+                state: SubRunState::Created,
+                retry_of: Some("r2".into()),
+            })
+            .await;
+
+        let chain = tracker.get_retry_chain("r3").await;
+        assert_eq!(chain, vec!["r1", "r2", "r3"]);
+
+        // Chain from original should return just [r1, r2, r3]
+        let chain_from_orig = tracker.get_retry_chain("r1").await;
+        assert_eq!(chain_from_orig, vec!["r1", "r2", "r3"]);
+    }
+
+    #[tokio::test]
+    async fn tracker_cleanup_delegation_removes_pause_flags() {
+        let tracker = DelegationTracker::new();
+        tracker
+            .record_sub_run(SubRunRecord {
+                run_id: "r1".into(),
+                parent_run_id: "parent".into(),
+                delegation_id: "d1".into(),
+                agent_id: "a1".into(),
+                depth: 1,
+                state: SubRunState::Running,
+                retry_of: None,
+            })
+            .await;
+        tracker
+            .record_sub_run(SubRunRecord {
+                run_id: "r2".into(),
+                parent_run_id: "parent".into(),
+                delegation_id: "d1".into(),
+                agent_id: "a2".into(),
+                depth: 1,
+                state: SubRunState::Running,
+                retry_of: None,
+            })
+            .await;
+
+        let _f1 = tracker.register_pause_flag("r1").await;
+        let _f2 = tracker.register_pause_flag("r2").await;
+        assert!(tracker.get_pause_flag("r1").await.is_some());
+        assert!(tracker.get_pause_flag("r2").await.is_some());
+
+        tracker.cleanup_delegation("d1").await;
+        assert!(tracker.get_pause_flag("r1").await.is_none());
+        assert!(tracker.get_pause_flag("r2").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn tracker_progress_tracking() {
+        let tracker = DelegationTracker::new();
+        tracker
+            .init_progress("d1", &["a1".into(), "a2".into()])
+            .await;
+
+        let progress = tracker.get_progress("d1").await.unwrap();
+        assert_eq!(progress.total_count, 2);
+        assert_eq!(progress.completed_count, 0);
+        assert_eq!(
+            *progress.agent_states.get("a1").unwrap(),
+            SubRunState::Created
+        );
+
+        // Update a1 to Running
+        tracker
+            .update_progress("d1", "a1", SubRunState::Running)
+            .await;
+        let progress = tracker.get_progress("d1").await.unwrap();
+        assert_eq!(
+            *progress.agent_states.get("a1").unwrap(),
+            SubRunState::Running
+        );
+        assert_eq!(progress.completed_count, 0);
+
+        // Complete a1
+        tracker
+            .update_progress("d1", "a1", SubRunState::Completed)
+            .await;
+        let progress = tracker.get_progress("d1").await.unwrap();
+        assert_eq!(progress.completed_count, 1);
+    }
+
+    #[tokio::test]
+    async fn cancel_token_per_execution_isolation() {
+        let (_, _engine, _tracker, de) = setup_with_executor(Arc::new(EchoExecutor));
+
+        // Create two separate cancel tokens
+        let token1 = Arc::new(tokio_util::sync::CancellationToken::new());
+        let token2 = Arc::new(tokio_util::sync::CancellationToken::new());
+
+        // Use unique delegation/parent IDs to avoid conflicts
+        let mut req1 = fan_out_request(vec!["coder"]);
+        req1.delegation_id = "del-iso-1".into();
+        req1.parent_run_id = "parent-iso-1".into();
+
+        let mut req2 = fan_out_request(vec!["reviewer"]);
+        req2.delegation_id = "del-iso-2".into();
+        req2.parent_run_id = "parent-iso-2".into();
+
+        // Execute with different tokens — cancelling one shouldn't affect the other
+        let (r1, r2) = tokio::join!(
+            de.execute(req1, "orch", Some(token1.clone())),
+            de.execute(req2, "orch", Some(token2.clone())),
+        );
+
+        // Both should succeed since neither token was cancelled
+        assert!(r1.is_ok(), "r1 failed: {:?}", r1.err());
+        assert!(r2.is_ok(), "r2 failed: {:?}", r2.err());
     }
 }

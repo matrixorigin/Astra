@@ -367,4 +367,173 @@ mod tests {
         let (status2, _) = internal_error("");
         assert_eq!(status2, StatusCode::INTERNAL_SERVER_ERROR);
     }
+
+    // --- SubRunState ---
+
+    #[test]
+    fn valid_transitions_succeed() {
+        // Created → Running
+        assert_eq!(
+            SubRunState::Created
+                .try_transition(SubRunState::Running)
+                .unwrap(),
+            SubRunState::Running
+        );
+        // Running → Completed
+        assert_eq!(
+            SubRunState::Running
+                .try_transition(SubRunState::Completed)
+                .unwrap(),
+            SubRunState::Completed
+        );
+        // Running → Failed
+        assert_eq!(
+            SubRunState::Running
+                .try_transition(SubRunState::Failed)
+                .unwrap(),
+            SubRunState::Failed
+        );
+        // Running → Paused
+        assert_eq!(
+            SubRunState::Running
+                .try_transition(SubRunState::Paused)
+                .unwrap(),
+            SubRunState::Paused
+        );
+        // Running → Cancelled
+        assert_eq!(
+            SubRunState::Running
+                .try_transition(SubRunState::Cancelled)
+                .unwrap(),
+            SubRunState::Cancelled
+        );
+        // Running → VerificationFailed
+        assert_eq!(
+            SubRunState::Running
+                .try_transition(SubRunState::VerificationFailed)
+                .unwrap(),
+            SubRunState::VerificationFailed
+        );
+        // Paused → Running (resume)
+        assert_eq!(
+            SubRunState::Paused
+                .try_transition(SubRunState::Running)
+                .unwrap(),
+            SubRunState::Running
+        );
+        // Paused → Cancelled
+        assert_eq!(
+            SubRunState::Paused
+                .try_transition(SubRunState::Cancelled)
+                .unwrap(),
+            SubRunState::Cancelled
+        );
+    }
+
+    #[test]
+    fn invalid_transitions_fail() {
+        // Created → Completed (must go through Running)
+        assert!(
+            SubRunState::Created
+                .try_transition(SubRunState::Completed)
+                .is_err()
+        );
+        // Completed → Running (terminal state)
+        assert!(
+            SubRunState::Completed
+                .try_transition(SubRunState::Running)
+                .is_err()
+        );
+        // Failed → Running (terminal state)
+        assert!(
+            SubRunState::Failed
+                .try_transition(SubRunState::Running)
+                .is_err()
+        );
+        // Cancelled → Running (terminal state)
+        assert!(
+            SubRunState::Cancelled
+                .try_transition(SubRunState::Running)
+                .is_err()
+        );
+        // Created → Paused (can't pause before running)
+        assert!(
+            SubRunState::Created
+                .try_transition(SubRunState::Paused)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn terminal_states_are_correct() {
+        assert!(!SubRunState::Created.is_terminal());
+        assert!(!SubRunState::Running.is_terminal());
+        assert!(!SubRunState::Paused.is_terminal());
+        assert!(SubRunState::Completed.is_terminal());
+        assert!(SubRunState::Failed.is_terminal());
+        assert!(SubRunState::Cancelled.is_terminal());
+        assert!(SubRunState::VerificationFailed.is_terminal());
+    }
+
+    #[test]
+    fn success_states() {
+        assert!(SubRunState::Completed.is_success());
+        assert!(!SubRunState::Failed.is_success());
+        assert!(!SubRunState::Running.is_success());
+        assert!(!SubRunState::VerificationFailed.is_success());
+    }
+
+    #[test]
+    fn display_and_from_str_roundtrip() {
+        for state in &[
+            SubRunState::Created,
+            SubRunState::Running,
+            SubRunState::Completed,
+            SubRunState::Failed,
+            SubRunState::Paused,
+            SubRunState::Cancelled,
+            SubRunState::VerificationFailed,
+        ] {
+            let s = state.as_str();
+            assert_eq!(SubRunState::from_str(s).unwrap(), *state);
+        }
+    }
+
+    #[test]
+    fn from_str_unknown_returns_none() {
+        assert!(SubRunState::from_str("unknown_state").is_none());
+    }
+
+    #[test]
+    fn can_transition_to_is_consistent_with_try() {
+        let all = [
+            SubRunState::Created,
+            SubRunState::Running,
+            SubRunState::Completed,
+            SubRunState::Failed,
+            SubRunState::Paused,
+            SubRunState::Cancelled,
+            SubRunState::VerificationFailed,
+        ];
+        for from in &all {
+            for to in &all {
+                assert_eq!(
+                    from.can_transition_to(*to),
+                    from.try_transition(*to).is_ok(),
+                    "mismatch for {:?} → {:?}",
+                    from,
+                    to
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn self_transition_created_to_created_fails() {
+        assert!(
+            SubRunState::Created
+                .try_transition(SubRunState::Created)
+                .is_err()
+        );
+    }
 }

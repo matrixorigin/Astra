@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use super::transport::{MessageStream, MessageTransport};
 use super::types::{AgentAddress, AgentMessage, MailboxError, MessageTarget};
-use crate::server::delegation_engine::{DelegationTracker, SubRunRecord};
+use crate::server::delegation_engine::{DelegationTracker, SubRunRecord, SubRunState};
 
 // ─── AgentMailbox ───────────────────────────────────────────────────────────
 
@@ -661,6 +661,7 @@ mod tests {
     #[tokio::test]
     async fn request_permission_rejects_wrong_payload_for_matching_correlation() {
         use crate::orchestration::permission_sync::PermissionRequest;
+        use crate::server::delegation_engine::{SubRunRecord, SubRunState};
 
         let transport = Arc::new(InProcessTransport::new());
         let dt = tracker();
