@@ -827,20 +827,36 @@ pub(super) async fn handle_team_command(
             let started_at = chrono::Utc::now().to_rfc3339();
             let timer = Instant::now();
 
-            // Progress renderer: shows elapsed time + live sub-agent tool events
+            // Progress renderer: 3s heartbeat with per-agent tracking and stall detection.
             let render_cancel = cancel_token.clone();
+            let member_count = cli_team.members.len();
             let progress_renderer = tokio::spawn(async move {
                 use astra_runtime::turn::agentic_headless_round::HeadlessStderrStyle;
-                let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
+                use std::collections::HashMap as ProgressMap;
+
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(3));
                 interval.tick().await; // skip first immediate tick
+                let mut last_event_at = Instant::now();
+                let mut agent_events: ProgressMap<String, u32> = ProgressMap::new();
+                let mut ticker_dirty = false;
+
                 loop {
                     tokio::select! {
                         biased;
                         Some(evt) = progress_rx.recv() => {
+                            last_event_at = Instant::now();
+                            if !evt.agent_id.is_empty() {
+                                *agent_events.entry(evt.agent_id.clone()).or_insert(0) += 1;
+                            }
+                            if ticker_dirty {
+                                eprint!("\r{}\r", " ".repeat(72));
+                                ticker_dirty = false;
+                            }
+                            let tag = format_duration(timer.elapsed());
                             let prefix = if evt.agent_id.is_empty() {
-                                String::new()
+                                format!("  [{}] ", tag.dim())
                             } else {
-                                format!("  {} ", evt.agent_id.cyan())
+                                format!("  [{}] {} ", tag.dim(), evt.agent_id.cyan())
                             };
                             match evt.style {
                                 HeadlessStderrStyle::Green =>
@@ -855,13 +871,29 @@ pub(super) async fn handle_team_command(
                         }
                         _ = interval.tick() => {
                             let elapsed = timer.elapsed();
-                            eprint!(
-                                "\r  {} {}",
-                                "⏳".dim(),
-                                format!("running… {}", format_duration(elapsed)).dim()
-                            );
+                            let silence = last_event_at.elapsed();
+                            let active = agent_events.len();
+                            let status = if silence.as_secs() >= 30 {
+                                format!(
+                                    "running… {} | {}/{} agents | no output for {}",
+                                    format_duration(elapsed), active, member_count,
+                                    format_duration(silence),
+                                )
+                            } else {
+                                format!(
+                                    "running… {} | {}/{} agents active",
+                                    format_duration(elapsed), active, member_count,
+                                )
+                            };
+                            eprint!("\r{}\r  {} {}", " ".repeat(72), "⏳".dim(), status.dim());
+                            ticker_dirty = true;
                         }
-                        _ = render_cancel.cancelled() => break,
+                        _ = render_cancel.cancelled() => {
+                            if ticker_dirty {
+                                eprint!("\r{}\r", " ".repeat(72));
+                            }
+                            break;
+                        }
                     }
                 }
             });
@@ -871,7 +903,8 @@ pub(super) async fn handle_team_command(
                 report = orchestrator.execute_team(team_name, task, repo_root) => report,
                 _ = tokio::signal::ctrl_c() => {
                     cancel_token.cancel();
-                    eprintln!("\n  {} Interrupting team run...", "⚠️ ".yellow());
+                    eprint!("\r{}\r", " ".repeat(72));
+                    eprintln!("  {} Interrupting team run...", "⚠️ ".yellow());
                     // Give sub-runs a moment to notice cancellation
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                     eprintln!("  {} Team run interrupted.", theme::icon_err());
@@ -881,8 +914,6 @@ pub(super) async fn handle_team_command(
             };
             cancel_token.cancel();
             progress_renderer.abort();
-            // Clear the ticker line
-            eprint!("\r{}\r", " ".repeat(60));
             let elapsed = timer.elapsed();
 
             // Display report header with status
@@ -1511,7 +1542,15 @@ mod tests {
     use super::*;
     use crate::cli_utils::{CredentialsFile, Profile};
     use axum::{Router, routing::get, routing::post};
-    use tempfile::tempdir;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    /// Serialize tests that mutate ASTRA_CREDENTIALS_DIR.
+    fn creds_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
 
     async fn spawn_mock(app: Router) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1790,7 +1829,8 @@ mod tests {
 
     #[tokio::test]
     async fn ensure_team_run_session_creates_remote_session_when_missing() {
-        let creds_dir = tempdir().unwrap();
+        let _lock = creds_lock();
+        let creds_dir = tempfile::tempdir().unwrap();
         unsafe {
             std::env::set_var("ASTRA_CREDENTIALS_DIR", creds_dir.path());
         }
@@ -1834,7 +1874,8 @@ mod tests {
 
     #[tokio::test]
     async fn ensure_team_run_session_replaces_stale_remote_session() {
-        let creds_dir = tempdir().unwrap();
+        let _lock = creds_lock();
+        let creds_dir = tempfile::tempdir().unwrap();
         unsafe {
             std::env::set_var("ASTRA_CREDENTIALS_DIR", creds_dir.path());
         }
