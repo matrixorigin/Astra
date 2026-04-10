@@ -423,11 +423,14 @@ fn record_edge_tool_observability(
 ) {
     if let Some(session) = &state.observability_session {
         for edge_result in edge_tool_round {
-            session.write().unwrap_or_else(|e| e.into_inner()).record_tool_result(
-                &edge_result.tool,
-                &edge_result.output,
-                edge_tool_status_exit_code(&edge_result.status),
-            );
+            session
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .record_tool_result(
+                    &edge_result.tool,
+                    &edge_result.output,
+                    edge_tool_status_exit_code(&edge_result.status),
+                );
         }
     }
 
@@ -692,7 +695,7 @@ fn merge_workspace_hint_into_delegation_request(
 }
 
 /// Partition tool calls into delegation calls and remaining calls,
-/// execute delegations, and return results as (call_id, result_text) pairs.
+/// execute delegations, and return formatted summaries plus terminal previews.
 async fn partition_and_execute_delegations(
     tool_calls: &[Value],
     engine: &crate::server::delegation_engine::DelegationEngine,
@@ -701,7 +704,7 @@ async fn partition_and_execute_delegations(
     source_agent_id: &str,
     workspace_hint: Option<&str>,
     skill_search: &astra_core::SkillSearchSettings,
-) -> (Vec<(String, String)>, Vec<Value>) {
+) -> (Vec<DelegationExecutionResult>, Vec<Value>) {
     let mut delegation_results = Vec::new();
     let mut remaining = Vec::new();
 
@@ -718,16 +721,33 @@ async fn partition_and_execute_delegations(
                     merge_workspace_hint_into_delegation_request(&mut request, workspace_hint);
                     match engine.execute(request, source_agent_id, None).await {
                         Ok(result) => {
-                            let summary = format_delegation_result(&result);
-                            delegation_results.push((call_id, summary));
+                            delegation_results.push(DelegationExecutionResult {
+                                call_id,
+                                summary: format_delegation_result(&result),
+                                preview_lines: format_delegation_terminal_preview(&result),
+                            });
                         }
                         Err(e) => {
-                            delegation_results.push((call_id, format!("Delegation failed: {e}")));
+                            delegation_results.push(DelegationExecutionResult {
+                                call_id,
+                                summary: format!("Delegation failed: {e}"),
+                                preview_lines: vec![(
+                                    HeadlessStderrStyle::Yellow,
+                                    format!("🤝 Delegation failed — {e}"),
+                                )],
+                            });
                         }
                     }
                 }
                 Err(e) => {
-                    delegation_results.push((call_id, format!("Invalid delegation request: {e}")));
+                    delegation_results.push(DelegationExecutionResult {
+                        call_id,
+                        summary: format!("Invalid delegation request: {e}"),
+                        preview_lines: vec![(
+                            HeadlessStderrStyle::Yellow,
+                            format!("🤝 Invalid delegation request — {e}"),
+                        )],
+                    });
                 }
             }
         } else {
@@ -738,14 +758,35 @@ async fn partition_and_execute_delegations(
     (delegation_results, remaining)
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DelegationExecutionResult {
+    call_id: String,
+    summary: String,
+    preview_lines: Vec<(HeadlessStderrStyle, String)>,
+}
+
 /// Format a DelegationResult as a human-readable summary for the LLM.
 fn format_delegation_result(result: &astra_services::coordination::DelegationResult) -> String {
+    let succeeded = result
+        .agent_results
+        .iter()
+        .filter(|ar| ar.is_success())
+        .count();
+    let failed = result.agent_results.len().saturating_sub(succeeded);
     let mut parts = Vec::new();
     parts.push(format!(
-        "Delegation {} — status: {}",
-        result.delegation_id, result.status
+        "Delegation {} — status: {} ({} ok / {} failed)",
+        result.delegation_id, result.status, succeeded, failed
     ));
 
+    if let Some(agg) = &result.aggregated_output {
+        parts.push(format!(
+            "\n📋 Final aggregated result:\n{}",
+            truncate_str(agg, 1_500)
+        ));
+    }
+
+    parts.push("\nSub-agent results:".to_string());
     for ar in &result.agent_results {
         let status_icon = if ar.is_success() { "✅" } else { "❌" };
         let output_preview = ar
@@ -762,16 +803,43 @@ fn format_delegation_result(result: &astra_services::coordination::DelegationRes
         }
     }
 
-    if let Some(agg) = &result.aggregated_output {
-        parts.push(format!("\n📋 Aggregated output:\n{agg}"));
-    }
-
     parts.push(format!(
         "\nTokens: {} prompt + {} completion, {} tool calls",
         result.total_prompt_tokens, result.total_completion_tokens, result.total_tool_calls
     ));
 
     parts.join("\n")
+}
+
+fn format_delegation_terminal_preview(
+    result: &astra_services::coordination::DelegationResult,
+) -> Vec<(HeadlessStderrStyle, String)> {
+    let succeeded = result
+        .agent_results
+        .iter()
+        .filter(|ar| ar.is_success())
+        .count();
+    let failed = result.agent_results.len().saturating_sub(succeeded);
+    let status_style = if failed == 0 {
+        HeadlessStderrStyle::Green
+    } else {
+        HeadlessStderrStyle::Yellow
+    };
+    let mut lines = vec![(
+        status_style,
+        format!(
+            "🤝 Delegation {} completed [{} ok / {} failed]",
+            result.delegation_id, succeeded, failed
+        ),
+    )];
+    if let Some(agg) = &result.aggregated_output {
+        let preview = agg.lines().next().unwrap_or(agg.as_str());
+        lines.push((
+            HeadlessStderrStyle::Dim,
+            format!("   {}", truncate_str(preview, 200)),
+        ));
+    }
+    lines
 }
 
 /// Generate the OpenAI-compatible tool schema for the "delegate" tool.
@@ -1772,7 +1840,8 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                                 tool_execution_ms: 0,
                                 total_ms,
                             };
-                            let mut session_guard = session.write().unwrap_or_else(|e| e.into_inner());
+                            let mut session_guard =
+                                session.write().unwrap_or_else(|e| e.into_inner());
                             crate::observability_integration::on_turn_end(
                                 &mut session_guard,
                                 timing,
@@ -1913,6 +1982,13 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
         // downstream tool-result messages have a matching assistant entry
         // (required by OpenAI conversation format).
         if !delegation_results.is_empty() {
+            if !quiet {
+                for result in &delegation_results {
+                    for (style, line) in &result.preview_lines {
+                        host.emit_headless_line(*style, line.clone());
+                    }
+                }
+            }
             let delegate_tool_calls: Vec<&Value> = turn_result
                 .accum
                 .tool_calls
@@ -1954,11 +2030,11 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                 }
                 state.messages.push(assistant_msg);
             }
-            for (call_id, result_text) in &delegation_results {
+            for result in &delegation_results {
                 let tool_msg = serde_json::json!({
                     "role": "tool",
-                    "tool_call_id": call_id,
-                    "content": result_text,
+                    "tool_call_id": result.call_id,
+                    "content": result.summary,
                 });
                 state.messages.push(tool_msg.clone());
                 state.tool_results.push(tool_msg);
@@ -1967,14 +2043,14 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                 // "acknowledged" placeholder from the edge executor.
                 state.tool_call_records.push(ToolCallRecord {
                     name: DELEGATE_TOOL_NAME.to_string(),
-                    ok: !result_text.starts_with("Delegation failed:")
-                        && !result_text.starts_with("Invalid delegation request:"),
+                    ok: !result.summary.starts_with("Delegation failed:")
+                        && !result.summary.starts_with("Invalid delegation request:"),
                     ms: 0, // delegation timing is inside the result text
                     error: None,
                     input_bytes: None,
-                    output_bytes: Some(result_text.len() as u32),
-                    args_preview: Some(call_id.clone()),
-                    result_preview: Some(result_text.chars().take(500).collect::<String>()),
+                    output_bytes: Some(result.summary.len() as u32),
+                    args_preview: Some(result.call_id.clone()),
+                    result_preview: Some(result.summary.chars().take(500).collect::<String>()),
                 });
             }
         }
@@ -2590,7 +2666,8 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                                 tool_execution_ms: 0,
                                 total_ms,
                             };
-                            let mut session_guard = session.write().unwrap_or_else(|e| e.into_inner());
+                            let mut session_guard =
+                                session.write().unwrap_or_else(|e| e.into_inner());
                             crate::observability_integration::on_turn_end(
                                 &mut session_guard,
                                 timing,
@@ -3747,6 +3824,12 @@ mod tests {
         assert!(formatted.contains("coder"));
         assert!(formatted.contains("implemented feature X"));
         assert!(formatted.contains("All tasks done"));
+        assert!(
+            formatted
+                .find("Final aggregated result")
+                .unwrap_or(usize::MAX)
+                < formatted.find("Sub-agent results").unwrap_or(usize::MAX)
+        );
         assert!(formatted.contains("Tokens:"));
     }
 
@@ -3801,6 +3884,32 @@ mod tests {
         assert!(formatted.contains("❌"));
         assert!(formatted.contains("timeout"));
         assert!(formatted.contains("partial_failure"));
+    }
+
+    #[test]
+    fn format_delegation_terminal_preview_surfaces_summary_first() {
+        let result = astra_services::coordination::DelegationResult {
+            delegation_id: "del-preview".to_string(),
+            status: "completed".to_string(),
+            agent_results: vec![astra_services::coordination::AgentResult {
+                agent_id: "coder".to_string(),
+                run_id: "run-1".to_string(),
+                status: "completed".to_string(),
+                output: Some("implemented feature X".to_string()),
+                error: None,
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                tool_calls: 0,
+            }],
+            aggregated_output: Some("Final merged answer".to_string()),
+            total_prompt_tokens: 0,
+            total_completion_tokens: 0,
+            total_tool_calls: 0,
+        };
+        let lines = super::format_delegation_terminal_preview(&result);
+        assert_eq!(lines[0].0, HeadlessStderrStyle::Green);
+        assert!(lines[0].1.contains("del-preview"));
+        assert!(lines[1].1.contains("Final merged answer"));
     }
 
     #[tokio::test]
@@ -3876,7 +3985,8 @@ mod tests {
         assert_eq!(remaining.len(), 1);
 
         // Delegation result should contain the call_id
-        assert_eq!(delegation_results[0].0, "call_delegate");
+        assert_eq!(delegation_results[0].call_id, "call_delegate");
+        assert!(delegation_results[0].summary.contains("Delegation"));
         // Remaining should be the bash call
         assert_eq!(remaining[0]["id"], "call_bash");
     }
@@ -3965,7 +4075,7 @@ mod tests {
         assert_eq!(delegation_results.len(), 1);
         assert!(
             delegation_results[0]
-                .1
+                .summary
                 .contains("Invalid delegation request")
         );
         assert!(remaining.is_empty());
@@ -4059,6 +4169,7 @@ mod tests {
         ];
 
         let mut host = MockHost::new(turns);
+        host.quiet = false;
         let mut state = make_state();
         state.messages.push(
             json!({"role": "user", "content": "Please delegate test writing to the coder agent."}),
@@ -4112,6 +4223,12 @@ mod tests {
         assert!(
             state.total_completion >= 80,
             "should accumulate completion tokens"
+        );
+        assert!(
+            host.emitted_lines
+                .iter()
+                .any(|line| line.contains("🤝 Delegation")),
+            "delegation completion preview should be emitted"
         );
     }
 
