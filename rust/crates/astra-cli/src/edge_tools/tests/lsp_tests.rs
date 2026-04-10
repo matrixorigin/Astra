@@ -978,6 +978,18 @@ fn lsp_rust_session_sends_rust_analyzer_init_and_configuration() {
             .as_str(),
         Some("quickfix")
     );
+    assert_eq!(
+        initialize["payload"]["capabilities"]["textDocument"]["completion"]["completionItem"]
+            ["snippetSupport"]
+            .as_bool(),
+        Some(true)
+    );
+    assert_eq!(
+        initialize["payload"]["capabilities"]["textDocument"]["completion"]["completionItem"]
+            ["resolveSupport"]["properties"][2]
+            .as_str(),
+        Some("additionalTextEdits")
+    );
 
     let did_change_configuration = entries
         .iter()

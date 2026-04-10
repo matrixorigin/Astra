@@ -309,6 +309,20 @@ impl LspStdioSession {
                     "didSave": true
                 },
                 "publishDiagnostics": {},
+                "completion": {
+                    "completionItem": {
+                        "snippetSupport": true,
+                        "insertReplaceSupport": true,
+                        "labelDetailsSupport": true,
+                        "resolveSupport": {
+                            "properties": [
+                                "documentation",
+                                "detail",
+                                "additionalTextEdits"
+                            ]
+                        }
+                    }
+                },
                 "codeAction": {
                     "codeActionLiteralSupport": {
                         "codeActionKind": {
