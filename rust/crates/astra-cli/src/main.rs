@@ -120,6 +120,8 @@ mod slash_state;
 mod slash_team;
 #[path = "cli/slash_experiment.rs"]
 mod slash_experiment;
+#[path = "cli/slash_profile.rs"]
+mod slash_profile;
 #[path = "cli/mock_llm.rs"]
 mod mock_llm;
 #[path = "cli/spawn_subrun.rs"]
@@ -1479,6 +1481,10 @@ struct ReplState {
     active_experiment_id: Option<String>,
     /// Active variant ID for this session (if enrolled).
     active_variant_id: Option<String>,
+
+    // ── User Profile (M5) ──
+    /// User profile manager for preferences and scenario detection.
+    user_profile_manager: std::sync::Arc<astra_runtime::user_profile::UserProfileManager>,
 }
 
 impl Default for ReplState {
@@ -1590,6 +1596,10 @@ impl Default for ReplState {
             )),
             active_experiment_id: None,
             active_variant_id: None,
+            user_profile_manager: {
+                let store = std::sync::Arc::new(astra_runtime::user_profile::UserProfileStore::new());
+                std::sync::Arc::new(astra_runtime::user_profile::UserProfileManager::new(store))
+            },
         }
     }
 }
@@ -6129,6 +6139,18 @@ async fn handle_slash_command(
                 active_variant_id: state.active_variant_id.as_deref(),
             };
             slash_experiment::handle_experiment_command(arg, &ctx);
+        }
+
+        "/profile" => {
+            // Use profile name or session_id as user identifier
+            let user_id = profile.unwrap_or_else(|| {
+                state.session_id.as_deref().unwrap_or("default")
+            });
+            let ctx = slash_profile::ProfileCommandContext {
+                profile_manager: &state.user_profile_manager,
+                user_id,
+            };
+            slash_profile::handle_profile_command(arg, &ctx);
         }
 
         "/register" | "/login" | "/logout" | "/memory-setup" => {
