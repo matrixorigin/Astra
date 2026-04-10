@@ -742,9 +742,21 @@ impl ToolExecutor {
                     if let Err(e) = self.check_staleness(&path) {
                         return format!("Error: Pre-write staleness check failed: {e}");
                     }
+                    // Journal: snapshot before-state for undo
+                    let turn_idx = self
+                        .journal_turn_index
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    let journal_call_id = format!("str_replace_quote_norm:{}", path.display());
+                    if let Ok(mut journal) = self.file_journal.lock() {
+                        journal.record_before_patch(&path, &journal_call_id, turn_idx);
+                    }
                     match fs::write(&path, &new_content) {
                         Ok(_) => {
                             self.record_write_with_content(&path, &new_content);
+                            // Journal: record after-state
+                            if let Ok(mut journal) = self.file_journal.lock() {
+                                journal.record_after(&path, &journal_call_id, new_content.as_bytes());
+                            }
                             let format_result = auto_format_file(&path, &self.project_root);
                             if format_result.is_some() {
                                 self.record_write(&path);
@@ -800,9 +812,21 @@ impl ToolExecutor {
                 if let Err(e) = self.check_staleness(&path) {
                     return format!("Error: Pre-write staleness check failed: {e}");
                 }
+                // Journal: snapshot before-state for undo
+                let turn_idx = self
+                    .journal_turn_index
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                let journal_call_id = format!("str_replace_fuzzy:{}", path.display());
+                if let Ok(mut journal) = self.file_journal.lock() {
+                    journal.record_before_patch(&path, &journal_call_id, turn_idx);
+                }
                 match fs::write(&path, &new_content) {
                     Ok(_) => {
                         self.record_write_with_content(&path, &new_content);
+                        // Journal: record after-state
+                        if let Ok(mut journal) = self.file_journal.lock() {
+                            journal.record_after(&path, &journal_call_id, new_content.as_bytes());
+                        }
                         let format_result = auto_format_file(&path, &self.project_root);
                         if format_result.is_some() {
                             self.record_write(&path);
@@ -1040,10 +1064,23 @@ impl ToolExecutor {
             return format!("Error: Pre-write staleness check failed: {e}");
         }
 
+        // Journal: snapshot before-state for undo
+        let turn_idx = self
+            .journal_turn_index
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let journal_call_id = format!("batch_edit:{}", path.display());
+        if let Ok(mut journal) = self.file_journal.lock() {
+            journal.record_before_patch(&path, &journal_call_id, turn_idx);
+        }
+
         // Apply
         match fs::write(&path, &working) {
             Ok(_) => {
                 self.record_write_with_content(&path, &working);
+                // Journal: record after-state
+                if let Ok(mut journal) = self.file_journal.lock() {
+                    journal.record_after(&path, &journal_call_id, working.as_bytes());
+                }
                 let format_result = auto_format_file(&path, &self.project_root);
                 if format_result.is_some() {
                     self.record_write(&path);

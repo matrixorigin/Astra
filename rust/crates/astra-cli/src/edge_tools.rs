@@ -340,7 +340,8 @@ pub struct ToolExecutor {
     pub mcp_manager:
         Option<std::sync::Arc<tokio::sync::RwLock<crate::mcp_client::McpClientManager>>>,
     /// File edit journal — records before-state of every file write for undo.
-    pub file_journal: std::sync::Mutex<astra_runtime::turn::file_edit_journal::FileEditJournal>,
+    /// Wrapped in Arc so the REPL session can share the journal across turns.
+    pub file_journal: std::sync::Arc<std::sync::Mutex<astra_runtime::turn::file_edit_journal::FileEditJournal>>,
     /// Current turn index for file journal entries. Set externally per-turn.
     pub journal_turn_index: std::sync::atomic::AtomicU32,
     /// Active worktree session state. When set, `effective_project_root()` returns
@@ -389,9 +390,9 @@ impl ToolExecutor {
             passive_tsc_pending: AtomicBool::new(false),
             passive_lsp: passive_lsp::PassiveLspManager::new(),
             mcp_manager: None,
-            file_journal: std::sync::Mutex::new(
+            file_journal: std::sync::Arc::new(std::sync::Mutex::new(
                 astra_runtime::turn::file_edit_journal::FileEditJournal::default(),
-            ),
+            )),
             journal_turn_index: std::sync::atomic::AtomicU32::new(0),
             worktree_session: std::sync::Mutex::new(None),
             task_manager: task_mgmt::TaskManager::new(),
@@ -425,6 +426,15 @@ impl ToolExecutor {
         ctx: Option<agent_messaging::SendMessageRuntimeContext>,
     ) {
         self.send_message_context = ctx;
+    }
+
+    /// Use a shared file edit journal (session-scoped) instead of the default.
+    pub fn with_shared_file_journal(
+        mut self,
+        journal: std::sync::Arc<std::sync::Mutex<astra_runtime::turn::file_edit_journal::FileEditJournal>>,
+    ) -> Self {
+        self.file_journal = journal;
+        self
     }
 
     /// Configure cloud proxy for memory tool calls.

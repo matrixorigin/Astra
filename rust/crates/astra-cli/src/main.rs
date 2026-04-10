@@ -2449,6 +2449,8 @@ mod tests {
             root_mailbox_slot: None,
             observability_hub: None,
             observability_session: None,
+            file_journal: None,
+            turn_index: 0,
         })
         .await
         .unwrap();
@@ -2512,6 +2514,8 @@ mod tests {
             root_mailbox_slot: None,
             observability_hub: None,
             observability_session: None,
+            file_journal: None,
+            turn_index: 0,
         })
         .await;
         assert!(result.is_err());
@@ -2591,6 +2595,8 @@ mod tests {
             root_mailbox_slot: None,
             observability_hub: None,
             observability_session: None,
+            file_journal: None,
+            turn_index: 0,
         })
         .await
         .unwrap();

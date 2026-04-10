@@ -1257,6 +1257,8 @@ pub(super) async fn handle_info_command(
                 root_mailbox_slot: Some(&mut state.root_mailbox),
                 observability_hub: None,
                 observability_session: None,
+                file_journal: None,
+                turn_index: 0,
             })
             .await
             .map_err(|f| f.error)?;

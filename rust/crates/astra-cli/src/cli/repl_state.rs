@@ -49,6 +49,8 @@ pub(crate) struct ReplState {
     pub model: Option<String>,
     pub turn: u32,
     pub last_response: Option<String>,
+    /// Session-scoped file edit journal — shared with ToolExecutors for undo.
+    pub file_journal: std::sync::Arc<std::sync::Mutex<astra_runtime::turn::file_edit_journal::FileEditJournal>>,
     /// Sticky task/thread summary used to anchor ultra-short follow-ups like
     /// "继续" even after history compaction prunes earlier turns.
     pub continuation_anchor: Option<String>,
@@ -247,6 +249,9 @@ impl Default for ReplState {
             model: None,
             turn: 0,
             last_response: None,
+            file_journal: std::sync::Arc::new(std::sync::Mutex::new(
+                astra_runtime::turn::file_edit_journal::FileEditJournal::default(),
+            )),
             continuation_anchor: None,
             session_goal: None,
             explain: ExplainMode::Off,

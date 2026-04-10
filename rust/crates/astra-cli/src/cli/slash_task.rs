@@ -303,6 +303,8 @@ pub(super) async fn handle_task_command(
                     root_mailbox_slot: None,
                     observability_hub: None,
                     observability_session: None,
+                    file_journal: None,
+                    turn_index: 0,
                 })
                 .await;
 

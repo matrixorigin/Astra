@@ -65,6 +65,35 @@ pub(super) async fn handle_state_command(
         }
 
         "/undo" => {
+            // Handle "/undo list" subcommand — show file edit history
+            if arg == "list" || arg == "files" {
+                if let Ok(journal) = state.file_journal.lock() {
+                    let summary = journal.summary();
+                    if summary.is_empty() {
+                        eprintln!("{}", "  No file edits in journal.".yellow());
+                    } else {
+                        eprintln!("  File edit journal ({} files):", summary.len());
+                        for (path, count, edit_type) in &summary {
+                            eprintln!(
+                                "    {} {} ({} edit{})",
+                                match edit_type {
+                                    astra_runtime::turn::file_edit_journal::EditType::Overwrite =>
+                                        "📝",
+                                    astra_runtime::turn::file_edit_journal::EditType::Create =>
+                                        "🆕",
+                                    astra_runtime::turn::file_edit_journal::EditType::Patch =>
+                                        "✏️",
+                                },
+                                path.display(),
+                                count,
+                                if *count == 1 { "" } else { "s" },
+                            );
+                        }
+                    }
+                }
+                return Ok(());
+            }
+
             if state.history.is_empty() {
                 eprintln!("{}", "  Nothing to undo.".yellow());
                 return Ok(());
@@ -81,7 +110,7 @@ pub(super) async fn handle_state_command(
                     Err(_) => {
                         eprintln!(
                             "{}",
-                            "  Usage: /undo [N]  — undo last N turns (default 1)".yellow()
+                            "  Usage: /undo [N] | /undo list  — undo last N turns or list file edits".yellow()
                         );
                         return Ok(());
                     }
@@ -89,6 +118,7 @@ pub(super) async fn handle_state_command(
             };
             let actual = count.min(state.history.len());
             let mut undone_previews = Vec::new();
+            let mut file_reverts: Vec<String> = Vec::new();
             for _ in 0..actual {
                 if let Some((user_msg, _)) = state.history.pop() {
                     let preview: String = user_msg.chars().take(50).collect();
@@ -98,6 +128,14 @@ pub(super) async fn handle_state_command(
                         preview
                     };
                     undone_previews.push(preview);
+                    // Revert file changes for this turn
+                    let turn_index = state.turn;
+                    if let Ok(journal) = state.file_journal.lock() {
+                        let result = journal.undo_turn(turn_index);
+                        for path in &result.reverted {
+                            file_reverts.push(path.display().to_string());
+                        }
+                    }
                     state.turn = state.turn.saturating_sub(1);
                 }
             }
@@ -113,6 +151,17 @@ pub(super) async fn handle_state_command(
                 eprintln!("  {} Undid {} turns:", theme::icon_ok(), actual,);
                 for (i, preview) in undone_previews.iter().enumerate() {
                     eprintln!("    {}. {}", actual - i, preview.as_str().dim());
+                }
+            }
+            if !file_reverts.is_empty() {
+                eprintln!(
+                    "  {} Reverted {} file{}:",
+                    "↩",
+                    file_reverts.len(),
+                    if file_reverts.len() == 1 { "" } else { "s" },
+                );
+                for f in &file_reverts {
+                    eprintln!("    {}", f.as_str().dim());
                 }
             }
             eprintln!("  {} turns remaining in context", state.history.len());
@@ -233,6 +282,8 @@ pub(super) async fn handle_state_command(
                     root_mailbox_slot: Some(&mut state.root_mailbox),
                     observability_hub: None,
                     observability_session: None,
+                    file_journal: None,
+                    turn_index: 0,
                 }) => r,
                 _ = tokio::signal::ctrl_c() => {
                     if let Some(ref t) = _cancel_token_guard { t.cancel(); }
@@ -331,6 +382,8 @@ pub(super) async fn handle_state_command(
                             root_mailbox_slot: Some(&mut state.root_mailbox),
                             observability_hub: None,
                             observability_session: None,
+                            file_journal: None,
+                            turn_index: 0,
                         })
                         .await;
 
@@ -410,6 +463,8 @@ pub(super) async fn handle_state_command(
                                     root_mailbox_slot: Some(&mut state.root_mailbox),
                                     observability_hub: None,
                                     observability_session: None,
+                                    file_journal: None,
+                                    turn_index: 0,
                                 })
                                 .await;
                                 if let Ok(sr2) = synth_result {

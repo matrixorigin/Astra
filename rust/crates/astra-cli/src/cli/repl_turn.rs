@@ -560,6 +560,8 @@ async fn maybe_auto_compact(
         root_mailbox_slot: Some(&mut state.root_mailbox),
         observability_hub: obs_hub,
         observability_session: obs_session,
+        file_journal: Some(state.file_journal.clone()),
+        turn_index: state.turn,
     })
     .await;
 
@@ -823,6 +825,8 @@ async fn run_chat_turn(
             root_mailbox_slot: Some(&mut state.root_mailbox),
             observability_hub: obs_hub,
             observability_session: obs_session,
+            file_journal: Some(state.file_journal.clone()),
+            turn_index: state.turn,
         }) => TurnAttempt::Completed(Box::new(result)),
         _ = tokio::signal::ctrl_c() => {
             // Trigger cancellation to interrupt any in-flight SSE streaming.

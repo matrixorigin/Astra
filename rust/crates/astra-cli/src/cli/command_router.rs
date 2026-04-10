@@ -431,6 +431,8 @@ pub(super) async fn execute_cli_command(
                 root_mailbox_slot: None,
                 observability_hub: None,
                 observability_session: None,
+                file_journal: None,
+                turn_index: 0,
             })
             .await
             {
@@ -473,6 +475,8 @@ pub(super) async fn execute_cli_command(
                         root_mailbox_slot: None,
                         observability_hub: None,
                         observability_session: None,
+                        file_journal: None,
+                        turn_index: 0,
                     })
                     .await
                     .map_err(|f| f.error)?
@@ -856,6 +860,8 @@ pub(super) async fn execute_cli_command(
                 root_mailbox_slot: None,
                 observability_hub: None,
                 observability_session: None,
+                file_journal: None,
+                turn_index: 0,
             })
             .await
             {
@@ -898,6 +904,8 @@ pub(super) async fn execute_cli_command(
                         root_mailbox_slot: None,
                         observability_hub: None,
                         observability_session: None,
+                        file_journal: None,
+                        turn_index: 0,
                     })
                     .await
                     .map_err(|f| f.error)?
@@ -1356,6 +1364,8 @@ pub(super) async fn run_print_mode(
         root_mailbox_slot: None,
         observability_hub: None,
         observability_session: None,
+        file_journal: None,
+        turn_index: 0,
     })
     .await
     {
@@ -1400,6 +1410,8 @@ pub(super) async fn run_print_mode(
                 root_mailbox_slot: None,
                 observability_hub: None,
                 observability_session: None,
+                file_journal: None,
+                turn_index: 0,
             })
             .await
             .map_err(|f| f.error)?

@@ -83,6 +83,14 @@ pub(crate) async fn stream_chat_sse(
     let mut executor = {
         let ex =
             edge_tools::ToolExecutor::new(&project_root).with_cloud(p.api.api_origin(), p.token);
+        // Wire session-scoped file journal for cross-turn undo support
+        let ex = if let Some(ref journal) = p.file_journal {
+            ex.with_shared_file_journal(journal.clone())
+        } else {
+            ex
+        };
+        // Set turn index so journal entries are tagged for undo
+        ex.journal_turn_index.store(p.turn_index, std::sync::atomic::Ordering::Relaxed);
         let ex = if let Some(ref mgr) = p.mcp_manager {
             ex.with_mcp_manager(mgr.clone())
         } else {
