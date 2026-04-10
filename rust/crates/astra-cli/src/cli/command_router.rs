@@ -424,6 +424,8 @@ pub(super) async fn execute_cli_command(
                 agent_spawner: None,
                 root_agent_id: None,
                 root_mailbox_slot: None,
+                observability_hub: None,
+                observability_session: None,
             })
             .await
             {
@@ -464,6 +466,8 @@ pub(super) async fn execute_cli_command(
                         agent_spawner: None,
                         root_agent_id: None,
                         root_mailbox_slot: None,
+                observability_hub: None,
+                observability_session: None,
                     })
                     .await
                     .map_err(|f| f.error)?
@@ -845,6 +849,8 @@ pub(super) async fn execute_cli_command(
                 agent_spawner: None,
                 root_agent_id: None,
                 root_mailbox_slot: None,
+                observability_hub: None,
+                observability_session: None,
             })
             .await
             {
@@ -885,6 +891,8 @@ pub(super) async fn execute_cli_command(
                         agent_spawner: None,
                         root_agent_id: None,
                         root_mailbox_slot: None,
+                observability_hub: None,
+                observability_session: None,
                     })
                     .await
                     .map_err(|f| f.error)?
@@ -1338,6 +1346,8 @@ pub(super) async fn run_print_mode(
         agent_spawner: None,
         root_agent_id: None,
         root_mailbox_slot: None,
+                observability_hub: None,
+                observability_session: None,
     })
     .await
     {
@@ -1380,6 +1390,8 @@ pub(super) async fn run_print_mode(
                 agent_spawner: None,
                 root_agent_id: None,
                 root_mailbox_slot: None,
+                observability_hub: None,
+                observability_session: None,
             })
             .await
             .map_err(|f| f.error)?

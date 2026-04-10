@@ -120,4 +120,9 @@ pub(crate) struct ChatTurnParams<'a> {
     /// Optional persistent top-level mailbox slot for cross-turn reply handling.
     pub(crate) root_mailbox_slot:
         Option<&'a mut Option<astra_runtime::messaging::router::AgentMailbox>>,
+    /// Optional observability hub for M1-M6 integration (profiles, experiments, auto-tuning).
+    pub(crate) observability_hub: Option<Arc<astra_runtime::observability_integration::ObservabilityHub>>,
+    /// Optional observability session for per-session tracking.
+    pub(crate) observability_session:
+        Option<Arc<std::sync::RwLock<astra_runtime::observability_integration::ObservabilitySession>>>,
 }

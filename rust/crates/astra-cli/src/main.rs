@@ -5734,6 +5734,8 @@ async fn handle_task_command(
                     agent_spawner: bg_agent_spawner.clone(),
                     root_agent_id: Some(bg_root_agent_id.as_str()),
                     root_mailbox_slot: None,
+                observability_hub: None,
+                observability_session: None,
                 })
                 .await;
 
@@ -7966,6 +7968,8 @@ mod tests {
             agent_spawner: None,
             root_agent_id: None,
             root_mailbox_slot: None,
+                observability_hub: None,
+                observability_session: None,
         })
         .await
         .unwrap();
@@ -8027,6 +8031,8 @@ mod tests {
             agent_spawner: None,
             root_agent_id: None,
             root_mailbox_slot: None,
+                observability_hub: None,
+                observability_session: None,
         })
         .await;
         assert!(result.is_err());
@@ -8104,6 +8110,8 @@ mod tests {
             agent_spawner: None,
             root_agent_id: None,
             root_mailbox_slot: None,
+                observability_hub: None,
+                observability_session: None,
         })
         .await
         .unwrap();

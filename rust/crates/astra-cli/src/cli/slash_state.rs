@@ -231,6 +231,8 @@ pub(super) async fn handle_state_command(
                     agent_spawner: state.agent_spawner.clone(),
                     root_agent_id: Some("main"),
                     root_mailbox_slot: Some(&mut state.root_mailbox),
+                    observability_hub: None,
+                    observability_session: None,
                 }) => r,
                 _ = tokio::signal::ctrl_c() => {
                     if let Some(ref t) = _cancel_token_guard { t.cancel(); }
@@ -327,6 +329,8 @@ pub(super) async fn handle_state_command(
                             agent_spawner: state.agent_spawner.clone(),
                             root_agent_id: Some("main"),
                             root_mailbox_slot: Some(&mut state.root_mailbox),
+                            observability_hub: None,
+                            observability_session: None,
                         })
                         .await;
 
@@ -403,6 +407,8 @@ pub(super) async fn handle_state_command(
                                     agent_spawner: state.agent_spawner.clone(),
                                     root_agent_id: Some("main"),
                                     root_mailbox_slot: Some(&mut state.root_mailbox),
+                                    observability_hub: None,
+                                    observability_session: None,
                                 })
                                 .await;
                                 if let Ok(sr2) = synth_result {

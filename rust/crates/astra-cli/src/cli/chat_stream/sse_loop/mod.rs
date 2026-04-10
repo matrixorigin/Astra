@@ -447,8 +447,8 @@ pub(crate) async fn stream_chat_sse(
         progress_emitter: None,
         permission_context: None,
         permission_handler: None,
-        observability_session: None,
-        observability_hub: None,
+        observability_session: p.observability_session.clone(),
+        observability_hub: p.observability_hub.clone(),
     };
 
     // ─── Run the runtime loop ────────────────────────────────────────────
