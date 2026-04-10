@@ -1389,16 +1389,25 @@ impl StreamRenderState {
         args: &Value,
         output: Option<&str>,
     ) -> String {
+        // Dynamic budget based on terminal width.
+        // Layout: "  ✓ {description} {duration}" — prefix ~6 chars, duration ~6 chars.
+        let term_w = crossterm::terminal::size()
+            .map(|(c, _)| c as usize)
+            .unwrap_or(80);
+        let desc_budget = term_w.saturating_sub(14); // room for prefix + duration
+        // Path budget: description budget minus the label prefix (e.g. "Reading: ")
+        let path_budget = |prefix_len: usize| desc_budget.saturating_sub(prefix_len).max(20);
+
         match tool {
             "bash" => {
                 let cmd = args.get("command").and_then(Value::as_str).unwrap_or("");
-                format!("$ {}", truncate_line(cmd, 55))
+                format!("$ {}", truncate_line(cmd, path_budget(2)))
             }
             "read_file" => {
                 let path = args.get("path").and_then(Value::as_str).unwrap_or("");
                 let start = args.get("start_line").and_then(Value::as_u64);
                 let end = args.get("end_line").and_then(Value::as_u64);
-                let short_path = shorten_path(path, 40);
+                let short_path = shorten_path(path, path_budget(10)); // "Reading: "
 
                 // Check if auto-expanded (ranged request but full file returned)
                 let auto_expanded = output
@@ -1417,36 +1426,38 @@ impl StreamRenderState {
             }
             "write_file" => {
                 let path = args.get("path").and_then(Value::as_str).unwrap_or("");
-                format!("Writing: {}", shorten_path(path, 50))
+                format!("Writing: {}", shorten_path(path, path_budget(9)))
             }
             "str_replace" | "multi_edit" => {
                 let path = args.get("path").and_then(Value::as_str).unwrap_or("");
-                format!("Editing: {}", shorten_path(path, 50))
+                format!("Editing: {}", shorten_path(path, path_budget(9)))
             }
             "delete_file" => {
                 let path = args.get("path").and_then(Value::as_str).unwrap_or("");
-                format!("Deleting: {}", shorten_path(path, 50))
+                format!("Deleting: {}", shorten_path(path, path_budget(10)))
             }
             "list_dir" => {
                 let path = args.get("path").and_then(Value::as_str).unwrap_or(".");
-                format!("Listing: {}", shorten_path(path, 50))
+                format!("Listing: {}", shorten_path(path, path_budget(9)))
             }
             "grep" => {
                 let pattern = args.get("pattern").and_then(Value::as_str).unwrap_or("");
                 let glob_filter = args.get("glob").and_then(Value::as_str);
                 let path = args.get("path").and_then(Value::as_str);
-                let short_pattern = truncate_line(pattern, 25);
+                let pat_budget = desc_budget / 3;
+                let short_pattern = truncate_line(pattern, pat_budget);
                 match (glob_filter, path) {
                     (Some(g), _) => format!("Grep: \"{short_pattern}\" in {g}"),
                     (None, Some(p)) => {
-                        format!("Grep: \"{short_pattern}\" in {}", shorten_path(p, 25))
+                        let p_budget = desc_budget.saturating_sub(10 + pat_budget);
+                        format!("Grep: \"{short_pattern}\" in {}", shorten_path(p, p_budget))
                     }
                     _ => format!("Grep: \"{short_pattern}\""),
                 }
             }
             "glob" => {
                 let pattern = args.get("pattern").and_then(Value::as_str).unwrap_or("");
-                format!("Glob: {}", truncate_line(pattern, 50))
+                format!("Glob: {}", truncate_line(pattern, path_budget(6)))
             }
             "git_status" => "Git status".to_string(),
             "git_log" => {
@@ -1465,53 +1476,57 @@ impl StreamRenderState {
                     .or_else(|| args.get("ref"))
                     .and_then(Value::as_str)
                     .unwrap_or("");
-                format!("Git show {}", truncate_line(commit, 12))
+                format!("Git show {}", truncate_line(commit, path_budget(9)))
             }
             "git_diff" => {
                 let staged = args.get("staged").and_then(Value::as_bool).unwrap_or(false);
                 let path = args.get("path").and_then(Value::as_str);
                 match (staged, path) {
-                    (true, Some(p)) => format!("Git diff --staged {}", shorten_path(p, 35)),
+                    (true, Some(p)) => {
+                        format!("Git diff --staged {}", shorten_path(p, path_budget(18)))
+                    }
                     (true, None) => "Git diff --staged".to_string(),
-                    (false, Some(p)) => format!("Git diff {}", shorten_path(p, 40)),
+                    (false, Some(p)) => {
+                        format!("Git diff {}", shorten_path(p, path_budget(10)))
+                    }
                     _ => "Git diff".to_string(),
                 }
             }
             "git_blame" => {
                 let path = args.get("path").and_then(Value::as_str).unwrap_or("");
-                format!("Git blame {}", shorten_path(path, 45))
+                format!("Git blame {}", shorten_path(path, path_budget(10)))
             }
             "git_commit" => {
                 let msg = args.get("message").and_then(Value::as_str).unwrap_or("");
-                format!("Git commit \"{}\"", truncate_line(msg, 40))
+                format!("Git commit \"{}\"", truncate_line(msg, path_budget(13)))
             }
             "find_definition" => {
                 let symbol = args.get("symbol").and_then(Value::as_str).unwrap_or("");
-                format!("Find definition of {}", truncate_line(symbol, 35))
+                format!("Find definition of {}", truncate_line(symbol, path_budget(20)))
             }
             "find_references" => {
                 let symbol = args.get("symbol").and_then(Value::as_str).unwrap_or("");
-                format!("Find references to {}", truncate_line(symbol, 35))
+                format!("Find references to {}", truncate_line(symbol, path_budget(19)))
             }
             "symbol_search" => {
                 let symbol = args.get("symbol").and_then(Value::as_str).unwrap_or("");
-                format!("Search symbol {}", truncate_line(symbol, 40))
+                format!("Search symbol {}", truncate_line(symbol, path_budget(15)))
             }
             "symbols" => {
                 let path = args.get("path").and_then(Value::as_str).unwrap_or("");
-                format!("Get symbols in {}", shorten_path(path, 40))
+                format!("Get symbols in {}", shorten_path(path, path_budget(16)))
             }
             "call_graph" => {
                 let symbol = args.get("symbol").and_then(Value::as_str).unwrap_or("");
-                format!("Call graph for {}", truncate_line(symbol, 40))
+                format!("Call graph for {}", truncate_line(symbol, path_budget(16)))
             }
             "run_build_test" => {
                 let cmd = args.get("command").and_then(Value::as_str).unwrap_or("");
-                format!("$ {}", truncate_line(cmd, 55))
+                format!("$ {}", truncate_line(cmd, path_budget(2)))
             }
             "web_fetch" => {
                 let url = args.get("url").and_then(Value::as_str).unwrap_or("");
-                format!("Fetching: {}", truncate_line(url, 50))
+                format!("Fetching: {}", truncate_line(url, path_budget(10)))
             }
             "github_get_pr" => {
                 let owner = args.get("owner").and_then(Value::as_str).unwrap_or("");
@@ -1527,15 +1542,15 @@ impl StreamRenderState {
             // Memory tools with natural verbs
             "memory_retrieve" => {
                 let query = args.get("query").and_then(Value::as_str).unwrap_or("");
-                format!("Recalling: \"{}\"", truncate_line(query, 45))
+                format!("Recalling: \"{}\"", truncate_line(query, path_budget(13)))
             }
             "memory_store" => {
                 let content = args.get("content").and_then(Value::as_str).unwrap_or("");
-                format!("Storing: \"{}\"", truncate_line(content, 40))
+                format!("Storing: \"{}\"", truncate_line(content, path_budget(11)))
             }
             "memory_search" => {
                 let query = args.get("query").and_then(Value::as_str).unwrap_or("");
-                format!("Searching memory: \"{}\"", truncate_line(query, 40))
+                format!("Searching memory: \"{}\"", truncate_line(query, path_budget(20)))
             }
             "memory_purge" => "Purging memory".to_string(),
             "memory_correct" => "Correcting memory".to_string(),
@@ -1546,15 +1561,17 @@ impl StreamRenderState {
                     .get("skill_name")
                     .and_then(Value::as_str)
                     .unwrap_or("unknown");
-                format!("Running skill: {}", truncate_line(skill_name, 45))
+                format!("Running skill: {}", truncate_line(skill_name, path_budget(16)))
             }
             other if other.starts_with("mcp_") => {
-                // MCP tool names are "mcp_{server}_{tool}" — show as "MCP {server} {tool}"
-                let rest = &other[4..]; // strip "mcp_"
+                let rest = &other[4..];
                 if let Some(sep) = rest.find('_') {
                     let server = &rest[..sep];
                     let tool_name = &rest[sep + 1..];
-                    format!("MCP {server} {}", truncate_line(tool_name, 40))
+                    format!(
+                        "MCP {server} {}",
+                        truncate_line(tool_name, path_budget(5 + server.len()))
+                    )
                 } else {
                     format!("MCP {rest}")
                 }

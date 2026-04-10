@@ -40,9 +40,9 @@ impl ToolRunningLineSpinner {
                 handle: None,
             };
         }
-        let detail = truncate_cli_status_detail(&description, 48);
-        let t0 = Instant::now();
         let w = term_width();
+        let detail = truncate_cli_status_detail(&description, w.saturating_sub(16).max(30));
+        let t0 = Instant::now();
         let icon = format!("{}", ICON_RUNNING.cyan());
 
         paint_unified_line(&icon, &detail, "0s", SPINNER_FRAMES[0], w);
