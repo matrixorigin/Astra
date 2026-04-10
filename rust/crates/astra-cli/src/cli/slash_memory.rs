@@ -149,9 +149,10 @@ pub(super) async fn handle_memory_domain_command(
             let sub_arg = arg.strip_prefix(subcmd).unwrap_or("").trim();
             match subcmd {
                 "search" if !sub_arg.is_empty() => {
+                    let top_k = state.runtime_config.memory.retrieval_top_k;
                     let payload = serde_json::json!({
                         "query": sub_arg,
-                        "top_k": 10,
+                        "top_k": top_k,
                     });
                     match api.post_memory_search_json(tok, &payload).await {
                         Ok(r) if r.status().is_success() => {

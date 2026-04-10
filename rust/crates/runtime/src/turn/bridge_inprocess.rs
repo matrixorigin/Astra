@@ -1262,7 +1262,11 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                         .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))
                         .and_then(|m| m.get("content").and_then(Value::as_str))
                         .unwrap_or("");
-                    let result = prefetch_memories(mem_url, mem_key, user_msg, &user_id).await;
+                    let top_k = edge_profile
+                        .get("retrieval_top_k")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(5) as u32;
+                    let result = prefetch_memories(mem_url, mem_key, user_msg, &user_id, top_k).await;
                     memory_fetch_ms = result.fetch_ms;
                     memory_items = result.items;
                     memory_preview = result.preview;
@@ -2265,6 +2269,7 @@ pub async fn prefetch_memories(
     mem_key: &str,
     user_msg: &str,
     user_id: &str,
+    top_k: u32,
 ) -> MemoryPrefetchResult {
     if mem_key.is_empty() || user_msg.trim().is_empty() {
         return MemoryPrefetchResult::default();
@@ -2277,10 +2282,10 @@ pub async fn prefetch_memories(
     // Saves one round-trip latency (~50-200ms) compared to sequential.
     let do_entity = !entity_query.is_empty() && entity_query != trimmed_msg;
     let (full_result, entity_result) = tokio::join!(
-        fetch_memories(mem_url, mem_key, trimmed_msg, user_id),
+        fetch_memories(mem_url, mem_key, trimmed_msg, user_id, top_k),
         async {
             if do_entity {
-                fetch_memories(mem_url, mem_key, &entity_query, user_id).await
+                fetch_memories(mem_url, mem_key, &entity_query, user_id, top_k).await
             } else {
                 String::new()
             }
@@ -2351,12 +2356,12 @@ fn extract_entity_tokens(msg: &str) -> String {
 }
 
 /// Fetch memories from Memoria HTTP API. Returns joined content string.
-async fn fetch_memories(base_url: &str, api_key: &str, query: &str, user_id: &str) -> String {
+async fn fetch_memories(base_url: &str, api_key: &str, query: &str, user_id: &str, top_k: u32) -> String {
     let client = reqwest::Client::builder()
         .no_proxy()
         .build()
         .unwrap_or_else(|_| reqwest::Client::new());
-    let mut payload = serde_json::json!({"query": query, "top_k": 10});
+    let mut payload = serde_json::json!({"query": query, "top_k": top_k});
     if !user_id.is_empty() {
         payload["session_id"] = serde_json::Value::String(user_id.to_string());
         payload["user_id"] = serde_json::Value::String(user_id.to_string());
@@ -3953,7 +3958,7 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let result = rt.block_on(prefetch_memories("http://localhost", "", "query", "user1"));
+        let result = rt.block_on(prefetch_memories("http://localhost", "", "query", "user1", 5));
         assert_eq!(result.items, 0);
         assert!(result.section.is_none());
     }
@@ -3964,7 +3969,7 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let result = rt.block_on(prefetch_memories("http://localhost", "key", "   ", "user1"));
+        let result = rt.block_on(prefetch_memories("http://localhost", "key", "   ", "user1", 5));
         assert_eq!(result.items, 0);
     }
 

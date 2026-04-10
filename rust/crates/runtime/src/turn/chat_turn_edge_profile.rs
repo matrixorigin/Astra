@@ -24,6 +24,14 @@ pub fn memoria_env_for_edge_profile() -> (String, String) {
     (memoria_url, memoria_key)
 }
 
+/// Retrieval top_k from environment (same semantics as RuntimeConfig).
+fn retrieval_top_k_from_env() -> u32 {
+    std::env::var("MO_RETRIEVAL_TOP_K")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(5) // default same as RuntimeConfig
+}
+
 /// Static `edge_profile` object before optional `active_skills` / selector hints / skills text.
 pub fn build_base_edge_profile_value(
     cwd: &str,
@@ -31,6 +39,7 @@ pub fn build_base_edge_profile_value(
     workspace: Value,
 ) -> Value {
     let (memoria_url, memoria_key) = memoria_env_for_edge_profile();
+    let retrieval_top_k = retrieval_top_k_from_env();
 
     // Collect environment context for the LLM
     let env_context =
@@ -41,6 +50,7 @@ pub fn build_base_edge_profile_value(
         "git_branch": git_branch,
         "memoria_url": memoria_url,
         "memoria_key": memoria_key,
+        "retrieval_top_k": retrieval_top_k,
         "workspace": workspace,
         "environment_context": env_context,
     })
@@ -89,6 +99,11 @@ mod tests {
         assert!(
             env_ctx.contains("## Environment"),
             "environment_context should have section header"
+        );
+        // retrieval_top_k is included (default 5 unless MO_RETRIEVAL_TOP_K set)
+        assert!(
+            v.get("retrieval_top_k").is_some(),
+            "should include retrieval_top_k"
         );
     }
 
