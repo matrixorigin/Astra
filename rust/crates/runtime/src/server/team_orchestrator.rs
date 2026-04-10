@@ -75,6 +75,7 @@ pub enum TeamExecutionStatus {
     Completed,
     Partial,
     CompletedWithConflicts,
+    CompletedOverBudget,
     Failed,
 }
 
@@ -84,6 +85,7 @@ impl std::fmt::Display for TeamExecutionStatus {
             Self::Completed => write!(f, "completed"),
             Self::Partial => write!(f, "partial"),
             Self::CompletedWithConflicts => write!(f, "completed_with_conflicts"),
+            Self::CompletedOverBudget => write!(f, "completed_over_budget"),
             Self::Failed => write!(f, "failed"),
         }
     }
@@ -494,7 +496,7 @@ impl TeamExecutionOrchestrator {
             });
             // Upgrade status: budget exceeded is a partial failure even if agents succeeded
             let status = match status {
-                TeamExecutionStatus::Completed => TeamExecutionStatus::CompletedWithConflicts,
+                TeamExecutionStatus::Completed => TeamExecutionStatus::CompletedOverBudget,
                 other => other,
             };
             (status, error)
@@ -859,6 +861,10 @@ mod tests {
             TeamExecutionStatus::CompletedWithConflicts.to_string(),
             "completed_with_conflicts"
         );
+        assert_eq!(
+            TeamExecutionStatus::CompletedOverBudget.to_string(),
+            "completed_over_budget"
+        );
         assert_eq!(TeamExecutionStatus::Failed.to_string(), "failed");
     }
 
@@ -1208,6 +1214,24 @@ mod tests {
         };
         store.save_team(&team).await.unwrap();
 
+        // Use an executor that returns tokens exceeding the budget
+        struct HighTokenExecutor;
+        #[async_trait::async_trait]
+        impl SubRunExecutor for HighTokenExecutor {
+            async fn execute(&self, config: SubRunConfig) -> Result<AgentResult, String> {
+                Ok(AgentResult {
+                    agent_id: config.agent_profile.agent_id,
+                    run_id: config.run_id,
+                    status: "completed".to_string(),
+                    output: Some("done".into()),
+                    error: None,
+                    prompt_tokens: 500,
+                    completion_tokens: 500,
+                    tool_calls: 0,
+                })
+            }
+        }
+
         let registry = Arc::new(RwLock::new(AgentProfileRegistry::new()));
         let run_store = Arc::new(InMemoryRunStateStore::new());
         let run_engine = Arc::new(RunEngine::new(run_store));
@@ -1219,7 +1243,7 @@ mod tests {
                 registry.clone(),
                 run_engine.clone(),
                 tracker.clone(),
-                Arc::new(StubSubRunExecutor),
+                Arc::new(HighTokenExecutor),
             )),
             tracker,
             run_engine.clone(),
@@ -1233,8 +1257,9 @@ mod tests {
         );
 
         let report = orch.execute_team("budget-test", "do something", None).await;
-        // Budget check is post-execution, so run completes normally
-        assert_ne!(report.status, TeamExecutionStatus::Failed);
+        // Budget check is post-execution: run completes but status is upgraded
+        assert_eq!(report.status, TeamExecutionStatus::CompletedOverBudget);
+        assert!(report.error.as_ref().unwrap().contains("token budget exceeded"));
         assert!(report.delegation_result.is_some());
     }
 

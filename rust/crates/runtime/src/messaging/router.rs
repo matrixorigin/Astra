@@ -265,11 +265,25 @@ impl AgentMailboxRouter {
                     let stale_run_id = existing.run_id.clone();
                     drop(idx);
                     self.address_registry.write().await.remove(&stale_run_id);
-                    // Re-verify after re-acquiring: another thread may have registered in between.
+                    // Re-acquire and re-verify: another thread may have registered
+                    // a fresh entry for the same agent_id during the lock gap.
                     idx = self.agent_id_index.write().await;
+                    if let Some(current) = idx.get(&addr.agent_id) {
+                        if current.run_id != stale_run_id && current != &addr {
+                            // Another thread registered a new (non-stale) entry; don't overwrite.
+                            // Our caller will still get a working mailbox via address_registry below.
+                        } else {
+                            idx.insert(addr.agent_id.clone(), addr.clone());
+                        }
+                    } else {
+                        idx.insert(addr.agent_id.clone(), addr.clone());
+                    }
+                } else {
+                    idx.insert(addr.agent_id.clone(), addr.clone());
                 }
+            } else {
+                idx.insert(addr.agent_id.clone(), addr.clone());
             }
-            idx.insert(addr.agent_id.clone(), addr.clone());
         }
 
         let stream = self.transport.subscribe(&addr).await?;

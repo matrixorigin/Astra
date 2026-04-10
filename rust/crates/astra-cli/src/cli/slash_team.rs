@@ -1050,6 +1050,16 @@ pub(super) async fn handle_team_command(
                         eprintln!("    {} {}", theme::icon_warn(), err.as_str().yellow());
                     }
                 }
+                astra_runtime::server::team_orchestrator::TeamExecutionStatus::CompletedOverBudget => {
+                    eprintln!(
+                        "  {}  Team '{}' completed over budget {}",
+                        theme::icon_warn(), team_name.yellow().bold(),
+                        format!("({})", format_duration(elapsed)).dim()
+                    );
+                    if let Some(ref err) = report.error {
+                        eprintln!("    {} {}", theme::icon_warn(), err.as_str().yellow());
+                    }
+                }
                 astra_runtime::server::team_orchestrator::TeamExecutionStatus::Failed => {
                     eprintln!(
                         "  {} Team '{}' execution failed {}",
