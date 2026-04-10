@@ -778,6 +778,56 @@ impl ToolExecutor {
                      Hint: Add more surrounding context to old_str to make it unique.\n"
                 );
             }
+            // Fuzzy cascade: try progressively looser matching strategies
+            if let Some(fuzzy_match) = super::fuzzy_replacer::fuzzy_find_replacement(
+                &content, old_str, replace_all,
+            ) {
+                let new_content = if replace_all {
+                    content.replace(&fuzzy_match.actual, new_str)
+                } else {
+                    content.replacen(&fuzzy_match.actual, new_str, 1)
+                };
+                if dry_run {
+                    return unified_diff(&content, &new_content, &path);
+                }
+                if let Err(e) = self.check_staleness(&path) {
+                    return format!("Error: Pre-write staleness check failed: {e}");
+                }
+                match fs::write(&path, &new_content) {
+                    Ok(_) => {
+                        self.record_write_with_content(&path, &new_content);
+                        let format_result = auto_format_file(&path, &self.project_root);
+                        if format_result.is_some() {
+                            self.record_write(&path);
+                        }
+                        let mut result = format!(
+                            "Replaced successfully (matched via {})\n",
+                            fuzzy_match.strategy
+                        );
+                        let old_lines: Vec<&str> = fuzzy_match.actual.lines().collect();
+                        let new_lines: Vec<&str> = new_str.lines().collect();
+                        if old_lines.len().max(new_lines.len()) <= 10 {
+                            for l in &old_lines {
+                                result.push_str(&format!("- {l}\n"));
+                            }
+                            for l in &new_lines {
+                                result.push_str(&format!("+ {l}\n"));
+                            }
+                        }
+                        if let Some(fmt_note) = format_result {
+                            result.push_str(&format!("\n{fmt_note}"));
+                        }
+                        append_str_replace_cli_unified_diff(
+                            &mut result,
+                            &content,
+                            &new_content,
+                            &path,
+                        );
+                        return result;
+                    }
+                    Err(e) => return format!("Error writing file: {e}"),
+                }
+            }
             return str_replace_not_found_hint(&content, old_str);
         }
         if count > 1 && !replace_all {
@@ -2179,14 +2229,28 @@ type Handler interface {
 
         let executor = test_executor_in(dir.path());
         executor.read_file(&serde_json::json!({"path": "code.rs"}));
+
+        // With fuzzy matching, slightly wrong indentation now succeeds via line-trimmed
         let result = executor.str_replace(&serde_json::json!({
             "path": "code.rs",
             "old_str": "fn hello() {\n  println!(\"hi\");\n}",
             "new_str": "fn hello() {}"
         }));
+        assert!(
+            result.contains("Replaced successfully") && result.contains("line-trimmed"),
+            "should auto-fix via fuzzy matching: {result}"
+        );
 
-        assert!(result.contains("Error"), "should be error: {result}");
-        assert!(result.contains("Hint"), "should have hints: {result}");
+        // Truly non-matching content still returns hints
+        std::fs::write(&file_path, "  fn hello() {\n    println!(\"hi\");\n  }\n").unwrap();
+        executor.read_file(&serde_json::json!({"path": "code.rs"}));
+        let result2 = executor.str_replace(&serde_json::json!({
+            "path": "code.rs",
+            "old_str": "fn totally_different() {\n  xyz();\n}",
+            "new_str": "fn replaced() {}"
+        }));
+        assert!(result2.contains("Error"), "truly different should be error: {result2}");
+        assert!(result2.contains("Hint"), "should have hints: {result2}");
     }
 
     #[test]
