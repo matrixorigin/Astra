@@ -537,6 +537,13 @@ impl LspStdioSession {
                 "hover": {
                     "contentFormat": ["markdown", "plaintext"]
                 },
+                "signatureHelp": {
+                    "signatureInformation": {
+                        "parameterInformation": {
+                            "labelOffsetSupport": true
+                        }
+                    }
+                },
                 "completion": {
                     "completionItem": {
                         "snippetSupport": true,
