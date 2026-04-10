@@ -66,8 +66,8 @@ mod tests {
     // ── Catalog invariants ──
 
     #[test]
-    fn catalog_has_33_tools() {
-        assert_eq!(TOOL_CATALOG.len(), 34);
+    fn catalog_has_35_tools() {
+        assert_eq!(TOOL_CATALOG.len(), 35);
     }
 
     #[test]
@@ -77,7 +77,7 @@ mod tests {
 
     #[test]
     fn catalog_has_26_dynamic() {
-        assert_eq!(ToolRegistry::dynamic_count(), 26);
+        assert_eq!(ToolRegistry::dynamic_count(), 27);
     }
 
     #[test]
@@ -198,6 +198,35 @@ mod tests {
             top_names.contains(&"memory_search"),
             "memory_search should appear for recall query, got: {:?}",
             top_names
+        );
+    }
+
+    #[test]
+    fn prefilter_ranks_lsp_for_code_intel_query() {
+        let state = ConversationState::from_message("帮我查这个符号的定义和引用", 1);
+        let ranked = pre_filter_dynamic(&state, "帮我查这个符号的定义和引用");
+
+        let top_names: Vec<&str> = ranked
+            .iter()
+            .take(6)
+            .map(|&(idx, _)| TOOL_CATALOG[idx].name)
+            .collect();
+        assert!(
+            top_names.contains(&"lsp"),
+            "lsp should appear near the top for code-intel query, got: {:?}",
+            top_names
+        );
+    }
+
+    #[test]
+    fn select_code_intel_query_includes_lsp() {
+        let registry = ToolRegistry::new(mock_schemas());
+        let selected = registry.select("find references for this symbol with lsp", 1);
+        let names = ToolRegistry::selected_names(&selected);
+        assert!(
+            names.contains(&"lsp".to_string()),
+            "lsp should be selected for code-intel query, got: {:?}",
+            names
         );
     }
 
