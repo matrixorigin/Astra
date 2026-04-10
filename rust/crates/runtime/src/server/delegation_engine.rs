@@ -682,9 +682,9 @@ pub struct DelegationEngine {
     /// Optional mailbox router for inter-agent messaging.
     mailbox_router: Option<Arc<AgentMailboxRouter>>,
     /// Optional cancellation token — when cancelled, spawned sub-runs stop gracefully.
-    /// Uses std::sync::RwLock for interior mutability so the orchestrator can set
+    /// Uses std::sync::Mutex for interior mutability so the orchestrator can set
     /// a fresh token per team execution even through an Arc<DelegationEngine>.
-    cancel_token: std::sync::RwLock<Option<Arc<tokio_util::sync::CancellationToken>>>,
+    cancel_token: std::sync::Mutex<Option<Arc<tokio_util::sync::CancellationToken>>>,
 }
 
 impl DelegationEngine {
@@ -704,7 +704,7 @@ impl DelegationEngine {
             executor: Arc::new(StubSubRunExecutor),
             gate: None,
             mailbox_router: None,
-            cancel_token: std::sync::RwLock::new(None),
+            cancel_token: std::sync::Mutex::new(None),
         }
     }
 
@@ -722,7 +722,7 @@ impl DelegationEngine {
             executor,
             gate: None,
             mailbox_router: None,
-            cancel_token: std::sync::RwLock::new(None),
+            cancel_token: std::sync::Mutex::new(None),
         }
     }
 
@@ -740,7 +740,7 @@ impl DelegationEngine {
 
     /// Attach a cancellation token for cooperative shutdown of spawned sub-runs.
     pub fn with_cancel_token(self, token: Arc<tokio_util::sync::CancellationToken>) -> Self {
-        *self.cancel_token.write().unwrap() = Some(token);
+        *self.cancel_token.lock().unwrap_or_else(|e| e.into_inner()) = Some(token);
         self
     }
 
@@ -757,7 +757,7 @@ impl DelegationEngine {
     /// Works through `Arc<DelegationEngine>` (no `&mut self` needed) so the orchestrator
     /// can create a fresh token per team execution.
     pub fn set_cancel_token(&self, token: Arc<tokio_util::sync::CancellationToken>) {
-        *self.cancel_token.write().unwrap() = Some(token);
+        *self.cancel_token.lock().unwrap_or_else(|e| e.into_inner()) = Some(token);
     }
 
     /// Remove the current verification gate (sub-runs will bypass verification).
@@ -778,7 +778,7 @@ impl DelegationEngine {
             executor: self.executor.clone(),
             gate: Some(gate),
             mailbox_router: self.mailbox_router.clone(),
-            cancel_token: std::sync::RwLock::new(self.cancel_token.read().unwrap().clone()),
+            cancel_token: std::sync::Mutex::new(self.cancel_token.lock().unwrap_or_else(|e| e.into_inner()).clone()),
         }
     }
 
@@ -792,13 +792,13 @@ impl DelegationEngine {
             executor: self.executor.clone(),
             gate: None,
             mailbox_router: self.mailbox_router.clone(),
-            cancel_token: std::sync::RwLock::new(self.cancel_token.read().unwrap().clone()),
+            cancel_token: std::sync::Mutex::new(self.cancel_token.lock().unwrap_or_else(|e| e.into_inner()).clone()),
         }
     }
 
     /// Read the current cancel token snapshot.
     fn current_cancel_token(&self) -> Option<Arc<tokio_util::sync::CancellationToken>> {
-        self.cancel_token.read().unwrap().clone()
+        self.cancel_token.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// Validate a delegation request without executing it.
