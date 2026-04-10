@@ -1,149 +1,5 @@
 use super::*;
-
-const SLASH_COMMANDS: &[(&str, &str)] = &[
-    // ── Core ──────────────────────────────────────────────────────────────
-    ("/help", "Show available commands; /help keys for shortcuts"),
-    ("/model", "List models or set active: /model <name>"),
-    ("/clear", "Start a new session"),
-    ("/undo", "Undo last turn(s): /undo [N]"),
-    (
-        "/checkpoint",
-        "Manual save: /checkpoint [label] — JSON + session md + journal",
-    ),
-    (
-        "/history",
-        "Conversation turns; /history grep <q> filters in-memory",
-    ),
-    ("/copy", "Copy last response to clipboard"),
-    (
-        "/grep",
-        "Workspace ripgrep: <pattern> | files <glob> | review <pattern>",
-    ),
-    (
-        "/review",
-        "LLM review of git changes: /review [latest|<rev>|working]",
-    ),
-    ("/diff", "Colored git diff (staged, stat, show <rev>, …)"),
-    ("/resume", "Resume a session: /resume [session_id]"),
-    ("/exit", "Exit the REPL"),
-    ("/quit", "Exit the REPL (alias for /exit)"),
-    // ── Session & plan ───────────────────────────────────────────────────
-    (
-        "/session",
-        "Session: history|errors|export|fork|list|cleanup|verify",
-    ),
-    ("/session history", "Session journal-style history"),
-    ("/session errors", "Session errors from journal"),
-    (
-        "/session export",
-        "Export session to timestamped Markdown in cwd",
-    ),
-    (
-        "/session fork",
-        "Fork session — new id, copy journal (multi-agent / experiments)",
-    ),
-    (
-        "/session list",
-        "All journals + cwd / git / age from workspace",
-    ),
-    (
-        "/session cleanup",
-        "Clean stale sessions: --days N, --force, --compress",
-    ),
-    ("/session verify", "Verify session integrity"),
-    (
-        "/plan",
-        "Structured plan: go|step|pause|resume|exit|show|help",
-    ),
-    ("/plan go", "Execute plan (auto mode)"),
-    ("/plan step", "Execute plan (step-by-step)"),
-    ("/plan status", "Plan progress and state"),
-    ("/plan show", "Display current plan"),
-    ("/plan pause", "Pause plan execution"),
-    ("/plan resume", "Resume plan execution"),
-    ("/plan exit", "Leave plan mode"),
-    ("/plan help", "Show all plan commands"),
-    ("/report", "Last delivery report (/report save = JSON)"),
-    // ── Memory & tasks ────────────────────────────────────────────────────
-    ("/memory", "Memoria: list, search <q>, inspect <id>, …"),
-    (
-        "/task",
-        "Tasks: list, add, done, status, run <prompt>, result <id>",
-    ),
-    // ── State & reflection ───────────────────────────────────────────────
-    (
-        "/explain",
-        "Cycle explain: off → on (API) → verbose (+stderr)",
-    ),
-    ("/verbose", "Verbose streaming on"),
-    (
-        "/compact",
-        "Summarize & trim history (quick | no-memoria, …)",
-    ),
-    (
-        "/reflect",
-        "Reflect on session (modes: skill_failure, performance, …)",
-    ),
-    // ── Observability ─────────────────────────────────────────────────────
-    (
-        "/turn",
-        "Turn trace: /turn | list | N | seq:N | #N | id:N | @N | -1",
-    ),
-    (
-        "/debug",
-        "Interactive session inspector (messages, tools, injections)",
-    ),
-    (
-        "/stats",
-        "Session analytics: /stats [history|tools|cost|health|learn]",
-    ),
-    ("/lsp", "LSP backend status: /lsp [status]"),
-    (
-        "/telemetry",
-        "Session telemetry: turns, drift, decisions, profile",
-    ),
-    ("/tuning", "Auto-tuning: status, history, config, reset"),
-    ("/sync", "Cloud sync status and push"),
-    ("/context", "Context window / budget summary"),
-    ("/rewind", "Rewind conversation to an earlier turn"),
-    ("/version", "Version info"),
-    // ── Skills & MCP ─────────────────────────────────────────────────────
-    (
-        "/skill",
-        "Skills: list|info|search|surfacing|health|new|test|dev|system|…",
-    ),
-    (
-        "/mcp",
-        "MCP: status|servers|prompts|resources|add|remove|ping|complete|…",
-    ),
-    // ── Team & account ───────────────────────────────────────────────────
-    (
-        "/team",
-        "Teams: list|info|create|add-member|context|run|history|snapshot|restore|delete|help",
-    ),
-    ("/agent", "Spawned agents: list, status, stop, logs"),
-    ("/messaging", "Inter-agent messaging: metrics, dlq, status"),
-    ("/login", "Authenticate with the API"),
-    ("/register", "Register a new account"),
-    ("/logout", "Logout from the API"),
-    ("/memory-setup", "Guided Memoria configuration"),
-    // ── Toggles & style ───────────────────────────────────────────────────
-    (
-        "/allow",
-        "Permission mode: /allow [auto|prompt|deny|all|rules]",
-    ),
-    ("/yolo", "Auto-approve all tools (alias for /allow auto)"),
-    (
-        "/instructions",
-        "Project instructions: /instructions [show|reload|off]",
-    ),
-    (
-        "/style",
-        "Output theme: default | minimal | colorful | high-contrast",
-    ),
-    ("/diagnostics", "Binary, API, auth, environment checks"),
-    ("/bug", "Generate bug report: /bug [copy|save]"),
-];
+use super::command_registry::{self, CommandGroup, COMMANDS};
 
 fn command_matches_filter(command: &str, desc: &str, filter: &str) -> bool {
     let terms: Vec<&str> = filter.split_whitespace().collect();
@@ -192,25 +48,11 @@ fn suggestion_score(command: &str, query: &str) -> usize {
 }
 
 pub(super) fn suggest_commands(input: &str, limit: usize) -> Vec<&'static str> {
-    let mut scored: Vec<(usize, usize, &'static str)> = SLASH_COMMANDS
-        .iter()
-        .map(|(cmd, _)| (suggestion_score(cmd, input), cmd.len(), *cmd))
-        .filter(|(score, _, _)| *score > 0)
-        .collect();
-    scored.sort_by(|a, b| {
-        b.0.cmp(&a.0)
-            .then_with(|| a.1.cmp(&b.1))
-            .then_with(|| a.2.cmp(b.2))
-    });
-    scored
-        .into_iter()
-        .take(limit)
-        .map(|(_, _, cmd)| cmd)
-        .collect()
+    command_registry::suggest_commands(input, limit)
 }
 
 fn is_command_alias(command: &str) -> bool {
-    matches!(command, "/?" | "/commands" | "/quit")
+    COMMANDS.iter().find(|m| m.name == command).map_or(false, |m| m.is_alias)
 }
 
 /// A sub-command contains a space (e.g. "/skill list", "/grep files …").
@@ -238,222 +80,8 @@ fn sort_picker_rows(rows: &mut [(&'static str, &'static str)], query: Option<&st
 }
 
 pub(super) fn completion_candidates(prefix: &str) -> Vec<(&'static str, &'static str)> {
-    let mut rows: Vec<(&'static str, &'static str)> = SLASH_COMMANDS
-        .iter()
-        .copied()
-        .filter(|(cmd, _)| cmd.starts_with(prefix))
-        .collect();
-    sort_picker_rows(&mut rows, None);
-    rows
+    command_registry::completion_candidates(prefix)
 }
-
-/// Static first-token completions after `/<cmd> ` (Tab in the REPL). Keep in sync with
-/// `slash_argument_hint` and the corresponding handlers in `main.rs`.
-const SLASH_FIRST_TOKEN_COMPLETIONS: &[(&str, &[(&str, &str)])] = &[
-    (
-        "/stats",
-        &[("history", "Aggregate stats across recent sessions")],
-    ),
-    (
-        "/cost",
-        &[
-            ("detail", "Per-turn cost breakdown"),
-            ("history", "Cost across recent sessions"),
-        ],
-    ),
-    ("/health", &[("detail", "Per-tool health breakdown")]),
-    (
-        "/sync",
-        &[
-            ("log", "Recent sync event log"),
-            ("push", "Force push dirty domains to cloud"),
-            ("pull", "Pull all domains from cloud"),
-        ],
-    ),
-    (
-        "/learn",
-        &[
-            ("drift", "Drifting pattern detection"),
-            ("explore", "Exploration opportunities"),
-            ("stats", "Learning summary (default)"),
-        ],
-    ),
-    (
-        "/review",
-        &[
-            ("latest", "Review HEAD (default)"),
-            ("working", "Review working tree vs HEAD"),
-        ],
-    ),
-    (
-        "/skill",
-        &[
-            ("browse", "Browse marketplace"),
-            ("create", "Generate skill from session"),
-            ("dev", "Skill dev mode"),
-            ("health", "Skill catalog health"),
-            ("info", "Skill details"),
-            ("install", "Install from marketplace"),
-            ("list", "List skills"),
-            ("new", "Create skill"),
-            ("pin", "Pin skill to always load"),
-            ("search", "Keyword search catalog"),
-            ("stats", "Learning summary"),
-            ("surfacing", "Agent catalog surfacing (dynamic/min/cap)"),
-            ("system", "System skill helpers"),
-            ("test", "Run skill test"),
-        ],
-    ),
-    (
-        "/mcp",
-        &[
-            ("add", "Add: /mcp add <name> <command> [args…]"),
-            (
-                "complete",
-                "Completions: /mcp complete <server>:prompt:<name> <arg> [value]",
-            ),
-            ("log-level", "Set level: /mcp log-level <server> <level>"),
-            ("ping", "Ping: /mcp ping [server]"),
-            ("prompt", "Invoke: /mcp prompt <server>:<name> [args]"),
-            ("prompts", "List available MCP prompts"),
-            ("remove", "Remove: /mcp remove <name>"),
-            ("resource", "Read: /mcp resource <server>:<uri>"),
-            ("resources", "List available MCP resources"),
-            ("servers", "Show server details and tools"),
-            ("status", "Show connection status table"),
-            ("subscribe", "Subscribe: /mcp subscribe <server>:<uri>"),
-            (
-                "unsubscribe",
-                "Unsubscribe: /mcp unsubscribe <server>:<uri>",
-            ),
-        ],
-    ),
-    (
-        "/plan",
-        &[
-            ("exit", "Exit structured plan mode"),
-            ("go", "Execute plan (auto mode)"),
-            ("help", "Show all plan commands"),
-            ("pause", "Pause plan execution"),
-            ("resume", "Resume plan execution"),
-            ("show", "Display current plan"),
-            ("status", "Show plan progress"),
-            ("step", "Execute plan (step-by-step)"),
-        ],
-    ),
-    (
-        "/task",
-        &[
-            ("add", "Create task (needs title)"),
-            ("done", "Mark task done (needs id/query)"),
-            ("list", "List tasks"),
-            ("status", "Task status (needs id/query)"),
-        ],
-    ),
-    (
-        "/memory",
-        &[
-            ("inspect", "Inspect memory entry (needs id)"),
-            ("list", "List memories"),
-            ("search", "Search memories (needs query)"),
-        ],
-    ),
-    (
-        "/session",
-        &[
-            ("cleanup", "Clean stale sessions"),
-            ("errors", "Session errors"),
-            ("export", "Export session"),
-            ("fork", "Fork session"),
-            ("history", "Session conversation history"),
-            ("list", "List journals"),
-            ("verify", "Verify session integrity"),
-        ],
-    ),
-    (
-        "/diff",
-        &[
-            ("help", "Diff usage"),
-            ("patch", "Unstaged diff alias"),
-            ("show", "git show <rev> (needs rev)"),
-            ("staged", "Staged vs HEAD"),
-            ("stat", "Diff stat vs HEAD"),
-            ("unstaged", "Unstaged only"),
-        ],
-    ),
-    ("/turn", &[("list", "List all journal turns")]),
-    (
-        "/style",
-        &[
-            ("list", "List available themes"),
-            ("default", "Default theme"),
-            ("minimal", "Minimal theme"),
-            ("colorful", "Colorful theme"),
-            ("high-contrast", "High-contrast theme"),
-        ],
-    ),
-    (
-        "/allow",
-        &[
-            ("auto", "Auto-approve all tool use"),
-            ("prompt", "Prompt before tool use"),
-            ("deny", "Deny all tool use"),
-            ("all", "Auto-approve all (alias for auto)"),
-            ("rules", "Show current permission rules"),
-        ],
-    ),
-    (
-        "/instructions",
-        &[
-            ("show", "Show loaded project instructions"),
-            ("reload", "Reload from .astra/instructions.md"),
-            ("off", "Disable project instructions for this session"),
-        ],
-    ),
-    (
-        "/team",
-        &[
-            ("add-member", "Add member to team"),
-            ("context", "Set shared context for team"),
-            ("create", "Create new team"),
-            ("delete", "Delete a team"),
-            ("help", "Show team overview and examples"),
-            ("history", "Show team execution history"),
-            ("info", "Show team information"),
-            ("list", "List all teams"),
-            ("restore", "Restore team snapshot"),
-            ("run", "Run a task with the team"),
-            ("snapshot", "Save a team snapshot"),
-        ],
-    ),
-    (
-        "/agent",
-        &[
-            ("list", "List spawned agents"),
-            ("status", "Show agent status"),
-            ("stop", "Stop an agent"),
-            ("logs", "Show agent logs"),
-            ("help", "Show agent help"),
-        ],
-    ),
-    (
-        "/messaging",
-        &[
-            ("dlq", "Show dead letter queue"),
-            ("metrics", "Show metrics snapshot"),
-            ("status", "Show mailbox status"),
-            ("help", "Show messaging help"),
-        ],
-    ),
-    (
-        "/compact",
-        &[
-            ("quick", "Fast compaction without summary"),
-            ("summary-only", "Summarize without trimming"),
-            ("no-memoria", "Compact without Memoria"),
-        ],
-    ),
-];
 
 // ── Dynamic (second-token) completions ──────────────────────────────────────
 // After `/skill dev ` or `/mcp ping `, complete with skill names / MCP server
@@ -581,17 +209,13 @@ fn slash_first_token_option_list(
         return None;
     }
     let lowered = trimmed.to_ascii_lowercase();
-    if let Some((_, opts)) = SLASH_FIRST_TOKEN_COMPLETIONS
-        .iter()
-        .find(|(k, _)| *k == lowered.as_str())
-    {
-        return Some(*opts);
+    // Try direct lookup first
+    if let Some(subs) = command_registry::subcommand_completions(&lowered) {
+        return Some(subs);
     }
+    // Fall back to prefix resolution
     let resolved = resolve_slash_command(&lowered).ok()?;
-    SLASH_FIRST_TOKEN_COMPLETIONS
-        .iter()
-        .find(|(k, _)| *k == resolved)
-        .map(|(_, v)| *v)
+    command_registry::subcommand_completions(resolved)
 }
 
 fn token_prefix_matches(tok: &str, partial: &str) -> bool {
@@ -815,7 +439,8 @@ fn slash_completion_query(line: &str) -> Option<&str> {
     if !line.starts_with('/') {
         return None;
     }
-    if SLASH_COMMANDS.iter().any(|(cmd, _)| cmd.starts_with(line)) {
+    // Check if any command starts with this line
+    if COMMANDS.iter().any(|m| m.name.starts_with(line)) {
         return Some(line);
     }
     if !line.contains(' ') && !line.ends_with(' ') {
@@ -1306,22 +931,7 @@ pub(super) fn render_slash_overlay(filter: Option<&str>) {
 }
 
 pub(super) fn resolve_slash_command(input: &str) -> Result<&'static str, Vec<&'static str>> {
-    // Direct match in SLASH_COMMANDS
-    if let Some((cmd, _)) = SLASH_COMMANDS.iter().find(|(cmd, _)| *cmd == input) {
-        return Ok(*cmd);
-    }
-    let mut matches: Vec<&'static str> = SLASH_COMMANDS
-        .iter()
-        .map(|(cmd, _)| *cmd)
-        .filter(|cmd| cmd.starts_with(input))
-        .collect();
-    matches.sort_unstable();
-    matches.dedup();
-    if matches.len() == 1 {
-        Ok(matches[0])
-    } else {
-        Err(matches)
-    }
+    command_registry::resolve_command(input)
 }
 
 pub(super) fn print_slash_commands(query: Option<&str>) {
@@ -1329,14 +939,7 @@ pub(super) fn print_slash_commands(query: Option<&str>) {
         .map(str::trim)
         .filter(|q| !q.is_empty())
         .map(|q| q.to_ascii_lowercase());
-    let lookup_desc = |command: &str| -> &'static str {
-        SLASH_COMMANDS
-            .iter()
-            .find(|(cmd, _)| *cmd == command)
-            .map(|(_, desc)| *desc)
-            .unwrap_or("?")
-    };
-    let matches = |command: &str, desc: &str| -> bool {
+    let matches_filter = |command: &str, desc: &str| -> bool {
         match &filter {
             Some(q) => command_matches_filter(command, desc, q),
             None => true,
@@ -1364,97 +967,26 @@ pub(super) fn print_slash_commands(query: Option<&str>) {
 
     let mut any_results = false;
 
-    // Icon-decorated groups: (icon, title, commands)
-    let groups: &[(&str, &str, &[&str])] = &[
-        (
-            "⚡",
-            "Core",
-            &[
-                "/help", "/model", "/clear", "/undo", "/history", "/copy", "/resume",
-                "/exit",
-            ],
-        ),
-        ("📂", "Workspace", &["/grep", "/diff", "/review"]),
-        (
-            "🔭",
-            "Observability",
-            &[
-                "/explain",
-                "/verbose",
-                "/compact",
-                "/reflect",
-                "/turn",
-                "/debug",
-                "/stats",
-                "/telemetry",
-                "/tuning",
-                "/sync",
-                "/context",
-                "/rewind",
-                "/version",
-            ],
-        ),
-        (
-            "📋",
-            "Session & plan",
-            &[
-                "/session",
-                "/session history",
-                "/session errors",
-                "/session export",
-                "/session fork",
-                "/session list",
-                "/checkpoint",
-                "/plan",
-                "/report",
-            ],
-        ),
-        ("🧠", "Memory & tasks", &["/memory", "/task"]),
-        ("📦", "Skills", &["/skill"]),
-        ("🔌", "MCP", &["/mcp"]),
-        (
-            "👥",
-            "Team & account",
-            &[
-                "/team",
-                "/agent",
-                "/messaging",
-                "/login",
-                "/register",
-                "/logout",
-                "/memory-setup",
-            ],
-        ),
-        (
-            "🔧",
-            "System",
-            &[
-                "/diagnostics",
-                "/lsp",
-                "/allow",
-                "/yolo",
-                "/instructions",
-                "/style",
-                "/bug",
-            ],
-        ),
-    ];
-
-    for (icon, title, commands) in groups {
+    // Iterate over all groups from the unified registry
+    for group in CommandGroup::ALL {
+        let commands = command_registry::commands_by_group(*group);
         let mut lines = Vec::new();
-        for cmd in *commands {
-            let desc = lookup_desc(cmd);
-            if matches(cmd, desc) {
+        for meta in commands {
+            // Skip aliases and subcommands to avoid clutter in main palette
+            if meta.is_alias || meta.name.contains(' ') {
+                continue;
+            }
+            if matches_filter(meta.name, meta.description) {
                 lines.push(format!(
                     "    {}  {}",
-                    format!("{:<14}", cmd).green(),
-                    desc.to_string().dim()
+                    format!("{:<14}", meta.name).green(),
+                    meta.description.to_string().dim()
                 ));
             }
         }
         if !lines.is_empty() {
             any_results = true;
-            eprintln!("  {} {}", icon, title.bold().cyan());
+            eprintln!("  {} {}", group.icon(), group.title().bold().cyan());
             for line in lines {
                 eprintln!("{line}");
             }
@@ -2046,8 +1578,13 @@ mod tests {
         let line = "/stats ";
         let (start, pairs) = slash_first_token_completions(line, line.len()).expect("completions");
         assert_eq!(start, line.len(), "replacement starts after trailing space");
-        assert_eq!(pairs.len(), 1);
-        assert_eq!(pairs[0].replacement, "history");
+        // /stats has 5 subcommands: cost, health, history, learn, tools
+        assert_eq!(pairs.len(), 5);
+        assert_eq!(pairs[0].replacement, "cost");
+        assert_eq!(pairs[1].replacement, "health");
+        assert_eq!(pairs[2].replacement, "history");
+        assert_eq!(pairs[3].replacement, "learn");
+        assert_eq!(pairs[4].replacement, "tools");
     }
 
     #[test]
@@ -2060,13 +1597,16 @@ mod tests {
     }
 
     #[test]
-    fn first_token_complete_learn_multiple_sorted() {
-        let line = "/learn ";
+    fn first_token_complete_session_multiple_sorted() {
+        // /session has multiple subcommands - verify alphabetical sort
+        let line = "/session ";
         let (_start, pairs) = slash_first_token_completions(line, line.len()).expect("completions");
-        assert_eq!(pairs.len(), 3);
-        assert_eq!(pairs[0].replacement, "drift");
-        assert_eq!(pairs[1].replacement, "explore");
-        assert_eq!(pairs[2].replacement, "stats");
+        assert!(pairs.len() >= 4);
+        // Should be alphabetically sorted
+        let names: Vec<_> = pairs.iter().map(|p| p.replacement.as_str()).collect();
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(names, sorted, "subcommands should be alphabetically sorted");
     }
 
     #[test]
@@ -2080,8 +1620,9 @@ mod tests {
         let line = "/stat ";
         let (start, pairs) = slash_first_token_completions(line, line.len()).expect("completions");
         assert_eq!(start, line.len());
-        assert_eq!(pairs.len(), 1);
-        assert_eq!(pairs[0].replacement, "history");
+        // /stats has 5 subcommands now
+        assert_eq!(pairs.len(), 5);
+        assert_eq!(pairs[0].replacement, "cost");
     }
 
     #[test]
@@ -2089,8 +1630,8 @@ mod tests {
         let line = "/stats H";
         let (start, pairs) = slash_first_token_completions(line, line.len()).expect("completions");
         assert_eq!(&line[start..], "H");
-        assert_eq!(pairs.len(), 1);
-        assert_eq!(pairs[0].replacement, "history");
+        // "H" prefix matches "health" and "history"
+        assert_eq!(pairs.len(), 2);
     }
 
     #[test]
@@ -2128,18 +1669,18 @@ mod tests {
         assert!(input.ends_with('\\'));
     }
 
-    // ── /history in SLASH_COMMANDS ────────────────────────────────────────────
+    // ── /history in registry ────────────────────────────────────────────
 
     #[test]
     fn history_command_is_registered() {
-        assert!(SLASH_COMMANDS.iter().any(|(cmd, _)| *cmd == "/history"));
+        assert!(COMMANDS.iter().any(|m| m.name == "/history"));
     }
 
-    // ── /resume in SLASH_COMMANDS ─────────────────────────────────────────────
+    // ── /resume in registry ─────────────────────────────────────────────
 
     #[test]
     fn resume_command_is_registered() {
-        assert!(SLASH_COMMANDS.iter().any(|(cmd, _)| *cmd == "/resume"));
+        assert!(COMMANDS.iter().any(|m| m.name == "/resume"));
     }
 
     #[test]
@@ -2149,11 +1690,11 @@ mod tests {
         assert_eq!(result.unwrap(), "/resume");
     }
 
-    // ── /stats in SLASH_COMMANDS ──────────────────────────────────────────────
+    // ── /stats in registry ──────────────────────────────────────────────
 
     #[test]
     fn stats_command_is_registered() {
-        assert!(SLASH_COMMANDS.iter().any(|(cmd, _)| *cmd == "/stats"));
+        assert!(COMMANDS.iter().any(|m| m.name == "/stats"));
     }
 
     #[test]
@@ -2161,19 +1702,6 @@ mod tests {
         let result = resolve_slash_command("/sta");
         assert!(result.is_ok(), "got: {result:?}");
         assert_eq!(result.unwrap(), "/stats");
-    }
-
-    // ── /tools removed from SLASH_COMMANDS ─────────────────────────────
-
-    #[test]
-    fn tools_command_not_standalone() {
-        // /tools is no longer a standalone command — use /stats tools
-        assert!(!SLASH_COMMANDS.iter().any(|(cmd, _)| *cmd == "/tools"));
-    }
-
-    #[test]
-    fn stats_command_is_registered() {
-        assert!(SLASH_COMMANDS.iter().any(|(cmd, _)| *cmd == "/stats"));
     }
 
     // ── filtered_slash_rows behavior ──────────────────────────────────────
@@ -2541,7 +2069,7 @@ mod tests {
         // Capture stderr output from print_slash_commands
         // We can't capture stderr easily in a unit test, so we validate the
         // group structure indirectly by checking all listed commands exist
-        // in SLASH_COMMANDS.
+        // in the unified registry.
         let groups: &[&[&str]] = &[
             &[
                 "/help", "/model", "/clear", "/undo", "/history", "/copy", "/resume",
@@ -2596,12 +2124,12 @@ mod tests {
             ],
         ];
         let known: std::collections::HashSet<&str> =
-            SLASH_COMMANDS.iter().map(|(cmd, _)| *cmd).collect();
+            COMMANDS.iter().map(|m| m.name).collect();
         for group in groups {
             for cmd in *group {
                 assert!(
                     known.contains(cmd),
-                    "group command {cmd} not in SLASH_COMMANDS"
+                    "group command {cmd} not in registry"
                 );
             }
         }

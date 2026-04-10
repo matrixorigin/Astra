@@ -92,6 +92,8 @@ mod repl_runtime;
 mod repl_turn;
 #[path = "cli/repl_ui.rs"]
 mod repl_ui;
+#[path = "cli/command_registry.rs"]
+mod command_registry;
 #[path = "cli/skill_subrun.rs"]
 mod skill_subrun;
 #[path = "cli/slash_account.rs"]
