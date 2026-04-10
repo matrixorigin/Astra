@@ -260,6 +260,13 @@ impl AgentMailboxRouter {
                         "  ⚠ messaging: agent_id '{}' already registered as {}; overwriting with {}",
                         addr.agent_id, existing, addr
                     );
+                    // Clean up stale entry from address_registry to prevent ghost registrations.
+                    // Drop idx lock first to avoid potential deadlock with address_registry.
+                    let stale_run_id = existing.run_id.clone();
+                    drop(idx);
+                    self.address_registry.write().await.remove(&stale_run_id);
+                    // Re-verify after re-acquiring: another thread may have registered in between.
+                    idx = self.agent_id_index.write().await;
                 }
             }
             idx.insert(addr.agent_id.clone(), addr.clone());

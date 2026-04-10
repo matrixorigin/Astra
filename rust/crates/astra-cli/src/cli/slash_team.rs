@@ -371,6 +371,11 @@ async fn ensure_team_run_session(
                 }
                 let _ = crate::auth_flow::clear_profile_last_session(profile);
                 state.session_id = None;
+                // Unregister stale mailbox to avoid agent_id collision on re-registration
+                if let Some(mailbox) = state.root_mailbox.take() {
+                    let addr = mailbox.address.clone();
+                    let _ = mailbox.router().unregister(&addr).await;
+                }
                 state.run_id = None;
                 state.journal = None;
             }

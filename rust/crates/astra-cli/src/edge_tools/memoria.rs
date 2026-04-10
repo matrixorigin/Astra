@@ -331,7 +331,7 @@ impl ToolExecutor {
             };
             let url = format!("{base}/v1/memories/feedback");
             for mid in memory_ids {
-                let _ = client
+                if let Err(e) = client
                     .post(&url)
                     .header("Authorization", format!("Bearer {key}"))
                     .json(&json!({
@@ -340,7 +340,11 @@ impl ToolExecutor {
                         "context": "boost_search retrieval"
                     }))
                     .send()
-                    .await;
+                    .await
+                {
+                    eprintln!("[memoria] feedback for {mid} failed: {e}");
+                    break; // don't spam on persistent failures
+                }
             }
         });
     }
@@ -365,12 +369,15 @@ fn memoria_oneshot_client(timeout_secs: u64) -> Option<(reqwest::Client, String,
 /// clean stale data). Called at session end. Server has 1-hour cooldown.
 pub async fn memoria_governance_fire_and_forget() {
     let Some((client, base, key)) = memoria_oneshot_client(10) else { return };
-    let _ = client
+    if let Err(e) = client
         .post(format!("{base}/v1/memories/governance"))
         .header("Authorization", format!("Bearer {key}"))
         .json(&json!({"force": false}))
         .send()
-        .await;
+        .await
+    {
+        eprintln!("[memoria] governance trigger failed: {e}");
+    }
 }
 
 /// Fire-and-forget: trigger Memoria graph consolidation (merge duplicates,
@@ -378,10 +385,13 @@ pub async fn memoria_governance_fire_and_forget() {
 /// Called at session end. Server has 30-minute cooldown.
 pub async fn memoria_consolidate_fire_and_forget() {
     let Some((client, base, key)) = memoria_oneshot_client(15) else { return };
-    let _ = client
+    if let Err(e) = client
         .post(format!("{base}/v1/memories/consolidate"))
         .header("Authorization", format!("Bearer {key}"))
         .json(&json!({"force": false}))
         .send()
-        .await;
+        .await
+    {
+        eprintln!("[memoria] consolidation trigger failed: {e}");
+    }
 }

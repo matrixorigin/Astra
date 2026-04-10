@@ -258,6 +258,11 @@ pub(super) async fn handle_chat_input(
                 if is_session_not_found_error(&failure.error) && state.session_id.is_some() {
                     let _ = clear_profile_last_session(ctx.profile);
                     state.session_id = None;
+                    // Unregister stale mailbox to avoid agent_id collision on re-registration
+                    if let Some(mailbox) = state.root_mailbox.take() {
+                        let addr = mailbox.address.clone();
+                        let _ = mailbox.router().unregister(&addr).await;
+                    }
                     eprintln!(
                         "{}",
                         "  Session not found. Creating a new session…".yellow()
