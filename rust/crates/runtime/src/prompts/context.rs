@@ -335,14 +335,28 @@ impl ContextBudget {
     }
 
     /// Determine the compaction tier for the current token usage.
+    ///
+    /// The tier boundaries are scaled relative to `compact_threshold`:
+    /// - TrimSchemas: starts at 80% of compact_threshold
+    /// - CompactHistory: starts at compact_threshold
+    /// - AggressivePrune: starts at 113% of compact_threshold
+    ///
+    /// With default compact_threshold=0.75, this gives ~60%/75%/85% boundaries.
+    /// With aggressive compact_threshold=0.60, boundaries become ~48%/60%/68%.
     pub fn compaction_tier(&self, estimated_tokens: usize) -> CompactionTier {
         let limit = self.effective_input_limit() as f64;
         let ratio = estimated_tokens as f64 / limit;
-        if ratio > 0.85 {
+
+        // Scale tier boundaries based on compact_threshold
+        let trim_start = self.compact_threshold * 0.80;        // ~60% for default 0.75
+        let compact_start = self.compact_threshold;            // 75% for default 0.75
+        let aggressive_start = self.compact_threshold * 1.133; // ~85% for default 0.75
+
+        if ratio > aggressive_start {
             CompactionTier::AggressivePrune
-        } else if ratio > 0.75 {
+        } else if ratio > compact_start {
             CompactionTier::CompactHistory
-        } else if ratio > 0.60 {
+        } else if ratio > trim_start {
             CompactionTier::TrimSchemas
         } else {
             CompactionTier::Normal
@@ -1393,5 +1407,42 @@ mod tests {
         assert_eq!(b.keep_recent_turns, 3); // default preserve_recent_turns
         // 4000 tokens * 4 chars = 16000 chars
         assert_eq!(b.memory_budget_chars, 16000);
+    }
+
+    #[test]
+    fn compaction_tier_scales_with_threshold() {
+        // Default threshold 0.75: tiers at ~60%/75%/85%
+        let default_budget = ContextBudget {
+            model_limit: 100_000,
+            compact_threshold: 0.75,
+            keep_recent_turns: 3,
+            memory_budget_chars: 8000,
+            output_reserve_ratio: 0.15,
+            compact_config: CompactConfig::default(),
+        };
+
+        // At default 0.75 threshold:
+        // TrimSchemas starts at 0.75 * 0.80 = 0.60 (60%)
+        // CompactHistory starts at 0.75 (75%)
+        // AggressivePrune starts at 0.75 * 1.133 ≈ 0.85 (85%)
+        let limit = default_budget.effective_input_limit(); // 85000
+        assert_eq!(default_budget.compaction_tier((0.59 * limit as f64) as usize), CompactionTier::Normal);
+        assert_eq!(default_budget.compaction_tier((0.61 * limit as f64) as usize), CompactionTier::TrimSchemas);
+        assert_eq!(default_budget.compaction_tier((0.76 * limit as f64) as usize), CompactionTier::CompactHistory);
+        assert_eq!(default_budget.compaction_tier((0.86 * limit as f64) as usize), CompactionTier::AggressivePrune);
+
+        // Aggressive threshold 0.60: tiers scale proportionally
+        // TrimSchemas starts at 0.60 * 0.80 = 0.48 (48%)
+        // CompactHistory starts at 0.60 (60%)
+        // AggressivePrune starts at 0.60 * 1.133 ≈ 0.68 (68%)
+        let aggressive_budget = ContextBudget {
+            compact_threshold: 0.60,
+            ..default_budget.clone()
+        };
+
+        assert_eq!(aggressive_budget.compaction_tier((0.47 * limit as f64) as usize), CompactionTier::Normal);
+        assert_eq!(aggressive_budget.compaction_tier((0.49 * limit as f64) as usize), CompactionTier::TrimSchemas);
+        assert_eq!(aggressive_budget.compaction_tier((0.61 * limit as f64) as usize), CompactionTier::CompactHistory);
+        assert_eq!(aggressive_budget.compaction_tier((0.69 * limit as f64) as usize), CompactionTier::AggressivePrune);
     }
 }
