@@ -67,20 +67,22 @@ impl ExecutionProfile {
         self.config.tool_selection.max_tools = strategy.max_tools_per_turn as u32;
 
         if strategy.prefer_read_only {
-            // Boost confidence threshold slightly to be more selective
             self.config.tool_selection.confidence_threshold =
-                (self.config.tool_selection.confidence_threshold + 0.05).min(0.9);
+                self.config.tool_selection.confidence_threshold.max(0.35);
         }
 
-        // Verbose scenarios get more history context
         match strategy.detail_level {
             crate::user_profile::Verbosity::Debug => {
                 self.config.compression.max_history_tokens =
                     self.config.compression.max_history_tokens.max(60_000);
+                self.config.token_budget.max_turn_input_tokens =
+                    self.config.token_budget.max_turn_input_tokens.max(100_000);
             }
             crate::user_profile::Verbosity::Verbose => {
                 self.config.compression.max_history_tokens =
                     self.config.compression.max_history_tokens.max(50_000);
+                self.config.token_budget.max_turn_input_tokens =
+                    self.config.token_budget.max_turn_input_tokens.max(90_000);
             }
             _ => {}
         }
@@ -138,8 +140,8 @@ mod tests {
             profile.config.tool_selection.confidence_threshold,
             orig_threshold
         );
-        // Debug detail level → at least 60k history tokens
         assert!(profile.config.compression.max_history_tokens >= 60_000);
+        assert!(profile.config.token_budget.max_turn_input_tokens >= 100_000);
     }
 
     #[test]
@@ -150,8 +152,10 @@ mod tests {
         profile.apply_scenario(Scenario::CodeReview);
 
         assert_eq!(profile.config.tool_selection.max_tools, 3);
-        // prefer_read_only → threshold bumped by 0.05
-        assert!((profile.config.tool_selection.confidence_threshold - (orig + 0.05)).abs() < 1e-9);
+        assert_eq!(
+            profile.config.tool_selection.confidence_threshold,
+            orig.max(0.35)
+        );
     }
 
     #[test]
