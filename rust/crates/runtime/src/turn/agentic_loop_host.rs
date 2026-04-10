@@ -518,7 +518,12 @@ fn parse_coordination_pattern(
                     output_transform: None,
                 })
                 .collect();
-            Ok(astra_services::coordination::CoordinationPattern::Pipeline { stages })
+            Ok(
+                astra_services::coordination::CoordinationPattern::Pipeline {
+                    stages,
+                    timeout_sec: 0,
+                },
+            )
         }
         "adversarial" => {
             let producer = agents
@@ -536,6 +541,7 @@ fn parse_coordination_pattern(
                     reviewer_id: reviewer,
                     max_rounds,
                     acceptance_threshold: 0.8,
+                    timeout_sec: 0,
                 },
             )
         }
@@ -543,6 +549,7 @@ fn parse_coordination_pattern(
             astra_services::coordination::CoordinationPattern::Sequential {
                 agent_ids: agents,
                 stop_on_success: false,
+                timeout_sec: 0,
             },
         ),
     }
@@ -3191,6 +3198,7 @@ mod tests {
             astra_services::coordination::CoordinationPattern::Sequential {
                 agent_ids,
                 stop_on_success,
+                ..
             } => {
                 assert_eq!(agent_ids, vec!["coder", "reviewer"]);
                 assert!(!stop_on_success);
@@ -3221,7 +3229,7 @@ mod tests {
         let args = json!({"pattern": "pipeline", "agents": ["coder", "reviewer"]});
         let pattern = super::parse_coordination_pattern(&args).unwrap();
         match pattern {
-            astra_services::coordination::CoordinationPattern::Pipeline { stages } => {
+            astra_services::coordination::CoordinationPattern::Pipeline { stages, .. } => {
                 assert_eq!(stages.len(), 2);
                 assert_eq!(stages[0].agent_id, "coder");
                 assert_eq!(stages[1].agent_id, "reviewer");

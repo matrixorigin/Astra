@@ -1009,6 +1009,24 @@ pub(super) async fn handle_team_command(
                             status.to_string().dim()
                         );
                     }
+                    ExecutionPhase::AgentProgress {
+                        ref agent_states,
+                        completed_count,
+                        total_count,
+                        ..
+                    } => {
+                        let summary: Vec<String> = agent_states
+                            .iter()
+                            .map(|(id, st)| format!("{}={}", id, st))
+                            .collect();
+                        eprintln!(
+                            "  {} Progress: {}/{} agents done [{}]",
+                            "📡".dim(),
+                            completed_count,
+                            total_count,
+                            summary.join(", ").dim()
+                        );
+                    }
                 });
 
             let config = astra_runtime::server::team_orchestrator::OrchestratorConfig {
