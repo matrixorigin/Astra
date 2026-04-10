@@ -75,7 +75,10 @@ pub struct ObservabilitySession {
 pub struct TurnTiming {
     pub turn: u32,
     pub context_assembly_ms: u64,
-    pub llm_latency_ms: u64,
+    /// Time to first LLM token (ms). Measures server responsiveness.
+    pub ttft_ms: u64,
+    /// Total LLM round-trip time including full stream (ms).
+    pub llm_total_ms: u64,
     pub tool_execution_ms: u64,
     pub total_ms: u64,
 }
@@ -468,9 +471,10 @@ mod tests {
             s.record_turn_timing(TurnTiming {
                 turn: 0,
                 context_assembly_ms: 50,
-                llm_latency_ms: 200,
+                ttft_ms: 200,
+                llm_total_ms: 800,
                 tool_execution_ms: 100,
-                total_ms: 350,
+                total_ms: 950,
             });
         }
 
