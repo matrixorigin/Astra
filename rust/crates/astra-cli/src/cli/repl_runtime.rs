@@ -246,7 +246,7 @@ fn create_tool_selector_with_quality_internal(
 ///
 /// With a non-empty `ctx.token` and unless `ASTRA_BACKGROUND_PLAN_SELECTOR_TFIDF_ONLY` is `1`
 /// or `true`, uses [`FallbackSelector`] + [`LlmToolSelector`] like the foreground REPL.
-pub(super) fn create_background_plan_selector(
+pub(crate) fn create_background_plan_selector(
     ctx: &crate::plan_executor::BackgroundPlanContext,
 ) -> Box<dyn tool_selector::ToolSelector> {
     let all_schemas = edge_tools::all_tool_schemas();
@@ -756,10 +756,7 @@ pub(super) fn print_repl_banner(profile: Option<&str>, state: &ReplState) {
     // Show active limits (system prompt, max-budget, permission mode)
     let mut limits = Vec::new();
     if let Ok(max_turns) = std::env::var("MO_MAX_TURNS") {
-        limits.push(format!(
-            "max-turns: {}",
-            max_turns
-        ));
+        limits.push(format!("max-turns: {}", max_turns));
     }
     if state.max_budget_limit > 0.0 {
         limits.push(format!("max-budget: ${:.2}", state.max_budget_limit));
