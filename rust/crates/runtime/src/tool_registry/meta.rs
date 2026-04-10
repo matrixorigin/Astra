@@ -152,7 +152,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
             "改代码",
             "改文件",
             "重构",
-            "重命名",
+            // Note: 重命名 is intentionally not here — LSP rename is preferred for semantic renames
         ],
         pinned: true,
         intents: &[IntentType::CodeEdit],
@@ -824,7 +824,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
             "调查",
             "哪里出错",
             "自检",
-            "诊断",
+            "自我诊断", // Note: 诊断 alone is reserved for LSP code diagnostics
             "排查",
             "怎么回事",
             "问题在哪",
