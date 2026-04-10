@@ -1263,9 +1263,25 @@ fn load_delegation_events(
 mod tests {
     use super::*;
     use astra_runtime::messaging::{AgentMailboxRouter, InProcessTransport};
+    use astra_runtime::orchestration::{SpawnedAgentInfo, SpawnedAgentMetrics};
     use astra_runtime::server::delegation_engine::DelegationTracker;
     use astra_services::session_journal::JournalEvent;
     use std::sync::Arc;
+    use std::time::SystemTime;
+
+    fn make_agent(agent_id: &str, run_id: &str, status: AgentStatus) -> SpawnedAgentInfo {
+        SpawnedAgentInfo {
+            agent_id: agent_id.to_string(),
+            run_id: run_id.to_string(),
+            parent_run_id: "root-run".to_string(),
+            agent_type: "task".to_string(),
+            description: "test agent".to_string(),
+            status,
+            started_at: SystemTime::now(),
+            metrics: SpawnedAgentMetrics::default(),
+            has_permission_issues: false,
+        }
+    }
 
     #[test]
     fn test_format_duration() {
@@ -1439,6 +1455,30 @@ mod tests {
                 ..DelegationHistoryEntry::default()
             }],
         );
+        assert!(snapshot.contains("Journal-backed delegations"));
+        assert!(snapshot.contains("del-1"));
+    }
+
+    #[test]
+    fn build_watch_snapshot_combines_spawned_agents_and_delegations() {
+        let snapshot = build_watch_snapshot(
+            &[make_agent(
+                "coder",
+                "run-1",
+                AgentStatus::Running {
+                    activity: "implementing".to_string(),
+                },
+            )],
+            &[DelegationHistoryEntry {
+                delegation_id: "del-1".to_string(),
+                pattern: "fan_out".to_string(),
+                status: "running".to_string(),
+                ..DelegationHistoryEntry::default()
+            }],
+        );
+        assert!(snapshot.contains("Spawned agents"));
+        assert!(snapshot.contains("coder"));
+        assert!(snapshot.contains("Summary: 1 running, 0 completed, 0 failed"));
         assert!(snapshot.contains("Journal-backed delegations"));
         assert!(snapshot.contains("del-1"));
     }
