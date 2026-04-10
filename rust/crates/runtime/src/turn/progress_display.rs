@@ -204,6 +204,9 @@ impl ProgressDisplay {
                     }
                 }
             }
+            ProgressEventType::AgentSpawned { .. } => {
+                // Tree updates handled by CLI layer; no progress bar change needed here
+            }
         }
     }
 

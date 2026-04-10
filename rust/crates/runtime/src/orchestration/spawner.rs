@@ -440,6 +440,7 @@ impl DynamicAgentSpawner {
         // 7. Emit started event
         let emitter = self.progress_broadcaster.for_agent(agent_id.clone());
         emitter.started(&input.description);
+        emitter.agent_spawned(&run_id, &context.parent_run_id, &input.agent_type, &input.description);
 
         // 7. Build parent address for permission requests
         let parent_address = crate::messaging::types::AgentAddress::new(

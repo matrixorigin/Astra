@@ -566,6 +566,24 @@ fn print_progress_event(event: &astra_runtime::orchestration::AgentProgressEvent
                 total_completion_tokens
             )
         }
+        ProgressEventType::AgentSpawned {
+            agent_type,
+            description,
+            parent_run_id,
+            ..
+        } => {
+            let parent_label = if parent_run_id.is_empty() {
+                String::new()
+            } else {
+                format!(" (child of {})", &parent_run_id[..8.min(parent_run_id.len())])
+            };
+            format!(
+                "🌲 {} spawned: {}{}",
+                agent_type.as_str().cyan(),
+                description,
+                parent_label.dim()
+            )
+        }
     };
 
     eprintln!("  [{}] {}", time_str.as_str().dim(), msg);

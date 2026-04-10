@@ -64,6 +64,13 @@ pub enum ProgressEventType {
         total_completion_tokens: u64,
         total_tool_calls: u32,
     },
+    /// Agent spawned with hierarchy information (enables real-time tree updates).
+    AgentSpawned {
+        run_id: String,
+        parent_run_id: String,
+        agent_type: String,
+        description: String,
+    },
 }
 
 /// Broadcasts progress events to multiple subscribers.
@@ -210,6 +217,22 @@ impl AgentProgressEmitter {
             total_prompt_tokens,
             total_completion_tokens,
             total_tool_calls,
+        });
+    }
+
+    /// Emit agent spawned event with hierarchy info for tree visualization.
+    pub fn agent_spawned(
+        &self,
+        run_id: impl Into<String>,
+        parent_run_id: impl Into<String>,
+        agent_type: impl Into<String>,
+        description: impl Into<String>,
+    ) {
+        self.emit(ProgressEventType::AgentSpawned {
+            run_id: run_id.into(),
+            parent_run_id: parent_run_id.into(),
+            agent_type: agent_type.into(),
+            description: description.into(),
         });
     }
 
