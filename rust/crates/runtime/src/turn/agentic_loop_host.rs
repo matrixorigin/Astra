@@ -443,6 +443,52 @@ fn record_edge_tool_observability(
     }
 }
 
+fn apply_adaptive_execution_profile(state: &mut AgenticLoopState) {
+    let (hub, session) = match (&state.observability_hub, &state.observability_session) {
+        (Some(hub), Some(session)) => (hub, session),
+        _ => return,
+    };
+
+    let mut session_guard = match session.write() {
+        Ok(guard) => guard,
+        Err(_) => return,
+    };
+
+    let mut detector = crate::user_profile::ScenarioDetector::new();
+    for query in &session_guard.recent_queries {
+        detector.observe_query(query);
+    }
+    for tool in &state.recent_tools {
+        detector.observe_tool(tool);
+    }
+
+    let routing = crate::pipeline::routing::RoutingEngine::analyze(
+        &state.message,
+        session_guard.turn_number,
+        &state.recent_tools,
+        &[],
+        Vec::new(),
+    );
+    let router = crate::scenario_router::ScenarioRouter::new(session_guard.config.clone());
+    let user_id = session_guard.user_id.clone();
+    let experiments = hub.experiments();
+    let profile = router.select(&routing, &detector, None, Some(&*experiments), &user_id);
+
+    if let Some(scenario) = profile.scenario {
+        session_guard.profile.set_scenario(scenario);
+    }
+    if let Some(experiment_id) = &profile.experiment_id {
+        session_guard
+            .profile
+            .enroll_experiment(experiment_id.clone());
+    }
+
+    session_guard.active_experiment_id = profile.experiment_id.clone();
+    session_guard.active_variant = profile.variant_id.clone();
+    session_guard.config = profile.config.clone();
+    state.max_turn_input_tokens = profile.config.token_budget.max_turn_input_tokens as u64;
+}
+
 // ─── Loop exit ───────────────────────────────────────────────────────────────
 
 /// Result of running the agentic loop to completion.
@@ -1087,6 +1133,22 @@ fn maybe_run_tuning_cycle(state: &mut AgenticLoopState) {
     if let Err(e) = crate::auto_tuning::save_feedback("default", hub.tuning()) {
         eprintln!("[auto-tuning] failed to persist feedback: {e}");
     }
+
+    let concluded = {
+        let experiments = hub.experiments();
+        crate::exploration_engine::ExplorationEngine::default()
+            .conclude_mature_experiments(&experiments)
+    };
+    if !concluded.is_empty() {
+        eprintln!(
+            "[adaptive-exec] concluded {} experiment(s): {:?}",
+            concluded.len(),
+            concluded
+                .iter()
+                .map(|c| (&c.experiment_id, &c.winner_variant_id))
+                .collect::<Vec<_>>()
+        );
+    }
 }
 
 async fn run_agentic_loop_impl<H: AgenticLoopHost>(
@@ -1212,6 +1274,7 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                 &state.message,
             );
         }
+        apply_adaptive_execution_profile(state);
 
         // ─── Turn trace collector ──────────────────────────────────────────
         // Create a collector for detailed context assembly traces.
@@ -6277,5 +6340,108 @@ print(json.dumps({'context': 'user said: ' + msg}))
         maybe_run_tuning_cycle(&mut state);
         // Counter is reset (passes threshold check) but no cycle runs (no session).
         assert_eq!(state.completed_turns_for_tuning, 0);
+    }
+
+    #[test]
+    fn adaptive_profile_updates_session_scenario_and_budget() {
+        let hub = make_hub();
+        let session = make_session();
+        let mut state = make_state();
+        state.observability_hub = Some(hub);
+        state.observability_session = Some(session.clone());
+        state.message = "fix the bug in the parser".into();
+        state.recent_tools = vec!["bash".into(), "view".into()];
+
+        {
+            let mut guard = session.write().unwrap();
+            for _ in 0..5 {
+                guard.record_query("fix the bug in the parser");
+            }
+        }
+
+        apply_adaptive_execution_profile(&mut state);
+
+        let guard = session.read().unwrap();
+        assert_eq!(
+            guard.profile.current_scenario,
+            Some(crate::user_profile::Scenario::Debugging)
+        );
+        assert!(state.max_turn_input_tokens >= 100_000);
+    }
+
+    #[test]
+    fn adaptive_profile_assigns_experiment_variant() {
+        let hub = make_hub();
+        let session = make_session();
+        let mut state = make_state();
+        state.observability_hub = Some(hub.clone());
+        state.observability_session = Some(session.clone());
+        state.message = "implement the feature".into();
+
+        let mut experiment = crate::ab_testing::Experiment::new("exp-router")
+            .with_variant(crate::ab_testing::Variant::control())
+            .with_variant(
+                crate::ab_testing::Variant::new("treatment")
+                    .with_traffic(0.5)
+                    .with_config_diff("compression.max_history_tokens", serde_json::json!(25_000)),
+            )
+            .with_metric(crate::ab_testing::MetricDefinition::success_rate())
+            .with_min_samples(5)
+            .build();
+        experiment.start();
+        hub.experiments_mut().register(experiment);
+
+        apply_adaptive_execution_profile(&mut state);
+
+        let guard = session.read().unwrap();
+        assert_eq!(guard.active_experiment_id.as_deref(), Some("exp-router"));
+        assert!(guard.active_variant.is_some());
+        assert!(
+            guard
+                .profile
+                .active_experiments
+                .contains(&"exp-router".to_string())
+        );
+    }
+
+    #[test]
+    fn tuning_cycle_concludes_mature_experiments() {
+        let hub = make_hub();
+        let session = make_session();
+        let mut state = make_state();
+        state.observability_hub = Some(hub.clone());
+        state.observability_session = Some(session);
+        state.completed_turns_for_tuning = TUNING_CYCLE_INTERVAL;
+
+        let mut experiment = crate::ab_testing::Experiment::new("exp-mature")
+            .with_variant(crate::ab_testing::Variant::control())
+            .with_variant(crate::ab_testing::Variant::new("treatment").with_traffic(0.5))
+            .with_metric(crate::ab_testing::MetricDefinition::success_rate())
+            .with_min_samples(1)
+            .build();
+        experiment.start();
+        hub.experiments_mut().register(experiment);
+        {
+            let experiments = hub.experiments();
+            experiments.record_outcome(
+                "exp-mature",
+                crate::ab_testing::ExperimentOutcome::new("u1", "control")
+                    .with_metric("success_rate", 0.0)
+                    .with_success(false),
+            );
+            experiments.record_outcome(
+                "exp-mature",
+                crate::ab_testing::ExperimentOutcome::new("u2", "treatment")
+                    .with_metric("success_rate", 1.0)
+                    .with_success(true),
+            );
+        }
+
+        maybe_run_tuning_cycle(&mut state);
+
+        assert_eq!(
+            hub.experiments().get("exp-mature").map(|exp| exp.status),
+            Some(crate::ab_testing::ExperimentStatus::Completed)
+        );
     }
 }
