@@ -925,15 +925,15 @@ impl TeamPersistenceService for MatrixOneTeamStore {
         user_id: &str,
         task: &str,
     ) -> Result<(), String> {
-        // Retention: prune oldest rows beyond MAX_EXECUTIONS_PER_TEAM.
-        // Uses a subquery to find the cutoff started_at, then deletes older rows.
-        const MAX_EXECUTIONS_PER_TEAM: u32 = 100;
+        // Retention: prune oldest completed rows beyond limit.
+        // Only completed records are pruned — running records are preserved.
+        const MAX_COMPLETED_PER_TEAM: u32 = 100;
         sqlx::query(
             "DELETE FROM team_execution_history \
-             WHERE team_id = ? AND execution_id NOT IN ( \
+             WHERE team_id = ? AND status != 'running' AND execution_id NOT IN ( \
                  SELECT execution_id FROM ( \
                      SELECT execution_id FROM team_execution_history \
-                     WHERE team_id = ? \
+                     WHERE team_id = ? AND status != 'running' \
                      ORDER BY started_at DESC \
                      LIMIT ? \
                  ) AS recent \
@@ -941,7 +941,7 @@ impl TeamPersistenceService for MatrixOneTeamStore {
         )
         .bind(team_id)
         .bind(team_id)
-        .bind(MAX_EXECUTIONS_PER_TEAM)
+        .bind(MAX_COMPLETED_PER_TEAM)
         .execute(&self.pool)
         .await
         .map_err(|e| format!("execution retention prune failed: {e}"))?;
