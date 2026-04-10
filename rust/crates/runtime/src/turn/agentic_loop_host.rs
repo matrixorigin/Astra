@@ -1002,6 +1002,41 @@ fn record_loop_completion_feedback(
     }
 }
 
+/// Run one auto-tuning evaluation cycle if enough turns have elapsed.
+///
+/// Every `TUNING_CYCLE_INTERVAL` turns, evaluates all registered evolution rules
+/// and applies any triggered actions to the session's RuntimeConfig.
+fn maybe_run_tuning_cycle(state: &mut AgenticLoopState) {
+    if state.completed_turns_for_tuning < TUNING_CYCLE_INTERVAL {
+        return;
+    }
+    state.completed_turns_for_tuning = 0;
+
+    let hub = match &state.observability_hub {
+        Some(h) => h,
+        None => return,
+    };
+
+    let session = match &state.observability_session {
+        Some(s) => s,
+        None => return,
+    };
+
+    let mut session_guard = match session.write() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+
+    let actions = hub.run_tuning_cycle(&mut session_guard.config);
+    if !actions.is_empty() {
+        eprintln!(
+            "[auto-tuning] cycle applied {} rule(s): {:?}",
+            actions.len(),
+            actions
+        );
+    }
+}
+
 async fn run_agentic_loop_impl<H: AgenticLoopHost>(
     host: &mut H,
     state: &mut AgenticLoopState,
@@ -2527,8 +2562,9 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
 
                 state.step_recorder.end_turn(false);
 
-                // ── Auto-tuning: count completed turns ──
+                // ── Auto-tuning: count completed turns & periodic cycle ──
                 state.completed_turns_for_tuning += 1;
+                maybe_run_tuning_cycle(state);
             }
         }
     }
