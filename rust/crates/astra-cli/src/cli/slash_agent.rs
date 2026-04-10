@@ -497,89 +497,71 @@ async fn show_watch(ctx: &AgentCommandContext) {
     use astra_runtime::orchestration::ProgressEventType;
     use std::time::{Duration, Instant};
 
-    let Some(ref spawner) = ctx.spawner else {
-        eprintln!("  {}", "No spawned-agent watcher is available.".dim());
-        eprintln!(
-            "  {}",
-            "Delegation runs are journal-backed; use /agent history or /agent logs <delegation_id>.".dim()
-        );
-        return;
-    };
-
     eprintln!("\n  {} Watching agent tree (Ctrl+C to stop)\n", "👁".cyan());
     eprintln!(
         "  {}",
-        "Watch follows live spawned agents. Delegation history stays available via /agent history and /agent logs."
+        "Watch follows live spawned agents and polls the session journal for delegation changes."
             .dim()
     );
     eprintln!();
 
-    // Subscribe to progress events
-    let mut rx = spawner.subscribe_progress();
-    let spawner_clone = spawner.clone();
-
-    let mut last_render = Instant::now() - Duration::from_secs(10);
-    let mut last_agent_count = 0usize;
+    let spawner_clone = ctx.spawner.clone();
+    let mut rx = spawner_clone
+        .as_ref()
+        .map(|spawner| spawner.subscribe_progress());
     let throttle_interval = Duration::from_millis(500);
-
-    let agents = spawner_clone.list_all_agents().await;
-    if !agents.is_empty() {
-        let forest = AgentTreeNode::build_forest(&agents);
-        let rendered = render_agent_forest(&forest);
-        eprintln!("  {}", "🌲 Agent Delegation Tree".cyan().bold());
-        eprintln!("  {}", "─".repeat(60).dim());
-        for line in rendered.lines() {
-            eprintln!("  {}", line);
-        }
-        last_agent_count = agents.len();
-        last_render = Instant::now();
+    let mut interval = tokio::time::interval(throttle_interval);
+    let mut last_render = Instant::now() - Duration::from_secs(10);
+    let mut last_snapshot = build_watch_snapshot(
+        &load_watch_agents(spawner_clone.as_ref()).await,
+        &load_recent_delegations(ctx.session_id.as_deref()),
+    );
+    if last_snapshot.is_empty() {
+        eprintln!("  {}", "No agents or delegations yet. Waiting...".dim());
     } else {
-        eprintln!("  {}", "No agents spawned yet. Waiting...".dim());
+        print_watch_snapshot(&last_snapshot);
     }
 
     loop {
-        match rx.recv().await {
-            Ok(event) => {
-                let is_tree_event = matches!(
-                    event.event_type,
-                    ProgressEventType::AgentSpawned { .. }
-                        | ProgressEventType::Completed { .. }
-                        | ProgressEventType::Failed { .. }
-                        | ProgressEventType::Cancelled { .. }
-                );
-
-                if is_tree_event && last_render.elapsed() >= throttle_interval {
-                    let agents = spawner_clone.list_all_agents().await;
-                    if agents.len() != last_agent_count || agents.is_empty() {
-                        eprintln!("\n  {}", "🌲 Agent Delegation Tree".cyan().bold());
-                        eprintln!("  {}", "─".repeat(60).dim());
-
-                        if agents.is_empty() {
-                            eprintln!("  {}", "(no agents)".dim());
-                        } else {
-                            let forest = AgentTreeNode::build_forest(&agents);
-                            let rendered = render_agent_forest(&forest);
-                            for line in rendered.lines() {
-                                eprintln!("  {}", line);
-                            }
-                        }
-
-                        last_agent_count = agents.len();
-                        last_render = Instant::now();
+        let should_refresh = tokio::select! {
+            _ = interval.tick() => {
+                true
+            }
+            maybe_event = async {
+                if let Some(rx) = &mut rx {
+                    rx.recv().await.ok()
+                } else {
+                    std::future::pending().await
+                }
+            } => {
+                match maybe_event {
+                    Some(event) => {
+                        let is_tree_event = matches!(
+                            event.event_type,
+                            ProgressEventType::AgentSpawned { .. }
+                                | ProgressEventType::Completed { .. }
+                                | ProgressEventType::Failed { .. }
+                                | ProgressEventType::Cancelled { .. }
+                        );
+                        is_tree_event
                     }
+                    None => true,
                 }
             }
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                eprintln!("  {}", format!("(skipped {n} events)").dim());
-            }
-            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                eprintln!("  {}", "Event stream closed.".dim());
-                break;
-            }
+        };
+        if !should_refresh || last_render.elapsed() < throttle_interval {
+            continue;
+        }
+        let snapshot = build_watch_snapshot(
+            &load_watch_agents(spawner_clone.as_ref()).await,
+            &load_recent_delegations(ctx.session_id.as_deref()),
+        );
+        if snapshot != last_snapshot {
+            print_watch_snapshot(&snapshot);
+            last_snapshot = snapshot;
+            last_render = Instant::now();
         }
     }
-
-    eprintln!();
 }
 
 async fn show_logs(ctx: &AgentCommandContext, agent_id: &str) {
@@ -1076,6 +1058,49 @@ fn render_delegation_tree(entries: &[DelegationHistoryEntry]) -> Vec<String> {
     lines
 }
 
+async fn load_watch_agents(
+    spawner: Option<&Arc<DynamicAgentSpawner>>,
+) -> Vec<astra_runtime::orchestration::SpawnedAgentInfo> {
+    if let Some(spawner) = spawner {
+        spawner.list_all_agents().await
+    } else {
+        Vec::new()
+    }
+}
+
+fn build_watch_snapshot(
+    agents: &[astra_runtime::orchestration::SpawnedAgentInfo],
+    delegations: &[DelegationHistoryEntry],
+) -> String {
+    let mut lines = Vec::new();
+    if !agents.is_empty() {
+        lines.push(format!("  {}", "Spawned agents"));
+        let forest = AgentTreeNode::build_forest(agents);
+        let rendered = render_agent_forest(&forest);
+        lines.extend(rendered.lines().map(|line| format!("  {line}")));
+    }
+    if !delegations.is_empty() {
+        if !lines.is_empty() {
+            lines.push(String::new());
+        }
+        lines.push("  Journal-backed delegations".to_string());
+        lines.extend(
+            render_delegation_tree(delegations)
+                .into_iter()
+                .map(|line| format!("  {line}")),
+        );
+    }
+    lines.join("\n")
+}
+
+fn print_watch_snapshot(snapshot: &str) {
+    eprintln!("\n  {}", "🌲 Agent Delegation Tree".cyan().bold());
+    eprintln!("  {}", "─".repeat(60).dim());
+    for line in snapshot.lines() {
+        eprintln!("  {}", line);
+    }
+}
+
 fn sub_run_status_icon(status: &str) -> &'static str {
     match status {
         "completed" => "✅",
@@ -1401,5 +1426,20 @@ mod tests {
         assert!(lines[0].contains("del-1"));
         assert!(lines[1].contains("coder"));
         assert!(lines[2].contains("reviewer"));
+    }
+
+    #[test]
+    fn build_watch_snapshot_includes_delegations() {
+        let snapshot = build_watch_snapshot(
+            &[],
+            &[DelegationHistoryEntry {
+                delegation_id: "del-1".to_string(),
+                pattern: "fan_out".to_string(),
+                status: "completed".to_string(),
+                ..DelegationHistoryEntry::default()
+            }],
+        );
+        assert!(snapshot.contains("Journal-backed delegations"));
+        assert!(snapshot.contains("del-1"));
     }
 }
