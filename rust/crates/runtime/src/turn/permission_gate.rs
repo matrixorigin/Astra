@@ -81,6 +81,23 @@ pub async fn check_tool_permission(
             };
         }
 
+        // Auto mode: approve locally without mailbox round-trip.
+        // This avoids the 30s permission-request timeout that would otherwise
+        // block child agents whose parent happens to be mid-LLM-call.
+        // Still respects the allowed_tools allowlist — tools not on the list
+        // are denied even in Auto mode.
+        if ctx_guard.mode() == PermissionMode::Auto {
+            if ctx_guard.inherited.is_tool_allowed_by_allowlist(tool_name) {
+                return PermissionCheckResult::Allowed;
+            } else {
+                drop(ctx_guard);
+                ctx.write().await.record_blocked_tool(tool_name);
+                return PermissionCheckResult::Denied {
+                    reason: format!("Tool '{}' not in allowed tools list", tool_name),
+                };
+            }
+        }
+
         // If mode is Deny, don't even try to request
         if ctx_guard.mode() == PermissionMode::Deny {
             drop(ctx_guard);
@@ -225,6 +242,69 @@ mod tests {
         assert_eq!(telemetry.permission_requests_approved, 0);
         assert_eq!(telemetry.tools_blocked, 1);
         assert_eq!(telemetry.recent_denials, vec!["edit".to_string()]);
+    }
+
+    /// Auto mode should approve locally without mailbox round-trip,
+    /// but still respect the allowed_tools allowlist.
+    #[tokio::test]
+    async fn auto_mode_approves_locally() {
+        let inherited = InheritedPermissions {
+            mode: PermissionMode::Auto,
+            allow_rules: vec![],
+            deny_rules: vec![],
+            ask_rules: vec![],
+            allowed_tools: None, // no allowlist = all tools allowed
+            is_background: false,
+        };
+        let ctx = Arc::new(RwLock::new(PermissionSyncContext::new(inherited)));
+
+        // Should approve without needing a mailbox
+        let result =
+            check_tool_permission("bash", None, Some(&ctx), None, Duration::from_secs(1)).await;
+        assert!(
+            matches!(result, PermissionCheckResult::Allowed),
+            "Auto mode should approve tools locally"
+        );
+
+        let telemetry = ctx.read().await.telemetry();
+        assert_eq!(
+            telemetry.permission_requests, 0,
+            "Auto mode should not send mailbox requests"
+        );
+    }
+
+    /// Auto mode should deny tools not in the allowed_tools allowlist.
+    #[tokio::test]
+    async fn auto_mode_respects_allowlist() {
+        let inherited = InheritedPermissions {
+            mode: PermissionMode::Auto,
+            allow_rules: vec![],
+            deny_rules: vec![],
+            ask_rules: vec![],
+            allowed_tools: Some(HashSet::from(["view".to_string(), "grep".to_string()])),
+            is_background: false,
+        };
+        let ctx = Arc::new(RwLock::new(PermissionSyncContext::new(inherited)));
+
+        // "view" is in the allowlist — should approve
+        let result =
+            check_tool_permission("view", None, Some(&ctx), None, Duration::from_secs(1)).await;
+        assert!(matches!(result, PermissionCheckResult::Allowed));
+
+        // "bash" is NOT in the allowlist — should deny
+        let result =
+            check_tool_permission("bash", None, Some(&ctx), None, Duration::from_secs(1)).await;
+        assert!(
+            matches!(result, PermissionCheckResult::Denied { .. }),
+            "Auto mode should deny tools not in allowlist"
+        );
+
+        let telemetry = ctx.read().await.telemetry();
+        assert_eq!(
+            telemetry.permission_requests, 0,
+            "Auto mode should never send mailbox requests"
+        );
+        assert_eq!(telemetry.tools_blocked, 1);
     }
 
     #[tokio::test]

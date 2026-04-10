@@ -487,6 +487,19 @@ fn print_progress_event(event: &astra_runtime::orchestration::AgentProgressEvent
         ProgressEventType::Cancelled { reason } => {
             format!("{} {}", "⊘ Cancelled:".yellow(), reason)
         }
+        ProgressEventType::PermissionDenied {
+            tool_name,
+            reason,
+            turn,
+        } => {
+            format!(
+                "{} tool={} turn={} — {}",
+                "🔒 Permission denied:".red(),
+                tool_name,
+                turn,
+                reason
+            )
+        }
     };
 
     eprintln!("  [{}] {}", time_str.as_str().dim(), msg);

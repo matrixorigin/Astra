@@ -108,6 +108,20 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
     >,
 ) {
     const PERMISSION_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+    const PERMISSION_REQUEST_TIMEOUT_BACKGROUND: Duration = Duration::from_secs(5);
+
+    // Choose shorter timeout for background agents to avoid long stalls
+    // when the parent is mid-LLM-call and not polling its mailbox.
+    let effective_permission_timeout = if let Some(ctx) = permission_context {
+        let guard = ctx.read().await;
+        if guard.inherited.is_background {
+            PERMISSION_REQUEST_TIMEOUT_BACKGROUND
+        } else {
+            PERMISSION_REQUEST_TIMEOUT
+        }
+    } else {
+        PERMISSION_REQUEST_TIMEOUT
+    };
 
     tool_results.clear();
 
@@ -286,7 +300,7 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
             args_str.as_deref(),
             permission_context,
             mailbox.as_deref_mut(),
-            PERMISSION_REQUEST_TIMEOUT,
+            effective_permission_timeout,
         )
         .await
         {

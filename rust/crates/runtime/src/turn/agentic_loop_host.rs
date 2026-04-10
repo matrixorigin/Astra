@@ -2090,6 +2090,23 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
             )
             .await;
         }
+
+        // ── Emit progress events for permission-denied tools so
+        //    parent/UI subscribers learn about blocked operations.
+        if let Some(ref emitter) = state.progress_emitter {
+            for rec in &state.tool_call_records {
+                if let Some(ref err) = rec.error {
+                    if err.starts_with("blocked_tool:") {
+                        emitter.permission_denied(
+                            &rec.name,
+                            err.trim_start_matches("blocked_tool: "),
+                            turn_index as u32,
+                        );
+                    }
+                }
+            }
+        }
+
         append_explain_turn_batch(
             &mut state.explain_turns,
             turn_result.accum.explain_turns.as_slice(),

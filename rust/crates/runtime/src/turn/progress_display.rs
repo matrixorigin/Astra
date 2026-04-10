@@ -148,6 +148,13 @@ impl ProgressDisplay {
                     agent.ended_at = Some(Instant::now());
                 }
             }
+
+            ProgressEventType::PermissionDenied { tool_name, .. } => {
+                // Track as a warning on the running agent; don't change status.
+                if let Some(agent) = self.agents.get_mut(agent_id) {
+                    agent.display_name = format!("{} (🔒 denied: {tool_name})", agent.display_name);
+                }
+            }
         }
     }
 

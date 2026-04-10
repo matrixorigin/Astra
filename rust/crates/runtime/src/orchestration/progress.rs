@@ -40,6 +40,12 @@ pub enum ProgressEventType {
     Failed { error: String },
     /// Agent cancelled.
     Cancelled { reason: String },
+    /// Tool blocked by permission policy (emitted so parent/UI can surface warnings).
+    PermissionDenied {
+        tool_name: String,
+        reason: String,
+        turn: u32,
+    },
 }
 
 /// Broadcasts progress events to multiple subscribers.
@@ -137,6 +143,19 @@ impl AgentProgressEmitter {
     pub fn cancelled(&self, reason: impl Into<String>) {
         self.emit(ProgressEventType::Cancelled {
             reason: reason.into(),
+        });
+    }
+
+    pub fn permission_denied(
+        &self,
+        tool_name: impl Into<String>,
+        reason: impl Into<String>,
+        turn: u32,
+    ) {
+        self.emit(ProgressEventType::PermissionDenied {
+            tool_name: tool_name.into(),
+            reason: reason.into(),
+            turn,
         });
     }
 
