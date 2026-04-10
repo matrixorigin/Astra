@@ -196,13 +196,23 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             agent_id: profile.agent_id.clone(),
         };
 
-        // Build system message from agent profile
-        let system_prompt = profile.system_prompt.clone().unwrap_or_else(|| {
-            format!(
-                "You are '{}', a specialized sub-agent. Complete the delegated task thoroughly.",
-                profile.name
-            )
-        });
+        // Build system message from agent profile.
+        // Always append the non-interactive directive so sub-agents never stall
+        // waiting for user input — they must make autonomous decisions.
+        const NON_INTERACTIVE: &str = "\n\nIMPORTANT: You are running as an autonomous sub-agent with no user present. \
+            Do NOT ask clarifying questions or prompt for input. \
+            Make reasonable assumptions and proceed to completion.";
+
+        let system_prompt = profile
+            .system_prompt
+            .as_deref()
+            .map(|p| format!("{p}{NON_INTERACTIVE}"))
+            .unwrap_or_else(|| {
+                format!(
+                    "You are '{}', a specialized sub-agent. Complete the delegated task thoroughly.{NON_INTERACTIVE}",
+                    profile.name
+                )
+            });
 
         // Build user message: task + optional context + previous_output
         let mut user_parts = vec![config.task.clone()];
