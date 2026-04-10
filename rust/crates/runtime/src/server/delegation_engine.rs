@@ -475,7 +475,7 @@ impl DelegationTracker {
                     );
                     SubRunState::Failed
                 }),
-                retry_of: None,
+                retry_of: rec.retry_of.clone(),
             };
 
             delegations
@@ -1182,6 +1182,23 @@ impl DelegationEngine {
                     let retry_config = config_builder();
                     let retry_run_id = retry_config.run_id.clone();
 
+                    astra_core::log_persist!(
+                        self.run_engine
+                            .start_run_ext(
+                                &retry_run_id,
+                                &retry_config.user_id,
+                                &retry_config.session_id,
+                                Some(parent_run_id),
+                                Some(delegation_id),
+                                Some(&retry_config.agent_profile.agent_id),
+                                Some(&original_run_id),
+                            )
+                            .await,
+                        "delegation",
+                        &retry_run_id,
+                        "start_retry_run"
+                    );
+
                     // Record retry sub-run with linkage to original
                     self.tracker
                         .record_sub_run(SubRunRecord {
@@ -1472,6 +1489,7 @@ impl DelegationEngine {
                     Some(&request.parent_run_id),
                     Some(&request.delegation_id),
                     Some(agent_id),
+                    None,
                 )
                 .await?;
 
@@ -1832,6 +1850,7 @@ impl DelegationEngine {
                     Some(&request.parent_run_id),
                     Some(&request.delegation_id),
                     Some(agent_id),
+                    None,
                 )
                 .await?;
 
@@ -2094,6 +2113,7 @@ impl DelegationEngine {
                     Some(&request.parent_run_id),
                     Some(&request.delegation_id),
                     Some(producer_id),
+                    None,
                 )
                 .await?;
             self.tracker
@@ -2278,6 +2298,7 @@ impl DelegationEngine {
                     Some(&request.parent_run_id),
                     Some(&request.delegation_id),
                     Some(reviewer_id),
+                    None,
                 )
                 .await?;
             self.tracker
@@ -2479,6 +2500,7 @@ impl DelegationEngine {
                     Some(&request.parent_run_id),
                     Some(&request.delegation_id),
                     Some(agent_id),
+                    None,
                 )
                 .await?;
             self.tracker
@@ -3858,6 +3880,7 @@ mod tests {
                 Some("parent-1"),
                 Some("del-1"),
                 Some("coder"),
+                None,
             )
             .await
             .unwrap();
@@ -3897,6 +3920,7 @@ mod tests {
                 Some("root"),
                 Some("del-1"),
                 Some("coder"),
+                None,
             )
             .await
             .unwrap();
@@ -3908,6 +3932,7 @@ mod tests {
                 Some("root"),
                 Some("del-1"),
                 Some("reviewer"),
+                None,
             )
             .await
             .unwrap();
@@ -3919,6 +3944,7 @@ mod tests {
                 Some("root"),
                 Some("del-2"),
                 Some("writer"),
+                None,
             )
             .await
             .unwrap();
@@ -3961,6 +3987,7 @@ mod tests {
                 parent_run_id: Some("parent-1".into()),
                 delegation_id: Some("del-1".into()),
                 agent_id: Some("coder".into()),
+                retry_of: None,
                 status: "completed".into(),
                 waiting_for: None,
                 checkpoint_json: None,
@@ -3980,6 +4007,7 @@ mod tests {
                 parent_run_id: Some("parent-1".into()),
                 delegation_id: Some("del-1".into()),
                 agent_id: Some("reviewer".into()),
+                retry_of: Some("sub-1".into()),
                 status: "paused".into(),
                 waiting_for: None,
                 checkpoint_json: None,
@@ -4000,6 +4028,7 @@ mod tests {
                 parent_run_id: None,
                 delegation_id: None,
                 agent_id: None,
+                retry_of: None,
                 status: "completed".into(),
                 waiting_for: None,
                 checkpoint_json: None,
@@ -4032,6 +4061,12 @@ mod tests {
         assert_eq!(
             tracker.get_agent_id("sub-1").await.as_deref(),
             Some("coder")
+        );
+        assert_eq!(
+            subs.iter()
+                .find(|sub| sub.run_id == "sub-2")
+                .and_then(|sub| sub.retry_of.as_deref()),
+            Some("sub-1")
         );
 
         // Paused sub-run gets pause flag

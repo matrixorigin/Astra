@@ -1660,8 +1660,8 @@ fn latest_context_trace_signal(state: &ReplState) -> Option<ContextTraceSignal> 
         tokens_before: trace.history.tokens_before,
         tokens_after: trace.history.tokens_after,
     });
-    let budget =
-        (trace.token_budget.max_tokens > 0 || trace.token_budget.total_used > 0).then_some({
+    let budget = (trace.token_budget.max_tokens > 0 || trace.token_budget.total_used > 0)
+        .then_some({
             ContextTraceBudgetSignal {
                 max_tokens: trace.token_budget.max_tokens,
                 total_used: trace.token_budget.total_used,

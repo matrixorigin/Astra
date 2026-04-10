@@ -848,9 +848,7 @@ impl UserProfileManager {
     /// Record a user query and update scenario detection.
     pub fn observe_query(&self, user_id: &str, query: &str) {
         let mut detectors = self.detectors.write().unwrap();
-        let detector = detectors
-            .entry(user_id.to_string())
-            .or_default();
+        let detector = detectors.entry(user_id.to_string()).or_default();
         detector.observe_query(query);
 
         // Update profile with new query count
@@ -869,9 +867,7 @@ impl UserProfileManager {
     /// Record a tool call.
     pub fn observe_tool(&self, user_id: &str, tool_name: &str) {
         let mut detectors = self.detectors.write().unwrap();
-        let detector = detectors
-            .entry(user_id.to_string())
-            .or_default();
+        let detector = detectors.entry(user_id.to_string()).or_default();
         detector.observe_tool(tool_name);
 
         // Update profile stats

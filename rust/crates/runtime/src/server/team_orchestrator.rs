@@ -191,6 +191,7 @@ impl TeamExecutionOrchestrator {
                 None,
                 None,
                 Some(&self.config.source_agent_id),
+                None,
             )
             .await
         {

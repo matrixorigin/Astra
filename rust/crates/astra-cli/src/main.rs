@@ -353,7 +353,6 @@ fn clear_panic_guard() {
     }
 }
 
-
 // CLI argument structs moved to cli/cli_args.rs
 use cli_args::*;
 
@@ -613,9 +612,7 @@ impl Default for ReplState {
             active_system_skills: Vec::new(),
             // Load RuntimeConfig from config files + env vars, then create
             // ContextBudget using the loaded config (M3 wiring).
-            runtime_config: {
-                astra_runtime::runtime_config::RuntimeConfig::load()
-            },
+            runtime_config: { astra_runtime::runtime_config::RuntimeConfig::load() },
             // Temporary: will be replaced with from_runtime_config when model is known
             context_budget: prompts::ContextBudget::default(),
             journal: None,
@@ -3453,11 +3450,11 @@ async fn run_chat_repl(
 // ---------------------------------------------------------------------------
 
 // Session cleanup moved to session_cleanup.rs
-use session_cleanup::finalize_session;
 use project_instructions::{
     discover_instructions_from_paths, discover_project_instructions, format_project_instructions,
     resolve_system_prompt,
 };
+use session_cleanup::finalize_session;
 
 // ════════════════════════════════════════════════════════════════ main ════
 

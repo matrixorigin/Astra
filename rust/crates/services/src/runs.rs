@@ -139,6 +139,8 @@ pub struct DurableRunRecord {
     pub delegation_id: Option<String>,
     /// Agent profile ID executing this run.
     pub agent_id: Option<String>,
+    /// If this run is a verification-gate retry, links to the original run.
+    pub retry_of: Option<String>,
     pub status: String,
     pub waiting_for: Option<String>,
     pub checkpoint_json: Option<String>,

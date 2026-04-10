@@ -66,7 +66,7 @@ impl RunEngine {
         user_id: &str,
         session_id: &str,
     ) -> Result<(), String> {
-        self.start_run_ext(run_id, user_id, session_id, None, None, None)
+        self.start_run_ext(run_id, user_id, session_id, None, None, None, None)
             .await
     }
 
@@ -79,6 +79,7 @@ impl RunEngine {
         parent_run_id: Option<&str>,
         delegation_id: Option<&str>,
         agent_id: Option<&str>,
+        retry_of: Option<&str>,
     ) -> Result<(), String> {
         let now = chrono::Utc::now().to_rfc3339();
         let record = DurableRunRecord {
@@ -88,6 +89,7 @@ impl RunEngine {
             parent_run_id: parent_run_id.map(ToString::to_string),
             delegation_id: delegation_id.map(ToString::to_string),
             agent_id: agent_id.map(ToString::to_string),
+            retry_of: retry_of.map(ToString::to_string),
             status: STATUS_RUNNING.to_string(),
             waiting_for: None,
             checkpoint_json: None,
@@ -221,6 +223,29 @@ mod tests {
         assert_eq!(run.session_id, "sess-1");
         assert_eq!(run.status, "running");
         assert_eq!(run.events.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn start_run_ext_persists_retry_linkage() {
+        let engine = test_engine();
+        engine
+            .start_run_ext(
+                "run-retry",
+                "user-1",
+                "sess-1",
+                Some("parent-1"),
+                Some("del-1"),
+                Some("coder"),
+                Some("run-original"),
+            )
+            .await
+            .unwrap();
+
+        let run = engine.load_run("run-retry").await.unwrap().unwrap();
+        assert_eq!(run.parent_run_id.as_deref(), Some("parent-1"));
+        assert_eq!(run.delegation_id.as_deref(), Some("del-1"));
+        assert_eq!(run.agent_id.as_deref(), Some("coder"));
+        assert_eq!(run.retry_of.as_deref(), Some("run-original"));
     }
 
     #[tokio::test]
