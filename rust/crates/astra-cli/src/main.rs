@@ -3451,9 +3451,10 @@ async fn run_chat_repl(
 
 // Session cleanup moved to session_cleanup.rs
 use project_instructions::{
-    discover_instructions_from_paths, discover_project_instructions, format_project_instructions,
-    resolve_system_prompt,
+    discover_project_instructions, format_project_instructions, resolve_system_prompt,
 };
+#[cfg(test)]
+use project_instructions::discover_instructions_from_paths;
 use session_cleanup::finalize_session;
 
 // ════════════════════════════════════════════════════════════════ main ════
