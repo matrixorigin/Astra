@@ -99,6 +99,10 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/tools", "Tool performance: calls, timing, success rate"),
     ("/health", "Tool health dashboard"),
     ("/lsp", "LSP backend status: /lsp [status]"),
+    (
+        "/telemetry",
+        "Session telemetry: turns, drift, decisions, profile",
+    ),
     ("/learn", "Learning insights: patterns, drift, exploration"),
     ("/sync", "Cloud sync status and push"),
     ("/context", "Context window / budget summary"),
@@ -1376,7 +1380,7 @@ pub(super) fn print_slash_commands(query: Option<&str>) {
             "Observability",
             &[
                 "/explain", "/verbose", "/compact", "/reflect", "/turn", "/debug", "/stats",
-                "/cost", "/tools", "/health", "/sync", "/learn", "/context", "/rewind", "/version",
+                "/cost", "/tools", "/health", "/telemetry", "/sync", "/learn", "/context", "/rewind", "/version",
             ],
         ),
         (
