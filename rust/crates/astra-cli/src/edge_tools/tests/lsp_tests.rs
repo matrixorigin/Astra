@@ -985,6 +985,10 @@ fn lsp_rust_session_sends_rust_analyzer_init_and_configuration() {
         Some(true)
     );
     assert_eq!(
+        initialize["payload"]["capabilities"]["textDocument"]["hover"]["contentFormat"][0].as_str(),
+        Some("markdown")
+    );
+    assert_eq!(
         initialize["payload"]["capabilities"]["textDocument"]["completion"]["completionItem"]
             ["resolveSupport"]["properties"][2]
             .as_str(),
@@ -2758,6 +2762,58 @@ fn lsp_completions_apply_selected_item_with_real_rust_analyzer() {
     assert!(
         !updated.contains("${"),
         "snippet placeholders should be stripped: {updated}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "manual validation with real rust-analyzer"]
+#[serial_test::serial]
+fn lsp_hover_returns_markdown_with_real_rust_analyzer() {
+    if !real_rust_analyzer_available() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let _cmd_guard = EnvGuard::unset("ASTRA_RUST_ANALYZER_CMD");
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname=\"demo\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(
+        dir.path().join("src/lib.rs"),
+        "pub fn demo() {\n    let s = String::new();\n    let _ = s.len();\n}\n",
+    )
+    .unwrap();
+    let exe = ToolExecutor::new(dir.path());
+
+    let mut hover = None;
+    for _ in 0..12 {
+        let candidate = exe.lsp(&json!({
+            "operation": "hover",
+            "file": "src/lib.rs",
+            "line": 2,
+            "column": 13
+        }));
+        let parsed: serde_json::Value = serde_json::from_str(&candidate).unwrap();
+        if parsed["result"]["contents"]["kind"].as_str().is_some() {
+            hover = Some((candidate, parsed));
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    let (hover, parsed) =
+        hover.unwrap_or_else(|| panic!("real rust-analyzer never returned hover"));
+    assert_eq!(
+        parsed["method"].as_str(),
+        Some("textDocument/hover"),
+        "{hover}"
+    );
+    assert_eq!(
+        parsed["result"]["contents"]["kind"].as_str(),
+        Some("markdown"),
+        "{hover}"
     );
 }
 

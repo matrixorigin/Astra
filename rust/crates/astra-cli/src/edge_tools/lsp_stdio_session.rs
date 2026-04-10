@@ -309,6 +309,9 @@ impl LspStdioSession {
                     "didSave": true
                 },
                 "publishDiagnostics": {},
+                "hover": {
+                    "contentFormat": ["markdown", "plaintext"]
+                },
                 "completion": {
                     "completionItem": {
                         "snippetSupport": true,
