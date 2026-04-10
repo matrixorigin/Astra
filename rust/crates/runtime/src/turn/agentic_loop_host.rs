@@ -1345,7 +1345,19 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
             AgenticIngestIterationControl::ProceedWithToolCalls => {}
         }
 
-        // ─── Step 2b: Token budget guard ─────────────────────────────────
+        // ─── Step 2a: Emit LLM text output for sub-run progress visibility ──
+        // In sub-run mode (quiet=false, no interactive terminal), the LLM's
+        // text response is the primary signal of agent activity. Emit a
+        // truncated preview so the parent process can show real-time progress.
+        if !quiet && !state.final_text.is_empty() {
+            let preview: String = state.final_text.chars().take(120).collect();
+            let line = if state.final_text.len() > 120 {
+                format!("{preview}…")
+            } else {
+                preview
+            };
+            host.emit_headless_line(HeadlessStderrStyle::Dim, line);
+        }
         // If the last LLM call's prompt_tokens exceeds max_turn_input_tokens,
         // inject a wrap-up system message and skip tool execution.  The loop
         // continues for exactly one more iteration so the model can produce a
