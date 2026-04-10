@@ -1063,6 +1063,11 @@ fn maybe_run_tuning_cycle(state: &mut AgenticLoopState) {
             actions
         );
     }
+
+    // Persist feedback state after each tuning cycle
+    if let Err(e) = crate::auto_tuning::save_feedback("default", hub.tuning()) {
+        eprintln!("[auto-tuning] failed to persist feedback: {e}");
+    }
 }
 
 async fn run_agentic_loop_impl<H: AgenticLoopHost>(

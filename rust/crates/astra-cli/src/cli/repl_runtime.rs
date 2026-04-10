@@ -574,6 +574,13 @@ pub(super) fn initialize_repl_state(
         astra_runtime::observability_integration::ObservabilityHub::with_storage(obs_path),
     ));
 
+    // Restore persisted feedback aggregator state (if any)
+    if let Some(ref hub) = state.observability_hub {
+        if let Err(e) = astra_runtime::auto_tuning::load_feedback("default", hub.tuning()) {
+            eprintln!("[auto-tuning] failed to load feedback: {e}");
+        }
+    }
+
     state
 }
 

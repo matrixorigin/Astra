@@ -241,7 +241,7 @@ pub enum RollbackCondition {
 // ─── Rule Evaluation ────────────────────────────────────────────────────────
 
 /// Tracks feedback signals for rule evaluation.
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct FeedbackAggregator {
     /// Recent signals.
     signals: VecDeque<FeedbackSignal>,
@@ -796,6 +796,20 @@ impl AutoTuningEngine {
             }
         }
     }
+
+    /// Serialize the feedback aggregator state for persistence.
+    pub fn save_aggregator(&self) -> Result<Vec<u8>, String> {
+        let agg = self.aggregator.read().unwrap();
+        serde_json::to_vec_pretty(&*agg).map_err(|e| format!("serialize aggregator: {e}"))
+    }
+
+    /// Restore feedback aggregator state from persisted data.
+    pub fn load_aggregator(&self, data: &[u8]) -> Result<(), String> {
+        let loaded: FeedbackAggregator =
+            serde_json::from_slice(data).map_err(|e| format!("deserialize aggregator: {e}"))?;
+        *self.aggregator.write().unwrap() = loaded;
+        Ok(())
+    }
 }
 
 fn get_config_value(config: &RuntimeConfig, path: &str) -> Option<serde_json::Value> {
@@ -837,6 +851,39 @@ fn apply_config_value(config: &mut RuntimeConfig, path: &str, value: &serde_json
             }
         }
         _ => {}
+    }
+}
+
+// ─── Feedback Persistence ───────────────────────────────────────────────────
+
+/// Path for a profile's feedback state file.
+pub fn feedback_path(profile: &str) -> std::path::PathBuf {
+    crate::pipeline::persistence::learning_dir().join(format!("{profile}.feedback.json"))
+}
+
+/// Save feedback aggregator state atomically.
+pub fn save_feedback(profile: &str, engine: &AutoTuningEngine) -> Result<(), String> {
+    let path = feedback_path(profile);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("mkdir: {e}"))?;
+    }
+    let data = engine.save_aggregator()?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, &data).map_err(|e| format!("write: {e}"))?;
+    std::fs::rename(&tmp, &path).map_err(|e| format!("rename: {e}"))?;
+    Ok(())
+}
+
+/// Load feedback aggregator state from disk (graceful — returns Ok(false) if missing).
+pub fn load_feedback(profile: &str, engine: &AutoTuningEngine) -> Result<bool, String> {
+    let path = feedback_path(profile);
+    match std::fs::read(&path) {
+        Ok(data) => {
+            engine.load_aggregator(&data)?;
+            Ok(true)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(format!("read feedback: {e}")),
     }
 }
 
@@ -1097,5 +1144,82 @@ mod tests {
         // Disable and check
         engine.set_enabled(false);
         assert_eq!(engine.evaluate(&config).len(), 0);
+    }
+
+    #[test]
+    fn aggregator_round_trip_serialization() {
+        let engine = AutoTuningEngine::new();
+        engine.record_feedback(FeedbackSignal::new(SignalType::TaskSuccess));
+        engine.record_feedback(FeedbackSignal::new(SignalType::TaskFailure {
+            reason: "test".into(),
+        }));
+        engine.record_feedback(FeedbackSignal::new(SignalType::HighTokenUsage {
+            tokens: 5000,
+            threshold: 4000,
+        }));
+
+        let data = engine.save_aggregator().expect("save should succeed");
+
+        let engine2 = AutoTuningEngine::new();
+        engine2.load_aggregator(&data).expect("load should succeed");
+
+        // Verify signals survived round-trip
+        let config = RuntimeConfig::default();
+        engine2.add_rule(EvolutionRule::new(
+            "low-success",
+            EvolutionTrigger::LowSuccessRate {
+                threshold: 0.8,
+                window_secs: 3600,
+                min_samples: 1,
+            },
+            EvolutionAction::Alert {
+                message: "test".into(),
+                severity: AlertSeverity::Info,
+            },
+        ));
+        let triggered = engine2.evaluate(&config);
+        // 1 success / 2 total = 0.5 < 0.8 threshold
+        assert!(
+            !triggered.is_empty(),
+            "restored signals should trigger rule"
+        );
+    }
+
+    #[test]
+    fn save_load_feedback_file_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = "test-persist";
+        let path = dir.path().join(format!("{profile}.feedback.json"));
+
+        let engine = AutoTuningEngine::new();
+        engine.record_feedback(FeedbackSignal::new(SignalType::TaskSuccess));
+        engine.record_feedback(FeedbackSignal::new(SignalType::TaskSuccess));
+
+        // Save directly to temp path (bypass learning_dir)
+        let data = engine.save_aggregator().unwrap();
+        std::fs::write(&path, &data).unwrap();
+
+        // Load into new engine
+        let engine2 = AutoTuningEngine::new();
+        let loaded = std::fs::read(&path).unwrap();
+        engine2.load_aggregator(&loaded).unwrap();
+
+        let config = RuntimeConfig::default();
+        engine2.add_rule(EvolutionRule::new(
+            "acc",
+            EvolutionTrigger::SignalAccumulation {
+                signal_type: "task_success".into(),
+                count: 2,
+                window_secs: 3600,
+            },
+            EvolutionAction::Alert {
+                message: "ok".into(),
+                severity: AlertSeverity::Info,
+            },
+        ));
+        assert!(
+            !engine2.evaluate(&config).is_empty(),
+            "loaded 2 success signals should trigger"
+        );
     }
 }
