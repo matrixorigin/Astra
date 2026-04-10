@@ -1187,7 +1187,12 @@ pub fn all_tool_schemas() -> Vec<Value> {
                         },
                         "dry_run": {
                             "type": "boolean",
-                            "description": "For rename, preview by default. Set false to apply the rename when the active LSP backend or fallback rename path supports it."
+                            "description": "Preview by default. Set false to apply a supported rename or code action edit."
+                        },
+                        "action_index": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "description": "For code_actions apply, choose which returned action to apply by index (default: 0)."
                         },
                         "scope": {
                             "type": "string",

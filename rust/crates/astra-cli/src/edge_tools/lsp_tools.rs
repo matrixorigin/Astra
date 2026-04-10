@@ -173,13 +173,18 @@ impl ToolExecutor {
         Ok(line_start + byte_in_line)
     }
 
-    fn apply_lsp_workspace_edit(&self, workspace_edit: &Value) -> Result<String, String> {
+    fn apply_lsp_workspace_edit(
+        &self,
+        operation: &str,
+        method: &str,
+        workspace_edit: &Value,
+    ) -> Result<String, String> {
         let edits_by_path = self.collect_workspace_edit_changes(workspace_edit)?;
         if edits_by_path.is_empty() {
             return Ok(json!({
                 "backend": "lsp",
-                "operation": "rename",
-                "method": "textDocument/rename",
+                "operation": operation,
+                "method": method,
                 "applied": true,
                 "files_changed": 0,
                 "edits_applied": 0,
@@ -254,8 +259,8 @@ impl ToolExecutor {
 
         Ok(json!({
             "backend": "lsp",
-            "operation": "rename",
-            "method": "textDocument/rename",
+            "operation": operation,
+            "method": method,
             "applied": true,
             "files_changed": files_changed,
             "edits_applied": edits_applied,
@@ -386,7 +391,7 @@ impl ToolExecutor {
         file: &str,
         line: usize,
         column: usize,
-    ) -> Result<Option<String>, String> {
+    ) -> Result<Option<Value>, String> {
         let (file_path, position_params) = self.lsp_position_params(file, line, column)?;
         let uri = position_params
             .get("textDocument")
@@ -424,11 +429,7 @@ impl ToolExecutor {
                     }
                 }),
             )
-            .map(|result| {
-                result.map(|value| {
-                    Self::active_lsp_response("code_actions", "textDocument/codeAction", value)
-                })
-            })
+            .map_err(|e| e.to_string())
     }
 
     fn try_active_call_hierarchy(
@@ -499,6 +500,11 @@ impl ToolExecutor {
         let query = args.get("query").and_then(Value::as_str);
         let new_name = args.get("new_name").and_then(Value::as_str);
         let dry_run = args.get("dry_run").and_then(Value::as_bool).unwrap_or(true);
+        let action_index = args
+            .get("action_index")
+            .and_then(Value::as_u64)
+            .map(|idx| idx as usize)
+            .unwrap_or(0);
         let scope = args.get("scope").and_then(Value::as_str).unwrap_or("file");
         let include_body = args
             .get("include_body")
@@ -697,10 +703,16 @@ impl ToolExecutor {
                         Ok(Some(result)) if dry_run => {
                             Self::active_lsp_response(operation, "textDocument/rename", result)
                         }
-                        Ok(Some(result)) => match self.apply_lsp_workspace_edit(&result) {
-                            Ok(applied) => applied,
-                            Err(error) => json!({ "error": error }).to_string(),
-                        },
+                        Ok(Some(result)) => {
+                            match self.apply_lsp_workspace_edit(
+                                "rename",
+                                "textDocument/rename",
+                                &result,
+                            ) {
+                                Ok(applied) => applied,
+                                Err(error) => json!({ "error": error }).to_string(),
+                            }
+                        }
                         Ok(None) => {
                             if let Some(sym) = symbol {
                                 self.rename_symbol(&json!({
@@ -732,7 +744,42 @@ impl ToolExecutor {
             "code_actions" => {
                 if let (Some(f), Some(l), Some(c)) = (file, line, column) {
                     match self.try_active_code_actions(f, l, c) {
-                        Ok(Some(result)) => result,
+                        Ok(Some(result)) if dry_run => {
+                            Self::active_lsp_response(
+                                "code_actions",
+                                "textDocument/codeAction",
+                                result,
+                            )
+                        }
+                        Ok(Some(result)) => {
+                            let Some(actions) = result.as_array() else {
+                                return json!({
+                                    "error": "code_actions returned a non-array result from the active LSP backend"
+                                }).to_string();
+                            };
+                            let Some(action) = actions.get(action_index) else {
+                                return json!({
+                                    "error": format!(
+                                        "code_actions action_index {} out of range ({} actions)",
+                                        action_index,
+                                        actions.len()
+                                    )
+                                }).to_string();
+                            };
+                            let Some(workspace_edit) = action.get("edit") else {
+                                return json!({
+                                    "error": "selected code action does not include an editable WorkspaceEdit"
+                                }).to_string();
+                            };
+                            match self.apply_lsp_workspace_edit(
+                                "code_actions",
+                                "textDocument/codeAction",
+                                workspace_edit,
+                            ) {
+                                Ok(applied) => applied,
+                                Err(error) => json!({ "error": error }).to_string(),
+                            }
+                        }
                         Ok(None) => json!({
                             "error": "code_actions requires an active LSP backend for that file"
                         }).to_string(),
