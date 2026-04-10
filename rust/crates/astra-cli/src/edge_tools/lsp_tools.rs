@@ -485,7 +485,7 @@ impl ToolExecutor {
                 "error": "Missing required 'operation' parameter",
                 "valid_operations": [
                     "goto_definition", "find_references", "hover", "document_symbols",
-                    "workspace_symbols", "call_hierarchy", "incoming_calls", "outgoing_calls", "rename", "code_actions", "completions", "signature_help", "diagnostics"
+                    "workspace_symbols", "call_hierarchy", "incoming_calls", "outgoing_calls", "implementation", "rename", "code_actions", "completions", "signature_help", "diagnostics"
                 ]
             }).to_string(),
         };
@@ -564,6 +564,43 @@ impl ToolExecutor {
                 } else {
                     json!({
                         "error": "find_references requires 'symbol' parameter"
+                    }).to_string()
+                }
+            }
+
+            "implementation" => {
+                if let (Some(f), Some(l), Some(c)) = (file, line, column) {
+                    match self.try_active_position_request(
+                        operation,
+                        f,
+                        l,
+                        c,
+                        "textDocument/implementation",
+                        None,
+                    ) {
+                        Ok(Some(result)) => result,
+                        Ok(None) => {
+                            if let Some(sym) = symbol {
+                                self.type_hierarchy(&json!({
+                                    "name": sym,
+                                    "direction": "implementations"
+                                }))
+                            } else {
+                                json!({
+                                    "error": "implementation requires an active LSP backend for position-based lookup, or 'symbol' for fallback type_hierarchy behavior"
+                                }).to_string()
+                            }
+                        }
+                        Err(error) => json!({ "error": error }).to_string(),
+                    }
+                } else if let Some(sym) = symbol {
+                    self.type_hierarchy(&json!({
+                        "name": sym,
+                        "direction": "implementations"
+                    }))
+                } else {
+                    json!({
+                        "error": "implementation requires either 'file'+'line'+'column' or 'symbol'"
                     }).to_string()
                 }
             }
@@ -857,6 +894,7 @@ impl ToolExecutor {
                             "document_symbols": true,
                             "workspace_symbols": true,
                             "call_hierarchy": true,
+                            "implementation": true,
                             "rename": true,
                             "code_actions": true,
                             "completions": true,
@@ -876,7 +914,7 @@ impl ToolExecutor {
                 "error": format!("Unknown operation: {}", operation),
                 "valid_operations": [
                     "goto_definition", "find_references", "hover", "document_symbols",
-                    "workspace_symbols", "call_hierarchy", "incoming_calls", "outgoing_calls", "rename", "code_actions", "completions", "signature_help", "diagnostics"
+                    "workspace_symbols", "call_hierarchy", "incoming_calls", "outgoing_calls", "implementation", "rename", "code_actions", "completions", "signature_help", "diagnostics"
                 ]
             }).to_string()
         }

@@ -1158,6 +1158,7 @@ pub fn all_tool_schemas() -> Vec<Value> {
                                 "call_hierarchy",
                                 "incoming_calls",
                                 "outgoing_calls",
+                                "implementation",
                                 "rename",
                                 "code_actions",
                                 "completions",
