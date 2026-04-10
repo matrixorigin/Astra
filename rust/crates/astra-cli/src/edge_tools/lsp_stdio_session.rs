@@ -46,6 +46,11 @@ pub(crate) struct LspSpawnSpec {
     pub diagnostic_title: &'static str,
     pub attachment_source: &'static str,
     pub language_policy: LanguageIdPolicy,
+    pub initialization_options: Option<Value>,
+    pub configuration_section: Option<&'static str>,
+    pub configuration_value: Option<Value>,
+    pub did_change_configuration: Option<Value>,
+    pub experimental_capabilities: Option<Value>,
 }
 
 type StdinShared = Arc<Mutex<BufWriter<std::process::ChildStdin>>>;
@@ -162,6 +167,8 @@ fn reader_loop(
     pending: Arc<Mutex<Vec<Value>>>,
     latest_diags: Arc<Mutex<HashMap<String, Value>>>,
     pending_requests: Arc<Mutex<HashMap<u64, Sender<io::Result<Value>>>>>,
+    configuration_section: Option<String>,
+    configuration_value: Option<Value>,
 ) {
     while let Ok(msg) = read_frame(&mut reader) {
         if let Some(id) = msg.get("id").and_then(Value::as_u64)
@@ -200,12 +207,26 @@ fn reader_loop(
             if let Some(id) = msg.get("id") {
                 let result = match method {
                     "workspace/configuration" => {
-                        let n = msg
+                        let items = msg
                             .pointer("/params/items")
                             .and_then(|x| x.as_array())
-                            .map(|a| a.len())
-                            .unwrap_or(0);
-                        Value::Array(vec![Value::Null; n])
+                            .cloned()
+                            .unwrap_or_default();
+                        Value::Array(
+                            items
+                                .into_iter()
+                                .map(|item| {
+                                    if let Some(section) =
+                                        item.get("section").and_then(Value::as_str)
+                                        && configuration_section.as_deref() == Some(section)
+                                    {
+                                        configuration_value.clone().unwrap_or_else(|| json!({}))
+                                    } else {
+                                        Value::Null
+                                    }
+                                })
+                                .collect(),
+                        )
                     }
                     "client/registerCapability" | "client/unregisterCapability" => Value::Null,
                     "window/workDoneProgress/create" => Value::Null,
@@ -233,6 +254,11 @@ impl LspStdioSession {
             diagnostic_title,
             attachment_source,
             language_policy,
+            initialization_options,
+            configuration_section,
+            configuration_value,
+            did_change_configuration,
+            experimental_capabilities,
         } = spec;
 
         let mut child = match Command::new(&command)
@@ -270,31 +296,42 @@ impl LspStdioSession {
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "workspace".into());
 
-        let init = json!({
+        let mut capabilities = json!({
+            "workspace": {
+                "configuration": true,
+                "workspaceFolders": true
+            },
+            "textDocument": {
+                "synchronization": {
+                    "dynamicRegistration": false,
+                    "willSave": false,
+                    "willSaveWaitUntil": false,
+                    "didSave": true
+                },
+                "publishDiagnostics": {}
+            }
+        });
+        if let Some(experimental) = experimental_capabilities
+            && let Some(root) = capabilities.as_object_mut()
+        {
+            root.insert("experimental".to_string(), experimental);
+        }
+        let mut init = json!({
             "jsonrpc": "2.0",
             "id": 1,
             "method": "initialize",
             "params": {
                 "processId": std::process::id(),
                 "rootUri": root_uri,
-                "capabilities": {
-                    "workspace": {
-                        "configuration": true,
-                        "workspaceFolders": true
-                    },
-                    "textDocument": {
-                        "synchronization": {
-                            "dynamicRegistration": false,
-                            "willSave": false,
-                            "willSaveWaitUntil": false,
-                            "didSave": true
-                        },
-                        "publishDiagnostics": {}
-                    }
-                },
+                "capabilities": capabilities,
                 "workspaceFolders": [{ "uri": root_uri, "name": name }]
             }
         });
+        if let Some(initialization_options) = initialization_options
+            && let Some(params) = init.get_mut("params").and_then(Value::as_object_mut)
+        {
+            params.insert("initializationOptions".to_string(), initialization_options);
+        }
         {
             let mut w = stdin
                 .lock()
@@ -332,6 +369,19 @@ impl LspStdioSession {
                 .map_err(|_| io::Error::other("stdin mutex poisoned"))?;
             write_frame(&mut *w, &initialized)?;
         }
+        if let Some(settings) = did_change_configuration {
+            let did_change_configuration = json!({
+                "jsonrpc": "2.0",
+                "method": "workspace/didChangeConfiguration",
+                "params": {
+                    "settings": settings,
+                }
+            });
+            let mut w = stdin
+                .lock()
+                .map_err(|_| io::Error::other("stdin mutex poisoned"))?;
+            write_frame(&mut *w, &did_change_configuration)?;
+        }
 
         let pending_diags = Arc::new(Mutex::new(Vec::new()));
         let pending_clone = Arc::clone(&pending_diags);
@@ -347,6 +397,8 @@ impl LspStdioSession {
                 pending_clone,
                 latest_diags_reader,
                 pending_requests_reader,
+                configuration_section.map(str::to_string),
+                configuration_value,
             );
         });
 

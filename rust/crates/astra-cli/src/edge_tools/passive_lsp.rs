@@ -56,12 +56,46 @@ fn typescript_server_cmd() -> String {
 }
 
 fn rust_spawn_spec() -> LspSpawnSpec {
+    let configuration = serde_json::json!({
+        "lens": {
+            "enable": true,
+            "run": { "enable": true },
+            "debug": { "enable": true },
+            "references": { "enable": true },
+            "impls": { "enable": true }
+        },
+        "runnables": {
+            "extraArgs": [],
+            "extraEnv": {}
+        }
+    });
     LspSpawnSpec {
         command: rust_analyzer_cmd(),
         args: Vec::new(),
         diagnostic_title: "rust-analyzer",
         attachment_source: "rust_analyzer_lsp",
         language_policy: LanguageIdPolicy::Fixed("rust"),
+        initialization_options: Some(configuration.clone()),
+        configuration_section: Some("rust-analyzer"),
+        configuration_value: Some(configuration),
+        did_change_configuration: Some(serde_json::json!({
+            "rust-analyzer": {
+                "lens": {
+                    "enable": true,
+                    "run": { "enable": true },
+                    "debug": { "enable": true },
+                    "references": { "enable": true },
+                    "impls": { "enable": true }
+                },
+                "runnables": {
+                    "extraArgs": [],
+                    "extraEnv": {}
+                }
+            }
+        })),
+        experimental_capabilities: Some(serde_json::json!({
+            "snippetTextEdit": true
+        })),
     }
 }
 
@@ -72,6 +106,11 @@ fn typescript_spawn_spec() -> LspSpawnSpec {
         diagnostic_title: "typescript-language-server",
         attachment_source: "typescript_lsp",
         language_policy: LanguageIdPolicy::TypeScript,
+        initialization_options: None,
+        configuration_section: None,
+        configuration_value: None,
+        did_change_configuration: None,
+        experimental_capabilities: None,
     }
 }
 

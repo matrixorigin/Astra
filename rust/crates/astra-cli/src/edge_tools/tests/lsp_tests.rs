@@ -34,6 +34,9 @@ def write_frame(payload):
     sys.stdout.buffer.flush()
 
 LOG_PATH = os.environ.get("FAKE_LSP_LOG")
+CAPTURE_PATH = os.environ.get("FAKE_LSP_CAPTURE")
+REQUEST_CONFIG = os.environ.get("FAKE_LSP_REQUEST_CONFIG") == "1"
+CONFIG_REQUEST_ID = 9001
 
 def log_event(name):
     if not LOG_PATH:
@@ -41,13 +44,22 @@ def log_event(name):
     with open(LOG_PATH, "a", encoding="utf-8") as fh:
         fh.write(name + "\n")
 
+def capture(kind, payload):
+    if not CAPTURE_PATH:
+        return
+    with open(CAPTURE_PATH, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps({"kind": kind, "payload": payload}) + "\n")
+
 while True:
     message = read_frame()
     if message is None:
         break
     method = message.get("method")
     msg_id = message.get("id")
+    if msg_id == CONFIG_REQUEST_ID and "result" in message:
+        capture("workspace/configuration", message["result"])
     if method == "initialize":
+        capture("initialize", message.get("params"))
         write_frame({
             "jsonrpc": "2.0",
             "id": msg_id,
@@ -88,6 +100,18 @@ while True:
                 }
             }
         })
+    elif method == "initialized":
+        if REQUEST_CONFIG:
+            write_frame({
+                "jsonrpc": "2.0",
+                "id": CONFIG_REQUEST_ID,
+                "method": "workspace/configuration",
+                "params": {
+                    "items": [{"section": "rust-analyzer"}]
+                }
+            })
+    elif method == "workspace/didChangeConfiguration":
+        capture("workspace/didChangeConfiguration", message.get("params"))
     elif method == "textDocument/documentSymbol":
         uri = message["params"]["textDocument"]["uri"]
         write_frame({
@@ -686,6 +710,31 @@ fn count_occurrences(haystack: &str, needle: &str) -> usize {
 }
 
 #[cfg(unix)]
+fn read_capture_entries(path: &std::path::Path) -> Vec<Value> {
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|content| {
+            content
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[cfg(unix)]
+fn wait_for_capture_entries(path: &std::path::Path, min_entries: usize) -> Vec<Value> {
+    for _ in 0..20 {
+        let entries = read_capture_entries(path);
+        if entries.len() >= min_entries {
+            return entries;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    read_capture_entries(path)
+}
+
+#[cfg(unix)]
 fn real_rust_analyzer_available() -> bool {
     let dir = tempfile::tempdir().unwrap();
     let _cmd_guard = EnvGuard::unset("ASTRA_RUST_ANALYZER_CMD");
@@ -793,6 +842,70 @@ fn lsp_diagnostics_returns_capabilities() {
             .is_some()
     );
     assert!(parsed["active_backends"]["rust"]["workspace_detected"].is_boolean());
+}
+
+#[cfg(unix)]
+#[test]
+#[serial_test::serial]
+fn lsp_rust_session_sends_rust_analyzer_init_and_configuration() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname=\"demo\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(
+        dir.path().join("src/lib.rs"),
+        "pub fn hello_from_lsp() {}\n",
+    )
+    .unwrap();
+    let script = fake_lsp_server_script(dir.path());
+    let capture = dir.path().join("fake-lsp-capture.jsonl");
+    let _cmd_guard = EnvGuard::set("ASTRA_RUST_ANALYZER_CMD", script.to_str().unwrap());
+    let _capture_guard = EnvGuard::set("FAKE_LSP_CAPTURE", capture.to_str().unwrap());
+    let _request_config_guard = EnvGuard::set("FAKE_LSP_REQUEST_CONFIG", "1");
+    let exe = ToolExecutor::new(dir.path());
+
+    let result = exe.lsp(&json!({
+        "operation": "document_symbols",
+        "file": "src/lib.rs"
+    }));
+    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+    assert_eq!(parsed["backend"].as_str(), Some("lsp"));
+
+    let entries = wait_for_capture_entries(&capture, 3);
+    let initialize = entries
+        .iter()
+        .find(|entry| entry["kind"].as_str() == Some("initialize"))
+        .unwrap();
+    assert_eq!(
+        initialize["payload"]["initializationOptions"]["lens"]["enable"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(
+        initialize["payload"]["capabilities"]["experimental"]["snippetTextEdit"].as_bool(),
+        Some(true)
+    );
+
+    let did_change_configuration = entries
+        .iter()
+        .find(|entry| entry["kind"].as_str() == Some("workspace/didChangeConfiguration"))
+        .unwrap();
+    assert_eq!(
+        did_change_configuration["payload"]["settings"]["rust-analyzer"]["lens"]["run"]["enable"]
+            .as_bool(),
+        Some(true)
+    );
+
+    let workspace_configuration = entries
+        .iter()
+        .find(|entry| entry["kind"].as_str() == Some("workspace/configuration"))
+        .unwrap();
+    assert_eq!(
+        workspace_configuration["payload"][0]["lens"]["debug"]["enable"].as_bool(),
+        Some(true)
+    );
 }
 
 #[cfg(unix)]
