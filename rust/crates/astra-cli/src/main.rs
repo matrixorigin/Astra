@@ -1553,6 +1553,17 @@ impl Default for ReplState {
     }
 }
 
+impl ReplState {
+    /// Unregister and drop the root mailbox so a subsequent turn can
+    /// re-register without agent_id collision.
+    async fn unregister_root_mailbox(&mut self) {
+        if let Some(mailbox) = self.root_mailbox.take() {
+            let addr = mailbox.address.clone();
+            let _ = mailbox.router().unregister(&addr).await;
+        }
+    }
+}
+
 // ═════════════════════════════════════════════════════════ ReplHelper ════
 
 // ═════════════════════════════════════════════════════════ Clipboard ══════
