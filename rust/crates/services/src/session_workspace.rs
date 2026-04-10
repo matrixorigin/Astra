@@ -15,6 +15,175 @@ fn is_zero(v: &usize) -> bool {
     *v == 0
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ContextTraceToolSelection {
+    #[serde(default)]
+    pub tools_available: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub selected_tools: Vec<String>,
+    #[serde(default)]
+    pub rejected_tools: usize,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub strategy: String,
+    #[serde(default)]
+    pub confidence: f64,
+    #[serde(default)]
+    pub latency_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ContextTraceMemorySignal {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub query: String,
+    #[serde(default)]
+    pub candidates_considered: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub selected_memory_ids: Vec<String>,
+    #[serde(default)]
+    pub total_tokens: u32,
+    #[serde(default)]
+    pub latency_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ContextTraceHistorySignal {
+    #[serde(default)]
+    pub total_turns_available: u32,
+    #[serde(default)]
+    pub retained_turns: usize,
+    #[serde(default)]
+    pub compressed_turns: usize,
+    #[serde(default)]
+    pub dropped_turns: usize,
+    #[serde(default)]
+    pub compression_ratio: f64,
+    #[serde(default)]
+    pub tokens_before: u32,
+    #[serde(default)]
+    pub tokens_after: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ContextTraceBudgetSignal {
+    #[serde(default)]
+    pub max_tokens: u32,
+    #[serde(default)]
+    pub total_used: u32,
+    #[serde(default)]
+    pub budget_pressure: f64,
+    #[serde(default)]
+    pub compression_triggered: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ContextTraceTimingSignal {
+    #[serde(default)]
+    pub turn: u32,
+    #[serde(default)]
+    pub context_assembly_ms: u64,
+    #[serde(default)]
+    pub ttft_ms: u64,
+    #[serde(default)]
+    pub llm_total_ms: u64,
+    #[serde(default)]
+    pub tool_execution_ms: u64,
+    #[serde(default)]
+    pub total_ms: u64,
+}
+
+/// Canonical per-turn cloud/local trace signal for resume and auto-tuning.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ContextTraceSignal {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub turn_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub captured_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_selection: Option<ContextTraceToolSelection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<ContextTraceMemorySignal>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history: Option<ContextTraceHistorySignal>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget: Option<ContextTraceBudgetSignal>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timing: Option<ContextTraceTimingSignal>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub explanations: Vec<String>,
+}
+
+impl ContextTraceSignal {
+    pub fn preview(&self) -> String {
+        let mut parts = Vec::new();
+        if !self.turn_id.is_empty() {
+            parts.push(self.turn_id.clone());
+        }
+        if let Some(selection) = self.tool_selection.as_ref() {
+            if !selection.selected_tools.is_empty() {
+                parts.push(format!("tools: {}", selection.selected_tools.join(", ")));
+            }
+            if !selection.strategy.is_empty() {
+                parts.push(format!(
+                    "strategy: {} ({:.2})",
+                    selection.strategy, selection.confidence
+                ));
+            }
+        }
+        if let Some(memory) = self.memory.as_ref()
+            && !memory.selected_memory_ids.is_empty()
+        {
+            let detail = (!memory.query.is_empty())
+                .then(|| {
+                    let preview: String = memory.query.chars().take(64).collect();
+                    if memory.query.chars().count() > 64 {
+                        format!(" for \"{preview}...\"")
+                    } else {
+                        format!(" for \"{preview}\"")
+                    }
+                })
+                .unwrap_or_default();
+            parts.push(format!(
+                "memory: {} selected{}",
+                memory.selected_memory_ids.len(),
+                detail
+            ));
+        }
+        if let Some(history) = self.history.as_ref()
+            && history.compressed_turns > 0
+        {
+            if history.compression_ratio > 0.0 {
+                parts.push(format!(
+                    "history: {} compressed (ratio {ratio:.2})",
+                    history.compressed_turns,
+                    ratio = history.compression_ratio
+                ));
+            } else {
+                parts.push(format!("history: {} compressed", history.compressed_turns));
+            }
+        }
+        if let Some(budget) = self.budget.as_ref() {
+            if budget.max_tokens > 0 || budget.total_used > 0 {
+                parts.push(format!("budget: {:.2}", budget.budget_pressure));
+                parts.push(format!("tokens: {}", budget.total_used));
+            }
+        }
+        if let Some(timing) = self.timing.as_ref()
+            && timing.total_ms > 0
+        {
+            parts.push(format!("time: {}ms", timing.total_ms));
+        }
+        if let Some(explanation) = self.explanations.first() {
+            let preview: String = explanation.chars().take(96).collect();
+            if explanation.chars().count() > 96 {
+                parts.push(format!("note: {preview}..."));
+            } else {
+                parts.push(format!("note: {preview}"));
+            }
+        }
+        parts.join(" | ")
+    }
+}
+
 /// Session workspace metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkspaceMetadata {
@@ -82,6 +251,9 @@ pub struct WorkspaceMetadata {
     pub correlation_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_role: Option<String>,
+    /// Compact summary of the most recent context-assembly trace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_context_trace: Option<ContextTraceSignal>,
 }
 
 impl WorkspaceMetadata {
@@ -162,6 +334,7 @@ impl WorkspaceMetadata {
             fork_note: None,
             correlation_id: None,
             agent_role: None,
+            last_context_trace: None,
         }
     }
     pub fn with_context(
@@ -197,6 +370,7 @@ impl WorkspaceMetadata {
             fork_note: None,
             correlation_id: None,
             agent_role: None,
+            last_context_trace: None,
         }
     }
 
@@ -502,6 +676,59 @@ mod tests {
     }
 
     #[test]
+    fn workspace_context_trace_signal_round_trip() {
+        let mut ws = WorkspaceMetadata::with_context("sess-trace", "gpt-4", "/tmp", Some("main"));
+        ws.last_context_trace = Some(ContextTraceSignal {
+            turn_id: "turn-7".into(),
+            captured_at: Some("2026-04-10T12:00:00Z".into()),
+            tool_selection: Some(ContextTraceToolSelection {
+                tools_available: 12,
+                selected_tools: vec!["lsp".into(), "view".into()],
+                rejected_tools: 4,
+                strategy: "code-intel".into(),
+                confidence: 0.91,
+                latency_ms: 18,
+            }),
+            memory: Some(ContextTraceMemorySignal {
+                query: "resume trace persistence".into(),
+                candidates_considered: 7,
+                selected_memory_ids: vec!["m1".into(), "m2".into()],
+                total_tokens: 240,
+                latency_ms: 9,
+            }),
+            history: Some(ContextTraceHistorySignal {
+                total_turns_available: 10,
+                retained_turns: 5,
+                compressed_turns: 3,
+                dropped_turns: 2,
+                compression_ratio: 0.58,
+                tokens_before: 900,
+                tokens_after: 522,
+            }),
+            budget: Some(ContextTraceBudgetSignal {
+                max_tokens: 20_000,
+                total_used: 14_200,
+                budget_pressure: 0.84,
+                compression_triggered: true,
+            }),
+            timing: Some(ContextTraceTimingSignal {
+                turn: 7,
+                context_assembly_ms: 14,
+                ttft_ms: 220,
+                llm_total_ms: 1100,
+                tool_execution_ms: 330,
+                total_ms: 1600,
+            }),
+            explanations: vec!["Kept LSP because symbol-aware navigation was required.".into()],
+        });
+
+        let yaml = serde_yaml::to_string(&ws).unwrap();
+        let parsed: WorkspaceMetadata = serde_yaml::from_str(&yaml).unwrap();
+
+        assert_eq!(parsed.last_context_trace, ws.last_context_trace);
+    }
+
+    #[test]
     fn workspace_fork_and_coordination_round_trip() {
         let mut ws = WorkspaceMetadata::with_context("child", "gpt-4", "/proj", Some("main"));
         ws.parent_session_id = Some("parent-uuid".into());
@@ -552,6 +779,7 @@ mod tests {
         assert!(ws.plan_goal.is_none());
         assert!(ws.plan_config_json.is_none());
         assert_eq!(ws.plan_execution_rounds, 0);
+        assert!(ws.last_context_trace.is_none());
     }
 
     #[test]

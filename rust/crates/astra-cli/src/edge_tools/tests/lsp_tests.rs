@@ -868,6 +868,82 @@ fn real_rust_analyzer_available() -> bool {
         == Some("lsp")
 }
 
+#[cfg(unix)]
+fn write_real_typescript_workspace(root: &std::path::Path) {
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("package.json"),
+        r#"{
+  "name": "demo-ts-lsp",
+  "private": true
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("tsconfig.json"),
+        r#"{
+  "compilerOptions": {
+    "target": "ES2020",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "strict": true
+  },
+  "include": ["src/**/*.ts"]
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("astra-lsp.json"),
+        r#"{
+  "typescript": {
+    "enabled": true,
+    "command": "npx",
+    "args": [
+      "--yes",
+      "-p",
+      "typescript",
+      "-p",
+      "typescript-language-server",
+      "typescript-language-server",
+      "--stdio"
+    ]
+  }
+}
+"#,
+    )
+    .unwrap();
+}
+
+#[cfg(unix)]
+fn real_typescript_language_server_available() -> bool {
+    let dir = tempfile::tempdir().unwrap();
+    let _enabled_guard = EnvGuard::unset("ASTRA_LSP_TYPESCRIPT");
+    let _cmd_guard = EnvGuard::unset("ASTRA_TYPESCRIPT_SERVER_CMD");
+    write_real_typescript_workspace(dir.path());
+    std::fs::write(
+        dir.path().join("src/demo.ts"),
+        "export function helloFromTsLsp(name: string): string {\n  return name.toUpperCase();\n}\n",
+    )
+    .unwrap();
+    let exe = ToolExecutor::new(dir.path());
+    let result = exe.lsp(&json!({
+        "operation": "document_symbols",
+        "file": "src/demo.ts"
+    }));
+    serde_json::from_str::<Value>(&result)
+        .ok()
+        .and_then(|parsed| {
+            parsed
+                .get("backend")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .as_deref()
+        == Some("lsp")
+}
+
 // ─── lsp tests ────────────────────────────────────────────────────────────────
 
 #[test]
@@ -3244,6 +3320,165 @@ fn lsp_code_lenses_execute_selected_item_with_real_rust_analyzer() {
             .as_str()
             .is_some_and(|stdout| stdout.contains("real-runnable-output")),
         "{executed}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "manual validation with real typescript-language-server"]
+#[serial_test::serial]
+fn lsp_completions_apply_selected_item_with_real_typescript_language_server() {
+    if !real_typescript_language_server_available() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let _enabled_guard = EnvGuard::unset("ASTRA_LSP_TYPESCRIPT");
+    let _cmd_guard = EnvGuard::unset("ASTRA_TYPESCRIPT_SERVER_CMD");
+    write_real_typescript_workspace(dir.path());
+    let file_path = dir.path().join("src/demo.ts");
+    let original = "const label = \"demo\";\nlabel.\n";
+    std::fs::write(&file_path, original).unwrap();
+    let exe = ToolExecutor::new(dir.path());
+
+    let mut preview = None;
+    for _ in 0..12 {
+        let candidate = exe.lsp(&json!({
+            "operation": "completions",
+            "file": "src/demo.ts",
+            "line": 2,
+            "column": 7
+        }));
+        let parsed: serde_json::Value = serde_json::from_str(&candidate).unwrap();
+        let items = parsed["result"]
+            .get("items")
+            .and_then(Value::as_array)
+            .or_else(|| parsed["result"].as_array());
+        if items.is_some_and(|items| !items.is_empty()) {
+            preview = Some((candidate, parsed));
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    let (preview, parsed) = preview
+        .unwrap_or_else(|| panic!("real typescript-language-server never returned completions"));
+    let items = parsed["result"]
+        .get("items")
+        .and_then(Value::as_array)
+        .or_else(|| parsed["result"].as_array())
+        .unwrap_or_else(|| panic!("unexpected completions preview: {preview}"));
+    let idx = items
+        .iter()
+        .position(|item| item.get("label").and_then(Value::as_str).is_some())
+        .unwrap_or_else(|| panic!("expected at least one named completion item, got: {preview}"));
+
+    let applied = exe.lsp(&json!({
+        "operation": "completions",
+        "file": "src/demo.ts",
+        "line": 2,
+        "column": 7,
+        "item_index": idx,
+        "dry_run": false
+    }));
+    let parsed: serde_json::Value = serde_json::from_str(&applied).unwrap();
+    assert_eq!(
+        parsed["applied"].as_bool(),
+        Some(true),
+        "unexpected apply result: {applied}"
+    );
+
+    let updated = std::fs::read_to_string(file_path).unwrap();
+    assert!(
+        updated.starts_with("const label = \"demo\";\nlabel."),
+        "expected completion apply to update file, got: {updated}"
+    );
+    assert_ne!(
+        updated, original,
+        "expected completion apply to modify the file"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "manual validation with real typescript-language-server"]
+#[serial_test::serial]
+fn lsp_code_actions_apply_selected_item_with_real_typescript_language_server() {
+    if !real_typescript_language_server_available() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let _enabled_guard = EnvGuard::unset("ASTRA_LSP_TYPESCRIPT");
+    let _cmd_guard = EnvGuard::unset("ASTRA_TYPESCRIPT_SERVER_CMD");
+    write_real_typescript_workspace(dir.path());
+    std::fs::write(
+        dir.path().join("src/helper.ts"),
+        "export function helperFromTsLsp(): string {\n  return \"ok\";\n}\n",
+    )
+    .unwrap();
+    let file_path = dir.path().join("src/demo.ts");
+    let original = "export function runDemo(): string {\n  return helperFromTsLsp();\n}\n";
+    std::fs::write(&file_path, original).unwrap();
+    let exe = ToolExecutor::new(dir.path());
+
+    let mut preview = None;
+    for _ in 0..12 {
+        let candidate = exe.lsp(&json!({
+            "operation": "code_actions",
+            "file": "src/demo.ts",
+            "line": 2,
+            "column": 10
+        }));
+        let parsed: serde_json::Value = serde_json::from_str(&candidate).unwrap();
+        if let Some(actions) = parsed["result"].as_array()
+            && !actions.is_empty()
+        {
+            preview = Some((candidate, parsed));
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    let (preview, parsed) = preview
+        .unwrap_or_else(|| panic!("real typescript-language-server never returned code actions"));
+    assert_eq!(
+        parsed["method"].as_str(),
+        Some("textDocument/codeAction"),
+        "{preview}"
+    );
+    let actions = parsed["result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("unexpected code action preview: {preview}"));
+    let idx = actions
+        .iter()
+        .position(|action| {
+            action
+                .get("title")
+                .and_then(Value::as_str)
+                .is_some_and(|title| title.contains("Add import from"))
+        })
+        .unwrap_or_else(|| panic!("expected import quick fix, got: {preview}"));
+
+    let applied = exe.lsp(&json!({
+        "operation": "code_actions",
+        "file": "src/demo.ts",
+        "line": 2,
+        "column": 10,
+        "action_index": idx,
+        "dry_run": false
+    }));
+    let parsed: serde_json::Value = serde_json::from_str(&applied).unwrap();
+    assert_eq!(
+        parsed["applied"].as_bool(),
+        Some(true),
+        "unexpected apply result: {applied}"
+    );
+
+    let updated = std::fs::read_to_string(file_path).unwrap();
+    assert!(
+        updated.contains("helperFromTsLsp"),
+        "expected quick fix to preserve helper call, got: {updated}"
+    );
+    assert!(
+        updated.contains("from \"./helper\"") || updated.contains("from './helper'"),
+        "expected import quick fix to add helper import, got: {updated}"
     );
 }
 

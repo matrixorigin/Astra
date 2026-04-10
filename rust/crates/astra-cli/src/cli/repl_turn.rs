@@ -1,5 +1,10 @@
 use std::time::Instant;
 
+use astra_services::session_workspace::{
+    ContextTraceBudgetSignal, ContextTraceHistorySignal, ContextTraceMemorySignal,
+    ContextTraceSignal, ContextTraceTimingSignal, ContextTraceToolSelection,
+};
+
 use super::*;
 
 pub(super) struct ReplTurnContext<'a> {
@@ -152,9 +157,7 @@ const CORRECTION_PATTERNS: &[&str] = &[
 /// Returns true if the message contains common correction phrases.
 pub(super) fn detect_correction_signal(message: &str) -> bool {
     let msg_lower = message.to_lowercase();
-    CORRECTION_PATTERNS
-        .iter()
-        .any(|p| msg_lower.contains(p))
+    CORRECTION_PATTERNS.iter().any(|p| msg_lower.contains(p))
 }
 
 // ─── Relevance-scored history pruning ───────────────────────────────────────
@@ -826,25 +829,8 @@ fn commit_turn_journal_workspace_and_sidecars(
             ws.record_turn(result.prompt_tokens, result.completion_tokens);
 
             // Persist plan state to workspace for session resume
-            ws.executing_plan_json = state
-                .executing_plan
-                .as_ref()
-                .and_then(|p| serde_json::to_string(p).ok());
-            ws.plan_goal = state.executing_plan_goal.clone();
-            ws.plan_config_json = state
-                .plan_execution_config
-                .as_ref()
-                .and_then(|c| serde_json::to_string(c).ok());
-            ws.plan_execution_rounds = state.plan_execution_rounds;
-
-            // Persist durable task contract for session resume
-            ws.contract_json = state
-                .durable_task_state
-                .as_ref()
-                .and_then(|d| serde_json::to_string(&d.contract).ok());
-
-            // Persist operator corrections so they survive a crash mid-plan
-            ws.plan_corrections = state.plan_execution_corrections.clone();
+            sync_plan_fields_to_workspace(state, &mut ws);
+            sync_context_trace_to_workspace(state, &mut ws);
 
             // Check if checkpoint is due
             if astra_services::session_checkpoint::should_checkpoint(
@@ -951,6 +937,25 @@ fn commit_turn_journal_workspace_and_sidecars(
                 });
             }
 
+            if let Some(ref mc) = state.matrix_runtime
+                && let Some(ref trace_signal) = ws.last_context_trace
+            {
+                let user_id = state.ingestion_user_id.as_deref().unwrap_or("anonymous");
+                let pool = mc.shared_pool().get().clone();
+                let sid_owned = sid.to_string();
+                let user_id_owned = user_id.to_string();
+                let trace_signal = trace_signal.clone();
+                tokio::spawn(async move {
+                    let _ = astra_services::session_restore::push_context_trace_signal_to_cloud(
+                        &pool,
+                        &sid_owned,
+                        &user_id_owned,
+                        &trace_signal,
+                    )
+                    .await;
+                });
+            }
+
             // Push plan state to cloud at checkpoint boundaries
             if let Some(ref mc) = state.matrix_runtime
                 && astra_services::session_checkpoint::should_checkpoint(
@@ -965,7 +970,7 @@ fn commit_turn_journal_workspace_and_sidecars(
                 let config = ws.plan_config_json.clone();
                 let rounds = ws.plan_execution_rounds;
                 tokio::spawn(async move {
-                    let _ = astra_services::session_restore::push_plan_state_to_cloud(
+                    let _ = astra_services::session_restore::push_session_state_to_cloud(
                         &pool,
                         &sid_owned,
                         plan_json.as_deref(),
@@ -1359,12 +1364,15 @@ fn initialize_journal(state: &mut ReplState, session_id: &str) {
         enqueue_ingestion(state, &start_event);
     }
 
-    // Initialize workspace metadata alongside journal
-    let ws = astra_services::session_workspace::WorkspaceMetadata::new(
-        session_id,
-        state.model.as_deref().unwrap_or("default"),
-    );
-    let _ = astra_services::session_workspace::write_workspace(&ws);
+    // Initialize workspace metadata alongside journal, but preserve existing
+    // persisted session state when resuming an existing session.
+    if astra_services::session_workspace::read_workspace(session_id).is_err() {
+        let ws = astra_services::session_workspace::WorkspaceMetadata::new(
+            session_id,
+            state.model.as_deref().unwrap_or("default"),
+        );
+        let _ = astra_services::session_workspace::write_workspace(&ws);
+    }
 
     // Initialize observability session for context tracing (M1).
     // This enables TurnTraceCollector creation in the agentic loop.
@@ -1485,6 +1493,100 @@ fn sync_plan_fields_to_workspace(
         .as_ref()
         .and_then(|d| serde_json::to_string(&d.contract).ok());
     ws.plan_corrections = state.plan_execution_corrections.clone();
+}
+
+fn latest_context_trace_signal(state: &ReplState) -> Option<ContextTraceSignal> {
+    let obs = state.observability_session.as_ref()?;
+    let guard = obs.read().ok()?;
+    let trace = guard.context_traces.last()?;
+    let timing = guard.turn_timings.last().cloned();
+
+    let tool_selection = (!trace.tools.selection_strategy.is_empty()
+        || !trace.tools.tools_selected.is_empty()
+        || trace.tools.tools_available > 0)
+        .then(|| ContextTraceToolSelection {
+            tools_available: trace.tools.tools_available,
+            selected_tools: trace
+                .tools
+                .tools_selected
+                .iter()
+                .map(|tool| tool.tool_name.clone())
+                .collect(),
+            rejected_tools: trace.tools.tools_rejected.len(),
+            strategy: trace.tools.selection_strategy.clone(),
+            confidence: trace.tools.selection_confidence,
+            latency_ms: trace.tools.selection_latency_ms,
+        });
+    let memory = (!trace.memory.query.trim().is_empty()
+        || !trace.memory.memories_selected.is_empty()
+        || trace.memory.candidates_considered > 0)
+        .then(|| ContextTraceMemorySignal {
+            query: trace.memory.query.trim().chars().take(160).collect(),
+            candidates_considered: trace.memory.candidates_considered,
+            selected_memory_ids: trace
+                .memory
+                .memories_selected
+                .iter()
+                .map(|memory| memory.memory_id.clone())
+                .collect(),
+            total_tokens: trace.memory.total_tokens,
+            latency_ms: trace.memory.retrieval_latency_ms,
+        });
+    let history = (trace.history.total_turns_available > 0
+        || !trace.history.turns_retained.is_empty()
+        || !trace.history.turns_compressed.is_empty()
+        || !trace.history.turns_dropped.is_empty())
+    .then(|| ContextTraceHistorySignal {
+        total_turns_available: trace.history.total_turns_available,
+        retained_turns: trace.history.turns_retained.len(),
+        compressed_turns: trace.history.turns_compressed.len(),
+        dropped_turns: trace.history.turns_dropped.len(),
+        compression_ratio: trace.history.compression_ratio,
+        tokens_before: trace.history.tokens_before,
+        tokens_after: trace.history.tokens_after,
+    });
+    let budget =
+        (trace.token_budget.max_tokens > 0 || trace.token_budget.total_used > 0).then(|| {
+            ContextTraceBudgetSignal {
+                max_tokens: trace.token_budget.max_tokens,
+                total_used: trace.token_budget.total_used,
+                budget_pressure: trace.token_budget.budget_pressure,
+                compression_triggered: trace.token_budget.compression_triggered,
+            }
+        });
+    let timing = timing.map(|timing| ContextTraceTimingSignal {
+        turn: timing.turn,
+        context_assembly_ms: timing.context_assembly_ms,
+        ttft_ms: timing.ttft_ms,
+        llm_total_ms: timing.llm_total_ms,
+        tool_execution_ms: timing.tool_execution_ms,
+        total_ms: timing.total_ms,
+    });
+
+    Some(ContextTraceSignal {
+        turn_id: trace.turn_id.clone(),
+        captured_at: Some(chrono::DateTime::<chrono::Utc>::from(trace.timestamp).to_rfc3339()),
+        tool_selection,
+        memory,
+        history,
+        budget,
+        timing,
+        explanations: trace
+            .explanations
+            .iter()
+            .filter_map(|explanation| {
+                let trimmed = explanation.reasoning.trim();
+                (!trimmed.is_empty()).then(|| trimmed.chars().take(200).collect::<String>())
+            })
+            .collect(),
+    })
+}
+
+fn sync_context_trace_to_workspace(
+    state: &ReplState,
+    ws: &mut astra_services::session_workspace::WorkspaceMetadata,
+) {
+    ws.last_context_trace = latest_context_trace_signal(state);
 }
 
 /// Next numeric id for `step_checkpoints/<NNNNNN>-*.json`.
@@ -1745,6 +1847,7 @@ pub(super) fn create_manual_repl_checkpoint(
     let mut ws = astra_services::session_workspace::read_workspace(sid)
         .map_err(|e| format!("read workspace: {e}"))?;
     sync_plan_fields_to_workspace(state, &mut ws);
+    sync_context_trace_to_workspace(state, &mut ws);
 
     let next_step = next_step_checkpoint_number(sid)?;
     let step_cp = build_manual_heavy_step_checkpoint(state, sid);
@@ -1799,6 +1902,142 @@ mod tests {
         assert_eq!(ws.plan_goal.as_deref(), Some("goal-x"));
         assert_eq!(ws.plan_execution_rounds, 9);
         assert_eq!(ws.plan_corrections, vec!["note".to_string()]);
+    }
+
+    #[test]
+    fn sync_context_trace_copies_latest_trace_into_workspace() {
+        let mut state = ReplState::default();
+        let mut obs =
+            astra_runtime::observability_integration::ObservabilitySession::new_simple("sid-trace");
+        obs.context_traces
+            .push(astra_runtime::turn::context_assembly_trace::ContextAssemblyTrace {
+                turn_id: "turn-3".into(),
+                tools: astra_runtime::turn::context_assembly_trace::ToolSelectionTrace {
+                    selection_strategy: "code-intel".into(),
+                    selection_confidence: 0.92,
+                    tools_selected: vec![astra_runtime::turn::context_assembly_trace::ToolSelected {
+                        tool_name: "lsp".into(),
+                        score: 1.0,
+                        tokens: 0,
+                        selection_factors: Vec::new(),
+                    }],
+                    ..Default::default()
+                },
+                memory: astra_runtime::turn::context_assembly_trace::MemoryRetrievalTrace {
+                    query: "resume trace persistence".into(),
+                    memories_selected: vec![astra_runtime::turn::context_assembly_trace::MemorySelection {
+                        memory_id: "m1".into(),
+                        memory_type: "semantic".into(),
+                        content_preview: "trace".into(),
+                        relevance_score: 0.8,
+                        tokens: 10,
+                        source: astra_runtime::turn::context_assembly_trace::MemorySource::Memoria,
+                    }],
+                    ..Default::default()
+                },
+                history: astra_runtime::turn::context_assembly_trace::HistorySelectionTrace {
+                    turns_compressed: vec![astra_runtime::turn::context_assembly_trace::TurnCompression {
+                        turn_index: 1,
+                        role: "assistant".into(),
+                        original_tokens: 100,
+                        compressed_tokens: 50,
+                        compression_method:
+                            astra_runtime::turn::context_assembly_trace::CompressionMethod::ReactiveCompact,
+                        information_lost: Vec::new(),
+                    }],
+                    compression_ratio: 0.5,
+                    tokens_before: 100,
+                    tokens_after: 50,
+                    ..Default::default()
+                },
+                token_budget: astra_runtime::turn::context_assembly_trace::TokenBudgetTrace {
+                    max_tokens: 16_000,
+                    total_used: 8_200,
+                    budget_pressure: 0.76,
+                    ..Default::default()
+                },
+                explanations: vec![astra_runtime::turn::context_assembly_trace::DecisionExplanation {
+                    decision_type:
+                        astra_runtime::turn::context_assembly_trace::DecisionType::StrategyChoice {
+                            strategy: "code-intel".into(),
+                        },
+                    reasoning: "Need symbol-aware context.".into(),
+                    alternatives_considered: Vec::new(),
+                    confidence: 0.9,
+                }],
+                ..Default::default()
+            });
+        state.observability_session = Some(std::sync::Arc::new(std::sync::RwLock::new(obs)));
+
+        let mut ws = astra_services::session_workspace::WorkspaceMetadata::new("sid-trace", "m");
+        sync_context_trace_to_workspace(&state, &mut ws);
+
+        let trace = ws.last_context_trace.expect("missing trace summary");
+        assert_eq!(trace.turn_id, "turn-3");
+        assert_eq!(
+            trace
+                .tool_selection
+                .as_ref()
+                .map(|selection| selection.selected_tools.clone()),
+            Some(vec!["lsp".to_string()])
+        );
+        assert_eq!(
+            trace
+                .memory
+                .as_ref()
+                .map(|memory| memory.selected_memory_ids.len()),
+            Some(1)
+        );
+        assert_eq!(
+            trace.budget.as_ref().map(|budget| budget.total_used),
+            Some(8_200)
+        );
+    }
+
+    #[test]
+    fn initialize_journal_preserves_existing_workspace() {
+        let (_tmp, _g) = isolated_sessions_dir();
+        let sid = "sess-existing-workspace";
+        let mut ws = astra_services::session_workspace::WorkspaceMetadata::new(sid, "old-model");
+        ws.turn_count = 7;
+        ws.last_context_trace = Some(ContextTraceSignal {
+            turn_id: "turn-7".into(),
+            captured_at: None,
+            tool_selection: Some(ContextTraceToolSelection {
+                tools_available: 8,
+                selected_tools: vec!["lsp".into()],
+                rejected_tools: 2,
+                strategy: "code-intel".into(),
+                confidence: 0.9,
+                latency_ms: 11,
+            }),
+            memory: None,
+            history: None,
+            budget: Some(ContextTraceBudgetSignal {
+                max_tokens: 4096,
+                total_used: 700,
+                budget_pressure: 0.17,
+                compression_triggered: false,
+            }),
+            timing: None,
+            explanations: Vec::new(),
+        });
+        astra_services::session_workspace::write_workspace(&ws).unwrap();
+
+        let mut state = ReplState::default();
+        state.model = Some("new-model".into());
+        initialize_journal(&mut state, sid);
+
+        let persisted = astra_services::session_workspace::read_workspace(sid).unwrap();
+        assert_eq!(persisted.model, "old-model");
+        assert_eq!(persisted.turn_count, 7);
+        assert_eq!(
+            persisted
+                .last_context_trace
+                .as_ref()
+                .map(|trace| trace.turn_id.as_str()),
+            Some("turn-7")
+        );
     }
 
     #[test]

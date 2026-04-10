@@ -695,9 +695,7 @@ impl DelegationEngine {
         &self,
     ) -> std::sync::MutexGuard<'_, Option<Arc<tokio_util::sync::CancellationToken>>> {
         self.cancel_token.lock().unwrap_or_else(|e| {
-            eprintln!(
-                "[delegation] cancel_token Mutex poisoned — recovering from sub-task panic"
-            );
+            eprintln!("[delegation] cancel_token Mutex poisoned — recovering from sub-task panic");
             e.into_inner()
         })
     }

@@ -416,26 +416,31 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
         let schema_tokens = ctx.selector.registry().total_pinned_token_cost() as u32;
         let budget = prompts::budget_for_model(ctx.model);
         let max_tokens = budget.model_limit as u32;
-        
+
         // Estimate history tokens from messages (excluding system prompt)
-        let history_tokens: u32 = ctx.messages.iter()
+        let history_tokens: u32 = ctx
+            .messages
+            .iter()
             .skip(1) // Skip system prompt
             .map(|m| prompts::estimate_str_tokens(&m.to_string()) as u32)
             .sum();
-        
+
         // Estimate user message tokens
         let user_message_tokens = prompts::estimate_str_tokens(ctx.message) as u32;
-        
+
         // System prompt tokens (default estimate if not passed explicitly)
         let system_prompt_tokens = 14_000u32; // Same as DEFAULT_SYSTEM_PROMPT in context.rs
-        
+
         // Memory tokens are tracked in memory retrieval trace, use 0 here
         // (would need to be passed from memory boost search results)
         let memory_tokens = 0u32;
-        
-        let estimated_total = system_prompt_tokens + history_tokens + memory_tokens 
-            + schema_tokens + user_message_tokens;
-        
+
+        let estimated_total = system_prompt_tokens
+            + history_tokens
+            + memory_tokens
+            + schema_tokens
+            + user_message_tokens;
+
         collector.record_token_budget_estimate(
             system_prompt_tokens,
             history_tokens,

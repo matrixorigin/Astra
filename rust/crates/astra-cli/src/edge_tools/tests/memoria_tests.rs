@@ -119,7 +119,8 @@ fn parse_hits_single_object_with_id() {
 
 #[test]
 fn parse_hits_empty_content_filtered() {
-    let raw = r#"{"memories":[{"memory_id":"m1","content":""},{"memory_id":"m2","content":"valid"}]}"#;
+    let raw =
+        r#"{"memories":[{"memory_id":"m1","content":""},{"memory_id":"m2","content":"valid"}]}"#;
     let hits = memoria::parse_memory_search_hits(raw);
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].memory_id.as_deref(), Some("m2"));

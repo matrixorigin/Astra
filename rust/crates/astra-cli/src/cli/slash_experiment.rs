@@ -65,7 +65,10 @@ pub fn handle_experiment_command(arg: &str, ctx: &ExperimentCommandContext<'_>) 
             if let Some(id) = parts.get(1) {
                 analyze_experiment(ctx, id);
             } else {
-                eprintln!("  {}", "Usage: /experiment analyze <experiment_id>".yellow());
+                eprintln!(
+                    "  {}",
+                    "Usage: /experiment analyze <experiment_id>".yellow()
+                );
             }
         }
         "help" | "?" => show_help(),
@@ -164,7 +167,10 @@ fn show_list(ctx: &ExperimentCommandContext<'_>) {
 }
 
 fn show_status(ctx: &ExperimentCommandContext<'_>) {
-    eprintln!("\n  {}", "🧪 Current Session Experiment Status".cyan().bold());
+    eprintln!(
+        "\n  {}",
+        "🧪 Current Session Experiment Status".cyan().bold()
+    );
     eprintln!("  {}", "─".repeat(50).dim());
 
     if let Some(session_id) = ctx.session_id {
@@ -277,10 +283,7 @@ fn create_experiment(ctx: &ExperimentCommandContext<'_>, id: &str) {
             Variant::new("treatment")
                 .with_name("Treatment")
                 .with_traffic(0.5)
-                .with_config_diff(
-                    "compression.compression_threshold",
-                    serde_json::json!(0.6),
-                ),
+                .with_config_diff("compression.compression_threshold", serde_json::json!(0.6)),
         )
         .with_metric(MetricDefinition::token_usage())
         .with_metric(MetricDefinition::latency())
@@ -295,7 +298,10 @@ fn create_experiment(ctx: &ExperimentCommandContext<'_>, id: &str) {
         "  {}",
         "Default: control (50%) vs treatment (50%, threshold=0.6)".dim()
     );
-    eprintln!("  {}", format!("Use /experiment start {id} to begin.").dim());
+    eprintln!(
+        "  {}",
+        format!("Use /experiment start {id} to begin.").dim()
+    );
 }
 
 fn start_experiment(ctx: &ExperimentCommandContext<'_>, id: &str) {
@@ -306,7 +312,10 @@ fn start_experiment(ctx: &ExperimentCommandContext<'_>, id: &str) {
     };
 
     if exp.status == ExperimentStatus::Running {
-        eprintln!("  {}", format!("Experiment {id} is already running.").yellow());
+        eprintln!(
+            "  {}",
+            format!("Experiment {id} is already running.").yellow()
+        );
         return;
     }
 
@@ -339,7 +348,10 @@ fn stop_experiment(ctx: &ExperimentCommandContext<'_>, id: &str) {
     store.register(exp);
 
     eprintln!("  {}", format!("⏹ Stopped experiment: {id}").green());
-    eprintln!("  {}", format!("Use /experiment analyze {id} to see results.").dim());
+    eprintln!(
+        "  {}",
+        format!("Use /experiment analyze {id} to see results.").dim()
+    );
 }
 
 fn analyze_experiment(ctx: &ExperimentCommandContext<'_>, id: &str) {
@@ -355,7 +367,10 @@ fn analyze_experiment(ctx: &ExperimentCommandContext<'_>, id: &str) {
             "  {}",
             format!("No outcomes recorded for experiment: {id}").yellow()
         );
-        eprintln!("  {}", "Run some sessions with this experiment active to collect data.".dim());
+        eprintln!(
+            "  {}",
+            "Run some sessions with this experiment active to collect data.".dim()
+        );
         return;
     }
 
@@ -367,7 +382,10 @@ fn analyze_experiment(ctx: &ExperimentCommandContext<'_>, id: &str) {
     // Variant stats
     eprintln!("  {}", "Variant Statistics:".bold());
     for (variant_id, stats) in &analysis.variant_stats {
-        let is_control = exp.variants.iter().any(|v| v.id == *variant_id && v.is_control);
+        let is_control = exp
+            .variants
+            .iter()
+            .any(|v| v.id == *variant_id && v.is_control);
         let label = if is_control {
             format!("{} (control)", variant_id)
         } else {
@@ -378,10 +396,7 @@ fn analyze_experiment(ctx: &ExperimentCommandContext<'_>, id: &str) {
         for (metric_name, metric_stats) in &stats.metric_stats {
             eprintln!(
                 "      {}: mean={:.2} ± {:.2} (p95={:.2})",
-                metric_name,
-                metric_stats.mean,
-                metric_stats.std_dev,
-                metric_stats.p95
+                metric_name, metric_stats.mean, metric_stats.std_dev, metric_stats.p95
             );
         }
     }
@@ -455,7 +470,10 @@ fn analyze_experiment(ctx: &ExperimentCommandContext<'_>, id: &str) {
 }
 
 fn show_help() {
-    eprintln!("\n  {}", "🧪 /experiment — A/B Testing Commands".cyan().bold());
+    eprintln!(
+        "\n  {}",
+        "🧪 /experiment — A/B Testing Commands".cyan().bold()
+    );
     eprintln!("  {}", "─".repeat(50).dim());
     eprintln!("  /experiment            List all experiments");
     eprintln!("  /experiment status     Show current session's experiment");

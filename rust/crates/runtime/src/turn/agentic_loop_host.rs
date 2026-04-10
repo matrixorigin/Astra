@@ -961,15 +961,19 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
         // ─── Observability: turn start hook ──────────────────────────────
         // Record query for scenario detection and drift analysis.
         let turn_start_time = std::time::Instant::now();
-        if let (Some(hub), Some(session)) =
-            (&state.observability_hub, &state.observability_session)
+        if let (Some(hub), Some(session)) = (&state.observability_hub, &state.observability_session)
         {
             let session_id = state.current_session_id.as_deref().unwrap_or("");
             let user_id = {
                 let s = session.read().unwrap();
                 s.user_id.clone()
             };
-            crate::observability_integration::on_turn_start(hub, session_id, &user_id, &state.message);
+            crate::observability_integration::on_turn_start(
+                hub,
+                session_id,
+                &user_id,
+                &state.message,
+            );
         }
 
         // ─── Turn trace collector ──────────────────────────────────────────
@@ -983,9 +987,7 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
                 let turn_id = format!("turn-{}", turn_index);
                 let session_id = state.current_session_id.clone().unwrap_or_default();
                 state.turn_trace_collector = Some(
-                    crate::turn::turn_trace_collector::TurnTraceCollector::new(
-                        turn_id, session_id,
-                    ),
+                    crate::turn::turn_trace_collector::TurnTraceCollector::new(turn_id, session_id),
                 );
             }
         }
@@ -1411,28 +1413,34 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
                 .collect();
             if !selected_tools.is_empty() {
                 let explanation = crate::turn::decision_explainer::DecisionExplanation {
-                    id: format!("tool-sel-{}-{}", 
-                        state.current_session_id.as_deref().unwrap_or("?"), 
-                        turn_index),
+                    id: format!(
+                        "tool-sel-{}-{}",
+                        state.current_session_id.as_deref().unwrap_or("?"),
+                        turn_index
+                    ),
                     timestamp: std::time::SystemTime::now(),
                     decision_type: crate::turn::decision_explainer::DecisionType::ToolSelection {
                         selected_tools: selected_tools.clone(),
                         total_available: state.all_tools_used.len() as u32,
                     },
-                    inputs: vec![
-                        crate::turn::decision_explainer::ExplainableInput {
-                            name: "user_query".to_string(),
-                            value: state.message.clone(),
-                            influence: 1.0,
-                            explanation: Some("Primary input driving tool selection".to_string()),
-                        },
-                    ],
-                    reasoning: format!("LLM selected {} tool(s) for this turn", selected_tools.len()),
+                    inputs: vec![crate::turn::decision_explainer::ExplainableInput {
+                        name: "user_query".to_string(),
+                        value: state.message.clone(),
+                        influence: 1.0,
+                        explanation: Some("Primary input driving tool selection".to_string()),
+                    }],
+                    reasoning: format!(
+                        "LLM selected {} tool(s) for this turn",
+                        selected_tools.len()
+                    ),
                     alternatives: vec![],
                     confidence: 0.8, // placeholder
                 };
                 let mut session_guard = session.write().unwrap();
-                crate::observability_integration::on_tool_selection(&mut session_guard, explanation);
+                crate::observability_integration::on_tool_selection(
+                    &mut session_guard,
+                    explanation,
+                );
             }
         }
 
@@ -1445,7 +1453,10 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
                 .collect();
             collector.record_tool_selection(
                 &selected_tools,
-                state.first_selector_strategy.as_deref().unwrap_or("unknown"),
+                state
+                    .first_selector_strategy
+                    .as_deref()
+                    .unwrap_or("unknown"),
                 state.first_selector_confidence.unwrap_or(0.0),
                 state.total_prompt as u32, // budget approximation
                 state.selector_tokens_in,
@@ -1561,9 +1572,7 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
                     input_bytes: None,
                     output_bytes: Some(result_text.len() as u32),
                     args_preview: Some(call_id.clone()),
-                    result_preview: Some(
-                        result_text.chars().take(500).collect::<String>(),
-                    ),
+                    result_preview: Some(result_text.chars().take(500).collect::<String>()),
                 });
             }
         }
@@ -2035,7 +2044,11 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
                 .map(|s| s.read().unwrap().user_id.clone())
                 .unwrap_or_default();
             for edge_result in &turn_result.edge_tool_round {
-                crate::observability_integration::on_tool_executed(hub, &user_id, &edge_result.tool);
+                crate::observability_integration::on_tool_executed(
+                    hub,
+                    &user_id,
+                    &edge_result.tool,
+                );
             }
         }
 
@@ -2230,10 +2243,10 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
                     let total_ms = turn_start_time.elapsed().as_millis() as u64;
                     let timing = crate::observability_integration::TurnTiming {
                         turn: turn_index as u32,
-                        context_assembly_ms: 0,  // TODO: measure separately
+                        context_assembly_ms: 0, // TODO: measure separately
                         ttft_ms: turn_result.ttft_ms.unwrap_or(0) as u64,
                         llm_total_ms,
-                        tool_execution_ms: 0,    // TODO: measure separately
+                        tool_execution_ms: 0, // TODO: measure separately
                         total_ms,
                     };
                     let mut session_guard = session.write().unwrap();
@@ -2251,7 +2264,7 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
                     } else {
                         state.first_budget_pressure
                     };
-                    
+
                     // Record token budget before finalizing.
                     // NOTE: Fine-grained breakdown (system_prompt, history, memory, etc.)
                     // is not available at runtime layer — would require CLI to pass it down.
@@ -2267,7 +2280,7 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
                             total_used: measured as u32,
                             budget_pressure,
                             compression_triggered: state.budget_wrapup_injected,
-                        }
+                        },
                     );
                     // Finalize and persist (errors logged but not propagated).
                     if let Err(e) = collector.finalize_and_persist(turn_index as u32) {

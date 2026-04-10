@@ -67,7 +67,10 @@ impl MockScenario {
     pub fn all() -> &'static [(&'static str, &'static str)] {
         &[
             ("complete", "immediate completion (no tools)"),
-            ("tool_then_complete", "one write_file tool call, then completion"),
+            (
+                "tool_then_complete",
+                "one write_file tool call, then completion",
+            ),
             ("multi_turn", "two LLM turns: think then complete"),
             ("fail", "agent returns error"),
             ("slow", "3s delay before response (tests progress display)"),
@@ -195,7 +198,9 @@ fn body_multi_turn(agent_id: &str, turn: u32) -> String {
 fn body_fail(_agent_id: &str, turn: u32) -> String {
     let mut s = String::new();
     s.push_str(&session_info(&format!("mock-run-fail-{turn}")));
-    s.push_str(&error_event("Mock agent failure: simulated LLM error for testing"));
+    s.push_str(&error_event(
+        "Mock agent failure: simulated LLM error for testing",
+    ));
     s
 }
 
@@ -221,7 +226,11 @@ async fn handle_chat_turn(
     // Extract agent_id from top-level payload field (set by chat_turn_base_payload)
     let agent_id = serde_json::from_slice::<Value>(&body)
         .ok()
-        .and_then(|v| v.get("agent_id").and_then(Value::as_str).map(str::to_string))
+        .and_then(|v| {
+            v.get("agent_id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
         .unwrap_or_else(|| format!("agent-{turn}"));
 
     let sse_body = match state.scenario {
@@ -372,8 +381,14 @@ mod tests {
         }
         assert!(MockScenario::from_str("nonexistent").is_none());
         // Aliases
-        assert_eq!(MockScenario::from_str("tool"), Some(MockScenario::ToolThenComplete));
-        assert_eq!(MockScenario::from_str("multi"), Some(MockScenario::MultiTurn));
+        assert_eq!(
+            MockScenario::from_str("tool"),
+            Some(MockScenario::ToolThenComplete)
+        );
+        assert_eq!(
+            MockScenario::from_str("multi"),
+            Some(MockScenario::MultiTurn)
+        );
         assert_eq!(MockScenario::from_str("error"), Some(MockScenario::Fail));
     }
 }

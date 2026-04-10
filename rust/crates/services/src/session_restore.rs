@@ -78,6 +78,17 @@ pub struct RestoredSession {
     /// Operator corrections stacked during plan pause (restored for crash recovery).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub plan_corrections: Vec<String>,
+    /// Latest structured context-trace signal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_context_trace: Option<super::session_workspace::ContextTraceSignal>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SessionMetadataState {
+    pub executing_plan_json: Option<String>,
+    pub plan_goal: Option<String>,
+    pub plan_config_json: Option<String>,
+    pub plan_execution_rounds: usize,
 }
 
 /// A restored checkpoint entry (lightweight, for listing).
@@ -234,11 +245,17 @@ impl HybridRestoreService {
 
                 // Extract plan state from metadata JSON
                 let metadata_str: Option<String> = row.try_get("metadata").ok().flatten();
-                let (plan_json, plan_goal, plan_config, plan_rounds) = match metadata_str.as_deref()
-                {
-                    Some(m) if !m.is_empty() => extract_plan_from_metadata(m),
-                    _ => (None, None, None, 0),
-                };
+                let metadata_state = metadata_str
+                    .as_deref()
+                    .filter(|m| !m.is_empty())
+                    .map(extract_session_state_from_metadata)
+                    .unwrap_or_default();
+
+                let last_context_trace = self
+                    .restore_latest_context_trace_signal(session_id)
+                    .await
+                    .ok()
+                    .flatten();
 
                 // Load active contract from task_contracts table
                 let mut contract_json = Self::load_cloud_contract(pool, session_id)
@@ -262,11 +279,12 @@ impl HybridRestoreService {
                     last_status: status,
                     title,
                     restored_from_cloud: true,
-                    executing_plan_json: plan_json,
-                    plan_goal,
-                    plan_config_json: plan_config,
-                    plan_execution_rounds: plan_rounds,
+                    executing_plan_json: metadata_state.executing_plan_json,
+                    plan_goal: metadata_state.plan_goal,
+                    plan_config_json: metadata_state.plan_config_json,
+                    plan_execution_rounds: metadata_state.plan_execution_rounds,
                     contract_json,
+                    last_context_trace,
                     ..Default::default()
                 }))
             }
@@ -377,6 +395,35 @@ impl HybridRestoreService {
             }
         }
         Ok(tools)
+    }
+
+    /// Restore the latest structured context-trace signal from cloud events.
+    async fn restore_latest_context_trace_signal(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<super::session_workspace::ContextTraceSignal>, String> {
+        let pool = match &self.pool {
+            Some(p) => p,
+            None => return Ok(None),
+        };
+
+        let row = sqlx::query(
+            "SELECT metadata FROM agent_events \
+             WHERE session_id = ? AND event_type = 'context_trace_signal' \
+             ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(session_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| format!("restore_latest_context_trace_signal: {e}"))?;
+
+        use sqlx::Row;
+        Ok(row.and_then(|row| {
+            row.try_get::<Option<String>, _>("metadata")
+                .ok()
+                .flatten()
+                .and_then(|meta| serde_json::from_str(&meta).ok())
+        }))
     }
 
     /// Pull learning snapshot from MatrixOne.
@@ -522,6 +569,7 @@ impl SessionRestoreService for HybridRestoreService {
                 plan_execution_rounds: ws.plan_execution_rounds,
                 contract_json: ws.contract_json,
                 plan_corrections: ws.plan_corrections,
+                last_context_trace: ws.last_context_trace,
                 ..Default::default()
             }));
         }
@@ -904,9 +952,9 @@ pub async fn pull_step_checkpoint_from_cloud(
 
 // ─── Plan State Cloud Sync ──────────────────────────────────────────────────
 
-/// Push plan execution state to cloud via the agent_sessions.metadata JSON column.
-/// Called at checkpoint boundaries and session end to enable cross-device plan restore.
-pub async fn push_plan_state_to_cloud(
+/// Push resumable session state to cloud via the agent_sessions.metadata JSON column.
+/// Called at checkpoint boundaries and session end to enable cross-device restore.
+pub async fn push_session_state_to_cloud(
     pool: &sqlx::Pool<sqlx::MySql>,
     session_id: &str,
     executing_plan_json: Option<&str>,
@@ -947,16 +995,68 @@ pub async fn push_plan_state_to_cloud(
         .bind(session_id)
         .execute(pool)
         .await
-        .map_err(|e| format!("push_plan_state: {e}"))?;
+        .map_err(|e| format!("push_session_state: {e}"))?;
+
+    Ok(())
+}
+
+/// Push a structured context-trace signal as a first-class cloud event.
+pub async fn push_context_trace_signal_to_cloud(
+    pool: &sqlx::Pool<sqlx::MySql>,
+    session_id: &str,
+    user_id: &str,
+    signal: &super::session_workspace::ContextTraceSignal,
+) -> Result<(), String> {
+    let metadata_json = serde_json::to_string(signal)
+        .map_err(|e| format!("serialize context_trace_signal: {e}"))?;
+    let duration_ms = signal
+        .timing
+        .as_ref()
+        .map(|timing| timing.total_ms.min(i32::MAX as u64) as i32);
+    let content = {
+        let preview = signal.preview();
+        if preview.is_empty() {
+            "context trace signal".to_string()
+        } else {
+            preview
+        }
+    };
+
+    sqlx::query(
+        "INSERT INTO agent_events \
+         (event_id, session_id, user_id, agent_id, agent_version, event_type, content, \
+          parent_event_id, causal_chain_id, metadata, reasoning_content, meta_tool_name, \
+          meta_duration_ms, created_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())",
+    )
+    .bind(uuid::Uuid::now_v7().to_string())
+    .bind(session_id)
+    .bind(user_id)
+    .bind("astra-cli")
+    .bind(env!("CARGO_PKG_VERSION"))
+    .bind("context_trace_signal")
+    .bind(content)
+    .bind(None::<String>)
+    .bind(&signal.turn_id)
+    .bind(metadata_json)
+    .bind(None::<String>)
+    .bind(
+        signal
+            .tool_selection
+            .as_ref()
+            .and_then(|selection| selection.selected_tools.first().cloned()),
+    )
+    .bind(duration_ms)
+    .execute(pool)
+    .await
+    .map_err(|e| format!("push_context_trace_signal: {e}"))?;
 
     Ok(())
 }
 
 /// Extract plan state from the metadata JSON returned by agent_sessions.
 /// Returns (executing_plan_json, plan_goal, plan_config_json, plan_execution_rounds).
-pub fn extract_plan_from_metadata(
-    metadata_json: &str,
-) -> (Option<String>, Option<String>, Option<String>, usize) {
+pub fn extract_session_state_from_metadata(metadata_json: &str) -> SessionMetadataState {
     // Defense: reject excessively large metadata to prevent DoS
     const MAX_METADATA_SIZE: usize = 512 * 1024; // 512 KB
     if metadata_json.len() > MAX_METADATA_SIZE {
@@ -964,35 +1064,47 @@ pub fn extract_plan_from_metadata(
             "[WARN] session metadata too large ({} bytes), skipping plan extraction",
             metadata_json.len()
         );
-        return (None, None, None, 0);
+        return SessionMetadataState::default();
     }
     let parsed: serde_json::Value = match serde_json::from_str(metadata_json) {
         Ok(v) => v,
-        Err(_) => return (None, None, None, 0),
+        Err(_) => return SessionMetadataState::default(),
     };
     let obj = match parsed.as_object() {
         Some(o) => o,
-        None => return (None, None, None, 0),
+        None => return SessionMetadataState::default(),
     };
 
-    let plan = obj
-        .get("executing_plan")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-    let goal = obj
-        .get("plan_goal")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-    let config = obj
-        .get("plan_config")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-    let rounds = obj
-        .get("plan_execution_rounds")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0) as usize;
+    SessionMetadataState {
+        executing_plan_json: obj
+            .get("executing_plan")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        plan_goal: obj
+            .get("plan_goal")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        plan_config_json: obj
+            .get("plan_config")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        plan_execution_rounds: obj
+            .get("plan_execution_rounds")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize,
+    }
+}
 
-    (plan, goal, config, rounds)
+pub fn extract_plan_from_metadata(
+    metadata_json: &str,
+) -> (Option<String>, Option<String>, Option<String>, usize) {
+    let state = extract_session_state_from_metadata(metadata_json);
+    (
+        state.executing_plan_json,
+        state.plan_goal,
+        state.plan_config_json,
+        state.plan_execution_rounds,
+    )
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
@@ -1010,6 +1122,7 @@ mod tests {
         assert!(s.recent_tools.is_empty());
         assert!(s.learning_snapshot_json.is_none());
         assert!(!s.restored_from_cloud);
+        assert!(s.last_context_trace.is_none());
     }
 
     #[test]
@@ -1343,6 +1456,28 @@ mod tests {
         assert_eq!(goal, Some("Fix bug".to_string()));
         assert!(config.is_none());
         assert_eq!(rounds, 1);
+    }
+
+    #[test]
+    fn extract_session_state_from_metadata_ignores_non_plan_trace_fields() {
+        let metadata = r#"{
+            "executing_plan": "{\"subtasks\":[]}",
+            "last_context_trace": {
+                "turn_id": "turn-9",
+                "selected_tools": ["lsp", "view"],
+                "selection_strategy": "code-intel",
+                "selection_confidence": 0.93,
+                "memory_query": "resume trace persistence",
+                "memories_selected": 2,
+                "compressed_turns": 1,
+                "compression_ratio": 0.72,
+                "budget_pressure": 0.88,
+                "total_tokens_used": 12345
+            }
+        }"#;
+        let state = extract_session_state_from_metadata(metadata);
+        assert!(state.executing_plan_json.is_some());
+        assert_eq!(state.plan_execution_rounds, 0);
     }
 
     #[test]

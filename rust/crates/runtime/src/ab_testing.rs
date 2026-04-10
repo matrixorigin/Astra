@@ -1101,7 +1101,11 @@ mod tests {
 
         assert!((stats.mean - 5.5).abs() < 0.01);
         // Sample std_dev (Bessel's correction: n-1 denominator) for [1..10] ≈ 3.0277
-        assert!((stats.std_dev - 3.0277).abs() < 0.01, "std_dev was {}", stats.std_dev);
+        assert!(
+            (stats.std_dev - 3.0277).abs() < 0.01,
+            "std_dev was {}",
+            stats.std_dev
+        );
         assert!((stats.median - 5.5).abs() < 0.01);
         assert_eq!(stats.min, 1.0);
         assert_eq!(stats.max, 10.0);
@@ -1111,17 +1115,15 @@ mod tests {
     #[test]
     fn test_welch_t_test_known_result() {
         // Two clearly distinct groups: control ~5, treatment ~10
-        let control = ExperimentAnalyzer::calculate_metric_stats(
-            "ctl",
-            &[4.0, 5.0, 5.0, 6.0, 5.0],
-        );
-        let treatment = ExperimentAnalyzer::calculate_metric_stats(
-            "trt",
-            &[9.0, 10.0, 10.0, 11.0, 10.0],
-        );
+        let control = ExperimentAnalyzer::calculate_metric_stats("ctl", &[4.0, 5.0, 5.0, 6.0, 5.0]);
+        let treatment =
+            ExperimentAnalyzer::calculate_metric_stats("trt", &[9.0, 10.0, 10.0, 11.0, 10.0]);
         let (p_value, se) = ExperimentAnalyzer::welch_t_test(&control, &treatment);
         // Large effect size → p should be very small
-        assert!(p_value < 0.01, "p_value {p_value} should be < 0.01 for distinct groups");
+        assert!(
+            p_value < 0.01,
+            "p_value {p_value} should be < 0.01 for distinct groups"
+        );
         assert!(se > 0.0, "standard error must be positive");
 
         // Two identical groups: should not be significant
@@ -1129,7 +1131,10 @@ mod tests {
         let same2 = ExperimentAnalyzer::calculate_metric_stats("b", &[5.0, 5.0, 5.0, 5.0, 5.0]);
         let (p_identical, _se) = ExperimentAnalyzer::welch_t_test(&same1, &same2);
         // Zero variance → se=0 → returns (1.0, 0.0)
-        assert!((p_identical - 1.0).abs() < 0.001, "identical groups should have p≈1.0");
+        assert!(
+            (p_identical - 1.0).abs() < 0.001,
+            "identical groups should have p≈1.0"
+        );
     }
 
     #[test]

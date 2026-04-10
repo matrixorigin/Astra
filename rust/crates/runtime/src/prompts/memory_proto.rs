@@ -563,12 +563,7 @@ mod tests {
     #[test]
     fn to_store_payload_with_meta_includes_trust_tier() {
         let e = MemoryEntry::new("fact", "semantic", "Rust is fast");
-        let meta = EntryMeta::from_session_with_tier(
-            Some("s1"),
-            3,
-            SRC_USER,
-            TIER_VERIFIED,
-        );
+        let meta = EntryMeta::from_session_with_tier(Some("s1"), 3, SRC_USER, TIER_VERIFIED);
         let p = e.to_store_payload_with_meta(&meta);
         assert_eq!(p["trust_tier"], "T1");
         assert_eq!(p["session_id"], "s1");

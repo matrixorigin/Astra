@@ -279,9 +279,7 @@ impl ObservabilitySession {
             "停一下",
         ];
 
-        let is_correction = correction_patterns
-            .iter()
-            .any(|p| query_lower.contains(p));
+        let is_correction = correction_patterns.iter().any(|p| query_lower.contains(p));
 
         if is_correction {
             self.record_user_correction();
@@ -300,10 +298,12 @@ impl ObservabilitySession {
     /// Uses the original query (from session start), recent queries,
     /// compression events, and user corrections to detect drift.
     pub fn check_drift(&self) -> FocusDriftAnalysis {
-        let original = self
-            .original_query
-            .as_deref()
-            .unwrap_or_else(|| self.recent_queries.first().map(|s| s.as_str()).unwrap_or(""));
+        let original = self.original_query.as_deref().unwrap_or_else(|| {
+            self.recent_queries
+                .first()
+                .map(|s| s.as_str())
+                .unwrap_or("")
+        });
 
         self.check_drift_against(original)
     }
@@ -335,12 +335,7 @@ impl ObservabilitySession {
     }
 
     /// Record a tool result as a potential goal milestone.
-    pub fn record_tool_result(
-        &mut self,
-        tool_name: &str,
-        output: &str,
-        exit_code: Option<i32>,
-    ) {
+    pub fn record_tool_result(&mut self, tool_name: &str, output: &str, exit_code: Option<i32>) {
         if let Some(ref mut tracker) = self.goal_tracker {
             if let Some(signal) =
                 crate::turn::goal_tracker::detect_signal(tool_name, output, exit_code)

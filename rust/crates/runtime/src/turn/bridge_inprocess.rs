@@ -2356,7 +2356,13 @@ fn extract_entity_tokens(msg: &str) -> String {
 }
 
 /// Fetch memories from Memoria HTTP API. Returns joined content string.
-async fn fetch_memories(base_url: &str, api_key: &str, query: &str, user_id: &str, top_k: u32) -> String {
+async fn fetch_memories(
+    base_url: &str,
+    api_key: &str,
+    query: &str,
+    user_id: &str,
+    top_k: u32,
+) -> String {
     let client = reqwest::Client::builder()
         .no_proxy()
         .build()
@@ -3958,7 +3964,13 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let result = rt.block_on(prefetch_memories("http://localhost", "", "query", "user1", 5));
+        let result = rt.block_on(prefetch_memories(
+            "http://localhost",
+            "",
+            "query",
+            "user1",
+            5,
+        ));
         assert_eq!(result.items, 0);
         assert!(result.section.is_none());
     }
@@ -3969,7 +3981,13 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let result = rt.block_on(prefetch_memories("http://localhost", "key", "   ", "user1", 5));
+        let result = rt.block_on(prefetch_memories(
+            "http://localhost",
+            "key",
+            "   ",
+            "user1",
+            5,
+        ));
         assert_eq!(result.items, 0);
     }
 

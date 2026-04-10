@@ -104,6 +104,8 @@ mod slash_bug;
 mod slash_config;
 #[path = "cli/slash_debug.rs"]
 mod slash_debug;
+#[path = "cli/slash_experiment.rs"]
+mod slash_experiment;
 #[path = "cli/slash_info.rs"]
 mod slash_info;
 #[path = "cli/slash_mcp.rs"]
@@ -112,6 +114,8 @@ mod slash_mcp;
 mod slash_memory;
 #[path = "cli/slash_messaging.rs"]
 mod slash_messaging;
+#[path = "cli/slash_profile.rs"]
+mod slash_profile;
 #[path = "cli/slash_session.rs"]
 mod slash_session;
 #[path = "cli/slash_skill.rs"]
@@ -120,10 +124,6 @@ mod slash_skill;
 mod slash_state;
 #[path = "cli/slash_team.rs"]
 mod slash_team;
-#[path = "cli/slash_experiment.rs"]
-mod slash_experiment;
-#[path = "cli/slash_profile.rs"]
-mod slash_profile;
 #[path = "cli/slash_tuning.rs"]
 mod slash_tuning;
 #[path = "cli/spawn_subrun.rs"]
@@ -1473,8 +1473,11 @@ struct ReplState {
     /// Original user query at session start (for drift baseline comparison).
     drift_original_query: Option<String>,
     /// Session-scoped observability for context tracing (M1).
-    observability_session:
-        Option<std::sync::Arc<std::sync::RwLock<astra_runtime::observability_integration::ObservabilitySession>>>,
+    observability_session: Option<
+        std::sync::Arc<
+            std::sync::RwLock<astra_runtime::observability_integration::ObservabilitySession>,
+        >,
+    >,
 
     // ── A/B Testing (M4) ──
     /// Shared experiment store for A/B testing.
@@ -1603,7 +1606,8 @@ impl Default for ReplState {
             active_experiment_id: None,
             active_variant_id: None,
             user_profile_manager: {
-                let store = std::sync::Arc::new(astra_runtime::user_profile::UserProfileStore::new());
+                let store =
+                    std::sync::Arc::new(astra_runtime::user_profile::UserProfileStore::new());
                 std::sync::Arc::new(astra_runtime::user_profile::UserProfileManager::new(store))
             },
             auto_tuning_engine: {
@@ -2060,7 +2064,7 @@ async fn handle_resume_command(arg: &str, profile: Option<&str>, state: &mut Rep
             state.plan_execution_rounds = restored.plan_execution_rounds;
 
             // Restore operator corrections stacked during plan pause
-            state.plan_execution_corrections = restored.plan_corrections;
+            state.plan_execution_corrections = restored.plan_corrections.clone();
 
             // Restore durable task contract if present
             if let Some(ref json) = restored.contract_json
@@ -2119,6 +2123,26 @@ async fn handle_resume_command(arg: &str, profile: Option<&str>, state: &mut Rep
             // Re-initialize journal for the resumed session
             repl_turn::initialize_journal_pub(state, &session_id);
             repl_turn::persist_last_session_id(profile, &session_id);
+            if let Ok(mut ws) = astra_services::session_workspace::read_workspace(&session_id) {
+                ws.turn_count = restored.turn_count;
+                ws.total_tokens_in = restored.total_tokens_in;
+                ws.total_tokens_out = restored.total_tokens_out;
+                ws.status = restored.last_status.clone();
+                if let Some(ref branch) = restored.git_branch {
+                    ws.git_branch = Some(branch.clone());
+                }
+                if let Some(ref model) = restored.model {
+                    ws.model = model.clone();
+                }
+                ws.executing_plan_json = restored.executing_plan_json.clone();
+                ws.plan_goal = restored.plan_goal.clone();
+                ws.plan_config_json = restored.plan_config_json.clone();
+                ws.plan_execution_rounds = restored.plan_execution_rounds;
+                ws.contract_json = restored.contract_json.clone();
+                ws.plan_corrections = restored.plan_corrections.clone();
+                ws.last_context_trace = restored.last_context_trace.clone();
+                let _ = astra_services::session_workspace::write_workspace(&ws);
+            }
 
             let source = if restored.restored_from_cloud {
                 "cloud"
@@ -2133,6 +2157,12 @@ async fn handle_resume_command(arg: &str, profile: Option<&str>, state: &mut Rep
                 restored.turn_count,
                 restored.checkpoint_count,
             );
+            if let Some(ref trace) = restored.last_context_trace {
+                let preview = trace.preview();
+                if !preview.is_empty() {
+                    eprintln!("    {} {}", "Last trace:".dim(), preview.dim());
+                }
+            }
 
             // Show paused plan banner
             if let Some(ref plan) = state.executing_plan {
@@ -6159,9 +6189,8 @@ async fn handle_slash_command(
 
         "/profile" => {
             // Use profile name or session_id as user identifier
-            let user_id = profile.unwrap_or_else(|| {
-                state.session_id.as_deref().unwrap_or("default")
-            });
+            let user_id =
+                profile.unwrap_or_else(|| state.session_id.as_deref().unwrap_or("default"));
             let ctx = slash_profile::ProfileCommandContext {
                 profile_manager: &state.user_profile_manager,
                 user_id,

@@ -72,7 +72,11 @@ fn cmd_status<W: Write>(ctx: TuningCommandContext<'_, W>) -> std::io::Result<()>
 
     // Rules count
     let rules = ctx.engine.get_rules();
-    writeln!(w, "Rules:     {} configured", rules.len().to_string().cyan())?;
+    writeln!(
+        w,
+        "Rules:     {} configured",
+        rules.len().to_string().cyan()
+    )?;
 
     // Active rules (enabled)
     let active_rules = rules.iter().filter(|r| r.enabled).count();
@@ -90,7 +94,11 @@ fn cmd_status<W: Write>(ctx: TuningCommandContext<'_, W>) -> std::io::Result<()>
     // Recent rollbacks
     let rollbacks = executions.iter().filter(|e| e.rolled_back).count();
     if rollbacks > 0 {
-        writeln!(w, "Rollbacks: {} (auto-reverted)", rollbacks.to_string().red())?;
+        writeln!(
+            w,
+            "Rollbacks: {} (auto-reverted)",
+            rollbacks.to_string().red()
+        )?;
     }
 
     // Current config values (relevant to auto-tuning)
@@ -164,10 +172,20 @@ fn print_rule<W: Write>(w: &mut W, rule: &EvolutionRule) -> std::io::Result<()> 
     )?;
 
     // Trigger
-    writeln!(w, "  {}: {}", "Trigger".yellow(), format_trigger(&rule.trigger))?;
+    writeln!(
+        w,
+        "  {}: {}",
+        "Trigger".yellow(),
+        format_trigger(&rule.trigger)
+    )?;
 
     // Action
-    writeln!(w, "  {}: {}", "Action".yellow(), format_action(&rule.action))?;
+    writeln!(
+        w,
+        "  {}: {}",
+        "Action".yellow(),
+        format_action(&rule.action)
+    )?;
 
     // Cooldown
     if rule.cooldown > Duration::ZERO {
@@ -181,12 +199,7 @@ fn print_rule<W: Write>(w: &mut W, rule: &EvolutionRule) -> std::io::Result<()> 
 
     // Rollback condition
     if let Some(ref rb) = rule.rollback_condition {
-        writeln!(
-            w,
-            "  {}: {}",
-            "Rollback".dim(),
-            format_rollback(rb).dim()
-        )?;
+        writeln!(w, "  {}: {}", "Rollback".dim(), format_rollback(rb).dim())?;
     }
 
     Ok(())
@@ -232,7 +245,10 @@ fn format_trigger(trigger: &EvolutionTrigger) -> String {
             format!("{} consecutive negative signals", count)
         }
         EvolutionTrigger::PatternDrift { confidence_drop } => {
-            format!("Pattern confidence drops by {:.0}%", confidence_drop * 100.0)
+            format!(
+                "Pattern confidence drops by {:.0}%",
+                confidence_drop * 100.0
+            )
         }
         EvolutionTrigger::SignalAccumulation {
             signal_type,
@@ -264,7 +280,10 @@ fn format_action(action: &EvolutionAction) -> String {
         EvolutionAction::SetConfig { path, value } => {
             format!("{} = {}", path, value)
         }
-        EvolutionAction::SwitchStrategy { strategy_key, new_value } => {
+        EvolutionAction::SwitchStrategy {
+            strategy_key,
+            new_value,
+        } => {
             format!("Switch {}: → {}", strategy_key, new_value)
         }
         EvolutionAction::EnableExperiment { experiment_id } => {
@@ -338,10 +357,7 @@ fn cmd_feedback<W: Write>(
         "  {} Feedback signals are aggregated internally.",
         "ℹ".blue()
     )?;
-    writeln!(
-        w,
-        "  Use `/tuning record <signal>` to add manual signals."
-    )?;
+    writeln!(w, "  Use `/tuning record <signal>` to add manual signals.")?;
     writeln!(w)?;
     writeln!(w, "  {}", "Available signal types:".dim())?;
     writeln!(w, "    - success      Task completed successfully")?;
@@ -376,7 +392,10 @@ fn cmd_history<W: Write>(
 
     if executions.is_empty() {
         writeln!(w, "  No rule executions yet.")?;
-        writeln!(w, "  Rules execute when their triggers are met and cooldown has elapsed.")?;
+        writeln!(
+            w,
+            "  Rules execute when their triggers are met and cooldown has elapsed."
+        )?;
         writeln!(w)?;
         return Ok(());
     }
@@ -464,7 +483,11 @@ fn cmd_cycle<W: Write>(ctx: TuningCommandContext<'_, W>) -> std::io::Result<()> 
     let w = ctx.writer;
 
     if !ctx.engine.is_enabled() {
-        writeln!(w, "{} Auto-tuning is disabled. Enable with `/tuning enable`.", "⚠".yellow())?;
+        writeln!(
+            w,
+            "{} Auto-tuning is disabled. Enable with `/tuning enable`.",
+            "⚠".yellow()
+        )?;
         return Ok(());
     }
 
@@ -475,16 +498,29 @@ fn cmd_cycle<W: Write>(ctx: TuningCommandContext<'_, W>) -> std::io::Result<()> 
     if executions.is_empty() {
         writeln!(w, "  No rules triggered.")?;
     } else {
-        writeln!(w, "  {} rule(s) executed:", executions.len().to_string().green())?;
+        writeln!(
+            w,
+            "  {} rule(s) executed:",
+            executions.len().to_string().green()
+        )?;
         for exec in &executions {
-            writeln!(w, "    - {}: {}", exec.rule_id.clone().cyan(), format_action(&exec.action))?;
+            writeln!(
+                w,
+                "    - {}: {}",
+                exec.rule_id.clone().cyan(),
+                format_action(&exec.action)
+            )?;
         }
     }
 
     // Check rollbacks
     let rollbacks = ctx.engine.check_rollbacks(ctx.runtime_config);
     if !rollbacks.is_empty() {
-        writeln!(w, "  {} rule(s) rolled back:", rollbacks.len().to_string().red())?;
+        writeln!(
+            w,
+            "  {} rule(s) rolled back:",
+            rollbacks.len().to_string().red()
+        )?;
         for rule_id in &rollbacks {
             let id: String = rule_id.clone();
             writeln!(w, "    - {}", id.red())?;
@@ -550,25 +586,64 @@ fn cmd_help<W: Write>(ctx: TuningCommandContext<'_, W>) -> std::io::Result<()> {
     writeln!(w, "\n{}", "Auto-Tuning Commands".cyan().bold())?;
     writeln!(w, "{}", "─".repeat(50).dim())?;
     writeln!(w)?;
-    writeln!(w, "  {}   Show system status and current config", "/tuning status".green())?;
-    writeln!(w, "  {}    List all evolution rules", "/tuning rules".green())?;
-    writeln!(w, "  {} Show feedback signal info", "/tuning feedback".green())?;
-    writeln!(w, "  {}  Show rule execution history", "/tuning history".green())?;
+    writeln!(
+        w,
+        "  {}   Show system status and current config",
+        "/tuning status".green()
+    )?;
+    writeln!(
+        w,
+        "  {}    List all evolution rules",
+        "/tuning rules".green()
+    )?;
+    writeln!(
+        w,
+        "  {} Show feedback signal info",
+        "/tuning feedback".green()
+    )?;
+    writeln!(
+        w,
+        "  {}  Show rule execution history",
+        "/tuning history".green()
+    )?;
     writeln!(w, "  {}   Enable auto-tuning", "/tuning enable".green())?;
     writeln!(w, "  {}  Disable auto-tuning", "/tuning disable".green())?;
-    writeln!(w, "  {}    Run one evaluation cycle", "/tuning cycle".green())?;
-    writeln!(w, "  {} Record a feedback signal", "/tuning record <signal>".green())?;
+    writeln!(
+        w,
+        "  {}    Run one evaluation cycle",
+        "/tuning cycle".green()
+    )?;
+    writeln!(
+        w,
+        "  {} Record a feedback signal",
+        "/tuning record <signal>".green()
+    )?;
     writeln!(w)?;
     writeln!(w, "{}", "About Auto-Tuning".cyan())?;
     writeln!(w, "{}", "─".repeat(50).dim())?;
     writeln!(w)?;
     writeln!(w, "  The auto-tuning system monitors feedback signals and")?;
-    writeln!(w, "  automatically adjusts runtime configuration to improve")?;
+    writeln!(
+        w,
+        "  automatically adjusts runtime configuration to improve"
+    )?;
     writeln!(w, "  performance. Evolution rules define:")?;
     writeln!(w)?;
-    writeln!(w, "  • {} - When to act (e.g., low success rate)", "Triggers".yellow())?;
-    writeln!(w, "  • {} - What to change (e.g., adjust threshold)", "Actions".yellow())?;
-    writeln!(w, "  • {} - When to undo (e.g., if things get worse)", "Rollbacks".yellow())?;
+    writeln!(
+        w,
+        "  • {} - When to act (e.g., low success rate)",
+        "Triggers".yellow()
+    )?;
+    writeln!(
+        w,
+        "  • {} - What to change (e.g., adjust threshold)",
+        "Actions".yellow()
+    )?;
+    writeln!(
+        w,
+        "  • {} - When to undo (e.g., if things get worse)",
+        "Rollbacks".yellow()
+    )?;
     writeln!(w)?;
 
     Ok(())

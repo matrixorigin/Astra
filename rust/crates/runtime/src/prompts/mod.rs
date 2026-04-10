@@ -702,12 +702,7 @@ mod tests {
     fn store_payload_with_trust_tier_emits_top_level_field() {
         use memory_proto::*;
         let entry = MemoryEntry::new(NS_FACT, ST_ACTIVE, "User prefers Rust");
-        let meta = EntryMeta::from_session_with_tier(
-            Some("sess-1"),
-            1,
-            SRC_USER,
-            TIER_VERIFIED,
-        );
+        let meta = EntryMeta::from_session_with_tier(Some("sess-1"), 1, SRC_USER, TIER_VERIFIED);
         let payload = entry.to_store_payload_with_meta(&meta);
         // trust_tier is top-level for Memoria API
         assert_eq!(payload["trust_tier"], "T1");

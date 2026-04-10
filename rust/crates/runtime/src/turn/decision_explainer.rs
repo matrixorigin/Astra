@@ -648,7 +648,12 @@ impl DriftDetector {
         budget_traces: &[TokenBudgetTrace],
     ) -> FocusDriftAnalysis {
         // Start with the base analysis
-        let mut base = self.analyze(original_query, recent_queries, compressed_turns, user_corrections);
+        let mut base = self.analyze(
+            original_query,
+            recent_queries,
+            compressed_turns,
+            user_corrections,
+        );
 
         // Even if base says "no drift", the additional signals can push it over
         let mut extra_severity = 0.0_f64;
@@ -860,7 +865,11 @@ fn cosine_sim(a: &HashMap<String, f64>, b: &HashMap<String, f64>) -> f64 {
         norm_b += c2 * c2;
     }
     let denom = norm_a.sqrt() * norm_b.sqrt();
-    if denom < 1e-9 { 0.0 } else { (dot / denom).min(1.0) }
+    if denom < 1e-9 {
+        0.0
+    } else {
+        (dot / denom).min(1.0)
+    }
 }
 
 /// Extract simple keywords from text (lowercase, 4+ chars).
@@ -1032,10 +1041,7 @@ mod tests {
     #[test]
     fn test_query_similarity_related_queries() {
         // Related queries should have high similarity
-        let sim = query_similarity(
-            "implement user authentication",
-            "implement auth module",
-        );
+        let sim = query_similarity("implement user authentication", "implement auth module");
         assert!(sim > 0.3, "related queries should be similar: {sim}");
     }
 
@@ -1046,14 +1052,20 @@ mod tests {
             "implement user authentication",
             "configure kubernetes deployment",
         );
-        assert!(sim < 0.15, "unrelated queries should have low similarity: {sim}");
+        assert!(
+            sim < 0.15,
+            "unrelated queries should have low similarity: {sim}"
+        );
     }
 
     #[test]
     fn test_query_similarity_chinese() {
         // CJK queries should work via bigram tokenization
         let sim = query_similarity("实现用户认证功能", "实现用户登录");
-        assert!(sim > 0.2, "related Chinese queries should be similar: {sim}");
+        assert!(
+            sim > 0.2,
+            "related Chinese queries should be similar: {sim}"
+        );
 
         let sim2 = query_similarity("实现用户认证", "配置数据库连接");
         assert!(sim2 < sim, "unrelated Chinese should be less similar");
@@ -1080,11 +1092,19 @@ mod tests {
             &[],
             &[],
         );
-        assert!(analysis.drift_detected, "two unrelated queries should trigger drift");
-        let topic_changes = analysis.evidence.iter()
+        assert!(
+            analysis.drift_detected,
+            "two unrelated queries should trigger drift"
+        );
+        let topic_changes = analysis
+            .evidence
+            .iter()
             .filter(|e| matches!(e.evidence_type, EvidenceType::ToolCallTopicChange))
             .count();
-        assert!(topic_changes >= 2, "should have evidence for both divergent queries, got {topic_changes}");
+        assert!(
+            topic_changes >= 2,
+            "should have evidence for both divergent queries, got {topic_changes}"
+        );
     }
 
     // ── analyze_with_context() tests ────────────────────────────────────
@@ -1094,14 +1114,17 @@ mod tests {
         MemoryRetrievalTrace {
             query: query.to_string(),
             candidates_considered: candidates,
-            memories_selected: scores.iter().map(|&s| MemorySelection {
-                memory_id: "m1".to_string(),
-                memory_type: "semantic".to_string(),
-                content_preview: "test".to_string(),
-                relevance_score: s,
-                tokens: 50,
-                source: MemorySource::Memoria,
-            }).collect(),
+            memories_selected: scores
+                .iter()
+                .map(|&s| MemorySelection {
+                    memory_id: "m1".to_string(),
+                    memory_type: "semantic".to_string(),
+                    content_preview: "test".to_string(),
+                    relevance_score: s,
+                    tokens: 50,
+                    source: MemorySource::Memoria,
+                })
+                .collect(),
             memories_rejected: vec![],
             total_tokens: 50 * scores.len() as u32,
             retrieval_latency_ms: 10,
@@ -1135,10 +1158,14 @@ mod tests {
             &[],
         );
         // MemoryMiss alone adds 0.2 severity — below 0.3 threshold
-        assert!(!analysis.drift_detected,
-            "memory miss alone (0.2) should not cross 0.3 threshold");
+        assert!(
+            !analysis.drift_detected,
+            "memory miss alone (0.2) should not cross 0.3 threshold"
+        );
         // But the evidence should be present
-        let mem_evidence = analysis.evidence.iter()
+        let mem_evidence = analysis
+            .evidence
+            .iter()
             .any(|e| matches!(e.evidence_type, EvidenceType::MemoryMismatch));
         assert!(mem_evidence, "should have MemoryMismatch evidence");
     }
@@ -1154,9 +1181,14 @@ mod tests {
             &[make_memory_trace("user auth", 5, &[0.1, 0.2])], // all < 0.3
             &[],
         );
-        let mem_evidence = analysis.evidence.iter()
+        let mem_evidence = analysis
+            .evidence
+            .iter()
             .any(|e| matches!(e.evidence_type, EvidenceType::MemoryMismatch));
-        assert!(mem_evidence, "low relevance scores should trigger MemoryMismatch");
+        assert!(
+            mem_evidence,
+            "low relevance scores should trigger MemoryMismatch"
+        );
     }
 
     #[test]
@@ -1170,9 +1202,14 @@ mod tests {
             &[make_memory_trace("user auth", 5, &[0.8, 0.6])], // above 0.3
             &[],
         );
-        let mem_evidence = analysis.evidence.iter()
+        let mem_evidence = analysis
+            .evidence
+            .iter()
             .any(|e| matches!(e.evidence_type, EvidenceType::MemoryMismatch));
-        assert!(!mem_evidence, "good relevance should not trigger MemoryMismatch");
+        assert!(
+            !mem_evidence,
+            "good relevance should not trigger MemoryMismatch"
+        );
     }
 
     #[test]
@@ -1187,9 +1224,13 @@ mod tests {
             &[make_budget_trace(0.92, true)], // 92% pressure, compression triggered
         );
         // Budget pressure alone adds 0.25 severity — below 0.3 threshold
-        assert!(!analysis.drift_detected,
-            "budget pressure alone (0.25) should not cross 0.3 threshold");
-        let budget_evidence = analysis.evidence.iter()
+        assert!(
+            !analysis.drift_detected,
+            "budget pressure alone (0.25) should not cross 0.3 threshold"
+        );
+        let budget_evidence = analysis
+            .evidence
+            .iter()
             .any(|e| e.description.contains("Token budget pressure"));
         assert!(budget_evidence, "should have budget pressure evidence");
     }
@@ -1205,9 +1246,14 @@ mod tests {
             &[],
             &[make_budget_trace(0.6, false)], // 60% — fine
         );
-        let budget_evidence = analysis.evidence.iter()
+        let budget_evidence = analysis
+            .evidence
+            .iter()
             .any(|e| e.description.contains("Token budget pressure"));
-        assert!(!budget_evidence, "normal budget should not trigger evidence");
+        assert!(
+            !budget_evidence,
+            "normal budget should not trigger evidence"
+        );
     }
 
     #[test]
@@ -1222,13 +1268,20 @@ mod tests {
             &[make_memory_trace("user auth", 0, &[])],
             &[make_budget_trace(0.92, true)],
         );
-        assert!(analysis.drift_detected,
-            "memory miss + budget pressure should trigger drift (0.45 > 0.3)");
-        assert!(analysis.drift_severity >= 0.4,
-            "combined severity should be >= 0.4, got {:.2}", analysis.drift_severity);
+        assert!(
+            analysis.drift_detected,
+            "memory miss + budget pressure should trigger drift (0.45 > 0.3)"
+        );
+        assert!(
+            analysis.drift_severity >= 0.4,
+            "combined severity should be >= 0.4, got {:.2}",
+            analysis.drift_severity
+        );
         // Cause should be MemoryMiss (detected first)
-        assert!(matches!(analysis.likely_cause, DriftCause::MemoryMiss { .. }),
-            "likely cause should be MemoryMiss when both are present");
+        assert!(
+            matches!(analysis.likely_cause, DriftCause::MemoryMiss { .. }),
+            "likely cause should be MemoryMiss when both are present"
+        );
     }
 
     #[test]
@@ -1248,10 +1301,18 @@ mod tests {
             &[],
         );
         // user corrections (0.4) + ambiguous instruction (0.3) = 0.7
-        assert!(analysis.drift_detected, "ambiguous instruction should be detected");
-        let clarification = analysis.evidence.iter()
+        assert!(
+            analysis.drift_detected,
+            "ambiguous instruction should be detected"
+        );
+        let clarification = analysis
+            .evidence
+            .iter()
             .any(|e| matches!(e.evidence_type, EvidenceType::ClarificationRequest));
-        assert!(clarification, "should have ClarificationRequest evidence for ambiguity");
+        assert!(
+            clarification,
+            "should have ClarificationRequest evidence for ambiguity"
+        );
     }
 
     #[test]
@@ -1274,9 +1335,14 @@ mod tests {
             &[],
         );
         // Has user correction evidence (0.4) but NOT ambiguity
-        let clarification = analysis.evidence.iter()
+        let clarification = analysis
+            .evidence
+            .iter()
             .any(|e| matches!(e.evidence_type, EvidenceType::ClarificationRequest));
-        assert!(!clarification, "non-consecutive corrections should not trigger ambiguity");
+        assert!(
+            !clarification,
+            "non-consecutive corrections should not trigger ambiguity"
+        );
     }
 
     #[test]
@@ -1294,10 +1360,14 @@ mod tests {
             &[],
             &[],
         );
-        let clarification = analysis.evidence.iter()
+        let clarification = analysis
+            .evidence
+            .iter()
             .any(|e| matches!(e.evidence_type, EvidenceType::ClarificationRequest));
-        assert!(!clarification,
-            "dissimilar corrections should not trigger ambiguity (different topics)");
+        assert!(
+            !clarification,
+            "dissimilar corrections should not trigger ambiguity (different topics)"
+        );
     }
 
     #[test]
@@ -1316,8 +1386,11 @@ mod tests {
             &[make_budget_trace(0.95, true)],
         );
         assert!(analysis.drift_detected);
-        assert!(analysis.drift_severity >= 0.6,
-            "severity should be >= 0.6, got {:.2}", analysis.drift_severity);
+        assert!(
+            analysis.drift_severity >= 0.6,
+            "severity should be >= 0.6, got {:.2}",
+            analysis.drift_severity
+        );
     }
 
     #[test]

@@ -171,7 +171,9 @@ impl TurnTraceCollector {
         budget_pressure: f64,
     ) {
         if let Ok(mut state) = self.inner.write() {
-            let budget = state.token_budget.get_or_insert_with(TokenBudgetTrace::default);
+            let budget = state
+                .token_budget
+                .get_or_insert_with(TokenBudgetTrace::default);
             budget.system_prompt_tokens = system_prompt_tokens;
             budget.history_tokens = history_tokens;
             budget.memory_tokens = memory_tokens;

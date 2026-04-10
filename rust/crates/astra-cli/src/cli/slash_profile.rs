@@ -33,7 +33,10 @@ pub fn handle_profile_command(arg: &str, ctx: &ProfileCommandContext<'_>) {
         "edit" | "set" => {
             if parts.len() < 3 {
                 eprintln!("  {}", "Usage: /profile edit <key> <value>".yellow());
-                eprintln!("  {}", "Keys: verbosity, language, formality, response_length, comments, emoji".dim());
+                eprintln!(
+                    "  {}",
+                    "Keys: verbosity, language, formality, response_length, comments, emoji".dim()
+                );
             } else {
                 edit_preference(ctx, parts[1], &parts[2..].join(" "));
             }
@@ -61,14 +64,8 @@ fn show_profile(ctx: &ProfileCommandContext<'_>) {
     eprintln!("  {}", "─".repeat(50).dim());
 
     eprintln!("  User ID: {}", ctx.user_id.dim());
-    eprintln!(
-        "  Created: {}",
-        format_time(profile.created_at).dim()
-    );
-    eprintln!(
-        "  Updated: {}",
-        format_time(profile.updated_at).dim()
-    );
+    eprintln!("  Created: {}", format_time(profile.created_at).dim());
+    eprintln!("  Updated: {}", format_time(profile.updated_at).dim());
 
     eprintln!("\n  {}", "Preferences:".bold());
     eprintln!(
@@ -124,7 +121,11 @@ fn show_profile(ctx: &ProfileCommandContext<'_>) {
     }
 
     if !profile.active_experiments.is_empty() {
-        eprintln!("\n  {} ({})", "Active Experiments:".bold(), profile.active_experiments.len());
+        eprintln!(
+            "\n  {} ({})",
+            "Active Experiments:".bold(),
+            profile.active_experiments.len()
+        );
         for exp_id in &profile.active_experiments {
             eprintln!("    • {}", exp_id.clone().cyan());
         }
@@ -161,11 +162,7 @@ fn edit_preference(ctx: &ProfileCommandContext<'_>, key: &str, value: &str) {
         }
         "language" | "lang" => {
             prefs.language_style.language = value.to_string();
-            eprintln!(
-                "  {} Language set to: {}",
-                "✓".green(),
-                value.cyan()
-            );
+            eprintln!("  {} Language set to: {}", "✓".green(), value.cyan());
         }
         "formality" | "f" => {
             match value_lower.as_str() {
@@ -318,7 +315,11 @@ fn show_scenario(ctx: &ProfileCommandContext<'_>) {
             eprintln!("    Max tools/turn: {}", strategy.max_tools_per_turn);
             eprintln!(
                 "    Prefer read-only: {}",
-                if strategy.prefer_read_only { "yes" } else { "no" }
+                if strategy.prefer_read_only {
+                    "yes"
+                } else {
+                    "no"
+                }
             );
             eprintln!(
                 "    Detail level: {}",
@@ -435,7 +436,10 @@ fn show_experiments(ctx: &ProfileCommandContext<'_>) {
             "Use /experiment list to see available experiments.".dim()
         );
     } else {
-        eprintln!("  Enrolled in {} experiment(s):", profile.active_experiments.len());
+        eprintln!(
+            "  Enrolled in {} experiment(s):",
+            profile.active_experiments.len()
+        );
         for exp_id in &profile.active_experiments {
             eprintln!("    • {}", exp_id.clone().cyan());
         }
@@ -452,7 +456,10 @@ fn reset_profile(ctx: &ProfileCommandContext<'_>) {
 }
 
 fn show_help() {
-    eprintln!("\n  {}", "👤 /profile - User Profile Management".cyan().bold());
+    eprintln!(
+        "\n  {}",
+        "👤 /profile - User Profile Management".cyan().bold()
+    );
     eprintln!("  {}", "─".repeat(55).dim());
 
     eprintln!("\n  {}", "Subcommands:".bold());
@@ -460,10 +467,7 @@ fn show_help() {
         "    {}",
         "/profile               Show current profile".cyan()
     );
-    eprintln!(
-        "    {}",
-        "/profile edit <k> <v>  Edit a preference".cyan()
-    );
+    eprintln!("    {}", "/profile edit <k> <v>  Edit a preference".cyan());
     eprintln!(
         "    {}",
         "/profile scenario      Show detected scenario".cyan()
@@ -480,28 +484,13 @@ fn show_help() {
         "    {}",
         "/profile experiments   Show experiment enrollment".cyan()
     );
-    eprintln!(
-        "    {}",
-        "/profile reset         Reset to defaults".cyan()
-    );
+    eprintln!("    {}", "/profile reset         Reset to defaults".cyan());
 
     eprintln!("\n  {}", "Editable Preferences:".bold());
-    eprintln!(
-        "    {} quiet|normal|verbose|debug",
-        "verbosity".green()
-    );
-    eprintln!(
-        "    {}     en|zh|ja|ko|es|fr|de|...",
-        "language".green()
-    );
-    eprintln!(
-        "    {}    casual|neutral|formal",
-        "formality".green()
-    );
-    eprintln!(
-        "    {}       short|medium|long",
-        "length".green()
-    );
+    eprintln!("    {} quiet|normal|verbose|debug", "verbosity".green());
+    eprintln!("    {}     en|zh|ja|ko|es|fr|de|...", "language".green());
+    eprintln!("    {}    casual|neutral|formal", "formality".green());
+    eprintln!("    {}       short|medium|long", "length".green());
     eprintln!(
         "    {}     none|minimal|moderate|extensive",
         "comments".green()
