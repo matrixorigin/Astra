@@ -291,6 +291,33 @@ pub struct ContextBudget {
 }
 
 impl ContextBudget {
+    /// Create a ContextBudget from RuntimeConfig, applying model-specific limits.
+    ///
+    /// This bridges RuntimeConfig's strategy parameters with model-aware defaults.
+    /// - Model limit and output reserve come from the model name
+    /// - compact_threshold, keep_recent_turns come from RuntimeConfig.compression
+    /// - memory_budget_chars comes from RuntimeConfig.memory.max_memory_tokens
+    pub fn from_runtime_config(
+        config: &crate::runtime_config::RuntimeConfig,
+        model: Option<&str>,
+    ) -> Self {
+        // Get model-specific limits
+        let base = budget_for_model(model);
+
+        // Apply RuntimeConfig overrides
+        Self {
+            model_limit: base.model_limit,
+            output_reserve_ratio: base.output_reserve_ratio,
+            // Map compression_threshold (0.8 = 80% full) to compact_threshold
+            compact_threshold: config.compression.compression_threshold,
+            // preserve_recent_turns from RuntimeConfig
+            keep_recent_turns: config.compression.preserve_recent_turns as usize,
+            // Convert max_memory_tokens to chars (rough: 4 chars/token avg)
+            memory_budget_chars: (config.memory.max_memory_tokens as usize) * 4,
+            compact_config: CompactConfig::from_env(),
+        }
+    }
+
     /// Usable input token budget after reserving headroom for output.
     pub fn effective_input_limit(&self) -> usize {
         (self.model_limit as f64 * (1.0 - self.output_reserve_ratio)) as usize
@@ -1330,5 +1357,41 @@ mod tests {
         assert_eq!(b.compact_trigger(), 0);
         // Any positive token count should trigger compaction
         assert!(b.should_compact(1));
+    }
+
+    // ---------------------------------------------------------------
+    // 8. RuntimeConfig integration (M3)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn from_runtime_config_applies_compression_settings() {
+        let mut config = crate::runtime_config::RuntimeConfig::default();
+        config.compression.compression_threshold = 0.6;
+        config.compression.preserve_recent_turns = 4;
+        config.memory.max_memory_tokens = 5000;
+
+        let b = ContextBudget::from_runtime_config(&config, Some("claude-3.5-sonnet"));
+
+        // Model-specific values should be applied
+        assert_eq!(b.model_limit, 200_000); // Claude
+        assert!((b.output_reserve_ratio - 0.20).abs() < f64::EPSILON);
+
+        // RuntimeConfig values should be applied
+        assert!((b.compact_threshold - 0.6).abs() < f64::EPSILON);
+        assert_eq!(b.keep_recent_turns, 4);
+        // 5000 tokens * 4 chars/token = 20000 chars
+        assert_eq!(b.memory_budget_chars, 20000);
+    }
+
+    #[test]
+    fn from_runtime_config_defaults() {
+        let config = crate::runtime_config::RuntimeConfig::default();
+        let b = ContextBudget::from_runtime_config(&config, None);
+
+        // Should use default values
+        assert!((b.compact_threshold - 0.8).abs() < f64::EPSILON);
+        assert_eq!(b.keep_recent_turns, 3); // default preserve_recent_turns
+        // 4000 tokens * 4 chars = 16000 chars
+        assert_eq!(b.memory_budget_chars, 16000);
     }
 }

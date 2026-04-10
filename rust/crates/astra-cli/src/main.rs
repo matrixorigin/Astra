@@ -1330,6 +1330,8 @@ struct ReplState {
     cached_pricing: astra_services::models::PricingData,
     skill_dev: Option<SkillDevState>,
     active_system_skills: Vec<prompts::SystemSkill>,
+    /// Runtime configuration loaded from config files + env vars (M3).
+    runtime_config: astra_runtime::runtime_config::RuntimeConfig,
     context_budget: prompts::ContextBudget,
     journal: Option<session_journal::JournalWriter>,
     /// Tools used in the last turn — fed into selection for recency boost.
@@ -1495,6 +1497,13 @@ impl Default for ReplState {
             cached_pricing: Default::default(),
             skill_dev: None,
             active_system_skills: Vec::new(),
+            // Load RuntimeConfig from config files + env vars, then create
+            // ContextBudget using the loaded config (M3 wiring).
+            runtime_config: {
+                let cfg = astra_runtime::runtime_config::RuntimeConfig::load();
+                cfg
+            },
+            // Temporary: will be replaced with from_runtime_config when model is known
             context_budget: prompts::ContextBudget::default(),
             journal: None,
             recent_tools: Vec::new(),
@@ -1973,6 +1982,9 @@ async fn handle_resume_command(arg: &str, profile: Option<&str>, state: &mut Rep
             if let Some(ref m) = restored.model {
                 state.model = Some(m.clone());
                 state.cached_pricing = fallback_pricing(m);
+                // M3: Use RuntimeConfig-driven context budget on session restore
+                state.context_budget =
+                    prompts::ContextBudget::from_runtime_config(&state.runtime_config, Some(m));
             }
 
             // Store learning snapshot for merge after handler returns
@@ -6017,6 +6029,9 @@ async fn handle_slash_command(
                     // Cache pricing: prefer API-provided, fall back to built-in table
                     state.cached_pricing = extract_pricing_for_model(&models, &chosen)
                         .unwrap_or_else(|| fallback_pricing(&chosen));
+                    // M3: Use RuntimeConfig-driven context budget
+                    state.context_budget =
+                        prompts::ContextBudget::from_runtime_config(&state.runtime_config, Some(&chosen));
                     eprintln!(
                         "  {} {}",
                         theme::icon_ok(),
@@ -6031,7 +6046,9 @@ async fn handle_slash_command(
         "/model" => {
             state.model = Some(arg.to_string());
             state.cached_pricing = fallback_pricing(arg);
-            state.context_budget = prompts::budget_for_model(Some(arg));
+            // M3: Use RuntimeConfig-driven context budget
+            state.context_budget =
+                prompts::ContextBudget::from_runtime_config(&state.runtime_config, Some(arg));
             eprintln!("{}", format!("  \u{2713}  Model set to: {}", arg).green());
             if let Some(ref j) = state.journal {
                 let _ = j.append(&session_journal::JournalEvent::config_change(
@@ -8846,6 +8863,9 @@ total_tokens_out: 3
             state.model = restored.model.clone();
             if let Some(ref m) = state.model {
                 state.cached_pricing = fallback_pricing(m);
+                // M3: Use RuntimeConfig-driven context budget on session restore (test code)
+                state.context_budget =
+                    prompts::ContextBudget::from_runtime_config(&state.runtime_config, Some(m));
             }
         }
 
