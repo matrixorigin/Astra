@@ -633,6 +633,80 @@ pub fn sections_to_string(sections: &[PromptSection]) -> String {
         .join("")
 }
 
+// ─── Prompt Section Overrides ─────────────────────────────────────────────
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
+/// Section name → override text mapping.
+/// Keys use snake_case matching the section builder function names:
+/// `core_rules`, `planning`, `coding_discipline`, `parallel_and_efficiency`,
+/// `plan_execution`, `output_format`, `tool_error_recovery`.
+pub type PromptOverrides = HashMap<String, String>;
+
+/// Section names in order, matching the Global sections in `build_system_prompt_sections_with_style`.
+const SECTION_NAMES: &[&str] = &[
+    "core_rules",
+    "planning",
+    "coding_discipline",
+    "parallel_and_efficiency",
+    "plan_execution",
+    "output_format",
+    "tool_error_recovery",
+];
+
+/// Load prompt overrides from a directory.
+///
+/// Reads `*.txt` files from the given directory. File stems become section keys
+/// (e.g., `core_rules.txt` → key "core_rules").
+///
+/// Returns empty map if directory doesn't exist (graceful degradation).
+pub fn load_overrides(dir: &Path) -> PromptOverrides {
+    let mut overrides = HashMap::new();
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return overrides,
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("txt") {
+            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    overrides.insert(stem.to_string(), content);
+                }
+            }
+        }
+    }
+    overrides
+}
+
+/// Default override directory: `~/.astra/prompts/`.
+pub fn default_overrides_dir() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".astra")
+        .join("prompts")
+}
+
+/// Apply overrides to built prompt sections.
+///
+/// For each Global section (indices 0–6), if the corresponding key exists in
+/// `overrides`, replaces the section text with the override content.
+pub fn apply_overrides(sections: &mut [PromptSection], overrides: &PromptOverrides) {
+    if overrides.is_empty() {
+        return;
+    }
+    // Global sections are indices 0..SECTION_NAMES.len() in the sections vec
+    for (i, &name) in SECTION_NAMES.iter().enumerate() {
+        if let Some(override_text) = overrides.get(name) {
+            if i < sections.len() && sections[i].scope == CacheScope::Global {
+                sections[i].text = override_text.clone();
+            }
+        }
+    }
+}
+
 // ── System Prompt Tracing ─────────────────────────────────────────────────────
 
 use crate::turn::context_assembly_trace::{MemoryInjection, SkillInjection, SystemPromptBreakdown};
@@ -2056,5 +2130,58 @@ mod tests {
             CacheScope::None,
             "output style should be None-scoped"
         );
+    }
+
+    // ── Prompt override tests ──
+
+    #[test]
+    fn apply_overrides_replaces_matching_section() {
+        let tools = &["bash", "grep"];
+        let mut sections =
+            build_system_prompt_sections_with_style(tools, "test project", 0.8, None, None);
+
+        let mut overrides = PromptOverrides::new();
+        overrides.insert("core_rules".into(), "Custom core rules content".into());
+
+        apply_overrides(&mut sections, &overrides);
+
+        assert_eq!(sections[0].text, "Custom core rules content");
+        assert_eq!(sections[0].scope, CacheScope::Global);
+        // Other sections should be unchanged
+        assert!(sections[1].text.contains("Planning Protocol"));
+    }
+
+    #[test]
+    fn apply_overrides_ignores_unknown_keys() {
+        let tools = &["bash"];
+        let mut sections = build_system_prompt_sections_with_style(tools, "", 0.8, None, None);
+
+        let original_text = sections[0].text.clone();
+        let mut overrides = PromptOverrides::new();
+        overrides.insert("nonexistent_section".into(), "should be ignored".into());
+
+        apply_overrides(&mut sections, &overrides);
+        assert_eq!(sections[0].text, original_text);
+    }
+
+    #[test]
+    fn load_overrides_from_directory() {
+        let dir = tempfile::tempdir().unwrap();
+
+        std::fs::write(dir.path().join("core_rules.txt"), "My rules").unwrap();
+        std::fs::write(dir.path().join("planning.txt"), "My planning").unwrap();
+        std::fs::write(dir.path().join("not_a_txt.md"), "ignored").unwrap();
+
+        let overrides = load_overrides(dir.path());
+
+        assert_eq!(overrides.get("core_rules").unwrap(), "My rules");
+        assert_eq!(overrides.get("planning").unwrap(), "My planning");
+        assert!(!overrides.contains_key("not_a_txt"));
+    }
+
+    #[test]
+    fn load_overrides_returns_empty_for_missing_dir() {
+        let overrides = load_overrides(Path::new("/nonexistent/path"));
+        assert!(overrides.is_empty());
     }
 }
