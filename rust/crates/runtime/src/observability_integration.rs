@@ -266,16 +266,15 @@ impl ObservabilityHub {
             (&session.active_variant, &session.active_experiment_id)
         {
             // Calculate success based on drift and feedback
-            let success_rate = if session.context_traces.is_empty() {
+            let success_rate = if session.decision_explanations.is_empty() {
                 0.5 // Neutral if no data
             } else {
-                // Simple heuristic: no drift detected = success
                 let drift_count = session
                     .decision_explanations
                     .iter()
                     .filter(|d| d.confidence < 0.5)
                     .count();
-                1.0 - (drift_count as f64 / session.context_traces.len().max(1) as f64)
+                1.0 - (drift_count as f64 / session.decision_explanations.len() as f64)
             };
 
             let store = self.experiment_store.read().unwrap();

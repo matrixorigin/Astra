@@ -760,19 +760,14 @@ impl UserProfileStore {
 
     /// Get or create a user profile.
     pub fn get_or_create(&self, user_id: &str) -> UserProfile {
-        {
-            let profiles = self.profiles.read().unwrap();
-            if let Some(profile) = profiles.get(user_id) {
-                return profile.clone();
-            }
+        let mut profiles = self.profiles.write().unwrap();
+        if let Some(profile) = profiles.get(user_id) {
+            return profile.clone();
         }
 
-        // Create new profile
         let profile = UserProfile::new(user_id);
-        self.profiles
-            .write()
-            .unwrap()
-            .insert(user_id.to_string(), profile.clone());
+        profiles.insert(user_id.to_string(), profile.clone());
+        drop(profiles); // release lock before I/O
         self.persist();
         profile
     }
@@ -805,12 +800,20 @@ impl UserProfileStore {
         removed
     }
 
-    /// Persist to storage if configured.
+    /// Persist to storage if configured. Uses atomic write (temp + rename)
+    /// to avoid data loss on crash.
     fn persist(&self) {
         if let Some(ref path) = self.storage_path {
             let profiles = self.profiles.read().unwrap();
             if let Ok(data) = serde_json::to_string_pretty(&*profiles) {
-                let _ = std::fs::write(path, data);
+                let tmp = path.with_extension("tmp");
+                if let Err(e) = std::fs::write(&tmp, &data) {
+                    eprintln!("[user-profile] failed to write temp file: {e}");
+                    return;
+                }
+                if let Err(e) = std::fs::rename(&tmp, path) {
+                    eprintln!("[user-profile] failed to rename temp file: {e}");
+                }
             }
         }
     }

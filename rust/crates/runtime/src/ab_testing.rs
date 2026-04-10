@@ -871,7 +871,11 @@ impl ExperimentAnalyzer {
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
         let mean = sorted.iter().sum::<f64>() / n as f64;
-        let variance = sorted.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n as f64;
+        let variance = if n > 1 {
+            sorted.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n - 1) as f64
+        } else {
+            0.0
+        };
         let std_dev = variance.sqrt();
 
         let median = if n % 2 == 0 {
