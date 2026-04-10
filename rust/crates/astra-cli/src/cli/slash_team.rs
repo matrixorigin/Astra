@@ -749,29 +749,32 @@ pub(super) async fn handle_team_command(
             let team_name = parts.next().unwrap_or("").trim();
             let rest = parts.next().unwrap_or("").trim();
 
-            // Parse optional --mock flag
-            let (task, mock_scenario) = if let Some(idx) = rest.find("--mock") {
-                let task_part = rest[..idx].trim();
-                let after = rest[idx + 6..].trim();
-                let scenario_name = after.split_whitespace().next().unwrap_or("complete");
-                let scenario = super::mock_llm::MockScenario::from_str(scenario_name)
-                    .unwrap_or_else(|| {
-                        eprintln!(
-                            "  {} Unknown mock scenario '{}'. Available: {}",
-                            theme::icon_warn(),
-                            scenario_name,
-                            super::mock_llm::MockScenario::all()
-                                .iter()
-                                .map(|(n, _)| *n)
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        );
-                        super::mock_llm::MockScenario::Complete
-                    });
-                (task_part, Some(scenario))
-            } else {
-                (rest, None)
+            // Parse optional --mock flag (must be a standalone word, not inside task text)
+            let (task, mock_scenario) = {
+                let words: Vec<&str> = rest.split_whitespace().collect();
+                if let Some(pos) = words.iter().position(|&w| w == "--mock") {
+                    let task_part = words[..pos].join(" ");
+                    let scenario_name = words.get(pos + 1).copied().unwrap_or("complete");
+                    let scenario = super::mock_llm::MockScenario::from_str(scenario_name)
+                        .unwrap_or_else(|| {
+                            eprintln!(
+                                "  {} Unknown mock scenario '{}'. Available: {}",
+                                theme::icon_warn(),
+                                scenario_name,
+                                super::mock_llm::MockScenario::all()
+                                    .iter()
+                                    .map(|(n, _)| *n)
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            );
+                            super::mock_llm::MockScenario::Complete
+                        });
+                    (task_part, Some(scenario))
+                } else {
+                    (rest.to_string(), None)
+                }
             };
+            let task = task.trim();
 
             if team_name.is_empty() || task.is_empty() {
                 eprintln!(

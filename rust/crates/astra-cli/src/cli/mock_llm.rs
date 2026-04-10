@@ -218,24 +218,11 @@ async fn handle_chat_turn(
 ) -> Response<axum::body::Body> {
     let turn = state.call_count.fetch_add(1, Ordering::Relaxed) + 1;
 
-    // Extract agent_id from payload if present (best-effort)
+    // Extract agent_id from top-level payload field (set by chat_turn_base_payload)
     let agent_id = serde_json::from_slice::<Value>(&body)
         .ok()
-        .and_then(|v| {
-            v.get("messages")
-                .and_then(Value::as_array)
-                .and_then(|msgs| msgs.first())
-                .and_then(|m| m.get("content"))
-                .and_then(Value::as_str)
-                .map(|s| s.to_string())
-        })
+        .and_then(|v| v.get("agent_id").and_then(Value::as_str).map(str::to_string))
         .unwrap_or_else(|| format!("agent-{turn}"));
-    // Use a short label
-    let agent_id = if agent_id.len() > 30 {
-        format!("agent-{turn}")
-    } else {
-        agent_id
-    };
 
     let sse_body = match state.scenario {
         MockScenario::Complete => body_complete(&agent_id, turn),
@@ -292,8 +279,6 @@ impl MockLlmServer {
 
         // Yield to let the server task start accepting connections
         tokio::task::yield_now().await;
-        // Small sleep to ensure the server is fully accepting
-        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
 
         eprintln!(
             "  🧪 Mock LLM server: {} (scenario: {})",
