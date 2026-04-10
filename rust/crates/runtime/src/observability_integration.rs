@@ -22,6 +22,7 @@ use crate::auto_tuning::{AutoTuningEngine, FeedbackSignal, SignalType};
 use crate::runtime_config::RuntimeConfig;
 use crate::turn::context_assembly_trace::ContextAssemblyTrace;
 use crate::turn::decision_explainer::{DecisionExplanation, DriftDetector, FocusDriftAnalysis};
+use crate::turn::goal_tracker::{GoalProgress, GoalTracker};
 use crate::user_profile::{Scenario, UserProfile, UserProfileManager, UserProfileStore};
 use std::sync::Arc;
 
@@ -78,6 +79,9 @@ pub struct ObservabilitySession {
 
     /// Turn timing data.
     pub turn_timings: Vec<TurnTiming>,
+
+    /// Goal completion tracker (initialized on first user query).
+    pub goal_tracker: Option<GoalTracker>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -144,6 +148,7 @@ impl ObservabilitySession {
             original_query: None,
             started_at: Instant::now(),
             turn_timings: Vec::new(),
+            goal_tracker: None,
         }
     }
 
@@ -169,6 +174,7 @@ impl ObservabilitySession {
             original_query: None,
             started_at: Instant::now(),
             turn_timings: Vec::new(),
+            goal_tracker: None,
         }
     }
 
@@ -195,16 +201,25 @@ impl ObservabilitySession {
 
     /// Record a query for drift analysis.
     ///
-    /// On the first turn, this also sets `original_query` for baseline comparison.
+    /// On the first turn, this also sets `original_query` for baseline comparison
+    /// and initializes the goal tracker.
     pub fn record_query(&mut self, query: &str) {
         // Set original query on first turn
         if self.original_query.is_none() {
             self.original_query = Some(query.to_string());
+            self.goal_tracker = Some(GoalTracker::new(query));
         }
         self.recent_queries.push(query.to_string());
         // Keep only the last N queries
         if self.recent_queries.len() > 20 {
             self.recent_queries.remove(0);
+        }
+
+        // Feed user sentiment to goal tracker
+        if let Some(ref mut tracker) = self.goal_tracker {
+            if let Some(signal) = crate::turn::goal_tracker::detect_user_sentiment(query) {
+                tracker.record(self.turn_number, signal);
+            }
         }
     }
 
@@ -306,6 +321,27 @@ impl ObservabilitySession {
             &self.compressed_turns,
             &self.user_corrections,
         )
+    }
+
+    /// Record a tool result as a potential goal milestone.
+    pub fn record_tool_result(
+        &mut self,
+        tool_name: &str,
+        output: &str,
+        exit_code: Option<i32>,
+    ) {
+        if let Some(ref mut tracker) = self.goal_tracker {
+            if let Some(signal) =
+                crate::turn::goal_tracker::detect_signal(tool_name, output, exit_code)
+            {
+                tracker.record(self.turn_number, signal);
+            }
+        }
+    }
+
+    /// Get current goal progress (None if no goal set yet).
+    pub fn goal_progress(&self) -> Option<GoalProgress> {
+        self.goal_tracker.as_ref().map(|t| t.progress())
     }
 }
 

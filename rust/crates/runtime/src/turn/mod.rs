@@ -34,6 +34,7 @@ pub mod context_compression;
 pub mod contracts;
 pub mod counter;
 pub mod decision_explainer;
+pub mod goal_tracker;
 pub mod edge_executor_id;
 pub mod edge_ledger;
 pub mod edge_prompt_context;

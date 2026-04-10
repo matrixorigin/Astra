@@ -2013,6 +2013,32 @@ fn handle_session_drift(arg: &str, state: &ReplState) {
         }
     }
 
+    // Show goal progress if available
+    if let Some(ref obs_lock) = state.observability_session {
+        if let Ok(obs) = obs_lock.read() {
+            if let Some(progress) = obs.goal_progress() {
+                eprintln!(
+                    "\n{}",
+                    "─── Goal Progress ────────────────────────────────"
+                        .bold()
+                        .cyan()
+                );
+                let pct = format!("{:.0}%", progress.completion_score * 100.0);
+                let momentum_str = if progress.momentum > 0.3 {
+                    "↑ positive".green().to_string()
+                } else if progress.momentum < -0.3 {
+                    "↓ struggling".red().to_string()
+                } else {
+                    "→ steady".dim().to_string()
+                };
+                eprintln!("  Completion: {}", pct.cyan().bold());
+                eprintln!("  Momentum:   {momentum_str}");
+                eprintln!("  Milestones: {}", progress.milestone_count);
+                eprintln!("  {}", progress.summary.dim());
+            }
+        }
+    }
+
     eprintln!();
 }
 
