@@ -12,6 +12,7 @@
 //! - Confidence level
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::time::SystemTime;
 
 // ─── Decision Explanation ────────────────────────────────────────────────────
@@ -560,20 +561,22 @@ impl DriftDetector {
             severity += 0.4;
         }
 
-        // Check for topic divergence (basic keyword overlap)
+        // Check for topic divergence (TF-IDF cosine similarity)
         let original_keywords = extract_keywords(original_query);
         for (i, query) in recent_queries.iter().enumerate() {
-            let query_keywords = extract_keywords(query);
-            let overlap = keyword_overlap(&original_keywords, &query_keywords);
-            if overlap < 0.2 {
+            let sim = query_similarity(original_query, query);
+            if sim < 0.15 {
+                let query_keywords = extract_keywords(query);
+                let overlap = keyword_overlap(&original_keywords, &query_keywords);
                 evidence.push(DriftEvidence {
                     turn: i as u32,
                     evidence_type: EvidenceType::ToolCallTopicChange,
                     description: format!(
-                        "Low keyword overlap ({:.0}%) with original query",
+                        "Low similarity ({:.0}%) with original query (keyword overlap: {:.0}%)",
+                        sim * 100.0,
                         overlap * 100.0
                     ),
-                    confidence: 0.6,
+                    confidence: 0.7,
                 });
                 severity += 0.2;
             }
@@ -626,7 +629,52 @@ impl DriftDetector {
     }
 }
 
+/// TF-IDF cosine similarity between two queries.
+///
+/// Uses the shared CJK-aware tokenizer (`text_tokenize`) which handles both
+/// English (with stemming) and Chinese (unigrams + bigrams).  Unlike the older
+/// `keyword_overlap`, this captures semantic proximity rather than exact keyword
+/// matches, and works correctly for non-Latin scripts.
+///
+/// Returns 0.0-1.0.  Two identical queries return 1.0; completely disjoint
+/// vocabularies return 0.0.
+fn query_similarity(a: &str, b: &str) -> f64 {
+    if a.is_empty() || b.is_empty() {
+        return 0.0;
+    }
+    if a == b {
+        return 1.0;
+    }
+    let tokens_a = crate::text_tokenize::tokenize(a);
+    let tokens_b = crate::text_tokenize::tokenize(b);
+    if tokens_a.is_empty() || tokens_b.is_empty() {
+        return 0.0;
+    }
+    let tf_a = crate::text_tokenize::build_tf(&tokens_a);
+    let tf_b = crate::text_tokenize::build_tf(&tokens_b);
+    cosine_sim(&tf_a, &tf_b)
+}
+
+/// Cosine similarity between two TF vectors.
+fn cosine_sim(a: &HashMap<String, f64>, b: &HashMap<String, f64>) -> f64 {
+    let mut dot = 0.0_f64;
+    let mut norm_a = 0.0_f64;
+    let mut norm_b = 0.0_f64;
+    for (term, &c1) in a {
+        norm_a += c1 * c1;
+        if let Some(&c2) = b.get(term) {
+            dot += c1 * c2;
+        }
+    }
+    for &c2 in b.values() {
+        norm_b += c2 * c2;
+    }
+    let denom = norm_a.sqrt() * norm_b.sqrt();
+    if denom < 1e-9 { 0.0 } else { (dot / denom).min(1.0) }
+}
+
 /// Extract simple keywords from text (lowercase, 4+ chars).
+/// Kept for backward compatibility and evidence description.
 fn extract_keywords(text: &str) -> Vec<String> {
     text.split_whitespace()
         .map(|w| {
@@ -783,5 +831,69 @@ mod tests {
         let text = analysis.to_human_readable();
         assert!(text.contains("Focus Drift Detected"));
         assert!(text.contains("60%"));
+    }
+
+    #[test]
+    fn test_query_similarity_identical() {
+        let sim = query_similarity("implement user auth", "implement user auth");
+        assert!((sim - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_query_similarity_related_queries() {
+        // Related queries should have high similarity
+        let sim = query_similarity(
+            "implement user authentication",
+            "implement auth module",
+        );
+        assert!(sim > 0.3, "related queries should be similar: {sim}");
+    }
+
+    #[test]
+    fn test_query_similarity_unrelated_queries() {
+        // Completely different topics should have low similarity
+        let sim = query_similarity(
+            "implement user authentication",
+            "configure kubernetes deployment",
+        );
+        assert!(sim < 0.15, "unrelated queries should have low similarity: {sim}");
+    }
+
+    #[test]
+    fn test_query_similarity_chinese() {
+        // CJK queries should work via bigram tokenization
+        let sim = query_similarity("实现用户认证功能", "实现用户登录");
+        assert!(sim > 0.2, "related Chinese queries should be similar: {sim}");
+
+        let sim2 = query_similarity("实现用户认证", "配置数据库连接");
+        assert!(sim2 < sim, "unrelated Chinese should be less similar");
+    }
+
+    #[test]
+    fn test_query_similarity_empty() {
+        assert_eq!(query_similarity("", "something"), 0.0);
+        assert_eq!(query_similarity("something", ""), 0.0);
+        assert_eq!(query_similarity("", ""), 0.0);
+    }
+
+    #[test]
+    fn test_drift_detector_topic_divergence() {
+        // Multiple unrelated queries (2 × 0.2 = 0.4 severity → above 0.3 threshold)
+        let detector = DriftDetector::default();
+        let original = "implement user authentication";
+        let analysis = detector.analyze(
+            original,
+            &[
+                "configure kubernetes deployment pipeline".to_string(),
+                "setup monitoring with prometheus".to_string(),
+            ],
+            &[],
+            &[],
+        );
+        assert!(analysis.drift_detected, "two unrelated queries should trigger drift");
+        let topic_changes = analysis.evidence.iter()
+            .filter(|e| matches!(e.evidence_type, EvidenceType::ToolCallTopicChange))
+            .count();
+        assert!(topic_changes >= 2, "should have evidence for both divergent queries, got {topic_changes}");
     }
 }
