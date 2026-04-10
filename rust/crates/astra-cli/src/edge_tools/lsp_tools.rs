@@ -548,6 +548,18 @@ impl ToolExecutor {
         .to_string())
     }
 
+    fn try_resolve_code_action(&self, file: &str, action: &Value) -> Result<Option<Value>, String> {
+        let (file_path, _) = self.ensure_lsp_file_ready(file)?;
+        self.passive_lsp
+            .request_for_file(
+                &self.project_root,
+                &file_path,
+                "codeAction/resolve",
+                action.clone(),
+            )
+            .map_err(|e| e.to_string())
+    }
+
     fn try_active_document_formatting(&self, file: &str) -> Result<Option<Value>, String> {
         let (file_path, uri) = self.ensure_lsp_file_ready(file)?;
         self.passive_lsp.request_for_file(
@@ -1261,7 +1273,18 @@ impl ToolExecutor {
                                     )
                                 }).to_string();
                             };
-                            if let Some(workspace_edit) = action.get("edit") {
+                            let resolved_action = if action.get("edit").is_none()
+                                && action.get("command").is_none()
+                            {
+                                match self.try_resolve_code_action(f, action) {
+                                    Ok(Some(resolved)) => resolved,
+                                    Ok(None) => action.clone(),
+                                    Err(error) => return json!({ "error": error }).to_string(),
+                                }
+                            } else {
+                                action.clone()
+                            };
+                            if let Some(workspace_edit) = resolved_action.get("edit") {
                                 match self.apply_lsp_workspace_edit(
                                     "code_actions",
                                     "textDocument/codeAction",
@@ -1270,14 +1293,14 @@ impl ToolExecutor {
                                     Ok(applied) => applied,
                                     Err(error) => json!({ "error": error }).to_string(),
                                 }
-                            } else if let Some(command) = action.get("command") {
+                            } else if let Some(command) = resolved_action.get("command") {
                                 match self.execute_lsp_command("code_actions", command) {
                                     Ok(executed) => executed,
                                     Err(error) => json!({ "error": error }).to_string(),
                                 }
                             } else {
                                 json!({
-                                    "error": "selected code action does not include an editable WorkspaceEdit or executable command"
+                                    "error": "selected code action does not include an editable WorkspaceEdit or executable command, even after resolve"
                                 }).to_string()
                             }
                         }
