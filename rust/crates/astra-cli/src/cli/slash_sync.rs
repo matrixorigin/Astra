@@ -1,6 +1,6 @@
 #![allow(unused_imports)]
-use crate::{cli_dim, cli_err, cli_info, cli_ok, cli_section, cli_warn};
 use super::*;
+use crate::{cli_dim, cli_err, cli_info, cli_ok, cli_section, cli_warn};
 
 /// Handle `/sync` command — show unified sync state across all domains.
 /// Subcommands: `/sync push`, `/sync pull`, `/sync log`.
@@ -143,7 +143,11 @@ async fn handle_sync_push(state: &ReplState) {
         return;
     }
 
-    cli_info!("Pushing {} dirty domain{}...", dirty_count, if dirty_count == 1 { "" } else { "s" });
+    cli_info!(
+        "Pushing {} dirty domain{}...",
+        dirty_count,
+        if dirty_count == 1 { "" } else { "s" }
+    );
     eprintln!();
 
     let results = orch.push_dirty().await;
@@ -179,7 +183,11 @@ async fn handle_sync_push(state: &ReplState) {
 
     eprintln!();
     if fail_count == 0 {
-        cli_ok!("{} domain{} pushed successfully.", ok_count, if ok_count == 1 { "" } else { "s" });
+        cli_ok!(
+            "{} domain{} pushed successfully.",
+            ok_count,
+            if ok_count == 1 { "" } else { "s" }
+        );
     } else {
         eprintln!(
             "  {} pushed, {} failed.",
@@ -257,7 +265,11 @@ async fn handle_sync_pull(state: &ReplState) {
 
     eprintln!();
     if fail_count == 0 {
-        cli_ok!("{} domain{} pulled successfully.", ok_count, if ok_count == 1 { "" } else { "s" });
+        cli_ok!(
+            "{} domain{} pulled successfully.",
+            ok_count,
+            if ok_count == 1 { "" } else { "s" }
+        );
     } else {
         eprintln!(
             "  {} pulled, {} failed.",

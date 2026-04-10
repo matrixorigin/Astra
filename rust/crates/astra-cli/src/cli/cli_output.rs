@@ -70,8 +70,8 @@ macro_rules! cli_info {
 #[macro_export]
 macro_rules! cli_section {
     ($title:expr) => {{
-        use $crate::theme::section;
         use crossterm::style::Stylize;
+        use $crate::theme::section;
         eprintln!();
         eprintln!("  {}", section($title).bold());
     }};
@@ -123,7 +123,11 @@ pub fn cli_table(headers: &[&str], rows: &[Vec<String>]) {
     eprintln!("  {}", header_line.bold());
 
     // Separator
-    let sep: String = widths.iter().map(|w| "─".repeat(*w)).collect::<Vec<_>>().join("──");
+    let sep: String = widths
+        .iter()
+        .map(|w| "─".repeat(*w))
+        .collect::<Vec<_>>()
+        .join("──");
     eprintln!("  {}", sep.dim());
 
     // Rows
@@ -151,12 +155,7 @@ pub fn cli_kvlist(items: &[(&str, &str)]) {
     }
     let max_key_len = items.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
     for (key, value) in items {
-        eprintln!(
-            "  {:width$}  {}",
-            key.dim(),
-            value,
-            width = max_key_len
-        );
+        eprintln!("  {:width$}  {}", key.dim(), value, width = max_key_len);
     }
 }
 

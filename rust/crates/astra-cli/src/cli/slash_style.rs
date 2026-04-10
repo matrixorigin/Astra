@@ -1,6 +1,6 @@
 #![allow(unused_imports)]
-use crate::{cli_dim, cli_err, cli_info, cli_ok, cli_section};
 use super::*;
+use crate::{cli_dim, cli_err, cli_info, cli_ok, cli_section};
 
 pub(super) fn handle_style_command(arg: &str) {
     match arg {

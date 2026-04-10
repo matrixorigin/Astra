@@ -33,16 +33,23 @@ pub(crate) fn try_replace_plan_from_llm_json(
                 .filter(|s| s.status == astra_services::task_orchestrator::TaskStatus::Completed)
                 .collect();
             if !old_completed.is_empty() {
+                // Collect subtasks to prepend (in original order) and track existing ones
+                let mut to_prepend = Vec::new();
                 for old in &old_completed {
                     let kept = new_plan.subtasks.iter().any(|n| n.id == old.id);
                     if !kept {
-                        new_plan.subtasks.insert(0, (*old).clone());
+                        to_prepend.push((*old).clone());
                     } else {
                         // Ensure status stays completed even if LLM reset it
                         if let Some(n) = new_plan.subtasks.iter_mut().find(|n| n.id == old.id) {
                             n.status = astra_services::task_orchestrator::TaskStatus::Completed;
                         }
                     }
+                }
+                // Prepend missing completed subtasks in their original order
+                if !to_prepend.is_empty() {
+                    to_prepend.append(&mut new_plan.subtasks);
+                    new_plan.subtasks = to_prepend;
                 }
             }
             plan_state.set_plan(new_plan);
