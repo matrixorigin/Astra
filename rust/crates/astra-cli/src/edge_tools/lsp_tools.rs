@@ -373,6 +373,34 @@ impl ToolExecutor {
         ))
     }
 
+    fn lsp_full_document_range_params(&self, file: &str) -> Result<(PathBuf, Value), String> {
+        let (file_path, uri) = self.ensure_lsp_file_ready(file)?;
+        let content = std::fs::read_to_string(&file_path)
+            .map_err(|e| format!("Failed to read {}: {e}", file_path.display()))?;
+        let lines: Vec<&str> = content.split('\n').collect();
+        let end_line = lines.len().saturating_sub(1);
+        let end_character = lines
+            .last()
+            .map(|line| line.encode_utf16().count())
+            .unwrap_or(0);
+        Ok((
+            file_path,
+            json!({
+                "textDocument": { "uri": uri },
+                "range": {
+                    "start": {
+                        "line": 0,
+                        "character": 0,
+                    },
+                    "end": {
+                        "line": end_line,
+                        "character": end_character,
+                    }
+                }
+            }),
+        ))
+    }
+
     fn try_active_file_request(
         &self,
         operation: &str,
@@ -555,6 +583,26 @@ impl ToolExecutor {
         )
     }
 
+    fn try_active_inlay_hints(
+        &self,
+        file: &str,
+        range: Option<(usize, usize, usize, usize)>,
+    ) -> Result<Option<Value>, String> {
+        let (file_path, params) = if let Some((line, column, end_line, end_column)) = range {
+            let (file_path, _, params) =
+                self.lsp_range_params(file, line, column, end_line, end_column)?;
+            (file_path, params)
+        } else {
+            self.lsp_full_document_range_params(file)?
+        };
+        self.passive_lsp.request_for_file(
+            &self.project_root,
+            &file_path,
+            "textDocument/inlayHint",
+            params,
+        )
+    }
+
     fn try_active_selection_ranges(
         &self,
         file: &str,
@@ -636,7 +684,7 @@ impl ToolExecutor {
                 "error": "Missing required 'operation' parameter",
                 "valid_operations": [
                     "goto_definition", "find_references", "hover", "document_symbols",
-                    "workspace_symbols", "call_hierarchy", "incoming_calls", "outgoing_calls", "declaration", "type_definition", "implementation", "prepare_rename", "rename", "code_actions", "completions", "signature_help", "document_highlight", "document_links", "selection_ranges", "linked_editing_range", "format_document", "format_range", "format_on_type", "diagnostics"
+                    "workspace_symbols", "call_hierarchy", "incoming_calls", "outgoing_calls", "declaration", "type_definition", "implementation", "prepare_rename", "rename", "code_actions", "completions", "signature_help", "document_highlight", "document_links", "inlay_hints", "selection_ranges", "linked_editing_range", "format_document", "format_range", "format_on_type", "diagnostics"
                 ]
             }).to_string(),
         };
@@ -1151,6 +1199,33 @@ impl ToolExecutor {
                 }
             }
 
+            "inlay_hints" => {
+                if let Some(f) = file {
+                    let range = match (line, column, end_line, end_column) {
+                        (Some(l), Some(c), Some(end_l), Some(end_c)) => Some((l, c, end_l, end_c)),
+                        (None, None, None, None) => None,
+                        _ => {
+                            return json!({
+                                "error": "inlay_hints accepts either 'file' alone for the whole document or 'file'+'line'+'column'+'end_line'+'end_column' for a sub-range"
+                            }).to_string();
+                        }
+                    };
+                    match self.try_active_inlay_hints(f, range) {
+                        Ok(Some(result)) => {
+                            Self::active_lsp_response("inlay_hints", "textDocument/inlayHint", result)
+                        }
+                        Ok(None) => json!({
+                            "error": "inlay_hints requires an active LSP backend for that file"
+                        }).to_string(),
+                        Err(error) => json!({ "error": error }).to_string(),
+                    }
+                } else {
+                    json!({
+                        "error": "inlay_hints requires 'file'"
+                    }).to_string()
+                }
+            }
+
             "selection_ranges" => {
                 if let (Some(f), Some(l), Some(c)) = (file, line, column) {
                     match self.try_active_selection_ranges(f, l, c) {
@@ -1332,6 +1407,7 @@ impl ToolExecutor {
                             "signature_help": true,
                             "document_highlight": true,
                             "document_links": true,
+                            "inlay_hints": true,
                             "selection_ranges": true,
                             "linked_editing_range": true,
                             "format_document": true,
@@ -1352,7 +1428,7 @@ impl ToolExecutor {
                 "error": format!("Unknown operation: {}", operation),
                 "valid_operations": [
                     "goto_definition", "find_references", "hover", "document_symbols",
-                    "workspace_symbols", "call_hierarchy", "incoming_calls", "outgoing_calls", "declaration", "type_definition", "implementation", "prepare_rename", "rename", "code_actions", "completions", "signature_help", "document_highlight", "document_links", "selection_ranges", "linked_editing_range", "format_document", "format_range", "format_on_type", "diagnostics"
+                    "workspace_symbols", "call_hierarchy", "incoming_calls", "outgoing_calls", "declaration", "type_definition", "implementation", "prepare_rename", "rename", "code_actions", "completions", "signature_help", "document_highlight", "document_links", "inlay_hints", "selection_ranges", "linked_editing_range", "format_document", "format_range", "format_on_type", "diagnostics"
                 ]
             }).to_string()
         }
