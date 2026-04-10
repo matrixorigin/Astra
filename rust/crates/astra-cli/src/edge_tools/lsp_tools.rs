@@ -523,6 +523,34 @@ impl ToolExecutor {
         )
     }
 
+    fn try_active_selection_ranges(
+        &self,
+        file: &str,
+        line: usize,
+        column: usize,
+    ) -> Result<Option<Value>, String> {
+        let (file_path, position_params) = self.lsp_position_params(file, line, column)?;
+        let uri = position_params
+            .get("textDocument")
+            .and_then(|doc| doc.get("uri"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| "failed to build textDocument URI for selection_ranges".to_string())?
+            .to_string();
+        let position = position_params
+            .get("position")
+            .cloned()
+            .ok_or_else(|| "failed to build LSP position for selection_ranges".to_string())?;
+        self.passive_lsp.request_for_file(
+            &self.project_root,
+            &file_path,
+            "textDocument/selectionRange",
+            json!({
+                "textDocument": { "uri": uri },
+                "positions": [position],
+            }),
+        )
+    }
+
     fn try_active_call_hierarchy(
         &self,
         operation: &str,
@@ -576,7 +604,7 @@ impl ToolExecutor {
                 "error": "Missing required 'operation' parameter",
                 "valid_operations": [
                     "goto_definition", "find_references", "hover", "document_symbols",
-                    "workspace_symbols", "call_hierarchy", "incoming_calls", "outgoing_calls", "declaration", "type_definition", "implementation", "prepare_rename", "rename", "code_actions", "completions", "signature_help", "document_highlight", "format_document", "format_range", "diagnostics"
+                    "workspace_symbols", "call_hierarchy", "incoming_calls", "outgoing_calls", "declaration", "type_definition", "implementation", "prepare_rename", "rename", "code_actions", "completions", "signature_help", "document_highlight", "selection_ranges", "format_document", "format_range", "diagnostics"
                 ]
             }).to_string(),
         };
@@ -1066,6 +1094,26 @@ impl ToolExecutor {
                 }
             }
 
+            "selection_ranges" => {
+                if let (Some(f), Some(l), Some(c)) = (file, line, column) {
+                    match self.try_active_selection_ranges(f, l, c) {
+                        Ok(Some(result)) => Self::active_lsp_response(
+                            "selection_ranges",
+                            "textDocument/selectionRange",
+                            result,
+                        ),
+                        Ok(None) => json!({
+                            "error": "selection_ranges requires an active LSP backend for that file"
+                        }).to_string(),
+                        Err(error) => json!({ "error": error }).to_string(),
+                    }
+                } else {
+                    json!({
+                        "error": "selection_ranges requires 'file'+'line'+'column'"
+                    }).to_string()
+                }
+            }
+
             "format_document" => {
                 if let Some(f) = file {
                     match self.try_active_document_formatting(f) {
@@ -1167,6 +1215,7 @@ impl ToolExecutor {
                             "completions": true,
                             "signature_help": true,
                             "document_highlight": true,
+                            "selection_ranges": true,
                             "format_document": true,
                             "format_range": true
                         },
@@ -1184,7 +1233,7 @@ impl ToolExecutor {
                 "error": format!("Unknown operation: {}", operation),
                 "valid_operations": [
                     "goto_definition", "find_references", "hover", "document_symbols",
-                    "workspace_symbols", "call_hierarchy", "incoming_calls", "outgoing_calls", "declaration", "type_definition", "implementation", "prepare_rename", "rename", "code_actions", "completions", "signature_help", "document_highlight", "format_document", "format_range", "diagnostics"
+                    "workspace_symbols", "call_hierarchy", "incoming_calls", "outgoing_calls", "declaration", "type_definition", "implementation", "prepare_rename", "rename", "code_actions", "completions", "signature_help", "document_highlight", "selection_ranges", "format_document", "format_range", "diagnostics"
                 ]
             }).to_string()
         }
