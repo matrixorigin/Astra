@@ -56,6 +56,7 @@ while True:
                     "definitionProvider": True,
                     "typeDefinitionProvider": True,
                     "documentSymbolProvider": True,
+                    "documentFormattingProvider": True,
                     "codeActionProvider": True,
                     "completionProvider": {"resolveProvider": False},
                     "documentHighlightProvider": True,
@@ -229,6 +230,18 @@ while True:
                 "kind": 1
             }]
         })
+    elif method == "textDocument/formatting":
+        write_frame({
+            "jsonrpc": "2.0",
+            "id": msg_id,
+            "result": [{
+                "range": {
+                    "start": {"line": 0, "character": 3},
+                    "end": {"line": 0, "character": 5}
+                },
+                "newText": " "
+            }]
+        })
     elif method in ("textDocument/didOpen", "textDocument/didChange", "textDocument/didSave"):
         log_event(method)
         uri = message["params"]["textDocument"]["uri"]
@@ -335,6 +348,7 @@ fn lsp_diagnostics_returns_capabilities() {
             .as_bool()
             .unwrap()
     );
+    assert!(parsed["capabilities"]["format_document"].as_bool().unwrap());
     assert!(parsed["capabilities"]["type_definition"].as_bool().unwrap());
     assert!(parsed["capabilities"]["implementation"].as_bool().unwrap());
     assert!(
@@ -527,6 +541,69 @@ fn lsp_document_highlight_uses_real_lsp_when_available() {
         Some("textDocument/documentHighlight")
     );
     assert_eq!(parsed["result"][0]["kind"].as_u64(), Some(1));
+}
+
+#[cfg(unix)]
+#[test]
+#[serial_test::serial]
+fn lsp_format_document_uses_real_lsp_when_available() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname=\"demo\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(
+        dir.path().join("src/lib.rs"),
+        "pub  fn hello_from_lsp() {}\n",
+    )
+    .unwrap();
+    let script = fake_lsp_server_script(dir.path());
+    let _guard = EnvGuard::set("ASTRA_RUST_ANALYZER_CMD", script.to_str().unwrap());
+    let exe = ToolExecutor::new(dir.path());
+
+    let result = exe.lsp(&json!({
+        "operation": "format_document",
+        "file": "src/lib.rs",
+    }));
+    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+
+    assert_eq!(parsed["backend"].as_str(), Some("lsp"));
+    assert_eq!(parsed["method"].as_str(), Some("textDocument/formatting"));
+    assert_eq!(parsed["result"][0]["newText"].as_str(), Some(" "));
+}
+
+#[cfg(unix)]
+#[test]
+#[serial_test::serial]
+fn lsp_format_document_applies_text_edits_when_dry_run_false() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname=\"demo\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    let file_path = dir.path().join("src/lib.rs");
+    std::fs::write(&file_path, "pub  fn hello_from_lsp() {}\n").unwrap();
+    let script = fake_lsp_server_script(dir.path());
+    let _guard = EnvGuard::set("ASTRA_RUST_ANALYZER_CMD", script.to_str().unwrap());
+    let exe = ToolExecutor::new(dir.path());
+
+    let result = exe.lsp(&json!({
+        "operation": "format_document",
+        "file": "src/lib.rs",
+        "dry_run": false
+    }));
+    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+
+    assert_eq!(parsed["applied"].as_bool(), Some(true));
+    assert_eq!(parsed["files_changed"].as_u64(), Some(1));
+    assert_eq!(
+        std::fs::read_to_string(file_path).unwrap(),
+        "pub fn hello_from_lsp() {}\n"
+    );
 }
 
 #[cfg(unix)]

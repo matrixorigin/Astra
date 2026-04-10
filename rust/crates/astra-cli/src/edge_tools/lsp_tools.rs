@@ -141,6 +141,20 @@ impl ToolExecutor {
         Ok(edits_by_path)
     }
 
+    fn lsp_text_edits_to_workspace_edit(uri: &str, edits: Value) -> Result<Value, String> {
+        let edit_array = edits
+            .as_array()
+            .ok_or_else(|| {
+                "LSP formatting response must be an array of TextEdit objects".to_string()
+            })?
+            .clone();
+        Ok(json!({
+            "changes": {
+                uri: edit_array,
+            }
+        }))
+    }
+
     fn lsp_position_to_byte_offset(
         content: &str,
         line: usize,
@@ -432,6 +446,22 @@ impl ToolExecutor {
             .map_err(|e| e.to_string())
     }
 
+    fn try_active_document_formatting(&self, file: &str) -> Result<Option<Value>, String> {
+        let (file_path, uri) = self.ensure_lsp_file_ready(file)?;
+        self.passive_lsp.request_for_file(
+            &self.project_root,
+            &file_path,
+            "textDocument/formatting",
+            json!({
+                "textDocument": { "uri": uri },
+                "options": {
+                    "tabSize": 4,
+                    "insertSpaces": true,
+                }
+            }),
+        )
+    }
+
     fn try_active_call_hierarchy(
         &self,
         operation: &str,
@@ -485,7 +515,7 @@ impl ToolExecutor {
                 "error": "Missing required 'operation' parameter",
                 "valid_operations": [
                     "goto_definition", "find_references", "hover", "document_symbols",
-                    "workspace_symbols", "call_hierarchy", "incoming_calls", "outgoing_calls", "declaration", "type_definition", "implementation", "rename", "code_actions", "completions", "signature_help", "document_highlight", "diagnostics"
+                    "workspace_symbols", "call_hierarchy", "incoming_calls", "outgoing_calls", "declaration", "type_definition", "implementation", "rename", "code_actions", "completions", "signature_help", "document_highlight", "format_document", "diagnostics"
                 ]
             }).to_string(),
         };
@@ -944,6 +974,41 @@ impl ToolExecutor {
                 }
             }
 
+            "format_document" => {
+                if let Some(f) = file {
+                    match self.try_active_document_formatting(f) {
+                        Ok(Some(result)) if dry_run => {
+                            Self::active_lsp_response(
+                                "format_document",
+                                "textDocument/formatting",
+                                result,
+                            )
+                        }
+                        Ok(Some(result)) => match self.ensure_lsp_file_ready(f) {
+                            Ok((_, uri)) => match Self::lsp_text_edits_to_workspace_edit(&uri, result)
+                            {
+                                Ok(workspace_edit) => self.apply_lsp_workspace_edit(
+                                    "format_document",
+                                    "textDocument/formatting",
+                                    &workspace_edit,
+                                ),
+                                Err(error) => Err(error),
+                            }
+                            .unwrap_or_else(|error| json!({ "error": error }).to_string()),
+                            Err(error) => json!({ "error": error }).to_string(),
+                        },
+                        Ok(None) => json!({
+                            "error": "format_document requires an active LSP backend for that file"
+                        }).to_string(),
+                        Err(error) => json!({ "error": error }).to_string(),
+                    }
+                } else {
+                    json!({
+                        "error": "format_document requires 'file'"
+                    }).to_string()
+                }
+            }
+
             "diagnostics" => {
                 if let Some(f) = file {
                     match self.try_active_file_diagnostics(f) {
@@ -970,7 +1035,8 @@ impl ToolExecutor {
                             "code_actions": true,
                             "completions": true,
                             "signature_help": true,
-                            "document_highlight": true
+                            "document_highlight": true,
+                            "format_document": true
                         },
                         "active_backends": self.passive_lsp.active_status(&self.project_root),
                         "supported_languages": {
@@ -986,7 +1052,7 @@ impl ToolExecutor {
                 "error": format!("Unknown operation: {}", operation),
                 "valid_operations": [
                     "goto_definition", "find_references", "hover", "document_symbols",
-                    "workspace_symbols", "call_hierarchy", "incoming_calls", "outgoing_calls", "declaration", "type_definition", "implementation", "rename", "code_actions", "completions", "signature_help", "document_highlight", "diagnostics"
+                    "workspace_symbols", "call_hierarchy", "incoming_calls", "outgoing_calls", "declaration", "type_definition", "implementation", "rename", "code_actions", "completions", "signature_help", "document_highlight", "format_document", "diagnostics"
                 ]
             }).to_string()
         }
