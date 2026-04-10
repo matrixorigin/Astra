@@ -74,7 +74,7 @@ fn merge_range(ranges: &mut Vec<(u64, u64)>, start: u64, end: u64) {
     for &(s, e) in ranges.iter() {
         if let Some(last) = merged.last_mut() {
             let (_, le): &mut (u64, u64) = last;
-            if s <= *le + 1 {
+            if s <= le.saturating_add(1) {
                 *le = (*le).max(e);
                 continue;
             }
