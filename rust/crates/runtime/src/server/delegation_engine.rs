@@ -1179,7 +1179,7 @@ impl DelegationEngine {
                     // Retry: re-execute with the same config
                     attempt += 1;
                     let original_run_id = current.run_id.clone();
-                    let retry_config = config_builder();
+                    let mut retry_config = config_builder();
                     let retry_run_id = retry_config.run_id.clone();
 
                     astra_core::log_persist!(
@@ -1211,6 +1211,9 @@ impl DelegationEngine {
                             retry_of: Some(original_run_id.clone()),
                         })
                         .await;
+
+                    let retry_pause_flag = self.tracker.register_pause_flag(&retry_run_id).await;
+                    retry_config.pause_flag = Some(retry_pause_flag);
 
                     Self::write_journal_event(
                         &retry_config.session_id,
@@ -3799,6 +3802,30 @@ mod tests {
         // Should eventually pass after retry
         assert_eq!(result.agent_results.len(), 1);
         assert_eq!(result.agent_results[0].status, "completed");
+    }
+
+    #[tokio::test]
+    async fn gate_retry_registers_pause_flag() {
+        let (reg, engine, tracker, _) = setup_with_executor(Arc::new(EchoExecutor));
+        let gate = Arc::new(FailThenPassGate::new(1));
+        let de =
+            DelegationEngine::with_executor(reg, engine, tracker.clone(), Arc::new(EchoExecutor))
+                .with_gate(gate);
+
+        let result = de
+            .execute(fan_out_request(vec!["coder"]), "orch", None)
+            .await
+            .unwrap();
+        assert_eq!(result.agent_results.len(), 1);
+        assert_eq!(result.agent_results[0].status, "completed");
+
+        let chain = tracker
+            .get_retry_chain(&result.agent_results[0].run_id)
+            .await;
+        assert_eq!(chain.len(), 2);
+        assert!(tracker.get_pause_flag(&chain[0]).await.is_some());
+        assert!(tracker.get_pause_flag(&chain[1]).await.is_some());
+        assert_eq!(de.pause_delegation("del-1").await, 2);
     }
 
     #[tokio::test(flavor = "current_thread")]
