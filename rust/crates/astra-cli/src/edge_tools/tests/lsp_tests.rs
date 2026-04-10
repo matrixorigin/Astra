@@ -541,11 +541,10 @@ while True:
         uri = message["params"]["textDocument"]["uri"]
         path = urllib.parse.urlparse(uri).path
         workspace = os.path.dirname(os.path.dirname(path))
-        write_frame({
-            "jsonrpc": "2.0",
-            "id": msg_id,
-            "result": [{
-                "label": "run fake runnable",
+        runnables = []
+        if os.environ.get("FAKE_LSP_MULTI_RUNNABLES") == "1":
+            runnables.append({
+                "label": "cargo check --workspace",
                 "location": {
                     "targetUri": uri,
                     "targetRange": {
@@ -562,11 +561,38 @@ while True:
                     "cwd": workspace,
                     "workspaceRoot": workspace,
                     "overrideCargo": None,
-                    "cargoArgs": ["run", "--quiet"],
+                    "cargoArgs": ["check", "--workspace"],
                     "executableArgs": [],
                     "environment": {}
                 }
-            }]
+            })
+        runnables.append({
+            "label": "run fake runnable",
+            "location": {
+                "targetUri": uri,
+                "targetRange": {
+                    "start": {"line": 0, "character": 0},
+                    "end": {"line": 0, "character": 3}
+                },
+                "targetSelectionRange": {
+                    "start": {"line": 0, "character": 0},
+                    "end": {"line": 0, "character": 3}
+                }
+            },
+            "kind": "cargo",
+            "args": {
+                "cwd": workspace,
+                "workspaceRoot": workspace,
+                "overrideCargo": None,
+                "cargoArgs": ["run", "--quiet"],
+                "executableArgs": [],
+                "environment": {}
+            }
+        })
+        write_frame({
+            "jsonrpc": "2.0",
+            "id": msg_id,
+            "result": runnables
         })
     elif method == "textDocument/selectionRange":
         write_frame({
@@ -1555,6 +1581,7 @@ fn lsp_code_lenses_fall_back_to_rust_analyzer_runnables_when_empty() {
     let script = fake_lsp_server_script(dir.path());
     let _cmd_guard = EnvGuard::set("ASTRA_RUST_ANALYZER_CMD", script.to_str().unwrap());
     let _lens_guard = EnvGuard::set("FAKE_LSP_EMPTY_CODE_LENSES", "1");
+    let _multi_guard = EnvGuard::set("FAKE_LSP_MULTI_RUNNABLES", "1");
     let exe = ToolExecutor::new(dir.path());
 
     let result = exe.lsp(&json!({
@@ -1566,8 +1593,24 @@ fn lsp_code_lenses_fall_back_to_rust_analyzer_runnables_when_empty() {
     assert_eq!(parsed["backend"].as_str(), Some("lsp"));
     assert_eq!(parsed["method"].as_str(), Some("experimental/runnables"));
     assert_eq!(
+        parsed["fallback_from"].as_str(),
+        Some("textDocument/codeLens")
+    );
+    assert_eq!(
         parsed["result"][0]["command"]["title"].as_str(),
         Some("run fake runnable")
+    );
+    assert_eq!(
+        parsed["result"][0]["data"]["preferred"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(
+        parsed["result"][0]["data"]["command_preview"].as_str(),
+        Some("cargo run --quiet")
+    );
+    assert_eq!(
+        parsed["result"][1]["command"]["title"].as_str(),
+        Some("cargo check --workspace")
     );
 }
 
@@ -1601,8 +1644,25 @@ fn lsp_code_lenses_execute_rust_analyzer_runnable_fallback_when_dry_run_false() 
     let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
 
     assert_eq!(parsed["method"].as_str(), Some("experimental/runnables"));
+    assert_eq!(
+        parsed["fallback_from"].as_str(),
+        Some("textDocument/codeLens")
+    );
+    assert_eq!(parsed["source"].as_str(), Some("rust-analyzer-runnables"));
     assert_eq!(parsed["executed"].as_bool(), Some(true));
     assert_eq!(parsed["command"].as_str(), Some("cargo"));
+    assert_eq!(parsed["cwd"].as_str(), Some(dir.path().to_str().unwrap()));
+    let expected_command_line = format!(
+        "cd {} && env {} {} {}",
+        crate::edge_tools::shell::shell_escape(dir.path().to_str().unwrap()),
+        crate::edge_tools::shell::shell_escape("cargo"),
+        crate::edge_tools::shell::shell_escape("run"),
+        crate::edge_tools::shell::shell_escape("--quiet")
+    );
+    assert_eq!(
+        parsed["command_line"].as_str(),
+        Some(expected_command_line.as_str())
+    );
     assert!(
         parsed["stdout"]
             .as_str()

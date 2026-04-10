@@ -518,9 +518,7 @@ impl ToolExecutor {
         let command_name = command
             .get("command")
             .and_then(Value::as_str)
-            .ok_or_else(|| {
-                format!("selected {operation} command is missing command identifier")
-            })?
+            .ok_or_else(|| format!("selected {operation} command is missing command identifier"))?
             .to_string();
         if command_name == "astra.rust-analyzer.runnable" {
             return self.execute_rust_analyzer_runnable(operation, &title, command);
@@ -632,6 +630,7 @@ impl ToolExecutor {
             parts.extend(exec_args.iter().map(|arg| shell_escape(arg)));
         }
         let command_line = parts.join(" ");
+        let runnable_kind = runnable.get("kind").cloned().unwrap_or(Value::Null);
         let output = self.run_shell_output(&command_line, 30.0)?;
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -639,11 +638,16 @@ impl ToolExecutor {
             "backend": "lsp",
             "operation": operation,
             "method": "experimental/runnables",
+            "source": "rust-analyzer-runnables",
+            "fallback_from": "textDocument/codeLens",
             "executed": output.status.success(),
             "title": title,
+            "kind": runnable_kind,
             "command": cargo_program,
             "cargo_args": cargo_args,
             "executable_args": exec_args,
+            "cwd": cwd,
+            "command_line": command_line,
             "exit_code": output.status.code(),
             "stdout": stdout,
             "stderr": stderr,
@@ -837,12 +841,107 @@ impl ToolExecutor {
         )
     }
 
+    fn rust_analyzer_runnable_strings(
+        runnable: &Value,
+    ) -> Option<(String, String, Vec<String>, Vec<String>)> {
+        let args = runnable.get("args")?;
+        let cargo_program = args
+            .get("overrideCargo")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("cargo")
+            .to_string();
+        let cargo_args = args
+            .get("cargoArgs")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let executable_args = args
+            .get("executableArgs")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .filter(|arg| !arg.is_empty())
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let mut preview = vec![cargo_program.clone()];
+        preview.extend(cargo_args.iter().cloned());
+        if !executable_args.is_empty() {
+            preview.push("--".to_string());
+            preview.extend(executable_args.iter().cloned());
+        }
+        Some((
+            cargo_program,
+            preview.join(" "),
+            cargo_args,
+            executable_args,
+        ))
+    }
+
+    fn rust_analyzer_runnable_priority(runnable: &Value) -> u8 {
+        let label = runnable
+            .get("label")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let cargo_args = Self::rust_analyzer_runnable_strings(runnable)
+            .map(|(_, _, cargo_args, _)| cargo_args.join(" ").to_ascii_lowercase())
+            .unwrap_or_default();
+        if label.starts_with("run ") || cargo_args.contains(" run") || cargo_args.starts_with("run")
+        {
+            0
+        } else if label.starts_with("test ")
+            || cargo_args.contains(" test")
+            || cargo_args.starts_with("test")
+        {
+            1
+        } else if label.starts_with("bench ")
+            || cargo_args.contains(" bench")
+            || cargo_args.starts_with("bench")
+        {
+            2
+        } else if cargo_args.contains("check") || label.contains("check") {
+            3
+        } else if cargo_args.contains("build") || label.contains("build") {
+            4
+        } else {
+            5
+        }
+    }
+
     fn rust_analyzer_runnables_to_code_lenses(runnables: &Value) -> Value {
         let Some(items) = runnables.as_array() else {
             return Value::Array(Vec::new());
         };
+        let mut sorted = items.to_vec();
+        sorted.sort_by(|left, right| {
+            let left_priority = Self::rust_analyzer_runnable_priority(left);
+            let right_priority = Self::rust_analyzer_runnable_priority(right);
+            left_priority.cmp(&right_priority).then_with(|| {
+                left.get("label")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .cmp(
+                        right
+                            .get("label")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default(),
+                    )
+            })
+        });
         Value::Array(
-            items.iter()
+            sorted
+                .iter()
                 .map(|item| {
                     let range = item
                         .pointer("/location/targetRange")
@@ -854,6 +953,16 @@ impl ToolExecutor {
                                 "end": { "line": 0, "character": 0 },
                             })
                         });
+                    let priority = Self::rust_analyzer_runnable_priority(item);
+                    let (_, command_preview, cargo_args, executable_args) =
+                        Self::rust_analyzer_runnable_strings(item).unwrap_or_else(|| {
+                            (
+                                "cargo".to_string(),
+                                "cargo".to_string(),
+                                Vec::new(),
+                                Vec::new(),
+                            )
+                        });
                     json!({
                         "range": range,
                         "command": {
@@ -864,6 +973,11 @@ impl ToolExecutor {
                         "data": {
                             "source": "experimental/runnables",
                             "kind": item.get("kind").cloned().unwrap_or(Value::Null),
+                            "preferred": priority <= 1,
+                            "priority": priority,
+                            "command_preview": command_preview,
+                            "cargo_args": cargo_args,
+                            "executable_args": executable_args,
                         }
                     })
                 })
@@ -2020,14 +2134,22 @@ impl ToolExecutor {
                                     (preview_method, lens.clone())
                                 };
                                 if dry_run {
-                                    json!({
+                                    let mut response = json!({
                                         "backend": "lsp",
                                         "operation": "code_lenses",
                                         "method": method,
                                         "selected_index": idx,
                                         "result": selected_lens,
-                                    })
-                                    .to_string()
+                                    });
+                                    if preview_method == "experimental/runnables"
+                                        && let Some(root) = response.as_object_mut()
+                                    {
+                                        root.insert(
+                                            "fallback_from".to_string(),
+                                            Value::String("textDocument/codeLens".to_string()),
+                                        );
+                                    }
+                                    response.to_string()
                                 } else if let Some(command) = selected_lens.get("command") {
                                     match self.execute_lsp_command("code_lenses", command) {
                                         Ok(executed) => executed,
@@ -2039,7 +2161,22 @@ impl ToolExecutor {
                                     }).to_string()
                                 }
                             } else {
-                                Self::active_lsp_response("code_lenses", preview_method, result)
+                                let mut response =
+                                    json!({
+                                        "backend": "lsp",
+                                        "operation": "code_lenses",
+                                        "method": preview_method,
+                                        "result": result,
+                                    });
+                                if preview_method == "experimental/runnables"
+                                    && let Some(root) = response.as_object_mut()
+                                {
+                                    root.insert(
+                                        "fallback_from".to_string(),
+                                        Value::String("textDocument/codeLens".to_string()),
+                                    );
+                                }
+                                response.to_string()
                             }
                         }
                         Ok(None) => json!({
