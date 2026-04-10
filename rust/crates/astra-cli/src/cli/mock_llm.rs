@@ -246,7 +246,7 @@ async fn handle_chat_turn(
         .header("content-type", "text/event-stream")
         .header("cache-control", "no-cache")
         .body(axum::body::Body::from(sse_body))
-        .unwrap()
+        .expect("valid HTTP response")
 }
 
 // ─── Public API ───────────────────────────────────────────────────────────────
@@ -263,7 +263,7 @@ impl MockLlmServer {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .map_err(|e| format!("mock server bind failed: {e}"))?;
-        let addr: SocketAddr = listener.local_addr().unwrap();
+        let addr: SocketAddr = listener.local_addr().expect("listener has local_addr");
         let base_url = format!("http://127.0.0.1:{}", addr.port());
 
         let state = ServerState {

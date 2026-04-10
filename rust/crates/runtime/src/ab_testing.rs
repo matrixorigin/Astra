@@ -605,23 +605,23 @@ impl ExperimentStore {
 
     /// Register an experiment.
     pub fn register(&self, experiment: Experiment) {
-        let mut experiments = self.experiments.write().unwrap();
+        let mut experiments = self.experiments.write().unwrap_or_else(|e| e.into_inner());
         experiments.insert(experiment.id.clone(), experiment);
     }
 
     /// Get an experiment by ID.
     pub fn get(&self, id: &str) -> Option<Experiment> {
-        self.experiments.read().unwrap().get(id).cloned()
+        self.experiments.read().unwrap_or_else(|e| e.into_inner()).get(id).cloned()
     }
 
     /// List all experiments.
     pub fn list(&self) -> Vec<Experiment> {
-        self.experiments.read().unwrap().values().cloned().collect()
+        self.experiments.read().unwrap_or_else(|e| e.into_inner()).values().cloned().collect()
     }
 
     /// Record an outcome.
     pub fn record_outcome(&self, experiment_id: &str, outcome: ExperimentOutcome) {
-        let mut outcomes = self.outcomes.write().unwrap();
+        let mut outcomes = self.outcomes.write().unwrap_or_else(|e| e.into_inner());
         outcomes
             .entry(experiment_id.to_string())
             .or_default()
@@ -632,7 +632,7 @@ impl ExperimentStore {
     pub fn get_outcomes(&self, experiment_id: &str) -> Vec<ExperimentOutcome> {
         self.outcomes
             .read()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .get(experiment_id)
             .cloned()
             .unwrap_or_default()
@@ -1004,9 +1004,9 @@ impl ExperimentAnalyzer {
             .collect();
 
         if improving_variants.len() == 1 {
-            return Recommendation::RolloutTreatment {
-                variant_id: improving_variants.into_iter().next().unwrap(),
-            };
+            if let Some(variant_id) = improving_variants.into_iter().next() {
+                return Recommendation::RolloutTreatment { variant_id };
+            }
         }
 
         Recommendation::NeedsManualReview

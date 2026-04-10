@@ -135,7 +135,7 @@ impl JobService for InMemoryJobService {
     ) -> Result<JobRecord, (StatusCode, Json<ErrorResponse>)> {
         self.jobs
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .get(&job_id)
             .cloned()
             .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Job not found"))

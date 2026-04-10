@@ -20,11 +20,16 @@ const REHAB_STABILITY_WINDOW: usize = 5;
 
 /// Maximum failure rate from cross-session import that triggers deprioritization.
 /// Tools below this threshold start fresh even with historical failures.
-const CROSS_SESSION_DEPRIORITIZE_RATE: f64 = 0.5;
+/// Set to 0.7 (was 0.5): tools like str_replace often fail due to LLM-generated
+/// match strings, not tool bugs. A higher threshold avoids penalizing tools
+/// for user/LLM errors on small sample sizes.
+const CROSS_SESSION_DEPRIORITIZE_RATE: f64 = 0.7;
 
 /// Minimum historical calls before cross-session failure rate is meaningful.
 /// Tools with fewer calls get the benefit of the doubt.
-const CROSS_SESSION_MIN_CALLS: usize = 5;
+/// Set to 8 (was 5): 5 calls is too small a sample — 3/5 failures (60%) can
+/// happen by chance. 8 calls provides more statistical confidence.
+const CROSS_SESSION_MIN_CALLS: usize = 8;
 
 /// Per-tool health record within a session.
 #[derive(Debug, Clone, Default)]
@@ -649,8 +654,44 @@ mod tests {
         let health = tracker.get("bash").unwrap();
         assert_eq!(health.total_calls, 10);
         assert_eq!(health.total_failures, 8);
-        // High failure rate → start deprioritized
+        // High failure rate (0.8 >= 0.7) AND sufficient calls (10 >= 8) → start deprioritized
         assert!(health.deprioritized);
+    }
+
+    #[test]
+    fn import_borderline_failure_rate_not_deprioritized() {
+        use crate::pipeline::persistence::ToolHealthEntry;
+        // 5 calls, 3 failures (60%) — below both thresholds (need 8 calls AND 70% rate)
+        let entries = vec![ToolHealthEntry {
+            name: "str_replace".to_string(),
+            total_calls: 5,
+            total_failures: 3,
+            failure_rate: 0.6,
+            last_updated_epoch: 0,
+        }];
+        let tracker = ToolHealthTracker::from_entries(&entries);
+        assert!(
+            !tracker.is_deprioritized("str_replace"),
+            "5 calls with 60% failure should NOT deprioritize (need >=8 calls AND >=70% rate)"
+        );
+    }
+
+    #[test]
+    fn import_sufficient_calls_moderate_rate_not_deprioritized() {
+        use crate::pipeline::persistence::ToolHealthEntry;
+        // 10 calls, 6 failures (60%) — enough calls but rate below 70%
+        let entries = vec![ToolHealthEntry {
+            name: "str_replace".to_string(),
+            total_calls: 10,
+            total_failures: 6,
+            failure_rate: 0.6,
+            last_updated_epoch: 0,
+        }];
+        let tracker = ToolHealthTracker::from_entries(&entries);
+        assert!(
+            !tracker.is_deprioritized("str_replace"),
+            "60% failure rate should NOT deprioritize (need >=70%)"
+        );
     }
 
     #[test]

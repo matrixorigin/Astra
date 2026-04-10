@@ -2682,12 +2682,10 @@ fn tool_health_export_import_roundtrip() {
     use astra_runtime::turn::tool_health::ToolHealthTracker;
 
     let mut tracker = ToolHealthTracker::new();
-    // Simulate a tool with failures (need 5+ calls for cross-session deprioritization)
-    tracker.record_failure("bad_tool");
-    tracker.record_failure("bad_tool");
-    tracker.record_failure("bad_tool");
-    tracker.record_failure("bad_tool");
-    tracker.record_failure("bad_tool");
+    // Simulate a tool with failures (need 8+ calls for cross-session deprioritization)
+    for _ in 0..8 {
+        tracker.record_failure("bad_tool");
+    }
     tracker.record_success("good_tool");
     tracker.record_success("good_tool");
     tracker.record_success("good_tool");

@@ -706,7 +706,8 @@ fn render_reflect_report(body: &str, session_id: &str) {
     if has_diagnoses {
         eprintln!();
         eprintln!("  {}", "Root-Cause Analysis:".bold());
-        for diag in report["diagnoses"].as_array().unwrap() {
+        if let Some(diagnoses) = report["diagnoses"].as_array() {
+        for diag in diagnoses {
             let severity = diag["severity"].as_str().unwrap_or("info");
             let summary = diag["summary"].as_str().unwrap_or("");
             let fix = diag["fix_hint"].as_str().unwrap_or("");
@@ -734,14 +735,15 @@ fn render_reflect_report(body: &str, session_id: &str) {
                 eprintln!("    {} {}", "→".green(), fix.green());
             }
         }
+        }
     }
 
     // ── Insights (secondary — statistical observations) ─────────────
     if has_insights {
         eprintln!();
-        let non_info_insights: Vec<_> = report["insights"]
-            .as_array()
-            .unwrap()
+        let empty = vec![];
+        let insights_arr = report["insights"].as_array().unwrap_or(&empty);
+        let non_info_insights: Vec<_> = insights_arr
             .iter()
             .filter(|i| i["severity"].as_str() != Some("info"))
             .collect();
@@ -766,10 +768,12 @@ fn render_reflect_report(body: &str, session_id: &str) {
     if has_recs {
         eprintln!();
         eprintln!("  {}", "Fix Actions:".bold());
-        for rec in report["recommendations"].as_array().unwrap() {
+        if let Some(recs) = report["recommendations"].as_array() {
+        for rec in recs {
             if let Some(r) = rec.as_str() {
                 eprintln!("    {} {}", "→".green(), r);
             }
+        }
         }
     }
 

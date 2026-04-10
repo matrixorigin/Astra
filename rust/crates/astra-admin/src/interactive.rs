@@ -112,7 +112,7 @@ pub(crate) async fn run_interactive(api: &ThinClient, profile: Option<&str>) -> 
     let rl_config = Config::builder()
         .completion_type(CompletionType::List)
         .max_history_size(500)
-        .unwrap()
+        .expect("valid config")
         .build();
 
     let mut editor: Editor<AdminHelper, FileHistory> =

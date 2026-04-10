@@ -231,7 +231,7 @@ pub(super) fn format_sync_age(ts: &str) -> String {
                 .map(|naive| {
                     naive
                         .and_utc()
-                        .with_timezone(&chrono::FixedOffset::east_opt(0).unwrap())
+                        .with_timezone(&chrono::FixedOffset::east_opt(0).expect("UTC offset"))
                 })
         });
     match parsed {

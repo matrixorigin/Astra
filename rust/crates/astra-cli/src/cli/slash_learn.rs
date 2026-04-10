@@ -6,7 +6,7 @@ pub(super) fn handle_learn_command(arg: &str, state: &ReplState) {
     use astra_runtime::pipeline::pattern::ExplorationReason;
 
     let lib = match &state.pattern_library {
-        Some(pl) => pl.lock().unwrap(),
+        Some(pl) => pl.lock().unwrap_or_else(|e| e.into_inner()),
         None => {
             eprintln!(
                 "  {} {}",

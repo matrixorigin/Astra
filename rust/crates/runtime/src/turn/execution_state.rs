@@ -64,11 +64,7 @@ fn normalize_max_rounds(value: Option<&Value>) -> i64 {
 
 fn normalize_outcome(data: &Map<String, Value>) -> Map<String, Value> {
     let status = match data.get("status").and_then(Value::as_str) {
-        Some("success" | "failure" | "exhausted") => data
-            .get("status")
-            .and_then(Value::as_str)
-            .unwrap()
-            .to_string(),
+        Some(s @ ("success" | "failure" | "exhausted")) => s.to_string(),
         _ => "failure".to_string(),
     };
 

@@ -82,7 +82,7 @@ pub fn handle_experiment_command(arg: &str, ctx: &ExperimentCommandContext<'_>) 
 }
 
 fn show_list(ctx: &ExperimentCommandContext<'_>) {
-    let store = ctx.experiment_store.read().unwrap();
+    let store = ctx.experiment_store.read().unwrap_or_else(|e| e.into_inner());
     let experiments = store.list();
 
     if experiments.is_empty() {
@@ -183,7 +183,7 @@ fn show_status(ctx: &ExperimentCommandContext<'_>) {
             eprintln!("  Variant: {}", variant_id.yellow());
 
             // Show variant config diff
-            let store = ctx.experiment_store.read().unwrap();
+            let store = ctx.experiment_store.read().unwrap_or_else(|e| e.into_inner());
             if let Some(exp) = store.get(exp_id) {
                 if let Some(variant) = exp.variants.iter().find(|v| v.id == variant_id) {
                     if !variant.config_diff.is_empty() {
@@ -210,7 +210,7 @@ fn show_status(ctx: &ExperimentCommandContext<'_>) {
 }
 
 fn show_experiment(ctx: &ExperimentCommandContext<'_>, id: &str) {
-    let store = ctx.experiment_store.read().unwrap();
+    let store = ctx.experiment_store.read().unwrap_or_else(|e| e.into_inner());
     let Some(exp) = store.get(id) else {
         eprintln!("  {}", format!("Experiment not found: {id}").red());
         return;
@@ -291,7 +291,7 @@ fn create_experiment(ctx: &ExperimentCommandContext<'_>, id: &str) {
         .with_min_samples(50)
         .build();
 
-    ctx.experiment_store.write().unwrap().register(experiment);
+    ctx.experiment_store.write().unwrap_or_else(|e| e.into_inner()).register(experiment);
 
     eprintln!("  {}", format!("✅ Created experiment: {id}").green());
     eprintln!(
@@ -305,7 +305,7 @@ fn create_experiment(ctx: &ExperimentCommandContext<'_>, id: &str) {
 }
 
 fn start_experiment(ctx: &ExperimentCommandContext<'_>, id: &str) {
-    let store = ctx.experiment_store.write().unwrap();
+    let store = ctx.experiment_store.write().unwrap_or_else(|e| e.into_inner());
     let Some(mut exp) = store.get(id) else {
         eprintln!("  {}", format!("Experiment not found: {id}").red());
         return;
@@ -330,7 +330,7 @@ fn start_experiment(ctx: &ExperimentCommandContext<'_>, id: &str) {
 }
 
 fn stop_experiment(ctx: &ExperimentCommandContext<'_>, id: &str) {
-    let store = ctx.experiment_store.write().unwrap();
+    let store = ctx.experiment_store.write().unwrap_or_else(|e| e.into_inner());
     let Some(mut exp) = store.get(id) else {
         eprintln!("  {}", format!("Experiment not found: {id}").red());
         return;
@@ -355,7 +355,7 @@ fn stop_experiment(ctx: &ExperimentCommandContext<'_>, id: &str) {
 }
 
 fn analyze_experiment(ctx: &ExperimentCommandContext<'_>, id: &str) {
-    let store = ctx.experiment_store.read().unwrap();
+    let store = ctx.experiment_store.read().unwrap_or_else(|e| e.into_inner());
     let Some(exp) = store.get(id) else {
         eprintln!("  {}", format!("Experiment not found: {id}").red());
         return;

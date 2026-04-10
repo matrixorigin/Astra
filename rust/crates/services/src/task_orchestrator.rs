@@ -774,7 +774,7 @@ impl TaskService for MatrixOneTaskService {
             return Ok(None);
         }
 
-        let plan = task.plan.as_ref().unwrap();
+        let plan = task.plan.as_ref().expect("plan checked above");
         let template_id = uuid::Uuid::new_v4().to_string();
         let template_json =
             serde_json::to_string(plan).map_err(|e| format!("serialize plan: {e}"))?;
@@ -1298,7 +1298,7 @@ impl TaskService for LocalTaskService {
             user_id: Some(task.user_id.clone()),
             goal_pattern: goal_pattern.to_string(),
             project_type: task.project_type.clone(),
-            template: task.plan.unwrap(),
+            template: task.plan.expect("plan exists for template creation"),
             success_rate: task.user_rating.map(|r| r as f32 / 5.0).unwrap_or(0.8),
             avg_completion_time: task.completion_time_sec,
             use_count: 1,

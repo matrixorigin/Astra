@@ -1092,6 +1092,24 @@ impl ToolExecutor {
             Some(c) => c,
             None => return "Error: missing 'command'".to_string(),
         };
+
+        // Block pure sleep commands — they waste time with no useful output.
+        // Only when no explicit timeout is set (explicit timeout = intentional test usage).
+        // Matches: "sleep N", "sleep 3.5", but not "sleep 1 && echo done" (has useful work).
+        if args.get("timeout").is_none() {
+            let trimmed = command.trim();
+            if trimmed.starts_with("sleep ")
+                && !trimmed.contains("&&")
+                && !trimmed.contains("||")
+                && !trimmed.contains(';')
+                && !trimmed.contains('|')
+            {
+                return "⚠ sleep commands are not useful — they waste time without producing output. \
+                        Remove the sleep and proceed with your next action."
+                    .to_string();
+            }
+        }
+
         // Use explicit timeout if provided, otherwise pick an adaptive default:
         // Tier 1 (5s):  instant commands — no I/O beyond trivial reads
         // Tier 2 (10s): fast read commands — cat, head, file stat
@@ -1196,7 +1214,7 @@ impl ToolExecutor {
                         parsed.enrich_with_scope(&self.project_root);
                     }
                     let delta = {
-                        let mut tracker = self.build_test_tracker.lock().unwrap();
+                        let mut tracker = self.build_test_tracker.lock().unwrap_or_else(|e| e.into_inner());
                         if tracker.command_changed(command) {
                             tracker.reset();
                         }
@@ -1966,6 +1984,20 @@ mod tests {
         let executor = test_executor();
         let result = executor.bash(&serde_json::json!({"command": "echo hello"}));
         assert!(result.trim().contains("hello"), "got: {result}");
+    }
+
+    #[test]
+    fn bash_pure_sleep_blocked() {
+        let executor = test_executor();
+        // Pure sleep without timeout should be blocked
+        let result = executor.bash(&serde_json::json!({"command": "sleep 5"}));
+        assert!(result.contains("not useful"), "got: {result}");
+        // sleep with pipeline work should NOT be blocked
+        let result = executor.bash(&serde_json::json!({"command": "sleep 0.01 && echo done"}));
+        assert!(result.contains("done"), "got: {result}");
+        // sleep with explicit timeout should NOT be blocked (test usage)
+        let result = executor.bash(&serde_json::json!({"command": "sleep 10", "timeout": 0.1}));
+        assert!(result.contains("timed out"), "got: {result}");
     }
 
     #[test]

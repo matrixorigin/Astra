@@ -1267,7 +1267,7 @@ fn execute_skill<'a>(
                     .map(|c| !c.steps.is_empty())
                     .unwrap_or(false);
                 if has_pipeline {
-                    let steps = &skill.composition.as_ref().unwrap().steps;
+                    let steps = &skill.composition.as_ref().expect("checked has_pipeline").steps;
                     // Create a child composition context for the pipeline
                     let pipeline_ctx;
                     let ctx_ref = match composition_ctx {
@@ -1279,7 +1279,7 @@ fn execute_skill<'a>(
                             Some(&pipeline_ctx)
                         }
                         None => {
-                            let comp = skill.composition.as_ref().unwrap();
+                            let comp = skill.composition.as_ref().expect("checked has_pipeline");
                             let mut root = match comp.max_depth {
                             Some(d) => crate::skills::composition::CompositionContext::root_with_max_depth(d),
                             None => crate::skills::composition::CompositionContext::root(),

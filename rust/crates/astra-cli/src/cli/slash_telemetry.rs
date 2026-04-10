@@ -77,7 +77,7 @@ fn show_summary(
     >,
     state: &ReplState,
 ) {
-    let session_guard = session.read().unwrap();
+    let session_guard = session.read().unwrap_or_else(|e| e.into_inner());
 
     eprintln!(
         "\n{}",
@@ -220,7 +220,7 @@ fn show_turn_timings(
         std::sync::RwLock<astra_runtime::observability_integration::ObservabilitySession>,
     >,
 ) {
-    let session_guard = session.read().unwrap();
+    let session_guard = session.read().unwrap_or_else(|e| e.into_inner());
 
     if session_guard.turn_timings.is_empty() {
         eprintln!("{}", "  No turn timing data yet.".yellow());
@@ -275,7 +275,7 @@ fn show_drift_analysis(
     >,
     state: &ReplState,
 ) {
-    let session_guard = session.read().unwrap();
+    let session_guard = session.read().unwrap_or_else(|e| e.into_inner());
 
     eprintln!(
         "\n{}",
@@ -363,7 +363,7 @@ fn show_decisions(
         std::sync::RwLock<astra_runtime::observability_integration::ObservabilitySession>,
     >,
 ) {
-    let session_guard = session.read().unwrap();
+    let session_guard = session.read().unwrap_or_else(|e| e.into_inner());
 
     if session_guard.decision_explanations.is_empty() {
         eprintln!("{}", "  No decision data yet.".yellow());

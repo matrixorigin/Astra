@@ -142,7 +142,7 @@ fn block_anchor_find(content: &str, old_str: &str) -> Vec<String> {
     }
 
     let first_search = search_lines[0].trim();
-    let last_search = search_lines.last().unwrap().trim();
+    let last_search = search_lines.last().expect("search_lines has >= 3 elements").trim();
 
     if first_search.is_empty() || last_search.is_empty() {
         return vec![];
@@ -209,7 +209,7 @@ fn block_anchor_find(content: &str, old_str: &str) -> Vec<String> {
     let best = candidates
         .iter()
         .filter(|c| c.similarity >= threshold)
-        .max_by(|a, b| a.similarity.partial_cmp(&b.similarity).unwrap());
+        .max_by(|a, b| a.similarity.partial_cmp(&b.similarity).unwrap_or(std::cmp::Ordering::Equal));
 
     match best {
         Some(c) => {

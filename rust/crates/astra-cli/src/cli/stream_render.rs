@@ -752,7 +752,14 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 eprintln!("{}", edge_sse_post_tool_result_fail_line(e).yellow());
             }
         }
-        self.edge_tool_round.last().unwrap().clone()
+        self.edge_tool_round.last().cloned().unwrap_or_else(|| EdgeToolExecResult {
+            request_id: String::new(),
+            tool: String::new(),
+            args: serde_json::Value::Null,
+            output: "Error: no tool result recorded".to_string(),
+            status: "error".to_string(),
+            duration_ms: 0,
+        })
     }
 
     async fn resolve_approval(
@@ -901,7 +908,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                         .await,
                 );
             }
-            return results.into_iter().map(|r| r.unwrap()).collect();
+            return results.into_iter().flatten().collect();
         }
 
         // ── Phase 1: Pre-execution UI setup (sequential, &mut self) ──
@@ -1073,7 +1080,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             }
         }
 
-        results.into_iter().map(|r| r.unwrap()).collect()
+        results.into_iter().flatten().collect()
     }
 }
 
@@ -1342,7 +1349,7 @@ impl StreamRenderState {
         }
         self.stop_tool_stdout_anim();
         let idx = {
-            let mut g = self.tool_ui.lock().unwrap();
+            let mut g = self.tool_ui.lock().unwrap_or_else(|e| e.into_inner());
             let idx = g.lines.len();
             let line = format!("  {} {} …", "⬢".cyan(), styled_desc);
             g.lines.push(line);
@@ -1735,7 +1742,7 @@ impl StreamRenderState {
         let description = self.format_tool_description_with_output(tool, args, Some(output));
         let styled_desc = style_tool_description(tool, &description);
         let dur_display = format!("{}", duration_suffix.dim());
-        let mut g = self.tool_ui.lock().unwrap();
+        let mut g = self.tool_ui.lock().unwrap_or_else(|e| e.into_inner());
         if idx < g.lines.len() {
             g.lines[idx] = format!("  {icon} {styled_desc}{dur_display}");
             if !line.is_empty() {
@@ -2061,7 +2068,7 @@ impl StreamRenderState {
     #[allow(dead_code)]
     fn clear_tool_region(&mut self) {
         self.stop_tool_stdout_anim();
-        let mut g = self.tool_ui.lock().unwrap();
+        let mut g = self.tool_ui.lock().unwrap_or_else(|e| e.into_inner());
         g.region.clear();
         g.lines.clear();
     }

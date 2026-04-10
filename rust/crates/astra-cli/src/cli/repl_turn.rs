@@ -713,7 +713,7 @@ async fn apply_auto_compact_result(
             alternatives: vec![],
             confidence: 0.9,
         };
-        let mut session_guard = session.write().unwrap();
+        let mut session_guard = session.write().unwrap_or_else(|e| e.into_inner());
         astra_runtime::observability_integration::on_tool_selection(
             &mut session_guard,
             explanation,

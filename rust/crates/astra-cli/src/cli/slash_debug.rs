@@ -612,7 +612,7 @@ fn resolve_session_id(input: &str) -> String {
             })
             .collect();
         if matches.len() == 1 {
-            return matches.into_iter().next().unwrap();
+            return matches.into_iter().next().expect("matches has exactly one item");
         }
     }
     input.to_string()

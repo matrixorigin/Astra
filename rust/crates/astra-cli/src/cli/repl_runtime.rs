@@ -755,10 +755,10 @@ pub(super) fn print_repl_banner(profile: Option<&str>, state: &ReplState) {
 
     // Show active limits (system prompt, max-budget, permission mode)
     let mut limits = Vec::new();
-    if std::env::var("MO_MAX_TURNS").is_ok() {
+    if let Ok(max_turns) = std::env::var("MO_MAX_TURNS") {
         limits.push(format!(
             "max-turns: {}",
-            std::env::var("MO_MAX_TURNS").unwrap()
+            max_turns
         ));
     }
     if state.max_budget_limit > 0.0 {

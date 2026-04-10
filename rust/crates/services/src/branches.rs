@@ -12,7 +12,7 @@ use astra_core::{
 // ── SafeIdent validation ─────────────────────────────────────────────────────
 
 pub static SAFE_IDENT_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^[a-zA-Z_][a-zA-Z0-9_.]{0,127}$").unwrap());
+    LazyLock::new(|| Regex::new(r"^[a-zA-Z_][a-zA-Z0-9_.]{0,127}$").expect("valid regex"));
 
 pub fn validate_ident(name: &str, label: &str) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
     if !SAFE_IDENT_RE.is_match(name) {

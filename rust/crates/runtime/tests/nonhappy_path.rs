@@ -233,9 +233,9 @@ mod turn_guard_integration {
         use astra_runtime::pipeline::persistence::ToolHealthEntry;
         use astra_runtime::turn::tool_health::ToolHealthTracker;
 
-        // Tool A: 3 calls, 100% failure → NOT deprioritized (too few calls)
-        // Tool B: 10 calls, 60% failure → deprioritized (enough data)
-        // Tool C: 10 calls, 40% failure → NOT deprioritized (below threshold)
+        // Tool A: 3 calls, 100% failure → NOT deprioritized (too few calls, need >=8)
+        // Tool B: 10 calls, 80% failure → deprioritized (enough data + above 70% threshold)
+        // Tool C: 10 calls, 60% failure → NOT deprioritized (below 70% threshold)
         let entries = vec![
             ToolHealthEntry {
                 name: "tool_a".to_string(),
@@ -247,15 +247,15 @@ mod turn_guard_integration {
             ToolHealthEntry {
                 name: "tool_b".to_string(),
                 total_calls: 10,
-                total_failures: 6,
-                failure_rate: 0.6,
+                total_failures: 8,
+                failure_rate: 0.8,
                 last_updated_epoch: 0,
             },
             ToolHealthEntry {
                 name: "tool_c".to_string(),
                 total_calls: 10,
-                total_failures: 4,
-                failure_rate: 0.4,
+                total_failures: 6,
+                failure_rate: 0.6,
                 last_updated_epoch: 0,
             },
         ];
@@ -1211,12 +1211,12 @@ mod chat_stream_turnguard_e2e {
 
         // --- Session 1: tool fails and gets deprioritized ---
         let mut guard1 = TurnGuard::new();
-        for _ in 0..5 {
+        for _ in 0..8 {
             guard1.record_tool_result("github_ci_status", "Error: API rate limit exceeded");
         }
         assert!(
             guard1.health.is_deprioritized("github_ci_status"),
-            "5 consecutive failures should deprioritize"
+            "8 consecutive failures should deprioritize"
         );
 
         // Export health state (would be persisted to disk/cloud)
@@ -1229,7 +1229,7 @@ mod chat_stream_turnguard_e2e {
             .iter()
             .find(|e| e.name == "github_ci_status")
             .unwrap();
-        assert!(ci_entry.failure_rate >= 0.5, "failure rate should be high");
+        assert!(ci_entry.failure_rate >= 0.7, "failure rate should be high");
 
         // --- Session 2: restore from exported health ---
         let tracker2 = ToolHealthTracker::from_entries(&exported);

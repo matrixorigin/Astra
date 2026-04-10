@@ -717,18 +717,26 @@ impl DriftDetector {
                         query_used: query,
                     }
                 } else if budget_pressure_detected {
-                    let trace = budget_traces
+                    if let Some(trace) = budget_traces
                         .iter()
                         .find(|t| t.budget_pressure > 0.85)
-                        .unwrap();
-                    DriftCause::TokenBudgetPressure {
-                        budget_available: trace.max_tokens.saturating_sub(trace.total_used),
-                        budget_needed: trace.total_used,
-                        sacrificed_context: if trace.compression_triggered {
-                            vec!["History compressed under budget pressure".to_string()]
-                        } else {
-                            vec![]
-                        },
+                    {
+                        DriftCause::TokenBudgetPressure {
+                            budget_available: trace.max_tokens.saturating_sub(trace.total_used),
+                            budget_needed: trace.total_used,
+                            sacrificed_context: if trace.compression_triggered {
+                                vec!["History compressed under budget pressure".to_string()]
+                            } else {
+                                vec![]
+                            },
+                        }
+                    } else {
+                        DriftCause::AmbiguousInstruction {
+                            instruction: original_query.chars().take(80).collect(),
+                            interpretations: vec![
+                                "User corrected the same intent multiple times".to_string(),
+                            ],
+                        }
                     }
                 } else {
                     DriftCause::AmbiguousInstruction {

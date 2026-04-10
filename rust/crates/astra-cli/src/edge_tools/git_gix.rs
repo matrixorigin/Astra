@@ -1585,30 +1585,30 @@ pub fn git_commit(project_root: &Path, args: &Value) -> String {
             .args(["add", "-A"])
             .current_dir(project_root)
             .output();
-        if let Err(e) = add_out {
-            return format!("Error: git add failed: {e}");
-        }
-        let add_out = add_out.unwrap();
-        if !add_out.status.success() {
-            return format!(
-                "Error: git add -A failed: {}",
-                String::from_utf8_lossy(&add_out.stderr).trim()
-            );
+        match add_out {
+            Err(e) => return format!("Error: git add failed: {e}"),
+            Ok(ref out) if !out.status.success() => {
+                return format!(
+                    "Error: git add -A failed: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
+            }
+            Ok(_) => {}
         }
     } else if !files.is_empty() {
         // Stage specific files
         let mut cmd = std::process::Command::new("git");
         cmd.arg("add").args(&files).current_dir(project_root);
         let add_out = cmd.output();
-        if let Err(e) = add_out {
-            return format!("Error: git add failed: {e}");
-        }
-        let add_out = add_out.unwrap();
-        if !add_out.status.success() {
-            return format!(
-                "Error: git add failed: {}",
-                String::from_utf8_lossy(&add_out.stderr).trim()
-            );
+        match add_out {
+            Err(e) => return format!("Error: git add failed: {e}"),
+            Ok(ref out) if !out.status.success() => {
+                return format!(
+                    "Error: git add failed: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
+            }
+            Ok(_) => {}
         }
     }
 

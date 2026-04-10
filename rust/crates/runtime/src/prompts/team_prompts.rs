@@ -60,7 +60,11 @@ pub fn fan_out_agent_prompt(
         "## Team Coordination: Parallel Execution\n\
          {sibling_clause}\n\n\
          **Aggregation strategy:** {aggregation}\n\
-         {aggregation_guidance}{gate_clause}"
+         {aggregation_guidance}{gate_clause}\n\n\
+         **Efficiency:** Avoid running build/compile/lint commands (cargo check, cargo clippy, \
+         make build, etc.) unless your specific review focus requires verifying compilation. \
+         For code review tasks, reading and analyzing the code is sufficient — \
+         other agents or the parent orchestrator can verify builds separately."
     )
 }
 

@@ -730,14 +730,19 @@ async fn handle_mcp_add(arg: &str) {
         "command": command,
         "args": args,
     });
-    config
-        .as_object_mut()
-        .unwrap()
+    let Some(config_obj) = config.as_object_mut() else {
+        eprintln!("{}", "  ⚠ MCP config must be a JSON object".yellow());
+        return;
+    };
+    let Some(servers_obj) = config_obj
         .entry("mcpServers")
         .or_insert_with(|| serde_json::json!({}))
         .as_object_mut()
-        .unwrap()
-        .insert(name.to_string(), entry);
+    else {
+        eprintln!("{}", "  ⚠ mcpServers must be a JSON object".yellow());
+        return;
+    };
+    servers_obj.insert(name.to_string(), entry);
 
     // Write atomically (temp + rename)
     if let Some(parent) = path.parent() {

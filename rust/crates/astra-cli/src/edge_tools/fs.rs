@@ -1182,13 +1182,10 @@ impl ToolExecutor {
         // mo-agent → astra-cli), fall back to a project-wide filename search
         // so the error message can suggest the correct path immediately instead
         // of forcing the LLM through a glob → read recovery loop.
-        let dir_exists = matches!(search_dir, Some(ref d) if d.exists());
 
         let mut candidates: Vec<(String, usize)> = Vec::new();
 
-        if dir_exists {
-            // Fast path: search within the same directory
-            let search_dir = search_dir.unwrap();
+        if let Some(search_dir) = search_dir.filter(|d| d.exists()) {
             Self::collect_similar_in_dir(
                 &search_dir,
                 &target_name,

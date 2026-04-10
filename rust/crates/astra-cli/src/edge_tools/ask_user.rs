@@ -119,7 +119,7 @@ impl ToolExecutor {
                                         KeyCode::Char(c)
                                             if c.is_ascii_digit() && input.is_empty() =>
                                         {
-                                            let idx = c.to_digit(10).unwrap() as usize;
+                                            let idx = c.to_digit(10).expect("ascii digit") as usize;
                                             if idx >= 1 && idx <= choices.len() {
                                                 drop(_guard);
                                                 eprintln!("{}", c);

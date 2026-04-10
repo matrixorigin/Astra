@@ -137,7 +137,7 @@ impl ToolExecutor {
             .into_iter()
             .take(max_results)
             .map(|(score, tool)| {
-                let func = tool.get("function").unwrap();
+                let func = tool.get("function").unwrap_or(tool);
                 let name = func.get("name").and_then(Value::as_str).unwrap_or("");
                 let desc = func.get("description").and_then(Value::as_str).unwrap_or("");
                 let short_desc: String = desc.chars().take(100).collect();

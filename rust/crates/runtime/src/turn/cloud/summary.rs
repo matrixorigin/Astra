@@ -212,7 +212,7 @@ impl SummaryLlmClient for HttpSummaryClient {
         if self.params.provider == "anthropic" || self.params.model_name.contains("claude") {
             body["max_tokens"] = serde_json::json!(self.params.max_output_tokens);
             body.as_object_mut()
-                .unwrap()
+                .expect("json object")
                 .remove("max_completion_tokens");
         }
 

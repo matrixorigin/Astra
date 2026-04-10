@@ -242,12 +242,12 @@ pub fn highlight_code_line(line: &str) -> String {
 
     let keyword_re = KEYWORD_RE.get_or_init(|| {
         let pattern = KEYWORDS.join("|");
-        Regex::new(&format!(r"\b({})\b", pattern)).unwrap()
+        Regex::new(&format!(r"\b({})\b", pattern)).expect("valid keyword regex")
     });
 
     // Match strings: "..." or '...' with basic escape handling (\")
     let string_re =
-        STRING_RE.get_or_init(|| Regex::new(r#"("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')"#).unwrap());
+        STRING_RE.get_or_init(|| Regex::new(r#"("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')"#).expect("valid regex"));
 
     // Check if line starts with line number (e.g., "420\t" or " 99\t")
     // Convert to more compact format: "  42│" (dim, right-aligned number + dim pipe)

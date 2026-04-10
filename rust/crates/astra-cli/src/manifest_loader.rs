@@ -651,7 +651,7 @@ pub fn expand_command_template(template: &str, args: &Value) -> String {
         }
     }
     // Remove any unexpanded placeholders (missing optional params)
-    let re = regex::Regex::new(r"\{\{[^}]+\}\}").unwrap();
+    let re = regex::Regex::new(r"\{\{[^}]+\}\}").expect("valid regex");
     re.replace_all(&result, "").trim().to_string()
 }
 
