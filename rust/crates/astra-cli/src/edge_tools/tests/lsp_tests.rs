@@ -54,7 +54,8 @@ while True:
                 "capabilities": {
                     "definitionProvider": True,
                     "documentSymbolProvider": True,
-                    "codeActionProvider": True
+                    "codeActionProvider": True,
+                    "completionProvider": {"resolveProvider": False}
                 }
             }
         })
@@ -144,6 +145,19 @@ while True:
                     }
                 }
             }]
+        })
+    elif method == "textDocument/completion":
+        write_frame({
+            "jsonrpc": "2.0",
+            "id": msg_id,
+            "result": {
+                "isIncomplete": False,
+                "items": [{
+                    "label": "hello_completion",
+                    "kind": 3,
+                    "detail": "fake completion"
+                }]
+            }
         })
     elif method in ("textDocument/didOpen", "textDocument/didChange", "textDocument/didSave"):
         log_event(method)
@@ -243,6 +257,7 @@ fn lsp_diagnostics_returns_capabilities() {
     assert!(parsed["capabilities"]["goto_definition"].as_bool().unwrap());
     assert!(parsed["capabilities"]["find_references"].as_bool().unwrap());
     assert!(parsed["capabilities"]["code_actions"].as_bool().unwrap());
+    assert!(parsed["capabilities"]["completions"].as_bool().unwrap());
     assert!(
         parsed["supported_languages"]["active_lsp"]
             .as_array()
@@ -358,6 +373,42 @@ fn lsp_code_actions_apply_selected_workspace_edit_when_dry_run_false() {
         std::fs::read_to_string(file_path)
             .unwrap()
             .contains("hello_from_second_fix")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+#[serial_test::serial]
+fn lsp_completions_use_real_lsp_when_available() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname=\"demo\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(
+        dir.path().join("src/lib.rs"),
+        "pub fn hello_from_lsp() {}\n",
+    )
+    .unwrap();
+    let script = fake_lsp_server_script(dir.path());
+    let _guard = EnvGuard::set("ASTRA_RUST_ANALYZER_CMD", script.to_str().unwrap());
+    let exe = ToolExecutor::new(dir.path());
+
+    let result = exe.lsp(&json!({
+        "operation": "completions",
+        "file": "src/lib.rs",
+        "line": 1,
+        "column": 8
+    }));
+    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+
+    assert_eq!(parsed["backend"].as_str(), Some("lsp"));
+    assert_eq!(parsed["method"].as_str(), Some("textDocument/completion"));
+    assert_eq!(
+        parsed["result"]["items"][0]["label"].as_str(),
+        Some("hello_completion")
     );
 }
 
