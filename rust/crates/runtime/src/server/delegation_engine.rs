@@ -1182,6 +1182,7 @@ impl DelegationEngine {
                     let original_run_id = current.run_id.clone();
                     let mut retry_config = config_builder();
                     let retry_run_id = retry_config.run_id.clone();
+                    let retry_depth = self.tracker.get_depth(&original_run_id).await.unwrap_or(0);
 
                     astra_core::log_persist!(
                         self.run_engine
@@ -1207,7 +1208,7 @@ impl DelegationEngine {
                             parent_run_id: parent_run_id.to_string(),
                             delegation_id: delegation_id.to_string(),
                             agent_id: retry_config.agent_profile.agent_id.clone(),
-                            depth: 0,
+                            depth: retry_depth,
                             state: SubRunState::Created,
                             retry_of: Some(original_run_id.clone()),
                         })
@@ -1215,6 +1216,24 @@ impl DelegationEngine {
 
                     let retry_pause_flag = self.tracker.register_pause_flag(&retry_run_id).await;
                     retry_config.pause_flag = Some(retry_pause_flag);
+
+                    if retry_config.mailbox.is_none() {
+                        if let Some(router) = &self.mailbox_router {
+                            let addr = crate::messaging::types::AgentAddress {
+                                run_id: retry_run_id.clone(),
+                                agent_id: retry_config.agent_profile.agent_id.clone(),
+                            };
+                            match router.register(addr, Some(delegation_id.to_string())).await {
+                                Ok(mailbox) => retry_config.mailbox = Some(mailbox),
+                                Err(e) => {
+                                    eprintln!(
+                                        "  ⚠ delegation: mailbox registration failed for retry {}: {}",
+                                        retry_config.agent_profile.agent_id, e
+                                    );
+                                }
+                            }
+                        }
+                    }
 
                     Self::write_journal_event(
                         &retry_config.session_id,
@@ -3930,6 +3949,27 @@ mod tests {
         assert_eq!(de.pause_delegation("del-1").await, 2);
     }
 
+    #[tokio::test]
+    async fn gate_retry_preserves_depth_metadata() {
+        let (reg, engine, tracker, _) = setup_with_executor(Arc::new(EchoExecutor));
+        let gate = Arc::new(FailThenPassGate::new(1));
+        let de =
+            DelegationEngine::with_executor(reg, engine, tracker.clone(), Arc::new(EchoExecutor))
+                .with_gate(gate);
+
+        let result = de
+            .execute(fan_out_request(vec!["coder"]), "orch", None)
+            .await
+            .unwrap();
+        let chain = tracker
+            .get_retry_chain(&result.agent_results[0].run_id)
+            .await;
+
+        assert_eq!(chain.len(), 2);
+        assert_eq!(tracker.get_depth(&chain[0]).await, Some(1));
+        assert_eq!(tracker.get_depth(&chain[1]).await, Some(1));
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn gate_retry_writes_journal_linkage_event() {
         let sessions_dir = std::env::temp_dir().join(format!(
@@ -5007,6 +5047,26 @@ mod tests {
         }
     }
 
+    /// Executor that reports whether a mailbox was attached to the sub-run config.
+    #[derive(Clone)]
+    struct MailboxEchoExecutor;
+
+    #[async_trait::async_trait]
+    impl SubRunExecutor for MailboxEchoExecutor {
+        async fn execute(&self, config: SubRunConfig) -> Result<AgentResult, String> {
+            Ok(AgentResult {
+                agent_id: config.agent_profile.agent_id.clone(),
+                run_id: config.run_id.clone(),
+                status: "completed".into(),
+                output: Some(format!("mailbox={}", config.mailbox.is_some())),
+                error: None,
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                tool_calls: 0,
+            })
+        }
+    }
+
     #[tokio::test]
     async fn fan_out_per_agent_timeout_enforced() {
         let slow = Arc::new(SlowExecutor {
@@ -5095,6 +5155,29 @@ mod tests {
             elapsed.as_secs() < 3,
             "retry timeout should cut execution short, took {}s",
             elapsed.as_secs()
+        );
+    }
+
+    #[tokio::test]
+    async fn gate_retry_registers_mailbox_when_router_present() {
+        let (reg, engine, tracker) = setup();
+        let gate = Arc::new(FailThenPassGate::new(1));
+        let router = Arc::new(crate::messaging::AgentMailboxRouter::new(
+            Arc::new(crate::messaging::InProcessTransport::new()),
+            tracker.clone(),
+        ));
+        let de =
+            DelegationEngine::with_executor(reg, engine, tracker, Arc::new(MailboxEchoExecutor))
+                .with_gate(gate)
+                .with_mailbox_router(router);
+
+        let result = de
+            .execute(fan_out_request(vec!["coder"]), "orch", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            result.agent_results[0].output.as_deref(),
+            Some("mailbox=true")
         );
     }
 
