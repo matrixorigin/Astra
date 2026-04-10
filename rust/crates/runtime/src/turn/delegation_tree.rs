@@ -124,8 +124,8 @@ impl AgentTreeNode {
         let (icon, status_text) = match &self.status {
             AgentStatus::Initializing => ("⏳", "initializing".to_string()),
             AgentStatus::Running { activity } => {
-                let activity_short = if activity.len() > 20 {
-                    format!("{}…", &activity[..19])
+                let activity_short = if activity.chars().count() > 20 {
+                    format!("{}…", activity.chars().take(19).collect::<String>())
                 } else {
                     activity.clone()
                 };

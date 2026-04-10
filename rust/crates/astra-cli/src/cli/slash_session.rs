@@ -2236,7 +2236,7 @@ fn handle_session_verify(state: &ReplState) {
                 );
                 if let Some(ref last_err) = stats.last_error {
                     let truncated = if last_err.len() > 80 {
-                        format!("{}…", &last_err[..80])
+                        format!("{}…", last_err.chars().take(80).collect::<String>())
                     } else {
                         last_err.clone()
                     };

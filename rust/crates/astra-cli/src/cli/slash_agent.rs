@@ -675,8 +675,8 @@ fn format_status(status: &AgentStatus) -> String {
         AgentStatus::Running { activity } => format!("running: {activity}"),
         AgentStatus::Idle => "idle".to_string(),
         AgentStatus::Completed { result } => {
-            let preview = if result.len() > 50 {
-                format!("{}...", &result[..50])
+            let preview = if result.chars().count() > 50 {
+                format!("{}...", result.chars().take(50).collect::<String>())
             } else {
                 result.clone()
             };

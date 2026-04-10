@@ -315,7 +315,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
                 // Emit completed event
                 if let Some(ref emitter) = progress_emitter {
                     let summary = if state.final_text.len() > 100 {
-                        format!("{}...", &state.final_text[..100])
+                        format!("{}...", state.final_text.chars().take(100).collect::<String>())
                     } else {
                         state.final_text.clone()
                     };

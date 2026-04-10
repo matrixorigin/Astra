@@ -155,7 +155,7 @@ impl ToolExecutor {
                     } else {
                         // Truncate long values
                         let display = if val.len() > 100 {
-                            format!("{}...", &val[..100])
+                            format!("{}...", val.chars().take(100).collect::<String>())
                         } else {
                             val
                         };

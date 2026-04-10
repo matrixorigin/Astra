@@ -200,7 +200,7 @@ pub(super) async fn handle_task_command(
                         title: format!(
                             "run: {}",
                             if sub_arg.len() > 60 {
-                                format!("{}…", &sub_arg[..60])
+                                format!("{}…", sub_arg.chars().take(60).collect::<String>())
                             } else {
                                 sub_arg.to_string()
                             }
@@ -241,7 +241,7 @@ pub(super) async fn handle_task_command(
                 "  {} Background task started: {} ({})",
                 "▶".cyan(),
                 if sub_arg.len() > 50 {
-                    format!("{}…", &sub_arg[..50])
+                    format!("{}…", sub_arg.chars().take(50).collect::<String>())
                 } else {
                     sub_arg.to_string()
                 },

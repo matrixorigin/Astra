@@ -1584,16 +1584,16 @@ pub(super) async fn handle_info_command(
 
             // ── Attention ──
             if let Some(ref anchor) = state.continuation_anchor {
-                let display = if anchor.len() > 60 {
-                    format!("{}…", &anchor[..60])
+                let display: String = if anchor.chars().count() > 60 {
+                    format!("{}…", anchor.chars().take(60).collect::<String>())
                 } else {
                     anchor.clone()
                 };
                 eprintln!("  {:<12}  {}", "anchor".cyan(), display.dim());
             }
             if let Some(ref goal) = state.session_goal {
-                let display = if goal.len() > 60 {
-                    format!("{}…", &goal[..60])
+                let display: String = if goal.chars().count() > 60 {
+                    format!("{}…", goal.chars().take(60).collect::<String>())
                 } else {
                     goal.clone()
                 };
