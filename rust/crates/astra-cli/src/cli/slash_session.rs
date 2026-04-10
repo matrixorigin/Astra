@@ -759,6 +759,7 @@ pub(super) fn handle_session_command(arg: &str, state: &mut ReplState) {
                                 );
                             }
                             session_journal::JournalEventType::DelegationSubRunCompleted => {
+                                let meta = evt.metadata.as_ref();
                                 let agent = evt
                                     .metadata
                                     .as_ref()
@@ -779,8 +780,23 @@ pub(super) fn handle_session_command(arg: &str, state: &mut ReplState) {
                                     agent,
                                     status,
                                 );
+                                if let Some(preview) = meta
+                                    .and_then(|m| m.get("output_preview"))
+                                    .and_then(|v| v.as_str())
+                                    .filter(|s| !s.is_empty())
+                                {
+                                    eprintln!("      {}", ellipsize(preview, 120).dim());
+                                }
+                                if let Some(error) = meta
+                                    .and_then(|m| m.get("error"))
+                                    .and_then(|v| v.as_str())
+                                    .filter(|s| !s.is_empty())
+                                {
+                                    eprintln!("      {}", ellipsize(error, 120).red());
+                                }
                             }
                             session_journal::JournalEventType::DelegationCompleted => {
+                                let meta = evt.metadata.as_ref();
                                 let succeeded = evt
                                     .metadata
                                     .as_ref()
@@ -800,6 +816,13 @@ pub(super) fn handle_session_command(arg: &str, state: &mut ReplState) {
                                     succeeded,
                                     failed,
                                 );
+                                if let Some(preview) = meta
+                                    .and_then(|m| m.get("aggregated_output_preview"))
+                                    .and_then(|v| v.as_str())
+                                    .filter(|s| !s.is_empty())
+                                {
+                                    eprintln!("      {}", ellipsize(preview, 120).cyan());
+                                }
                             }
                             session_journal::JournalEventType::AgentTerminated => {
                                 let m = evt.metadata.as_ref();
