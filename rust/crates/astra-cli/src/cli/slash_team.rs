@@ -1012,6 +1012,27 @@ pub(super) async fn handle_team_command(
             });
 
             let repo_root = std::env::current_dir().ok();
+
+            // ─── Journal: record team execution start ────────────────────────
+            let agent_roles: Vec<String> =
+                cli_team.members.iter().map(|m| m.role.clone()).collect();
+            let coordination_label = cli_team
+                .coordination
+                .as_ref()
+                .map(|c| format!("{c:?}"))
+                .unwrap_or_else(|| "auto".to_string());
+            if let Some(ref j) = state.journal {
+                let _ = j.append(
+                    &astra_services::session_journal::JournalEvent::delegation_started(
+                        state.session_id.as_deref(),
+                        team_name, // delegation_id not yet known — use team name
+                        "orchestrator",
+                        &coordination_label,
+                        &agent_roles,
+                    ),
+                );
+            }
+
             let report = tokio::select! {
                 report = orchestrator.execute_team(team_name, task, repo_root) => report,
                 _ = tokio::signal::ctrl_c() => {
@@ -1022,6 +1043,20 @@ pub(super) async fn handle_team_command(
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                     eprintln!("  {} Team run interrupted.", theme::icon_err());
                     progress_renderer.abort();
+                    // Journal: record interrupted execution
+                    if let Some(ref j) = state.journal {
+                        let _ = j.append(
+                            &astra_services::session_journal::JournalEvent::delegation_completed(
+                                state.session_id.as_deref(),
+                                team_name,
+                                &coordination_label,
+                                cli_team.members.len(),
+                                0,
+                                0,
+                                "interrupted",
+                            ),
+                        );
+                    }
                     return;
                 }
             };
@@ -1242,6 +1277,33 @@ pub(super) async fn handle_team_command(
                 error: report.error.clone(),
                 started_at,
             });
+
+            // ─── Journal: record team execution completion ───────────────
+            if let Some(ref j) = state.journal {
+                let (succeeded, failed) = report
+                    .delegation_result
+                    .as_ref()
+                    .map(|dr| {
+                        let s = dr
+                            .agent_results
+                            .iter()
+                            .filter(|r| r.status == "completed" && r.error.is_none())
+                            .count();
+                        (s, dr.agent_results.len() - s)
+                    })
+                    .unwrap_or((0, 0));
+                let _ = j.append(
+                    &astra_services::session_journal::JournalEvent::delegation_completed(
+                        state.session_id.as_deref(),
+                        &report.delegation_id,
+                        &coordination_label,
+                        agent_count,
+                        succeeded,
+                        failed,
+                        &report.status.to_string(),
+                    ),
+                );
+            }
         }
 
         "history" => {
