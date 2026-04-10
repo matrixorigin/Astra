@@ -585,6 +585,12 @@ pub(super) async fn handle_team_command(
             };
             match state.team_registry.create(name.to_string(), description, coordination) {
                 Ok(()) => {
+                    // Persist so team survives restart
+                    let user_id = state.ingestion_user_id.clone().unwrap_or_else(|| "local".into());
+                    if let Some(t) = state.team_registry.get(name) {
+                        let def = cli_team_to_definition(t, &user_id);
+                        let _ = state.team_store.save_team(&def).await;
+                    }
                     eprintln!(
                         "  {} Team '{}' created. Add members with /team add-member {} <role> <description>",
                         theme::icon_ok(),
@@ -621,6 +627,12 @@ pub(super) async fn handle_team_command(
             };
             match state.team_registry.add_member(team, member) {
                 Ok(()) => {
+                    // Sync to persistence store
+                    let user_id = state.ingestion_user_id.clone().unwrap_or_else(|| "local".into());
+                    if let Some(t) = state.team_registry.get(team) {
+                        let def = cli_team_to_definition(t, &user_id);
+                        let _ = state.team_store.save_team(&def).await;
+                    }
                     eprintln!(
                         "  {} Added role '{}' to team '{}'",
                         theme::icon_ok(),

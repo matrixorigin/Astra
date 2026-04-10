@@ -397,6 +397,24 @@ impl TeamExecutionOrchestrator {
             .persist_usage(&parent_run_id, total_prompt, total_completion, total_tools)
             .await;
 
+        // Check token budget (post-execution — tokens are only known after completion)
+        let total_tokens = total_prompt + total_completion;
+        if let Some(ref budget) = team.budget {
+            if budget.max_tokens > 0 && total_tokens > budget.max_tokens {
+                let _ = self
+                    .run_engine
+                    .append_event(
+                        &parent_run_id,
+                        serde_json::json!({
+                            "event_type": "team_budget_exceeded",
+                            "budget_max_tokens": budget.max_tokens,
+                            "actual_tokens": total_tokens,
+                        }),
+                    )
+                    .await;
+            }
+        }
+
         let _ = self
             .run_engine
             .append_event(
