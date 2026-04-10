@@ -672,6 +672,54 @@ async fn apply_auto_compact_result(
         let _ = journal.append(&evt);
     }
 
+    // ─── Observability: record history compression decision ───────────────
+    if let Some(session) = &state.observability_session {
+        use astra_runtime::turn::decision_explainer::{
+            DecisionExplanation, DecisionType, ExplainableInput,
+        };
+        let compacted_turns: Vec<u32> = (0..(total - kept_indices.len()) as u32).collect();
+        let retained_turns: Vec<u32> = kept_indices.iter().map(|&i| i as u32).collect();
+        let compression_ratio = if total > 0 {
+            compacted_count as f64 / total as f64
+        } else {
+            0.0
+        };
+        let trigger_tokens = state.context_budget.compact_trigger();
+        let explanation = DecisionExplanation {
+            id: format!(
+                "compact-{}-{}",
+                state.session_id.as_deref().unwrap_or("?"),
+                state.turn
+            ),
+            timestamp: std::time::SystemTime::now(),
+            decision_type: DecisionType::HistoryCompression {
+                turns_compressed: compacted_turns,
+                turns_retained: retained_turns.clone(),
+                compression_ratio,
+            },
+            inputs: vec![ExplainableInput {
+                name: "token_budget".to_string(),
+                value: format!("{}k trigger", trigger_tokens / 1000),
+                influence: 1.0,
+                explanation: Some("Exceeded context budget trigger".to_string()),
+            }],
+            reasoning: format!(
+                "Auto-compacted {} turns to {} (kept {} by relevance), ratio {:.1}%",
+                total,
+                state.history.len(),
+                retained_turns.len(),
+                compression_ratio * 100.0
+            ),
+            alternatives: vec![],
+            confidence: 0.9,
+        };
+        let mut session_guard = session.write().unwrap();
+        astra_runtime::observability_integration::on_tool_selection(
+            &mut session_guard,
+            explanation,
+        );
+    }
+
     // Report which turns were kept by relevance (if any older turns survived)
     let recent_start = total.saturating_sub(keep / 2);
     let relevance_kept: Vec<usize> = kept_indices
