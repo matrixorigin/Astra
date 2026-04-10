@@ -521,7 +521,25 @@ impl ToolExecutor {
             .ok_or_else(|| format!("selected {operation} command is missing command identifier"))?
             .to_string();
         if command_name == "astra.rust-analyzer.runnable" {
-            return self.execute_rust_analyzer_runnable(operation, &title, command);
+            return self.execute_rust_analyzer_runnable(
+                operation,
+                &title,
+                command,
+                "experimental/runnables",
+                Some("textDocument/codeLens"),
+            );
+        }
+        if matches!(
+            command_name.as_str(),
+            "rust-analyzer.runSingle" | "rust-analyzer.debugSingle"
+        ) {
+            return self.execute_rust_analyzer_runnable(
+                operation,
+                &title,
+                command,
+                "textDocument/codeLens",
+                None,
+            );
         }
         let arguments = command
             .get("arguments")
@@ -555,6 +573,8 @@ impl ToolExecutor {
         operation: &str,
         title: &str,
         command: &Value,
+        method: &str,
+        fallback_from: Option<&str>,
     ) -> Result<String, String> {
         let runnable = command
             .get("arguments")
@@ -634,12 +654,11 @@ impl ToolExecutor {
         let output = self.run_shell_output(&command_line, 30.0)?;
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        Ok(json!({
+        let mut response = json!({
             "backend": "lsp",
             "operation": operation,
-            "method": "experimental/runnables",
+            "method": method,
             "source": "rust-analyzer-runnables",
-            "fallback_from": "textDocument/codeLens",
             "executed": output.status.success(),
             "title": title,
             "kind": runnable_kind,
@@ -651,8 +670,16 @@ impl ToolExecutor {
             "exit_code": output.status.code(),
             "stdout": stdout,
             "stderr": stderr,
-        })
-        .to_string())
+        });
+        if let Some(fallback_from) = fallback_from
+            && let Some(root) = response.as_object_mut()
+        {
+            root.insert(
+                "fallback_from".to_string(),
+                Value::String(fallback_from.to_string()),
+            );
+        }
+        Ok(response.to_string())
     }
 
     fn try_resolve_code_action(&self, file: &str, action: &Value) -> Result<Option<Value>, String> {
@@ -2122,6 +2149,7 @@ impl ToolExecutor {
                                 };
                                 let (method, selected_lens) = if preview_method
                                     == "textDocument/codeLens"
+                                    && lens.get("command").is_none()
                                 {
                                     match self.try_resolve_code_lens(f, lens) {
                                         Ok(Some(resolved)) => ("codeLens/resolve", resolved),

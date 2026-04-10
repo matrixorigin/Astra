@@ -494,7 +494,46 @@ while True:
             }
         })
     elif method == "textDocument/codeLens":
-        if os.environ.get("FAKE_LSP_EMPTY_CODE_LENSES") == "1":
+        if os.environ.get("FAKE_LSP_RUST_ANALYZER_CODE_LENS") == "1":
+            uri = message["params"]["textDocument"]["uri"]
+            path = urllib.parse.urlparse(uri).path
+            workspace = os.path.dirname(os.path.dirname(path))
+            runnable = {
+                "label": "run fake runnable",
+                "location": {
+                    "targetUri": uri,
+                    "targetRange": {
+                        "start": {"line": 0, "character": 0},
+                        "end": {"line": 0, "character": 3}
+                    },
+                    "targetSelectionRange": {
+                        "start": {"line": 0, "character": 0},
+                        "end": {"line": 0, "character": 3}
+                    }
+                },
+                "kind": "cargo",
+                "args": {
+                    "cwd": workspace,
+                    "workspaceRoot": workspace,
+                    "overrideCargo": None,
+                    "cargoArgs": ["run", "--quiet"],
+                    "executableArgs": [],
+                    "environment": {}
+                }
+            }
+            write_frame({
+                "jsonrpc": "2.0",
+                "id": msg_id,
+                "result": [{
+                    "range": runnable["location"]["targetSelectionRange"],
+                    "command": {
+                        "title": "▶ Run",
+                        "command": "rust-analyzer.runSingle",
+                        "arguments": [runnable]
+                    }
+                }]
+            })
+        elif os.environ.get("FAKE_LSP_EMPTY_CODE_LENSES") == "1":
             write_frame({
                 "jsonrpc": "2.0",
                 "id": msg_id,
@@ -912,6 +951,10 @@ fn lsp_rust_session_sends_rust_analyzer_init_and_configuration() {
     assert_eq!(
         initialize["payload"]["capabilities"]["experimental"]["snippetTextEdit"].as_bool(),
         Some(true)
+    );
+    assert_eq!(
+        initialize["payload"]["capabilities"]["experimental"]["commands"]["commands"][0].as_str(),
+        Some("rust-analyzer.runSingle")
     );
 
     let did_change_configuration = entries
@@ -2347,6 +2390,45 @@ impl Config {
 #[cfg(unix)]
 #[test]
 #[serial_test::serial]
+fn lsp_code_lenses_execute_native_rust_analyzer_code_lens_when_dry_run_false() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname=\"demo\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(
+        dir.path().join("src/main.rs"),
+        "fn main() { println!(\"native-code-lens-output\"); }\n",
+    )
+    .unwrap();
+    let script = fake_lsp_server_script(dir.path());
+    let _cmd_guard = EnvGuard::set("ASTRA_RUST_ANALYZER_CMD", script.to_str().unwrap());
+    let _native_lens_guard = EnvGuard::set("FAKE_LSP_RUST_ANALYZER_CODE_LENS", "1");
+    let exe = ToolExecutor::new(dir.path());
+
+    let result = exe.lsp(&json!({
+        "operation": "code_lenses",
+        "file": "src/main.rs",
+        "item_index": 0,
+        "dry_run": false
+    }));
+    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+
+    assert_eq!(parsed["method"].as_str(), Some("textDocument/codeLens"));
+    assert_eq!(parsed["source"].as_str(), Some("rust-analyzer-runnables"));
+    assert_eq!(parsed["executed"].as_bool(), Some(true));
+    assert!(
+        parsed["stdout"]
+            .as_str()
+            .is_some_and(|stdout| stdout.contains("native-code-lens-output"))
+    );
+}
+
+#[cfg(unix)]
+#[test]
+#[serial_test::serial]
 fn lsp_document_symbols_prefers_real_lsp_when_available() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
@@ -2628,7 +2710,7 @@ fn lsp_code_lenses_execute_selected_item_with_real_rust_analyzer() {
     std::fs::create_dir_all(dir.path().join("src")).unwrap();
     std::fs::write(
         dir.path().join("src/main.rs"),
-        "fn main() { println!(\"real-runnable-output\"); }\n",
+        "fn helper() { println!(\"real-runnable-output\"); }\n\n#[test]\nfn smoke() { helper(); }\n\nfn main() { helper(); }\n",
     )
     .unwrap();
     let exe = ToolExecutor::new(dir.path());
@@ -2646,7 +2728,7 @@ fn lsp_code_lenses_execute_selected_item_with_real_rust_analyzer() {
                 lens.get("command")
                     .and_then(|command| command.get("title"))
                     .and_then(Value::as_str)
-                    .is_some_and(|title| title.starts_with("run ") || title.starts_with("test "))
+                    .is_some_and(|title| title.contains("Run"))
             })
         {
             preview = Some(candidate);
@@ -2665,7 +2747,7 @@ fn lsp_code_lenses_execute_selected_item_with_real_rust_analyzer() {
             lens.get("command")
                 .and_then(|command| command.get("title"))
                 .and_then(Value::as_str)
-                .is_some_and(|title| title.starts_with("run "))
+                .is_some_and(|title| title.contains("Run"))
         })
         .unwrap_or(0);
 
@@ -2678,7 +2760,7 @@ fn lsp_code_lenses_execute_selected_item_with_real_rust_analyzer() {
     let parsed: serde_json::Value = serde_json::from_str(&executed).unwrap();
     assert_eq!(
         parsed["method"].as_str(),
-        Some("experimental/runnables"),
+        Some("textDocument/codeLens"),
         "unexpected code_lens preview: {preview}; execute result: {executed}"
     );
     assert_eq!(parsed["executed"].as_bool(), Some(true), "{executed}");

@@ -94,7 +94,13 @@ fn rust_spawn_spec() -> LspSpawnSpec {
             }
         })),
         experimental_capabilities: Some(serde_json::json!({
-            "snippetTextEdit": true
+            "snippetTextEdit": true,
+            "commands": {
+                "commands": [
+                    "rust-analyzer.runSingle",
+                    "rust-analyzer.debugSingle"
+                ]
+            }
         })),
     }
 }
