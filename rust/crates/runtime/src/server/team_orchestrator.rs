@@ -38,6 +38,14 @@ pub enum ExecutionPhase {
     WorktreesCreated { agent_ids: Vec<String> },
     /// Delegation started via DelegationEngine.
     Executing { delegation_id: String },
+    /// Real-time agent state update within a delegation.
+    AgentProgress {
+        delegation_id: String,
+        /// agent_id → current state
+        agent_states: std::collections::HashMap<String, String>,
+        completed_count: usize,
+        total_count: usize,
+    },
     /// Delegation completed, merging worktrees.
     Merging { agent_count: usize },
     /// Merge complete, producing final report.
@@ -404,6 +412,26 @@ impl TeamExecutionOrchestrator {
                 );
             }
         };
+
+        // Emit final agent progress snapshot
+        if let Some(progress) = self
+            .delegation_engine
+            .tracker()
+            .get_progress(&delegation_id)
+            .await
+        {
+            let agent_states: std::collections::HashMap<String, String> = progress
+                .agent_states
+                .into_iter()
+                .map(|(k, v)| (k, v.as_str().to_string()))
+                .collect();
+            self.emit_progress(ExecutionPhase::AgentProgress {
+                delegation_id: delegation_id.clone(),
+                agent_states,
+                completed_count: progress.completed_count,
+                total_count: progress.total_count,
+            });
+        }
 
         // Persist token usage from delegation results
         let (total_prompt, total_completion, total_tools) = sum_usage(&delegation_result);
