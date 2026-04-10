@@ -691,6 +691,21 @@ impl ToolExecutor {
         )
     }
 
+    fn try_active_completions(
+        &self,
+        file: &str,
+        line: usize,
+        column: usize,
+    ) -> Result<Option<Value>, String> {
+        let (file_path, params) = self.lsp_position_params(file, line, column)?;
+        self.passive_lsp.request_for_file(
+            &self.project_root,
+            &file_path,
+            "textDocument/completion",
+            params,
+        )
+    }
+
     fn try_active_code_lenses(&self, file: &str) -> Result<Option<Value>, String> {
         let (file_path, uri) = self.ensure_lsp_file_ready(file)?;
         self.passive_lsp.request_for_file(
@@ -700,6 +715,30 @@ impl ToolExecutor {
             json!({
                 "textDocument": { "uri": uri },
             }),
+        )
+    }
+
+    fn try_resolve_completion_item(
+        &self,
+        file: &str,
+        item: &Value,
+    ) -> Result<Option<Value>, String> {
+        let file_path = self.resolve_lsp_file_path(file);
+        self.passive_lsp.request_for_file(
+            &self.project_root,
+            &file_path,
+            "completionItem/resolve",
+            item.clone(),
+        )
+    }
+
+    fn try_resolve_code_lens(&self, file: &str, lens: &Value) -> Result<Option<Value>, String> {
+        let file_path = self.resolve_lsp_file_path(file);
+        self.passive_lsp.request_for_file(
+            &self.project_root,
+            &file_path,
+            "codeLens/resolve",
+            lens.clone(),
         )
     }
 
@@ -925,6 +964,10 @@ impl ToolExecutor {
             .and_then(Value::as_u64)
             .map(|idx| idx as usize)
             .unwrap_or(0);
+        let item_index = args
+            .get("item_index")
+            .and_then(Value::as_u64)
+            .map(|idx| idx as usize);
         let scope = args.get("scope").and_then(Value::as_str).unwrap_or("file");
         let include_body = args
             .get("include_body")
@@ -1382,15 +1425,46 @@ impl ToolExecutor {
 
             "completions" => {
                 if let (Some(f), Some(l), Some(c)) = (file, line, column) {
-                    match self.try_active_position_request(
-                        "completions",
-                        f,
-                        l,
-                        c,
-                        "textDocument/completion",
-                        None,
-                    ) {
-                        Ok(Some(result)) => result,
+                    match self.try_active_completions(f, l, c) {
+                        Ok(Some(result)) => {
+                            if let Some(idx) = item_index {
+                                let Some(item) = result
+                                    .get("items")
+                                    .and_then(Value::as_array)
+                                    .or_else(|| result.as_array())
+                                    .and_then(|items| items.get(idx))
+                                else {
+                                    return json!({
+                                        "error": format!(
+                                            "completions item_index {} out of range",
+                                            idx
+                                        )
+                                    })
+                                    .to_string();
+                                };
+                                match self.try_resolve_completion_item(f, item) {
+                                    Ok(Some(resolved)) => json!({
+                                        "backend": "lsp",
+                                        "operation": "completions",
+                                        "method": "completionItem/resolve",
+                                        "selected_index": idx,
+                                        "result": resolved,
+                                    })
+                                    .to_string(),
+                                    Ok(None) => json!({
+                                        "error": "completion resolve requires an active LSP backend for that file"
+                                    })
+                                    .to_string(),
+                                    Err(error) => json!({ "error": error }).to_string(),
+                                }
+                            } else {
+                                Self::active_lsp_response(
+                                    "completions",
+                                    "textDocument/completion",
+                                    result,
+                                )
+                            }
+                        }
                         Ok(None) => json!({
                             "error": "completions requires an active LSP backend for that file"
                         }).to_string(),
@@ -1560,7 +1634,35 @@ impl ToolExecutor {
                 if let Some(f) = file {
                     match self.try_active_code_lenses(f) {
                         Ok(Some(result)) => {
-                            Self::active_lsp_response("code_lenses", "textDocument/codeLens", result)
+                            if let Some(idx) = item_index {
+                                let Some(lens) = result.as_array().and_then(|items| items.get(idx))
+                                else {
+                                    return json!({
+                                        "error": format!(
+                                            "code_lenses item_index {} out of range",
+                                            idx
+                                        )
+                                    })
+                                    .to_string();
+                                };
+                                match self.try_resolve_code_lens(f, lens) {
+                                    Ok(Some(resolved)) => json!({
+                                        "backend": "lsp",
+                                        "operation": "code_lenses",
+                                        "method": "codeLens/resolve",
+                                        "selected_index": idx,
+                                        "result": resolved,
+                                    })
+                                    .to_string(),
+                                    Ok(None) => json!({
+                                        "error": "code_lens resolve requires an active LSP backend for that file"
+                                    })
+                                    .to_string(),
+                                    Err(error) => json!({ "error": error }).to_string(),
+                                }
+                            } else {
+                                Self::active_lsp_response("code_lenses", "textDocument/codeLens", result)
+                            }
                         }
                         Ok(None) => json!({
                             "error": "code_lenses requires an active LSP backend for that file"

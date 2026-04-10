@@ -1230,6 +1230,11 @@ pub fn all_tool_schemas() -> Vec<Value> {
                             "minimum": 0,
                             "description": "For code_actions apply, choose which returned action to apply by index (default: 0)."
                         },
+                        "item_index": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "description": "For completions or code_lenses, optionally resolve a specific returned item by index instead of only previewing the raw list."
+                        },
                         "scope": {
                             "type": "string",
                             "enum": ["file", "project"],

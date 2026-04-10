@@ -65,7 +65,7 @@ while True:
                     },
                     "renameProvider": {"prepareProvider": True},
                     "codeActionProvider": {"resolveProvider": True},
-                    "completionProvider": {"resolveProvider": False},
+                    "completionProvider": {"resolveProvider": True},
                     "documentHighlightProvider": True,
                     "documentLinkProvider": {"resolveProvider": False},
                     "inlayHintProvider": True,
@@ -78,7 +78,7 @@ while True:
                         },
                         "full": True
                     },
-                    "codeLensProvider": {"resolveProvider": False},
+                    "codeLensProvider": {"resolveProvider": True},
                     "selectionRangeProvider": True,
                     "linkedEditingRangeProvider": True,
                     "signatureHelpProvider": {
@@ -337,7 +337,24 @@ while True:
                     "label": "hello_completion",
                     "kind": 3,
                     "detail": "fake completion"
+                }, {
+                    "label": "resolved_completion",
+                    "kind": 3,
+                    "data": {
+                        "resolve_kind": "completion"
+                    }
                 }]
+            }
+        })
+    elif method == "completionItem/resolve":
+        item = message["params"]
+        write_frame({
+            "jsonrpc": "2.0",
+            "id": msg_id,
+            "result": {
+                **item,
+                "detail": "resolved completion detail",
+                "documentation": "resolved completion docs"
             }
         })
     elif method == "textDocument/signatureHelp":
@@ -450,7 +467,28 @@ while True:
                     "title": "1 reference",
                     "command": "fake.references"
                 }
+            }, {
+                "range": {
+                    "start": {"line": 0, "character": 4},
+                    "end": {"line": 0, "character": 8}
+                },
+                "data": {
+                    "resolve_kind": "code_lens"
+                }
             }]
+        })
+    elif method == "codeLens/resolve":
+        lens = message["params"]
+        write_frame({
+            "jsonrpc": "2.0",
+            "id": msg_id,
+            "result": {
+                **lens,
+                "command": {
+                    "title": "2 references",
+                    "command": "fake.resolvedReferences"
+                }
+            }
         })
     elif method == "textDocument/selectionRange":
         write_frame({
@@ -1192,6 +1230,42 @@ fn lsp_code_lenses_use_real_lsp_when_available() {
 #[cfg(unix)]
 #[test]
 #[serial_test::serial]
+fn lsp_code_lenses_resolve_selected_item_when_item_index_provided() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname=\"demo\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(
+        dir.path().join("src/lib.rs"),
+        "pub fn hello_from_lsp() {}\n",
+    )
+    .unwrap();
+    let script = fake_lsp_server_script(dir.path());
+    let _guard = EnvGuard::set("ASTRA_RUST_ANALYZER_CMD", script.to_str().unwrap());
+    let exe = ToolExecutor::new(dir.path());
+
+    let result = exe.lsp(&json!({
+        "operation": "code_lenses",
+        "file": "src/lib.rs",
+        "item_index": 1
+    }));
+    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+
+    assert_eq!(parsed["backend"].as_str(), Some("lsp"));
+    assert_eq!(parsed["method"].as_str(), Some("codeLens/resolve"));
+    assert_eq!(parsed["selected_index"].as_u64(), Some(1));
+    assert_eq!(
+        parsed["result"]["command"]["title"].as_str(),
+        Some("2 references")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+#[serial_test::serial]
 fn lsp_selection_ranges_uses_real_lsp_when_available() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
@@ -1660,6 +1734,44 @@ fn lsp_completions_use_real_lsp_when_available() {
     assert_eq!(
         parsed["result"]["items"][0]["label"].as_str(),
         Some("hello_completion")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+#[serial_test::serial]
+fn lsp_completions_resolve_selected_item_when_item_index_provided() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname=\"demo\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(
+        dir.path().join("src/lib.rs"),
+        "pub fn hello_from_lsp() {}\n",
+    )
+    .unwrap();
+    let script = fake_lsp_server_script(dir.path());
+    let _guard = EnvGuard::set("ASTRA_RUST_ANALYZER_CMD", script.to_str().unwrap());
+    let exe = ToolExecutor::new(dir.path());
+
+    let result = exe.lsp(&json!({
+        "operation": "completions",
+        "file": "src/lib.rs",
+        "line": 1,
+        "column": 8,
+        "item_index": 1
+    }));
+    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+
+    assert_eq!(parsed["backend"].as_str(), Some("lsp"));
+    assert_eq!(parsed["method"].as_str(), Some("completionItem/resolve"));
+    assert_eq!(parsed["selected_index"].as_u64(), Some(1));
+    assert_eq!(
+        parsed["result"]["documentation"].as_str(),
+        Some("resolved completion docs")
     );
 }
 
