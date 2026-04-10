@@ -1143,7 +1143,7 @@ pub fn all_tool_schemas() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "lsp",
-                "description": "Interact with Language Server Protocol for code intelligence. Unified interface for definition, references, hover, symbols, call hierarchy, completions, signature help, rename, code actions, and diagnostics. Without a file, diagnostics reports backend availability; with a file, diagnostics returns the latest publishDiagnostics snapshot.",
+                "description": "Interact with Language Server Protocol for code intelligence. Unified interface for definition, references, hover, symbols, call hierarchy, completions, signature help, document highlights, rename, code actions, and diagnostics. Without a file, diagnostics reports backend availability; with a file, diagnostics returns the latest publishDiagnostics snapshot.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -1163,6 +1163,7 @@ pub fn all_tool_schemas() -> Vec<Value> {
                                 "code_actions",
                                 "completions",
                                 "signature_help",
+                                "document_highlight",
                                 "diagnostics"
                             ],
                             "description": "LSP operation to perform"

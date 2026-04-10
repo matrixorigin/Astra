@@ -485,7 +485,7 @@ impl ToolExecutor {
                 "error": "Missing required 'operation' parameter",
                 "valid_operations": [
                     "goto_definition", "find_references", "hover", "document_symbols",
-                    "workspace_symbols", "call_hierarchy", "incoming_calls", "outgoing_calls", "implementation", "rename", "code_actions", "completions", "signature_help", "diagnostics"
+                    "workspace_symbols", "call_hierarchy", "incoming_calls", "outgoing_calls", "implementation", "rename", "code_actions", "completions", "signature_help", "document_highlight", "diagnostics"
                 ]
             }).to_string(),
         };
@@ -875,6 +875,29 @@ impl ToolExecutor {
                 }
             }
 
+            "document_highlight" => {
+                if let (Some(f), Some(l), Some(c)) = (file, line, column) {
+                    match self.try_active_position_request(
+                        "document_highlight",
+                        f,
+                        l,
+                        c,
+                        "textDocument/documentHighlight",
+                        None,
+                    ) {
+                        Ok(Some(result)) => result,
+                        Ok(None) => json!({
+                            "error": "document_highlight requires an active LSP backend for that file"
+                        }).to_string(),
+                        Err(error) => json!({ "error": error }).to_string(),
+                    }
+                } else {
+                    json!({
+                        "error": "document_highlight requires 'file'+'line'+'column'"
+                    }).to_string()
+                }
+            }
+
             "diagnostics" => {
                 if let Some(f) = file {
                     match self.try_active_file_diagnostics(f) {
@@ -898,7 +921,8 @@ impl ToolExecutor {
                             "rename": true,
                             "code_actions": true,
                             "completions": true,
-                            "signature_help": true
+                            "signature_help": true,
+                            "document_highlight": true
                         },
                         "active_backends": self.passive_lsp.active_status(&self.project_root),
                         "supported_languages": {
@@ -914,7 +938,7 @@ impl ToolExecutor {
                 "error": format!("Unknown operation: {}", operation),
                 "valid_operations": [
                     "goto_definition", "find_references", "hover", "document_symbols",
-                    "workspace_symbols", "call_hierarchy", "incoming_calls", "outgoing_calls", "implementation", "rename", "code_actions", "completions", "signature_help", "diagnostics"
+                    "workspace_symbols", "call_hierarchy", "incoming_calls", "outgoing_calls", "implementation", "rename", "code_actions", "completions", "signature_help", "document_highlight", "diagnostics"
                 ]
             }).to_string()
         }
