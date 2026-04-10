@@ -908,7 +908,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                         .await,
                 );
             }
-            return results.into_iter().flatten().collect();
+            return results.into_iter().map(|r| r.expect("all tool result slots filled")).collect();
         }
 
         // ── Phase 1: Pre-execution UI setup (sequential, &mut self) ──
@@ -1080,7 +1080,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             }
         }
 
-        results.into_iter().flatten().collect()
+        results.into_iter().map(|r| r.expect("all tool result slots filled")).collect()
     }
 }
 
