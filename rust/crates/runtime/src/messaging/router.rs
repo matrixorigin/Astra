@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use super::transport::{MessageStream, MessageTransport};
 use super::types::{AgentAddress, AgentMessage, MailboxError, MessageTarget};
-use crate::server::delegation_engine::{DelegationTracker, SubRunRecord, SubRunState};
+use crate::server::delegation_engine::{DelegationTracker, SubRunRecord};
 
 // ─── AgentMailbox ───────────────────────────────────────────────────────────
 
