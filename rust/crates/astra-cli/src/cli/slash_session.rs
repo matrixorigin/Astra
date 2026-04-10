@@ -900,6 +900,34 @@ pub(super) fn handle_session_command(arg: &str, state: &mut ReplState) {
                                     tokens,
                                 );
                             }
+                            session_journal::JournalEventType::DelegationRetry => {
+                                let m = evt.metadata.as_ref();
+                                let original = m
+                                    .and_then(|x| x.get("original_run_id"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("?");
+                                let retry = m
+                                    .and_then(|x| x.get("retry_run_id"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("?");
+                                let attempt = m
+                                    .and_then(|x| x.get("attempt"))
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0);
+                                let reason = m
+                                    .and_then(|x| x.get("reason"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("");
+                                eprintln!(
+                                    "  {} {} retry #{} {} → {} {}",
+                                    ts_short.dim(),
+                                    "↻".yellow(),
+                                    attempt,
+                                    original.dim(),
+                                    retry.dim(),
+                                    reason.dim(),
+                                );
+                            }
                             session_journal::JournalEventType::DriftDetected => {
                                 let severity = evt
                                     .metadata
