@@ -197,9 +197,6 @@ pub fn cli_blank() {
     eprintln!();
 }
 
-// Re-export macros at module level
-pub use crate::{cli_dim, cli_err, cli_info, cli_ok, cli_section, cli_warn};
-
 #[cfg(test)]
 mod tests {
     use super::*;
