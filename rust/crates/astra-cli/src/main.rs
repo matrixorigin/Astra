@@ -1472,12 +1472,15 @@ struct ReplState {
     drift_user_corrections: Vec<u32>,
     /// Original user query at session start (for drift baseline comparison).
     drift_original_query: Option<String>,
-    /// Session-scoped observability for context tracing (M1).
-    observability_session: Option<
-        std::sync::Arc<
-            std::sync::RwLock<astra_runtime::observability_integration::ObservabilitySession>,
-        >,
-    >,
+
+    // ── Observability (M1-M6) ──
+    /// Global observability hub for M1-M6 integration (profiles, experiments, auto-tuning).
+    /// Created at REPL startup, shared across sessions.
+    observability_hub: Option<std::sync::Arc<astra_runtime::observability_integration::ObservabilityHub>>,
+    /// Per-session observability context for tracing, drift detection, and timing.
+    /// Created when a session starts, reset on `/session new`.
+    observability_session:
+        Option<std::sync::Arc<std::sync::RwLock<astra_runtime::observability_integration::ObservabilitySession>>>,
 
     // ── A/B Testing (M4) ──
     /// Shared experiment store for A/B testing.
@@ -1599,7 +1602,9 @@ impl Default for ReplState {
             drift_compressed_turns: Vec::new(),
             drift_user_corrections: Vec::new(),
             drift_original_query: None,
-            observability_session: None, // Created when session starts
+            // Observability: hub is created at REPL startup, session on first turn
+            observability_hub: None,
+            observability_session: None,
             experiment_store: std::sync::Arc::new(std::sync::RwLock::new(
                 astra_runtime::ab_testing::ExperimentStore::new(),
             )),
@@ -7330,6 +7335,12 @@ async fn finalize_session(state: &ReplState) {
         if let Some(ref sid) = state.session_id {
             astra_services::session_workspace::finalize_workspace_on_end(sid);
         }
+    }
+    // 2b. End observability session and collect summary
+    if let (Some(hub), Some(session_id)) = (&state.observability_hub, &state.session_id) {
+        // End the session silently — summary is collected but not displayed
+        // (could be exposed via /telemetry command in future)
+        let _ = hub.end_session(session_id);
     }
     // 3. Session-end knowledge extraction (opt-in, async with timeout)
     let knowledge_handle = session_end_extract_learnings(&state.history);

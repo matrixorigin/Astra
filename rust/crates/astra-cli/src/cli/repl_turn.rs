@@ -304,9 +304,16 @@ pub(super) async fn handle_chat_input(
             Err(failure) => {
                 if is_session_not_found_error(&failure.error) && state.session_id.is_some() {
                     let _ = clear_profile_last_session(ctx.profile);
+                    // End the current observability session before creating a new one
+                    if let (Some(hub), Some(old_sid)) =
+                        (&state.observability_hub, &state.session_id)
+                    {
+                        let _ = hub.end_session(old_sid);
+                    }
                     state.session_id = None;
                     // Unregister stale mailbox to avoid agent_id collision on re-registration
                     state.unregister_root_mailbox().await;
+                    state.observability_session = None;
                     eprintln!(
                         "{}",
                         "  Session not found. Creating a new session…".yellow()
@@ -515,6 +522,8 @@ async fn maybe_auto_compact(
 
     let mut auto_pm_compact =
         PermissionManager::with_project(true, &std::env::current_dir().unwrap_or_default());
+    let obs_hub = state.observability_hub.clone();
+    let obs_session = state.observability_session.clone();
     let compact_result = stream_chat_sse(ChatTurnParams {
         api: ctx.api,
         token,
@@ -549,8 +558,8 @@ async fn maybe_auto_compact(
         agent_spawner: state.agent_spawner.clone(),
         root_agent_id: Some("main"),
         root_mailbox_slot: Some(&mut state.root_mailbox),
-        observability_hub: None,
-        observability_session: state.observability_session.clone(),
+        observability_hub: obs_hub,
+        observability_session: obs_session,
     })
     .await;
 
@@ -725,6 +734,10 @@ async fn run_chat_turn(
     let cancel_token = std::sync::Arc::new(tokio_util::sync::CancellationToken::new());
     let cancel_token_for_signal = cancel_token.clone();
 
+    // Clone observability context for the turn
+    let obs_hub = state.observability_hub.clone();
+    let obs_session = state.observability_session.clone();
+
     tokio::select! {
         result = stream_chat_sse(ChatTurnParams {
             api: ctx.api,
@@ -760,8 +773,8 @@ async fn run_chat_turn(
             agent_spawner: state.agent_spawner.clone(),
             root_agent_id: Some("main"),
             root_mailbox_slot: Some(&mut state.root_mailbox),
-            observability_hub: None,
-            observability_session: state.observability_session.clone(),
+            observability_hub: obs_hub,
+            observability_session: obs_session,
         }) => TurnAttempt::Completed(Box::new(result)),
         _ = tokio::signal::ctrl_c() => {
             // Trigger cancellation to interrupt any in-flight SSE streaming.
@@ -1117,6 +1130,18 @@ fn apply_turn_success(
         initialize_journal(state, session_id);
         state.session_id = Some(session_id.to_string());
         state.run_id = result.run_id.clone();
+
+        // Initialize observability session if hub is available and session not yet created
+        if state.observability_session.is_none() {
+            if let Some(hub) = &state.observability_hub {
+                let user_id = state
+                    .ingestion_user_id
+                    .clone()
+                    .unwrap_or_else(|| "anonymous".to_string());
+                let obs_session = hub.start_session(&user_id, session_id);
+                state.observability_session = Some(obs_session);
+            }
+        }
     }
 
     state.turn += 1;

@@ -564,6 +564,16 @@ pub(super) fn initialize_repl_state(
         tasks_dir,
     )));
 
+    // Initialize observability hub for M1-M6 integration
+    // Use persistent storage under ~/.astra/observability for user profiles
+    let obs_path = dirs::home_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join(".astra")
+        .join("observability");
+    state.observability_hub = Some(std::sync::Arc::new(
+        astra_runtime::observability_integration::ObservabilityHub::with_storage(obs_path),
+    ));
+
     state
 }
 
