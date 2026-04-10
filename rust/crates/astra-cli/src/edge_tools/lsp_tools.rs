@@ -732,6 +732,47 @@ impl ToolExecutor {
         )
     }
 
+    fn normalize_completion_text_edit(edit: &Value) -> Result<Value, String> {
+        let new_text = edit
+            .get("newText")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "CompletionItem textEdit is missing newText".to_string())?;
+        if let Some(range) = edit.get("range") {
+            return Ok(json!({
+                "range": range,
+                "newText": new_text,
+            }));
+        }
+        if let Some(range) = edit.get("replace").or_else(|| edit.get("insert")) {
+            return Ok(json!({
+                "range": range,
+                "newText": new_text,
+            }));
+        }
+        Err("CompletionItem textEdit is missing range/replace/insert".to_string())
+    }
+
+    fn completion_item_to_workspace_edit(&self, file: &str, item: &Value) -> Result<Value, String> {
+        let (_, uri) = self.ensure_lsp_file_ready(file)?;
+        let mut edits = Vec::new();
+        if let Some(text_edit) = item.get("textEdit") {
+            edits.push(Self::normalize_completion_text_edit(text_edit)?);
+        }
+        if let Some(additional) = item.get("additionalTextEdits") {
+            let additional = additional
+                .as_array()
+                .ok_or_else(|| "CompletionItem additionalTextEdits must be an array".to_string())?;
+            edits.extend(additional.iter().cloned());
+        }
+        if edits.is_empty() {
+            return Err(
+                "selected completion item does not include applyable text edits, even after resolve"
+                    .to_string(),
+            );
+        }
+        Self::lsp_text_edits_to_workspace_edit(&uri, Value::Array(edits))
+    }
+
     fn try_resolve_code_lens(&self, file: &str, lens: &Value) -> Result<Option<Value>, String> {
         let file_path = self.resolve_lsp_file_path(file);
         self.passive_lsp.request_for_file(
@@ -1425,6 +1466,11 @@ impl ToolExecutor {
 
             "completions" => {
                 if let (Some(f), Some(l), Some(c)) = (file, line, column) {
+                    if !dry_run && item_index.is_none() {
+                        return json!({
+                            "error": "completions apply requires 'item_index' to choose a returned completion item"
+                        }).to_string();
+                    }
                     match self.try_active_completions(f, l, c) {
                         Ok(Some(result)) => {
                             if let Some(idx) = item_index {
@@ -1442,20 +1488,38 @@ impl ToolExecutor {
                                     })
                                     .to_string();
                                 };
-                                match self.try_resolve_completion_item(f, item) {
-                                    Ok(Some(resolved)) => json!({
+                                let (method, selected_item) =
+                                    match self.try_resolve_completion_item(f, item) {
+                                        Ok(Some(resolved)) => {
+                                            ("completionItem/resolve", resolved)
+                                        }
+                                        Ok(None) => ("textDocument/completion", item.clone()),
+                                        Err(error) => {
+                                            return json!({ "error": error }).to_string();
+                                        }
+                                    };
+                                if dry_run {
+                                    json!({
                                         "backend": "lsp",
                                         "operation": "completions",
-                                        "method": "completionItem/resolve",
+                                        "method": method,
                                         "selected_index": idx,
-                                        "result": resolved,
+                                        "result": selected_item,
                                     })
-                                    .to_string(),
-                                    Ok(None) => json!({
-                                        "error": "completion resolve requires an active LSP backend for that file"
-                                    })
-                                    .to_string(),
-                                    Err(error) => json!({ "error": error }).to_string(),
+                                    .to_string()
+                                } else {
+                                    match self.completion_item_to_workspace_edit(f, &selected_item)
+                                    {
+                                        Ok(workspace_edit) => match self.apply_lsp_workspace_edit(
+                                            "completions",
+                                            method,
+                                            &workspace_edit,
+                                        ) {
+                                            Ok(applied) => applied,
+                                            Err(error) => json!({ "error": error }).to_string(),
+                                        },
+                                        Err(error) => json!({ "error": error }).to_string(),
+                                    }
                                 }
                             } else {
                                 Self::active_lsp_response(
@@ -1632,6 +1696,11 @@ impl ToolExecutor {
 
             "code_lenses" => {
                 if let Some(f) = file {
+                    if !dry_run && item_index.is_none() {
+                        return json!({
+                            "error": "code_lenses execution requires 'item_index' to choose a returned code lens"
+                        }).to_string();
+                    }
                     match self.try_active_code_lenses(f) {
                         Ok(Some(result)) => {
                             if let Some(idx) = item_index {
@@ -1645,20 +1714,31 @@ impl ToolExecutor {
                                     })
                                     .to_string();
                                 };
-                                match self.try_resolve_code_lens(f, lens) {
-                                    Ok(Some(resolved)) => json!({
+                                let (method, selected_lens) = match self.try_resolve_code_lens(
+                                    f, lens,
+                                ) {
+                                    Ok(Some(resolved)) => ("codeLens/resolve", resolved),
+                                    Ok(None) => ("textDocument/codeLens", lens.clone()),
+                                    Err(error) => return json!({ "error": error }).to_string(),
+                                };
+                                if dry_run {
+                                    json!({
                                         "backend": "lsp",
                                         "operation": "code_lenses",
-                                        "method": "codeLens/resolve",
+                                        "method": method,
                                         "selected_index": idx,
-                                        "result": resolved,
+                                        "result": selected_lens,
                                     })
-                                    .to_string(),
-                                    Ok(None) => json!({
-                                        "error": "code_lens resolve requires an active LSP backend for that file"
-                                    })
-                                    .to_string(),
-                                    Err(error) => json!({ "error": error }).to_string(),
+                                    .to_string()
+                                } else if let Some(command) = selected_lens.get("command") {
+                                    match self.execute_lsp_command("code_lenses", command) {
+                                        Ok(executed) => executed,
+                                        Err(error) => json!({ "error": error }).to_string(),
+                                    }
+                                } else {
+                                    json!({
+                                        "error": "selected code lens does not include an executable command, even after resolve"
+                                    }).to_string()
                                 }
                             } else {
                                 Self::active_lsp_response("code_lenses", "textDocument/codeLens", result)

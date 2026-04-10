@@ -354,7 +354,21 @@ while True:
             "result": {
                 **item,
                 "detail": "resolved completion detail",
-                "documentation": "resolved completion docs"
+                "documentation": "resolved completion docs",
+                "textEdit": {
+                    "range": {
+                        "start": {"line": 0, "character": 7},
+                        "end": {"line": 0, "character": 21}
+                    },
+                    "newText": "resolved_completion"
+                },
+                "additionalTextEdits": [{
+                    "range": {
+                        "start": {"line": 0, "character": 0},
+                        "end": {"line": 0, "character": 0}
+                    },
+                    "newText": "// resolved completion\n"
+                }]
             }
         })
     elif method == "textDocument/signatureHelp":
@@ -486,7 +500,8 @@ while True:
                 **lens,
                 "command": {
                     "title": "2 references",
-                    "command": "fake.resolvedReferences"
+                    "command": "fake.resolvedReferences",
+                    "arguments": ["resolved-code-lens"]
                 }
             }
         })
@@ -1266,6 +1281,43 @@ fn lsp_code_lenses_resolve_selected_item_when_item_index_provided() {
 #[cfg(unix)]
 #[test]
 #[serial_test::serial]
+fn lsp_code_lenses_execute_selected_item_when_dry_run_false() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname=\"demo\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(
+        dir.path().join("src/lib.rs"),
+        "pub fn hello_from_lsp() {}\n",
+    )
+    .unwrap();
+    let script = fake_lsp_server_script(dir.path());
+    let _guard = EnvGuard::set("ASTRA_RUST_ANALYZER_CMD", script.to_str().unwrap());
+    let exe = ToolExecutor::new(dir.path());
+
+    let result = exe.lsp(&json!({
+        "operation": "code_lenses",
+        "file": "src/lib.rs",
+        "item_index": 1,
+        "dry_run": false
+    }));
+    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+
+    assert_eq!(parsed["executed"].as_bool(), Some(true));
+    assert_eq!(parsed["method"].as_str(), Some("workspace/executeCommand"));
+    assert_eq!(parsed["command"].as_str(), Some("fake.resolvedReferences"));
+    assert_eq!(
+        parsed["result"]["arguments"][0].as_str(),
+        Some("resolved-code-lens")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+#[serial_test::serial]
 fn lsp_selection_ranges_uses_real_lsp_when_available() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
@@ -1773,6 +1825,40 @@ fn lsp_completions_resolve_selected_item_when_item_index_provided() {
         parsed["result"]["documentation"].as_str(),
         Some("resolved completion docs")
     );
+}
+
+#[cfg(unix)]
+#[test]
+#[serial_test::serial]
+fn lsp_completions_apply_selected_item_when_dry_run_false() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname=\"demo\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    let file_path = dir.path().join("src/lib.rs");
+    std::fs::write(&file_path, "pub fn hello_from_lsp() {}\n").unwrap();
+    let script = fake_lsp_server_script(dir.path());
+    let _guard = EnvGuard::set("ASTRA_RUST_ANALYZER_CMD", script.to_str().unwrap());
+    let exe = ToolExecutor::new(dir.path());
+
+    let result = exe.lsp(&json!({
+        "operation": "completions",
+        "file": "src/lib.rs",
+        "line": 1,
+        "column": 8,
+        "item_index": 1,
+        "dry_run": false
+    }));
+    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+
+    assert_eq!(parsed["applied"].as_bool(), Some(true));
+    assert_eq!(parsed["files_changed"].as_u64(), Some(1));
+    let updated = std::fs::read_to_string(file_path).unwrap();
+    assert!(updated.contains("// resolved completion"));
+    assert!(updated.contains("resolved_completion"));
 }
 
 #[cfg(unix)]
