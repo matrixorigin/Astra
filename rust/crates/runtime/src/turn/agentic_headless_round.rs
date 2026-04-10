@@ -435,8 +435,10 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
             );
         }
 
-        // Skip redundant display for edge tools (already shown during SSE stream).
-        if !quiet && !is_edge_tool {
+        // Skip redundant display for edge tools only when NOT in sub-run mode.
+        // In sub-run mode (quiet=false but SSE stream is suppressed), edge tools
+        // are the only tools executed, so we must emit them for progress visibility.
+        if !quiet {
             let duration_str = format_headless_tool_duration(tool_elapsed);
             let detail = tool_call_detail(&name, &args);
             let summary = if !is_err {
@@ -469,7 +471,7 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
             }
         }
 
-        // Also skip body preview for edge tools.
+        // Also skip body preview for edge tools in interactive mode (already shown in SSE).
         if !is_edge_tool {
             emit_headless_tool_body_preview(term, quiet, &name, &result_str, is_err);
         }
