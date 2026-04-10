@@ -182,8 +182,9 @@ fn tool_conditional_section(tool_names: &[&str], selection_confidence: f64) -> S
     let has_git = tool_names.iter().any(|n| n.starts_with("git_"));
     let has_spawn_agent = tool_names.contains(&"spawn_agent");
     let has_delegate = tool_names.contains(&"delegate");
-    let has_code_nav =
-        tool_names.contains(&"find_definition") || tool_names.contains(&"find_references");
+    let has_code_nav = tool_names.contains(&"find_definition")
+        || tool_names.contains(&"find_references")
+        || tool_names.contains(&"lsp");
     let has_call_graph = tool_names.contains(&"call_graph");
     let has_multi_edit = tool_names.contains(&"multi_edit");
     let has_build_test = tool_names.contains(&"run_build_test");
@@ -237,6 +238,11 @@ fn tool_conditional_section(tool_names: &[&str], selection_confidence: f64) -> S
     }
     if tool_names.contains(&"type_hierarchy") {
         s.push_str("- **type_hierarchy**: Who implements trait / what traits a type has.\n");
+    }
+    if tool_names.contains(&"lsp") {
+        s.push_str(
+            "- **lsp**: Prefer this for editor-grade code intelligence from an active language server: definitions/references/hover, declaration/type/implementation lookup, diagnostics, rename/code actions, formatting, inlay hints, semantic tokens, code lenses, and type hierarchy. Use `action_index` to apply a chosen code action, `item_index` to resolve a returned completion or code lens, and `dry_run=false` only for supported write operations.\n",
+        );
     }
     if has_multi_edit {
         s.push_str(
@@ -1936,6 +1942,7 @@ mod tests {
             "dead_code",
             "extract_members",
             "type_hierarchy",
+            "lsp",
         ];
         let sections = build_system_prompt_sections(&tools, "", 0.8, None);
         let session_text: String = sections
@@ -1949,6 +1956,20 @@ mod tests {
         assert!(session_text.contains("dead_code"));
         assert!(session_text.contains("extract_members"));
         assert!(session_text.contains("type_hierarchy"));
+        assert!(session_text.contains("lsp"));
+    }
+
+    #[test]
+    fn sections_lsp_alone_adds_code_navigation_guidance() {
+        let sections = build_system_prompt_sections(&["lsp"], "", 0.8, None);
+        let session_text: String = sections
+            .iter()
+            .filter(|s| s.scope == CacheScope::Session)
+            .map(|s| s.text.as_str())
+            .collect();
+        assert!(session_text.contains("Code Navigation"));
+        assert!(session_text.contains("item_index"));
+        assert!(session_text.contains("action_index"));
     }
 
     // ── Empty-tools + empty-profile section behavior ─────────────
