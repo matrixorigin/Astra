@@ -228,6 +228,14 @@ fn explicit_lsp_signal(query_lower: &str, query_chars: &[char]) -> bool {
         "rename symbol",
         "prepare rename",
         "code action",
+        "quick fix",
+        "quickfix",
+        "completion",
+        "completions",
+        "autocomplete",
+        "auto-complete",
+        "auto import",
+        "postfix completion",
         "diagnostics",
         "document highlight",
         "document link",
@@ -255,6 +263,10 @@ fn explicit_lsp_signal(query_lower: &str, query_chars: &[char]) -> bool {
         "声明",
         "重命名",
         "代码动作",
+        "快速修复",
+        "补全",
+        "自动补全",
+        "自动导入",
         "诊断",
         "高亮",
         "文档链接",
@@ -984,6 +996,24 @@ mod tests {
         ];
         let score = tfidf_score(&terms, idx);
         assert!(score <= 1.0, "expected score <= 1.0, got {score}");
+    }
+
+    #[test]
+    fn explicit_lsp_signal_recognizes_completion_and_quickfix_queries() {
+        for query in [
+            "show autocomplete candidates",
+            "can you do auto import here",
+            "apply the quick fix",
+            "帮我自动补全",
+            "这里能自动导入吗",
+        ] {
+            let lower = query.to_lowercase();
+            let chars: Vec<char> = query.chars().collect();
+            assert!(
+                explicit_lsp_signal(&lower, &chars),
+                "expected explicit LSP signal for query: {query}"
+            );
+        }
     }
 
     // ──────────────────────────────────────────────────────────
