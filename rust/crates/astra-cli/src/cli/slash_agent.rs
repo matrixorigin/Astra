@@ -174,26 +174,44 @@ async fn show_list(ctx: &AgentCommandContext) {
 }
 
 async fn show_tree(ctx: &AgentCommandContext) {
-    let Some(ref spawner) = ctx.spawner else {
-        eprintln!(
-            "  {}",
-            "No agent spawner available. Use spawn_agent tool to create agents.".dim()
-        );
-        return;
+    let agents = if let Some(ref spawner) = ctx.spawner {
+        spawner.list_all_agents().await
+    } else {
+        Vec::new()
     };
+    let delegations = load_recent_delegations(ctx.session_id.as_deref());
 
-    let agents = spawner.list_all_agents().await;
+    if agents.is_empty() && delegations.is_empty() {
+        eprintln!(
+            "\n  {}",
+            "🌲 No agent or delegation tree available".cyan().bold()
+        );
+        eprintln!();
+        return;
+    }
 
     eprintln!("\n  {}", "🌲 Agent Delegation Tree".cyan().bold());
     eprintln!("  {}", "─".repeat(60).dim());
 
-    let forest = AgentTreeNode::build_forest(&agents);
-    let rendered = render_agent_forest(&forest);
-
-    // Indent all output
-    for line in rendered.lines() {
-        eprintln!("  {}", line);
+    if !agents.is_empty() {
+        eprintln!("  {}", "Spawned agents".white().bold());
+        let forest = AgentTreeNode::build_forest(&agents);
+        let rendered = render_agent_forest(&forest);
+        for line in rendered.lines() {
+            eprintln!("  {}", line);
+        }
     }
+
+    if !delegations.is_empty() {
+        if !agents.is_empty() {
+            eprintln!();
+        }
+        eprintln!("  {}", "Journal-backed delegations".white().bold());
+        for line in render_delegation_tree(&delegations) {
+            eprintln!("  {}", line);
+        }
+    }
+    eprintln!();
 }
 
 async fn show_status(ctx: &AgentCommandContext, agent_id: &str) {
@@ -380,7 +398,21 @@ async fn show_permissions(ctx: &AgentCommandContext, agent_id: &str) {
             eprintln!();
         }
         None => {
-            eprintln!("  {}", format!("Agent not found: {agent_id}").yellow());
+            if let Some(entry) = find_delegation_entry(ctx.session_id.as_deref(), agent_id) {
+                eprintln!(
+                    "  {}",
+                    format!(
+                        "Permissions are only tracked for spawned agents. Delegation '{}' is journal-backed; use /agent status or /agent logs.",
+                        entry.delegation_id
+                    )
+                    .yellow()
+                );
+            } else {
+                eprintln!(
+                    "  {}",
+                    format!("Agent or delegation not found: {agent_id}").yellow()
+                );
+            }
         }
     }
 }
@@ -429,7 +461,21 @@ async fn stop_agent(ctx: &AgentCommandContext, agent_id: &str) {
     // First check if agent exists
     let agent = spawner.get_agent_state_any(agent_id).await;
     if agent.is_none() {
-        eprintln!("  {}", format!("Agent not found: {agent_id}").yellow());
+        if let Some(entry) = find_delegation_entry(ctx.session_id.as_deref(), agent_id) {
+            eprintln!(
+                "  {}",
+                format!(
+                    "Delegation '{}' runs synchronously under its parent agent and cannot be stopped via /agent stop. Cancel the parent run while it is active instead.",
+                    entry.delegation_id
+                )
+                .yellow()
+            );
+        } else {
+            eprintln!(
+                "  {}",
+                format!("Agent or delegation not found: {agent_id}").yellow()
+            );
+        }
         return;
     }
 
@@ -452,14 +498,21 @@ async fn show_watch(ctx: &AgentCommandContext) {
     use std::time::{Duration, Instant};
 
     let Some(ref spawner) = ctx.spawner else {
+        eprintln!("  {}", "No spawned-agent watcher is available.".dim());
         eprintln!(
             "  {}",
-            "No agent spawner available. Use spawn_agent tool to create agents.".dim()
+            "Delegation runs are journal-backed; use /agent history or /agent logs <delegation_id>.".dim()
         );
         return;
     };
 
     eprintln!("\n  {} Watching agent tree (Ctrl+C to stop)\n", "👁".cyan());
+    eprintln!(
+        "  {}",
+        "Watch follows live spawned agents. Delegation history stays available via /agent history and /agent logs."
+            .dim()
+    );
+    eprintln!();
 
     // Subscribe to progress events
     let mut rx = spawner.subscribe_progress();
@@ -873,6 +926,11 @@ fn show_help() {
         "  {}",
         "Use /agent status <agent_id|delegation_id> to inspect a specific item.".dim()
     );
+    eprintln!(
+        "  {}",
+        "/agent watch, /agent stop, and /agent permissions operate on live spawned agents; delegation history is read from the session journal."
+            .dim()
+    );
     eprintln!();
 }
 
@@ -989,6 +1047,33 @@ fn print_delegation_section(entries: &[DelegationHistoryEntry]) {
             eprintln!("    {}", preview.as_str().cyan());
         }
     }
+}
+
+fn render_delegation_tree(entries: &[DelegationHistoryEntry]) -> Vec<String> {
+    let mut lines = Vec::new();
+    for entry in entries {
+        lines.push(format!(
+            "{} {} [{}]",
+            sub_run_status_icon(&entry.status),
+            entry.delegation_id,
+            entry.pattern
+        ));
+        for (idx, sub_run) in entry.sub_runs.iter().enumerate() {
+            let branch = if idx + 1 == entry.sub_runs.len() {
+                "└──"
+            } else {
+                "├──"
+            };
+            lines.push(format!(
+                "{} {} {} [{}]",
+                branch,
+                sub_run_status_icon(&sub_run.status),
+                sub_run.agent_id,
+                sub_run.status
+            ));
+        }
+    }
+    lines
 }
 
 fn sub_run_status_icon(status: &str) -> &'static str {
@@ -1286,5 +1371,35 @@ mod tests {
         assert_eq!(delegation_id, "del-logs");
         assert_eq!(events.len(), 3);
         assert_eq!(events[1].event_type, JournalEventType::DelegationRetry);
+    }
+
+    #[test]
+    fn render_delegation_tree_includes_subruns() {
+        let lines = render_delegation_tree(&[DelegationHistoryEntry {
+            delegation_id: "del-1".to_string(),
+            pattern: "fan_out".to_string(),
+            status: "completed".to_string(),
+            sub_runs: vec![
+                DelegationSubRunSummary {
+                    sub_run_id: "run-1".to_string(),
+                    agent_id: "coder".to_string(),
+                    status: "completed".to_string(),
+                    error: None,
+                    output_preview: None,
+                },
+                DelegationSubRunSummary {
+                    sub_run_id: "run-2".to_string(),
+                    agent_id: "reviewer".to_string(),
+                    status: "failed".to_string(),
+                    error: Some("oops".to_string()),
+                    output_preview: None,
+                },
+            ],
+            ..DelegationHistoryEntry::default()
+        }]);
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].contains("del-1"));
+        assert!(lines[1].contains("coder"));
+        assert!(lines[2].contains("reviewer"));
     }
 }
