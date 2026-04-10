@@ -555,6 +555,15 @@ pub fn suggest_pattern(hints: &CoordinationHints) -> CoordinationPattern {
     let n = hints.agent_ids.len();
     let timeout = hints.timeout_sec;
 
+    // No agents → Sequential with stop_on_success (nothing to run)
+    if n == 0 {
+        return CoordinationPattern::Sequential {
+            agent_ids: vec![],
+            stop_on_success: true,
+            timeout_sec: timeout,
+        };
+    }
+
     // Check for review keywords in task
     let review_keywords = ["review", "审查", "check", "verify", "验证", "critique"];
     let task_lower = hints.task.to_lowercase();
@@ -1235,5 +1244,22 @@ mod tests {
             matches!(pattern, CoordinationPattern::AdversarialReview { .. }),
             "Chinese review keyword should yield AdversarialReview"
         );
+    }
+
+    #[test]
+    fn suggest_empty_agents_returns_sequential() {
+        let hints = CoordinationHints {
+            agent_ids: vec![],
+            task: "do something".into(),
+            timeout_sec: 30,
+            ..Default::default()
+        };
+        let pattern = suggest_pattern(&hints);
+        match pattern {
+            CoordinationPattern::Sequential { agent_ids, .. } => {
+                assert!(agent_ids.is_empty());
+            }
+            other => panic!("expected Sequential, got {:?}", other),
+        }
     }
 }
