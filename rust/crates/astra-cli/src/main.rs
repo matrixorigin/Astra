@@ -118,6 +118,8 @@ mod slash_skill;
 mod slash_state;
 #[path = "cli/slash_team.rs"]
 mod slash_team;
+#[path = "cli/mock_llm.rs"]
+mod mock_llm;
 #[path = "cli/spawn_subrun.rs"]
 mod spawn_subrun;
 #[path = "cli/sse_utils.rs"]

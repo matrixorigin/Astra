@@ -744,19 +744,48 @@ pub(super) async fn handle_team_command(
         }
 
         "run" => {
-            // /team run <team> <task description>
+            // /team run <team> <task description> [--mock <scenario>]
             let mut parts = sub_arg.splitn(2, ' ');
             let team_name = parts.next().unwrap_or("").trim();
-            let task = parts.next().unwrap_or("").trim();
+            let rest = parts.next().unwrap_or("").trim();
+
+            // Parse optional --mock flag
+            let (task, mock_scenario) = if let Some(idx) = rest.find("--mock") {
+                let task_part = rest[..idx].trim();
+                let after = rest[idx + 6..].trim();
+                let scenario_name = after.split_whitespace().next().unwrap_or("complete");
+                let scenario = super::mock_llm::MockScenario::from_str(scenario_name)
+                    .unwrap_or_else(|| {
+                        eprintln!(
+                            "  {} Unknown mock scenario '{}'. Available: {}",
+                            theme::icon_warn(),
+                            scenario_name,
+                            super::mock_llm::MockScenario::all()
+                                .iter()
+                                .map(|(n, _)| *n)
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        );
+                        super::mock_llm::MockScenario::Complete
+                    });
+                (task_part, Some(scenario))
+            } else {
+                (rest, None)
+            };
+
             if team_name.is_empty() || task.is_empty() {
                 eprintln!(
                     "{}",
-                    "  Usage: /team run <team> <task description>".yellow()
+                    "  Usage: /team run <team> <task description> [--mock <scenario>]".yellow()
                 );
                 eprintln!(
                     "{}",
                     "  Executes a team task through the delegation engine.".dim()
                 );
+                eprintln!("  Mock scenarios (bypass LLM, test orchestration only):");
+                for (name, desc) in super::mock_llm::MockScenario::all() {
+                    eprintln!("    --mock {:<20} {}", name, desc);
+                }
                 return;
             }
 
@@ -821,8 +850,34 @@ pub(super) async fn handle_team_command(
             };
             let (progress_tx, mut progress_rx) =
                 tokio::sync::mpsc::unbounded_channel::<super::skill_subrun::SubRunProgressEvent>();
+
+            // Start mock LLM server if --mock was requested
+            let _mock_server;
+            let effective_api = if let Some(scenario) = mock_scenario {
+                match super::mock_llm::MockLlmServer::start(scenario).await {
+                    Ok(srv) => {
+                        let mock_api = match astra_thin_client::ThinClient::new(&srv.base_url, None) {
+                            Ok(a) => a,
+                            Err(e) => {
+                                eprintln!("  {} Failed to create mock API client: {e}", theme::icon_err());
+                                return;
+                            }
+                        };
+                        _mock_server = Some(srv);
+                        mock_api
+                    }
+                    Err(e) => {
+                        eprintln!("  {} Failed to start mock server: {e}", theme::icon_err());
+                        return;
+                    }
+                }
+            } else {
+                _mock_server = None;
+                api.clone()
+            };
+
             let executor = super::delegate_subrun::CliDelegateSubRunExecutor::new(
-                api.clone(),
+                effective_api,
                 token,
                 state.model.clone(),
                 project_root.clone(),
