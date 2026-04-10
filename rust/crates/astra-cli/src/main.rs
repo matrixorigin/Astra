@@ -124,6 +124,8 @@ mod slash_skill;
 mod slash_state;
 #[path = "cli/slash_team.rs"]
 mod slash_team;
+#[path = "cli/slash_telemetry.rs"]
+mod slash_telemetry;
 #[path = "cli/slash_tuning.rs"]
 mod slash_tuning;
 #[path = "cli/spawn_subrun.rs"]
@@ -1476,7 +1478,8 @@ struct ReplState {
     // ── Observability (M1-M6) ──
     /// Global observability hub for M1-M6 integration (profiles, experiments, auto-tuning).
     /// Created at REPL startup, shared across sessions.
-    observability_hub: Option<std::sync::Arc<astra_runtime::observability_integration::ObservabilityHub>>,
+    observability_hub:
+        Option<std::sync::Arc<astra_runtime::observability_integration::ObservabilityHub>>,
     /// Per-session observability context for tracing, drift detection, and timing.
     /// Created when a session starts, reset on `/session new`.
     observability_session:
@@ -6169,6 +6172,10 @@ async fn handle_slash_command(
 
         "/team" => {
             slash_team::handle_team_command(arg, api, profile, state).await;
+        }
+
+        "/telemetry" => {
+            slash_telemetry::handle_telemetry_command(arg, state);
         }
 
         "/messaging" => {
