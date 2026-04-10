@@ -60,6 +60,8 @@ mod auth_flow;
 mod chat_stream;
 #[path = "cli/cli_formatting.rs"]
 mod cli_formatting;
+#[path = "cli/cli_output.rs"]
+mod cli_output;
 #[path = "cli/cli_utils.rs"]
 mod cli_utils;
 #[path = "cli/command_router.rs"]

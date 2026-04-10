@@ -1,4 +1,5 @@
 #![allow(unused_imports)]
+use crate::{cli_dim, cli_section, cli_warn};
 use super::*;
 
 // ═══════════════════════════════════════════════ Tool Profile ═════════════
@@ -9,7 +10,7 @@ pub(super) fn handle_tools_command(state: &ReplState) {
     let sid = match &state.session_id {
         Some(s) => s.clone(),
         None => {
-            eprintln!("{}", "  No active session.".dim());
+            cli_warn!("No active session.");
             return;
         }
     };
@@ -17,14 +18,12 @@ pub(super) fn handle_tools_command(state: &ReplState) {
     let profiles = session_analytics::compute_tool_profiles(&events);
 
     if profiles.is_empty() {
-        eprintln!("{}", "  No tool calls recorded yet.".dim());
+        cli_dim!("No tool calls recorded yet.");
         return;
     }
 
-    eprintln!(
-        "\n{}",
-        "─── Tool Performance ────────────────────────────".bold()
-    );
+    cli_section!("Tool Performance");
+    eprintln!();
     eprintln!(
         "  {:<20} {:>5} {:>5} {:>7} {:>7} {:>7} {:>6}",
         "tool".bold(),
