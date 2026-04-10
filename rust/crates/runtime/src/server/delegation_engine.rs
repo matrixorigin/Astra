@@ -35,6 +35,7 @@ use astra_core::{
 
 use super::run_engine::RunEngine;
 use crate::messaging::router::AgentMailboxRouter;
+use crate::prompts::team_prompts;
 
 // ─── Sub-run Executor Trait ─────────────────────────────────────────────────
 
@@ -1291,6 +1292,17 @@ impl DelegationEngine {
         cancel_token: Option<&Arc<tokio_util::sync::CancellationToken>>,
     ) -> Result<DelegationResult, String> {
         let reg = self.registry.read().await;
+        let has_gate = self.gate.is_some();
+
+        // Compute aggregation strategy name and budget info for team prompts
+        let aggregation_name = match aggregation {
+            AggregationStrategy::FirstSuccess => "FirstSuccess",
+            AggregationStrategy::AllResults => "AllResults",
+            AggregationStrategy::Consensus => "Consensus",
+            AggregationStrategy::LlmGuided { .. } => "LlmGuided",
+        };
+        let budget_prompt = Self::extract_budget_prompt(&request.context);
+        let agent_id_strs: Vec<&str> = agent_ids.iter().map(|s| s.as_str()).collect();
 
         // Build configs + create runs in parallel
         let mut configs = Vec::new();
@@ -1367,10 +1379,24 @@ impl DelegationEngine {
                 None
             };
 
+            // Inject team coordination prompt into task
+            let coordination_prompt = format!(
+                "{}{}",
+                team_prompts::fan_out_agent_prompt(
+                    agent_id,
+                    &agent_id_strs,
+                    aggregation_name,
+                    has_gate,
+                ),
+                budget_prompt,
+            );
+            let enhanced_task =
+                team_prompts::wrap_task_with_coordination(&coordination_prompt, &request.task);
+
             configs.push(SubRunConfig {
                 run_id: sub_run_id,
                 agent_profile: profile,
-                task: request.task.clone(),
+                task: enhanced_task,
                 session_id: request
                     .context
                     .get("session_id")
@@ -1598,8 +1624,11 @@ impl DelegationEngine {
         let reg = self.registry.read().await;
         let mut results = Vec::new();
         let mut previous_output: Option<String> = None;
+        let has_gate = self.gate.is_some();
+        let total_stages = agent_ids.len();
+        let budget_prompt = Self::extract_budget_prompt(&request.context);
 
-        for agent_id in agent_ids {
+        for (stage_index, agent_id) in agent_ids.iter().enumerate() {
             // Check cancellation before starting next sequential agent
             if let Some(ref token) = cancel_token {
                 if token.is_cancelled() {
@@ -1678,10 +1707,27 @@ impl DelegationEngine {
                 None
             };
 
+            // Inject sequential/pipeline coordination prompt
+            let has_prev = previous_output.is_some();
+            let coordination_prompt = format!(
+                "{}{}",
+                team_prompts::sequential_stage_prompt(
+                    stage_index,
+                    total_stages,
+                    agent_id,
+                    has_prev,
+                    stop_on_success,
+                    has_gate,
+                ),
+                budget_prompt,
+            );
+            let enhanced_task =
+                team_prompts::wrap_task_with_coordination(&coordination_prompt, &request.task);
+
             let config = SubRunConfig {
                 run_id: sub_run_id.clone(),
                 agent_profile: profile,
-                task: request.task.clone(),
+                task: enhanced_task,
                 session_id: request
                     .context
                     .get("session_id")
@@ -1808,6 +1854,7 @@ impl DelegationEngine {
         let reg = self.registry.read().await;
         let mut results = Vec::new();
         let mut last_producer_output: Option<String> = None;
+        let budget_prompt = Self::extract_budget_prompt(&request.context);
 
         let producer_profile = reg.get(producer_id).cloned().unwrap_or_else(|| {
             AgentProfile::new(
@@ -1897,10 +1944,27 @@ impl DelegationEngine {
                 None
             };
 
+            // Inject adversarial producer coordination prompt
+            let has_feedback = last_producer_output.is_some();
+            let has_gate = self.gate.is_some();
+            let prod_coordination = format!(
+                "{}{}",
+                team_prompts::adversarial_producer_prompt(
+                    reviewer_id,
+                    max_rounds,
+                    round,
+                    has_feedback,
+                    has_gate,
+                ),
+                budget_prompt,
+            );
+            let prod_enhanced_task =
+                team_prompts::wrap_task_with_coordination(&prod_coordination, &request.task);
+
             let prod_config = SubRunConfig {
                 run_id: prod_run_id.clone(),
                 agent_profile: producer_profile.clone(),
-                task: request.task.clone(),
+                task: prod_enhanced_task,
                 session_id: request
                     .context
                     .get("session_id")
@@ -2051,13 +2115,16 @@ impl DelegationEngine {
                 None
             };
 
+            // Inject adversarial reviewer coordination prompt
+            let rev_coordination =
+                team_prompts::adversarial_reviewer_prompt(producer_id, max_rounds, round);
+            let rev_enhanced_task =
+                team_prompts::wrap_task_with_coordination(&rev_coordination, &request.task);
+
             let rev_config = SubRunConfig {
                 run_id: rev_run_id.clone(),
                 agent_profile: reviewer_profile.clone(),
-                task: format!(
-                    "Review this output:\n\n{}",
-                    last_producer_output.as_deref().unwrap_or("[no output]")
-                ),
+                task: rev_enhanced_task,
                 session_id: request
                     .context
                     .get("session_id")
@@ -2237,17 +2304,14 @@ impl DelegationEngine {
             fork_context.insert("parent_messages".to_string(), parent_messages.clone());
             fork_context.insert("is_fork_child".to_string(), serde_json::json!(true));
 
-            let fork_task = format!(
-                "You are fork child #{i} of {total}.\n\
-                 Task: {task}\n\n\
-                 Rules:\n\
-                 - Do NOT fork or delegate to other agents.\n\
-                 - Execute the task directly and report results.\n\
-                 - Be concise in your output.",
-                i = i,
-                total = tasks.len(),
-                task = task,
+            let has_parent_ctx = !parent_messages.as_array().map_or(true, |a| a.is_empty());
+            let budget_prompt = Self::extract_budget_prompt(&request.context);
+            let fork_coordination = format!(
+                "{}{}",
+                team_prompts::fork_child_prompt(i, tasks.len(), has_parent_ctx),
+                budget_prompt,
             );
+            let fork_task = team_prompts::wrap_task_with_coordination(&fork_coordination, task);
 
             let mut fork_profile = profile.clone();
             fork_profile.can_delegate = false;
@@ -2457,6 +2521,24 @@ impl DelegationEngine {
             );
         }
         count
+    }
+
+    /// Extract budget awareness prompt from delegation context.
+    fn extract_budget_prompt(
+        context: &std::collections::HashMap<String, serde_json::Value>,
+    ) -> String {
+        let budget = context.get("team_budget").and_then(|v| v.as_u64());
+        let max_parallel = context.get("team_max_parallel").and_then(|v| v.as_u64());
+        // Also check for timeout
+        let timeout = context.get("team_timeout_sec").and_then(|v| v.as_u64());
+        if budget.is_some() || max_parallel.is_some() || timeout.is_some() {
+            format!(
+                "\n{}",
+                team_prompts::budget_awareness_prompt(budget, timeout)
+            )
+        } else {
+            String::new()
+        }
     }
 }
 
