@@ -288,7 +288,7 @@ async fn execute_repl_bridge_command(
             let ctx = slash_agent::AgentCommandContext {
                 spawner: state.agent_spawner.clone(),
             };
-            slash_agent::handle_agent_command(arg, &ctx);
+            slash_agent::handle_agent_command(arg, &ctx).await;
         }
         "/messaging" => handle_messaging_command(arg, &state),
         _ => return Err(format!("unsupported bridged command: {slash_cmd}")),

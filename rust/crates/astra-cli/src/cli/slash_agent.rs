@@ -21,42 +21,42 @@ pub struct AgentCommandContext {
 }
 
 /// Handle `/agent [subcommand]` command.
-pub fn handle_agent_command(arg: &str, ctx: &AgentCommandContext) {
+pub async fn handle_agent_command(arg: &str, ctx: &AgentCommandContext) {
     let parts: Vec<&str> = arg.split_whitespace().collect();
     let subcmd = parts.first().copied().unwrap_or("list");
 
     match subcmd {
-        "" | "list" => show_list(ctx),
-        "tree" => show_tree(ctx),
+        "" | "list" => show_list(ctx).await,
+        "tree" => show_tree(ctx).await,
         "status" => {
             if let Some(id) = parts.get(1) {
-                show_status(ctx, id);
+                show_status(ctx, id).await;
             } else {
                 eprintln!("  {}", "Usage: /agent status <agent_id>".yellow());
             }
         }
         "permissions" | "perms" => {
             if let Some(id) = parts.get(1) {
-                show_permissions(ctx, id);
+                show_permissions(ctx, id).await;
             } else {
                 eprintln!("  {}", "Usage: /agent permissions <agent_id>".yellow());
             }
         }
         "stop" => {
             if let Some(id) = parts.get(1) {
-                stop_agent(ctx, id);
+                stop_agent(ctx, id).await;
             } else {
                 eprintln!("  {}", "Usage: /agent stop <agent_id>".yellow());
             }
         }
         "logs" => {
             if let Some(id) = parts.get(1) {
-                show_logs(ctx, id);
+                show_logs(ctx, id).await;
             } else {
                 eprintln!("  {}", "Usage: /agent logs <agent_id>".yellow());
             }
         }
-        "watch" => show_watch(ctx),
+        "watch" => show_watch(ctx).await,
         "help" | "?" => show_help(),
         _ => {
             eprintln!(
@@ -67,7 +67,7 @@ pub fn handle_agent_command(arg: &str, ctx: &AgentCommandContext) {
     }
 }
 
-fn show_list(ctx: &AgentCommandContext) {
+async fn show_list(ctx: &AgentCommandContext) {
     let Some(ref spawner) = ctx.spawner else {
         eprintln!(
             "  {}",
@@ -76,15 +76,7 @@ fn show_list(ctx: &AgentCommandContext) {
         return;
     };
 
-    let rt = match tokio::runtime::Handle::try_current() {
-        Ok(rt) => rt,
-        Err(_) => {
-            eprintln!("  {}", "No tokio runtime available.".red());
-            return;
-        }
-    };
-
-    let agents = rt.block_on(spawner.list_all_agents());
+    let agents = spawner.list_all_agents().await;
 
     if agents.is_empty() {
         eprintln!("\n  {}", "🤖 No active agents".cyan().bold());
@@ -150,7 +142,7 @@ fn show_list(ctx: &AgentCommandContext) {
     eprintln!();
 }
 
-fn show_tree(ctx: &AgentCommandContext) {
+async fn show_tree(ctx: &AgentCommandContext) {
     let Some(ref spawner) = ctx.spawner else {
         eprintln!(
             "  {}",
@@ -159,15 +151,7 @@ fn show_tree(ctx: &AgentCommandContext) {
         return;
     };
 
-    let rt = match tokio::runtime::Handle::try_current() {
-        Ok(rt) => rt,
-        Err(_) => {
-            eprintln!("  {}", "No tokio runtime available.".red());
-            return;
-        }
-    };
-
-    let agents = rt.block_on(spawner.list_all_agents());
+    let agents = spawner.list_all_agents().await;
 
     eprintln!("\n  {}", "🌲 Agent Delegation Tree".cyan().bold());
     eprintln!("  {}", "─".repeat(60).dim());
@@ -181,21 +165,13 @@ fn show_tree(ctx: &AgentCommandContext) {
     }
 }
 
-fn show_status(ctx: &AgentCommandContext, agent_id: &str) {
+async fn show_status(ctx: &AgentCommandContext, agent_id: &str) {
     let Some(ref spawner) = ctx.spawner else {
         eprintln!("  {}", "No agent spawner available.".dim());
         return;
     };
 
-    let rt = match tokio::runtime::Handle::try_current() {
-        Ok(rt) => rt,
-        Err(_) => {
-            eprintln!("  {}", "No tokio runtime available.".red());
-            return;
-        }
-    };
-
-    match rt.block_on(spawner.get_agent_state(agent_id)) {
+    match spawner.get_agent_state(agent_id).await {
         Some(state) => {
             eprintln!(
                 "\n  {} {}",
@@ -280,21 +256,13 @@ fn show_status(ctx: &AgentCommandContext, agent_id: &str) {
     }
 }
 
-fn show_permissions(ctx: &AgentCommandContext, agent_id: &str) {
+async fn show_permissions(ctx: &AgentCommandContext, agent_id: &str) {
     let Some(ref spawner) = ctx.spawner else {
         eprintln!("  {}", "No agent spawner available.".dim());
         return;
     };
 
-    let rt = match tokio::runtime::Handle::try_current() {
-        Ok(rt) => rt,
-        Err(_) => {
-            eprintln!("  {}", "No tokio runtime available.".red());
-            return;
-        }
-    };
-
-    match rt.block_on(spawner.get_agent_state(agent_id)) {
+    match spawner.get_agent_state(agent_id).await {
         Some(state) => {
             eprintln!(
                 "\n  {} {} {}",
@@ -375,29 +343,23 @@ fn print_permission_summary(
     }
 }
 
-fn stop_agent(ctx: &AgentCommandContext, agent_id: &str) {
+async fn stop_agent(ctx: &AgentCommandContext, agent_id: &str) {
     let Some(ref spawner) = ctx.spawner else {
         eprintln!("  {}", "No agent spawner available.".dim());
         return;
     };
 
-    let rt = match tokio::runtime::Handle::try_current() {
-        Ok(rt) => rt,
-        Err(_) => {
-            eprintln!("  {}", "No tokio runtime available.".red());
-            return;
-        }
-    };
-
     // First check if agent exists
-    let agent = rt.block_on(spawner.get_agent_state(agent_id));
+    let agent = spawner.get_agent_state(agent_id).await;
     if agent.is_none() {
         eprintln!("  {}", format!("Agent not found: {agent_id}").yellow());
         return;
     }
 
     // Update status to cancelled
-    rt.block_on(spawner.update_status(agent_id, AgentStatus::Cancelled));
+    spawner
+        .update_status(agent_id, AgentStatus::Cancelled)
+        .await;
 
     eprintln!(
         "  {} Shutdown request sent to {}",
@@ -408,7 +370,7 @@ fn stop_agent(ctx: &AgentCommandContext, agent_id: &str) {
 
 /// Watch agent tree with real-time updates on spawn/complete events.
 /// Throttles rendering to max once per 500ms.
-fn show_watch(ctx: &AgentCommandContext) {
+async fn show_watch(ctx: &AgentCommandContext) {
     use astra_runtime::orchestration::ProgressEventType;
     use std::time::{Duration, Instant};
 
@@ -420,110 +382,83 @@ fn show_watch(ctx: &AgentCommandContext) {
         return;
     };
 
-    let rt = match tokio::runtime::Handle::try_current() {
-        Ok(rt) => rt,
-        Err(_) => {
-            eprintln!("  {}", "No tokio runtime available.".red());
-            return;
-        }
-    };
-
     eprintln!("\n  {} Watching agent tree (Ctrl+C to stop)\n", "👁".cyan());
 
     // Subscribe to progress events
     let mut rx = spawner.subscribe_progress();
     let spawner_clone = spawner.clone();
 
-    rt.block_on(async {
-        let mut last_render = Instant::now() - Duration::from_secs(10); // Allow immediate first render
-        let mut last_agent_count = 0usize;
-        let throttle_interval = Duration::from_millis(500);
+    let mut last_render = Instant::now() - Duration::from_secs(10);
+    let mut last_agent_count = 0usize;
+    let throttle_interval = Duration::from_millis(500);
 
-        // Render initial tree
-        let agents = spawner_clone.list_all_agents().await;
-        if !agents.is_empty() {
-            let forest = AgentTreeNode::build_forest(&agents);
-            let rendered = render_agent_forest(&forest);
-            eprintln!("  {}", "🌲 Agent Delegation Tree".cyan().bold());
-            eprintln!("  {}", "─".repeat(60).dim());
-            for line in rendered.lines() {
-                eprintln!("  {}", line);
-            }
-            last_agent_count = agents.len();
-            last_render = Instant::now();
-        } else {
-            eprintln!("  {}", "No agents spawned yet. Waiting...".dim());
+    let agents = spawner_clone.list_all_agents().await;
+    if !agents.is_empty() {
+        let forest = AgentTreeNode::build_forest(&agents);
+        let rendered = render_agent_forest(&forest);
+        eprintln!("  {}", "🌲 Agent Delegation Tree".cyan().bold());
+        eprintln!("  {}", "─".repeat(60).dim());
+        for line in rendered.lines() {
+            eprintln!("  {}", line);
         }
+        last_agent_count = agents.len();
+        last_render = Instant::now();
+    } else {
+        eprintln!("  {}", "No agents spawned yet. Waiting...".dim());
+    }
 
-        loop {
-            match rx.recv().await {
-                Ok(event) => {
-                    // Only re-render on tree-relevant events
-                    let is_tree_event = matches!(
-                        event.event_type,
-                        ProgressEventType::AgentSpawned { .. }
-                            | ProgressEventType::Completed { .. }
-                            | ProgressEventType::Failed { .. }
-                            | ProgressEventType::Cancelled { .. }
-                    );
+    loop {
+        match rx.recv().await {
+            Ok(event) => {
+                let is_tree_event = matches!(
+                    event.event_type,
+                    ProgressEventType::AgentSpawned { .. }
+                        | ProgressEventType::Completed { .. }
+                        | ProgressEventType::Failed { .. }
+                        | ProgressEventType::Cancelled { .. }
+                );
 
-                    if is_tree_event {
-                        // Throttle: only render every 500ms
-                        if last_render.elapsed() >= throttle_interval {
-                            let agents = spawner_clone.list_all_agents().await;
+                if is_tree_event && last_render.elapsed() >= throttle_interval {
+                    let agents = spawner_clone.list_all_agents().await;
+                    if agents.len() != last_agent_count || agents.is_empty() {
+                        eprintln!("\n  {}", "🌲 Agent Delegation Tree".cyan().bold());
+                        eprintln!("  {}", "─".repeat(60).dim());
 
-                            // Only render if agent count changed (quick check)
-                            if agents.len() != last_agent_count || agents.is_empty() {
-                                // Clear and re-render
-                                eprintln!("\n  {}", "🌲 Agent Delegation Tree".cyan().bold());
-                                eprintln!("  {}", "─".repeat(60).dim());
-
-                                if agents.is_empty() {
-                                    eprintln!("  {}", "(no agents)".dim());
-                                } else {
-                                    let forest = AgentTreeNode::build_forest(&agents);
-                                    let rendered = render_agent_forest(&forest);
-                                    for line in rendered.lines() {
-                                        eprintln!("  {}", line);
-                                    }
-                                }
-
-                                last_agent_count = agents.len();
-                                last_render = Instant::now();
+                        if agents.is_empty() {
+                            eprintln!("  {}", "(no agents)".dim());
+                        } else {
+                            let forest = AgentTreeNode::build_forest(&agents);
+                            let rendered = render_agent_forest(&forest);
+                            for line in rendered.lines() {
+                                eprintln!("  {}", line);
                             }
                         }
+
+                        last_agent_count = agents.len();
+                        last_render = Instant::now();
                     }
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    eprintln!("  {}", format!("(skipped {n} events)").dim());
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                    eprintln!("  {}", "Event stream closed.".dim());
-                    break;
-                }
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                eprintln!("  {}", format!("(skipped {n} events)").dim());
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                eprintln!("  {}", "Event stream closed.".dim());
+                break;
             }
         }
-    });
+    }
 
     eprintln!();
 }
 
-fn show_logs(ctx: &AgentCommandContext, agent_id: &str) {
+async fn show_logs(ctx: &AgentCommandContext, agent_id: &str) {
     let Some(ref spawner) = ctx.spawner else {
         eprintln!("  {}", "No agent spawner available.".dim());
         return;
     };
 
-    // Check if agent exists
-    let rt = match tokio::runtime::Handle::try_current() {
-        Ok(rt) => rt,
-        Err(_) => {
-            eprintln!("  {}", "No tokio runtime available.".red());
-            return;
-        }
-    };
-
-    let agent = rt.block_on(spawner.get_agent_state(agent_id));
+    let agent = spawner.get_agent_state(agent_id).await;
     if agent.is_none() {
         eprintln!("  {}", format!("Agent not found: {agent_id}").yellow());
         return;
@@ -539,35 +474,31 @@ fn show_logs(ctx: &AgentCommandContext, agent_id: &str) {
     let mut rx = spawner.subscribe_progress();
     let target_agent_id = agent_id.to_string();
 
-    // Block and stream events
-    rt.block_on(async {
-        loop {
-            match rx.recv().await {
-                Ok(event) => {
-                    if event.agent_id == target_agent_id {
-                        print_progress_event(&event);
+    loop {
+        match rx.recv().await {
+            Ok(event) => {
+                if event.agent_id == target_agent_id {
+                    print_progress_event(&event);
 
-                        // Stop on terminal events
-                        if matches!(
-                            event.event_type,
-                            astra_runtime::orchestration::ProgressEventType::Completed { .. }
-                                | astra_runtime::orchestration::ProgressEventType::Failed { .. }
-                                | astra_runtime::orchestration::ProgressEventType::Cancelled { .. }
-                        ) {
-                            break;
-                        }
+                    if matches!(
+                        event.event_type,
+                        astra_runtime::orchestration::ProgressEventType::Completed { .. }
+                            | astra_runtime::orchestration::ProgressEventType::Failed { .. }
+                            | astra_runtime::orchestration::ProgressEventType::Cancelled { .. }
+                    ) {
+                        break;
                     }
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    eprintln!("  {}", format!("(skipped {n} events)").dim());
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                    eprintln!("  {}", "Event stream closed.".dim());
-                    break;
-                }
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                eprintln!("  {}", format!("(skipped {n} events)").dim());
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                eprintln!("  {}", "Event stream closed.".dim());
+                break;
             }
         }
-    });
+    }
 
     eprintln!();
 }
@@ -770,6 +701,9 @@ fn format_duration(d: std::time::Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use astra_runtime::messaging::{AgentMailboxRouter, InProcessTransport};
+    use astra_runtime::server::delegation_engine::DelegationTracker;
+    use std::sync::Arc;
 
     #[test]
     fn test_format_duration() {
@@ -791,5 +725,18 @@ mod tests {
         };
         let formatted = format_status(&status);
         assert!(formatted.to_string().contains("running"));
+    }
+
+    #[tokio::test]
+    async fn handle_agent_list_does_not_block_on_runtime() {
+        let transport = Arc::new(InProcessTransport::new());
+        let tracker = Arc::new(DelegationTracker::new());
+        let router = Arc::new(AgentMailboxRouter::new(transport, tracker));
+        let spawner = Arc::new(DynamicAgentSpawner::new(router));
+        let ctx = AgentCommandContext {
+            spawner: Some(spawner),
+        };
+
+        handle_agent_command("list", &ctx).await;
     }
 }
