@@ -598,6 +598,12 @@ impl ToolExecutor {
             "env".to_string(),
         ];
         for (key, value) in environment {
+            // Validate env var name — reject anything that could inject shell commands.
+            if !key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') || key.is_empty() {
+                return Err(format!(
+                    "rust-analyzer runnable environment variable name is invalid: {key}"
+                ));
+            }
             let Some(value) = value.as_str() else {
                 return Err(format!(
                     "rust-analyzer runnable environment value for {key} must be a string"
@@ -612,12 +618,15 @@ impl ToolExecutor {
             };
             parts.push(shell_escape(arg));
         }
-        let exec_args: Vec<String> = executable_args
-            .iter()
-            .filter_map(Value::as_str)
-            .filter(|arg| !arg.is_empty())
-            .map(str::to_string)
-            .collect();
+        let mut exec_args = Vec::new();
+        for arg in &executable_args {
+            let Some(arg) = arg.as_str() else {
+                return Err("rust-analyzer runnable executableArgs must be strings".to_string());
+            };
+            if !arg.is_empty() {
+                exec_args.push(arg.to_string());
+            }
+        }
         if !exec_args.is_empty() {
             parts.push("--".to_string());
             parts.extend(exec_args.iter().map(|arg| shell_escape(arg)));
