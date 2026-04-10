@@ -714,7 +714,7 @@ async fn run_chat_turn(
     // ─── Drift Tracking: Detect user corrections ────────────────────────────
     // If this message looks like a correction, record the current turn index.
     if detect_correction_signal(message) {
-        let correction_turn = (state.history.len() / 2) as u32;
+        let correction_turn = state.history.len() as u32;
         state.drift_user_corrections.push(correction_turn);
     }
 

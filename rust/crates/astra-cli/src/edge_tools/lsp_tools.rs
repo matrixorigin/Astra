@@ -518,7 +518,7 @@ impl ToolExecutor {
             .get("command")
             .and_then(Value::as_str)
             .ok_or_else(|| {
-                "selected code action command is missing command identifier".to_string()
+                format!("selected {operation} command is missing command identifier")
             })?
             .to_string();
         let arguments = command
