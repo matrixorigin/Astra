@@ -516,6 +516,22 @@ fn print_progress_event(event: &astra_runtime::orchestration::AgentProgressEvent
                 .unwrap_or_default();
             format!("🧠 turn={} done {}ms{}", turn, duration_ms, ttft)
         }
+        ProgressEventType::MetricsUpdate {
+            turn,
+            max_turns,
+            total_prompt_tokens,
+            total_completion_tokens,
+            total_tool_calls,
+        } => {
+            format!(
+                "📊 {}/{} turns | {} tools | {}+{} tokens",
+                turn,
+                max_turns,
+                total_tool_calls,
+                total_prompt_tokens,
+                total_completion_tokens
+            )
+        }
     };
 
     eprintln!("  [{}] {}", time_str.as_str().dim(), msg);

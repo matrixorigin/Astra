@@ -184,6 +184,26 @@ impl ProgressDisplay {
             ProgressEventType::LlmCallCompleted { .. } => {
                 // Status stays Running; next event (ToolExecuting or TurnCompleted) will update.
             }
+
+            ProgressEventType::MetricsUpdate {
+                turn, max_turns, ..
+            } => {
+                // Update progress bar based on turn/max_turns ratio
+                if let Some(agent) = self.agents.get_mut(agent_id) {
+                    if let AgentStatus::Running {
+                        current_turn: _,
+                        max_turns: _,
+                        last_tool,
+                    } = &agent.status
+                    {
+                        agent.status = AgentStatus::Running {
+                            current_turn: *turn,
+                            max_turns: *max_turns,
+                            last_tool: last_tool.clone(),
+                        };
+                    }
+                }
+            }
         }
     }
 

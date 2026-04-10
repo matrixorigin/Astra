@@ -376,18 +376,61 @@ impl TeamExecutionOrchestrator {
             Some(cancel_token.clone()),
         );
 
-        let delegation_outcome = match budget_timeout {
-            Some(dur) => match tokio::time::timeout(dur, delegation_future).await {
-                Ok(r) => r,
-                Err(_) => {
+        // Poll progress during execution (every 500ms) so UI can show real-time updates.
+        // This replaces the blocking await with a polling loop that emits AgentProgress.
+        let poll_interval = std::time::Duration::from_millis(500);
+        let mut last_completed_count = 0usize;
+
+        let delegation_future = Box::pin(delegation_future);
+        tokio::pin!(delegation_future);
+
+        // Create budget timeout once (if configured) so it tracks cumulative time
+        let budget_deadline = budget_timeout.map(|dur| tokio::time::Instant::now() + dur);
+
+        let delegation_outcome: Result<DelegationResult, String> = loop {
+            // Check if budget has been exceeded
+            if let Some(deadline) = budget_deadline {
+                if tokio::time::Instant::now() >= deadline {
                     cancel_token.cancel();
-                    Err(format!(
+                    break Err(format!(
                         "team execution exceeded budget timeout of {}s",
-                        dur.as_secs()
-                    ))
+                        budget_timeout.map(|d| d.as_secs()).unwrap_or(0)
+                    ));
                 }
-            },
-            None => delegation_future.await,
+            }
+
+            tokio::select! {
+                biased; // Prefer completion over polling
+
+                result = &mut delegation_future => {
+                    break result;
+                }
+                _ = tokio::time::sleep(poll_interval) => {
+                    // Poll and emit intermediate progress
+                    if let Some(progress) = self
+                        .delegation_engine
+                        .tracker()
+                        .get_progress(&delegation_id)
+                        .await
+                    {
+                        // Only emit if something changed (avoid spamming)
+                        if progress.completed_count != last_completed_count {
+                            last_completed_count = progress.completed_count;
+                            let agent_states: std::collections::HashMap<String, String> = progress
+                                .agent_states
+                                .iter()
+                                .map(|(k, v)| (k.clone(), v.as_str().to_string()))
+                                .collect();
+                            self.emit_progress(ExecutionPhase::AgentProgress {
+                                delegation_id: delegation_id.clone(),
+                                agent_states,
+                                completed_count: progress.completed_count,
+                                total_count: progress.total_count,
+                            });
+                        }
+                    }
+                }
+            }
         };
 
         let delegation_result = match delegation_outcome {

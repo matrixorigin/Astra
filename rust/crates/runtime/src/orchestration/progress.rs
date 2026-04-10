@@ -56,6 +56,14 @@ pub enum ProgressEventType {
         ttft_ms: Option<u64>,
         duration_ms: u64,
     },
+    /// Intermediate metrics snapshot after each turn (allows UI to show progress).
+    MetricsUpdate {
+        turn: u32,
+        max_turns: u32,
+        total_prompt_tokens: u64,
+        total_completion_tokens: u64,
+        total_tool_calls: u32,
+    },
 }
 
 /// Broadcasts progress events to multiple subscribers.
@@ -185,6 +193,23 @@ impl AgentProgressEmitter {
             turn,
             ttft_ms,
             duration_ms,
+        });
+    }
+
+    pub fn metrics_update(
+        &self,
+        turn: u32,
+        max_turns: u32,
+        total_prompt_tokens: u64,
+        total_completion_tokens: u64,
+        total_tool_calls: u32,
+    ) {
+        self.emit(ProgressEventType::MetricsUpdate {
+            turn,
+            max_turns,
+            total_prompt_tokens,
+            total_completion_tokens,
+            total_tool_calls,
         });
     }
 

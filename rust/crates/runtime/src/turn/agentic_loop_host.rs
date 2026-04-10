@@ -2341,6 +2341,15 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
                         .map(|r| r.tool.clone())
                         .unwrap_or_else(|| "thinking".to_string());
                     emitter.turn_completed(turn_index as u32 + 1, tool_calls_this_turn, last_tool);
+
+                    // Emit intermediate metrics so UI can show progress (e.g., "5/30 turns, 12 tools, 8k tokens")
+                    emitter.metrics_update(
+                        turn_index as u32 + 1,
+                        state.max_turns as u32,
+                        state.total_prompt,
+                        state.total_completion,
+                        state.total_tool_calls,
+                    );
                 }
 
                 // Send progress update to parent agent (best-effort).
