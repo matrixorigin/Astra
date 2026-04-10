@@ -2895,6 +2895,9 @@ async fn run_chat_repl(
     state.pattern_library = Some(pipeline_modules.pattern_library.clone());
     state.entity_graph = Some(pipeline_modules.entity_graph.clone());
     state.calibrator = Some(pipeline_modules.calibrator.clone());
+    if let Some(hub) = &state.observability_hub {
+        hub.attach_pattern_library(pipeline_modules.pattern_library.clone());
+    }
     // Store skill registry and MCP manager from pipeline initialization
     state.unified_skill_registry = pipeline_modules.unified_skill_registry.clone();
     state.mcp_manager = pipeline_modules.mcp_manager.clone();
@@ -3949,8 +3952,8 @@ mod tests {
     use super::*;
     use axum::{Router, routing::get, routing::post};
     use cloud_sync::{
-        try_connect_matrixone, CloudPullResult, cloud_pull_warrants_sync_marker,
-        should_append_cloud_pull_journal, ASTRA_JOURNAL_CLOUD_EMPTY_ACK,
+        ASTRA_JOURNAL_CLOUD_EMPTY_ACK, CloudPullResult, cloud_pull_warrants_sync_marker,
+        should_append_cloud_pull_journal, try_connect_matrixone,
     };
 
     async fn spawn_mock(app: Router) -> String {

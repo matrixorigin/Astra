@@ -1,7 +1,7 @@
 use super::*;
 use cloud_sync::{
-    try_connect_matrixone, CloudPullResult, cloud_pull_warrants_sync_marker,
-    should_append_cloud_pull_journal,
+    CloudPullResult, cloud_pull_warrants_sync_marker, should_append_cloud_pull_journal,
+    try_connect_matrixone,
 };
 
 // ── slash_health::format_sync_age tests ────────────────────────────────────────────

@@ -12,19 +12,19 @@
 //! in the agentic loop lifecycle.
 
 use std::collections::HashMap;
-use std::sync::RwLock;
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
 use crate::ab_testing::{ExperimentOutcome, ExperimentStatus, ExperimentStore};
 use crate::auto_tuning::{AutoTuningEngine, FeedbackSignal, SignalType};
+use crate::pipeline::pattern::PatternLibrary;
 use crate::runtime_config::RuntimeConfig;
 use crate::turn::context_assembly_trace::ContextAssemblyTrace;
 use crate::turn::decision_explainer::{DecisionExplanation, DriftDetector, FocusDriftAnalysis};
 use crate::turn::goal_tracker::{GoalProgress, GoalTracker};
 use crate::user_profile::{Scenario, UserProfile, UserProfileManager, UserProfileStore};
-use std::sync::Arc;
 
 // ─── Session Context ────────────────────────────────────────────────────────
 
@@ -369,6 +369,9 @@ pub struct ObservabilityHub {
     /// Auto-tuning engine.
     tuning_engine: AutoTuningEngine,
 
+    /// Shared pattern library for adaptive routing and exploration.
+    pattern_library: RwLock<Option<Arc<Mutex<PatternLibrary>>>>,
+
     /// Active sessions.
     sessions: RwLock<HashMap<String, Arc<RwLock<ObservabilitySession>>>>,
 }
@@ -387,6 +390,7 @@ impl ObservabilityHub {
             profile_manager: UserProfileManager::new(profile_store),
             experiment_store: RwLock::new(ExperimentStore::new()),
             tuning_engine: AutoTuningEngine::new(),
+            pattern_library: RwLock::new(None),
             sessions: RwLock::new(HashMap::new()),
         }
     }
@@ -398,6 +402,7 @@ impl ObservabilityHub {
             profile_manager: UserProfileManager::new(profile_store),
             experiment_store: RwLock::new(ExperimentStore::new()),
             tuning_engine: AutoTuningEngine::new(),
+            pattern_library: RwLock::new(None),
             sessions: RwLock::new(HashMap::new()),
         }
     }
@@ -547,6 +552,16 @@ impl ObservabilityHub {
     /// Get the auto-tuning engine.
     pub fn tuning(&self) -> &AutoTuningEngine {
         &self.tuning_engine
+    }
+
+    /// Attach the shared pattern library used by the active tool-selection stack.
+    pub fn attach_pattern_library(&self, pattern_library: Arc<Mutex<PatternLibrary>>) {
+        *self.pattern_library.write().unwrap() = Some(pattern_library);
+    }
+
+    /// Get the shared pattern library, if one has been attached.
+    pub fn pattern_library(&self) -> Option<Arc<Mutex<PatternLibrary>>> {
+        self.pattern_library.read().unwrap().clone()
     }
 
     /// Get the profile manager.

@@ -471,8 +471,25 @@ fn apply_adaptive_execution_profile(state: &mut AgenticLoopState) {
     );
     let router = crate::scenario_router::ScenarioRouter::new(session_guard.config.clone());
     let user_id = session_guard.user_id.clone();
+    let pattern_library = hub.pattern_library();
+    let pattern_library = match pattern_library.as_ref() {
+        Some(pattern_library) => match pattern_library.lock() {
+            Ok(guard) => Some(guard),
+            Err(err) => {
+                eprintln!("[adaptive-exec] failed to lock pattern library: {err}");
+                None
+            }
+        },
+        None => None,
+    };
     let experiments = hub.experiments();
-    let profile = router.select(&routing, &detector, None, Some(&*experiments), &user_id);
+    let profile = router.select(
+        &routing,
+        &detector,
+        pattern_library.as_deref(),
+        Some(&*experiments),
+        &user_id,
+    );
 
     if let Some(scenario) = profile.scenario {
         session_guard.profile.set_scenario(scenario);
@@ -1134,10 +1151,31 @@ fn maybe_run_tuning_cycle(state: &mut AgenticLoopState) {
         eprintln!("[auto-tuning] failed to persist feedback: {e}");
     }
 
+    let exploration = crate::exploration_engine::ExplorationEngine::default();
+    let created = match hub.pattern_library() {
+        Some(pattern_library) => match pattern_library.lock() {
+            Ok(pattern_library) => {
+                let experiments = hub.experiments();
+                exploration.check_and_create_experiments(&pattern_library, &experiments)
+            }
+            Err(err) => {
+                eprintln!("[adaptive-exec] failed to lock pattern library: {err}");
+                Vec::new()
+            }
+        },
+        None => Vec::new(),
+    };
+    if !created.is_empty() {
+        eprintln!(
+            "[adaptive-exec] created {} experiment(s): {:?}",
+            created.len(),
+            created.iter().map(|exp| &exp.id).collect::<Vec<_>>()
+        );
+    }
+
     let concluded = {
         let experiments = hub.experiments();
-        crate::exploration_engine::ExplorationEngine::default()
-            .conclude_mature_experiments(&experiments)
+        exploration.conclude_mature_experiments(&experiments)
     };
     if !concluded.is_empty() {
         eprintln!(
@@ -6442,6 +6480,53 @@ print(json.dumps({'context': 'user said: ' + msg}))
         assert_eq!(
             hub.experiments().get("exp-mature").map(|exp| exp.status),
             Some(crate::ab_testing::ExperimentStatus::Completed)
+        );
+    }
+
+    #[test]
+    fn tuning_cycle_creates_exploration_experiments_from_pattern_library() {
+        let hub = make_hub();
+        let session = make_session();
+        let mut state = make_state();
+        state.observability_hub = Some(hub.clone());
+        state.observability_session = Some(session);
+        state.completed_turns_for_tuning = TUNING_CYCLE_INTERVAL;
+
+        let pattern_library = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::pipeline::pattern::PatternLibrary::default(),
+        ));
+        {
+            let mut library = pattern_library.lock().unwrap();
+            library.record_outcome(
+                &["view".to_string()],
+                crate::pipeline::routing::TaskType::Fetch,
+                None,
+                false,
+                0.2,
+                None,
+            );
+            library.record_outcome(
+                &["view".to_string()],
+                crate::pipeline::routing::TaskType::Fetch,
+                None,
+                false,
+                0.3,
+                None,
+            );
+        }
+        hub.attach_pattern_library(pattern_library);
+
+        maybe_run_tuning_cycle(&mut state);
+
+        let experiments = hub.experiments();
+        let created = experiments.get("explore-fetch-any");
+        assert!(
+            created.is_some(),
+            "tuning cycle should auto-create exploration"
+        );
+        assert_eq!(
+            created.map(|experiment| experiment.status),
+            Some(crate::ab_testing::ExperimentStatus::Running)
         );
     }
 }

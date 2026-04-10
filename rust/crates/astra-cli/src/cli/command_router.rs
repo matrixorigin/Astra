@@ -257,6 +257,9 @@ async fn execute_repl_bridge_command(
     state.pattern_library = Some(pipeline_modules.pattern_library.clone());
     state.entity_graph = Some(pipeline_modules.entity_graph.clone());
     state.calibrator = Some(pipeline_modules.calibrator.clone());
+    if let Some(hub) = &state.observability_hub {
+        hub.attach_pattern_library(pipeline_modules.pattern_library.clone());
+    }
     state.unified_skill_registry = pipeline_modules.unified_skill_registry.clone();
     state.mcp_manager = pipeline_modules.mcp_manager.clone();
 
