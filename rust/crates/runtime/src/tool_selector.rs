@@ -567,6 +567,30 @@ impl TfIdfSelector {
                 user_feedback_score,
             );
         }
+
+        // Record tool usage feedback → ToolQualityTracker
+        if let Some(qt) = &self.quality_tracker
+            && let Ok(mut guard) = qt.lock()
+        {
+            // Record which tools were actually used (vs selected)
+            let feedback = tool_registry::SelectionFeedback {
+                tools_used: tools_used.to_vec(),
+                unused_count: 0, // not tracked at this level
+                precision: 0.0,
+                recall: 0.0,
+            };
+            guard.record_feedback(&feedback);
+
+            // Record per-tool quality based on turn success
+            let score = if success {
+                quality.clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            for tool in tools_used {
+                guard.record_quality(tool, score);
+            }
+        }
     }
 }
 
@@ -2764,6 +2788,60 @@ mod tests {
             0.7,
             true, // was corrected
             None,
+        );
+    }
+
+    #[tokio::test]
+    async fn record_turn_outcome_updates_quality_tracker() {
+        let tracker = Arc::new(Mutex::new(ToolQualityTracker::new()));
+        let selector = TfIdfSelector::new(mock_registry()).with_quality_tracker(tracker.clone());
+
+        // Record a successful turn using two tools
+        selector.record_turn_outcome(
+            "check PRs",
+            &["bash".into(), "grep".into()],
+            TaskType::Fetch,
+            None,
+            true,
+            0.9,
+            false,
+            None,
+        );
+
+        let guard = tracker.lock().unwrap();
+        let entries = guard.all_entries();
+
+        // Both tools should have 1 use and quality recorded
+        let bash = entries.get("bash").expect("bash should be tracked");
+        assert_eq!(bash.uses, 1, "bash should have 1 use");
+        assert!(
+            (bash.quality_sum - 0.9).abs() < 0.01,
+            "bash quality should be 0.9"
+        );
+
+        let grep = entries.get("grep").expect("grep should be tracked");
+        assert_eq!(grep.uses, 1, "grep should have 1 use");
+
+        drop(guard);
+
+        // Record a failed turn — quality should be 0.0
+        selector.record_turn_outcome(
+            "check PRs",
+            &["bash".into()],
+            TaskType::Fetch,
+            None,
+            false,
+            0.5,
+            false,
+            None,
+        );
+
+        let guard = tracker.lock().unwrap();
+        let bash = guard.all_entries().get("bash").unwrap();
+        assert_eq!(bash.uses, 2, "bash should have 2 uses");
+        assert!(
+            (bash.quality_sum - 0.9).abs() < 0.01,
+            "failed turn adds 0.0 quality"
         );
     }
 
