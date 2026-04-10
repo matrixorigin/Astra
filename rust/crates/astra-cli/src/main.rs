@@ -76,6 +76,8 @@ mod edge_lifecycle;
 mod effects;
 #[path = "cli/journal_digest.rs"]
 mod journal_digest;
+#[path = "cli/mock_llm.rs"]
+mod mock_llm;
 #[path = "cli/permission_manager.rs"]
 mod permission_manager;
 #[path = "cli/plan_executor.rs"]
@@ -124,8 +126,6 @@ mod slash_experiment;
 mod slash_profile;
 #[path = "cli/slash_tuning.rs"]
 mod slash_tuning;
-#[path = "cli/mock_llm.rs"]
-mod mock_llm;
 #[path = "cli/spawn_subrun.rs"]
 mod spawn_subrun;
 #[path = "cli/sse_utils.rs"]
@@ -5813,8 +5813,8 @@ async fn handle_task_command(
                     agent_spawner: bg_agent_spawner.clone(),
                     root_agent_id: Some(bg_root_agent_id.as_str()),
                     root_mailbox_slot: None,
-                observability_hub: None,
-                observability_session: None,
+                    observability_hub: None,
+                    observability_session: None,
                 })
                 .await;
 
@@ -6069,8 +6069,10 @@ async fn handle_slash_command(
                     state.cached_pricing = extract_pricing_for_model(&models, &chosen)
                         .unwrap_or_else(|| fallback_pricing(&chosen));
                     // M3: Use RuntimeConfig-driven context budget
-                    state.context_budget =
-                        prompts::ContextBudget::from_runtime_config(&state.runtime_config, Some(&chosen));
+                    state.context_budget = prompts::ContextBudget::from_runtime_config(
+                        &state.runtime_config,
+                        Some(&chosen),
+                    );
                     eprintln!(
                         "  {} {}",
                         theme::icon_ok(),
@@ -6117,8 +6119,8 @@ async fn handle_slash_command(
             handle_style_command(arg);
         }
 
-        "/history" | "/grep" | "/review" | "/copy" | "/diagnostics" | "/context" | "/version"
-        | "/rewind" | "/turn" | "/report" => {
+        "/history" | "/grep" | "/review" | "/copy" | "/diagnostics" | "/lsp" | "/context"
+        | "/version" | "/rewind" | "/turn" | "/report" => {
             handle_info_command(cmd, arg, api, state, token).await?;
         }
 
@@ -8083,8 +8085,8 @@ mod tests {
             agent_spawner: None,
             root_agent_id: None,
             root_mailbox_slot: None,
-                observability_hub: None,
-                observability_session: None,
+            observability_hub: None,
+            observability_session: None,
         })
         .await
         .unwrap();
@@ -8146,8 +8148,8 @@ mod tests {
             agent_spawner: None,
             root_agent_id: None,
             root_mailbox_slot: None,
-                observability_hub: None,
-                observability_session: None,
+            observability_hub: None,
+            observability_session: None,
         })
         .await;
         assert!(result.is_err());
@@ -8225,8 +8227,8 @@ mod tests {
             agent_spawner: None,
             root_agent_id: None,
             root_mailbox_slot: None,
-                observability_hub: None,
-                observability_session: None,
+            observability_hub: None,
+            observability_session: None,
         })
         .await
         .unwrap();

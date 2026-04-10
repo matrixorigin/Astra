@@ -1409,7 +1409,7 @@ impl ToolExecutor {
     /// Unified LSP tool providing code intelligence operations.
     /// Prefers a real stdio LSP backend when one is available for the workspace/file,
     /// then falls back to the existing symbol/AST-based implementations.
-    pub(super) fn lsp(&self, args: &Value) -> String {
+    pub(crate) fn lsp(&self, args: &Value) -> String {
         let operation = match args.get("operation").and_then(Value::as_str) {
             Some(op) => op,
             None => return json!({

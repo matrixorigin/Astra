@@ -923,6 +923,56 @@ fn lsp_diagnostics_returns_capabilities() {
             .is_some()
     );
     assert!(parsed["active_backends"]["rust"]["workspace_detected"].is_boolean());
+    assert!(parsed["active_backends"]["rust"]["enabled"].is_boolean());
+    assert!(parsed["active_backends"]["rust"]["command_available"].is_boolean());
+    assert!(parsed["active_backends"]["rust"]["session_started"].is_boolean());
+    assert!(parsed["active_backends"]["rust"]["session_state"].is_string());
+    assert!(parsed["active_backends"]["rust"]["last_start_error"].is_null());
+}
+
+#[cfg(unix)]
+#[test]
+#[serial_test::serial]
+fn lsp_diagnostics_reports_last_start_error_for_missing_rust_backend() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname=\"demo\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    let rust_file = dir.path().join("src/lib.rs");
+    std::fs::write(&rust_file, "pub fn hello_from_lsp() {}\n").unwrap();
+
+    let _enabled_guard = EnvGuard::set("ASTRA_LSP_RUST", "1");
+    let _cmd_guard = EnvGuard::set(
+        "ASTRA_RUST_ANALYZER_CMD",
+        "definitely-missing-rust-analyzer",
+    );
+
+    let exe = ToolExecutor::new(dir.path());
+    let request = serde_json::json!({
+        "operation": "document_links",
+        "file": rust_file.to_string_lossy(),
+    });
+    let failure = exe.lsp(&request);
+    assert!(failure.contains("failed to start rust-analyzer LSP session"));
+
+    let status = exe.lsp(&serde_json::json!({"operation": "diagnostics"}));
+    let parsed: serde_json::Value = serde_json::from_str(&status).unwrap();
+    assert_eq!(
+        parsed["active_backends"]["rust"]["session_state"].as_str(),
+        Some("command_missing")
+    );
+    assert_eq!(
+        parsed["active_backends"]["rust"]["command_available"].as_bool(),
+        Some(false)
+    );
+    let last_error = parsed["active_backends"]["rust"]["last_start_error"]
+        .as_str()
+        .unwrap_or("");
+    assert!(last_error.contains("failed to start rust-analyzer LSP session"));
+    assert!(last_error.contains("definitely-missing-rust-analyzer"));
 }
 
 #[cfg(unix)]

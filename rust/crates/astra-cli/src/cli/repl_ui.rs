@@ -98,6 +98,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/cost", "Per-session API cost estimate"),
     ("/tools", "Tool performance: calls, timing, success rate"),
     ("/health", "Tool health dashboard"),
+    ("/lsp", "LSP backend status: /lsp [status]"),
     ("/learn", "Learning insights: patterns, drift, exploration"),
     ("/sync", "Cloud sync status and push"),
     ("/context", "Context window / budget summary"),
@@ -844,6 +845,7 @@ fn slash_argument_hint(command: &str) -> Option<&'static str> {
         "/skill health" => Some("— registry + on-disk SKILL.md checks"),
         "/skill system" => Some("<name|list>"),
         "/diagnostics" => Some("— API, auth, binary, environment"),
+        "/lsp" => Some("[status] — backend readiness, command, last error"),
         "/mcp" => Some("[status|servers|prompts|resources|prompt|add|remove|ping|complete]"),
         "/memory" => Some("[list|search <q>|inspect <id>]"),
         "/diff" => Some("[staged|unstaged|stat|show <rev>|help|<paths…>]"),
@@ -1413,6 +1415,7 @@ pub(super) fn print_slash_commands(query: Option<&str>) {
             "System",
             &[
                 "/diagnostics",
+                "/lsp",
                 "/allow",
                 "/yolo",
                 "/instructions",
@@ -2558,7 +2561,14 @@ mod tests {
                 "/logout",
                 "/memory-setup",
             ],
-            &["/diagnostics", "/allow", "/yolo", "/instructions", "/style"],
+            &[
+                "/diagnostics",
+                "/lsp",
+                "/allow",
+                "/yolo",
+                "/instructions",
+                "/style",
+            ],
         ];
         let known: std::collections::HashSet<&str> =
             SLASH_COMMANDS.iter().map(|(cmd, _)| *cmd).collect();

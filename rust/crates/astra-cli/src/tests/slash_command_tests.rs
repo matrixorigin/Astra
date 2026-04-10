@@ -175,6 +175,25 @@ async fn slash_health_does_not_crash_empty() {
 }
 
 #[tokio::test]
+async fn slash_lsp_status_does_not_crash() {
+    let api = astra_thin_client::ThinClient::new("http://unused", None).unwrap();
+    let selector = tool_selector::TfIdfSelector::new(tool_registry::ToolRegistry::new(
+        edge_tools::all_tool_schemas(),
+    ));
+    let mut state = ReplState::default();
+
+    let exit = handle_slash_command("/lsp", &api, None, &mut state, None, &selector)
+        .await
+        .unwrap();
+    assert!(!exit);
+
+    let exit = handle_slash_command("/lsp status", &api, None, &mut state, None, &selector)
+        .await
+        .unwrap();
+    assert!(!exit);
+}
+
+#[tokio::test]
 async fn slash_health_with_entries_does_not_crash() {
     let api = astra_thin_client::ThinClient::new("http://unused", None).unwrap();
     let selector = tool_selector::TfIdfSelector::new(tool_registry::ToolRegistry::new(

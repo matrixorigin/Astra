@@ -55,6 +55,21 @@ fn typescript_server_cmd() -> String {
         .unwrap_or_else(|| "typescript-language-server".to_string())
 }
 
+fn command_available(command: &str) -> bool {
+    let path = Path::new(command);
+    if path.is_absolute() || command.contains(std::path::MAIN_SEPARATOR) {
+        return path.is_file();
+    }
+    std::env::var_os("PATH")
+        .map(|paths| {
+            std::env::split_paths(&paths).any(|dir| {
+                let candidate = dir.join(command);
+                candidate.is_file()
+            })
+        })
+        .unwrap_or(false)
+}
+
 fn rust_spawn_spec() -> LspSpawnSpec {
     let configuration = serde_json::json!({
         "lens": {
@@ -141,6 +156,7 @@ pub(crate) fn should_use_typescript_lsp(project_root: &Path, edited: &Path) -> b
 
 fn ensure_session(
     slot: &Mutex<Option<Arc<LspStdioSession>>>,
+    error_slot: &Mutex<Option<String>>,
     root: PathBuf,
     spec: LspSpawnSpec,
 ) -> Result<Arc<LspStdioSession>, String> {
@@ -151,18 +167,32 @@ fn ensure_session(
         .map_err(|_| format!("{diagnostic_title} LSP session mutex poisoned"))?;
     if g.is_none() {
         match LspStdioSession::try_spawn(root, spec) {
-            Ok(Some(s)) => *g = Some(Arc::clone(&s)),
+            Ok(Some(s)) => {
+                *g = Some(Arc::clone(&s));
+                if let Ok(mut last_error) = error_slot.lock() {
+                    *last_error = None;
+                }
+            }
             Ok(None) => {
-                return Err(format!(
+                let error = format!(
                     "failed to start {diagnostic_title} LSP session: command `{command}` was not found"
-                ));
+                );
+                if let Ok(mut last_error) = error_slot.lock() {
+                    *last_error = Some(error.clone());
+                }
+                return Err(error);
             }
             Err(error) => {
-                return Err(format!(
-                    "failed to start {diagnostic_title} LSP session: {error}"
-                ));
+                let error = format!("failed to start {diagnostic_title} LSP session: {error}");
+                if let Ok(mut last_error) = error_slot.lock() {
+                    *last_error = Some(error.clone());
+                }
+                return Err(error);
             }
         }
+    }
+    if let Ok(mut last_error) = error_slot.lock() {
+        *last_error = None;
     }
     g.as_ref()
         .map(Arc::clone)
@@ -190,6 +220,8 @@ fn typescript_active_supported(project_root: &Path, path: Option<&Path>) -> bool
 pub(crate) struct PassiveLspManager {
     rust: Mutex<Option<Arc<LspStdioSession>>>,
     typescript: Mutex<Option<Arc<LspStdioSession>>>,
+    rust_last_error: Mutex<Option<String>>,
+    typescript_last_error: Mutex<Option<String>>,
 }
 
 impl PassiveLspManager {
@@ -197,18 +229,30 @@ impl PassiveLspManager {
         Self {
             rust: Mutex::new(None),
             typescript: Mutex::new(None),
+            rust_last_error: Mutex::new(None),
+            typescript_last_error: Mutex::new(None),
         }
     }
 
     pub fn sync_after_write(&self, root: &Path, path: &Path) {
         let root_buf = root.to_path_buf();
         if should_use_rust_lsp(root, path)
-            && let Ok(s) = ensure_session(&self.rust, root_buf.clone(), rust_spawn_spec())
+            && let Ok(s) = ensure_session(
+                &self.rust,
+                &self.rust_last_error,
+                root_buf.clone(),
+                rust_spawn_spec(),
+            )
         {
             let _ = s.sync_document_from_disk(path);
         }
         if should_use_typescript_lsp(root, path)
-            && let Ok(s) = ensure_session(&self.typescript, root_buf, typescript_spawn_spec())
+            && let Ok(s) = ensure_session(
+                &self.typescript,
+                &self.typescript_last_error,
+                root_buf,
+                typescript_spawn_spec(),
+            )
         {
             let _ = s.sync_document_from_disk(path);
         }
@@ -217,12 +261,22 @@ impl PassiveLspManager {
     pub fn sync_after_write_with_content(&self, root: &Path, path: &Path, content: &str) {
         let root_buf = root.to_path_buf();
         if should_use_rust_lsp(root, path)
-            && let Ok(s) = ensure_session(&self.rust, root_buf.clone(), rust_spawn_spec())
+            && let Ok(s) = ensure_session(
+                &self.rust,
+                &self.rust_last_error,
+                root_buf.clone(),
+                rust_spawn_spec(),
+            )
         {
             let _ = s.sync_document_text(path, content);
         }
         if should_use_typescript_lsp(root, path)
-            && let Ok(s) = ensure_session(&self.typescript, root_buf, typescript_spawn_spec())
+            && let Ok(s) = ensure_session(
+                &self.typescript,
+                &self.typescript_last_error,
+                root_buf,
+                typescript_spawn_spec(),
+            )
         {
             let _ = s.sync_document_text(path, content);
         }
@@ -239,12 +293,14 @@ impl PassiveLspManager {
         let session = if rust_active_supported(root, Some(path)) {
             Some(ensure_session(
                 &self.rust,
+                &self.rust_last_error,
                 root_buf.clone(),
                 rust_spawn_spec(),
             )?)
         } else if typescript_active_supported(root, Some(path)) {
             Some(ensure_session(
                 &self.typescript,
+                &self.typescript_last_error,
                 root_buf,
                 typescript_spawn_spec(),
             )?)
@@ -277,12 +333,14 @@ impl PassiveLspManager {
         let session = if rust_active_supported(root, None) {
             Some(ensure_session(
                 &self.rust,
+                &self.rust_last_error,
                 root_buf.clone(),
                 rust_spawn_spec(),
             )?)
         } else if typescript_active_supported(root, None) {
             Some(ensure_session(
                 &self.typescript,
+                &self.typescript_last_error,
                 root_buf,
                 typescript_spawn_spec(),
             )?)
@@ -307,12 +365,14 @@ impl PassiveLspManager {
         let session = if rust_active_supported(root, Some(path)) {
             Some(ensure_session(
                 &self.rust,
+                &self.rust_last_error,
                 root_buf.clone(),
                 rust_spawn_spec(),
             )?)
         } else if typescript_active_supported(root, Some(path)) {
             Some(ensure_session(
                 &self.typescript,
+                &self.typescript_last_error,
                 root_buf,
                 typescript_spawn_spec(),
             )?)
@@ -333,16 +393,80 @@ impl PassiveLspManager {
     }
 
     pub fn active_status(&self, root: &Path) -> Value {
+        let rust_enabled = lsp_rust_enabled();
+        let rust_workspace_detected = rust_active_supported(root, None);
+        let rust_command = rust_analyzer_cmd();
+        let rust_command_available = command_available(&rust_command);
+        let rust_session_started = self
+            .rust
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().cloned())
+            .is_some();
+        let rust_last_error = self.rust_last_error.lock().ok().and_then(|g| g.clone());
+        let rust_session_state = if !rust_enabled {
+            "disabled"
+        } else if !rust_workspace_detected {
+            "workspace_not_detected"
+        } else if rust_session_started {
+            "running"
+        } else if !rust_command_available {
+            "command_missing"
+        } else if rust_last_error.is_some() {
+            "error"
+        } else {
+            "idle"
+        };
+
+        let typescript_enabled = lsp_typescript_enabled();
+        let typescript_workspace_detected = typescript_active_supported(root, None);
+        let typescript_command = typescript_server_cmd();
+        let typescript_command_available = command_available(&typescript_command);
+        let typescript_session_started = self
+            .typescript
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().cloned())
+            .is_some();
+        let typescript_last_error = self
+            .typescript_last_error
+            .lock()
+            .ok()
+            .and_then(|g| g.clone());
+        let typescript_session_state = if !typescript_enabled {
+            "disabled"
+        } else if !typescript_workspace_detected {
+            "workspace_not_detected"
+        } else if typescript_session_started {
+            "running"
+        } else if !typescript_command_available {
+            "command_missing"
+        } else if typescript_last_error.is_some() {
+            "error"
+        } else {
+            "idle"
+        };
+
         serde_json::json!({
             "rust": {
-                "workspace_detected": rust_active_supported(root, None),
-                "passive_diagnostics_enabled": lsp_rust_enabled(),
-                "command": rust_analyzer_cmd(),
+                "enabled": rust_enabled,
+                "workspace_detected": rust_workspace_detected,
+                "passive_diagnostics_enabled": rust_enabled,
+                "command": rust_command,
+                "command_available": rust_command_available,
+                "session_started": rust_session_started,
+                "session_state": rust_session_state,
+                "last_start_error": rust_last_error,
             },
             "typescript": {
-                "workspace_detected": typescript_active_supported(root, None),
-                "passive_diagnostics_enabled": lsp_typescript_enabled(),
-                "command": typescript_server_cmd(),
+                "enabled": typescript_enabled,
+                "workspace_detected": typescript_workspace_detected,
+                "passive_diagnostics_enabled": typescript_enabled,
+                "command": typescript_command,
+                "command_available": typescript_command_available,
+                "session_started": typescript_session_started,
+                "session_state": typescript_session_state,
+                "last_start_error": typescript_last_error,
             }
         })
     }

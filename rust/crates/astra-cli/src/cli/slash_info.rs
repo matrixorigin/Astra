@@ -120,6 +120,113 @@ fn run_git_stdout(project_root: &std::path::Path, args: &[&str]) -> String {
     }
 }
 
+fn lsp_backend_label(name: &str) -> &str {
+    match name {
+        "rust" => "Rust",
+        "typescript" => "TypeScript",
+        _ => name,
+    }
+}
+
+fn lsp_session_state_summary(session_state: &str) -> String {
+    match session_state {
+        "running" => format!("{} {}", theme::icon_ok(), "running".green()),
+        "idle" => format!("{} {}", "○".cyan(), "ready".cyan()),
+        "workspace_not_detected" => format!("{} {}", "·".dim(), "no workspace".dim()),
+        "disabled" => format!("{} {}", "·".dim(), "disabled".dim()),
+        "command_missing" => format!("{} {}", "✗".yellow(), "command missing".yellow()),
+        "error" => format!("{} {}", "✗".red(), "startup error".red()),
+        other => format!("{} {other}", "?".yellow()),
+    }
+}
+
+fn print_lsp_status_report(parsed: &serde_json::Value) {
+    eprintln!(
+        "\n{}",
+        "─── LSP Status ───────────────────────────────────────────────"
+            .bold()
+            .cyan()
+    );
+
+    let active_backends = parsed
+        .get("active_backends")
+        .and_then(serde_json::Value::as_object);
+    let mut printed_any = false;
+    if let Some(backends) = active_backends {
+        for key in ["rust", "typescript"] {
+            let Some(status) = backends.get(key) else {
+                continue;
+            };
+            printed_any = true;
+            let enabled = status
+                .get("enabled")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or_else(|| {
+                    status["passive_diagnostics_enabled"]
+                        .as_bool()
+                        .unwrap_or(false)
+                });
+            let workspace = status["workspace_detected"].as_bool().unwrap_or(false);
+            let command = status["command"].as_str().unwrap_or("?");
+            let command_available = status["command_available"].as_bool().unwrap_or(false);
+            let session_started = status["session_started"].as_bool().unwrap_or(false);
+            let session_state = status["session_state"].as_str().unwrap_or("unknown");
+
+            eprintln!(
+                "  {} {}",
+                lsp_backend_label(key).bold(),
+                lsp_session_state_summary(session_state)
+            );
+            eprintln!(
+                "     enabled: {}   workspace: {}   session started: {}",
+                if enabled { "yes".green() } else { "no".dim() },
+                if workspace { "yes".green() } else { "no".dim() },
+                if session_started {
+                    "yes".green()
+                } else {
+                    "no".dim()
+                }
+            );
+            if command_available {
+                eprintln!("     command: {}", command);
+            } else {
+                eprintln!(
+                    "     command: {}{}",
+                    command,
+                    " (not found on PATH)".yellow()
+                );
+            }
+            if let Some(error) = status["last_start_error"].as_str() {
+                eprintln!("     last error: {}", truncate_str(error, 140).yellow());
+            }
+            eprintln!();
+        }
+    }
+
+    if !printed_any {
+        eprintln!("  {}", "No LSP backend status available.".dim());
+        eprintln!();
+    }
+
+    if let Some(active) = parsed
+        .get("supported_languages")
+        .and_then(|v| v.get("active_lsp"))
+        .and_then(serde_json::Value::as_array)
+    {
+        let langs: Vec<&str> = active
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect();
+        if !langs.is_empty() {
+            eprintln!("  Active LSP language ids: {}", langs.join(", ").dim());
+        }
+    }
+    if let Some(note) = parsed.get("note").and_then(serde_json::Value::as_str) {
+        eprintln!("  {}", note.dim());
+    }
+    eprintln!();
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ReviewGitTarget<'a> {
     Head,
@@ -1044,6 +1151,32 @@ pub(super) async fn handle_info_command(
                 eprintln!("  {line}");
             }
             eprintln!();
+        }
+
+        "/lsp" => {
+            let subcommand = arg.trim();
+            if !subcommand.is_empty() && subcommand != "status" {
+                eprintln!("{}", "  Usage: /lsp [status]".yellow());
+                return Ok(());
+            }
+
+            let project_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            let executor = edge_tools::ToolExecutor::new(project_root);
+            let result = executor.lsp(&serde_json::json!({"operation": "diagnostics"}));
+            let parsed: serde_json::Value = serde_json::from_str(&result)
+                .unwrap_or_else(|_| serde_json::json!({ "error": "invalid lsp status response" }));
+
+            if let Some(error) = parsed.get("error").and_then(serde_json::Value::as_str) {
+                eprintln!(
+                    "\n{}\n  {}\n",
+                    "─── LSP Status ───────────────────────────────────────────────"
+                        .bold()
+                        .cyan(),
+                    error.yellow()
+                );
+            } else {
+                print_lsp_status_report(&parsed);
+            }
         }
 
         "/review" => {
