@@ -1143,7 +1143,7 @@ pub fn all_tool_schemas() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "lsp",
-                "description": "Interact with Language Server Protocol for editor-grade code intelligence from an active language server. Unified interface for declaration, definition, type definition, references, hover, symbols, call hierarchy, type hierarchy supertypes/subtypes, completions, signature help, document highlights, document links, inlay hints, folding ranges, document colors, color presentations, semantic tokens, code lenses, selection ranges, linked editing, document/range/on-type formatting, rename preparation, rename, code actions, and diagnostics. Prefer this over text search when you need symbol-aware navigation or follow-up actions. Use action_index with code_actions apply, item_index to resolve or execute/apply a returned completion or code lens, and dry_run=false only for supported write operations. Without a file, diagnostics reports backend availability; with a file, diagnostics returns the latest publishDiagnostics snapshot.",
+                "description": "Interact with Language Server Protocol for editor-grade code intelligence from an active language server. Unified interface for declaration, definition, type definition, references, hover, symbols, call hierarchy, type hierarchy supertypes/subtypes, completions, signature help, document highlights, document links, inlay hints, folding ranges, document colors, color presentations, semantic tokens, code lenses, selection ranges, linked editing, document/range/on-type formatting, rename preparation, rename, code actions, and diagnostics. Prefer this over text search when you need symbol-aware navigation or follow-up actions. Use action_index with code_actions apply, item_index to resolve or execute/apply a returned completion or code lens, and dry_run=false only for supported write operations. On Rust files, code_lenses may fall back to rust-analyzer runnables when standard LSP code lenses are empty. Without a file, diagnostics reports backend availability; with a file, diagnostics returns the latest publishDiagnostics snapshot.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -1223,7 +1223,7 @@ pub fn all_tool_schemas() -> Vec<Value> {
                         },
                         "dry_run": {
                             "type": "boolean",
-                            "description": "Preview by default. Set false only to apply a supported rename, document/range/on-type format, code action edit, selected completion item, or selected code lens command."
+                            "description": "Preview by default. Set false only to apply a supported rename, document/range/on-type format, code action edit, selected completion item, or selected code lens command/runnable."
                         },
                         "action_index": {
                             "type": "integer",

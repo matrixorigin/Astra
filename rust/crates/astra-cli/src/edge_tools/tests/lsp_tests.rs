@@ -11,6 +11,7 @@ fn fake_lsp_server_script(dir: &std::path::Path) -> std::path::PathBuf {
 import json
 import os
 import sys
+import urllib.parse
 
 def read_frame():
     headers = {}
@@ -469,28 +470,35 @@ while True:
             }
         })
     elif method == "textDocument/codeLens":
-        write_frame({
-            "jsonrpc": "2.0",
-            "id": msg_id,
-            "result": [{
-                "range": {
-                    "start": {"line": 0, "character": 0},
-                    "end": {"line": 0, "character": 3}
-                },
-                "command": {
-                    "title": "1 reference",
-                    "command": "fake.references"
-                }
-            }, {
-                "range": {
-                    "start": {"line": 0, "character": 4},
-                    "end": {"line": 0, "character": 8}
-                },
-                "data": {
-                    "resolve_kind": "code_lens"
-                }
-            }]
-        })
+        if os.environ.get("FAKE_LSP_EMPTY_CODE_LENSES") == "1":
+            write_frame({
+                "jsonrpc": "2.0",
+                "id": msg_id,
+                "result": []
+            })
+        else:
+            write_frame({
+                "jsonrpc": "2.0",
+                "id": msg_id,
+                "result": [{
+                    "range": {
+                        "start": {"line": 0, "character": 0},
+                        "end": {"line": 0, "character": 3}
+                    },
+                    "command": {
+                        "title": "1 reference",
+                        "command": "fake.references"
+                    }
+                }, {
+                    "range": {
+                        "start": {"line": 0, "character": 4},
+                        "end": {"line": 0, "character": 8}
+                    },
+                    "data": {
+                        "resolve_kind": "code_lens"
+                    }
+                }]
+            })
     elif method == "codeLens/resolve":
         lens = message["params"]
         write_frame({
@@ -504,6 +512,37 @@ while True:
                     "arguments": ["resolved-code-lens"]
                 }
             }
+        })
+    elif method == "experimental/runnables":
+        uri = message["params"]["textDocument"]["uri"]
+        path = urllib.parse.urlparse(uri).path
+        workspace = os.path.dirname(os.path.dirname(path))
+        write_frame({
+            "jsonrpc": "2.0",
+            "id": msg_id,
+            "result": [{
+                "label": "run fake runnable",
+                "location": {
+                    "targetUri": uri,
+                    "targetRange": {
+                        "start": {"line": 0, "character": 0},
+                        "end": {"line": 0, "character": 3}
+                    },
+                    "targetSelectionRange": {
+                        "start": {"line": 0, "character": 0},
+                        "end": {"line": 0, "character": 3}
+                    }
+                },
+                "kind": "cargo",
+                "args": {
+                    "cwd": workspace,
+                    "workspaceRoot": workspace,
+                    "overrideCargo": None,
+                    "cargoArgs": ["run", "--quiet"],
+                    "executableArgs": [],
+                    "environment": {}
+                }
+            }]
         })
     elif method == "textDocument/selectionRange":
         write_frame({
@@ -1385,6 +1424,76 @@ fn lsp_code_lenses_execute_selected_item_when_dry_run_false() {
     assert_eq!(
         parsed["result"]["arguments"][0].as_str(),
         Some("resolved-code-lens")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+#[serial_test::serial]
+fn lsp_code_lenses_fall_back_to_rust_analyzer_runnables_when_empty() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname=\"demo\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(dir.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+    let script = fake_lsp_server_script(dir.path());
+    let _cmd_guard = EnvGuard::set("ASTRA_RUST_ANALYZER_CMD", script.to_str().unwrap());
+    let _lens_guard = EnvGuard::set("FAKE_LSP_EMPTY_CODE_LENSES", "1");
+    let exe = ToolExecutor::new(dir.path());
+
+    let result = exe.lsp(&json!({
+        "operation": "code_lenses",
+        "file": "src/main.rs"
+    }));
+    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+
+    assert_eq!(parsed["backend"].as_str(), Some("lsp"));
+    assert_eq!(parsed["method"].as_str(), Some("experimental/runnables"));
+    assert_eq!(
+        parsed["result"][0]["command"]["title"].as_str(),
+        Some("run fake runnable")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+#[serial_test::serial]
+fn lsp_code_lenses_execute_rust_analyzer_runnable_fallback_when_dry_run_false() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname=\"demo\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(
+        dir.path().join("src/main.rs"),
+        "fn main() { println!(\"fake-runnable-output\"); }\n",
+    )
+    .unwrap();
+    let script = fake_lsp_server_script(dir.path());
+    let _cmd_guard = EnvGuard::set("ASTRA_RUST_ANALYZER_CMD", script.to_str().unwrap());
+    let _lens_guard = EnvGuard::set("FAKE_LSP_EMPTY_CODE_LENSES", "1");
+    let exe = ToolExecutor::new(dir.path());
+
+    let result = exe.lsp(&json!({
+        "operation": "code_lenses",
+        "file": "src/main.rs",
+        "item_index": 0,
+        "dry_run": false
+    }));
+    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+
+    assert_eq!(parsed["method"].as_str(), Some("experimental/runnables"));
+    assert_eq!(parsed["executed"].as_bool(), Some(true));
+    assert_eq!(parsed["command"].as_str(), Some("cargo"));
+    assert!(
+        parsed["stdout"]
+            .as_str()
+            .is_some_and(|stdout| stdout.contains("fake-runnable-output"))
     );
 }
 
@@ -2345,8 +2454,8 @@ fn lsp_code_lenses_execute_selected_item_with_real_rust_analyzer() {
     .unwrap();
     std::fs::create_dir_all(dir.path().join("src")).unwrap();
     std::fs::write(
-        dir.path().join("src/lib.rs"),
-        "pub fn hello_from_lsp() {}\n\npub fn demo() {\n    hello_from_lsp();\n}\n",
+        dir.path().join("src/main.rs"),
+        "fn main() { println!(\"real-runnable-output\"); }\n",
     )
     .unwrap();
     let exe = ToolExecutor::new(dir.path());
@@ -2356,11 +2465,16 @@ fn lsp_code_lenses_execute_selected_item_with_real_rust_analyzer() {
     for _ in 0..12 {
         let candidate = exe.lsp(&json!({
             "operation": "code_lenses",
-            "file": "src/lib.rs"
+            "file": "src/main.rs"
         }));
         let parsed: serde_json::Value = serde_json::from_str(&candidate).unwrap();
         if let Some(items) = parsed["result"].as_array()
-            && !items.is_empty()
+            && items.iter().any(|lens| {
+                lens.get("command")
+                    .and_then(|command| command.get("title"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|title| title.starts_with("run ") || title.starts_with("test "))
+            })
         {
             preview = Some(candidate);
             lenses = Some(items.clone());
@@ -2374,22 +2488,33 @@ fn lsp_code_lenses_execute_selected_item_with_real_rust_analyzer() {
     let preview = preview.unwrap();
     let idx = lenses
         .iter()
-        .position(|lens| lens.get("command").is_none())
+        .position(|lens| {
+            lens.get("command")
+                .and_then(|command| command.get("title"))
+                .and_then(Value::as_str)
+                .is_some_and(|title| title.starts_with("run "))
+        })
         .unwrap_or(0);
 
     let executed = exe.lsp(&json!({
         "operation": "code_lenses",
-        "file": "src/lib.rs",
+        "file": "src/main.rs",
         "item_index": idx,
         "dry_run": false
     }));
     let parsed: serde_json::Value = serde_json::from_str(&executed).unwrap();
     assert_eq!(
         parsed["method"].as_str(),
-        Some("workspace/executeCommand"),
+        Some("experimental/runnables"),
         "unexpected code_lens preview: {preview}; execute result: {executed}"
     );
-    assert_eq!(parsed["executed"].as_bool(), Some(true));
+    assert_eq!(parsed["executed"].as_bool(), Some(true), "{executed}");
+    assert!(
+        parsed["stdout"]
+            .as_str()
+            .is_some_and(|stdout| stdout.contains("real-runnable-output")),
+        "{executed}"
+    );
 }
 
 #[test]

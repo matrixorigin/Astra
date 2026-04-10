@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 use url::Url;
 
 use super::lsp_stdio_session::path_to_uri;
+use super::shell::shell_escape;
 use super::{MAX_LSP_FILE_SIZE, ToolExecutor, utf16_col_to_char_idx};
 
 impl ToolExecutor {
@@ -521,6 +522,9 @@ impl ToolExecutor {
                 format!("selected {operation} command is missing command identifier")
             })?
             .to_string();
+        if command_name == "astra.rust-analyzer.runnable" {
+            return self.execute_rust_analyzer_runnable(operation, &title, command);
+        }
         let arguments = command
             .get("arguments")
             .cloned()
@@ -544,6 +548,96 @@ impl ToolExecutor {
             "command": command_name,
             "title": title,
             "result": result.unwrap_or(Value::Null),
+        })
+        .to_string())
+    }
+
+    fn execute_rust_analyzer_runnable(
+        &self,
+        operation: &str,
+        title: &str,
+        command: &Value,
+    ) -> Result<String, String> {
+        let runnable = command
+            .get("arguments")
+            .and_then(Value::as_array)
+            .and_then(|args| args.first())
+            .ok_or_else(|| {
+                "rust-analyzer runnable command is missing runnable payload".to_string()
+            })?;
+        let runnable_args = runnable
+            .get("args")
+            .ok_or_else(|| "rust-analyzer runnable is missing args".to_string())?;
+        let cwd = runnable_args
+            .get("cwd")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "rust-analyzer runnable is missing args.cwd".to_string())?;
+        let cargo_program = runnable_args
+            .get("overrideCargo")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("cargo");
+        let cargo_args = runnable_args
+            .get("cargoArgs")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "rust-analyzer runnable is missing args.cargoArgs".to_string())?;
+        let executable_args = runnable_args
+            .get("executableArgs")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let environment = runnable_args
+            .get("environment")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+
+        let mut parts = vec![
+            format!("cd {}", shell_escape(cwd)),
+            "&&".to_string(),
+            "env".to_string(),
+        ];
+        for (key, value) in environment {
+            let Some(value) = value.as_str() else {
+                return Err(format!(
+                    "rust-analyzer runnable environment value for {key} must be a string"
+                ));
+            };
+            parts.push(format!("{key}={}", shell_escape(value)));
+        }
+        parts.push(shell_escape(cargo_program));
+        for arg in cargo_args {
+            let Some(arg) = arg.as_str() else {
+                return Err("rust-analyzer runnable cargoArgs must be strings".to_string());
+            };
+            parts.push(shell_escape(arg));
+        }
+        let exec_args: Vec<String> = executable_args
+            .iter()
+            .filter_map(Value::as_str)
+            .filter(|arg| !arg.is_empty())
+            .map(str::to_string)
+            .collect();
+        if !exec_args.is_empty() {
+            parts.push("--".to_string());
+            parts.extend(exec_args.iter().map(|arg| shell_escape(arg)));
+        }
+        let command_line = parts.join(" ");
+        let output = self.run_shell_output(&command_line, 30.0)?;
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        Ok(json!({
+            "backend": "lsp",
+            "operation": operation,
+            "method": "experimental/runnables",
+            "executed": output.status.success(),
+            "title": title,
+            "command": cargo_program,
+            "cargo_args": cargo_args,
+            "executable_args": exec_args,
+            "exit_code": output.status.code(),
+            "stdout": stdout,
+            "stderr": stderr,
         })
         .to_string())
     }
@@ -716,6 +810,77 @@ impl ToolExecutor {
                 "textDocument": { "uri": uri },
             }),
         )
+    }
+
+    fn try_active_rust_analyzer_runnables(&self, file: &str) -> Result<Option<Value>, String> {
+        let (file_path, uri) = self.ensure_lsp_file_ready(file)?;
+        if file_path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+            return Ok(None);
+        }
+        self.passive_lsp.request_for_file(
+            &self.project_root,
+            &file_path,
+            "experimental/runnables",
+            json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": 0, "character": 0 },
+            }),
+        )
+    }
+
+    fn rust_analyzer_runnables_to_code_lenses(runnables: &Value) -> Value {
+        let Some(items) = runnables.as_array() else {
+            return Value::Array(Vec::new());
+        };
+        Value::Array(
+            items.iter()
+                .map(|item| {
+                    let range = item
+                        .pointer("/location/targetRange")
+                        .cloned()
+                        .or_else(|| item.pointer("/location/targetSelectionRange").cloned())
+                        .unwrap_or_else(|| {
+                            json!({
+                                "start": { "line": 0, "character": 0 },
+                                "end": { "line": 0, "character": 0 },
+                            })
+                        });
+                    json!({
+                        "range": range,
+                        "command": {
+                            "title": item.get("label").and_then(Value::as_str).unwrap_or("rust-analyzer runnable"),
+                            "command": "astra.rust-analyzer.runnable",
+                            "arguments": [item.clone()],
+                        },
+                        "data": {
+                            "source": "experimental/runnables",
+                            "kind": item.get("kind").cloned().unwrap_or(Value::Null),
+                        }
+                    })
+                })
+                .collect(),
+        )
+    }
+
+    fn try_active_code_lenses_with_fallback(
+        &self,
+        file: &str,
+    ) -> Result<Option<(&'static str, Value)>, String> {
+        match self.try_active_code_lenses(file)? {
+            Some(result) if result.as_array().is_some_and(|items| !items.is_empty()) => {
+                Ok(Some(("textDocument/codeLens", result)))
+            }
+            Some(result) => match self.try_active_rust_analyzer_runnables(file)? {
+                Some(runnables) if runnables.as_array().is_some_and(|items| !items.is_empty()) => {
+                    Ok(Some((
+                        "experimental/runnables",
+                        Self::rust_analyzer_runnables_to_code_lenses(&runnables),
+                    )))
+                }
+                _ => Ok(Some(("textDocument/codeLens", result))),
+            },
+            None => Ok(None),
+        }
     }
 
     fn try_resolve_completion_item(
@@ -1819,8 +1984,8 @@ impl ToolExecutor {
                             "error": "code_lenses execution requires 'item_index' to choose a returned code lens"
                         }).to_string();
                     }
-                    match self.try_active_code_lenses(f) {
-                        Ok(Some(result)) => {
+                    match self.try_active_code_lenses_with_fallback(f) {
+                        Ok(Some((preview_method, result))) => {
                             if let Some(idx) = item_index {
                                 let Some(lens) = result.as_array().and_then(|items| items.get(idx))
                                 else {
@@ -1832,12 +1997,18 @@ impl ToolExecutor {
                                     })
                                     .to_string();
                                 };
-                                let (method, selected_lens) = match self.try_resolve_code_lens(
-                                    f, lens,
-                                ) {
-                                    Ok(Some(resolved)) => ("codeLens/resolve", resolved),
-                                    Ok(None) => ("textDocument/codeLens", lens.clone()),
-                                    Err(error) => return json!({ "error": error }).to_string(),
+                                let (method, selected_lens) = if preview_method
+                                    == "textDocument/codeLens"
+                                {
+                                    match self.try_resolve_code_lens(f, lens) {
+                                        Ok(Some(resolved)) => ("codeLens/resolve", resolved),
+                                        Ok(None) => ("textDocument/codeLens", lens.clone()),
+                                        Err(error) => {
+                                            return json!({ "error": error }).to_string();
+                                        }
+                                    }
+                                } else {
+                                    (preview_method, lens.clone())
                                 };
                                 if dry_run {
                                     json!({
@@ -1859,7 +2030,7 @@ impl ToolExecutor {
                                     }).to_string()
                                 }
                             } else {
-                                Self::active_lsp_response("code_lenses", "textDocument/codeLens", result)
+                                Self::active_lsp_response("code_lenses", preview_method, result)
                             }
                         }
                         Ok(None) => json!({
