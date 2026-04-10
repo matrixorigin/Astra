@@ -1245,7 +1245,6 @@ mod tests {
     }
 
     #[async_trait]
-    #[async_trait]
     impl SubRunExecutor for TokenBudgetExecutor {
         async fn execute(&self, config: SubRunConfig) -> Result<AgentResult, String> {
             Ok(AgentResult {
