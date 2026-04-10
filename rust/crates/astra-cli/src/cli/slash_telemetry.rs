@@ -376,7 +376,7 @@ fn show_decisions(
 
     eprintln!(
         "\n{}",
-        "─── Tool Selection Decisions ────────────────────"
+        "─── Decision History ────────────────────────────"
             .bold()
             .cyan()
     );
@@ -391,10 +391,53 @@ fn show_decisions(
             conf_str.red()
         };
 
+        // Format decision type nicely
+        use astra_runtime::turn::decision_explainer::DecisionType;
+        let type_label = match &decision.decision_type {
+            DecisionType::ToolSelection {
+                selected_tools,
+                total_available,
+            } => {
+                format!(
+                    "ToolSelection ({}/{})",
+                    selected_tools.len(),
+                    total_available
+                )
+            }
+            DecisionType::HistoryCompression {
+                turns_compressed,
+                turns_retained,
+                compression_ratio,
+            } => {
+                format!(
+                    "HistoryCompression (-{}/+{}, {:.0}%)",
+                    turns_compressed.len(),
+                    turns_retained.len(),
+                    compression_ratio * 100.0
+                )
+            }
+            DecisionType::MemoryRetrieval {
+                memories_selected,
+                total_candidates,
+            } => {
+                format!(
+                    "MemoryRetrieval ({}/{})",
+                    memories_selected.len(),
+                    total_candidates
+                )
+            }
+            DecisionType::StrategyChoice { strategy, .. } => {
+                format!("StrategyChoice: {}", strategy)
+            }
+            DecisionType::ModelRouting { selected_model, .. } => {
+                format!("ModelRouting → {}", selected_model)
+            }
+        };
+
         eprintln!(
-            "  {} {:?} — {} confidence",
+            "  {} {} — {} confidence",
             format!("[{}]", i + 1).dim(),
-            decision.decision_type,
+            type_label.cyan(),
             conf_color
         );
 
