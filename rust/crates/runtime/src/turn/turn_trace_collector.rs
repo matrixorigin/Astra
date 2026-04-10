@@ -154,6 +154,42 @@ impl TurnTraceCollector {
         }
     }
 
+    /// Record pre-estimated token breakdown from context assembly.
+    ///
+    /// Unlike `record_token_budget`, this only sets the estimated component values
+    /// (system_prompt, history, tool_schema, user_message) without overwriting
+    /// actual measured values that runtime will set later.
+    pub fn record_token_budget_estimate(
+        &self,
+        system_prompt_tokens: u32,
+        history_tokens: u32,
+        memory_tokens: u32,
+        tool_schema_tokens: u32,
+        user_message_tokens: u32,
+        estimated_total: u32,
+        max_tokens: u32,
+        budget_pressure: f64,
+    ) {
+        if let Ok(mut state) = self.inner.write() {
+            let budget = state.token_budget.get_or_insert_with(TokenBudgetTrace::default);
+            budget.system_prompt_tokens = system_prompt_tokens;
+            budget.history_tokens = history_tokens;
+            budget.memory_tokens = memory_tokens;
+            budget.tool_schema_tokens = tool_schema_tokens;
+            budget.user_message_tokens = user_message_tokens;
+            // Set estimated total (runtime will overwrite with actual measured value later)
+            if budget.total_used == 0 {
+                budget.total_used = estimated_total;
+            }
+            if budget.max_tokens == 0 {
+                budget.max_tokens = max_tokens;
+            }
+            if budget.budget_pressure == 0.0 {
+                budget.budget_pressure = budget_pressure;
+            }
+        }
+    }
+
     /// Add a decision explanation.
     pub fn add_explanation(&self, explanation: DecisionExplanation) {
         if let Ok(mut state) = self.inner.write() {
