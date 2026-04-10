@@ -1,5 +1,5 @@
-use crate::{cli_dim, cli_err, cli_ok, cli_warn};
 use super::*;
+use crate::{cli_dim, cli_err, cli_ok, cli_warn};
 use std::io::Write;
 use std::process::{Command as SysCommand, Stdio};
 

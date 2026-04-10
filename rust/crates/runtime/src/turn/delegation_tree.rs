@@ -3,9 +3,9 @@
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
-use crate::orchestration::{AgentStatus, SpawnedAgentInfo};
 #[cfg(test)]
 use crate::orchestration::SpawnedAgentMetrics;
+use crate::orchestration::{AgentStatus, SpawnedAgentInfo};
 
 /// Node in the agent delegation tree.
 #[derive(Debug, Clone)]
@@ -254,9 +254,30 @@ mod tests {
     #[test]
     fn test_build_simple_tree() {
         let agents = vec![
-            make_agent("main", "run-1", "root", AgentStatus::Running { activity: "planning".into() }),
-            make_agent("child-1", "run-2", "run-1", AgentStatus::Completed { result: "ok".into() }),
-            make_agent("child-2", "run-3", "run-1", AgentStatus::Running { activity: "coding".into() }),
+            make_agent(
+                "main",
+                "run-1",
+                "root",
+                AgentStatus::Running {
+                    activity: "planning".into(),
+                },
+            ),
+            make_agent(
+                "child-1",
+                "run-2",
+                "run-1",
+                AgentStatus::Completed {
+                    result: "ok".into(),
+                },
+            ),
+            make_agent(
+                "child-2",
+                "run-3",
+                "run-1",
+                AgentStatus::Running {
+                    activity: "coding".into(),
+                },
+            ),
         ];
 
         let forest = AgentTreeNode::build_forest(&agents);
@@ -268,9 +289,30 @@ mod tests {
     #[test]
     fn test_render_tree() {
         let agents = vec![
-            make_agent("main", "run-1", "root", AgentStatus::Running { activity: "planning".into() }),
-            make_agent("researcher", "run-2", "run-1", AgentStatus::Completed { result: "ok".into() }),
-            make_agent("coder", "run-3", "run-1", AgentStatus::Running { activity: "writing".into() }),
+            make_agent(
+                "main",
+                "run-1",
+                "root",
+                AgentStatus::Running {
+                    activity: "planning".into(),
+                },
+            ),
+            make_agent(
+                "researcher",
+                "run-2",
+                "run-1",
+                AgentStatus::Completed {
+                    result: "ok".into(),
+                },
+            ),
+            make_agent(
+                "coder",
+                "run-3",
+                "run-1",
+                AgentStatus::Running {
+                    activity: "writing".into(),
+                },
+            ),
             make_agent("tester", "run-4", "run-3", AgentStatus::Idle),
         ];
 

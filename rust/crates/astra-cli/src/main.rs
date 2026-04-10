@@ -64,6 +64,8 @@ mod cli_formatting;
 mod cli_output;
 #[path = "cli/cli_utils.rs"]
 mod cli_utils;
+#[path = "cli/command_registry.rs"]
+mod command_registry;
 #[path = "cli/command_router.rs"]
 mod command_router;
 #[path = "cli/delegate_subrun.rs"]
@@ -94,8 +96,6 @@ mod repl_runtime;
 mod repl_turn;
 #[path = "cli/repl_ui.rs"]
 mod repl_ui;
-#[path = "cli/command_registry.rs"]
-mod command_registry;
 #[path = "cli/skill_subrun.rs"]
 mod skill_subrun;
 #[path = "cli/slash_account.rs"]
@@ -243,12 +243,22 @@ impl StartupTracer {
         eprintln!("  {}", "─".repeat(50).dim());
         for (name, dur) in &self.phases {
             let ms = dur.as_millis();
-            let bar = if ms > 100 { "█".repeat((ms / 20) as usize).yellow() } else { "█".repeat((ms / 20).max(1) as usize).dim() };
+            let bar = if ms > 100 {
+                "█".repeat((ms / 20) as usize).yellow()
+            } else {
+                "█".repeat((ms / 20).max(1) as usize).dim()
+            };
             eprintln!("  {:30} {:>6}ms {}", name, ms, bar);
         }
         eprintln!("  {}", "─".repeat(50).dim());
         let total_ms = total.as_millis();
-        let status = if total_ms < 200 { "✓".green() } else if total_ms < 500 { "⚠".yellow() } else { "✗".red() };
+        let status = if total_ms < 200 {
+            "✓".green()
+        } else if total_ms < 500 {
+            "⚠".yellow()
+        } else {
+            "✗".red()
+        };
         eprintln!("  {:30} {:>6}ms {}", "Total".bold(), total_ms, status);
         eprintln!();
     }

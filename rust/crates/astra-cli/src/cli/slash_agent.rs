@@ -428,10 +428,7 @@ fn show_watch(ctx: &AgentCommandContext) {
         }
     };
 
-    eprintln!(
-        "\n  {} Watching agent tree (Ctrl+C to stop)\n",
-        "👁".cyan()
-    );
+    eprintln!("\n  {} Watching agent tree (Ctrl+C to stop)\n", "👁".cyan());
 
     // Subscribe to progress events
     let mut rx = spawner.subscribe_progress();
@@ -666,11 +663,7 @@ fn print_progress_event(event: &astra_runtime::orchestration::AgentProgressEvent
         } => {
             format!(
                 "📊 {}/{} turns | {} tools | {}+{} tokens",
-                turn,
-                max_turns,
-                total_tool_calls,
-                total_prompt_tokens,
-                total_completion_tokens
+                turn, max_turns, total_tool_calls, total_prompt_tokens, total_completion_tokens
             )
         }
         ProgressEventType::AgentSpawned {

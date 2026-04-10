@@ -1,5 +1,5 @@
-use crate::{cli_dim, cli_err, cli_ok, cli_section, cli_warn};
 use super::*;
+use crate::{cli_dim, cli_err, cli_ok, cli_section, cli_warn};
 use crate::{current_access_token, initialize_multi_agent_runtime, post_auth_cloud_resync};
 
 async fn refresh_auth_runtime(
@@ -89,7 +89,9 @@ pub(super) async fn handle_account_command(
         "/memory-setup" => {
             if arg.is_empty() {
                 cli_dim!("Usage: /memory-setup <api_key>");
-                cli_dim!("Get a key from Memoria: curl -X POST http://localhost:8100/auth/keys -H 'Authorization: Bearer <master_key>' -H 'Content-Type: application/json' -d '{{\"user_id\":\"<user>\",\"name\":\"astra\"}}'");
+                cli_dim!(
+                    "Get a key from Memoria: curl -X POST http://localhost:8100/auth/keys -H 'Authorization: Bearer <master_key>' -H 'Content-Type: application/json' -d '{{\"user_id\":\"<user>\",\"name\":\"astra\"}}'"
+                );
             } else {
                 let mut creds = load_credentials();
                 let pname = profile_name(profile, &creds);

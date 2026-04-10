@@ -84,6 +84,7 @@ mod app_state;
 pub mod auto_tuning;
 pub mod bridge;
 pub mod evaluation;
+pub mod execution_profile;
 pub mod introspection;
 pub mod matrix_cloud_runtime;
 pub mod observability_integration;

@@ -1,6 +1,6 @@
 #![allow(unused_imports)]
-use crate::{cli_dim, cli_section, cli_warn};
 use super::*;
+use crate::{cli_dim, cli_section, cli_warn};
 
 // ═══════════════════════════════════════════════ Tool Profile ═════════════
 

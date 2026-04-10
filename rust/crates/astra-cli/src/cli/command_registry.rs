@@ -88,11 +88,7 @@ pub struct CommandMeta {
 
 impl CommandMeta {
     /// Create a new command with defaults.
-    pub const fn new(
-        name: &'static str,
-        description: &'static str,
-        group: CommandGroup,
-    ) -> Self {
+    pub const fn new(name: &'static str, description: &'static str, group: CommandGroup) -> Self {
         Self {
             name,
             description,
@@ -165,7 +161,10 @@ const SKILL_SUBCOMMANDS: &[(&str, &str)] = &[
 
 const MCP_SUBCOMMANDS: &[(&str, &str)] = &[
     ("add", "Add: /mcp add <name> <command> [args…]"),
-    ("complete", "Completions: /mcp complete <server>:prompt:<name> <arg> [value]"),
+    (
+        "complete",
+        "Completions: /mcp complete <server>:prompt:<name> <arg> [value]",
+    ),
     ("log-level", "Set level: /mcp log-level <server> <level>"),
     ("ping", "Ping: /mcp ping [server]"),
     ("prompt", "Invoke: /mcp prompt <server>:<name> [args]"),
@@ -176,7 +175,10 @@ const MCP_SUBCOMMANDS: &[(&str, &str)] = &[
     ("servers", "Show server details and tools"),
     ("status", "Show connection status table"),
     ("subscribe", "Subscribe: /mcp subscribe <server>:<uri>"),
-    ("unsubscribe", "Unsubscribe: /mcp unsubscribe <server>:<uri>"),
+    (
+        "unsubscribe",
+        "Unsubscribe: /mcp unsubscribe <server>:<uri>",
+    ),
 ];
 
 const PLAN_SUBCOMMANDS: &[(&str, &str)] = &[
@@ -224,9 +226,7 @@ const DIFF_SUBCOMMANDS: &[(&str, &str)] = &[
     ("unstaged", "Unstaged only"),
 ];
 
-const TURN_SUBCOMMANDS: &[(&str, &str)] = &[
-    ("list", "List all journal turns"),
-];
+const TURN_SUBCOMMANDS: &[(&str, &str)] = &[("list", "List all journal turns")];
 
 const STYLE_SUBCOMMANDS: &[(&str, &str)] = &[
     ("colorful", "Colorful theme"),
@@ -292,120 +292,336 @@ const TUNING_SUBCOMMANDS: &[(&str, &str)] = &[
     ("status", "Show tuning status (default)"),
 ];
 
-const HELP_SUBCOMMANDS: &[(&str, &str)] = &[
-    ("keys", "Keyboard shortcuts"),
-];
+const HELP_SUBCOMMANDS: &[(&str, &str)] = &[("keys", "Keyboard shortcuts")];
 
 // ── The unified command registry ────────────────────────────────────────────
 
 /// All registered slash commands.
 pub static COMMANDS: &[CommandMeta] = &[
     // ── Core ──────────────────────────────────────────────────────────────
-    CommandMeta::new("/help", "Show available commands; /help keys for shortcuts", CommandGroup::Core)
-        .with_subcommands(HELP_SUBCOMMANDS),
-    CommandMeta::new("/model", "List models or set active: /model <name>", CommandGroup::Core)
-        .with_arg_hint("<name>"),
+    CommandMeta::new(
+        "/help",
+        "Show available commands; /help keys for shortcuts",
+        CommandGroup::Core,
+    )
+    .with_subcommands(HELP_SUBCOMMANDS),
+    CommandMeta::new(
+        "/model",
+        "List models or set active: /model <name>",
+        CommandGroup::Core,
+    )
+    .with_arg_hint("<name>"),
     CommandMeta::new("/clear", "Start a new session", CommandGroup::Core),
     CommandMeta::new("/undo", "Undo last turn(s): /undo [N]", CommandGroup::Core)
         .with_arg_hint("[N]"),
-    CommandMeta::new("/checkpoint", "Manual save: /checkpoint [label] — JSON + session md + journal", CommandGroup::Core)
-        .with_arg_hint("[label]"),
-    CommandMeta::new("/history", "Conversation turns; /history grep <q> filters in-memory", CommandGroup::Core),
-    CommandMeta::new("/copy", "Copy last response to clipboard", CommandGroup::Core),
-    CommandMeta::new("/resume", "Resume a session: /resume [session_id]", CommandGroup::Core)
-        .with_arg_hint("[session_id]"),
+    CommandMeta::new(
+        "/checkpoint",
+        "Manual save: /checkpoint [label] — JSON + session md + journal",
+        CommandGroup::Core,
+    )
+    .with_arg_hint("[label]"),
+    CommandMeta::new(
+        "/history",
+        "Conversation turns; /history grep <q> filters in-memory",
+        CommandGroup::Core,
+    ),
+    CommandMeta::new(
+        "/copy",
+        "Copy last response to clipboard",
+        CommandGroup::Core,
+    ),
+    CommandMeta::new(
+        "/resume",
+        "Resume a session: /resume [session_id]",
+        CommandGroup::Core,
+    )
+    .with_arg_hint("[session_id]"),
     CommandMeta::new("/exit", "Exit the REPL", CommandGroup::Core),
-    CommandMeta::new("/quit", "Exit the REPL (alias for /exit)", CommandGroup::Core).alias(),
-
+    CommandMeta::new(
+        "/quit",
+        "Exit the REPL (alias for /exit)",
+        CommandGroup::Core,
+    )
+    .alias(),
     // ── Workspace ─────────────────────────────────────────────────────────
-    CommandMeta::new("/grep", "Workspace ripgrep: <pattern> | files <glob> | review <pattern>", CommandGroup::Workspace)
-        .with_arg_hint("<pattern>"),
-    CommandMeta::new("/diff", "Colored git diff (staged, stat, show <rev>, …)", CommandGroup::Workspace)
-        .with_subcommands(DIFF_SUBCOMMANDS),
-    CommandMeta::new("/review", "LLM review of git changes: /review [latest|<rev>|working]", CommandGroup::Workspace)
-        .with_subcommands(REVIEW_SUBCOMMANDS),
-
+    CommandMeta::new(
+        "/grep",
+        "Workspace ripgrep: <pattern> | files <glob> | review <pattern>",
+        CommandGroup::Workspace,
+    )
+    .with_arg_hint("<pattern>"),
+    CommandMeta::new(
+        "/diff",
+        "Colored git diff (staged, stat, show <rev>, …)",
+        CommandGroup::Workspace,
+    )
+    .with_subcommands(DIFF_SUBCOMMANDS),
+    CommandMeta::new(
+        "/review",
+        "LLM review of git changes: /review [latest|<rev>|working]",
+        CommandGroup::Workspace,
+    )
+    .with_subcommands(REVIEW_SUBCOMMANDS),
     // ── Session & plan ───────────────────────────────────────────────────
-    CommandMeta::new("/session", "Session: history|errors|export|fork|list|cleanup|verify", CommandGroup::SessionPlan)
-        .with_subcommands(SESSION_SUBCOMMANDS),
-    CommandMeta::new("/session history", "Session journal-style history", CommandGroup::SessionPlan),
-    CommandMeta::new("/session errors", "Session errors from journal", CommandGroup::SessionPlan),
-    CommandMeta::new("/session export", "Export session to timestamped Markdown in cwd", CommandGroup::SessionPlan),
-    CommandMeta::new("/session fork", "Fork session — new id, copy journal (multi-agent / experiments)", CommandGroup::SessionPlan),
-    CommandMeta::new("/session list", "All journals + cwd / git / age from workspace", CommandGroup::SessionPlan),
-    CommandMeta::new("/session cleanup", "Clean stale sessions: --days N, --force, --compress", CommandGroup::SessionPlan),
-    CommandMeta::new("/session verify", "Verify session integrity", CommandGroup::SessionPlan),
-    CommandMeta::new("/plan", "Structured plan: go|step|pause|resume|exit|show|help", CommandGroup::SessionPlan)
-        .with_subcommands(PLAN_SUBCOMMANDS),
-    CommandMeta::new("/plan go", "Execute plan (auto mode)", CommandGroup::SessionPlan),
-    CommandMeta::new("/plan step", "Execute plan (step-by-step)", CommandGroup::SessionPlan),
-    CommandMeta::new("/plan status", "Plan progress and state", CommandGroup::SessionPlan),
-    CommandMeta::new("/plan show", "Display current plan", CommandGroup::SessionPlan),
-    CommandMeta::new("/plan pause", "Pause plan execution", CommandGroup::SessionPlan),
-    CommandMeta::new("/plan resume", "Resume plan execution", CommandGroup::SessionPlan),
+    CommandMeta::new(
+        "/session",
+        "Session: history|errors|export|fork|list|cleanup|verify",
+        CommandGroup::SessionPlan,
+    )
+    .with_subcommands(SESSION_SUBCOMMANDS),
+    CommandMeta::new(
+        "/session history",
+        "Session journal-style history",
+        CommandGroup::SessionPlan,
+    ),
+    CommandMeta::new(
+        "/session errors",
+        "Session errors from journal",
+        CommandGroup::SessionPlan,
+    ),
+    CommandMeta::new(
+        "/session export",
+        "Export session to timestamped Markdown in cwd",
+        CommandGroup::SessionPlan,
+    ),
+    CommandMeta::new(
+        "/session fork",
+        "Fork session — new id, copy journal (multi-agent / experiments)",
+        CommandGroup::SessionPlan,
+    ),
+    CommandMeta::new(
+        "/session list",
+        "All journals + cwd / git / age from workspace",
+        CommandGroup::SessionPlan,
+    ),
+    CommandMeta::new(
+        "/session cleanup",
+        "Clean stale sessions: --days N, --force, --compress",
+        CommandGroup::SessionPlan,
+    ),
+    CommandMeta::new(
+        "/session verify",
+        "Verify session integrity",
+        CommandGroup::SessionPlan,
+    ),
+    CommandMeta::new(
+        "/plan",
+        "Structured plan: go|step|pause|resume|exit|show|help",
+        CommandGroup::SessionPlan,
+    )
+    .with_subcommands(PLAN_SUBCOMMANDS),
+    CommandMeta::new(
+        "/plan go",
+        "Execute plan (auto mode)",
+        CommandGroup::SessionPlan,
+    ),
+    CommandMeta::new(
+        "/plan step",
+        "Execute plan (step-by-step)",
+        CommandGroup::SessionPlan,
+    ),
+    CommandMeta::new(
+        "/plan status",
+        "Plan progress and state",
+        CommandGroup::SessionPlan,
+    ),
+    CommandMeta::new(
+        "/plan show",
+        "Display current plan",
+        CommandGroup::SessionPlan,
+    ),
+    CommandMeta::new(
+        "/plan pause",
+        "Pause plan execution",
+        CommandGroup::SessionPlan,
+    ),
+    CommandMeta::new(
+        "/plan resume",
+        "Resume plan execution",
+        CommandGroup::SessionPlan,
+    ),
     CommandMeta::new("/plan exit", "Leave plan mode", CommandGroup::SessionPlan),
-    CommandMeta::new("/plan help", "Show all plan commands", CommandGroup::SessionPlan),
-    CommandMeta::new("/report", "Last delivery report (/report save = JSON)", CommandGroup::SessionPlan),
-
+    CommandMeta::new(
+        "/plan help",
+        "Show all plan commands",
+        CommandGroup::SessionPlan,
+    ),
+    CommandMeta::new(
+        "/report",
+        "Last delivery report (/report save = JSON)",
+        CommandGroup::SessionPlan,
+    ),
     // ── Memory & tasks ────────────────────────────────────────────────────
-    CommandMeta::new("/memory", "Memoria: list, search <q>, inspect <id>, …", CommandGroup::MemoryTasks)
-        .with_subcommands(MEMORY_SUBCOMMANDS),
-    CommandMeta::new("/task", "Tasks: list, add, done, status, run <prompt>, result <id>", CommandGroup::MemoryTasks)
-        .with_subcommands(TASK_SUBCOMMANDS),
-
+    CommandMeta::new(
+        "/memory",
+        "Memoria: list, search <q>, inspect <id>, …",
+        CommandGroup::MemoryTasks,
+    )
+    .with_subcommands(MEMORY_SUBCOMMANDS),
+    CommandMeta::new(
+        "/task",
+        "Tasks: list, add, done, status, run <prompt>, result <id>",
+        CommandGroup::MemoryTasks,
+    )
+    .with_subcommands(TASK_SUBCOMMANDS),
     // ── Observability ─────────────────────────────────────────────────────
-    CommandMeta::new("/explain", "Cycle explain: off → on (API) → verbose (+stderr)", CommandGroup::Observability),
-    CommandMeta::new("/verbose", "Verbose streaming on", CommandGroup::Observability),
-    CommandMeta::new("/compact", "Summarize & trim history (quick | no-memoria, …)", CommandGroup::Observability)
-        .with_subcommands(COMPACT_SUBCOMMANDS),
-    CommandMeta::new("/reflect", "Reflect on session (modes: skill_failure, performance, …)", CommandGroup::Observability),
-    CommandMeta::new("/turn", "Turn trace: /turn | list | N | seq:N | #N | id:N | @N | -1", CommandGroup::Observability)
-        .with_subcommands(TURN_SUBCOMMANDS),
-    CommandMeta::new("/debug", "Interactive session inspector (messages, tools, injections)", CommandGroup::Observability),
-    CommandMeta::new("/stats", "Session analytics: /stats [history|tools|cost|health|learn]", CommandGroup::Observability)
-        .with_subcommands(STATS_SUBCOMMANDS),
-    CommandMeta::new("/lsp", "LSP backend status: /lsp [status]", CommandGroup::Observability),
-    CommandMeta::new("/telemetry", "Session telemetry: turns, drift, decisions, profile", CommandGroup::Observability),
-    CommandMeta::new("/tuning", "Auto-tuning: status, history, config, reset", CommandGroup::Observability)
-        .with_subcommands(TUNING_SUBCOMMANDS),
-    CommandMeta::new("/sync", "Cloud sync status and push", CommandGroup::Observability)
-        .with_subcommands(SYNC_SUBCOMMANDS),
-    CommandMeta::new("/context", "Context window / budget summary", CommandGroup::Observability),
-    CommandMeta::new("/rewind", "Rewind conversation to an earlier turn", CommandGroup::Observability)
-        .with_arg_hint("<turn>"),
+    CommandMeta::new(
+        "/explain",
+        "Cycle explain: off → on (API) → verbose (+stderr)",
+        CommandGroup::Observability,
+    ),
+    CommandMeta::new(
+        "/verbose",
+        "Verbose streaming on",
+        CommandGroup::Observability,
+    ),
+    CommandMeta::new(
+        "/compact",
+        "Summarize & trim history (quick | no-memoria, …)",
+        CommandGroup::Observability,
+    )
+    .with_subcommands(COMPACT_SUBCOMMANDS),
+    CommandMeta::new(
+        "/reflect",
+        "Reflect on session (modes: skill_failure, performance, …)",
+        CommandGroup::Observability,
+    ),
+    CommandMeta::new(
+        "/turn",
+        "Turn trace: /turn | list | N | seq:N | #N | id:N | @N | -1",
+        CommandGroup::Observability,
+    )
+    .with_subcommands(TURN_SUBCOMMANDS),
+    CommandMeta::new(
+        "/debug",
+        "Interactive session inspector (messages, tools, injections)",
+        CommandGroup::Observability,
+    ),
+    CommandMeta::new(
+        "/stats",
+        "Session analytics: /stats [history|tools|cost|health|learn]",
+        CommandGroup::Observability,
+    )
+    .with_subcommands(STATS_SUBCOMMANDS),
+    CommandMeta::new(
+        "/lsp",
+        "LSP backend status: /lsp [status]",
+        CommandGroup::Observability,
+    ),
+    CommandMeta::new(
+        "/telemetry",
+        "Session telemetry: turns, drift, decisions, profile",
+        CommandGroup::Observability,
+    ),
+    CommandMeta::new(
+        "/tuning",
+        "Auto-tuning: status, history, config, reset",
+        CommandGroup::Observability,
+    )
+    .with_subcommands(TUNING_SUBCOMMANDS),
+    CommandMeta::new(
+        "/sync",
+        "Cloud sync status and push",
+        CommandGroup::Observability,
+    )
+    .with_subcommands(SYNC_SUBCOMMANDS),
+    CommandMeta::new(
+        "/context",
+        "Context window / budget summary",
+        CommandGroup::Observability,
+    ),
+    CommandMeta::new(
+        "/rewind",
+        "Rewind conversation to an earlier turn",
+        CommandGroup::Observability,
+    )
+    .with_arg_hint("<turn>"),
     CommandMeta::new("/version", "Version info", CommandGroup::Observability),
-
     // ── Skills ────────────────────────────────────────────────────────────
-    CommandMeta::new("/skill", "Skills: list|info|search|surfacing|health|new|test|dev|system|…", CommandGroup::Skills)
-        .with_subcommands(SKILL_SUBCOMMANDS),
-
+    CommandMeta::new(
+        "/skill",
+        "Skills: list|info|search|surfacing|health|new|test|dev|system|…",
+        CommandGroup::Skills,
+    )
+    .with_subcommands(SKILL_SUBCOMMANDS),
     // ── MCP ───────────────────────────────────────────────────────────────
-    CommandMeta::new("/mcp", "MCP: status|servers|prompts|resources|add|remove|ping|complete|…", CommandGroup::Mcp)
-        .with_subcommands(MCP_SUBCOMMANDS),
-
+    CommandMeta::new(
+        "/mcp",
+        "MCP: status|servers|prompts|resources|add|remove|ping|complete|…",
+        CommandGroup::Mcp,
+    )
+    .with_subcommands(MCP_SUBCOMMANDS),
     // ── Team & account ───────────────────────────────────────────────────
-    CommandMeta::new("/team", "Teams: list|info|create|add-member|context|run|history|snapshot|restore|delete|help", CommandGroup::TeamAccount)
-        .with_subcommands(TEAM_SUBCOMMANDS),
-    CommandMeta::new("/agent", "Spawned agents: list, status, stop, logs", CommandGroup::TeamAccount)
-        .with_subcommands(AGENT_SUBCOMMANDS),
-    CommandMeta::new("/messaging", "Inter-agent messaging: metrics, dlq, status", CommandGroup::TeamAccount)
-        .with_subcommands(MESSAGING_SUBCOMMANDS),
-    CommandMeta::new("/login", "Authenticate with the API", CommandGroup::TeamAccount),
-    CommandMeta::new("/register", "Register a new account", CommandGroup::TeamAccount),
+    CommandMeta::new(
+        "/team",
+        "Teams: list|info|create|add-member|context|run|history|snapshot|restore|delete|help",
+        CommandGroup::TeamAccount,
+    )
+    .with_subcommands(TEAM_SUBCOMMANDS),
+    CommandMeta::new(
+        "/agent",
+        "Spawned agents: list, status, stop, logs",
+        CommandGroup::TeamAccount,
+    )
+    .with_subcommands(AGENT_SUBCOMMANDS),
+    CommandMeta::new(
+        "/messaging",
+        "Inter-agent messaging: metrics, dlq, status",
+        CommandGroup::TeamAccount,
+    )
+    .with_subcommands(MESSAGING_SUBCOMMANDS),
+    CommandMeta::new(
+        "/login",
+        "Authenticate with the API",
+        CommandGroup::TeamAccount,
+    ),
+    CommandMeta::new(
+        "/register",
+        "Register a new account",
+        CommandGroup::TeamAccount,
+    ),
     CommandMeta::new("/logout", "Logout from the API", CommandGroup::TeamAccount),
-    CommandMeta::new("/memory-setup", "Guided Memoria configuration", CommandGroup::TeamAccount),
-
+    CommandMeta::new(
+        "/memory-setup",
+        "Guided Memoria configuration",
+        CommandGroup::TeamAccount,
+    ),
     // ── System ────────────────────────────────────────────────────────────
-    CommandMeta::new("/allow", "Permission mode: /allow [auto|prompt|deny|all|rules]", CommandGroup::System)
-        .with_subcommands(ALLOW_SUBCOMMANDS),
-    CommandMeta::new("/yolo", "Auto-approve all tools (alias for /allow auto)", CommandGroup::System).alias(),
-    CommandMeta::new("/instructions", "Project instructions: /instructions [show|reload|off]", CommandGroup::System)
-        .with_subcommands(INSTRUCTIONS_SUBCOMMANDS),
-    CommandMeta::new("/style", "Output theme: default | minimal | colorful | high-contrast", CommandGroup::System)
-        .with_subcommands(STYLE_SUBCOMMANDS),
-    CommandMeta::new("/diagnostics", "Binary, API, auth, environment checks", CommandGroup::System),
+    CommandMeta::new(
+        "/allow",
+        "Permission mode: /allow [auto|prompt|deny|all|rules]",
+        CommandGroup::System,
+    )
+    .with_subcommands(ALLOW_SUBCOMMANDS),
+    CommandMeta::new(
+        "/yolo",
+        "Auto-approve all tools (alias for /allow auto)",
+        CommandGroup::System,
+    )
+    .alias(),
+    CommandMeta::new(
+        "/instructions",
+        "Project instructions: /instructions [show|reload|off]",
+        CommandGroup::System,
+    )
+    .with_subcommands(INSTRUCTIONS_SUBCOMMANDS),
+    CommandMeta::new(
+        "/style",
+        "Output theme: default | minimal | colorful | high-contrast",
+        CommandGroup::System,
+    )
+    .with_subcommands(STYLE_SUBCOMMANDS),
+    CommandMeta::new(
+        "/diagnostics",
+        "Binary, API, auth, environment checks",
+        CommandGroup::System,
+    ),
     // Note: /lsp is in Observability group, not duplicated here
-    CommandMeta::new("/bug", "Generate bug report: /bug [copy|save]", CommandGroup::System),
+    CommandMeta::new(
+        "/bug",
+        "Generate bug report: /bug [copy|save]",
+        CommandGroup::System,
+    ),
 ];
 
 // ── Query functions ─────────────────────────────────────────────────────────
@@ -474,8 +690,14 @@ pub fn completion_candidates(prefix: &str) -> Vec<(&'static str, &'static str)> 
         .collect();
     // Sort: non-aliases first, then aliases, then by name
     rows.sort_by(|(a_name, _), (b_name, _)| {
-        let a_alias = COMMANDS.iter().find(|m| m.name == *a_name).map_or(false, |m| m.is_alias);
-        let b_alias = COMMANDS.iter().find(|m| m.name == *b_name).map_or(false, |m| m.is_alias);
+        let a_alias = COMMANDS
+            .iter()
+            .find(|m| m.name == *a_name)
+            .map_or(false, |m| m.is_alias);
+        let b_alias = COMMANDS
+            .iter()
+            .find(|m| m.name == *b_name)
+            .map_or(false, |m| m.is_alias);
         a_alias.cmp(&b_alias).then_with(|| a_name.cmp(b_name))
     });
     rows

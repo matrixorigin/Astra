@@ -1,5 +1,5 @@
+use super::command_registry::{self, COMMANDS, CommandGroup};
 use super::*;
-use super::command_registry::{self, CommandGroup, COMMANDS};
 
 fn command_matches_filter(command: &str, desc: &str, filter: &str) -> bool {
     let terms: Vec<&str> = filter.split_whitespace().collect();
@@ -52,7 +52,10 @@ pub(super) fn suggest_commands(input: &str, limit: usize) -> Vec<&'static str> {
 }
 
 fn is_command_alias(command: &str) -> bool {
-    COMMANDS.iter().find(|m| m.name == command).map_or(false, |m| m.is_alias)
+    COMMANDS
+        .iter()
+        .find(|m| m.name == command)
+        .map_or(false, |m| m.is_alias)
 }
 
 /// A sub-command contains a space (e.g. "/skill list", "/grep files …").
@@ -2072,8 +2075,7 @@ mod tests {
         // in the unified registry.
         let groups: &[&[&str]] = &[
             &[
-                "/help", "/model", "/clear", "/undo", "/history", "/copy", "/resume",
-                "/exit",
+                "/help", "/model", "/clear", "/undo", "/history", "/copy", "/resume", "/exit",
             ],
             &["/grep", "/diff", "/review"],
             &[
@@ -2123,14 +2125,10 @@ mod tests {
                 "/style",
             ],
         ];
-        let known: std::collections::HashSet<&str> =
-            COMMANDS.iter().map(|m| m.name).collect();
+        let known: std::collections::HashSet<&str> = COMMANDS.iter().map(|m| m.name).collect();
         for group in groups {
             for cmd in *group {
-                assert!(
-                    known.contains(cmd),
-                    "group command {cmd} not in registry"
-                );
+                assert!(known.contains(cmd), "group command {cmd} not in registry");
             }
         }
     }
