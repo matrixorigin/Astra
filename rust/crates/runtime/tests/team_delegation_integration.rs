@@ -148,9 +148,12 @@ async fn full_pipeline_team_execution() {
         .unwrap();
     assert_eq!(run.status, "completed");
 
-    // Verify sub-runs tracked
+    // Verify sub-runs cleaned up after orchestrator completes
     let subs = tracker.get_sub_runs(&report.delegation_id).await;
-    assert_eq!(subs.len(), 2);
+    assert_eq!(subs.len(), 0, "tracker should be cleaned up after orchestration");
+
+    // Verify delegation results still accessible via the report
+    assert_eq!(dr.agent_results.len(), 2);
 
     // Verify execution history recorded
     let history = store.list_executions(&team.team_id, 10).await.unwrap();
@@ -300,24 +303,19 @@ async fn orchestrator_delegation_failure_propagates() {
 // ─── Pause / Resume Tests ───────────────────────────────────────────────────
 
 #[tokio::test]
-async fn orchestrator_pause_and_resume() {
+async fn orchestrator_pause_after_completion_is_noop() {
     let store = Arc::new(InMemoryTeamStore::with_builtins("test-user"));
     let (orch, _, _tracker) = setup_orchestrator(store).await;
 
-    // Execute a team first to populate tracker
+    // Execute a team — orchestrator cleans up tracker state on completion
     let report = orch.execute_team("research", "analyze", None).await;
     assert_eq!(report.status, TeamExecutionStatus::Completed);
 
     let delegation_id = &report.delegation_id;
 
-    // Pause
+    // After completion, delegation state is cleaned up — pause is a no-op
     let paused = orch.pause_team(delegation_id).await;
-    assert!(paused > 0);
-    assert!(orch.is_paused(delegation_id).await);
-
-    // Resume
-    let resumed = orch.resume_team(delegation_id).await;
-    assert_eq!(resumed, paused);
+    assert_eq!(paused, 0);
     assert!(!orch.is_paused(delegation_id).await);
 }
 
