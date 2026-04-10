@@ -241,7 +241,7 @@ fn tool_conditional_section(tool_names: &[&str], selection_confidence: f64) -> S
     }
     if tool_names.contains(&"lsp") {
         s.push_str(
-            "- **lsp**: Prefer this for editor-grade code intelligence from an active language server: definitions/references/hover, declaration/type/implementation lookup, diagnostics, rename/code actions, formatting, inlay hints, semantic tokens, code lenses, and type hierarchy. Use `action_index` to apply a chosen code action, `item_index` to resolve or execute/apply a returned completion or code lens, and `dry_run=false` only for supported write operations. On Rust files, `code_lenses` can fall back to rust-analyzer runnables when standard LSP lenses come back empty.\n",
+            "- **lsp**: Prefer this for editor-grade code intelligence from an active language server: definitions/references/hover, declaration/type/implementation lookup, diagnostics, rename/code actions, formatting, inlay hints, semantic tokens, code lenses, and type hierarchy. Use `action_index` to apply a chosen code action, `item_index` to resolve or execute/apply a returned completion or code lens, and `dry_run=false` only for supported write operations. On Rust files, `code_lenses` first use native rust-analyzer Run/Debug lenses from `textDocument/codeLens`; if those come back empty, they can still fall back to rust-analyzer runnables. Both paths support `item_index` + `dry_run=false` execution.\n",
         );
     }
     if has_multi_edit {
