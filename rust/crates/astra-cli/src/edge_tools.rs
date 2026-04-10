@@ -92,7 +92,7 @@ use worktree::detect_git_remote_repos;
 #[cfg(test)]
 use worktree::extract_github_owner_repo;
 #[path = "edge_tools/memoria.rs"]
-mod memoria;
+pub(crate) mod memoria;
 #[cfg(test)]
 use memoria::parse_memory_search_contents;
 #[path = "edge_tools/ask_user.rs"]

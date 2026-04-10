@@ -7185,6 +7185,9 @@ async fn finalize_session(state: &ReplState) {
     }
     // 3. Session-end knowledge extraction (opt-in, async with timeout)
     let knowledge_handle = session_end_extract_learnings(&state.history);
+    // 3b. Trigger Memoria governance + consolidation (best-effort, fire-and-forget)
+    tokio::spawn(edge_tools::memoria::memoria_governance_fire_and_forget());
+    tokio::spawn(edge_tools::memoria::memoria_consolidate_fire_and_forget());
     // 4. Graceful ingestion shutdown: await worker flush
     if let Some(mc) = state.matrix_runtime.as_ref() {
         mc.shutdown_ingestion_and_wait().await;
