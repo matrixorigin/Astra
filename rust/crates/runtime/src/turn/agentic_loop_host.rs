@@ -396,6 +396,10 @@ pub struct AgenticLoopState {
     /// When set, records system prompt, history, memory, and tool selection traces.
     /// Created at turn start, finalized at turn end.
     pub turn_trace_collector: Option<crate::turn::turn_trace_collector::TurnTraceCollector>,
+
+    // ── Auto-tuning feedback loop ──
+    /// Number of turns completed in this loop invocation (for tuning cycle trigger).
+    pub completed_turns_for_tuning: u32,
 }
 
 /// Consecutive same-category error turns before forcing a strategy change.
@@ -895,6 +899,110 @@ fn is_valid_model_string(model: &str) -> bool {
 /// CLI/server-specific behavior; the runtime handles cognitive decisions:
 /// turn ingest, stall detection, tool round orchestration, post-tool policy.
 pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
+    host: &mut H,
+    state: &mut AgenticLoopState,
+) -> Result<AgenticLoopOutcome, String> {
+    let result = run_agentic_loop_impl(host, state).await;
+    record_loop_completion_feedback(state, &result);
+    result
+}
+
+/// How often (in turns) to run the auto-tuning evaluation cycle.
+const TUNING_CYCLE_INTERVAL: u32 = 5;
+
+/// Record feedback signals based on the loop's outcome and accumulated state.
+///
+/// Called once after the loop finishes (or errors) to feed the auto-tuning engine.
+fn record_loop_completion_feedback(
+    state: &mut AgenticLoopState,
+    result: &Result<AgenticLoopOutcome, String>,
+) {
+    use crate::auto_tuning::{FeedbackSignal, SignalType};
+
+    let hub = match &state.observability_hub {
+        Some(h) => h,
+        None => return,
+    };
+
+    let turn_id = state.current_run_id.clone().unwrap_or_default();
+
+    // ── 1. Outcome signal ──
+    match result {
+        Ok(AgenticLoopOutcome::Completed) => {
+            hub.record_feedback(FeedbackSignal::new(SignalType::TaskSuccess).with_turn(&turn_id));
+        }
+        Ok(AgenticLoopOutcome::Cancelled) => {
+            hub.record_feedback(FeedbackSignal::new(SignalType::Interruption).with_turn(&turn_id));
+        }
+        Ok(AgenticLoopOutcome::Error(reason)) => {
+            hub.record_feedback(
+                FeedbackSignal::new(SignalType::TaskFailure {
+                    reason: reason.clone(),
+                })
+                .with_turn(&turn_id),
+            );
+        }
+        Err(reason) => {
+            hub.record_feedback(
+                FeedbackSignal::new(SignalType::TaskFailure {
+                    reason: reason.clone(),
+                })
+                .with_turn(&turn_id),
+            );
+        }
+        Ok(AgenticLoopOutcome::Waiting(_)) => {
+            // No signal for waiting — the loop will resume.
+        }
+    }
+
+    // ── 2. Token usage signal ──
+    let total_tokens = state.total_prompt + state.total_completion;
+    // Heuristic threshold: >50k tokens suggests inefficiency for most tasks.
+    let token_threshold = 50_000u64;
+    if total_tokens > token_threshold {
+        hub.record_feedback(
+            FeedbackSignal::new(SignalType::HighTokenUsage {
+                tokens: total_tokens,
+                threshold: token_threshold,
+            })
+            .with_turn(&turn_id),
+        );
+    }
+
+    // ── 3. Tool churn signal ──
+    let tool_calls = state.total_tool_calls;
+    let unique_tools = state.all_tools_used.len() as u32;
+    // High tool calls with low unique tools suggests repetitive/failing usage.
+    if tool_calls > 10 && unique_tools > 0 && (tool_calls / unique_tools) > 5 {
+        hub.record_feedback(
+            FeedbackSignal::new(SignalType::ToolChurn {
+                calls: tool_calls,
+                unique_tools,
+            })
+            .with_turn(&turn_id),
+        );
+    }
+
+    // ── 4. Tool-level failure signals ──
+    let failed_tools: u32 = state.tool_call_records.iter().filter(|r| !r.ok).count() as u32;
+    if failed_tools > 0 && tool_calls > 0 {
+        let failure_rate = failed_tools as f64 / tool_calls as f64;
+        if failure_rate > 0.3 {
+            hub.record_feedback(
+                FeedbackSignal::new(SignalType::TaskFailure {
+                    reason: format!(
+                        "high tool failure rate: {failed_tools}/{tool_calls} ({:.0}%)",
+                        failure_rate * 100.0
+                    ),
+                })
+                .with_turn(&turn_id)
+                .with_context("tool_failure_rate", serde_json::json!(failure_rate)),
+            );
+        }
+    }
+}
+
+async fn run_agentic_loop_impl<H: AgenticLoopHost>(
     host: &mut H,
     state: &mut AgenticLoopState,
 ) -> Result<AgenticLoopOutcome, String> {
@@ -2418,6 +2526,9 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
                 state.turn_trace_collector = None;
 
                 state.step_recorder.end_turn(false);
+
+                // ── Auto-tuning: count completed turns ──
+                state.completed_turns_for_tuning += 1;
             }
         }
     }
@@ -2739,6 +2850,7 @@ mod tests {
             permission_handler: None,
             observability_session: None,
             observability_hub: None,
+            completed_turns_for_tuning: 0,
         }
     }
 

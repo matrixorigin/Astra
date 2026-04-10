@@ -346,6 +346,7 @@ mod tests {
             permission_handler: None,
             observability_session: None,
             observability_hub: None,
+            completed_turns_for_tuning: 0,
         }
     }
 

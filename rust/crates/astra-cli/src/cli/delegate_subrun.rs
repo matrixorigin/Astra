@@ -348,6 +348,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             permission_handler: None,
             observability_session: None,
             observability_hub: None,
+            completed_turns_for_tuning: 0,
         };
 
         let loop_result = run_agentic_loop_with_host(&mut host, &mut state).await;

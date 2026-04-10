@@ -523,6 +523,7 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             permission_handler: None,
             observability_session: None,
             observability_hub: None,
+            completed_turns_for_tuning: 0,
         };
 
         if let Err(err) = run_agentic_loop_with_host(&mut host, &mut state).await {
