@@ -64,6 +64,15 @@ pub struct ObservabilitySession {
     /// Recent queries for drift analysis.
     pub recent_queries: Vec<String>,
 
+    /// Turns where history compression occurred.
+    pub compressed_turns: Vec<u32>,
+
+    /// Turns where user provided correction/redirection.
+    pub user_corrections: Vec<u32>,
+
+    /// The original user query at session start (for drift comparison).
+    pub original_query: Option<String>,
+
     /// Session start time.
     pub started_at: Instant,
 
@@ -130,6 +139,9 @@ impl ObservabilitySession {
             decision_explanations: Vec::new(),
             drift_detector: DriftDetector::default(),
             recent_queries: Vec::new(),
+            compressed_turns: Vec::new(),
+            user_corrections: Vec::new(),
+            original_query: None,
             started_at: Instant::now(),
             turn_timings: Vec::new(),
         }
@@ -157,7 +169,13 @@ impl ObservabilitySession {
     }
 
     /// Record a query for drift analysis.
+    ///
+    /// On the first turn, this also sets `original_query` for baseline comparison.
     pub fn record_query(&mut self, query: &str) {
+        // Set original query on first turn
+        if self.original_query.is_none() {
+            self.original_query = Some(query.to_string());
+        }
         self.recent_queries.push(query.to_string());
         // Keep only the last N queries
         if self.recent_queries.len() > 20 {
@@ -165,18 +183,103 @@ impl ObservabilitySession {
         }
     }
 
+    /// Record that history compression occurred at the given turn.
+    ///
+    /// Called by the compression pipeline when turns are compressed/dropped.
+    pub fn record_compression(&mut self, turn: u32) {
+        if !self.compressed_turns.contains(&turn) {
+            self.compressed_turns.push(turn);
+        }
+    }
+
+    /// Record that user provided a correction at the current turn.
+    ///
+    /// Called when user correction signals are detected (e.g., "no, I meant...",
+    /// "that's wrong", explicit redirection).
+    pub fn record_user_correction(&mut self) {
+        let turn = self.turn_number;
+        if !self.user_corrections.contains(&turn) {
+            self.user_corrections.push(turn);
+        }
+    }
+
+    /// Detect if the current query appears to be a user correction.
+    ///
+    /// Heuristic detection of correction phrases that indicate drift.
+    pub fn detect_correction_signal(&mut self, query: &str) -> bool {
+        let query_lower = query.to_lowercase();
+        let correction_patterns = [
+            "no,",
+            "no i",
+            "that's wrong",
+            "that's not",
+            "i meant",
+            "i mean",
+            "not that",
+            "wrong,",
+            "wrong.",
+            "incorrect",
+            "actually,",
+            "actually i",
+            "instead,",
+            "forget that",
+            "ignore that",
+            "let me clarify",
+            "to clarify",
+            "what i want",
+            "wait,",
+            "hold on",
+            "stop,",
+            "不对",
+            "错了",
+            "不是这样",
+            "我的意思是",
+            "我是说",
+            "等等",
+            "停一下",
+        ];
+
+        let is_correction = correction_patterns
+            .iter()
+            .any(|p| query_lower.contains(p));
+
+        if is_correction {
+            self.record_user_correction();
+        }
+
+        is_correction
+    }
+
     /// Get session duration.
     pub fn duration(&self) -> Duration {
         self.started_at.elapsed()
     }
 
-    /// Check for focus drift.
-    pub fn check_drift(&self, original_query: &str) -> FocusDriftAnalysis {
+    /// Check for focus drift using all available signals.
+    ///
+    /// Uses the original query (from session start), recent queries,
+    /// compression events, and user corrections to detect drift.
+    pub fn check_drift(&self) -> FocusDriftAnalysis {
+        let original = self
+            .original_query
+            .as_deref()
+            .unwrap_or_else(|| self.recent_queries.first().map(|s| s.as_str()).unwrap_or(""));
+
+        self.drift_detector.analyze(
+            original,
+            &self.recent_queries,
+            &self.compressed_turns,
+            &self.user_corrections,
+        )
+    }
+
+    /// Check drift against a specific original query (override).
+    pub fn check_drift_against(&self, original_query: &str) -> FocusDriftAnalysis {
         self.drift_detector.analyze(
             original_query,
             &self.recent_queries,
-            &[], // compressed_turns - not tracked in this simple version
-            &[], // user_corrections - not tracked in this simple version
+            &self.compressed_turns,
+            &self.user_corrections,
         )
     }
 }
@@ -511,7 +614,7 @@ mod tests {
         let hub = ObservabilityHub::new();
         let session = hub.start_session("user1", "session1");
 
-        // Record some queries
+        // Record some queries (first one sets original_query)
         {
             let mut s = session.write().unwrap();
             s.record_query("find all Rust files in the crates directory");
@@ -519,10 +622,10 @@ mod tests {
             s.record_query("show me the temperature in Paris"); // still off-topic
         }
 
-        // Check for drift
+        // Check for drift - uses original_query automatically
         {
             let s = session.read().unwrap();
-            let analysis = s.check_drift("find all Rust files in the crates directory");
+            let analysis = s.check_drift();
             // Should detect some topic shift
             assert!(analysis.drift_severity >= 0.0);
         }

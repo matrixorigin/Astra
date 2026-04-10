@@ -57,6 +57,22 @@ pub struct CompressionResult {
     pub estimated_tokens_freed: u64,
     /// Human-readable description of what this layer did.
     pub description: String,
+    /// Turn indices that were compressed/modified by this layer.
+    ///
+    /// Used for drift detection - if important context was in these turns,
+    /// that could explain focus drift.
+    pub affected_turns: Vec<u32>,
+}
+
+impl Default for CompressionResult {
+    fn default() -> Self {
+        Self {
+            messages_removed: 0,
+            estimated_tokens_freed: 0,
+            description: String::new(),
+            affected_turns: Vec::new(),
+        }
+    }
 }
 
 /// Outcome of running the full pipeline.
@@ -71,6 +87,20 @@ pub struct PipelineOutcome {
 }
 
 impl PipelineOutcome {
+    /// Get all turn indices that were affected by compression.
+    ///
+    /// Useful for drift detection - these turns may have lost context.
+    pub fn all_affected_turns(&self) -> Vec<u32> {
+        let mut turns: Vec<u32> = self
+            .layer_results
+            .iter()
+            .flat_map(|(_, result)| result.affected_turns.iter().copied())
+            .collect();
+        turns.sort_unstable();
+        turns.dedup();
+        turns
+    }
+
     /// Convert to telemetry trace format.
     pub fn to_compression_trace(
         &self,
@@ -278,8 +308,9 @@ impl CompressionLayer for ToolResultTruncation {
 
         let mut removed_chars: usize = 0;
         let mut count: usize = 0;
+        let mut affected_turns: Vec<u32> = Vec::new();
 
-        for msg in messages.iter_mut() {
+        for (idx, msg) in messages.iter_mut().enumerate() {
             if msg.get("role").and_then(|v| v.as_str()) != Some("tool") {
                 continue;
             }
@@ -305,6 +336,11 @@ impl CompressionLayer for ToolResultTruncation {
                         obj.insert("content".into(), Value::String(truncated));
                     }
                     count += 1;
+                    // Approximate turn from message index (user+assistant pairs)
+                    let turn = (idx / 2) as u32;
+                    if !affected_turns.contains(&turn) {
+                        affected_turns.push(turn);
+                    }
                 }
             }
         }
@@ -316,6 +352,7 @@ impl CompressionLayer for ToolResultTruncation {
                 "Truncated {} old tool results, freed ~{} chars",
                 count, removed_chars
             ),
+            affected_turns,
         }
     }
 }
@@ -372,6 +409,7 @@ impl CompressionLayer for DuplicateReadElimination {
 
         let mut freed_chars: usize = 0;
         let mut count: usize = 0;
+        let mut affected_turns: Vec<u32> = Vec::new();
 
         for (i, path) in &read_indices {
             if last_index.get(path).copied() != Some(*i) {
@@ -386,6 +424,11 @@ impl CompressionLayer for DuplicateReadElimination {
                         obj.insert("content".into(), Value::String(stub));
                     }
                     count += 1;
+                    // Approximate turn from message index
+                    let turn = (*i / 2) as u32;
+                    if !affected_turns.contains(&turn) {
+                        affected_turns.push(turn);
+                    }
                 }
             }
         }
@@ -397,6 +440,7 @@ impl CompressionLayer for DuplicateReadElimination {
                 "Stubbed {} duplicate reads, freed ~{} chars",
                 count, freed_chars
             ),
+            affected_turns,
         }
     }
 }
@@ -495,6 +539,7 @@ impl CompressionLayer for TieredCompaction {
                 messages_removed: 0,
                 estimated_tokens_freed: 0,
                 description: "Not enough messages to compact".into(),
+                affected_turns: Vec::new(),
             };
         }
 
@@ -519,6 +564,7 @@ impl CompressionLayer for TieredCompaction {
                 messages_removed: 0,
                 estimated_tokens_freed: 0,
                 description: "Nothing to compact after preserving system + recent".into(),
+                affected_turns: Vec::new(),
             };
         }
 
@@ -527,6 +573,13 @@ impl CompressionLayer for TieredCompaction {
             .map(|m| m.to_string().len())
             .sum();
         let removed_count = removable_end - removable_start;
+
+        // Calculate affected turns (those being removed)
+        let affected_turns: Vec<u32> = (removable_start..removable_end)
+            .map(|idx| (idx / 2) as u32)
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
 
         // Build boundary marker
         let boundary = serde_json::json!({
@@ -552,6 +605,7 @@ impl CompressionLayer for TieredCompaction {
                 "Compacted {} middle messages, freed ~{} tokens",
                 removed_count, freed_tokens
             ),
+            affected_turns,
         }
     }
 }
@@ -606,6 +660,7 @@ impl CompressionLayer for ReactiveCompact {
                 messages_removed: 0,
                 estimated_tokens_freed: 0,
                 description: "Too few messages for reactive compact".into(),
+                affected_turns: Vec::new(),
             };
         }
 
@@ -629,6 +684,7 @@ impl CompressionLayer for ReactiveCompact {
                 messages_removed: 0,
                 estimated_tokens_freed: 0,
                 description: "Nothing to remove in reactive compact".into(),
+                affected_turns: Vec::new(),
             };
         }
 
@@ -637,6 +693,13 @@ impl CompressionLayer for ReactiveCompact {
             .map(|m| m.to_string().len())
             .sum();
         let removed_count = removable_end - removable_start;
+
+        // Calculate affected turns (those being removed)
+        let affected_turns: Vec<u32> = (removable_start..removable_end)
+            .map(|idx| (idx / 2) as u32)
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
 
         let boundary = serde_json::json!({
             "role": "system",
@@ -662,6 +725,7 @@ impl CompressionLayer for ReactiveCompact {
                 "Reactive compaction: removed {} messages, freed ~{} tokens",
                 removed_count, freed_tokens
             ),
+            affected_turns,
         }
     }
 }
