@@ -11,14 +11,47 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio::time::sleep;
 
-use super::lsp_stdio_session::{LanguageIdPolicy, LspSpawnSpec, LspStdioSession};
+use super::lsp_stdio_session::{LanguageIdPolicy, LspSpawnSpec, LspStdioSession, path_to_uri};
 
 pub(crate) const POST_SYNC_DRAIN_MS: u64 = 80;
 pub(crate) const ACTIVE_LSP_REQUEST_TIMEOUT_MS: u64 = 3_000;
 const ASTRA_LSP_CONFIG_FILE: &str = "astra-lsp.json";
+
+fn normalize_pull_diagnostics(uri: &str, report: Value) -> Option<Value> {
+    let items = report.get("items")?.as_array()?.clone();
+    let result_id = report
+        .get("resultId")
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+    let mut normalized = json!({
+        "uri": uri,
+        "diagnostics": items,
+        "source_method": "textDocument/diagnostic",
+        "diagnostic_report": report,
+    });
+    if let Some(result_id) = result_id
+        && let Some(root) = normalized.as_object_mut()
+    {
+        root.insert("result_id".to_string(), Value::String(result_id));
+    }
+    Some(normalized)
+}
+
+fn attach_publish_snapshot_metadata(mut snapshot: Value, pull_error: Option<String>) -> Value {
+    if let Some(root) = snapshot.as_object_mut() {
+        root.insert(
+            "source_method".to_string(),
+            Value::String("publishDiagnostics".to_string()),
+        );
+        if let Some(error) = pull_error {
+            root.insert("pull_diagnostics_error".to_string(), Value::String(error));
+        }
+    }
+    snapshot
+}
 
 #[derive(Clone, Debug, Default, serde::Deserialize)]
 struct ProjectLanguageLspConfig {
@@ -521,9 +554,32 @@ impl PassiveLspManager {
             .sync_document_from_disk(path)
             .map_err(|e| format!("failed to sync file into LSP: {e}"))?;
         std::thread::sleep(Duration::from_millis(POST_SYNC_DRAIN_MS));
+        let pull_result = path_to_uri(path)
+            .ok_or_else(|| format!("failed to create file URI for {}", path.display()))
+            .and_then(|uri| {
+                session
+                    .request(
+                        "textDocument/diagnostic",
+                        json!({
+                            "textDocument": { "uri": uri.clone() }
+                        }),
+                        Duration::from_millis(ACTIVE_LSP_REQUEST_TIMEOUT_MS),
+                    )
+                    .map(|report| (uri, report))
+                    .map_err(|e| format!("LSP request textDocument/diagnostic failed: {e}"))
+            });
+        let pull_error = match pull_result {
+            Ok((uri, report)) => {
+                if let Some(normalized) = normalize_pull_diagnostics(&uri, report) {
+                    return Ok(Some(normalized));
+                }
+                Some("textDocument/diagnostic returned no usable diagnostic items".to_string())
+            }
+            Err(error) => Some(error),
+        };
         session
             .latest_diagnostics_for_path(path)
-            .map(Some)
+            .map(|snapshot| Some(attach_publish_snapshot_metadata(snapshot, pull_error)))
             .map_err(|e| format!("failed to read LSP diagnostics: {e}"))
     }
 

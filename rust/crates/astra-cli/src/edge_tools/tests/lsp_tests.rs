@@ -36,6 +36,7 @@ def write_frame(payload):
 LOG_PATH = os.environ.get("FAKE_LSP_LOG")
 CAPTURE_PATH = os.environ.get("FAKE_LSP_CAPTURE")
 REQUEST_CONFIG = os.environ.get("FAKE_LSP_REQUEST_CONFIG") == "1"
+PULL_DIAGNOSTICS_MODE = os.environ.get("FAKE_LSP_PULL_DIAGNOSTICS", "full")
 CONFIG_REQUEST_ID = 9001
 
 def log_event(name):
@@ -43,6 +44,16 @@ def log_event(name):
         return
     with open(LOG_PATH, "a", encoding="utf-8") as fh:
         fh.write(name + "\n")
+
+def fake_diagnostics():
+    return [{
+        "range": {
+            "start": {"line": 0, "character": 7},
+            "end": {"line": 0, "character": 21}
+        },
+        "severity": 2,
+        "message": "fake LSP diagnostic"
+    }]
 
 def capture(kind, payload):
     if not CAPTURE_PATH:
@@ -96,7 +107,11 @@ while True:
                     "linkedEditingRangeProvider": True,
                     "signatureHelpProvider": {
                         "triggerCharacters": ["("]
-                    }
+                    },
+                    "diagnosticProvider": {
+                        "interFileDependencies": False,
+                        "workspaceDiagnostics": False
+                    } if PULL_DIAGNOSTICS_MODE != "unsupported" else None
                 }
             }
         })
@@ -425,6 +440,19 @@ while True:
                 "activeParameter": 0
             }
         })
+    elif method == "textDocument/diagnostic":
+        result = None
+        if PULL_DIAGNOSTICS_MODE == "full":
+            result = {
+                "kind": "full",
+                "resultId": "fake-diagnostics-v1",
+                "items": fake_diagnostics()
+            }
+        write_frame({
+            "jsonrpc": "2.0",
+            "id": msg_id,
+            "result": result
+        })
     elif method == "textDocument/documentHighlight":
         write_frame({
             "jsonrpc": "2.0",
@@ -725,14 +753,7 @@ while True:
             "method": "textDocument/publishDiagnostics",
             "params": {
                 "uri": uri,
-                "diagnostics": [{
-                    "range": {
-                        "start": {"line": 0, "character": 7},
-                        "end": {"line": 0, "character": 21}
-                    },
-                    "severity": 2,
-                    "message": "fake LSP diagnostic"
-                }]
+                "diagnostics": fake_diagnostics()
             }
         })
     elif msg_id is not None:
@@ -1053,6 +1074,11 @@ fn lsp_rust_session_sends_rust_analyzer_init_and_configuration() {
         Some(true)
     );
     assert_eq!(
+        initialize["payload"]["capabilities"]["textDocument"]["diagnostic"]["dynamicRegistration"]
+            .as_bool(),
+        Some(false)
+    );
+    assert_eq!(
         initialize["payload"]["capabilities"]["textDocument"]["completion"]["completionItem"]
             ["resolveSupport"]["properties"][2]
             .as_str(),
@@ -1106,7 +1132,55 @@ fn lsp_diagnostics_returns_file_snapshot_when_available() {
     let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
 
     assert_eq!(parsed["backend"].as_str(), Some("lsp"));
+    assert_eq!(parsed["method"].as_str(), Some("textDocument/diagnostic"));
+    assert_eq!(
+        parsed["result"]["source_method"].as_str(),
+        Some("textDocument/diagnostic")
+    );
+    assert_eq!(
+        parsed["result"]["diagnostics"][0]["message"].as_str(),
+        Some("fake LSP diagnostic")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+#[serial_test::serial]
+fn lsp_diagnostics_fall_back_to_publish_snapshot_when_pull_returns_null() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname=\"demo\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(
+        dir.path().join("src/lib.rs"),
+        "pub fn hello_from_lsp(name: &str) {}\n",
+    )
+    .unwrap();
+    let script = fake_lsp_server_script(dir.path());
+    let _guard = EnvGuard::set("ASTRA_RUST_ANALYZER_CMD", script.to_str().unwrap());
+    let _pull_guard = EnvGuard::set("FAKE_LSP_PULL_DIAGNOSTICS", "null");
+    let exe = ToolExecutor::new(dir.path());
+
+    let result = exe.lsp(&json!({
+        "operation": "diagnostics",
+        "file": "src/lib.rs"
+    }));
+    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+
+    assert_eq!(parsed["backend"].as_str(), Some("lsp"));
     assert_eq!(parsed["method"].as_str(), Some("publishDiagnostics"));
+    assert_eq!(
+        parsed["result"]["source_method"].as_str(),
+        Some("publishDiagnostics")
+    );
+    assert!(
+        parsed["result"]["pull_diagnostics_error"]
+            .as_str()
+            .is_some_and(|s| s.contains("no usable diagnostic items"))
+    );
     assert_eq!(
         parsed["result"]["diagnostics"][0]["message"].as_str(),
         Some("fake LSP diagnostic")

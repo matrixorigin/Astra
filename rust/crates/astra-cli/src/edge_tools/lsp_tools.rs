@@ -463,7 +463,12 @@ impl ToolExecutor {
             .diagnostics_for_file(&self.project_root, &file_path)
             .map(|result| {
                 result.map(|value| {
-                    Self::active_lsp_response("diagnostics", "publishDiagnostics", value)
+                    let method = value
+                        .get("source_method")
+                        .and_then(Value::as_str)
+                        .unwrap_or("publishDiagnostics")
+                        .to_string();
+                    Self::active_lsp_response("diagnostics", &method, value)
                 })
             })
     }
@@ -2426,7 +2431,7 @@ impl ToolExecutor {
                             "active_lsp": ["rust", "typescript", "typescriptreact"],
                             "fallback_tools": ["rust", "python", "typescript", "javascript", "go", "java", "c", "cpp", "ruby"]
                         },
-                        "note": "Without a file, diagnostics reports LSP backend availability. With a file, it returns the latest publishDiagnostics snapshot after syncing that file into the active backend."
+                        "note": "Without a file, diagnostics reports LSP backend availability. With a file, it first tries textDocument/diagnostic and falls back to the latest publishDiagnostics snapshot after syncing that file into the active backend."
                     }).to_string()
                 }
             }

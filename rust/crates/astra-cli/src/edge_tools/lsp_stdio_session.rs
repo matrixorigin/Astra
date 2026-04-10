@@ -534,6 +534,10 @@ impl LspStdioSession {
                     "didSave": true
                 },
                 "publishDiagnostics": {},
+                "diagnostic": {
+                    "dynamicRegistration": false,
+                    "relatedDocumentSupport": false
+                },
                 "hover": {
                     "contentFormat": ["markdown", "plaintext"]
                 },
