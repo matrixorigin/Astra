@@ -87,6 +87,7 @@ pub mod matrix_cloud_runtime;
 pub mod output_style;
 pub mod ab_testing;
 pub mod auto_tuning;
+pub mod observability_integration;
 pub mod pipeline;
 pub mod plan;
 pub mod plan_decompose;
