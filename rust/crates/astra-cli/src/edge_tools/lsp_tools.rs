@@ -339,6 +339,40 @@ impl ToolExecutor {
         ))
     }
 
+    fn lsp_range_params(
+        &self,
+        file: &str,
+        line: usize,
+        column: usize,
+        end_line: usize,
+        end_column: usize,
+    ) -> Result<(PathBuf, String, Value), String> {
+        if line == 0 || column == 0 || end_line == 0 || end_column == 0 {
+            return Err(
+                "line, column, end_line, and end_column must be 1-based positive integers"
+                    .to_string(),
+            );
+        }
+        let (file_path, uri) = self.ensure_lsp_file_ready(file)?;
+        Ok((
+            file_path,
+            uri.clone(),
+            json!({
+                "textDocument": { "uri": uri },
+                "range": {
+                    "start": {
+                        "line": line.saturating_sub(1),
+                        "character": column.saturating_sub(1),
+                    },
+                    "end": {
+                        "line": end_line.saturating_sub(1),
+                        "character": end_column.saturating_sub(1),
+                    }
+                }
+            }),
+        ))
+    }
+
     fn try_active_file_request(
         &self,
         operation: &str,
@@ -462,6 +496,33 @@ impl ToolExecutor {
         )
     }
 
+    fn try_active_range_formatting(
+        &self,
+        file: &str,
+        line: usize,
+        column: usize,
+        end_line: usize,
+        end_column: usize,
+    ) -> Result<Option<Value>, String> {
+        let (file_path, _, mut params) =
+            self.lsp_range_params(file, line, column, end_line, end_column)?;
+        if let Some(root) = params.as_object_mut() {
+            root.insert(
+                "options".to_string(),
+                json!({
+                    "tabSize": 4,
+                    "insertSpaces": true,
+                }),
+            );
+        }
+        self.passive_lsp.request_for_file(
+            &self.project_root,
+            &file_path,
+            "textDocument/rangeFormatting",
+            params,
+        )
+    }
+
     fn try_active_call_hierarchy(
         &self,
         operation: &str,
@@ -515,7 +576,7 @@ impl ToolExecutor {
                 "error": "Missing required 'operation' parameter",
                 "valid_operations": [
                     "goto_definition", "find_references", "hover", "document_symbols",
-                    "workspace_symbols", "call_hierarchy", "incoming_calls", "outgoing_calls", "declaration", "type_definition", "implementation", "rename", "code_actions", "completions", "signature_help", "document_highlight", "format_document", "diagnostics"
+                    "workspace_symbols", "call_hierarchy", "incoming_calls", "outgoing_calls", "declaration", "type_definition", "implementation", "rename", "code_actions", "completions", "signature_help", "document_highlight", "format_document", "format_range", "diagnostics"
                 ]
             }).to_string(),
         };
@@ -524,6 +585,14 @@ impl ToolExecutor {
         let line = args.get("line").and_then(Value::as_i64).map(|l| l as usize);
         let column = args
             .get("column")
+            .and_then(Value::as_i64)
+            .map(|c| c as usize);
+        let end_line = args
+            .get("end_line")
+            .and_then(Value::as_i64)
+            .map(|l| l as usize);
+        let end_column = args
+            .get("end_column")
             .and_then(Value::as_i64)
             .map(|c| c as usize);
         let symbol = args.get("symbol").and_then(Value::as_str);
@@ -1009,6 +1078,44 @@ impl ToolExecutor {
                 }
             }
 
+            "format_range" => {
+                if let (Some(f), Some(l), Some(c), Some(end_l), Some(end_c)) =
+                    (file, line, column, end_line, end_column)
+                {
+                    match self.try_active_range_formatting(f, l, c, end_l, end_c) {
+                        Ok(Some(result)) if dry_run => {
+                            Self::active_lsp_response(
+                                "format_range",
+                                "textDocument/rangeFormatting",
+                                result,
+                            )
+                        }
+                        Ok(Some(result)) => match self.ensure_lsp_file_ready(f) {
+                            Ok((_, uri)) => {
+                                match Self::lsp_text_edits_to_workspace_edit(&uri, result) {
+                                    Ok(workspace_edit) => self.apply_lsp_workspace_edit(
+                                        "format_range",
+                                        "textDocument/rangeFormatting",
+                                        &workspace_edit,
+                                    ),
+                                    Err(error) => Err(error),
+                                }
+                                .unwrap_or_else(|error| json!({ "error": error }).to_string())
+                            }
+                            Err(error) => json!({ "error": error }).to_string(),
+                        },
+                        Ok(None) => json!({
+                            "error": "format_range requires an active LSP backend for that file"
+                        }).to_string(),
+                        Err(error) => json!({ "error": error }).to_string(),
+                    }
+                } else {
+                    json!({
+                        "error": "format_range requires 'file'+'line'+'column'+'end_line'+'end_column'"
+                    }).to_string()
+                }
+            }
+
             "diagnostics" => {
                 if let Some(f) = file {
                     match self.try_active_file_diagnostics(f) {
@@ -1036,7 +1143,8 @@ impl ToolExecutor {
                             "completions": true,
                             "signature_help": true,
                             "document_highlight": true,
-                            "format_document": true
+                            "format_document": true,
+                            "format_range": true
                         },
                         "active_backends": self.passive_lsp.active_status(&self.project_root),
                         "supported_languages": {
@@ -1052,7 +1160,7 @@ impl ToolExecutor {
                 "error": format!("Unknown operation: {}", operation),
                 "valid_operations": [
                     "goto_definition", "find_references", "hover", "document_symbols",
-                    "workspace_symbols", "call_hierarchy", "incoming_calls", "outgoing_calls", "declaration", "type_definition", "implementation", "rename", "code_actions", "completions", "signature_help", "document_highlight", "format_document", "diagnostics"
+                    "workspace_symbols", "call_hierarchy", "incoming_calls", "outgoing_calls", "declaration", "type_definition", "implementation", "rename", "code_actions", "completions", "signature_help", "document_highlight", "format_document", "format_range", "diagnostics"
                 ]
             }).to_string()
         }

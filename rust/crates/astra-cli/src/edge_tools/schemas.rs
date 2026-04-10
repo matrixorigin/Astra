@@ -1143,7 +1143,7 @@ pub fn all_tool_schemas() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "lsp",
-                "description": "Interact with Language Server Protocol for code intelligence. Unified interface for declaration, definition, type definition, references, hover, symbols, call hierarchy, completions, signature help, document highlights, document formatting, rename, code actions, and diagnostics. Without a file, diagnostics reports backend availability; with a file, diagnostics returns the latest publishDiagnostics snapshot.",
+                "description": "Interact with Language Server Protocol for code intelligence. Unified interface for declaration, definition, type definition, references, hover, symbols, call hierarchy, completions, signature help, document highlights, document and range formatting, rename, code actions, and diagnostics. Without a file, diagnostics reports backend availability; with a file, diagnostics returns the latest publishDiagnostics snapshot.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -1167,6 +1167,7 @@ pub fn all_tool_schemas() -> Vec<Value> {
                                 "signature_help",
                                 "document_highlight",
                                 "format_document",
+                                "format_range",
                                 "diagnostics"
                             ],
                             "description": "LSP operation to perform"
@@ -1183,6 +1184,14 @@ pub fn all_tool_schemas() -> Vec<Value> {
                             "type": "integer",
                             "description": "Column/character offset (1-based). Required for position-based operations."
                         },
+                        "end_line": {
+                            "type": "integer",
+                            "description": "End line number (1-based). Required for range-based operations like format_range."
+                        },
+                        "end_column": {
+                            "type": "integer",
+                            "description": "End column/character offset (1-based). Required for range-based operations like format_range."
+                        },
                         "symbol": {
                             "type": "string",
                             "description": "Symbol name for symbol-based operations (alternative to line/column)"
@@ -1197,7 +1206,7 @@ pub fn all_tool_schemas() -> Vec<Value> {
                         },
                         "dry_run": {
                             "type": "boolean",
-                            "description": "Preview by default. Set false to apply a supported rename, document format, or code action edit."
+                            "description": "Preview by default. Set false to apply a supported rename, document/range format, or code action edit."
                         },
                         "action_index": {
                             "type": "integer",
