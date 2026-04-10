@@ -11,10 +11,9 @@
 //! - **Conflict resolution**: Optimistic locking with version numbers; conflicts trigger re-pull
 
 use astra_runtime::pipeline::persistence::{
-    DeltaSnapshot, LearningSnapshot, ToolHealthEntry,
-    clear_dirty_learning_in_modules, export_dirty_learning_from_modules,
-    export_from_modules_with_health, export_tool_health_delta, has_dirty_learning_data,
-    merge_into_modules, merge_tool_health, save_synced_tool_health,
+    DeltaSnapshot, LearningSnapshot, ToolHealthEntry, clear_dirty_learning_in_modules,
+    export_dirty_learning_from_modules, export_from_modules_with_health, export_tool_health_delta,
+    has_dirty_learning_data, merge_into_modules, merge_tool_health, save_synced_tool_health,
 };
 use astra_services::session_journal;
 use astra_services::state_sync::{MatrixOneSyncService, StateSyncService, pref_keys};
@@ -153,12 +152,8 @@ pub(super) async fn try_cloud_push_versioned(
         Some(p) => p,
         None => return None,
     };
-    let snapshot = export_from_modules_with_health(
-        entity_graph,
-        pattern_library,
-        calibrator,
-        tool_health,
-    );
+    let snapshot =
+        export_from_modules_with_health(entity_graph, pattern_library, calibrator, tool_health);
     let json = match serde_json::to_string(&snapshot) {
         Ok(j) => j,
         Err(_) => return None,
@@ -220,7 +215,8 @@ pub(super) async fn try_cloud_push_delta(
     expected_version: Option<i64>,
 ) -> Option<i64> {
     let learning_dirty = has_dirty_learning_data(entity_graph, pattern_library, calibrator);
-    let tool_health_deltas = export_tool_health_delta(tool_health_entries, synced_tool_health_entries);
+    let tool_health_deltas =
+        export_tool_health_delta(tool_health_entries, synced_tool_health_entries);
 
     if !learning_dirty && tool_health_deltas.is_empty() {
         return expected_version;
@@ -252,7 +248,9 @@ pub(super) async fn try_cloud_push_delta(
     let svc = MatrixOneSyncService::new(pool);
     let user_id = std::env::var("MO_USER_ID").unwrap_or_else(|_| "local".to_string());
 
-    let result = StateSyncService::push_delta(&svc, &user_id, profile_name, &delta_json, expected_version).await;
+    let result =
+        StateSyncService::push_delta(&svc, &user_id, profile_name, &delta_json, expected_version)
+            .await;
 
     if result.is_conflict {
         eprintln!(
@@ -391,7 +389,10 @@ pub(super) async fn try_cloud_push_preferences(state: &ReplState) {
 /// returned no learning rows, tool health, or preferences (audit / connectivity proof).
 pub(super) const ASTRA_JOURNAL_CLOUD_EMPTY_ACK: &str = "ASTRA_JOURNAL_CLOUD_EMPTY_ACK";
 
-pub(super) fn cloud_pull_warrants_sync_marker(pull: &CloudPullResult, pref_keys: &[String]) -> bool {
+pub(super) fn cloud_pull_warrants_sync_marker(
+    pull: &CloudPullResult,
+    pref_keys: &[String],
+) -> bool {
     pull.cloud_reachable
         && (pull.version.is_some() || !pull.tool_health.is_empty() || !pref_keys.is_empty())
 }
@@ -430,7 +431,8 @@ pub(super) fn append_cloud_pull_sync_journal(
     let Some(sid) = state.session_id.as_deref() else {
         return;
     };
-    let reachable_empty_ack = pull.cloud_reachable && !cloud_pull_warrants_sync_marker(pull, pref_keys);
+    let reachable_empty_ack =
+        pull.cloud_reachable && !cloud_pull_warrants_sync_marker(pull, pref_keys);
     let evt = session_journal::JournalEvent::cloud_pull_sync_marker(
         Some(sid),
         profile,
@@ -501,7 +503,10 @@ mod tests {
         assert!(cloud_pull_warrants_sync_marker(&versioned_pull, &[]));
 
         // With pref keys
-        assert!(cloud_pull_warrants_sync_marker(&empty_pull, &["explain_mode".to_string()]));
+        assert!(cloud_pull_warrants_sync_marker(
+            &empty_pull,
+            &["explain_mode".to_string()]
+        ));
     }
 
     #[test]
@@ -511,7 +516,11 @@ mod tests {
             version: None,
             cloud_reachable: false,
         };
-        assert!(!should_append_cloud_pull_journal(&unreachable, &[], "startup"));
+        assert!(!should_append_cloud_pull_journal(
+            &unreachable,
+            &[],
+            "startup"
+        ));
 
         // post_login always journals if reachable
         let reachable_empty = CloudPullResult {
@@ -519,6 +528,10 @@ mod tests {
             version: None,
             cloud_reachable: true,
         };
-        assert!(should_append_cloud_pull_journal(&reachable_empty, &[], "post_login"));
+        assert!(should_append_cloud_pull_journal(
+            &reachable_empty,
+            &[],
+            "post_login"
+        ));
     }
 }

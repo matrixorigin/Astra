@@ -1034,9 +1034,7 @@ impl DelegationEngine {
     }
 
     /// Get the progress broadcaster from the underlying tracker, if configured.
-    pub fn progress_broadcaster(
-        &self,
-    ) -> Option<&Arc<crate::orchestration::ProgressBroadcaster>> {
+    pub fn progress_broadcaster(&self) -> Option<&Arc<crate::orchestration::ProgressBroadcaster>> {
         self.tracker.progress_broadcaster()
     }
 
