@@ -417,12 +417,20 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
         let budget = prompts::budget_for_model(ctx.model);
         let max_tokens = budget.model_limit as u32;
 
-        // Helper: extract content string from a message Value for estimation.
+        // Helper: extract text content from a message Value for estimation.
+        // Handles both string content and Anthropic-style array-of-blocks.
         let msg_content = |m: &Value| -> String {
-            m.get("content")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string()
+            match m.get("content") {
+                Some(v) if v.is_string() => v.as_str().unwrap_or("").to_string(),
+                Some(v) if v.is_array() => v
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                    .collect::<Vec<_>>()
+                    .join(""),
+                _ => String::new(),
+            }
         };
 
         // Estimate history tokens from messages (excluding system prompt)
@@ -841,19 +849,40 @@ mod tests {
     #[test]
     fn system_prompt_estimate_scales_with_content() {
         use astra_runtime::prompts::estimate_str_tokens;
+        use serde_json::Value;
 
-        let short_prompt = json!({"role": "system", "content": "You are a helpful assistant."});
-        let long_prompt = json!({"role": "system", "content": "You are a helpful assistant. ".repeat(200)});
+        // Helper mirrors the closure in prepare_chat_turn_payload.
+        let msg_content = |m: &Value| -> String {
+            match m.get("content") {
+                Some(v) if v.is_string() => v.as_str().unwrap_or("").to_string(),
+                Some(v) if v.is_array() => v
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|b: &Value| b.get("text").and_then(|t| t.as_str()))
+                    .collect::<Vec<_>>()
+                    .join(""),
+                _ => String::new(),
+            }
+        };
 
-        let short_tokens = estimate_str_tokens(&short_prompt.to_string()) as u32;
-        let long_tokens = estimate_str_tokens(&long_prompt.to_string()) as u32;
+        // String content (OpenAI format)
+        let str_msg = json!({"role": "system", "content": "You are a helpful assistant."});
+        let str_tokens = estimate_str_tokens(&msg_content(&str_msg)) as u32;
+        assert!(str_tokens > 0 && str_tokens < 100, "string: {str_tokens}");
 
-        // Short prompt should be well under the old hardcoded 14000
-        assert!(short_tokens < 100, "short prompt: {short_tokens}");
-        // Long prompt should be proportionally larger
-        assert!(long_tokens > short_tokens * 10, "long {long_tokens} vs short {short_tokens}");
-        // Neither should be exactly 14000 (the old constant)
-        assert_ne!(short_tokens, 14_000);
+        // Array content (Anthropic format)
+        let arr_msg = json!({"role": "system", "content": [
+            {"type": "text", "text": "You are a helpful assistant."},
+            {"type": "text", "text": " Follow instructions carefully."}
+        ]});
+        let arr_tokens = estimate_str_tokens(&msg_content(&arr_msg)) as u32;
+        assert!(arr_tokens > str_tokens, "array {arr_tokens} should > string {str_tokens}");
+
+        // Long content should scale, never be the old hardcoded 14000
+        let long_msg = json!({"role": "system", "content": "x".repeat(40000)});
+        let long_tokens = estimate_str_tokens(&msg_content(&long_msg)) as u32;
+        assert!(long_tokens > 5000, "long: {long_tokens}");
         assert_ne!(long_tokens, 14_000);
     }
 }
