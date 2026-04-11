@@ -134,6 +134,20 @@ fn bridge_error_sse_response(
     sse_stream_response(StatusCode::OK, Body::from(body))
 }
 
+fn trusted_bridge_identity(headers: &HeaderMap) -> (Option<String>, Option<String>) {
+    let trusted_session_id = headers
+        .get("x-mo-session-id")
+        .and_then(|value| value.to_str().ok())
+        .map(ToString::to_string)
+        .filter(|value| !value.is_empty());
+    let trusted_turn_chain_id = headers
+        .get("x-mo-turn-chain-id")
+        .and_then(|value| value.to_str().ok())
+        .map(ToString::to_string)
+        .filter(|value| !value.is_empty());
+    (trusted_session_id, trusted_turn_chain_id)
+}
+
 async fn read_bridge_error_body_excerpt<S, E>(mut stream: S, max_bytes: usize) -> String
 where
     S: futures_util::Stream<Item = Result<Bytes, E>> + Unpin,
@@ -339,16 +353,19 @@ impl ChatTurnBridge for HttpChatTurnBridge {
             }
         }
         request = request.body(body.to_vec());
+        let (trusted_session_id, trusted_turn_chain_id) = trusted_bridge_identity(&bridge_headers);
 
         // Circuit breaker: fast-reject if bridge is in open state
         if !self.circuit_breaker.allow_request() {
             let metrics = self.circuit_breaker.metrics();
-            return Err((
+            return Ok(bridge_error_sse_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 format!(
                     "Bridge circuit breaker is open (consecutive failures: {}, state: {}). Retry after recovery timeout.",
                     metrics.consecutive_failures, metrics.state
                 ),
+                trusted_session_id.as_deref(),
+                trusted_turn_chain_id.as_deref(),
             ));
         }
 
@@ -361,7 +378,12 @@ impl ChatTurnBridge for HttpChatTurnBridge {
                 self.circuit_breaker.record_failure();
                 self.health_metrics
                     .record_request(latency_ms, false, is_timeout);
-                return Err((StatusCode::BAD_GATEWAY, error.to_string()));
+                return Ok(bridge_error_sse_response(
+                    StatusCode::BAD_GATEWAY,
+                    error.to_string(),
+                    trusted_session_id.as_deref(),
+                    trusted_turn_chain_id.as_deref(),
+                ));
             }
         };
         let status = StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::OK);
@@ -374,16 +396,6 @@ impl ChatTurnBridge for HttpChatTurnBridge {
         // These bridge headers were synthesized by server-side bridge prep before dispatch, so
         // they remain the authoritative session/run identity even if the upstream response is a
         // non-SSE error body with no usable metadata of its own.
-        let trusted_session_id = headers
-            .get("x-mo-session-id")
-            .and_then(|value| value.to_str().ok())
-            .map(ToString::to_string)
-            .filter(|value| !value.is_empty());
-        let trusted_turn_chain_id = headers
-            .get("x-mo-turn-chain-id")
-            .and_then(|value| value.to_str().ok())
-            .map(ToString::to_string)
-            .filter(|value| !value.is_empty());
         let request_latency_ms = request_start.elapsed().as_millis() as u64;
         let (is_success, should_trip_breaker) = bridge_http_response_health(status, is_sse);
         self.health_metrics
@@ -1263,6 +1275,7 @@ pub(crate) fn sse_stream_response(status: StatusCode, body: Body) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::HeaderValue;
 
     // ── Phase 6.6: Header filtering security tests ──
 
@@ -1322,6 +1335,41 @@ mod tests {
         assert_eq!(event["run_id"], "run-1");
     }
 
+    fn trusted_identity_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-mo-session-id", HeaderValue::from_static("sess-1"));
+        headers.insert("x-mo-turn-chain-id", HeaderValue::from_static("run-1"));
+        headers
+    }
+
+    async fn forward_with_noop_writers(
+        bridge: &HttpChatTurnBridge,
+        headers: &HeaderMap,
+    ) -> Result<Response, (StatusCode, String)> {
+        bridge
+            .forward(
+                headers,
+                Bytes::from_static(b"{}"),
+                Arc::new(crate::turn::services::NoopTurnCoreEventWriter),
+                Arc::new(crate::turn::services::NoopTurnToolEventWriter),
+                Arc::new(crate::turn::services::NoopTurnHookDbWriter),
+                Arc::new(InMemoryTurnReflectionStateStore::default()),
+                Arc::new(NoopTurnReflectionLessonWriter),
+                Arc::new(NoopTurnObserverWorker),
+                Arc::new(crate::turn::services::NoopTurnAuxiliaryEventWriter),
+                Arc::new(crate::turn::services::NoopTurnSessionActivityWriter),
+                None,
+            )
+            .await
+    }
+
+    async fn response_text(response: Response) -> String {
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("body should read");
+        String::from_utf8(body.to_vec()).expect("utf8")
+    }
+
     #[test]
     fn bridge_http_500_counts_as_failure_and_breaker_signal() {
         let (is_success, should_trip_breaker) =
@@ -1335,6 +1383,47 @@ mod tests {
         let (is_success, should_trip_breaker) = bridge_http_response_health(StatusCode::OK, false);
         assert!(!is_success);
         assert!(should_trip_breaker);
+    }
+
+    #[tokio::test]
+    async fn circuit_breaker_fast_reject_preserves_trusted_session_info() {
+        use tokio::sync::Mutex;
+
+        let cache = Arc::new(Mutex::new(SessionCache::default()));
+        let bridge = HttpChatTurnBridge::new("http://localhost:9999".to_string(), cache);
+        for _ in 0..5 {
+            bridge.circuit_breaker.record_failure();
+        }
+
+        let response = forward_with_noop_writers(&bridge, &trusted_identity_headers())
+            .await
+            .expect("fast reject should normalize to SSE");
+        let text = response_text(response).await;
+
+        assert!(text.contains("\"type\":\"session_info\""));
+        assert!(text.contains("\"session_id\":\"sess-1\""));
+        assert!(text.contains("\"run_id\":\"run-1\""));
+        assert!(text.contains("\"type\":\"error\""));
+        assert!(text.contains("\"code\":\"UPSTREAM_ERROR\""));
+    }
+
+    #[tokio::test]
+    async fn request_send_failure_preserves_trusted_session_info() {
+        use tokio::sync::Mutex;
+
+        let cache = Arc::new(Mutex::new(SessionCache::default()));
+        let bridge = HttpChatTurnBridge::new("http://[::1".to_string(), cache);
+
+        let response = forward_with_noop_writers(&bridge, &trusted_identity_headers())
+            .await
+            .expect("send failure should normalize to SSE");
+        let text = response_text(response).await;
+
+        assert!(text.contains("\"type\":\"session_info\""));
+        assert!(text.contains("\"session_id\":\"sess-1\""));
+        assert!(text.contains("\"run_id\":\"run-1\""));
+        assert!(text.contains("\"type\":\"error\""));
+        assert!(text.contains("\"code\":\"UPSTREAM_ERROR\""));
     }
 
     #[tokio::test]
