@@ -49,8 +49,8 @@ pub(crate) async fn insert_core_turn_event(
     .bind(&event.llm_model_used)
     .bind(event.llm_params.as_ref().map(serde_json::Value::to_string))
     .bind(&event.reasoning_content)
-    .bind(event.token_usage.as_ref().and_then(|v| v.get("input")).and_then(|v| v.as_i64()))
-    .bind(event.token_usage.as_ref().and_then(|v| v.get("output")).and_then(|v| v.as_i64()))
+    .bind(event.token_usage.as_ref().and_then(|v| v.get("input").or_else(|| v.get("prompt"))).and_then(|v| v.as_i64()))
+    .bind(event.token_usage.as_ref().and_then(|v| v.get("output").or_else(|| v.get("completion"))).and_then(|v| v.as_i64()))
     .bind(event.token_usage.as_ref().and_then(|v| v.get("total")).and_then(|v| v.as_i64()))
     .execute(&mut **tx)
     .await?;
