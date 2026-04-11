@@ -440,7 +440,7 @@ pub(super) async fn execute_cli_command(
                 observability_session: None,
                 file_journal: None,
                 turn_index: 0,
-                    evolution_service: None,
+                evolution_service: None,
             })
             .await
             {
@@ -485,7 +485,7 @@ pub(super) async fn execute_cli_command(
                         observability_session: None,
                         file_journal: None,
                         turn_index: 0,
-                    evolution_service: None,
+                        evolution_service: None,
                     })
                     .await
                     .map_err(|f| f.error)?
@@ -871,7 +871,7 @@ pub(super) async fn execute_cli_command(
                 observability_session: None,
                 file_journal: None,
                 turn_index: 0,
-                    evolution_service: None,
+                evolution_service: None,
             })
             .await
             {
@@ -916,7 +916,7 @@ pub(super) async fn execute_cli_command(
                         observability_session: None,
                         file_journal: None,
                         turn_index: 0,
-                    evolution_service: None,
+                        evolution_service: None,
                     })
                     .await
                     .map_err(|f| f.error)?
@@ -1377,7 +1377,7 @@ pub(super) async fn run_print_mode(
         observability_session: None,
         file_journal: None,
         turn_index: 0,
-                    evolution_service: None,
+        evolution_service: None,
     })
     .await
     {
@@ -1424,7 +1424,7 @@ pub(super) async fn run_print_mode(
                 observability_session: None,
                 file_journal: None,
                 turn_index: 0,
-                    evolution_service: None,
+                evolution_service: None,
             })
             .await
             .map_err(|f| f.error)?
