@@ -260,8 +260,16 @@ async fn execute_repl_bridge_command(
 
     // Initialize evolution service with pattern library for drift detection.
     {
-        let evo = astra_runtime::evolution::service::EvolutionService::new()
+        let mut evo = astra_runtime::evolution::service::EvolutionService::new()
             .with_pattern_library(pipeline_modules.pattern_library.clone());
+        if let Some(skills_dir) = astra_runtime::skills::loader::skill_search_paths()
+            .into_iter()
+            .next()
+        {
+            evo = evo.with_evolution_store(std::sync::Arc::new(
+                astra_runtime::evolution::store::EvolutionStore::new(skills_dir),
+            ));
+        }
         state.evolution_service = Some(std::sync::Arc::new(evo));
     }
     if let Some(hub) = &state.observability_hub {

@@ -5,6 +5,7 @@ use tokio::sync::Mutex;
 
 use super::evolver;
 use super::signal_collector::SignalCollector;
+use super::store::EvolutionStore;
 use super::types::{
     ApprovalStatus, EvolutionAxis, EvolutionProposal, EvolutionSignal, ToolResultContext,
     TurnSummary,
@@ -22,6 +23,8 @@ pub struct EvolutionService {
     applied_log: Mutex<Vec<EvolutionProposal>>,
     /// Optional pattern library for drift detection during flush.
     pattern_library: Option<Arc<std::sync::Mutex<PatternLibrary>>>,
+    /// Optional durable store for skill evolution proposals and approved diffs.
+    evolution_store: Option<Arc<EvolutionStore>>,
     /// Cached reflection engine (stateless — reusable across calls).
     reflection_engine: ReflectionEngine,
 }
@@ -33,6 +36,7 @@ impl EvolutionService {
             pending_proposals: Mutex::new(Vec::new()),
             applied_log: Mutex::new(Vec::new()),
             pattern_library: None,
+            evolution_store: None,
             reflection_engine: ReflectionEngine::new(),
         }
     }
@@ -40,6 +44,12 @@ impl EvolutionService {
     /// Create with a pattern library reference for drift detection.
     pub fn with_pattern_library(mut self, lib: Arc<std::sync::Mutex<PatternLibrary>>) -> Self {
         self.pattern_library = Some(lib);
+        self
+    }
+
+    /// Create with a durable evolution store for skill proposals.
+    pub fn with_evolution_store(mut self, store: Arc<EvolutionStore>) -> Self {
+        self.evolution_store = Some(store);
         self
     }
 
@@ -164,8 +174,17 @@ impl EvolutionService {
     }
 
     /// Approve a proposal by ID. Returns the proposal if found.
-    pub async fn approve(&self, id: &str) -> Option<EvolutionProposal> {
-        // Extract from pending under its own lock scope (avoid nested lock across await).
+    pub async fn approve(&self, id: &str) -> Result<Option<EvolutionProposal>, String> {
+        let candidate = {
+            let pending = self.pending_proposals.lock().await;
+            pending.iter().find(|p| p.id == id).cloned()
+        };
+        let Some(candidate) = candidate else {
+            return Ok(None);
+        };
+
+        self.apply_proposal(&candidate)?;
+
         let extracted = {
             let mut pending = self.pending_proposals.lock().await;
             if let Some(pos) = pending.iter().position(|p| p.id == id) {
@@ -176,22 +195,30 @@ impl EvolutionService {
                 None
             }
         };
-        // Now safe to lock applied_log without nesting.
         if let Some(p) = extracted.as_ref() {
             self.applied_log.lock().await.push(p.clone());
         }
-        extracted
+        Ok(extracted)
     }
 
     /// Reject a proposal by ID. Returns the proposal if found.
-    pub async fn reject(&self, id: &str) -> Option<EvolutionProposal> {
+    pub async fn reject(&self, id: &str) -> Result<Option<EvolutionProposal>, String> {
+        let candidate = {
+            let pending = self.pending_proposals.lock().await;
+            pending.iter().find(|p| p.id == id).cloned()
+        };
+        let Some(candidate) = candidate else {
+            return Ok(None);
+        };
+        self.persist_rejection(&candidate)?;
+
         let mut pending = self.pending_proposals.lock().await;
         if let Some(pos) = pending.iter().position(|p| p.id == id) {
             let mut p = pending.remove(pos);
             p.status = ApprovalStatus::Rejected;
-            Some(p)
+            Ok(Some(p))
         } else {
-            None
+            Ok(None)
         }
     }
 
@@ -259,12 +286,76 @@ impl EvolutionService {
         let proposals = self
             .reflection_engine
             .convert_proposals(&parsed.proposals, ctx);
+        self.persist_skill_proposals(&proposals)?;
         let count = proposals.len();
         let mut pending = self.pending_proposals.lock().await;
         for p in proposals {
             pending.push(p);
         }
         Ok(count)
+    }
+
+    fn persist_skill_proposals(&self, proposals: &[EvolutionProposal]) -> Result<(), String> {
+        let Some(store) = self.evolution_store.as_ref() else {
+            return Ok(());
+        };
+        for proposal in proposals {
+            if let EvolutionAxis::Skill { skill_name, .. } = &proposal.axis {
+                store.append(skill_name, proposal)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_proposal(&self, proposal: &EvolutionProposal) -> Result<(), String> {
+        match &proposal.axis {
+            EvolutionAxis::Skill {
+                skill_name,
+                section,
+                diff,
+            } => {
+                let Some(store) = self.evolution_store.as_ref() else {
+                    return Err("evolution store not configured for skill proposal approval".into());
+                };
+                store.apply_skill_diff(skill_name, section, diff)?;
+                store
+                    .mark_applied(skill_name, &proposal.id)
+                    .map_err(|e| format!("skill diff applied but failed to persist approval: {e}"))
+            }
+            EvolutionAxis::Pattern { signature, action } => {
+                let Some(pattern_library) = self.pattern_library.as_ref() else {
+                    return Err(
+                        "pattern library not configured for pattern proposal approval".into(),
+                    );
+                };
+                let Ok(mut library) = pattern_library.lock() else {
+                    return Err("pattern library lock poisoned during proposal approval".into());
+                };
+                let updated = library.apply_evolution_action(signature, *action);
+                if updated == 0 {
+                    return Err(format!(
+                        "no patterns matched signature '{signature}' for approval"
+                    ));
+                }
+                Ok(())
+            }
+            EvolutionAxis::Calibration { .. } => {
+                Err("calibration proposal approval is not wired yet".into())
+            }
+            EvolutionAxis::Entity { .. } => Err("entity proposal approval is not wired yet".into()),
+        }
+    }
+
+    fn persist_rejection(&self, proposal: &EvolutionProposal) -> Result<(), String> {
+        match &proposal.axis {
+            EvolutionAxis::Skill { skill_name, .. } => {
+                let Some(store) = self.evolution_store.as_ref() else {
+                    return Ok(());
+                };
+                store.mark_rejected(skill_name, &proposal.id)
+            }
+            _ => Ok(()),
+        }
     }
 }
 
@@ -276,9 +367,9 @@ pub fn new_shared() -> Arc<EvolutionService> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::evolution::types::{
-        ApprovalStatus, EvolutionAxis, PatternAction, SkillDiff, SkillSection,
-    };
+    use crate::evolution::store::StoredStatus;
+    use crate::evolution::types::{ApprovalStatus, EvolutionAxis, PatternAction};
+    use crate::liquid::reflection::ReflectionContext;
     use crate::pipeline::routing::{DomainHint, TaskType};
 
     fn tool_failure_signal(tool: &str, skill: Option<&str>) -> EvolutionSignal {
@@ -341,16 +432,27 @@ mod tests {
 
     #[tokio::test]
     async fn approve_moves_to_applied() {
-        let svc = EvolutionService::new();
+        use crate::pipeline::pattern::PatternLibrary;
+
+        let lib = Arc::new(std::sync::Mutex::new(PatternLibrary::default()));
+        {
+            let mut l = lib.lock().unwrap();
+            l.record_outcome(
+                &["bash".to_string()],
+                TaskType::Code,
+                Some(DomainHint::Code),
+                true,
+                0.8,
+                None,
+            );
+        }
+        let svc = EvolutionService::new().with_pattern_library(lib);
         let proposal = EvolutionProposal {
             id: "ev_test123".into(),
             signal: tool_failure_signal("bash", Some("s")),
-            axis: EvolutionAxis::Skill {
-                skill_name: "review_changes".into(),
-                section: SkillSection::Troubleshooting,
-                diff: SkillDiff::Append {
-                    content: "new rule".into(),
-                },
+            axis: EvolutionAxis::Pattern {
+                signature: "bash".into(),
+                action: PatternAction::Boost,
             },
             confidence: 0.8,
             reasoning: "test".into(),
@@ -360,7 +462,7 @@ mod tests {
         svc.propose(proposal).await;
         assert_eq!(svc.pending().await.len(), 1);
 
-        let approved = svc.approve("ev_test123").await;
+        let approved = svc.approve("ev_test123").await.unwrap();
         assert!(approved.is_some());
         assert_eq!(approved.unwrap().status, ApprovalStatus::Approved);
         assert!(svc.pending().await.is_empty());
@@ -383,7 +485,7 @@ mod tests {
             status: ApprovalStatus::Pending,
         };
         svc.propose(proposal).await;
-        let rejected = svc.reject("ev_reject").await;
+        let rejected = svc.reject("ev_reject").await.unwrap();
         assert!(rejected.is_some());
         assert_eq!(rejected.unwrap().status, ApprovalStatus::Rejected);
         assert!(svc.pending().await.is_empty());
@@ -394,13 +496,13 @@ mod tests {
     #[tokio::test]
     async fn approve_nonexistent_returns_none() {
         let svc = EvolutionService::new();
-        assert!(svc.approve("ev_nonexistent").await.is_none());
+        assert!(svc.approve("ev_nonexistent").await.unwrap().is_none());
     }
 
     #[tokio::test]
     async fn reject_nonexistent_returns_none() {
         let svc = EvolutionService::new();
-        assert!(svc.reject("ev_nonexistent").await.is_none());
+        assert!(svc.reject("ev_nonexistent").await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -661,7 +763,21 @@ mod tests {
 
     #[tokio::test]
     async fn ingest_then_approve_proposal() {
-        let svc = EvolutionService::new();
+        use crate::pipeline::pattern::PatternLibrary;
+
+        let lib = Arc::new(std::sync::Mutex::new(PatternLibrary::default()));
+        {
+            let mut l = lib.lock().unwrap();
+            l.record_outcome(
+                &["a".to_string()],
+                TaskType::Code,
+                Some(DomainHint::Code),
+                true,
+                0.8,
+                None,
+            );
+        }
+        let svc = EvolutionService::new().with_pattern_library(lib);
         let ctx = svc.build_reflection_context("s", 1, None, 0.0, &[], vec![], vec![], None);
 
         let llm = r#"{"proposals": [{"axis": "pattern", "description": "Boost", "confidence": 0.9, "details": {"signature": "a", "action": "boost"}}], "summary": "ok"}"#;
@@ -671,7 +787,7 @@ mod tests {
         assert_eq!(pending.len(), 1);
         let id = pending[0].id.clone();
 
-        let approved = svc.approve(&id).await;
+        let approved = svc.approve(&id).await.unwrap();
         assert!(approved.is_some());
         assert_eq!(approved.unwrap().status, ApprovalStatus::Approved);
 
@@ -679,5 +795,96 @@ mod tests {
         assert!(svc.pending().await.is_empty());
         // Shows in applied log.
         assert_eq!(svc.applied().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn ingest_and_approve_skill_proposal_persists_and_applies() {
+        let temp = tempfile::tempdir().unwrap();
+        let skill_dir = temp.path().join("review_changes");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "# Skill\n\n## Troubleshooting\n\nExisting tip.\n",
+        )
+        .unwrap();
+
+        let store = Arc::new(EvolutionStore::new(temp.path().to_path_buf()));
+        let svc = EvolutionService::new().with_evolution_store(store.clone());
+        let ctx = ReflectionContext::new("sess-skill");
+        let llm_response = r#"{
+            "proposals": [
+                {
+                    "axis": "skill",
+                    "description": "Add troubleshooting note for review_changes",
+                    "confidence": 0.92,
+                    "details": {
+                        "skill_name": "review_changes",
+                        "section": "troubleshooting",
+                        "content": "Re-check staged vs unstaged diffs before final review."
+                    }
+                }
+            ],
+            "summary": "Need a sharper review troubleshooting note."
+        }"#;
+
+        let count = svc
+            .ingest_reflection_response(llm_response, &ctx)
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+        let stored = store.load("review_changes").unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].status, StoredStatus::Pending);
+
+        let proposal_id = svc.pending().await[0].id.clone();
+        let approved = svc.approve(&proposal_id).await.unwrap();
+        assert!(approved.is_some());
+
+        let updated_skill = std::fs::read_to_string(skill_dir.join("SKILL.md")).unwrap();
+        assert!(updated_skill.contains("Re-check staged vs unstaged diffs before final review."));
+
+        let stored = store.load("review_changes").unwrap();
+        assert_eq!(stored[0].status, StoredStatus::Applied);
+    }
+
+    #[tokio::test]
+    async fn reject_skill_proposal_marks_store_rejected() {
+        let temp = tempfile::tempdir().unwrap();
+        let skill_dir = temp.path().join("review_changes");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "# Skill\n\n## Troubleshooting\n\nExisting tip.\n",
+        )
+        .unwrap();
+
+        let store = Arc::new(EvolutionStore::new(temp.path().to_path_buf()));
+        let svc = EvolutionService::new().with_evolution_store(store.clone());
+        let ctx = ReflectionContext::new("sess-skill");
+        let llm_response = r#"{
+            "proposals": [
+                {
+                    "axis": "skill",
+                    "description": "Add troubleshooting note for review_changes",
+                    "confidence": 0.92,
+                    "details": {
+                        "skill_name": "review_changes",
+                        "section": "troubleshooting",
+                        "content": "Do not skip diff context."
+                    }
+                }
+            ],
+            "summary": "Need a sharper review troubleshooting note."
+        }"#;
+
+        svc.ingest_reflection_response(llm_response, &ctx)
+            .await
+            .unwrap();
+        let proposal_id = svc.pending().await[0].id.clone();
+        let rejected = svc.reject(&proposal_id).await.unwrap();
+        assert!(rejected.is_some());
+
+        let stored = store.load("review_changes").unwrap();
+        assert_eq!(stored[0].status, StoredStatus::Rejected);
     }
 }

@@ -65,9 +65,23 @@ impl EvolutionStore {
 
     /// Mark a proposal as applied in the store.
     pub fn mark_applied(&self, skill_name: &str, proposal_id: &str) -> Result<(), String> {
+        self.mark_status(skill_name, proposal_id, StoredStatus::Applied)
+    }
+
+    /// Mark a proposal as rejected in the store.
+    pub fn mark_rejected(&self, skill_name: &str, proposal_id: &str) -> Result<(), String> {
+        self.mark_status(skill_name, proposal_id, StoredStatus::Rejected)
+    }
+
+    fn mark_status(
+        &self,
+        skill_name: &str,
+        proposal_id: &str,
+        status: StoredStatus,
+    ) -> Result<(), String> {
         let mut proposals = self.load(skill_name)?;
         if let Some(p) = proposals.iter_mut().find(|p| p.id == proposal_id) {
-            p.status = StoredStatus::Applied;
+            p.status = status;
         }
         self.save_proposals(skill_name, &proposals)
     }

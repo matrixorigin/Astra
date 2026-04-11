@@ -1531,67 +1531,22 @@ Follow these steps:
             } else if let Some(id) = sub_arg.strip_prefix("approve ") {
                 let id = id.trim();
                 match evo.approve(id).await {
-                    Some(p) => {
-                        eprintln!("  {} Approved: {}", "✓".green(), p.id);
-                        // If it's a skill diff, apply it
-                        if let astra_runtime::evolution::types::EvolutionAxis::Skill {
-                            ref skill_name,
-                            ref section,
-                            ref diff,
-                        } = p.axis
-                        {
-                            let skills_dir = astra_runtime::skills::loader::skill_search_paths()
-                                .into_iter()
-                                .next()
-                                .unwrap_or_else(|| {
-                                    let fallback = std::env::current_dir()
-                                        .unwrap_or_default()
-                                        .join(".astra")
-                                        .join("skills");
-                                    eprintln!(
-                                        "  {} No skill search paths configured, using {}",
-                                        "⚠".yellow(),
-                                        fallback.display()
-                                    );
-                                    fallback
-                                });
-                            let store =
-                                astra_runtime::evolution::store::EvolutionStore::new(skills_dir);
-                            // Persist state first to prevent duplicate application on restart.
-                            if let Err(e) = store.mark_applied(skill_name, &p.id) {
-                                eprintln!("  {} Failed to persist approval: {}", "✗".red(), e);
-                            } else {
-                                match store.apply_skill_diff(skill_name, section, diff) {
-                                    Ok(_) => {
-                                        eprintln!(
-                                            "  {} Applied diff to {}/SKILL.md § {}",
-                                            "✓".green(),
-                                            skill_name,
-                                            section.heading()
-                                        );
-                                    }
-                                    Err(e) => {
-                                        eprintln!(
-                                            "  {} Failed to apply diff (proposal already marked applied): {}",
-                                            "✗".red(),
-                                            e
-                                        );
-                                    }
-                                }
-                            }
-                        }
+                    Ok(Some(p)) => {
+                        eprintln!("  {} Approved and applied: {}", "✓".green(), p.id);
                     }
-                    None => {
+                    Ok(None) => {
                         eprintln!("  {} No pending proposal with id '{}'", "✗".red(), id);
                     }
+                    Err(e) => eprintln!("  {} Approval failed: {}", "✗".red(), e),
                 }
             } else if let Some(id) = sub_arg.strip_prefix("reject ") {
                 let id = id.trim();
                 match evo.reject(id).await {
-                    Some(_) => eprintln!("  {} Rejected: {}", "✓".green(), id),
-                    None => {
+                    Ok(Some(_)) => eprintln!("  {} Rejected: {}", "✓".green(), id),
+                    Ok(None) => {
                         eprintln!("  {} No pending proposal with id '{}'", "✗".red(), id)
                     }
+                    Err(e) => eprintln!("  {} Reject failed: {}", "✗".red(), e),
                 }
             } else {
                 eprintln!("  {}", "Usage:".yellow());
