@@ -51,6 +51,9 @@ pub(crate) async fn headless_plan_decompose(
     } else {
         stream_sse_markdown(resp).await
     };
+    if let Some(err) = collected.completion_error() {
+        return Err(err);
+    }
     if collected.event_types.iter().any(|t| t == "error") && collected.text.trim().is_empty() {
         return Err("LLM stream returned an error event with no text".to_string());
     }
@@ -505,11 +508,14 @@ pub(super) async fn handle_memory_domain_command(
                     match api.post_chat_turn(tok, &payload).await {
                         Ok(resp) if resp.status().is_success() => {
                             let sse_result = stream_sse_markdown(resp).await;
-
-                            match plan_decompose::parse_plan_response(&sse_result.text) {
-                                Ok(_plan) => {}
-                                Err(e) => {
-                                    eprint_plan_json_parse_failed(&sse_result.text, &e);
+                            if let Some(err) = sse_result.completion_error() {
+                                eprintln!("  {} {}", theme::icon_err(), err.red());
+                            } else {
+                                match plan_decompose::parse_plan_response(&sse_result.text) {
+                                    Ok(_plan) => {}
+                                    Err(e) => {
+                                        eprint_plan_json_parse_failed(&sse_result.text, &e);
+                                    }
                                 }
                             }
                         }
@@ -1589,6 +1595,10 @@ async fn _old_handle_plan_mode_input(
         match resp {
             Ok(r) if r.status().is_success() => {
                 let sse_result = stream_sse_markdown(r).await;
+                if let Some(err) = sse_result.completion_error() {
+                    eprintln!("  {} {}", theme::icon_err(), err.red());
+                    return Ok(());
+                }
                 let full_text = sse_result.text;
 
                 match parse_plan_response(&full_text) {
@@ -1697,6 +1707,10 @@ async fn _old_handle_plan_mode_input(
                 match resp {
                     Ok(r) if r.status().is_success() => {
                         let sse_result = stream_sse_markdown(r).await;
+                        if let Some(err) = sse_result.completion_error() {
+                            eprintln!("  {} {}", theme::icon_err(), err.red());
+                            return Ok(());
+                        }
                         let full_text = sse_result.text;
 
                         if let Some(questions) = detect_clarification_questions(&full_text) {
@@ -1977,6 +1991,10 @@ async fn _old_handle_plan_mode_input(
     match resp {
         Ok(r) if r.status().is_success() => {
             let sse_result = stream_sse_markdown(r).await;
+            if let Some(err) = sse_result.completion_error() {
+                eprintln!("  {} {}", theme::icon_err(), err.red());
+                return Ok(());
+            }
 
             if sse_result.text.is_empty() {
                 if sse_result.event_count == 0 {

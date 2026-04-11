@@ -649,6 +649,10 @@ pub async fn handle_plan_mode_input(
         match resp {
             Ok(r) if r.status().is_success() => {
                 let sse_result = collect_sse_with_preview(r).await;
+                if let Some(err) = sse_result.completion_error() {
+                    eprintln!("  {} {}", theme::icon_err(), err.red());
+                    return Ok(());
+                }
                 let full_text = sse_result.text;
 
                 match parse_plan_response(&full_text) {
@@ -890,6 +894,10 @@ pub async fn handle_plan_mode_input(
     match resp {
         Ok(r) if r.status().is_success() => {
             let sse_result = collect_sse_with_preview(r).await;
+            if let Some(err) = sse_result.completion_error() {
+                eprintln!("  {} {}", theme::icon_err(), err.red());
+                return Ok(());
+            }
 
             if sse_result.text.is_empty() {
                 if sse_result.event_count == 0 {
@@ -1584,6 +1592,10 @@ async fn handle_goal_submission(
     match resp {
         Ok(r) if r.status().is_success() => {
             let sse_result = collect_sse_with_preview(r).await;
+            if let Some(err) = sse_result.completion_error() {
+                eprintln!("  {} {}", theme::icon_err(), err.red());
+                return Ok(());
+            }
             let full_text = sse_result.text;
 
             if let Some(questions) = detect_clarification_questions(&full_text) {

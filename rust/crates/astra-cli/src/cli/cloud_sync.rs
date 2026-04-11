@@ -261,9 +261,10 @@ pub(super) async fn try_cloud_push_delta(
     }
 
     if result.success {
+        let synced_tool_health_snapshot = tool_health_entries.to_vec();
+        *synced_tool_health_entries = synced_tool_health_snapshot.clone();
         clear_dirty_learning_in_modules(entity_graph, pattern_library, calibrator);
-        *synced_tool_health_entries = tool_health_entries.to_vec();
-        if let Err(e) = save_synced_tool_health(profile_name, synced_tool_health_entries) {
+        if let Err(e) = save_synced_tool_health(profile_name, &synced_tool_health_snapshot) {
             eprintln!(
                 "{}",
                 format!("  ⚠ Tool-health sync metadata not saved: {e}").dim()

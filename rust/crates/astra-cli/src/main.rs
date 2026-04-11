@@ -870,7 +870,16 @@ async fn main() {
     dotenvy::dotenv().ok();
     let cli = Cli::parse();
     let base = cli.api_url.trim_end_matches('/').to_string();
-    let api = astra_thin_client::ThinClient::new(&base, None).expect("valid API URL");
+    let api = match astra_thin_client::ThinClient::new(&base, None) {
+        Ok(api) => api,
+        Err(err) => {
+            eprintln!(
+                "{}",
+                format!("Error: invalid API URL '{base}': {err}").red()
+            );
+            std::process::exit(1);
+        }
+    };
 
     // Set MEMORIA_API_KEY from credentials if not already set
     if std::env::var("MEMORIA_API_KEY").is_err() {

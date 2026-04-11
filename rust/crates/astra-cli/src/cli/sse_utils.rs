@@ -18,6 +18,20 @@ pub struct SseTextResult {
     pub event_count: usize,
     /// Distinct event types seen (e.g. `["text_delta", "error"]`).
     pub event_types: Vec<String>,
+    /// Transport-level failure while reading the SSE body.
+    pub stream_error: Option<String>,
+    /// True when we had to truncate an oversized malformed SSE buffer.
+    pub truncated: bool,
+}
+
+impl SseTextResult {
+    pub fn completion_error(&self) -> Option<String> {
+        self.stream_error.clone().or_else(|| {
+            self.truncated.then(|| {
+                format!("SSE buffer exceeded {MAX_SSE_BUFFER} bytes before a complete event")
+            })
+        })
+    }
 }
 
 /// Collect text from an SSE response: `data: {...}` lines, `text_delta` → `text`, `error` → stderr.
@@ -28,12 +42,20 @@ pub async fn collect_sse_text(resp: reqwest::Response, stream_to_stderr: bool) -
         text: String::new(),
         event_count: 0,
         event_types: Vec::new(),
+        stream_error: None,
+        truncated: false,
     };
     let mut buffer = String::new();
     let mut stream = resp.bytes_stream();
 
     while let Some(chunk) = stream.next().await {
-        let Ok(bytes) = chunk else { break };
+        let Ok(bytes) = chunk else {
+            result.stream_error = Some(format!(
+                "SSE stream read failed: {}",
+                chunk.err().expect("error branch checked above")
+            ));
+            break;
+        };
         buffer.push_str(&String::from_utf8_lossy(&bytes));
 
         // Guard against unbounded buffer growth from malformed streams
@@ -43,7 +65,9 @@ pub async fn collect_sse_text(resp: reqwest::Response, stream_to_stderr: bool) -
                 theme::icon_warn(),
                 MAX_SSE_BUFFER
             );
+            result.truncated = true;
             buffer.clear();
+            break;
         }
 
         while let Some(event_end) = buffer.find("\n\n") {
@@ -132,12 +156,20 @@ pub async fn stream_sse_markdown(resp: reqwest::Response) -> SseTextResult {
         text: String::new(),
         event_count: 0,
         event_types: Vec::new(),
+        stream_error: None,
+        truncated: false,
     };
     let mut buffer = String::new();
     let mut stream = resp.bytes_stream();
 
     while let Some(chunk) = stream.next().await {
-        let Ok(bytes) = chunk else { break };
+        let Ok(bytes) = chunk else {
+            result.stream_error = Some(format!(
+                "SSE stream read failed: {}",
+                chunk.err().expect("error branch checked above")
+            ));
+            break;
+        };
         buffer.push_str(&String::from_utf8_lossy(&bytes));
 
         // Guard against unbounded buffer growth from malformed streams
@@ -147,7 +179,9 @@ pub async fn stream_sse_markdown(resp: reqwest::Response) -> SseTextResult {
                 theme::icon_warn(),
                 MAX_SSE_BUFFER
             );
+            result.truncated = true;
             buffer.clear();
+            break;
         }
 
         while let Some(event_end) = buffer.find("\n\n") {
@@ -246,16 +280,31 @@ pub async fn collect_sse_with_preview(resp: reqwest::Response) -> SseTextResult 
         text: String::new(),
         event_count: 0,
         event_types: Vec::new(),
+        stream_error: None,
+        truncated: false,
     };
     let mut buffer = String::new();
     let mut stream = resp.bytes_stream();
 
     while let Some(chunk) = stream.next().await {
-        let Ok(bytes) = chunk else { break };
+        let Ok(bytes) = chunk else {
+            result.stream_error = Some(format!(
+                "SSE stream read failed: {}",
+                chunk.err().expect("error branch checked above")
+            ));
+            break;
+        };
         buffer.push_str(&String::from_utf8_lossy(&bytes));
 
         if buffer.len() > MAX_SSE_BUFFER {
+            eprintln!(
+                "\r  {} SSE buffer exceeded {} bytes, truncating incomplete events",
+                theme::icon_warn(),
+                MAX_SSE_BUFFER
+            );
+            result.truncated = true;
             buffer.clear();
+            break;
         }
 
         while let Some(event_end) = buffer.find("\n\n") {
@@ -337,6 +386,17 @@ mod tests {
         reqwest::Response::from(r)
     }
 
+    fn sse_error_response() -> reqwest::Response {
+        let body = reqwest::Body::wrap_stream(futures_util::stream::once(async {
+            Err::<Vec<u8>, std::io::Error>(std::io::Error::other("boom"))
+        }));
+        let r = Response::builder()
+            .status(200)
+            .body(body)
+            .expect("test response");
+        reqwest::Response::from(r)
+    }
+
     #[tokio::test]
     async fn collect_sse_merges_text_deltas() {
         let body = concat!(
@@ -347,6 +407,7 @@ mod tests {
         assert_eq!(r.text, "hello");
         assert!(r.event_types.contains(&"text_delta".to_string()));
         assert!(r.event_count >= 2);
+        assert!(r.completion_error().is_none());
     }
 
     #[tokio::test]
@@ -355,6 +416,7 @@ mod tests {
         let r = collect_sse_text(sse_response(body), false).await;
         assert!(r.event_types.contains(&"error".to_string()));
         assert!(r.text.is_empty());
+        assert!(r.completion_error().is_none());
     }
 
     #[tokio::test]
@@ -363,6 +425,32 @@ mod tests {
         let body = "data: {\"type\":\"text_delta\",\"content\":\"x\"}\n";
         let r = collect_sse_text(sse_response(body), false).await;
         assert_eq!(r.text, "x");
+        assert!(r.completion_error().is_none());
+    }
+
+    #[tokio::test]
+    async fn collect_sse_reports_stream_read_errors() {
+        let r = collect_sse_text(sse_error_response(), false).await;
+        assert_eq!(r.text, "");
+        assert!(
+            r.completion_error()
+                .is_some_and(|msg| msg.contains("SSE stream read failed"))
+        );
+    }
+
+    #[tokio::test]
+    async fn collect_sse_reports_buffer_truncation() {
+        let oversized = format!(
+            "data: {{\"type\":\"text_delta\",\"content\":\"{}\n",
+            "x".repeat(MAX_SSE_BUFFER)
+        );
+        let response = Response::builder()
+            .status(200)
+            .body(reqwest::Body::from(oversized))
+            .expect("test response");
+        let r = collect_sse_text(reqwest::Response::from(response), false).await;
+        assert!(r.truncated);
+        assert!(r.completion_error().is_some());
     }
 
     #[tokio::test]
@@ -375,6 +463,7 @@ mod tests {
         assert_eq!(r.text, "hello");
         assert!(r.event_types.contains(&"text_delta".to_string()));
         assert!(r.event_count >= 2);
+        assert!(r.completion_error().is_none());
     }
 
     #[tokio::test]
@@ -383,6 +472,7 @@ mod tests {
         let r = stream_sse_markdown(sse_response(body)).await;
         assert!(r.event_types.contains(&"error".to_string()));
         assert!(r.text.is_empty());
+        assert!(r.completion_error().is_none());
     }
 
     #[tokio::test]
@@ -390,6 +480,7 @@ mod tests {
         let body = "data: {\"type\":\"text_delta\",\"content\":\"x\"}\n";
         let r = stream_sse_markdown(sse_response(body)).await;
         assert_eq!(r.text, "x");
+        assert!(r.completion_error().is_none());
     }
 
     #[tokio::test]
@@ -409,6 +500,11 @@ mod tests {
         assert_eq!(
             streamed.event_count, collected.event_count,
             "event_count must stay in sync with collect_sse_text"
+        );
+        assert_eq!(
+            streamed.completion_error(),
+            collected.completion_error(),
+            "terminal failure state must match collect_sse_text"
         );
     }
 }

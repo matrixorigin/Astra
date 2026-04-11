@@ -1492,7 +1492,16 @@ fn initialize_journal(state: &mut ReplState, session_id: &str) {
         .unwrap_or(false);
 
     if !already_attached {
-        state.journal = session_journal::JournalWriter::new(session_id).ok();
+        state.journal = match session_journal::JournalWriter::new(session_id) {
+            Ok(journal) => Some(journal),
+            Err(err) => {
+                eprintln!(
+                    "{}",
+                    format!("  ⚠ Session journal not available for {session_id}: {err}").yellow()
+                );
+                None
+            }
+        };
     }
 
     let needs_start_event = match session_journal::read_journal(session_id) {
