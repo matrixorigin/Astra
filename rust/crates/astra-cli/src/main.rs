@@ -1093,13 +1093,16 @@ fn should_clear_picker_submission_echo(line: &str, pending_execute: Option<&str>
     pending_execute.is_some_and(|cmd| cmd != line)
 }
 
+fn build_picker_submission_echo(prompt: &str, actual_cmd: &str) -> String {
+    format!("\x1b[A\x1b[2K\r{}{actual_cmd}\n", prompt)
+}
+
 /// Clear the readline echo line and re-print with the actual dispatched command.
 fn replace_picker_submission_echo(prompt: &str, actual_cmd: &str) {
     // Readline echoes on stdout, so we must also use stdout for the fixup
     // to keep cursor positions in sync.
     use std::io::Write;
-    print!("\x1b[A\x1b[2K\r{}{}", prompt, actual_cmd);
-    println!();
+    print!("{}", build_picker_submission_echo(prompt, actual_cmd));
     let _ = std::io::stdout().flush();
 }
 
@@ -2953,6 +2956,15 @@ mod tests {
             "/checkpoint",
             Some("/checkpoint")
         ));
+    }
+
+    #[test]
+    fn picker_submission_echo_reprints_prompt_and_selected_command() {
+        let rendered = build_picker_submission_echo(theme::PROMPT_DEFAULT, "/checkpoint");
+        assert_eq!(
+            rendered,
+            format!("\x1b[A\x1b[2K\r{}/checkpoint\n", theme::PROMPT_DEFAULT)
+        );
     }
 
     #[test]
