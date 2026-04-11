@@ -1294,9 +1294,15 @@ pub(super) fn print_slash_commands(query: Option<&str>) {
                 continue;
             }
             if matches_filter(meta.name, meta.description) {
+                // Build command with arg_hint for better context
+                let cmd_with_hint = if let Some(hint) = meta.arg_hint {
+                    format!("{} {}", meta.name, hint)
+                } else {
+                    meta.name.to_string()
+                };
                 lines.push(format!(
                     "    {}  {}",
-                    format!("{:<14}", meta.name).green(),
+                    format!("{:<30}", cmd_with_hint).green(),
                     meta.description.to_string().dim()
                 ));
             }
@@ -1306,6 +1312,40 @@ pub(super) fn print_slash_commands(query: Option<&str>) {
             eprintln!("  {} {}", group.icon(), group.title().bold().cyan());
             for line in lines {
                 eprintln!("{line}");
+            }
+            eprintln!();
+        }
+    }
+
+    // If filtering, also search subcommands
+    if let Some(ref q) = filter {
+        let mut subcmd_lines: Vec<String> = Vec::new();
+        for meta in COMMANDS.iter() {
+            if meta.is_alias || meta.name.contains(' ') {
+                continue;
+            }
+            for (subcmd, desc) in meta.subcommands {
+                let full_cmd = format!("{} {}", meta.name, subcmd);
+                if command_matches_filter(&full_cmd, desc, q) {
+                    subcmd_lines.push(format!(
+                        "    {}  {}",
+                        format!("{:<30}", full_cmd).green(),
+                        desc.to_string().dim()
+                    ));
+                }
+            }
+        }
+        if !subcmd_lines.is_empty() {
+            any_results = true;
+            eprintln!("  {} {}", "🔍", "Matching Subcommands".bold().cyan());
+            for line in subcmd_lines.iter().take(10) {
+                eprintln!("{line}");
+            }
+            if subcmd_lines.len() > 10 {
+                eprintln!(
+                    "    {}",
+                    format!("… and {} more", subcmd_lines.len() - 10).dim()
+                );
             }
             eprintln!();
         }
