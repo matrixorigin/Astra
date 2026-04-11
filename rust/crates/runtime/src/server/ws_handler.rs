@@ -587,6 +587,19 @@ fn ws_error_from_status(status: StatusCode, message: impl Into<String>) -> WsSer
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LifecyclePollErrorPolicy {
+    cancel_run: bool,
+    emit_failed_terminal: bool,
+}
+
+fn lifecycle_poll_error_policy(_status: StatusCode) -> LifecyclePollErrorPolicy {
+    LifecyclePollErrorPolicy {
+        cancel_run: false,
+        emit_failed_terminal: false,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum WsSendFailure {
     Failed(String),
@@ -754,21 +767,26 @@ async fn stream_run_over_websocket(
                     Ok(events) => events,
                     Err((status, err)) => {
                         let message = err.0.detail;
+                        let policy = lifecycle_poll_error_policy(status);
                         send_msg(
                             socket,
                             &ws_error_from_status(status, message.clone()),
                         )
                         .await;
-                        best_effort_cancel_run(state, conn, run_id).await;
-                        send_msg(
-                            socket,
-                            &WsServerMessage::RunFinished {
-                                run_id: run_id.to_string(),
-                                status: STATUS_FAILED.to_string(),
-                                error: Some(message),
-                            },
-                        )
-                        .await;
+                        if policy.cancel_run {
+                            best_effort_cancel_run(state, conn, run_id).await;
+                        }
+                        if policy.emit_failed_terminal {
+                            send_msg(
+                                socket,
+                                &WsServerMessage::RunFinished {
+                                    run_id: run_id.to_string(),
+                                    status: STATUS_FAILED.to_string(),
+                                    error: Some(message),
+                                },
+                            )
+                            .await;
+                        }
                         return;
                     }
                 };
@@ -815,21 +833,26 @@ async fn stream_run_over_websocket(
                     Ok(status) => status,
                     Err((status, err)) => {
                         let message = err.0.detail;
+                        let policy = lifecycle_poll_error_policy(status);
                         send_msg(
                             socket,
                             &ws_error_from_status(status, message.clone()),
                         )
                         .await;
-                        best_effort_cancel_run(state, conn, run_id).await;
-                        send_msg(
-                            socket,
-                            &WsServerMessage::RunFinished {
-                                run_id: run_id.to_string(),
-                                status: STATUS_FAILED.to_string(),
-                                error: Some(message),
-                            },
-                        )
-                        .await;
+                        if policy.cancel_run {
+                            best_effort_cancel_run(state, conn, run_id).await;
+                        }
+                        if policy.emit_failed_terminal {
+                            send_msg(
+                                socket,
+                                &WsServerMessage::RunFinished {
+                                    run_id: run_id.to_string(),
+                                    status: STATUS_FAILED.to_string(),
+                                    error: Some(message),
+                                },
+                            )
+                            .await;
+                        }
                         return;
                     }
                 };
@@ -2153,6 +2176,19 @@ mod tests {
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains(r#""type":"run_cancelled""#));
         assert!(json.contains(r#""run_id":"r1""#));
+    }
+
+    #[test]
+    fn lifecycle_poll_error_policy_is_nonterminal_for_transient_errors() {
+        for status in [
+            StatusCode::NOT_FOUND,
+            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ] {
+            let policy = lifecycle_poll_error_policy(status);
+            assert!(!policy.cancel_run);
+            assert!(!policy.emit_failed_terminal);
+        }
     }
 
     #[test]
