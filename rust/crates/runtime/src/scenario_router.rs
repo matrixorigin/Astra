@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 //! Scenario router — selects an [`ExecutionProfile`] per task based on detected
 //! scenario, pattern-library suggestions, and active A/B experiments.
 //!
@@ -8,7 +9,6 @@
 //! The router is stateless: it reads from `PatternLibrary` and `ExperimentStore`
 //! but does not mutate them. Mutation (recording outcomes, creating experiments)
 //! is handled by the agentic loop and [`ExplorationEngine`].
-#![allow(deprecated)]
 
 use crate::ab_testing::{ExperimentStatus, ExperimentStore};
 use crate::adaptive_baselines::AdaptiveBaselineStore;
@@ -28,7 +28,7 @@ use crate::user_profile::{Scenario, ScenarioDetector};
 #[derive(Default)]
 pub struct ScenarioRouter;
 
-#[allow(deprecated)]
+#![allow(deprecated)]
 impl ScenarioRouter {
     /// Create a new stateless scenario router.
     pub fn new() -> Self {
@@ -141,7 +141,7 @@ pub fn scenario_from_task_type(task_type: crate::pipeline::routing::TaskType) ->
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
-#[allow(deprecated)]
+#![allow(deprecated)]
 mod tests {
     use super::*;
     use crate::ab_testing::{Experiment, MetricDefinition, Variant};
