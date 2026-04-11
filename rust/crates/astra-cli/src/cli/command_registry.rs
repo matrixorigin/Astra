@@ -782,6 +782,27 @@ pub fn command_tuples() -> Vec<(&'static str, &'static str)> {
     COMMANDS.iter().map(|m| (m.name, m.description)).collect()
 }
 
+/// Fuzzy completion candidates: returns matches scored by quality (best first).
+/// Falls back gracefully — prefix > contains > subsequence.
+pub fn fuzzy_completion_candidates(
+    partial: &str,
+    score_fn: impl Fn(&str, &str) -> Option<usize>,
+) -> Vec<(&'static str, &'static str)> {
+    let mut scored: Vec<(usize, bool, &'static str, &'static str)> = COMMANDS
+        .iter()
+        .filter_map(|m| score_fn(m.name, partial).map(|s| (s, m.is_alias, m.name, m.description)))
+        .collect();
+    scored.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| a.1.cmp(&b.1))
+            .then_with(|| a.2.cmp(b.2))
+    });
+    scored
+        .into_iter()
+        .map(|(_, _, name, desc)| (name, desc))
+        .collect()
+}
+
 /// Get argument hint for a command (e.g., "/model" → "<name>").
 pub fn get_arg_hint(command: &str) -> Option<&'static str> {
     COMMANDS
@@ -916,5 +937,18 @@ mod tests {
         // Command without arg_hint should return None
         assert!(get_arg_hint("/clear").is_none());
         assert!(get_arg_hint("/nonexistent").is_none());
+    }
+
+    #[test]
+    fn fuzzy_completion_candidates_keep_aliases() {
+        let rows = fuzzy_completion_candidates("/qit", |tok, partial| {
+            if tok == "/quit" && partial == "/qit" {
+                Some(1)
+            } else {
+                None
+            }
+        });
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "/quit");
     }
 }

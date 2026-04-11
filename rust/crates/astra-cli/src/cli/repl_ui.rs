@@ -72,6 +72,12 @@ fn command_name_matches_prefix(command: &str, query: &str) -> bool {
     !q.is_empty() && cmd.starts_with(&q)
 }
 
+fn command_name_matches_fuzzy(command: &str, query: &str) -> bool {
+    let cmd = command.trim_start_matches('/');
+    let q = query.trim_start().trim_start_matches('/');
+    !q.is_empty() && token_fuzzy_match(cmd, q).is_some()
+}
+
 fn sort_picker_rows(rows: &mut [(&'static str, &'static str)], query: Option<&str>) {
     rows.sort_by(|(a_cmd, _), (b_cmd, _)| {
         let query_cmp = query.map(|q| suggestion_score(b_cmd, q).cmp(&suggestion_score(a_cmd, q)));
@@ -495,9 +501,47 @@ fn slash_first_token_option_list(
     command_registry::subcommand_completions(resolved)
 }
 
-fn token_prefix_matches(tok: &str, partial: &str) -> bool {
+/// Fuzzy match: substring or subsequence matching with score.
+/// Returns (matches, score) where higher score = better match.
+fn token_fuzzy_match(tok: &str, partial: &str) -> Option<usize> {
+    let tok_lc = tok.to_ascii_lowercase();
     let partial_lc = partial.to_ascii_lowercase();
-    tok.to_ascii_lowercase().starts_with(&partial_lc)
+
+    if partial_lc.is_empty() {
+        return Some(0); // Empty matches everything with lowest score
+    }
+
+    // Exact prefix match: highest priority
+    if tok_lc.starts_with(&partial_lc) {
+        return Some(10_000 + (100 - tok.len().min(100))); // Shorter = higher
+    }
+
+    // Contains match: high priority
+    if tok_lc.contains(&partial_lc) {
+        return Some(5_000 + (100 - tok.len().min(100)));
+    }
+
+    // Subsequence match: medium priority
+    let mut score = 0usize;
+    let mut partial_chars = partial_lc.chars().peekable();
+    let mut consecutive = 0usize;
+
+    for c in tok_lc.chars() {
+        if partial_chars.peek() == Some(&c) {
+            partial_chars.next();
+            consecutive += 1;
+            score += consecutive; // Bonus for consecutive matches
+        } else {
+            consecutive = 0;
+        }
+    }
+
+    if partial_chars.peek().is_none() {
+        // All chars matched
+        Some(score + (100 - tok.len().min(100)))
+    } else {
+        None // Not all chars found
+    }
 }
 
 /// Cursor at end of line, no whitespace yet: Tab offers ` <subcommand>` insertions.
@@ -552,18 +596,23 @@ fn slash_first_token_completions(line: &str, pos: usize) -> Option<(usize, Vec<P
     }
 
     let partial = token_raw;
-    let mut matches: Vec<Pair> = options
+    // Collect matches with fuzzy scores for ranking
+    let mut scored: Vec<(usize, &str, &str)> = options
         .iter()
-        .filter(|(tok, _)| token_prefix_matches(tok, partial))
-        .map(|(tok, desc)| Pair {
-            display: format!("{:<15}  {}", tok, desc),
-            replacement: (*tok).to_string(),
-        })
+        .filter_map(|(tok, desc)| token_fuzzy_match(tok, partial).map(|score| (score, *tok, *desc)))
         .collect();
-    if matches.is_empty() {
+    if scored.is_empty() {
         return None;
     }
-    matches.sort_by(|a, b| a.replacement.cmp(&b.replacement));
+    // Sort by score descending, then alphabetically for ties
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
+    let matches: Vec<Pair> = scored
+        .into_iter()
+        .map(|(_, tok, desc)| Pair {
+            display: format!("{:<15}  {}", tok, desc),
+            replacement: tok.to_string(),
+        })
+        .collect();
     Some((arg_start, matches))
 }
 
@@ -586,6 +635,15 @@ fn filtered_slash_rows(query: Option<&str>) -> Vec<(&'static str, &'static str)>
         if !prefix_rows.is_empty() {
             sort_picker_rows(&mut prefix_rows, Some(q));
             return prefix_rows;
+        }
+        let mut fuzzy_rows: Vec<(&'static str, &'static str)> = rows
+            .iter()
+            .copied()
+            .filter(|(cmd, _)| command_name_matches_fuzzy(cmd, q))
+            .collect();
+        if !fuzzy_rows.is_empty() {
+            sort_picker_rows(&mut fuzzy_rows, Some(q));
+            return fuzzy_rows;
         }
         rows.retain(|(cmd, desc)| command_matches_filter(cmd, desc, q));
         sort_picker_rows(&mut rows, Some(q));
@@ -731,11 +789,12 @@ fn slash_completion_query(line: &str) -> Option<&str> {
     if !line.starts_with('/') {
         return None;
     }
-    // Check if any command starts with this line
-    if COMMANDS.iter().any(|m| m.name.starts_with(line)) {
+    // Single-token (no space): always eligible for completion
+    if !line.contains(' ') && !line.ends_with(' ') {
         return Some(line);
     }
-    if !line.contains(' ') && !line.ends_with(' ') {
+    // Multi-token: only if some command starts with this line
+    if COMMANDS.iter().any(|m| m.name.starts_with(line)) {
         return Some(line);
     }
     None
@@ -1955,7 +2014,8 @@ impl Completer for ReplHelper {
             (prefix, false)
         };
 
-        let matches: Vec<Pair> = completion_candidates(prefix)
+        // Try prefix-based matching first
+        let mut matches: Vec<Pair> = completion_candidates(prefix)
             .into_iter()
             .map(|(cmd, desc)| Pair {
                 display: format!("{:<15}  {}", cmd, desc),
@@ -1966,6 +2026,18 @@ impl Completer for ReplHelper {
                 },
             })
             .collect();
+
+        // Fall back to fuzzy matching when prefix yields nothing
+        if matches.is_empty() && !show_all_from_empty {
+            matches = command_registry::fuzzy_completion_candidates(prefix, token_fuzzy_match)
+                .into_iter()
+                .map(|(cmd, desc)| Pair {
+                    display: format!("{:<15}  {}", cmd, desc),
+                    replacement: cmd.to_string(),
+                })
+                .collect();
+        }
+
         Ok((0, matches))
     }
 }
@@ -2153,6 +2225,18 @@ mod tests {
     }
 
     #[test]
+    fn top_level_fuzzy_completion_candidates_match_help() {
+        let candidates = command_registry::fuzzy_completion_candidates("/hlp", token_fuzzy_match);
+        assert!(!candidates.is_empty());
+        assert_eq!(candidates[0].0, "/help");
+    }
+
+    #[test]
+    fn slash_completion_query_keeps_single_token_for_fuzzy_completion() {
+        assert_eq!(slash_completion_query("/hlp"), Some("/hlp"));
+    }
+
+    #[test]
     fn slash_inline_hint_for_team_includes_recent_subcommands() {
         let hint = slash_inline_hint("/team").expect("hint");
         // The hint should show common subcommands - we show a subset with "…"
@@ -2220,6 +2304,14 @@ mod tests {
         let (start, pairs) = slash_first_token_completions(line, line.len()).expect("completions");
         assert_eq!(&line[start..], "hi");
         assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].replacement, "history");
+    }
+
+    #[test]
+    fn first_token_complete_stats_fuzzy_subsequence() {
+        let line = "/stats hsty";
+        let (start, pairs) = slash_first_token_completions(line, line.len()).expect("completions");
+        assert_eq!(&line[start..], "hsty");
         assert_eq!(pairs[0].replacement, "history");
     }
 
@@ -2355,6 +2447,13 @@ mod tests {
         assert_eq!(rows[0].0, "/exit");
         assert!(rows.iter().any(|(cmd, _)| *cmd == "/explain"));
         assert!(!rows.iter().any(|(cmd, _)| *cmd == "/copy"));
+    }
+
+    #[test]
+    fn filtered_rows_fuzzy_query_matches_command_name() {
+        let rows = filtered_slash_rows(Some("hlp"));
+        assert!(!rows.is_empty());
+        assert_eq!(rows[0].0, "/help");
     }
 
     #[test]
