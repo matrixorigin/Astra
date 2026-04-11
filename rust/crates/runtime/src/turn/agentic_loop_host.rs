@@ -1600,6 +1600,18 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
     state: &mut AgenticLoopState,
 ) -> Result<AgenticLoopOutcome, String> {
     let result = run_agentic_loop_impl(host, state).await;
+
+    // ── Evolution: flush signals and auto-apply fast-path proposals ──
+    if let Some(ref evo) = state.evolution_service {
+        let (auto_applied, _llm_signals) = evo.flush().await;
+        if !auto_applied.is_empty() {
+            eprintln!(
+                "[evolution] auto-applied {} fast-path proposals",
+                auto_applied.len()
+            );
+        }
+    }
+
     record_loop_completion_feedback(state, &result);
     result
 }
@@ -3278,6 +3290,22 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                     turn_id,
                 };
                 evo.on_tool_result(&ctx).await;
+            }
+
+            // Feed stall events as RepeatedStall signals.
+            if !state.stall.turn_sigs.is_empty() {
+                // Check if the last 3 turns have the same tool signature.
+                let sigs = &state.stall.turn_sigs;
+                let n = sigs.len();
+                if n >= 3 && sigs[n - 1] == sigs[n - 2] && sigs[n - 2] == sigs[n - 3] {
+                    let chain: Vec<String> = sigs[n - 1].iter().cloned().collect();
+                    evo.add_signal(crate::evolution::types::EvolutionSignal::RepeatedStall {
+                        tool_chain: chain,
+                        stall_count: 3,
+                        turn_id: turn_id.to_string(),
+                    })
+                    .await;
+                }
             }
         }
 
