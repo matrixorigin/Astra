@@ -684,11 +684,13 @@ fn apply_adaptive_execution_profile(state: &mut AgenticLoopState) {
     drop(session_guard);
 
     // Emit journal event for adaptive profile selection.
+    // Skip when scenario is empty (no scenario detected) and no config changes.
     if should_emit_adaptive_scenario_event(
         scenario_changed,
         scenario_suppressed,
         config_changes.is_empty(),
-    ) {
+    ) && !scenario_name.is_empty()
+    {
         let sid = state.current_session_id.as_deref();
         let event = astra_services::session_journal::JournalEvent::adaptive_scenario_applied(
             sid,
@@ -3628,7 +3630,9 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                         },
                     );
                     // Finalize and persist (errors logged but not propagated).
-                    if let Err(e) = collector.finalize_and_persist(turn_index as u32) {
+                    // Use actual turn number (1-based) instead of loop index.
+                    let turn_number = (state.max_turns - state.remaining_turns) as u32;
+                    if let Err(e) = collector.finalize_and_persist(turn_number) {
                         eprintln!("trace persist: {e}");
                     }
                 }
