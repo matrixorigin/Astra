@@ -761,6 +761,8 @@ mod chat_stream_bridge_fallback_tests {
             .await
             .expect("body should be readable");
         let text = String::from_utf8(bytes.to_vec()).expect("sse should be utf8");
+        assert!(text.contains("\"type\":\"session_info\""));
+        assert!(text.contains("\"session_id\":\"s-created\""));
         assert!(text.contains("\"type\":\"error\""));
         assert!(text.contains("chat turn bridge disabled"));
     }

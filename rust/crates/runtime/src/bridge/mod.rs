@@ -302,7 +302,7 @@ impl HttpChatTurnBridge {
 impl ChatTurnBridge for UnavailableChatTurnBridge {
     async fn forward(
         &self,
-        _headers: &HeaderMap,
+        headers: &HeaderMap,
         _body: Bytes,
         _turn_core_event_writer: Arc<dyn TurnCoreEventWriter>,
         _turn_tool_event_writer: Arc<dyn TurnToolEventWriter>,
@@ -314,10 +314,13 @@ impl ChatTurnBridge for UnavailableChatTurnBridge {
         _turn_session_activity_writer: Arc<dyn TurnSessionActivityWriter>,
         _client_cancel: Option<Arc<CancellationToken>>,
     ) -> Result<Response, (StatusCode, String)> {
-        Err((
+        let (trusted_session_id, trusted_turn_chain_id) = trusted_bridge_identity(headers);
+        Ok(bridge_error_sse_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "chat turn bridge disabled. Configure CHAT_TURN_BRIDGE_URL to a reachable /internal/chat/turn endpoint (example: compatible chat-turn bridge service), then restart API."
                 .to_string(),
+            trusted_session_id.as_deref(),
+            trusted_turn_chain_id.as_deref(),
         ))
     }
 }
@@ -1342,8 +1345,8 @@ mod tests {
         headers
     }
 
-    async fn forward_with_noop_writers(
-        bridge: &HttpChatTurnBridge,
+    async fn forward_with_noop_writers<B: ChatTurnBridge + ?Sized>(
+        bridge: &B,
         headers: &HeaderMap,
     ) -> Result<Response, (StatusCode, String)> {
         bridge
@@ -1424,6 +1427,21 @@ mod tests {
         assert!(text.contains("\"run_id\":\"run-1\""));
         assert!(text.contains("\"type\":\"error\""));
         assert!(text.contains("\"code\":\"UPSTREAM_ERROR\""));
+    }
+
+    #[tokio::test]
+    async fn unavailable_bridge_preserves_trusted_session_info() {
+        let response =
+            forward_with_noop_writers(&UnavailableChatTurnBridge, &trusted_identity_headers())
+                .await
+                .expect("disabled bridge should normalize to SSE");
+        let text = response_text(response).await;
+
+        assert!(text.contains("\"type\":\"session_info\""));
+        assert!(text.contains("\"session_id\":\"sess-1\""));
+        assert!(text.contains("\"run_id\":\"run-1\""));
+        assert!(text.contains("\"type\":\"error\""));
+        assert!(text.contains("chat turn bridge disabled"));
     }
 
     #[tokio::test]
