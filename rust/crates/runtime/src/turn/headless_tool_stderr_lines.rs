@@ -1,8 +1,20 @@
 //! Plain stderr line text for the headless tool round (CLI applies crossterm styles).
 
+/// Human-friendly display name for a tool (matches the SSE stream rendering).
+fn friendly_tool_name(tool_name: &str) -> &str {
+    match tool_name {
+        "read_file" | "view_file" => "Reading",
+        "write_file" | "create_file" => "Writing",
+        "str_replace" | "multi_edit" => "Editing",
+        "delete_file" => "Deleting",
+        "list_dir" => "Listing",
+        _ => tool_name,
+    }
+}
+
 #[must_use]
 pub fn headless_stderr_cache_hit_line(tool_name: &str) -> String {
-    format!("  ↻ {tool_name} (cached)")
+    format!("  ↻ {} (cached)", friendly_tool_name(tool_name))
 }
 
 #[must_use]
@@ -25,14 +37,35 @@ pub fn headless_stderr_resource_limit_in_output(tool: &str) -> String {
     format!("  ⚠ {tool}: resource limit detected in output — tool blocked")
 }
 
+/// Single-line tool success: `  ✓ Reading: path:1-20  46 lines (0ms)`
 #[must_use]
-pub fn headless_stderr_tool_error_header(tool_name: &str, duration_str: &str) -> String {
-    format!("  ✗ {tool_name} ({duration_str})")
+pub fn headless_stderr_tool_ok_line(
+    tool_name: &str,
+    duration_str: &str,
+    detail: Option<&str>,
+    summary: Option<&str>,
+) -> String {
+    let name = friendly_tool_name(tool_name);
+    match (detail, summary) {
+        (Some(d), Some(s)) => format!("  ✓ {name}: {d}  {s} ({duration_str})"),
+        (Some(d), None) => format!("  ✓ {name}: {d} ({duration_str})"),
+        (None, Some(s)) => format!("  ✓ {name}  {s} ({duration_str})"),
+        (None, None) => format!("  ✓ {name} ({duration_str})"),
+    }
 }
 
+/// Single-line tool error: `  ✗ Reading: path:1-20 (0ms)`
 #[must_use]
-pub fn headless_stderr_tool_ok_header(tool_name: &str, duration_str: &str) -> String {
-    format!("  ✓ {tool_name} ({duration_str})")
+pub fn headless_stderr_tool_error_line(
+    tool_name: &str,
+    duration_str: &str,
+    detail: Option<&str>,
+) -> String {
+    let name = friendly_tool_name(tool_name);
+    match detail {
+        Some(d) => format!("  ✗ {name}: {d} ({duration_str})"),
+        None => format!("  ✗ {name} ({duration_str})"),
+    }
 }
 
 /// Truncate at UTF-8 char boundary for a one-line preview.
@@ -46,23 +79,10 @@ pub fn headless_stderr_error_preview_line(first_line: &str, max_chars: usize) ->
     }
 }
 
+/// Footer line for tool errors (second line with error preview).
 #[must_use]
 pub fn headless_stderr_tool_error_detail_line(preview: &str) -> String {
-    format!("  └ Error: {preview}")
-}
-
-/// Footer after a successful tool (`detail` / `summary` from CLI helpers).
-#[must_use]
-pub fn headless_stderr_tool_ok_footer_line(
-    detail: Option<&str>,
-    summary: Option<&str>,
-) -> Option<String> {
-    match (detail, summary) {
-        (Some(d), Some(s)) => Some(format!("  └ {d}  →  {s}")),
-        (Some(d), None) => Some(format!("  └ {d}")),
-        (None, Some(s)) => Some(format!("  └ {s}")),
-        (None, None) => None,
-    }
+    format!("    {preview}")
 }
 
 #[cfg(test)]
@@ -73,25 +93,56 @@ mod tests {
     fn cache_hit_line_shape() {
         assert_eq!(
             headless_stderr_cache_hit_line("read_file"),
-            "  ↻ read_file (cached)"
+            "  ↻ Reading (cached)"
         );
     }
 
     #[test]
-    fn ok_footer_four_cases() {
+    fn ok_line_with_detail_and_summary() {
         assert_eq!(
-            headless_stderr_tool_ok_footer_line(Some("a"), Some("b")).as_deref(),
-            Some("  └ a  →  b")
+            headless_stderr_tool_ok_line("read_file", "0ms", Some("src/main.rs:1-20"), Some("20 lines")),
+            "  ✓ Reading: src/main.rs:1-20  20 lines (0ms)"
         );
+    }
+
+    #[test]
+    fn ok_line_detail_only() {
         assert_eq!(
-            headless_stderr_tool_ok_footer_line(Some("a"), None).as_deref(),
-            Some("  └ a")
+            headless_stderr_tool_ok_line("grep", "100ms", Some("\"TODO\" in src"), None),
+            "  ✓ grep: \"TODO\" in src (100ms)"
         );
+    }
+
+    #[test]
+    fn ok_line_summary_only() {
         assert_eq!(
-            headless_stderr_tool_ok_footer_line(None, Some("b")).as_deref(),
-            Some("  └ b")
+            headless_stderr_tool_ok_line("git_status", "5ms", None, Some("3 files")),
+            "  ✓ git_status  3 files (5ms)"
         );
-        assert!(headless_stderr_tool_ok_footer_line(None, None).is_none());
+    }
+
+    #[test]
+    fn ok_line_no_detail_no_summary() {
+        assert_eq!(
+            headless_stderr_tool_ok_line("bash", "50ms", None, None),
+            "  ✓ bash (50ms)"
+        );
+    }
+
+    #[test]
+    fn error_line_with_detail() {
+        assert_eq!(
+            headless_stderr_tool_error_line("read_file", "0ms", Some("missing.rs")),
+            "  ✗ Reading: missing.rs (0ms)"
+        );
+    }
+
+    #[test]
+    fn error_line_no_detail() {
+        assert_eq!(
+            headless_stderr_tool_error_line("bash", "150ms", None),
+            "  ✗ bash (150ms)"
+        );
     }
 
     #[test]
@@ -100,10 +151,6 @@ mod tests {
         let p = headless_stderr_error_preview_line(s, 3);
         assert_eq!(p, "αβγ…");
     }
-
-    // ──────────────────────────────────────────────────────────
-    // headless_stderr_unknown_tool_header / detail
-    // ──────────────────────────────────────────────────────────
 
     #[test]
     fn unknown_tool_header() {
@@ -121,10 +168,6 @@ mod tests {
         );
     }
 
-    // ──────────────────────────────────────────────────────────
-    // resource limit lines
-    // ──────────────────────────────────────────────────────────
-
     #[test]
     fn resource_limit_blocked() {
         let s = headless_stderr_resource_limit_blocked("bash");
@@ -139,51 +182,40 @@ mod tests {
         assert!(s.contains("resource limit"));
     }
 
-    // ──────────────────────────────────────────────────────────
-    // tool error/ok headers
-    // ──────────────────────────────────────────────────────────
-
-    #[test]
-    fn tool_error_header() {
-        let s = headless_stderr_tool_error_header("bash", "150ms");
-        assert_eq!(s, "  ✗ bash (150ms)");
-    }
-
-    #[test]
-    fn tool_ok_header() {
-        let s = headless_stderr_tool_ok_header("read_file", "5ms");
-        assert_eq!(s, "  ✓ read_file (5ms)");
-    }
-
-    // ──────────────────────────────────────────────────────────
-    // error preview line edge cases
-    // ──────────────────────────────────────────────────────────
-
     #[test]
     fn preview_within_limit_no_truncation() {
-        let s = headless_stderr_error_preview_line("short", 100);
-        assert_eq!(s, "short");
+        assert_eq!(headless_stderr_error_preview_line("short", 100), "short");
     }
 
     #[test]
     fn preview_empty_string() {
-        let s = headless_stderr_error_preview_line("", 10);
-        assert_eq!(s, "");
+        assert_eq!(headless_stderr_error_preview_line("", 10), "");
     }
 
     #[test]
     fn preview_exact_limit() {
-        let s = headless_stderr_error_preview_line("abcde", 5);
-        assert_eq!(s, "abcde"); // exact match, no truncation
+        assert_eq!(headless_stderr_error_preview_line("abcde", 5), "abcde");
     }
-
-    // ──────────────────────────────────────────────────────────
-    // tool error/ok detail lines
-    // ──────────────────────────────────────────────────────────
 
     #[test]
     fn tool_error_detail_line() {
-        let s = headless_stderr_tool_error_detail_line("permission denied");
-        assert_eq!(s, "  └ Error: permission denied");
+        assert_eq!(
+            headless_stderr_tool_error_detail_line("permission denied"),
+            "    permission denied"
+        );
+    }
+
+    #[test]
+    fn friendly_names_match_sse_rendering() {
+        assert_eq!(friendly_tool_name("read_file"), "Reading");
+        assert_eq!(friendly_tool_name("view_file"), "Reading");
+        assert_eq!(friendly_tool_name("write_file"), "Writing");
+        assert_eq!(friendly_tool_name("create_file"), "Writing");
+        assert_eq!(friendly_tool_name("str_replace"), "Editing");
+        assert_eq!(friendly_tool_name("multi_edit"), "Editing");
+        assert_eq!(friendly_tool_name("delete_file"), "Deleting");
+        assert_eq!(friendly_tool_name("list_dir"), "Listing");
+        assert_eq!(friendly_tool_name("bash"), "bash");
+        assert_eq!(friendly_tool_name("grep"), "grep");
     }
 }

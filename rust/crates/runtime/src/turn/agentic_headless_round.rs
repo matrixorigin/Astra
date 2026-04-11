@@ -31,8 +31,8 @@ use super::headless_tool_status_display::{tool_call_detail, tool_result_summary}
 use super::headless_tool_stderr_lines::{
     headless_stderr_cache_hit_line, headless_stderr_error_preview_line,
     headless_stderr_resource_limit_blocked, headless_stderr_resource_limit_in_output,
-    headless_stderr_tool_error_detail_line, headless_stderr_tool_error_header,
-    headless_stderr_tool_ok_footer_line, headless_stderr_tool_ok_header,
+    headless_stderr_tool_error_detail_line, headless_stderr_tool_error_line,
+    headless_stderr_tool_ok_line,
     headless_stderr_unknown_tool_detail, headless_stderr_unknown_tool_header,
 };
 use super::hydrate_reflect::hydrate_reflect_placeholder_if_needed;
@@ -478,7 +478,7 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
             if is_err {
                 term.emit_line(
                     HeadlessStderrStyle::Red,
-                    headless_stderr_tool_error_header(&name, &duration_str),
+                    headless_stderr_tool_error_line(&name, &duration_str, detail.as_deref()),
                 );
                 if let Some(first_line) = result_str.lines().next() {
                     let preview = headless_stderr_error_preview_line(first_line, 100);
@@ -490,13 +490,13 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
             } else {
                 term.emit_line(
                     HeadlessStderrStyle::Green,
-                    headless_stderr_tool_ok_header(&name, &duration_str),
+                    headless_stderr_tool_ok_line(
+                        &name,
+                        &duration_str,
+                        detail.as_deref(),
+                        summary.as_deref(),
+                    ),
                 );
-                if let Some(line) =
-                    headless_stderr_tool_ok_footer_line(detail.as_deref(), summary.as_deref())
-                {
-                    term.emit_line(HeadlessStderrStyle::Dim, line);
-                }
             }
         }
 

@@ -452,6 +452,12 @@ impl ObservabilityHub {
 
     /// Create a hub with persistent storage.
     pub fn with_storage(storage_root: std::path::PathBuf) -> Self {
+        // Legacy cleanup: older versions stored data as a flat file at this path.
+        // The new layout expects a directory. Just remove the stale file.
+        if storage_root.is_file() {
+            let _ = std::fs::remove_file(&storage_root);
+        }
+
         let profile_path = observability_storage_file(&storage_root, "profiles.json");
         let baseline_path = observability_storage_file(&storage_root, "adaptive-baselines.json");
         let profile_store = Arc::new(UserProfileStore::with_storage(profile_path));
