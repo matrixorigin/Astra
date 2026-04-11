@@ -248,6 +248,272 @@ fn print_workspace_metadata(ws: &session_workspace::WorkspaceMetadata, sid: &str
     eprintln!();
 }
 
+/// Handle `/session list [--all|--active|--completed] [--here|--project] [search_term]`
+///
+/// Sorting:
+/// - Default: most recent first (by mtime)
+/// - Shows up to 20 sessions unless `--all` specified
+///
+/// Filtering:
+/// - `--active`: only active sessions
+/// - `--completed`: only completed sessions
+/// - `--here`: only sessions from current directory
+/// - `--project`: only sessions from current git project (any branch)
+///
+/// Search:
+/// - Matches session ID prefix, cwd, git branch, or summary
+fn handle_session_list(sub_arg: &str, state: &ReplState) {
+    // Parse options
+    let mut show_all = false;
+    let mut filter_active = false;
+    let mut filter_completed = false;
+    let mut filter_here = false;
+    let mut filter_project = false;
+    let mut search_term: Option<String> = None;
+
+    for part in sub_arg.split_whitespace() {
+        match part {
+            "--all" | "-a" => show_all = true,
+            "--active" => filter_active = true,
+            "--completed" | "--done" => filter_completed = true,
+            "--here" | "--cwd" => filter_here = true,
+            "--project" | "--repo" => filter_project = true,
+            _ if !part.starts_with('-') => search_term = Some(part.to_lowercase()),
+            other => {
+                eprintln!("{}", format!("  Unknown option: {other}").red());
+                eprintln!(
+                    "  {}",
+                    "Usage: /session list [--all|--active|--completed|--here|--project] [search]"
+                        .dim()
+                );
+                return;
+            }
+        }
+    }
+
+    // Get current cwd and git root for filtering
+    let current_cwd = std::env::current_dir()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let current_git_root = std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+
+    // Load sessions by recency
+    let limit = if show_all { 500 } else { 50 }; // scan more than display for filtering
+    let sessions = match session_journal::list_sessions_by_time(limit) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("{}", format!("  ✗ {e}").red());
+            return;
+        }
+    };
+
+    if sessions.is_empty() {
+        eprintln!("{}", "  No journal files yet.".dim());
+        eprintln!(
+            "  {}",
+            "Chat once to create a session, or check ~/.astra/sessions.".dim()
+        );
+        return;
+    }
+
+    // Build session list with metadata for filtering/searching
+    struct SessionEntry {
+        sid: String,
+        ws: Option<session_workspace::WorkspaceMetadata>,
+        hint: String,
+    }
+
+    let mut entries: Vec<SessionEntry> = sessions
+        .iter()
+        .map(|sid| {
+            let ws = session_workspace::read_workspace(sid).ok();
+            let hint = workspace_summary_line(sid);
+            SessionEntry {
+                sid: sid.clone(),
+                ws,
+                hint,
+            }
+        })
+        .collect();
+
+    // Apply filters
+    if filter_active {
+        entries.retain(|e| {
+            e.ws.as_ref()
+                .map(|w| w.status == "active")
+                .unwrap_or(false)
+        });
+    }
+    if filter_completed {
+        entries.retain(|e| {
+            e.ws.as_ref()
+                .map(|w| w.status == "completed")
+                .unwrap_or(false)
+        });
+    }
+    if filter_here {
+        entries.retain(|e| {
+            e.ws.as_ref()
+                .map(|w| w.cwd == current_cwd)
+                .unwrap_or(false)
+        });
+    }
+    if filter_project {
+        if let Some(ref root) = current_git_root {
+            entries.retain(|e| {
+                e.ws.as_ref()
+                    .and_then(|w| w.git_root.as_ref())
+                    .map(|r| r == root)
+                    .unwrap_or(false)
+            });
+        } else {
+            eprintln!(
+                "  {}",
+                "Not in a git repository — --project filter ignored.".yellow()
+            );
+        }
+    }
+
+    // Apply search
+    if let Some(ref term) = search_term {
+        entries.retain(|e| {
+            // Match session ID prefix
+            if e.sid.to_lowercase().starts_with(term) {
+                return true;
+            }
+            // Match cwd, git branch, or summary
+            if let Some(ref ws) = e.ws {
+                if ws.cwd.to_lowercase().contains(term) {
+                    return true;
+                }
+                if let Some(ref b) = ws.git_branch {
+                    if b.to_lowercase().contains(term) {
+                        return true;
+                    }
+                }
+                if let Some(ref s) = ws.summary {
+                    if s.to_lowercase().contains(term) {
+                        return true;
+                    }
+                }
+            }
+            false
+        });
+    }
+
+    // Limit display
+    let display_limit = if show_all { entries.len() } else { 20 };
+    let total = entries.len();
+    let showing = total.min(display_limit);
+
+    if entries.is_empty() {
+        let mut filter_desc = Vec::new();
+        if filter_active {
+            filter_desc.push("active");
+        }
+        if filter_completed {
+            filter_desc.push("completed");
+        }
+        if filter_here {
+            filter_desc.push("this directory");
+        }
+        if filter_project {
+            filter_desc.push("this project");
+        }
+        let desc = if filter_desc.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", filter_desc.join(", "))
+        };
+        eprintln!(
+            "  {}",
+            format!("No sessions match{desc}.").dim()
+        );
+        return;
+    }
+
+    // Display header
+    eprintln!(
+        "\n{}",
+        "─── Session Journals ────────────────────────────"
+            .bold()
+            .cyan()
+    );
+    let sort_info = "sorted by recent";
+    let filter_info = {
+        let mut parts = Vec::new();
+        if filter_active {
+            parts.push("active only");
+        }
+        if filter_completed {
+            parts.push("completed only");
+        }
+        if filter_here {
+            parts.push("this dir");
+        }
+        if filter_project {
+            parts.push("this project");
+        }
+        if let Some(ref t) = search_term {
+            parts.push(t);
+        }
+        if parts.is_empty() {
+            String::new()
+        } else {
+            format!(" · filter: {}", parts.join(", "))
+        }
+    };
+    eprintln!("  {}", format!("{sort_info}{filter_info}").dim());
+
+    // Display entries
+    let current = state.session_id.as_deref().unwrap_or("");
+    for entry in entries.iter().take(display_limit) {
+        let marker = if entry.sid == current {
+            " ← current"
+        } else {
+            ""
+        };
+        // Show abbreviated session ID (first 8 chars) for cleaner display
+        let sid_short = if entry.sid.len() > 8 {
+            &entry.sid[..8]
+        } else {
+            &entry.sid
+        };
+        eprintln!(
+            "  {}  {}{}",
+            sid_short.cyan(),
+            entry.hint.as_str().dim(),
+            marker.green()
+        );
+    }
+
+    // Summary
+    if total > showing {
+        eprintln!(
+            "  {} {} (showing {}; use --all for more)",
+            total.to_string().dim(),
+            "sessions match",
+            showing
+        );
+    } else {
+        eprintln!(
+            "  {} {}",
+            total.to_string().dim(),
+            if total == 1 {
+                "session"
+            } else {
+                "sessions"
+            }
+        );
+    }
+    eprintln!();
+}
+
 pub(super) fn resolve_journal_target_session(
     sub_arg: &str,
     state: &ReplState,
@@ -374,7 +640,7 @@ pub(super) fn handle_session_command(arg: &str, state: &mut ReplState) {
             eprintln!();
             eprintln!(
                 "  {}",
-                "Subcommands: /session history · context · errors · export · list · fork · cleanup · verify · drift"
+                "Subcommands: history · context · errors · export · list [--here|--project|--active|search] · fork · cleanup · verify · drift"
                     .dim()
             );
             eprintln!();
@@ -1166,49 +1432,9 @@ pub(super) fn handle_session_command(arg: &str, state: &mut ReplState) {
                 }
             }
         }
-        "list" => match session_journal::list_sessions() {
-            Ok(sessions) if sessions.is_empty() => {
-                eprintln!("{}", "  No journal files yet.".dim());
-                eprintln!(
-                    "  {}",
-                    "Chat once to create a session, or check ~/.astra/sessions.".dim()
-                );
-            }
-            Ok(sessions) => {
-                eprintln!(
-                    "\n{}",
-                    "─── Session Journals ────────────────────────────"
-                        .bold()
-                        .cyan()
-                );
-                eprintln!(
-                    "  {}",
-                    "sorted A–Z · right column: cwd, git, turns (from workspace.yaml)".dim()
-                );
-                let current = state.session_id.as_deref().unwrap_or("");
-                for sid in &sessions {
-                    let marker = if sid == current { " ← current" } else { "" };
-                    let hint = workspace_summary_line(sid);
-                    eprintln!(
-                        "  {}  {}{}",
-                        sid.as_str().cyan(),
-                        hint.dim(),
-                        marker.green()
-                    );
-                }
-                eprintln!(
-                    "  {} {}",
-                    sessions.len().to_string().dim(),
-                    if sessions.len() == 1 {
-                        "session total"
-                    } else {
-                        "sessions total"
-                    }
-                );
-                eprintln!();
-            }
-            Err(e) => eprintln!("{}", format!("  ✗ {e}").red()),
-        },
+        "list" => {
+            handle_session_list(sub_arg, state);
+        }
         "context" => {
             // /session context [turn] [session_id]
             // Shows context assembly trace for a specific turn
