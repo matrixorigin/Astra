@@ -1124,7 +1124,7 @@ pub fn delete_session(session_id: &str) -> std::io::Result<u64> {
 }
 
 /// Recursively compute total size of a directory (best-effort, ignores errors).
-/// 
+///
 /// Safeguards:
 /// - Maximum depth of 10 levels to prevent deep traversal
 /// - Maximum 1000 entries per call to prevent hangs on huge directories

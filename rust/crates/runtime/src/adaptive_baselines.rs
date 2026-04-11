@@ -220,6 +220,53 @@ impl AdaptiveBaselineStore {
         })
     }
 
+    /// Rollback all baselines promoted from a specific experiment.
+    ///
+    /// Returns the list of rollbacks performed (one per scope where the
+    /// experiment had a promoted baseline).
+    pub fn rollback_experiment(&self, experiment_id: &str) -> Vec<AdaptiveBaselineRollback> {
+        let mut snapshot = self.baselines.write().unwrap_or_else(|e| e.into_inner());
+        let mut rollbacks = Vec::new();
+
+        // Find all active baselines belonging to this experiment.
+        let keys_to_rollback: Vec<String> = snapshot
+            .active
+            .iter()
+            .filter(|(_, b)| b.experiment_id == experiment_id)
+            .map(|(k, _)| k.clone())
+            .collect();
+
+        for key in keys_to_rollback {
+            let Some(removed) = snapshot.active.remove(&key) else {
+                continue;
+            };
+            let restored = snapshot
+                .history
+                .get_mut(&key)
+                .and_then(|history| history.pop());
+            if let Some(previous) = restored.clone() {
+                snapshot.active.insert(key.clone(), previous);
+            }
+            if snapshot
+                .history
+                .get(&key)
+                .is_some_and(|history| history.is_empty())
+            {
+                snapshot.history.remove(&key);
+            }
+            rollbacks.push(AdaptiveBaselineRollback {
+                scope: removed.scope.clone(),
+                removed_variant_id: removed.variant_id,
+                restored_variant_id: restored.map(|b| b.variant_id),
+            });
+        }
+
+        if !rollbacks.is_empty() {
+            self.persist(&snapshot);
+        }
+        rollbacks
+    }
+
     fn persist(&self, snapshot: &AdaptiveBaselineSnapshot) {
         let Some(path) = &self.storage_path else {
             return;
@@ -347,5 +394,55 @@ mod tests {
             baseline.config_diff.get("compression.max_history_tokens"),
             Some(&serde_json::json!(28000))
         );
+    }
+
+    #[test]
+    fn rollback_experiment_removes_all_matching_baselines() {
+        let store = AdaptiveBaselineStore::new();
+
+        // Two experiments — one promoted for Code, one for Fetch.
+        let exp_a = Experiment::new("exp-a")
+            .with_variant(Variant::control())
+            .with_variant(
+                Variant::new("treatment-a")
+                    .with_traffic(0.5)
+                    .with_config_diff("max_tools", serde_json::json!(50)),
+            )
+            .with_tag("task_type:code")
+            .with_tag("domain:any")
+            .build();
+        store.promote_winner(&exp_a, "treatment-a");
+
+        let exp_b = Experiment::new("exp-b")
+            .with_variant(Variant::control())
+            .with_variant(
+                Variant::new("treatment-b")
+                    .with_traffic(0.5)
+                    .with_config_diff("max_tools", serde_json::json!(60)),
+            )
+            .with_tag("task_type:fetch")
+            .with_tag("domain:any")
+            .build();
+        store.promote_winner(&exp_b, "treatment-b");
+
+        // Both are active.
+        assert!(store.resolve(TaskType::Code, None).is_some());
+        assert!(store.resolve(TaskType::Fetch, None).is_some());
+
+        // Rollback experiment-a only.
+        let rollbacks = store.rollback_experiment("exp-a");
+        assert_eq!(rollbacks.len(), 1);
+        assert_eq!(rollbacks[0].removed_variant_id, "treatment-a");
+
+        // Code baseline is gone, Fetch is untouched.
+        assert!(store.resolve(TaskType::Code, None).is_none());
+        assert!(store.resolve(TaskType::Fetch, None).is_some());
+    }
+
+    #[test]
+    fn rollback_experiment_no_match_returns_empty() {
+        let store = AdaptiveBaselineStore::new();
+        let rollbacks = store.rollback_experiment("no-such-experiment");
+        assert!(rollbacks.is_empty());
     }
 }

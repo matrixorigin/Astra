@@ -14,7 +14,7 @@ const MAX_BUFFERED_SIGNALS: usize = 200;
 const MAX_SNIPPET_LEN: usize = 300;
 
 /// Correction keywords (lowercase). Checked via `contains` on the user message.
-static CORRECTION_KEYWORDS: &[&str] = &[
+pub static CORRECTION_KEYWORDS: &[&str] = &[
     // Chinese
     "不对",
     "错了",

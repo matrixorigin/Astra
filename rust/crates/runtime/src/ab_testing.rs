@@ -738,6 +738,20 @@ impl ExperimentStore {
             false
         }
     }
+
+    /// Cancel an experiment (mark as cancelled, preventing further outcome recording).
+    ///
+    /// Returns true if state changed, false otherwise.
+    pub fn cancel_experiment(&self, experiment_id: &str) -> bool {
+        let mut experiments = self.experiments.write().unwrap_or_else(|e| e.into_inner());
+        if let Some(exp) = experiments.get_mut(experiment_id) {
+            let old_status = exp.status.clone();
+            exp.cancel();
+            exp.status != old_status
+        } else {
+            false
+        }
+    }
 }
 
 // ─── Statistical Analysis ────────────────────────────────────────────────────
@@ -1299,5 +1313,28 @@ mod tests {
         assert!((normal_cdf(0.0) - 0.5).abs() < 0.01);
         assert!((normal_cdf(1.96) - 0.975).abs() < 0.01);
         assert!((normal_cdf(-1.96) - 0.025).abs() < 0.01);
+    }
+
+    #[test]
+    fn cancel_experiment_marks_cancelled() {
+        let store = ExperimentStore::new();
+        let mut exp = Experiment::new("exp-cancel")
+            .with_variant(Variant::control())
+            .with_variant(Variant::new("treatment").with_traffic(0.5))
+            .build();
+        exp.start();
+        store.register(exp);
+
+        assert!(store.cancel_experiment("exp-cancel"));
+        assert_eq!(
+            store.get("exp-cancel").map(|e| e.status),
+            Some(ExperimentStatus::Cancelled)
+        );
+    }
+
+    #[test]
+    fn cancel_nonexistent_returns_false() {
+        let store = ExperimentStore::new();
+        assert!(!store.cancel_experiment("no-such"));
     }
 }

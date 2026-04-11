@@ -7,6 +7,7 @@ use crate::ab_testing::{
     Experiment, ExperimentAnalyzer, ExperimentStatus, ExperimentStore, MetricDefinition,
     Recommendation, Variant,
 };
+use crate::adaptive_baselines::{AdaptiveBaselineRollback, AdaptiveBaselineStore};
 use crate::pipeline::pattern::{ExplorationOpportunity, ExplorationReason, PatternLibrary};
 use crate::pipeline::routing::{DomainHint, TaskType, domain_hint_to_label};
 
@@ -137,6 +138,21 @@ impl ExplorationEngine {
         }
 
         conclusions
+    }
+
+    /// Abort a running experiment: cancel it and rollback any promoted baselines.
+    ///
+    /// Returns (cancelled, rollbacks) — whether the experiment was actually
+    /// cancelled, and any baseline rollbacks that were performed.
+    pub fn abort_experiment(
+        &self,
+        experiment_id: &str,
+        store: &ExperimentStore,
+        baselines: &AdaptiveBaselineStore,
+    ) -> (bool, Vec<AdaptiveBaselineRollback>) {
+        let cancelled = store.cancel_experiment(experiment_id);
+        let rollbacks = baselines.rollback_experiment(experiment_id);
+        (cancelled, rollbacks)
     }
 
     fn build_experiment(&self, opportunity: &ExplorationOpportunity) -> Experiment {
@@ -356,5 +372,60 @@ mod tests {
         let created = engine.check_and_create_experiments(&library, &store);
 
         assert!(created.is_empty());
+    }
+
+    #[test]
+    fn abort_experiment_cancels_and_rolls_back_baseline() {
+        let store = ExperimentStore::new();
+        let baselines = AdaptiveBaselineStore::new();
+        let engine = ExplorationEngine::new(0.5, 3, 5);
+
+        // Create and start an experiment.
+        let mut experiment = Experiment::new("exp-abort")
+            .with_variant(Variant::control())
+            .with_variant(
+                Variant::new("treatment")
+                    .with_traffic(0.5)
+                    .with_config_diff("max_tools", serde_json::json!(50)),
+            )
+            .with_tag("task_type:code")
+            .with_tag("domain:any")
+            .with_metric(MetricDefinition::success_rate())
+            .build();
+        experiment.start();
+        store.register(experiment.clone());
+
+        // Promote the treatment variant as a baseline.
+        baselines.promote_winner(&experiment, "treatment");
+
+        // Verify baseline exists.
+        assert!(baselines.resolve(TaskType::Code, None).is_some());
+
+        // Abort the experiment.
+        let (cancelled, rollbacks) = engine.abort_experiment("exp-abort", &store, &baselines);
+
+        assert!(cancelled);
+        assert_eq!(rollbacks.len(), 1);
+        assert_eq!(rollbacks[0].removed_variant_id, "treatment");
+
+        // Experiment is now cancelled.
+        assert_eq!(
+            store.get("exp-abort").map(|e| e.status),
+            Some(ExperimentStatus::Cancelled)
+        );
+
+        // Baseline was rolled back.
+        assert!(baselines.resolve(TaskType::Code, None).is_none());
+    }
+
+    #[test]
+    fn abort_nonexistent_experiment_returns_false() {
+        let store = ExperimentStore::new();
+        let baselines = AdaptiveBaselineStore::new();
+        let engine = ExplorationEngine::new(0.5, 3, 5);
+
+        let (cancelled, rollbacks) = engine.abort_experiment("no-such", &store, &baselines);
+        assert!(!cancelled);
+        assert!(rollbacks.is_empty());
     }
 }

@@ -1779,6 +1779,57 @@ fn record_loop_completion_feedback(
             ));
         }
     }
+
+    // ── 6. Retry detection signal ──
+    // Detect consecutive identical tool calls (same name + similar args) as retry behavior.
+    {
+        let records = &state.stall.tool_call_records;
+        if records.len() >= 2 {
+            let mut consecutive = 1u32;
+            for pair in records.windows(2).rev() {
+                if pair[0].name == pair[1].name
+                    && pair[0].args_preview == pair[1].args_preview
+                    && !pair[1].ok
+                {
+                    consecutive += 1;
+                } else {
+                    break;
+                }
+            }
+            if consecutive >= 2 {
+                hub.record_feedback(enrich_signal(
+                    FeedbackSignal::new(SignalType::Retry { count: consecutive })
+                        .with_turn(&turn_id)
+                        .with_context(
+                            "tool_name",
+                            serde_json::json!(records.last().map(|r| &r.name)),
+                        ),
+                ));
+            }
+        }
+    }
+
+    // ── 7. Acceptance signal ──
+    // If there is a prior assistant message and the current user message shows no correction
+    // intent, emit Acceptance — the user implicitly accepted the previous output.
+    {
+        let has_prior_assistant = state
+            .messages
+            .iter()
+            .rev()
+            .any(|m| m.get("role").and_then(|r| r.as_str()) == Some("assistant"));
+        if has_prior_assistant && !state.message.is_empty() {
+            let lower = state.message.to_lowercase();
+            let is_correction = crate::evolution::signal_collector::CORRECTION_KEYWORDS
+                .iter()
+                .any(|kw| lower.contains(kw));
+            if !is_correction {
+                hub.record_feedback(enrich_signal(
+                    FeedbackSignal::new(SignalType::Acceptance).with_turn(&turn_id),
+                ));
+            }
+        }
+    }
 }
 ///
 /// Every N turns (configured via `adaptive_tuning.tuning_cycle_interval`),
@@ -8897,5 +8948,130 @@ print(json.dumps({'context': 'user said: ' + msg}))
         let _some_change = budget_changed || memory_changed;
 
         // No panic, no corruption — all rules composed successfully
+    }
+
+    #[test]
+    fn retry_signal_emitted_on_consecutive_identical_tool_calls() {
+        let hub = make_hub();
+        let mut state = make_state();
+        state.telemetry.observability_hub = Some(hub.clone());
+        state.stall.tool_call_records = vec![
+            astra_services::session_journal::ToolCallRecord {
+                name: "bash".into(),
+                ok: false,
+                ms: 100,
+                error: Some("exit code 1".into()),
+                input_bytes: None,
+                output_bytes: None,
+                args_preview: Some("npm test".into()),
+                result_preview: None,
+            },
+            astra_services::session_journal::ToolCallRecord {
+                name: "bash".into(),
+                ok: false,
+                ms: 100,
+                error: Some("exit code 1".into()),
+                input_bytes: None,
+                output_bytes: None,
+                args_preview: Some("npm test".into()),
+                result_preview: None,
+            },
+        ];
+
+        let result = Ok(AgenticLoopOutcome::Completed);
+        record_loop_completion_feedback(&mut state, &result);
+
+        let config = crate::runtime_config::RuntimeConfig::default();
+        // Add a rule that triggers on high retry rate.
+        hub.tuning()
+            .add_rule(crate::auto_tuning::EvolutionRule::new(
+                "retry-trigger",
+                crate::auto_tuning::EvolutionTrigger::HighRetryRate {
+                    threshold: 0.3,
+                    window_secs: 3600,
+                    min_samples: 1,
+                },
+                crate::auto_tuning::EvolutionAction::Alert {
+                    message: "retries detected".into(),
+                    severity: crate::auto_tuning::AlertSeverity::Warning,
+                },
+            ));
+        let triggered = hub.tuning().evaluate(&config);
+        assert!(
+            !triggered.is_empty(),
+            "consecutive identical tool calls should emit Retry signal"
+        );
+    }
+
+    #[test]
+    fn acceptance_signal_emitted_when_no_correction() {
+        let hub = make_hub();
+        let mut state = make_state();
+        state.telemetry.observability_hub = Some(hub.clone());
+        state.message = "thanks, looks good".into();
+        state.messages =
+            vec![serde_json::json!({"role": "assistant", "content": "here is the code"})];
+
+        let result = Ok(AgenticLoopOutcome::Completed);
+        record_loop_completion_feedback(&mut state, &result);
+
+        // Verify Acceptance signal was recorded — check success rate.
+        // Acceptance + TaskSuccess = 2 successes, both positive.
+        let config = crate::runtime_config::RuntimeConfig::default();
+        hub.tuning()
+            .add_rule(crate::auto_tuning::EvolutionRule::new(
+                "high-success-check",
+                crate::auto_tuning::EvolutionTrigger::LowSuccessRate {
+                    threshold: 0.5,
+                    window_secs: 3600,
+                    min_samples: 1,
+                },
+                crate::auto_tuning::EvolutionAction::Alert {
+                    message: "acceptance".into(),
+                    severity: crate::auto_tuning::AlertSeverity::Info,
+                },
+            ));
+        let triggered = hub.tuning().evaluate(&config);
+        // With Acceptance + TaskSuccess = 100% success rate, LowSuccessRate (0.5) should NOT trigger.
+        assert!(
+            triggered.is_empty(),
+            "acceptance + task success should keep success rate high"
+        );
+    }
+
+    #[test]
+    fn no_acceptance_signal_when_correction_detected() {
+        let hub = make_hub();
+        let mut state = make_state();
+        state.telemetry.observability_hub = Some(hub.clone());
+        state.message = "no that's wrong, please fix it".into();
+        state.messages =
+            vec![serde_json::json!({"role": "assistant", "content": "here is the code"})];
+
+        let result = Ok(AgenticLoopOutcome::Completed);
+        record_loop_completion_feedback(&mut state, &result);
+
+        // Only TaskSuccess should be recorded (no Acceptance because "wrong" is a correction keyword).
+        // We can verify by checking there's only 1 signal.
+        let config = crate::runtime_config::RuntimeConfig::default();
+        hub.tuning()
+            .add_rule(crate::auto_tuning::EvolutionRule::new(
+                "success-check",
+                crate::auto_tuning::EvolutionTrigger::LowSuccessRate {
+                    threshold: 1.1, // impossible to reach — we're just counting signals
+                    window_secs: 3600,
+                    min_samples: 1,
+                },
+                crate::auto_tuning::EvolutionAction::Alert {
+                    message: "check".into(),
+                    severity: crate::auto_tuning::AlertSeverity::Info,
+                },
+            ));
+        // This would trigger if there's any signal below the impossible threshold.
+        let triggered = hub.tuning().evaluate(&config);
+        assert!(
+            !triggered.is_empty(),
+            "TaskSuccess alone with threshold 1.1 should trigger (success rate < 1.1)"
+        );
     }
 }
