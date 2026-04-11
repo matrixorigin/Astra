@@ -509,6 +509,14 @@ fn record_edge_tool_observability(
     }
 }
 
+fn should_emit_adaptive_scenario_event(
+    scenario_changed: bool,
+    scenario_suppressed: bool,
+    config_changes_empty: bool,
+) -> bool {
+    !scenario_suppressed && (scenario_changed || !config_changes_empty)
+}
+
 fn apply_adaptive_execution_profile(state: &mut AgenticLoopState) {
     let (hub, session) = match (
         &state.telemetry.observability_hub,
@@ -616,6 +624,7 @@ fn apply_adaptive_execution_profile(state: &mut AgenticLoopState) {
     let confidence = profile.confidence;
     let experiment_id = profile.experiment_id.clone();
     let variant_id = profile.variant_id.clone();
+    let scenario_changed = profile.scenario != old_scenario;
 
     // Compute config deltas for journal.
     let mut config_changes = Vec::new();
@@ -670,7 +679,11 @@ fn apply_adaptive_execution_profile(state: &mut AgenticLoopState) {
     drop(session_guard);
 
     // Emit journal event for adaptive profile selection.
-    if profile.scenario.is_some() || !config_changes.is_empty() {
+    if should_emit_adaptive_scenario_event(
+        scenario_changed,
+        scenario_suppressed,
+        config_changes.is_empty(),
+    ) {
         let sid = state.current_session_id.as_deref();
         let event = astra_services::session_journal::JournalEvent::adaptive_scenario_applied(
             sid,
@@ -3829,6 +3842,15 @@ mod tests {
         assert_eq!(state.total_prompt, 10);
         assert_eq!(state.total_completion, 5);
         assert!(state.has_any_usage);
+    }
+
+    #[test]
+    fn adaptive_scenario_event_only_emits_for_real_changes() {
+        assert!(should_emit_adaptive_scenario_event(true, false, true));
+        assert!(should_emit_adaptive_scenario_event(false, false, false));
+        assert!(!should_emit_adaptive_scenario_event(false, false, true));
+        assert!(!should_emit_adaptive_scenario_event(true, true, true));
+        assert!(!should_emit_adaptive_scenario_event(false, true, false));
     }
 
     #[test]
