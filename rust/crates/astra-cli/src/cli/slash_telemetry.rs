@@ -36,6 +36,8 @@ pub(super) fn handle_telemetry_command(arg: &str, state: &ReplState) {
         "decisions" => show_decisions(session),
         "profile" => show_user_profile(hub, state),
         "context" => show_context_trace(session, sub_arg),
+        "context-detail" => show_context_detail(session, sub_arg),
+        "session" => show_session_analysis(session),
         "tools" => show_tool_trace(session, sub_arg),
         "compression" => show_compression_trace(session, sub_arg),
         "budget" => show_budget_evolution(session),
@@ -538,6 +540,10 @@ fn show_help() {
         "/telemetry context [N]".cyan()
     );
     eprintln!(
+        "  {}  Hierarchical proportional analysis",
+        "/telemetry context-detail [N]".cyan()
+    );
+    eprintln!(
         "  {}    Tool selection scoring for turn N",
         "/telemetry tools [N]".cyan()
     );
@@ -546,6 +552,12 @@ fn show_help() {
         "/telemetry compression [N]".cyan()
     );
     eprintln!("  {}   Token budget evolution", "/telemetry budget".cyan());
+    eprintln!();
+    eprintln!("  {}", "── Session-Level Analysis ──".bold().cyan());
+    eprintln!(
+        "  {}  Multi-turn context evolution",
+        "/telemetry session".cyan()
+    );
     eprintln!();
     eprintln!(
         "  {}",
@@ -1209,6 +1221,703 @@ fn show_budget_evolution(
     }
 
     eprintln!();
+}
+
+// ─── Deep Trace: Context Detail (Hierarchical Proportional) ──────────────────
+
+fn show_context_detail(
+    session: &std::sync::Arc<
+        std::sync::RwLock<astra_runtime::observability_integration::ObservabilitySession>,
+    >,
+    arg: &str,
+) {
+    let session_guard = session.read().unwrap_or_else(|e| e.into_inner());
+    let traces = &session_guard.context_traces;
+
+    if traces.is_empty() {
+        eprintln!("{}", "  No context assembly traces yet.".yellow());
+        return;
+    }
+
+    let trace = match resolve_turn_index(arg, traces.len()) {
+        Some(idx) => &traces[idx],
+        None => {
+            eprintln!(
+                "{}",
+                format!(
+                    "  Invalid turn: '{}'. Available: 1–{} or -1 for latest.",
+                    arg,
+                    traces.len()
+                )
+                .yellow()
+            );
+            return;
+        }
+    };
+
+    let tb = &trace.token_budget;
+    let total = tb.total_used.max(1) as f64;
+
+    eprintln!(
+        "\n{}",
+        format!(
+            "─── Context Detail — Turn {} ───────────────────",
+            trace.turn_id
+        )
+        .bold()
+        .cyan()
+    );
+    eprintln!(
+        "  {} {} / {} tokens  (pressure: {})",
+        "Total:".bold(),
+        tb.total_used.to_string().cyan().bold(),
+        tb.max_tokens.to_string().dim(),
+        format_pressure(tb.budget_pressure)
+    );
+
+    // ── System Prompt (hierarchical) ──
+    let sp = &trace.system_prompt;
+    let sp_pct = tb.system_prompt_tokens as f64 / total * 100.0;
+    eprintln!();
+    eprintln!(
+        "  {} {} tokens ({:.1}%)",
+        "▸ System Prompt".bold(),
+        tb.system_prompt_tokens.to_string().cyan(),
+        sp_pct
+    );
+    eprintln!("  {}", proportional_bar(sp_pct, 50));
+
+    // Sub-components of system prompt
+    let sp_total = sp.total_tokens.max(1) as f64;
+    let sp_items: Vec<(&str, u32)> = {
+        let mut items = vec![
+            ("base_persona", sp.base_persona_tokens),
+            ("environment", sp.environment_tokens),
+            ("user_preferences", sp.user_preferences_tokens),
+        ];
+        let skills_total: u32 = sp.skills_injected.iter().map(|s| s.tokens).sum();
+        if skills_total > 0 {
+            items.push(("skills", skills_total));
+        }
+        let mem_total: u32 = sp.repository_memories.iter().map(|m| m.tokens).sum();
+        if mem_total > 0 {
+            items.push(("repo_memories", mem_total));
+        }
+        items
+    };
+
+    for (label, tokens) in &sp_items {
+        let sub_pct = *tokens as f64 / sp_total * 100.0;
+        let global_pct = *tokens as f64 / total * 100.0;
+        eprintln!(
+            "    {:<20} {:>6} tok  {:>5.1}% of system  {:>5.1}% of total  {}",
+            format!("{label}:").dim(),
+            tokens.to_string().cyan(),
+            sub_pct,
+            global_pct,
+            mini_bar(sub_pct, 20)
+        );
+    }
+
+    // Individual skills
+    if !sp.skills_injected.is_empty() {
+        for sk in &sp.skills_injected {
+            let sk_pct = sk.tokens as f64 / sp_total * 100.0;
+            let ver = sk
+                .skill_version
+                .as_deref()
+                .map(|v| format!(" v{v}"))
+                .unwrap_or_default();
+            eprintln!(
+                "      {} {}{} — {} tok ({:.1}%)",
+                "•".dim(),
+                sk.skill_name.clone().cyan(),
+                ver.dim(),
+                sk.tokens,
+                sk_pct
+            );
+        }
+    }
+
+    // Individual repo memories
+    if !sp.repository_memories.is_empty() {
+        for mem in &sp.repository_memories {
+            let m_pct = mem.tokens as f64 / sp_total * 100.0;
+            let preview: String = mem.content_preview.chars().take(40).collect();
+            let suffix = if mem.content_preview.len() > 40 {
+                "…"
+            } else {
+                ""
+            };
+            eprintln!(
+                "      {} [{:.2}] {} tok ({:.1}%) {}{}",
+                "•".dim(),
+                mem.relevance_score,
+                mem.tokens,
+                m_pct,
+                preview,
+                suffix
+            );
+        }
+    }
+
+    // ── History ──
+    let hist_pct = tb.history_tokens as f64 / total * 100.0;
+    let hist = &trace.history;
+    eprintln!();
+    eprintln!(
+        "  {} {} tokens ({:.1}%)",
+        "▸ History".bold(),
+        tb.history_tokens.to_string().cyan(),
+        hist_pct
+    );
+    eprintln!("  {}", proportional_bar(hist_pct, 50));
+
+    if hist.tokens_before > 0 {
+        eprintln!(
+            "    {:<20} {} → {} tokens ({:.0}% compression)",
+            "compression:".dim(),
+            hist.tokens_before.to_string().dim(),
+            hist.tokens_after.to_string().cyan(),
+            hist.compression_ratio * 100.0
+        );
+    }
+    eprintln!(
+        "    {:<20} {} retained, {} compressed, {} dropped",
+        "turns:".dim(),
+        hist.turns_retained.len().to_string().green(),
+        hist.turns_compressed.len().to_string().yellow(),
+        hist.turns_dropped.len().to_string().red()
+    );
+
+    // Show retained turns breakdown
+    if !hist.turns_retained.is_empty() {
+        let retained_total: u32 = hist.turns_retained.iter().map(|t| t.tokens).sum();
+        eprintln!(
+            "    {:<20} {} tokens across {} turns",
+            "retained:".dim(),
+            retained_total.to_string().cyan(),
+            hist.turns_retained.len()
+        );
+        for t in hist.turns_retained.iter().take(5) {
+            let tc_flag = if t.has_tool_calls { " ⚙" } else { "" };
+            let t_pct = t.tokens as f64 / total * 100.0;
+            eprintln!(
+                "      T{:<3} {:>5} {} tok ({:.1}%){tc_flag}",
+                t.turn_index,
+                t.role.clone().dim(),
+                t.tokens,
+                t_pct
+            );
+        }
+        if hist.turns_retained.len() > 5 {
+            eprintln!(
+                "      {} … and {} more",
+                "".dim(),
+                hist.turns_retained.len() - 5
+            );
+        }
+    }
+
+    // Show compressed turns
+    if !hist.turns_compressed.is_empty() {
+        let saved: u32 = hist
+            .turns_compressed
+            .iter()
+            .map(|t| t.original_tokens.saturating_sub(t.compressed_tokens))
+            .sum();
+        eprintln!(
+            "    {:<20} {} tokens saved",
+            "compressed:".dim(),
+            saved.to_string().yellow()
+        );
+        for t in hist.turns_compressed.iter().take(3) {
+            eprintln!(
+                "      T{:<3} {} → {} tok ({}) {}",
+                t.turn_index,
+                t.original_tokens.to_string().dim(),
+                t.compressed_tokens.to_string().cyan(),
+                format_compression_method(&t.compression_method),
+                t.information_lost
+                    .first()
+                    .map(|s| {
+                        let preview: String = s.chars().take(30).collect();
+                        format!("lost: {preview}…")
+                    })
+                    .unwrap_or_default()
+                    .dim()
+            );
+        }
+    }
+
+    // ── Memory Retrieval ──
+    let mem_pct = tb.memory_tokens as f64 / total * 100.0;
+    let mem = &trace.memory;
+    eprintln!();
+    eprintln!(
+        "  {} {} tokens ({:.1}%)",
+        "▸ Memory".bold(),
+        tb.memory_tokens.to_string().cyan(),
+        mem_pct
+    );
+    eprintln!("  {}", proportional_bar(mem_pct, 50));
+
+    if mem.candidates_considered > 0 {
+        eprintln!(
+            "    {:<20} {} considered → {} selected ({}ms)",
+            "retrieval:".dim(),
+            mem.candidates_considered.to_string().dim(),
+            mem.memories_selected.len().to_string().green(),
+            mem.retrieval_latency_ms
+        );
+        for m in &mem.memories_selected {
+            let m_local_pct = if tb.memory_tokens > 0 {
+                m.tokens as f64 / tb.memory_tokens as f64 * 100.0
+            } else {
+                0.0
+            };
+            let preview: String = m.content_preview.chars().take(35).collect();
+            let suffix = if m.content_preview.len() > 35 {
+                "…"
+            } else {
+                ""
+            };
+            eprintln!(
+                "      {} [{:.2}] {:>4} tok ({:>4.1}%) {:?} {}{}",
+                "✓".green(),
+                m.relevance_score,
+                m.tokens,
+                m_local_pct,
+                m.source,
+                preview,
+                suffix
+            );
+        }
+    } else {
+        eprintln!("    {}", "(no retrieval performed)".dim());
+    }
+
+    // ── Tool Schemas ──
+    let tool_pct = tb.tool_schema_tokens as f64 / total * 100.0;
+    let ts = &trace.tools;
+    eprintln!();
+    eprintln!(
+        "  {} {} tokens ({:.1}%)",
+        "▸ Tool Schemas".bold(),
+        tb.tool_schema_tokens.to_string().cyan(),
+        tool_pct
+    );
+    eprintln!("  {}", proportional_bar(tool_pct, 50));
+
+    eprintln!(
+        "    {:<20} {} available → {} selected ({})",
+        "selection:".dim(),
+        ts.tools_available.to_string().dim(),
+        ts.tools_selected.len().to_string().green(),
+        ts.selection_strategy.clone().dim()
+    );
+
+    if !ts.tools_selected.is_empty() {
+        for tool in &ts.tools_selected {
+            let t_local_pct = if tb.tool_schema_tokens > 0 {
+                tool.tokens as f64 / tb.tool_schema_tokens as f64 * 100.0
+            } else {
+                0.0
+            };
+            eprintln!(
+                "      {:<22} {:>4} tok ({:>4.1}%)  score: {:.2}",
+                tool.tool_name.clone().cyan(),
+                tool.tokens,
+                t_local_pct,
+                tool.score
+            );
+        }
+    }
+
+    // ── User Message ──
+    let user_pct = tb.user_message_tokens as f64 / total * 100.0;
+    eprintln!();
+    eprintln!(
+        "  {} {} tokens ({:.1}%)",
+        "▸ User Message".bold(),
+        tb.user_message_tokens.to_string().cyan(),
+        user_pct
+    );
+    eprintln!("  {}", proportional_bar(user_pct, 50));
+
+    // ── Overall Proportion Summary ──
+    eprintln!();
+    eprintln!("  {}", "▸ Proportion Summary".bold());
+    let components = [
+        ("System Prompt", tb.system_prompt_tokens, sp_pct),
+        ("History", tb.history_tokens, hist_pct),
+        ("Memory", tb.memory_tokens, mem_pct),
+        ("Tool Schemas", tb.tool_schema_tokens, tool_pct),
+        ("User Message", tb.user_message_tokens, user_pct),
+    ];
+    for (label, tokens, pct) in &components {
+        eprintln!(
+            "    {:<18} {:>6} tok  {:>5.1}%  {}",
+            format!("{label}:").dim(),
+            tokens.to_string().cyan(),
+            pct,
+            proportional_bar(*pct, 30)
+        );
+    }
+
+    eprintln!();
+}
+
+// ─── Session-Level Analysis ──────────────────────────────────────────────────
+
+fn show_session_analysis(
+    session: &std::sync::Arc<
+        std::sync::RwLock<astra_runtime::observability_integration::ObservabilitySession>,
+    >,
+) {
+    use astra_runtime::turn::context_assembly_trace::TraceAggregation;
+
+    let session_guard = session.read().unwrap_or_else(|e| e.into_inner());
+    let traces = &session_guard.context_traces;
+
+    if traces.is_empty() {
+        eprintln!("{}", "  No context assembly traces yet.".yellow());
+        return;
+    }
+
+    let agg = TraceAggregation::from_traces(traces);
+
+    eprintln!(
+        "\n{}",
+        "─── Session Context Analysis ───────────────────"
+            .bold()
+            .cyan()
+    );
+    eprintln!(
+        "  {} {} turns analyzed",
+        "Turns:".bold(),
+        traces.len().to_string().cyan()
+    );
+
+    // ── Per-Turn Timeline ──
+    eprintln!();
+    eprintln!("  {}", "▸ Per-Turn Timeline".bold());
+    eprintln!(
+        "    {:<6} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>8} {}",
+        "Turn".dim(),
+        "System".dim(),
+        "History".dim(),
+        "Memory".dim(),
+        "Tools".dim(),
+        "User".dim(),
+        "Total".dim(),
+        "Pressure".dim(),
+        "".dim()
+    );
+    eprintln!("    {}", "─".repeat(74).dim());
+
+    for (i, trace) in traces.iter().enumerate() {
+        let tb = &trace.token_budget;
+        let compress_flag = if tb.compression_triggered {
+            " ⚠".yellow().to_string()
+        } else {
+            String::new()
+        };
+        eprintln!(
+            "    {:<6} {:>7} {:>7} {:>7} {:>7} {:>7} {:>7} {:>8}{}",
+            format!("T{}", i + 1).cyan(),
+            tb.system_prompt_tokens,
+            tb.history_tokens,
+            tb.memory_tokens,
+            tb.tool_schema_tokens,
+            tb.user_message_tokens,
+            tb.total_used,
+            format_pressure(tb.budget_pressure),
+            compress_flag
+        );
+    }
+
+    // ── Component Proportion Shift (sparkline-style) ──
+    if traces.len() >= 2 {
+        eprintln!();
+        eprintln!("  {}", "▸ Component Proportion Shift".bold());
+
+        let component_extractors: Vec<(
+            &str,
+            Box<dyn Fn(&astra_runtime::turn::context_assembly_trace::ContextAssemblyTrace) -> f64>,
+        )> = vec![
+            (
+                "system_prompt",
+                Box::new(
+                    |t: &astra_runtime::turn::context_assembly_trace::ContextAssemblyTrace| {
+                        let total = t.token_budget.total_used.max(1) as f64;
+                        t.token_budget.system_prompt_tokens as f64 / total * 100.0
+                    },
+                ),
+            ),
+            (
+                "history",
+                Box::new(
+                    |t: &astra_runtime::turn::context_assembly_trace::ContextAssemblyTrace| {
+                        let total = t.token_budget.total_used.max(1) as f64;
+                        t.token_budget.history_tokens as f64 / total * 100.0
+                    },
+                ),
+            ),
+            (
+                "memory",
+                Box::new(
+                    |t: &astra_runtime::turn::context_assembly_trace::ContextAssemblyTrace| {
+                        let total = t.token_budget.total_used.max(1) as f64;
+                        t.token_budget.memory_tokens as f64 / total * 100.0
+                    },
+                ),
+            ),
+            (
+                "tools",
+                Box::new(
+                    |t: &astra_runtime::turn::context_assembly_trace::ContextAssemblyTrace| {
+                        let total = t.token_budget.total_used.max(1) as f64;
+                        t.token_budget.tool_schema_tokens as f64 / total * 100.0
+                    },
+                ),
+            ),
+            (
+                "user_msg",
+                Box::new(
+                    |t: &astra_runtime::turn::context_assembly_trace::ContextAssemblyTrace| {
+                        let total = t.token_budget.total_used.max(1) as f64;
+                        t.token_budget.user_message_tokens as f64 / total * 100.0
+                    },
+                ),
+            ),
+        ];
+
+        for (label, extractor) in &component_extractors {
+            let values: Vec<f64> = traces.iter().map(|t| extractor(t)).collect();
+            let first = values[0];
+            let last = *values.last().unwrap();
+            let delta = last - first;
+            let trend = if delta.abs() < 0.5 {
+                "→".dim().to_string()
+            } else if delta > 0.0 {
+                format!("↑{:.0}%", delta).yellow().to_string()
+            } else {
+                format!("↓{:.0}%", delta.abs()).green().to_string()
+            };
+            eprintln!(
+                "    {:<16} {} {}",
+                format!("{label}:").dim(),
+                ascii_sparkline(&values, 20),
+                trend
+            );
+        }
+    }
+
+    // ── Aggregated Averages ──
+    eprintln!();
+    eprintln!("  {}", "▸ Averages".bold());
+    eprintln!(
+        "    {:<24} {:.0} tokens",
+        "system_prompt:".dim(),
+        agg.avg_system_prompt_tokens
+    );
+    eprintln!(
+        "    {:<24} {:.0} tokens",
+        "history:".dim(),
+        agg.avg_history_tokens
+    );
+    eprintln!(
+        "    {:<24} {:.0} tokens",
+        "memory:".dim(),
+        agg.avg_memory_tokens
+    );
+    eprintln!(
+        "    {:<24} {:.0} tokens",
+        "tool_schemas:".dim(),
+        agg.avg_tool_schema_tokens
+    );
+    eprintln!(
+        "    {:<24} {:.1} memories (avg relevance: {:.2})",
+        "memory_selection:".dim(),
+        agg.avg_memories_selected,
+        agg.avg_memory_relevance
+    );
+    eprintln!(
+        "    {:<24} {:.1} tools (avg confidence: {:.0}%)",
+        "tool_selection:".dim(),
+        agg.avg_tools_selected,
+        agg.avg_selection_confidence * 100.0
+    );
+
+    // ── Peak / Min ──
+    eprintln!();
+    eprintln!("  {}", "▸ Peak & Min".bold());
+    let peak_total = traces
+        .iter()
+        .map(|t| t.token_budget.total_used)
+        .max()
+        .unwrap_or(0);
+    let peak_idx = traces
+        .iter()
+        .position(|t| t.token_budget.total_used == peak_total)
+        .unwrap_or(0);
+    let min_total = traces
+        .iter()
+        .map(|t| t.token_budget.total_used)
+        .min()
+        .unwrap_or(0);
+    let min_idx = traces
+        .iter()
+        .position(|t| t.token_budget.total_used == min_total)
+        .unwrap_or(0);
+    eprintln!(
+        "    {:<24} {} tokens (T{})",
+        "peak_usage:".dim(),
+        peak_total.to_string().red(),
+        peak_idx + 1
+    );
+    eprintln!(
+        "    {:<24} {} tokens (T{})",
+        "min_usage:".dim(),
+        min_total.to_string().green(),
+        min_idx + 1
+    );
+
+    let peak_pressure = traces
+        .iter()
+        .map(|t| t.token_budget.budget_pressure)
+        .fold(0.0_f64, f64::max);
+    let peak_p_idx = traces
+        .iter()
+        .position(|t| (t.token_budget.budget_pressure - peak_pressure).abs() < f64::EPSILON)
+        .unwrap_or(0);
+    eprintln!(
+        "    {:<24} {} (T{})",
+        "peak_pressure:".dim(),
+        format_pressure(peak_pressure),
+        peak_p_idx + 1
+    );
+
+    // ── Compression Events ──
+    let compression_turns: Vec<usize> = traces
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| t.token_budget.compression_triggered)
+        .map(|(i, _)| i + 1)
+        .collect();
+
+    if !compression_turns.is_empty() {
+        eprintln!();
+        eprintln!("  {}", "▸ Compression Events".bold());
+        eprintln!(
+            "    {:<24} {} of {} turns",
+            "triggered:".dim(),
+            compression_turns.len().to_string().yellow(),
+            traces.len()
+        );
+        eprintln!(
+            "    {:<24} {}",
+            "turns:".dim(),
+            compression_turns
+                .iter()
+                .map(|t| format!("T{t}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+                .yellow()
+        );
+        eprintln!(
+            "    {:<24} {:.0}%",
+            "trigger_rate:".dim(),
+            agg.compression_trigger_rate * 100.0
+        );
+        eprintln!(
+            "    {:<24} {:.0}%",
+            "avg_compression_ratio:".dim(),
+            agg.avg_compression_ratio * 100.0
+        );
+    }
+
+    // ── Budget Pressure Sparkline ──
+    if traces.len() >= 2 {
+        eprintln!();
+        eprintln!("  {}", "▸ Budget Pressure Trend".bold());
+        let pressures: Vec<f64> = traces
+            .iter()
+            .map(|t| t.token_budget.budget_pressure * 100.0)
+            .collect();
+        eprintln!("    {}", ascii_sparkline(&pressures, 40));
+        eprintln!(
+            "    {} {:.0}%  {} {:.0}%",
+            "T1:".dim(),
+            pressures[0],
+            format!("T{}:", traces.len()).dim(),
+            pressures.last().unwrap()
+        );
+    }
+
+    eprintln!();
+}
+
+// ─── Rendering Helpers ───────────────────────────────────────────────────────
+
+/// Render a proportional bar using block characters.
+fn proportional_bar(pct: f64, width: usize) -> String {
+    let filled = (pct / 100.0 * width as f64).round() as usize;
+    let filled = filled.min(width);
+    let empty = width - filled;
+    format!("{}{}", "█".repeat(filled).dim(), "░".repeat(empty).dim())
+}
+
+/// Render a small proportional bar (no border).
+fn mini_bar(pct: f64, width: usize) -> String {
+    let filled = (pct / 100.0 * width as f64).round() as usize;
+    let filled = filled.min(width);
+    format!("{}", "▓".repeat(filled).dim())
+}
+
+/// Format budget pressure with color.
+fn format_pressure(pressure: f64) -> String {
+    let s = format!("{:.0}%", pressure * 100.0);
+    if pressure > 0.9 {
+        s.red().to_string()
+    } else if pressure > 0.7 {
+        s.yellow().to_string()
+    } else {
+        s.green().to_string()
+    }
+}
+
+/// Render ASCII sparkline from a series of values.
+fn ascii_sparkline(values: &[f64], width: usize) -> String {
+    if values.is_empty() {
+        return String::new();
+    }
+
+    let spark_chars = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    let min = values.iter().cloned().fold(f64::INFINITY, f64::min);
+    let max = values.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let range = (max - min).max(0.001);
+
+    // If more values than width, sample; otherwise use all
+    let sampled: Vec<f64> = if values.len() > width {
+        (0..width)
+            .map(|i| {
+                let idx = i * values.len() / width;
+                values[idx.min(values.len() - 1)]
+            })
+            .collect()
+    } else {
+        values.to_vec()
+    };
+
+    sampled
+        .iter()
+        .map(|v| {
+            let normalized = ((v - min) / range * 7.0).round() as usize;
+            spark_chars[normalized.min(7)]
+        })
+        .collect()
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
