@@ -37,6 +37,11 @@ impl Default for ExplorationEngine {
 }
 
 impl ExplorationEngine {
+    /// Create an exploration engine with the given thresholds.
+    ///
+    /// * `confidence_threshold` — create experiments for opportunities below this score
+    /// * `max_concurrent_experiments` — cap on simultaneous experiments to limit noise
+    /// * `min_samples_per_variant` — minimum outcomes required before concluding
     pub fn new(
         confidence_threshold: f64,
         max_concurrent_experiments: usize,

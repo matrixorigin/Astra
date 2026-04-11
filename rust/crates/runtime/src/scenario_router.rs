@@ -18,6 +18,7 @@ use crate::user_profile::{Scenario, ScenarioDetector};
 pub struct ScenarioRouter;
 
 impl ScenarioRouter {
+    /// Create a new stateless scenario router.
     pub fn new() -> Self {
         Self
     }
