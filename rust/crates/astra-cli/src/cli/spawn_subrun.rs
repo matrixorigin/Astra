@@ -230,6 +230,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             delegation_engine: None,
             project_context: None,
             checkpoint_gate: None,
+            evolution_service: None,
             data_snapshot_provider: None,
             last_composite_snapshot: None,
             last_measured_prompt_tokens: None,

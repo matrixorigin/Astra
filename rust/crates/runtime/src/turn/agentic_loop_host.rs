@@ -462,6 +462,11 @@ pub struct AgenticLoopState {
     /// Optional checkpoint gate checked every N turns during delegation sub-runs.
     /// When the gate returns `false`, the loop aborts with `Cancelled`.
     pub checkpoint_gate: Option<Arc<dyn crate::server::delegation_engine::CheckpointGate>>,
+
+    // ── Evolution ──
+    /// Optional evolution service for multi-axis self-evolution.
+    /// When set, tool results and user messages feed into signal collection.
+    pub evolution_service: Option<Arc<crate::evolution::service::EvolutionService>>,
 }
 
 /// Consecutive same-category error turns before forcing a strategy change.
@@ -2029,6 +2034,32 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
         }));
     }
 
+    // ─── Preamble: feed user message into evolution signal collector ──
+    if let Some(ref evo) = state.evolution_service {
+        let turn_id = state.current_run_id.as_deref().unwrap_or("unknown");
+        // Extract prior assistant text from the last assistant message.
+        let prior_assistant = state
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("assistant"))
+            .and_then(|m| m.get("content").and_then(|c| c.as_str()))
+            .map(String::from);
+        let active_skill: Option<String> = state
+            .skills
+            .invoked
+            .iter()
+            .max_by_key(|(_, v)| v.invoked_at_turn)
+            .map(|(name, _)| name.clone());
+        evo.on_user_message(
+            &state.message,
+            prior_assistant.as_deref(),
+            active_skill.as_deref(),
+            turn_id,
+        )
+        .await;
+    }
+
     for turn_index in 0..state.max_turns {
         // ─── Cancel check (cooperative) ─────────────────────────────────
         if state
@@ -3221,6 +3252,35 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
             .await;
         }
 
+        // ── Feed tool results into evolution signal collector ──
+        if let Some(ref evo) = state.evolution_service {
+            let turn_id = state
+                .current_run_id
+                .as_deref()
+                .unwrap_or("unknown");
+            // Determine active skill from the most recently invoked skill.
+            let active_skill: Option<String> = state
+                .skills
+                .invoked
+                .iter()
+                .max_by_key(|(_, v)| v.invoked_at_turn)
+                .map(|(name, _)| name.clone());
+            let active_skill_ref = active_skill.as_deref();
+            for rec in &state.stall.tool_call_records {
+                let is_error = !rec.ok;
+                let ctx = crate::evolution::types::ToolResultContext {
+                    tool_name: &rec.name,
+                    tool_args: rec.args_preview.as_deref().unwrap_or(""),
+                    result: rec.result_preview.as_deref().unwrap_or(""),
+                    is_error,
+                    duration_ms: rec.ms,
+                    active_skill: active_skill_ref,
+                    turn_id,
+                };
+                evo.on_tool_result(&ctx).await;
+            }
+        }
+
         // ── Emit progress events for permission-denied tools so
         //    parent/UI subscribers learn about blocked operations.
         if let Some(ref emitter) = state.messaging.progress_emitter {
@@ -3825,6 +3885,7 @@ mod tests {
             delegation_engine: None,
             project_context: None,
             checkpoint_gate: None,
+            evolution_service: None,
             data_snapshot_provider: None,
             last_composite_snapshot: None,
             last_measured_prompt_tokens: None,

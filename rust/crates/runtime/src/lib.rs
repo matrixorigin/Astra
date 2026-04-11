@@ -85,6 +85,7 @@ mod app_state;
 pub mod auto_tuning;
 pub mod bridge;
 pub mod evaluation;
+pub mod evolution;
 pub mod execution_profile;
 pub mod exploration_engine;
 pub mod introspection;

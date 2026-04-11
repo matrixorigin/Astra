@@ -323,6 +323,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             delegation_engine: None,
             project_context: None,
             checkpoint_gate: config.checkpoint_gate.clone(),
+            evolution_service: None,
             data_snapshot_provider: None,
             last_composite_snapshot: None,
             last_measured_prompt_tokens: None,

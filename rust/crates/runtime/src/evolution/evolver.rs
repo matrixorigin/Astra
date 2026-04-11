@@ -1,0 +1,260 @@
+//! Fast-path proposal generation from evolution signals.
+//!
+//! Pattern/Calibration/Entity axes are pure computation (no LLM).
+//! Skill axis proposals require LLM and are deferred to a separate path.
+
+use super::types::*;
+
+/// Generate proposals from signals. Fast path only — no LLM, no IO.
+pub fn generate_fast_proposals(signals: &[EvolutionSignal]) -> Vec<EvolutionProposal> {
+    let mut proposals = Vec::new();
+    let now = now_epoch();
+
+    for signal in signals {
+        match signal {
+            EvolutionSignal::PatternDrift {
+                pattern_signature,
+                historical_rate,
+                recent_rate,
+                ..
+            } => {
+                let drop = historical_rate - recent_rate;
+                // Only demote if the drop is significant (>25%).
+                if drop > 0.25 {
+                    proposals.push(EvolutionProposal {
+                        id: make_id(),
+                        signal: signal.clone(),
+                        axis: EvolutionAxis::Pattern {
+                            signature: pattern_signature.clone(),
+                            action: PatternAction::Demote,
+                        },
+                        confidence: drop.min(1.0),
+                        reasoning: format!(
+                            "Pattern success rate dropped from {:.0}% to {:.0}%",
+                            historical_rate * 100.0,
+                            recent_rate * 100.0
+                        ),
+                        created_at: now,
+                        status: ApprovalStatus::AutoApplied,
+                    });
+                }
+            }
+            EvolutionSignal::RepeatedStall {
+                tool_chain,
+                stall_count,
+                ..
+            } => {
+                if *stall_count >= 3 {
+                    let sig = {
+                        let mut sorted = tool_chain.clone();
+                        sorted.sort();
+                        sorted.join("|")
+                    };
+                    proposals.push(EvolutionProposal {
+                        id: make_id(),
+                        signal: signal.clone(),
+                        axis: EvolutionAxis::Pattern {
+                            signature: sig,
+                            action: PatternAction::Block,
+                        },
+                        confidence: 0.9,
+                        reasoning: format!(
+                            "Tool chain stalled {stall_count} consecutive rounds"
+                        ),
+                        created_at: now,
+                        status: ApprovalStatus::AutoApplied,
+                    });
+                }
+            }
+            // ToolFailure and UserCorrection are skill-axis candidates (LLM path).
+            // We don't generate proposals for them here.
+            EvolutionSignal::ToolFailure { .. } | EvolutionSignal::UserCorrection { .. } => {}
+        }
+    }
+    proposals
+}
+
+/// Check if a signal requires the LLM path (skill evolution).
+pub fn needs_llm(signal: &EvolutionSignal) -> bool {
+    matches!(
+        signal,
+        EvolutionSignal::ToolFailure {
+            skill_context: Some(_),
+            ..
+        } | EvolutionSignal::UserCorrection {
+            skill_context: Some(_),
+            ..
+        }
+    )
+}
+
+fn make_id() -> String {
+    format!("ev_{:08x}", rand_u32())
+}
+
+fn rand_u32() -> u32 {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    RandomState::new().build_hasher().finish() as u32
+}
+
+fn now_epoch() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pipeline::routing::{DomainHint, TaskType};
+
+    #[test]
+    fn pattern_drift_generates_demote() {
+        let signals = vec![EvolutionSignal::PatternDrift {
+            pattern_signature: "bash|read_file".into(),
+            task_type: TaskType::Code,
+            domain: Some(DomainHint::Code),
+            historical_rate: 0.85,
+            recent_rate: 0.30,
+        }];
+        let proposals = generate_fast_proposals(&signals);
+        assert_eq!(proposals.len(), 1);
+        match &proposals[0].axis {
+            EvolutionAxis::Pattern { action, .. } => {
+                assert_eq!(*action, PatternAction::Demote);
+            }
+            _ => panic!("expected Pattern axis"),
+        }
+        assert_eq!(proposals[0].status, ApprovalStatus::AutoApplied);
+    }
+
+    #[test]
+    fn small_drift_ignored() {
+        let signals = vec![EvolutionSignal::PatternDrift {
+            pattern_signature: "bash".into(),
+            task_type: TaskType::Code,
+            domain: None,
+            historical_rate: 0.80,
+            recent_rate: 0.70, // only 10% drop
+        }];
+        let proposals = generate_fast_proposals(&signals);
+        assert!(proposals.is_empty());
+    }
+
+    #[test]
+    fn repeated_stall_generates_block() {
+        let signals = vec![EvolutionSignal::RepeatedStall {
+            tool_chain: vec!["bash".into(), "read_file".into()],
+            stall_count: 3,
+            turn_id: "t1".into(),
+        }];
+        let proposals = generate_fast_proposals(&signals);
+        assert_eq!(proposals.len(), 1);
+        match &proposals[0].axis {
+            EvolutionAxis::Pattern {
+                signature, action, ..
+            } => {
+                assert_eq!(*action, PatternAction::Block);
+                assert_eq!(signature, "bash|read_file"); // sorted
+            }
+            _ => panic!("expected Pattern axis"),
+        }
+    }
+
+    #[test]
+    fn stall_below_threshold_ignored() {
+        let signals = vec![EvolutionSignal::RepeatedStall {
+            tool_chain: vec!["bash".into()],
+            stall_count: 2,
+            turn_id: "t1".into(),
+        }];
+        let proposals = generate_fast_proposals(&signals);
+        assert!(proposals.is_empty());
+    }
+
+    #[test]
+    fn tool_failure_not_fast_path() {
+        let signals = vec![EvolutionSignal::ToolFailure {
+            tool_name: "bash".into(),
+            error_snippet: "Error: fail".into(),
+            skill_context: Some("review_changes".into()),
+            turn_id: "t1".into(),
+        }];
+        let proposals = generate_fast_proposals(&signals);
+        assert!(proposals.is_empty(), "ToolFailure needs LLM path");
+    }
+
+    #[test]
+    fn needs_llm_with_skill_context() {
+        let s = EvolutionSignal::ToolFailure {
+            tool_name: "bash".into(),
+            error_snippet: "err".into(),
+            skill_context: Some("review_changes".into()),
+            turn_id: "t1".into(),
+        };
+        assert!(needs_llm(&s));
+    }
+
+    #[test]
+    fn needs_llm_without_skill_context() {
+        let s = EvolutionSignal::ToolFailure {
+            tool_name: "bash".into(),
+            error_snippet: "err".into(),
+            skill_context: None,
+            turn_id: "t1".into(),
+        };
+        assert!(!needs_llm(&s), "no skill context → no skill to evolve");
+    }
+
+    #[test]
+    fn proposal_ids_are_unique() {
+        let signals = vec![
+            EvolutionSignal::PatternDrift {
+                pattern_signature: "a".into(),
+                task_type: TaskType::Code,
+                domain: None,
+                historical_rate: 0.9,
+                recent_rate: 0.1,
+            },
+            EvolutionSignal::PatternDrift {
+                pattern_signature: "b".into(),
+                task_type: TaskType::Fetch,
+                domain: None,
+                historical_rate: 0.9,
+                recent_rate: 0.1,
+            },
+        ];
+        let proposals = generate_fast_proposals(&signals);
+        assert_eq!(proposals.len(), 2);
+        assert_ne!(proposals[0].id, proposals[1].id);
+    }
+
+    #[test]
+    fn mixed_signals_only_fast_path() {
+        let signals = vec![
+            EvolutionSignal::PatternDrift {
+                pattern_signature: "x".into(),
+                task_type: TaskType::Code,
+                domain: None,
+                historical_rate: 0.9,
+                recent_rate: 0.2,
+            },
+            EvolutionSignal::ToolFailure {
+                tool_name: "bash".into(),
+                error_snippet: "err".into(),
+                skill_context: Some("s".into()),
+                turn_id: "t1".into(),
+            },
+            EvolutionSignal::UserCorrection {
+                correction_text: "wrong".into(),
+                prior_assistant_text: "".into(),
+                skill_context: None,
+                turn_id: "t2".into(),
+            },
+        ];
+        let proposals = generate_fast_proposals(&signals);
+        assert_eq!(proposals.len(), 1, "only PatternDrift should produce a proposal");
+    }
+}
