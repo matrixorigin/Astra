@@ -2746,6 +2746,27 @@ mod tests {
     }
 
     #[test]
+    fn build_system_message_returns_non_empty_sections() {
+        let (_, _, sections) = build_system_message(
+            &["bash", "grep"],
+            "cwd: /test\ngit_branch: main",
+            0.8,
+            None,
+            &PromptCacheConfig::latch("openai", "gpt-4"),
+        );
+        assert!(!sections.is_empty(), "should return prompt sections");
+        // Should have Global + Session scoped sections
+        let has_global = sections
+            .iter()
+            .any(|s| s.scope == crate::prompts::CacheScope::Global);
+        let has_session = sections
+            .iter()
+            .any(|s| s.scope == crate::prompts::CacheScope::Session);
+        assert!(has_global, "should have Global sections");
+        assert!(has_session, "should have Session sections");
+    }
+
+    #[test]
     fn annotate_tool_schemas_for_caching_adds_cache_control() {
         let _lock = CACHE_ENV_MUTEX.lock().unwrap();
         unsafe {

@@ -23,8 +23,9 @@ use std::time::Instant;
 
 use super::context_assembly_trace::{
     CompressionMethod, ContextAssemblyTrace, ContextAssemblyTraceBuilder, DecisionExplanation,
-    HistorySelectionTrace, MemoryRetrievalTrace, SystemPromptBreakdown, TokenBudgetTrace,
-    ToolSelectionTrace, build_history_trace_from_compression, build_memory_trace_from_retrieval,
+    HistorySelectionTrace, MemoryInjection, MemoryRetrievalTrace, SkillInjection,
+    SystemPromptBreakdown, TokenBudgetTrace, ToolSelectionTrace,
+    build_history_trace_from_compression, build_memory_trace_from_retrieval,
     build_tool_trace_from_selection,
 };
 
@@ -427,5 +428,38 @@ mod tests {
         assert_eq!(trace.token_budget.history_tokens, 5_000);
         assert_eq!(trace.token_budget.tool_schema_tokens, 3_000);
         assert_eq!(trace.token_budget.user_message_tokens, 200);
+    }
+
+    #[test]
+    fn record_system_prompt_breakdown_persists_in_trace() {
+        let collector = TurnTraceCollector::new("turn-0", "sess-1");
+        let breakdown = SystemPromptBreakdown {
+            base_persona_tokens: 8000,
+            environment_tokens: 300,
+            user_preferences_tokens: 100,
+            skills_injected: vec![SkillInjection {
+                skill_name: "review".into(),
+                skill_version: Some("1.0".into()),
+                tokens: 500,
+                selection_reason: "user_invoked".into(),
+            }],
+            repository_memories: vec![MemoryInjection {
+                memory_id: "m-42".into(),
+                memory_type: "hybrid".into(),
+                tokens: 200,
+                relevance_score: 0.85,
+                content_preview: "prefers concise code".into(),
+            }],
+            total_tokens: 9100,
+        };
+        collector.record_system_prompt(breakdown);
+        let trace = collector.finalize();
+        let sp = &trace.system_prompt;
+        assert_eq!(sp.total_tokens, 9100);
+        assert_eq!(sp.base_persona_tokens, 8000);
+        assert_eq!(sp.skills_injected.len(), 1);
+        assert_eq!(sp.skills_injected[0].skill_name, "review");
+        assert_eq!(sp.repository_memories.len(), 1);
+        assert_eq!(sp.repository_memories[0].memory_id, "m-42");
     }
 }

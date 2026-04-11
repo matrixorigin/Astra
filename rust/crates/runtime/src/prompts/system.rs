@@ -2202,4 +2202,45 @@ mod tests {
         let overrides = load_overrides(Path::new("/nonexistent/path"));
         assert!(overrides.is_empty());
     }
+
+    #[test]
+    fn build_system_prompt_trace_includes_skills_and_memories() {
+        use crate::turn::context_assembly_trace::{MemoryInjection, SkillInjection};
+
+        let sections = build_system_prompt_sections(&["bash", "grep"], "", 0.8, None);
+        let skills = vec![SkillInjection {
+            skill_name: "concise".into(),
+            skill_version: None,
+            tokens: 150,
+            selection_reason: "active".into(),
+        }];
+        let memories = vec![MemoryInjection {
+            memory_id: "m-1".into(),
+            memory_type: "hybrid".into(),
+            tokens: 200,
+            relevance_score: 0.95,
+            content_preview: "user prefers rust".into(),
+        }];
+        let bd = build_system_prompt_trace(&sections, skills, memories);
+
+        assert!(bd.base_persona_tokens > 0, "base_persona should be non-zero");
+        assert_eq!(bd.skills_injected.len(), 1);
+        assert_eq!(bd.skills_injected[0].skill_name, "concise");
+        assert_eq!(bd.skills_injected[0].tokens, 150);
+        assert_eq!(bd.repository_memories.len(), 1);
+        assert_eq!(bd.repository_memories[0].tokens, 200);
+        // total includes sections + skills + memories
+        assert!(bd.total_tokens >= bd.base_persona_tokens + 150 + 200);
+    }
+
+    #[test]
+    fn build_system_prompt_trace_empty_skills_and_memories() {
+        let sections = build_system_prompt_sections(&["bash"], "", 0.5, None);
+        let bd = build_system_prompt_trace(&sections, vec![], vec![]);
+
+        assert!(bd.base_persona_tokens > 0);
+        assert!(bd.skills_injected.is_empty());
+        assert!(bd.repository_memories.is_empty());
+        assert_eq!(bd.total_tokens, bd.base_persona_tokens + bd.environment_tokens + bd.user_preferences_tokens);
+    }
 }

@@ -888,6 +888,43 @@ mod tests {
         dispatch_chat_turn_sse_event_block(sse, &mut accum, &mut vec![]);
         assert_eq!(accum.system_prompt_tokens, Some(5432));
     }
+
+    #[test]
+    fn context_meta_sse_event_parses_full_breakdown() {
+        use astra_runtime::turn::chat_turn_sse_dispatch::{
+            ChatTurnSseAccum, dispatch_chat_turn_sse_event_block,
+        };
+        use astra_runtime::turn::context_assembly_trace::SystemPromptBreakdown;
+
+        let mut accum = ChatTurnSseAccum::default();
+        let sse = concat!(
+            "data: {\"type\":\"context_meta\",\"system_prompt_tokens\":8000,",
+            "\"system_prompt_breakdown\":{",
+            "\"base_persona_tokens\":6000,\"environment_tokens\":500,",
+            "\"user_preferences_tokens\":200,",
+            "\"skills_injected\":[{\"skill_name\":\"concise\",\"tokens\":100,",
+            "\"selection_reason\":\"active_output_skill\"}],",
+            "\"repository_memories\":[{\"memory_id\":\"prefetch-0\",",
+            "\"memory_type\":\"hybrid_retrieval\",\"tokens\":80,",
+            "\"relevance_score\":0.9,\"content_preview\":\"user likes rust\"}],",
+            "\"total_tokens\":8000}}\n\n"
+        );
+        dispatch_chat_turn_sse_event_block(sse, &mut accum, &mut vec![]);
+        assert_eq!(accum.system_prompt_tokens, Some(8000));
+
+        let bd: SystemPromptBreakdown =
+            serde_json::from_value(accum.system_prompt_breakdown.unwrap()).unwrap();
+        assert_eq!(bd.base_persona_tokens, 6000);
+        assert_eq!(bd.environment_tokens, 500);
+        assert_eq!(bd.user_preferences_tokens, 200);
+        assert_eq!(bd.skills_injected.len(), 1);
+        assert_eq!(bd.skills_injected[0].skill_name, "concise");
+        assert_eq!(bd.skills_injected[0].tokens, 100);
+        assert_eq!(bd.repository_memories.len(), 1);
+        assert_eq!(bd.repository_memories[0].memory_id, "prefetch-0");
+        assert_eq!(bd.repository_memories[0].tokens, 80);
+        assert_eq!(bd.total_tokens, 8000);
+    }
 }
 
 // Note: Environment variable parsing tests for `chat_turn_timing_stderr_enabled` were removed
