@@ -1045,13 +1045,6 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
     },
 ];
 
-/// Check if a tool name is in the pinned set.
-pub fn is_pinned_tool(name: &str) -> bool {
-    TOOL_CATALOG
-        .iter()
-        .any(|t| t.pinned && t.name == name)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

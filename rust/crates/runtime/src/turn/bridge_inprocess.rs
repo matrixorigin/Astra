@@ -482,46 +482,23 @@ fn build_system_message(
     }
 }
 
-/// Add `cache_control` to tool schemas for Anthropic caching.
+/// Add `cache_control` to the last tool schema for Anthropic caching.
 ///
-/// Places breakpoints on:
-/// 1. The last pinned tool — caches the stable pinned prefix (reusable across all turns)
-/// 2. The last overall tool — caches the full tool list (reusable when dynamic tools match)
+/// Anthropic allows only 4 cache_control breakpoints per request. Our allocation:
+/// - System prompt: 2 breakpoints (global scope + session scope)
+/// - Tools: 1 breakpoint (last tool only)
+/// - Messages: 1 breakpoint (last message)
 ///
-/// This uses 2 of Anthropic's 4 allowed cache breakpoints. The system prompt and
-/// message history use the other 2.
+/// This matches Claude Code's strategy of prioritizing message history caching
+/// for multi-turn conversations while still caching the stable tool prefix.
 fn annotate_tool_schemas_for_caching(tools: &mut [Value], cache_cfg: &PromptCacheConfig) {
     if !cache_cfg.should_annotate() || tools.is_empty() {
         return;
     }
-
-    // Find the last pinned tool index by scanning from the end
-    // (since pinned tools come first, we want the last one before dynamic tools start)
-    let last_pinned_idx = tools
-        .iter()
-        .enumerate()
-        .rev()
-        .find(|(_, t)| {
-            t.get("function")
-                .and_then(|f| f.get("name"))
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(crate::tool_registry::is_pinned_tool)
-        })
-        .map(|(i, _)| i);
-
+    // Mark only the last tool — this creates a single cache covering all tools.
+    // Since tools rarely change mid-conversation, this is usually a cache hit.
     let last_idx = tools.len() - 1;
-    let has_dynamic_tools = last_pinned_idx != Some(last_idx);
-
-    // Mark last pinned tool with cache_control (creates cache for stable prefix)
-    if let Some(idx) = last_pinned_idx {
-        tools[idx]["cache_control"] = json!({"type": "ephemeral", "ttl": "1h"});
-    }
-
-    // Mark last overall tool (for turn-to-turn caching of full tool list)
-    // Skip if it's the same as last pinned (no dynamic tools)
-    if has_dynamic_tools {
-        tools[last_idx]["cache_control"] = json!({"type": "ephemeral", "ttl": "1h"});
-    }
+    tools[last_idx]["cache_control"] = json!({"type": "ephemeral", "ttl": "1h"});
 }
 
 /// Add a cache breakpoint on the last conversation message for Anthropic.
@@ -2849,7 +2826,7 @@ mod tests {
     }
 
     #[test]
-    fn annotate_tool_schemas_with_mixed_pinned_dynamic() {
+    fn annotate_tool_schemas_only_last_tool() {
         let _lock = CACHE_ENV_MUTEX.lock().unwrap();
         unsafe {
             std::env::remove_var("MO_PROMPT_CACHE_DISABLED");
@@ -2866,23 +2843,24 @@ mod tests {
             &PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514"),
         );
 
-        // First pinned tool should NOT have cache_control
+        // Only the LAST tool should have cache_control (simplified strategy)
         assert!(
             tools[0].get("cache_control").is_none(),
-            "first pinned tool should not have cache_control"
+            "first tool should not have cache_control"
         );
-
-        // Last pinned tool (read_file) SHOULD have cache_control for prefix caching
         assert!(
-            tools[1].get("cache_control").is_some(),
-            "last pinned tool should have cache_control"
+            tools[1].get("cache_control").is_none(),
+            "middle tool should not have cache_control"
         );
-
-        // Last overall tool (dynamic) SHOULD also have cache_control
         assert!(
             tools[2].get("cache_control").is_some(),
-            "last dynamic tool should have cache_control for full-list caching"
+            "last tool should have cache_control"
         );
+        assert_eq!(
+            tools[2]["cache_control"]["type"].as_str(),
+            Some("ephemeral")
+        );
+        assert_eq!(tools[2]["cache_control"]["ttl"].as_str(), Some("1h"));
     }
 
     #[test]
