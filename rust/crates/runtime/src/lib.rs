@@ -80,6 +80,7 @@ pub(crate) use storage::{
 // ── Public modules: runtime core ─────────────────────────────────────────────
 
 pub mod ab_testing;
+pub mod adaptive_baselines;
 mod app_state;
 pub mod auto_tuning;
 pub mod bridge;

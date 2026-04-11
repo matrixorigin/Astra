@@ -851,6 +851,34 @@ pub(super) fn handle_session_command(arg: &str, state: &mut ReplState) {
                                     eprintln!("      {}", ellipsize(preview, 120).cyan());
                                 }
                             }
+                            session_journal::JournalEventType::AdaptiveBaselinePromoted => {
+                                let meta = evt.metadata.as_ref();
+                                let task_type = meta
+                                    .and_then(|m| m.get("task_type"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("?");
+                                let domain = meta
+                                    .and_then(|m| m.get("domain"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("any");
+                                let variant = meta
+                                    .and_then(|m| m.get("variant_id"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("?");
+                                let experiment = meta
+                                    .and_then(|m| m.get("experiment_id"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("?");
+                                eprintln!(
+                                    "  {} {} adaptive baseline {} / {} → {} ({})",
+                                    ts_short.dim(),
+                                    "⚙".cyan(),
+                                    task_type,
+                                    domain,
+                                    variant,
+                                    experiment.dim(),
+                                );
+                            }
                             session_journal::JournalEventType::AgentTerminated => {
                                 let m = evt.metadata.as_ref();
                                 let agent = m
@@ -1693,6 +1721,28 @@ fn build_export_markdown(session_id: &str, events: &[session_journal::JournalEve
                 md.push_str(&format!(
                     "### Sync marker\n- **Time:** {ts_short}\n- **Note:** {}\n\n",
                     evt.user_input.as_deref().unwrap_or(""),
+                ));
+            }
+            session_journal::JournalEventType::AdaptiveBaselinePromoted => {
+                let meta = evt.metadata.as_ref();
+                let task_type = meta
+                    .and_then(|m| m.get("task_type"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?");
+                let domain = meta
+                    .and_then(|m| m.get("domain"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("any");
+                let variant = meta
+                    .and_then(|m| m.get("variant_id"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?");
+                let experiment = meta
+                    .and_then(|m| m.get("experiment_id"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?");
+                md.push_str(&format!(
+                    "### Adaptive baseline promoted\n- **Time:** {ts_short}\n- **Scope:** {task_type} / {domain}\n- **Winner:** {variant}\n- **Experiment:** {experiment}\n\n"
                 ));
             }
             _ => {}

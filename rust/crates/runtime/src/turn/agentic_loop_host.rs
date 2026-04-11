@@ -555,6 +555,7 @@ fn apply_adaptive_execution_profile(state: &mut AgenticLoopState) {
     let profile = router.select(
         &routing,
         &detector,
+        Some(hub.adaptive_baselines()),
         pattern_library.as_deref(),
         Some(&*experiments),
         &user_id,
@@ -610,6 +611,7 @@ fn parse_delegation_request(
     parent_run_id: &str,
     session_id: &str,
     skill_search: &astra_core::SkillSearchSettings,
+    adaptive_context: Option<&DelegationAdaptiveContext>,
 ) -> Result<astra_services::coordination::DelegationRequest, String> {
     let args_str = tool_call
         .get("function")
@@ -626,7 +628,14 @@ fn parse_delegation_request(
         .unwrap_or("delegated task")
         .to_string();
 
-    let pattern = parse_coordination_pattern(&args)?;
+    let explicit_pattern = args.get("pattern").and_then(Value::as_str);
+    let (pattern, adaptive_policy) = if explicit_pattern.is_some() {
+        (parse_coordination_pattern(&args)?, None)
+    } else {
+        let (pattern, policy) =
+            select_default_coordination_pattern(&args, &task, adaptive_context)?;
+        (pattern, Some(policy))
+    };
 
     let mut context = std::collections::HashMap::new();
     context.insert(
@@ -643,6 +652,9 @@ fn parse_delegation_request(
             context.insert(k.clone(), v.clone());
         }
     }
+    if let Some(policy) = adaptive_policy {
+        context.insert("adaptive_coordination".to_string(), policy);
+    }
 
     Ok(astra_services::coordination::DelegationRequest {
         delegation_id: uuid::Uuid::new_v4().to_string(),
@@ -655,6 +667,121 @@ fn parse_delegation_request(
     })
 }
 
+#[derive(Debug, Clone)]
+struct DelegationAdaptiveContext {
+    scenario: Option<crate::user_profile::Scenario>,
+}
+
+fn delegation_adaptive_context(
+    session: &crate::observability_integration::ObservabilitySession,
+) -> DelegationAdaptiveContext {
+    DelegationAdaptiveContext {
+        scenario: session.current_scenario(),
+    }
+}
+
+fn select_default_coordination_pattern(
+    args: &Value,
+    task: &str,
+    adaptive_context: Option<&DelegationAdaptiveContext>,
+) -> Result<(astra_services::coordination::CoordinationPattern, Value), String> {
+    let agents = parse_delegate_agents(args);
+    let scenario = adaptive_context.and_then(|ctx| ctx.scenario.clone());
+    let task_requests_review = task_needs_review(task);
+    let should_adapt = matches!(
+        scenario,
+        Some(
+            crate::user_profile::Scenario::CodeReview | crate::user_profile::Scenario::Exploration
+        )
+    ) || task_requests_review;
+
+    if !should_adapt {
+        let pattern = astra_services::coordination::CoordinationPattern::Sequential {
+            agent_ids: agents.clone(),
+            stop_on_success: false,
+            timeout_sec: 0,
+        };
+        return Ok((
+            pattern,
+            serde_json::json!({
+                "selected_pattern": "sequential",
+                "selection_source": "legacy_default",
+                "reason": "no explicit pattern and no adaptive delegation signal",
+                "scenario": scenario,
+            }),
+        ));
+    }
+
+    let hints = astra_services::coordination::CoordinationHints {
+        agent_ids: agents,
+        task: task.to_string(),
+        needs_review: matches!(scenario, Some(crate::user_profile::Scenario::CodeReview)),
+        has_dependencies: !matches!(
+            scenario,
+            Some(
+                crate::user_profile::Scenario::Exploration
+                    | crate::user_profile::Scenario::CodeReview
+            )
+        ),
+        timeout_sec: args.get("timeout").and_then(Value::as_u64).unwrap_or(0),
+    };
+    let pattern = astra_services::coordination::suggest_pattern(&hints);
+    let selected_pattern = coordination_pattern_name(&pattern);
+    let reason = if matches!(scenario, Some(crate::user_profile::Scenario::CodeReview)) {
+        "code_review_scenario_prefers_review_loop"
+    } else if matches!(scenario, Some(crate::user_profile::Scenario::Exploration)) {
+        "exploration_scenario_prefers_parallel_scouting"
+    } else if task_requests_review {
+        "task_keywords_request_review"
+    } else {
+        "adaptive_default"
+    };
+
+    Ok((
+        pattern,
+        serde_json::json!({
+            "selected_pattern": selected_pattern,
+            "selection_source": "adaptive_default",
+            "reason": reason,
+            "scenario": scenario,
+        }),
+    ))
+}
+
+fn parse_delegate_agents(args: &Value) -> Vec<String> {
+    args.get("agents")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(Value::as_str)
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_else(|| vec!["coder".to_string()])
+}
+
+fn task_needs_review(task: &str) -> bool {
+    let review_keywords = ["review", "审查", "check", "verify", "验证", "critique"];
+    let task_lower = task.to_lowercase();
+    review_keywords
+        .iter()
+        .any(|keyword| task_lower.contains(keyword))
+}
+
+fn coordination_pattern_name(
+    pattern: &astra_services::coordination::CoordinationPattern,
+) -> &'static str {
+    match pattern {
+        astra_services::coordination::CoordinationPattern::FanOut { .. } => "fan_out",
+        astra_services::coordination::CoordinationPattern::Pipeline { .. } => "pipeline",
+        astra_services::coordination::CoordinationPattern::AdversarialReview { .. } => {
+            "adversarial"
+        }
+        astra_services::coordination::CoordinationPattern::Sequential { .. } => "sequential",
+        astra_services::coordination::CoordinationPattern::Fork { .. } => "fork",
+    }
+}
+
 /// Parse a CoordinationPattern from the LLM's delegate arguments.
 fn parse_coordination_pattern(
     args: &Value,
@@ -664,16 +791,7 @@ fn parse_coordination_pattern(
         .and_then(Value::as_str)
         .unwrap_or("sequential");
 
-    let agents: Vec<String> = args
-        .get("agents")
-        .and_then(Value::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter_map(Value::as_str)
-                .map(String::from)
-                .collect()
-        })
-        .unwrap_or_else(|| vec!["coder".to_string()]);
+    let agents = parse_delegate_agents(args);
 
     let task = args
         .get("task")
@@ -770,6 +888,7 @@ async fn partition_and_execute_delegations(
     source_agent_id: &str,
     workspace_hint: Option<&str>,
     skill_search: &astra_core::SkillSearchSettings,
+    adaptive_context: Option<&DelegationAdaptiveContext>,
 ) -> (Vec<DelegationExecutionResult>, Vec<Value>) {
     let mut delegation_results = Vec::new();
     let mut remaining = Vec::new();
@@ -782,7 +901,13 @@ async fn partition_and_execute_delegations(
                 .unwrap_or("unknown")
                 .to_string();
 
-            match parse_delegation_request(tc, parent_run_id, session_id, skill_search) {
+            match parse_delegation_request(
+                tc,
+                parent_run_id,
+                session_id,
+                skill_search,
+                adaptive_context,
+            ) {
                 Ok(mut request) => {
                     merge_workspace_hint_into_delegation_request(&mut request, workspace_hint);
                     match engine.execute(request, source_agent_id, None).await {
@@ -1191,30 +1316,54 @@ fn record_loop_completion_feedback(
     };
 
     let turn_id = state.current_run_id.clone().unwrap_or_default();
+    let session_attribution = state
+        .telemetry
+        .observability_session
+        .as_ref()
+        .map(|session| {
+            let session = session.read().unwrap_or_else(|e| e.into_inner());
+            crate::observability_integration::session_signal_attribution(&session)
+        });
+    let enrich_signal = |signal: FeedbackSignal| {
+        let mut signal = crate::observability_integration::with_signal_attribution(
+            signal,
+            session_attribution.as_ref(),
+        );
+        if !signal.context.contains_key("session_id")
+            && let Some(session_id) = state.current_session_id.as_deref()
+        {
+            signal = signal.with_context("session_id", serde_json::json!(session_id));
+        }
+        signal
+    };
 
     // ── 1. Outcome signal ──
     match result {
         Ok(AgenticLoopOutcome::Completed) => {
-            hub.record_feedback(FeedbackSignal::new(SignalType::TaskSuccess).with_turn(&turn_id));
+            hub.record_feedback(enrich_signal(
+                FeedbackSignal::new(SignalType::TaskSuccess).with_turn(&turn_id),
+            ));
         }
         Ok(AgenticLoopOutcome::Cancelled) => {
-            hub.record_feedback(FeedbackSignal::new(SignalType::Interruption).with_turn(&turn_id));
+            hub.record_feedback(enrich_signal(
+                FeedbackSignal::new(SignalType::Interruption).with_turn(&turn_id),
+            ));
         }
         Ok(AgenticLoopOutcome::Error(reason)) => {
-            hub.record_feedback(
+            hub.record_feedback(enrich_signal(
                 FeedbackSignal::new(SignalType::TaskFailure {
                     reason: reason.clone(),
                 })
                 .with_turn(&turn_id),
-            );
+            ));
         }
         Err(reason) => {
-            hub.record_feedback(
+            hub.record_feedback(enrich_signal(
                 FeedbackSignal::new(SignalType::TaskFailure {
                     reason: reason.clone(),
                 })
                 .with_turn(&turn_id),
-            );
+            ));
         }
         Ok(AgenticLoopOutcome::Waiting(_)) => {
             // No signal for waiting — the loop will resume.
@@ -1226,13 +1375,13 @@ fn record_loop_completion_feedback(
     // Heuristic threshold: >50k tokens suggests inefficiency for most tasks.
     let token_threshold = 50_000u64;
     if total_tokens > token_threshold {
-        hub.record_feedback(
+        hub.record_feedback(enrich_signal(
             FeedbackSignal::new(SignalType::HighTokenUsage {
                 tokens: total_tokens,
                 threshold: token_threshold,
             })
             .with_turn(&turn_id),
-        );
+        ));
     }
 
     // ── 3. Tool churn signal ──
@@ -1240,13 +1389,13 @@ fn record_loop_completion_feedback(
     let unique_tools = state.telemetry.all_tools_used.len() as u32;
     // High tool calls with low unique tools suggests repetitive/failing usage.
     if tool_calls > 10 && unique_tools > 0 && (tool_calls / unique_tools) > 5 {
-        hub.record_feedback(
+        hub.record_feedback(enrich_signal(
             FeedbackSignal::new(SignalType::ToolChurn {
                 calls: tool_calls,
                 unique_tools,
             })
             .with_turn(&turn_id),
-        );
+        ));
     }
 
     // ── 4. Tool-level failure signals ──
@@ -1259,7 +1408,7 @@ fn record_loop_completion_feedback(
     if failed_tools > 0 && tool_calls > 0 {
         let failure_rate = failed_tools as f64 / tool_calls as f64;
         if failure_rate > 0.3 {
-            hub.record_feedback(
+            hub.record_feedback(enrich_signal(
                 FeedbackSignal::new(SignalType::TaskFailure {
                     reason: format!(
                         "high tool failure rate: {failed_tools}/{tool_calls} ({:.0}%)",
@@ -1268,7 +1417,7 @@ fn record_loop_completion_feedback(
                 })
                 .with_turn(&turn_id)
                 .with_context("tool_failure_rate", serde_json::json!(failure_rate)),
-            );
+            ));
         }
     }
 
@@ -1278,7 +1427,7 @@ fn record_loop_completion_feedback(
             continue;
         }
         if entry.failures > 0 {
-            hub.record_feedback(
+            hub.record_feedback(enrich_signal(
                 FeedbackSignal::new(SignalType::TaskFailure {
                     reason: format!(
                         "skill '{}' failed {}/{} invocations",
@@ -1291,14 +1440,14 @@ fn record_loop_completion_feedback(
                     "skill_success_rate",
                     serde_json::json!(entry.success_rate()),
                 ),
-            );
+            ));
         } else {
-            hub.record_feedback(
+            hub.record_feedback(enrich_signal(
                 FeedbackSignal::new(SignalType::TaskSuccess)
                     .with_turn(&turn_id)
                     .with_context("skill_name", serde_json::json!(name))
                     .with_context("skill_invocations", serde_json::json!(entry.invocations)),
-            );
+            ));
         }
     }
 }
@@ -1385,6 +1534,56 @@ fn maybe_run_tuning_cycle(state: &mut AgenticLoopState) {
                 .map(|c| (&c.experiment_id, &c.winner_variant_id))
                 .collect::<Vec<_>>()
         );
+    }
+    let mut promoted = Vec::new();
+    for conclusion in &concluded {
+        let Some(winner_variant_id) = conclusion.winner_variant_id.as_deref() else {
+            continue;
+        };
+        match hub.promote_experiment_winner(&conclusion.experiment_id, winner_variant_id) {
+            Ok(Some(promotion)) => promoted.push(promotion),
+            Ok(None) => {}
+            Err(err) => eprintln!(
+                "[adaptive-exec] failed to promote winner for {}: {err}",
+                conclusion.experiment_id
+            ),
+        }
+    }
+    if !promoted.is_empty() {
+        eprintln!(
+            "[adaptive-exec] promoted {} adaptive baseline(s): {:?}",
+            promoted.len(),
+            promoted
+                .iter()
+                .map(|p| (&p.scope.task_type, &p.scope.domain, &p.variant_id))
+                .collect::<Vec<_>>()
+        );
+        for promotion in &promoted {
+            write_session_journal_event(
+                state,
+                astra_services::session_journal::JournalEvent::adaptive_baseline_promoted(
+                    state.current_session_id.as_deref(),
+                    &promotion.scope.task_type,
+                    promotion.scope.domain.as_deref(),
+                    &promotion.experiment_id,
+                    &promotion.variant_id,
+                    promotion.replaced_existing,
+                    &promotion.config_keys,
+                ),
+            );
+        }
+    }
+}
+
+fn write_session_journal_event(
+    state: &AgenticLoopState,
+    event: astra_services::session_journal::JournalEvent,
+) {
+    let Some(session_id) = state.current_session_id.as_deref() else {
+        return;
+    };
+    if let Ok(writer) = astra_services::session_journal::JournalWriter::new(session_id) {
+        let _ = writer.append(&event);
     }
 }
 
@@ -1869,7 +2068,10 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                         state.total_tool_calls, e,
                     );
                     // ─── Observability: turn end hook (rate limit path) ───
-                    if let Some(ref session) = state.telemetry.observability_session {
+                    if let (Some(hub), Some(session)) = (
+                        state.telemetry.observability_hub.as_ref(),
+                        state.telemetry.observability_session.as_ref(),
+                    ) {
                         let total_ms = turn_start_time.elapsed().as_millis() as u64;
                         let timing = crate::observability_integration::TurnTiming {
                             turn: turn_index as u32,
@@ -1880,7 +2082,11 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                             total_ms,
                         };
                         let mut session_guard = session.write().unwrap_or_else(|e| e.into_inner());
-                        crate::observability_integration::on_turn_end(&mut session_guard, timing);
+                        crate::observability_integration::on_turn_end(
+                            hub,
+                            &mut session_guard,
+                            timing,
+                        );
                     }
                     try_write_heavy_checkpoint(state);
                     return Ok(AgenticLoopOutcome::Completed);
@@ -1913,7 +2119,10 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                     continue;
                 }
                 // ─── Observability: turn end hook (no tool calls path) ───
-                if let Some(ref session) = state.telemetry.observability_session {
+                if let (Some(hub), Some(session)) = (
+                    state.telemetry.observability_hub.as_ref(),
+                    state.telemetry.observability_session.as_ref(),
+                ) {
                     let total_ms = turn_start_time.elapsed().as_millis() as u64;
                     let timing = crate::observability_integration::TurnTiming {
                         turn: turn_index as u32,
@@ -1924,7 +2133,7 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                         total_ms,
                     };
                     let mut session_guard = session.write().unwrap_or_else(|e| e.into_inner());
-                    crate::observability_integration::on_turn_end(&mut session_guard, timing);
+                    crate::observability_integration::on_turn_end(hub, &mut session_guard, timing);
                 }
                 try_write_heavy_checkpoint(state);
                 return Ok(AgenticLoopOutcome::Completed);
@@ -1967,7 +2176,10 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                             );
                         }
                         // ─── Observability: turn end hook (budget exceeded) ───
-                        if let Some(ref session) = state.telemetry.observability_session {
+                        if let (Some(hub), Some(session)) = (
+                            state.telemetry.observability_hub.as_ref(),
+                            state.telemetry.observability_session.as_ref(),
+                        ) {
                             let total_ms = turn_start_time.elapsed().as_millis() as u64;
                             let timing = crate::observability_integration::TurnTiming {
                                 turn: turn_index as u32,
@@ -1980,6 +2192,7 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                             let mut session_guard =
                                 session.write().unwrap_or_else(|e| e.into_inner());
                             crate::observability_integration::on_turn_end(
+                                hub,
                                 &mut session_guard,
                                 timing,
                             );
@@ -2092,6 +2305,15 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
         let (delegation_results, remaining_tool_calls) = if let Some(engine) =
             &state.delegation_engine
         {
+            let adaptive_delegation_context =
+                state
+                    .telemetry
+                    .observability_session
+                    .as_ref()
+                    .map(|session| {
+                        let session = session.read().unwrap_or_else(|e| e.into_inner());
+                        delegation_adaptive_context(&session)
+                    });
             // Fire SubagentStart hooks before delegation.
             if turn_result.accum.tool_calls.iter().any(is_delegation_call) {
                 if !quiet {
@@ -2117,6 +2339,7 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                 "orchestrator",
                 state.hooks.workspace_root_hint.as_deref(),
                 &state.skills.search,
+                adaptive_delegation_context.as_ref(),
             )
             .await
         } else {
@@ -2812,7 +3035,10 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                     Ok(true) => { /* continue */ }
                     Ok(false) => {
                         // ─── Observability: turn end hook (gate cancelled) ───
-                        if let Some(ref session) = state.telemetry.observability_session {
+                        if let (Some(hub), Some(session)) = (
+                            state.telemetry.observability_hub.as_ref(),
+                            state.telemetry.observability_session.as_ref(),
+                        ) {
                             let total_ms = turn_start_time.elapsed().as_millis() as u64;
                             let timing = crate::observability_integration::TurnTiming {
                                 turn: turn_index as u32,
@@ -2825,6 +3051,7 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                             let mut session_guard =
                                 session.write().unwrap_or_else(|e| e.into_inner());
                             crate::observability_integration::on_turn_end(
+                                hub,
                                 &mut session_guard,
                                 timing,
                             );
@@ -2908,7 +3135,10 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
 
                 // ─── Observability: turn end hook ────────────────────────
                 // Capture timing and feed to auto-tuning.
-                if let Some(ref session) = state.telemetry.observability_session {
+                if let (Some(hub), Some(session)) = (
+                    state.telemetry.observability_hub.as_ref(),
+                    state.telemetry.observability_session.as_ref(),
+                ) {
                     let total_ms = turn_start_time.elapsed().as_millis() as u64;
                     let timing = crate::observability_integration::TurnTiming {
                         turn: turn_index as u32,
@@ -2919,7 +3149,7 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                         total_ms,
                     };
                     let mut session_guard = session.write().unwrap_or_else(|e| e.into_inner());
-                    crate::observability_integration::on_turn_end(&mut session_guard, timing);
+                    crate::observability_integration::on_turn_end(hub, &mut session_guard, timing);
                 }
 
                 // ─── Finalize turn trace collector ────────────────────────
@@ -3883,6 +4113,7 @@ mod tests {
             "run-123",
             "session-456",
             &astra_core::SkillSearchSettings::default(),
+            None,
         )
         .unwrap();
         assert_eq!(req.task, "write tests");
@@ -3906,9 +4137,74 @@ mod tests {
             "run-1",
             "sess-1",
             &astra_core::SkillSearchSettings::default(),
+            None,
         );
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("missing arguments"));
+    }
+
+    #[test]
+    fn parse_delegation_request_without_pattern_uses_exploration_fan_out() {
+        let tool_call = json!({
+            "type": "function",
+            "function": {
+                "name": "delegate",
+                "arguments": "{\"task\": \"search the codebase for relevant modules\", \"agents\": [\"coder\", \"reviewer\"]}"
+            }
+        });
+        let adaptive_context = super::DelegationAdaptiveContext {
+            scenario: Some(crate::user_profile::Scenario::Exploration),
+        };
+
+        let req = super::parse_delegation_request(
+            &tool_call,
+            "run-123",
+            "session-456",
+            &astra_core::SkillSearchSettings::default(),
+            Some(&adaptive_context),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            req.pattern,
+            astra_services::coordination::CoordinationPattern::FanOut { .. }
+        ));
+        assert_eq!(
+            req.context["adaptive_coordination"]["selected_pattern"],
+            json!("fan_out")
+        );
+    }
+
+    #[test]
+    fn parse_delegation_request_without_pattern_uses_code_review_adversarial() {
+        let tool_call = json!({
+            "type": "function",
+            "function": {
+                "name": "delegate",
+                "arguments": "{\"task\": \"review this patch\", \"agents\": [\"coder\", \"reviewer\"]}"
+            }
+        });
+        let adaptive_context = super::DelegationAdaptiveContext {
+            scenario: Some(crate::user_profile::Scenario::CodeReview),
+        };
+
+        let req = super::parse_delegation_request(
+            &tool_call,
+            "run-123",
+            "session-456",
+            &astra_core::SkillSearchSettings::default(),
+            Some(&adaptive_context),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            req.pattern,
+            astra_services::coordination::CoordinationPattern::AdversarialReview { .. }
+        ));
+        assert_eq!(
+            req.context["adaptive_coordination"]["reason"],
+            json!("code_review_scenario_prefers_review_loop")
+        );
     }
 
     #[test]
@@ -4116,6 +4412,7 @@ mod tests {
             "orchestrator",
             None,
             &astra_core::SkillSearchSettings::default(),
+            None,
         )
         .await;
 
@@ -4171,6 +4468,7 @@ mod tests {
             "orchestrator",
             None,
             &astra_core::SkillSearchSettings::default(),
+            None,
         )
         .await;
 
@@ -4208,6 +4506,7 @@ mod tests {
             "orchestrator",
             None,
             &astra_core::SkillSearchSettings::default(),
+            None,
         )
         .await;
 
@@ -6735,35 +7034,48 @@ print(json.dumps({'context': 'user said: ' + msg}))
 
     #[test]
     fn tuning_cycle_concludes_mature_experiments() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
         let hub = make_hub();
         let session = make_session();
         let mut state = make_state();
         state.telemetry.observability_hub = Some(hub.clone());
         state.telemetry.observability_session = Some(session);
         state.telemetry.completed_turns_for_tuning = TUNING_CYCLE_INTERVAL;
+        state.current_session_id = Some("test-session-promote".to_string());
 
         let mut experiment = crate::ab_testing::Experiment::new("exp-mature")
             .with_variant(crate::ab_testing::Variant::control())
-            .with_variant(crate::ab_testing::Variant::new("treatment").with_traffic(0.5))
+            .with_variant(
+                crate::ab_testing::Variant::new("treatment")
+                    .with_traffic(0.5)
+                    .with_config_diff("memory.retrieval_top_k", serde_json::json!(8)),
+            )
             .with_metric(crate::ab_testing::MetricDefinition::success_rate())
+            .with_tag("task_type:fetch")
+            .with_tag("domain:any")
             .with_min_samples(1)
             .build();
         experiment.start();
         hub.experiments_mut().register(experiment);
         {
             let experiments = hub.experiments();
-            experiments.record_outcome(
-                "exp-mature",
-                crate::ab_testing::ExperimentOutcome::new("u1", "control")
-                    .with_metric("success_rate", 0.0)
-                    .with_success(false),
-            );
-            experiments.record_outcome(
-                "exp-mature",
-                crate::ab_testing::ExperimentOutcome::new("u2", "treatment")
-                    .with_metric("success_rate", 1.0)
-                    .with_success(true),
-            );
+            for (idx, value) in [0.10, 0.20, 0.25, 0.15, 0.30].into_iter().enumerate() {
+                experiments.record_outcome(
+                    "exp-mature",
+                    crate::ab_testing::ExperimentOutcome::new(format!("c{idx}"), "control")
+                        .with_metric("success_rate", value)
+                        .with_success(false),
+                );
+            }
+            for (idx, value) in [0.82, 0.91, 0.88, 0.95, 0.86].into_iter().enumerate() {
+                experiments.record_outcome(
+                    "exp-mature",
+                    crate::ab_testing::ExperimentOutcome::new(format!("t{idx}"), "treatment")
+                        .with_metric("success_rate", value)
+                        .with_success(true),
+                );
+            }
         }
 
         maybe_run_tuning_cycle(&mut state);
@@ -6772,6 +7084,18 @@ print(json.dumps({'context': 'user said: ' + msg}))
             hub.experiments().get("exp-mature").map(|exp| exp.status),
             Some(crate::ab_testing::ExperimentStatus::Completed)
         );
+        let baseline = hub
+            .adaptive_baselines()
+            .resolve(crate::pipeline::routing::TaskType::Fetch, None);
+        assert!(
+            baseline.is_some(),
+            "winner should be promoted into a baseline"
+        );
+        let events = astra_services::session_journal::read_journal("test-session-promote").unwrap();
+        assert!(events.iter().any(|event| {
+            event.event_type
+                == astra_services::session_journal::JournalEventType::AdaptiveBaselinePromoted
+        }));
     }
 
     #[test]

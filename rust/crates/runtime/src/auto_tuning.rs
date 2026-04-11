@@ -285,6 +285,11 @@ impl FeedbackAggregator {
             .collect()
     }
 
+    /// Return a clone of the retained signal window for inspection/testing.
+    pub fn recent_signals(&self) -> Vec<FeedbackSignal> {
+        self.signals.iter().cloned().collect()
+    }
+
     /// Count signals of a specific type within a window.
     pub fn count_signals(&self, signal_type: &str, window: Duration) -> u32 {
         let signals = self.signals_in_window(window);
@@ -502,6 +507,14 @@ impl AutoTuningEngine {
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .record(signal);
+    }
+
+    /// Return the retained feedback signal window for inspection/testing.
+    pub fn recent_signals(&self) -> Vec<FeedbackSignal> {
+        self.aggregator
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .recent_signals()
     }
 
     /// Evaluate all rules and return triggered actions.

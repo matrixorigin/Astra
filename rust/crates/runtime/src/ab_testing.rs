@@ -155,14 +155,20 @@ impl Variant {
 
     /// Apply this variant's config overrides to a base config.
     pub fn apply_to_config(&self, config: &mut RuntimeConfig) {
-        // Apply serialized diffs
-        for (key, value) in &self.config_diff {
-            apply_config_diff(config, key, value);
-        }
+        apply_config_diffs(config, &self.config_diff);
     }
 }
 
-fn apply_config_diff(config: &mut RuntimeConfig, key: &str, value: &serde_json::Value) {
+pub(crate) fn apply_config_diffs(
+    config: &mut RuntimeConfig,
+    config_diff: &HashMap<String, serde_json::Value>,
+) {
+    for (key, value) in config_diff {
+        apply_config_diff(config, key, value);
+    }
+}
+
+pub(crate) fn apply_config_diff(config: &mut RuntimeConfig, key: &str, value: &serde_json::Value) {
     match key {
         "compression.max_history_tokens" => {
             if let Some(n) = value.as_u64() {
@@ -420,6 +426,13 @@ impl Experiment {
     /// Get the control variant.
     pub fn control(&self) -> Option<&Variant> {
         self.variants.iter().find(|v| v.is_control)
+    }
+
+    /// Get a variant by ID.
+    pub fn variant(&self, variant_id: &str) -> Option<&Variant> {
+        self.variants
+            .iter()
+            .find(|variant| variant.id == variant_id)
     }
 
     /// Check if experiment has sufficient samples.

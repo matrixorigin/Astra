@@ -818,6 +818,12 @@ impl UserProfileStore {
     /// to avoid data loss on crash.
     fn persist(&self) {
         if let Some(ref path) = self.storage_path {
+            if let Some(parent) = path.parent() {
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    eprintln!("[user-profile] failed to create storage directory: {e}");
+                    return;
+                }
+            }
             let profiles = self.profiles.read().unwrap_or_else(|e| e.into_inner());
             if let Ok(data) = serde_json::to_string_pretty(&*profiles) {
                 let tmp = path.with_extension("tmp");

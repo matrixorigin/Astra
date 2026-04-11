@@ -15,9 +15,11 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
+use astra_services::session_journal::{JournalEvent, JournalWriter};
 use serde::{Deserialize, Serialize};
 
 use crate::ab_testing::{ExperimentOutcome, ExperimentStatus, ExperimentStore};
+use crate::adaptive_baselines::{AdaptiveBaselinePromotion, AdaptiveBaselineStore};
 use crate::auto_tuning::{AutoTuningEngine, FeedbackSignal, SignalType};
 use crate::pipeline::pattern::PatternLibrary;
 use crate::runtime_config::RuntimeConfig;
@@ -77,11 +79,23 @@ pub struct ObservabilitySession {
     /// Session start time.
     pub started_at: Instant,
 
+    /// When the last user query was observed.
+    last_query_at: Option<Instant>,
+
     /// Turn timing data.
     pub turn_timings: Vec<TurnTiming>,
 
     /// Goal completion tracker (initialized on first user query).
     pub goal_tracker: Option<GoalTracker>,
+
+    /// Last drift origin turn already emitted as a signal/journal event.
+    last_reported_drift_turn: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueryBehavior {
+    pub delay_since_last_query_ms: Option<u64>,
+    pub correction_detected: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -147,8 +161,10 @@ impl ObservabilitySession {
             user_corrections: Vec::new(),
             original_query: None,
             started_at: Instant::now(),
+            last_query_at: None,
             turn_timings: Vec::new(),
             goal_tracker: None,
+            last_reported_drift_turn: None,
         }
     }
 
@@ -173,8 +189,10 @@ impl ObservabilitySession {
             user_corrections: Vec::new(),
             original_query: None,
             started_at: Instant::now(),
+            last_query_at: None,
             turn_timings: Vec::new(),
             goal_tracker: None,
+            last_reported_drift_turn: None,
         }
     }
 
@@ -204,6 +222,10 @@ impl ObservabilitySession {
     /// On the first turn, this also sets `original_query` for baseline comparison
     /// and initializes the goal tracker.
     pub fn record_query(&mut self, query: &str) {
+        self.record_query_at(query, Instant::now());
+    }
+
+    fn record_query_at(&mut self, query: &str, query_time: Instant) {
         // Set original query on first turn
         if self.original_query.is_none() {
             self.original_query = Some(query.to_string());
@@ -221,6 +243,7 @@ impl ObservabilitySession {
                 tracker.record(self.turn_number, signal);
             }
         }
+        self.last_query_at = Some(query_time);
     }
 
     /// Record that history compression occurred at the given turn.
@@ -288,6 +311,20 @@ impl ObservabilitySession {
         is_correction
     }
 
+    /// Record a query and return timing/correction behavior for signal wiring.
+    pub fn observe_query_behavior(&mut self, query: &str) -> QueryBehavior {
+        let query_time = Instant::now();
+        let delay_since_last_query_ms = self
+            .last_query_at
+            .map(|previous| query_time.duration_since(previous).as_millis() as u64);
+        let correction_detected = self.detect_correction_signal(query);
+        self.record_query_at(query, query_time);
+        QueryBehavior {
+            delay_since_last_query_ms,
+            correction_detected,
+        }
+    }
+
     /// Get session duration.
     pub fn duration(&self) -> Duration {
         self.started_at.elapsed()
@@ -334,6 +371,20 @@ impl ObservabilitySession {
         )
     }
 
+    /// Return a newly-detected drift analysis only once per drift origin turn.
+    pub fn take_new_drift_signal(&mut self, detected_at_turn: u32) -> Option<FocusDriftAnalysis> {
+        let analysis = self.check_drift();
+        if !analysis.drift_detected {
+            return None;
+        }
+        let drift_origin_turn = analysis.drift_turn.unwrap_or(detected_at_turn);
+        if self.last_reported_drift_turn == Some(drift_origin_turn) {
+            return None;
+        }
+        self.last_reported_drift_turn = Some(drift_origin_turn);
+        Some(analysis)
+    }
+
     /// Record a tool result as a potential goal milestone.
     pub fn record_tool_result(&mut self, tool_name: &str, output: &str, exit_code: Option<i32>) {
         if let Some(ref mut tracker) = self.goal_tracker {
@@ -366,6 +417,9 @@ pub struct ObservabilityHub {
     /// A/B experiment store.
     experiment_store: RwLock<ExperimentStore>,
 
+    /// Durable promoted baselines from completed experiments.
+    adaptive_baselines: AdaptiveBaselineStore,
+
     /// Auto-tuning engine.
     tuning_engine: AutoTuningEngine,
 
@@ -389,6 +443,7 @@ impl ObservabilityHub {
         Self {
             profile_manager: UserProfileManager::new(profile_store),
             experiment_store: RwLock::new(ExperimentStore::new()),
+            adaptive_baselines: AdaptiveBaselineStore::new(),
             tuning_engine: AutoTuningEngine::new(),
             pattern_library: RwLock::new(None),
             sessions: RwLock::new(HashMap::new()),
@@ -396,11 +451,14 @@ impl ObservabilityHub {
     }
 
     /// Create a hub with persistent storage.
-    pub fn with_storage(profile_path: std::path::PathBuf) -> Self {
+    pub fn with_storage(storage_root: std::path::PathBuf) -> Self {
+        let profile_path = observability_storage_file(&storage_root, "profiles.json");
+        let baseline_path = observability_storage_file(&storage_root, "adaptive-baselines.json");
         let profile_store = Arc::new(UserProfileStore::with_storage(profile_path));
         Self {
             profile_manager: UserProfileManager::new(profile_store),
             experiment_store: RwLock::new(ExperimentStore::new()),
+            adaptive_baselines: AdaptiveBaselineStore::with_storage(baseline_path),
             tuning_engine: AutoTuningEngine::new(),
             pattern_library: RwLock::new(None),
             sessions: RwLock::new(HashMap::new()),
@@ -492,38 +550,54 @@ impl ObservabilityHub {
         self.tuning_engine.record_feedback(signal);
     }
 
+    fn signal_with_session_context(
+        &self,
+        session_id: &str,
+        signal: FeedbackSignal,
+    ) -> FeedbackSignal {
+        let fallback = signal.with_context("session_id", serde_json::json!(session_id));
+        let Some(session) = self.get_session(session_id) else {
+            return fallback;
+        };
+        let session = session.read().unwrap_or_else(|e| e.into_inner());
+        let attribution = session_signal_attribution(&session);
+        with_signal_attribution(fallback, Some(&attribution))
+    }
+
     /// Record task success.
     pub fn record_success(&self, session_id: &str) {
         self.record_feedback(
-            FeedbackSignal::new(SignalType::TaskSuccess)
-                .with_context("session_id", serde_json::json!(session_id)),
+            self.signal_with_session_context(
+                session_id,
+                FeedbackSignal::new(SignalType::TaskSuccess),
+            ),
         );
     }
 
     /// Record task failure.
     pub fn record_failure(&self, session_id: &str, reason: &str) {
-        self.record_feedback(
+        self.record_feedback(self.signal_with_session_context(
+            session_id,
             FeedbackSignal::new(SignalType::TaskFailure {
                 reason: reason.to_string(),
-            })
-            .with_context("session_id", serde_json::json!(session_id)),
-        );
+            }),
+        ));
     }
 
     /// Record user retry.
     pub fn record_retry(&self, session_id: &str) {
-        self.record_feedback(
-            FeedbackSignal::new(SignalType::Retry { count: 1 })
-                .with_context("session_id", serde_json::json!(session_id)),
-        );
+        self.record_feedback(self.signal_with_session_context(
+            session_id,
+            FeedbackSignal::new(SignalType::Retry { count: 1 }),
+        ));
     }
 
     /// Record explicit rating.
     pub fn record_rating(&self, session_id: &str, positive: bool) {
-        self.record_feedback(
-            FeedbackSignal::new(SignalType::ThumbsRating { positive })
-                .with_context("session_id", serde_json::json!(session_id)),
-        );
+        self.record_feedback(self.signal_with_session_context(
+            session_id,
+            FeedbackSignal::new(SignalType::ThumbsRating { positive }),
+        ));
     }
 
     // ─── Auto-Tuning Cycle ──────────────────────────────────────────────────
@@ -590,6 +664,25 @@ impl ObservabilityHub {
             .unwrap_or_else(|e| e.into_inner())
     }
 
+    pub fn adaptive_baselines(&self) -> &AdaptiveBaselineStore {
+        &self.adaptive_baselines
+    }
+
+    pub fn promote_experiment_winner(
+        &self,
+        experiment_id: &str,
+        winner_variant_id: &str,
+    ) -> Result<Option<AdaptiveBaselinePromotion>, String> {
+        let experiment = self
+            .experiment_store
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(experiment_id)
+            .ok_or_else(|| format!("missing experiment {experiment_id}"))?;
+        self.adaptive_baselines
+            .promote_winner(&experiment, winner_variant_id)
+    }
+
     /// Get the auto-tuning engine.
     pub fn tuning(&self) -> &AutoTuningEngine {
         &self.tuning_engine
@@ -617,6 +710,13 @@ impl ObservabilityHub {
     }
 }
 
+fn observability_storage_file(root: &std::path::Path, filename: &str) -> std::path::PathBuf {
+    if root.extension().is_some() {
+        return root.to_path_buf();
+    }
+    root.join(filename)
+}
+
 // ─── Session Summary ────────────────────────────────────────────────────────
 
 /// Summary of a completed session.
@@ -631,6 +731,72 @@ pub struct SessionSummary {
     pub decisions_explained: u32,
 }
 
+const QUICK_FOLLOW_UP_MAX_DELAY_MS: u64 = 20_000;
+const LONG_PAUSE_MIN_DELAY_MS: u64 = 300_000;
+
+#[derive(Debug, Clone)]
+pub(crate) struct SessionSignalAttribution {
+    session_id: String,
+    user_id: String,
+    turn_number: u32,
+    scenario: Option<Scenario>,
+    active_experiment_id: Option<String>,
+    active_variant: Option<String>,
+}
+
+pub(crate) fn session_signal_attribution(
+    session: &ObservabilitySession,
+) -> SessionSignalAttribution {
+    SessionSignalAttribution {
+        session_id: session.session_id.clone(),
+        user_id: session.user_id.clone(),
+        turn_number: session.turn_number,
+        scenario: session.current_scenario(),
+        active_experiment_id: session.active_experiment_id.clone(),
+        active_variant: session.active_variant.clone(),
+    }
+}
+
+pub(crate) fn with_signal_attribution(
+    mut signal: FeedbackSignal,
+    attribution: Option<&SessionSignalAttribution>,
+) -> FeedbackSignal {
+    let Some(attribution) = attribution else {
+        return signal;
+    };
+
+    signal.context.insert(
+        "session_id".to_string(),
+        serde_json::json!(attribution.session_id),
+    );
+    signal.context.insert(
+        "user_id".to_string(),
+        serde_json::json!(attribution.user_id),
+    );
+    signal.context.insert(
+        "turn_number".to_string(),
+        serde_json::json!(attribution.turn_number),
+    );
+    if let Some(scenario) = attribution.scenario.as_ref() {
+        signal
+            .context
+            .insert("scenario".to_string(), serde_json::json!(scenario));
+    }
+    if let Some(experiment_id) = &attribution.active_experiment_id {
+        signal.context.insert(
+            "active_experiment_id".to_string(),
+            serde_json::json!(experiment_id),
+        );
+    }
+    if let Some(variant) = &attribution.active_variant {
+        signal
+            .context
+            .insert("active_variant".to_string(), serde_json::json!(variant));
+    }
+
+    signal
+}
+
 // ─── Hook Points ────────────────────────────────────────────────────────────
 
 /// Hook called at the start of each turn.
@@ -640,10 +806,41 @@ pub fn on_turn_start(hub: &ObservabilityHub, session_id: &str, user_id: &str, qu
 
     // Record query in session
     if let Some(session) = hub.get_session(session_id) {
-        session
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .record_query(query);
+        let mut session = session.write().unwrap_or_else(|e| e.into_inner());
+        let latest_profile = hub.profiles().get_profile(user_id);
+        session.profile.preferences = latest_profile.preferences;
+        session.profile.current_scenario = latest_profile.current_scenario;
+        session.profile.stats = latest_profile.stats;
+        session.profile.updated_at = latest_profile.updated_at;
+        let behavior = session.observe_query_behavior(query);
+        let attribution = session_signal_attribution(&session);
+
+        if behavior.correction_detected {
+            let mut signal = with_signal_attribution(
+                FeedbackSignal::new(SignalType::Correction),
+                Some(&attribution),
+            );
+            if let Some(delay_ms) = behavior.delay_since_last_query_ms {
+                signal = signal.with_context("query_delay_ms", serde_json::json!(delay_ms));
+            }
+            hub.record_feedback(signal);
+        }
+
+        if let Some(delay_ms) = behavior.delay_since_last_query_ms {
+            let signal = if delay_ms <= QUICK_FOLLOW_UP_MAX_DELAY_MS {
+                Some(FeedbackSignal::new(SignalType::QuickFollowUp { delay_ms }))
+            } else if delay_ms >= LONG_PAUSE_MIN_DELAY_MS {
+                Some(FeedbackSignal::new(SignalType::LongPause { delay_ms }))
+            } else {
+                None
+            };
+            if let Some(signal) = signal {
+                hub.record_feedback(
+                    with_signal_attribution(signal, Some(&attribution))
+                        .with_context("query_delay_ms", serde_json::json!(delay_ms)),
+                );
+            }
+        }
     }
 }
 
@@ -663,8 +860,44 @@ pub fn on_tool_executed(hub: &ObservabilityHub, user_id: &str, tool_name: &str) 
 }
 
 /// Hook called at turn end.
-pub fn on_turn_end(session: &mut ObservabilitySession, timing: TurnTiming) {
+pub fn on_turn_end(hub: &ObservabilityHub, session: &mut ObservabilitySession, timing: TurnTiming) {
+    let detected_at_turn = timing.turn;
     session.record_turn_timing(timing);
+
+    if let Some(analysis) = session.take_new_drift_signal(detected_at_turn) {
+        let attribution = session_signal_attribution(session);
+        hub.record_feedback(
+            with_signal_attribution(
+                FeedbackSignal::new(SignalType::FocusDrift),
+                Some(&attribution),
+            )
+            .with_context(
+                "drift_detected_at_turn",
+                serde_json::json!(detected_at_turn),
+            )
+            .with_context(
+                "drift_turn",
+                serde_json::json!(analysis.drift_turn.unwrap_or(detected_at_turn)),
+            )
+            .with_context("drift_severity", serde_json::json!(analysis.drift_severity))
+            .with_context(
+                "drift_cause",
+                serde_json::json!(analysis.likely_cause.clone()),
+            )
+            .with_context("evidence_count", serde_json::json!(analysis.evidence.len())),
+        );
+
+        if let Ok(writer) = JournalWriter::new(&session.session_id) {
+            let _ = writer.append(&JournalEvent::drift_detected(
+                Some(&session.session_id),
+                detected_at_turn,
+                analysis.drift_severity,
+                analysis.likely_cause,
+                analysis.evidence,
+                &analysis.recovery_suggestion,
+            ));
+        }
+    }
 }
 
 /// Hook called on task completion.
@@ -742,6 +975,113 @@ mod tests {
     }
 
     #[test]
+    fn on_turn_start_emits_correction_and_quick_followup_with_attribution() {
+        let hub = ObservabilityHub::new();
+        let session = hub.start_session("user1", "session1");
+
+        on_turn_start(&hub, "session1", "user1", "fix the login flow");
+        {
+            let mut guard = session.write().unwrap_or_else(|e| e.into_inner());
+            guard.last_query_at = Some(Instant::now() - Duration::from_secs(4));
+        }
+        on_turn_start(&hub, "session1", "user1", "no, I meant the logout flow");
+
+        let signals = hub.tuning().recent_signals();
+        assert_eq!(signals.len(), 2);
+        assert!(signals.iter().any(|signal| {
+            matches!(signal.signal_type, SignalType::Correction)
+                && signal.context.get("session_id").and_then(|v| v.as_str()) == Some("session1")
+                && signal.context.get("user_id").and_then(|v| v.as_str()) == Some("user1")
+        }));
+        assert!(signals.iter().any(|signal| {
+            matches!(signal.signal_type, SignalType::QuickFollowUp { delay_ms } if delay_ms <= QUICK_FOLLOW_UP_MAX_DELAY_MS)
+                && signal.context.get("query_delay_ms").and_then(|v| v.as_u64()).is_some()
+        }));
+    }
+
+    #[test]
+    fn on_turn_start_emits_long_pause_signal() {
+        let hub = ObservabilityHub::new();
+        let session = hub.start_session("user1", "session1");
+
+        on_turn_start(&hub, "session1", "user1", "inspect the failing tests");
+        {
+            let mut guard = session.write().unwrap_or_else(|e| e.into_inner());
+            guard.last_query_at = Some(Instant::now() - Duration::from_secs(360));
+        }
+        on_turn_start(&hub, "session1", "user1", "continue with the same failure");
+
+        let signals = hub.tuning().recent_signals();
+        assert!(signals.iter().any(|signal| {
+            matches!(signal.signal_type, SignalType::LongPause { delay_ms } if delay_ms >= LONG_PAUSE_MIN_DELAY_MS)
+                && signal.context.get("session_id").and_then(|v| v.as_str()) == Some("session1")
+        }));
+    }
+
+    #[test]
+    fn on_turn_end_emits_focus_drift_signal_and_journal_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
+        let hub = ObservabilityHub::new();
+        let session = hub.start_session("user1", "session-drift");
+
+        {
+            let mut guard = session.write().unwrap_or_else(|e| e.into_inner());
+            guard.record_query("implement user auth");
+            guard.record_query("configure kubernetes");
+            guard.record_query("setup monitoring");
+            on_turn_end(
+                &hub,
+                &mut guard,
+                TurnTiming {
+                    turn: 2,
+                    context_assembly_ms: 0,
+                    ttft_ms: 0,
+                    llm_total_ms: 0,
+                    tool_execution_ms: 0,
+                    total_ms: 0,
+                },
+            );
+            on_turn_end(
+                &hub,
+                &mut guard,
+                TurnTiming {
+                    turn: 3,
+                    context_assembly_ms: 0,
+                    ttft_ms: 0,
+                    llm_total_ms: 0,
+                    tool_execution_ms: 0,
+                    total_ms: 0,
+                },
+            );
+        }
+
+        let signals = hub.tuning().recent_signals();
+        let drift_signals: Vec<_> = signals
+            .iter()
+            .filter(|signal| matches!(signal.signal_type, SignalType::FocusDrift))
+            .collect();
+        assert_eq!(drift_signals.len(), 1);
+        assert!(
+            drift_signals[0]
+                .context
+                .get("drift_severity")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0)
+                >= 0.3
+        );
+
+        let events = astra_services::session_journal::read_journal("session-drift").unwrap();
+        let drift_events: Vec<_> = events
+            .iter()
+            .filter(|event| {
+                event.event_type == astra_services::session_journal::JournalEventType::DriftDetected
+            })
+            .collect();
+        assert_eq!(drift_events.len(), 1);
+    }
+
+    #[test]
     fn test_drift_detection() {
         let hub = ObservabilityHub::new();
         let session = hub.start_session("user1", "session1");
@@ -761,5 +1101,17 @@ mod tests {
             // Should detect some topic shift
             assert!(analysis.drift_severity >= 0.0);
         }
+    }
+
+    #[test]
+    fn test_with_storage_uses_directory_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage_root = temp.path().join("observability");
+        let hub = ObservabilityHub::with_storage(storage_root.clone());
+
+        hub.observe_query("user1", "find all Rust files");
+
+        assert!(storage_root.join("profiles.json").exists());
+        assert!(!storage_root.join("adaptive-baselines.json").exists());
     }
 }
