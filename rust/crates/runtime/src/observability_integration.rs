@@ -540,6 +540,20 @@ impl ObservabilityHub {
         let executions = self
             .tuning_engine
             .run_cycle_with_patterns(config, pattern_lib_ref);
+
+        // Handle experiment enable/disable actions
+        for execution in &executions {
+            match &execution.action {
+                crate::auto_tuning::EvolutionAction::EnableExperiment { experiment_id } => {
+                    self.experiments_mut().enable_experiment(experiment_id);
+                }
+                crate::auto_tuning::EvolutionAction::DisableExperiment { experiment_id } => {
+                    self.experiments_mut().disable_experiment(experiment_id);
+                }
+                _ => {}
+            }
+        }
+
         executions.into_iter().map(|e| e.rule_id).collect()
     }
 

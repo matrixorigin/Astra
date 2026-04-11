@@ -228,6 +228,16 @@ const DIFF_SUBCOMMANDS: &[(&str, &str)] = &[
 
 const TURN_SUBCOMMANDS: &[(&str, &str)] = &[("list", "List all journal turns")];
 
+const EXPERIMENT_SUBCOMMANDS: &[(&str, &str)] = &[
+    ("analyze", "Analyze experiment results"),
+    ("create", "Create new experiment"),
+    ("list", "List all experiments"),
+    ("show", "Show experiment details"),
+    ("start", "Start an experiment"),
+    ("status", "Show active experiment"),
+    ("stop", "Stop an experiment"),
+];
+
 const STYLE_SUBCOMMANDS: &[(&str, &str)] = &[
     ("colorful", "Colorful theme"),
     ("default", "Default theme"),
@@ -557,6 +567,12 @@ pub static COMMANDS: &[CommandMeta] = &[
     )
     .with_arg_hint("<turn>"),
     CommandMeta::new("/version", "Version info", CommandGroup::Observability),
+    CommandMeta::new(
+        "/experiment",
+        "A/B testing: list, start, stop, analyze experiments",
+        CommandGroup::Observability,
+    )
+    .with_subcommands(EXPERIMENT_SUBCOMMANDS),
     // ── Skills ────────────────────────────────────────────────────────────
     CommandMeta::new(
         "/skill",

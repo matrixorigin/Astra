@@ -656,6 +656,48 @@ impl ExperimentStore {
         }
         counts
     }
+
+    /// Enable an experiment (start if draft, resume if paused).
+    ///
+    /// Returns true if state changed, false otherwise.
+    pub fn enable_experiment(&self, experiment_id: &str) -> bool {
+        let mut experiments = self.experiments.write().unwrap_or_else(|e| e.into_inner());
+        if let Some(exp) = experiments.get_mut(experiment_id) {
+            let old_status = exp.status.clone();
+            exp.start();
+            exp.status != old_status
+        } else {
+            false
+        }
+    }
+
+    /// Disable an experiment (pause if running).
+    ///
+    /// Returns true if state changed, false otherwise.
+    pub fn disable_experiment(&self, experiment_id: &str) -> bool {
+        let mut experiments = self.experiments.write().unwrap_or_else(|e| e.into_inner());
+        if let Some(exp) = experiments.get_mut(experiment_id) {
+            let old_status = exp.status.clone();
+            exp.pause();
+            exp.status != old_status
+        } else {
+            false
+        }
+    }
+
+    /// Stop an experiment (mark as completed).
+    ///
+    /// Returns true if state changed, false otherwise.
+    pub fn stop_experiment(&self, experiment_id: &str) -> bool {
+        let mut experiments = self.experiments.write().unwrap_or_else(|e| e.into_inner());
+        if let Some(exp) = experiments.get_mut(experiment_id) {
+            let old_status = exp.status.clone();
+            exp.stop();
+            exp.status != old_status
+        } else {
+            false
+        }
+    }
 }
 
 // ─── Statistical Analysis ────────────────────────────────────────────────────
