@@ -23,8 +23,8 @@ use uuid::Uuid;
 use astra_core::{ErrorResponse, SharedPool, error_response};
 use astra_services::EdgeContext;
 use astra_services::runs::{
-    CancelRunRecord, ChatRequestData, ChatRunRecord, ChatStreamRecord, RunLifecycleService,
-    RunListRecord, RunMutationRecord, RunStatusRecord,
+    CancelRunRecord, ChatRequestData, ChatRunRecord, ChatStreamRecord, DurableRunRecord,
+    RunLifecycleService, RunListRecord, RunMutationRecord, RunStatusRecord,
 };
 
 use crate::FernetTokenEncryptor;
@@ -590,6 +590,52 @@ impl AgenticRunLifecycleService {
         }
     }
 
+    fn durable_status_record(run: &DurableRunRecord) -> RunStatusRecord {
+        RunStatusRecord {
+            run_id: run.run_id.clone(),
+            session_id: run.session_id.clone(),
+            status: run.status.clone(),
+            waiting_for: run.waiting_for.clone(),
+            events_count: run.events.len() as i64,
+        }
+    }
+
+    fn durable_stream_events(run: &DurableRunRecord, last_index: u32) -> Vec<Value> {
+        let offset = last_index as usize;
+        if offset < run.events.len() {
+            Self::format_run_events(&run.events[offset..], offset)
+        } else {
+            Vec::new()
+        }
+    }
+
+    async fn load_durable_run_for_user(
+        &self,
+        run_id: &str,
+        user_id: &str,
+    ) -> Result<Option<DurableRunRecord>, (StatusCode, Json<ErrorResponse>)> {
+        let Some(engine) = &self.run_engine else {
+            return Ok(None);
+        };
+
+        let run = engine.load_run(run_id).await.map_err(|error| {
+            error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("Failed to load durable run state: {error}"),
+            )
+        })?;
+
+        let Some(run) = run else {
+            return Ok(None);
+        };
+
+        if run.user_id != user_id {
+            return Err(error_response(StatusCode::FORBIDDEN, "Access denied"));
+        }
+
+        Ok(Some(run))
+    }
+
     #[cfg(test)]
     pub(crate) async fn test_llm_cancel_token_is_cancelled(&self, run_id: &str) -> Option<bool> {
         let runs = self.runs.read().await;
@@ -796,14 +842,21 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         run_id: String,
         user_id: String,
     ) -> Result<RunStatusRecord, (StatusCode, Json<ErrorResponse>)> {
-        let runs = self.runs.read().await;
-        let run = runs
-            .get(&run_id)
-            .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Run not found"))?;
-        if run.user_id != user_id {
-            return Err(error_response(StatusCode::FORBIDDEN, "Access denied"));
+        {
+            let runs = self.runs.read().await;
+            if let Some(run) = runs.get(&run_id) {
+                if run.user_id != user_id {
+                    return Err(error_response(StatusCode::FORBIDDEN, "Access denied"));
+                }
+                return Ok(Self::status_record(run));
+            }
         }
-        Ok(Self::status_record(run))
+
+        if let Some(run) = self.load_durable_run_for_user(&run_id, &user_id).await? {
+            return Ok(Self::durable_status_record(&run));
+        }
+
+        Err(error_response(StatusCode::NOT_FOUND, "Run not found"))
     }
 
     async fn stream_run(
@@ -812,20 +865,27 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         user_id: String,
         last_index: u32,
     ) -> Result<Vec<Value>, (StatusCode, Json<ErrorResponse>)> {
-        let runs = self.runs.read().await;
-        let run = runs
-            .get(&run_id)
-            .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Run not found"))?;
-        if run.user_id != user_id {
-            return Err(error_response(StatusCode::FORBIDDEN, "Access denied"));
+        {
+            let runs = self.runs.read().await;
+            if let Some(run) = runs.get(&run_id) {
+                if run.user_id != user_id {
+                    return Err(error_response(StatusCode::FORBIDDEN, "Access denied"));
+                }
+                let offset = last_index as usize;
+                let events = if offset < run.events.len() {
+                    Self::format_run_events(&run.events[offset..], offset)
+                } else {
+                    Vec::new()
+                };
+                return Ok(events);
+            }
         }
-        let offset = last_index as usize;
-        let events = if offset < run.events.len() {
-            Self::format_run_events(&run.events[offset..], offset)
-        } else {
-            Vec::new()
-        };
-        Ok(events)
+
+        if let Some(run) = self.load_durable_run_for_user(&run_id, &user_id).await? {
+            return Ok(Self::durable_stream_events(&run, last_index));
+        }
+
+        Err(error_response(StatusCode::NOT_FOUND, "Run not found"))
     }
 
     async fn cancel_run(
@@ -1944,6 +2004,47 @@ mod tests {
         let durable = engine.load_run(&run.run_id).await.unwrap().unwrap();
         assert_eq!(durable.status, "running");
         assert!(durable.waiting_for.is_none());
+    }
+
+    #[tokio::test]
+    async fn get_run_status_falls_back_to_durable_store_on_cache_miss() {
+        let svc = test_service_with_engine();
+        let stream = ok(svc
+            .stream_chat("user-1".into(), test_request("hello"))
+            .await);
+        let engine = svc.run_engine.as_ref().unwrap();
+        let durable = engine.load_run(&stream.run_id).await.unwrap().unwrap();
+
+        svc.runs.write().await.remove(&stream.run_id);
+
+        let status = ok(svc
+            .get_run_status(stream.run_id.clone(), "user-1".into())
+            .await);
+        assert_eq!(status.run_id, stream.run_id);
+        assert_eq!(status.session_id, stream.session_id);
+        assert_eq!(status.status, durable.status);
+        assert_eq!(status.waiting_for, durable.waiting_for);
+        assert_eq!(status.events_count, durable.events.len() as i64);
+    }
+
+    #[tokio::test]
+    async fn stream_run_falls_back_to_durable_store_on_cache_miss() {
+        let svc = test_service_with_engine();
+        let stream = ok(svc
+            .stream_chat("user-1".into(), test_request("hello"))
+            .await);
+        let engine = svc.run_engine.as_ref().unwrap();
+        let durable = engine.load_run(&stream.run_id).await.unwrap().unwrap();
+
+        svc.runs.write().await.remove(&stream.run_id);
+
+        let events = ok(svc
+            .stream_run(stream.run_id.clone(), "user-1".into(), 1)
+            .await);
+        assert_eq!(
+            events,
+            AgenticRunLifecycleService::format_run_events(&durable.events[1..], 1)
+        );
     }
 
     #[tokio::test]
