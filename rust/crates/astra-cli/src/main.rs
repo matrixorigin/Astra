@@ -732,6 +732,50 @@ async fn handle_slash_command(
         }
 
         "/model" => {
+            // Validate model against available list (if token available)
+            if let Some(tok) = token {
+                match api.get_models_text(tok).await {
+                    Ok(body) => {
+                        let value: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+                        let models = value
+                            .as_array()
+                            .cloned()
+                            .or_else(|| value.get("models").and_then(|v| v.as_array()).cloned())
+                            .unwrap_or_default();
+
+                        let available: Vec<String> = models
+                            .iter()
+                            .filter_map(|m| {
+                                let name = m.get("name")
+                                    .or_else(|| m.get("model_name"))
+                                    .and_then(|v| v.as_str())?;
+                                let active = m.get("active").and_then(|v| v.as_bool()).unwrap_or(true);
+                                if active { Some(name.to_string()) } else { None }
+                            })
+                            .collect();
+
+                        // Check if model exists
+                        let model_exists = available.iter().any(|m| m.eq_ignore_ascii_case(arg));
+
+                        if !model_exists && !available.is_empty() {
+                            // Model not found — suggest alternatives
+                            let suggestions = cli_output::suggest_models(arg, &available);
+                            let refs: Vec<&str> = suggestions.iter().map(|s| s.as_str()).collect();
+                            cli_output::format_not_found_error(
+                                "Model",
+                                arg,
+                                &refs,
+                                Some("/model to see available models"),
+                            );
+                            return Ok(false);
+                        }
+                    }
+                    Err(_) => {
+                        // API failed — proceed without validation (offline mode)
+                    }
+                }
+            }
+
             state.model = Some(arg.to_string());
             state.cached_pricing = slash_stats::fallback_pricing(arg);
             // M3: Use RuntimeConfig-driven context budget

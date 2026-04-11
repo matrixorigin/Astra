@@ -483,28 +483,16 @@ pub(super) async fn handle_skill_command(
             }
             match registry.get_manifest(name.as_str()) {
                 None => {
-                    eprintln!("  {}", format!("✗ Skill '{name}' not found").yellow());
-                    // Suggest similar names
+                    // Suggest similar skill names using fuzzy matching
                     let all = registry.skill_names();
-                    let suggestions: Vec<_> = all
-                        .iter()
-                        .filter(|n| n.contains(name.as_str()) || name.contains(n.as_str()))
-                        .take(5)
-                        .collect();
-                    if !suggestions.is_empty() {
-                        eprintln!(
-                            "  {}",
-                            format!(
-                                "Did you mean: {}?",
-                                suggestions
-                                    .iter()
-                                    .map(|s| s.as_str())
-                                    .collect::<Vec<_>>()
-                                    .join(", ")
-                            )
-                            .dim()
-                        );
-                    }
+                    let suggestions = cli_output::suggest_skills(&name, &all);
+                    let refs: Vec<&str> = suggestions.iter().map(|s| s.as_str()).collect();
+                    cli_output::format_not_found_error(
+                        "Skill",
+                        &name,
+                        &refs,
+                        Some("/skill list to see available skills"),
+                    );
                 }
                 Some(m) => {
                     eprintln!("\n{}", format!("── {} ──", m.name).bold().cyan());

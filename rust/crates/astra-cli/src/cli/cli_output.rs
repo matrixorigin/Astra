@@ -197,6 +197,219 @@ pub fn cli_blank() {
     eprintln!();
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Layered Error Formatting — "Did you mean?" suggestions + actionable hints
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Calculate fuzzy match score between two strings (higher = better match).
+/// Uses Jaro-Winkler-like scoring optimized for CLI suggestions.
+pub fn fuzzy_score(needle: &str, haystack: &str) -> usize {
+    let n = needle.to_ascii_lowercase();
+    let h = haystack.to_ascii_lowercase();
+
+    // Exact prefix match: highest priority
+    if h.starts_with(&n) {
+        return 200 + (30_usize.saturating_sub(haystack.len()));
+    }
+
+    // Exact substring match
+    if h.contains(&n) {
+        return 100 + (30_usize.saturating_sub(haystack.len()));
+    }
+
+    // Character-level matching for typos
+    let mut score = 0;
+    let mut last_match_pos = 0;
+    for ch in n.chars() {
+        if let Some(pos) = h[last_match_pos..].find(ch) {
+            score += 10;
+            // Bonus for consecutive matches
+            if pos == 0 {
+                score += 5;
+            }
+            last_match_pos += pos + 1;
+        }
+    }
+
+    // Bonus for similar length (catches transpositions)
+    if (haystack.len() as i32 - needle.len() as i32).abs() <= 2 {
+        score += 15;
+    }
+
+    score
+}
+
+/// Find best matches from a list of candidates.
+pub fn find_suggestions<'a>(input: &str, candidates: &[&'a str], limit: usize) -> Vec<&'a str> {
+    let mut scored: Vec<(usize, &'a str)> = candidates
+        .iter()
+        .map(|c| (fuzzy_score(input, c), *c))
+        .filter(|(score, _)| *score > 20) // Minimum threshold
+        .collect();
+
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.len().cmp(&b.1.len())));
+
+    scored.into_iter().take(limit).map(|(_, c)| c).collect()
+}
+
+/// Format a "not found" error with suggestions and next steps.
+///
+/// # Example output
+/// ```text
+///   ✗ Model 'gpt-4x' not found
+///     Did you mean: gpt-4, gpt-4o, gpt-4-turbo?
+///     Try: /model to see available models
+/// ```
+pub fn format_not_found_error(
+    entity_type: &str,   // "Model", "Session", "Skill", etc.
+    name: &str,          // The name that wasn't found
+    suggestions: &[&str], // Fuzzy-matched candidates
+    hint_command: Option<&str>, // e.g. "/model", "/session list"
+) {
+    eprintln!(
+        "  {} {} '{}' not found",
+        theme::icon_err(),
+        entity_type,
+        name.red()
+    );
+
+    if !suggestions.is_empty() {
+        let suggestion_text = suggestions
+            .iter()
+            .take(3)
+            .copied()
+            .collect::<Vec<_>>()
+            .join(", ");
+        eprintln!("    {} {}", "Did you mean:".dim(), suggestion_text.cyan());
+    }
+
+    if let Some(cmd) = hint_command {
+        eprintln!("    {} {}", "Try:".dim(), cmd.cyan());
+    }
+}
+
+/// Format an invalid value error with valid options.
+///
+/// # Example output
+/// ```text
+///   ✗ Invalid verbosity: 'loud'
+///     Valid options: quiet, normal, verbose, debug
+/// ```
+pub fn format_invalid_value_error(field: &str, value: &str, valid_options: &[&str]) {
+    eprintln!(
+        "  {} Invalid {}: '{}'",
+        theme::icon_err(),
+        field,
+        value.red()
+    );
+
+    if !valid_options.is_empty() {
+        eprintln!(
+            "    {} {}",
+            "Valid options:".dim(),
+            valid_options.join(", ").cyan()
+        );
+    }
+}
+
+/// Format a permission denied error with context.
+///
+/// # Example output
+/// ```text
+///   ✗ Permission denied: Bash(rm -rf /)
+///     This operation was blocked by safety rules.
+///     Try: /allow to adjust permission mode
+/// ```
+pub fn format_permission_error(operation: &str, reason: Option<&str>) {
+    eprintln!(
+        "  {} Permission denied: {}",
+        theme::icon_err(),
+        operation.red()
+    );
+
+    if let Some(r) = reason {
+        eprintln!("    {}", r.dim());
+    }
+
+    eprintln!("    {} {}", "Try:".dim(), "/allow to adjust permission mode".cyan());
+}
+
+/// Format a connection/API error with troubleshooting steps.
+///
+/// # Example output
+/// ```text
+///   ✗ API request failed: connection refused
+///     • Check your internet connection
+///     • Verify API endpoint in /config
+///     • Try: /diagnostics to troubleshoot
+/// ```
+pub fn format_api_error(error: &str, endpoint: Option<&str>) {
+    eprintln!("  {} API request failed: {}", theme::icon_err(), error.red());
+
+    if let Some(ep) = endpoint {
+        eprintln!("    {} {}", "Endpoint:".dim(), ep);
+    }
+
+    eprintln!("    {} Check your internet connection", "•".dim());
+    eprintln!("    {} {}", "Try:".dim(), "/diagnostics to troubleshoot".cyan());
+}
+
+/// Format a configuration error with fix suggestions.
+///
+/// # Example output
+/// ```text
+///   ✗ Configuration error in settings.json
+///     Invalid JSON at line 15: unexpected token
+///     Try: /config reset to restore defaults
+/// ```
+pub fn format_config_error(file: &str, detail: &str) {
+    eprintln!("  {} Configuration error in {}", theme::icon_err(), file.red());
+    eprintln!("    {}", detail.dim());
+    eprintln!("    {} {}", "Try:".dim(), "/config reset to restore defaults".cyan());
+}
+
+/// Format a generic error with optional context and suggestion.
+///
+/// Use this for errors that don't fit other categories.
+pub fn format_error_with_hint(message: &str, context: Option<&str>, hint: Option<&str>) {
+    eprintln!("  {} {}", theme::icon_err(), message.red());
+
+    if let Some(ctx) = context {
+        eprintln!("    {}", ctx.dim());
+    }
+
+    if let Some(h) = hint {
+        eprintln!("    {} {}", "Try:".dim(), h.cyan());
+    }
+}
+
+/// Suggest models from a list (for /model command validation).
+pub fn suggest_models(input: &str, available: &[String]) -> Vec<String> {
+    let refs: Vec<&str> = available.iter().map(|s| s.as_str()).collect();
+    find_suggestions(input, &refs, 3)
+        .into_iter()
+        .map(|s| s.to_string())
+        .collect()
+}
+
+/// Suggest sessions from a list.
+pub fn suggest_sessions(input: &str, available: &[String]) -> Vec<String> {
+    let refs: Vec<&str> = available.iter().map(|s| s.as_str()).collect();
+    find_suggestions(input, &refs, 3)
+        .into_iter()
+        .map(|s| s.to_string())
+        .collect()
+}
+
+/// Suggest skills from a list.
+pub fn suggest_skills(input: &str, available: &[String]) -> Vec<String> {
+    let refs: Vec<&str> = available.iter().map(|s| s.as_str()).collect();
+    find_suggestions(input, &refs, 3)
+        .into_iter()
+        .map(|s| s.to_string())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -234,5 +447,65 @@ mod tests {
         cli_bullet("item one");
         cli_numbered(1, "first");
         cli_numbered(10, "tenth");
+    }
+
+    // ─── Fuzzy matching tests ───
+
+    #[test]
+    fn fuzzy_score_exact_prefix_highest() {
+        // Exact prefix should score highest
+        assert!(fuzzy_score("gpt", "gpt-4") > fuzzy_score("gpt", "claude-gpt"));
+        assert!(fuzzy_score("mod", "model") > fuzzy_score("mod", "remodel"));
+    }
+
+    #[test]
+    fn fuzzy_score_substring_match() {
+        // Substring should score lower than prefix
+        let prefix_score = fuzzy_score("ses", "session");
+        let contains_score = fuzzy_score("ses", "obsession");
+        assert!(prefix_score > contains_score);
+    }
+
+    #[test]
+    fn fuzzy_score_typo_tolerance() {
+        // Should detect character-level matches for typos
+        let score = fuzzy_score("gtp-4", "gpt-4"); // transposition
+        assert!(score > 0);
+    }
+
+    #[test]
+    fn find_suggestions_returns_best_matches() {
+        let candidates = &["gpt-4", "gpt-4o", "gpt-4-turbo", "claude-3", "gemini-pro"];
+        let suggestions = find_suggestions("gpt", candidates, 3);
+        assert!(suggestions.contains(&"gpt-4"));
+        assert!(suggestions.contains(&"gpt-4o"));
+        assert!(!suggestions.contains(&"claude-3"));
+    }
+
+    #[test]
+    fn find_suggestions_limits_results() {
+        let candidates = &["a1", "a2", "a3", "a4", "a5"];
+        let suggestions = find_suggestions("a", candidates, 2);
+        assert_eq!(suggestions.len(), 2);
+    }
+
+    #[test]
+    fn suggest_models_wrapper() {
+        let models = vec!["gpt-4".to_string(), "gpt-4o".to_string(), "claude-3".to_string()];
+        let suggestions = suggest_models("gpt", &models);
+        assert!(suggestions.contains(&"gpt-4".to_string()));
+    }
+
+    #[test]
+    fn format_not_found_no_panic() {
+        // Just verify no panic with various inputs
+        format_not_found_error("Model", "gpt-999", &["gpt-4", "gpt-4o"], Some("/model"));
+        format_not_found_error("Session", "abc", &[], None);
+    }
+
+    #[test]
+    fn format_invalid_value_no_panic() {
+        format_invalid_value_error("verbosity", "loud", &["quiet", "normal", "verbose"]);
+        format_invalid_value_error("mode", "x", &[]);
     }
 }

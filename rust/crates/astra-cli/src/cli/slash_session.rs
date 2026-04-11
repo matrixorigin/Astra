@@ -3170,8 +3170,16 @@ pub(super) async fn handle_resume_command(arg: &str, profile: Option<&str>, stat
                     );
                 }
                 _ => {
-                    eprintln!("{}", format!("  Session '{arg}' not found.").yellow());
-                    eprintln!("{}", "  Use /resume to see available sessions.".dim());
+                    // Suggest similar session IDs/prefixes
+                    let recent = session_journal::list_sessions_by_time(10).unwrap_or_default();
+                    let suggestions = cli_output::suggest_sessions(arg, &recent);
+                    let refs: Vec<&str> = suggestions.iter().map(|s| s.as_str()).collect();
+                    cli_output::format_not_found_error(
+                        "Session",
+                        arg,
+                        &refs,
+                        Some("/resume to see available sessions"),
+                    );
                 }
             }
         }
