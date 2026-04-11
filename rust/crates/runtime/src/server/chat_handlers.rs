@@ -449,9 +449,7 @@ mod chat_stream_bridge_fallback_tests {
             } else {
                 Err((
                     StatusCode::UNAUTHORIZED,
-                    Json(ErrorResponse {
-                        detail: "Not authenticated".to_string(),
-                    }),
+                    Json(ErrorResponse::new("Not authenticated".to_string())),
                 ))
             }
         }

@@ -407,7 +407,13 @@ impl ReplState {
     pub async fn unregister_root_mailbox(&mut self) {
         if let Some(mailbox) = self.root_mailbox.take() {
             let addr = mailbox.address.clone();
-            let _ = mailbox.router().unregister(&addr).await;
+            let router = mailbox.router();
+            if let Err(e) = router.unregister(&addr).await {
+                eprintln!(
+                    "astra: failed to unregister root mailbox run_id={} agent_id={}: {e}",
+                    addr.run_id, addr.agent_id
+                );
+            }
         }
     }
 }

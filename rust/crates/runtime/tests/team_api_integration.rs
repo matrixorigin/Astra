@@ -79,9 +79,7 @@ impl AuthService for StubAuth {
             }
             _ => Err((
                 StatusCode::UNAUTHORIZED,
-                axum::Json(ErrorResponse {
-                    detail: "Not authenticated".into(),
-                }),
+                axum::Json(ErrorResponse::new("Not authenticated")),
             )),
         }
     }

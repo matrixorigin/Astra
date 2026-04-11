@@ -39,9 +39,7 @@ impl AuthService for E2eAuth {
     ) -> Result<AuthUserRecord, (StatusCode, axum::Json<ErrorResponse>)> {
         Err((
             StatusCode::NOT_IMPLEMENTED,
-            axum::Json(ErrorResponse {
-                detail: "e2e stub".into(),
-            }),
+            axum::Json(ErrorResponse::new("e2e stub")),
         ))
     }
 
@@ -51,9 +49,7 @@ impl AuthService for E2eAuth {
     ) -> Result<AuthTokenRecord, (StatusCode, axum::Json<ErrorResponse>)> {
         Err((
             StatusCode::NOT_IMPLEMENTED,
-            axum::Json(ErrorResponse {
-                detail: "e2e stub".into(),
-            }),
+            axum::Json(ErrorResponse::new("e2e stub")),
         ))
     }
 
@@ -63,9 +59,7 @@ impl AuthService for E2eAuth {
     ) -> Result<AuthTokenRecord, (StatusCode, axum::Json<ErrorResponse>)> {
         Err((
             StatusCode::NOT_IMPLEMENTED,
-            axum::Json(ErrorResponse {
-                detail: "e2e stub".into(),
-            }),
+            axum::Json(ErrorResponse::new("e2e stub")),
         ))
     }
 
@@ -75,9 +69,7 @@ impl AuthService for E2eAuth {
     ) -> Result<(), (StatusCode, axum::Json<ErrorResponse>)> {
         Err((
             StatusCode::NOT_IMPLEMENTED,
-            axum::Json(ErrorResponse {
-                detail: "e2e stub".into(),
-            }),
+            axum::Json(ErrorResponse::new("e2e stub")),
         ))
     }
 
@@ -97,9 +89,7 @@ impl AuthService for E2eAuth {
         } else {
             Err((
                 StatusCode::UNAUTHORIZED,
-                axum::Json(ErrorResponse {
-                    detail: "bad token".into(),
-                }),
+                axum::Json(ErrorResponse::new("bad token")),
             ))
         }
     }

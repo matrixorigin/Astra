@@ -98,9 +98,7 @@ impl AuthService for LedgerE2eAuth {
         } else {
             Err((
                 StatusCode::UNAUTHORIZED,
-                axum::Json(ErrorResponse {
-                    detail: "bad token".into(),
-                }),
+                axum::Json(ErrorResponse::new("bad token")),
             ))
         }
     }

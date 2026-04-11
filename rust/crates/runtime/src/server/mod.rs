@@ -35,6 +35,7 @@ mod learning_handlers;
 mod meta_handlers;
 mod platform_handlers;
 mod reflect_handlers;
+mod request_trace;
 mod router_builder;
 pub mod run_engine;
 mod run_handlers;
@@ -58,6 +59,7 @@ use self::{
 mod chat_route;
 mod completions;
 
+pub use request_trace::RequestTrace;
 pub use state_builder::build_server_state;
 
 pub fn build_app(state: AppState) -> Router {
@@ -73,10 +75,23 @@ pub fn build_app(state: AppState) -> Router {
         .allow_headers(AllowHeaders::any())
         .expose_headers([HeaderName::from_static("x-request-id")]);
 
-    router_builder::build_router(state).layer(cors)
+    router_builder::build_router(state)
+        .layer(axum::middleware::from_fn(request_trace::request_trace_middleware))
+        .layer(cors)
 }
 
 pub async fn serve(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
+    static TRACING: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    TRACING.get_or_init(|| {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                    tracing_subscriber::EnvFilter::new("warn,astra_runtime=info")
+                }),
+            )
+            .try_init();
+    });
+
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let settings = AppSettings::from_env()?;
     let state = state_builder::build_server_state(settings).await?;

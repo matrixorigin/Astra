@@ -99,9 +99,7 @@ impl AuthService for StubAuth {
         } else {
             Err((
                 StatusCode::UNAUTHORIZED,
-                axum::Json(ErrorResponse {
-                    detail: "bad".into(),
-                }),
+                axum::Json(ErrorResponse::new("bad")),
             ))
         }
     }

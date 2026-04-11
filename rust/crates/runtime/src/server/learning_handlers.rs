@@ -63,9 +63,7 @@ pub(super) async fn learning_trigger_handler(
     if !(1..=30).contains(&payload.days) {
         return Err((
             StatusCode::UNPROCESSABLE_ENTITY,
-            Json(ErrorResponse {
-                detail: "Invalid request body".to_string(),
-            }),
+            Json(ErrorResponse::new("Invalid request body".to_string())),
         ));
     }
 

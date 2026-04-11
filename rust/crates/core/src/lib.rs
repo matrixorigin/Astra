@@ -5,7 +5,7 @@ use axum::{
     Json,
     http::{HeaderMap, StatusCode},
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sqlx::{MySql, Pool, mysql::MySqlPoolOptions};
 
 pub mod composite_snapshot;
@@ -204,9 +204,38 @@ impl SharedPool {
     }
 }
 
-#[derive(Debug, Serialize, PartialEq, Eq)]
+/// Standard JSON error envelope for HTTP APIs.
+///
+/// `detail` is the human-readable message. `error_code` and `request_id` are optional
+/// in the wire format so older clients keep working; the server middleware fills
+/// `request_id` when missing on 4xx/5xx JSON responses.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ErrorResponse {
     pub detail: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+}
+
+impl ErrorResponse {
+    pub fn new(detail: impl Into<String>) -> Self {
+        Self {
+            detail: detail.into(),
+            error_code: None,
+            request_id: None,
+        }
+    }
+
+    pub fn with_error_code(mut self, code: impl Into<String>) -> Self {
+        self.error_code = Some(code.into());
+        self
+    }
+
+    pub fn with_request_id(mut self, id: impl Into<String>) -> Self {
+        self.request_id = Some(id.into());
+        self
+    }
 }
 
 pub fn error_response(
@@ -215,14 +244,34 @@ pub fn error_response(
 ) -> (StatusCode, Json<ErrorResponse>) {
     (
         status,
-        Json(ErrorResponse {
-            detail: detail.into(),
-        }),
+        Json(ErrorResponse::new(detail)),
+    )
+}
+
+/// Same as [`error_response`] but attaches a stable machine-oriented `error_code`.
+pub fn error_response_coded(
+    status: StatusCode,
+    detail: impl Into<String>,
+    error_code: impl Into<String>,
+) -> (StatusCode, Json<ErrorResponse>) {
+    (
+        status,
+        Json(ErrorResponse::new(detail).with_error_code(error_code)),
     )
 }
 
 pub fn internal_error(error: impl ToString) -> (StatusCode, Json<ErrorResponse>) {
     error_response(StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+}
+
+pub fn internal_error_coded(
+    error: impl ToString,
+    error_code: impl Into<String>,
+) -> (StatusCode, Json<ErrorResponse>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(ErrorResponse::new(error.to_string()).with_error_code(error_code)),
+    )
 }
 
 pub fn current_unix_seconds() -> f64 {
@@ -260,6 +309,27 @@ mod tests {
         let (status, Json(body)) = error_response(StatusCode::NOT_FOUND, String::from("missing"));
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body.detail, "missing");
+        assert!(body.error_code.is_none());
+        assert!(body.request_id.is_none());
+    }
+
+    #[test]
+    fn error_response_coded_sets_error_code() {
+        let (status, Json(body)) =
+            error_response_coded(StatusCode::BAD_REQUEST, "bad", "validation_failed");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body.detail, "bad");
+        assert_eq!(body.error_code.as_deref(), Some("validation_failed"));
+        assert!(body.request_id.is_none());
+    }
+
+    #[test]
+    fn error_response_json_omits_empty_optional_fields() {
+        let Json(body) = error_response(StatusCode::NOT_FOUND, "x").1;
+        let v = serde_json::to_value(&body).expect("serialize");
+        assert_eq!(v["detail"], "x");
+        assert!(v.get("error_code").is_none());
+        assert!(v.get("request_id").is_none());
     }
 
     // --- internal_error ---

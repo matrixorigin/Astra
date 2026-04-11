@@ -90,15 +90,11 @@ impl AdminAuthorizer for StubAdminAuthorizer {
             }),
             Some("Bearer user-token") => Err((
                 StatusCode::FORBIDDEN,
-                axum::Json(ErrorResponse {
-                    detail: "Admin role required".to_string(),
-                }),
+                axum::Json(ErrorResponse::new("Admin role required".to_string())),
             )),
             _ => Err((
                 StatusCode::UNAUTHORIZED,
-                axum::Json(ErrorResponse {
-                    detail: "Not authenticated".to_string(),
-                }),
+                axum::Json(ErrorResponse::new("Not authenticated".to_string())),
             )),
         }
     }
@@ -273,17 +269,13 @@ impl AdminUserRoleManager for StubAdminUserRoleManager {
         if request.username == "contract-missing-user" {
             return Err((
                 StatusCode::NOT_FOUND,
-                axum::Json(ErrorResponse {
-                    detail: "User not found".to_string(),
-                }),
+                axum::Json(ErrorResponse::new("User not found".to_string())),
             ));
         }
         if request.role_name == "contract_missing_role" {
             return Err((
                 StatusCode::NOT_FOUND,
-                axum::Json(ErrorResponse {
-                    detail: "Role not found".to_string(),
-                }),
+                axum::Json(ErrorResponse::new("Role not found".to_string())),
             ));
         }
 
@@ -305,17 +297,13 @@ impl AdminUserRoleManager for StubAdminUserRoleManager {
         if request.username == "contract-missing-user" {
             return Err((
                 StatusCode::NOT_FOUND,
-                axum::Json(ErrorResponse {
-                    detail: "User not found".to_string(),
-                }),
+                axum::Json(ErrorResponse::new("User not found".to_string())),
             ));
         }
         if request.role_name == "contract_missing_role" {
             return Err((
                 StatusCode::NOT_FOUND,
-                axum::Json(ErrorResponse {
-                    detail: "Role not found".to_string(),
-                }),
+                axum::Json(ErrorResponse::new("Role not found".to_string())),
             ));
         }
 

@@ -575,7 +575,12 @@ async fn cleanup_plan_root_mailbox(ctx: &mut BackgroundPlanContext) {
     if let Some(mailbox) = ctx.root_mailbox.take() {
         let addr = mailbox.address.clone();
         let router = mailbox.router();
-        let _ = router.unregister(&addr).await;
+        if let Err(e) = router.unregister(&addr).await {
+            eprintln!(
+                "astra: failed to unregister plan root mailbox run_id={} agent_id={}: {e}",
+                addr.run_id, addr.agent_id
+            );
+        }
     }
 }
 

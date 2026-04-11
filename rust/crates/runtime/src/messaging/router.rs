@@ -146,12 +146,15 @@ impl AgentMailbox {
 
         // Build and send the request message
         let request_id = uuid::Uuid::new_v4().to_string();
+        let data = serde_json::to_value(&request).map_err(|e| {
+            MailboxError::Transport(format!("serialize permission request: {e}"))
+        })?;
         let msg = AgentMessage::new(
             self.address.clone(),
             MessageTarget::Parent,
             MessagePayload::Request {
                 request_type: RequestType::ToolPermission,
-                data: serde_json::to_value(&request).unwrap_or_default(),
+                data,
             },
         )
         .with_correlation(&request_id);
@@ -269,9 +272,12 @@ impl AgentMailboxRouter {
                 if existing == &addr {
                     // Already registered with same address — no-op.
                 } else {
-                    eprintln!(
-                        "  ⚠ messaging: agent_id '{}' already registered as {}; overwriting with {}",
-                        addr.agent_id, existing, addr
+                    tracing::warn!(
+                        target: "astra_runtime::messaging",
+                        agent_id = %addr.agent_id,
+                        existing = %existing,
+                        new_addr = %addr,
+                        "agent_id already registered; overwriting address index",
                     );
                     // Clean up stale entry from address_registry (both locks held).
                     reg.remove(&existing.run_id.clone());
@@ -295,9 +301,11 @@ impl AgentMailboxRouter {
                     }
                 }
                 if let Err(unregister_err) = self.transport.unregister(&addr).await {
-                    eprintln!(
-                        "  ⚠ messaging: failed to roll back transport registration for {} after subscribe error: {:?}",
-                        addr, unregister_err
+                    tracing::warn!(
+                        target: "astra_runtime::messaging",
+                        addr = %addr,
+                        error = ?unregister_err,
+                        "failed to roll back transport registration after subscribe error",
                     );
                 }
                 return Err(err);

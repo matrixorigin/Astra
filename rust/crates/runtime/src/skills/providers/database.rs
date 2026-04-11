@@ -166,9 +166,10 @@ mod tests {
                 .ok_or_else(|| {
                     (
                         StatusCode::NOT_FOUND,
-                        Json(ErrorResponse {
-                            detail: format!("Skill '{}' not found", skill_id),
-                        }),
+                        Json(ErrorResponse::new(format!(
+                            "Skill '{}' not found",
+                            skill_id
+                        ))),
                     )
                 })
         }
