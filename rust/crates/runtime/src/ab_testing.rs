@@ -180,9 +180,19 @@ pub(crate) fn apply_config_diff(config: &mut RuntimeConfig, key: &str, value: &s
                 config.compression.compression_threshold = n;
             }
         }
+        "compression.preserve_recent_turns" => {
+            if let Some(n) = value.as_u64() {
+                config.compression.preserve_recent_turns = n as u32;
+            }
+        }
         "memory.retrieval_top_k" => {
             if let Some(n) = value.as_u64() {
                 config.memory.retrieval_top_k = n as u32;
+            }
+        }
+        "memory.min_relevance_score" => {
+            if let Some(n) = value.as_f64() {
+                config.memory.min_relevance_score = n;
             }
         }
         "tool_selection.confidence_threshold" => {
@@ -190,12 +200,29 @@ pub(crate) fn apply_config_diff(config: &mut RuntimeConfig, key: &str, value: &s
                 config.tool_selection.confidence_threshold = n;
             }
         }
+        "tool_selection.max_tools" => {
+            if let Some(n) = value.as_u64() {
+                config.tool_selection.max_tools = n as u32;
+            }
+        }
         "learning.exploration_rate" => {
             if let Some(n) = value.as_f64() {
                 config.learning.exploration_rate = n;
             }
         }
-        // Add more as needed
+        "token_budget.max_turn_input_tokens" => {
+            if let Some(n) = value.as_u64() {
+                config.token_budget.max_turn_input_tokens = n as u32;
+            }
+        }
+        "verification.strictness" => {
+            if let Some(n) = value.as_f64() {
+                config.verification.strictness = n.clamp(
+                    config.verification.min_strictness,
+                    config.verification.max_strictness,
+                );
+            }
+        }
         _ => {}
     }
 }

@@ -47,6 +47,18 @@ pub struct RuntimeConfig {
     /// Token budget configuration.
     #[serde(default)]
     pub token_budget: TokenBudgetConfig,
+
+    /// Adaptive verification / review strictness.
+    #[serde(default)]
+    pub verification: VerificationConfig,
+
+    /// Adaptive memory-retrieval pressure.
+    #[serde(default)]
+    pub memory_pressure: MemoryPressureConfig,
+
+    /// Adaptive context-window / token-burn management.
+    #[serde(default)]
+    pub context_window: ContextWindowConfig,
 }
 
 fn default_config_version() -> String {
@@ -63,6 +75,9 @@ impl Default for RuntimeConfig {
             learning: LearningConfig::default(),
             telemetry: TelemetryConfig::default(),
             token_budget: TokenBudgetConfig::default(),
+            verification: VerificationConfig::default(),
+            memory_pressure: MemoryPressureConfig::default(),
+            context_window: ContextWindowConfig::default(),
         }
     }
 }
@@ -450,6 +465,174 @@ impl Default for TokenBudgetConfig {
     }
 }
 
+// ─── Verification Configuration ──────────────────────────────────────────────
+
+/// Configuration for adaptive verification / review strictness.
+///
+/// When adaptive is enabled, the runtime raises or lowers review strictness
+/// based on user corrections, drift, and failure patterns.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VerificationConfig {
+    /// Whether adaptive strictness adjustment is active.
+    #[serde(default = "default_true")]
+    pub adaptive: bool,
+
+    /// Current strictness level (0.0 = lenient, 1.0 = maximum).
+    #[serde(default = "default_verification_strictness")]
+    pub strictness: f64,
+
+    /// Minimum strictness (clamped).
+    #[serde(default = "default_verification_min")]
+    pub min_strictness: f64,
+
+    /// Maximum strictness (clamped).
+    #[serde(default = "default_verification_max")]
+    pub max_strictness: f64,
+
+    /// Whether corrections should automatically raise strictness.
+    #[serde(default = "default_true")]
+    pub increase_on_correction: bool,
+
+    /// Whether detected focus-drift should raise strictness.
+    #[serde(default)]
+    pub increase_on_drift: bool,
+}
+
+fn default_verification_strictness() -> f64 {
+    0.5
+}
+fn default_verification_min() -> f64 {
+    0.2
+}
+fn default_verification_max() -> f64 {
+    0.9
+}
+
+impl Default for VerificationConfig {
+    fn default() -> Self {
+        Self {
+            adaptive: true,
+            strictness: default_verification_strictness(),
+            min_strictness: default_verification_min(),
+            max_strictness: default_verification_max(),
+            increase_on_correction: true,
+            increase_on_drift: false,
+        }
+    }
+}
+
+// ─── Memory Pressure Configuration ──────────────────────────────────────────
+
+/// Configuration for adaptive memory-retrieval pressure.
+///
+/// When adaptive is enabled, retrieval top-k and history preservation
+/// expand or contract based on tool churn, focus drift, and corrections.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryPressureConfig {
+    /// Whether adaptive memory pressure is active.
+    #[serde(default = "default_true")]
+    pub adaptive: bool,
+
+    /// Minimum retrieval top-k (adaptive floor).
+    #[serde(default = "default_retrieval_min")]
+    pub retrieval_min: u32,
+
+    /// Maximum retrieval top-k (adaptive ceiling).
+    #[serde(default = "default_retrieval_max")]
+    pub retrieval_max: u32,
+
+    /// Expand memory retrieval on tool churn (repeated failures).
+    #[serde(default = "default_true")]
+    pub expand_on_churn: bool,
+
+    /// Expand memory retrieval on detected focus drift.
+    #[serde(default = "default_true")]
+    pub expand_on_drift: bool,
+
+    /// Expand memory retrieval on user corrections.
+    #[serde(default)]
+    pub expand_on_correction: bool,
+}
+
+fn default_retrieval_min() -> u32 {
+    3
+}
+fn default_retrieval_max() -> u32 {
+    15
+}
+
+impl Default for MemoryPressureConfig {
+    fn default() -> Self {
+        Self {
+            adaptive: true,
+            retrieval_min: default_retrieval_min(),
+            retrieval_max: default_retrieval_max(),
+            expand_on_churn: true,
+            expand_on_drift: true,
+            expand_on_correction: false,
+        }
+    }
+}
+
+// ─── Context-Window Configuration ───────────────────────────────────────────
+
+/// Configuration for adaptive token-budget and compression management.
+///
+/// When adaptive is enabled, the runtime adjusts token budgets per-turn
+/// based on actual burn rate, compression frequency, and error patterns.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextWindowConfig {
+    /// Whether adaptive token budgets are active.
+    #[serde(default = "default_true")]
+    pub adaptive: bool,
+
+    /// Whether the compression threshold adjusts automatically.
+    #[serde(default = "default_true")]
+    pub dynamic_compression: bool,
+
+    /// Minimum compression threshold (adaptive floor).
+    #[serde(default = "default_compression_threshold_min")]
+    pub compression_threshold_min: f64,
+
+    /// Maximum compression threshold (adaptive ceiling).
+    #[serde(default = "default_compression_threshold_max")]
+    pub compression_threshold_max: f64,
+
+    /// Fraction of remaining budget to allocate per remaining turn.
+    #[serde(default = "default_remaining_turn_factor")]
+    pub remaining_turn_factor: f64,
+
+    /// Tokens reserved for error recovery retries.
+    #[serde(default = "default_error_recovery_reserve")]
+    pub error_recovery_reserve: u32,
+}
+
+fn default_compression_threshold_min() -> f64 {
+    0.5
+}
+fn default_compression_threshold_max() -> f64 {
+    0.95
+}
+fn default_remaining_turn_factor() -> f64 {
+    0.33
+}
+fn default_error_recovery_reserve() -> u32 {
+    10_000
+}
+
+impl Default for ContextWindowConfig {
+    fn default() -> Self {
+        Self {
+            adaptive: true,
+            dynamic_compression: true,
+            compression_threshold_min: default_compression_threshold_min(),
+            compression_threshold_max: default_compression_threshold_max(),
+            remaining_turn_factor: default_remaining_turn_factor(),
+            error_recovery_reserve: default_error_recovery_reserve(),
+        }
+    }
+}
+
 // ─── Configuration Loading ───────────────────────────────────────────────────
 
 impl RuntimeConfig {
@@ -586,5 +769,48 @@ mod tests {
         unsafe {
             std::env::remove_var("MO_MAX_HISTORY_TOKENS");
         }
+    }
+
+    #[test]
+    fn test_verification_config_defaults() {
+        let config = VerificationConfig::default();
+        assert!(config.adaptive);
+        assert!((config.strictness - 0.5).abs() < 0.001);
+        assert!((config.min_strictness - 0.2).abs() < 0.001);
+        assert!((config.max_strictness - 0.9).abs() < 0.001);
+        assert!(config.increase_on_correction);
+        assert!(!config.increase_on_drift);
+    }
+
+    #[test]
+    fn test_memory_pressure_config_defaults() {
+        let config = MemoryPressureConfig::default();
+        assert!(config.adaptive);
+        assert_eq!(config.retrieval_min, 3);
+        assert_eq!(config.retrieval_max, 15);
+        assert!(config.expand_on_churn);
+        assert!(config.expand_on_drift);
+        assert!(!config.expand_on_correction);
+    }
+
+    #[test]
+    fn test_context_window_config_defaults() {
+        let config = ContextWindowConfig::default();
+        assert!(config.adaptive);
+        assert!(config.dynamic_compression);
+        assert!((config.compression_threshold_min - 0.5).abs() < 0.001);
+        assert!((config.compression_threshold_max - 0.95).abs() < 0.001);
+        assert!((config.remaining_turn_factor - 0.33).abs() < 0.001);
+        assert_eq!(config.error_recovery_reserve, 10_000);
+    }
+
+    #[test]
+    fn test_runtime_config_has_new_sub_configs() {
+        let config = RuntimeConfig::default();
+        // Just verify they exist and serialize
+        let toml = config.to_toml().unwrap();
+        assert!(toml.contains("[verification]"));
+        assert!(toml.contains("[memory_pressure]"));
+        assert!(toml.contains("[context_window]"));
     }
 }

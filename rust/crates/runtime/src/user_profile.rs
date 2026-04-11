@@ -405,51 +405,71 @@ impl Scenario {
                 max_tools_per_turn: 3,
                 prefer_read_only: true,
                 detail_level: Verbosity::Verbose,
+                memory_top_k: Some(7),
+                verification_strictness: Some(0.7),
             },
             Scenario::Debugging => ScenarioStrategy {
                 max_tools_per_turn: 5,
                 prefer_read_only: false,
                 detail_level: Verbosity::Debug,
+                memory_top_k: Some(8),
+                verification_strictness: None,
             },
             Scenario::Exploration => ScenarioStrategy {
                 max_tools_per_turn: 6,
                 prefer_read_only: true,
                 detail_level: Verbosity::Normal,
+                memory_top_k: Some(10),
+                verification_strictness: None,
             },
             Scenario::Planning => ScenarioStrategy {
                 max_tools_per_turn: 2,
                 prefer_read_only: true,
                 detail_level: Verbosity::Verbose,
+                memory_top_k: None,
+                verification_strictness: None,
             },
             Scenario::Implementation => ScenarioStrategy {
                 max_tools_per_turn: 4,
                 prefer_read_only: false,
                 detail_level: Verbosity::Normal,
+                memory_top_k: None,
+                verification_strictness: Some(0.6),
             },
             Scenario::Refactoring => ScenarioStrategy {
                 max_tools_per_turn: 4,
                 prefer_read_only: false,
                 detail_level: Verbosity::Verbose,
+                memory_top_k: Some(7),
+                verification_strictness: Some(0.65),
             },
             Scenario::Testing => ScenarioStrategy {
                 max_tools_per_turn: 5,
                 prefer_read_only: false,
                 detail_level: Verbosity::Normal,
+                memory_top_k: None,
+                verification_strictness: Some(0.55),
             },
             Scenario::Documentation => ScenarioStrategy {
                 max_tools_per_turn: 3,
                 prefer_read_only: false,
                 detail_level: Verbosity::Verbose,
+                memory_top_k: None,
+                verification_strictness: None,
             },
             Scenario::DevOps => ScenarioStrategy {
                 max_tools_per_turn: 4,
                 prefer_read_only: false,
                 detail_level: Verbosity::Normal,
+                memory_top_k: None,
+                verification_strictness: Some(0.6),
             },
             Scenario::Learning => ScenarioStrategy {
                 max_tools_per_turn: 4,
                 prefer_read_only: true,
                 detail_level: Verbosity::Verbose,
+                memory_top_k: Some(10),
+                verification_strictness: None,
             },
         }
     }
@@ -461,6 +481,10 @@ pub struct ScenarioStrategy {
     pub max_tools_per_turn: usize,
     pub prefer_read_only: bool,
     pub detail_level: Verbosity,
+    /// Suggested memory retrieval top-k override (None = use default).
+    pub memory_top_k: Option<u32>,
+    /// Suggested verification strictness override (None = use default).
+    pub verification_strictness: Option<f64>,
 }
 
 // ─── Scenario Detector ──────────────────────────────────────────────────────

@@ -60,6 +60,8 @@ impl ExecutionProfile {
     /// - `max_tools_per_turn` → `tool_selection.max_tools`
     /// - `prefer_read_only` → `tool_selection.confidence_threshold` boost
     /// - Higher detail scenarios get more token budget for history
+    /// - `memory_top_k` → `memory.retrieval_top_k` (if set by scenario)
+    /// - `verification_strictness` → `verification.strictness` (if set by scenario)
     pub fn apply_scenario(&mut self, scenario: Scenario) {
         self.scenario = Some(scenario);
         let strategy = scenario.strategy_hints();
@@ -85,6 +87,22 @@ impl ExecutionProfile {
                     self.config.token_budget.max_turn_input_tokens.max(90_000);
             }
             _ => {}
+        }
+
+        // Scenario-driven memory retrieval
+        if let Some(top_k) = strategy.memory_top_k {
+            self.config.memory.retrieval_top_k = top_k.clamp(
+                self.config.memory_pressure.retrieval_min,
+                self.config.memory_pressure.retrieval_max,
+            );
+        }
+
+        // Scenario-driven verification strictness
+        if let Some(strictness) = strategy.verification_strictness {
+            self.config.verification.strictness = strictness.clamp(
+                self.config.verification.min_strictness,
+                self.config.verification.max_strictness,
+            );
         }
     }
 
@@ -200,5 +218,40 @@ mod tests {
             restored.config.tool_selection.max_tools,
             profile.config.tool_selection.max_tools
         );
+    }
+
+    #[test]
+    fn apply_scenario_sets_memory_top_k_for_exploration() {
+        let mut profile = ExecutionProfile::from_base(RuntimeConfig::default());
+        profile.apply_scenario(Scenario::Exploration);
+        // Exploration has memory_top_k=10
+        assert_eq!(profile.config.memory.retrieval_top_k, 10);
+    }
+
+    #[test]
+    fn apply_scenario_sets_verification_for_code_review() {
+        let mut profile = ExecutionProfile::from_base(RuntimeConfig::default());
+        profile.apply_scenario(Scenario::CodeReview);
+        assert!((profile.config.verification.strictness - 0.7).abs() < 0.01);
+    }
+
+    #[test]
+    fn apply_scenario_clamps_memory_top_k_to_config_bounds() {
+        let mut config = RuntimeConfig::default();
+        config.memory_pressure.retrieval_max = 8;
+        let mut profile = ExecutionProfile::from_base(config);
+        profile.apply_scenario(Scenario::Exploration);
+        // Exploration wants 10, but max is 8
+        assert_eq!(profile.config.memory.retrieval_top_k, 8);
+    }
+
+    #[test]
+    fn apply_scenario_clamps_verification_to_config_bounds() {
+        let mut config = RuntimeConfig::default();
+        config.verification.max_strictness = 0.6;
+        let mut profile = ExecutionProfile::from_base(config);
+        profile.apply_scenario(Scenario::CodeReview);
+        // CodeReview wants 0.7, but max is 0.6
+        assert!((profile.config.verification.strictness - 0.6).abs() < 0.01);
     }
 }

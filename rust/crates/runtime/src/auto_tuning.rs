@@ -881,6 +881,21 @@ fn get_config_value(config: &RuntimeConfig, path: &str) -> Option<serde_json::Va
         "token_budget.system_prompt_reserve" => {
             Some(serde_json::json!(config.token_budget.system_prompt_reserve))
         }
+        "token_budget.max_turn_input_tokens" => {
+            Some(serde_json::json!(config.token_budget.max_turn_input_tokens))
+        }
+        "compression.compression_threshold" => {
+            Some(serde_json::json!(config.compression.compression_threshold))
+        }
+        "compression.max_history_tokens" => {
+            Some(serde_json::json!(config.compression.max_history_tokens))
+        }
+        "compression.preserve_recent_turns" => {
+            Some(serde_json::json!(config.compression.preserve_recent_turns))
+        }
+        "memory.retrieval_top_k" => Some(serde_json::json!(config.memory.retrieval_top_k)),
+        "memory.min_relevance_score" => Some(serde_json::json!(config.memory.min_relevance_score)),
+        "verification.strictness" => Some(serde_json::json!(config.verification.strictness)),
         _ => None,
     }
 }
@@ -905,6 +920,44 @@ fn apply_config_value(config: &mut RuntimeConfig, path: &str, value: &serde_json
         "token_budget.system_prompt_reserve" => {
             if let Some(v) = value.as_u64() {
                 config.token_budget.system_prompt_reserve = v as u32;
+            }
+        }
+        "token_budget.max_turn_input_tokens" => {
+            if let Some(v) = value.as_u64() {
+                config.token_budget.max_turn_input_tokens = v as u32;
+            }
+        }
+        "compression.compression_threshold" => {
+            if let Some(v) = value.as_f64() {
+                config.compression.compression_threshold = v;
+            }
+        }
+        "compression.max_history_tokens" => {
+            if let Some(v) = value.as_u64() {
+                config.compression.max_history_tokens = v as u32;
+            }
+        }
+        "compression.preserve_recent_turns" => {
+            if let Some(v) = value.as_u64() {
+                config.compression.preserve_recent_turns = v as u32;
+            }
+        }
+        "memory.retrieval_top_k" => {
+            if let Some(v) = value.as_u64() {
+                config.memory.retrieval_top_k = v as u32;
+            }
+        }
+        "memory.min_relevance_score" => {
+            if let Some(v) = value.as_f64() {
+                config.memory.min_relevance_score = v;
+            }
+        }
+        "verification.strictness" => {
+            if let Some(v) = value.as_f64() {
+                config.verification.strictness = v.clamp(
+                    config.verification.min_strictness,
+                    config.verification.max_strictness,
+                );
             }
         }
         _ => {}
@@ -996,6 +1049,92 @@ pub fn default_rules() -> Vec<EvolutionRule> {
         )
         .with_name("Alert on negative streak")
         .with_cooldown(Duration::from_secs(7200)),
+        // ── Verification surface ──
+        // User corrections accumulate → raise review strictness
+        EvolutionRule::new(
+            "correction-raise-strictness",
+            EvolutionTrigger::SignalAccumulation {
+                signal_type: "Correction".to_string(),
+                count: 2,
+                window_secs: 3600,
+            },
+            EvolutionAction::AdjustConfig {
+                path: "verification.strictness".to_string(),
+                delta: 0.1,
+                min: Some(0.2),
+                max: Some(0.9),
+            },
+        )
+        .with_name("Raise verification on corrections")
+        .with_cooldown(Duration::from_secs(600)),
+        // ── Memory-pressure surface ──
+        // Tool churn → expand memory retrieval to give agent more context
+        EvolutionRule::new(
+            "churn-expand-memory",
+            EvolutionTrigger::SignalAccumulation {
+                signal_type: "ToolChurn".to_string(),
+                count: 1,
+                window_secs: 600,
+            },
+            EvolutionAction::AdjustConfig {
+                path: "memory.retrieval_top_k".to_string(),
+                delta: 2.0,
+                min: Some(3.0),
+                max: Some(15.0),
+            },
+        )
+        .with_name("Expand memory on tool churn")
+        .with_cooldown(Duration::from_secs(300)),
+        // Focus drift → reset preserve_recent_turns to 1 (aggressive trim)
+        EvolutionRule::new(
+            "drift-trim-history",
+            EvolutionTrigger::SignalAccumulation {
+                signal_type: "FocusDrift".to_string(),
+                count: 1,
+                window_secs: 600,
+            },
+            EvolutionAction::SetConfig {
+                path: "compression.preserve_recent_turns".to_string(),
+                value: serde_json::json!(1),
+            },
+        )
+        .with_name("Trim history on focus drift")
+        .with_cooldown(Duration::from_secs(600)),
+        // ── Token/context-window surface ──
+        // High token usage → reduce turn budget to prevent runaway
+        EvolutionRule::new(
+            "high-tokens-reduce-budget",
+            EvolutionTrigger::HighTokenUsage {
+                threshold_tokens: 70_000,
+                window_secs: 600,
+                min_samples: 1,
+            },
+            EvolutionAction::AdjustConfig {
+                path: "token_budget.max_turn_input_tokens".to_string(),
+                delta: -5000.0,
+                min: Some(30_000.0),
+                max: None,
+            },
+        )
+        .with_name("Reduce token budget on high usage")
+        .with_cooldown(Duration::from_secs(300)),
+        // High token usage → also lower compression threshold to compress sooner
+        EvolutionRule::new(
+            "high-tokens-compress-earlier",
+            EvolutionTrigger::HighTokenUsage {
+                threshold_tokens: 70_000,
+                window_secs: 600,
+                min_samples: 1,
+            },
+            EvolutionAction::AdjustConfig {
+                path: "compression.compression_threshold".to_string(),
+                delta: -0.05,
+                min: Some(0.5),
+                max: Some(0.95),
+            },
+        )
+        .with_name("Compress earlier on high token usage")
+        .with_cooldown(Duration::from_secs(300)),
     ]
 }
 
@@ -1163,8 +1302,77 @@ mod tests {
     #[test]
     fn test_default_rules() {
         let rules = default_rules();
-        assert_eq!(rules.len(), 3);
+        assert_eq!(rules.len(), 8);
         assert!(rules.iter().any(|r| r.id == "low-success-boost-confidence"));
+        assert!(rules.iter().any(|r| r.id == "correction-raise-strictness"));
+        assert!(rules.iter().any(|r| r.id == "churn-expand-memory"));
+        assert!(rules.iter().any(|r| r.id == "drift-trim-history"));
+        assert!(rules.iter().any(|r| r.id == "high-tokens-reduce-budget"));
+        assert!(rules.iter().any(|r| r.id == "high-tokens-compress-earlier"));
+    }
+
+    #[test]
+    fn test_config_paths_get_set_round_trip() {
+        let mut config = RuntimeConfig::default();
+
+        // Verification strictness
+        let orig = get_config_value(&config, "verification.strictness");
+        assert!(orig.is_some());
+        assert!((orig.unwrap().as_f64().unwrap() - 0.5).abs() < 0.001);
+
+        apply_config_value(
+            &mut config,
+            "verification.strictness",
+            &serde_json::json!(0.8),
+        );
+        assert!((config.verification.strictness - 0.8).abs() < 0.001);
+
+        // Memory retrieval_top_k
+        apply_config_value(
+            &mut config,
+            "memory.retrieval_top_k",
+            &serde_json::json!(10),
+        );
+        assert_eq!(config.memory.retrieval_top_k, 10);
+
+        // Compression preserve_recent_turns
+        apply_config_value(
+            &mut config,
+            "compression.preserve_recent_turns",
+            &serde_json::json!(1),
+        );
+        assert_eq!(config.compression.preserve_recent_turns, 1);
+
+        // Token budget
+        apply_config_value(
+            &mut config,
+            "token_budget.max_turn_input_tokens",
+            &serde_json::json!(50_000),
+        );
+        assert_eq!(config.token_budget.max_turn_input_tokens, 50_000);
+    }
+
+    #[test]
+    fn test_verification_strictness_clamped_by_config() {
+        let mut config = RuntimeConfig::default();
+        config.verification.min_strictness = 0.3;
+        config.verification.max_strictness = 0.7;
+
+        // Try to set above max — should clamp
+        apply_config_value(
+            &mut config,
+            "verification.strictness",
+            &serde_json::json!(0.95),
+        );
+        assert!((config.verification.strictness - 0.7).abs() < 0.001);
+
+        // Try to set below min — should clamp
+        apply_config_value(
+            &mut config,
+            "verification.strictness",
+            &serde_json::json!(0.1),
+        );
+        assert!((config.verification.strictness - 0.3).abs() < 0.001);
     }
 
     #[test]

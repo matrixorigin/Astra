@@ -1406,10 +1406,7 @@ Follow these steps:
             // Parse: <skill_name> +/- or <skill_name> up/down or <skill_name> thumbs_up/thumbs_down
             let parts: Vec<&str> = sub_arg.split_whitespace().collect();
             if parts.len() < 2 {
-                eprintln!(
-                    "  {} Usage: /skill feedback <skill_name> +/-",
-                    "⚠".yellow()
-                );
+                eprintln!("  {} Usage: /skill feedback <skill_name> +/-", "⚠".yellow());
                 eprintln!("  Examples:");
                 eprintln!("    /skill feedback pdf +     {} thumbs up", "—".dim());
                 eprintln!("    /skill feedback pdf -     {} thumbs down", "—".dim());
@@ -1420,17 +1417,15 @@ Follow these steps:
                 "+" | "+1" | "up" | "thumbs_up" | "good" | "yes" => true,
                 "-" | "-1" | "down" | "thumbs_down" | "bad" | "no" => false,
                 other => {
-                    eprintln!(
-                        "  {} Unknown feedback type: {}",
-                        "✗".red(),
-                        other.yellow()
-                    );
+                    eprintln!("  {} Unknown feedback type: {}", "✗".red(), other.yellow());
                     eprintln!("  Use + (positive) or - (negative)");
                     return Ok(());
                 }
             };
             // Record feedback via the quality tracker
-            state.skill_quality_tracker.record_feedback(skill_name, positive);
+            state
+                .skill_quality_tracker
+                .record_feedback(skill_name, positive);
             let emoji = if positive { "👍" } else { "👎" };
             let word = if positive { "positive" } else { "negative" };
             eprintln!(

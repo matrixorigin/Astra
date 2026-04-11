@@ -576,6 +576,80 @@ fn apply_adaptive_execution_profile(state: &mut AgenticLoopState) {
     state.max_turn_input_tokens = profile.config.token_budget.max_turn_input_tokens as u64;
 }
 
+/// Per-turn micro-adaptation: reads recent signals and adjusts the session config
+/// for the next turn without waiting for a full tuning cycle.
+///
+/// This is lightweight and runs after each turn completes. It handles:
+/// - Token budget adjustment based on burn rate
+/// - Compression threshold tightening if compression fired
+/// - Memory retrieval expansion on tool churn or drift
+/// - Verification strictness increase on corrections
+fn apply_per_turn_adaptation(state: &mut AgenticLoopState, turn_tokens_used: u64) {
+    let session = match &state.telemetry.observability_session {
+        Some(s) => s,
+        None => return,
+    };
+
+    let mut session_guard = match session.write() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+
+    // Read immutable session state first to avoid borrow conflicts.
+    let compression_count = session_guard.compressed_turns.len();
+    let turn = session_guard.turn_number;
+    let recent_corrections = session_guard
+        .user_corrections
+        .iter()
+        .filter(|&&t| turn.saturating_sub(t) <= 3)
+        .count();
+
+    let config = &mut session_guard.config;
+
+    // ── 1. Dynamic token budget ──
+    if config.context_window.adaptive && turn_tokens_used > 0 {
+        let max_budget = config.token_budget.max_turn_input_tokens;
+        let threshold = (max_budget as f64 * 0.85) as u64;
+        if turn_tokens_used > threshold && max_budget > 30_000 {
+            let reduction = ((turn_tokens_used as f64 * 0.1) as u32).min(10_000);
+            config.token_budget.max_turn_input_tokens = config
+                .token_budget
+                .max_turn_input_tokens
+                .saturating_sub(reduction)
+                .max(30_000);
+        }
+    }
+
+    // ── 2. Dynamic compression threshold ──
+    if config.context_window.dynamic_compression && compression_count > 1 {
+        let new_threshold = (config.compression.compression_threshold - 0.05)
+            .max(config.context_window.compression_threshold_min);
+        config.compression.compression_threshold = new_threshold;
+    }
+
+    // ── 3. Memory pressure expansion on corrections ──
+    if config.memory_pressure.adaptive
+        && config.memory_pressure.expand_on_correction
+        && recent_corrections > 0
+    {
+        let new_k = (config.memory.retrieval_top_k + 1).min(config.memory_pressure.retrieval_max);
+        config.memory.retrieval_top_k = new_k;
+    }
+
+    // ── 4. Verification strictness on corrections ──
+    if config.verification.adaptive
+        && config.verification.increase_on_correction
+        && recent_corrections >= 1
+    {
+        let new_strictness =
+            (config.verification.strictness + 0.05).min(config.verification.max_strictness);
+        config.verification.strictness = new_strictness;
+    }
+
+    // Sync the loop-level token budget with the updated config
+    state.max_turn_input_tokens = config.token_budget.max_turn_input_tokens as u64;
+}
+
 // ─── Loop exit ───────────────────────────────────────────────────────────────
 
 /// Result of running the agentic loop to completion.
@@ -3194,6 +3268,10 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                 // ── Auto-tuning: count completed turns & periodic cycle ──
                 state.telemetry.completed_turns_for_tuning += 1;
                 maybe_run_tuning_cycle(state);
+
+                // ── Per-turn micro-adaptation ──
+                let turn_tokens = state.last_measured_prompt_tokens.unwrap_or(0);
+                apply_per_turn_adaptation(state, turn_tokens);
             }
         }
     }
@@ -7142,6 +7220,208 @@ print(json.dumps({'context': 'user said: ' + msg}))
         assert_eq!(
             created.map(|experiment| experiment.status),
             Some(crate::ab_testing::ExperimentStatus::Running)
+        );
+    }
+
+    // ── Per-turn micro-adaptation tests ──
+
+    #[test]
+    fn per_turn_adaptation_shrinks_token_budget_on_high_usage() {
+        let session = make_session();
+        let mut state = make_state();
+        state.telemetry.observability_session = Some(session.clone());
+
+        {
+            let mut guard = session.write().unwrap();
+            guard.config.token_budget.max_turn_input_tokens = 80_000;
+            guard.config.context_window.adaptive = true;
+        }
+        state.max_turn_input_tokens = 80_000;
+
+        // Simulate a turn that used 72k tokens (90% of 80k, above 85% threshold)
+        apply_per_turn_adaptation(&mut state, 72_000);
+
+        let guard = session.read().unwrap();
+        assert!(
+            guard.config.token_budget.max_turn_input_tokens < 80_000,
+            "budget should shrink: {}",
+            guard.config.token_budget.max_turn_input_tokens
+        );
+        assert!(
+            guard.config.token_budget.max_turn_input_tokens >= 30_000,
+            "budget should not go below floor"
+        );
+        assert_eq!(
+            state.max_turn_input_tokens, guard.config.token_budget.max_turn_input_tokens as u64,
+            "loop state should stay in sync"
+        );
+    }
+
+    #[test]
+    fn per_turn_adaptation_no_change_on_low_usage() {
+        let session = make_session();
+        let mut state = make_state();
+        state.telemetry.observability_session = Some(session.clone());
+
+        {
+            let mut guard = session.write().unwrap();
+            guard.config.token_budget.max_turn_input_tokens = 80_000;
+            guard.config.context_window.adaptive = true;
+        }
+        state.max_turn_input_tokens = 80_000;
+
+        // Simulate a turn that used only 40k tokens (50% of 80k, below 85% threshold)
+        apply_per_turn_adaptation(&mut state, 40_000);
+
+        let guard = session.read().unwrap();
+        assert_eq!(
+            guard.config.token_budget.max_turn_input_tokens, 80_000,
+            "budget should not change for low usage"
+        );
+    }
+
+    #[test]
+    fn per_turn_adaptation_lowers_compression_threshold_after_multiple_compressions() {
+        let session = make_session();
+        let mut state = make_state();
+        state.telemetry.observability_session = Some(session.clone());
+
+        {
+            let mut guard = session.write().unwrap();
+            guard.config.compression.compression_threshold = 0.8;
+            guard.config.context_window.dynamic_compression = true;
+            guard.config.context_window.compression_threshold_min = 0.5;
+            // Record 2 compressions
+            guard.record_compression(1);
+            guard.record_compression(3);
+        }
+
+        apply_per_turn_adaptation(&mut state, 0);
+
+        let guard = session.read().unwrap();
+        assert!(
+            (guard.config.compression.compression_threshold - 0.75).abs() < 0.001,
+            "threshold should drop by 0.05: {}",
+            guard.config.compression.compression_threshold
+        );
+    }
+
+    #[test]
+    fn per_turn_adaptation_respects_compression_threshold_floor() {
+        let session = make_session();
+        let mut state = make_state();
+        state.telemetry.observability_session = Some(session.clone());
+
+        {
+            let mut guard = session.write().unwrap();
+            guard.config.compression.compression_threshold = 0.52;
+            guard.config.context_window.dynamic_compression = true;
+            guard.config.context_window.compression_threshold_min = 0.5;
+            guard.record_compression(1);
+            guard.record_compression(2);
+        }
+
+        apply_per_turn_adaptation(&mut state, 0);
+
+        let guard = session.read().unwrap();
+        assert!(
+            guard.config.compression.compression_threshold >= 0.5,
+            "threshold should not go below floor: {}",
+            guard.config.compression.compression_threshold
+        );
+    }
+
+    #[test]
+    fn per_turn_adaptation_raises_verification_on_corrections() {
+        let session = make_session();
+        let mut state = make_state();
+        state.telemetry.observability_session = Some(session.clone());
+
+        let initial_strictness;
+        {
+            let mut guard = session.write().unwrap();
+            guard.config.verification.adaptive = true;
+            guard.config.verification.increase_on_correction = true;
+            guard.config.verification.strictness = 0.5;
+            guard.config.verification.max_strictness = 0.9;
+            initial_strictness = guard.config.verification.strictness;
+            // Simulate a recent correction at current turn
+            guard.turn_number = 5;
+            guard.user_corrections.push(4);
+        }
+
+        apply_per_turn_adaptation(&mut state, 0);
+
+        let guard = session.read().unwrap();
+        assert!(
+            guard.config.verification.strictness > initial_strictness,
+            "strictness should increase: {} > {}",
+            guard.config.verification.strictness,
+            initial_strictness
+        );
+        assert!(
+            (guard.config.verification.strictness - 0.55).abs() < 0.001,
+            "should increase by 0.05: {}",
+            guard.config.verification.strictness
+        );
+    }
+
+    #[test]
+    fn per_turn_adaptation_no_verification_change_without_recent_corrections() {
+        let session = make_session();
+        let mut state = make_state();
+        state.telemetry.observability_session = Some(session.clone());
+
+        {
+            let mut guard = session.write().unwrap();
+            guard.config.verification.adaptive = true;
+            guard.config.verification.increase_on_correction = true;
+            guard.config.verification.strictness = 0.5;
+            // Old correction, not recent
+            guard.turn_number = 10;
+            guard.user_corrections.push(2);
+        }
+
+        apply_per_turn_adaptation(&mut state, 0);
+
+        let guard = session.read().unwrap();
+        assert!(
+            (guard.config.verification.strictness - 0.5).abs() < 0.001,
+            "strictness should not change for old corrections: {}",
+            guard.config.verification.strictness
+        );
+    }
+
+    #[test]
+    fn adaptive_profile_applies_scenario_memory_and_verification() {
+        let hub = make_hub();
+        let session = make_session();
+        let mut state = make_state();
+        state.telemetry.observability_hub = Some(hub);
+        state.telemetry.observability_session = Some(session.clone());
+        state.message = "review the PR diff and approve the change".into();
+        state.recent_tools = vec!["view".into()];
+
+        {
+            let mut guard = session.write().unwrap();
+            for _ in 0..5 {
+                guard.record_query("review the PR diff and approve the change");
+            }
+        }
+
+        apply_adaptive_execution_profile(&mut state);
+
+        let guard = session.read().unwrap();
+        // CodeReview scenario should set memory_top_k=7 and verification_strictness=0.7
+        assert_eq!(
+            guard.profile.current_scenario,
+            Some(crate::user_profile::Scenario::CodeReview)
+        );
+        assert_eq!(guard.config.memory.retrieval_top_k, 7);
+        assert!(
+            (guard.config.verification.strictness - 0.7).abs() < 0.01,
+            "verification should be 0.7 for code review: {}",
+            guard.config.verification.strictness
         );
     }
 }
