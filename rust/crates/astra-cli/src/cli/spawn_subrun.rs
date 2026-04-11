@@ -242,6 +242,8 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             recent_file_reads: Vec::new(),
             permission_context: config.permission_context,
             permission_handler: None,
+            tactical_adapter: None,
+            step_signal_collector: None,
         };
 
         // Inherit skills from parent: pre-populate discovered skills

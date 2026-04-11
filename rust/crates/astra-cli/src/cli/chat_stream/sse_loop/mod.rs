@@ -481,6 +481,8 @@ pub(crate) async fn stream_chat_sse(
         recent_file_reads: Vec::new(),
         permission_context: None,
         permission_handler: None,
+        tactical_adapter: None,
+        step_signal_collector: None,
     };
 
     // ─── Run the runtime loop ────────────────────────────────────────────

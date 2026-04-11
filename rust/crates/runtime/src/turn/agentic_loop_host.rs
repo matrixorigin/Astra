@@ -474,6 +474,12 @@ pub struct AgenticLoopState {
     /// turns can wait or reject early instead of immediately re-hitting the
     /// limit.  Shared across all turns within a single agentic loop invocation.
     pub rate_limit_cooldown: crate::bridge::RateLimitCooldown,
+
+    // ── Liquid (within-turn tactical adaptation) ──
+    /// Optional tactical adapter for step-level adaptation within a turn.
+    pub tactical_adapter: Option<crate::liquid::tactical::TacticalAdapter>,
+    /// Optional step signal collector for within-turn outcome tracking.
+    pub step_signal_collector: Option<crate::liquid::step_signals::StepSignalCollector>,
 }
 
 /// Consecutive same-category error turns before forcing a strategy change.
@@ -2219,6 +2225,15 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
         state.remaining_turns = state.remaining_turns.saturating_sub(1);
         state.step_recorder.begin_turn(turn_index as u32);
 
+        // ── Reset liquid tactical adapter for the new turn ──
+        if let Some(ref mut adapter) = state.tactical_adapter {
+            adapter.reset_turn();
+        }
+        if let Some(ref mut collector) = state.step_signal_collector {
+            let budget = state.max_turn_input_tokens as u64;
+            collector.reset(budget);
+        }
+
         // ─── Observability: turn start hook ──────────────────────────────
         // Record query for scenario detection and drift analysis.
         let turn_start_time = std::time::Instant::now();
@@ -3444,6 +3459,83 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
             }
         }
 
+        // ── Feed tool results into liquid step-level signal collector ──
+        if state.step_signal_collector.is_some() || state.tactical_adapter.is_some() {
+            let new_records = &state.stall.tool_call_records[evo_records_before..];
+            let mut step_actions: Vec<crate::liquid::tactical::TacticalAction> = Vec::new();
+
+            for rec in new_records {
+                let outcome = crate::liquid::step_signals::StepOutcome {
+                    tool_name: rec.name.clone(),
+                    ok: rec.ok,
+                    latency_ms: rec.ms,
+                    tokens_used: (rec.input_bytes.unwrap_or(0) + rec.output_bytes.unwrap_or(0))
+                        as u64,
+                    error_hint: rec.error.clone(),
+                };
+                // Record into step signal collector
+                let triggers = if let Some(ref mut collector) = state.step_signal_collector {
+                    collector.record(outcome)
+                } else {
+                    vec![]
+                };
+                // Evaluate triggers through tactical adapter
+                if !triggers.is_empty() {
+                    if let Some(ref mut adapter) = state.tactical_adapter {
+                        let actions = adapter.evaluate(&triggers);
+                        for action in actions {
+                            if !matches!(action, crate::liquid::tactical::TacticalAction::NoOp) {
+                                step_actions.push(action);
+                            }
+                        }
+                        adapter.advance_step();
+                    }
+                }
+            }
+
+            // Apply tactical actions as hints in the conversation
+            if !step_actions.is_empty() {
+                let hint_parts: Vec<String> = step_actions
+                    .iter()
+                    .map(|a| match a {
+                        crate::liquid::tactical::TacticalAction::IncreaseVerification {
+                            reason,
+                        } => {
+                            format!("⚠️ {}", reason)
+                        }
+                        crate::liquid::tactical::TacticalAction::SuggestToolSwitch {
+                            from_tool,
+                            reason,
+                        } => {
+                            format!("💡 Consider switching from '{}': {}", from_tool, reason)
+                        }
+                        crate::liquid::tactical::TacticalAction::TokenBudgetWarning {
+                            used,
+                            budget,
+                        } => {
+                            format!(
+                                "📊 Token usage: {}% of budget consumed. Be concise.",
+                                used * 100 / budget.max(&1)
+                            )
+                        }
+                        crate::liquid::tactical::TacticalAction::ThrottleHint { reason } => {
+                            format!("🐢 {}", reason)
+                        }
+                        crate::liquid::tactical::TacticalAction::NoOp => String::new(),
+                    })
+                    .filter(|s| !s.is_empty())
+                    .collect();
+
+                if !hint_parts.is_empty() {
+                    let hint_text = format!("[Tactical Adaptation]\n{}", hint_parts.join("\n"));
+                    state.messages.push(serde_json::json!({
+                        "role": "system",
+                        "content": hint_text
+                    }));
+                }
+            }
+        }
+
         // ── Emit progress events for permission-denied tools so
         //    parent/UI subscribers learn about blocked operations.
         if let Some(ref emitter) = state.messaging.progress_emitter {
@@ -4086,6 +4178,8 @@ mod tests {
             recent_file_reads: Vec::new(),
             permission_context: None,
             permission_handler: None,
+            tactical_adapter: None,
+            step_signal_collector: None,
         }
     }
 
@@ -9224,5 +9318,206 @@ print(json.dumps({'context': 'user said: ' + msg}))
             !triggered.is_empty(),
             "TaskSuccess alone with threshold 1.1 should trigger (success rate < 1.1)"
         );
+    }
+
+    // ── L1.3 Tactical adapter wiring tests ──────────────────────────────
+
+    #[test]
+    fn tactical_adapter_state_fields_default_to_none() {
+        let state = make_state();
+        assert!(state.tactical_adapter.is_none());
+        assert!(state.step_signal_collector.is_none());
+    }
+
+    #[test]
+    fn tactical_adapter_wiring_produces_hints_on_error_streak() {
+        use crate::liquid::step_signals::{StepSignalCollector, StepSignalConfig};
+        use crate::liquid::tactical::{DampenerConfig, TacticalAction, TacticalAdapter};
+
+        let mut state = make_state();
+        state.max_turn_input_tokens = 100_000;
+
+        // Set up collector with low error-streak threshold for testability.
+        let mut sig_cfg = StepSignalConfig::default();
+        sig_cfg.error_streak_threshold = 2;
+        state.step_signal_collector = Some(StepSignalCollector::new(sig_cfg, 100_000));
+
+        // Use a permissive dampener so actions fire easily.
+        let dampener_cfg = DampenerConfig {
+            min_calls_between_same_type: 1,
+            max_actions_per_turn: 10,
+            drift_freeze_threshold: 1.0,
+        };
+        state.tactical_adapter = Some(TacticalAdapter::new(dampener_cfg));
+
+        // Simulate 3 consecutive failures for the same tool
+        let records = vec![
+            ToolCallRecord {
+                name: "bash".into(),
+                ok: false,
+                ms: 100,
+                error: Some("exit code 1".into()),
+                input_bytes: Some(50),
+                output_bytes: Some(200),
+                args_preview: Some("ls -la".into()),
+                result_preview: Some("error".into()),
+            },
+            ToolCallRecord {
+                name: "bash".into(),
+                ok: false,
+                ms: 120,
+                error: Some("exit code 1".into()),
+                input_bytes: Some(50),
+                output_bytes: Some(200),
+                args_preview: Some("cat foo".into()),
+                result_preview: Some("not found".into()),
+            },
+            ToolCallRecord {
+                name: "bash".into(),
+                ok: false,
+                ms: 130,
+                error: Some("exit code 1".into()),
+                input_bytes: Some(50),
+                output_bytes: Some(200),
+                args_preview: Some("rm bar".into()),
+                result_preview: Some("permission denied".into()),
+            },
+        ];
+
+        let evo_records_before = state.stall.tool_call_records.len();
+        state.stall.tool_call_records.extend(records);
+
+        // Replay the tactical wiring logic manually (mirrors the loop body)
+        let new_records: Vec<ToolCallRecord> =
+            state.stall.tool_call_records[evo_records_before..].to_vec();
+        let mut step_actions: Vec<TacticalAction> = Vec::new();
+
+        for rec in &new_records {
+            let outcome = crate::liquid::step_signals::StepOutcome {
+                tool_name: rec.name.clone(),
+                ok: rec.ok,
+                latency_ms: rec.ms,
+                tokens_used: (rec.input_bytes.unwrap_or(0) + rec.output_bytes.unwrap_or(0)) as u64,
+                error_hint: rec.error.clone(),
+            };
+            let triggers = if let Some(ref mut collector) = state.step_signal_collector {
+                collector.record(outcome)
+            } else {
+                vec![]
+            };
+            if !triggers.is_empty() {
+                if let Some(ref mut adapter) = state.tactical_adapter {
+                    let actions = adapter.evaluate(&triggers);
+                    for action in actions {
+                        if !matches!(action, TacticalAction::NoOp) {
+                            step_actions.push(action);
+                        }
+                    }
+                    adapter.advance_step();
+                }
+            }
+        }
+
+        // We should see at least one non-NoOp action (IncreaseVerification or SuggestToolSwitch)
+        assert!(
+            !step_actions.is_empty(),
+            "3 consecutive errors should produce tactical actions, got none"
+        );
+
+        // Build hint text like the loop does
+        let hint_parts: Vec<String> = step_actions
+            .iter()
+            .map(|a| match a {
+                TacticalAction::IncreaseVerification { reason } => {
+                    format!("⚠️ {}", reason)
+                }
+                TacticalAction::SuggestToolSwitch { from_tool, reason } => {
+                    format!("💡 Switch from '{}': {}", from_tool, reason)
+                }
+                TacticalAction::TokenBudgetWarning { used, budget } => {
+                    format!("📊 {}% used", used * 100 / budget.max(&1))
+                }
+                TacticalAction::ThrottleHint { reason } => {
+                    format!("🐢 {}", reason)
+                }
+                TacticalAction::NoOp => String::new(),
+            })
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        assert!(!hint_parts.is_empty(), "Should produce non-empty hint text");
+    }
+
+    #[test]
+    fn tactical_adapter_reset_clears_turn_state() {
+        use crate::liquid::step_signals::{StepSignalCollector, StepSignalConfig};
+        use crate::liquid::tactical::TacticalAdapter;
+
+        let mut state = make_state();
+        state.max_turn_input_tokens = 50_000;
+        state.step_signal_collector = Some(StepSignalCollector::new(
+            StepSignalConfig::default(),
+            50_000,
+        ));
+        state.tactical_adapter = Some(TacticalAdapter::new(
+            crate::liquid::tactical::DampenerConfig::default(),
+        ));
+
+        // Record some outcomes
+        if let Some(ref mut collector) = state.step_signal_collector {
+            collector.record(crate::liquid::step_signals::StepOutcome {
+                tool_name: "test".into(),
+                ok: false,
+                latency_ms: 100,
+                tokens_used: 500,
+                error_hint: Some("err".into()),
+            });
+        }
+
+        // Reset (mimics turn boundary logic)
+        if let Some(ref mut adapter) = state.tactical_adapter {
+            adapter.reset_turn();
+        }
+        if let Some(ref mut collector) = state.step_signal_collector {
+            let budget = state.max_turn_input_tokens as u64;
+            collector.reset(budget);
+        }
+
+        // After reset, recording a single OK outcome should produce no triggers
+        let triggers = if let Some(ref mut collector) = state.step_signal_collector {
+            collector.record(crate::liquid::step_signals::StepOutcome {
+                tool_name: "test".into(),
+                ok: true,
+                latency_ms: 50,
+                tokens_used: 100,
+                error_hint: None,
+            })
+        } else {
+            vec![]
+        };
+
+        assert!(
+            triggers.is_empty()
+                || triggers
+                    .iter()
+                    .all(|t| matches!(t, crate::liquid::step_signals::AdaptationTrigger::Nominal)),
+            "After reset, a single OK call should not trigger error-based adaptation"
+        );
+    }
+
+    #[test]
+    fn tactical_adapter_noop_when_none() {
+        // When tactical fields are None, the code path just skips.
+        // This test ensures no panic.
+        let state = make_state();
+        assert!(state.tactical_adapter.is_none());
+        assert!(state.step_signal_collector.is_none());
+
+        // The guard condition in the loop body is:
+        // if state.step_signal_collector.is_some() || state.tactical_adapter.is_some()
+        // When both are None, the block is skipped entirely.
+        let should_enter =
+            state.step_signal_collector.is_some() || state.tactical_adapter.is_some();
+        assert!(!should_enter, "Neither field set — block should be skipped");
     }
 }

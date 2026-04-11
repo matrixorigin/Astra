@@ -300,6 +300,8 @@ mod tests {
             recent_file_reads: Vec::new(),
             permission_context: None,
             permission_handler: None,
+            tactical_adapter: None,
+            step_signal_collector: None,
         }
     }
 

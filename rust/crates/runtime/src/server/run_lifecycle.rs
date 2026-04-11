@@ -321,6 +321,8 @@ impl AgenticRunLifecycleService {
             recent_file_reads: Vec::new(),
             permission_context: None,
             permission_handler: None,
+            tactical_adapter: None,
+            step_signal_collector: None,
         }
     }
 
@@ -1044,6 +1046,8 @@ impl SubRunExecutor for ServerSubRunExecutor {
             recent_file_reads: Vec::new(),
             permission_context: None,
             permission_handler: None,
+            tactical_adapter: None,
+            step_signal_collector: None,
         };
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut loop_state).await;
