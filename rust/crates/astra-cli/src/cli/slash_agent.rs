@@ -1108,6 +1108,7 @@ async fn wait_for_watch_snapshot_change(
                             | ProgressEventType::Completed { .. }
                             | ProgressEventType::Failed { .. }
                             | ProgressEventType::Cancelled { .. }
+                            | ProgressEventType::PermissionDenied { .. }
                     ),
                     Err(RecvError::Lagged(_)) => true,
                     Err(RecvError::Closed) => {
