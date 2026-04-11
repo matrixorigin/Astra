@@ -2001,3 +2001,198 @@ fn format_trace_decision_type(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ─── proportional_bar ────────────────────────────────────────────────────
+
+    #[test]
+    fn proportional_bar_zero() {
+        let bar = proportional_bar(0.0, 10);
+        // Should be all empty chars
+        assert!(bar.contains('░'));
+        assert!(!bar.contains('█'));
+    }
+
+    #[test]
+    fn proportional_bar_full() {
+        let bar = proportional_bar(100.0, 10);
+        assert!(bar.contains('█'));
+    }
+
+    #[test]
+    fn proportional_bar_half() {
+        let bar = proportional_bar(50.0, 10);
+        // Should have both filled and empty
+        assert!(bar.contains('█'));
+        assert!(bar.contains('░'));
+    }
+
+    #[test]
+    fn proportional_bar_over_100() {
+        // Should not panic, clamped to width
+        let bar = proportional_bar(150.0, 10);
+        assert!(!bar.is_empty());
+    }
+
+    #[test]
+    fn proportional_bar_negative() {
+        // Should not panic
+        let bar = proportional_bar(-10.0, 10);
+        assert!(!bar.is_empty());
+    }
+
+    #[test]
+    fn proportional_bar_zero_width() {
+        // Zero width produces two empty styled strings concatenated
+        let bar = proportional_bar(50.0, 0);
+        // Should not panic; result contains only ANSI escape sequences
+        assert!(!bar.contains('█'));
+        assert!(!bar.contains('░'));
+    }
+
+    // ─── mini_bar ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn mini_bar_zero() {
+        let bar = mini_bar(0.0, 10);
+        assert!(!bar.contains('▓'));
+    }
+
+    #[test]
+    fn mini_bar_full() {
+        let bar = mini_bar(100.0, 10);
+        assert!(bar.contains('▓'));
+    }
+
+    // ─── format_pressure ─────────────────────────────────────────────────────
+
+    #[test]
+    fn format_pressure_low() {
+        let s = format_pressure(0.3);
+        assert!(s.contains("30%"));
+    }
+
+    #[test]
+    fn format_pressure_medium() {
+        let s = format_pressure(0.75);
+        assert!(s.contains("75%"));
+    }
+
+    #[test]
+    fn format_pressure_high() {
+        let s = format_pressure(0.95);
+        assert!(s.contains("95%"));
+    }
+
+    #[test]
+    fn format_pressure_zero() {
+        let s = format_pressure(0.0);
+        assert!(s.contains("0%"));
+    }
+
+    #[test]
+    fn format_pressure_over_one() {
+        let s = format_pressure(1.2);
+        assert!(s.contains("120%"));
+    }
+
+    // ─── ascii_sparkline ─────────────────────────────────────────────────────
+
+    #[test]
+    fn ascii_sparkline_empty() {
+        let result = ascii_sparkline(&[], 10);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn ascii_sparkline_single_value() {
+        let result = ascii_sparkline(&[50.0], 10);
+        assert_eq!(result.chars().count(), 1);
+    }
+
+    #[test]
+    fn ascii_sparkline_constant_values() {
+        let values = vec![50.0, 50.0, 50.0, 50.0];
+        let result = ascii_sparkline(&values, 10);
+        // All same value — sparkline should work without division-by-zero
+        assert_eq!(result.chars().count(), 4);
+    }
+
+    #[test]
+    fn ascii_sparkline_ascending() {
+        let values = vec![0.0, 25.0, 50.0, 75.0, 100.0];
+        let result = ascii_sparkline(&values, 10);
+        let chars: Vec<char> = result.chars().collect();
+        assert_eq!(chars.len(), 5);
+        // First should be lowest block, last should be highest
+        assert!(chars[0] <= chars[4]);
+    }
+
+    #[test]
+    fn ascii_sparkline_many_values_downsampled() {
+        let values: Vec<f64> = (0..100).map(|i| i as f64).collect();
+        let result = ascii_sparkline(&values, 20);
+        // Should downsample to 20 chars
+        assert_eq!(result.chars().count(), 20);
+    }
+
+    #[test]
+    fn ascii_sparkline_fewer_values_than_width() {
+        let values = vec![10.0, 50.0, 90.0];
+        let result = ascii_sparkline(&values, 20);
+        // Should use all 3 values (not pad to 20)
+        assert_eq!(result.chars().count(), 3);
+    }
+
+    // ─── resolve_turn_index ──────────────────────────────────────────────────
+
+    #[test]
+    fn resolve_turn_index_empty_len() {
+        assert_eq!(resolve_turn_index("1", 0), None);
+    }
+
+    #[test]
+    fn resolve_turn_index_empty_arg() {
+        assert_eq!(resolve_turn_index("", 5), Some(4)); // latest
+    }
+
+    #[test]
+    fn resolve_turn_index_positive() {
+        assert_eq!(resolve_turn_index("1", 5), Some(0));
+        assert_eq!(resolve_turn_index("3", 5), Some(2));
+        assert_eq!(resolve_turn_index("5", 5), Some(4));
+    }
+
+    #[test]
+    fn resolve_turn_index_out_of_bounds() {
+        assert_eq!(resolve_turn_index("6", 5), None);
+        assert_eq!(resolve_turn_index("100", 5), None);
+    }
+
+    #[test]
+    fn resolve_turn_index_negative() {
+        assert_eq!(resolve_turn_index("-1", 5), Some(4)); // last
+        assert_eq!(resolve_turn_index("-3", 5), Some(2)); // 3rd from end
+        assert_eq!(resolve_turn_index("-5", 5), Some(0)); // first
+    }
+
+    #[test]
+    fn resolve_turn_index_negative_beyond() {
+        assert_eq!(resolve_turn_index("-6", 5), None);
+        assert_eq!(resolve_turn_index("-100", 5), None);
+    }
+
+    #[test]
+    fn resolve_turn_index_zero() {
+        assert_eq!(resolve_turn_index("0", 5), None);
+    }
+
+    #[test]
+    fn resolve_turn_index_non_numeric() {
+        assert_eq!(resolve_turn_index("abc", 5), None);
+        assert_eq!(resolve_turn_index("1.5", 5), None);
+    }
+}

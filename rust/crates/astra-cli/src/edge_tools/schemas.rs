@@ -879,7 +879,7 @@ pub fn all_tool_schemas() -> Vec<Value> {
                             "description": "Second turn for comparison (1-based, -1 for latest). Used with mode='compare'."
                         }
                     },
-                    "required": ["mode"]
+                    "required": []
                 }
             }
         }),

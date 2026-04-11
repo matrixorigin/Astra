@@ -840,7 +840,7 @@ impl ToolExecutor {
                  git_diff, git_log, git_show, git_blame, call_graph, run_build_test, web_fetch, \
                  mo_query, memory_search, memory_profile, ask_user, task_create, task_list, \
                  task_get, task_update, task_stop, sleep, tool_search, web_search, send_message, \
-                 spawn_agent, share_context, query_context, \
+                 spawn_agent, share_context, query_context, context_analysis, \
                  diagnose, lsp, env, notebook_edit, config, powershell, brief"
             ),
         };
@@ -1035,6 +1035,7 @@ mod tests {
     mod code_intel_integration_tests;
     mod code_intel_tests;
     mod config_tests;
+    mod context_analysis_tests;
     mod cross_file_caller_tests;
     mod diagnose_tests;
     mod env_tests;
