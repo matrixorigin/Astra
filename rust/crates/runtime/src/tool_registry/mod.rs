@@ -22,7 +22,7 @@ pub mod state;
 pub mod tool_pool;
 
 pub use chain::{ChainContext, ChainStep, ToolChain};
-pub use meta::{IntentType, Scope, TOOL_CATALOG, ToolMeta};
+pub use meta::{IntentType, Scope, TOOL_CATALOG, ToolMeta, is_pinned_tool};
 pub use plugin::{PluginRegistry, PluginToolEntry};
 pub use registry::ToolRegistry;
 pub use report::{SelectionFeedback, SelectionReport, ToolQualityTracker};

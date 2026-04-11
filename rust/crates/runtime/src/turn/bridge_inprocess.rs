@@ -482,17 +482,45 @@ fn build_system_message(
     }
 }
 
-/// Add `cache_control` to the last tool schema for Anthropic,
-/// marking the tool definitions as cache-eligible.
+/// Add `cache_control` to tool schemas for Anthropic caching.
+///
+/// Places breakpoints on:
+/// 1. The last pinned tool — caches the stable pinned prefix (reusable across all turns)
+/// 2. The last overall tool — caches the full tool list (reusable when dynamic tools match)
+///
+/// This uses 2 of Anthropic's 4 allowed cache breakpoints. The system prompt and
+/// message history use the other 2.
 fn annotate_tool_schemas_for_caching(tools: &mut [Value], cache_cfg: &PromptCacheConfig) {
     if !cache_cfg.should_annotate() || tools.is_empty() {
         return;
     }
-    // Mark last tool definition with cache_control — Anthropic caches the prefix
-    // up to the last cache_control marker. Use 1h TTL since tool schemas are
-    // stable within a session.
-    if let Some(last) = tools.last_mut() {
-        last["cache_control"] = json!({"type": "ephemeral", "ttl": "1h"});
+
+    // Find the last pinned tool index by scanning from the end
+    // (since pinned tools come first, we want the last one before dynamic tools start)
+    let last_pinned_idx = tools
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, t)| {
+            t.get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(crate::tool_registry::is_pinned_tool)
+        })
+        .map(|(i, _)| i);
+
+    let last_idx = tools.len() - 1;
+    let has_dynamic_tools = last_pinned_idx != Some(last_idx);
+
+    // Mark last pinned tool with cache_control (creates cache for stable prefix)
+    if let Some(idx) = last_pinned_idx {
+        tools[idx]["cache_control"] = json!({"type": "ephemeral", "ttl": "1h"});
+    }
+
+    // Mark last overall tool (for turn-to-turn caching of full tool list)
+    // Skip if it's the same as last pinned (no dynamic tools)
+    if has_dynamic_tools {
+        tools[last_idx]["cache_control"] = json!({"type": "ephemeral", "ttl": "1h"});
     }
 }
 
@@ -2817,6 +2845,43 @@ mod tests {
         assert!(
             tools[0].get("cache_control").is_none(),
             "OpenAI tools should not get cache_control"
+        );
+    }
+
+    #[test]
+    fn annotate_tool_schemas_with_mixed_pinned_dynamic() {
+        let _lock = CACHE_ENV_MUTEX.lock().unwrap();
+        unsafe {
+            std::env::remove_var("MO_PROMPT_CACHE_DISABLED");
+        }
+
+        // bash and read_file are pinned; github_list_prs is dynamic
+        let mut tools = vec![
+            json!({"function": {"name": "bash"}}),
+            json!({"function": {"name": "read_file"}}),
+            json!({"function": {"name": "github_list_prs"}}),
+        ];
+        annotate_tool_schemas_for_caching(
+            &mut tools,
+            &PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514"),
+        );
+
+        // First pinned tool should NOT have cache_control
+        assert!(
+            tools[0].get("cache_control").is_none(),
+            "first pinned tool should not have cache_control"
+        );
+
+        // Last pinned tool (read_file) SHOULD have cache_control for prefix caching
+        assert!(
+            tools[1].get("cache_control").is_some(),
+            "last pinned tool should have cache_control"
+        );
+
+        // Last overall tool (dynamic) SHOULD also have cache_control
+        assert!(
+            tools[2].get("cache_control").is_some(),
+            "last dynamic tool should have cache_control for full-list caching"
         );
     }
 
