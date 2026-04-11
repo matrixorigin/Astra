@@ -216,11 +216,29 @@ impl MessageTransport for InProcessTransport {
         }
 
         let broadcasts = self.broadcasts.read().await;
-        if let Some(tx) = broadcasts.get(delegation_id) {
-            let _ = tx.send(msg);
-            self.metrics.messages_sent.fetch_add(1, Ordering::Relaxed);
+        let Some(tx) = broadcasts.get(delegation_id) else {
+            self.metrics
+                .messages_dropped
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(MailboxError::Transport(format!(
+                "broadcast group not found: {delegation_id}"
+            )));
+        };
+
+        match tx.send(msg) {
+            Ok(_) => {
+                self.metrics.messages_sent.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+            Err(_) => {
+                self.metrics
+                    .messages_dropped
+                    .fetch_add(1, Ordering::Relaxed);
+                Err(MailboxError::Transport(format!(
+                    "broadcast group '{delegation_id}' has no subscribers"
+                )))
+            }
         }
-        Ok(())
     }
 
     async fn shutdown(&self) -> Result<(), MailboxError> {
@@ -530,6 +548,67 @@ mod tests {
         assert!(
             dropped > 0,
             "should have dropped some messages due to backpressure"
+        );
+    }
+
+    #[tokio::test]
+    async fn broadcast_without_registered_group_returns_error() {
+        let transport = InProcessTransport::new();
+        let msg = Arc::new(AgentMessage::new(
+            addr("r0", "sender"),
+            MessageTarget::Broadcast {
+                delegation_id: "missing-del".into(),
+            },
+            MessagePayload::Signal(AgentSignal::Heartbeat),
+        ));
+
+        let err = transport
+            .broadcast("missing-del", msg)
+            .await
+            .expect_err("missing broadcast group should error");
+        match err {
+            MailboxError::Transport(message) => {
+                assert!(message.contains("broadcast group not found"));
+            }
+            other => panic!("expected transport error, got {other:?}"),
+        }
+        assert_eq!(
+            transport.metrics().messages_dropped.load(Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn broadcast_without_subscribers_returns_error() {
+        let transport = InProcessTransport::new();
+        let a = addr("r1", "a");
+
+        transport
+            .register(a.clone(), Some("del-empty".into()))
+            .await
+            .unwrap();
+
+        let msg = Arc::new(AgentMessage::new(
+            a.clone(),
+            MessageTarget::Broadcast {
+                delegation_id: "del-empty".into(),
+            },
+            MessagePayload::Signal(AgentSignal::Heartbeat),
+        ));
+
+        let err = transport
+            .broadcast("del-empty", msg)
+            .await
+            .expect_err("broadcast without subscribers should error");
+        match err {
+            MailboxError::Transport(message) => {
+                assert!(message.contains("has no subscribers"));
+            }
+            other => panic!("expected transport error, got {other:?}"),
+        }
+        assert_eq!(
+            transport.metrics().messages_dropped.load(Ordering::Relaxed),
+            1
         );
     }
 
