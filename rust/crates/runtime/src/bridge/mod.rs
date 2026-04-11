@@ -43,6 +43,80 @@ const TOOL_RESULT_AUDIT_CHARS: usize = 4000;
 /// response is unexpectedly large. 16 MB accommodates any realistic SSE stream.
 const MAX_SSE_BUFFER_BYTES: usize = 16 * 1024 * 1024;
 
+fn synthesized_session_info_event(session_id: &str, run_id: Option<&str>) -> serde_json::Value {
+    let mut event = serde_json::json!({
+        "type": "session_info",
+        "session_id": session_id,
+    });
+    if let Some(run_id) = run_id
+        && let Some(obj) = event.as_object_mut()
+    {
+        obj.insert(
+            "run_id".to_string(),
+            serde_json::Value::String(run_id.to_string()),
+        );
+    }
+    event
+}
+
+fn is_bridge_sse_content_type(content_type: Option<&str>) -> bool {
+    content_type.is_some_and(|value| value.starts_with("text/event-stream"))
+}
+
+fn bridge_http_response_health(status: StatusCode, is_sse: bool) -> (bool, bool) {
+    let is_success = status.is_success() && is_sse;
+    let should_trip_breaker =
+        status.is_server_error() || status == StatusCode::TOO_MANY_REQUESTS || !is_sse;
+    (is_success, should_trip_breaker)
+}
+
+fn bridge_error_sse_message(status: StatusCode, body: &str) -> String {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return format!(
+            "Bridge returned HTTP {} {}",
+            status.as_u16(),
+            status.canonical_reason().unwrap_or("error")
+        );
+    }
+    format!(
+        "Bridge returned HTTP {} {}: {}",
+        status.as_u16(),
+        status.canonical_reason().unwrap_or("error"),
+        trimmed
+    )
+}
+
+fn bridge_status_to_sse_error_code(status: StatusCode) -> &'static str {
+    match status {
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => "AUTH_ERROR",
+        StatusCode::NOT_FOUND => "NOT_FOUND",
+        StatusCode::UNPROCESSABLE_ENTITY => "VALIDATION_ERROR",
+        StatusCode::TOO_MANY_REQUESTS => "RATE_LIMIT",
+        StatusCode::BAD_GATEWAY | StatusCode::SERVICE_UNAVAILABLE | StatusCode::GATEWAY_TIMEOUT => {
+            "UPSTREAM_ERROR"
+        }
+        _ => "INTERNAL_ERROR",
+    }
+}
+
+fn bridge_error_sse_response(status: StatusCode, message: impl Into<String>) -> Response {
+    let event = serde_json::json!({
+        "type": "error",
+        "message": message.into(),
+        "code": bridge_status_to_sse_error_code(status),
+        "retryable": status.is_server_error()
+            || matches!(
+                status,
+                StatusCode::TOO_MANY_REQUESTS
+                    | StatusCode::BAD_GATEWAY
+                    | StatusCode::SERVICE_UNAVAILABLE
+                    | StatusCode::GATEWAY_TIMEOUT
+            ),
+    });
+    sse_stream_response(StatusCode::OK, Body::from(render_sse_json(event)))
+}
+
 #[async_trait]
 pub trait ChatTurnBridge: Send + Sync {
     /// Last argument: optional cancel token — HTTP `/chat/turn` passes one so dropping the SSE body
@@ -215,12 +289,7 @@ impl ChatTurnBridge for HttpChatTurnBridge {
 
         let request_start = std::time::Instant::now();
         let response = match request.send().await {
-            Ok(resp) => {
-                let latency_ms = request_start.elapsed().as_millis() as u64;
-                self.circuit_breaker.record_success();
-                self.health_metrics.record_request(latency_ms, true, false);
-                resp
-            }
+            Ok(resp) => resp,
             Err(error) => {
                 let latency_ms = request_start.elapsed().as_millis() as u64;
                 let is_timeout = error.is_timeout();
@@ -236,6 +305,23 @@ impl ChatTurnBridge for HttpChatTurnBridge {
             .get(reqwest::header::CONTENT_TYPE)
             .and_then(|value| value.to_str().ok())
             .map(ToString::to_string);
+        let is_sse = is_bridge_sse_content_type(content_type.as_deref());
+        let request_latency_ms = request_start.elapsed().as_millis() as u64;
+        let (is_success, should_trip_breaker) = bridge_http_response_health(status, is_sse);
+        self.health_metrics
+            .record_request(request_latency_ms, is_success, false);
+        if is_success {
+            self.circuit_breaker.record_success();
+        } else if should_trip_breaker {
+            self.circuit_breaker.record_failure();
+        }
+        if !is_sse {
+            let error_body = response.text().await.unwrap_or_default();
+            return Ok(bridge_error_sse_response(
+                status,
+                bridge_error_sse_message(status, &error_body),
+            ));
+        }
         let trusted_session_id = headers
             .get("x-mo-session-id")
             .and_then(|value| value.to_str().ok())
@@ -335,7 +421,7 @@ impl ChatTurnBridge for HttpChatTurnBridge {
             self.turn_learning_writer.clone(),
         );
         Ok(sse_stream_response(
-            status,
+            StatusCode::OK,
             Body::from_stream(filtered_stream),
         ))
     }
@@ -411,10 +497,10 @@ where
 
     stream! {
         if let Some(session_id) = trusted_session_id.as_deref() {
-            yield Ok(Bytes::from(render_sse_json(serde_json::json!({
-                "type": "session_info",
-                "session_id": session_id,
-            }))));
+            yield Ok(Bytes::from(render_sse_json(synthesized_session_info_event(
+                session_id,
+                trusted_turn_chain_id.as_deref(),
+            ))));
         }
         let mut buffer = Vec::new();
         let mut pending_bridge_state: Option<serde_json::Map<String, serde_json::Value>> = None;
@@ -842,5 +928,44 @@ mod tests {
         assert_eq!(snap.total_requests, 0);
         assert_eq!(snap.total_failures, 0);
         assert_eq!(snap.failure_rate, 0.0);
+    }
+
+    #[test]
+    fn synthesized_session_info_includes_trusted_run_id() {
+        let event = synthesized_session_info_event("sess-1", Some("run-1"));
+        assert_eq!(event["type"], "session_info");
+        assert_eq!(event["session_id"], "sess-1");
+        assert_eq!(event["run_id"], "run-1");
+    }
+
+    #[test]
+    fn bridge_http_500_counts_as_failure_and_breaker_signal() {
+        let (is_success, should_trip_breaker) =
+            bridge_http_response_health(StatusCode::INTERNAL_SERVER_ERROR, true);
+        assert!(!is_success);
+        assert!(should_trip_breaker);
+    }
+
+    #[test]
+    fn bridge_non_sse_200_counts_as_failure_and_breaker_signal() {
+        let (is_success, should_trip_breaker) = bridge_http_response_health(StatusCode::OK, false);
+        assert!(!is_success);
+        assert!(should_trip_breaker);
+    }
+
+    #[tokio::test]
+    async fn bridge_error_sse_response_wraps_plaintext_body() {
+        let response = bridge_error_sse_response(
+            StatusCode::BAD_GATEWAY,
+            bridge_error_sse_message(StatusCode::BAD_GATEWAY, "upstream exploded"),
+        );
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("body should read");
+        let text = String::from_utf8(body.to_vec()).expect("utf8");
+        assert!(text.contains("\"type\":\"error\""));
+        assert!(text.contains("\"code\":\"UPSTREAM_ERROR\""));
+        assert!(text.contains("upstream exploded"));
     }
 }

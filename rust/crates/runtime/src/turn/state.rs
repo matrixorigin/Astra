@@ -59,13 +59,13 @@ pub fn resolve_turn_identifiers(
     new_turn_chain_id: &str,
     new_user_query_event_id: &str,
 ) -> (String, String) {
-    let has_new_user_query = messages.iter().any(|message| {
-        message
-            .get("role")
-            .and_then(Value::as_str)
-            .map(|role| role == "user")
-            .unwrap_or(false)
+    let latest_conversation_role = messages.iter().rev().find_map(|message| {
+        match message.get("role").and_then(Value::as_str) {
+            Some("user" | "assistant" | "tool") => message.get("role").and_then(Value::as_str),
+            _ => None,
+        }
     });
+    let has_new_user_query = latest_conversation_role == Some("user");
 
     if !has_new_user_query
         && has_tool_results
@@ -273,5 +273,25 @@ mod tests {
             resolve_turn_identifiers(&msgs, true, Some(&mut prev), "fallback-c", "fallback-q");
         assert_eq!(chain, "fallback-c");
         assert_eq!(query, "fallback-q");
+    }
+
+    #[test]
+    fn resolve_tool_results_with_history_reuses_prev_ids() {
+        let msgs = vec![
+            json!({"role": "system", "content": "sys"}),
+            json!({"role": "user", "content": "find the bug"}),
+            json!({"role": "assistant", "content": null, "tool_calls": [{"id": "call-1"}]}),
+            json!({"role": "tool", "tool_call_id": "call-1", "content": "done"}),
+        ];
+        let mut prev = Map::from_iter([
+            ("turn_chain_id".to_string(), json!("old-chain")),
+            ("user_query_event_id".to_string(), json!("old-query")),
+        ]);
+
+        let (chain, query) =
+            resolve_turn_identifiers(&msgs, true, Some(&mut prev), "new-chain", "new-query");
+
+        assert_eq!(chain, "old-chain");
+        assert_eq!(query, "old-query");
     }
 }

@@ -148,6 +148,27 @@ impl PreparedChatTurnBridgeRequest {
     }
 }
 
+fn validate_session_id_shape(
+    request: &ChatTurnRequestBody,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    if request.has_non_null_session_id() && request.session_id_str().is_none() {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "session_id must be a string",
+        ));
+    }
+    if request
+        .session_id_str()
+        .is_some_and(|session_id| session_id.trim().is_empty())
+    {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "session_id must not be empty",
+        ));
+    }
+    Ok(())
+}
+
 pub(super) async fn prepare_chat_turn_bridge_body(
     state: &AppState,
     user: &AuthUserRecord,
@@ -156,6 +177,7 @@ pub(super) async fn prepare_chat_turn_bridge_body(
     let Ok(mut request) = serde_json::from_slice::<ChatTurnRequestBody>(&body) else {
         return Ok(PreparedChatTurnBridgeRequest::passthrough(body));
     };
+    validate_session_id_shape(&request)?;
 
     // ── Session resolution ──────────────────────────────────────────────
     let (trusted_session_id, trusted_session_created_at) =
@@ -169,8 +191,6 @@ pub(super) async fn prepare_chat_turn_bridge_body(
                 Some(session_id),
                 normalize_session_created_at_for_bridge(&session.created_at),
             )
-        } else if request.has_non_null_session_id() {
-            (None, None)
         } else {
             let agent_id = request.agent_id_str();
             let metadata = agent_id.as_ref().map(|agent_id| {
@@ -905,6 +925,33 @@ mod tests {
         let request: ChatTurnRequestBody = serde_json::from_str(r#"{"session_id": 42}"#).unwrap();
         assert!(request.session_id_str().is_none());
         assert!(request.has_non_null_session_id());
+    }
+
+    #[test]
+    fn validate_session_id_shape_rejects_non_string_values() {
+        let request: ChatTurnRequestBody = serde_json::from_str(r#"{"session_id": 42}"#).unwrap();
+        let (status, body) = validate_session_id_shape(&request).unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body.0.detail, "session_id must be a string");
+    }
+
+    #[test]
+    fn validate_session_id_shape_allows_absent_or_string_values() {
+        let absent: ChatTurnRequestBody = serde_json::from_str(r#"{"messages":[]}"#).unwrap();
+        let stringy: ChatTurnRequestBody =
+            serde_json::from_str(r#"{"session_id":"sess-1"}"#).unwrap();
+        assert!(validate_session_id_shape(&absent).is_ok());
+        assert!(validate_session_id_shape(&stringy).is_ok());
+    }
+
+    #[test]
+    fn validate_session_id_shape_rejects_empty_strings() {
+        for raw in [r#"{"session_id":""}"#, r#"{"session_id":"   "}"#] {
+            let request: ChatTurnRequestBody = serde_json::from_str(raw).unwrap();
+            let (status, body) = validate_session_id_shape(&request).unwrap_err();
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(body.0.detail, "session_id must not be empty");
+        }
     }
 
     #[test]

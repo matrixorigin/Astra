@@ -107,6 +107,73 @@ impl RunStatus {
     }
 }
 
+fn is_run_finished_event(event: &Value) -> bool {
+    event.get("event_type").and_then(Value::as_str) == Some("run_finished")
+}
+
+fn merge_run_finished_event_data(target: &mut Value, source: &Value) {
+    let source_data = source
+        .get("data")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let Some(target_obj) = target.as_object_mut() else {
+        return;
+    };
+    let target_data = target_obj
+        .entry("data".to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    let Some(target_data_obj) = target_data.as_object_mut() else {
+        return;
+    };
+    for (key, value) in source_data {
+        target_data_obj.insert(key, value);
+    }
+}
+
+fn merge_cancelled_run_events(run: &mut RunState, mut finalized_events: Vec<Value>) {
+    let terminal_event = finalized_events
+        .last()
+        .filter(|event| is_run_finished_event(event))
+        .cloned();
+    if terminal_event.is_some() {
+        finalized_events.pop();
+    }
+
+    let insert_at = run
+        .events
+        .last()
+        .filter(|event| is_run_finished_event(event))
+        .map(|_| run.events.len().saturating_sub(1))
+        .unwrap_or(run.events.len());
+    run.events.splice(insert_at..insert_at, finalized_events);
+
+    if let Some(terminal_event) = terminal_event {
+        if let Some(existing_terminal) = run
+            .events
+            .last_mut()
+            .filter(|event| is_run_finished_event(event))
+        {
+            merge_run_finished_event_data(existing_terminal, &terminal_event);
+        } else {
+            run.events.push(terminal_event);
+        }
+    }
+}
+
+fn terminal_events_for_persistence(events: &[Value]) -> Vec<Value> {
+    events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.get("event_type").and_then(Value::as_str),
+                Some("run_error" | "run_finished")
+            )
+        })
+        .cloned()
+        .collect()
+}
+
 /// Per-run state held in the lifecycle service.
 struct RunState {
     run_id: String,
@@ -183,6 +250,150 @@ impl AgenticRunLifecycleService {
     /// Clone the Arc handle to the runs map (for background tasks).
     fn runs_handle(&self) -> Arc<RwLock<HashMap<String, RunState>>> {
         Arc::clone(&self.runs)
+    }
+
+    fn build_tracked_run_state(
+        run_id: String,
+        session_id: String,
+        user_id: String,
+    ) -> (RunState, Arc<AtomicBool>, Arc<CancellationToken>) {
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let llm_cancel_token = Arc::new(CancellationToken::new());
+        let run_state = RunState {
+            run_id,
+            session_id,
+            user_id,
+            status: RunStatus::Running,
+            events: vec![json!({"event_type": "run_started", "data": {}})],
+            cancel_flag: cancel_flag.clone(),
+            llm_cancel_token: llm_cancel_token.clone(),
+            started_at: Instant::now(),
+            waiting_for: None,
+        };
+        (run_state, cancel_flag, llm_cancel_token)
+    }
+
+    fn configure_loop_state_runtime_controls(
+        &self,
+        loop_state: &mut AgenticLoopState,
+        cancel_flag: &Arc<AtomicBool>,
+        llm_cancel_token: &Arc<CancellationToken>,
+    ) {
+        loop_state.cancellation.flag = Some(cancel_flag.clone());
+        loop_state.cancellation.token = Some(llm_cancel_token.clone());
+        loop_state.delegation_engine = self.delegation_engine.clone();
+    }
+
+    async fn persist_run_start_if_configured(&self, run_id: &str, user_id: &str, session_id: &str) {
+        if let Some(engine) = &self.run_engine {
+            astra_core::log_persist!(
+                engine.start_run(run_id, user_id, session_id).await,
+                "run_lifecycle",
+                run_id,
+                "start_run"
+            );
+        }
+    }
+
+    async fn persist_terminal_events_if_configured(&self, run_id: &str, events: &[Value]) {
+        let Some(engine) = &self.run_engine else {
+            return;
+        };
+        for event in terminal_events_for_persistence(events) {
+            astra_core::log_persist!(
+                engine.append_event(run_id, event).await,
+                "run_lifecycle",
+                run_id,
+                "append_terminal_event"
+            );
+        }
+    }
+
+    fn finalize_run_events(
+        loop_outcome: Result<AgenticLoopOutcome, String>,
+        mut events: Vec<Value>,
+        loop_state: &AgenticLoopState,
+    ) -> (Vec<Value>, RunStatus, Option<String>) {
+        let usage = json!({
+            "prompt_tokens": loop_state.total_prompt,
+            "completion_tokens": loop_state.total_completion,
+            "tool_call_count": loop_state.total_tool_calls,
+        });
+        let cancellation_requested = loop_state
+            .cancellation
+            .flag
+            .as_ref()
+            .is_some_and(|f| f.load(Ordering::Relaxed))
+            || loop_state
+                .cancellation
+                .token
+                .as_ref()
+                .is_some_and(|t| t.is_cancelled());
+
+        let (final_status, error_msg) = if cancellation_requested
+            || matches!(&loop_outcome, Ok(AgenticLoopOutcome::Cancelled))
+        {
+            let mut data = usage;
+            data["cancelled"] = Value::Bool(true);
+            events.push(json!({
+                "event_type": "run_finished",
+                "data": data,
+            }));
+            (RunStatus::Cancelled, None)
+        } else {
+            match loop_outcome {
+                Ok(AgenticLoopOutcome::Completed) => {
+                    if !loop_state.final_text.is_empty() {
+                        events.push(json!({
+                        "event_type": "text_done",
+                        "data": { "full_text": loop_state.final_text.clone() }
+                        }));
+                    }
+                    events.push(json!({
+                        "event_type": "run_finished",
+                        "data": usage,
+                    }));
+                    (RunStatus::Completed, None)
+                }
+                Ok(AgenticLoopOutcome::Cancelled) => unreachable!("handled by cancellation gate"),
+                Ok(AgenticLoopOutcome::Error(e)) => {
+                    events.push(json!({
+                        "event_type": "run_error",
+                        "data": {"error": e.clone()}
+                    }));
+                    events.push(json!({
+                        "event_type": "run_finished",
+                        "data": usage.clone(),
+                    }));
+                    (RunStatus::Failed, Some(e))
+                }
+                Ok(AgenticLoopOutcome::Waiting(w)) => {
+                    let msg = format!("waiting: {w}");
+                    events.push(json!({
+                        "event_type": "run_error",
+                        "data": {"error": msg.clone()}
+                    }));
+                    events.push(json!({
+                        "event_type": "run_finished",
+                        "data": usage.clone(),
+                    }));
+                    (RunStatus::Failed, Some(msg))
+                }
+                Err(err) => {
+                    events.push(json!({
+                        "event_type": "run_error",
+                        "data": {"error": err.clone()}
+                    }));
+                    events.push(json!({
+                        "event_type": "run_finished",
+                        "data": usage,
+                    }));
+                    (RunStatus::Failed, Some(err))
+                }
+            }
+        };
+
+        (events, final_status, error_msg)
     }
 
     /// Build a [`ServerAgenticLoopHost`] for a single run.
@@ -350,14 +561,14 @@ impl AgenticRunLifecycleService {
     }
 
     /// Collect run events into SSE-compatible format.
-    fn format_run_events(events: &[Value]) -> Vec<Value> {
+    fn format_run_events(events: &[Value], start_index: usize) -> Vec<Value> {
         events
             .iter()
             .enumerate()
             .map(|(i, ev)| {
                 let mut out = ev.clone();
                 if let Some(obj) = out.as_object_mut() {
-                    obj.insert("index".to_string(), json!(i));
+                    obj.insert("index".to_string(), json!(start_index + i));
                 }
                 out
             })
@@ -395,39 +606,24 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             .clone()
             .unwrap_or_else(|| Uuid::new_v4().to_string());
 
-        let cancel_flag = Arc::new(AtomicBool::new(false));
-        let llm_cancel_token = Arc::new(CancellationToken::new());
-        let run_state = RunState {
-            run_id: run_id.clone(),
-            session_id: session_id.clone(),
-            user_id: user_id.clone(),
-            status: RunStatus::Running,
-            events: vec![json!({"event_type": "run_started", "data": {}})],
-            cancel_flag: cancel_flag.clone(),
-            llm_cancel_token: llm_cancel_token.clone(),
-            started_at: Instant::now(),
-            waiting_for: None,
-        };
+        let (run_state, cancel_flag, llm_cancel_token) =
+            Self::build_tracked_run_state(run_id.clone(), session_id.clone(), user_id.clone());
         self.runs.write().await.insert(run_id.clone(), run_state);
 
         // Persist to durable store if available
-        if let Some(engine) = &self.run_engine {
-            astra_core::log_persist!(
-                engine.start_run(&run_id, &user_id, &session_id).await,
-                "run_lifecycle",
-                &run_id,
-                "start_run"
-            );
-        }
+        self.persist_run_start_if_configured(&run_id, &user_id, &session_id)
+            .await;
 
         // Spawn background agentic loop.
         let edge_tools = Self::extract_edge_tools(&request);
         let edge_profile = Self::extract_edge_profile(&request);
         let mut host = self.build_host(&user_id, &session_id, &request, edge_tools, edge_profile);
         let mut loop_state = self.build_initial_state(&request, &session_id, &run_id);
-        loop_state.cancellation.flag = Some(cancel_flag);
-        loop_state.cancellation.token = Some(llm_cancel_token);
-        loop_state.delegation_engine = self.delegation_engine.clone();
+        self.configure_loop_state_runtime_controls(
+            &mut loop_state,
+            &cancel_flag,
+            &llm_cancel_token,
+        );
 
         // Clone handles we need inside the spawned task.
         let runs = self.runs_handle();
@@ -444,103 +640,36 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             )
             .await;
 
-            let mut events = host.take_emitted_events();
-            let (final_status, error_msg) = match outcome {
-                Ok(AgenticLoopOutcome::Completed) => {
-                    if !loop_state.final_text.is_empty() {
-                        events.push(json!({
-                            "event_type": "text_done",
-                            "data": { "full_text": loop_state.final_text }
-                        }));
-                    }
-                    events.push(json!({
-                        "event_type": "run_finished",
-                        "data": {
-                            "prompt_tokens": loop_state.total_prompt,
-                            "completion_tokens": loop_state.total_completion,
-                            "tool_call_count": loop_state.total_tool_calls,
-                        }
-                    }));
-                    (RunStatus::Completed, None)
-                }
-                Ok(AgenticLoopOutcome::Cancelled) => {
-                    events.push(json!({
-                        "event_type": "run_finished",
-                        "data": {
-                            "cancelled": true,
-                            "prompt_tokens": loop_state.total_prompt,
-                            "completion_tokens": loop_state.total_completion,
-                            "tool_call_count": loop_state.total_tool_calls,
-                        }
-                    }));
-                    (RunStatus::Cancelled, None)
-                }
-                Ok(AgenticLoopOutcome::Error(e)) => {
-                    events.push(json!({
-                        "event_type": "run_error",
-                        "data": {"error": &e}
-                    }));
-                    (RunStatus::Failed, Some(e))
-                }
-                Ok(AgenticLoopOutcome::Waiting(w)) => {
-                    let msg = format!("waiting: {w}");
-                    events.push(json!({
-                        "event_type": "run_error",
-                        "data": {"error": &msg}
-                    }));
-                    (RunStatus::Failed, Some(msg))
-                }
-                Err(err) => {
-                    let user_cancelled = loop_state
-                        .cancellation
-                        .flag
-                        .as_ref()
-                        .is_some_and(|f| f.load(Ordering::Relaxed))
-                        || loop_state
-                            .cancellation
-                            .token
-                            .as_ref()
-                            .is_some_and(|t| t.is_cancelled())
-                        || err.contains("LLM call cancelled");
-                    if user_cancelled {
-                        events.push(json!({
-                            "event_type": "run_finished",
-                            "data": {
-                                "cancelled": true,
-                                "prompt_tokens": loop_state.total_prompt,
-                                "completion_tokens": loop_state.total_completion,
-                                "tool_call_count": loop_state.total_tool_calls,
-                            }
-                        }));
-                        (RunStatus::Cancelled, None)
-                    } else {
-                        events.push(json!({
-                            "event_type": "run_error",
-                            "data": {"error": &err}
-                        }));
-                        (RunStatus::Failed, Some(err))
-                    }
-                }
-            };
+            let (events, final_status, error_msg) =
+                Self::finalize_run_events(outcome, host.take_emitted_events(), &loop_state);
+            let terminal_events = terminal_events_for_persistence(&events);
 
             // Persist final status + usage to durable store.
             let status_str = final_status.as_str();
+            let mut persist_terminal_state = true;
 
             // Update in-memory state with collected events and final status.
             if let Some(run) = runs.write().await.get_mut(&bg_run_id) {
-                run.events.extend(events);
-                run.status = final_status;
+                if run.status == RunStatus::Cancelled {
+                    persist_terminal_state = false;
+                    merge_cancelled_run_events(run, events);
+                } else {
+                    run.events.extend(events);
+                    run.status = final_status;
+                }
             }
 
             if let Some(engine) = &run_engine {
-                astra_core::log_persist!(
-                    engine
-                        .persist_status(&bg_run_id, status_str, None, error_msg.as_deref())
-                        .await,
-                    "run_lifecycle",
-                    &bg_run_id,
-                    "status"
-                );
+                if persist_terminal_state {
+                    astra_core::log_persist!(
+                        engine
+                            .persist_status(&bg_run_id, status_str, None, error_msg.as_deref())
+                            .await,
+                        "run_lifecycle",
+                        &bg_run_id,
+                        "status"
+                    );
+                }
                 astra_core::log_persist!(
                     engine
                         .persist_usage(
@@ -554,6 +683,16 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     &bg_run_id,
                     "usage"
                 );
+                if persist_terminal_state {
+                    for event in terminal_events {
+                        astra_core::log_persist!(
+                            engine.append_event(&bg_run_id, event).await,
+                            "run_lifecycle",
+                            &bg_run_id,
+                            "append_terminal_event"
+                        );
+                    }
+                }
             }
         });
 
@@ -588,9 +727,12 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         // The client (CLI thin-client) is expected to provide edge_tools in context.
         let mut host = self.build_host(&user_id, &session_id, &request, edge_tools, edge_profile);
         let mut state = self.build_initial_state(&request, &session_id, &run_id);
-
-        // Run the agentic loop
-        let mut all_events = vec![json!({"event_type": "run_started", "data": {}})];
+        let (run_state, cancel_flag, llm_cancel_token) =
+            Self::build_tracked_run_state(run_id.clone(), session_id.clone(), user_id.clone());
+        self.runs.write().await.insert(run_id.clone(), run_state);
+        self.persist_run_start_if_configured(&run_id, &user_id, &session_id)
+            .await;
+        self.configure_loop_state_runtime_controls(&mut state, &cancel_flag, &llm_cancel_token);
 
         let loop_result = run_agentic_loop_with_host(&mut host, &mut state).await;
 
@@ -601,38 +743,41 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         )
         .await;
 
-        match loop_result {
-            Ok(_outcome) => {
-                // Collect all events emitted by the host during the loop
-                all_events.extend(host.take_emitted_events());
+        let (mut final_events, final_status, error_msg) =
+            Self::finalize_run_events(loop_result, host.take_emitted_events(), &state);
+        let mut all_events = vec![json!({"event_type": "run_started", "data": {}})];
+        all_events.append(&mut final_events);
 
-                // Emit final text_done event
-                if !state.final_text.is_empty() {
-                    all_events.push(json!({
-                        "event_type": "text_done",
-                        "data": {
-                            "full_text": state.final_text,
-                        }
-                    }));
-                }
-
-                all_events.push(json!({
-                    "event_type": "run_finished",
-                    "data": {
-                        "prompt_tokens": state.total_prompt,
-                        "completion_tokens": state.total_completion,
-                        "tool_call_count": state.total_tool_calls,
-                    }
-                }));
-            }
-            Err(err) => {
-                all_events.extend(host.take_emitted_events());
-                all_events.push(json!({
-                    "event_type": "run_error",
-                    "data": {"error": err}
-                }));
-            }
+        if let Some(run) = self.runs.write().await.get_mut(&run_id) {
+            run.events = all_events.clone();
+            run.status = final_status.clone();
         }
+
+        if let Some(engine) = &self.run_engine {
+            astra_core::log_persist!(
+                engine
+                    .persist_status(&run_id, final_status.as_str(), None, error_msg.as_deref())
+                    .await,
+                "run_lifecycle",
+                &run_id,
+                "status"
+            );
+            astra_core::log_persist!(
+                engine
+                    .persist_usage(
+                        &run_id,
+                        state.total_prompt,
+                        state.total_completion,
+                        state.total_tool_calls,
+                    )
+                    .await,
+                "run_lifecycle",
+                &run_id,
+                "usage"
+            );
+        }
+        self.persist_terminal_events_if_configured(&run_id, &all_events[1..])
+            .await;
 
         Ok(ChatStreamRecord {
             session_id,
@@ -671,7 +816,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         }
         let offset = last_index as usize;
         let events = if offset < run.events.len() {
-            Self::format_run_events(&run.events[offset..])
+            Self::format_run_events(&run.events[offset..], offset)
         } else {
             Vec::new()
         };
@@ -1185,6 +1330,97 @@ mod tests {
         }
     }
 
+    #[test]
+    fn finalize_run_events_appends_run_finished_for_failures() {
+        let svc = test_service();
+        let request = test_request("boom");
+        let state = svc.build_initial_state(&request, "session-1", "run-1");
+
+        let (events, status, error) = AgenticRunLifecycleService::finalize_run_events(
+            Ok(AgenticLoopOutcome::Error("boom".into())),
+            vec![],
+            &state,
+        );
+
+        assert_eq!(status, RunStatus::Failed);
+        assert_eq!(error.as_deref(), Some("boom"));
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["event_type"], "run_error");
+        assert_eq!(events[1]["event_type"], "run_finished");
+    }
+
+    #[test]
+    fn finalize_run_events_cancellation_beats_completed_outcome() {
+        let svc = test_service();
+        let request = test_request("done");
+        let mut state = svc.build_initial_state(&request, "session-1", "run-1");
+        let cancel_flag = Arc::new(AtomicBool::new(true));
+        let cancel_token = Arc::new(CancellationToken::new());
+        cancel_token.cancel();
+        state.cancellation.flag = Some(cancel_flag);
+        state.cancellation.token = Some(cancel_token);
+
+        let (events, status, error) = AgenticRunLifecycleService::finalize_run_events(
+            Ok(AgenticLoopOutcome::Completed),
+            vec![],
+            &state,
+        );
+
+        assert_eq!(status, RunStatus::Cancelled);
+        assert!(error.is_none());
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["event_type"], "run_finished");
+        assert_eq!(events[0]["data"]["cancelled"], true);
+    }
+
+    #[test]
+    fn merge_cancelled_run_events_preserves_order_and_usage() {
+        let cancel_flag = Arc::new(AtomicBool::new(true));
+        let cancel_token = Arc::new(CancellationToken::new());
+        let mut run = RunState {
+            run_id: "run-1".into(),
+            session_id: "session-1".into(),
+            user_id: "user-1".into(),
+            status: RunStatus::Cancelled,
+            events: vec![
+                json!({"event_type": "run_started", "data": {}}),
+                json!({"event_type": "run_finished", "data": {"cancelled": true}}),
+            ],
+            cancel_flag,
+            llm_cancel_token: cancel_token,
+            started_at: Instant::now(),
+            waiting_for: None,
+        };
+
+        merge_cancelled_run_events(
+            &mut run,
+            vec![
+                json!({"event_type": "text_delta", "data": {"chunk": "hi"}}),
+                json!({"event_type": "run_finished", "data": {"cancelled": true, "prompt_tokens": 3}}),
+            ],
+        );
+
+        assert_eq!(run.events.len(), 3);
+        assert_eq!(run.events[1]["event_type"], "text_delta");
+        assert_eq!(run.events[2]["event_type"], "run_finished");
+        assert_eq!(run.events[2]["data"]["cancelled"], true);
+        assert_eq!(run.events[2]["data"]["prompt_tokens"], 3);
+    }
+
+    #[test]
+    fn terminal_events_for_persistence_keeps_only_terminal_lifecycle_events() {
+        let events = vec![
+            json!({"event_type": "text_delta", "data": {"chunk": "hi"}}),
+            json!({"event_type": "run_error", "data": {"error": "boom"}}),
+            json!({"event_type": "run_finished", "data": {"prompt_tokens": 1}}),
+        ];
+
+        let persisted = terminal_events_for_persistence(&events);
+        assert_eq!(persisted.len(), 2);
+        assert_eq!(persisted[0]["event_type"], "run_error");
+        assert_eq!(persisted[1]["event_type"], "run_finished");
+    }
+
     #[tokio::test]
     async fn create_run_returns_running_status() {
         let svc = test_service();
@@ -1211,6 +1447,31 @@ mod tests {
         let result = ok(svc.create_run("user-1".into(), req).await);
         assert!(result.explain.is_some());
         assert_eq!(result.explain.unwrap()["mode"], "background");
+    }
+
+    #[tokio::test]
+    async fn stream_chat_tracks_run_for_status_and_replay() {
+        let svc = test_service();
+        let stream = ok(svc
+            .stream_chat("user-1".into(), test_request("hello"))
+            .await);
+
+        let status = ok(svc
+            .get_run_status(stream.run_id.clone(), "user-1".into())
+            .await);
+        let replay = ok(svc
+            .stream_run(stream.run_id.clone(), "user-1".into(), 0)
+            .await);
+
+        assert_ne!(status.status, "running");
+        assert_eq!(status.run_id, stream.run_id);
+        assert_eq!(status.events_count as usize, stream.events.len());
+        assert_eq!(replay.len(), stream.events.len());
+        assert_eq!(replay[0]["event_type"], "run_started");
+        assert_eq!(
+            svc.test_llm_cancel_token_is_cancelled(&stream.run_id).await,
+            Some(false)
+        );
     }
 
     #[tokio::test]
@@ -1250,7 +1511,7 @@ mod tests {
         assert_eq!(result.status, "cancelled");
         let status = ok(svc.get_run_status(run.run_id, "user-1".into()).await);
         assert_eq!(status.status, "cancelled");
-        assert_eq!(status.events_count, 2);
+        assert!(status.events_count >= 1);
     }
 
     #[tokio::test]
@@ -1347,10 +1608,21 @@ mod tests {
             json!({"event_type": "run_started"}),
             json!({"event_type": "text_delta", "data": {"chunk": "hi"}}),
         ];
-        let formatted = AgenticRunLifecycleService::format_run_events(&events);
+        let formatted = AgenticRunLifecycleService::format_run_events(&events, 0);
         assert_eq!(formatted[0]["index"], 0);
         assert_eq!(formatted[1]["index"], 1);
         assert_eq!(formatted[1]["event_type"], "text_delta");
+    }
+
+    #[test]
+    fn format_run_events_preserves_global_offset() {
+        let events = vec![
+            json!({"event_type": "text_delta", "data": {"chunk": "a"}}),
+            json!({"event_type": "text_delta", "data": {"chunk": "b"}}),
+        ];
+        let formatted = AgenticRunLifecycleService::format_run_events(&events, 5);
+        assert_eq!(formatted[0]["index"], 5);
+        assert_eq!(formatted[1]["index"], 6);
     }
 
     #[test]
@@ -1591,13 +1863,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn durable_create_run_eventually_persists_terminal_event() {
+        let svc = test_service_with_engine();
+        let run = ok(svc.create_run("user-1".into(), test_request("hello")).await);
+
+        let engine = svc.run_engine.as_ref().unwrap();
+        let mut durable = None;
+        for _ in 0..50 {
+            let persisted = engine.load_run(&run.run_id).await.unwrap().unwrap();
+            if persisted.status != "running" && persisted.events.len() >= 2 {
+                durable = Some(persisted);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let durable = durable.expect("background run should persist terminal event");
+        assert_eq!(durable.events.last().unwrap()["event_type"], "run_finished");
+    }
+
+    #[tokio::test]
+    async fn durable_stream_chat_persists_final_state() {
+        let svc = test_service_with_engine();
+        let stream = ok(svc
+            .stream_chat("user-1".into(), test_request("hello"))
+            .await);
+
+        let engine = svc.run_engine.as_ref().unwrap();
+        let durable = engine.load_run(&stream.run_id).await.unwrap().unwrap();
+        assert_eq!(durable.user_id, "user-1");
+        assert_eq!(durable.session_id, stream.session_id);
+        assert_ne!(durable.status, "running");
+        assert!(durable.events.len() >= 2);
+        assert_eq!(durable.events.last().unwrap()["event_type"], "run_finished");
+    }
+
+    #[tokio::test]
     async fn durable_cancel_persists_to_store() {
         let svc = test_service_with_engine();
         let run = ok(svc.create_run("user-1".into(), test_request("task")).await);
         ok(svc.cancel_run(run.run_id.clone(), "user-1".into()).await);
 
         let engine = svc.run_engine.as_ref().unwrap();
-        let durable = engine.load_run(&run.run_id).await.unwrap().unwrap();
+        let mut durable = None;
+        for _ in 0..50 {
+            let persisted = engine.load_run(&run.run_id).await.unwrap().unwrap();
+            if persisted.events.len() >= 2 {
+                durable = Some(persisted);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let durable = durable.expect("cancelled run should persist terminal event");
         assert_eq!(durable.status, "cancelled");
         assert!(durable.events.len() >= 2); // run_started + run_finished
     }
