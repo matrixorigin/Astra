@@ -37,6 +37,10 @@ use super::stream_render::{EdgeSseContext, consume_turn_sse};
 
 const SUBRUN_MAX_TURNS: usize = 25;
 
+/// Cumulative token budget for skill subruns.
+/// Caps total (prompt + completion) across all rounds to prevent runaway cost.
+const SUBRUN_MAX_CUMULATIVE_TOKENS: u64 = 120_000;
+
 // ─── SubRunHost ──────────────────────────────────────────────────────────────
 
 /// Minimal agentic loop host for fork sub-runs.
@@ -503,6 +507,7 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             consecutive_context_window_errors: 0,
             max_turn_input_tokens: astra_core::RuntimeLimits::global().max_turn_input_tokens,
             budget_wrapup_injected: false,
+            max_cumulative_tokens: SUBRUN_MAX_CUMULATIVE_TOKENS,
             thinking_budget_tokens: None,
             recent_file_reads: Vec::new(),
             permission_context: None,

@@ -437,6 +437,12 @@ pub struct AgenticLoopState {
     /// The loop allows exactly one more LLM iteration after injection.
     pub budget_wrapup_injected: bool,
 
+    // ── Cumulative token budget ──
+    /// Maximum cumulative (prompt + completion) tokens across all rounds.
+    /// 0 = unlimited (default for interactive sessions).
+    /// Skill subruns set this to cap total cost.
+    pub max_cumulative_tokens: u64,
+
     // ── Thinking budget ──
     /// Optional thinking/reasoning budget in tokens for models with extended thinking.
     /// When Some, passed to the API request so the server constrains thinking output.
@@ -3274,6 +3280,33 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
             }
         }
 
+        // ─── Cumulative token budget check ─────────────────────────────
+        // Skill subruns set max_cumulative_tokens to cap total cost.
+        // When exceeded, inject wrap-up (same pattern as per-turn budget).
+        if state.max_cumulative_tokens > 0 {
+            let cumulative = state.total_prompt + state.total_completion;
+            if cumulative > state.max_cumulative_tokens && !state.budget_wrapup_injected {
+                state.budget_wrapup_injected = true;
+                if !quiet {
+                    host.emit_headless_line(
+                        HeadlessStderrStyle::Yellow,
+                        format!(
+                            "⚠ Cumulative token budget reached ({cumulative}/{} tokens) — wrapping up.",
+                            state.max_cumulative_tokens,
+                        ),
+                    );
+                }
+                state.messages.push(serde_json::json!({
+                    "role": "system",
+                    "content": "You have reached the cumulative token budget. \
+                        Do NOT call any more tools. Summarize your progress so far and \
+                        present your results to the user."
+                }));
+                try_write_heavy_checkpoint(state);
+                continue;
+            }
+        }
+
         // ─── Observability: tool selection hook ──────────────────────────
         // Record which tools the LLM chose for this turn (before execution).
         if let Some(session) = &state.telemetry.observability_session {
@@ -4632,6 +4665,7 @@ mod tests {
             consecutive_context_window_errors: 0,
             max_turn_input_tokens: 0,
             budget_wrapup_injected: false,
+            max_cumulative_tokens: 0,
             thinking_budget_tokens: None,
             recent_file_reads: Vec::new(),
             permission_context: None,
