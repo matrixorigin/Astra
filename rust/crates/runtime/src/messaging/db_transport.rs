@@ -470,8 +470,23 @@ impl MessageTransport for DatabaseTransport {
     }
 
     async fn shutdown(&self) -> Result<(), MailboxError> {
+        let consumer_ids: Vec<String> = self
+            .registrations
+            .read()
+            .await
+            .keys()
+            .map(|addr| format!("{}@{}", addr.agent_id, addr.run_id))
+            .collect();
         // Signal all poll tasks to stop.
         let _ = self.shutdown_tx.send(true);
+        for consumer_id in consumer_ids {
+            release_claimed_for_consumer_in_pool(
+                &self.pool,
+                &consumer_id,
+                self.max_delivery_attempts,
+            )
+            .await?;
+        }
         Ok(())
     }
 }

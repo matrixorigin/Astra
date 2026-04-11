@@ -1064,6 +1064,103 @@ mod tests {
         cleanup(&pool).await;
     }
 
+    #[tokio::test]
+    async fn shutdown_releases_claimed_rows_immediately() {
+        skip_without_db!(pool);
+
+        let transport = DatabaseTransport::new(pool.clone())
+            .with_poll_interval(Duration::from_millis(50))
+            .with_max_delivery_attempts(2);
+
+        let sender = addr("run-db-shutdown-release-a", "alice");
+        let receiver = addr("run-db-shutdown-release-b", "bob");
+        let consumer_id = format!("{}@{}", receiver.agent_id, receiver.run_id);
+
+        transport.register(sender.clone(), None).await.unwrap();
+        transport.register(receiver.clone(), None).await.unwrap();
+
+        let retryable = Arc::new(AgentMessage::new(
+            sender.clone(),
+            MessageTarget::Direct {
+                address: receiver.clone(),
+            },
+            MessagePayload::Text {
+                content: "requeue on shutdown".into(),
+                summary: None,
+            },
+        ));
+        let exhausted = Arc::new(AgentMessage::new(
+            sender.clone(),
+            MessageTarget::Direct {
+                address: receiver.clone(),
+            },
+            MessagePayload::Text {
+                content: "dead-letter on shutdown".into(),
+                summary: None,
+            },
+        ));
+        transport.send(retryable.clone()).await.unwrap();
+        transport.send(exhausted.clone()).await.unwrap();
+
+        let claimed_at_ms = chrono::Utc::now().timestamp_millis();
+        sqlx::query(
+            "UPDATE agent_message_queue
+             SET status = 'claimed', claimed_by = ?, claimed_at_ms = ?, attempt_count = 1
+             WHERE message_id = ?",
+        )
+        .bind(&consumer_id)
+        .bind(claimed_at_ms)
+        .bind(&retryable.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE agent_message_queue
+             SET status = 'claimed', claimed_by = ?, claimed_at_ms = ?, attempt_count = 2
+             WHERE message_id = ?",
+        )
+        .bind(&consumer_id)
+        .bind(claimed_at_ms)
+        .bind(&exhausted.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        transport.shutdown().await.unwrap();
+
+        let rows = sqlx::query(
+            "SELECT message_id, status, claimed_by, claimed_at_ms
+             FROM agent_message_queue
+             WHERE message_id IN (?, ?)",
+        )
+        .bind(&retryable.id)
+        .bind(&exhausted.id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+
+        let mut by_id = std::collections::HashMap::new();
+        for row in rows {
+            let message_id: String = row.try_get("message_id").unwrap();
+            let status: String = row.try_get("status").unwrap();
+            let claimed_by: Option<String> = row.try_get("claimed_by").unwrap();
+            let claimed_at_ms: Option<i64> = row.try_get("claimed_at_ms").unwrap();
+            by_id.insert(message_id, (status, claimed_by, claimed_at_ms));
+        }
+
+        let retryable_state = by_id.get(&retryable.id).expect("retryable message row");
+        assert_eq!(retryable_state.0, "pending");
+        assert!(retryable_state.1.is_none());
+        assert!(retryable_state.2.is_none());
+
+        let exhausted_state = by_id.get(&exhausted.id).expect("exhausted message row");
+        assert_eq!(exhausted_state.0, "failed");
+        assert!(exhausted_state.1.is_none());
+        assert!(exhausted_state.2.is_none());
+
+        cleanup(&pool).await;
+    }
+
     // ── Subscribe requires registration ─────────────────────────────────────
 
     #[tokio::test]
