@@ -59,6 +59,10 @@ pub struct RuntimeConfig {
     /// Adaptive context-window / token-burn management.
     #[serde(default)]
     pub context_window: ContextWindowConfig,
+
+    /// Adaptive tuning engine parameters (cooldowns, cycle intervals).
+    #[serde(default)]
+    pub adaptive_tuning: AdaptiveTuningConfig,
 }
 
 fn default_config_version() -> String {
@@ -78,6 +82,7 @@ impl Default for RuntimeConfig {
             verification: VerificationConfig::default(),
             memory_pressure: MemoryPressureConfig::default(),
             context_window: ContextWindowConfig::default(),
+            adaptive_tuning: AdaptiveTuningConfig::default(),
         }
     }
 }
@@ -633,6 +638,44 @@ impl Default for ContextWindowConfig {
     }
 }
 
+// ─── Adaptive Tuning Configuration ──────────────────────────────────────────
+
+/// Parameters controlling the adaptive tuning engine's timing and dampening.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AdaptiveTuningConfig {
+    /// Minimum turns between scenario changes (anti-flap).
+    #[serde(default = "default_scenario_cooldown_turns")]
+    pub scenario_cooldown_turns: u32,
+
+    /// Minimum turns between token-budget direction reversals (anti-oscillation).
+    #[serde(default = "default_budget_cooldown_turns")]
+    pub budget_cooldown_turns: u32,
+
+    /// Number of completed turns between tuning cycle evaluations.
+    #[serde(default = "default_tuning_cycle_interval")]
+    pub tuning_cycle_interval: u32,
+}
+
+fn default_scenario_cooldown_turns() -> u32 {
+    5
+}
+fn default_budget_cooldown_turns() -> u32 {
+    3
+}
+fn default_tuning_cycle_interval() -> u32 {
+    5
+}
+
+impl Default for AdaptiveTuningConfig {
+    fn default() -> Self {
+        Self {
+            scenario_cooldown_turns: default_scenario_cooldown_turns(),
+            budget_cooldown_turns: default_budget_cooldown_turns(),
+            tuning_cycle_interval: default_tuning_cycle_interval(),
+        }
+    }
+}
+
 fn merge_if_non_default<T: PartialEq>(slot: &mut T, incoming: T, default: T) {
     if incoming != default {
         *slot = incoming;
@@ -695,6 +738,7 @@ impl RuntimeConfig {
             verification,
             memory_pressure,
             context_window,
+            adaptive_tuning,
         } = other;
 
         merge_if_non_default(&mut self.version, version, default_config_version());
@@ -1022,6 +1066,28 @@ impl RuntimeConfig {
             default_error_recovery_reserve(),
         );
 
+        // ── Adaptive Tuning ──
+        let AdaptiveTuningConfig {
+            scenario_cooldown_turns,
+            budget_cooldown_turns,
+            tuning_cycle_interval,
+        } = adaptive_tuning;
+        merge_if_non_default(
+            &mut self.adaptive_tuning.scenario_cooldown_turns,
+            scenario_cooldown_turns,
+            default_scenario_cooldown_turns(),
+        );
+        merge_if_non_default(
+            &mut self.adaptive_tuning.budget_cooldown_turns,
+            budget_cooldown_turns,
+            default_budget_cooldown_turns(),
+        );
+        merge_if_non_default(
+            &mut self.adaptive_tuning.tuning_cycle_interval,
+            tuning_cycle_interval,
+            default_tuning_cycle_interval(),
+        );
+
         self
     }
 
@@ -1221,6 +1287,11 @@ mod tests {
                 remaining_turn_factor: 0.5,
                 error_recovery_reserve: 12000,
             },
+            adaptive_tuning: AdaptiveTuningConfig {
+                scenario_cooldown_turns: 10,
+                budget_cooldown_turns: 6,
+                tuning_cycle_interval: 8,
+            },
         });
 
         assert_eq!(merged.version, "2.0");
@@ -1284,5 +1355,10 @@ mod tests {
         assert!((merged.context_window.compression_threshold_max - 0.98).abs() < 0.001);
         assert!((merged.context_window.remaining_turn_factor - 0.5).abs() < 0.001);
         assert_eq!(merged.context_window.error_recovery_reserve, 12000);
+
+        // Adaptive tuning
+        assert_eq!(merged.adaptive_tuning.scenario_cooldown_turns, 10);
+        assert_eq!(merged.adaptive_tuning.budget_cooldown_turns, 6);
+        assert_eq!(merged.adaptive_tuning.tuning_cycle_interval, 8);
     }
 }

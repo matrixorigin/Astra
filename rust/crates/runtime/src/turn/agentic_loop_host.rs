@@ -575,13 +575,13 @@ fn apply_adaptive_execution_profile(state: &mut AgenticLoopState) {
     );
 
     // ── Anti-flap: scenario change cooldown ──
-    // Suppress scenario changes within SCENARIO_COOLDOWN_TURNS of the last change
+    // Suppress scenario changes within cooldown period of the last change
     // to prevent rapid oscillation between scenarios.
-    const SCENARIO_COOLDOWN_TURNS: u32 = 5;
+    let scenario_cooldown = session_guard.config.adaptive_tuning.scenario_cooldown_turns;
     let scenario_suppressed = if profile.scenario != old_scenario && profile.scenario.is_some() {
         if let Some(last_change) = session_guard.last_scenario_change_turn {
             let turns_since = session_guard.turn_number.saturating_sub(last_change);
-            if turns_since < SCENARIO_COOLDOWN_TURNS {
+            if turns_since < scenario_cooldown {
                 // Revert to old scenario and config
                 profile.scenario = old_scenario;
                 profile.config = old_config.clone();
@@ -752,7 +752,7 @@ fn apply_per_turn_adaptation(state: &mut AgenticLoopState, turn_tokens_used: u64
 
     // ── 1. Dynamic token budget ──
     // Anti-flap: detect direction oscillation and suppress rapid reversals.
-    const BUDGET_COOLDOWN_TURNS: u32 = 3;
+    let budget_cooldown = config.adaptive_tuning.budget_cooldown_turns;
     if config.context_window.adaptive && turn_tokens_used > 0 {
         let max_budget = config.token_budget.max_turn_input_tokens;
         let threshold = (max_budget as f64 * 0.85) as u64;
@@ -761,7 +761,7 @@ fn apply_per_turn_adaptation(state: &mut AgenticLoopState, turn_tokens_used: u64
             // it happened recently, skip this decrease to prevent ping-pong.
             let oscillation_suppressed = if prev_budget_direction > 0 {
                 if let Some(last_turn) = prev_budget_change_turn {
-                    turn.saturating_sub(last_turn) < BUDGET_COOLDOWN_TURNS
+                    turn.saturating_sub(last_turn) < budget_cooldown
                 } else {
                     false
                 }
@@ -1600,7 +1600,8 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
 }
 
 /// How often (in turns) to run the auto-tuning evaluation cycle.
-const TUNING_CYCLE_INTERVAL: u32 = 5;
+/// Falls back to this constant when session config is unavailable.
+const DEFAULT_TUNING_CYCLE_INTERVAL: u32 = 5;
 
 /// Record feedback signals based on the loop's outcome and accumulated state.
 ///
@@ -1753,10 +1754,20 @@ fn record_loop_completion_feedback(
     }
 }
 ///
-/// Every `TUNING_CYCLE_INTERVAL` turns, evaluates all registered evolution rules
-/// and applies any triggered actions to the session's RuntimeConfig.
+/// Every N turns (configured via `adaptive_tuning.tuning_cycle_interval`),
+/// evaluates all registered evolution rules and applies any triggered actions
+/// to the session's RuntimeConfig.
 fn maybe_run_tuning_cycle(state: &mut AgenticLoopState) {
-    if state.telemetry.completed_turns_for_tuning < TUNING_CYCLE_INTERVAL {
+    // Read the interval from session config if available, else use default.
+    let interval = state
+        .telemetry
+        .observability_session
+        .as_ref()
+        .and_then(|s| s.read().ok())
+        .map(|g| g.config.adaptive_tuning.tuning_cycle_interval)
+        .unwrap_or(DEFAULT_TUNING_CYCLE_INTERVAL);
+
+    if state.telemetry.completed_turns_for_tuning < interval {
         return;
     }
     state.telemetry.completed_turns_for_tuning = 0;
@@ -7296,11 +7307,11 @@ print(json.dumps({'context': 'user said: ' + msg}))
         }
 
         // Below interval — should NOT trigger.
-        state.telemetry.completed_turns_for_tuning = TUNING_CYCLE_INTERVAL - 1;
+        state.telemetry.completed_turns_for_tuning = DEFAULT_TUNING_CYCLE_INTERVAL - 1;
         maybe_run_tuning_cycle(&mut state);
         assert_eq!(
             state.telemetry.completed_turns_for_tuning,
-            TUNING_CYCLE_INTERVAL - 1,
+            DEFAULT_TUNING_CYCLE_INTERVAL - 1,
             "counter should not reset below interval"
         );
         assert!(
@@ -7309,7 +7320,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
         );
 
         // At interval — SHOULD trigger.
-        state.telemetry.completed_turns_for_tuning = TUNING_CYCLE_INTERVAL;
+        state.telemetry.completed_turns_for_tuning = DEFAULT_TUNING_CYCLE_INTERVAL;
         maybe_run_tuning_cycle(&mut state);
         assert_eq!(
             state.telemetry.completed_turns_for_tuning, 0,
@@ -7326,7 +7337,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
         let hub = make_hub();
         let mut state = make_state();
         state.telemetry.observability_hub = Some(hub.clone());
-        state.telemetry.completed_turns_for_tuning = TUNING_CYCLE_INTERVAL;
+        state.telemetry.completed_turns_for_tuning = DEFAULT_TUNING_CYCLE_INTERVAL;
         maybe_run_tuning_cycle(&mut state);
         // Counter is reset (passes threshold check) but no cycle runs (no session).
         assert_eq!(state.telemetry.completed_turns_for_tuning, 0);
@@ -7403,7 +7414,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
         let mut state = make_state();
         state.telemetry.observability_hub = Some(hub.clone());
         state.telemetry.observability_session = Some(session);
-        state.telemetry.completed_turns_for_tuning = TUNING_CYCLE_INTERVAL;
+        state.telemetry.completed_turns_for_tuning = DEFAULT_TUNING_CYCLE_INTERVAL;
         state.current_session_id = Some("test-session-promote".to_string());
 
         let mut experiment = crate::ab_testing::Experiment::new("exp-mature")
@@ -7467,7 +7478,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
         let mut state = make_state();
         state.telemetry.observability_hub = Some(hub.clone());
         state.telemetry.observability_session = Some(session);
-        state.telemetry.completed_turns_for_tuning = TUNING_CYCLE_INTERVAL;
+        state.telemetry.completed_turns_for_tuning = DEFAULT_TUNING_CYCLE_INTERVAL;
 
         let pattern_library = std::sync::Arc::new(std::sync::Mutex::new(
             crate::pipeline::pattern::PatternLibrary::default(),
@@ -7952,7 +7963,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
         let mut state = make_state();
         state.telemetry.observability_hub = Some(hub.clone());
         state.telemetry.observability_session = Some(session.clone());
-        state.telemetry.completed_turns_for_tuning = TUNING_CYCLE_INTERVAL;
+        state.telemetry.completed_turns_for_tuning = DEFAULT_TUNING_CYCLE_INTERVAL;
 
         // Set a low budget so tuning might increase it
         {
@@ -8148,7 +8159,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
             ));
 
         // Step 1: Fire tuning cycle — should increase budget
-        state.telemetry.completed_turns_for_tuning = TUNING_CYCLE_INTERVAL;
+        state.telemetry.completed_turns_for_tuning = DEFAULT_TUNING_CYCLE_INTERVAL;
         maybe_run_tuning_cycle(&mut state);
 
         let budget_after_tuning = {
@@ -8239,7 +8250,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
             }
         }
 
-        // With SCENARIO_COOLDOWN_TURNS=5, max possible changes in 100 turns is ~20
+        // With scenario_cooldown_turns=5 (default), max possible changes in 100 turns is ~20
         // (initial detection + one change per 5 turns).
         assert!(
             scenario_changes <= 25,
@@ -8546,7 +8557,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
             let mut guard = session.write().unwrap();
             guard.turn_number = 10;
         }
-        state.telemetry.completed_turns_for_tuning = TUNING_CYCLE_INTERVAL;
+        state.telemetry.completed_turns_for_tuning = DEFAULT_TUNING_CYCLE_INTERVAL;
 
         let config_before = {
             let guard = session.read().unwrap();
