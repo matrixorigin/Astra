@@ -115,6 +115,10 @@ pub(crate) async fn stream_chat_sse(
             ex
         }
     };
+    // Wire observability session for context_analysis tool
+    if let Some(ref obs) = p.observability_session {
+        executor.observability_session = Some(obs.clone());
+    }
     let root_send_message_context = p.agent_spawner.as_ref().map(|spawner| {
         edge_tools::agent_messaging::SendMessageRuntimeContext {
             agent_id: root_agent_id.to_string(),

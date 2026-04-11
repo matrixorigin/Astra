@@ -857,6 +857,36 @@ pub fn all_tool_schemas() -> Vec<Value> {
         json!({
             "type": "function",
             "function": {
+                "name": "context_analysis",
+                "description": "Deep analysis of context window composition, token allocation, and budget pressure. Modes: 'turn' — hierarchical breakdown of a single turn (system prompt sub-components, history, memory, tools with proportional percentages). 'session' — multi-turn aggregation with trends, compression events, peak/average stats. 'compare' — side-by-side delta between two turns.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "mode": {
+                            "type": "string",
+                            "enum": ["turn", "session", "compare"],
+                            "description": "Analysis mode. 'turn': single-turn deep breakdown. 'session': multi-turn trends. 'compare': diff two turns."
+                        },
+                        "turn": {
+                            "type": "integer",
+                            "description": "Turn number (1-based, -1 for latest). Used with mode='turn'."
+                        },
+                        "turn_a": {
+                            "type": "integer",
+                            "description": "First turn for comparison (1-based). Used with mode='compare'."
+                        },
+                        "turn_b": {
+                            "type": "integer",
+                            "description": "Second turn for comparison (1-based, -1 for latest). Used with mode='compare'."
+                        }
+                    },
+                    "required": []
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
                 "name": "run_chain",
                 "description": "Execute a multi-step tool chain. Each step runs a tool and passes its output to the next step via variable substitution ($prev for previous output, $step.{key} for named step output, $input.{key} for original input). Stops on first error. Use for complex multi-tool workflows like: find files → read contents → analyze.",
                 "parameters": {

@@ -99,6 +99,8 @@ pub(crate) mod memoria;
 use memoria::parse_memory_search_contents;
 #[path = "edge_tools/ask_user.rs"]
 mod ask_user;
+#[path = "edge_tools/context_analysis.rs"]
+mod context_analysis;
 #[path = "edge_tools/mcp_dispatch.rs"]
 mod mcp_dispatch;
 #[path = "edge_tools/tool_search.rs"]
@@ -359,6 +361,14 @@ pub struct ToolExecutor {
     pub agent_id: Option<String>,
     /// Optional messaging context for the `send_message` tool.
     pub send_message_context: Option<agent_messaging::SendMessageRuntimeContext>,
+    /// Optional observability session for context analysis tools.
+    /// Provides access to per-turn context assembly traces, timing data,
+    /// drift detection, and decision explanations.
+    pub observability_session: Option<
+        std::sync::Arc<
+            std::sync::RwLock<astra_runtime::observability_integration::ObservabilitySession>,
+        >,
+    >,
 }
 
 impl ToolExecutor {
@@ -401,6 +411,7 @@ impl ToolExecutor {
             context_cache: None,
             agent_id: None,
             send_message_context: None,
+            observability_session: None,
         }
     }
 
@@ -427,6 +438,17 @@ impl ToolExecutor {
         ctx: Option<agent_messaging::SendMessageRuntimeContext>,
     ) {
         self.send_message_context = ctx;
+    }
+
+    /// Set the observability session for context analysis tools.
+    pub fn with_observability_session(
+        mut self,
+        session: std::sync::Arc<
+            std::sync::RwLock<astra_runtime::observability_integration::ObservabilitySession>,
+        >,
+    ) -> Self {
+        self.observability_session = Some(session);
+        self
     }
 
     /// Use a shared file edit journal (session-scoped) instead of the default.
@@ -810,6 +832,7 @@ impl ToolExecutor {
             "notebook_edit" => self.notebook_edit(args),
             "config" => self.config_tool(args),
             "brief" => self.brief(args),
+            "context_analysis" => self.context_analysis(args),
             _ if name.starts_with("mcp_") => self.execute_mcp_tool(name, args).await,
             _ => format!(
                 "Unknown tool: {name}. Available tools: bash, read_file, write_file, str_replace, \
@@ -817,7 +840,7 @@ impl ToolExecutor {
                  git_diff, git_log, git_show, git_blame, call_graph, run_build_test, web_fetch, \
                  mo_query, memory_search, memory_profile, ask_user, task_create, task_list, \
                  task_get, task_update, task_stop, sleep, tool_search, web_search, send_message, \
-                 spawn_agent, share_context, query_context, \
+                 spawn_agent, share_context, query_context, context_analysis, \
                  diagnose, lsp, env, notebook_edit, config, powershell, brief"
             ),
         };
@@ -1012,6 +1035,7 @@ mod tests {
     mod code_intel_integration_tests;
     mod code_intel_tests;
     mod config_tests;
+    mod context_analysis_tests;
     mod cross_file_caller_tests;
     mod diagnose_tests;
     mod env_tests;
