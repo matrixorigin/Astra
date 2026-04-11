@@ -206,7 +206,9 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
                 astra_runtime::semantic_dedup::DEFAULT_SIMILARITY_THRESHOLD,
             ),
             call_counts: HashMap::new(),
-            max_identical_tool_calls: astra_runtime::runtime_config::RuntimeConfig::load().tool_selection.effective_max_identical_calls(),
+            max_identical_tool_calls: astra_runtime::runtime_config::RuntimeConfig::load()
+                .tool_selection
+                .effective_max_identical_calls(),
             stall: Default::default(),
             telemetry: Default::default(),
             skills: SkillState {

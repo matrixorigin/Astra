@@ -1225,7 +1225,9 @@ mod tests {
             idempotency_cache: InMemoryIdempotencyCache::new(),
             semantic_dedup: SemanticDedup::new(0.75),
             call_counts: HashMap::new(),
-            max_identical_tool_calls: crate::runtime_config::RuntimeConfig::load().tool_selection.effective_max_identical_calls(),
+            max_identical_tool_calls: crate::runtime_config::RuntimeConfig::load()
+                .tool_selection
+                .effective_max_identical_calls(),
             stall: Default::default(),
             telemetry: Default::default(),
             skills: Default::default(),

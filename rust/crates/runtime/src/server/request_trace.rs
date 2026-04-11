@@ -25,9 +25,8 @@ pub struct RequestTrace {
 fn is_safe_request_id_token(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= MAX_REQUEST_ID_LEN
-        && s.chars().all(|c| {
-            c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')
-        })
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
 /// Resolve the effective request id: honor a safe client header, otherwise generate.
@@ -186,9 +185,9 @@ pub async fn request_trace_middleware(mut req: Request, next: Next) -> Response 
 mod tests {
     use super::*;
     use axum::Json;
+    use axum::Router;
     use axum::http::StatusCode;
     use axum::routing::get;
-    use axum::Router;
     use tower::ServiceExt;
 
     fn test_app() -> Router {
@@ -208,10 +207,7 @@ mod tests {
     #[tokio::test]
     async fn injects_request_id_into_json_error_body() {
         let app = test_app();
-        let req = Request::builder()
-            .uri("/err")
-            .body(Body::empty())
-            .unwrap();
+        let req = Request::builder().uri("/err").body(Body::empty()).unwrap();
         let res = app.oneshot(req).await.unwrap();
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
         let hdr = res
@@ -235,18 +231,12 @@ mod tests {
                 get(|| async {
                     (
                         StatusCode::BAD_REQUEST,
-                        Json(
-                            astra_core::ErrorResponse::new("bad")
-                                .with_request_id("client-rid-1"),
-                        ),
+                        Json(astra_core::ErrorResponse::new("bad").with_request_id("client-rid-1")),
                     )
                 }),
             )
             .layer(axum::middleware::from_fn(request_trace_middleware));
-        let req = Request::builder()
-            .uri("/err")
-            .body(Body::empty())
-            .unwrap();
+        let req = Request::builder().uri("/err").body(Body::empty()).unwrap();
         let res = app.oneshot(req).await.unwrap();
         let bytes = res.into_body().collect().await.unwrap().to_bytes();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -289,10 +279,7 @@ mod tests {
                 get(|| async { Json(serde_json::json!({ "status": "ok" })) }),
             )
             .layer(axum::middleware::from_fn(request_trace_middleware));
-        let req = Request::builder()
-            .uri("/ok")
-            .body(Body::empty())
-            .unwrap();
+        let req = Request::builder().uri("/ok").body(Body::empty()).unwrap();
         let res = app.oneshot(req).await.unwrap();
         assert_eq!(res.status(), StatusCode::OK);
         assert!(res.headers().get("x-request-id").is_some());
@@ -315,10 +302,7 @@ mod tests {
                 }),
             )
             .layer(axum::middleware::from_fn(request_trace_middleware));
-        let req = Request::builder()
-            .uri("/err")
-            .body(Body::empty())
-            .unwrap();
+        let req = Request::builder().uri("/err").body(Body::empty()).unwrap();
         let res = app.oneshot(req).await.unwrap();
         let hdr = res
             .headers()
@@ -341,10 +325,7 @@ mod tests {
                 get(|| async { (StatusCode::NOT_FOUND, "plain-not-found") }),
             )
             .layer(axum::middleware::from_fn(request_trace_middleware));
-        let req = Request::builder()
-            .uri("/txt")
-            .body(Body::empty())
-            .unwrap();
+        let req = Request::builder().uri("/txt").body(Body::empty()).unwrap();
         let res = app.oneshot(req).await.unwrap();
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
         let bytes = res.into_body().collect().await.unwrap().to_bytes();

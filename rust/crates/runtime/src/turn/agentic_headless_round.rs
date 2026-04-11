@@ -192,8 +192,7 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
                      Do NOT call this tool again with the same arguments.",
                     cached.output, *count, max_identical
                 );
-                let (tool_msg, tr) =
-                    headless_idempotency_hit_openai_pair(&id, &name, &body);
+                let (tool_msg, tr) = headless_idempotency_hit_openai_pair(&id, &name, &body);
                 messages.push(tool_msg);
                 tool_results.push(tr);
             } else {

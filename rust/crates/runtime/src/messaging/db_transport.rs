@@ -605,7 +605,7 @@ async fn poll_loop(
                                 metrics
                                     .poll_errors
                                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                tracing::warn!(target: "astra_runtime::messaging::db_transport", 
+                                tracing::warn!(target: "astra_runtime::messaging::db_transport",
                                     "  ⚠ messaging: failed to extract direct row id for {}@{} (message_id: {}): {:?}",
                                     addr.agent_id,
                                     addr.run_id,
@@ -633,7 +633,7 @@ async fn poll_loop(
                                     metrics
                                         .poll_errors
                                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    tracing::warn!(target: "astra_runtime::messaging::db_transport", 
+                                    tracing::warn!(target: "astra_runtime::messaging::db_transport",
                                         "  ⚠ messaging: failed to dead-letter direct row without id (message_id: {}) for {}@{}: {:?}",
                                         message_id.as_deref().unwrap_or("<unavailable>"),
                                         addr.agent_id,
@@ -664,7 +664,7 @@ async fn poll_loop(
                                         metrics
                                             .poll_errors
                                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                        tracing::warn!(target: "astra_runtime::messaging::db_transport", 
+                                        tracing::warn!(target: "astra_runtime::messaging::db_transport",
                                             "  ⚠ messaging: failed to dead-letter undecodable direct row (row_id: {:?}, message_id: {}) for {}@{}: {:?}",
                                             row_id,
                                             message_id.as_deref().unwrap_or("<unavailable>"),
@@ -694,7 +694,7 @@ async fn poll_loop(
                                     )
                                     .await
                                     {
-                                        tracing::warn!(target: "astra_runtime::messaging::db_transport", 
+                                        tracing::warn!(target: "astra_runtime::messaging::db_transport",
                                             "  ⚠ messaging: failed to release direct claims after closed channel for {}@{}: {:?}",
                                             addr.agent_id, addr.run_id, e
                                         );
@@ -708,7 +708,7 @@ async fn poll_loop(
                                     metrics
                                         .poll_errors
                                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    tracing::warn!(target: "astra_runtime::messaging::db_transport", 
+                                    tracing::warn!(target: "astra_runtime::messaging::db_transport",
                                         "  ⚠ messaging: failed to ack delivered direct row {} for {}@{}: {:?}",
                                         row_id, addr.agent_id, addr.run_id, e
                                     );
@@ -732,7 +732,7 @@ async fn poll_loop(
                                         metrics
                                             .poll_errors
                                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                        tracing::warn!(target: "astra_runtime::messaging::db_transport", 
+                                        tracing::warn!(target: "astra_runtime::messaging::db_transport",
                                             "  ⚠ messaging: failed to dead-letter direct row (row_id: {:?}, message_id: {}) for {}@{}: {:?}",
                                             row_id,
                                             message_id.as_deref().unwrap_or("<unavailable>"),
@@ -750,7 +750,7 @@ async fn poll_loop(
                     metrics
                         .poll_errors
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    tracing::warn!(target: "astra_runtime::messaging::db_transport", 
+                    tracing::warn!(target: "astra_runtime::messaging::db_transport",
                         "  ⚠ messaging: direct fetch error for {}@{}: {:?}",
                         addr.agent_id,
                         addr.run_id,
@@ -766,7 +766,7 @@ async fn poll_loop(
                 metrics
                     .poll_errors
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                tracing::warn!(target: "astra_runtime::messaging::db_transport", 
+                tracing::warn!(target: "astra_runtime::messaging::db_transport",
                     "  ⚠ messaging: direct claim error for {}@{}: {:?}",
                     addr.agent_id, addr.run_id, e
                 );
@@ -797,7 +797,7 @@ async fn poll_loop(
                             metrics
                                 .poll_errors
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            tracing::warn!(target: "astra_runtime::messaging::db_transport", 
+                            tracing::warn!(target: "astra_runtime::messaging::db_transport",
                                 "  ⚠ messaging: failed to extract broadcast row id for delegation {} (message_id: {}): {:?}",
                                 did,
                                 message_id.as_deref().unwrap_or("<unavailable>"),
@@ -824,7 +824,7 @@ async fn poll_loop(
                                 metrics
                                     .poll_errors
                                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                tracing::warn!(target: "astra_runtime::messaging::db_transport", 
+                                tracing::warn!(target: "astra_runtime::messaging::db_transport",
                                     "  ⚠ messaging: failed to dead-letter broadcast row without id (message_id: {}) for delegation {}: {:?}",
                                     message_id.as_deref().unwrap_or("<unavailable>"),
                                     did,
@@ -850,7 +850,7 @@ async fn poll_loop(
                                     metrics
                                         .poll_errors
                                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    tracing::warn!(target: "astra_runtime::messaging::db_transport", 
+                                    tracing::warn!(target: "astra_runtime::messaging::db_transport",
                                         "  ⚠ messaging: failed to dead-letter undecodable broadcast row {} for delegation {}: {:?}",
                                         row_id, did, e
                                     );
@@ -884,7 +884,7 @@ async fn poll_loop(
                                     metrics
                                         .poll_errors
                                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    tracing::warn!(target: "astra_runtime::messaging::db_transport", 
+                                    tracing::warn!(target: "astra_runtime::messaging::db_transport",
                                         "  ⚠ messaging: failed to dead-letter broadcast row {} for delegation {}: {:?}",
                                         row_id, did, e
                                     );
@@ -899,7 +899,7 @@ async fn poll_loop(
                 metrics
                     .poll_errors
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                tracing::warn!(target: "astra_runtime::messaging::db_transport", 
+                tracing::warn!(target: "astra_runtime::messaging::db_transport",
                     "  ⚠ messaging: broadcast poll error for delegation {}: {:?}",
                     did,
                     broadcast_result.unwrap_err()
@@ -911,7 +911,7 @@ async fn poll_loop(
         let sleep_duration = if had_error {
             consecutive_errors = consecutive_errors.saturating_add(1);
             if consecutive_errors == CRITICAL_FAILURE_THRESHOLD {
-                tracing::warn!(target: "astra_runtime::messaging::db_transport", 
+                tracing::warn!(target: "astra_runtime::messaging::db_transport",
                     "  🔴 messaging: CRITICAL — {} consecutive poll failures for {}@{}",
                     consecutive_errors, addr.agent_id, addr.run_id
                 );

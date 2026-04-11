@@ -242,10 +242,7 @@ pub fn error_response(
     status: StatusCode,
     detail: impl Into<String>,
 ) -> (StatusCode, Json<ErrorResponse>) {
-    (
-        status,
-        Json(ErrorResponse::new(detail)),
-    )
+    (status, Json(ErrorResponse::new(detail)))
 }
 
 /// Same as [`error_response`] but attaches a stable machine-oriented `error_code`.

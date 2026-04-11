@@ -401,7 +401,9 @@ pub(crate) async fn stream_chat_sse(
             astra_runtime::semantic_dedup::DEFAULT_SIMILARITY_THRESHOLD,
         ),
         call_counts: HashMap::new(),
-            max_identical_tool_calls: astra_runtime::runtime_config::RuntimeConfig::load().tool_selection.effective_max_identical_calls(),
+        max_identical_tool_calls: astra_runtime::runtime_config::RuntimeConfig::load()
+            .tool_selection
+            .effective_max_identical_calls(),
         stall: StallTrackingState {
             turn_sigs: Vec::new(),
             turn_tool_names: Vec::new(),

@@ -146,9 +146,8 @@ impl AgentMailbox {
 
         // Build and send the request message
         let request_id = uuid::Uuid::new_v4().to_string();
-        let data = serde_json::to_value(&request).map_err(|e| {
-            MailboxError::Transport(format!("serialize permission request: {e}"))
-        })?;
+        let data = serde_json::to_value(&request)
+            .map_err(|e| MailboxError::Transport(format!("serialize permission request: {e}")))?;
         let msg = AgentMessage::new(
             self.address.clone(),
             MessageTarget::Parent,

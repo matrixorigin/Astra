@@ -76,7 +76,9 @@ pub fn build_app(state: AppState) -> Router {
         .expose_headers([HeaderName::from_static("x-request-id")]);
 
     router_builder::build_router(state)
-        .layer(axum::middleware::from_fn(request_trace::request_trace_middleware))
+        .layer(axum::middleware::from_fn(
+            request_trace::request_trace_middleware,
+        ))
         .layer(cors)
 }
 

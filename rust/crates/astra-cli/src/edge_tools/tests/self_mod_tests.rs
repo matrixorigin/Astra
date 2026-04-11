@@ -189,16 +189,25 @@ async fn prioritize_tool_preserves_existing_state_when_persist_fails() {
     let workspace_path = session_workspace::workspace_dir_for(&session_id).join("workspace.yaml");
     std::fs::remove_file(workspace_path).unwrap();
 
-    let out = exe.execute("prioritize_tool", &json!({"tool": "bash"})).await;
+    let out = exe
+        .execute("prioritize_tool", &json!({"tool": "bash"}))
+        .await;
     let parsed: Value = serde_json::from_str(&out).unwrap();
     assert_eq!(parsed["error"], "failed_to_persist_tool_preferences");
 
     let model = exe.build_self_model_snapshot().unwrap();
-    assert!(model.capabilities.pinned_tools.contains(&"bash".to_string()));
-    assert!(!model
-        .capabilities
-        .deprioritized_tools
-        .contains(&"bash".to_string()));
+    assert!(
+        model
+            .capabilities
+            .pinned_tools
+            .contains(&"bash".to_string())
+    );
+    assert!(
+        !model
+            .capabilities
+            .deprioritized_tools
+            .contains(&"bash".to_string())
+    );
 
     drop(guard);
 }
@@ -227,16 +236,25 @@ async fn deprioritize_tool_preserves_existing_state_when_persist_fails() {
     let workspace_path = session_workspace::workspace_dir_for(&session_id).join("workspace.yaml");
     std::fs::remove_file(workspace_path).unwrap();
 
-    let out = exe.execute("deprioritize_tool", &json!({"tool": "bash"})).await;
+    let out = exe
+        .execute("deprioritize_tool", &json!({"tool": "bash"}))
+        .await;
     let parsed: Value = serde_json::from_str(&out).unwrap();
     assert_eq!(parsed["error"], "failed_to_persist_tool_preferences");
 
     let model = exe.build_self_model_snapshot().unwrap();
-    assert!(model
-        .capabilities
-        .deprioritized_tools
-        .contains(&"bash".to_string()));
-    assert!(!model.capabilities.pinned_tools.contains(&"bash".to_string()));
+    assert!(
+        model
+            .capabilities
+            .deprioritized_tools
+            .contains(&"bash".to_string())
+    );
+    assert!(
+        !model
+            .capabilities
+            .pinned_tools
+            .contains(&"bash".to_string())
+    );
 
     drop(guard);
 }

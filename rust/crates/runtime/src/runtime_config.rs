@@ -321,7 +321,11 @@ pub struct ToolSelectionConfig {
 impl ToolSelectionConfig {
     /// Resolved max identical tool calls (0 → default of 2).
     pub fn effective_max_identical_calls(&self) -> u32 {
-        if self.max_identical_tool_calls > 0 { self.max_identical_tool_calls } else { 2 }
+        if self.max_identical_tool_calls > 0 {
+            self.max_identical_tool_calls
+        } else {
+            2
+        }
     }
 }
 
@@ -1178,6 +1182,18 @@ mod tests {
         assert_eq!(config.compression.max_history_tokens, 40000);
         assert!((config.compression.compression_threshold - 0.8).abs() < 0.001);
         assert_eq!(config.memory.retrieval_top_k, 5);
+    }
+
+    #[test]
+    fn test_effective_max_identical_calls() {
+        let mut config = ToolSelectionConfig::default();
+        assert_eq!(config.effective_max_identical_calls(), 2);
+
+        config.max_identical_tool_calls = 5;
+        assert_eq!(config.effective_max_identical_calls(), 5);
+
+        config.max_identical_tool_calls = 1;
+        assert_eq!(config.effective_max_identical_calls(), 1);
     }
 
     #[test]
