@@ -299,16 +299,24 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
 
         // Record tool selection trace (M1 observability)
         if let Some(collector) = ctx.telem.trace_collector {
+            let tool_token_costs: Vec<(String, u32)> = sel_result
+                .tool_names
+                .iter()
+                .map(|n| (n.clone(), ctx.registry.token_cost(n)))
+                .collect();
+            let total: u32 = tool_token_costs.iter().map(|(_, t)| t).sum();
             collector.record_tool_selection(
                 &sel_result.tool_names,
                 sel_result.strategy,
                 sel_result.confidence,
-                sel_result.budget_used,
+                total,
                 sel_result.selector_tokens_in,
                 sel_result.selector_tokens_out,
                 ctx.registry.total_tool_count() as u32,
                 sel_latency_ms,
             );
+            // Patch per-tool token costs (record_tool_selection distributes evenly)
+            collector.patch_tool_tokens(&tool_token_costs);
         }
 
         let conf = sel_result.confidence;
@@ -439,6 +447,30 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
             .iter()
             .map(|m| prompts::estimate_str_tokens(&msg_content(m)) as u32)
             .sum();
+
+        // Record per-turn history breakdown
+        let turns_retained: Vec<astra_runtime::turn::context_assembly_trace::TurnRetention> = ctx
+            .messages
+            .iter()
+            .enumerate()
+            .map(|(i, m)| {
+                let role = m
+                    .get("role")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                let has_tool_calls = m.get("tool_calls").is_some()
+                    || role == "tool";
+                let tokens = prompts::estimate_str_tokens(&msg_content(m)) as u32;
+                astra_runtime::turn::context_assembly_trace::TurnRetention {
+                    turn_index: i as u32,
+                    role,
+                    tokens,
+                    has_tool_calls,
+                }
+            })
+            .collect();
+        collector.set_history_retained(&turns_retained);
 
         // Estimate user message tokens
         let user_message_tokens = prompts::estimate_str_tokens(ctx.message) as u32;

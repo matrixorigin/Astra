@@ -111,7 +111,32 @@ impl TurnTraceCollector {
         }
     }
 
+    /// Patch per-tool token costs on the existing tool selection trace.
+    pub fn patch_tool_tokens(&self, costs: &[(String, u32)]) {
+        if let Ok(mut state) = self.inner.write() {
+            if let Some(ref mut tools) = state.tools {
+                for ts in &mut tools.tools_selected {
+                    if let Some((_, cost)) = costs.iter().find(|(n, _)| n == &ts.tool_name) {
+                        ts.tokens = *cost;
+                    }
+                }
+            }
+        }
+    }
+
     /// Record memory retrieval results.
+    /// Set per-turn history retention data.
+    pub fn set_history_retained(&self, turns: &[super::context_assembly_trace::TurnRetention]) {
+        if let Ok(mut state) = self.inner.write() {
+            let hist = state
+                .history
+                .get_or_insert_with(HistorySelectionTrace::default);
+            hist.turns_retained = turns.to_vec();
+            hist.total_turns_available = turns.len() as u32;
+            hist.tokens_after = turns.iter().map(|t| t.tokens).sum();
+        }
+    }
+
     pub fn record_memory_retrieval(
         &self,
         query: &str,
@@ -471,5 +496,38 @@ mod tests {
         assert_eq!(sp.skills_injected[0].skill_name, "review");
         assert_eq!(sp.repository_memories.len(), 1);
         assert_eq!(sp.repository_memories[0].memory_id, "m-42");
+    }
+
+    #[test]
+    fn patch_tool_tokens_updates_per_tool_costs() {
+        let collector = TurnTraceCollector::new("turn-0", "s1");
+        collector.record_tool_selection(&["bash".into(), "grep".into()], "tfidf", 0.8, 0, 0, 0, 10, 5);
+        collector.patch_tool_tokens(&[("bash".into(), 350), ("grep".into(), 280)]);
+        let trace = collector.finalize();
+        assert_eq!(trace.tools.tools_selected[0].tool_name, "bash");
+        assert_eq!(trace.tools.tools_selected[0].tokens, 350);
+        assert_eq!(trace.tools.tools_selected[1].tool_name, "grep");
+        assert_eq!(trace.tools.tools_selected[1].tokens, 280);
+    }
+
+    #[test]
+    fn set_history_retained_populates_trace() {
+        let collector = TurnTraceCollector::new("turn-0", "s1");
+        let turns = vec![
+            super::super::context_assembly_trace::TurnRetention {
+                turn_index: 0, role: "user".into(), tokens: 50, has_tool_calls: false,
+            },
+            super::super::context_assembly_trace::TurnRetention {
+                turn_index: 1, role: "assistant".into(), tokens: 800, has_tool_calls: true,
+            },
+        ];
+        collector.set_history_retained(&turns);
+        let trace = collector.finalize();
+        assert_eq!(trace.history.turns_retained.len(), 2);
+        assert_eq!(trace.history.turns_retained[0].tokens, 50);
+        assert_eq!(trace.history.turns_retained[1].tokens, 800);
+        assert!(trace.history.turns_retained[1].has_tool_calls);
+        assert_eq!(trace.history.total_turns_available, 2);
+        assert_eq!(trace.history.tokens_after, 850);
     }
 }

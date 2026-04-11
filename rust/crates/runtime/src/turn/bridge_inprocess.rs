@@ -391,6 +391,17 @@ fn build_system_message(
 
     let is_anthropic = cache_cfg.is_anthropic;
 
+    // Build complete sections list (stable + dynamic) for trace.
+    let append_dynamic = |mut secs: Vec<prompts::PromptSection>| -> Vec<prompts::PromptSection> {
+        if !profile_desc.is_empty() {
+            secs.push(prompts::PromptSection {
+                text: profile_desc.to_string(),
+                scope: prompts::CacheScope::None,
+            });
+        }
+        secs
+    };
+
     if is_anthropic {
         // Anthropic: multi-block content with cache_control on stable sections.
         // Even via OpenAI-compatible proxies, many forward cache_control to the
@@ -449,7 +460,7 @@ fn build_system_message(
                 "content": blocks,
             }),
             None,
-            sections,
+            append_dynamic(sections),
         )
     } else {
         // OpenAI-compatible: split stable / dynamic into separate system messages
@@ -467,7 +478,7 @@ fn build_system_message(
                 "content": profile_desc,
             }))
         };
-        (primary, dynamic, sections)
+        (primary, dynamic, append_dynamic(sections))
     }
 }
 
