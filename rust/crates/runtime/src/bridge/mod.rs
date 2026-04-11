@@ -3,10 +3,11 @@ use super::*;
 pub mod side_effects;
 
 use self::side_effects::{
-    build_bridge_response_guard_error_event, build_bridge_side_effect_payloads,
-    dispatch_bridge_side_effect_request, run_bridge_hook_side_effects, sync_bridge_state_event,
-    take_bridge_explain_event, take_bridge_prompt_fingerprints, take_bridge_side_effect_inputs,
-    take_bridge_tail_update_args, take_bridge_warning_event,
+    build_bridge_response_guard_error_event, build_bridge_response_guard_side_effect_payloads,
+    build_bridge_side_effect_payloads, dispatch_bridge_side_effect_request,
+    run_bridge_hook_side_effects, sync_bridge_state_event, take_bridge_explain_event,
+    take_bridge_prompt_fingerprints, take_bridge_side_effect_inputs, take_bridge_tail_update_args,
+    take_bridge_warning_event,
 };
 
 pub mod circuit_breaker;
@@ -115,6 +116,23 @@ fn bridge_error_sse_response(status: StatusCode, message: impl Into<String>) -> 
             ),
     });
     sse_stream_response(StatusCode::OK, Body::from(render_sse_json(event)))
+}
+
+fn build_max_rounds_turn_complete_event(
+    bridge_state: &serde_json::Map<String, serde_json::Value>,
+    trusted_execution_state: Option<&serde_json::Value>,
+    latest_user_message: Option<&str>,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut turn_complete = build_turn_complete_event_from_bridge_state(
+        bridge_state,
+        trusted_execution_state,
+        latest_user_message,
+    );
+    turn_complete.insert(
+        "max_rounds_exceeded".to_string(),
+        serde_json::Value::Bool(true),
+    );
+    turn_complete
 }
 
 #[async_trait]
@@ -511,6 +529,7 @@ where
         let mut suppress_next_turn_complete = false;
         let mut tool_rounds: i64 = 0;
         let mut received_turn_complete = false;
+        let mut force_max_rounds_completion = false;
         while let Some(chunk) = stream.next().await {
             match chunk {
                 Ok(chunk) => {
@@ -525,6 +544,10 @@ where
                     while let Some(end) = find_sse_frame_end(&buffer) {
                         let frame = buffer.drain(..end + 2).collect::<Vec<_>>();
                         if is_session_info_frame(&frame) {
+                            if trusted_session_id.is_some() {
+                                continue;
+                            }
+                            yield Ok(Bytes::from(frame));
                             continue;
                         } else if suppress_next_turn_complete && is_turn_complete_frame(&frame) {
                             suppress_next_turn_complete = false;
@@ -556,10 +579,59 @@ where
                                 pending_followup_user_message = None;
                                 pending_warning_event = None;
                                 pending_explain_event = None;
+                                if let Some(side_effect_inputs) = side_effect_inputs.as_ref()
+                                    && let Some((persist_payload, hook_payload)) =
+                                        build_bridge_response_guard_side_effect_payloads(
+                                            side_effect_user_id.as_deref(),
+                                            trusted_session_id,
+                                            &bridge_state,
+                                            side_effect_inputs,
+                                            tail_update_args.as_ref(),
+                                            trusted_turn_chain_id.as_deref(),
+                                            trusted_user_query_event_id.as_deref(),
+                                            latest_token_usage.as_ref(),
+                                            trusted_routing_meta.as_ref(),
+                                            side_effect_request_context.as_ref(),
+                                        )
+                                {
+                                    dispatch_bridge_side_effect_request(
+                                        Some(persist_payload),
+                                        turn_core_event_writer.clone(),
+                                        turn_tool_event_writer.clone(),
+                                        turn_auxiliary_event_writer.clone(),
+                                        turn_session_activity_writer.clone(),
+                                    );
+                                    run_bridge_hook_side_effects(
+                                        Some(hook_payload),
+                                        turn_hook_db_writer.clone(),
+                                        turn_reflection_state_store.clone(),
+                                        turn_reflection_lesson_writer.clone(),
+                                        turn_observer_worker.clone(),
+                                        turn_learning_writer.clone(),
+                                    );
+                                }
                                 suppress_next_turn_complete = true;
+                                if let Some(warning_event) = warning_event {
+                                    yield Ok(Bytes::from(render_sse_json(
+                                        serde_json::Value::Object(warning_event),
+                                    )));
+                                }
+                                if let Some(explain_event) = explain_event {
+                                    yield Ok(Bytes::from(render_sse_json(
+                                        serde_json::Value::Object(explain_event),
+                                    )));
+                                }
                                 yield Ok(Bytes::from(render_sse_json(
                                     serde_json::Value::Object(response_guard_error),
                                 )));
+                                yield Ok(Bytes::from(render_sse_json(serde_json::Value::Object(
+                                    build_turn_complete_event_from_bridge_state(
+                                        &bridge_state,
+                                        trusted_execution_state.as_ref(),
+                                        followup_user_message.as_deref(),
+                                    ),
+                                ))));
+                                received_turn_complete = true;
                                 continue;
                             }
                             let synced_bridge_state =
@@ -612,11 +684,28 @@ where
                                     tool_rounds += 1;
                                     if tool_rounds > max_tool_rounds() {
                                         astra_core::agent_warn!("bridge", "Turn exceeded max_tool_rounds ({}), forcing completion", max_tool_rounds());
-                                        yield Ok(Bytes::from(render_sse_json(serde_json::json!({
-                                            "type": "turn_complete",
-                                            "has_tool_calls": false,
-                                            "max_rounds_exceeded": true,
-                                        }))));
+                                        if let Some(warning_event) = pending_warning_event.take() {
+                                            yield Ok(Bytes::from(render_sse_json(
+                                                serde_json::Value::Object(warning_event),
+                                            )));
+                                        }
+                                        if let Some(explain_event) = pending_explain_event.take() {
+                                            yield Ok(Bytes::from(render_sse_json(
+                                                serde_json::Value::Object(explain_event),
+                                            )));
+                                        }
+                                        let bridge_state = pending_bridge_state
+                                            .as_ref()
+                                            .expect("pending bridge state should exist");
+                                        yield Ok(Bytes::from(render_sse_json(
+                                            serde_json::Value::Object(
+                                                build_max_rounds_turn_complete_event(
+                                                    bridge_state,
+                                                    trusted_execution_state.as_ref(),
+                                                    pending_followup_user_message.as_deref(),
+                                                ),
+                                            ),
+                                        )));
                                         return;
                                     }
                                 }
@@ -668,7 +757,15 @@ where
                                 yield Ok(Bytes::from(render_sse_json(
                                     serde_json::Value::Object(tool_call_start_event),
                                 )));
-                            } else if is_warning_frame(&frame) || is_explain_frame(&frame) {
+                            } else if is_warning_frame(&frame) {
+                                if pending_warning_event.is_none() {
+                                    yield Ok(Bytes::from(frame));
+                                }
+                                continue;
+                            } else if is_explain_frame(&frame) {
+                                if pending_explain_event.is_none() {
+                                    yield Ok(Bytes::from(frame));
+                                }
                                 continue;
                             } else if is_turn_complete_frame(&frame) {
                                 if let Some(warning_event) = pending_warning_event.take() {
@@ -750,6 +847,7 @@ where
                                 serde_json::Value::Object(tool_call_start_event),
                             )));
                         } else if is_warning_frame(&frame) || is_explain_frame(&frame) {
+                            yield Ok(Bytes::from(frame));
                             continue;
                         } else {
                             yield Ok(Bytes::from(frame));
@@ -784,9 +882,58 @@ where
                         )
                     })
                 {
+                    if let Some(side_effect_inputs) = side_effect_inputs.as_ref()
+                        && let Some((persist_payload, hook_payload)) =
+                            build_bridge_response_guard_side_effect_payloads(
+                                side_effect_user_id.as_deref(),
+                                trusted_session_id,
+                                &bridge_state,
+                                side_effect_inputs,
+                                tail_update_args.as_ref(),
+                                trusted_turn_chain_id.as_deref(),
+                                trusted_user_query_event_id.as_deref(),
+                                latest_token_usage.as_ref(),
+                                trusted_routing_meta.as_ref(),
+                                side_effect_request_context.as_ref(),
+                            )
+                    {
+                        dispatch_bridge_side_effect_request(
+                            Some(persist_payload),
+                            turn_core_event_writer.clone(),
+                            turn_tool_event_writer.clone(),
+                            turn_auxiliary_event_writer.clone(),
+                            turn_session_activity_writer.clone(),
+                        );
+                        run_bridge_hook_side_effects(
+                            Some(hook_payload),
+                            turn_hook_db_writer.clone(),
+                            turn_reflection_state_store.clone(),
+                            turn_reflection_lesson_writer.clone(),
+                            turn_observer_worker.clone(),
+                            turn_learning_writer.clone(),
+                        );
+                    }
+                    if let Some(warning_event) = warning_event {
+                        yield Ok(Bytes::from(render_sse_json(
+                            serde_json::Value::Object(warning_event),
+                        )));
+                    }
+                    if let Some(explain_event) = explain_event {
+                        yield Ok(Bytes::from(render_sse_json(
+                            serde_json::Value::Object(explain_event),
+                        )));
+                    }
                     yield Ok(Bytes::from(render_sse_json(
                         serde_json::Value::Object(response_guard_error),
                     )));
+                    yield Ok(Bytes::from(render_sse_json(serde_json::Value::Object(
+                        build_turn_complete_event_from_bridge_state(
+                            &bridge_state,
+                            trusted_execution_state.as_ref(),
+                            followup_user_message.as_deref(),
+                        ),
+                    ))));
+                    received_turn_complete = true;
                 } else {
                     let synced_bridge_state =
                         sync_bridge_state_event(
@@ -831,6 +978,20 @@ where
                     pending_followup_user_message = followup_user_message;
                     pending_warning_event = warning_event;
                     pending_explain_event = explain_event;
+                    if let Some(sigs) =
+                        pending_bridge_state.as_ref().and_then(bridge_state_tool_signatures)
+                        && !sigs.is_empty()
+                    {
+                        tool_rounds += 1;
+                        if tool_rounds > max_tool_rounds() {
+                            astra_core::agent_warn!(
+                                "bridge",
+                                "Turn exceeded max_tool_rounds ({}) in buffered tail frame, forcing completion",
+                                max_tool_rounds()
+                            );
+                            force_max_rounds_completion = true;
+                        }
+                    }
                 }
             } else {
                 yield Ok(Bytes::from(buffer));
@@ -848,11 +1009,19 @@ where
                 ))));
             }
             yield Ok(Bytes::from(render_sse_json(serde_json::Value::Object(
-                build_turn_complete_event_from_bridge_state(
-                    &bridge_state,
-                    trusted_execution_state.as_ref(),
-                    pending_followup_user_message.as_deref(),
-                ),
+                if force_max_rounds_completion {
+                    build_max_rounds_turn_complete_event(
+                        &bridge_state,
+                        trusted_execution_state.as_ref(),
+                        pending_followup_user_message.as_deref(),
+                    )
+                } else {
+                    build_turn_complete_event_from_bridge_state(
+                        &bridge_state,
+                        trusted_execution_state.as_ref(),
+                        pending_followup_user_message.as_deref(),
+                    )
+                },
             ))));
             received_turn_complete = true;
         }
@@ -967,5 +1136,322 @@ mod tests {
         assert!(text.contains("\"type\":\"error\""));
         assert!(text.contains("\"code\":\"UPSTREAM_ERROR\""));
         assert!(text.contains("upstream exploded"));
+    }
+
+    #[tokio::test]
+    async fn passthrough_bridge_keeps_upstream_session_info_when_untrusted() {
+        use futures_util::stream;
+        use tokio::sync::Mutex;
+
+        let filtered = filter_bridge_state_events(
+            stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from(
+                "data: {\"type\":\"session_info\",\"session_id\":\"upstream-s1\"}\n\n",
+            ))]),
+            Arc::new(Mutex::new(SessionCache::default())),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Arc::new(crate::turn::services::NoopTurnCoreEventWriter),
+            Arc::new(crate::turn::services::NoopTurnToolEventWriter),
+            Arc::new(crate::turn::services::NoopTurnHookDbWriter),
+            Arc::new(InMemoryTurnReflectionStateStore::default()),
+            Arc::new(NoopTurnReflectionLessonWriter),
+            Arc::new(NoopTurnObserverWorker),
+            Arc::new(crate::turn::services::NoopTurnAuxiliaryEventWriter),
+            Arc::new(crate::turn::services::NoopTurnSessionActivityWriter),
+            None,
+        );
+
+        let body = axum::body::to_bytes(Body::from_stream(filtered), 1024 * 1024)
+            .await
+            .expect("body should read");
+        let text = String::from_utf8(body.to_vec()).expect("utf8");
+        assert!(text.contains("\"type\":\"session_info\""));
+        assert!(text.contains("\"session_id\":\"upstream-s1\""));
+    }
+
+    #[tokio::test]
+    async fn guard_error_emits_local_turn_complete_without_upstream_terminal() {
+        use futures_util::stream;
+        use tokio::sync::Mutex;
+
+        let filtered = filter_bridge_state_events(
+            stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from(
+                "data: {\"type\":\"bridge_state\",\"tool_sigs\":[],\"tail_update_args\":{\"full_text\":\"hello hello hello hello hello hello hello hello\"}}\n\n",
+            ))]),
+            Arc::new(Mutex::new(SessionCache::default())),
+            Some("sess-1".to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Arc::new(crate::turn::services::NoopTurnCoreEventWriter),
+            Arc::new(crate::turn::services::NoopTurnToolEventWriter),
+            Arc::new(crate::turn::services::NoopTurnHookDbWriter),
+            Arc::new(InMemoryTurnReflectionStateStore::default()),
+            Arc::new(NoopTurnReflectionLessonWriter),
+            Arc::new(NoopTurnObserverWorker),
+            Arc::new(crate::turn::services::NoopTurnAuxiliaryEventWriter),
+            Arc::new(crate::turn::services::NoopTurnSessionActivityWriter),
+            None,
+        );
+
+        let body = axum::body::to_bytes(Body::from_stream(filtered), 1024 * 1024)
+            .await
+            .expect("body should read");
+        let text = String::from_utf8(body.to_vec()).expect("utf8");
+        assert!(text.contains("\"type\":\"error\""));
+        assert!(text.contains("\"code\":\"MODEL_DEGRADED\""));
+        assert_eq!(text.matches("\"type\":\"turn_complete\"").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn buffered_guard_error_emits_local_turn_complete_without_upstream_terminal() {
+        use futures_util::stream;
+        use tokio::sync::Mutex;
+
+        let filtered = filter_bridge_state_events(
+            stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from(
+                "data: {\"type\":\"bridge_state\",\"tool_sigs\":[],\"tail_update_args\":{\"full_text\":\"hello hello hello hello hello hello hello hello\"}}",
+            ))]),
+            Arc::new(Mutex::new(SessionCache::default())),
+            Some("sess-1".to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Arc::new(crate::turn::services::NoopTurnCoreEventWriter),
+            Arc::new(crate::turn::services::NoopTurnToolEventWriter),
+            Arc::new(crate::turn::services::NoopTurnHookDbWriter),
+            Arc::new(InMemoryTurnReflectionStateStore::default()),
+            Arc::new(NoopTurnReflectionLessonWriter),
+            Arc::new(NoopTurnObserverWorker),
+            Arc::new(crate::turn::services::NoopTurnAuxiliaryEventWriter),
+            Arc::new(crate::turn::services::NoopTurnSessionActivityWriter),
+            None,
+        );
+
+        let body = axum::body::to_bytes(Body::from_stream(filtered), 1024 * 1024)
+            .await
+            .expect("body should read");
+        let text = String::from_utf8(body.to_vec()).expect("utf8");
+        assert!(text.contains("\"type\":\"error\""));
+        assert!(text.contains("\"code\":\"MODEL_DEGRADED\""));
+        assert_eq!(text.matches("\"type\":\"turn_complete\"").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn guard_error_flushes_pending_warning_before_terminal_events() {
+        use futures_util::stream;
+        use tokio::sync::Mutex;
+
+        let filtered = filter_bridge_state_events(
+            stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from(
+                "data: {\"type\":\"bridge_state\",\"tool_sigs\":[],\"firewall_warning_claims_failed\":2,\"tail_update_args\":{\"full_text\":\"hello hello hello hello hello hello hello hello\"}}\n\n",
+            ))]),
+            Arc::new(Mutex::new(SessionCache::default())),
+            Some("sess-1".to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Arc::new(crate::turn::services::NoopTurnCoreEventWriter),
+            Arc::new(crate::turn::services::NoopTurnToolEventWriter),
+            Arc::new(crate::turn::services::NoopTurnHookDbWriter),
+            Arc::new(InMemoryTurnReflectionStateStore::default()),
+            Arc::new(NoopTurnReflectionLessonWriter),
+            Arc::new(NoopTurnObserverWorker),
+            Arc::new(crate::turn::services::NoopTurnAuxiliaryEventWriter),
+            Arc::new(crate::turn::services::NoopTurnSessionActivityWriter),
+            None,
+        );
+
+        let body = axum::body::to_bytes(Body::from_stream(filtered), 1024 * 1024)
+            .await
+            .expect("body should read");
+        let text = String::from_utf8(body.to_vec()).expect("utf8");
+        let warning_pos = text.find("\"type\":\"warning\"").expect("warning event");
+        let error_pos = text.find("\"type\":\"error\"").expect("error event");
+        let turn_complete_pos = text
+            .find("\"type\":\"turn_complete\"")
+            .expect("turn_complete event");
+        assert!(warning_pos < error_pos);
+        assert!(error_pos < turn_complete_pos);
+    }
+
+    #[tokio::test]
+    async fn max_tool_rounds_flushes_pending_warning_before_forced_completion() {
+        use futures_util::stream;
+        use tokio::sync::Mutex;
+
+        let mut frames = Vec::new();
+        for idx in 0..=max_tool_rounds() {
+            let warning = if idx == max_tool_rounds() {
+                ",\"firewall_warning_claims_failed\":2"
+            } else {
+                ""
+            };
+            frames.push(Ok::<Bytes, reqwest::Error>(Bytes::from(format!(
+                "data: {{\"type\":\"bridge_state\",\"tool_sigs\":[[\"run_build_test:{{}}\"]]{warning}}}\n\n"
+            ))));
+        }
+
+        let filtered = filter_bridge_state_events(
+            stream::iter(frames),
+            Arc::new(Mutex::new(SessionCache::default())),
+            Some("sess-1".to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Arc::new(crate::turn::services::NoopTurnCoreEventWriter),
+            Arc::new(crate::turn::services::NoopTurnToolEventWriter),
+            Arc::new(crate::turn::services::NoopTurnHookDbWriter),
+            Arc::new(InMemoryTurnReflectionStateStore::default()),
+            Arc::new(NoopTurnReflectionLessonWriter),
+            Arc::new(NoopTurnObserverWorker),
+            Arc::new(crate::turn::services::NoopTurnAuxiliaryEventWriter),
+            Arc::new(crate::turn::services::NoopTurnSessionActivityWriter),
+            None,
+        );
+
+        let body = axum::body::to_bytes(Body::from_stream(filtered), 1024 * 1024)
+            .await
+            .expect("body should read");
+        let text = String::from_utf8(body.to_vec()).expect("utf8");
+        let warning_pos = text.find("\"type\":\"warning\"").expect("warning event");
+        let turn_complete_pos = text
+            .find("\"type\":\"turn_complete\"")
+            .expect("turn_complete event");
+        assert!(warning_pos < turn_complete_pos);
+        assert!(text.contains("\"max_rounds_exceeded\":true"));
+    }
+
+    #[tokio::test]
+    async fn raw_explain_frame_is_preserved_without_bridge_state() {
+        use futures_util::stream;
+        use tokio::sync::Mutex;
+
+        let filtered = filter_bridge_state_events(
+            stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from(
+                "data: {\"type\":\"explain\",\"total_ms\":12,\"tools_selected\":1,\"tools_available\":2}\n\n",
+            ))]),
+            Arc::new(Mutex::new(SessionCache::default())),
+            Some("sess-1".to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Arc::new(crate::turn::services::NoopTurnCoreEventWriter),
+            Arc::new(crate::turn::services::NoopTurnToolEventWriter),
+            Arc::new(crate::turn::services::NoopTurnHookDbWriter),
+            Arc::new(InMemoryTurnReflectionStateStore::default()),
+            Arc::new(NoopTurnReflectionLessonWriter),
+            Arc::new(NoopTurnObserverWorker),
+            Arc::new(crate::turn::services::NoopTurnAuxiliaryEventWriter),
+            Arc::new(crate::turn::services::NoopTurnSessionActivityWriter),
+            None,
+        );
+
+        let body = axum::body::to_bytes(Body::from_stream(filtered), 1024 * 1024)
+            .await
+            .expect("body should read");
+        let text = String::from_utf8(body.to_vec()).expect("utf8");
+        assert!(text.contains("\"type\":\"explain\""));
+        assert!(text.contains("\"total_ms\":12"));
+    }
+
+    #[tokio::test]
+    async fn raw_warning_frame_is_preserved_without_bridge_state() {
+        use futures_util::stream;
+        use tokio::sync::Mutex;
+
+        let filtered = filter_bridge_state_events(
+            stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from(
+                "data: {\"type\":\"warning\",\"message\":\"approaching limit\"}\n\n",
+            ))]),
+            Arc::new(Mutex::new(SessionCache::default())),
+            Some("sess-1".to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Arc::new(crate::turn::services::NoopTurnCoreEventWriter),
+            Arc::new(crate::turn::services::NoopTurnToolEventWriter),
+            Arc::new(crate::turn::services::NoopTurnHookDbWriter),
+            Arc::new(InMemoryTurnReflectionStateStore::default()),
+            Arc::new(NoopTurnReflectionLessonWriter),
+            Arc::new(NoopTurnObserverWorker),
+            Arc::new(crate::turn::services::NoopTurnAuxiliaryEventWriter),
+            Arc::new(crate::turn::services::NoopTurnSessionActivityWriter),
+            None,
+        );
+
+        let body = axum::body::to_bytes(Body::from_stream(filtered), 1024 * 1024)
+            .await
+            .expect("body should read");
+        let text = String::from_utf8(body.to_vec()).expect("utf8");
+        assert!(text.contains("\"type\":\"warning\""));
+        assert!(text.contains("approaching limit"));
+    }
+
+    #[tokio::test]
+    async fn buffered_final_bridge_state_still_enforces_max_tool_rounds() {
+        use futures_util::stream;
+        use tokio::sync::Mutex;
+
+        let mut frames = Vec::new();
+        for _ in 0..max_tool_rounds() {
+            frames.push(Ok::<Bytes, reqwest::Error>(Bytes::from(
+                "data: {\"type\":\"bridge_state\",\"tool_sigs\":[[\"run_build_test:{}\"]]}\n\n",
+            )));
+        }
+        frames.push(Ok::<Bytes, reqwest::Error>(Bytes::from(
+            "data: {\"type\":\"bridge_state\",\"tool_sigs\":[[\"run_build_test:{}\"]]}",
+        )));
+
+        let filtered = filter_bridge_state_events(
+            stream::iter(frames),
+            Arc::new(Mutex::new(SessionCache::default())),
+            Some("sess-1".to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Arc::new(crate::turn::services::NoopTurnCoreEventWriter),
+            Arc::new(crate::turn::services::NoopTurnToolEventWriter),
+            Arc::new(crate::turn::services::NoopTurnHookDbWriter),
+            Arc::new(InMemoryTurnReflectionStateStore::default()),
+            Arc::new(NoopTurnReflectionLessonWriter),
+            Arc::new(NoopTurnObserverWorker),
+            Arc::new(crate::turn::services::NoopTurnAuxiliaryEventWriter),
+            Arc::new(crate::turn::services::NoopTurnSessionActivityWriter),
+            None,
+        );
+
+        let body = axum::body::to_bytes(Body::from_stream(filtered), 1024 * 1024)
+            .await
+            .expect("body should read");
+        let text = String::from_utf8(body.to_vec()).expect("utf8");
+        assert!(text.contains("\"type\":\"turn_complete\""));
+        assert!(text.contains("\"max_rounds_exceeded\":true"));
     }
 }

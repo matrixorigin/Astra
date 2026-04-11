@@ -1041,7 +1041,9 @@ fn sync_conn_state_from_stream_event(conn: &mut WsConnection, event: &Value) {
         if let Some(session_id) = event.get("session_id").and_then(Value::as_str) {
             conn.session_id = Some(session_id.to_string());
         }
-        if let Some(run_id) = event.get("run_id").and_then(Value::as_str) {
+        if conn.active_run_id.is_none()
+            && let Some(run_id) = event.get("run_id").and_then(Value::as_str)
+        {
             conn.active_run_id = Some(run_id.to_string());
         }
     }
@@ -1547,6 +1549,32 @@ mod tests {
 
         assert_eq!(conn.session_id.as_deref(), Some("sess-42"));
         assert_eq!(conn.active_run_id.as_deref(), Some("run-9"));
+    }
+
+    #[test]
+    fn session_info_stream_event_does_not_override_existing_active_run_id() {
+        let mut conn = WsConnection {
+            user: AuthUserRecord {
+                user_id: "u1".into(),
+                username: "alice".into(),
+                email: "alice@example.com".into(),
+                display_name: Some("Alice".into()),
+            },
+            session_id: Some("sess-1".into()),
+            active_run_id: Some("prepared-run".into()),
+        };
+
+        sync_conn_state_from_stream_event(
+            &mut conn,
+            &serde_json::json!({
+                "type": "session_info",
+                "session_id": "sess-2",
+                "run_id": "upstream-run"
+            }),
+        );
+
+        assert_eq!(conn.session_id.as_deref(), Some("sess-2"));
+        assert_eq!(conn.active_run_id.as_deref(), Some("prepared-run"));
     }
 
     #[test]

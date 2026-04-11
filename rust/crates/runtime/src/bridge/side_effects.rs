@@ -1074,6 +1074,91 @@ pub(super) fn build_bridge_side_effect_payloads(
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(super) fn build_bridge_response_guard_side_effect_payloads(
+    side_effect_user_id: Option<&str>,
+    session_id: &str,
+    bridge_state: &serde_json::Map<String, serde_json::Value>,
+    side_effect_inputs: &serde_json::Map<String, serde_json::Value>,
+    tail_update_args: Option<&serde_json::Map<String, serde_json::Value>>,
+    trusted_turn_chain_id: Option<&str>,
+    trusted_user_query_event_id: Option<&str>,
+    streamed_token_usage: Option<&serde_json::Value>,
+    trusted_routing_meta: Option<&serde_json::Value>,
+    side_effect_request_context: Option<&BridgeSideEffectRequestContext>,
+) -> Option<(serde_json::Value, serde_json::Value)> {
+    let mut sanitized_bridge_state = bridge_state.clone();
+    sanitized_bridge_state.remove("history");
+    if let Some(turn_chain_id) = trusted_turn_chain_id {
+        sanitized_bridge_state.insert(
+            "turn_chain_id".to_string(),
+            serde_json::Value::String(turn_chain_id.to_string()),
+        );
+    }
+    if let Some(user_query_event_id) = trusted_user_query_event_id {
+        sanitized_bridge_state.insert(
+            "user_query_event_id".to_string(),
+            serde_json::Value::String(user_query_event_id.to_string()),
+        );
+    }
+
+    let mut sanitized_inputs = side_effect_inputs.clone();
+    sanitized_inputs.remove("full_text");
+    sanitized_inputs.remove("reasoning_content");
+
+    let sanitized_tail_update_args = tail_update_args.map(|tail| {
+        let mut sanitized = tail.clone();
+        sanitized.insert(
+            "full_text".to_string(),
+            serde_json::Value::String(String::new()),
+        );
+        sanitized.insert(
+            "reasoning_content".to_string(),
+            serde_json::Value::String(String::new()),
+        );
+        sanitized
+    });
+
+    let (mut persist_payload, mut hook_payload) = build_bridge_side_effect_payloads(
+        side_effect_user_id,
+        session_id,
+        &sanitized_bridge_state,
+        &sanitized_inputs,
+        sanitized_tail_update_args.as_ref(),
+        streamed_token_usage,
+        trusted_routing_meta,
+        side_effect_request_context,
+    )?;
+
+    if let Some(persist_obj) = persist_payload.as_object_mut() {
+        persist_obj.insert(
+            "run_session_activity".to_string(),
+            serde_json::Value::Bool(true),
+        );
+    }
+    if let Some(hook_obj) = hook_payload.as_object_mut() {
+        hook_obj.insert(
+            "run_hook_db_writes".to_string(),
+            serde_json::Value::Bool(true),
+        );
+        hook_obj.insert("run_observer".to_string(), serde_json::Value::Bool(true));
+        hook_obj.insert(
+            "run_implicit_feedback".to_string(),
+            serde_json::Value::Bool(true),
+        );
+        hook_obj.insert(
+            "run_reflection_learning".to_string(),
+            serde_json::Value::Bool(true),
+        );
+        hook_obj.insert(
+            "full_text".to_string(),
+            serde_json::Value::String(String::new()),
+        );
+    }
+
+    Some((persist_payload, hook_payload))
+}
+
 pub(super) fn take_bridge_warning_event(
     bridge_state: &mut serde_json::Map<String, serde_json::Value>,
 ) -> Option<serde_json::Map<String, serde_json::Value>> {
@@ -1479,6 +1564,59 @@ mod tests {
         }));
         let result = take_bridge_side_effect_inputs(&mut map).unwrap();
         assert_eq!(result.get("full_text").unwrap(), &json!(null));
+    }
+
+    #[test]
+    fn response_guard_side_effect_payloads_scrub_blocked_response_content() {
+        let bridge_state = to_map(json!({
+            "history": [{"role": "assistant", "content": "leaked"}],
+            "turn_count": 3,
+            "turn_chain_id": "chain-1",
+            "user_query_event_id": "event-1",
+            "tool_quality_assessments": [{"grade": "warning"}],
+        }));
+        let side_effect_inputs = to_map(json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "tool_results": [{"name": "bash", "result": "ok"}],
+            "full_text": "leaked text",
+            "reasoning_content": "leaked reasoning",
+        }));
+        let tail_update_args = to_map(json!({
+            "full_text": "leaked text",
+            "reasoning_content": "leaked reasoning",
+        }));
+
+        let (persist_payload, hook_payload) = build_bridge_response_guard_side_effect_payloads(
+            Some("user-1"),
+            "sess-1",
+            &bridge_state,
+            &side_effect_inputs,
+            Some(&tail_update_args),
+            Some("trusted-chain"),
+            Some("trusted-event"),
+            None,
+            None,
+            None,
+        )
+        .expect("guard side effects should build");
+
+        assert_eq!(persist_payload["full_text"], json!(""));
+        assert_eq!(persist_payload["reasoning_content"], json!(""));
+        assert_eq!(persist_payload["history"], json!([]));
+        assert_eq!(persist_payload["run_session_activity"], json!(true));
+        assert_eq!(persist_payload["turn_chain_id"], json!("trusted-chain"));
+        assert_eq!(
+            persist_payload["user_query_event_id"],
+            json!("trusted-event")
+        );
+        assert_eq!(persist_payload["messages"][0]["content"], json!("hi"));
+        assert_eq!(persist_payload["tool_results"][0]["name"], json!("bash"));
+
+        assert_eq!(hook_payload["full_text"], json!(""));
+        assert_eq!(hook_payload["run_hook_db_writes"], json!(true));
+        assert_eq!(hook_payload["run_observer"], json!(true));
+        assert_eq!(hook_payload["run_implicit_feedback"], json!(true));
+        assert_eq!(hook_payload["run_reflection_learning"], json!(true));
     }
 
     // ──────────────────────────────────────────────────────────
