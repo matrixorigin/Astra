@@ -10,6 +10,7 @@
 //!
 //! This module provides hooks that can be called at strategic points
 //! in the agentic loop lifecycle.
+#![allow(deprecated)]
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};

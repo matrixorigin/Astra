@@ -5,6 +5,7 @@
 //!
 //! This bridges the architectural gap: the trait lives in `services` (no pipeline dependency),
 //! while this implementation lives in `runtime` (has access to pipeline internals).
+#![allow(deprecated)]
 
 use std::sync::{Arc, Mutex};
 

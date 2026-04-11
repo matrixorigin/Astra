@@ -673,6 +673,7 @@ impl ExperimentOutcome {
     since = "0.9.0",
     note = "Superseded by SelfModel + LLM reasoning. See self_model.rs."
 )]
+#[allow(deprecated)]
 #[derive(Default)]
 pub struct ExperimentStore {
     experiments: Arc<RwLock<HashMap<String, Experiment>>>,

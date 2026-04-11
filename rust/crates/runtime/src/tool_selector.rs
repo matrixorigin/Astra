@@ -20,6 +20,7 @@
 //!   if the LLM yields nothing usable, falls back to the TF-IDF result.
 //!
 //! # Design rationale
+#![allow(deprecated)]
 //!
 //! ConversationState was a **leaky abstraction**: every new edge case required
 //! adding a field (`is_github`, `is_fetch`, `recent_tools`, etc.), effectively

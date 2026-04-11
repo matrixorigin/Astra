@@ -8,6 +8,7 @@
 //! The router is stateless: it reads from `PatternLibrary` and `ExperimentStore`
 //! but does not mutate them. Mutation (recording outcomes, creating experiments)
 //! is handled by the agentic loop and [`ExplorationEngine`].
+#![allow(deprecated)]
 
 use crate::ab_testing::{ExperimentStatus, ExperimentStore};
 use crate::adaptive_baselines::AdaptiveBaselineStore;

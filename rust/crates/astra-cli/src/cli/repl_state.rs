@@ -2,6 +2,7 @@
 //!
 //! This module defines `ReplState`, the central struct that holds all session state
 //! for the CLI REPL. It also includes helper types like `ExplainMode` and `SkillDevState`.
+#![allow(deprecated)]
 
 use crate::PermissionManager;
 use crate::durable_bridge;

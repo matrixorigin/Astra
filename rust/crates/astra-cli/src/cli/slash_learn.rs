@@ -1,4 +1,5 @@
 #![allow(unused_imports)]
+#![allow(deprecated)]
 use super::*;
 
 /// Handle `/learn` command — show learning insights, drift detection, exploration.

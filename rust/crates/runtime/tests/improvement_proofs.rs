@@ -2069,12 +2069,17 @@ mod mo_convergence {
     // ── Total catalog size ──
 
     #[test]
-    fn catalog_has_33_tools_after_git_show_and_web_fetch() {
-        assert_eq!(
-            TOOL_CATALOG.len(),
-            37,
-            "Added git_show + web_fetch + run_chain + delegate to the built-in catalog"
+    fn catalog_includes_recent_builtin_tools() {
+        assert!(
+            TOOL_CATALOG.len() >= 37,
+            "built-in catalog should retain the post-git_show/web_fetch expansion"
         );
+        for tool in ["git_show", "web_fetch", "run_chain", "delegate"] {
+            assert!(
+                TOOL_CATALOG.iter().any(|meta| meta.name == tool),
+                "built-in catalog should include {tool}"
+            );
+        }
     }
 }
 

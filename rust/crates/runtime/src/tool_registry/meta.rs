@@ -941,7 +941,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
     ToolMeta {
         name: "prioritize_tool",
         description: "Pin a tool as preferred in this session",
-        triggers: &["prioritize tool", "pin tool", "工具优先"],
+        triggers: &["prioritize tool", "pin tool", "prefer tool", "工具优先"],
         pinned: false,
         intents: &[IntentType::Introspect],
         scope: Scope::Local,
@@ -950,7 +950,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
     ToolMeta {
         name: "deprioritize_tool",
         description: "Mark a tool as deprioritized in this session",
-        triggers: &["deprioritize tool", "avoid tool", "工具降级"],
+        triggers: &["deprioritize tool", "avoid tool", "demote tool", "工具降级"],
         pinned: false,
         intents: &[IntentType::Introspect],
         scope: Scope::Local,
@@ -968,7 +968,12 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
     ToolMeta {
         name: "compress_context",
         description: "Record a manual context compression request",
-        triggers: &["compress context", "context too long", "压缩上下文"],
+        triggers: &[
+            "compress context",
+            "context too long",
+            "shrink context",
+            "压缩上下文",
+        ],
         pinned: false,
         intents: &[IntentType::Introspect],
         scope: Scope::Local,

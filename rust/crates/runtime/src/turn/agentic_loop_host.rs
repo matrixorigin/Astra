@@ -7,6 +7,7 @@
 //! can run identically in CLI and headless cloud contexts.
 //!
 //! # Host Implementations
+#![allow(deprecated)]
 //!
 //! | Host | Crate | Context | Tool execution |
 //! |------|-------|---------|----------------|
@@ -555,6 +556,125 @@ fn should_emit_adaptive_scenario_event(
     !scenario_suppressed && (scenario_changed || !config_changes_empty)
 }
 
+fn sync_liquid_tactical_runtime(
+    state: &mut AgenticLoopState,
+    adaptive_enabled: bool,
+    turn_token_budget: u64,
+) {
+    if !adaptive_enabled {
+        state.tactical_adapter = None;
+        state.step_signal_collector = None;
+        return;
+    }
+
+    if let Some(ref mut collector) = state.step_signal_collector {
+        collector.reset(turn_token_budget);
+    } else {
+        state.step_signal_collector = Some(crate::liquid::step_signals::StepSignalCollector::new(
+            crate::liquid::step_signals::StepSignalConfig::default(),
+            turn_token_budget,
+        ));
+    }
+
+    if state.tactical_adapter.is_none() {
+        state.tactical_adapter = Some(crate::liquid::tactical::TacticalAdapter::new(
+            crate::liquid::tactical::DampenerConfig::default(),
+        ));
+    }
+}
+
+fn shrink_u32_budget(current: u32, percent: u32, floor: u32) -> u32 {
+    let retained = 100_u32.saturating_sub(percent.min(100));
+    current
+        .saturating_mul(retained)
+        .saturating_div(100)
+        .max(floor)
+}
+
+fn apply_tactical_actions(
+    state: &mut AgenticLoopState,
+    step_actions: &[crate::liquid::tactical::TacticalAction],
+) -> Vec<String> {
+    let session = state.telemetry.observability_session.clone();
+    let mut session_guard = session.as_ref().and_then(|s| s.write().ok());
+    let mut hint_parts = Vec::new();
+
+    for action in step_actions {
+        match action {
+            crate::liquid::tactical::TacticalAction::IncreaseVerification { reason } => {
+                let mut suffix = String::new();
+                if let Some(guard) = session_guard.as_mut() {
+                    let old = guard.config.verification.strictness;
+                    let new = (old + 0.05).min(guard.config.verification.max_strictness);
+                    guard.config.verification.strictness = new;
+                    if (new - old).abs() > f64::EPSILON {
+                        suffix = format!(" (verification {:.2}->{:.2})", old, new);
+                    }
+                }
+                hint_parts.push(format!("⚠️ {reason}{suffix}"));
+            }
+            crate::liquid::tactical::TacticalAction::SuggestToolSwitch { from_tool, reason } => {
+                state.turn_guard.health.force_deprioritize(from_tool);
+                hint_parts.push(format!(
+                    "💡 Consider switching from '{}': {} (deprioritized for follow-up selection)",
+                    from_tool, reason
+                ));
+            }
+            crate::liquid::tactical::TacticalAction::TokenBudgetWarning { used, budget } => {
+                let baseline = state
+                    .tool_budget_override
+                    .or_else(|| {
+                        session_guard
+                            .as_ref()
+                            .map(|guard| guard.config.tool_selection.tool_budget_tokens)
+                    })
+                    .filter(|&v| v > 0)
+                    .unwrap_or(800);
+                let new_budget = shrink_u32_budget(baseline, 15, 400);
+                state.tool_budget_override = Some(new_budget);
+
+                let mut suffix = format!(" (tool budget {}->{})", baseline, new_budget);
+                if let Some(guard) = session_guard.as_mut() {
+                    guard.config.tool_selection.tool_budget_tokens = new_budget;
+
+                    let old_threshold = guard.config.compression.compression_threshold;
+                    let new_threshold = (old_threshold - 0.05)
+                        .max(guard.config.context_window.compression_threshold_min);
+                    guard.config.compression.compression_threshold = new_threshold;
+                    if (new_threshold - old_threshold).abs() > f64::EPSILON {
+                        suffix.push_str(&format!(
+                            ", compression {:.2}->{:.2}",
+                            old_threshold, new_threshold
+                        ));
+                    }
+                }
+
+                hint_parts.push(format!(
+                    "📊 Token usage: {}% of budget consumed. Be concise.{}",
+                    used * 100 / budget.max(&1),
+                    suffix
+                ));
+            }
+            crate::liquid::tactical::TacticalAction::ThrottleHint { reason } => {
+                let mut suffix = String::new();
+                if let Some(guard) = session_guard.as_mut() {
+                    let old = guard.config.token_budget.max_turn_input_tokens;
+                    let new = shrink_u32_budget(old, 10, 30_000);
+                    guard.config.token_budget.max_turn_input_tokens = new;
+                    state.max_turn_input_tokens = new as u64;
+                    if new != old {
+                        suffix = format!(" (turn budget {}->{})", old, new);
+                    }
+                }
+                hint_parts.push(format!("🐢 {reason}{suffix}"));
+            }
+            crate::liquid::tactical::TacticalAction::NoOp => {}
+        }
+    }
+
+    hint_parts
+}
+
 fn apply_adaptive_execution_profile(state: &mut AgenticLoopState) {
     let (hub, session) = match (
         &state.telemetry.observability_hub,
@@ -673,6 +793,8 @@ fn apply_adaptive_execution_profile(state: &mut AgenticLoopState) {
     let experiment_id = profile.experiment_id.clone();
     let variant_id = profile.variant_id.clone();
     let scenario_changed = profile.scenario != old_scenario;
+    let adaptive_enabled = session_guard.config.context_window.adaptive;
+    let turn_token_budget = session_guard.config.token_budget.max_turn_input_tokens as u64;
 
     // Compute config deltas for journal.
     let mut config_changes = Vec::new();
@@ -734,6 +856,9 @@ fn apply_adaptive_execution_profile(state: &mut AgenticLoopState) {
 
     // Release session lock before writing journal.
     drop(session_guard);
+    drop(experiments);
+    drop(pattern_library);
+    sync_liquid_tactical_runtime(state, adaptive_enabled, turn_token_budget);
 
     // Emit journal event for adaptive profile selection.
     // Skip when scenario is empty (no scenario detected) and no config changes.
@@ -3803,39 +3928,11 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                 }
             }
 
-            // Apply tactical actions as hints in the conversation
+            // Apply tactical actions as real bounded runtime mutations plus
+            // inline hints so the next round can see both the changed state
+            // and an explicit explanation.
             if !step_actions.is_empty() {
-                let hint_parts: Vec<String> = step_actions
-                    .iter()
-                    .map(|a| match a {
-                        crate::liquid::tactical::TacticalAction::IncreaseVerification {
-                            reason,
-                        } => {
-                            format!("⚠️ {}", reason)
-                        }
-                        crate::liquid::tactical::TacticalAction::SuggestToolSwitch {
-                            from_tool,
-                            reason,
-                        } => {
-                            format!("💡 Consider switching from '{}': {}", from_tool, reason)
-                        }
-                        crate::liquid::tactical::TacticalAction::TokenBudgetWarning {
-                            used,
-                            budget,
-                        } => {
-                            format!(
-                                "📊 Token usage: {}% of budget consumed. Be concise.",
-                                used * 100 / budget.max(&1)
-                            )
-                        }
-                        crate::liquid::tactical::TacticalAction::ThrottleHint { reason } => {
-                            format!("🐢 {}", reason)
-                        }
-                        crate::liquid::tactical::TacticalAction::NoOp => String::new(),
-                    })
-                    .filter(|s| !s.is_empty())
-                    .collect();
-
+                let hint_parts = apply_tactical_actions(state, &step_actions);
                 if !hint_parts.is_empty() {
                     let hint_text = format!("[Tactical Adaptation]\n{}", hint_parts.join("\n"));
                     state.messages.push(serde_json::json!({
@@ -8266,6 +8363,52 @@ print(json.dumps({'context': 'user said: ' + msg}))
     }
 
     #[test]
+    fn adaptive_profile_enables_liquid_runtime_when_adaptive_context_is_on() {
+        let hub = make_hub();
+        let session = make_session();
+        let mut state = make_state();
+        state.telemetry.observability_hub = Some(hub);
+        state.telemetry.observability_session = Some(session.clone());
+
+        {
+            let mut guard = session.write().unwrap();
+            guard.config.context_window.adaptive = true;
+            guard.config.token_budget.max_turn_input_tokens = 64_000;
+        }
+
+        apply_adaptive_execution_profile(&mut state);
+
+        assert!(state.tactical_adapter.is_some());
+        assert!(state.step_signal_collector.is_some());
+    }
+
+    #[test]
+    fn adaptive_profile_disables_liquid_runtime_when_adaptive_context_is_off() {
+        let hub = make_hub();
+        let session = make_session();
+        let mut state = make_state();
+        state.telemetry.observability_hub = Some(hub);
+        state.telemetry.observability_session = Some(session.clone());
+        state.tactical_adapter = Some(crate::liquid::tactical::TacticalAdapter::new(
+            crate::liquid::tactical::DampenerConfig::default(),
+        ));
+        state.step_signal_collector = Some(crate::liquid::step_signals::StepSignalCollector::new(
+            crate::liquid::step_signals::StepSignalConfig::default(),
+            64_000,
+        ));
+
+        {
+            let mut guard = session.write().unwrap();
+            guard.config.context_window.adaptive = false;
+        }
+
+        apply_adaptive_execution_profile(&mut state);
+
+        assert!(state.tactical_adapter.is_none());
+        assert!(state.step_signal_collector.is_none());
+    }
+
+    #[test]
     fn tuning_cycle_concludes_mature_experiments() {
         let temp = tempfile::tempdir().unwrap();
         let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
@@ -9834,28 +9977,62 @@ print(json.dumps({'context': 'user said: ' + msg}))
             "3 consecutive errors should produce tactical actions, got none"
         );
 
-        // Build hint text like the loop does
-        let hint_parts: Vec<String> = step_actions
-            .iter()
-            .map(|a| match a {
-                TacticalAction::IncreaseVerification { reason } => {
-                    format!("⚠️ {}", reason)
-                }
-                TacticalAction::SuggestToolSwitch { from_tool, reason } => {
-                    format!("💡 Switch from '{}': {}", from_tool, reason)
-                }
-                TacticalAction::TokenBudgetWarning { used, budget } => {
-                    format!("📊 {}% used", used * 100 / budget.max(&1))
-                }
-                TacticalAction::ThrottleHint { reason } => {
-                    format!("🐢 {}", reason)
-                }
-                TacticalAction::NoOp => String::new(),
-            })
-            .filter(|s| !s.is_empty())
-            .collect();
+        let hint_parts = apply_tactical_actions(&mut state, &step_actions);
 
         assert!(!hint_parts.is_empty(), "Should produce non-empty hint text");
+    }
+
+    #[test]
+    fn tactical_actions_apply_bounded_runtime_mutations() {
+        use crate::liquid::tactical::TacticalAction;
+
+        let session = make_session();
+        let mut state = make_state();
+        state.telemetry.observability_session = Some(session.clone());
+        state.max_turn_input_tokens = 100_000;
+        state.tool_budget_override = Some(1000);
+
+        {
+            let mut guard = session.write().unwrap();
+            guard.config.verification.strictness = 0.5;
+            guard.config.verification.max_strictness = 0.9;
+            guard.config.compression.compression_threshold = 0.8;
+            guard.config.context_window.compression_threshold_min = 0.5;
+            guard.config.tool_selection.tool_budget_tokens = 1000;
+            guard.config.token_budget.max_turn_input_tokens = 100_000;
+        }
+
+        let hints = apply_tactical_actions(
+            &mut state,
+            &[
+                TacticalAction::IncreaseVerification {
+                    reason: "3 consecutive errors".into(),
+                },
+                TacticalAction::SuggestToolSwitch {
+                    from_tool: "bash".into(),
+                    reason: "repeated failures".into(),
+                },
+                TacticalAction::TokenBudgetWarning {
+                    used: 90_000,
+                    budget: 100_000,
+                },
+                TacticalAction::ThrottleHint {
+                    reason: "latency spike".into(),
+                },
+            ],
+        );
+
+        let guard = session.read().unwrap();
+        assert!(guard.config.verification.strictness > 0.5);
+        assert!(state.turn_guard.health.is_deprioritized("bash"));
+        assert_eq!(state.tool_budget_override, Some(850));
+        assert!(guard.config.compression.compression_threshold < 0.8);
+        assert!(guard.config.token_budget.max_turn_input_tokens < 100_000);
+        assert_eq!(
+            state.max_turn_input_tokens,
+            guard.config.token_budget.max_turn_input_tokens as u64
+        );
+        assert!(!hints.is_empty());
     }
 
     #[test]

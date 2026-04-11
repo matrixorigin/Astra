@@ -9,6 +9,7 @@
 //! - `/experiment stop <id>`: Stop an experiment
 //! - `/experiment analyze <id>`: Analyze experiment results
 //! - `/experiment help`: Show help
+#![allow(deprecated)]
 
 use super::*;
 use astra_runtime::ab_testing::{

@@ -184,6 +184,14 @@ impl ToolHealthTracker {
         self.tools.get(tool_name).is_some_and(|h| h.deprioritized)
     }
 
+    /// Manually deprioritize a tool when a higher-level policy decides the
+    /// current turn should steer away from it immediately.
+    pub fn force_deprioritize(&mut self, tool_name: &str) {
+        let health = self.tools.entry(tool_name.to_string()).or_default();
+        health.deprioritized = true;
+        self.dirty_tools.insert(tool_name.to_string());
+    }
+
     /// Get list of all deprioritized tools.
     pub fn deprioritized_tools(&self) -> Vec<&str> {
         self.tools
