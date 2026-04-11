@@ -101,6 +101,11 @@ describe('useChatStream', () => {
     expect(result.current.usage.totalTokens).toBe(0);
   });
 
+  it('starts with no followup suggestion', () => {
+    const { result } = renderHook(() => useChatStream(baseConfig));
+    expect(result.current.followupSuggestion).toBeNull();
+  });
+
   // ── sendMessage ────────────────────────────────────────────────────────
   it('sendMessage adds user + assistant messages', async () => {
     fetchMock.mockResolvedValueOnce(
@@ -159,6 +164,28 @@ describe('useChatStream', () => {
     const assistant = result.current.messages[1];
     expect(assistant.content).toBe('Hello world');
     expect(assistant.streaming).toBe(false);
+  });
+
+  it('derives a followup suggestion from the completed turn', async () => {
+    fetchMock.mockResolvedValueOnce(
+      sseResponse([
+        { type: 'text_delta', content: 'Patched and verified.' },
+        { type: 'tool_call_start', call_id: '1', tool: 'str_replace', arguments: '{}' },
+        { type: 'tool_call_end', call_id: '1', result: 'ok' },
+        { type: 'tool_call_start', call_id: '2', tool: 'run_build_test', arguments: '{}' },
+        { type: 'tool_call_end', call_id: '2', result: 'ok' },
+        { type: 'turn_complete' },
+      ]),
+    );
+
+    const { result } = renderHook(() => useChatStream(baseConfig));
+
+    await act(async () => {
+      result.current.sendMessage('Fix the bug');
+      await new Promise((r) => setTimeout(r, 50));
+    });
+
+    expect(result.current.followupSuggestion).toBe('commit this');
   });
 
   it('sets connectionState to error on fetch failure', async () => {
@@ -242,6 +269,7 @@ describe('useChatStream', () => {
     expect(result.current.isStreaming).toBe(false);
     expect(result.current.error).toBeNull();
     expect(result.current.plan).toBeNull();
+    expect(result.current.followupSuggestion).toBeNull();
     expect(result.current.connectionState).toBe('idle');
     expect(result.current.usage.totalTokens).toBe(0);
   });

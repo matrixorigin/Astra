@@ -136,6 +136,7 @@ export function WorkspaceShell({
           onStop={chat.stop}
           disabled={chat.isStreaming}
           isStreaming={chat.isStreaming}
+          followupSuggestion={chat.followupSuggestion}
           placeholder={
             displaySessionId
               ? 'Send a message…'

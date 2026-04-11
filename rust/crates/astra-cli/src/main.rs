@@ -86,6 +86,8 @@ mod dynamic_completions;
 mod edge_lifecycle;
 #[path = "cli/effects/mod.rs"]
 mod effects;
+#[path = "cli/followup_suggestion.rs"]
+mod followup_suggestion;
 #[path = "cli/idle_agent_messages.rs"]
 mod idle_agent_messages;
 #[path = "cli/journal_digest.rs"]
@@ -231,9 +233,9 @@ use repl_runtime::{
 };
 use repl_turn::{ReplTurnContext, create_manual_repl_checkpoint, handle_chat_input};
 use repl_ui::{
-    ReplHelper, SlashStartCompleteHandler, clear_slash_overlay, history_path,
-    is_slash_picker_active, print_keyboard_shortcuts, print_slash_commands, resolve_slash_command,
-    suggest_commands,
+    ReplHelper, SlashStartCompleteHandler, clear_followup_prompt_hint, clear_slash_overlay,
+    history_path, is_slash_picker_active, print_keyboard_shortcuts, print_slash_commands,
+    resolve_slash_command, suggest_commands,
 };
 use session_guard::update_panic_guard;
 use slash_account::handle_account_command;
@@ -398,6 +400,8 @@ async fn run_chat_repl(
                     if line.is_empty() {
                         continue;
                     }
+                    clear_followup_prompt_hint();
+                    state.pending_followup_suggestion = None;
                     readline.add_history(line.clone());
 
                     // ── Handle pending approval from background plan executor ──

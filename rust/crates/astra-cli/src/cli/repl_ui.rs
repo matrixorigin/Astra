@@ -331,6 +331,7 @@ static SLASH_PICKER_SELECTED: OnceLock<Mutex<usize>> = OnceLock::new();
 static SLASH_OVERLAY_STATE: OnceLock<Mutex<(Option<String>, usize)>> = OnceLock::new();
 static SLASH_FILTER_QUERY: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 static SLASH_PENDING_EXECUTE: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+static FOLLOWUP_PROMPT_HINT: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 
 fn slash_overlay_lines() -> &'static Mutex<u16> {
     SLASH_OVERLAY_LINES.get_or_init(|| Mutex::new(0))
@@ -367,6 +368,9 @@ fn get_slash_filter() -> Option<String> {
 fn slash_pending_execute() -> &'static Mutex<Option<String>> {
     SLASH_PENDING_EXECUTE.get_or_init(|| Mutex::new(None))
 }
+fn followup_prompt_hint() -> &'static Mutex<Option<String>> {
+    FOLLOWUP_PROMPT_HINT.get_or_init(|| Mutex::new(None))
+}
 fn set_slash_pending_execute(cmd: Option<String>) {
     if let Ok(mut g) = slash_pending_execute().lock() {
         *g = cmd;
@@ -379,6 +383,17 @@ pub(super) fn take_slash_pending_execute() -> Option<String> {
         .lock()
         .ok()
         .and_then(|mut g| g.take())
+}
+pub(super) fn set_followup_prompt_hint(hint: Option<String>) {
+    if let Ok(mut g) = followup_prompt_hint().lock() {
+        *g = hint;
+    }
+}
+pub(super) fn clear_followup_prompt_hint() {
+    set_followup_prompt_hint(None);
+}
+fn get_followup_prompt_hint() -> Option<String> {
+    followup_prompt_hint().lock().ok().and_then(|g| g.clone())
 }
 pub(super) fn is_slash_picker_active() -> bool {
     slash_overlay_lines()
@@ -525,6 +540,16 @@ fn slash_inline_hint(line: &str) -> Option<String> {
         return Some(cmd[line.len()..].to_string());
     }
     None
+}
+
+fn prompt_inline_hint(line: &str) -> Option<String> {
+    if line.is_empty()
+        && !is_slash_picker_active()
+        && let Some(hint) = get_followup_prompt_hint()
+    {
+        return Some(hint);
+    }
+    slash_inline_hint(line)
 }
 
 fn apply_accepted_slash_edit(edit: AcceptedSlashEdit) -> RlCmd {
@@ -1241,6 +1266,11 @@ impl ConditionalEventHandler for SlashStartCompleteHandler {
                     return Some(RlCmd::Move(RlMovement::EndOfLine));
                 }
             }
+            RlKeyEvent(RlKeyCode::Tab, _) if !active && ctx.line().is_empty() => {
+                if let Some(hint) = get_followup_prompt_hint() {
+                    return Some(RlCmd::Insert(1, hint));
+                }
+            }
             RlKeyEvent(RlKeyCode::BackTab, _) if in_slash && active => {
                 nav!(-1);
             }
@@ -1391,7 +1421,7 @@ impl Hinter for ReplHelper {
     type Hint = String;
 
     fn hint(&self, line: &str, _pos: usize, _ctx: &Context<'_>) -> Option<String> {
-        slash_inline_hint(line)
+        prompt_inline_hint(line)
     }
 }
 
@@ -1575,6 +1605,20 @@ mod tests {
         assert!(hint.contains("run"));
         assert!(hint.contains("history"));
         assert!(hint.contains("restore"));
+    }
+
+    #[test]
+    fn prompt_inline_hint_uses_followup_suggestion_on_empty_line() {
+        set_followup_prompt_hint(Some("run the tests".to_string()));
+        assert_eq!(prompt_inline_hint(""), Some("run the tests".to_string()));
+        clear_followup_prompt_hint();
+    }
+
+    #[test]
+    fn prompt_inline_hint_keeps_slash_completion_when_typing_command() {
+        set_followup_prompt_hint(Some("run the tests".to_string()));
+        assert_eq!(prompt_inline_hint("/he"), slash_inline_hint("/he"));
+        clear_followup_prompt_hint();
     }
 
     // ── slash_first_token_completions (Tab after `/cmd `) ─────────────────────

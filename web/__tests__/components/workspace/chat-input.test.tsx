@@ -97,4 +97,16 @@ describe('ChatInput', () => {
     render(<ChatInput {...defaultProps} placeholder="Ask me anything…" />);
     expect(screen.getByPlaceholderText('Ask me anything…')).toBeInTheDocument();
   });
+
+  it('shows a followup suggestion chip when the input is empty', () => {
+    render(<ChatInput {...defaultProps} followupSuggestion="run the tests" />);
+    expect(screen.getByRole('button', { name: 'Next: run the tests' })).toBeInTheDocument();
+  });
+
+  it('accepts the followup suggestion on Tab', () => {
+    render(<ChatInput {...defaultProps} followupSuggestion="run the tests" />);
+    const textarea = screen.getByPlaceholderText('Send a message…') as HTMLTextAreaElement;
+    fireEvent.keyDown(textarea, { key: 'Tab' });
+    expect(textarea.value).toBe('run the tests');
+  });
 });

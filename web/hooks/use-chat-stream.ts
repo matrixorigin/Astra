@@ -11,6 +11,7 @@ import type {
   TokenUsage,
 } from '@/lib/workspace/types';
 import type { StreamEvent } from '@/lib/streaming/types';
+import { suggestFollowupPrompt } from '@/lib/workspace/followup-suggestion';
 
 let nextId = 0;
 function uid(): string {
@@ -49,6 +50,7 @@ export function useChatStream(config: ChatConfig): UseChatStreamReturn {
   const [usage, setUsage] = useState<TokenUsage>(EMPTY_USAGE);
   const [connectionState, setConnectionState] = useState<ConnectionState>('idle');
   const [agentEvents, setAgentEvents] = useState<StreamEvent[]>([]);
+  const [followupSuggestion, setFollowupSuggestion] = useState<string | null>(null);
 
   // Refs for mutable state during stream processing
   const controllerRef = useRef<AbortController | null>(null);
@@ -56,6 +58,7 @@ export function useChatStream(config: ChatConfig): UseChatStreamReturn {
   const accumulatedTextRef = useRef('');
   const accumulatedThinkingRef = useRef('');
   const toolCallMapRef = useRef<Map<string, ToolCall>>(new Map());
+  const lastUserMessageRef = useRef('');
   // Track config.sessionId to detect external changes
   const configSessionIdRef = useRef(config.sessionId);
 
@@ -77,8 +80,10 @@ export function useChatStream(config: ChatConfig): UseChatStreamReturn {
       setUsage(EMPTY_USAGE);
       setConnectionState('idle');
       setAgentEvents([]);
+      setFollowupSuggestion(null);
       accumulatedTextRef.current = '';
       accumulatedThinkingRef.current = '';
+      lastUserMessageRef.current = '';
       toolCallMapRef.current.clear();
     }
   }, [config.sessionId]);
@@ -233,6 +238,13 @@ export function useChatStream(config: ChatConfig): UseChatStreamReturn {
         case 'turn_complete': {
           const id = assistantIdRef.current;
           const finalTools = Array.from(toolCallMapRef.current.values());
+          setFollowupSuggestion(
+            suggestFollowupPrompt({
+              userMessage: lastUserMessageRef.current,
+              assistantMessage: accumulatedTextRef.current,
+              toolCalls: finalTools,
+            }),
+          );
           setMessages((prev) =>
             prev.map((m) =>
               m.id === id
@@ -254,6 +266,7 @@ export function useChatStream(config: ChatConfig): UseChatStreamReturn {
           setError(event.message);
           setIsStreaming(false);
           setConnectionState('error');
+          setFollowupSuggestion(null);
           break;
         }
 
@@ -286,6 +299,7 @@ export function useChatStream(config: ChatConfig): UseChatStreamReturn {
     }
     setIsStreaming(false);
     setConnectionState('idle');
+    setFollowupSuggestion(null);
   }, []);
 
   const sendMessage = useCallback(
@@ -295,6 +309,8 @@ export function useChatStream(config: ChatConfig): UseChatStreamReturn {
       setError(null);
       setIsStreaming(true);
       setConnectionState('streaming');
+      setFollowupSuggestion(null);
+      lastUserMessageRef.current = content;
 
       const userMsg: ChatMessage = {
         id: uid(),
@@ -406,8 +422,10 @@ export function useChatStream(config: ChatConfig): UseChatStreamReturn {
     setUsage(EMPTY_USAGE);
     setConnectionState('idle');
     setAgentEvents([]);
+    setFollowupSuggestion(null);
     accumulatedTextRef.current = '';
     accumulatedThinkingRef.current = '';
+    lastUserMessageRef.current = '';
     toolCallMapRef.current.clear();
   }, [config.sessionId]);
 
@@ -416,6 +434,7 @@ export function useChatStream(config: ChatConfig): UseChatStreamReturn {
     runId,
     messages,
     toolCalls,
+    followupSuggestion,
     isStreaming,
     error,
     plan,

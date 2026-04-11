@@ -8,12 +8,14 @@ export function ChatInput({
   disabled = false,
   isStreaming = false,
   placeholder = 'Send a message…',
+  followupSuggestion = null,
 }: {
   onSend: (message: string) => void;
   onStop?: () => void;
   disabled?: boolean;
   isStreaming?: boolean;
   placeholder?: string;
+  followupSuggestion?: string | null;
 }) {
   const [value, setValue] = useState('');
 
@@ -26,16 +28,33 @@ export function ChatInput({
 
   const handleKeyDown = useCallback(
     (e: KeyboardEvent<HTMLTextAreaElement>) => {
+      if (e.key === 'Tab' && !e.shiftKey && value.length === 0 && followupSuggestion) {
+        e.preventDefault();
+        setValue(followupSuggestion);
+        return;
+      }
       if (e.key === 'Enter' && !e.shiftKey) {
         e.preventDefault();
         handleSend();
       }
     },
-    [handleSend],
+    [followupSuggestion, handleSend, value.length],
   );
 
   return (
     <div className="border-t border-slate-800 bg-slate-950/80 p-4">
+      {followupSuggestion && value.length === 0 && !isStreaming ? (
+        <div className="mb-3 flex items-center gap-2 text-xs">
+          <button
+            type="button"
+            onClick={() => setValue(followupSuggestion)}
+            className="rounded-full border border-sky-500/40 bg-sky-500/10 px-3 py-1 text-sky-200 hover:bg-sky-500/20"
+          >
+            Next: {followupSuggestion}
+          </button>
+          <span className="text-slate-500">Press Tab to accept</span>
+        </div>
+      ) : null}
       <div className="flex gap-3">
         <textarea
           value={value}

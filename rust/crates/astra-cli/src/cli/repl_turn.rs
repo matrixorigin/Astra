@@ -431,7 +431,7 @@ pub(super) fn build_effective_line(line: &str, state: &ReplState) -> String {
     effective_line
 }
 
-fn is_short_continuation_prompt(line: &str) -> bool {
+pub(super) fn is_short_continuation_prompt(line: &str) -> bool {
     let trimmed = line.trim();
     if trimmed.is_empty() || trimmed.chars().count() > 16 {
         return false;
@@ -1221,6 +1221,13 @@ fn apply_turn_success(
     state.total_session_cost += turn_cost;
     state.last_response = Some(result.full_text.clone());
     state.continuation_anchor = build_continuation_anchor(state, line, &result);
+    state.pending_followup_suggestion =
+        crate::followup_suggestion::suggest_followup(line, state, &result);
+    if let Some(suggestion) = state.pending_followup_suggestion.as_ref() {
+        super::repl_ui::set_followup_prompt_hint(Some(suggestion.text.clone()));
+    } else {
+        super::repl_ui::clear_followup_prompt_hint();
+    }
 
     // Capture session goal from the first substantive user message.
     if state.session_goal.is_none() && !line.trim().is_empty() {
@@ -1258,6 +1265,12 @@ fn apply_turn_success(
 
     // ── Post-turn status line ────────────────────────────────────────────
     print_turn_status_line(state, &result, turn_start);
+    if let Some(suggestion) = state.pending_followup_suggestion.as_ref() {
+        eprintln!(
+            "{}",
+            format!("  💡 Next prompt: {}  (Tab to accept)", suggestion.text).dim()
+        );
+    }
 
     if result.tool_calls_count == 0 && looks_like_live_query_with_context(line, &state.recent_tools)
     {

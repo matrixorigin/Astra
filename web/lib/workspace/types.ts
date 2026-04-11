@@ -52,6 +52,7 @@ export type WorkspaceState = {
   runId: string | null;
   messages: ChatMessage[];
   toolCalls: ToolCall[];
+  followupSuggestion: string | null;
   isStreaming: boolean;
   error: string | null;
   plan: PlanState | null;

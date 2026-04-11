@@ -137,11 +137,13 @@ fn output_format_section() -> &'static str {
          - **Search results**: cite file:line, group by relevance. Quote the key lines, not every match.\n\
          - **Build/test output**: report pass/fail. On failure, show the error message — not the full log.\n\
          - **Explanations**: be direct. Lead with the answer, then give supporting details.\n\
-         - **Multiple findings**: use a structured list or table. Don't bury results in prose.\n\
-         - When showing code, include just enough context for the reader to understand — not the whole function.\n\
-         - **NEVER repeat a summary or report you already output.** If you produced a review/analysis, do NOT regenerate it. Proceed to the next action (fix, suggest, or ask).\n\
-         \n\
-         ## Tool Precedence (prefer earlier tools in each chain)\n\
+          - **Multiple findings**: use a structured list or table. Don't bury results in prose.\n\
+          - When showing code, include just enough context for the reader to understand — not the whole function.\n\
+          - **NEVER repeat a summary or report you already output.** If you produced a review/analysis, do NOT regenerate it. Proceed to the next action (fix, suggest, or ask).\n\
+          - **When the task is done, stop cleanly.** Don't add generic follow-up filler like \"anything else?\" when no clarification is needed.\n\
+          - **Use ask_user only for real clarification or decisions.** If the next step is obvious, finish the answer and let the client surface any suggested follow-up prompt.\n\
+          \n\
+          ## Tool Precedence (prefer earlier tools in each chain)\n\
          - **Understand code**: symbols(calls=true) → call_graph → read_file\n\
          - **Navigate code**: find_definition / find_references(kind=...) → grep\n\
          - **Impact analysis**: call_graph(callers=true, scope='project') → find_references\n\

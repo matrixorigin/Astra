@@ -71,6 +71,8 @@ pub(crate) struct ReplState {
     /// Session-level goal derived from the first substantive user message.
     /// Survives compaction and is injected alongside the continuation anchor.
     pub session_goal: Option<String>,
+    /// Suggested next prompt shown after a completed turn when the next action is obvious.
+    pub pending_followup_suggestion: Option<crate::followup_suggestion::FollowupSuggestion>,
     pub explain: ExplainMode,
     pub verbose_mode: bool,
     pub history: Vec<(String, String)>, // (user_msg, assistant_msg)
@@ -279,6 +281,7 @@ impl Default for ReplState {
             )),
             continuation_anchor: None,
             session_goal: None,
+            pending_followup_suggestion: None,
             explain: ExplainMode::Off,
             verbose_mode: true,
             history: Vec::new(),
