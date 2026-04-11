@@ -1052,7 +1052,148 @@ where
                     }
                 }
             } else {
-                yield Ok(Bytes::from(buffer));
+                if is_session_info_frame(&buffer) {
+                    if trusted_session_id.is_none() {
+                        yield Ok(Bytes::from(buffer));
+                    }
+                } else if suppress_next_turn_complete && is_turn_complete_frame(&buffer) {
+                } else if pending_bridge_state.is_some() {
+                    if let Some(text_delta_event) = build_text_delta_event_from_frame(&buffer) {
+                        yield Ok(Bytes::from(render_sse_json(
+                            serde_json::Value::Object(text_delta_event),
+                        )));
+                    } else if let Some(reasoning_delta_event) =
+                        build_reasoning_delta_event_from_frame(&buffer)
+                    {
+                        yield Ok(Bytes::from(render_sse_json(
+                            serde_json::Value::Object(reasoning_delta_event),
+                        )));
+                    } else if let Some(usage_event) = build_usage_event_from_frame(&buffer) {
+                        yield Ok(Bytes::from(render_sse_json(
+                            serde_json::Value::Object(usage_event),
+                        )));
+                    } else if let Some(tool_result_quality_event) =
+                        build_tool_result_quality_event_from_frame(&buffer)
+                    {
+                        yield Ok(Bytes::from(render_sse_json(
+                            serde_json::Value::Object(tool_result_quality_event),
+                        )));
+                    } else if let Some(cloud_loop_progress_event) =
+                        build_cloud_loop_progress_event_from_frame(&buffer)
+                    {
+                        yield Ok(Bytes::from(render_sse_json(
+                            serde_json::Value::Object(cloud_loop_progress_event),
+                        )));
+                    } else if let Some(cloud_tool_result_event) =
+                        build_cloud_tool_result_event_from_frame(&buffer)
+                    {
+                        yield Ok(Bytes::from(render_sse_json(
+                            serde_json::Value::Object(cloud_tool_result_event),
+                        )));
+                    } else if let Some(error_event) = build_error_event_from_frame(&buffer) {
+                        yield Ok(Bytes::from(render_sse_json(
+                            serde_json::Value::Object(error_event),
+                        )));
+                    } else if let Some(tool_call_event) = build_tool_call_event_from_frame(&buffer) {
+                        yield Ok(Bytes::from(render_sse_json(
+                            serde_json::Value::Object(tool_call_event),
+                        )));
+                    } else if let Some(tool_call_start_event) =
+                        build_tool_call_start_event_from_frame(&buffer)
+                    {
+                        yield Ok(Bytes::from(render_sse_json(
+                            serde_json::Value::Object(tool_call_start_event),
+                        )));
+                    } else if is_warning_frame(&buffer) {
+                        if pending_warning_event.is_none() {
+                            yield Ok(Bytes::from(buffer));
+                        }
+                    } else if is_explain_frame(&buffer) {
+                        if pending_explain_event.is_none() {
+                            yield Ok(Bytes::from(buffer));
+                        }
+                    } else if is_turn_complete_frame(&buffer) {
+                        if let Some(warning_event) = pending_warning_event.take() {
+                            yield Ok(Bytes::from(render_sse_json(
+                                serde_json::Value::Object(warning_event),
+                            )));
+                        }
+                        if let Some(explain_event) = pending_explain_event.take() {
+                            yield Ok(Bytes::from(render_sse_json(
+                                serde_json::Value::Object(explain_event),
+                            )));
+                        }
+                        let bridge_state = pending_bridge_state
+                            .as_ref()
+                            .expect("pending bridge state should exist");
+                        yield Ok(Bytes::from(render_sse_json(
+                            serde_json::Value::Object(
+                                build_turn_complete_event_from_bridge_state(
+                                    bridge_state,
+                                    trusted_execution_state.as_ref(),
+                                    pending_followup_user_message.as_deref(),
+                                ),
+                            ),
+                        )));
+                        received_turn_complete = true;
+                        pending_bridge_state = None;
+                        pending_followup_user_message = None;
+                        pending_warning_event = None;
+                        pending_explain_event = None;
+                    } else {
+                        yield Ok(Bytes::from(buffer));
+                    }
+                } else if let Some(text_delta_event) = build_text_delta_event_from_frame(&buffer) {
+                    yield Ok(Bytes::from(render_sse_json(
+                        serde_json::Value::Object(text_delta_event),
+                    )));
+                } else if let Some(reasoning_delta_event) =
+                    build_reasoning_delta_event_from_frame(&buffer)
+                {
+                    yield Ok(Bytes::from(render_sse_json(
+                        serde_json::Value::Object(reasoning_delta_event),
+                    )));
+                } else if let Some(usage_event) = build_usage_event_from_frame(&buffer) {
+                    yield Ok(Bytes::from(render_sse_json(
+                        serde_json::Value::Object(usage_event),
+                    )));
+                } else if let Some(tool_result_quality_event) =
+                    build_tool_result_quality_event_from_frame(&buffer)
+                {
+                    yield Ok(Bytes::from(render_sse_json(
+                        serde_json::Value::Object(tool_result_quality_event),
+                    )));
+                } else if let Some(cloud_loop_progress_event) =
+                    build_cloud_loop_progress_event_from_frame(&buffer)
+                {
+                    yield Ok(Bytes::from(render_sse_json(
+                        serde_json::Value::Object(cloud_loop_progress_event),
+                    )));
+                } else if let Some(cloud_tool_result_event) =
+                    build_cloud_tool_result_event_from_frame(&buffer)
+                {
+                    yield Ok(Bytes::from(render_sse_json(
+                        serde_json::Value::Object(cloud_tool_result_event),
+                    )));
+                } else if let Some(error_event) = build_error_event_from_frame(&buffer) {
+                    yield Ok(Bytes::from(render_sse_json(
+                        serde_json::Value::Object(error_event),
+                    )));
+                } else if let Some(tool_call_event) = build_tool_call_event_from_frame(&buffer) {
+                    yield Ok(Bytes::from(render_sse_json(
+                        serde_json::Value::Object(tool_call_event),
+                    )));
+                } else if let Some(tool_call_start_event) =
+                    build_tool_call_start_event_from_frame(&buffer)
+                {
+                    yield Ok(Bytes::from(render_sse_json(
+                        serde_json::Value::Object(tool_call_start_event),
+                    )));
+                } else if is_warning_frame(&buffer) || is_explain_frame(&buffer) {
+                    yield Ok(Bytes::from(buffer));
+                } else {
+                    yield Ok(Bytes::from(buffer));
+                }
             }
         }
         if let Some(bridge_state) = pending_bridge_state {
@@ -1274,6 +1415,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn buffered_final_session_info_is_suppressed_when_trusted() {
+        use futures_util::stream;
+        use tokio::sync::Mutex;
+
+        let filtered = filter_bridge_state_events(
+            stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from(
+                "data: {\"type\":\"session_info\",\"session_id\":\"upstream-s1\"}",
+            ))]),
+            Arc::new(Mutex::new(SessionCache::default())),
+            Some("trusted-s1".to_string()),
+            None,
+            None,
+            Some("run-1".to_string()),
+            None,
+            None,
+            None,
+            Arc::new(crate::turn::services::NoopTurnCoreEventWriter),
+            Arc::new(crate::turn::services::NoopTurnToolEventWriter),
+            Arc::new(crate::turn::services::NoopTurnHookDbWriter),
+            Arc::new(InMemoryTurnReflectionStateStore::default()),
+            Arc::new(NoopTurnReflectionLessonWriter),
+            Arc::new(NoopTurnObserverWorker),
+            Arc::new(crate::turn::services::NoopTurnAuxiliaryEventWriter),
+            Arc::new(crate::turn::services::NoopTurnSessionActivityWriter),
+            None,
+        );
+
+        let body = axum::body::to_bytes(Body::from_stream(filtered), 1024 * 1024)
+            .await
+            .expect("body should read");
+        let text = String::from_utf8(body.to_vec()).expect("utf8");
+        assert_eq!(text.matches("\"type\":\"session_info\"").count(), 1);
+        assert!(text.contains("\"session_id\":\"trusted-s1\""));
+        assert!(!text.contains("\"session_id\":\"upstream-s1\""));
+    }
+
+    #[tokio::test]
     async fn guard_error_emits_local_turn_complete_without_upstream_terminal() {
         use futures_util::stream;
         use tokio::sync::Mutex;
@@ -1345,6 +1523,48 @@ mod tests {
         assert!(text.contains("\"type\":\"error\""));
         assert!(text.contains("\"code\":\"MODEL_DEGRADED\""));
         assert_eq!(text.matches("\"type\":\"turn_complete\"").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn buffered_guard_error_suppresses_unterminated_upstream_turn_complete() {
+        use futures_util::stream;
+        use tokio::sync::Mutex;
+
+        let filtered = filter_bridge_state_events(
+            stream::iter(vec![
+                Ok::<Bytes, reqwest::Error>(Bytes::from(
+                    "data: {\"type\":\"bridge_state\",\"tool_sigs\":[],\"tail_update_args\":{\"full_text\":\"hello hello hello hello hello hello hello hello\"}}\n\n",
+                )),
+                Ok::<Bytes, reqwest::Error>(Bytes::from(
+                    "data: {\"type\":\"turn_complete\",\"message\":\"upstream\"}",
+                )),
+            ]),
+            Arc::new(Mutex::new(SessionCache::default())),
+            Some("sess-1".to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Arc::new(crate::turn::services::NoopTurnCoreEventWriter),
+            Arc::new(crate::turn::services::NoopTurnToolEventWriter),
+            Arc::new(crate::turn::services::NoopTurnHookDbWriter),
+            Arc::new(InMemoryTurnReflectionStateStore::default()),
+            Arc::new(NoopTurnReflectionLessonWriter),
+            Arc::new(NoopTurnObserverWorker),
+            Arc::new(crate::turn::services::NoopTurnAuxiliaryEventWriter),
+            Arc::new(crate::turn::services::NoopTurnSessionActivityWriter),
+            None,
+        );
+
+        let body = axum::body::to_bytes(Body::from_stream(filtered), 1024 * 1024)
+            .await
+            .expect("body should read");
+        let text = String::from_utf8(body.to_vec()).expect("utf8");
+        assert!(text.contains("\"type\":\"error\""));
+        assert_eq!(text.matches("\"type\":\"turn_complete\"").count(), 1);
+        assert!(!text.contains("\"message\":\"upstream\""));
     }
 
     #[tokio::test]
