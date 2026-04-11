@@ -450,9 +450,9 @@ pub(crate) async fn stream_chat_sse(
         messaging: MessagingState {
             mailbox: root_mailbox,
             ack_tracker: None,
-            dead_letter_queue: None,
             metrics: p.messaging_metrics.clone(),
             progress_emitter: None,
+            ..Default::default()
         },
         cancellation: CancellationState {
             flag: None,
