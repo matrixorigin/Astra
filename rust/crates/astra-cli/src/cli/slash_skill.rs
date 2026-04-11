@@ -254,6 +254,23 @@ pub(super) async fn handle_skill_command(
                 "Upgrade installed skill".dim()
             );
             eprintln!();
+            eprintln!("  {}", "Evolution:".dim());
+            eprintln!(
+                "    {}  {}",
+                "/skill evolve".cyan(),
+                "Show evolution status (signals, proposals)".dim()
+            );
+            eprintln!(
+                "    {}  {}",
+                "/skill evolve approve <id>".cyan(),
+                "Approve and apply a pending proposal".dim()
+            );
+            eprintln!(
+                "    {}  {}",
+                "/skill evolve reject <id>".cyan(),
+                "Reject a pending proposal".dim()
+            );
+            eprintln!();
         }
 
         "list" => {
