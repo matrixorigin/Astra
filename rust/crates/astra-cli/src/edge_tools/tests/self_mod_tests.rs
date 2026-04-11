@@ -166,6 +166,82 @@ async fn self_mod_persists_goal_config_and_tool_preferences() {
 }
 
 #[tokio::test]
+async fn prioritize_tool_preserves_existing_state_when_persist_fails() {
+    let tmp = tempfile::tempdir().unwrap();
+    let guard = JournalDirGuard::new(tmp.path());
+    let session_id = "persisted-prioritize-rollback".to_string();
+    let mut ws = session_workspace::WorkspaceMetadata::with_context(
+        &session_id,
+        "gpt-5.4",
+        "/repo",
+        Some("main"),
+    );
+    ws.pinned_tools = vec!["bash".to_string()];
+    session_workspace::write_workspace(&ws).unwrap();
+
+    let session = std::sync::Arc::new(std::sync::RwLock::new(
+        astra_runtime::observability_integration::ObservabilitySession::new_simple("test-session"),
+    ));
+    let exe = ToolExecutor::new(tmp.path())
+        .with_active_session_id(session_id.clone())
+        .with_observability_session(session);
+
+    let workspace_path = session_workspace::workspace_dir_for(&session_id).join("workspace.yaml");
+    std::fs::remove_file(workspace_path).unwrap();
+
+    let out = exe.execute("prioritize_tool", &json!({"tool": "bash"})).await;
+    let parsed: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(parsed["error"], "failed_to_persist_tool_preferences");
+
+    let model = exe.build_self_model_snapshot().unwrap();
+    assert!(model.capabilities.pinned_tools.contains(&"bash".to_string()));
+    assert!(!model
+        .capabilities
+        .deprioritized_tools
+        .contains(&"bash".to_string()));
+
+    drop(guard);
+}
+
+#[tokio::test]
+async fn deprioritize_tool_preserves_existing_state_when_persist_fails() {
+    let tmp = tempfile::tempdir().unwrap();
+    let guard = JournalDirGuard::new(tmp.path());
+    let session_id = "persisted-deprioritize-rollback".to_string();
+    let mut ws = session_workspace::WorkspaceMetadata::with_context(
+        &session_id,
+        "gpt-5.4",
+        "/repo",
+        Some("main"),
+    );
+    ws.deprioritized_tools = vec!["bash".to_string()];
+    session_workspace::write_workspace(&ws).unwrap();
+
+    let session = std::sync::Arc::new(std::sync::RwLock::new(
+        astra_runtime::observability_integration::ObservabilitySession::new_simple("test-session"),
+    ));
+    let exe = ToolExecutor::new(tmp.path())
+        .with_active_session_id(session_id.clone())
+        .with_observability_session(session);
+
+    let workspace_path = session_workspace::workspace_dir_for(&session_id).join("workspace.yaml");
+    std::fs::remove_file(workspace_path).unwrap();
+
+    let out = exe.execute("deprioritize_tool", &json!({"tool": "bash"})).await;
+    let parsed: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(parsed["error"], "failed_to_persist_tool_preferences");
+
+    let model = exe.build_self_model_snapshot().unwrap();
+    assert!(model
+        .capabilities
+        .deprioritized_tools
+        .contains(&"bash".to_string()));
+    assert!(!model.capabilities.pinned_tools.contains(&"bash".to_string()));
+
+    drop(guard);
+}
+
+#[tokio::test]
 async fn get_agent_info_snapshot_uses_persistent_surface() {
     let (_tmp, _guard, exe, _session, session_id) = executor_with_persisted_session();
     let mut ws = session_workspace::read_workspace(&session_id).unwrap();

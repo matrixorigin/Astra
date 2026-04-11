@@ -305,6 +305,8 @@ impl ToolExecutor {
             Ok(v) => v,
             Err(_) => return json!({"error": "Failed to access deprioritized tools"}).to_string(),
         };
+        let original_pinned = pinned.clone();
+        let original_deprioritized = deprioritized.clone();
 
         if !pinned.contains(&tool) {
             pinned.push(tool.clone());
@@ -316,11 +318,8 @@ impl ToolExecutor {
             && let Err(error) =
                 crate::self_command::persist_tool_preferences(session_id, &pinned, &deprioritized)
         {
-            pinned.retain(|t| t != &tool);
-            if !deprioritized.contains(&tool) {
-                deprioritized.push(tool.clone());
-                deprioritized.sort();
-            }
+            *pinned = original_pinned;
+            *deprioritized = original_deprioritized;
             return json!({
                 "error": "failed_to_persist_tool_preferences",
                 "detail": error,
@@ -354,6 +353,8 @@ impl ToolExecutor {
             Ok(v) => v,
             Err(_) => return json!({"error": "Failed to access deprioritized tools"}).to_string(),
         };
+        let original_pinned = pinned.clone();
+        let original_deprioritized = deprioritized.clone();
 
         if !deprioritized.contains(&tool) {
             deprioritized.push(tool.clone());
@@ -365,11 +366,8 @@ impl ToolExecutor {
             && let Err(error) =
                 crate::self_command::persist_tool_preferences(session_id, &pinned, &deprioritized)
         {
-            deprioritized.retain(|t| t != &tool);
-            if !pinned.contains(&tool) {
-                pinned.push(tool.clone());
-                pinned.sort();
-            }
+            *pinned = original_pinned;
+            *deprioritized = original_deprioritized;
             return json!({
                 "error": "failed_to_persist_tool_preferences",
                 "detail": error,
