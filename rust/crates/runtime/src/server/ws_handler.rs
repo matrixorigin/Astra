@@ -486,16 +486,8 @@ async fn handle_chat_message(
             )
             .await;
         }
-        Err((_status, err)) => {
-            send_msg(
-                socket,
-                &WsServerMessage::Error {
-                    message: err.0.detail,
-                    code: "RUN_ERROR".into(),
-                    retryable: false,
-                },
-            )
-            .await;
+        Err((status, err)) => {
+            send_msg(socket, &ws_error_from_status(status, err.0.detail)).await;
         }
     }
 }
@@ -515,16 +507,8 @@ async fn handle_cancel_run(
         Ok(record) => {
             send_msg(socket, &cancel_run_outcome_message(&record)).await;
         }
-        Err((_status, err)) => {
-            send_msg(
-                socket,
-                &WsServerMessage::Error {
-                    message: err.0.detail,
-                    code: "CANCEL_ERROR".into(),
-                    retryable: false,
-                },
-            )
-            .await;
+        Err((status, err)) => {
+            send_msg(socket, &ws_error_from_status(status, err.0.detail)).await;
         }
     }
 }
@@ -592,6 +576,14 @@ fn cancel_run_outcome_message(record: &astra_services::runs::CancelRunRecord) ->
             code: "CANCEL_NOOP".into(),
             retryable: false,
         },
+    }
+}
+
+fn ws_error_from_status(status: StatusCode, message: impl Into<String>) -> WsServerMessage {
+    WsServerMessage::Error {
+        message: message.into(),
+        code: super::http_helpers::status_to_sse_error_code(status).to_string(),
+        retryable: super::http_helpers::status_to_sse_retryable(status),
     }
 }
 
@@ -760,15 +752,11 @@ async fn stream_run_over_websocket(
                     .await
                 {
                     Ok(events) => events,
-                    Err((_status, err)) => {
+                    Err((status, err)) => {
                         let message = err.0.detail;
                         send_msg(
                             socket,
-                            &WsServerMessage::Error {
-                                message: message.clone(),
-                                code: "RUN_STREAM_ERROR".into(),
-                                retryable: false,
-                            },
+                            &ws_error_from_status(status, message.clone()),
                         )
                         .await;
                         best_effort_cancel_run(state, conn, run_id).await;
@@ -825,15 +813,11 @@ async fn stream_run_over_websocket(
                     .await
                 {
                     Ok(status) => status,
-                    Err((_status, err)) => {
+                    Err((status, err)) => {
                         let message = err.0.detail;
                         send_msg(
                             socket,
-                            &WsServerMessage::Error {
-                                message: message.clone(),
-                                code: "RUN_STATUS_ERROR".into(),
-                                retryable: false,
-                            },
+                            &ws_error_from_status(status, message.clone()),
                         )
                         .await;
                         best_effort_cancel_run(state, conn, run_id).await;
@@ -945,16 +929,8 @@ async fn handle_chat_message_via_bridge(
     // Prepare request through bridge_prep (session validation, etc.)
     let prepared = match prepare_chat_turn_bridge_body(state, &conn.user, body).await {
         Ok(r) => r,
-        Err((_status, error)) => {
-            send_msg(
-                socket,
-                &WsServerMessage::Error {
-                    message: error.0.detail,
-                    code: "INTERNAL_ERROR".into(),
-                    retryable: false,
-                },
-            )
-            .await;
+        Err((status, error)) => {
+            send_msg(socket, &ws_error_from_status(status, error.0.detail)).await;
             return;
         }
     };
@@ -1034,14 +1010,10 @@ async fn handle_chat_message_via_bridge(
             }
             conn.active_run_id = None;
         }
-        Err((_status, error)) => {
+        Err((status, error)) => {
             send_msg(
                 socket,
-                &WsServerMessage::Error {
-                    message: format!("Bridge error: {error}"),
-                    code: "BRIDGE_ERROR".into(),
-                    retryable: true,
-                },
+                &ws_error_from_status(status, format!("Bridge error: {error}")),
             )
             .await;
         }
@@ -1550,6 +1522,38 @@ mod tests {
                 assert!(message.contains(STATUS_PAUSED));
                 assert_eq!(code, "CANCEL_NOOP");
                 assert!(!retryable);
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ws_error_from_status_uses_not_found_code() {
+        match ws_error_from_status(StatusCode::NOT_FOUND, "missing run") {
+            WsServerMessage::Error {
+                message,
+                code,
+                retryable,
+            } => {
+                assert_eq!(message, "missing run");
+                assert_eq!(code, "NOT_FOUND");
+                assert!(!retryable);
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ws_error_from_status_marks_transient_statuses_retryable() {
+        match ws_error_from_status(StatusCode::SERVICE_UNAVAILABLE, "backend unavailable") {
+            WsServerMessage::Error {
+                message,
+                code,
+                retryable,
+            } => {
+                assert_eq!(message, "backend unavailable");
+                assert_eq!(code, "INTERNAL_ERROR");
+                assert!(retryable);
             }
             other => panic!("expected Error, got {other:?}"),
         }
