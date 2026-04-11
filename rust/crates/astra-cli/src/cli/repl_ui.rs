@@ -101,6 +101,9 @@ const DYN_SECOND_TOKEN: &[(&str, &str, DynKey)] = &[
     ("/skill", "dev", DynKey::SkillName),
     ("/skill", "test", DynKey::SkillName),
     ("/skill", "info", DynKey::SkillName),
+    ("/skill", "feedback", DynKey::SkillName),
+    ("/skill", "pin", DynKey::SkillName),
+    ("/skill", "unpin", DynKey::SkillName),
     ("/mcp", "ping", DynKey::McpServer),
     ("/mcp", "log-level", DynKey::McpServer),
 ];
