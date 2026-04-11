@@ -33,7 +33,7 @@ pub(super) fn sse_error_response(status: StatusCode, message: impl Into<String>)
         "type": "error",
         "message": message.into(),
         "code": status_to_sse_error_code(status),
-        "retryable": false,
+        "retryable": status_to_sse_retryable(status),
     })])
 }
 
@@ -44,6 +44,10 @@ pub(super) fn status_to_sse_error_code(status: StatusCode) -> &'static str {
         StatusCode::UNPROCESSABLE_ENTITY => "VALIDATION_ERROR",
         _ => "INTERNAL_ERROR",
     }
+}
+
+pub(super) fn status_to_sse_retryable(status: StatusCode) -> bool {
+    status.is_server_error() || status == StatusCode::TOO_MANY_REQUESTS
 }
 
 #[cfg(test)]
@@ -93,5 +97,15 @@ mod tests {
             status_to_sse_error_code(StatusCode::IM_A_TEAPOT),
             "INTERNAL_ERROR"
         );
+    }
+
+    #[test]
+    fn sse_retryable_service_unavailable() {
+        assert!(status_to_sse_retryable(StatusCode::SERVICE_UNAVAILABLE));
+    }
+
+    #[test]
+    fn sse_retryable_validation_error_is_false() {
+        assert!(!status_to_sse_retryable(StatusCode::UNPROCESSABLE_ENTITY));
     }
 }
