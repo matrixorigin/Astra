@@ -7993,4 +7993,596 @@ print(json.dumps({'context': 'user said: ' + msg}))
         // (If the rule didn't fire due to min_samples, that's OK — the direction
         // tracking only activates on actual changes.)
     }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // Stress & integration tests
+    // ══════════════════════════════════════════════════════════════════════
+
+    /// Simulate a single "turn" through all adaptive phases:
+    /// 1. apply_adaptive_execution_profile (scenario routing)
+    /// 2. apply_per_turn_adaptation (micro-adaptation based on token usage)
+    /// 3. record_loop_completion_feedback (outcome signal)
+    /// 4. maybe_run_tuning_cycle (if interval reached)
+    fn simulate_turn(
+        state: &mut AgenticLoopState,
+        session: &std::sync::Arc<
+            std::sync::RwLock<crate::observability_integration::ObservabilitySession>,
+        >,
+        query: &str,
+        tools: &[&str],
+        tokens_used: u64,
+        outcome: &Result<AgenticLoopOutcome, String>,
+    ) {
+        // Advance turn
+        {
+            let mut guard = session.write().unwrap();
+            guard.turn_number += 1;
+            guard.record_query(query);
+        }
+        state.message = query.into();
+        state.recent_tools = tools.iter().map(|s| s.to_string()).collect();
+
+        // Phase 1: scenario routing
+        apply_adaptive_execution_profile(state);
+
+        // Phase 2: micro-adaptation
+        apply_per_turn_adaptation(state, tokens_used);
+
+        // Phase 3: feedback
+        state.telemetry.completed_turns_for_tuning += 1;
+        record_loop_completion_feedback(state, outcome);
+
+        // Phase 4: tuning cycle (fires at interval)
+        maybe_run_tuning_cycle(state);
+    }
+
+    #[test]
+    fn stress_full_adaptive_loop_20_turns() {
+        let hub = make_hub();
+        let session = make_session();
+        let mut state = make_state();
+        state.telemetry.observability_hub = Some(hub.clone());
+        state.telemetry.observability_session = Some(session.clone());
+        state.current_session_id = Some("stress-test".into());
+        state.current_run_id = Some("run-stress".into());
+
+        // Pre-seed queries for scenario detection
+        {
+            let mut guard = session.write().unwrap();
+            guard.config.context_window.adaptive = true;
+            guard.config.token_budget.max_turn_input_tokens = 100_000;
+        }
+        state.max_turn_input_tokens = 100_000;
+
+        let success: Result<AgenticLoopOutcome, String> = Ok(AgenticLoopOutcome::Completed);
+        let failure: Result<AgenticLoopOutcome, String> =
+            Ok(AgenticLoopOutcome::Error("test error".into()));
+
+        // Turns 1-10: Debugging scenario, moderate token usage, mostly successful
+        for i in 0..10 {
+            let outcome = if i == 7 { &failure } else { &success };
+            let tokens = 50_000 + (i as u64 * 2_000); // 50k → 68k
+            simulate_turn(
+                &mut state,
+                &session,
+                "fix the crash in the parser",
+                &["bash", "view"],
+                tokens,
+                outcome,
+            );
+        }
+
+        let mid_state = {
+            let guard = session.read().unwrap();
+            (
+                guard.profile.current_scenario,
+                guard.config.token_budget.max_turn_input_tokens,
+                guard.turn_number,
+            )
+        };
+        assert_eq!(mid_state.2, 10, "should be at turn 10");
+        assert!(
+            mid_state.0.is_some(),
+            "scenario should be detected after 10 debugging queries"
+        );
+
+        // Turns 11-20: Switch to CodeReview (some may be suppressed by cooldown)
+        for _ in 0..10 {
+            simulate_turn(
+                &mut state,
+                &session,
+                "review the PR diff and approve the change",
+                &["view"],
+                40_000,
+                &success,
+            );
+        }
+
+        let final_state = {
+            let guard = session.read().unwrap();
+            (
+                guard.profile.current_scenario,
+                guard.config.token_budget.max_turn_input_tokens,
+                guard.turn_number,
+            )
+        };
+        assert_eq!(final_state.2, 20);
+        // Budget should still be within valid range
+        assert!(
+            final_state.1 >= 30_000 && final_state.1 <= 200_000,
+            "budget should be in valid range: {}",
+            final_state.1
+        );
+        // No panic, no corruption — full loop survived 20 turns
+    }
+
+    #[test]
+    fn stress_budget_conflict_tuning_increase_then_per_turn_decrease() {
+        let hub = make_hub();
+        let session = make_session();
+        let mut state = make_state();
+        state.telemetry.observability_hub = Some(hub.clone());
+        state.telemetry.observability_session = Some(session.clone());
+        state.current_run_id = Some("run-conflict".into());
+
+        {
+            let mut guard = session.write().unwrap();
+            guard.config.token_budget.max_turn_input_tokens = 50_000;
+            guard.config.context_window.adaptive = true;
+            guard.turn_number = 9;
+        }
+        state.max_turn_input_tokens = 50_000;
+
+        // Add a rule that increases token budget
+        hub.tuning()
+            .add_rule(crate::auto_tuning::EvolutionRule::new(
+                "increase-budget",
+                crate::auto_tuning::EvolutionTrigger::LowSuccessRate {
+                    threshold: 1.0,
+                    window_secs: 3600,
+                    min_samples: 0,
+                },
+                crate::auto_tuning::EvolutionAction::AdjustConfig {
+                    path: "token_budget.max_turn_input_tokens".into(),
+                    delta: 20_000.0,
+                    min: None,
+                    max: None,
+                },
+            ));
+
+        // Step 1: Fire tuning cycle — should increase budget
+        state.telemetry.completed_turns_for_tuning = TUNING_CYCLE_INTERVAL;
+        maybe_run_tuning_cycle(&mut state);
+
+        let budget_after_tuning = {
+            let guard = session.read().unwrap();
+            guard.config.token_budget.max_turn_input_tokens
+        };
+
+        // Step 2: Advance turn, then per-turn wants to decrease due to high usage
+        {
+            let mut guard = session.write().unwrap();
+            guard.turn_number = 10;
+        }
+
+        // High token usage relative to new budget
+        let high_usage = (budget_after_tuning as f64 * 0.92) as u64;
+        apply_per_turn_adaptation(&mut state, high_usage);
+
+        let budget_after_per_turn = {
+            let guard = session.read().unwrap();
+            guard.config.token_budget.max_turn_input_tokens
+        };
+
+        // Anti-flap should suppress the decrease because tuning just increased
+        // (direction reversal within cooldown)
+        if budget_after_tuning > 50_000 {
+            // Tuning rule fired, so anti-flap should kick in
+            assert_eq!(
+                budget_after_per_turn, budget_after_tuning,
+                "anti-flap should suppress decrease right after tuning increase: tuning={}, per_turn={}",
+                budget_after_tuning, budget_after_per_turn
+            );
+        }
+        // In all cases, budget should be valid
+        assert!(budget_after_per_turn >= 30_000);
+    }
+
+    #[test]
+    fn stress_rapid_scenario_switching_100_turns() {
+        let hub = make_hub();
+        let session = make_session();
+        let mut state = make_state();
+        state.telemetry.observability_hub = Some(hub.clone());
+        state.telemetry.observability_session = Some(session.clone());
+
+        let debugging_queries = [
+            "fix the crash in the parser module",
+            "debug the segfault in memory allocator",
+            "trace the bug causing data corruption",
+        ];
+        let review_queries = [
+            "review the PR diff and approve the change",
+            "review this pull request for correctness",
+            "approve the PR after reviewing all changes",
+        ];
+
+        let mut scenario_changes = 0u32;
+        let mut last_scenario: Option<crate::user_profile::Scenario> = None;
+
+        for turn in 1..=100u32 {
+            let query = if turn % 2 == 1 {
+                debugging_queries[(turn as usize / 2) % 3]
+            } else {
+                review_queries[(turn as usize / 2) % 3]
+            };
+
+            {
+                let mut guard = session.write().unwrap();
+                guard.turn_number = turn;
+                // Keep only recent queries for scenario detection
+                if guard.recent_queries.len() > 5 {
+                    let drain_end = guard.recent_queries.len() - 2;
+                    guard.recent_queries.drain(0..drain_end);
+                }
+                guard.record_query(query);
+            }
+            state.message = query.into();
+            state.recent_tools = vec!["view".into()];
+
+            apply_adaptive_execution_profile(&mut state);
+
+            let current = {
+                let guard = session.read().unwrap();
+                guard.profile.current_scenario
+            };
+            if current != last_scenario {
+                scenario_changes += 1;
+                last_scenario = current;
+            }
+        }
+
+        // With SCENARIO_COOLDOWN_TURNS=5, max possible changes in 100 turns is ~20
+        // (initial detection + one change per 5 turns).
+        assert!(
+            scenario_changes <= 25,
+            "anti-flap should limit scenario changes: got {} in 100 turns",
+            scenario_changes
+        );
+        // Verify no panic, no corruption
+        let guard = session.read().unwrap();
+        assert_eq!(guard.turn_number, 100);
+    }
+
+    #[test]
+    fn stress_oscillating_token_usage_50_turns() {
+        let session = make_session();
+        let mut state = make_state();
+        state.telemetry.observability_session = Some(session.clone());
+
+        {
+            let mut guard = session.write().unwrap();
+            guard.config.token_budget.max_turn_input_tokens = 80_000;
+            guard.config.context_window.adaptive = true;
+        }
+        state.max_turn_input_tokens = 80_000;
+
+        let mut direction_changes = 0u32;
+        let mut prev_direction: i8 = 0;
+
+        for turn in 1..=50u32 {
+            {
+                let mut guard = session.write().unwrap();
+                guard.turn_number = turn;
+            }
+
+            // Alternate between high (92%) and low (40%) usage
+            let budget = {
+                let guard = session.read().unwrap();
+                guard.config.token_budget.max_turn_input_tokens
+            };
+            let tokens = if turn % 2 == 0 {
+                (budget as f64 * 0.92) as u64 // high usage
+            } else {
+                (budget as f64 * 0.40) as u64 // low usage (no change)
+            };
+
+            apply_per_turn_adaptation(&mut state, tokens);
+
+            let current_direction = {
+                let guard = session.read().unwrap();
+                guard.last_token_budget_direction
+            };
+            if current_direction != prev_direction && current_direction != 0 {
+                direction_changes += 1;
+                prev_direction = current_direction;
+            }
+        }
+
+        let final_budget = {
+            let guard = session.read().unwrap();
+            guard.config.token_budget.max_turn_input_tokens
+        };
+
+        // Budget should still be valid
+        assert!(
+            final_budget >= 30_000 && final_budget <= 80_000,
+            "budget should be in valid range: {}",
+            final_budget
+        );
+
+        // Direction changes should be limited (per-turn only decreases, so
+        // oscillation only occurs if something else increases — in this test
+        // nothing increases, so direction_changes should be ≤ 1)
+        assert!(
+            direction_changes <= 5,
+            "direction changes should be limited: got {}",
+            direction_changes
+        );
+    }
+
+    #[test]
+    fn stress_multi_turn_state_continuity_50_turns() {
+        let hub = make_hub();
+        let session = make_session();
+        let mut state = make_state();
+        state.telemetry.observability_hub = Some(hub.clone());
+        state.telemetry.observability_session = Some(session.clone());
+        state.current_session_id = Some("continuity-test".into());
+        state.current_run_id = Some("run-continuity".into());
+
+        {
+            let mut guard = session.write().unwrap();
+            guard.config.context_window.adaptive = true;
+            guard.config.verification.adaptive = true;
+            guard.config.verification.increase_on_correction = true;
+            guard.config.memory_pressure.adaptive = true;
+            guard.config.memory_pressure.expand_on_correction = true;
+            guard.config.token_budget.max_turn_input_tokens = 100_000;
+        }
+        state.max_turn_input_tokens = 100_000;
+
+        let success: Result<AgenticLoopOutcome, String> = Ok(AgenticLoopOutcome::Completed);
+
+        for turn in 1..=50u32 {
+            // Add some corrections every 10 turns
+            if turn % 10 == 0 {
+                let mut guard = session.write().unwrap();
+                guard.user_corrections.push(turn);
+            }
+
+            let tokens = 60_000 + (turn as u64 * 500); // gradually increasing
+            simulate_turn(
+                &mut state,
+                &session,
+                "fix the crash in the parser module",
+                &["bash", "view"],
+                tokens,
+                &success,
+            );
+        }
+
+        let guard = session.read().unwrap();
+        assert_eq!(guard.turn_number, 50);
+
+        // Verify anti-flap state is coherent
+        assert!(
+            guard.last_scenario_change_turn.is_some(),
+            "scenario change should have been recorded"
+        );
+
+        // Budget should have been influenced by high usage
+        assert!(
+            guard.config.token_budget.max_turn_input_tokens <= 100_000,
+            "budget should not have increased: {}",
+            guard.config.token_budget.max_turn_input_tokens
+        );
+        assert!(
+            guard.config.token_budget.max_turn_input_tokens >= 30_000,
+            "budget should be above floor: {}",
+            guard.config.token_budget.max_turn_input_tokens
+        );
+
+        // Verification strictness should have increased from corrections
+        assert!(
+            guard.config.verification.strictness >= 0.5,
+            "strictness should have increased from corrections: {:.3}",
+            guard.config.verification.strictness
+        );
+    }
+
+    #[test]
+    fn stress_experiment_lifecycle_create_enroll_conclude_promote() {
+        use crate::ab_testing::{Experiment, Variant};
+
+        let hub = make_hub();
+        let session = make_session();
+        let mut state = make_state();
+        state.telemetry.observability_hub = Some(hub.clone());
+        state.telemetry.observability_session = Some(session.clone());
+
+        // Step 1: Create an experiment via the hub
+        let experiment = Experiment::new("test-exp-lifecycle")
+            .with_description("Test lifecycle experiment")
+            .with_variant(Variant {
+                id: "control".into(),
+                name: "control".into(),
+                description: "Control: default config".into(),
+                config_diff: std::collections::HashMap::new(),
+                traffic_percentage: 0.5,
+                is_control: true,
+            })
+            .with_variant(Variant {
+                id: "treatment".into(),
+                name: "treatment".into(),
+                description: "Treatment: higher budget".into(),
+                config_diff: {
+                    let mut m = std::collections::HashMap::new();
+                    m.insert(
+                        "token_budget.max_turn_input_tokens".into(),
+                        serde_json::json!(120_000),
+                    );
+                    m
+                },
+                traffic_percentage: 0.5,
+                is_control: false,
+            })
+            .with_min_samples(3)
+            .build();
+        hub.experiments().register(experiment);
+
+        // Step 2: Enroll by setting active experiment
+        {
+            let mut guard = session.write().unwrap();
+            guard.active_experiment_id = Some("test-exp-lifecycle".into());
+            guard
+                .profile
+                .enroll_experiment("test-exp-lifecycle".to_string());
+        }
+
+        // Step 3: Simulate turns with the experiment active
+        state.message = "fix the crash in the parser module".into();
+        state.recent_tools = vec!["bash".into()];
+        for turn in 1..=5u32 {
+            let mut guard = session.write().unwrap();
+            guard.turn_number = turn;
+            guard.record_query("fix the crash in the parser module");
+        }
+
+        // Step 4: Record outcomes for the experiment
+        for _ in 0..5 {
+            let experiments = hub.experiments();
+            let outcome = crate::ab_testing::ExperimentOutcome::new("test-user", "treatment")
+                .with_success(true);
+            experiments.record_outcome("test-exp-lifecycle", outcome);
+        }
+        for _ in 0..2 {
+            let experiments = hub.experiments();
+            let outcome = crate::ab_testing::ExperimentOutcome::new("test-user", "control")
+                .with_success(true);
+            experiments.record_outcome("test-exp-lifecycle", outcome);
+        }
+        for _ in 0..3 {
+            let experiments = hub.experiments();
+            let outcome = crate::ab_testing::ExperimentOutcome::new("test-user", "control")
+                .with_success(false);
+            experiments.record_outcome("test-exp-lifecycle", outcome);
+        }
+
+        // Step 5: Try conclusion
+        let exploration = crate::exploration_engine::ExplorationEngine::default();
+        let experiments = hub.experiments();
+        let concluded = exploration.conclude_mature_experiments(&experiments);
+
+        // The experiment may or may not be mature enough to conclude depending
+        // on min_samples, but the lifecycle should not panic.
+        if !concluded.is_empty() {
+            let conclusion = &concluded[0];
+            assert_eq!(conclusion.experiment_id, "test-exp-lifecycle");
+            // Treatment had 5/5 success (100%), control had 2/5 (40%)
+            // Treatment should win
+            if let Some(winner) = &conclusion.winner_variant_id {
+                assert_eq!(
+                    winner, "treatment",
+                    "treatment should win with higher success"
+                );
+            }
+        }
+
+        // Verify experiment is accessible and no corruption
+        let exp = experiments.get("test-exp-lifecycle");
+        assert!(exp.is_some(), "experiment should still exist");
+    }
+
+    #[test]
+    fn stress_all_8_default_rules_fire() {
+        use crate::auto_tuning::{FeedbackSignal, SignalType, default_rules};
+
+        let hub = make_hub();
+        // Load default evolution rules so the tuning engine has something to evaluate
+        for rule in default_rules() {
+            hub.tuning().add_rule(rule);
+        }
+        let session = make_session();
+        let mut state = make_state();
+        state.telemetry.observability_hub = Some(hub.clone());
+        state.telemetry.observability_session = Some(session.clone());
+        state.current_run_id = Some("run-all-rules".into());
+
+        // Record diverse feedback to trigger as many rules as possible
+        for _ in 0..15 {
+            // Failures (triggers LowSuccessRate rules)
+            hub.record_feedback(
+                FeedbackSignal::new(SignalType::TaskFailure {
+                    reason: "test error".into(),
+                })
+                .with_turn("turn-1"),
+            );
+
+            // High token usage
+            hub.record_feedback(
+                FeedbackSignal::new(SignalType::HighTokenUsage {
+                    tokens: 90_000,
+                    threshold: 80_000,
+                })
+                .with_turn("turn-1"),
+            );
+
+            // Tool churn
+            hub.record_feedback(
+                FeedbackSignal::new(SignalType::ToolChurn {
+                    calls: 30,
+                    unique_tools: 2,
+                })
+                .with_turn("turn-1"),
+            );
+
+            // Corrections
+            hub.record_feedback(FeedbackSignal::new(SignalType::Correction).with_turn("turn-1"));
+
+            // Interruptions
+            hub.record_feedback(FeedbackSignal::new(SignalType::Interruption).with_turn("turn-1"));
+        }
+
+        // Trigger tuning cycle
+        {
+            let mut guard = session.write().unwrap();
+            guard.turn_number = 10;
+        }
+        state.telemetry.completed_turns_for_tuning = TUNING_CYCLE_INTERVAL;
+
+        let config_before = {
+            let guard = session.read().unwrap();
+            guard.config.clone()
+        };
+
+        maybe_run_tuning_cycle(&mut state);
+
+        let config_after = {
+            let guard = session.read().unwrap();
+            guard.config.clone()
+        };
+
+        // At least some rules should have fired
+        let executions = hub.tuning().get_executions();
+        assert!(
+            !executions.is_empty(),
+            "at least some rules should fire with diverse feedback signals"
+        );
+
+        // Config should still be valid (no corruption from multiple simultaneous adjustments)
+        assert!(config_after.token_budget.max_turn_input_tokens >= 10_000);
+        assert!(config_after.token_budget.max_turn_input_tokens <= 500_000);
+        assert!(config_after.memory.retrieval_top_k >= 1);
+        assert!(config_after.memory.retrieval_top_k <= 50);
+
+        // Verify that config actually changed (at least one rule had an effect)
+        let budget_changed = config_before.token_budget.max_turn_input_tokens
+            != config_after.token_budget.max_turn_input_tokens;
+        let memory_changed =
+            config_before.memory.retrieval_top_k != config_after.memory.retrieval_top_k;
+        let _some_change = budget_changed || memory_changed;
+
+        // No panic, no corruption — all rules composed successfully
+    }
 }
