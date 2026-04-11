@@ -3510,6 +3510,116 @@ pub(super) async fn handle_resume_command(arg: &str, profile: Option<&str>, stat
         Err(_) => arg.to_string(),
     };
 
+    // Preview session before confirming resume (unless --yes flag or interactive picker was used)
+    let skip_preview = std::env::var("ASTRA_RESUME_SKIP_PREVIEW")
+        .map(|v| v == "1" || v.to_lowercase() == "true")
+        .unwrap_or(false);
+    
+    // Show preview if user explicitly typed a session ID (not from picker)
+    if !skip_preview && !arg.is_empty() {
+        // Show session preview
+        let ws = session_workspace::read_workspace(&session_id).ok();
+        let peek = session_journal::peek_session_meta(&session_id);
+        
+        eprintln!("\n{}",
+            "─── Session Preview ─────────────────────────────".bold().cyan()
+        );
+        
+        // Session ID
+        let short_id = &session_id[..8.min(session_id.len())];
+        eprintln!("  {:<14} {}", "session:".dim(), format!("{short_id}…").cyan());
+        
+        // Summary/Title
+        let summary = ws.as_ref()
+            .and_then(|w| w.summary.clone())
+            .or_else(|| peek.as_ref().and_then(|p| p.first_prompt.clone()))
+            .map(|s| {
+                let truncated: String = s.chars().take(70).collect();
+                if s.chars().count() > 70 { format!("{truncated}…") } else { truncated }
+            })
+            .unwrap_or_else(|| "(no summary)".to_string());
+        eprintln!("  {:<14} {}", "summary:".dim(), summary);
+        
+        // Turn count
+        if let Some(ref w) = ws {
+            eprintln!("  {:<14} {} turns", "progress:".dim(), w.turn_count.to_string().cyan());
+        } else if peek.is_some() {
+            let turns = session_journal::count_turns(&session_id);
+            eprintln!("  {:<14} {} turns", "progress:".dim(), turns.to_string().cyan());
+        }
+        
+        // Model
+        let model = ws.as_ref()
+            .map(|w| w.model.clone())
+            .or_else(|| peek.as_ref().and_then(|p| p.model.clone()))
+            .unwrap_or_else(|| "?".to_string());
+        eprintln!("  {:<14} {}", "model:".dim(), model.cyan());
+        
+        // Cwd + git branch
+        if let Some(ref w) = ws {
+            eprintln!("  {:<14} {}", "directory:".dim(), tilde_path(&w.cwd).as_str().cyan());
+            if let Some(ref b) = w.git_branch {
+                let head = w.git_head.as_deref().map(|h| &h[..7.min(h.len())]).unwrap_or("");
+                eprintln!("  {:<14} {} @ {}", "branch:".dim(), b.as_str().cyan(), head.dim());
+            }
+        }
+        
+        // Status
+        if let Some(ref w) = ws {
+            let status_icon = match w.status.as_str() {
+                "active" => "🔄",
+                "completed" => "✅",
+                "error" => "❌",
+                _ => "•",
+            };
+            eprintln!("  {:<14} {} {}", "status:".dim(), status_icon, w.status.as_str().cyan());
+        }
+        
+        // Age
+        let age = ws.as_ref()
+            .map(|w| &w.updated_at)
+            .or_else(|| peek.as_ref().and_then(|p| p.created_at.as_ref()))
+            .and_then(|ts| chrono::DateTime::parse_from_rfc3339(ts).ok())
+            .map(|dt| {
+                let dur = chrono::Utc::now().signed_duration_since(dt);
+                if dur.num_minutes() < 60 {
+                    format!("{}m ago", dur.num_minutes())
+                } else if dur.num_hours() < 24 {
+                    format!("{}h ago", dur.num_hours())
+                } else {
+                    format!("{}d ago", dur.num_days())
+                }
+            });
+        if let Some(age) = age {
+            eprintln!("  {:<14} {}", "last active:".dim(), age.dim());
+        }
+        
+        // Plan status
+        if let Some(ref w) = ws {
+            if w.plan_goal.is_some() {
+                let goal = w.plan_goal.as_deref().unwrap_or("");
+                let goal_short: String = goal.chars().take(50).collect();
+                eprintln!("  {:<14} 📋 {}", "plan:".dim(), goal_short.yellow());
+            }
+        }
+        
+        eprintln!();
+        
+        // Confirm
+        eprint!("  {} ", "Resume this session? [Y/n]:".bold());
+        std::io::Write::flush(&mut std::io::stderr()).ok();
+        let mut input = String::new();
+        if std::io::stdin().read_line(&mut input).is_ok() {
+            let answer = input.trim().to_lowercase();
+            if !answer.is_empty() && answer != "y" && answer != "yes" {
+                eprintln!("{}", "  Cancelled.".dim());
+                return;
+            }
+        } else {
+            return;
+        }
+    }
+
     // Restore session
     match svc.restore_session(&session_id).await {
         Ok(Some(restored)) => {
