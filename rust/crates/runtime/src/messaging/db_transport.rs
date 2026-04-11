@@ -372,6 +372,9 @@ impl MessageTransport for DatabaseTransport {
 
     async fn unregister(&self, addr: &AgentAddress) -> Result<(), MailboxError> {
         self.registrations.write().await.remove(addr);
+        let consumer_id = format!("{}@{}", addr.agent_id, addr.run_id);
+        release_claimed_for_consumer_in_pool(&self.pool, &consumer_id, self.max_delivery_attempts)
+            .await?;
         Ok(())
     }
 
@@ -1146,6 +1149,51 @@ fn extract_queue_row_id(row: &MySqlRow) -> Result<i64, sqlx::Error> {
 
 fn parse_row_id_text_fallback(value: &str) -> Option<i64> {
     value.parse::<i64>().ok()
+}
+
+async fn release_claimed_for_consumer_in_pool(
+    pool: &Pool<MySql>,
+    consumer_id: &str,
+    max_delivery_attempts: u32,
+) -> Result<(), MailboxError> {
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| MailboxError::Transport(format!("release claimed begin: {e}")))?;
+
+    query(
+        "UPDATE agent_message_queue
+         SET status = 'pending', claimed_by = NULL, claimed_at_ms = NULL
+         WHERE status = 'claimed'
+           AND is_broadcast = FALSE
+           AND claimed_by = ?
+           AND attempt_count < ?",
+    )
+    .bind(consumer_id)
+    .bind(max_delivery_attempts as i64)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| MailboxError::Transport(format!("release claimed requeue: {e}")))?;
+
+    query(
+        "UPDATE agent_message_queue
+         SET status = 'failed', claimed_by = NULL, claimed_at_ms = NULL
+         WHERE status = 'claimed'
+           AND is_broadcast = FALSE
+           AND claimed_by = ?
+           AND attempt_count >= ?",
+    )
+    .bind(consumer_id)
+    .bind(max_delivery_attempts as i64)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| MailboxError::Transport(format!("release claimed dead-letter: {e}")))?;
+
+    tx.commit()
+        .await
+        .map_err(|e| MailboxError::Transport(format!("release claimed commit: {e}")))?;
+
+    Ok(())
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
