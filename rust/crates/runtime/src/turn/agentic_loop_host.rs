@@ -1440,6 +1440,50 @@ pub fn delegate_tool_schema() -> Value {
 
 // ─── Runtime loop ────────────────────────────────────────────────────────────
 
+/// Finalize the turn trace collector: record measured token budget, feed to
+/// observability session, and persist to journal. Called from every exit path
+/// in the agentic loop so `/context breakdown` always reflects the latest turn.
+fn finalize_turn_trace(state: &mut AgenticLoopState) {
+    let Some(collector) = state.telemetry.turn_trace_collector.take() else {
+        return;
+    };
+    let measured = state.last_measured_prompt_tokens.unwrap_or(0);
+    let max = state.max_turn_input_tokens;
+    let budget_pressure = if max > 0 {
+        measured as f64 / max as f64
+    } else {
+        state.telemetry.first_budget_pressure
+    };
+    collector.record_token_budget(
+        crate::turn::context_assembly_trace::TokenBudgetTrace {
+            max_tokens: max as u32,
+            total_used: measured as u32,
+            budget_pressure,
+            compression_triggered: state.budget_wrapup_injected,
+            ..Default::default()
+        },
+    );
+    let trace = collector.finalize();
+    if let Some(ref session) = state.telemetry.observability_session {
+        let mut guard = session.write().unwrap_or_else(|e| e.into_inner());
+        crate::observability_integration::on_context_assembled(&mut guard, trace.clone());
+    }
+    if collector.has_data() {
+        let turn_number = (state.max_turns - state.remaining_turns) as u32;
+        if let Some(ref sid) = state.current_session_id {
+            if let Ok(writer) = astra_services::session_journal::JournalWriter::new(sid) {
+                let event =
+                    astra_services::session_journal::JournalEvent::context_assembly_recorded(
+                        Some(sid),
+                        turn_number,
+                        trace.to_json_value(),
+                    );
+                let _ = writer.append(&event);
+            }
+        }
+    }
+}
+
 /// Best-effort heavy checkpoint write.
 ///
 /// Several early-exit paths in the agentic loop (text-only responses, stop-hook
@@ -2722,10 +2766,12 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                             timing,
                         );
                     }
+                    finalize_turn_trace(state);
                     try_write_heavy_checkpoint(state);
                     return Ok(AgenticLoopOutcome::Completed);
                 }
 
+                finalize_turn_trace(state);
                 try_write_heavy_checkpoint(state);
                 return Err(e);
             }
@@ -2769,6 +2815,7 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                     let mut session_guard = session.write().unwrap_or_else(|e| e.into_inner());
                     crate::observability_integration::on_turn_end(hub, &mut session_guard, timing);
                 }
+                finalize_turn_trace(state);
                 try_write_heavy_checkpoint(state);
                 return Ok(AgenticLoopOutcome::Completed);
             }
@@ -2831,6 +2878,7 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                                 timing,
                             );
                         }
+                        finalize_turn_trace(state);
                         try_write_heavy_checkpoint(state);
                         return Ok(AgenticLoopOutcome::Completed);
                     }
@@ -3811,6 +3859,7 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                             );
                         }
                         state.step_recorder.end_turn(true);
+                        finalize_turn_trace(state);
                         return Ok(AgenticLoopOutcome::Cancelled);
                     }
                     Err(e) => {
@@ -3842,7 +3891,10 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                 last_heavy_checkpoint: &mut state.stall.last_heavy_checkpoint,
             },
         )) {
-            AgenticPostToolIterationControl::Abort(e) => return Err(e),
+            AgenticPostToolIterationControl::Abort(e) => {
+                finalize_turn_trace(state);
+                return Err(e);
+            }
             AgenticPostToolIterationControl::RetryLlmClearToolResults => {
                 state.tool_results.clear();
             }
@@ -3911,66 +3963,7 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                 // ─── Finalize turn trace collector ────────────────────────
                 // Persist context assembly trace to session journal (best-effort)
                 // and feed to observability session for /telemetry context.
-                if let Some(ref collector) = state.telemetry.turn_trace_collector {
-                    // Compute budget pressure from last measured tokens.
-                    let measured = state.last_measured_prompt_tokens.unwrap_or(0);
-                    let max = state.max_turn_input_tokens;
-                    let budget_pressure = if max > 0 {
-                        measured as f64 / max as f64
-                    } else {
-                        state.telemetry.first_budget_pressure
-                    };
-
-                    // Record token budget before finalizing.
-                    // NOTE: Fine-grained breakdown (system_prompt, history, memory, etc.)
-                    // is not available at runtime layer — would require CLI to pass it down.
-                    // For now, we capture what we have: total_used and budget_pressure.
-                    collector.record_token_budget(
-                        crate::turn::context_assembly_trace::TokenBudgetTrace {
-                            max_tokens: max as u32,
-                            system_prompt_tokens: 0, // Future: measure from CLI host
-                            history_tokens: 0,       // Future: measure from CLI host
-                            memory_tokens: 0,        // Future: measure from CLI host
-                            tool_schema_tokens: 0,   // Future: measure from CLI host
-                            user_message_tokens: 0,  // Future: measure from CLI host
-                            total_used: measured as u32,
-                            budget_pressure,
-                            compression_triggered: state.budget_wrapup_injected,
-                        },
-                    );
-
-                    // Finalize trace and feed to observability session.
-                    let trace = collector.finalize();
-                    if let Some(ref session) = state.telemetry.observability_session {
-                        let mut guard = session.write().unwrap_or_else(|e| e.into_inner());
-                        crate::observability_integration::on_context_assembled(
-                            &mut guard,
-                            trace.clone(),
-                        );
-                    }
-
-                    // Persist to journal (best-effort).
-                    if collector.has_data() {
-                        let turn_number = (state.max_turns - state.remaining_turns) as u32;
-                        if let Some(ref sid) = state.current_session_id {
-                            if let Ok(writer) =
-                                astra_services::session_journal::JournalWriter::new(sid)
-                            {
-                                let event =
-                                    astra_services::session_journal::JournalEvent::context_assembly_recorded(
-                                        Some(sid),
-                                        turn_number,
-                                        trace.to_json_value(),
-                                    );
-                                if let Err(e) = writer.append(&event) {
-                                    eprintln!("trace persist: {e}");
-                                }
-                            }
-                        }
-                    }
-                }
-                // Clear collector for next turn.
-                state.telemetry.turn_trace_collector = None;
+                finalize_turn_trace(state);
 
                 state.step_recorder.end_turn(false);
 

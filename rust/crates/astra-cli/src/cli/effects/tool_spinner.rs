@@ -23,7 +23,8 @@ pub struct ToolRegionState {
 
 /// stderr `\r` status while a tool runs (markdown mode).
 ///
-/// Format: `  ⬢ description                       3s ⣾`
+/// Format: `  ⬢ [1/5] description                  3s ⣾`
+/// Or without progress: `  ⬢ description            3s ⣾`
 pub struct ToolRunningLineSpinner {
     stop: Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
@@ -34,6 +35,13 @@ impl ToolRunningLineSpinner {
     ///
     /// Returns a no-op spinner if stderr is not a terminal.
     pub fn start(description: String) -> Self {
+        Self::start_with_progress(description, None)
+    }
+
+    /// Start a tool running spinner with optional batch progress indicator.
+    ///
+    /// When `progress` is `Some((current, total))`, shows `[1/5]` prefix.
+    pub fn start_with_progress(description: String, progress: Option<(usize, usize)>) -> Self {
         if !io::stderr().is_terminal() {
             return Self {
                 stop: Arc::new(AtomicBool::new(true)),
@@ -41,11 +49,19 @@ impl ToolRunningLineSpinner {
             };
         }
         let w = term_width();
-        let detail = truncate_cli_status_detail(&description, w.saturating_sub(16).max(30));
+        // Build label with optional progress prefix
+        let label = match progress {
+            Some((cur, total)) if total > 1 => {
+                let prefix = format!("[{}/{}] ", cur, total);
+                let remaining = w.saturating_sub(16 + prefix.len()).max(20);
+                format!("{}{}", prefix, truncate_cli_status_detail(&description, remaining))
+            }
+            _ => truncate_cli_status_detail(&description, w.saturating_sub(16).max(30)),
+        };
         let t0 = Instant::now();
         let icon = format!("{}", ICON_RUNNING.cyan());
 
-        paint_unified_line(&icon, &detail, "0s", SPINNER_FRAMES[0], w);
+        paint_unified_line(&icon, &label, "0s", SPINNER_FRAMES[0], w);
 
         let stop = Arc::new(AtomicBool::new(false));
         let stop2 = stop.clone();
@@ -60,7 +76,7 @@ impl ToolRunningLineSpinner {
                 let frame = SPINNER_FRAMES[spin_idx % SPINNER_FRAMES.len()];
                 spin_idx += 1;
                 let time_part = format!("{sec}s");
-                paint_unified_line(&icon, &detail, &time_part, frame, w);
+                paint_unified_line(&icon, &label, &time_part, frame, w);
             }
         });
         Self {

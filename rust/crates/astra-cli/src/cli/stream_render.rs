@@ -865,6 +865,11 @@ impl SseStreamHost for CliSseStreamHost<'_> {
     ) -> Vec<EdgeToolExecResult> {
         let n = requests.len();
 
+        // Set batch progress for multi-tool turns.
+        if n > 1 {
+            self.render.tool_batch_progress = Some((1, n));
+        }
+
         // Fast path: ≤1 tool — use existing sequential code.
         if n <= 1 {
             let mut out = Vec::with_capacity(n);
@@ -874,6 +879,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                         .await,
                 );
             }
+            self.render.tool_batch_progress = None;
             return out;
         }
 
@@ -887,24 +893,30 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         // < 2 concurrent-safe tools: no parallelism benefit.
         if conc_count < 2 {
             let mut out = Vec::with_capacity(n);
-            for req in requests {
+            for (i, req) in requests.iter().enumerate() {
+                self.render.tool_batch_progress = Some((i + 1, n));
                 out.push(
                     self.execute_tool(&req.request_id, &req.tool, &req.args)
                         .await,
                 );
             }
+            self.render.tool_batch_progress = None;
             return out;
         }
 
         let mut results: Vec<Option<EdgeToolExecResult>> = (0..n).map(|_| None).collect();
 
         // Collect concurrent-safe requests (preserving order) and run sequential ones first.
+        let mut seq_done = 0usize;
+        let seq_total = requests.iter().enumerate().filter(|(i, _)| !conc_flags[*i]).count();
         let mut conc_reqs: Vec<(usize, &ToolBatchRequest)> = Vec::with_capacity(conc_count);
         for (i, req) in requests.iter().enumerate() {
             if conc_flags[i] {
                 conc_reqs.push((i, req));
             } else {
                 // Side-effect tools execute eagerly in original order.
+                seq_done += 1;
+                self.render.tool_batch_progress = Some((seq_done, seq_total + conc_count));
                 results[i] = Some(
                     self.execute_tool(&req.request_id, &req.tool, &req.args)
                         .await,
@@ -944,6 +956,8 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         }
 
         // ── Phase 1: Pre-execution UI setup (sequential, &mut self) ──
+        // For parallel tools, clear progress indicator (they all run together).
+        self.render.tool_batch_progress = None;
         let mut ui_indices: Vec<Option<usize>> = Vec::with_capacity(conc_reqs.len());
         for (_, req) in &conc_reqs {
             // Forward tool-started event.
@@ -1112,6 +1126,9 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             }
         }
 
+        // Clear batch progress when done.
+        self.render.tool_batch_progress = None;
+
         results
             .into_iter()
             .map(|r| r.expect("all tool result slots filled"))
@@ -1187,6 +1204,8 @@ pub(super) struct StreamRenderState {
     suppress_reasoning_viewport: bool,
     /// Accumulated output bytes for live token estimation.
     output_bytes: usize,
+    /// Tool batch progress: (current_index, total_count). None when not in batch.
+    tool_batch_progress: Option<(usize, usize)>,
 }
 
 impl StreamRenderState {
@@ -1219,6 +1238,7 @@ impl StreamRenderState {
             tool_stdout_anim: None,
             suppress_reasoning_viewport,
             output_bytes: 0,
+            tool_batch_progress: None,
         }
     }
 
@@ -1383,9 +1403,18 @@ impl StreamRenderState {
             self.stop_tool_stderr_running();
             if io::stderr().is_terminal() {
                 // Spinner uses plain description (truncated internally with .dim())
-                self.tool_stderr_running = Some(ToolRunningLineSpinner::start(description));
+                // Pass batch progress for [1/5] prefix when running multiple tools.
+                self.tool_stderr_running = Some(ToolRunningLineSpinner::start_with_progress(
+                    description,
+                    self.tool_batch_progress,
+                ));
             } else {
-                let line = format!("  {} {} …", "⬢".cyan(), styled_desc);
+                // Non-terminal: include progress prefix inline.
+                let prefix = match self.tool_batch_progress {
+                    Some((cur, total)) if total > 1 => format!("[{}/{}] ", cur, total),
+                    _ => String::new(),
+                };
+                let line = format!("  {} {}{} …", "⬢".cyan(), prefix, styled_desc);
                 eprintln!("{line}");
                 self.stderr_lines += 1;
             }
@@ -1395,7 +1424,12 @@ impl StreamRenderState {
         let idx = {
             let mut g = self.tool_ui.lock().unwrap_or_else(|e| e.into_inner());
             let idx = g.lines.len();
-            let line = format!("  {} {} …", "⬢".cyan(), styled_desc);
+            // Include progress prefix for stdout mode too.
+            let prefix = match self.tool_batch_progress {
+                Some((cur, total)) if total > 1 => format!("[{}/{}] ", cur, total),
+                _ => String::new(),
+            };
+            let line = format!("  {} {}{} …", "⬢".cyan(), prefix, styled_desc);
             g.lines.push(line);
             let lines = g.lines.clone();
             g.region.update(lines);
