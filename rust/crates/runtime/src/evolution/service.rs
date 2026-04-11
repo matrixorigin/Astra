@@ -6,7 +6,8 @@ use tokio::sync::Mutex;
 use super::evolver;
 use super::signal_collector::SignalCollector;
 use super::types::{
-    ApprovalStatus, EvolutionProposal, EvolutionSignal, ToolResultContext, TurnSummary,
+    ApprovalStatus, EvolutionAxis, EvolutionProposal, EvolutionSignal, ToolResultContext,
+    TurnSummary,
 };
 
 use crate::liquid::reflection::ReflectionEngine;
@@ -109,6 +110,10 @@ impl EvolutionService {
             .filter(|s| evolver::needs_llm(s))
             .collect();
 
+        if !fast.is_empty() {
+            self.apply_auto_proposals(&fast).await;
+        }
+
         // Auto-applied proposals go to the log.
         {
             let mut log = self.applied_log.lock().await;
@@ -124,6 +129,20 @@ impl EvolutionService {
         }
 
         (fast, llm_signals)
+    }
+
+    async fn apply_auto_proposals(&self, proposals: &[EvolutionProposal]) {
+        let Some(pattern_library) = self.pattern_library.as_ref() else {
+            return;
+        };
+        let Ok(mut library) = pattern_library.lock() else {
+            return;
+        };
+        for proposal in proposals {
+            if let EvolutionAxis::Pattern { signature, action } = &proposal.axis {
+                library.apply_evolution_action(signature, *action);
+            }
+        }
     }
 
     /// Add a skill-axis proposal (from LLM path) for user approval.
@@ -498,6 +517,48 @@ mod tests {
             "drift proposal should be Demote"
         );
         assert_eq!(auto[0].status, ApprovalStatus::AutoApplied);
+    }
+
+    #[tokio::test]
+    async fn flush_applies_auto_pattern_proposals_to_pattern_library() {
+        use crate::pipeline::pattern::PatternLibrary;
+
+        let lib = Arc::new(std::sync::Mutex::new(PatternLibrary::default()));
+        {
+            let mut l = lib.lock().unwrap();
+            for _ in 0..5 {
+                l.record_outcome(
+                    &["bash".to_string()],
+                    TaskType::Code,
+                    Some(DomainHint::Code),
+                    true,
+                    0.8,
+                    None,
+                );
+            }
+        }
+        let before = lib
+            .lock()
+            .unwrap()
+            .pattern_stats("bash", TaskType::Code)
+            .unwrap()
+            .1;
+
+        let svc = EvolutionService::new().with_pattern_library(lib.clone());
+        svc.add_signal(drift_signal("bash")).await;
+        let (auto, _) = svc.flush().await;
+
+        assert_eq!(auto.len(), 1);
+        let after = lib
+            .lock()
+            .unwrap()
+            .pattern_stats("bash", TaskType::Code)
+            .unwrap()
+            .1;
+        assert!(
+            after > before,
+            "auto proposal should mutate pattern library"
+        );
     }
 
     // ── L2.3 reflection integration tests ───────────────────────────────

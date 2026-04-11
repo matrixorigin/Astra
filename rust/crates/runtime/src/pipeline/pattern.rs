@@ -374,6 +374,55 @@ impl PatternLibrary {
         }
     }
 
+    /// Inspect success/failure counts for a concrete signature/task pair.
+    pub fn pattern_stats(&self, signature: &str, task_type: TaskType) -> Option<(u32, u32)> {
+        self.patterns
+            .get(&pattern_key(signature, task_type))
+            .map(|pattern| (pattern.success_count, pattern.failure_count))
+    }
+
+    /// Apply an explicit evolution action to every pattern with the given signature.
+    ///
+    /// Returns the number of patterns updated across task types/domains.
+    pub fn apply_evolution_action(
+        &mut self,
+        signature: &str,
+        action: crate::evolution::types::PatternAction,
+    ) -> usize {
+        let matching_keys: Vec<String> = self
+            .patterns
+            .iter()
+            .filter(|(_, pattern)| pattern.signature == signature)
+            .map(|(key, _)| key.clone())
+            .collect();
+
+        for key in &matching_keys {
+            if let Some(pattern) = self.patterns.get_mut(key) {
+                match action {
+                    crate::evolution::types::PatternAction::Demote => {
+                        pattern.failure_count += 2;
+                        pattern.push_outcome(false);
+                    }
+                    crate::evolution::types::PatternAction::Block => {
+                        pattern.failure_count += 5;
+                        for _ in 0..3 {
+                            pattern.push_outcome(false);
+                        }
+                    }
+                    crate::evolution::types::PatternAction::Boost => {
+                        pattern.success_count += 1;
+                        pattern.quality_sum += 0.8;
+                        pattern.push_outcome(true);
+                    }
+                }
+                pattern.touch();
+                self.dirty_patterns.insert(key.clone());
+            }
+        }
+
+        matching_keys.len()
+    }
+
     /// Record effort metrics (retries, turns) for an existing pattern.
     ///
     /// Called separately from `record_outcome()` to avoid changing that
@@ -2197,6 +2246,23 @@ mod tests {
                 "Failure count should increase after demotion"
             );
         }
+    }
+
+    #[test]
+    fn apply_evolution_action_mutates_matching_pattern() {
+        let mut lib = PatternLibrary::new();
+        for _ in 0..3 {
+            lib.record_outcome(&tools(&["bash"]), TaskType::Code, None, true, 0.8, None);
+        }
+
+        let key = pattern_key("bash", TaskType::Code);
+        let before = lib.patterns.get(&key).unwrap().failure_count;
+        let updated =
+            lib.apply_evolution_action("bash", crate::evolution::types::PatternAction::Block);
+
+        assert_eq!(updated, 1);
+        let after = lib.patterns.get(&key).unwrap().failure_count;
+        assert!(after >= before + 5);
     }
 
     // ── Active Exploration Tests ──

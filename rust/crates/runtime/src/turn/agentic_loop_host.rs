@@ -2485,7 +2485,19 @@ async fn maybe_trigger_auto_reflection(state: &mut AgenticLoopState) {
         None => return,
     };
 
-    let (_fast, llm_signals) = evo.flush().await;
+    let (fast, llm_signals) = evo.flush().await;
+
+    if !fast.is_empty() {
+        for proposal in fast.iter().take(MAX_RECENT_TACTICAL_ACTIONS) {
+            state
+                .recent_tactical_actions
+                .push(format!("auto-evolution: {}", proposal.reasoning));
+        }
+        if state.recent_tactical_actions.len() > MAX_RECENT_TACTICAL_ACTIONS {
+            let overflow = state.recent_tactical_actions.len() - MAX_RECENT_TACTICAL_ACTIONS;
+            state.recent_tactical_actions.drain(..overflow);
+        }
+    }
 
     if !llm_signals.is_empty() {
         state.pending_reflection_signals.extend(llm_signals);
@@ -10488,6 +10500,18 @@ print(json.dumps({'context': 'user said: ' + msg}))
             guard.turn_number = 4;
         }
         state.telemetry.observability_session = Some(session);
+        state
+            .evolution_service
+            .as_ref()
+            .unwrap()
+            .add_signal(crate::evolution::types::EvolutionSignal::PatternDrift {
+                pattern_signature: "bash".into(),
+                task_type: crate::pipeline::routing::TaskType::Code,
+                domain: Some(crate::pipeline::routing::DomainHint::Code),
+                historical_rate: 0.9,
+                recent_rate: 0.2,
+            })
+            .await;
 
         maybe_trigger_auto_reflection(&mut state).await;
 
@@ -10497,6 +10521,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
         assert!(content.contains("Active experiment: exp-123 (variant=variant-b, samples=4)"));
         assert!(content.contains("Recent tactical actions:"));
         assert!(content.contains("verify outputs more strictly"));
+        assert!(content.contains("auto-evolution: Pattern success rate dropped"));
         assert!(state.recent_tactical_actions.is_empty());
     }
 
