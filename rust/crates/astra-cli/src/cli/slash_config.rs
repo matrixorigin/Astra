@@ -189,7 +189,9 @@ fn show_sources() {
 
     println!(
         "\n{}",
-        "Configuration Sources (showing non-default values)".bold().cyan()
+        "Configuration Sources (showing non-default values)"
+            .bold()
+            .cyan()
     );
     println!("{}", "═".repeat(55).dim());
     println!(
@@ -221,7 +223,11 @@ fn show_sources() {
         println!(
             "  • {} = {} [{}]",
             "compression.max_history_tokens".cyan(),
-            final_config.compression.max_history_tokens.to_string().yellow(),
+            final_config
+                .compression
+                .max_history_tokens
+                .to_string()
+                .yellow(),
             source_for("MO_MAX_HISTORY_TOKENS")
         );
     }
@@ -251,13 +257,18 @@ fn show_sources() {
     }
 
     // Token budget
-    if final_config.token_budget.max_turn_input_tokens != defaults.token_budget.max_turn_input_tokens
+    if final_config.token_budget.max_turn_input_tokens
+        != defaults.token_budget.max_turn_input_tokens
     {
         shown_any = true;
         println!(
             "  • {} = {} [{}]",
             "token_budget.max_turn_input_tokens".cyan(),
-            final_config.token_budget.max_turn_input_tokens.to_string().yellow(),
+            final_config
+                .token_budget
+                .max_turn_input_tokens
+                .to_string()
+                .yellow(),
             source_for("MO_MAX_TURN_INPUT_TOKENS")
         );
     }
@@ -268,22 +279,20 @@ fn show_sources() {
         println!(
             "  • {} = {} [{}]",
             "telemetry.capture_context_traces".cyan(),
-            final_config.telemetry.capture_context_traces.to_string().yellow(),
+            final_config
+                .telemetry
+                .capture_context_traces
+                .to_string()
+                .yellow(),
             source_for("MO_CAPTURE_TRACES")
         );
     }
 
     if !shown_any {
-        println!(
-            "\n{}",
-            "  All settings are at their default values.".dim()
-        );
+        println!("\n{}", "  All settings are at their default values.".dim());
     }
 
-    println!(
-        "\n{}",
-        "Priority: env > project > user > defaults".dim()
-    );
+    println!("\n{}", "Priority: env > project > user > defaults".dim());
 }
 
 fn show_paths() {

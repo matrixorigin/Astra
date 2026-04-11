@@ -6315,7 +6315,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
             },
         ]);
 
-        let output = crate::skills::hooks::evaluate_session_hooks(
+        let _output = crate::skills::hooks::evaluate_session_hooks(
             &registry,
             crate::skills::hooks::SessionEvent::SessionStart,
             "s1",
