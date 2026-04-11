@@ -636,6 +636,20 @@ impl AgenticRunLifecycleService {
         Ok(Some(run))
     }
 
+    fn run_state_conflict(action: &str, status: &str) -> (StatusCode, Json<ErrorResponse>) {
+        error_response(
+            StatusCode::CONFLICT,
+            format!("Cannot {action} run in '{status}' state"),
+        )
+    }
+
+    fn run_control_state_unavailable(action: &str) -> (StatusCode, Json<ErrorResponse>) {
+        error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("Run control state unavailable for {action}"),
+        )
+    }
+
     #[cfg(test)]
     pub(crate) async fn test_llm_cancel_token_is_cancelled(&self, run_id: &str) -> Option<bool> {
         let runs = self.runs.read().await;
@@ -893,48 +907,62 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         run_id: String,
         user_id: String,
     ) -> Result<CancelRunRecord, (StatusCode, Json<ErrorResponse>)> {
-        let mut runs = self.runs.write().await;
-        let run = runs
-            .get_mut(&run_id)
-            .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Run not found"))?;
-        if run.user_id != user_id {
-            return Err(error_response(StatusCode::FORBIDDEN, "Access denied"));
-        }
-        if run.status == RunStatus::Running {
-            run.cancel_flag.store(true, Ordering::SeqCst);
-            run.llm_cancel_token.cancel();
-            run.status = RunStatus::Cancelled;
-            run.events.push(json!({
-                "event_type": "run_finished",
-                "data": {"cancelled": true}
-            }));
-            // Persist cancellation
-            if let Some(engine) = &self.run_engine {
-                astra_core::log_persist!(
-                    engine
-                        .persist_status(&run_id, STATUS_CANCELLED, None, None)
-                        .await,
-                    "run_lifecycle",
-                    &run_id,
-                    "cancel_status"
-                );
-                astra_core::log_persist!(
-                    engine
-                        .append_event(
+        {
+            let mut runs = self.runs.write().await;
+            if let Some(run) = runs.get_mut(&run_id) {
+                if run.user_id != user_id {
+                    return Err(error_response(StatusCode::FORBIDDEN, "Access denied"));
+                }
+                if run.status == RunStatus::Running {
+                    run.cancel_flag.store(true, Ordering::SeqCst);
+                    run.llm_cancel_token.cancel();
+                    run.status = RunStatus::Cancelled;
+                    run.events.push(json!({
+                        "event_type": "run_finished",
+                        "data": {"cancelled": true}
+                    }));
+                    // Persist cancellation
+                    if let Some(engine) = &self.run_engine {
+                        astra_core::log_persist!(
+                            engine
+                                .persist_status(&run_id, STATUS_CANCELLED, None, None)
+                                .await,
+                            "run_lifecycle",
                             &run_id,
-                            json!({"event_type": "run_finished", "data": {"cancelled": true}}),
-                        )
-                        .await,
-                    "run_lifecycle",
-                    &run_id,
-                    "cancel_event"
-                );
+                            "cancel_status"
+                        );
+                        astra_core::log_persist!(
+                            engine
+                                .append_event(
+                                    &run_id,
+                                    json!({"event_type": "run_finished", "data": {"cancelled": true}}),
+                                )
+                                .await,
+                            "run_lifecycle",
+                            &run_id,
+                            "cancel_event"
+                        );
+                    }
+                }
+                return Ok(CancelRunRecord {
+                    run_id,
+                    status: run.status.as_str().to_string(),
+                });
             }
         }
-        Ok(CancelRunRecord {
-            run_id,
-            status: run.status.as_str().to_string(),
-        })
+
+        if let Some(run) = self.load_durable_run_for_user(&run_id, &user_id).await? {
+            return if run.status == STATUS_RUNNING {
+                Err(Self::run_control_state_unavailable("cancellation"))
+            } else {
+                Ok(CancelRunRecord {
+                    run_id,
+                    status: run.status,
+                })
+            };
+        }
+
+        Err(error_response(StatusCode::NOT_FOUND, "Run not found"))
     }
 
     async fn list_runs(
@@ -993,57 +1021,65 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         run_id: String,
         user_id: String,
     ) -> Result<RunMutationRecord, (StatusCode, Json<ErrorResponse>)> {
-        let mut runs = self.runs.write().await;
-        let run = runs
-            .get_mut(&run_id)
-            .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Run not found"))?;
-        if run.user_id != user_id {
-            return Err(error_response(StatusCode::FORBIDDEN, "Access denied"));
-        }
-        if run.status != RunStatus::Running {
-            return Err(error_response(
-                StatusCode::CONFLICT,
-                format!("Cannot pause run in '{}' state", run.status.as_str()),
-            ));
-        }
-        let previous = run.status.as_str().to_string();
-        run.status = RunStatus::Paused;
-        run.waiting_for = Some("user_resume".to_string());
-        run.events.push(json!({
-            "event_type": "run_paused",
-            "data": {}
-        }));
-        // Drop the write lock before async delegation calls.
-        drop(runs);
+        {
+            let mut runs = self.runs.write().await;
+            if let Some(run) = runs.get_mut(&run_id) {
+                if run.user_id != user_id {
+                    return Err(error_response(StatusCode::FORBIDDEN, "Access denied"));
+                }
+                if run.status != RunStatus::Running {
+                    return Err(Self::run_state_conflict("pause", run.status.as_str()));
+                }
+                let previous = run.status.as_str().to_string();
+                run.status = RunStatus::Paused;
+                run.waiting_for = Some("user_resume".to_string());
+                run.events.push(json!({
+                    "event_type": "run_paused",
+                    "data": {}
+                }));
+                // Drop the write lock before async delegation calls.
+                drop(runs);
 
-        // Persist pause
-        if let Some(engine) = &self.run_engine {
-            astra_core::log_persist!(
-                engine
-                    .persist_status(&run_id, STATUS_PAUSED, Some("user_resume"), None)
-                    .await,
-                "run_lifecycle",
-                &run_id,
-                "pause_status"
-            );
-            astra_core::log_persist!(
-                engine
-                    .append_event(&run_id, json!({"event_type": "run_paused", "data": {}}))
-                    .await,
-                "run_lifecycle",
-                &run_id,
-                "pause_event"
-            );
+                // Persist pause
+                if let Some(engine) = &self.run_engine {
+                    astra_core::log_persist!(
+                        engine
+                            .persist_status(&run_id, STATUS_PAUSED, Some("user_resume"), None)
+                            .await,
+                        "run_lifecycle",
+                        &run_id,
+                        "pause_status"
+                    );
+                    astra_core::log_persist!(
+                        engine
+                            .append_event(&run_id, json!({"event_type": "run_paused", "data": {}}))
+                            .await,
+                        "run_lifecycle",
+                        &run_id,
+                        "pause_event"
+                    );
+                }
+                // Cascade: pause all delegated sub-runs of this parent.
+                if let Some(de) = &self.delegation_engine {
+                    de.pause_children_of(&run_id).await;
+                }
+                return Ok(RunMutationRecord {
+                    run_id,
+                    status: STATUS_PAUSED.to_string(),
+                    previous_status: previous,
+                });
+            }
         }
-        // Cascade: pause all delegated sub-runs of this parent.
-        if let Some(de) = &self.delegation_engine {
-            de.pause_children_of(&run_id).await;
+
+        if let Some(run) = self.load_durable_run_for_user(&run_id, &user_id).await? {
+            return if run.status == STATUS_RUNNING {
+                Err(Self::run_control_state_unavailable("pause"))
+            } else {
+                Err(Self::run_state_conflict("pause", &run.status))
+            };
         }
-        Ok(RunMutationRecord {
-            run_id,
-            status: STATUS_PAUSED.to_string(),
-            previous_status: previous,
-        })
+
+        Err(error_response(StatusCode::NOT_FOUND, "Run not found"))
     }
 
     async fn resume_run(
@@ -1051,57 +1087,65 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         run_id: String,
         user_id: String,
     ) -> Result<RunMutationRecord, (StatusCode, Json<ErrorResponse>)> {
-        let mut runs = self.runs.write().await;
-        let run = runs
-            .get_mut(&run_id)
-            .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Run not found"))?;
-        if run.user_id != user_id {
-            return Err(error_response(StatusCode::FORBIDDEN, "Access denied"));
-        }
-        if run.status != RunStatus::Paused {
-            return Err(error_response(
-                StatusCode::CONFLICT,
-                format!("Cannot resume run in '{}' state", run.status.as_str()),
-            ));
-        }
-        let previous = run.status.as_str().to_string();
-        run.status = RunStatus::Running;
-        run.waiting_for = None;
-        run.events.push(json!({
-            "event_type": "run_resumed",
-            "data": {}
-        }));
-        // Drop the write lock before async delegation calls.
-        drop(runs);
+        {
+            let mut runs = self.runs.write().await;
+            if let Some(run) = runs.get_mut(&run_id) {
+                if run.user_id != user_id {
+                    return Err(error_response(StatusCode::FORBIDDEN, "Access denied"));
+                }
+                if run.status != RunStatus::Paused {
+                    return Err(Self::run_state_conflict("resume", run.status.as_str()));
+                }
+                let previous = run.status.as_str().to_string();
+                run.status = RunStatus::Running;
+                run.waiting_for = None;
+                run.events.push(json!({
+                    "event_type": "run_resumed",
+                    "data": {}
+                }));
+                // Drop the write lock before async delegation calls.
+                drop(runs);
 
-        // Persist resume
-        if let Some(engine) = &self.run_engine {
-            astra_core::log_persist!(
-                engine
-                    .persist_status(&run_id, STATUS_RUNNING, None, None)
-                    .await,
-                "run_lifecycle",
-                &run_id,
-                "resume_status"
-            );
-            astra_core::log_persist!(
-                engine
-                    .append_event(&run_id, json!({"event_type": "run_resumed", "data": {}}))
-                    .await,
-                "run_lifecycle",
-                &run_id,
-                "resume_event"
-            );
+                // Persist resume
+                if let Some(engine) = &self.run_engine {
+                    astra_core::log_persist!(
+                        engine
+                            .persist_status(&run_id, STATUS_RUNNING, None, None)
+                            .await,
+                        "run_lifecycle",
+                        &run_id,
+                        "resume_status"
+                    );
+                    astra_core::log_persist!(
+                        engine
+                            .append_event(&run_id, json!({"event_type": "run_resumed", "data": {}}))
+                            .await,
+                        "run_lifecycle",
+                        &run_id,
+                        "resume_event"
+                    );
+                }
+                // Cascade: resume all delegated sub-runs of this parent.
+                if let Some(de) = &self.delegation_engine {
+                    de.resume_children_of(&run_id).await;
+                }
+                return Ok(RunMutationRecord {
+                    run_id,
+                    status: STATUS_RUNNING.to_string(),
+                    previous_status: previous,
+                });
+            }
         }
-        // Cascade: resume all delegated sub-runs of this parent.
-        if let Some(de) = &self.delegation_engine {
-            de.resume_children_of(&run_id).await;
+
+        if let Some(run) = self.load_durable_run_for_user(&run_id, &user_id).await? {
+            return if run.status == STATUS_PAUSED {
+                Err(Self::run_control_state_unavailable("resume"))
+            } else {
+                Err(Self::run_state_conflict("resume", &run.status))
+            };
         }
-        Ok(RunMutationRecord {
-            run_id,
-            status: STATUS_RUNNING.to_string(),
-            previous_status: previous,
-        })
+
+        Err(error_response(StatusCode::NOT_FOUND, "Run not found"))
     }
 }
 
@@ -2031,6 +2075,61 @@ mod tests {
         let durable = engine.load_run(&run.run_id).await.unwrap().unwrap();
         assert_eq!(durable.status, "running");
         assert!(durable.waiting_for.is_none());
+    }
+
+    #[tokio::test]
+    async fn cancel_run_returns_durable_terminal_status_on_cache_miss() {
+        let svc = test_service_with_engine();
+        let engine = svc.run_engine.as_ref().unwrap();
+        engine.start_run("run-1", "user-1", "sess-1").await.unwrap();
+        engine
+            .persist_status("run-1", STATUS_COMPLETED, None, None)
+            .await
+            .unwrap();
+
+        let result = ok(svc.cancel_run("run-1".into(), "user-1".into()).await);
+        assert_eq!(result.run_id, "run-1");
+        assert_eq!(result.status, STATUS_COMPLETED);
+    }
+
+    #[tokio::test]
+    async fn cancel_run_running_cache_miss_returns_service_unavailable() {
+        let svc = test_service_with_engine();
+        let engine = svc.run_engine.as_ref().unwrap();
+        engine.start_run("run-1", "user-1", "sess-1").await.unwrap();
+
+        let e = err(svc.cancel_run("run-1".into(), "user-1".into()).await);
+        assert_eq!(e.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            e.1.0.detail,
+            "Run control state unavailable for cancellation"
+        );
+    }
+
+    #[tokio::test]
+    async fn pause_run_running_cache_miss_returns_service_unavailable() {
+        let svc = test_service_with_engine();
+        let engine = svc.run_engine.as_ref().unwrap();
+        engine.start_run("run-1", "user-1", "sess-1").await.unwrap();
+
+        let e = err(svc.pause_run("run-1".into(), "user-1".into()).await);
+        assert_eq!(e.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(e.1.0.detail, "Run control state unavailable for pause");
+    }
+
+    #[tokio::test]
+    async fn resume_run_paused_cache_miss_returns_service_unavailable() {
+        let svc = test_service_with_engine();
+        let engine = svc.run_engine.as_ref().unwrap();
+        engine.start_run("run-1", "user-1", "sess-1").await.unwrap();
+        engine
+            .persist_status("run-1", STATUS_PAUSED, Some("user_resume"), None)
+            .await
+            .unwrap();
+
+        let e = err(svc.resume_run("run-1".into(), "user-1".into()).await);
+        assert_eq!(e.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(e.1.0.detail, "Run control state unavailable for resume");
     }
 
     #[tokio::test]
