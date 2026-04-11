@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::ab_testing::{ExperimentOutcome, ExperimentStatus, ExperimentStore};
 use crate::adaptive_baselines::{AdaptiveBaselinePromotion, AdaptiveBaselineStore};
-use crate::auto_tuning::{AutoTuningEngine, FeedbackSignal, SignalType};
+use crate::auto_tuning::{AutoTuningEngine, DelegationOutcomeTracker, FeedbackSignal, SignalType};
 use crate::pipeline::pattern::PatternLibrary;
 use crate::runtime_config::RuntimeConfig;
 use crate::turn::context_assembly_trace::ContextAssemblyTrace;
@@ -479,6 +479,9 @@ pub struct ObservabilityHub {
     /// Auto-tuning engine.
     tuning_engine: AutoTuningEngine,
 
+    /// Delegation outcome tracker for coordination auto-select.
+    delegation_outcomes: DelegationOutcomeTracker,
+
     /// Shared pattern library for adaptive routing and exploration.
     pattern_library: RwLock<Option<Arc<Mutex<PatternLibrary>>>>,
 
@@ -501,6 +504,7 @@ impl ObservabilityHub {
             experiment_store: RwLock::new(ExperimentStore::new()),
             adaptive_baselines: AdaptiveBaselineStore::new(),
             tuning_engine: AutoTuningEngine::new(),
+            delegation_outcomes: DelegationOutcomeTracker::new(),
             pattern_library: RwLock::new(None),
             sessions: RwLock::new(HashMap::new()),
         }
@@ -516,12 +520,15 @@ impl ObservabilityHub {
 
         let profile_path = observability_storage_file(&storage_root, "profiles.json");
         let baseline_path = observability_storage_file(&storage_root, "adaptive-baselines.json");
+        let tuning_path = observability_storage_file(&storage_root, "feedback-aggregator.json");
+        let outcomes_path = observability_storage_file(&storage_root, "delegation-outcomes.json");
         let profile_store = Arc::new(UserProfileStore::with_storage(profile_path));
         Self {
             profile_manager: UserProfileManager::new(profile_store),
             experiment_store: RwLock::new(ExperimentStore::new()),
             adaptive_baselines: AdaptiveBaselineStore::with_storage(baseline_path),
-            tuning_engine: AutoTuningEngine::new(),
+            tuning_engine: AutoTuningEngine::with_storage(tuning_path),
+            delegation_outcomes: DelegationOutcomeTracker::with_storage(outcomes_path),
             pattern_library: RwLock::new(None),
             sessions: RwLock::new(HashMap::new()),
         }
@@ -663,6 +670,27 @@ impl ObservabilityHub {
         ));
     }
 
+    // ─── Delegation Outcome Tracking ────────────────────────────────────────
+
+    /// Record a delegation outcome for coordination auto-select learning.
+    pub fn record_delegation_outcome(&self, scenario: &str, pattern: &str, succeeded: bool) {
+        self.delegation_outcomes
+            .record(scenario, pattern, succeeded);
+        self.delegation_outcomes.persist();
+    }
+
+    /// Get the historically preferred coordination pattern for a scenario.
+    ///
+    /// Returns `None` if insufficient data (< `min_observations` executions).
+    pub fn preferred_delegation_pattern(
+        &self,
+        scenario: &str,
+        min_observations: u32,
+    ) -> Option<String> {
+        self.delegation_outcomes
+            .preferred_pattern(scenario, min_observations)
+    }
+
     // ─── Auto-Tuning Cycle ──────────────────────────────────────────────────
 
     /// Run one auto-tuning cycle and return executed rules.
@@ -691,12 +719,22 @@ impl ObservabilityHub {
             }
         }
 
+        // Persist aggregator state after tuning cycle.
+        if !executions.is_empty() {
+            self.tuning_engine.persist();
+        }
+
         executions.into_iter().map(|e| e.rule_id).collect()
     }
 
     /// Check and execute rollbacks.
     pub fn check_rollbacks(&self, config: &mut RuntimeConfig) -> Vec<String> {
-        self.tuning_engine.check_rollbacks(config)
+        let rollbacks = self.tuning_engine.check_rollbacks(config);
+        // Persist aggregator after rollbacks too (state may have changed).
+        if !rollbacks.is_empty() {
+            self.tuning_engine.persist();
+        }
+        rollbacks
     }
 
     // ─── Query Observation ──────────────────────────────────────────────────

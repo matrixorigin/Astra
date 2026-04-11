@@ -1023,13 +1023,24 @@ fn parse_delegation_request(
 #[derive(Debug, Clone)]
 struct DelegationAdaptiveContext {
     scenario: Option<crate::user_profile::Scenario>,
+    /// Historically preferred pattern from outcome tracking.
+    preferred_pattern: Option<String>,
 }
 
 fn delegation_adaptive_context(
     session: &crate::observability_integration::ObservabilitySession,
+    hub: Option<&crate::observability_integration::ObservabilityHub>,
 ) -> DelegationAdaptiveContext {
+    let scenario = session.current_scenario();
+    let preferred_pattern = scenario.as_ref().and_then(|s| {
+        let scenario_key = serde_json::to_value(s)
+            .ok()
+            .and_then(|v| v.as_str().map(String::from))?;
+        hub?.preferred_delegation_pattern(&scenario_key, 3)
+    });
     DelegationAdaptiveContext {
-        scenario: session.current_scenario(),
+        scenario,
+        preferred_pattern,
     }
 }
 
@@ -1040,11 +1051,32 @@ fn select_default_coordination_pattern(
 ) -> Result<(astra_services::coordination::CoordinationPattern, Value), String> {
     let agents = parse_delegate_agents(args);
     let scenario = adaptive_context.and_then(|ctx| ctx.scenario.clone());
+    let preferred = adaptive_context.and_then(|ctx| ctx.preferred_pattern.as_deref());
     let task_requests_review = task_needs_review(task);
+
+    // Check if we have a historically learned preference for this scenario.
+    if let Some(pref) = preferred {
+        if let Some(pattern) = pattern_from_name(pref, &agents, args) {
+            return Ok((
+                pattern,
+                serde_json::json!({
+                    "selected_pattern": pref,
+                    "selection_source": "outcome_history",
+                    "reason": "historically preferred pattern for this scenario",
+                    "scenario": scenario,
+                }),
+            ));
+        }
+    }
+
+    // Expanded scenario heuristics.
     let should_adapt = matches!(
         scenario,
         Some(
-            crate::user_profile::Scenario::CodeReview | crate::user_profile::Scenario::Exploration
+            crate::user_profile::Scenario::CodeReview
+                | crate::user_profile::Scenario::Exploration
+                | crate::user_profile::Scenario::Debugging
+                | crate::user_profile::Scenario::Testing
         )
     ) || task_requests_review;
 
@@ -1074,6 +1106,7 @@ fn select_default_coordination_pattern(
             Some(
                 crate::user_profile::Scenario::Exploration
                     | crate::user_profile::Scenario::CodeReview
+                    | crate::user_profile::Scenario::Testing
             )
         ),
         timeout_sec: args.get("timeout").and_then(Value::as_u64).unwrap_or(0),
@@ -1084,6 +1117,10 @@ fn select_default_coordination_pattern(
         "code_review_scenario_prefers_review_loop"
     } else if matches!(scenario, Some(crate::user_profile::Scenario::Exploration)) {
         "exploration_scenario_prefers_parallel_scouting"
+    } else if matches!(scenario, Some(crate::user_profile::Scenario::Debugging)) {
+        "debugging_scenario_prefers_sequential_with_stop"
+    } else if matches!(scenario, Some(crate::user_profile::Scenario::Testing)) {
+        "testing_scenario_prefers_parallel_execution"
     } else if task_requests_review {
         "task_keywords_request_review"
     } else {
@@ -1099,6 +1136,51 @@ fn select_default_coordination_pattern(
             "scenario": scenario,
         }),
     ))
+}
+
+/// Construct a `CoordinationPattern` from a pattern name string.
+/// Used when the outcome tracker suggests a historically preferred pattern.
+fn pattern_from_name(
+    name: &str,
+    agents: &[String],
+    args: &Value,
+) -> Option<astra_services::coordination::CoordinationPattern> {
+    let timeout = args.get("timeout").and_then(Value::as_u64).unwrap_or(0);
+    match name {
+        "fan_out" => Some(astra_services::coordination::CoordinationPattern::FanOut {
+            agent_ids: agents.to_vec(),
+            aggregation: astra_services::coordination::AggregationStrategy::AllResults,
+            timeout_sec: timeout,
+        }),
+        "sequential" => Some(
+            astra_services::coordination::CoordinationPattern::Sequential {
+                agent_ids: agents.to_vec(),
+                stop_on_success: false,
+                timeout_sec: timeout,
+            },
+        ),
+        "adversarial" if agents.len() >= 2 => Some(
+            astra_services::coordination::CoordinationPattern::AdversarialReview {
+                producer_id: agents[0].clone(),
+                reviewer_id: agents[1].clone(),
+                max_rounds: 3,
+                acceptance_threshold: 0.7,
+                timeout_sec: timeout,
+            },
+        ),
+        "fork" => {
+            agents.first().map(
+                |agent| astra_services::coordination::CoordinationPattern::Fork {
+                    agent_id: agent.clone(),
+                    tasks: vec!["delegated task".to_string()],
+                    max_turns: 10,
+                    aggregation: astra_services::coordination::AggregationStrategy::AllResults,
+                    timeout_sec: timeout,
+                },
+            )
+        }
+        _ => None,
+    }
 }
 
 fn parse_delegate_agents(args: &Value) -> Vec<String> {
@@ -1263,12 +1345,29 @@ async fn partition_and_execute_delegations(
             ) {
                 Ok(mut request) => {
                     merge_workspace_hint_into_delegation_request(&mut request, workspace_hint);
+                    let pattern_name = coordination_pattern_name(&request.pattern).to_string();
+                    let scenario_name =
+                        adaptive_context
+                            .and_then(|ctx| ctx.scenario.as_ref())
+                            .map(|s| {
+                                serde_json::to_value(s)
+                                    .ok()
+                                    .and_then(|v| v.as_str().map(String::from))
+                                    .unwrap_or_else(|| format!("{s:?}").to_lowercase())
+                            });
                     match engine.execute(request, source_agent_id, None).await {
                         Ok(result) => {
+                            let succeeded =
+                                result.status == "completed" || result.status == "success";
                             delegation_results.push(DelegationExecutionResult {
                                 call_id,
                                 summary: format_delegation_result(&result),
                                 preview_lines: format_delegation_terminal_preview(&result),
+                                outcome: Some(DelegationOutcomeMetadata {
+                                    scenario: scenario_name,
+                                    pattern: pattern_name,
+                                    succeeded,
+                                }),
                             });
                         }
                         Err(e) => {
@@ -1279,6 +1378,11 @@ async fn partition_and_execute_delegations(
                                     HeadlessStderrStyle::Yellow,
                                     format!("🤝 Delegation failed — {e}"),
                                 )],
+                                outcome: Some(DelegationOutcomeMetadata {
+                                    scenario: scenario_name,
+                                    pattern: pattern_name,
+                                    succeeded: false,
+                                }),
                             });
                         }
                     }
@@ -1291,6 +1395,7 @@ async fn partition_and_execute_delegations(
                             HeadlessStderrStyle::Yellow,
                             format!("🤝 Invalid delegation request — {e}"),
                         )],
+                        outcome: None,
                     });
                 }
             }
@@ -1307,6 +1412,16 @@ struct DelegationExecutionResult {
     call_id: String,
     summary: String,
     preview_lines: Vec<(HeadlessStderrStyle, String)>,
+    /// Outcome metadata for coordination auto-select learning.
+    outcome: Option<DelegationOutcomeMetadata>,
+}
+
+/// Metadata recorded after a delegation completes, used for learning.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DelegationOutcomeMetadata {
+    scenario: Option<String>,
+    pattern: String,
+    succeeded: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1905,6 +2020,31 @@ fn record_loop_completion_feedback(
             if !is_correction {
                 hub.record_feedback(enrich_signal(
                     FeedbackSignal::new(SignalType::Acceptance).with_turn(&turn_id),
+                ));
+            }
+        }
+    }
+
+    // ── 8. Tool health signals ──
+    // Emit signals for deprioritized tools so tuning rules can react.
+    {
+        let deprioritized = state.turn_guard.health.deprioritized_tools();
+        for tool_name in deprioritized {
+            hub.record_feedback(enrich_signal(
+                FeedbackSignal::new(SignalType::ToolDeprioritized {
+                    tool_name: tool_name.to_string(),
+                })
+                .with_turn(&turn_id),
+            ));
+        }
+        // Track tools that were rehabilitated this session (rehab count > 0 but not deprioritized).
+        for (name, health) in state.turn_guard.health.all() {
+            if health.rehabilitation_count > 0 && !health.deprioritized {
+                hub.record_feedback(enrich_signal(
+                    FeedbackSignal::new(SignalType::ToolRehabilitated {
+                        tool_name: name.clone(),
+                    })
+                    .with_turn(&turn_id),
                 ));
             }
         }
@@ -3032,7 +3172,10 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                     .as_ref()
                     .map(|session| {
                         let session = session.read().unwrap_or_else(|e| e.into_inner());
-                        delegation_adaptive_context(&session)
+                        delegation_adaptive_context(
+                            &session,
+                            state.telemetry.observability_hub.as_deref(),
+                        )
                     });
             // Fire SubagentStart hooks before delegation.
             if turn_result.accum.tool_calls.iter().any(is_delegation_call) {
@@ -3065,6 +3208,20 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
         } else {
             (Vec::new(), turn_result.accum.tool_calls.clone())
         };
+
+        // Record delegation outcomes for coordination auto-select learning.
+        if let Some(hub) = &state.telemetry.observability_hub {
+            for result in &delegation_results {
+                if let Some(ref outcome) = result.outcome {
+                    let scenario_key = outcome.scenario.as_deref().unwrap_or("unknown");
+                    hub.record_delegation_outcome(
+                        scenario_key,
+                        &outcome.pattern,
+                        outcome.succeeded,
+                    );
+                }
+            }
+        }
 
         // Inject delegation results into messages + tool_results.
         // Build a proper assistant message with the delegate tool_calls so
@@ -4996,6 +5153,7 @@ mod tests {
         });
         let adaptive_context = super::DelegationAdaptiveContext {
             scenario: Some(crate::user_profile::Scenario::Exploration),
+            preferred_pattern: None,
         };
 
         let req = super::parse_delegation_request(
@@ -5028,6 +5186,7 @@ mod tests {
         });
         let adaptive_context = super::DelegationAdaptiveContext {
             scenario: Some(crate::user_profile::Scenario::CodeReview),
+            preferred_pattern: None,
         };
 
         let req = super::parse_delegation_request(
@@ -5046,6 +5205,102 @@ mod tests {
         assert_eq!(
             req.context["adaptive_coordination"]["reason"],
             json!("code_review_scenario_prefers_review_loop")
+        );
+    }
+
+    #[test]
+    fn pattern_from_name_fan_out() {
+        let agents = vec!["a".to_string(), "b".to_string()];
+        let args = json!({"timeout": 60});
+        let pattern = super::pattern_from_name("fan_out", &agents, &args).unwrap();
+        match pattern {
+            astra_services::coordination::CoordinationPattern::FanOut {
+                agent_ids,
+                timeout_sec,
+                ..
+            } => {
+                assert_eq!(agent_ids, vec!["a", "b"]);
+                assert_eq!(timeout_sec, 60);
+            }
+            _ => panic!("expected FanOut"),
+        }
+    }
+
+    #[test]
+    fn pattern_from_name_sequential() {
+        let agents = vec!["x".to_string()];
+        let args = json!({});
+        let pattern = super::pattern_from_name("sequential", &agents, &args).unwrap();
+        assert!(matches!(
+            pattern,
+            astra_services::coordination::CoordinationPattern::Sequential { .. }
+        ));
+    }
+
+    #[test]
+    fn pattern_from_name_unknown_returns_none() {
+        let agents = vec!["a".to_string()];
+        let args = json!({});
+        assert!(super::pattern_from_name("unknown_pattern", &agents, &args).is_none());
+    }
+
+    #[test]
+    fn select_default_uses_history_when_available() {
+        let args = json!({"agents": ["coder", "reviewer"]});
+        let adaptive_context = super::DelegationAdaptiveContext {
+            scenario: Some(crate::user_profile::Scenario::CodeReview),
+            preferred_pattern: Some("fan_out".to_string()),
+        };
+        let (pattern, policy) = super::select_default_coordination_pattern(
+            &args,
+            "review code",
+            Some(&adaptive_context),
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                pattern,
+                astra_services::coordination::CoordinationPattern::FanOut { .. }
+            ),
+            "history should override scenario heuristic"
+        );
+        assert_eq!(policy["selection_source"], "outcome_history");
+    }
+
+    #[test]
+    fn select_default_debugging_scenario() {
+        let args = json!({"agents": ["coder"]});
+        let adaptive_context = super::DelegationAdaptiveContext {
+            scenario: Some(crate::user_profile::Scenario::Debugging),
+            preferred_pattern: None,
+        };
+        let (_pattern, policy) = super::select_default_coordination_pattern(
+            &args,
+            "find the bug",
+            Some(&adaptive_context),
+        )
+        .unwrap();
+        assert_eq!(policy["selection_source"], "adaptive_default");
+        assert_eq!(
+            policy["reason"],
+            "debugging_scenario_prefers_sequential_with_stop"
+        );
+    }
+
+    #[test]
+    fn select_default_testing_scenario() {
+        let args = json!({"agents": ["coder", "tester"]});
+        let adaptive_context = super::DelegationAdaptiveContext {
+            scenario: Some(crate::user_profile::Scenario::Testing),
+            preferred_pattern: None,
+        };
+        let (_pattern, policy) =
+            super::select_default_coordination_pattern(&args, "run tests", Some(&adaptive_context))
+                .unwrap();
+        assert_eq!(policy["selection_source"], "adaptive_default");
+        assert_eq!(
+            policy["reason"],
+            "testing_scenario_prefers_parallel_execution"
         );
     }
 
