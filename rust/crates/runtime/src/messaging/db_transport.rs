@@ -139,6 +139,8 @@ pub struct DatabaseTransport {
     /// Shutdown signal: when sent, all poll tasks stop.
     shutdown_tx: watch::Sender<bool>,
     shutdown_rx: watch::Receiver<bool>,
+    /// Active poll task abort handles — aborted on shutdown for clean drain.
+    poll_abort_handles: std::sync::Mutex<Vec<tokio::task::AbortHandle>>,
     /// Observable metrics.
     metrics: Arc<TransportMetrics>,
     /// Lazily started maintenance task for reclaiming stale claims and pruning
@@ -166,6 +168,7 @@ impl DatabaseTransport {
             registrations: Arc::new(RwLock::new(HashMap::new())),
             shutdown_tx,
             shutdown_rx,
+            poll_abort_handles: std::sync::Mutex::new(Vec::new()),
             metrics: Arc::new(TransportMetrics::default()),
             cleanup_scheduler: Mutex::new(None),
         }
@@ -414,6 +417,7 @@ impl MessageTransport for DatabaseTransport {
             Arc::clone(&self.metrics),
             consumer_id,
         ));
+        self.poll_abort_handles.lock().unwrap().push(poll_task.abort_handle());
 
         Ok(Box::new(DatabaseMessageStream {
             buffer_rx: rx,
@@ -491,6 +495,13 @@ impl MessageTransport for DatabaseTransport {
     }
 
     async fn shutdown(&self) -> Result<(), MailboxError> {
+        // Signal all poll tasks to stop.
+        let _ = self.shutdown_tx.send(true);
+        // Abort any poll tasks that haven't noticed the signal yet.
+        for h in self.poll_abort_handles.lock().unwrap().drain(..) {
+            h.abort();
+        }
+        // Release all claimed messages back to pending.
         let consumer_ids: Vec<String> = self
             .registrations
             .read()
@@ -498,8 +509,6 @@ impl MessageTransport for DatabaseTransport {
             .keys()
             .map(|addr| format!("{}@{}", addr.agent_id, addr.run_id))
             .collect();
-        // Signal all poll tasks to stop.
-        let _ = self.shutdown_tx.send(true);
         for consumer_id in consumer_ids {
             release_claimed_for_consumer_in_pool(
                 &self.pool,
