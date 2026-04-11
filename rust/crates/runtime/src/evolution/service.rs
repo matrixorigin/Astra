@@ -177,6 +177,61 @@ impl EvolutionService {
     pub async fn clear_dedup(&self) {
         self.collector.lock().await.clear_dedup();
     }
+
+    // ── Reflection integration (L2.3) ──────────────────────────────────
+
+    /// Build a ReflectionContext from the current state + provided llm_signals.
+    ///
+    /// Call this after `flush_and_propose()` returns llm_signals.
+    /// The caller is responsible for sending the prompt to an LLM and
+    /// feeding the response back via `ingest_reflection_response()`.
+    pub fn build_reflection_context(
+        &self,
+        session_id: &str,
+        turns_completed: u32,
+        scenario: Option<&str>,
+        token_utilisation: f64,
+        llm_signals: &[EvolutionSignal],
+        tool_stats: Vec<crate::liquid::reflection::ToolStat>,
+        active_experiment: Option<crate::liquid::reflection::ExperimentSummary>,
+    ) -> crate::liquid::reflection::ReflectionContext {
+        let mut ctx = crate::liquid::reflection::ReflectionContext::new(session_id);
+        ctx.turns_completed = turns_completed;
+        ctx.scenario = scenario.map(String::from);
+        ctx.token_utilisation = token_utilisation;
+        ctx.add_signals(llm_signals);
+        ctx.tool_stats = tool_stats;
+        ctx.active_experiment = active_experiment;
+        ctx
+    }
+
+    /// Build the LLM prompt pair (system, user) for a given reflection context.
+    pub fn build_reflection_prompt(
+        &self,
+        ctx: &crate::liquid::reflection::ReflectionContext,
+    ) -> (String, String) {
+        let engine = crate::liquid::reflection::ReflectionEngine::new();
+        engine.build_prompt(ctx)
+    }
+
+    /// Parse an LLM response and queue the resulting proposals as pending.
+    ///
+    /// Returns the number of proposals queued.
+    pub async fn ingest_reflection_response(
+        &self,
+        llm_response: &str,
+        ctx: &crate::liquid::reflection::ReflectionContext,
+    ) -> Result<usize, String> {
+        let engine = crate::liquid::reflection::ReflectionEngine::new();
+        let parsed = engine.parse_response(llm_response)?;
+        let proposals = engine.convert_proposals(&parsed.proposals, ctx);
+        let count = proposals.len();
+        let mut pending = self.pending_proposals.lock().await;
+        for p in proposals {
+            pending.push(p);
+        }
+        Ok(count)
+    }
 }
 
 /// Wrap in Arc for shared ownership across async tasks.
@@ -425,5 +480,115 @@ mod tests {
             "drift proposal should be Demote"
         );
         assert_eq!(auto[0].status, ApprovalStatus::AutoApplied);
+    }
+
+    // ── L2.3 reflection integration tests ───────────────────────────────
+
+    #[tokio::test]
+    async fn build_reflection_context_populates_fields() {
+        let svc = EvolutionService::new();
+        let signals = vec![EvolutionSignal::ToolFailure {
+            tool_name: "bash".into(),
+            error_snippet: "not found".into(),
+            skill_context: Some("ops".into()),
+            turn_id: "t1".into(),
+        }];
+
+        let ctx = svc.build_reflection_context(
+            "test-sess",
+            5,
+            Some("Debugging"),
+            0.42,
+            &signals,
+            vec![crate::liquid::reflection::ToolStat {
+                tool_name: "bash".into(),
+                calls: 10,
+                failures: 2,
+                avg_latency_ms: 150,
+            }],
+            None,
+        );
+
+        assert_eq!(ctx.session_id, "test-sess");
+        assert_eq!(ctx.turns_completed, 5);
+        assert_eq!(ctx.scenario.as_deref(), Some("Debugging"));
+        assert!((ctx.token_utilisation - 0.42).abs() < 0.01);
+        assert_eq!(ctx.signals.len(), 1);
+        assert_eq!(ctx.tool_stats.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn build_reflection_prompt_produces_valid_pair() {
+        let svc = EvolutionService::new();
+        let ctx = svc.build_reflection_context("sess-1", 3, None, 0.1, &[], vec![], None);
+        let (system, user) = svc.build_reflection_prompt(&ctx);
+        assert!(system.contains("execution improvement advisor"));
+        assert!(user.contains("sess-1"));
+    }
+
+    #[tokio::test]
+    async fn ingest_reflection_response_queues_proposals() {
+        let svc = EvolutionService::new();
+        let ctx =
+            svc.build_reflection_context("sess-1", 10, Some("CodeReview"), 0.5, &[], vec![], None);
+
+        let llm_response = r#"{
+            "proposals": [
+                {
+                    "axis": "pattern",
+                    "description": "Demote failing chain",
+                    "confidence": 0.8,
+                    "details": { "signature": "bash→grep", "action": "demote" }
+                },
+                {
+                    "axis": "skill",
+                    "description": "Add retry hint",
+                    "confidence": 0.6,
+                    "details": { "skill_name": "ops", "section": "troubleshooting", "content": "retry" }
+                }
+            ],
+            "summary": "Two issues found."
+        }"#;
+
+        let count = svc
+            .ingest_reflection_response(llm_response, &ctx)
+            .await
+            .unwrap();
+        assert_eq!(count, 2);
+
+        // Should now appear in pending proposals.
+        let pending = svc.pending().await;
+        assert_eq!(pending.len(), 2);
+        assert!(pending.iter().all(|p| p.id.starts_with("reflect-")));
+    }
+
+    #[tokio::test]
+    async fn ingest_reflection_bad_json_returns_error() {
+        let svc = EvolutionService::new();
+        let ctx = svc.build_reflection_context("s", 1, None, 0.0, &[], vec![], None);
+        let result = svc.ingest_reflection_response("not json", &ctx).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn ingest_then_approve_proposal() {
+        let svc = EvolutionService::new();
+        let ctx = svc.build_reflection_context("s", 1, None, 0.0, &[], vec![], None);
+
+        let llm = r#"{"proposals": [{"axis": "pattern", "description": "Boost", "confidence": 0.9, "details": {"signature": "a", "action": "boost"}}], "summary": "ok"}"#;
+        svc.ingest_reflection_response(llm, &ctx).await.unwrap();
+
+        let pending = svc.pending().await;
+        assert_eq!(pending.len(), 1);
+        let id = pending[0].id.clone();
+
+        let approved = svc.approve(&id).await;
+        assert!(approved.is_some());
+        assert_eq!(approved.unwrap().status, ApprovalStatus::Approved);
+
+        // No longer pending.
+        assert!(svc.pending().await.is_empty());
+        // Shows in applied log.
+        assert_eq!(svc.applied().await.len(), 1);
     }
 }
