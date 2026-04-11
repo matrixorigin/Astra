@@ -627,6 +627,7 @@ where
                             continue;
                         } else if let Some(mut bridge_state) = parse_bridge_state_frame(&frame) {
                             let Some(trusted_session_id) = trusted_session_id.as_deref() else {
+                                yield Ok(Bytes::from(frame));
                                 continue;
                             };
                             let prompt_fingerprints =
@@ -953,6 +954,7 @@ where
         if !buffer.is_empty() {
             if let Some(mut bridge_state) = parse_bridge_state_frame(&buffer) {
                 let Some(trusted_session_id) = trusted_session_id.as_deref() else {
+                    yield Ok(Bytes::from(buffer));
                     return;
                 };
                 let prompt_fingerprints = take_bridge_prompt_fingerprints(&mut bridge_state);
@@ -1535,6 +1537,78 @@ mod tests {
         let text = String::from_utf8(body.to_vec()).expect("utf8");
         assert!(text.contains("\"type\":\"session_info\""));
         assert!(text.contains("\"session_id\":\"upstream-s1\""));
+    }
+
+    #[tokio::test]
+    async fn passthrough_bridge_keeps_upstream_bridge_state_when_untrusted() {
+        use futures_util::stream;
+        use tokio::sync::Mutex;
+
+        let filtered = filter_bridge_state_events(
+            stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from(
+                "data: {\"type\":\"bridge_state\",\"tool_sigs\":[],\"tail_update_args\":{\"full_text\":\"hello\"}}\n\n",
+            ))]),
+            Arc::new(Mutex::new(SessionCache::default())),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Arc::new(crate::turn::services::NoopTurnCoreEventWriter),
+            Arc::new(crate::turn::services::NoopTurnToolEventWriter),
+            Arc::new(crate::turn::services::NoopTurnHookDbWriter),
+            Arc::new(InMemoryTurnReflectionStateStore::default()),
+            Arc::new(NoopTurnReflectionLessonWriter),
+            Arc::new(NoopTurnObserverWorker),
+            Arc::new(crate::turn::services::NoopTurnAuxiliaryEventWriter),
+            Arc::new(crate::turn::services::NoopTurnSessionActivityWriter),
+            None,
+        );
+
+        let body = axum::body::to_bytes(Body::from_stream(filtered), 1024 * 1024)
+            .await
+            .expect("body should read");
+        let text = String::from_utf8(body.to_vec()).expect("utf8");
+        assert!(text.contains("\"type\":\"bridge_state\""));
+        assert!(text.contains("\"full_text\":\"hello\""));
+    }
+
+    #[tokio::test]
+    async fn passthrough_bridge_keeps_buffered_bridge_state_when_untrusted() {
+        use futures_util::stream;
+        use tokio::sync::Mutex;
+
+        let filtered = filter_bridge_state_events(
+            stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from(
+                "data: {\"type\":\"bridge_state\",\"tool_sigs\":[],\"tail_update_args\":{\"full_text\":\"hello\"}}",
+            ))]),
+            Arc::new(Mutex::new(SessionCache::default())),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Arc::new(crate::turn::services::NoopTurnCoreEventWriter),
+            Arc::new(crate::turn::services::NoopTurnToolEventWriter),
+            Arc::new(crate::turn::services::NoopTurnHookDbWriter),
+            Arc::new(InMemoryTurnReflectionStateStore::default()),
+            Arc::new(NoopTurnReflectionLessonWriter),
+            Arc::new(NoopTurnObserverWorker),
+            Arc::new(crate::turn::services::NoopTurnAuxiliaryEventWriter),
+            Arc::new(crate::turn::services::NoopTurnSessionActivityWriter),
+            None,
+        );
+
+        let body = axum::body::to_bytes(Body::from_stream(filtered), 1024 * 1024)
+            .await
+            .expect("body should read");
+        let text = String::from_utf8(body.to_vec()).expect("utf8");
+        assert!(text.contains("\"type\":\"bridge_state\""));
+        assert!(text.contains("\"full_text\":\"hello\""));
     }
 
     #[tokio::test]
