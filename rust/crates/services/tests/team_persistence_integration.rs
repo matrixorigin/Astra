@@ -152,6 +152,51 @@ async fn team_crud_roundtrip() {
     cleanup_team(&pool, &team.team_id).await;
 }
 
+#[tokio::test]
+#[ignore = "ASTRA_MULTI_AGENT_IT=1 and live MatrixOne"]
+async fn save_team_rejects_primary_key_collision_with_different_logical_team() {
+    let shared = setup_pool().await;
+    let pool = shared.get().clone();
+    let store = MatrixOneTeamStore::new(pool.clone());
+
+    let original = test_team("pk-conflict-a", TeamCoordination::Pipeline);
+    cleanup_team(&pool, &original.team_id).await;
+    store
+        .save_team(&original)
+        .await
+        .expect("save original team");
+
+    let mut conflicting = test_team("pk-conflict-b", TeamCoordination::Pipeline);
+    conflicting.team_id = original.team_id.clone();
+
+    let err = store
+        .save_team(&conflicting)
+        .await
+        .expect_err("primary-key collision must not overwrite another logical team");
+    assert!(err.contains("duplicate team_id"));
+
+    let reloaded = store
+        .load_team(&original.user_id, &original.name)
+        .await
+        .expect("load original after conflict")
+        .expect("original team should remain");
+    assert_eq!(reloaded.team_id, original.team_id);
+    assert_eq!(reloaded.user_id, original.user_id);
+    assert_eq!(reloaded.name, original.name);
+    assert_eq!(reloaded.description, original.description);
+
+    assert!(
+        store
+            .load_team(&conflicting.user_id, &conflicting.name)
+            .await
+            .expect("load conflicting team")
+            .is_none(),
+        "conflicting logical team should not be created"
+    );
+
+    cleanup_team(&pool, &original.team_id).await;
+}
+
 // ─── Execution History Tests ────────────────────────────────────────────────
 
 #[tokio::test]

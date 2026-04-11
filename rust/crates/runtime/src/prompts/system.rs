@@ -2223,7 +2223,10 @@ mod tests {
         }];
         let bd = build_system_prompt_trace(&sections, skills, memories);
 
-        assert!(bd.base_persona_tokens > 0, "base_persona should be non-zero");
+        assert!(
+            bd.base_persona_tokens > 0,
+            "base_persona should be non-zero"
+        );
         assert_eq!(bd.skills_injected.len(), 1);
         assert_eq!(bd.skills_injected[0].skill_name, "concise");
         assert_eq!(bd.skills_injected[0].tokens, 150);
@@ -2241,6 +2244,9 @@ mod tests {
         assert!(bd.base_persona_tokens > 0);
         assert!(bd.skills_injected.is_empty());
         assert!(bd.repository_memories.is_empty());
-        assert_eq!(bd.total_tokens, bd.base_persona_tokens + bd.environment_tokens + bd.user_preferences_tokens);
+        assert_eq!(
+            bd.total_tokens,
+            bd.base_persona_tokens + bd.environment_tokens + bd.user_preferences_tokens
+        );
     }
 }

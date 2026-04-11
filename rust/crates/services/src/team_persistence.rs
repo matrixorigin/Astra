@@ -773,6 +773,10 @@ pub struct MatrixOneTeamStore {
     pool: sqlx::Pool<sqlx::MySql>,
 }
 
+fn is_duplicate_key_error(err: &sqlx::Error) -> bool {
+    matches!(err, sqlx::Error::Database(db_err) if db_err.code().as_deref() == Some("1062"))
+}
+
 impl MatrixOneTeamStore {
     /// Create from an existing connection pool.
     pub fn new(pool: sqlx::Pool<sqlx::MySql>) -> Self {
@@ -810,21 +814,18 @@ impl TeamPersistenceService for MatrixOneTeamStore {
             .transpose()
             .map_err(|e| e.to_string())?;
 
-        // Upsert: try UPDATE first (by user_id + name), INSERT if no rows affected.
-        let updated = sqlx::query(
-            "UPDATE team_definitions SET \
-                 team_id       = ?, \
-                 description   = ?, \
-                 coordination  = ?, \
-                 members_json  = ?, \
-                 context_json  = ?, \
-                 worktree_mode = ?, \
-                 budget_json   = ?, \
-                 max_parallel  = ?, \
-                 updated_at    = NOW(6) \
-             WHERE user_id = ? AND name = ?",
+        // Insert first so concurrent creates collapse into a duplicate-key path, then
+        // update only the logical team identified by UNIQUE(user_id, name).
+        match sqlx::query(
+            "INSERT INTO team_definitions \
+             (team_id, user_id, name, description, coordination, members_json, \
+              context_json, worktree_mode, budget_json, max_parallel, \
+              created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6), NOW(6))",
         )
         .bind(&team.team_id)
+        .bind(&team.user_id)
+        .bind(&team.name)
         .bind(&team.description)
         .bind(&coordination_json)
         .bind(&members_json)
@@ -832,33 +833,46 @@ impl TeamPersistenceService for MatrixOneTeamStore {
         .bind(&worktree_str)
         .bind(&budget_json)
         .bind(team.max_parallel)
-        .bind(&team.user_id)
-        .bind(&team.name)
         .execute(&self.pool)
         .await
-        .map_err(|e| format!("team UPDATE failed: {e}"))?;
+        {
+            Ok(_) => {}
+            Err(error) if is_duplicate_key_error(&error) => {
+                let updated = sqlx::query(
+                    "UPDATE team_definitions SET \
+                         team_id       = ?, \
+                         description   = ?, \
+                         coordination  = ?, \
+                         members_json  = ?, \
+                         context_json  = ?, \
+                         worktree_mode = ?, \
+                         budget_json   = ?, \
+                         max_parallel  = ?, \
+                         updated_at    = NOW(6) \
+                     WHERE user_id = ? AND name = ?",
+                )
+                .bind(&team.team_id)
+                .bind(&team.description)
+                .bind(&coordination_json)
+                .bind(&members_json)
+                .bind(&context_json)
+                .bind(&worktree_str)
+                .bind(&budget_json)
+                .bind(team.max_parallel)
+                .bind(&team.user_id)
+                .bind(&team.name)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| format!("team UPDATE after duplicate failed: {e}"))?;
 
-        if updated.rows_affected() == 0 {
-            sqlx::query(
-                "INSERT INTO team_definitions \
-                 (team_id, user_id, name, description, coordination, members_json, \
-                  context_json, worktree_mode, budget_json, max_parallel, \
-                  created_at, updated_at) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6), NOW(6))",
-            )
-            .bind(&team.team_id)
-            .bind(&team.user_id)
-            .bind(&team.name)
-            .bind(&team.description)
-            .bind(&coordination_json)
-            .bind(&members_json)
-            .bind(&context_json)
-            .bind(&worktree_str)
-            .bind(&budget_json)
-            .bind(team.max_parallel)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| format!("team INSERT failed: {e}"))?;
+                if updated.rows_affected() == 0 {
+                    return Err(format!(
+                        "team INSERT failed: duplicate team_id {} belongs to a different team",
+                        team.team_id
+                    ));
+                }
+            }
+            Err(error) => return Err(format!("team INSERT failed: {error}")),
         }
 
         Ok(())
