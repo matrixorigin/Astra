@@ -1,4 +1,3 @@
-#![allow(deprecated)]
 //! Exploration engine — turns low-confidence pattern-library areas into A/B
 //! experiments and concludes mature experiments once enough evidence exists.
 //!
@@ -40,7 +39,6 @@ pub struct ExplorationEngine {
     min_samples_per_variant: u32,
 }
 
-#![allow(deprecated)]
 impl Default for ExplorationEngine {
     fn default() -> Self {
         Self {
@@ -51,7 +49,6 @@ impl Default for ExplorationEngine {
     }
 }
 
-#![allow(deprecated)]
 impl ExplorationEngine {
     /// Create an exploration engine with the given thresholds.
     ///
@@ -279,7 +276,6 @@ fn reason_tag(reason: &ExplorationReason) -> &'static str {
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
-#![allow(deprecated)]
 mod tests {
     use super::*;
     use crate::ab_testing::ExperimentOutcome;

@@ -1,6 +1,7 @@
 // Clippy 1.94 — allow backlog in the large CLI binary; refine incrementally.
 #![allow(
     dead_code,
+    deprecated,
     clippy::collapsible_if,
     clippy::derivable_impls,
     clippy::field_reassign_with_default,

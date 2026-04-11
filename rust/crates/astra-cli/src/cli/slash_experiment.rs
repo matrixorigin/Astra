@@ -1,4 +1,3 @@
-#![allow(deprecated)]
 //! `/experiment` slash command — A/B testing experiment management.
 //!
 //! Subcommands:

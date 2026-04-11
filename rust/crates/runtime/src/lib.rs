@@ -1,5 +1,7 @@
 // Clippy 1.94 tightened several lints; clean up incrementally rather than blocking CI.
+// ab_testing / execution_profile / exploration_engine are deprecated (superseded by SelfModel).
 #![allow(
+    deprecated,
     clippy::await_holding_lock,
     clippy::collapsible_if,
     clippy::derivable_impls,

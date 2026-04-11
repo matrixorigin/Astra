@@ -1,4 +1,3 @@
-#![allow(deprecated)]
 //! Scenario router — selects an [`ExecutionProfile`] per task based on detected
 //! scenario, pattern-library suggestions, and active A/B experiments.
 //!
@@ -28,7 +27,6 @@ use crate::user_profile::{Scenario, ScenarioDetector};
 #[derive(Default)]
 pub struct ScenarioRouter;
 
-#![allow(deprecated)]
 impl ScenarioRouter {
     /// Create a new stateless scenario router.
     pub fn new() -> Self {
@@ -141,7 +139,6 @@ pub fn scenario_from_task_type(task_type: crate::pipeline::routing::TaskType) ->
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
-#![allow(deprecated)]
 mod tests {
     use super::*;
     use crate::ab_testing::{Experiment, MetricDefinition, Variant};
