@@ -44,6 +44,7 @@ pub mod explain;
 pub mod explain_report_lines;
 pub mod file_edit_journal;
 pub mod firewall;
+pub mod followup_suggestion;
 pub mod goal_tracker;
 pub mod headless_tool_assembly;
 pub mod headless_tool_body_preview;

@@ -239,11 +239,12 @@ export function useChatStream(config: ChatConfig): UseChatStreamReturn {
           const id = assistantIdRef.current;
           const finalTools = Array.from(toolCallMapRef.current.values());
           setFollowupSuggestion(
-            suggestFollowupPrompt({
-              userMessage: lastUserMessageRef.current,
-              assistantMessage: accumulatedTextRef.current,
-              toolCalls: finalTools,
-            }),
+            event.followup_suggestion ??
+              suggestFollowupPrompt({
+                userMessage: lastUserMessageRef.current,
+                assistantMessage: accumulatedTextRef.current,
+                toolCalls: finalTools,
+              }),
           );
           setMessages((prev) =>
             prev.map((m) =>

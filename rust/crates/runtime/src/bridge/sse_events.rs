@@ -356,12 +356,13 @@ pub(super) fn build_tool_result_quality_event_from_frame(
 pub(super) fn build_turn_complete_event_from_bridge_state(
     bridge_state: &serde_json::Map<String, serde_json::Value>,
     trusted_execution_state: Option<&serde_json::Value>,
+    latest_user_message: Option<&str>,
 ) -> serde_json::Map<String, serde_json::Value> {
     let tool_sigs = bridge_state_tool_signatures(bridge_state).unwrap_or_default();
     let has_tool_calls = !tool_sigs.is_empty();
     let stall_detected = detect_server_stall(&tool_sigs, SERVER_STALL_WINDOW);
     let divergence_status = detect_divergence(&tool_sigs);
-    build_turn_complete_event(
+    let mut event = build_turn_complete_event(
         has_tool_calls,
         stall_detected,
         &divergence_status,
@@ -369,7 +370,16 @@ pub(super) fn build_turn_complete_event_from_bridge_state(
             .and_then(serde_json::Value::as_object)
             .map(normalize_execution_state)
             .map(serde_json::Value::Object),
-    )
+    );
+    if let Some(suggestion) = latest_user_message
+        .and_then(|user_message| build_followup_suggestion(bridge_state, user_message))
+    {
+        event.insert(
+            "followup_suggestion".to_string(),
+            serde_json::Value::String(suggestion.text),
+        );
+    }
+    event
 }
 
 pub(super) fn bridge_state_tool_signatures(
@@ -391,6 +401,55 @@ pub(super) fn bridge_state_tool_signatures(
                 })
                 .collect::<Option<Vec<_>>>()
         })?
+}
+
+fn build_followup_suggestion(
+    bridge_state: &serde_json::Map<String, serde_json::Value>,
+    user_message: &str,
+) -> Option<crate::turn::followup_suggestion::FollowupSuggestion> {
+    let assistant_turn = latest_assistant_turn(bridge_state)?;
+    crate::turn::followup_suggestion::suggest_followup(
+        user_message,
+        &assistant_turn.0,
+        &assistant_turn.1,
+    )
+}
+
+fn latest_assistant_turn(
+    bridge_state: &serde_json::Map<String, serde_json::Value>,
+) -> Option<(String, Vec<String>)> {
+    let assistant = bridge_state
+        .get("history")
+        .and_then(serde_json::Value::as_array)?
+        .iter()
+        .rev()
+        .find(|entry| entry.get("role").and_then(serde_json::Value::as_str) == Some("assistant"))?;
+    let content = assistant
+        .get("content")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let tool_names = assistant
+        .get("tool_calls")
+        .and_then(serde_json::Value::as_array)
+        .map(|tool_calls| {
+            tool_calls
+                .iter()
+                .filter_map(extract_tool_name)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    Some((content, tool_names))
+}
+
+fn extract_tool_name(tool_call: &serde_json::Value) -> Option<String> {
+    tool_call
+        .get("function")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|function| function.get("name"))
+        .or_else(|| tool_call.get("name"))
+        .and_then(serde_json::Value::as_str)
+        .map(ToString::to_string)
 }
 
 // ── SSE frame resilience ─────────────────────────────────────────────────────
@@ -585,5 +644,29 @@ mod tests {
     #[test]
     fn standard_parse_returns_none_for_invalid_utf8() {
         assert!(parse_sse_json_frame(&[0xFF, 0xFE]).is_none());
+    }
+
+    #[test]
+    fn turn_complete_event_includes_followup_suggestion_when_available() {
+        let bridge_state = serde_json::json!({
+            "tool_sigs": [["str_replace:{}"], ["run_build_test:{}"]],
+            "history": [{
+                "role": "assistant",
+                "content": "Patched and verified.",
+                "tool_calls": [
+                    {"function": {"name": "str_replace"}},
+                    {"function": {"name": "run_build_test"}}
+                ]
+            }]
+        });
+        let event = build_turn_complete_event_from_bridge_state(
+            bridge_state.as_object().expect("object"),
+            None,
+            Some("Fix the bug"),
+        );
+        assert_eq!(
+            event.get("followup_suggestion"),
+            Some(&serde_json::json!("commit this"))
+        );
     }
 }

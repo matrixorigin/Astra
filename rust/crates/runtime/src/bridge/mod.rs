@@ -389,6 +389,26 @@ fn filter_bridge_state_events<S>(
 where
     S: futures_util::stream::Stream<Item = Result<Bytes, reqwest::Error>> + Unpin + Send + 'static,
 {
+    fn latest_user_message_from_side_effect_inputs(
+        side_effect_inputs: Option<&serde_json::Map<String, serde_json::Value>>,
+    ) -> Option<String> {
+        side_effect_inputs
+            .and_then(|inputs| inputs.get("messages"))
+            .and_then(serde_json::Value::as_array)
+            .and_then(|messages| {
+                messages.iter().rev().find_map(|message| {
+                    let object = message.as_object()?;
+                    if object.get("role").and_then(serde_json::Value::as_str) != Some("user") {
+                        return None;
+                    }
+                    object
+                        .get("content")
+                        .and_then(serde_json::Value::as_str)
+                        .map(ToString::to_string)
+                })
+            })
+    }
+
     stream! {
         if let Some(session_id) = trusted_session_id.as_deref() {
             yield Ok(Bytes::from(render_sse_json(serde_json::json!({
@@ -398,6 +418,7 @@ where
         }
         let mut buffer = Vec::new();
         let mut pending_bridge_state: Option<serde_json::Map<String, serde_json::Value>> = None;
+        let mut pending_followup_user_message: Option<String> = None;
         let mut pending_warning_event: Option<serde_json::Map<String, serde_json::Value>> = None;
         let mut pending_explain_event: Option<serde_json::Map<String, serde_json::Value>> = None;
         let mut latest_token_usage: Option<serde_json::Value> = None;
@@ -434,6 +455,8 @@ where
                             let explain_event = take_bridge_explain_event(&mut bridge_state);
                             let side_effect_inputs =
                                 take_bridge_side_effect_inputs(&mut bridge_state);
+                            let followup_user_message =
+                                latest_user_message_from_side_effect_inputs(side_effect_inputs.as_ref());
                             if let Some(response_guard_error) = tail_update_args
                                 .as_ref()
                                 .and_then(|tail_update_args| {
@@ -444,6 +467,7 @@ where
                                 })
                             {
                                 pending_bridge_state = None;
+                                pending_followup_user_message = None;
                                 pending_warning_event = None;
                                 pending_explain_event = None;
                                 suppress_next_turn_complete = true;
@@ -492,6 +516,7 @@ where
                                     );
                                 }
                             pending_bridge_state = Some(synced_bridge_state);
+                            pending_followup_user_message = followup_user_message;
                             pending_warning_event = warning_event;
                             pending_explain_event = explain_event;
 
@@ -578,11 +603,13 @@ where
                                         build_turn_complete_event_from_bridge_state(
                                             bridge_state,
                                             trusted_execution_state.as_ref(),
+                                            pending_followup_user_message.as_deref(),
                                         ),
                                     ),
                                 )));
                                 received_turn_complete = true;
                                 pending_bridge_state = None;
+                                pending_followup_user_message = None;
                                 pending_warning_event = None;
                                 pending_explain_event = None;
                                 latest_token_usage = None;
@@ -660,6 +687,8 @@ where
                 let warning_event = take_bridge_warning_event(&mut bridge_state);
                 let explain_event = take_bridge_explain_event(&mut bridge_state);
                 let side_effect_inputs = take_bridge_side_effect_inputs(&mut bridge_state);
+                let followup_user_message =
+                    latest_user_message_from_side_effect_inputs(side_effect_inputs.as_ref());
                 if let Some(response_guard_error) = tail_update_args
                     .as_ref()
                     .and_then(|tail_update_args| {
@@ -713,6 +742,7 @@ where
                             );
                         }
                     pending_bridge_state = Some(synced_bridge_state);
+                    pending_followup_user_message = followup_user_message;
                     pending_warning_event = warning_event;
                     pending_explain_event = explain_event;
                 }
@@ -735,6 +765,7 @@ where
                 build_turn_complete_event_from_bridge_state(
                     &bridge_state,
                     trusted_execution_state.as_ref(),
+                    pending_followup_user_message.as_deref(),
                 ),
             ))));
             received_turn_complete = true;

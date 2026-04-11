@@ -58,6 +58,7 @@ export type UsageEvent = {
 
 export type TurnCompleteEvent = {
   type: 'turn_complete';
+  followup_suggestion?: string;
 };
 
 export type StreamErrorEvent = {

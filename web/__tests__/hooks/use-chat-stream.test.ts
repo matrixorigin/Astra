@@ -188,6 +188,24 @@ describe('useChatStream', () => {
     expect(result.current.followupSuggestion).toBe('commit this');
   });
 
+  it('prefers server followup suggestion from turn_complete', async () => {
+    fetchMock.mockResolvedValueOnce(
+      sseResponse([
+        { type: 'text_delta', content: 'Patched and verified.' },
+        { type: 'turn_complete', followup_suggestion: 'server says push it' },
+      ]),
+    );
+
+    const { result } = renderHook(() => useChatStream(baseConfig));
+
+    await act(async () => {
+      result.current.sendMessage('Fix the bug');
+      await new Promise((r) => setTimeout(r, 50));
+    });
+
+    expect(result.current.followupSuggestion).toBe('server says push it');
+  });
+
   it('sets connectionState to error on fetch failure', async () => {
     fetchMock.mockResolvedValueOnce(failResponse(500, 'Internal Error'));
 
