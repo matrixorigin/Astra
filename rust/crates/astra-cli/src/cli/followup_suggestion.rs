@@ -5,6 +5,7 @@ pub(crate) enum FollowupSuggestionKind {
     Validate,
     Commit,
     Push,
+    Continue,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,12 +29,12 @@ pub(crate) fn suggest_followup(
         || state.pending_approval.is_some()
         || state.last_turn_interrupted
         || result.full_text.trim().is_empty()
-        || assistant_requests_reply(&result.full_text)
         || assistant_looks_incomplete(&result.full_text)
     {
         return None;
     }
 
+    let lexicon = suggestion_lexicon(trimmed, &result.full_text);
     let edited = result.tools_used.iter().any(|tool| is_edit_tool(tool));
     let validated = result
         .tools_used
@@ -41,28 +42,72 @@ pub(crate) fn suggest_followup(
         .any(|tool| is_validation_tool(tool));
     let committed = result.tools_used.iter().any(|tool| tool == "git_commit");
 
+    if let Some(question_reply) = suggest_reply_to_assistant_question(
+        &result.full_text,
+        edited,
+        validated,
+        committed,
+        &lexicon,
+    ) {
+        return Some(question_reply);
+    }
+
+    if assistant_requests_reply(&result.full_text) {
+        return None;
+    }
+
     if committed {
         return Some(FollowupSuggestion {
-            text: "push it".to_string(),
+            text: lexicon.push.to_string(),
             kind: FollowupSuggestionKind::Push,
         });
     }
 
     if edited && validated {
         return Some(FollowupSuggestion {
-            text: "commit this".to_string(),
+            text: lexicon.commit.to_string(),
             kind: FollowupSuggestionKind::Commit,
         });
     }
 
     if edited {
         return Some(FollowupSuggestion {
-            text: "run the tests".to_string(),
+            text: lexicon.validate.to_string(),
             kind: FollowupSuggestionKind::Validate,
         });
     }
 
     None
+}
+
+struct SuggestionLexicon {
+    validate: &'static str,
+    commit: &'static str,
+    push: &'static str,
+    continue_prompt: &'static str,
+}
+
+fn suggestion_lexicon(line: &str, assistant_text: &str) -> SuggestionLexicon {
+    if prefers_chinese(line) || prefers_chinese(assistant_text) {
+        SuggestionLexicon {
+            validate: "跑一下测试",
+            commit: "提交一下",
+            push: "推上去",
+            continue_prompt: "继续",
+        }
+    } else {
+        SuggestionLexicon {
+            validate: "run the tests",
+            commit: "commit this",
+            push: "push it",
+            continue_prompt: "go ahead",
+        }
+    }
+}
+
+fn prefers_chinese(text: &str) -> bool {
+    text.chars()
+        .any(|ch| ('\u{4E00}'..='\u{9FFF}').contains(&ch))
 }
 
 fn is_edit_tool(tool: &str) -> bool {
@@ -104,6 +149,77 @@ fn assistant_requests_reply(full_text: &str) -> bool {
         || full_text.contains("你想")
         || full_text.contains("是否需要")
         || full_text.contains("要不要")
+}
+
+fn suggest_reply_to_assistant_question(
+    full_text: &str,
+    edited: bool,
+    validated: bool,
+    committed: bool,
+    lexicon: &SuggestionLexicon,
+) -> Option<FollowupSuggestion> {
+    if !assistant_requests_reply(full_text) {
+        return None;
+    }
+
+    let lower = full_text.to_ascii_lowercase();
+    if committed && mentions_push_question(&lower, full_text) {
+        return Some(FollowupSuggestion {
+            text: lexicon.push.to_string(),
+            kind: FollowupSuggestionKind::Push,
+        });
+    }
+
+    if edited && validated && mentions_commit_question(&lower, full_text) {
+        return Some(FollowupSuggestion {
+            text: lexicon.commit.to_string(),
+            kind: FollowupSuggestionKind::Commit,
+        });
+    }
+
+    if edited && mentions_test_question(&lower, full_text) {
+        return Some(FollowupSuggestion {
+            text: lexicon.validate.to_string(),
+            kind: FollowupSuggestionKind::Validate,
+        });
+    }
+
+    if mentions_continue_question(&lower, full_text) {
+        return Some(FollowupSuggestion {
+            text: lexicon.continue_prompt.to_string(),
+            kind: FollowupSuggestionKind::Continue,
+        });
+    }
+
+    None
+}
+
+fn mentions_continue_question(lower: &str, full_text: &str) -> bool {
+    lower.contains("continue")
+        || lower.contains("keep going")
+        || lower.contains("keep working")
+        || lower.contains("go ahead")
+        || full_text.contains("继续")
+        || full_text.contains("接着")
+        || full_text.contains("往下")
+}
+
+fn mentions_test_question(lower: &str, full_text: &str) -> bool {
+    lower.contains("run the tests")
+        || lower.contains("run tests")
+        || lower.contains("run the test")
+        || lower.contains("test this")
+        || lower.contains("verify it")
+        || full_text.contains("测试")
+        || full_text.contains("验证")
+}
+
+fn mentions_commit_question(lower: &str, full_text: &str) -> bool {
+    lower.contains("commit") || full_text.contains("提交")
+}
+
+fn mentions_push_question(lower: &str, full_text: &str) -> bool {
+    lower.contains("push") || full_text.contains("推上去") || full_text.contains("推到远端")
 }
 
 fn assistant_looks_incomplete(full_text: &str) -> bool {
@@ -174,6 +290,18 @@ mod tests {
     }
 
     #[test]
+    fn suggests_chinese_validation_after_edit_turn() {
+        let suggestion = suggest_followup(
+            "修一下这个 bug",
+            &base_state(),
+            &base_result(vec!["str_replace"], "已经修好了。"),
+        )
+        .expect("suggestion");
+        assert_eq!(suggestion.text, "跑一下测试");
+        assert_eq!(suggestion.kind, FollowupSuggestionKind::Validate);
+    }
+
+    #[test]
     fn suggests_commit_after_validated_edit_turn() {
         let suggestion = suggest_followup(
             "fix the bug",
@@ -208,11 +336,38 @@ mod tests {
                 &base_state(),
                 &base_result(
                     vec!["str_replace"],
-                    "I can keep going. Would you like me to run tests?"
+                    "I have two valid options. Which one do you want me to try?"
                 ),
             ),
             None
         );
+    }
+
+    #[test]
+    fn suggests_continue_when_assistant_asks_to_continue() {
+        let suggestion = suggest_followup(
+            "修一下这个 bug",
+            &base_state(),
+            &base_result(Vec::new(), "已经定位到原因了，要我继续改吗？"),
+        )
+        .expect("suggestion");
+        assert_eq!(suggestion.text, "继续");
+        assert_eq!(suggestion.kind, FollowupSuggestionKind::Continue);
+    }
+
+    #[test]
+    fn suggests_commit_when_assistant_asks_about_commit() {
+        let suggestion = suggest_followup(
+            "修一下这个 bug",
+            &base_state(),
+            &base_result(
+                vec!["str_replace", "run_build_test"],
+                "已经修好并验证了，要我直接提交吗？",
+            ),
+        )
+        .expect("suggestion");
+        assert_eq!(suggestion.text, "提交一下");
+        assert_eq!(suggestion.kind, FollowupSuggestionKind::Commit);
     }
 
     #[test]
