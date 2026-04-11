@@ -314,6 +314,8 @@ pub static COMMANDS: &[CommandMeta] = &[
     CommandMeta::new("/clear", "Start a new session", CommandGroup::Core),
     CommandMeta::new("/undo", "Undo last turn(s): /undo [N]", CommandGroup::Core)
         .with_arg_hint("[N]"),
+    CommandMeta::new("/redo", "Redo undone turn(s): /redo [N]", CommandGroup::Core)
+        .with_arg_hint("[N]"),
     CommandMeta::new(
         "/checkpoint",
         "Manual save: /checkpoint [label] — JSON + session md + journal",

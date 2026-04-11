@@ -1222,6 +1222,8 @@ fn apply_turn_success(
         let goal: String = line.trim().chars().take(220).collect();
         state.session_goal = Some(goal);
     }
+    // New user input invalidates redo stack (history diverged)
+    state.redo_stack.clear();
     state
         .history
         .push((line.to_string(), result.full_text.clone()));

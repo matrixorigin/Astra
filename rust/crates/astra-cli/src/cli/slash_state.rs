@@ -119,7 +119,7 @@ pub(super) async fn handle_state_command(
             let mut undone_previews = Vec::new();
             let mut file_reverts: Vec<String> = Vec::new();
             for _ in 0..actual {
-                if let Some((user_msg, _)) = state.history.pop() {
+                if let Some((user_msg, assistant_msg)) = state.history.pop() {
                     let preview: String = user_msg.chars().take(50).collect();
                     let preview = if user_msg.chars().count() > 50 {
                         format!("{}…", preview)
@@ -135,6 +135,10 @@ pub(super) async fn handle_state_command(
                             file_reverts.push(path.display().to_string());
                         }
                     }
+                    // Save to redo stack
+                    state
+                        .redo_stack
+                        .push((user_msg, assistant_msg, state.turn));
                     state.turn = state.turn.saturating_sub(1);
                 }
             }
@@ -163,10 +167,87 @@ pub(super) async fn handle_state_command(
                 }
             }
             eprintln!("  {} turns remaining in context", state.history.len());
+            if !state.redo_stack.is_empty() {
+                eprintln!(
+                    "  💡 {} turn{} available for /redo",
+                    state.redo_stack.len(),
+                    if state.redo_stack.len() == 1 { "" } else { "s" }
+                );
+            }
             if let Some(ref j) = state.journal {
                 let _ = j.append(&session_journal::JournalEvent::config_change(
                     state.session_id.as_deref(),
                     "undo",
+                    &actual.to_string(),
+                ));
+            }
+        }
+
+        "/redo" => {
+            if state.redo_stack.is_empty() {
+                eprintln!("{}", "  Nothing to redo.".yellow());
+                return Ok(());
+            }
+            let count: usize = if arg.is_empty() {
+                1
+            } else {
+                match arg.parse::<usize>() {
+                    Ok(0) => {
+                        eprintln!("{}", "  /redo requires a positive number.".yellow());
+                        return Ok(());
+                    }
+                    Ok(n) => n,
+                    Err(_) => {
+                        eprintln!(
+                            "{}",
+                            "  Usage: /redo [N] — restore last N undone turns".yellow()
+                        );
+                        return Ok(());
+                    }
+                }
+            };
+            let actual = count.min(state.redo_stack.len());
+            let mut redone_previews = Vec::new();
+            for _ in 0..actual {
+                if let Some((user_msg, assistant_msg, turn_num)) = state.redo_stack.pop() {
+                    let preview: String = user_msg.chars().take(50).collect();
+                    let preview = if user_msg.chars().count() > 50 {
+                        format!("{}…", preview)
+                    } else {
+                        preview
+                    };
+                    redone_previews.push(preview);
+                    // Restore to history and update turn counter
+                    state.history.push((user_msg, assistant_msg.clone()));
+                    state.turn = turn_num;
+                    state.last_response = Some(assistant_msg);
+                }
+            }
+            state.continuation_anchor = None;
+            if actual == 1 {
+                eprintln!(
+                    "  {} Redid 1 turn: {}",
+                    theme::icon_ok(),
+                    redone_previews[0].as_str().dim()
+                );
+            } else {
+                eprintln!("  {} Redid {} turns:", theme::icon_ok(), actual);
+                for (i, preview) in redone_previews.iter().enumerate() {
+                    eprintln!("    {}. {}", i + 1, preview.as_str().dim());
+                }
+            }
+            eprintln!("  {} turns now in context", state.history.len());
+            if !state.redo_stack.is_empty() {
+                eprintln!(
+                    "  💡 {} turn{} still available for /redo",
+                    state.redo_stack.len(),
+                    if state.redo_stack.len() == 1 { "" } else { "s" }
+                );
+            }
+            if let Some(ref j) = state.journal {
+                let _ = j.append(&session_journal::JournalEvent::config_change(
+                    state.session_id.as_deref(),
+                    "redo",
                     &actual.to_string(),
                 ));
             }

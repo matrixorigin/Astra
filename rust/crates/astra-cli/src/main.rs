@@ -1010,7 +1010,7 @@ async fn handle_slash_command(
             }
         },
 
-        "/clear" | "/explain" | "/verbose" | "/compact" | "/reflect" | "/undo" => {
+        "/clear" | "/explain" | "/verbose" | "/compact" | "/reflect" | "/undo" | "/redo" => {
             handle_state_command(
                 cmd,
                 arg,

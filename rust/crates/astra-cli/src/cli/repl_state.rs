@@ -203,6 +203,10 @@ pub(crate) struct ReplState {
     pub pending_idle_agent_messages: Vec<std::sync::Arc<astra_runtime::messaging::AgentMessage>>,
 
     // ── Drift tracking ──
+    /// Redo stack — stores undone turns for `/redo` recovery.
+    /// Each entry is (user_msg, assistant_msg, turn_number).
+    pub redo_stack: Vec<(String, String, u32)>,
+
     /// Turns where history compaction occurred (for drift detection).
     pub drift_compressed_turns: Vec<u32>,
     /// Turns where user provided correction/redirection (for drift detection).
@@ -341,6 +345,7 @@ impl Default for ReplState {
             agent_spawner: None, // Created lazily when spawn_agent is first used
             root_mailbox: None,
             pending_idle_agent_messages: Vec::new(),
+            redo_stack: Vec::new(),
             drift_compressed_turns: Vec::new(),
             drift_user_corrections: Vec::new(),
             drift_original_query: None,
