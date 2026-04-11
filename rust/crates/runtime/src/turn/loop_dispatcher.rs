@@ -184,7 +184,6 @@ impl Default for LoopDispatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
     use crate::pipeline::step_protocol::InMemoryIdempotencyCache;
     use crate::pipeline::step_recorder::StepRecorder;
     use crate::semantic_dedup::SemanticDedup;
@@ -195,6 +194,7 @@ mod tests {
     use crate::turn::turn_guard::TurnGuard;
     use async_trait::async_trait;
     use serde_json::json;
+    use std::collections::HashMap;
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
     use tokio_util::sync::CancellationToken;

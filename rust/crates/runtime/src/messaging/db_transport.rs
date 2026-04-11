@@ -417,7 +417,10 @@ impl MessageTransport for DatabaseTransport {
             Arc::clone(&self.metrics),
             consumer_id,
         ));
-        self.poll_abort_handles.lock().unwrap().push(poll_task.abort_handle());
+        self.poll_abort_handles
+            .lock()
+            .unwrap()
+            .push(poll_task.abort_handle());
 
         Ok(Box::new(DatabaseMessageStream {
             buffer_rx: rx,
