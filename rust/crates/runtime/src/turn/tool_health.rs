@@ -143,6 +143,7 @@ impl ToolHealthTracker {
         health.total_failures += 1;
         health.timeout_count += 1;
         health.consecutive_failures += 1;
+        health.consecutive_successes = 0;
         // Use standard threshold (not flaky), since timeouts are infrastructure issues
         if health.consecutive_failures >= CONSECUTIVE_FAILURE_THRESHOLD {
             health.deprioritized = true;
@@ -159,6 +160,7 @@ impl ToolHealthTracker {
         health.total_calls += 1;
         health.total_failures += 1;
         health.consecutive_failures += 1;
+        health.consecutive_successes = 0;
         // Immediate deprioritization — resource limits affect the whole system
         health.deprioritized = true;
         // Mark dirty for delta sync
@@ -893,6 +895,46 @@ mod tests {
             1,
             "a single post-empty success must not clear flaky history"
         );
+    }
+
+    #[test]
+    fn timeout_breaks_rehabilitation_stability_window() {
+        let mut tracker = ToolHealthTracker::new();
+        for _ in 0..3 {
+            tracker.record_failure("bash");
+        }
+        tracker.record_success("bash"); // rehabilitates
+        for _ in 0..3 {
+            tracker.record_success("bash");
+        }
+        assert_eq!(tracker.get("bash").unwrap().consecutive_successes, 4);
+
+        tracker.record_timeout("bash");
+        assert_eq!(tracker.get("bash").unwrap().consecutive_successes, 0);
+        assert_eq!(tracker.get("bash").unwrap().rehabilitation_count, 1);
+
+        tracker.record_success("bash");
+        assert_eq!(tracker.get("bash").unwrap().consecutive_successes, 1);
+        assert_eq!(tracker.get("bash").unwrap().rehabilitation_count, 1);
+    }
+
+    #[test]
+    fn resource_limit_breaks_rehabilitation_stability_window() {
+        let mut tracker = ToolHealthTracker::new();
+        for _ in 0..3 {
+            tracker.record_failure("bash");
+        }
+        tracker.record_success("bash"); // rehabilitates
+        for _ in 0..3 {
+            tracker.record_success("bash");
+        }
+        assert_eq!(tracker.get("bash").unwrap().consecutive_successes, 4);
+
+        tracker.record_resource_limit_failure("bash");
+        let health = tracker.get("bash").unwrap();
+        assert_eq!(health.consecutive_successes, 0);
+        assert!(health.deprioritized);
+        assert_eq!(health.rehabilitation_count, 1);
     }
 
     #[test]
