@@ -1651,16 +1651,94 @@ Follow these steps:
                 return Ok(());
             }
 
-            eprintln!(
-                "\n  {} Reflection prompt ready ({} chars).",
-                "✓".green(),
-                system_prompt.len() + user_prompt.len()
+            let Some(tok) = token else {
+                eprintln!(
+                    "\n  {} Reflection prompt ready ({} chars).",
+                    "✓".green(),
+                    system_prompt.len() + user_prompt.len()
+                );
+                eprintln!(
+                    "  {}",
+                    "Not logged in, so live reflection was skipped.".yellow()
+                );
+                eprintln!(
+                    "  💡 To see full prompt: {}",
+                    "/skill reflect prompt".cyan()
+                );
+                return Ok(());
+            };
+
+            let reflection_message = format!(
+                "Follow these reflection instructions exactly and respond with JSON only.\n\nSystem instructions:\n{}\n\nReflection context:\n{}",
+                system_prompt, user_prompt
             );
-            eprintln!(
-                "  💡 To see full prompt: {}",
-                "/skill reflect prompt".cyan()
-            );
-            eprintln!("  💡 Proposals will appear in: {}", "/skill evolve".cyan());
+            let reflection_history: Vec<(String, String)> = Vec::new();
+            let (selector, _) = create_tool_selector_quiet(api, None);
+            let mut auto_pm =
+                PermissionManager::with_project(true, &std::env::current_dir().unwrap_or_default());
+            let result = stream_chat_sse(ChatTurnParams {
+                api,
+                token: tok,
+                message: &reflection_message,
+                session_id: state.session_id.as_deref(),
+                model: state.model.as_deref(),
+                explain: ExplainMode::Off,
+                render_md: false,
+                history: &reflection_history,
+                perm_manager: &mut auto_pm,
+                verbose_mode: false,
+                quiet: true,
+                suppress_intermediate_output: true,
+                selector: selector.as_ref(),
+                recent_tools: &[],
+                tool_health_entries: &[],
+                unified_skill_registry: &state.unified_skill_registry,
+                plan_only_chat: false,
+                hide_streaming_assistant_text: true,
+                is_plan_subtask: false,
+                plan_subtask_id: None,
+                delegation_engine: None,
+                cancel_token: None,
+                plan_assemble_line_release: None,
+                stream_event_tx: None,
+                approval_request_tx: None,
+                mcp_manager: Some(state.mcp_manager.clone()),
+                skill_search: &state.skill_search,
+                skill_quality_tracker: &mut state.skill_quality_tracker,
+                discovered_skills: None,
+                messaging_metrics: state.messaging_metrics.clone(),
+                agent_spawner: state.agent_spawner.clone(),
+                root_agent_id: Some("main"),
+                root_mailbox_slot: Some(&mut state.root_mailbox),
+                observability_hub: None,
+                observability_session: state.observability_session.clone(),
+                file_journal: Some(state.file_journal.clone()),
+                turn_index: state.turn,
+                evolution_service: None,
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+
+            let response = result.full_text.trim();
+            let queued = evo.ingest_reflection_response(response, &ctx).await;
+            match queued {
+                Ok(count) => {
+                    eprintln!(
+                        "\n  {} Reflection executed live; queued {} proposal(s).",
+                        "✓".green(),
+                        count.to_string().cyan()
+                    );
+                    eprintln!("  💡 Review proposals in: {}", "/skill evolve".cyan());
+                }
+                Err(err) => {
+                    let preview = response.lines().take(12).collect::<Vec<_>>().join("\n");
+                    eprintln!("  {} Reflection response parse failed: {}", "✗".red(), err);
+                    if !preview.is_empty() {
+                        eprintln!("\n  {}", "Response preview:".yellow());
+                        eprintln!("{}", preview.dim());
+                    }
+                }
+            }
         }
 
         _ => {
