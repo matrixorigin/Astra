@@ -913,7 +913,23 @@ where
                     }
                 }
                 Err(error) => {
-                    yield Err(std::io::Error::other(error));
+                    if let Some(warning_event) = pending_warning_event.take() {
+                        yield Ok(Bytes::from(render_sse_json(serde_json::Value::Object(
+                            warning_event,
+                        ))));
+                    }
+                    if let Some(explain_event) = pending_explain_event.take() {
+                        yield Ok(Bytes::from(render_sse_json(serde_json::Value::Object(
+                            explain_event,
+                        ))));
+                    }
+                    yield Ok(Bytes::from(render_sse_json(serde_json::Value::Object(
+                        build_stream_error_event(
+                            &format!("Failed to read bridge response: {error}"),
+                            "UPSTREAM_ERROR",
+                            true,
+                        ),
+                    ))));
                     return;
                 }
             }
@@ -1412,6 +1428,93 @@ mod tests {
         let text = String::from_utf8(body.to_vec()).expect("utf8");
         assert!(text.contains("\"type\":\"session_info\""));
         assert!(text.contains("\"session_id\":\"upstream-s1\""));
+    }
+
+    #[tokio::test]
+    async fn bridge_stream_read_error_is_normalized_to_sse_error() {
+        use futures_util::stream;
+        use tokio::sync::Mutex;
+
+        let reqwest_error = reqwest::Client::new()
+            .get("http://[::1")
+            .build()
+            .expect_err("invalid url should build reqwest error");
+
+        let filtered = filter_bridge_state_events(
+            stream::iter(vec![Err::<Bytes, reqwest::Error>(reqwest_error)]),
+            Arc::new(Mutex::new(SessionCache::default())),
+            Some("sess-1".to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Arc::new(crate::turn::services::NoopTurnCoreEventWriter),
+            Arc::new(crate::turn::services::NoopTurnToolEventWriter),
+            Arc::new(crate::turn::services::NoopTurnHookDbWriter),
+            Arc::new(InMemoryTurnReflectionStateStore::default()),
+            Arc::new(NoopTurnReflectionLessonWriter),
+            Arc::new(NoopTurnObserverWorker),
+            Arc::new(crate::turn::services::NoopTurnAuxiliaryEventWriter),
+            Arc::new(crate::turn::services::NoopTurnSessionActivityWriter),
+            None,
+        );
+
+        let body = axum::body::to_bytes(Body::from_stream(filtered), 1024 * 1024)
+            .await
+            .expect("body should stay readable");
+        let text = String::from_utf8(body.to_vec()).expect("utf8");
+        assert!(text.contains("\"type\":\"session_info\""));
+        assert!(text.contains("\"type\":\"error\""));
+        assert!(text.contains("\"code\":\"UPSTREAM_ERROR\""));
+        assert!(text.contains("Failed to read bridge response"));
+    }
+
+    #[tokio::test]
+    async fn bridge_stream_read_error_flushes_pending_warning_before_error() {
+        use futures_util::stream;
+        use tokio::sync::Mutex;
+
+        let reqwest_error = reqwest::Client::new()
+            .get("http://[::1")
+            .build()
+            .expect_err("invalid url should build reqwest error");
+
+        let filtered = filter_bridge_state_events(
+            stream::iter(vec![
+                Ok::<Bytes, reqwest::Error>(Bytes::from(
+                    "data: {\"type\":\"bridge_state\",\"tool_sigs\":[],\"firewall_warning_claims_failed\":2}\n\n",
+                )),
+                Err::<Bytes, reqwest::Error>(reqwest_error),
+            ]),
+            Arc::new(Mutex::new(SessionCache::default())),
+            Some("sess-1".to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Arc::new(crate::turn::services::NoopTurnCoreEventWriter),
+            Arc::new(crate::turn::services::NoopTurnToolEventWriter),
+            Arc::new(crate::turn::services::NoopTurnHookDbWriter),
+            Arc::new(InMemoryTurnReflectionStateStore::default()),
+            Arc::new(NoopTurnReflectionLessonWriter),
+            Arc::new(NoopTurnObserverWorker),
+            Arc::new(crate::turn::services::NoopTurnAuxiliaryEventWriter),
+            Arc::new(crate::turn::services::NoopTurnSessionActivityWriter),
+            None,
+        );
+
+        let body = axum::body::to_bytes(Body::from_stream(filtered), 1024 * 1024)
+            .await
+            .expect("body should stay readable");
+        let text = String::from_utf8(body.to_vec()).expect("utf8");
+        let warning_pos = text.find("\"type\":\"warning\"").expect("warning event");
+        let error_pos = text.find("\"type\":\"error\"").expect("error event");
+        assert!(warning_pos < error_pos);
+        assert!(text.contains("\"code\":\"UPSTREAM_ERROR\""));
     }
 
     #[tokio::test]
