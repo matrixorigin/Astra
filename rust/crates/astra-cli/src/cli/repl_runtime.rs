@@ -220,7 +220,7 @@ fn create_tool_selector_with_quality_internal(
     let selector: Box<dyn tool_selector::ToolSelector> = match token {
         Some(tok) => {
             let mut llm = tool_selector::LlmToolSelector::new(api.clone(), tok.to_string());
-            // Priority: per-user config > auto-detect cheapest model from /models.
+            // Auto-detect cheapest model by pricing_prompt; config override if set.
             let selector_model = config
                 .tool_selection
                 .selector_model
@@ -322,7 +322,8 @@ fn pick_cheapest_model(api: &astra_thin_client::ThinClient, token: &str) -> Opti
     })
 }
 
-/// Extract the active model with the smallest context_window from a /models response.
+/// Extract the cheapest active model from a /models response.
+/// Priority: lowest pricing_prompt > smallest context_window (fallback).
 fn cheapest_model_from_json(body: &serde_json::Value) -> Option<String> {
     let arr = body
         .as_array()
@@ -331,14 +332,22 @@ fn cheapest_model_from_json(body: &serde_json::Value) -> Option<String> {
         .filter(|m| m.get("is_active").and_then(|v| v.as_bool()).unwrap_or(true))
         .filter_map(|m| {
             let name = m.get("name").and_then(|v| v.as_str())?;
+            let price = m
+                .get("pricing_prompt")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(f64::MAX);
             let cw = m
                 .get("context_window")
                 .and_then(|v| v.as_i64())
                 .unwrap_or(i64::MAX);
-            Some((name.to_string(), cw))
+            Some((name.to_string(), price, cw))
         })
-        .min_by_key(|(_, cw)| *cw)
-        .map(|(name, _)| name)
+        .min_by(|(_, p1, cw1), (_, p2, cw2)| {
+            p1.partial_cmp(p2)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(cw1.cmp(cw2))
+        })
+        .map(|(name, _, _)| name)
 }
 
 /// Quick check whether the server has at least one LLM model configured.
@@ -1345,20 +1354,39 @@ mod tests {
     // ── cheapest_model_from_json tests ──
 
     #[test]
-    fn cheapest_model_picks_smallest_context_window() {
+    fn cheapest_model_picks_lowest_pricing_prompt() {
+        let body = serde_json::json!([
+            {"name": "opus", "context_window": 200000, "pricing_prompt": 0.015, "is_active": true},
+            {"name": "sonnet", "context_window": 100000, "pricing_prompt": 0.003, "is_active": true},
+            {"name": "haiku", "context_window": 32000, "pricing_prompt": 0.00025, "is_active": true},
+        ]);
+        assert_eq!(cheapest_model_from_json(&body).as_deref(), Some("haiku"));
+    }
+
+    #[test]
+    fn cheapest_model_falls_back_to_context_window_without_pricing() {
         let body = serde_json::json!([
             {"name": "opus", "context_window": 200000, "is_active": true},
-            {"name": "sonnet", "context_window": 100000, "is_active": true},
             {"name": "haiku", "context_window": 32000, "is_active": true},
         ]);
         assert_eq!(cheapest_model_from_json(&body).as_deref(), Some("haiku"));
     }
 
     #[test]
+    fn cheapest_model_pricing_beats_context_window() {
+        // Large context but cheapest price should win
+        let body = serde_json::json!([
+            {"name": "small-expensive", "context_window": 8000, "pricing_prompt": 0.01, "is_active": true},
+            {"name": "large-cheap", "context_window": 1000000, "pricing_prompt": 0.0001, "is_active": true},
+        ]);
+        assert_eq!(cheapest_model_from_json(&body).as_deref(), Some("large-cheap"));
+    }
+
+    #[test]
     fn cheapest_model_skips_inactive() {
         let body = serde_json::json!([
-            {"name": "haiku", "context_window": 32000, "is_active": false},
-            {"name": "sonnet", "context_window": 100000, "is_active": true},
+            {"name": "haiku", "context_window": 32000, "pricing_prompt": 0.0001, "is_active": false},
+            {"name": "sonnet", "context_window": 100000, "pricing_prompt": 0.003, "is_active": true},
         ]);
         assert_eq!(cheapest_model_from_json(&body).as_deref(), Some("sonnet"));
     }
@@ -1386,11 +1414,19 @@ mod tests {
 
     #[test]
     fn cheapest_model_defaults_inactive_to_true() {
-        // Models without is_active field should be treated as active
         let body = serde_json::json!([
             {"name": "flash", "context_window": 8000},
             {"name": "pro", "context_window": 200000},
         ]);
         assert_eq!(cheapest_model_from_json(&body).as_deref(), Some("flash"));
+    }
+
+    #[test]
+    fn cheapest_model_same_price_picks_smaller_context() {
+        let body = serde_json::json!([
+            {"name": "a", "pricing_prompt": 0.001, "context_window": 128000, "is_active": true},
+            {"name": "b", "pricing_prompt": 0.001, "context_window": 32000, "is_active": true},
+        ]);
+        assert_eq!(cheapest_model_from_json(&body).as_deref(), Some("b"));
     }
 }
