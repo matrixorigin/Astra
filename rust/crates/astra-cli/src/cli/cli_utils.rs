@@ -123,7 +123,38 @@ pub(super) fn resumable_last_session_id(cli_profile: Option<&str>) -> Option<Str
 }
 
 pub(super) fn read_api_error(status: u16, body: &str) -> String {
-    format!("request failed ({status}): {}", compact_or_raw(body))
+    // Try to extract user-friendly message from JSON error response
+    if let Ok(json) = serde_json::from_str::<serde_json::Value>(body) {
+        // Common API error formats: {"error": "..."} or {"message": "..."} or {"detail": "..."}
+        if let Some(msg) = json.get("error").and_then(|v| v.as_str())
+            .or_else(|| json.get("message").and_then(|v| v.as_str()))
+            .or_else(|| json.get("detail").and_then(|v| v.as_str()))
+        {
+            return format_error_with_context(status, msg);
+        }
+    }
+    // Fallback: raw body
+    format_error_with_context(status, &compact_or_raw(body))
+}
+
+/// Format error with helpful context based on status code
+fn format_error_with_context(status: u16, message: &str) -> String {
+    let hint = match status {
+        400 => "Bad request — check your input",
+        401 => "Authentication required — try /login",
+        403 => "Permission denied — check your access rights",
+        404 => "Resource not found",
+        408 | 504 => "Request timed out — try again",
+        429 => "Rate limited — wait a moment and retry",
+        500 => "Server error — this is a bug, please report it",
+        502 | 503 => "Service temporarily unavailable — try again shortly",
+        _ => "",
+    };
+    if hint.is_empty() {
+        format!("request failed ({status}): {message}")
+    } else {
+        format!("request failed ({status}): {message}\n  Hint: {hint}")
+    }
 }
 
 pub(super) fn map_thin_err(e: astra_thin_client::ThinClientError) -> String {

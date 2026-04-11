@@ -1800,8 +1800,7 @@ impl StreamRenderState {
     /// Returns multiple lines for richer context — Cursor-style.
     fn format_output_summary(&self, tool: &str, output: &str, status: &str) -> Option<String> {
         if status == "error" {
-            let first_line = output.lines().next().unwrap_or("").trim();
-            return Some(truncate_line(first_line, 60));
+            return Some(format_tool_error_summary(tool, output));
         }
         let line_count = output.lines().count();
         let byte_size = output.len();
@@ -2112,6 +2111,73 @@ impl StreamRenderState {
         g.region.clear();
         g.lines.clear();
     }
+}
+
+/// Format error message for tool failures with helpful context.
+/// Extracts relevant info from common error patterns.
+fn format_tool_error_summary(tool: &str, output: &str) -> String {
+    let output_trimmed = output.trim();
+    let first_line = output.lines().next().unwrap_or("").trim();
+
+    // Tool-specific error extraction
+    match tool {
+        "bash" | "shell" | "run_build_test" => {
+            // For bash errors, try to find the most informative part
+            // Common patterns: "command not found", "No such file", "Permission denied"
+            if let Some(line) = output
+                .lines()
+                .find(|l| {
+                    let lower = l.to_lowercase();
+                    lower.contains("error:")
+                        || lower.contains("failed")
+                        || lower.contains("not found")
+                        || lower.contains("permission denied")
+                        || lower.contains("no such file")
+                })
+            {
+                return truncate_line(line.trim(), 80);
+            }
+            // Fall back to last non-empty line (often contains the actual error)
+            if let Some(last) = output.lines().rev().find(|l| !l.trim().is_empty()) {
+                return truncate_line(last.trim(), 80);
+            }
+        }
+        "read_file" | "view_file" => {
+            if output_trimmed.contains("No such file") || output_trimmed.contains("ENOENT") {
+                return "File not found".to_string();
+            }
+            if output_trimmed.contains("Permission denied") || output_trimmed.contains("EACCES") {
+                return "Permission denied".to_string();
+            }
+            if output_trimmed.contains("Is a directory") || output_trimmed.contains("EISDIR") {
+                return "Path is a directory, not a file".to_string();
+            }
+        }
+        "edit" | "write_file" | "create_file" => {
+            if output_trimmed.contains("No match found") || output_trimmed.contains("not found") {
+                // Extract what wasn't found if possible
+                if let Some(line) = output.lines().find(|l| l.contains("old_str") || l.contains("pattern")) {
+                    return truncate_line(line.trim(), 80);
+                }
+                return "Pattern not found in file".to_string();
+            }
+            if output_trimmed.contains("Permission denied") {
+                return "Permission denied — cannot write file".to_string();
+            }
+            if output_trimmed.contains("already exists") {
+                return "File already exists".to_string();
+            }
+        }
+        "grep" | "glob" => {
+            if output_trimmed.contains("No matches") || output_trimmed.is_empty() {
+                return "No matches found".to_string();
+            }
+        }
+        _ => {}
+    }
+
+    // Generic: return first meaningful line, truncated
+    truncate_line(first_line, 80)
 }
 
 /// Apply bold+magenta styling to Skill/MCP tool description prefixes,
