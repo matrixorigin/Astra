@@ -220,6 +220,16 @@ impl TurnTraceCollector {
         }
     }
 
+    /// Update just the system_prompt_tokens field without clobbering other budget fields.
+    pub fn set_system_prompt_tokens(&self, tokens: u32) {
+        if let Ok(mut state) = self.inner.write() {
+            let budget = state
+                .token_budget
+                .get_or_insert_with(TokenBudgetTrace::default);
+            budget.system_prompt_tokens = tokens;
+        }
+    }
+
     /// Add a decision explanation.
     pub fn add_explanation(&self, explanation: DecisionExplanation) {
         if let Ok(mut state) = self.inner.write() {

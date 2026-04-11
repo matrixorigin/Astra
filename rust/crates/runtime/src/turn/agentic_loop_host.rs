@@ -2671,12 +2671,7 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
         // Update trace collector with runtime-measured system prompt tokens + breakdown.
         if let Some(ref collector) = state.telemetry.turn_trace_collector {
             if let Some(spt) = turn_result.accum.system_prompt_tokens {
-                collector.record_token_budget(
-                    crate::turn::context_assembly_trace::TokenBudgetTrace {
-                        system_prompt_tokens: spt,
-                        ..Default::default()
-                    },
-                );
+                collector.set_system_prompt_tokens(spt);
             }
             if let Some(ref breakdown_json) = turn_result.accum.system_prompt_breakdown {
                 if let Ok(breakdown) = serde_json::from_value::<
