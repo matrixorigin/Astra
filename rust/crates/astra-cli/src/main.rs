@@ -1046,9 +1046,14 @@ fn should_clear_picker_submission_echo(line: &str, pending_execute: Option<&str>
     pending_execute.is_some_and(|cmd| cmd != line)
 }
 
-fn clear_picker_submission_echo() {
-    eprint!("{}\r", theme::CURSOR_UP_CLEAR);
-    let _ = std::io::Write::flush(&mut std::io::stderr());
+/// Clear the readline echo line and re-print with the actual dispatched command.
+fn replace_picker_submission_echo(prompt: &str, actual_cmd: &str) {
+    // Readline echoes on stdout, so we must also use stdout for the fixup
+    // to keep cursor positions in sync.
+    use std::io::Write;
+    print!("\x1b[A\x1b[2K\r{}{}", prompt, actual_cmd);
+    println!();
+    let _ = std::io::stdout().flush();
 }
 
 // ═══════════════════════════════════════════════════════════════ REPL ════
@@ -1434,7 +1439,7 @@ async fn run_chat_repl(
         };
 
         // ── Send readline request to actor thread ────────────────────
-        readline.request_readline(prompt_str);
+        readline.request_readline(prompt_str.clone());
 
         // Wait for user input. Do NOT flush plan updates during active readline — writing
         // to stderr (\r\x1b[2K) while rustyline owns the terminal disrupts cursor tracking
@@ -1536,11 +1541,10 @@ async fn run_chat_repl(
 
                 if line.starts_with('/') {
                     if should_clear_picker_submission_echo(&line, pending_execute.as_deref()) {
-                        clear_picker_submission_echo();
-                        // Re-echo the actual command so the line isn't blank
-                        if let Some(ref cmd) = pending_execute {
-                            eprintln!("{}", cmd.as_str().dim());
-                        }
+                        replace_picker_submission_echo(
+                            &prompt_str,
+                            pending_execute.as_deref().unwrap_or(&line),
+                        );
                     }
                     // If Enter was pressed in the picker, the selected command is
                     // stored in pending-execute (captured by readline actor thread).
