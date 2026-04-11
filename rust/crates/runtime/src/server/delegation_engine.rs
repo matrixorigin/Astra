@@ -219,6 +219,22 @@ impl VerificationGate for DefaultQualityGate {
     ) -> GateVerdict {
         let output: &str = result.output.as_deref().unwrap_or("");
 
+        // Check for binary garbage (null bytes)
+        let null_count = output.as_bytes().iter().filter(|&&b| b == 0).count();
+        if null_count > 5 || (null_count > 0 && null_count * 100 > output.len()) {
+            return GateVerdict::Fail {
+                reason: format!(
+                    "output contains binary garbage ({null_count} null bytes in {} bytes)",
+                    output.len()
+                ),
+                details: Some(serde_json::json!({
+                    "check": "binary_garbage",
+                    "null_bytes": null_count,
+                    "total_len": output.len(),
+                })),
+            };
+        }
+
         // Check minimum length
         let trimmed_len = output.trim().len();
         if trimmed_len < self.thresholds.min_output_len {
@@ -3874,6 +3890,43 @@ mod tests {
         fn max_retries(&self) -> u32 {
             2
         }
+    }
+
+    #[tokio::test]
+    async fn default_gate_rejects_binary_garbage() {
+        let gate = DefaultQualityGate::new();
+        let result = AgentResult {
+            agent_id: "test".into(),
+            run_id: "r1".into(),
+            status: "completed".into(),
+            output: Some("some text\0\0\0\0\0\0\0\0\0\0garbage".into()),
+            error: None,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            tool_calls: 0,
+        };
+        let verdict = gate.verify(&result, "d1", 0).await;
+        assert!(
+            matches!(verdict, GateVerdict::Fail { .. }),
+            "should reject output with null bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn default_gate_passes_clean_output() {
+        let gate = DefaultQualityGate::new();
+        let result = AgentResult {
+            agent_id: "test".into(),
+            run_id: "r1".into(),
+            status: "completed".into(),
+            output: Some("This is a perfectly normal output with enough content.".into()),
+            error: None,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            tool_calls: 0,
+        };
+        let verdict = gate.verify(&result, "d1", 0).await;
+        assert!(matches!(verdict, GateVerdict::Pass));
     }
 
     #[tokio::test]

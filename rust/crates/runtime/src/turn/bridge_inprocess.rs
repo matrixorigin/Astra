@@ -856,15 +856,15 @@ async fn call_llm_stream(
                 sorted_tcs.sort_by_key(|(idx, _)| *idx);
                 let mut tool_calls: Vec<Value> = sorted_tcs.into_iter().map(|(_, v)| Value::Object(v)).collect();
 
-                // XML fallback: recover <invoke> blocks from content.
+                // Degraded tool-call fallback: recover <invoke> or <tool_call> blocks.
                 if tool_calls.is_empty() {
-                    if let Some(parsed) = crate::turn::xml_tool_call_fallback::parse_xml_tool_calls(&full_text) {
+                    if let Some(parsed) = crate::turn::xml_tool_call_fallback::parse_degraded_tool_calls(&full_text) {
                         astra_core::agent_warn!(
                             "llm",
-                            "recovered {} tool call(s) from XML <invoke> in content (inprocess)",
+                            "recovered {} tool call(s) from degraded text in content (inprocess)",
                             parsed.len()
                         );
-                        full_text = crate::turn::xml_tool_call_fallback::strip_parsed_invocations(&full_text);
+                        full_text = crate::turn::xml_tool_call_fallback::strip_degraded_tool_calls(&full_text);
                         tool_calls = parsed;
                     }
                 }

@@ -583,16 +583,16 @@ async fn collect_llm_stream(
         .map(|(_, v)| Value::Object(v))
         .collect();
 
-    // XML fallback: some models emit <invoke> XML in content instead of
-    // structured tool_calls.  Recover them so the agentic loop can proceed.
+    // Degraded tool-call fallback: some models emit <invoke> XML or <tool_call>
+    // tags in content instead of structured tool_calls. Recover them.
     if tool_calls.is_empty() {
-        if let Some(parsed) = super::xml_tool_call_fallback::parse_xml_tool_calls(&full_text) {
+        if let Some(parsed) = super::xml_tool_call_fallback::parse_degraded_tool_calls(&full_text) {
             astra_core::agent_warn!(
                 "llm",
-                "recovered {} tool call(s) from XML <invoke> in content (stream)",
+                "recovered {} tool call(s) from degraded text in content (stream)",
                 parsed.len()
             );
-            full_text = super::xml_tool_call_fallback::strip_parsed_invocations(&full_text);
+            full_text = super::xml_tool_call_fallback::strip_degraded_tool_calls(&full_text);
             tool_calls = parsed;
         }
     }
@@ -747,15 +747,15 @@ fn parse_nonstream_response(v: &Value, model_name: &str, started: Instant) -> Ll
         .and_then(Value::as_str)
         .map(String::from);
 
-    // XML fallback: same recovery for non-stream responses.
+    // Degraded tool-call fallback: same recovery for non-stream responses.
     if tool_calls.is_empty() {
-        if let Some(parsed) = super::xml_tool_call_fallback::parse_xml_tool_calls(&full_text) {
+        if let Some(parsed) = super::xml_tool_call_fallback::parse_degraded_tool_calls(&full_text) {
             astra_core::agent_warn!(
                 "llm",
-                "recovered {} tool call(s) from XML <invoke> in content (non-stream)",
+                "recovered {} tool call(s) from degraded text in content (non-stream)",
                 parsed.len()
             );
-            full_text = super::xml_tool_call_fallback::strip_parsed_invocations(&full_text);
+            full_text = super::xml_tool_call_fallback::strip_degraded_tool_calls(&full_text);
             tool_calls = parsed;
         }
     }
