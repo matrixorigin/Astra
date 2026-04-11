@@ -257,6 +257,11 @@ impl DatabaseTransport {
     pub async fn reclaim_stale(&self) -> Result<u64, MailboxError> {
         let cutoff_ms =
             chrono::Utc::now().timestamp_millis() - self.visibility_timeout.as_millis() as i64;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| MailboxError::Transport(format!("reclaim begin: {e}")))?;
 
         // Messages under max attempts: set back to 'pending' for re-delivery.
         let reclaimed = query(
@@ -268,22 +273,27 @@ impl DatabaseTransport {
         )
         .bind(cutoff_ms)
         .bind(self.max_delivery_attempts as i64)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| MailboxError::Transport(format!("reclaim: {e}")))?;
 
         // Messages over max attempts: mark as 'failed' (dead letter).
-        let _ = query(
+        query(
             "UPDATE agent_message_queue
-             SET status = 'failed'
-             WHERE status = 'claimed'
-               AND claimed_at_ms < ?
-               AND attempt_count >= ?",
+              SET status = 'failed'
+              WHERE status = 'claimed'
+                AND claimed_at_ms < ?
+                AND attempt_count >= ?",
         )
         .bind(cutoff_ms)
         .bind(self.max_delivery_attempts as i64)
-        .execute(&self.pool)
-        .await;
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| MailboxError::Transport(format!("reclaim dead-letter: {e}")))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| MailboxError::Transport(format!("reclaim commit: {e}")))?;
 
         Ok(reclaimed.rows_affected())
     }
