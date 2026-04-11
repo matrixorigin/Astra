@@ -830,6 +830,24 @@ mod tests {
         assert_eq!(payload["effort"], json!("high"));
         assert_eq!(payload["agent_type"], json!("coder"));
     }
+    #[test]
+    fn system_prompt_estimate_scales_with_content() {
+        use astra_runtime::prompts::estimate_str_tokens;
+
+        let short_prompt = json!({"role": "system", "content": "You are a helpful assistant."});
+        let long_prompt = json!({"role": "system", "content": "You are a helpful assistant. ".repeat(200)});
+
+        let short_tokens = estimate_str_tokens(&short_prompt.to_string()) as u32;
+        let long_tokens = estimate_str_tokens(&long_prompt.to_string()) as u32;
+
+        // Short prompt should be well under the old hardcoded 14000
+        assert!(short_tokens < 100, "short prompt: {short_tokens}");
+        // Long prompt should be proportionally larger
+        assert!(long_tokens > short_tokens * 10, "long {long_tokens} vs short {short_tokens}");
+        // Neither should be exactly 14000 (the old constant)
+        assert_ne!(short_tokens, 14_000);
+        assert_ne!(long_tokens, 14_000);
+    }
 }
 
 // Note: Environment variable parsing tests for `chat_turn_timing_stderr_enabled` were removed
