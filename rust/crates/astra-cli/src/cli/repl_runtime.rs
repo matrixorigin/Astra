@@ -216,13 +216,15 @@ fn create_tool_selector_with_quality_internal(
     // FallbackSelector tries LLM first; if it fails or returns empty, uses TF-IDF.
     // Skill activation is handled by the `skill` tool in the agentic loop, not
     // by the tool selector.
+    let config = astra_runtime::runtime_config::RuntimeConfig::load();
     let selector: Box<dyn tool_selector::ToolSelector> = match token {
         Some(tok) => {
             let mut llm = tool_selector::LlmToolSelector::new(api.clone(), tok.to_string());
-            // Use the cheapest available model for tool selection (simple classification).
-            // Priority: ASTRA_SELECTOR_MODEL env > smallest context_window from /models.
-            let selector_model = std::env::var("ASTRA_SELECTOR_MODEL")
-                .ok()
+            // Priority: per-user config > auto-detect cheapest model from /models.
+            let selector_model = config
+                .tool_selection
+                .selector_model
+                .clone()
                 .or_else(|| pick_cheapest_model(&api, &tok));
             if let Some(m) = selector_model {
                 llm = llm.with_model(m);
@@ -276,8 +278,11 @@ pub(crate) fn create_background_plan_selector(
     }
 
     let mut llm = tool_selector::LlmToolSelector::new(ctx.api.clone(), ctx.token.clone());
-    let selector_model = std::env::var("ASTRA_SELECTOR_MODEL")
-        .ok()
+    let config = astra_runtime::runtime_config::RuntimeConfig::load();
+    let selector_model = config
+        .tool_selection
+        .selector_model
+        .clone()
         .or_else(|| pick_cheapest_model(&ctx.api, &ctx.token));
     if let Some(m) = selector_model {
         llm = llm.with_model(m);
