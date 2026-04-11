@@ -10,9 +10,31 @@
 //! - Thread-safe via `RwLock<HashMap>`
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, SystemTime};
 use tokio::sync::Notify;
+
+/// Recover a poisoned RwLock write guard, logging a warning.
+fn recover_write<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
+    match lock.write() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            astra_core::agent_warn!("mailbox", "lock was poisoned (write) — recovering");
+            poisoned.into_inner()
+        }
+    }
+}
+
+/// Recover a poisoned RwLock read guard, logging a warning.
+fn recover_read<T>(lock: &RwLock<T>) -> RwLockReadGuard<'_, T> {
+    match lock.read() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            astra_core::agent_warn!("mailbox", "lock was poisoned (read) — recovering");
+            poisoned.into_inner()
+        }
+    }
+}
 
 // ───────────────────────────── Message Types ─────────────────────────────
 
@@ -130,7 +152,7 @@ impl AgentMailbox {
     /// Register an agent so it can receive messages.
     pub fn register(&self, agent_id: &str) {
         let id = agent_id.to_string();
-        let mut s = self.state.write().unwrap_or_else(|e| e.into_inner());
+        let mut s = recover_write(&self.state);
         s.queues.entry(id.clone()).or_default();
         s.notifiers
             .entry(id.clone())
@@ -142,7 +164,7 @@ impl AgentMailbox {
 
     /// Unregister an agent, dropping its queue.
     pub fn unregister(&self, agent_id: &str) {
-        let mut s = self.state.write().unwrap_or_else(|e| e.into_inner());
+        let mut s = recover_write(&self.state);
         s.queues.remove(agent_id);
         s.notifiers.remove(agent_id);
         s.agents.retain(|a| a != agent_id);
@@ -153,7 +175,7 @@ impl AgentMailbox {
     pub fn send(&self, msg: AgentMessage) {
         if msg.is_broadcast() {
             let from = msg.from.clone();
-            let s = self.state.read().unwrap_or_else(|e| e.into_inner());
+            let s = recover_read(&self.state);
             let targets: Vec<String> = s.agents.iter().filter(|a| **a != from).cloned().collect();
             drop(s); // release read lock before enqueue which needs write
             for target in targets {
@@ -168,7 +190,7 @@ impl AgentMailbox {
     }
 
     fn enqueue(&self, agent_id: &str, msg: AgentMessage) {
-        let mut s = self.state.write().unwrap_or_else(|e| e.into_inner());
+        let mut s = recover_write(&self.state);
         if let Some(q) = s.queues.get_mut(agent_id) {
             q.push_back(msg);
         }
@@ -181,9 +203,7 @@ impl AgentMailbox {
 
     /// Try to receive a message without waiting. Returns `None` if queue is empty.
     pub fn try_recv(&self, agent_id: &str) -> Option<AgentMessage> {
-        self.state
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
+        recover_write(&self.state)
             .queues
             .get_mut(agent_id)?
             .pop_front()
@@ -191,9 +211,7 @@ impl AgentMailbox {
 
     /// Drain all pending messages for an agent.
     pub fn drain(&self, agent_id: &str) -> Vec<AgentMessage> {
-        self.state
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
+        recover_write(&self.state)
             .queues
             .get_mut(agent_id)
             .map(|q| q.drain(..).collect())
@@ -206,13 +224,7 @@ impl AgentMailbox {
             return Some(msg);
         }
 
-        let notifier = self
-            .state
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .notifiers
-            .get(agent_id)?
-            .clone();
+        let notifier = recover_read(&self.state).notifiers.get(agent_id)?.clone();
 
         tokio::select! {
             _ = notifier.notified() => {
@@ -224,9 +236,7 @@ impl AgentMailbox {
 
     /// Number of pending messages for an agent.
     pub fn pending_count(&self, agent_id: &str) -> usize {
-        self.state
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
+        recover_read(&self.state)
             .queues
             .get(agent_id)
             .map_or(0, |q| q.len())
@@ -234,11 +244,7 @@ impl AgentMailbox {
 
     /// List all registered agent IDs.
     pub fn registered_agents(&self) -> Vec<String> {
-        self.state
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .agents
-            .clone()
+        recover_read(&self.state).agents.clone()
     }
 }
 

@@ -178,7 +178,11 @@ pub fn save_snapshot(profile: &str, snapshot: &LearningSnapshot) -> Result<(), S
     // Atomic write: tmp file + rename
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, &json).map_err(|e| format!("write: {e}"))?;
-    std::fs::rename(&tmp, path).map_err(|e| format!("rename: {e}"))?;
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        // Clean up orphaned tmp file before returning error.
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("rename: {e}"));
+    }
 
     Ok(())
 }

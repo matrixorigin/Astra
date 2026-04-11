@@ -276,15 +276,20 @@ impl MessageStream for InProcessStream {
         if let Ok(msg) = self.direct.try_recv() {
             return Some(msg);
         }
-        // Then broadcast.
+        // Then broadcast (with bounded retry to avoid CPU spin on persistent lag).
         if let Some(ref mut rx) = self.broadcast {
-            loop {
+            const MAX_LAG_RETRIES: usize = 64;
+            for _ in 0..MAX_LAG_RETRIES {
                 match rx.try_recv() {
                     Ok(msg) => return Some(msg),
                     Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
                     _ => return None,
                 }
             }
+            astra_core::agent_warn!(
+                "messaging",
+                "broadcast receiver lagged > {MAX_LAG_RETRIES} times — dropping"
+            );
         }
         None
     }

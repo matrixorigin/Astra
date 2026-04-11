@@ -146,15 +146,22 @@ impl EvolutionService {
 
     /// Approve a proposal by ID. Returns the proposal if found.
     pub async fn approve(&self, id: &str) -> Option<EvolutionProposal> {
-        let mut pending = self.pending_proposals.lock().await;
-        if let Some(pos) = pending.iter().position(|p| p.id == id) {
-            let mut p = pending.remove(pos);
-            p.status = ApprovalStatus::Approved;
+        // Extract from pending under its own lock scope (avoid nested lock across await).
+        let extracted = {
+            let mut pending = self.pending_proposals.lock().await;
+            if let Some(pos) = pending.iter().position(|p| p.id == id) {
+                let mut p = pending.remove(pos);
+                p.status = ApprovalStatus::Approved;
+                Some(p)
+            } else {
+                None
+            }
+        };
+        // Now safe to lock applied_log without nesting.
+        if let Some(p) = extracted.as_ref() {
             self.applied_log.lock().await.push(p.clone());
-            Some(p)
-        } else {
-            None
         }
+        extracted
     }
 
     /// Reject a proposal by ID. Returns the proposal if found.

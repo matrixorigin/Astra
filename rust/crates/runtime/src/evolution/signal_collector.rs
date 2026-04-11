@@ -123,7 +123,9 @@ impl SignalCollector {
             return; // duplicate
         }
         if self.signals.len() >= MAX_BUFFERED_SIGNALS {
-            self.signals.remove(0); // evict oldest
+            let evicted = self.signals.remove(0);
+            // Prune the dedup key so the same signal pattern can be re-detected.
+            self.seen_keys.remove(&evicted.dedup_key());
         }
         self.signals.push(signal);
     }

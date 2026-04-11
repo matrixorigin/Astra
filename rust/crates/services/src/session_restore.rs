@@ -580,8 +580,14 @@ impl SessionRestoreService for HybridRestoreService {
 
     async fn list_checkpoints(&self, session_id: &str) -> Result<Vec<RestoredCheckpoint>, String> {
         // Try local first
-        let local_entries =
-            super::session_checkpoint::read_checkpoint_index(session_id).unwrap_or_default();
+        let local_entries = super::session_checkpoint::read_checkpoint_index(session_id)
+            .unwrap_or_else(|e| {
+                astra_core::agent_warn!(
+                    "restore",
+                    "failed to read checkpoint index for {session_id}: {e}"
+                );
+                Vec::new()
+            });
 
         if !local_entries.is_empty() {
             // Parse the index entries (format: "NNN - Turn NN - title")

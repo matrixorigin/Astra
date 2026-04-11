@@ -464,14 +464,19 @@ pub fn write_workspace(metadata: &WorkspaceMetadata) -> std::io::Result<()> {
     let yaml = serde_yaml::to_string(metadata)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     let tmp = dir.join(".workspace.yaml.tmp");
-    std::fs::write(&tmp, &yaml)?;
-    std::fs::rename(&tmp, &path)?;
-    // Restrict to owner-only (0o600) — workspace may contain plan details/secrets
-    #[cfg(unix)]
+    // Write to tmp, set perms, fsync, then atomically rename.
     {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        use std::io::Write;
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(yaml.as_bytes())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+        }
+        file.sync_all()?;
     }
+    std::fs::rename(&tmp, &path)?;
     Ok(())
 }
 

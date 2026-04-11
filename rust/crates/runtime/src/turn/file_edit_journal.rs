@@ -122,6 +122,12 @@ impl FileEditJournal {
                 return;
             }
         }
+        astra_core::agent_warn!(
+            "file_edit",
+            "record_after: no matching entry for path={} tool_call_id={}",
+            path.display(),
+            tool_call_id
+        );
     }
 
     /// Convenience: record before-state with `Patch` edit type (for str_replace).

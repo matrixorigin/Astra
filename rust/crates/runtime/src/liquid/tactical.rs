@@ -110,7 +110,15 @@ impl AdaptationDampener {
     /// Reset for a new turn.
     pub fn reset_turn(&mut self) {
         self.actions_this_turn = 0;
-        // Drift and last_fired persist across turns within a session.
+        // Decay drift gradually so the system can recover from drift-freeze.
+        // 10% decay per turn prevents permanent lockout while still penalizing drift.
+        if self.cumulative_drift > 0.0 {
+            self.cumulative_drift *= 0.9;
+            // Snap to zero when negligible to avoid floating-point drift.
+            if self.cumulative_drift < 0.01 {
+                self.cumulative_drift = 0.0;
+            }
+        }
     }
 
     pub fn actions_this_turn(&self) -> u32 {

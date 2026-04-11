@@ -22,7 +22,7 @@ fn metadata_duration_ms(metadata: Option<&serde_json::Value>) -> Option<i32> {
     metadata
         .and_then(|v| v.get("duration_ms"))
         .and_then(|v| v.as_i64())
-        .map(|v| v as i32)
+        .and_then(|v| i32::try_from(v).ok())
 }
 
 pub(crate) async fn insert_core_turn_event(

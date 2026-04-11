@@ -258,11 +258,13 @@ impl AgentMailboxRouter {
             .await?;
 
         {
+            // Acquire both locks atomically to avoid TOCTOU race between
+            // address_registry and agent_id_index.
             let mut reg = self.address_registry.write().await;
-            reg.insert(addr.run_id.clone(), addr.clone());
-        }
-        {
             let mut idx = self.agent_id_index.write().await;
+
+            reg.insert(addr.run_id.clone(), addr.clone());
+
             if let Some(existing) = idx.get(&addr.agent_id) {
                 if existing == &addr {
                     // Already registered with same address — no-op.
@@ -271,21 +273,9 @@ impl AgentMailboxRouter {
                         "  ⚠ messaging: agent_id '{}' already registered as {}; overwriting with {}",
                         addr.agent_id, existing, addr
                     );
-                    // Clean up stale entry from address_registry to prevent ghost registrations.
-                    // Drop idx lock first to avoid potential deadlock with address_registry.
-                    let stale_run_id = existing.run_id.clone();
-                    drop(idx);
-                    self.address_registry.write().await.remove(&stale_run_id);
-                    // Re-acquire and re-verify: another thread may have registered
-                    // a fresh entry for the same agent_id during the lock gap.
-                    idx = self.agent_id_index.write().await;
-                    // Skip insert if a newer (non-stale) entry was registered concurrently.
-                    let superseded = idx
-                        .get(&addr.agent_id)
-                        .is_some_and(|c| c.run_id != stale_run_id && c != &addr);
-                    if !superseded {
-                        idx.insert(addr.agent_id.clone(), addr.clone());
-                    }
+                    // Clean up stale entry from address_registry (both locks held).
+                    reg.remove(&existing.run_id.clone());
+                    idx.insert(addr.agent_id.clone(), addr.clone());
                 }
             } else {
                 idx.insert(addr.agent_id.clone(), addr.clone());

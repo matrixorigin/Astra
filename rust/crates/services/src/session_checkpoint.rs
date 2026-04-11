@@ -133,7 +133,13 @@ fn update_index(dir: &Path, checkpoint: &Checkpoint) -> std::io::Result<()> {
         "# Checkpoint Index\n\n".to_string()
     };
     content.push_str(&entry);
-    std::fs::write(&index_path, content)?;
+    // Atomic write: tmp file + rename to prevent corruption on crash.
+    let tmp_path = index_path.with_extension("md.tmp");
+    std::fs::write(&tmp_path, &content)?;
+    std::fs::rename(&tmp_path, &index_path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp_path);
+        e
+    })?;
     Ok(())
 }
 

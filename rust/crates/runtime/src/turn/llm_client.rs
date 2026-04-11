@@ -454,6 +454,11 @@ pub(crate) async fn call_llm_and_collect(
     Err(format!("{last_err} (after {} retries)", LLM_MAX_RETRIES))
 }
 
+/// Maximum accumulated response size (text + reasoning + args) before aborting stream (16 MB).
+const MAX_STREAM_ACCUMULATION_BYTES: usize = 16 * 1024 * 1024;
+/// Maximum number of tool calls per LLM stream response.
+const MAX_STREAM_TOOL_CALLS: usize = 128;
+
 /// Parse an OpenAI-compatible SSE stream and collect into `LlmCallResult`.
 async fn collect_llm_stream(
     stream: impl futures_util::Stream<Item = Result<Bytes, reqwest::Error>> + Unpin + Send + 'static,
@@ -466,6 +471,7 @@ async fn collect_llm_stream(
     let mut tool_calls_map: HashMap<usize, Map<String, Value>> = HashMap::new();
     let mut usage = Map::new();
     let mut finish_reason: Option<String> = None;
+    let mut accumulated_bytes: usize = 0;
 
     let sse = parse_openai_sse_json_stream(stream);
     tokio::pin!(sse);
@@ -533,6 +539,12 @@ async fn collect_llm_stream(
         if let Some(content) = delta.get("content").and_then(Value::as_str)
             && !content.is_empty()
         {
+            accumulated_bytes += content.len();
+            if accumulated_bytes > MAX_STREAM_ACCUMULATION_BYTES {
+                return Err(StreamCollectError::Transport(format!(
+                    "LLM stream exceeded {MAX_STREAM_ACCUMULATION_BYTES} bytes — aborting"
+                )));
+            }
             full_text.push_str(content);
         }
 
@@ -540,6 +552,12 @@ async fn collect_llm_stream(
         if let Some(r) = delta.get("reasoning_content").and_then(Value::as_str)
             && !r.is_empty()
         {
+            accumulated_bytes += r.len();
+            if accumulated_bytes > MAX_STREAM_ACCUMULATION_BYTES {
+                return Err(StreamCollectError::Transport(format!(
+                    "LLM stream exceeded {MAX_STREAM_ACCUMULATION_BYTES} bytes — aborting"
+                )));
+            }
             reasoning.push_str(r);
         }
 
@@ -547,6 +565,15 @@ async fn collect_llm_stream(
         if let Some(tcs) = delta.get("tool_calls").and_then(Value::as_array) {
             for tc in tcs {
                 let idx = tc.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                if tool_calls_map.len() >= MAX_STREAM_TOOL_CALLS
+                    && !tool_calls_map.contains_key(&idx)
+                {
+                    astra_core::agent_warn!(
+                        "llm",
+                        "stream tool_calls exceeded {MAX_STREAM_TOOL_CALLS} — ignoring extra"
+                    );
+                    continue;
+                }
                 let entry = tool_calls_map.entry(idx).or_insert_with(|| {
                     Map::from_iter([
                         ("id".to_string(), Value::String(String::new())),

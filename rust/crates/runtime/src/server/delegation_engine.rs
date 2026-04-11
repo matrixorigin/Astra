@@ -1680,6 +1680,13 @@ impl DelegationEngine {
         drop(reg);
 
         // Execute sub-runs in parallel, respecting optional max_parallel limit.
+        const MAX_FAN_OUT_AGENTS: usize = 32;
+        if configs.len() > MAX_FAN_OUT_AGENTS {
+            return Err(format!(
+                "Fan-out request with {} agents exceeds limit of {MAX_FAN_OUT_AGENTS}",
+                configs.len()
+            ));
+        }
         let max_parallel = request
             .context
             .get("team_max_parallel")

@@ -571,10 +571,32 @@ impl AutoTuningEngine {
         config: &mut RuntimeConfig,
         actions: Vec<(EvolutionRule, EvolutionAction)>,
     ) -> Vec<RuleExecution> {
-        let mut executions = Vec::new();
+        let mut executions_store = self.executions.write().unwrap_or_else(|e| e.into_inner());
+        let mut last_triggered = self
+            .last_triggered
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut result = Vec::new();
         let now = SystemTime::now();
 
         for (rule, action) in actions {
+            // Anti-oscillation: skip if this rule has been rolled back recently.
+            let recent_rollbacks = executions_store
+                .iter()
+                .rev()
+                .take(20)
+                .filter(|e| e.rule_id == rule.id && e.rolled_back)
+                .count();
+            if recent_rollbacks >= 2 {
+                astra_core::agent_warn!(
+                    "tuning",
+                    "rule '{}' suppressed — rolled back {} times recently",
+                    rule.id,
+                    recent_rollbacks
+                );
+                continue;
+            }
+
             let (previous_value, new_value) = self.apply_action(config, &action);
 
             let execution = RuleExecution {
@@ -586,18 +608,12 @@ impl AutoTuningEngine {
                 rolled_back: false,
             };
 
-            executions.push(execution.clone());
-            self.executions
-                .write()
-                .unwrap_or_else(|e| e.into_inner())
-                .push(execution);
-            self.last_triggered
-                .write()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(rule.id, now);
+            result.push(execution.clone());
+            executions_store.push(execution);
+            last_triggered.insert(rule.id, now);
         }
 
-        executions
+        result
     }
 
     /// Run one evaluation cycle: evaluate and execute.
@@ -904,52 +920,52 @@ fn apply_config_value(config: &mut RuntimeConfig, path: &str, value: &serde_json
     match path {
         "tool_selection.confidence_threshold" => {
             if let Some(v) = value.as_f64() {
-                config.tool_selection.confidence_threshold = v;
+                config.tool_selection.confidence_threshold = v.clamp(0.0, 1.0);
             }
         }
         "tool_selection.max_tools" => {
             if let Some(v) = value.as_u64() {
-                config.tool_selection.max_tools = v as u32;
+                config.tool_selection.max_tools = (v as u32).clamp(1, 256);
             }
         }
         "token_budget.max_prompt_tokens" => {
             if let Some(v) = value.as_u64() {
-                config.token_budget.max_prompt_tokens = v as u32;
+                config.token_budget.max_prompt_tokens = (v as u32).clamp(1000, 500_000);
             }
         }
         "token_budget.system_prompt_reserve" => {
             if let Some(v) = value.as_u64() {
-                config.token_budget.system_prompt_reserve = v as u32;
+                config.token_budget.system_prompt_reserve = (v as u32).clamp(500, 100_000);
             }
         }
         "token_budget.max_turn_input_tokens" => {
             if let Some(v) = value.as_u64() {
-                config.token_budget.max_turn_input_tokens = v as u32;
+                config.token_budget.max_turn_input_tokens = (v as u32).clamp(1000, 500_000);
             }
         }
         "compression.compression_threshold" => {
             if let Some(v) = value.as_f64() {
-                config.compression.compression_threshold = v;
+                config.compression.compression_threshold = v.clamp(0.0, 1.0);
             }
         }
         "compression.max_history_tokens" => {
             if let Some(v) = value.as_u64() {
-                config.compression.max_history_tokens = v as u32;
+                config.compression.max_history_tokens = (v as u32).min(1_000_000);
             }
         }
         "compression.preserve_recent_turns" => {
             if let Some(v) = value.as_u64() {
-                config.compression.preserve_recent_turns = v as u32;
+                config.compression.preserve_recent_turns = (v as u32).min(100);
             }
         }
         "memory.retrieval_top_k" => {
             if let Some(v) = value.as_u64() {
-                config.memory.retrieval_top_k = v as u32;
+                config.memory.retrieval_top_k = (v as u32).clamp(1, 100);
             }
         }
         "memory.min_relevance_score" => {
             if let Some(v) = value.as_f64() {
-                config.memory.min_relevance_score = v;
+                config.memory.min_relevance_score = v.clamp(0.0, 1.0);
             }
         }
         "verification.strictness" => {

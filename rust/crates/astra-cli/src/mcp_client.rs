@@ -1048,7 +1048,13 @@ impl McpClientManager {
         if removed {
             self.states
                 .insert(name.to_string(), ConnectionState::Disconnected);
-            let _ = skill_registry.remove_mcp_server_skills(name).await;
+            if let Err(e) = skill_registry.remove_mcp_server_skills(name).await {
+                astra_core::agent_warn!(
+                    "mcp",
+                    "failed to remove skills for server '{}': {e}",
+                    name
+                );
+            }
         }
         removed
     }
@@ -1382,7 +1388,13 @@ impl McpClientManager {
         };
 
         // Clean up old skills first
-        let _ = skill_registry.remove_mcp_server_skills(name).await;
+        if let Err(e) = skill_registry.remove_mcp_server_skills(name).await {
+            astra_core::agent_warn!(
+                "mcp",
+                "failed to remove skills for server '{}' during reconnect: {e}",
+                name
+            );
+        }
         self.connections.remove(name);
         self.states
             .insert(name.to_string(), ConnectionState::Reconnecting);

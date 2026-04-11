@@ -231,6 +231,12 @@ impl CloudLlmJudge {
         });
 
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
+        // Validate URL has a proper protocol to prevent SSRF / malformed requests.
+        if !url.starts_with("http://") && !url.starts_with("https://") {
+            return Err(format!(
+                "Invalid base_url: must start with http:// or https://, got: {url}"
+            ));
+        }
 
         let resp = self
             .client
@@ -238,22 +244,34 @@ impl CloudLlmJudge {
             .header("Authorization", format!("Bearer {}", self.api_key))
             .header("Content-Type", "application/json")
             .json(&body)
+            .timeout(std::time::Duration::from_secs(30))
             .send()
             .await
             .map_err(|e| format!("Cloud LLM request failed: {e}"))?;
 
         if !resp.status().is_success() {
             let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
+            // Limit error body read to 4 KB to prevent OOM from malicious upstream.
+            let bytes = resp.bytes().await.unwrap_or_default();
+            let text = String::from_utf8_lossy(&bytes[..bytes.len().min(4096)]);
             return Err(format!(
                 "Cloud LLM API error {status}: {}",
                 &text[..text.len().min(200)]
             ));
         }
 
-        let json: serde_json::Value = resp
-            .json()
+        // Limit response body to 1 MB to prevent OOM from oversized responses.
+        let body_bytes = resp
+            .bytes()
             .await
+            .map_err(|e| format!("Cloud LLM response read failed: {e}"))?;
+        if body_bytes.len() > 1_048_576 {
+            return Err(format!(
+                "Cloud LLM response too large: {} bytes (limit 1MB)",
+                body_bytes.len()
+            ));
+        }
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes)
             .map_err(|e| format!("Cloud LLM response parse failed: {e}"))?;
 
         let content = json["choices"][0]["message"]["content"]
@@ -1148,6 +1166,9 @@ async fn run_shell_cmd_streaming(
     use tokio::io::{AsyncBufReadExt, BufReader};
     use tokio::process::Command;
 
+    // NOTE: Shell execution is intentional here — build/test commands need shell features
+    // (pipes, redirection, env expansion). Commands are validated through the permission
+    // system before reaching this point. Do not replace with direct exec.
     let mut child = Command::new("sh")
         .arg("-c")
         .arg(cmd)

@@ -172,47 +172,47 @@ pub(crate) fn apply_config_diff(config: &mut RuntimeConfig, key: &str, value: &s
     match key {
         "compression.max_history_tokens" => {
             if let Some(n) = value.as_u64() {
-                config.compression.max_history_tokens = n as u32;
+                config.compression.max_history_tokens = (n as u32).min(1_000_000);
             }
         }
         "compression.compression_threshold" => {
             if let Some(n) = value.as_f64() {
-                config.compression.compression_threshold = n;
+                config.compression.compression_threshold = n.clamp(0.0, 1.0);
             }
         }
         "compression.preserve_recent_turns" => {
             if let Some(n) = value.as_u64() {
-                config.compression.preserve_recent_turns = n as u32;
+                config.compression.preserve_recent_turns = (n as u32).min(100);
             }
         }
         "memory.retrieval_top_k" => {
             if let Some(n) = value.as_u64() {
-                config.memory.retrieval_top_k = n as u32;
+                config.memory.retrieval_top_k = (n as u32).clamp(1, 100);
             }
         }
         "memory.min_relevance_score" => {
             if let Some(n) = value.as_f64() {
-                config.memory.min_relevance_score = n;
+                config.memory.min_relevance_score = n.clamp(0.0, 1.0);
             }
         }
         "tool_selection.confidence_threshold" => {
             if let Some(n) = value.as_f64() {
-                config.tool_selection.confidence_threshold = n;
+                config.tool_selection.confidence_threshold = n.clamp(0.0, 1.0);
             }
         }
         "tool_selection.max_tools" => {
             if let Some(n) = value.as_u64() {
-                config.tool_selection.max_tools = n as u32;
+                config.tool_selection.max_tools = (n as u32).clamp(1, 256);
             }
         }
         "learning.exploration_rate" => {
             if let Some(n) = value.as_f64() {
-                config.learning.exploration_rate = n;
+                config.learning.exploration_rate = n.clamp(0.0, 1.0);
             }
         }
         "token_budget.max_turn_input_tokens" => {
             if let Some(n) = value.as_u64() {
-                config.token_budget.max_turn_input_tokens = n as u32;
+                config.token_budget.max_turn_input_tokens = (n as u32).clamp(1000, 500_000);
             }
         }
         "verification.strictness" => {
@@ -631,6 +631,10 @@ impl ExperimentOutcome {
 // ─── Experiment Store ────────────────────────────────────────────────────────
 
 /// In-memory store for experiments and outcomes.
+///
+/// **WARNING**: This store is volatile — all data is lost on process restart.
+/// For durable experiment state, pair with the adaptive baseline persistence
+/// layer (see `AdaptiveBaselineStore`).
 #[derive(Default)]
 pub struct ExperimentStore {
     experiments: Arc<RwLock<HashMap<String, Experiment>>>,

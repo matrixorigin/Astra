@@ -380,6 +380,8 @@ impl ToolExecutor {
             project_root: root,
             cloud_base: None,
             cloud_token: None,
+            // TODO: Consider using a zeroize-capable wrapper for tokens to prevent
+            // memory-resident secrets from lingering after drop.
             github_token: env::var("GITHUB_TOKEN")
                 .ok()
                 .map(|value| value.trim().to_string())
@@ -388,7 +390,7 @@ impl ToolExecutor {
                 .timeout(Duration::from_secs(15))
                 .user_agent(format!("astra/{}", env!("CARGO_PKG_VERSION")))
                 .build()
-                .expect("failed to create GitHub HTTP client"),
+                .unwrap_or_else(|_| Client::new()),
             sandbox_policy: Some(sandbox),
             preferred_repos: std::sync::Mutex::new(preferred_repos),
             budget_pressure: std::sync::Mutex::new(0.0),

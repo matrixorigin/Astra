@@ -137,7 +137,12 @@ impl AppState {
             reflect_service: Arc::new(UnconfiguredReflectService),
             learning_feedback_service: Arc::new(UnconfiguredLearningFeedbackService),
             fernet_encryptor: FernetTokenEncryptor::new("dev-key-not-for-production")
-                .unwrap_or_else(|_| FernetTokenEncryptor::new("0123456789abcdef").unwrap()),
+                .or_else(|_| FernetTokenEncryptor::new("0123456789abcdef"))
+                .unwrap_or_else(|e| {
+                    eprintln!("  ⚠ fallback encryption init failed: {e}; using insecure default");
+                    // Last resort: use a deterministic key so the app doesn't crash.
+                    FernetTokenEncryptor::new("abcdefghijklmnop").expect("hardcoded key must work")
+                }),
             turn_core_event_writer: Arc::new(NoopTurnCoreEventWriter),
             turn_tool_event_writer: Arc::new(NoopTurnToolEventWriter),
             turn_hook_db_writer: Arc::new(NoopTurnHookDbWriter),

@@ -683,7 +683,10 @@ impl DynamicAgentSpawner {
         let Some(state) = state else { return };
         let writer = match astra_services::session_journal::JournalWriter::new(sid) {
             Ok(w) => w,
-            Err(_) => return,
+            Err(e) => {
+                astra_core::agent_warn!("spawner", "journal writer init failed: {e}");
+                return;
+            }
         };
         let duration_ms = state
             .started_at
@@ -708,7 +711,13 @@ impl DynamicAgentSpawner {
     /// Archive a completed agent state for history queries.
     async fn archive_agent(&self, agent_id: &str) {
         if let Some(state) = self.active_agents.read().await.get(agent_id) {
-            self.completed_agents.write().await.push(state.clone());
+            let mut completed = self.completed_agents.write().await;
+            // Cap history to prevent unbounded memory growth.
+            const MAX_COMPLETED_AGENTS: usize = 256;
+            if completed.len() >= MAX_COMPLETED_AGENTS {
+                completed.remove(0);
+            }
+            completed.push(state.clone());
         }
     }
 
@@ -871,7 +880,10 @@ impl DynamicAgentSpawner {
         };
         let events = match astra_services::session_journal::read_journal(sid) {
             Ok(e) => e,
-            Err(_) => return Vec::new(),
+            Err(e) => {
+                astra_core::agent_warn!("spawner", "journal read failed: {e}");
+                return Vec::new();
+            }
         };
         events
             .into_iter()

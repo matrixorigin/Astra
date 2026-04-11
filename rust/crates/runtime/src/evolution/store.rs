@@ -127,8 +127,14 @@ impl EvolutionStore {
         }
         let json = serde_json::to_string_pretty(proposals)
             .map_err(|e| format!("failed to serialize: {e}"))?;
-        std::fs::write(&path, json)
-            .map_err(|e| format!("failed to write {}: {e}", path.display()))?;
+        // Atomic write: tmp file + rename to prevent corruption on crash.
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, &json)
+            .map_err(|e| format!("failed to write tmp {}: {e}", tmp.display()))?;
+        if let Err(e) = std::fs::rename(&tmp, &path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!("failed to rename {}: {e}", path.display()));
+        }
         Ok(())
     }
 }
@@ -180,15 +186,60 @@ pub fn apply_diff_to_content(
             old_marker,
             new_content,
         } => {
-            if content.contains(old_marker) {
-                Ok(content.replace(old_marker, new_content))
+            // Scope replacement to the target section to avoid unintended matches elsewhere.
+            if let Some(section_start) = content.find(&heading) {
+                let after_heading = section_start + heading.len();
+                let section_end = content[after_heading..]
+                    .find("\n## ")
+                    .map(|i| after_heading + i)
+                    .unwrap_or(content.len());
+                let section_text = &content[section_start..section_end];
+                if section_text.contains(old_marker.as_str()) {
+                    let new_section = section_text.replacen(old_marker, new_content, 1);
+                    Ok(format!(
+                        "{}{}{}",
+                        &content[..section_start],
+                        new_section,
+                        &content[section_end..]
+                    ))
+                } else {
+                    Err(format!(
+                        "marker not found in section '{}': {old_marker}",
+                        section.heading()
+                    ))
+                }
+            } else if content.contains(old_marker) {
+                // Fallback: section heading not found, but marker exists globally.
+                Ok(content.replacen(old_marker, new_content, 1))
             } else {
                 Err(format!("marker not found in SKILL.md: {old_marker}"))
             }
         }
         SkillDiff::Remove { marker } => {
-            if content.contains(marker) {
-                Ok(content.replace(marker, ""))
+            // Scope removal to the target section.
+            if let Some(section_start) = content.find(&heading) {
+                let after_heading = section_start + heading.len();
+                let section_end = content[after_heading..]
+                    .find("\n## ")
+                    .map(|i| after_heading + i)
+                    .unwrap_or(content.len());
+                let section_text = &content[section_start..section_end];
+                if section_text.contains(marker.as_str()) {
+                    let new_section = section_text.replacen(marker, "", 1);
+                    Ok(format!(
+                        "{}{}{}",
+                        &content[..section_start],
+                        new_section,
+                        &content[section_end..]
+                    ))
+                } else {
+                    Err(format!(
+                        "marker not found in section '{}': {marker}",
+                        section.heading()
+                    ))
+                }
+            } else if content.contains(marker) {
+                Ok(content.replacen(marker, "", 1))
             } else {
                 Err(format!("marker not found in SKILL.md: {marker}"))
             }

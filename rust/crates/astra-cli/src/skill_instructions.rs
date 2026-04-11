@@ -665,7 +665,10 @@ impl ProgressiveSkill {
                 let entry = entry.map_err(|e| e.to_string())?;
                 let path = entry.path();
                 if path.is_file() {
-                    let name = path.file_name().unwrap().to_string_lossy().to_string();
+                    let Some(fname) = path.file_name() else {
+                        continue;
+                    };
+                    let name = fname.to_string_lossy().to_string();
                     let content = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
                     resources.resource_tokens += (content.len() as u32) / 4;
                     resources.templates.insert(name, content);
@@ -680,7 +683,10 @@ impl ProgressiveSkill {
                 let entry = entry.map_err(|e| e.to_string())?;
                 let path = entry.path();
                 if path.is_file() {
-                    let name = path.file_name().unwrap().to_string_lossy().to_string();
+                    let Some(fname) = path.file_name() else {
+                        continue;
+                    };
+                    let name = fname.to_string_lossy().to_string();
                     let content = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
                     resources.resource_tokens += (content.len() as u32) / 4;
                     resources.scripts.insert(name, content);

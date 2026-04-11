@@ -941,7 +941,10 @@ impl PermissionRequestHandler {
         } = &msg.payload
         {
             if let Some(request) = PermissionRequest::from_message_payload(data) {
-                let correlation_id = msg.correlation_id.clone().unwrap_or_default();
+                let correlation_id = msg
+                    .correlation_id
+                    .clone()
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
                 let response = self.handle_request(&request).await;
                 return Some((correlation_id, response));
             }

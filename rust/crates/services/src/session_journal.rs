@@ -725,6 +725,8 @@ impl JournalWriter {
             }
             return Err(e);
         }
+        // Ensure durability: flush to disk so a crash doesn't lose the event.
+        file.sync_data()?;
         Ok(())
     }
 
@@ -1194,7 +1196,9 @@ pub fn archive_journal(session_id: &str) -> std::io::Result<(u64, u64)> {
     let out_file = std::fs::File::create(&dst)?;
     let mut encoder = GzEncoder::new(out_file, Compression::default());
     encoder.write_all(&content)?;
-    encoder.finish()?;
+    let out_file = encoder.finish()?;
+    // Ensure compressed data is durable before deleting the original.
+    out_file.sync_all()?;
     let compressed_bytes = std::fs::metadata(&dst)?.len();
     std::fs::remove_file(&src)?;
     Ok((original_bytes, compressed_bytes))
@@ -2364,7 +2368,9 @@ fn compress_journal(sessions_dir: &Path, session_id: &str) -> std::io::Result<()
         encoder.write_all(line.as_bytes())?;
         encoder.write_all(b"\n")?;
     }
-    encoder.finish()?;
+    let out_file = encoder.finish()?;
+    // Ensure compressed data is durable before deleting the original.
+    out_file.sync_all()?;
 
     // Remove original after successful compression
     std::fs::remove_file(&src)?;

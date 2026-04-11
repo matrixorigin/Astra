@@ -11,6 +11,7 @@
 use astra_services::session_journal;
 use crossterm::style::Stylize;
 use std::path::Path;
+use std::time::Duration;
 
 use super::ReplState;
 use super::edge_tools;
@@ -41,15 +42,21 @@ pub(super) async fn finalize_session(state: &ReplState) {
     }
     // 3. Session-end knowledge extraction (opt-in, async with timeout)
     let knowledge_handle = session_end_extract_learnings(&state.history);
-    // 3b. Trigger Memoria governance + consolidation (best-effort, fire-and-forget)
-    tokio::spawn(edge_tools::memoria::memoria_governance_fire_and_forget());
-    tokio::spawn(edge_tools::memoria::memoria_consolidate_fire_and_forget());
+    // 3b. Trigger Memoria governance + consolidation (best-effort with timeout)
+    let gov_handle = tokio::spawn(edge_tools::memoria::memoria_governance_fire_and_forget());
+    let con_handle = tokio::spawn(edge_tools::memoria::memoria_consolidate_fire_and_forget());
     // 4. Graceful ingestion shutdown: await worker flush
     if let Some(mc) = state.matrix_runtime.as_ref() {
         mc.shutdown_ingestion_and_wait().await;
     }
     // 5. Await knowledge extraction with timeout
     await_knowledge_extraction(knowledge_handle).await;
+    // 5b. Await Memoria maintenance (bounded 5s so we don't hang on exit)
+    let _ = tokio::time::timeout(Duration::from_secs(5), async {
+        let _ = gov_handle.await;
+        let _ = con_handle.await;
+    })
+    .await;
     // 6. Clear panic guard
     clear_panic_guard();
 }
