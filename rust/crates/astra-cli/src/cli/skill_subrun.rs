@@ -488,6 +488,7 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             messaging: Default::default(),
             cancellation: CancellationState {
                 flag: None,
+                pause_flag: None,
                 token: self.cancel_token.clone(),
             },
             error_recovery: Default::default(),

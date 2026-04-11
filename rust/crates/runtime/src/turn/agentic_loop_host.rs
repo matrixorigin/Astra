@@ -51,6 +51,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use astra_services::session_journal::ToolCallRecord;
 use async_trait::async_trait;
@@ -339,6 +340,8 @@ pub struct StopHookState {
 pub struct CancellationState {
     /// Shared flag checked between turns. Set externally (e.g. by cancel_run).
     pub flag: Option<Arc<AtomicBool>>,
+    /// Shared pause flag checked between turns. Set externally (e.g. by pause_run).
+    pub pause_flag: Option<Arc<AtomicBool>>,
     /// Optional token cancelled with user cancel for immediate LLM/stream wake.
     pub token: Option<Arc<CancellationToken>>,
 }
@@ -2686,7 +2689,29 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
     }
 
     for turn_index in 0..state.max_turns {
-        // ─── Cancel check (cooperative) ─────────────────────────────────
+        // ─── Pause/cancel checks (cooperative) ──────────────────────────
+        while state
+            .cancellation
+            .pause_flag
+            .as_ref()
+            .is_some_and(|f| f.load(Ordering::Relaxed))
+        {
+            if state
+                .cancellation
+                .flag
+                .as_ref()
+                .is_some_and(|f| f.load(Ordering::Relaxed))
+                || state
+                    .cancellation
+                    .token
+                    .as_ref()
+                    .is_some_and(|t| t.is_cancelled())
+            {
+                return Ok(AgenticLoopOutcome::Cancelled);
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
         if state
             .cancellation
             .flag
@@ -5178,6 +5203,33 @@ mod tests {
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(matches!(outcome, Ok(AgenticLoopOutcome::Cancelled)));
+    }
+
+    #[tokio::test]
+    async fn pause_flag_true_waits_until_cleared() {
+        let pause_flag = Arc::new(AtomicBool::new(true));
+        let pause_flag_clone = pause_flag.clone();
+
+        let handle = tokio::spawn(async move {
+            let mut host = MockHost::new(vec![text_result("ok", 10, 5, Some(42))]);
+            let mut state = make_state();
+            state.cancellation.pause_flag = Some(pause_flag_clone);
+            let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+            (outcome, host.current_turn, state.final_text)
+        });
+
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        assert!(
+            !handle.is_finished(),
+            "loop should stay paused while flag is set"
+        );
+
+        pause_flag.store(false, Ordering::Relaxed);
+
+        let (outcome, turns, final_text) = handle.await.unwrap();
+        assert!(matches!(outcome, Ok(AgenticLoopOutcome::Completed)));
+        assert_eq!(turns, 1);
+        assert_eq!(final_text, "ok");
     }
 
     #[test]

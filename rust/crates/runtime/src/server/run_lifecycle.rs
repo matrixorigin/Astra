@@ -182,6 +182,7 @@ struct RunState {
     status: RunStatus,
     events: Vec<Value>,
     cancel_flag: Arc<AtomicBool>,
+    pause_flag: Arc<AtomicBool>,
     /// Cancelled together with `cancel_flag` on `cancel_run` for low-latency LLM abort.
     llm_cancel_token: Arc<CancellationToken>,
     #[allow(dead_code)]
@@ -256,8 +257,14 @@ impl AgenticRunLifecycleService {
         run_id: String,
         session_id: String,
         user_id: String,
-    ) -> (RunState, Arc<AtomicBool>, Arc<CancellationToken>) {
+    ) -> (
+        RunState,
+        Arc<AtomicBool>,
+        Arc<AtomicBool>,
+        Arc<CancellationToken>,
+    ) {
         let cancel_flag = Arc::new(AtomicBool::new(false));
+        let pause_flag = Arc::new(AtomicBool::new(false));
         let llm_cancel_token = Arc::new(CancellationToken::new());
         let run_state = RunState {
             run_id,
@@ -266,20 +273,23 @@ impl AgenticRunLifecycleService {
             status: RunStatus::Running,
             events: vec![json!({"event_type": "run_started", "data": {}})],
             cancel_flag: cancel_flag.clone(),
+            pause_flag: pause_flag.clone(),
             llm_cancel_token: llm_cancel_token.clone(),
             started_at: Instant::now(),
             waiting_for: None,
         };
-        (run_state, cancel_flag, llm_cancel_token)
+        (run_state, cancel_flag, pause_flag, llm_cancel_token)
     }
 
     fn configure_loop_state_runtime_controls(
         &self,
         loop_state: &mut AgenticLoopState,
         cancel_flag: &Arc<AtomicBool>,
+        pause_flag: &Arc<AtomicBool>,
         llm_cancel_token: &Arc<CancellationToken>,
     ) {
         loop_state.cancellation.flag = Some(cancel_flag.clone());
+        loop_state.cancellation.pause_flag = Some(pause_flag.clone());
         loop_state.cancellation.token = Some(llm_cancel_token.clone());
         loop_state.delegation_engine = self.delegation_engine.clone();
     }
@@ -655,6 +665,13 @@ impl AgenticRunLifecycleService {
         let runs = self.runs.read().await;
         runs.get(run_id).map(|r| r.llm_cancel_token.is_cancelled())
     }
+
+    #[cfg(test)]
+    pub(crate) async fn test_pause_flag_is_set(&self, run_id: &str) -> Option<bool> {
+        let runs = self.runs.read().await;
+        runs.get(run_id)
+            .map(|r| r.pause_flag.load(Ordering::Relaxed))
+    }
 }
 
 #[async_trait]
@@ -671,7 +688,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             .clone()
             .unwrap_or_else(|| Uuid::new_v4().to_string());
 
-        let (run_state, cancel_flag, llm_cancel_token) =
+        let (run_state, cancel_flag, pause_flag, llm_cancel_token) =
             Self::build_tracked_run_state(run_id.clone(), session_id.clone(), user_id.clone());
         self.runs.write().await.insert(run_id.clone(), run_state);
 
@@ -687,6 +704,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         self.configure_loop_state_runtime_controls(
             &mut loop_state,
             &cancel_flag,
+            &pause_flag,
             &llm_cancel_token,
         );
 
@@ -792,12 +810,17 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         // The client (CLI thin-client) is expected to provide edge_tools in context.
         let mut host = self.build_host(&user_id, &session_id, &request, edge_tools, edge_profile);
         let mut state = self.build_initial_state(&request, &session_id, &run_id);
-        let (run_state, cancel_flag, llm_cancel_token) =
+        let (run_state, cancel_flag, pause_flag, llm_cancel_token) =
             Self::build_tracked_run_state(run_id.clone(), session_id.clone(), user_id.clone());
         self.runs.write().await.insert(run_id.clone(), run_state);
         self.persist_run_start_if_configured(&run_id, &user_id, &session_id)
             .await;
-        self.configure_loop_state_runtime_controls(&mut state, &cancel_flag, &llm_cancel_token);
+        self.configure_loop_state_runtime_controls(
+            &mut state,
+            &cancel_flag,
+            &pause_flag,
+            &llm_cancel_token,
+        );
 
         let loop_result = run_agentic_loop_with_host(&mut host, &mut state).await;
 
@@ -1032,6 +1055,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 }
                 let previous = run.status.as_str().to_string();
                 run.status = RunStatus::Paused;
+                run.pause_flag.store(true, Ordering::SeqCst);
                 run.waiting_for = Some("user_resume".to_string());
                 run.events.push(json!({
                     "event_type": "run_paused",
@@ -1098,6 +1122,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 }
                 let previous = run.status.as_str().to_string();
                 run.status = RunStatus::Running;
+                run.pause_flag.store(false, Ordering::SeqCst);
                 run.waiting_for = None;
                 run.events.push(json!({
                     "event_type": "run_resumed",
@@ -1305,8 +1330,9 @@ impl SubRunExecutor for ServerSubRunExecutor {
                 ..Default::default()
             },
             cancellation: CancellationState {
-                flag: config.pause_flag.clone(),
-                token: None,
+                flag: None,
+                pause_flag: config.pause_flag.clone(),
+                token: config.cancel_token.clone(),
             },
             messaging: MessagingState {
                 mailbox: config.mailbox,
@@ -1528,6 +1554,7 @@ mod tests {
                 json!({"event_type": "run_finished", "data": {"cancelled": true}}),
             ],
             cancel_flag,
+            pause_flag: Arc::new(AtomicBool::new(false)),
             llm_cancel_token: cancel_token,
             started_at: Instant::now(),
             waiting_for: None,
@@ -1668,6 +1695,17 @@ mod tests {
             svc.test_llm_cancel_token_is_cancelled(&run.run_id).await,
             Some(true)
         );
+    }
+
+    #[tokio::test]
+    async fn pause_run_sets_live_pause_flag_and_resume_clears_it() {
+        let svc = test_service();
+        let run = ok(svc.create_run("user-1".into(), test_request("task")).await);
+        assert_eq!(svc.test_pause_flag_is_set(&run.run_id).await, Some(false));
+        ok(svc.pause_run(run.run_id.clone(), "user-1".into()).await);
+        assert_eq!(svc.test_pause_flag_is_set(&run.run_id).await, Some(true));
+        ok(svc.resume_run(run.run_id.clone(), "user-1".into()).await);
+        assert_eq!(svc.test_pause_flag_is_set(&run.run_id).await, Some(false));
     }
 
     #[tokio::test]

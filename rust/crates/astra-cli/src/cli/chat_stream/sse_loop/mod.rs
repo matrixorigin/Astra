@@ -472,6 +472,7 @@ pub(crate) async fn stream_chat_sse(
         },
         cancellation: CancellationState {
             flag: None,
+            pause_flag: None,
             token: p.cancel_token.clone(),
         },
         error_recovery: ErrorRecoveryState {

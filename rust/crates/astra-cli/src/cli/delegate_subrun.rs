@@ -320,7 +320,8 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
                 ..Default::default()
             },
             cancellation: CancellationState {
-                flag: config.pause_flag.clone(),
+                flag: None,
+                pause_flag: config.pause_flag.clone(),
                 token: self.cancel_token.clone(),
             },
             error_recovery: Default::default(),
