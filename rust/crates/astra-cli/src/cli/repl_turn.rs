@@ -1620,14 +1620,20 @@ fn report_turn_failure(
         if !failure.partial.tools_used.is_empty() {
             err_event.tools_used = Some(failure.partial.tools_used.clone());
         }
-        if !failure.partial.stall_events.is_empty() || !failure.partial.verdict_events.is_empty() {
+        // Always populate metadata for post-mortem analysis.
+        {
+            let error_category = classify_turn_error(&failure.error);
             err_event.metadata = Some(serde_json::json!({
-                "error_type": "turn_failure",
+                "error_category": error_category,
                 "stall_count": failure.partial.stall_events.len(),
                 "verdict_count": failure.partial.verdict_events.len(),
                 "has_checkpoint": failure.partial.last_heavy_checkpoint.is_some(),
+                "partial_tokens_in": failure.partial.prompt_tokens,
+                "partial_tokens_out": failure.partial.completion_tokens,
+                "partial_tool_calls": failure.partial.tool_calls_count,
             }));
         }
+
 
         let _ = journal.append(&err_event);
         enqueue_ingestion(state, &err_event);
@@ -2110,6 +2116,24 @@ pub(super) fn create_manual_repl_checkpoint(
         heavy_path,
         cloud_sync_queued: state.matrix_runtime.is_some(),
     })
+}
+
+/// Classify a turn error message into a category for post-mortem analysis.
+fn classify_turn_error(error: &str) -> &'static str {
+    let lower = error.to_lowercase();
+    if lower.contains("timeout") || lower.contains("timed out") {
+        "timeout"
+    } else if lower.contains("rate limit") || lower.contains("429") || lower.contains("too many") {
+        "rate_limit"
+    } else if lower.contains("connection") || lower.contains("network") || lower.contains("dns") {
+        "network"
+    } else if lower.contains("auth") || lower.contains("401") || lower.contains("403") {
+        "auth"
+    } else if lower.contains("500") || lower.contains("502") || lower.contains("503") {
+        "server_error"
+    } else {
+        "unknown"
+    }
 }
 
 #[cfg(test)]
@@ -3386,5 +3410,53 @@ mod tests {
         // With empty context, only recent turns kept
         assert!(kept.len() <= 4);
         assert!(kept.contains(&9), "must keep latest turn");
+    }
+
+    #[test]
+    fn classify_turn_error_timeout() {
+        assert_eq!(classify_turn_error("Request timed out after 30s"), "timeout");
+        assert_eq!(classify_turn_error("connection timeout"), "timeout");
+        assert_eq!(classify_turn_error("TIMEOUT waiting for LLM"), "timeout");
+    }
+
+    #[test]
+    fn classify_turn_error_rate_limit() {
+        assert_eq!(classify_turn_error("Rate limit exceeded"), "rate_limit");
+        assert_eq!(classify_turn_error("HTTP 429: too many requests"), "rate_limit");
+        assert_eq!(classify_turn_error("Too many requests, retry later"), "rate_limit");
+    }
+
+    #[test]
+    fn classify_turn_error_network() {
+        assert_eq!(classify_turn_error("Connection refused"), "network");
+        assert_eq!(classify_turn_error("DNS resolution failed"), "network");
+        assert_eq!(classify_turn_error("network unreachable"), "network");
+    }
+
+    #[test]
+    fn classify_turn_error_auth() {
+        assert_eq!(classify_turn_error("HTTP 401 Unauthorized"), "auth");
+        assert_eq!(classify_turn_error("403 Forbidden"), "auth");
+        assert_eq!(classify_turn_error("Authentication failed"), "auth");
+    }
+
+    #[test]
+    fn classify_turn_error_server() {
+        assert_eq!(classify_turn_error("Internal Server Error 500"), "server_error");
+        assert_eq!(classify_turn_error("502 Bad Gateway"), "server_error");
+        assert_eq!(classify_turn_error("503 Service Unavailable"), "server_error");
+    }
+
+    #[test]
+    fn classify_turn_error_unknown() {
+        assert_eq!(classify_turn_error("something weird happened"), "unknown");
+        assert_eq!(classify_turn_error(""), "unknown");
+    }
+
+    #[test]
+    fn classify_turn_error_priority_timeout_over_network() {
+        // "connection timeout" contains both "connection" and "timeout"
+        // timeout should win (checked first)
+        assert_eq!(classify_turn_error("connection timeout"), "timeout");
     }
 }
