@@ -1472,6 +1472,9 @@ fn finalize_turn_trace(state: &mut AgenticLoopState) {
     let Some(collector) = state.telemetry.turn_trace_collector.take() else {
         return;
     };
+    if let Some(ref session_id) = state.current_session_id {
+        collector.set_session_id(session_id);
+    }
     let measured = state.last_measured_prompt_tokens.unwrap_or(0);
     let max = state.max_turn_input_tokens;
     let budget_pressure = if max > 0 {
@@ -9797,11 +9800,11 @@ print(json.dumps({'context': 'user said: ' + msg}))
         assert_eq!(guard.context_traces.len(), 1);
         let trace = &guard.context_traces[0];
         assert_eq!(trace.turn_id, "turn-0");
-        // CLI estimates preserved (merge semantics)
+        // CLI component estimates preserved.
         assert_eq!(trace.token_budget.system_prompt_tokens, 14_000);
         assert_eq!(trace.token_budget.history_tokens, 5_000);
-        // Runtime measured values applied
-        assert_eq!(trace.token_budget.total_used, 25_000);
+        // Persisted total remains aligned with the component breakdown.
+        assert_eq!(trace.token_budget.total_used, 22_200);
         assert_eq!(trace.token_budget.max_tokens, 100_000);
         assert!((trace.token_budget.budget_pressure - 0.25).abs() < 0.01);
     }

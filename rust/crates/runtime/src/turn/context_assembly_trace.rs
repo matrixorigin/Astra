@@ -546,6 +546,14 @@ mod tests {
         assert!((agg.avg_system_prompt_tokens - 1500.0).abs() < 0.001);
         assert!((agg.compression_trigger_rate - 0.5).abs() < 0.001);
     }
+
+    #[test]
+    fn tool_trace_scores_are_clamped_non_negative() {
+        let selected_tools: Vec<String> = (0..16).map(|i| format!("tool-{i}")).collect();
+        let trace =
+            build_tool_trace_from_selection(16, &selected_tools, "tfidf", 0.4, 1600, 0, 0, 5);
+        assert!(trace.tools_selected.iter().all(|tool| tool.score >= 0.0));
+    }
 }
 
 // ─── Integration with Context Compression ────────────────────────────────────
@@ -612,7 +620,7 @@ pub fn build_tool_trace_from_selection(
         .enumerate()
         .map(|(idx, name)| ToolSelected {
             tool_name: name.clone(),
-            score: 1.0 - (idx as f64 * 0.1), // Approximate ranking score
+            score: (1.0 - (idx as f64 * 0.1)).max(0.0), // Approximate ranking score
             tokens: budget_used / selected_tools.len().max(1) as u32, // Distribute evenly
             selection_factors: vec![SelectionFactor {
                 factor_name: "selector".to_string(),

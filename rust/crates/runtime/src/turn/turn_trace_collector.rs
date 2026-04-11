@@ -75,6 +75,15 @@ impl TurnTraceCollector {
         }
     }
 
+    pub fn set_session_id(&self, session_id: impl Into<String>) {
+        if let Ok(mut state) = self.inner.write() {
+            let session_id = session_id.into();
+            if !session_id.is_empty() {
+                state.session_id = session_id;
+            }
+        }
+    }
+
     // ─── Recording Methods ───────────────────────────────────────────────────
 
     /// Record system prompt breakdown.
@@ -180,7 +189,6 @@ impl TurnTraceCollector {
         if let Ok(mut state) = self.inner.write() {
             if let Some(ref mut existing) = state.token_budget {
                 // Preserve CLI-estimated component breakdown; overwrite measured fields.
-                existing.total_used = budget.total_used;
                 existing.max_tokens = budget.max_tokens;
                 existing.budget_pressure = budget.budget_pressure;
                 existing.compression_triggered = budget.compression_triggered;
@@ -200,7 +208,18 @@ impl TurnTraceCollector {
                 if budget.user_message_tokens > 0 {
                     existing.user_message_tokens = budget.user_message_tokens;
                 }
+                let component_total = budget_component_total(existing);
+                existing.total_used = if component_total > 0 {
+                    component_total
+                } else {
+                    budget.total_used
+                };
             } else {
+                let mut budget = budget;
+                let component_total = budget_component_total(&budget);
+                if component_total > 0 {
+                    budget.total_used = component_total;
+                }
                 state.token_budget = Some(budget);
             }
         }
@@ -343,6 +362,14 @@ impl Clone for TurnTraceCollector {
     }
 }
 
+fn budget_component_total(budget: &TokenBudgetTrace) -> u32 {
+    budget.system_prompt_tokens
+        + budget.history_tokens
+        + budget.memory_tokens
+        + budget.tool_schema_tokens
+        + budget.user_message_tokens
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::context_assembly_trace::{MemoryInjection, SkillInjection};
@@ -440,7 +467,7 @@ mod tests {
     }
 
     #[test]
-    fn record_token_budget_merges_preserving_estimates() {
+    fn record_token_budget_keeps_component_totals_consistent() {
         let collector = TurnTraceCollector::new("turn-0", "s1");
         // First: CLI records component estimates
         collector.record_token_budget_estimate(14_000, 5_000, 0, 3_000, 200, 22_200, 128_000, 0.17);
@@ -454,8 +481,8 @@ mod tests {
         });
 
         let trace = collector.finalize();
-        // Measured fields overwritten by runtime
-        assert_eq!(trace.token_budget.total_used, 25_000);
+        // Total stays aligned with the persisted component breakdown.
+        assert_eq!(trace.token_budget.total_used, 22_200);
         assert_eq!(trace.token_budget.budget_pressure, 0.20);
         assert!(trace.token_budget.compression_triggered);
         // Component estimates preserved (runtime sent zeros)
@@ -544,5 +571,13 @@ mod tests {
         assert!(trace.history.turns_retained[1].has_tool_calls);
         assert_eq!(trace.history.total_turns_available, 2);
         assert_eq!(trace.history.tokens_after, 850);
+    }
+
+    #[test]
+    fn set_session_id_updates_finalized_trace() {
+        let collector = TurnTraceCollector::new("turn-0", "");
+        collector.set_session_id("sess-1");
+        let trace = collector.finalize();
+        assert_eq!(trace.session_id, "sess-1");
     }
 }

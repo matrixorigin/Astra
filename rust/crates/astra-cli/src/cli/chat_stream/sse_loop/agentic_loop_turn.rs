@@ -83,6 +83,71 @@ fn touch_prep_ui_phase(phase: &Option<ChatPrepPhaseLabel>, label: &str) {
     }
 }
 
+fn msg_content(m: &Value) -> String {
+    match m.get("content") {
+        Some(v) if v.is_string() => v.as_str().unwrap_or("").to_string(),
+        Some(v) if v.is_array() => v
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+            .collect::<Vec<_>>()
+            .join(""),
+        _ => String::new(),
+    }
+}
+
+fn message_has_tool_calls(m: &Value) -> bool {
+    m.get("tool_calls")
+        .and_then(Value::as_array)
+        .is_some_and(|calls| !calls.is_empty())
+}
+
+fn retained_history_messages(messages: &[Value]) -> &[Value] {
+    match messages.split_last() {
+        Some((last, history)) if last.get("role").and_then(Value::as_str) == Some("user") => {
+            history
+        }
+        _ => messages,
+    }
+}
+
+fn build_retained_history_turns(
+    messages: &[Value],
+) -> Vec<astra_runtime::turn::context_assembly_trace::TurnRetention> {
+    let mut turns = Vec::new();
+
+    for message in messages {
+        let role = message
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_string();
+        let tokens = prompts::estimate_str_tokens(&msg_content(message)) as u32;
+        let has_tool_calls = message_has_tool_calls(message);
+
+        if turns.is_empty() || role == "user" {
+            turns.push(astra_runtime::turn::context_assembly_trace::TurnRetention {
+                turn_index: turns.len() as u32,
+                role,
+                tokens,
+                has_tool_calls,
+            });
+            continue;
+        }
+
+        if let Some(turn) = turns.last_mut() {
+            turn.tokens += tokens;
+            turn.has_tool_calls |= has_tool_calls;
+            if role != "tool" {
+                turn.role = role;
+            }
+        }
+    }
+
+    turns
+}
+
 // ─── Outbound `/chat` JSON body (was `prepare_turn_request.rs`) ───────────────
 
 /// First-turn / cross-turn counters updated while building the payload.
@@ -261,7 +326,15 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
     // to invoke skills by calling the tool, rather than having skills pre-injected by
     // the selector.
 
-    let (turn_schemas, selection_report, selection_confidence) = if ctx.tool_results.is_empty() {
+    let (
+        turn_schemas,
+        selection_report,
+        selection_confidence,
+        selection_strategy,
+        selection_tokens_in,
+        selection_tokens_out,
+        selection_latency_ms,
+    ) = if ctx.tool_results.is_empty() {
         let sel_start = Instant::now();
         touch_prep_ui_phase(&ctx.prep_ui_phase, "Scanning context…");
         let sel_ctx = build_agentic_tool_selection_context(
@@ -302,35 +375,21 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
             sel_result.selector_tokens_out,
         );
 
-        // Record tool selection trace (M1 observability)
-        if let Some(collector) = ctx.telem.trace_collector {
-            let tool_token_costs: Vec<(String, u32)> = sel_result
-                .tool_names
-                .iter()
-                .map(|n| (n.clone(), ctx.registry.token_cost(n)))
-                .collect();
-            let total: u32 = tool_token_costs.iter().map(|(_, t)| t).sum();
-            collector.record_tool_selection(
-                &sel_result.tool_names,
-                sel_result.strategy,
-                sel_result.confidence,
-                total,
-                sel_result.selector_tokens_in,
-                sel_result.selector_tokens_out,
-                ctx.registry.total_tool_count() as u32,
-                sel_latency_ms,
-            );
-            // Patch per-tool token costs (record_tool_selection distributes evenly)
-            collector.patch_tool_tokens(&tool_token_costs);
-        }
-
         let conf = sel_result.confidence;
         let (schemas, report) = tool_selector::resolve_schemas_with_pressure(
             ctx.registry,
             &sel_result.tool_names,
             budget_pressure,
         );
-        (schemas, report, conf)
+        (
+            schemas,
+            report,
+            conf,
+            sel_result.strategy.to_string(),
+            sel_result.selector_tokens_in,
+            sel_result.selector_tokens_out,
+            sel_latency_ms,
+        )
     } else {
         touch_prep_ui_phase(&ctx.prep_ui_phase, "Continuing…");
         let sel_ctx = build_agentic_tool_selection_context(
@@ -347,10 +406,12 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
             ctx.tool_budget_override,
         );
         touch_prep_ui_phase(&ctx.prep_ui_phase, "Thinking…");
+        let sel_start = Instant::now();
         let sel_result = ctx
             .selector
             .select_with_learned_context(&sel_ctx, &learned_context)
             .await;
+        let sel_latency_ms = sel_start.elapsed().as_millis() as u64;
         touch_prep_ui_phase(&ctx.prep_ui_phase, "Loading schemas…");
         accumulate_selector_token_usage(
             ctx.telem.selector_tokens_in,
@@ -370,14 +431,43 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
             ctx.tool_results,
             ctx.all_schemas,
         );
-        (selected, report, conf)
+        (
+            selected,
+            report,
+            conf,
+            sel_result.strategy.to_string(),
+            sel_result.selector_tokens_in,
+            sel_result.selector_tokens_out,
+            sel_latency_ms,
+        )
     };
     log_chat_turn_timing_phase(timing, "tool_selector_resolve_schemas", &mut mark);
+
+    let selected_tool_costs: Vec<(String, u32)> = selection_report
+        .tools_selected
+        .iter()
+        .map(|name| (name.clone(), ctx.registry.token_cost(name)))
+        .collect();
+    let selected_tool_tokens_total: u32 = selected_tool_costs.iter().map(|(_, cost)| *cost).sum();
+
+    if let Some(collector) = ctx.telem.trace_collector {
+        collector.record_tool_selection(
+            &selection_report.tools_selected,
+            &selection_strategy,
+            selection_confidence,
+            selected_tool_tokens_total,
+            selection_tokens_in,
+            selection_tokens_out,
+            ctx.registry.total_tool_count() as u32,
+            selection_latency_ms,
+        );
+        collector.patch_tool_tokens(&selected_tool_costs);
+    }
 
     capture_first_selection_report_if_empty(
         ctx.telem.first_selection_report,
         ctx.telem.first_budget_pressure,
-        selection_report,
+        selection_report.clone(),
         budget_pressure,
     );
     ctx.executor.set_budget_pressure(budget_pressure);
@@ -427,54 +517,19 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
 
     // ─── Record token budget estimate to trace collector (M1 observability) ───
     if let Some(collector) = ctx.telem.trace_collector {
-        let schema_tokens = ctx.selector.registry().total_pinned_token_cost();
+        let schema_tokens = selected_tool_tokens_total;
         let budget = prompts::budget_for_model(ctx.model);
         let max_tokens = budget.model_limit as u32;
+        let history_messages = retained_history_messages(ctx.messages);
 
-        // Helper: extract text content from a message Value for estimation.
-        // Handles both string content and Anthropic-style array-of-blocks.
-        let msg_content = |m: &Value| -> String {
-            match m.get("content") {
-                Some(v) if v.is_string() => v.as_str().unwrap_or("").to_string(),
-                Some(v) if v.is_array() => v
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
-                    .collect::<Vec<_>>()
-                    .join(""),
-                _ => String::new(),
-            }
-        };
-
-        // Estimate history tokens from messages (ctx.messages = history + user, no system prompt)
-        let history_tokens: u32 = ctx
-            .messages
+        // Estimate retained history tokens from prior messages only.
+        let history_tokens: u32 = history_messages
             .iter()
             .map(|m| prompts::estimate_str_tokens(&msg_content(m)) as u32)
             .sum();
 
         // Record per-turn history breakdown
-        let turns_retained: Vec<astra_runtime::turn::context_assembly_trace::TurnRetention> = ctx
-            .messages
-            .iter()
-            .enumerate()
-            .map(|(i, m)| {
-                let role = m
-                    .get("role")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown")
-                    .to_string();
-                let has_tool_calls = m.get("tool_calls").is_some() || role == "tool";
-                let tokens = prompts::estimate_str_tokens(&msg_content(m)) as u32;
-                astra_runtime::turn::context_assembly_trace::TurnRetention {
-                    turn_index: i as u32,
-                    role,
-                    tokens,
-                    has_tool_calls,
-                }
-            })
-            .collect();
+        let turns_retained = build_retained_history_turns(history_messages);
         collector.set_history_retained(&turns_retained);
 
         // Estimate user message tokens
@@ -886,37 +941,45 @@ mod tests {
     }
     #[test]
     fn msg_content_extracts_string_and_array_formats() {
-        use serde_json::Value;
-
-        // Helper mirrors the closure in prepare_chat_turn_payload.
-        let msg_content = |m: &Value| -> String {
-            match m.get("content") {
-                Some(v) if v.is_string() => v.as_str().unwrap_or("").to_string(),
-                Some(v) if v.is_array() => v
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .filter_map(|b: &Value| b.get("text").and_then(|t| t.as_str()))
-                    .collect::<Vec<_>>()
-                    .join(""),
-                _ => String::new(),
-            }
-        };
-
         // String content (OpenAI format)
         let str_msg = json!({"role": "user", "content": "hello world"});
-        assert!(!msg_content(&str_msg).is_empty());
+        assert!(!super::msg_content(&str_msg).is_empty());
 
         // Array content (Anthropic format)
         let arr_msg = json!({"role": "user", "content": [
             {"type": "text", "text": "hello "},
             {"type": "text", "text": "world"}
         ]});
-        assert_eq!(msg_content(&arr_msg), "hello world");
+        assert_eq!(super::msg_content(&arr_msg), "hello world");
 
         // Null/missing content
         let null_msg = json!({"role": "assistant", "content": null});
-        assert!(msg_content(&null_msg).is_empty());
+        assert!(super::msg_content(&null_msg).is_empty());
+    }
+
+    #[test]
+    fn retained_history_excludes_current_user_and_groups_messages_by_turn() {
+        let messages = vec![
+            json!({"role": "user", "content": "first"}),
+            json!({"role": "assistant", "content": "reply one"}),
+            json!({"role": "user", "content": "second"}),
+            json!({"role": "assistant", "content": "calling tool", "tool_calls": [{"id": "call-1"}]}),
+            json!({"role": "tool", "content": "tool output"}),
+            json!({"role": "assistant", "content": "final answer"}),
+            json!({"role": "user", "content": "current"}),
+        ];
+
+        let history_messages = super::retained_history_messages(&messages);
+        assert_eq!(history_messages.len(), 6);
+
+        let turns = super::build_retained_history_turns(history_messages);
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].turn_index, 0);
+        assert_eq!(turns[0].role, "assistant");
+        assert!(!turns[0].has_tool_calls);
+        assert_eq!(turns[1].turn_index, 1);
+        assert_eq!(turns[1].role, "assistant");
+        assert!(turns[1].has_tool_calls);
     }
 
     #[test]
