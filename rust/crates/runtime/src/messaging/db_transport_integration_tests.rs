@@ -800,6 +800,170 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cleanup_older_than_preserves_pending_and_claimed_messages() {
+        skip_without_db!(pool);
+
+        let transport =
+            DatabaseTransport::new(pool.clone()).with_poll_interval(Duration::from_millis(50));
+
+        let sender = addr("run-db-cleanup-age-a", "alice");
+        let pending_target = addr("run-db-cleanup-age-b", "bob");
+        let claimed_target = addr("run-db-cleanup-age-c", "carol");
+        let acked_target = addr("run-db-cleanup-age-d", "dave");
+        let failed_target = addr("run-db-cleanup-age-e", "erin");
+
+        transport.register(sender.clone(), None).await.unwrap();
+
+        let pending_msg = Arc::new(AgentMessage::new(
+            sender.clone(),
+            MessageTarget::Direct {
+                address: pending_target,
+            },
+            MessagePayload::Text {
+                content: "pending".into(),
+                summary: None,
+            },
+        ));
+        let pending_id = pending_msg.id.clone();
+        transport.send(pending_msg).await.unwrap();
+
+        let claimed_msg = Arc::new(AgentMessage::new(
+            sender.clone(),
+            MessageTarget::Direct {
+                address: claimed_target,
+            },
+            MessagePayload::Text {
+                content: "claimed".into(),
+                summary: None,
+            },
+        ));
+        let claimed_id = claimed_msg.id.clone();
+        transport.send(claimed_msg).await.unwrap();
+
+        let acked_msg = Arc::new(AgentMessage::new(
+            sender.clone(),
+            MessageTarget::Direct {
+                address: acked_target,
+            },
+            MessagePayload::Text {
+                content: "acked".into(),
+                summary: None,
+            },
+        ));
+        let acked_id = acked_msg.id.clone();
+        transport.send(acked_msg).await.unwrap();
+
+        let failed_msg = Arc::new(AgentMessage::new(
+            sender.clone(),
+            MessageTarget::Direct {
+                address: failed_target,
+            },
+            MessagePayload::Text {
+                content: "failed".into(),
+                summary: None,
+            },
+        ));
+        let failed_id = failed_msg.id.clone();
+        transport.send(failed_msg).await.unwrap();
+
+        let old_timestamp_ms = chrono::Utc::now().timestamp_millis() - 5_000;
+
+        sqlx::query(
+            "UPDATE agent_message_queue
+             SET status = 'pending', claimed_by = NULL, claimed_at_ms = NULL, timestamp_ms = ?
+             WHERE message_id = ?",
+        )
+        .bind(old_timestamp_ms)
+        .bind(&pending_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "UPDATE agent_message_queue
+             SET status = 'claimed', claimed_by = 'cleanup-test-consumer', claimed_at_ms = ?, timestamp_ms = ?
+             WHERE message_id = ?",
+        )
+        .bind(old_timestamp_ms)
+        .bind(old_timestamp_ms)
+        .bind(&claimed_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "UPDATE agent_message_queue
+             SET status = 'acked', claimed_by = NULL, claimed_at_ms = NULL, timestamp_ms = ?
+             WHERE message_id = ?",
+        )
+        .bind(old_timestamp_ms)
+        .bind(&acked_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "UPDATE agent_message_queue
+             SET status = 'failed', claimed_by = NULL, claimed_at_ms = NULL, timestamp_ms = ?
+             WHERE message_id = ?",
+        )
+        .bind(old_timestamp_ms)
+        .bind(&failed_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let removed = transport
+            .cleanup_older_than(Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(removed, 2, "only terminal messages should be removed");
+
+        let pending_status: String =
+            sqlx::query("SELECT status FROM agent_message_queue WHERE message_id = ?")
+                .bind(&pending_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+                .try_get("status")
+                .unwrap();
+        assert_eq!(pending_status, "pending");
+
+        let claimed_row =
+            sqlx::query("SELECT status, claimed_by FROM agent_message_queue WHERE message_id = ?")
+                .bind(&claimed_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let claimed_status: String = claimed_row.try_get("status").unwrap();
+        let claimed_by: Option<String> = claimed_row.try_get("claimed_by").unwrap();
+        assert_eq!(claimed_status, "claimed");
+        assert_eq!(claimed_by.as_deref(), Some("cleanup-test-consumer"));
+
+        let acked_count: i64 =
+            sqlx::query("SELECT COUNT(*) AS count FROM agent_message_queue WHERE message_id = ?")
+                .bind(&acked_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+                .try_get("count")
+                .unwrap();
+        assert_eq!(acked_count, 0);
+
+        let failed_count: i64 =
+            sqlx::query("SELECT COUNT(*) AS count FROM agent_message_queue WHERE message_id = ?")
+                .bind(&failed_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+                .try_get("count")
+                .unwrap();
+        assert_eq!(failed_count, 0);
+
+        cleanup(&pool).await;
+    }
+
+    #[tokio::test]
     async fn reclaim_stale_requeues_retryable_and_dead_letters_exhausted_messages() {
         skip_without_db!(pool);
 

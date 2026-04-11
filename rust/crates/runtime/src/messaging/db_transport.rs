@@ -220,13 +220,17 @@ impl DatabaseTransport {
         Ok(result.rows_affected())
     }
 
-    /// Delete all messages older than the given duration.
+    /// Delete terminal messages older than the given duration.
     pub async fn cleanup_older_than(&self, max_age: Duration) -> Result<u64, sqlx::Error> {
         let cutoff_ms = chrono::Utc::now().timestamp_millis() - max_age.as_millis() as i64;
-        let result = query("DELETE FROM agent_message_queue WHERE timestamp_ms < ?")
-            .bind(cutoff_ms)
-            .execute(&self.pool)
-            .await?;
+        let result = query(
+            "DELETE FROM agent_message_queue
+             WHERE timestamp_ms < ?
+               AND status IN ('acked', 'failed')",
+        )
+        .bind(cutoff_ms)
+        .execute(&self.pool)
+        .await?;
         Ok(result.rows_affected())
     }
 
@@ -1043,8 +1047,7 @@ impl MessageStream for DatabaseMessageStream {
 /// Default cleanup interval.
 const DEFAULT_CLEANUP_INTERVAL: Duration = Duration::from_secs(300); // 5 minutes
 
-/// Default max message age for cleanup (messages older than this are removed
-/// regardless of TTL).
+/// Default max message age for cleanup of terminal rows.
 const DEFAULT_MAX_AGE: Duration = Duration::from_secs(3600); // 1 hour
 
 /// Periodic background task that cleans up expired and old messages.
@@ -1058,7 +1061,7 @@ impl CleanupScheduler {
     /// Start a cleanup scheduler for the given transport.
     ///
     /// - `cleanup_interval`: how often to run cleanup (default 5 minutes)
-    /// - `max_age`: delete messages older than this regardless of TTL (default 1 hour)
+    /// - `max_age`: delete terminal messages older than this regardless of TTL (default 1 hour)
     pub fn start(
         transport: &DatabaseTransport,
         cleanup_interval: Option<Duration>,
@@ -1122,12 +1125,16 @@ impl CleanupScheduler {
                     }
                 }
 
-                // 2. Cleanup old messages (regardless of TTL).
+                // 2. Cleanup old terminal messages (regardless of TTL).
                 let cutoff_ms = now_ms - age.as_millis() as i64;
-                match query("DELETE FROM agent_message_queue WHERE timestamp_ms < ?")
-                    .bind(cutoff_ms)
-                    .execute(&pool)
-                    .await
+                match query(
+                    "DELETE FROM agent_message_queue
+                     WHERE timestamp_ms < ?
+                       AND status IN ('acked', 'failed')",
+                )
+                .bind(cutoff_ms)
+                .execute(&pool)
+                .await
                 {
                     Ok(result) => {
                         let n = result.rows_affected();
