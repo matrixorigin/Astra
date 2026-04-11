@@ -499,18 +499,6 @@ impl DelegationTracker {
         let delegation_id = record.delegation_id.clone();
         let agent_id = record.agent_id.clone();
 
-        // Persist to journal before updating in-memory state
-        self.persist_event(
-            astra_services::session_journal::JournalEventType::DelegationStarted,
-            serde_json::json!({
-                "delegation_id": &delegation_id,
-                "run_id": &run_id,
-                "parent_run_id": &parent_id,
-                "agent_id": &agent_id,
-                "depth": record.depth,
-            }),
-        );
-
         // Emit SSE event for web clients
         if let Some(ref broadcaster) = self.progress_broadcaster {
             use crate::orchestration::{AgentProgressEvent, ProgressEventType};
@@ -756,7 +744,25 @@ impl DelegationTracker {
                     // Capture values before releasing the lock
                     let delegation_id = record.delegation_id.clone();
                     let agent_id = record.agent_id.clone();
+                    let parent_run_id = record.parent_run_id.clone();
+                    let depth = record.depth;
+                    let retry_of = record.retry_of.clone();
                     drop(delegations);
+
+                    if new_state == SubRunState::Running {
+                        self.persist_event(
+                            astra_services::session_journal::JournalEventType::DelegationSubRunStarted,
+                            serde_json::json!({
+                                "delegation_id": delegation_id,
+                                "sub_run_id": run_id,
+                                "parent_run_id": parent_run_id,
+                                "agent_id": agent_id,
+                                "status": new_state.as_str(),
+                                "depth": depth,
+                                "retry_of": retry_of,
+                            }),
+                        );
+                    }
 
                     // Update progress tracking
                     self.update_progress(&delegation_id, &agent_id, new_state)
@@ -4024,6 +4030,58 @@ mod tests {
         assert_eq!(meta["agent_id"], "coder");
         assert_eq!(meta["attempt"], 2);
         assert_eq!(meta["reason"], "fail #1");
+
+        let _ = std::fs::remove_file(journal_path);
+        let _ = std::fs::remove_dir_all(sessions_dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tracker_running_transition_writes_sub_run_started_event() {
+        let sessions_dir = std::env::temp_dir().join(format!(
+            "delegation-engine-subrun-start-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(&sessions_dir);
+        let tracker = DelegationTracker::with_session("sess-subrun-start".into());
+
+        tracker
+            .record_sub_run(SubRunRecord {
+                run_id: "run-1".into(),
+                parent_run_id: "parent-1".into(),
+                delegation_id: "del-1".into(),
+                agent_id: "coder".into(),
+                depth: 1,
+                state: SubRunState::Created,
+                retry_of: Some("run-0".into()),
+            })
+            .await;
+        tracker
+            .transition_state("run-1", SubRunState::Running)
+            .await
+            .unwrap();
+
+        let journal_path = sessions_dir.join("sess-subrun-start.jsonl");
+        let content = std::fs::read_to_string(&journal_path).unwrap();
+        let started_events: Vec<astra_services::session_journal::JournalEvent> = content
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<astra_services::session_journal::JournalEvent>(line).unwrap()
+            })
+            .filter(|evt| {
+                evt.event_type
+                    == astra_services::session_journal::JournalEventType::DelegationSubRunStarted
+            })
+            .collect();
+
+        assert_eq!(started_events.len(), 1);
+        let meta = started_events[0].metadata.as_ref().unwrap();
+        assert_eq!(meta["delegation_id"], "del-1");
+        assert_eq!(meta["sub_run_id"], "run-1");
+        assert_eq!(meta["parent_run_id"], "parent-1");
+        assert_eq!(meta["agent_id"], "coder");
+        assert_eq!(meta["status"], "running");
+        assert_eq!(meta["retry_of"], "run-0");
 
         let _ = std::fs::remove_file(journal_path);
         let _ = std::fs::remove_dir_all(sessions_dir);

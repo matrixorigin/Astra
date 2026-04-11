@@ -1177,6 +1177,8 @@ fn print_watch_snapshot(snapshot: &str) {
 
 fn sub_run_status_icon(status: &str) -> &'static str {
     match status {
+        "created" => "⏳",
+        "running" => "🔄",
         "completed" => "✅",
         "partial" => "🟡",
         "failed" => "❌",
@@ -1277,6 +1279,48 @@ fn load_recent_delegations(session_id: Option<&str>) -> Vec<DelegationHistoryEnt
                     .get("agent_count")
                     .and_then(|value| value.as_u64())
                     .unwrap_or(0) as usize;
+                if entry.status.is_empty() {
+                    entry.status = "running".to_string();
+                }
+            }
+            JournalEventType::DelegationSubRunStarted => {
+                let sub_run_id = metadata
+                    .get("sub_run_id")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let started = DelegationSubRunSummary {
+                    sub_run_id: sub_run_id.clone(),
+                    agent_id: metadata
+                        .get("agent_id")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("?")
+                        .to_string(),
+                    status: metadata
+                        .get("status")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("running")
+                        .to_string(),
+                    retry_of: metadata
+                        .get("retry_of")
+                        .and_then(|value| value.as_str())
+                        .map(str::to_string),
+                    attempt: 1,
+                    retry_reason: None,
+                    error: None,
+                    output_preview: None,
+                };
+                if let Some(existing) = entry
+                    .sub_runs
+                    .iter_mut()
+                    .find(|existing| existing.sub_run_id == sub_run_id)
+                {
+                    existing.agent_id = started.agent_id;
+                    existing.status = started.status;
+                    existing.retry_of = started.retry_of;
+                } else {
+                    entry.sub_runs.push(started);
+                }
                 if entry.status.is_empty() {
                     entry.status = "running".to_string();
                 }
@@ -1477,6 +1521,25 @@ fn format_delegation_event_brief(event: &session_journal::JournalEvent) -> Optio
             Some(format!(
                 "[{}] ▶ started {} ({} agents)",
                 event.ts, pattern, count
+            ))
+        }
+        JournalEventType::DelegationSubRunStarted => {
+            let agent_id = metadata
+                .get("agent_id")
+                .and_then(|value| value.as_str())
+                .unwrap_or("?");
+            let sub_run_id = metadata
+                .get("sub_run_id")
+                .and_then(|value| value.as_str())
+                .unwrap_or("?");
+            let retry_suffix = metadata
+                .get("retry_of")
+                .and_then(|value| value.as_str())
+                .map(|retry_of| format!(" (retry of {})", retry_of))
+                .unwrap_or_default();
+            Some(format!(
+                "[{}] ↳ {} running {}{}",
+                event.ts, agent_id, sub_run_id, retry_suffix
             ))
         }
         JournalEventType::DelegationRetry => {
@@ -1935,6 +1998,40 @@ mod tests {
     }
 
     #[test]
+    fn load_recent_delegations_includes_running_subruns() {
+        let sid = format!("slash-agent-running-test-{}", uuid::Uuid::new_v4());
+        let writer = session_journal::JournalWriter::new(&sid).unwrap();
+        writer
+            .append(&JournalEvent::delegation_started(
+                Some(&sid),
+                "del-live",
+                "run-parent",
+                "fan_out",
+                &["coder".to_string()],
+            ))
+            .unwrap();
+        writer
+            .append(&JournalEvent::delegation_sub_run_started(
+                Some(&sid),
+                "del-live",
+                "run-1",
+                "run-parent",
+                "coder",
+                "running",
+                1,
+                None,
+            ))
+            .unwrap();
+
+        let delegations = load_recent_delegations(Some(&sid));
+        assert_eq!(delegations.len(), 1);
+        assert_eq!(delegations[0].status, "running");
+        assert_eq!(delegations[0].sub_runs.len(), 1);
+        assert_eq!(delegations[0].sub_runs[0].sub_run_id, "run-1");
+        assert_eq!(delegations[0].sub_runs[0].status, "running");
+    }
+
+    #[test]
     fn render_delegation_tree_includes_parent_and_retry_annotations() {
         let lines = render_delegation_tree(&[DelegationHistoryEntry {
             delegation_id: "del-1".to_string(),
@@ -1971,6 +2068,24 @@ mod tests {
         assert!(lines[1].contains("coder"));
         assert!(lines[2].contains("reviewer"));
         assert!(lines[2].contains("retry #2"));
+    }
+
+    #[test]
+    fn format_delegation_event_brief_formats_sub_run_started() {
+        let event = JournalEvent::delegation_sub_run_started(
+            Some("sid"),
+            "del-1",
+            "run-2",
+            "run-parent",
+            "coder",
+            "running",
+            1,
+            Some("run-1"),
+        );
+        let rendered = format_delegation_event_brief(&event).unwrap();
+        assert!(rendered.contains("coder"));
+        assert!(rendered.contains("run-2"));
+        assert!(rendered.contains("retry of run-1"));
     }
 
     #[test]

@@ -650,6 +650,8 @@ pub enum JournalEventType {
     SyncMarker,
     /// Delegation group started (sub-run group spawned).
     DelegationStarted,
+    /// A single sub-run within a delegation started running.
+    DelegationSubRunStarted,
     /// A single sub-run within a delegation completed.
     DelegationSubRunCompleted,
     /// A sub-run was retried, linking the original run to the new retry run.
@@ -1782,6 +1784,31 @@ impl JournalEvent {
             "pattern": pattern,
             "agent_ids": agent_ids,
             "agent_count": agent_ids.len(),
+        }));
+        evt
+    }
+
+    /// Delegation sub-run started event — emitted when a single sub-run enters running state.
+    #[allow(clippy::too_many_arguments)]
+    pub fn delegation_sub_run_started(
+        session_id: Option<&str>,
+        delegation_id: &str,
+        sub_run_id: &str,
+        parent_run_id: &str,
+        agent_id: &str,
+        status: &str,
+        depth: u32,
+        retry_of: Option<&str>,
+    ) -> Self {
+        let mut evt = Self::base(JournalEventType::DelegationSubRunStarted, session_id);
+        evt.metadata = Some(serde_json::json!({
+            "delegation_id": delegation_id,
+            "sub_run_id": sub_run_id,
+            "parent_run_id": parent_run_id,
+            "agent_id": agent_id,
+            "status": status,
+            "depth": depth,
+            "retry_of": retry_of,
         }));
         evt
     }
@@ -3303,6 +3330,29 @@ mod tests {
         assert_eq!(meta["status"], "completed");
         assert!(meta["error"].is_null());
         assert_eq!(meta["output_preview"], "finished the review");
+    }
+
+    #[test]
+    fn delegation_sub_run_started_event_builder() {
+        let evt = JournalEvent::delegation_sub_run_started(
+            Some("s1"),
+            "del-1",
+            "run-sub-1",
+            "run-parent",
+            "agent-a",
+            "running",
+            2,
+            Some("run-sub-0"),
+        );
+        assert_eq!(evt.event_type, JournalEventType::DelegationSubRunStarted);
+        let meta = evt.metadata.as_ref().unwrap();
+        assert_eq!(meta["delegation_id"], "del-1");
+        assert_eq!(meta["sub_run_id"], "run-sub-1");
+        assert_eq!(meta["parent_run_id"], "run-parent");
+        assert_eq!(meta["agent_id"], "agent-a");
+        assert_eq!(meta["status"], "running");
+        assert_eq!(meta["depth"], 2);
+        assert_eq!(meta["retry_of"], "run-sub-0");
     }
 
     #[test]

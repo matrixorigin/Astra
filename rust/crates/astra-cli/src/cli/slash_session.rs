@@ -761,6 +761,30 @@ pub(super) fn handle_session_command(arg: &str, state: &mut ReplState) {
                                     count,
                                 );
                             }
+                            session_journal::JournalEventType::DelegationSubRunStarted => {
+                                let meta = evt.metadata.as_ref();
+                                let agent = meta
+                                    .and_then(|m| m.get("agent_id"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("?");
+                                let run = meta
+                                    .and_then(|m| m.get("sub_run_id"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("?");
+                                let retry_of = meta
+                                    .and_then(|m| m.get("retry_of"))
+                                    .and_then(|v| v.as_str())
+                                    .map(|run_id| format!(" (retry of {run_id})"))
+                                    .unwrap_or_default();
+                                eprintln!(
+                                    "  {} {} sub-run {} started {}{}",
+                                    ts_short.dim(),
+                                    "↳".cyan(),
+                                    agent,
+                                    run.dim(),
+                                    retry_of.dim(),
+                                );
+                            }
                             session_journal::JournalEventType::DelegationSubRunCompleted => {
                                 let meta = evt.metadata.as_ref();
                                 let agent = evt
