@@ -2,6 +2,7 @@
 use super::*;
 
 /// Handle `/learn` command — show learning insights, drift detection, exploration.
+#[allow(deprecated)]
 pub(super) fn handle_learn_command(arg: &str, state: &ReplState) {
     use astra_runtime::pipeline::pattern::ExplorationReason;
 
