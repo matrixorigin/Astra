@@ -32,8 +32,8 @@ use super::headless_tool_stderr_lines::{
     headless_stderr_cache_hit_line, headless_stderr_error_preview_line,
     headless_stderr_resource_limit_blocked, headless_stderr_resource_limit_in_output,
     headless_stderr_tool_error_detail_line, headless_stderr_tool_error_line,
-    headless_stderr_tool_ok_line,
-    headless_stderr_unknown_tool_detail, headless_stderr_unknown_tool_header,
+    headless_stderr_tool_ok_line, headless_stderr_unknown_tool_detail,
+    headless_stderr_unknown_tool_header,
 };
 use super::hydrate_reflect::hydrate_reflect_placeholder_if_needed;
 use super::tool_result_sanitize::tool_result_content_for_model;

@@ -960,11 +960,7 @@ impl RuntimeConfig {
             expand_on_drift,
             expand_on_correction,
         } = memory_pressure;
-        merge_if_non_default(
-            &mut self.memory_pressure.adaptive,
-            adaptive,
-            default_true(),
-        );
+        merge_if_non_default(&mut self.memory_pressure.adaptive, adaptive, default_true());
         merge_if_non_default(
             &mut self.memory_pressure.retrieval_min,
             retrieval_min,
@@ -999,11 +995,7 @@ impl RuntimeConfig {
             remaining_turn_factor,
             error_recovery_reserve,
         } = context_window;
-        merge_if_non_default(
-            &mut self.context_window.adaptive,
-            adaptive,
-            default_true(),
-        );
+        merge_if_non_default(&mut self.context_window.adaptive, adaptive, default_true());
         merge_if_non_default(
             &mut self.context_window.dynamic_compression,
             dynamic_compression,

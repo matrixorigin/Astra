@@ -100,7 +100,12 @@ mod tests {
     #[test]
     fn ok_line_with_detail_and_summary() {
         assert_eq!(
-            headless_stderr_tool_ok_line("read_file", "0ms", Some("src/main.rs:1-20"), Some("20 lines")),
+            headless_stderr_tool_ok_line(
+                "read_file",
+                "0ms",
+                Some("src/main.rs:1-20"),
+                Some("20 lines")
+            ),
             "  ✓ Reading: src/main.rs:1-20  20 lines (0ms)"
         );
     }
