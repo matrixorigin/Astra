@@ -9,7 +9,7 @@ use tokio::sync::Mutex as TokioMutex;
 
 use astra_core::{MatrixOneSettings, SharedPool};
 use astra_services::{
-    CloudTransport, DomainAdapter, SyncOrchestrator, SyncPolicy, TaskLeaseHoldCache, TaskRecord,
+    CloudTransport, SyncOrchestrator, SyncPolicy, TaskLeaseHoldCache, TaskRecord,
     event_ingestion::{self, IngestionConfig, IngestionEvent},
     session_journal::JournalEvent,
     state_sync::{MatrixOneSyncService, PlanTemplateSyncRow},
@@ -99,11 +99,10 @@ impl MatrixCloudRuntime {
         let mut orch = SyncOrchestrator::new(transport, user_id.to_string());
         let learning_adapter =
             LearningAdapter::new(entity_graph, pattern_library, calibrator, tool_health);
-        if let Some(v) = cloud_learning_version {
-            let mut env = learning_adapter.envelope();
-            env.mark_pulled(v as u64);
-            learning_adapter.set_envelope(env);
-        }
+        // NOTE: Do NOT mark_pulled without actually fetching and merging data.
+        // The cloud_learning_version hint is ignored here; proper sync should
+        // happen via the orchestrator's pull cycle after initialization.
+        let _ = cloud_learning_version; // suppress unused warning
         orch.register(Box::new(learning_adapter), SyncPolicy::learning());
 
         let preference_store = Arc::new(Mutex::new(BTreeMap::new()));

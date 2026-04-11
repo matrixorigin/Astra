@@ -2192,7 +2192,7 @@ impl ToolExecutor {
 
         // Track iteration deltas — reset if command changed
         let delta = {
-            let mut tracker = self.build_test_tracker.lock().unwrap();
+            let mut tracker = self.build_test_tracker.lock().unwrap_or_else(|e| e.into_inner());
             if tracker.command_changed(command) {
                 tracker.reset();
             }

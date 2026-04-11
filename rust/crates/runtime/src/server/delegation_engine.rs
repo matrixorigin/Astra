@@ -868,25 +868,19 @@ impl DelegationTracker {
         let records = self.get_sub_runs(delegation_id).await;
         let run_ids: Vec<String> = records.iter().map(|r| r.run_id.clone()).collect();
 
-        // Remove pause flags
-        let mut flags = self.pause_flags.write().await;
-        for rid in &run_ids {
-            flags.remove(rid);
-        }
-        drop(flags);
-
-        // Remove parent mappings
+        // Acquire locks in consistent order: delegations → parents → pause_flags → progress
+        // (same order as load_from_run_records to prevent deadlock)
+        let mut delegations = self.delegations.write().await;
         let mut parents = self.parents.write().await;
+        let mut pause_flags = self.pause_flags.write().await;
+        let mut progress_map = self.progress.write().await;
+
+        delegations.remove(delegation_id);
         for rid in &run_ids {
             parents.remove(rid);
+            pause_flags.remove(rid);
         }
-        drop(parents);
-
-        // Remove delegation records
-        self.delegations.write().await.remove(delegation_id);
-
-        // Remove progress
-        self.progress.write().await.remove(delegation_id);
+        progress_map.remove(delegation_id);
     }
 
     /// Get the full retry chain for a run: [original, retry1, retry2, ...]
