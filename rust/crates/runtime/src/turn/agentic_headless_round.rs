@@ -184,9 +184,23 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
         let count = call_counts.entry(call_sig.clone()).or_insert(0);
         *count += 1;
         if *count > MAX_IDENTICAL_CALLS {
-            let (tool_msg, tr) = headless_openai_duplicate_within_turn_pair(&id, &name);
-            messages.push(tool_msg);
-            tool_results.push(tr);
+            // Hard cap: return cached result if available, otherwise short stub.
+            let idem_key = IdempotencyKey::semantic(&name, &args);
+            if let Some(cached) = idempotency_cache.check(&idem_key) {
+                let body = format!(
+                    "{}\n\n⛔ This is a cached repeat (call #{} for identical args). \
+                     Do NOT call this tool again with the same arguments.",
+                    cached.output, *count
+                );
+                let (tool_msg, tr) =
+                    headless_idempotency_hit_openai_pair(&id, &name, &body);
+                messages.push(tool_msg);
+                tool_results.push(tr);
+            } else {
+                let (tool_msg, tr) = headless_openai_duplicate_within_turn_pair(&id, &name);
+                messages.push(tool_msg);
+                tool_results.push(tr);
+            }
             tool_call_records.push(journal_record_duplicate_within_turn(
                 name.clone(),
                 make_args_preview(&name, &args),
