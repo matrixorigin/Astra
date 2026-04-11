@@ -225,7 +225,7 @@ mod tests {
     // ── TTL Expiry ──────────────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn expired_messages_not_delivered() {
+    async fn expired_direct_messages_are_marked_failed() {
         skip_without_db!(pool);
 
         let transport =
@@ -247,6 +247,7 @@ mod tests {
             },
         )
         .with_ttl(Duration::ZERO);
+        let expired_message_id = msg.id.clone();
 
         transport.send(Arc::new(msg)).await.unwrap();
 
@@ -275,6 +276,88 @@ mod tests {
             }
             _ => panic!("unexpected payload"),
         }
+
+        let status = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let row =
+                    sqlx::query("SELECT status FROM agent_message_queue WHERE message_id = ?")
+                        .bind(&expired_message_id)
+                        .fetch_one(&pool)
+                        .await
+                        .unwrap();
+                let status: String = row.try_get("status").unwrap();
+                if status == "failed" {
+                    break status;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("expired direct message should eventually be dead-lettered");
+
+        assert_eq!(status, "failed");
+
+        cleanup(&pool).await;
+    }
+
+    #[tokio::test]
+    async fn invalid_direct_payloads_are_marked_failed() {
+        skip_without_db!(pool);
+
+        let transport =
+            DatabaseTransport::new(pool.clone()).with_poll_interval(Duration::from_millis(50));
+
+        let sender = addr("run-db-bad-json-a", "alice");
+        let receiver = addr("run-db-bad-json-b", "bob");
+
+        transport.register(sender.clone(), None).await.unwrap();
+        transport.register(receiver.clone(), None).await.unwrap();
+
+        let mut stream_b = transport.subscribe(&receiver).await.unwrap();
+        let message_id = "test-invalid-direct-json";
+
+        sqlx::query(
+            "INSERT INTO agent_message_queue
+             (message_id, from_run_id, from_agent_id, to_run_id, to_agent_id,
+              delegation_id, is_broadcast, payload_json, timestamp_ms, ttl_ms)
+             VALUES (?, ?, ?, ?, ?, NULL, FALSE, ?, ?, NULL)",
+        )
+        .bind(message_id)
+        .bind(&sender.run_id)
+        .bind(&sender.agent_id)
+        .bind(&receiver.run_id)
+        .bind(&receiver.agent_id)
+        .bind("{not-valid-json")
+        .bind(chrono::Utc::now().timestamp_millis())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let receive = tokio::time::timeout(Duration::from_millis(300), stream_b.recv()).await;
+        assert!(
+            receive.is_err(),
+            "invalid direct payload should not be delivered"
+        );
+
+        let status = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let row =
+                    sqlx::query("SELECT status FROM agent_message_queue WHERE message_id = ?")
+                        .bind(message_id)
+                        .fetch_one(&pool)
+                        .await
+                        .unwrap();
+                let status: String = row.try_get("status").unwrap();
+                if status == "failed" {
+                    break status;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("invalid direct payload should eventually be dead-lettered");
+
+        assert_eq!(status, "failed");
 
         cleanup(&pool).await;
     }
