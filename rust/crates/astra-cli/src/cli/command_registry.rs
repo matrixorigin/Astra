@@ -146,6 +146,7 @@ const SKILL_SUBCOMMANDS: &[(&str, &str)] = &[
     ("browse", "Browse marketplace"),
     ("create", "Generate skill from session"),
     ("dev", "Skill dev mode"),
+    ("feedback", "Record user feedback (+/-)"),
     ("health", "Skill catalog health"),
     ("info", "Skill details"),
     ("install", "Install from marketplace"),

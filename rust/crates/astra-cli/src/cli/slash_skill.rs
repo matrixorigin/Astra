@@ -218,6 +218,11 @@ pub(super) async fn handle_skill_command(
             );
             eprintln!(
                 "    {}  {}",
+                "/skill feedback <name> +/-".cyan(),
+                "Record user feedback".dim()
+            );
+            eprintln!(
+                "    {}  {}",
                 "/skill pin/unpin <name>".cyan(),
                 "Pin/unpin for priority".dim()
             );
@@ -1395,6 +1400,45 @@ Follow these steps:
         "create" => {
             // Auto-generate a skill from the current session transcript
             create_skill_from_session(sub_arg, state).await?;
+        }
+
+        "feedback" => {
+            // Parse: <skill_name> +/- or <skill_name> up/down or <skill_name> thumbs_up/thumbs_down
+            let parts: Vec<&str> = sub_arg.split_whitespace().collect();
+            if parts.len() < 2 {
+                eprintln!(
+                    "  {} Usage: /skill feedback <skill_name> +/-",
+                    "⚠".yellow()
+                );
+                eprintln!("  Examples:");
+                eprintln!("    /skill feedback pdf +     {} thumbs up", "—".dim());
+                eprintln!("    /skill feedback pdf -     {} thumbs down", "—".dim());
+                return Ok(());
+            }
+            let skill_name = parts[0];
+            let positive = match parts[1] {
+                "+" | "+1" | "up" | "thumbs_up" | "good" | "yes" => true,
+                "-" | "-1" | "down" | "thumbs_down" | "bad" | "no" => false,
+                other => {
+                    eprintln!(
+                        "  {} Unknown feedback type: {}",
+                        "✗".red(),
+                        other.yellow()
+                    );
+                    eprintln!("  Use + (positive) or - (negative)");
+                    return Ok(());
+                }
+            };
+            // Record feedback via the quality tracker
+            state.skill_quality_tracker.record_feedback(skill_name, positive);
+            let emoji = if positive { "👍" } else { "👎" };
+            let word = if positive { "positive" } else { "negative" };
+            eprintln!(
+                "  {} Recorded {} feedback for skill '{}'",
+                emoji,
+                word.cyan(),
+                skill_name.green()
+            );
         }
 
         _ => {
