@@ -51,7 +51,7 @@
 //! ```
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -140,6 +140,9 @@ pub struct DatabaseTransport {
     shutdown_rx: watch::Receiver<bool>,
     /// Observable metrics.
     metrics: Arc<TransportMetrics>,
+    /// Lazily started maintenance task for reclaiming stale claims and pruning
+    /// expired rows.
+    cleanup_scheduler: Mutex<Option<CleanupScheduler>>,
 }
 
 /// Default visibility timeout (how long before an unclaimed message reappears).
@@ -163,6 +166,7 @@ impl DatabaseTransport {
             shutdown_tx,
             shutdown_rx,
             metrics: Arc::new(TransportMetrics::default()),
+            cleanup_scheduler: Mutex::new(None),
         }
     }
 
@@ -187,6 +191,16 @@ impl DatabaseTransport {
     /// Get the underlying pool (for tests / diagnostics).
     pub fn pool(&self) -> &Pool<MySql> {
         &self.pool
+    }
+
+    fn ensure_cleanup_scheduler_started(&self) {
+        let mut scheduler = match self.cleanup_scheduler.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if scheduler.is_none() {
+            *scheduler = Some(CleanupScheduler::start(self, None, None));
+        }
     }
 
     /// Delete expired messages from the queue.
@@ -255,47 +269,12 @@ impl DatabaseTransport {
     ///
     /// This is called periodically to handle crashed consumers.
     pub async fn reclaim_stale(&self) -> Result<u64, MailboxError> {
-        let cutoff_ms =
-            chrono::Utc::now().timestamp_millis() - self.visibility_timeout.as_millis() as i64;
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| MailboxError::Transport(format!("reclaim begin: {e}")))?;
-
-        // Messages under max attempts: set back to 'pending' for re-delivery.
-        let reclaimed = query(
-            "UPDATE agent_message_queue
-             SET status = 'pending', claimed_by = NULL, claimed_at_ms = NULL
-             WHERE status = 'claimed'
-               AND claimed_at_ms < ?
-               AND attempt_count < ?",
+        reclaim_stale_in_pool(
+            &self.pool,
+            self.visibility_timeout,
+            self.max_delivery_attempts,
         )
-        .bind(cutoff_ms)
-        .bind(self.max_delivery_attempts as i64)
-        .execute(&mut *tx)
         .await
-        .map_err(|e| MailboxError::Transport(format!("reclaim: {e}")))?;
-
-        // Messages over max attempts: mark as 'failed' (dead letter).
-        query(
-            "UPDATE agent_message_queue
-              SET status = 'failed'
-              WHERE status = 'claimed'
-                AND claimed_at_ms < ?
-                AND attempt_count >= ?",
-        )
-        .bind(cutoff_ms)
-        .bind(self.max_delivery_attempts as i64)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| MailboxError::Transport(format!("reclaim dead-letter: {e}")))?;
-
-        tx.commit()
-            .await
-            .map_err(|e| MailboxError::Transport(format!("reclaim commit: {e}")))?;
-
-        Ok(reclaimed.rows_affected())
     }
 
     /// Count messages in each status (for diagnostics).
@@ -372,6 +351,7 @@ impl MessageTransport for DatabaseTransport {
         delegation_id: Option<String>,
     ) -> Result<(), MailboxError> {
         self.registrations.write().await.insert(addr, delegation_id);
+        self.ensure_cleanup_scheduler_started();
         Ok(())
     }
 
@@ -996,18 +976,40 @@ impl CleanupScheduler {
         max_age: Option<Duration>,
     ) -> Self {
         let pool = transport.pool.clone();
-        let interval = cleanup_interval.unwrap_or(DEFAULT_CLEANUP_INTERVAL);
+        let cleanup_every = cleanup_interval.unwrap_or(DEFAULT_CLEANUP_INTERVAL);
+        let reclaim_every = std::cmp::max(transport.visibility_timeout, Duration::from_millis(1));
+        let tick_every = std::cmp::min(cleanup_every, reclaim_every);
         let age = max_age.unwrap_or(DEFAULT_MAX_AGE);
+        let visibility_timeout = transport.visibility_timeout;
+        let max_delivery_attempts = transport.max_delivery_attempts;
         let mut shutdown_rx = transport.shutdown_rx.clone();
 
         let task = tokio::spawn(async move {
+            let mut last_cleanup = tokio::time::Instant::now();
             loop {
                 tokio::select! {
-                    _ = tokio::time::sleep(interval) => {}
+                    _ = tokio::time::sleep(tick_every) => {}
                     _ = shutdown_rx.changed() => {
                         break;
                     }
                 }
+
+                match reclaim_stale_in_pool(&pool, visibility_timeout, max_delivery_attempts).await
+                {
+                    Ok(n) => {
+                        if n > 0 {
+                            eprintln!("  ℹ messaging: reclaimed {n} stale claimed messages");
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("  ⚠ messaging: reclaim_stale error: {e}");
+                    }
+                }
+
+                if last_cleanup.elapsed() < cleanup_every {
+                    continue;
+                }
+                last_cleanup = tokio::time::Instant::now();
 
                 // 1. Cleanup TTL-expired messages.
                 let now_ms = chrono::Utc::now().timestamp_millis();
@@ -1058,6 +1060,50 @@ impl CleanupScheduler {
             _task: AbortOnDrop(task),
         }
     }
+}
+
+async fn reclaim_stale_in_pool(
+    pool: &Pool<MySql>,
+    visibility_timeout: Duration,
+    max_delivery_attempts: u32,
+) -> Result<u64, MailboxError> {
+    let cutoff_ms = chrono::Utc::now().timestamp_millis() - visibility_timeout.as_millis() as i64;
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| MailboxError::Transport(format!("reclaim begin: {e}")))?;
+
+    let reclaimed = query(
+        "UPDATE agent_message_queue
+         SET status = 'pending', claimed_by = NULL, claimed_at_ms = NULL
+         WHERE status = 'claimed'
+           AND claimed_at_ms < ?
+           AND attempt_count < ?",
+    )
+    .bind(cutoff_ms)
+    .bind(max_delivery_attempts as i64)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| MailboxError::Transport(format!("reclaim: {e}")))?;
+
+    query(
+        "UPDATE agent_message_queue
+           SET status = 'failed', claimed_by = NULL, claimed_at_ms = NULL
+           WHERE status = 'claimed'
+             AND claimed_at_ms < ?
+             AND attempt_count >= ?",
+    )
+    .bind(cutoff_ms)
+    .bind(max_delivery_attempts as i64)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| MailboxError::Transport(format!("reclaim dead-letter: {e}")))?;
+
+    tx.commit()
+        .await
+        .map_err(|e| MailboxError::Transport(format!("reclaim commit: {e}")))?;
+
+    Ok(reclaimed.rows_affected())
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────

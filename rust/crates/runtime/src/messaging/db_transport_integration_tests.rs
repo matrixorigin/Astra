@@ -625,7 +625,71 @@ mod tests {
 
         let exhausted_state = by_id.get(&exhausted_msg.id).expect("exhausted message row");
         assert_eq!(exhausted_state.0, "failed");
+        assert!(exhausted_state.1.is_none());
+        assert!(exhausted_state.2.is_none());
 
+        cleanup(&pool).await;
+    }
+
+    #[tokio::test]
+    async fn register_starts_cleanup_scheduler_and_reclaims_stale_claims() {
+        skip_without_db!(pool);
+
+        let transport = DatabaseTransport::new(pool.clone())
+            .with_visibility_timeout(Duration::from_millis(50))
+            .with_max_delivery_attempts(3);
+
+        let sender = addr("run-db-auto-reclaim-a", "alice");
+        let receiver = addr("run-db-auto-reclaim-b", "bob");
+
+        transport.register(sender.clone(), None).await.unwrap();
+        transport.register(receiver.clone(), None).await.unwrap();
+
+        let msg = Arc::new(AgentMessage::new(
+            sender,
+            MessageTarget::Direct {
+                address: receiver.clone(),
+            },
+            MessagePayload::Text {
+                content: "auto reclaim me".into(),
+                summary: None,
+            },
+        ));
+        transport.send(msg.clone()).await.unwrap();
+
+        let stale_claimed_at = chrono::Utc::now().timestamp_millis() - 60_000;
+        sqlx::query(
+            "UPDATE agent_message_queue
+             SET status = 'claimed', claimed_by = 'it-consumer', claimed_at_ms = ?, attempt_count = 1
+             WHERE message_id = ?",
+        )
+        .bind(stale_claimed_at)
+        .bind(&msg.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(180)).await;
+
+        let row = sqlx::query(
+            "SELECT status, claimed_by, claimed_at_ms
+             FROM agent_message_queue
+             WHERE message_id = ?",
+        )
+        .bind(&msg.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let status: String = row.try_get("status").unwrap();
+        let claimed_by: Option<String> = row.try_get("claimed_by").unwrap();
+        let claimed_at_ms: Option<i64> = row.try_get("claimed_at_ms").unwrap();
+
+        assert_eq!(status, "pending");
+        assert!(claimed_by.is_none());
+        assert!(claimed_at_ms.is_none());
+
+        transport.shutdown().await.unwrap();
         cleanup(&pool).await;
     }
 
