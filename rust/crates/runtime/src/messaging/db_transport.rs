@@ -555,6 +555,35 @@ async fn poll_loop(
                                 None
                             }
                         };
+                        if row_id.is_none() {
+                            metrics
+                                .messages_dropped
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            match mark_direct_failed_by_identity(
+                                &pool,
+                                None,
+                                message_id.as_deref(),
+                                &consumer_id,
+                            )
+                            .await
+                            {
+                                Ok(()) => continue,
+                                Err(e) => {
+                                    had_error = true;
+                                    metrics
+                                        .poll_errors
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    eprintln!(
+                                        "  ⚠ messaging: failed to dead-letter direct row without id (message_id: {}) for {}@{}: {:?}",
+                                        message_id.as_deref().unwrap_or("<unavailable>"),
+                                        addr.agent_id,
+                                        addr.run_id,
+                                        e
+                                    );
+                                    break;
+                                }
+                            }
+                        }
                         let json: String = match row.try_get("payload_json") {
                             Ok(j) => j,
                             Err(_) => {
@@ -892,7 +921,7 @@ async fn mark_direct_failed_by_message_id(
     Ok(())
 }
 
-async fn mark_direct_failed_by_identity(
+pub(super) async fn mark_direct_failed_by_identity(
     pool: &Pool<MySql>,
     row_id: Option<i64>,
     message_id: Option<&str>,

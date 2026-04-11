@@ -14,7 +14,9 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use crate::messaging::db_transport::{DatabaseTransport, ensure_schema};
+    use crate::messaging::db_transport::{
+        DatabaseTransport, ensure_schema, mark_direct_failed_by_identity,
+    };
     use crate::messaging::transport::MessageTransport;
     use crate::messaging::types::*;
     use sqlx::Row;
@@ -358,6 +360,69 @@ mod tests {
         .expect("invalid direct payload should eventually be dead-lettered");
 
         assert_eq!(status, "failed");
+
+        cleanup(&pool).await;
+    }
+
+    #[tokio::test]
+    async fn direct_failure_identity_falls_back_to_message_id() {
+        skip_without_db!(pool);
+
+        let transport =
+            DatabaseTransport::new(pool.clone()).with_poll_interval(Duration::from_millis(50));
+
+        let sender = addr("run-db-rowid-fallback-a", "alice");
+        let receiver = addr("run-db-rowid-fallback-b", "bob");
+
+        transport.register(sender.clone(), None).await.unwrap();
+        transport.register(receiver.clone(), None).await.unwrap();
+
+        let msg = Arc::new(AgentMessage::new(
+            sender.clone(),
+            MessageTarget::Direct {
+                address: receiver.clone(),
+            },
+            MessagePayload::Text {
+                content: "fallback".into(),
+                summary: None,
+            },
+        ));
+        let message_id = msg.id.clone();
+        transport.send(msg).await.unwrap();
+
+        let claimed_by = format!("{}@{}", receiver.run_id, receiver.agent_id);
+        sqlx::query(
+            "UPDATE agent_message_queue
+             SET status = 'claimed', claimed_by = ?, claimed_at_ms = ?
+             WHERE message_id = ?",
+        )
+        .bind(&claimed_by)
+        .bind(chrono::Utc::now().timestamp_millis())
+        .bind(&message_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        mark_direct_failed_by_identity(&pool, None, Some(&message_id), &claimed_by)
+            .await
+            .unwrap();
+
+        let row = sqlx::query(
+            "SELECT status, claimed_by, claimed_at_ms
+             FROM agent_message_queue
+             WHERE message_id = ?",
+        )
+        .bind(&message_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let status: String = row.try_get("status").unwrap();
+        let claimed_by_after: Option<String> = row.try_get("claimed_by").unwrap();
+        let claimed_at_ms_after: Option<i64> = row.try_get("claimed_at_ms").unwrap();
+
+        assert_eq!(status, "failed");
+        assert!(claimed_by_after.is_none());
+        assert!(claimed_at_ms_after.is_none());
 
         cleanup(&pool).await;
     }
