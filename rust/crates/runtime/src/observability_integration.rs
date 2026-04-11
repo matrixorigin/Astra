@@ -1174,4 +1174,61 @@ mod tests {
         assert!(storage_root.join("profiles.json").exists());
         assert!(!storage_root.join("adaptive-baselines.json").exists());
     }
+
+    #[test]
+    fn on_context_assembled_populates_session_traces() {
+        let hub = ObservabilityHub::new();
+        let session = hub.start_session("u1", "s1");
+        {
+            let guard = session.read().unwrap();
+            assert!(guard.context_traces.is_empty());
+        }
+
+        let trace = crate::turn::context_assembly_trace::ContextAssemblyTrace {
+            turn_id: "turn-0".into(),
+            session_id: "s1".into(),
+            token_budget: crate::turn::context_assembly_trace::TokenBudgetTrace {
+                max_tokens: 128_000,
+                system_prompt_tokens: 14_000,
+                history_tokens: 5_000,
+                tool_schema_tokens: 3_000,
+                user_message_tokens: 200,
+                total_used: 22_200,
+                budget_pressure: 0.17,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        {
+            let mut guard = session.write().unwrap();
+            on_context_assembled(&mut guard, trace);
+        }
+
+        let guard = session.read().unwrap();
+        assert_eq!(guard.context_traces.len(), 1);
+        assert_eq!(guard.context_traces[0].turn_id, "turn-0");
+        assert_eq!(guard.context_traces[0].token_budget.system_prompt_tokens, 14_000);
+        assert_eq!(guard.context_traces[0].token_budget.total_used, 22_200);
+    }
+
+    #[test]
+    fn on_context_assembled_accumulates_multiple_turns() {
+        let hub = ObservabilityHub::new();
+        let session = hub.start_session("u1", "s1");
+
+        for i in 0..3 {
+            let trace = crate::turn::context_assembly_trace::ContextAssemblyTrace {
+                turn_id: format!("turn-{i}"),
+                session_id: "s1".into(),
+                ..Default::default()
+            };
+            let mut guard = session.write().unwrap();
+            on_context_assembled(&mut guard, trace);
+        }
+
+        let guard = session.read().unwrap();
+        assert_eq!(guard.context_traces.len(), 3);
+        assert_eq!(guard.context_traces[2].turn_id, "turn-2");
+    }
 }

@@ -73,6 +73,20 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
         state: &mut AgenticLoopState,
     ) -> Result<HostTurnResult, String> {
         let assembly_start = Instant::now();
+
+        // Create trace collector for this turn if observability is active.
+        if state.telemetry.observability_session.is_some()
+            && state.telemetry.turn_trace_collector.is_none()
+        {
+            let turn_num = state.max_turns - state.remaining_turns;
+            let turn_id = format!("turn-{turn_num}");
+            let session_id = state.current_session_id.clone().unwrap_or_default();
+            state.telemetry.turn_trace_collector = Some(
+                astra_runtime::turn::turn_trace_collector::TurnTraceCollector::new(
+                    turn_id, session_id,
+                ),
+            );
+        }
         let pre_clear = std::mem::take(&mut self.pending_clear_lines);
 
         // If a skill activation overrode the model, use that; otherwise fall back to host default.
@@ -161,7 +175,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
                 first_budget_pressure: &mut state.telemetry.first_budget_pressure,
                 first_context_assembly_ms: &mut state.telemetry.first_context_assembly_ms,
                 all_selected_skills: &mut state.telemetry.all_selected_skills,
-                trace_collector: None, // TODO: wire from session config when enabled
+                trace_collector: state.telemetry.turn_trace_collector.as_ref(),
             },
             perm_manager: self.perm_manager,
             skill_search: &state.skills.search,

@@ -3684,7 +3684,8 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                 }
 
                 // ─── Finalize turn trace collector ────────────────────────
-                // Persist context assembly trace to session journal (best-effort).
+                // Persist context assembly trace to session journal (best-effort)
+                // and feed to observability session for /telemetry context.
                 if let Some(ref collector) = state.telemetry.turn_trace_collector {
                     // Compute budget pressure from last measured tokens.
                     let measured = state.last_measured_prompt_tokens.unwrap_or(0);
@@ -3712,11 +3713,22 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                             compression_triggered: state.budget_wrapup_injected,
                         },
                     );
-                    // Finalize and persist (errors logged but not propagated).
-                    // Use actual turn number (1-based) instead of loop index.
-                    let turn_number = (state.max_turns - state.remaining_turns) as u32;
-                    if let Err(e) = collector.finalize_and_persist(turn_number) {
-                        eprintln!("trace persist: {e}");
+
+                    // Finalize trace and feed to observability session.
+                    let trace = collector.finalize();
+                    if let Some(ref session) = state.telemetry.observability_session {
+                        let mut guard = session.write().unwrap_or_else(|e| e.into_inner());
+                        crate::observability_integration::on_context_assembled(
+                            &mut guard, trace.clone(),
+                        );
+                    }
+
+                    // Persist to journal (best-effort).
+                    if collector.has_data() {
+                        let turn_number = (state.max_turns - state.remaining_turns) as u32;
+                        if let Err(e) = collector.finalize_and_persist(turn_number) {
+                            eprintln!("trace persist: {e}");
+                        }
                     }
                 }
                 // Clear collector for next turn.

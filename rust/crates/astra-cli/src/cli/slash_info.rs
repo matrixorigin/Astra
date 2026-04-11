@@ -1472,6 +1472,35 @@ pub(super) async fn handle_info_command(
         }
 
         "/context" => {
+            let (sub_cmd, _sub_arg) = match arg.find(char::is_whitespace) {
+                Some(pos) => (arg[..pos].trim(), arg[pos..].trim()),
+                None => (arg.trim(), ""),
+            };
+
+            // /context breakdown — show last turn's actual context assembly trace
+            if sub_cmd == "breakdown" || sub_cmd == "trace" {
+                let session = state.observability_session.as_ref();
+                if let Some(session) = session {
+                    let guard = session.read().unwrap_or_else(|e| e.into_inner());
+                    if guard.context_traces.is_empty() {
+                        eprintln!(
+                            "{}",
+                            "  No context assembly traces yet. Complete a turn first.".yellow()
+                        );
+                    } else {
+                        // Show latest trace
+                        let trace = guard.context_traces.last().unwrap();
+                        print_context_breakdown(trace);
+                    }
+                } else {
+                    eprintln!(
+                        "{}",
+                        "  No observability session active.".yellow()
+                    );
+                }
+                return Ok(());
+            }
+
             let sep = "─".repeat(38);
             eprintln!("\n  {}", format!("─── Context Window {sep}").bold().cyan());
 
@@ -1626,6 +1655,10 @@ pub(super) async fn handle_info_command(
             }
 
             eprintln!("  {}", "─".repeat(56).cyan().dim());
+            eprintln!(
+                "  {}",
+                "Use /context breakdown for last turn's actual token allocation".dim()
+            );
             eprintln!();
         }
 
@@ -1878,6 +1911,102 @@ fn parse_continuation_anchor(anchor: &str) -> ContinuationAnchorParts {
     }
 
     ContinuationAnchorParts { task, direction }
+}
+
+fn print_context_breakdown(trace: &astra_runtime::turn::context_assembly_trace::ContextAssemblyTrace) {
+    eprintln!(
+        "\n{}",
+        format!("─── Context Breakdown — {} ──────────────────", trace.turn_id)
+            .bold()
+            .cyan()
+    );
+
+    let tb = &trace.token_budget;
+    let components: &[(&str, u32)] = &[
+        ("system_prompt", tb.system_prompt_tokens),
+        ("history", tb.history_tokens),
+        ("memory", tb.memory_tokens),
+        ("tool_schemas", tb.tool_schema_tokens),
+        ("user_message", tb.user_message_tokens),
+    ];
+    let max_tok = components.iter().map(|(_, t)| *t).max().unwrap_or(1).max(1);
+    let bar_max = 30;
+
+    eprintln!();
+    for (label, tokens) in components {
+        let bar_len = (*tokens as usize * bar_max) / max_tok as usize;
+        let bar: String = "█".repeat(bar_len.max(if *tokens > 0 { 1 } else { 0 }));
+        let pct = if tb.total_used > 0 {
+            (*tokens as f64 / tb.total_used as f64 * 100.0) as u32
+        } else {
+            0
+        };
+        eprintln!(
+            "  {:<16} {:>6} ({:>2}%) {}",
+            format!("{label}:").dim(),
+            tokens.to_string().cyan(),
+            pct,
+            bar.dim()
+        );
+    }
+
+    let pressure_str = format!("{:.0}%", tb.budget_pressure * 100.0);
+    let pressure_colored = if tb.budget_pressure > 0.9 {
+        pressure_str.red().to_string()
+    } else if tb.budget_pressure > 0.7 {
+        pressure_str.yellow().to_string()
+    } else {
+        pressure_str.green().to_string()
+    };
+    eprintln!(
+        "\n  {:<16} {} / {} ({}{})",
+        "total:".bold().dim(),
+        tb.total_used.to_string().cyan().bold(),
+        tb.max_tokens.to_string().dim(),
+        pressure_colored,
+        if tb.compression_triggered { " compressed" } else { "" }
+    );
+
+    // Skills injected
+    if !trace.system_prompt.skills_injected.is_empty() {
+        eprintln!("\n  {}", "Skills:".bold());
+        for sk in &trace.system_prompt.skills_injected {
+            eprintln!(
+                "    {} {} ({} tok) — {}",
+                "•".dim(),
+                sk.skill_name.clone().cyan(),
+                sk.tokens,
+                sk.selection_reason.clone().dim()
+            );
+        }
+    }
+
+    // Tool selection
+    let ts = &trace.tools;
+    if !ts.tools_selected.is_empty() {
+        eprintln!(
+            "\n  {} {} tools via {} (conf={:.0}%)",
+            "Tools:".bold(),
+            ts.tools_selected.len(),
+            ts.selection_strategy.clone().dim(),
+            ts.selection_confidence * 100.0
+        );
+    }
+
+    // Memory
+    let mem = &trace.memory;
+    if mem.candidates_considered > 0 {
+        eprintln!(
+            "\n  {} {} considered → {} selected ({} tok, {}ms)",
+            "Memory:".bold(),
+            mem.candidates_considered,
+            mem.memories_selected.len(),
+            mem.total_tokens,
+            mem.retrieval_latency_ms
+        );
+    }
+
+    eprintln!();
 }
 
 fn describe_context_pressure(
