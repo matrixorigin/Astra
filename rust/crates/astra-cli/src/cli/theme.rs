@@ -144,12 +144,19 @@ fn active_theme() -> &'static RwLock<ThemeConfig> {
 
 /// Get a clone of the current active theme.
 pub fn current_theme() -> ThemeConfig {
-    active_theme().read().unwrap_or_else(|e| e.into_inner()).clone()
+    active_theme()
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
 }
 
 /// Get the current theme name.
 pub fn current_theme_name() -> String {
-    active_theme().read().unwrap_or_else(|e| e.into_inner()).name.clone()
+    active_theme()
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .name
+        .clone()
 }
 
 /// Set the active theme.

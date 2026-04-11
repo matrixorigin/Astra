@@ -587,7 +587,13 @@ impl StepRecorder {
             caused_by: if self.events.is_empty() {
                 vec![]
             } else {
-                vec![self.events.last().expect("events non-empty").event_id.clone()]
+                vec![
+                    self.events
+                        .last()
+                        .expect("events non-empty")
+                        .event_id
+                        .clone(),
+                ]
             },
             payload: None,
             created_at: epoch_ms(),
@@ -606,7 +612,13 @@ impl StepRecorder {
         let caused_by = if self.events.is_empty() {
             vec![]
         } else {
-            vec![self.events.last().expect("events non-empty").event_id.clone()]
+            vec![
+                self.events
+                    .last()
+                    .expect("events non-empty")
+                    .event_id
+                    .clone(),
+            ]
         };
         let event = StepEvent {
             event_id: format!("evt-{}-{}", self.events.len(), epoch_ms()),

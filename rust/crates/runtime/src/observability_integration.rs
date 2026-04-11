@@ -415,7 +415,10 @@ impl ObservabilityHub {
         user_id: &str,
         session_id: &str,
     ) -> Arc<RwLock<ObservabilitySession>> {
-        let store = self.experiment_store.read().unwrap_or_else(|e| e.into_inner());
+        let store = self
+            .experiment_store
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
         let session =
             ObservabilitySession::new(user_id, session_id, &self.profile_manager, Some(&store));
         let session = Arc::new(RwLock::new(session));
@@ -428,12 +431,20 @@ impl ObservabilityHub {
 
     /// Get an existing session.
     pub fn get_session(&self, session_id: &str) -> Option<Arc<RwLock<ObservabilitySession>>> {
-        self.sessions.read().unwrap_or_else(|e| e.into_inner()).get(session_id).cloned()
+        self.sessions
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(session_id)
+            .cloned()
     }
 
     /// End a session and collect final metrics.
     pub fn end_session(&self, session_id: &str) -> Option<SessionSummary> {
-        let session = self.sessions.write().unwrap_or_else(|e| e.into_inner()).remove(session_id)?;
+        let session = self
+            .sessions
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(session_id)?;
         let session = session.read().unwrap_or_else(|e| e.into_inner());
 
         // Record experiment outcome if active
@@ -452,7 +463,10 @@ impl ObservabilityHub {
                 1.0 - (drift_count as f64 / session.decision_explanations.len() as f64)
             };
 
-            let store = self.experiment_store.read().unwrap_or_else(|e| e.into_inner());
+            let store = self
+                .experiment_store
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
             let outcome = ExperimentOutcome::new(&session.user_id, variant_id)
                 .with_metric("success_rate", success_rate)
                 .with_metric("turns", session.turn_number as f64)
@@ -541,12 +555,16 @@ impl ObservabilityHub {
 
     /// Get the experiment store for management.
     pub fn experiments(&self) -> std::sync::RwLockReadGuard<'_, ExperimentStore> {
-        self.experiment_store.read().unwrap_or_else(|e| e.into_inner())
+        self.experiment_store
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
     }
 
     /// Get mutable experiment store.
     pub fn experiments_mut(&self) -> std::sync::RwLockWriteGuard<'_, ExperimentStore> {
-        self.experiment_store.write().unwrap_or_else(|e| e.into_inner())
+        self.experiment_store
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
     }
 
     /// Get the auto-tuning engine.
@@ -556,12 +574,18 @@ impl ObservabilityHub {
 
     /// Attach the shared pattern library used by the active tool-selection stack.
     pub fn attach_pattern_library(&self, pattern_library: Arc<Mutex<PatternLibrary>>) {
-        *self.pattern_library.write().unwrap_or_else(|e| e.into_inner()) = Some(pattern_library);
+        *self
+            .pattern_library
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = Some(pattern_library);
     }
 
     /// Get the shared pattern library, if one has been attached.
     pub fn pattern_library(&self) -> Option<Arc<Mutex<PatternLibrary>>> {
-        self.pattern_library.read().unwrap_or_else(|e| e.into_inner()).clone()
+        self.pattern_library
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Get the profile manager.
@@ -593,7 +617,10 @@ pub fn on_turn_start(hub: &ObservabilityHub, session_id: &str, user_id: &str, qu
 
     // Record query in session
     if let Some(session) = hub.get_session(session_id) {
-        session.write().unwrap_or_else(|e| e.into_inner()).record_query(query);
+        session
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .record_query(query);
     }
 }
 

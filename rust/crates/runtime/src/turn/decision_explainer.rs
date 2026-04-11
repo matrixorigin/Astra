@@ -717,10 +717,7 @@ impl DriftDetector {
                         query_used: query,
                     }
                 } else if budget_pressure_detected {
-                    if let Some(trace) = budget_traces
-                        .iter()
-                        .find(|t| t.budget_pressure > 0.85)
-                    {
+                    if let Some(trace) = budget_traces.iter().find(|t| t.budget_pressure > 0.85) {
                         DriftCause::TokenBudgetPressure {
                             budget_available: trace.max_tokens.saturating_sub(trace.total_used),
                             budget_needed: trace.total_used,

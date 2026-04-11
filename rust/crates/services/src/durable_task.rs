@@ -1413,7 +1413,10 @@ impl TaskBranchOps for GitBranchOps {
         .await
         .map_err(|e| format!("spawn: {e}"))??;
 
-        self.refs.lock().unwrap_or_else(|e| e.into_inner()).insert(name.clone(), sha);
+        self.refs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(name.clone(), sha);
         Ok(name)
     }
 
@@ -1484,7 +1487,10 @@ impl TaskBranchOps for GitBranchOps {
 
     async fn cleanup_snapshot(&self, snapshot: &str) -> Result<(), String> {
         // Just remove from in-memory map — no disk I/O needed
-        self.refs.lock().unwrap_or_else(|e| e.into_inner()).remove(snapshot);
+        self.refs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(snapshot);
         Ok(())
     }
 }
@@ -4936,11 +4942,11 @@ mod tests {
                 return Err("mock snapshot failure".into());
             }
             let name = sanitize_snapshot_name(&format!("task_{task_id}_{subtask_id}_v{version}"));
-            self.log.lock().unwrap_or_else(|e| e.into_inner()).snapshots_created.push((
-                task_id.into(),
-                subtask_id.into(),
-                version,
-            ));
+            self.log
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .snapshots_created
+                .push((task_id.into(), subtask_id.into(), version));
             Ok(name)
         }
 
@@ -4963,12 +4969,20 @@ mod tests {
             if self.fail_rollback {
                 return Err("mock rollback failure".into());
             }
-            self.log.lock().unwrap_or_else(|e| e.into_inner()).rollbacks.push(snapshot.into());
+            self.log
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .rollbacks
+                .push(snapshot.into());
             Ok(())
         }
 
         async fn cleanup_snapshot(&self, snapshot: &str) -> Result<(), String> {
-            self.log.lock().unwrap_or_else(|e| e.into_inner()).cleanups.push(snapshot.into());
+            self.log
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .cleanups
+                .push(snapshot.into());
             Ok(())
         }
     }
@@ -5762,7 +5776,12 @@ mod tests {
         let result = runner.run_criterion(&criterion).await;
         assert!(result.passed);
 
-        let context = judge.captured.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap();
+        let context = judge
+            .captured
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .unwrap();
         assert!(
             context.contains("authenticate"),
             "context should include file contents: {context}"
@@ -5852,7 +5871,10 @@ mod tests {
     #[async_trait::async_trait]
     impl TaskLearningBridge for RecordingLearningBridge {
         async fn learn_from_task_outcome(&self, signal: &TaskOutcomeSignal) -> Result<(), String> {
-            self.outcome_calls.lock().unwrap_or_else(|e| e.into_inner()).push(signal.clone());
+            self.outcome_calls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(signal.clone());
             Ok(())
         }
         async fn extract_template(
@@ -5881,7 +5903,10 @@ mod tests {
             &self,
             signal: &VerificationLearningSignal,
         ) -> Result<(), String> {
-            self.verification_calls.lock().unwrap_or_else(|e| e.into_inner()).push(signal.clone());
+            self.verification_calls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(signal.clone());
             Ok(())
         }
     }
@@ -5934,7 +5959,10 @@ mod tests {
         assert!(report.all_required_passed);
 
         // Check that learning bridge was called
-        let calls = recorder.verification_calls.lock().unwrap_or_else(|e| e.into_inner());
+        let calls = recorder
+            .verification_calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         assert_eq!(calls.len(), 1, "learning bridge should be called once");
         assert_eq!(calls[0].subtask_id, "sub-1");
         assert!(calls[0].all_passed);
@@ -5987,7 +6015,10 @@ mod tests {
         assert_eq!(report.goal, "deliver learning test");
 
         // Check that outcome learning was called
-        let outcome_calls = recorder.outcome_calls.lock().unwrap_or_else(|e| e.into_inner());
+        let outcome_calls = recorder
+            .outcome_calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         assert_eq!(
             outcome_calls.len(),
             1,
@@ -5997,7 +6028,10 @@ mod tests {
         assert_eq!(outcome_calls[0].goal, "deliver learning test");
 
         // Check that template extraction was called
-        let template_calls = recorder.template_calls.lock().unwrap_or_else(|e| e.into_inner());
+        let template_calls = recorder
+            .template_calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         assert_eq!(
             template_calls.len(),
             1,

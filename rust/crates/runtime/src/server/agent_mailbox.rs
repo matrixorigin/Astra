@@ -206,7 +206,13 @@ impl AgentMailbox {
             return Some(msg);
         }
 
-        let notifier = self.state.read().unwrap_or_else(|e| e.into_inner()).notifiers.get(agent_id)?.clone();
+        let notifier = self
+            .state
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .notifiers
+            .get(agent_id)?
+            .clone();
 
         tokio::select! {
             _ = notifier.notified() => {
@@ -228,7 +234,11 @@ impl AgentMailbox {
 
     /// List all registered agent IDs.
     pub fn registered_agents(&self) -> Vec<String> {
-        self.state.read().unwrap_or_else(|e| e.into_inner()).agents.clone()
+        self.state
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .agents
+            .clone()
     }
 }
 

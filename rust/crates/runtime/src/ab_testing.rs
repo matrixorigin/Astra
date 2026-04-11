@@ -611,12 +611,21 @@ impl ExperimentStore {
 
     /// Get an experiment by ID.
     pub fn get(&self, id: &str) -> Option<Experiment> {
-        self.experiments.read().unwrap_or_else(|e| e.into_inner()).get(id).cloned()
+        self.experiments
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(id)
+            .cloned()
     }
 
     /// List all experiments.
     pub fn list(&self) -> Vec<Experiment> {
-        self.experiments.read().unwrap_or_else(|e| e.into_inner()).values().cloned().collect()
+        self.experiments
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .cloned()
+            .collect()
     }
 
     /// Record an outcome.

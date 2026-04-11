@@ -771,10 +771,22 @@ pub async fn compact_with_memoria(
     }
 
     let Some(client) = client else {
-        return compact_tiered_with_result(messages, params.budget_chars, params.keep_chars, params.tier, params.keep_recent_turns);
+        return compact_tiered_with_result(
+            messages,
+            params.budget_chars,
+            params.keep_chars,
+            params.tier,
+            params.keep_recent_turns,
+        );
     };
     let Some(sid) = session_id else {
-        return compact_tiered_with_result(messages, params.budget_chars, params.keep_chars, params.tier, params.keep_recent_turns);
+        return compact_tiered_with_result(
+            messages,
+            params.budget_chars,
+            params.keep_chars,
+            params.tier,
+            params.keep_recent_turns,
+        );
     };
 
     // Step 1: Retrieve session context from Memoria

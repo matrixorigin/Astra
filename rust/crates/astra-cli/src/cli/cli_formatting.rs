@@ -246,8 +246,9 @@ pub fn highlight_code_line(line: &str) -> String {
     });
 
     // Match strings: "..." or '...' with basic escape handling (\")
-    let string_re =
-        STRING_RE.get_or_init(|| Regex::new(r#"("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')"#).expect("valid regex"));
+    let string_re = STRING_RE.get_or_init(|| {
+        Regex::new(r#"("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')"#).expect("valid regex")
+    });
 
     // Check if line starts with line number (e.g., "420\t" or " 99\t")
     // Convert to more compact format: "  42│" (dim, right-aligned number + dim pipe)

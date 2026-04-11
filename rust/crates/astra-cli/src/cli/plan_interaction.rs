@@ -776,7 +776,9 @@ pub async fn handle_plan_mode_input(
             );
             return Ok(());
         }
-        let Some(plan_state) = state.plan_mode.as_mut() else { return Ok(()); };
+        let Some(plan_state) = state.plan_mode.as_mut() else {
+            return Ok(());
+        };
         match plan_state.complete_subtask(done_id) {
             Ok(title) => {
                 let pct = plan_state.plan.progress_pct();
@@ -855,7 +857,9 @@ pub async fn handle_plan_mode_input(
         );
         return Ok(());
     }
-    let Some(plan_state) = state.plan_mode.as_mut() else { return Ok(()); };
+    let Some(plan_state) = state.plan_mode.as_mut() else {
+        return Ok(());
+    };
     let prompt = plan_state.plan_mode_prompt(&input);
     plan_state.add_turn(&input, "");
 
@@ -904,7 +908,9 @@ pub async fn handle_plan_mode_input(
             }
 
             if !sse_result.text.is_empty() {
-                let Some(plan_state) = state.plan_mode.as_mut() else { return Ok(()); };
+                let Some(plan_state) = state.plan_mode.as_mut() else {
+                    return Ok(());
+                };
                 match try_replace_plan_from_llm_json(&sse_result.text, plan_state) {
                     Ok(true) => {
                         plan_state.modified = true;
@@ -1536,7 +1542,9 @@ async fn handle_goal_submission(
         return Ok(());
     };
 
-    let Some(plan_state) = state.plan_mode.as_mut() else { return Ok(()); };
+    let Some(plan_state) = state.plan_mode.as_mut() else {
+        return Ok(());
+    };
     plan_state.goal = goal.clone();
 
     journal_plan_event(
@@ -1593,7 +1601,9 @@ async fn handle_goal_submission(
                 );
                 eprintln!();
 
-                let Some(plan_state) = state.plan_mode.as_mut() else { return Ok(()); };
+                let Some(plan_state) = state.plan_mode.as_mut() else {
+                    return Ok(());
+                };
                 let pending = PendingClarifications {
                     questions: questions.clone(),
                     answers: Vec::new(),
@@ -1605,7 +1615,9 @@ async fn handle_goal_submission(
             } else {
                 match parse_plan_response(&full_text) {
                     Ok(plan) => {
-                        let Some(plan_state) = state.plan_mode.as_mut() else { return Ok(()); };
+                        let Some(plan_state) = state.plan_mode.as_mut() else {
+                            return Ok(());
+                        };
                         plan_state.set_plan(plan);
                         let _ = plan_state.save_to_file(&PlanModeState::state_path());
 

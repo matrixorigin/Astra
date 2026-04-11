@@ -216,7 +216,11 @@ impl McpLifecycleManager {
 
     /// Stop MCP connections for an agent (cleanup on agent completion).
     pub fn stop_agent_session(&self, agent_id: &str) -> Option<AgentMcpSession> {
-        let session = self.sessions.lock().unwrap_or_else(|e| e.into_inner()).remove(agent_id);
+        let session = self
+            .sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(agent_id);
         if let Some(ref s) = session {
             for name in &s.connected_servers {
                 eprintln!(
@@ -230,7 +234,10 @@ impl McpLifecycleManager {
 
     /// Check if an agent has an active MCP session.
     pub fn has_session(&self, agent_id: &str) -> bool {
-        self.sessions.lock().unwrap_or_else(|e| e.into_inner()).contains_key(agent_id)
+        self.sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(agent_id)
     }
 
     /// Get discovered tools for an agent.
@@ -245,7 +252,12 @@ impl McpLifecycleManager {
 
     /// List all active agent sessions.
     pub fn active_sessions(&self) -> Vec<String> {
-        self.sessions.lock().unwrap_or_else(|e| e.into_inner()).keys().cloned().collect()
+        self.sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .cloned()
+            .collect()
     }
 }
 

@@ -98,7 +98,9 @@ pub(super) async fn completions_handler(
 
     // Anthropic uses max_tokens; OpenAI prefers max_completion_tokens
     if resolved.provider != "anthropic" && !resolved.model_name.contains("claude") {
-        body.as_object_mut().expect("json object").remove("max_tokens");
+        body.as_object_mut()
+            .expect("json object")
+            .remove("max_tokens");
         body["max_completion_tokens"] = serde_json::json!(request.max_tokens);
     }
 

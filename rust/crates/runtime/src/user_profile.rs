@@ -783,17 +783,31 @@ impl UserProfileStore {
 
     /// Get a profile if it exists.
     pub fn get(&self, user_id: &str) -> Option<UserProfile> {
-        self.profiles.read().unwrap_or_else(|e| e.into_inner()).get(user_id).cloned()
+        self.profiles
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(user_id)
+            .cloned()
     }
 
     /// List all user IDs.
     pub fn list_users(&self) -> Vec<String> {
-        self.profiles.read().unwrap_or_else(|e| e.into_inner()).keys().cloned().collect()
+        self.profiles
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .cloned()
+            .collect()
     }
 
     /// Delete a profile.
     pub fn delete(&self, user_id: &str) -> bool {
-        let removed = self.profiles.write().unwrap_or_else(|e| e.into_inner()).remove(user_id).is_some();
+        let removed = self
+            .profiles
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(user_id)
+            .is_some();
         if removed {
             self.persist();
         }
@@ -931,7 +945,12 @@ impl UserProfileManager {
 
     /// Clear scenario detection history for a user.
     pub fn clear_detection(&self, user_id: &str) {
-        if let Some(detector) = self.detectors.write().unwrap_or_else(|e| e.into_inner()).get_mut(user_id) {
+        if let Some(detector) = self
+            .detectors
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(user_id)
+        {
             detector.clear();
         }
     }

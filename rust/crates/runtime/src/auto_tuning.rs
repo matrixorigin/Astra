@@ -465,7 +465,10 @@ impl AutoTuningEngine {
 
     /// Add an evolution rule.
     pub fn add_rule(&self, rule: EvolutionRule) {
-        self.rules.write().unwrap_or_else(|e| e.into_inner()).push(rule);
+        self.rules
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(rule);
     }
 
     /// Remove a rule by ID.
@@ -494,7 +497,10 @@ impl AutoTuningEngine {
 
     /// Record a feedback signal.
     pub fn record_feedback(&self, signal: FeedbackSignal) {
-        self.aggregator.write().unwrap_or_else(|e| e.into_inner()).record(signal);
+        self.aggregator
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .record(signal);
     }
 
     /// Evaluate all rules and return triggered actions.
@@ -505,7 +511,10 @@ impl AutoTuningEngine {
 
         let rules = self.rules.read().unwrap_or_else(|e| e.into_inner());
         let aggregator = self.aggregator.read().unwrap_or_else(|e| e.into_inner());
-        let last_triggered = self.last_triggered.read().unwrap_or_else(|e| e.into_inner());
+        let last_triggered = self
+            .last_triggered
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
         let now = SystemTime::now();
 
         let mut triggered = Vec::new();
@@ -555,8 +564,14 @@ impl AutoTuningEngine {
             };
 
             executions.push(execution.clone());
-            self.executions.write().unwrap_or_else(|e| e.into_inner()).push(execution);
-            self.last_triggered.write().unwrap_or_else(|e| e.into_inner()).insert(rule.id, now);
+            self.executions
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(execution);
+            self.last_triggered
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(rule.id, now);
         }
 
         executions
@@ -613,7 +628,10 @@ impl AutoTuningEngine {
 
     /// Get execution history.
     pub fn get_executions(&self) -> Vec<RuleExecution> {
-        self.executions.read().unwrap_or_else(|e| e.into_inner()).clone()
+        self.executions
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Get all rules.

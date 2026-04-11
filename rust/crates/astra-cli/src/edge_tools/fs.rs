@@ -1392,13 +1392,13 @@ impl ToolExecutor {
         if errors == 0 && warnings == 0 {
             return None;
         }
-        let file_name = path
-            .file_name()
-            .and_then(|f| f.to_str())
-            .unwrap_or("file");
+        let file_name = path.file_name().and_then(|f| f.to_str()).unwrap_or("file");
         let mut summary = format!("\n🔍 LSP diagnostics ({file_name}):");
         if errors > 0 {
-            summary.push_str(&format!(" {errors} error{}", if errors > 1 { "s" } else { "" }));
+            summary.push_str(&format!(
+                " {errors} error{}",
+                if errors > 1 { "s" } else { "" }
+            ));
         }
         if warnings > 0 {
             if errors > 0 {

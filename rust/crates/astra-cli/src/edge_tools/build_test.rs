@@ -1422,7 +1422,8 @@ static CARGO_LOCATION_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\s*--> (.+):(\d+):(\d+)").expect("valid regex"));
 
 static CARGO_TEST_RESULT_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"test result: (ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored").expect("valid regex")
+    Regex::new(r"test result: (ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored")
+        .expect("valid regex")
 });
 
 fn parse_cargo_output(output: &str, exit_code: Option<i32>, truncated: bool) -> BuildTestResult {
@@ -1825,8 +1826,9 @@ static TS_ERROR_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(.+)\((\d+),(\d+)\): error (TS\d+): (.+)").expect("valid regex"));
 
 // Matches generic file:line:col: error patterns
-static GENERIC_LOCATION_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^(.+?):(\d+):(\d+):\s*(error|warning):\s*(.+)").expect("valid regex"));
+static GENERIC_LOCATION_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^(.+?):(\d+):(\d+):\s*(error|warning):\s*(.+)").expect("valid regex")
+});
 
 fn count_generic_errors(lower: &str) -> usize {
     let mut count = 0;

@@ -761,34 +761,34 @@ fn render_reflect_report(body: &str, session_id: &str) {
         eprintln!();
         eprintln!("  {}", "Root-Cause Analysis:".bold());
         if let Some(diagnoses) = report["diagnoses"].as_array() {
-        for diag in diagnoses {
-            let severity = diag["severity"].as_str().unwrap_or("info");
-            let summary = diag["summary"].as_str().unwrap_or("");
-            let fix = diag["fix_hint"].as_str().unwrap_or("");
+            for diag in diagnoses {
+                let severity = diag["severity"].as_str().unwrap_or("info");
+                let summary = diag["summary"].as_str().unwrap_or("");
+                let fix = diag["fix_hint"].as_str().unwrap_or("");
 
-            match severity {
-                "critical" => eprintln!("  🔴 {}", summary.red().bold()),
-                "warning" => eprintln!("  ⚠️ {}", summary.yellow()),
-                _ => eprintln!("  ℹ️ {}", summary),
-            }
+                match severity {
+                    "critical" => eprintln!("  🔴 {}", summary.red().bold()),
+                    "warning" => eprintln!("  ⚠️ {}", summary.yellow()),
+                    _ => eprintln!("  ℹ️ {}", summary),
+                }
 
-            // Show sample errors (truncated)
-            if let Some(samples) = diag["samples"].as_array() {
-                for (i, sample) in samples.iter().enumerate() {
-                    if i >= 2 {
-                        break;
-                    }
-                    if let Some(s) = sample.as_str() {
-                        let truncated: String = s.chars().take(80).collect();
-                        eprintln!("    {} {}", "│".dim(), truncated.dim());
+                // Show sample errors (truncated)
+                if let Some(samples) = diag["samples"].as_array() {
+                    for (i, sample) in samples.iter().enumerate() {
+                        if i >= 2 {
+                            break;
+                        }
+                        if let Some(s) = sample.as_str() {
+                            let truncated: String = s.chars().take(80).collect();
+                            eprintln!("    {} {}", "│".dim(), truncated.dim());
+                        }
                     }
                 }
-            }
 
-            if !fix.is_empty() {
-                eprintln!("    {} {}", "→".green(), fix.green());
+                if !fix.is_empty() {
+                    eprintln!("    {} {}", "→".green(), fix.green());
+                }
             }
-        }
         }
     }
 
@@ -823,11 +823,11 @@ fn render_reflect_report(body: &str, session_id: &str) {
         eprintln!();
         eprintln!("  {}", "Fix Actions:".bold());
         if let Some(recs) = report["recommendations"].as_array() {
-        for rec in recs {
-            if let Some(r) = rec.as_str() {
-                eprintln!("    {} {}", "→".green(), r);
+            for rec in recs {
+                if let Some(r) = rec.as_str() {
+                    eprintln!("    {} {}", "→".green(), r);
+                }
             }
-        }
         }
     }
 

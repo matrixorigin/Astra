@@ -302,7 +302,8 @@ impl AgenticRunLifecycleService {
             message: request.message.clone(),
             recent_tools: Vec::new(),
             task_profile,
-            api: astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).expect("valid dummy URL"),
+            api: astra_thin_client::ThinClient::new("http://127.0.0.1:1", None)
+                .expect("valid dummy URL"),
             api_token: String::new(),
             cancel_flag: None,
             cancel_token: None,
@@ -1049,7 +1050,8 @@ impl SubRunExecutor for ServerSubRunExecutor {
             message: full_task,
             recent_tools: Vec::new(),
             task_profile,
-            api: astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).expect("valid dummy URL"),
+            api: astra_thin_client::ThinClient::new("http://127.0.0.1:1", None)
+                .expect("valid dummy URL"),
             api_token: String::new(),
             cancel_flag: config.pause_flag.clone(),
             cancel_token: None,

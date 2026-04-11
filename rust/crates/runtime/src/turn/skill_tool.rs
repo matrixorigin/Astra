@@ -1281,7 +1281,11 @@ fn execute_skill<'a>(
                     .map(|c| !c.steps.is_empty())
                     .unwrap_or(false);
                 if has_pipeline {
-                    let steps = &skill.composition.as_ref().expect("checked has_pipeline").steps;
+                    let steps = &skill
+                        .composition
+                        .as_ref()
+                        .expect("checked has_pipeline")
+                        .steps;
                     // Create a child composition context for the pipeline
                     let pipeline_ctx;
                     let ctx_ref = match composition_ctx {
