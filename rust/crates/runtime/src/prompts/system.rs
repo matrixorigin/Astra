@@ -212,6 +212,18 @@ fn tool_conditional_section(tool_names: &[&str], selection_confidence: f64) -> S
              - Do NOT call `delegate` unless it appears in the current tool list — it is an internal, conditional tool in some runtimes.\n",
         );
     }
+    if has_delegate {
+        s.push_str(
+            "\n## Delegation\n\
+             Use `delegate` when the user asks for multi-agent help (e.g., \"have agents help me\", \"让多个agent帮我\", \"并行分析\"):\n\
+             - **fan_out**: Parallel execution for independent tasks (default when agents >1).\n\
+             - **sequential**: Agents run one by one, each seeing prior outputs.\n\
+             - **pipeline**: Each agent's output becomes the next's input.\n\
+             - **adversarial**: Producer + reviewer iterate until consensus.\n\
+             Available agents: 'coder' (code tasks), 'reviewer' (code review), 'writer' (docs).\n\
+             Example: delegate(task=\"analyze auth module\", agents=[\"coder\", \"reviewer\"], pattern=\"adversarial\")\n",
+        );
+    }
     if has_code_nav {
         s.push_str(
             "\n## Code Navigation\n\

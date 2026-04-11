@@ -67,7 +67,7 @@ mod tests {
 
     #[test]
     fn catalog_has_35_tools() {
-        assert_eq!(TOOL_CATALOG.len(), 36);
+        assert_eq!(TOOL_CATALOG.len(), 37);
     }
 
     #[test]
@@ -77,7 +77,7 @@ mod tests {
 
     #[test]
     fn catalog_has_26_dynamic() {
-        assert_eq!(ToolRegistry::dynamic_count(), 28);
+        assert_eq!(ToolRegistry::dynamic_count(), 29);
     }
 
     #[test]

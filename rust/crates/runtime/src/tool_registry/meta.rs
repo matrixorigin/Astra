@@ -960,6 +960,42 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         scope: Scope::Local,
         schema_tokens: 80,
     },
+    // ── Delegation (multi-agent coordination) ────────────────────────
+    ToolMeta {
+        name: "delegate",
+        description: "Delegate tasks to specialized sub-agents for parallel or coordinated execution",
+        triggers: &[
+            "delegate",
+            "multi-agent",
+            "multiple agents",
+            "agents help",
+            "have agents",
+            "parallel agents",
+            "sub-agent",
+            "subagent",
+            "fan out",
+            "fan-out",
+            "distribute work",
+            "team up",
+            "coordinate agents",
+            "split task",
+            "委托",
+            "多agent",
+            "多智能体",
+            "并行分析",
+            "分发任务",
+            "协作",
+            "让agent帮我",
+            "几个agent",
+            "多个agent",
+            "分工",
+            "协同工作",
+        ],
+        pinned: false, // Actually injected dynamically when delegation_engine is present
+        intents: &[IntentType::CodeEdit, IntentType::CodeRead],
+        scope: Scope::Local,
+        schema_tokens: 120,
+    },
 ];
 
 #[cfg(test)]
