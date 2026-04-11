@@ -762,7 +762,7 @@ async fn poll_loop(
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             match mark_broadcast_failed(&pool, row_id).await {
                                 Ok(()) => {
-                                    last_broadcast_id = last_broadcast_id.max(row_id);
+                                    advance_broadcast_cursor(&mut last_broadcast_id, row_id);
                                 }
                                 Err(e) => {
                                     had_error = true;
@@ -773,6 +773,7 @@ async fn poll_loop(
                                         "  ⚠ messaging: failed to dead-letter undecodable broadcast row {} for delegation {}: {:?}",
                                         row_id, did, e
                                     );
+                                    advance_broadcast_cursor(&mut last_broadcast_id, row_id);
                                 }
                             }
                             continue;
@@ -787,7 +788,7 @@ async fn poll_loop(
                             if tx.send(Arc::new(msg)).is_err() {
                                 return;
                             }
-                            last_broadcast_id = last_broadcast_id.max(row_id);
+                            advance_broadcast_cursor(&mut last_broadcast_id, row_id);
                         }
                         Ok(_) | Err(_) => {
                             metrics
@@ -795,7 +796,7 @@ async fn poll_loop(
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             match mark_broadcast_failed(&pool, row_id).await {
                                 Ok(()) => {
-                                    last_broadcast_id = last_broadcast_id.max(row_id);
+                                    advance_broadcast_cursor(&mut last_broadcast_id, row_id);
                                 }
                                 Err(e) => {
                                     had_error = true;
@@ -806,6 +807,7 @@ async fn poll_loop(
                                         "  ⚠ messaging: failed to dead-letter broadcast row {} for delegation {}: {:?}",
                                         row_id, did, e
                                     );
+                                    advance_broadcast_cursor(&mut last_broadcast_id, row_id);
                                 }
                             }
                         }
@@ -1151,6 +1153,10 @@ fn parse_row_id_text_fallback(value: &str) -> Option<i64> {
     value.parse::<i64>().ok()
 }
 
+fn advance_broadcast_cursor(last_broadcast_id: &mut i64, row_id: i64) {
+    *last_broadcast_id = (*last_broadcast_id).max(row_id);
+}
+
 async fn release_claimed_for_consumer_in_pool(
     pool: &Pool<MySql>,
     consumer_id: &str,
@@ -1249,6 +1255,15 @@ mod tests {
     #[test]
     fn parse_row_id_text_fallback_rejects_non_numeric_ids() {
         assert_eq!(super::parse_row_id_text_fallback("not-a-row-id"), None);
+    }
+
+    #[test]
+    fn broadcast_cursor_advances_monotonically() {
+        let mut cursor = 5;
+        super::advance_broadcast_cursor(&mut cursor, 3);
+        assert_eq!(cursor, 5);
+        super::advance_broadcast_cursor(&mut cursor, 9);
+        assert_eq!(cursor, 9);
     }
 
     #[test]
