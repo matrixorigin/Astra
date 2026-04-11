@@ -495,10 +495,7 @@ fn handle_session_list(sub_arg: &str, state: &ReplState) {
         LAST_SESSION_LIST.with(|cell| {
             *cell.borrow_mut() = shortcuts;
         });
-        eprintln!(
-            "  {}",
-            "Tip: /session switch <N> to resume by number".dim()
-        );
+        eprintln!("  {}", "Tip: /session switch <N> to resume by number".dim());
     }
 
     // Summary
@@ -526,15 +523,13 @@ thread_local! {
 
 /// Get session ID from shortcut number (1-indexed)
 fn get_session_shortcut(num: usize) -> Option<String> {
-    LAST_SESSION_LIST.with(|cell| {
-        cell.borrow().get(num.saturating_sub(1)).cloned()
-    })
+    LAST_SESSION_LIST.with(|cell| cell.borrow().get(num.saturating_sub(1)).cloned())
 }
 
 /// Handle `/session switch <N>` - quick switch to session by number from last list
 fn handle_session_switch(sub_arg: &str, state: &mut ReplState) {
     let arg = sub_arg.trim();
-    
+
     if arg.is_empty() {
         eprintln!(
             "  {}",
@@ -542,7 +537,7 @@ fn handle_session_switch(sub_arg: &str, state: &mut ReplState) {
         );
         return;
     }
-    
+
     // Parse number
     let num: usize = match arg.parse() {
         Ok(n) if n >= 1 && n <= 9 => n,
@@ -551,7 +546,7 @@ fn handle_session_switch(sub_arg: &str, state: &mut ReplState) {
             return;
         }
     };
-    
+
     // Get session ID from shortcuts
     let session_id = match get_session_shortcut(num) {
         Some(sid) => sid,
@@ -563,23 +558,29 @@ fn handle_session_switch(sub_arg: &str, state: &mut ReplState) {
             return;
         }
     };
-    
+
     // Show preview and confirm
     let ws = session_workspace::read_workspace(&session_id).ok();
-    
+
     let short_id = &session_id[..8.min(session_id.len())];
-    let summary = ws.as_ref()
+    let summary = ws
+        .as_ref()
         .and_then(|w| w.summary.clone())
         .map(|s| {
             let truncated: String = s.chars().take(50).collect();
-            if s.chars().count() > 50 { format!("{truncated}…") } else { truncated }
+            if s.chars().count() > 50 {
+                format!("{truncated}…")
+            } else {
+                truncated
+            }
         })
         .unwrap_or_else(|| "(no summary)".to_string());
-    
-    let turns = ws.as_ref()
+
+    let turns = ws
+        .as_ref()
         .map(|w| w.turn_count)
         .unwrap_or_else(|| session_journal::count_turns(&session_id));
-    
+
     eprintln!(
         "\n  {} {}  {}  {} turns",
         format!("[{num}]").cyan().bold(),
@@ -587,7 +588,7 @@ fn handle_session_switch(sub_arg: &str, state: &mut ReplState) {
         summary.dim(),
         turns
     );
-    
+
     // Quick confirm
     eprint!("  {} ", "Switch to this session? [Y/n]:".bold());
     std::io::Write::flush(&mut std::io::stderr()).ok();
@@ -601,7 +602,7 @@ fn handle_session_switch(sub_arg: &str, state: &mut ReplState) {
     } else {
         return;
     }
-    
+
     // Restore session state
     let st = crate::repl_runtime::session_state_from_journal(&session_id);
     state.session_id = Some(session_id.clone());
@@ -613,7 +614,7 @@ fn handle_session_switch(sub_arg: &str, state: &mut ReplState) {
     state.recent_tools = st.recent_tools;
     state.last_turn_event = None;
     state.run_id = None;
-    
+
     eprintln!(
         "  {} Switched to session {} ({} turns loaded)",
         theme::icon_ok(),
@@ -3625,56 +3626,90 @@ pub(super) async fn handle_resume_command(arg: &str, profile: Option<&str>, stat
     let skip_preview = std::env::var("ASTRA_RESUME_SKIP_PREVIEW")
         .map(|v| v == "1" || v.to_lowercase() == "true")
         .unwrap_or(false);
-    
+
     // Show preview if user explicitly typed a session ID (not from picker)
     if !skip_preview && !arg.is_empty() {
         // Show session preview
         let ws = session_workspace::read_workspace(&session_id).ok();
         let peek = session_journal::peek_session_meta(&session_id);
-        
-        eprintln!("\n{}",
-            "─── Session Preview ─────────────────────────────".bold().cyan()
+
+        eprintln!(
+            "\n{}",
+            "─── Session Preview ─────────────────────────────"
+                .bold()
+                .cyan()
         );
-        
+
         // Session ID
         let short_id = &session_id[..8.min(session_id.len())];
-        eprintln!("  {:<14} {}", "session:".dim(), format!("{short_id}…").cyan());
-        
+        eprintln!(
+            "  {:<14} {}",
+            "session:".dim(),
+            format!("{short_id}…").cyan()
+        );
+
         // Summary/Title
-        let summary = ws.as_ref()
+        let summary = ws
+            .as_ref()
             .and_then(|w| w.summary.clone())
             .or_else(|| peek.as_ref().and_then(|p| p.first_prompt.clone()))
             .map(|s| {
                 let truncated: String = s.chars().take(70).collect();
-                if s.chars().count() > 70 { format!("{truncated}…") } else { truncated }
+                if s.chars().count() > 70 {
+                    format!("{truncated}…")
+                } else {
+                    truncated
+                }
             })
             .unwrap_or_else(|| "(no summary)".to_string());
         eprintln!("  {:<14} {}", "summary:".dim(), summary);
-        
+
         // Turn count
         if let Some(ref w) = ws {
-            eprintln!("  {:<14} {} turns", "progress:".dim(), w.turn_count.to_string().cyan());
+            eprintln!(
+                "  {:<14} {} turns",
+                "progress:".dim(),
+                w.turn_count.to_string().cyan()
+            );
         } else if peek.is_some() {
             let turns = session_journal::count_turns(&session_id);
-            eprintln!("  {:<14} {} turns", "progress:".dim(), turns.to_string().cyan());
+            eprintln!(
+                "  {:<14} {} turns",
+                "progress:".dim(),
+                turns.to_string().cyan()
+            );
         }
-        
+
         // Model
-        let model = ws.as_ref()
+        let model = ws
+            .as_ref()
             .map(|w| w.model.clone())
             .or_else(|| peek.as_ref().and_then(|p| p.model.clone()))
             .unwrap_or_else(|| "?".to_string());
         eprintln!("  {:<14} {}", "model:".dim(), model.cyan());
-        
+
         // Cwd + git branch
         if let Some(ref w) = ws {
-            eprintln!("  {:<14} {}", "directory:".dim(), tilde_path(&w.cwd).as_str().cyan());
+            eprintln!(
+                "  {:<14} {}",
+                "directory:".dim(),
+                tilde_path(&w.cwd).as_str().cyan()
+            );
             if let Some(ref b) = w.git_branch {
-                let head = w.git_head.as_deref().map(|h| &h[..7.min(h.len())]).unwrap_or("");
-                eprintln!("  {:<14} {} @ {}", "branch:".dim(), b.as_str().cyan(), head.dim());
+                let head = w
+                    .git_head
+                    .as_deref()
+                    .map(|h| &h[..7.min(h.len())])
+                    .unwrap_or("");
+                eprintln!(
+                    "  {:<14} {} @ {}",
+                    "branch:".dim(),
+                    b.as_str().cyan(),
+                    head.dim()
+                );
             }
         }
-        
+
         // Status
         if let Some(ref w) = ws {
             let status_icon = match w.status.as_str() {
@@ -3683,11 +3718,17 @@ pub(super) async fn handle_resume_command(arg: &str, profile: Option<&str>, stat
                 "error" => "❌",
                 _ => "•",
             };
-            eprintln!("  {:<14} {} {}", "status:".dim(), status_icon, w.status.as_str().cyan());
+            eprintln!(
+                "  {:<14} {} {}",
+                "status:".dim(),
+                status_icon,
+                w.status.as_str().cyan()
+            );
         }
-        
+
         // Age
-        let age = ws.as_ref()
+        let age = ws
+            .as_ref()
             .map(|w| &w.updated_at)
             .or_else(|| peek.as_ref().and_then(|p| p.created_at.as_ref()))
             .and_then(|ts| chrono::DateTime::parse_from_rfc3339(ts).ok())
@@ -3704,7 +3745,7 @@ pub(super) async fn handle_resume_command(arg: &str, profile: Option<&str>, stat
         if let Some(age) = age {
             eprintln!("  {:<14} {}", "last active:".dim(), age.dim());
         }
-        
+
         // Plan status
         if let Some(ref w) = ws {
             if w.plan_goal.is_some() {
@@ -3713,9 +3754,9 @@ pub(super) async fn handle_resume_command(arg: &str, profile: Option<&str>, stat
                 eprintln!("  {:<14} 📋 {}", "plan:".dim(), goal_short.yellow());
             }
         }
-        
+
         eprintln!();
-        
+
         // Confirm
         eprint!("  {} ", "Resume this session? [Y/n]:".bold());
         std::io::Write::flush(&mut std::io::stderr()).ok();

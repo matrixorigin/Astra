@@ -470,6 +470,7 @@ pub(crate) async fn stream_chat_sse(
         project_context,
         checkpoint_gate: None,
         evolution_service: p.evolution_service.clone(),
+        rate_limit_cooldown: Default::default(),
         data_snapshot_provider: None,
         last_composite_snapshot: None,
         last_measured_prompt_tokens: None,

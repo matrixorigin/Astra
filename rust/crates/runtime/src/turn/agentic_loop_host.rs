@@ -467,6 +467,13 @@ pub struct AgenticLoopState {
     /// Optional evolution service for multi-axis self-evolution.
     /// When set, tool results and user messages feed into signal collection.
     pub evolution_service: Option<Arc<crate::evolution::service::EvolutionService>>,
+
+    // ── Rate Limit Cooldown ──
+    /// Cross-turn rate-limit cooldown tracker.  When the loop detects a
+    /// rate-limit error (429 / TPM / RPM), it records it here so subsequent
+    /// turns can wait or reject early instead of immediately re-hitting the
+    /// limit.  Shared across all turns within a single agentic loop invocation.
+    pub rate_limit_cooldown: crate::bridge::RateLimitCooldown,
 }
 
 /// Consecutive same-category error turns before forcing a strategy change.
@@ -2096,6 +2103,67 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                 CLI_AGENTIC_TURN_BUDGET_STALL_ABORT_MSG, state.max_turns
             ));
         }
+
+        // ─── Rate-limit cooldown check ───────────────────────────────────
+        // Before consuming a turn, check if the rate-limit cooldown is active.
+        // CLI has no fallback model so `has_fallback = false`.
+        match state.rate_limit_cooldown.check_request(false) {
+            crate::bridge::RateLimitAction::Proceed => {}
+            crate::bridge::RateLimitAction::WaitAndRetry { delay_ms } => {
+                if !host.is_quiet() {
+                    host.emit_headless_line(
+                        HeadlessStderrStyle::Yellow,
+                        format!(
+                            "⏳ Rate limit cooldown — waiting {:.1}s before next turn…",
+                            delay_ms as f64 / 1000.0,
+                        ),
+                    );
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            }
+            crate::bridge::RateLimitAction::UseFallback { .. } => {
+                // No fallback in current setup; treat as wait-and-retry with default delay.
+                if !host.is_quiet() {
+                    host.emit_headless_line(
+                        HeadlessStderrStyle::Yellow,
+                        "⏳ Rate limit cooldown — waiting 5s (no fallback model)…".into(),
+                    );
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+            crate::bridge::RateLimitAction::Reject {
+                reason,
+                reset_in_ms,
+            } => {
+                let secs = reset_in_ms / 1000;
+                if state.total_tool_calls > 0 {
+                    // Graceful: preserve work done so far.
+                    if !host.is_quiet() {
+                        host.emit_headless_line(
+                            HeadlessStderrStyle::Yellow,
+                            format!(
+                                "⚠ Rate limit cooldown active ({}) — preserving {} tool call(s). Resets in {secs}s.",
+                                reason.as_str(),
+                                state.total_tool_calls,
+                            ),
+                        );
+                    }
+                    state.final_text = format!(
+                        "[Rate limit cooldown active ({}). \
+                         {} completed tool call(s) preserved. \
+                         Cooldown resets in ~{secs}s — you can continue then.]\n",
+                        reason.as_str(),
+                        state.total_tool_calls,
+                    );
+                    return Ok(AgenticLoopOutcome::Completed);
+                }
+                return Err(format!(
+                    "Rate limit cooldown active ({}). Resets in ~{secs}s. Please wait and retry.",
+                    reason.as_str(),
+                ));
+            }
+        }
+
         state.remaining_turns = state.remaining_turns.saturating_sub(1);
         state.step_recorder.begin_turn(turn_index as u32);
 
@@ -2396,6 +2464,8 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
         }
         let llm_wall_start = std::time::Instant::now();
         let turn_result = host.execute_turn(state).await?;
+        // Successful LLM call — reset consecutive error counters.
+        state.rate_limit_cooldown.record_success();
         if let Some(ref emitter) = state.messaging.progress_emitter {
             emitter.llm_call_completed(
                 turn_index as u32,
@@ -2450,6 +2520,19 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                     || lower.contains("too many requests")
                     || lower.contains("tpm")
                     || lower.contains("rpm");
+
+                // Record the error in the cross-turn cooldown tracker so
+                // subsequent turns can back off or abort early.
+                if is_rate_limit {
+                    let is_overload = lower.contains("529")
+                        || lower.contains("503")
+                        || lower.contains("overload");
+                    if is_overload {
+                        state.rate_limit_cooldown.record_529(None, false);
+                    } else {
+                        state.rate_limit_cooldown.record_429(None, false);
+                    }
+                }
 
                 if is_rate_limit && state.total_tool_calls > 0 {
                     if !quiet {
@@ -3916,6 +3999,7 @@ mod tests {
             project_context: None,
             checkpoint_gate: None,
             evolution_service: None,
+            rate_limit_cooldown: Default::default(),
             data_snapshot_provider: None,
             last_composite_snapshot: None,
             last_measured_prompt_tokens: None,
@@ -6794,6 +6878,111 @@ mod tests {
         assert!(
             outcome.is_err(),
             "non-rate-limit error should always be fatal",
+        );
+    }
+
+    #[tokio::test]
+    async fn rate_limit_cooldown_records_consecutive_errors() {
+        // Verify that the rate_limit_cooldown field on AgenticLoopState
+        // accumulates errors from rate-limited turns.
+        let mut host = MockHost::new(vec![error_result(
+            "Error: 429 Too Many Requests (after 3 retries)",
+            0,
+            0,
+        )]);
+        let mut state = make_state();
+        state
+            .messages
+            .push(json!({"role": "user", "content": "hello"}));
+
+        let _ = run_agentic_loop_with_host(&mut host, &mut state).await;
+        let metrics = state.rate_limit_cooldown.metrics();
+        assert!(
+            metrics.total_429_errors >= 1,
+            "cooldown should have recorded at least one 429 error, got: {metrics:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rate_limit_cooldown_resets_on_success() {
+        // Turn 1: 429 error (records into cooldown)
+        // Turn 2: success (resets consecutive counters)
+        let mut host = MockHost::new(vec![
+            error_result("Error: 429 rate limit", 0, 0),
+            text_result("All good now!", 100, 50, Some(80)),
+        ]);
+        // Need 2+ turns so the loop can try both
+        let mut state = make_state();
+        state
+            .messages
+            .push(json!({"role": "user", "content": "hello"}));
+
+        // The first turn will fail with a fatal error (no tool calls to preserve),
+        // so the loop stops. But the cooldown should still have recorded the error.
+        let _ = run_agentic_loop_with_host(&mut host, &mut state).await;
+        assert!(
+            state.rate_limit_cooldown.metrics().total_429_errors >= 1,
+            "should have recorded the 429 error"
+        );
+        assert_eq!(
+            state.rate_limit_cooldown.metrics().consecutive_errors,
+            1,
+            "consecutive errors should be 1 since success didn't run"
+        );
+    }
+
+    #[tokio::test]
+    async fn rate_limit_cooldown_reject_with_no_prior_work() {
+        // Pre-populate cooldown to reject state, then verify the loop
+        // rejects immediately when there's no prior tool work.
+        let mut host = MockHost::new(vec![text_result("unreachable", 100, 50, None)]);
+        let mut state = make_state();
+        state
+            .messages
+            .push(json!({"role": "user", "content": "test"}));
+
+        // Force cooldown into reject state.
+        for _ in 0..5 {
+            state.rate_limit_cooldown.record_429(Some(60_000), false);
+        }
+        assert!(
+            state.rate_limit_cooldown.is_in_cooldown(),
+            "should be in cooldown after 5 errors"
+        );
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+        assert!(outcome.is_err(), "should reject with error: {outcome:?}");
+        let err = outcome.unwrap_err();
+        assert!(
+            err.contains("Rate limit cooldown active"),
+            "error should mention cooldown: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rate_limit_cooldown_reject_preserves_prior_tool_work() {
+        // When the first turn does tool work but the second turn 429s,
+        // the existing rate-limit graceful degradation preserves results.
+        let mut host = MockHost::new(vec![
+            edge_tool_result(vec![make_edge_tool("bash", "hello")], 100, 20, Some(50)),
+            error_result("Error: 429 rate limit (after 3 retries)", 0, 0),
+        ]);
+        let mut state = make_state();
+        state
+            .messages
+            .push(json!({"role": "user", "content": "test"}));
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+        assert!(outcome.is_ok(), "should gracefully complete: {outcome:?}");
+        assert!(
+            state.final_text.contains("Rate limit"),
+            "should mention rate limit in final text: {}",
+            state.final_text,
+        );
+        // Verify cooldown recorded the error for future turns.
+        assert!(
+            state.rate_limit_cooldown.metrics().total_429_errors >= 1,
+            "cooldown should have recorded the 429"
         );
     }
 

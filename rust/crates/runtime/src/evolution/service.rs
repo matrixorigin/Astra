@@ -131,7 +131,9 @@ impl EvolutionService {
         // Higher confidence first.
         v.sort_by(|a, b| {
             let score = |p: &EvolutionProposal| p.confidence;
-            score(b).partial_cmp(&score(a)).unwrap_or(std::cmp::Ordering::Equal)
+            score(b)
+                .partial_cmp(&score(a))
+                .unwrap_or(std::cmp::Ordering::Equal)
         });
         v
     }

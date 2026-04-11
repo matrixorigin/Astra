@@ -61,12 +61,10 @@ impl ToolExecutor {
                     .to_string(),
                 }
             }
-            "session" => analyze_session(
-                traces,
-                &session.turn_timings,
-                &session.fuzzy_match_events,
-            )
-            .to_string(),
+            "session" => {
+                analyze_session(traces, &session.turn_timings, &session.fuzzy_match_events)
+                    .to_string()
+            }
             "compare" => {
                 let t1 = args.get("turn_a").and_then(|v| v.as_i64()).unwrap_or(1);
                 let t2 = args.get("turn_b").and_then(|v| v.as_i64()).unwrap_or(-1);

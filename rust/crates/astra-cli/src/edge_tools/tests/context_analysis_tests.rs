@@ -1,6 +1,6 @@
 use super::*;
-use astra_runtime::observability_integration::{FuzzyMatchEvent, FuzzyMatchOutcome};
 use astra_runtime::observability_integration::TurnTiming;
+use astra_runtime::observability_integration::{FuzzyMatchEvent, FuzzyMatchOutcome};
 use astra_runtime::turn::context_assembly_trace::*;
 use serde_json::json;
 
@@ -476,8 +476,7 @@ fn context_analysis_session_includes_fuzzy_matching_summary() {
             outcome: FuzzyMatchOutcome::Matched,
         },
     ];
-    let (_dir, executor) =
-        make_executor_with_session_and_fuzzy(vec![t1, t2], vec![], fuzzy_events);
+    let (_dir, executor) = make_executor_with_session_and_fuzzy(vec![t1, t2], vec![], fuzzy_events);
 
     let result = executor.context_analysis(&json!({"mode": "session"}));
     let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
@@ -485,7 +484,10 @@ fn context_analysis_session_includes_fuzzy_matching_summary() {
     assert_eq!(parsed["fuzzy_matching"]["events"], 3);
     assert_eq!(parsed["fuzzy_matching"]["matched"], 2);
     assert_eq!(parsed["fuzzy_matching"]["ambiguous"], 1);
-    assert_eq!(parsed["fuzzy_matching"]["by_strategy"][0]["strategy"], "exact");
+    assert_eq!(
+        parsed["fuzzy_matching"]["by_strategy"][0]["strategy"],
+        "exact"
+    );
     assert_eq!(
         parsed["fuzzy_matching"]["by_strategy"][1]["strategy"],
         "line-number-stripped"
