@@ -3771,7 +3771,9 @@ pub(super) async fn handle_resume_command(arg: &str, profile: Option<&str>, stat
                 ws.contract_json = restored.contract_json.clone();
                 ws.plan_corrections = restored.plan_corrections.clone();
                 ws.last_context_trace = restored.last_context_trace.clone();
-                let _ = astra_services::session_workspace::write_workspace(&ws);
+                if let Err(e) = astra_services::session_workspace::write_workspace(&ws) {
+                    eprintln!("  ⚠ workspace write failed during resume: {e}");
+                }
             }
 
             let source = if restored.restored_from_cloud {

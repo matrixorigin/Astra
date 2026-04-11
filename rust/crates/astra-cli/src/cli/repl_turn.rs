@@ -1050,7 +1050,9 @@ fn commit_turn_journal_workspace_and_sidecars(
                 });
             }
 
-            let _ = astra_services::session_workspace::write_workspace(&ws);
+            if let Err(e) = astra_services::session_workspace::write_workspace(&ws) {
+                eprintln!("  ⚠ workspace write failed after stall detection: {e}");
+            }
         }
 
         // Log stall events to journal (use state.turn for user turn, not internal loop turn)
@@ -1197,6 +1199,7 @@ fn apply_turn_success(
                     .unwrap_or_else(|| "anonymous".to_string());
                 let obs_session = hub.start_session(&user_id, session_id);
                 state.observability_session = Some(obs_session);
+                apply_pending_adaptive_state(state);
             }
         }
     }
@@ -1538,7 +1541,9 @@ fn initialize_journal(state: &mut ReplState, session_id: &str) {
     }
     if dirty {
         ws.updated_at = chrono::Utc::now().to_rfc3339();
-        let _ = astra_services::session_workspace::write_workspace(&ws);
+        if let Err(e) = astra_services::session_workspace::write_workspace(&ws) {
+            eprintln!("  ⚠ workspace write failed during init: {e}");
+        }
     }
 
     // Initialize observability session for context tracing (M1).
@@ -1547,6 +1552,7 @@ fn initialize_journal(state: &mut ReplState, session_id: &str) {
         state.observability_session = Some(std::sync::Arc::new(std::sync::RwLock::new(
             astra_runtime::observability_integration::ObservabilitySession::new_simple(session_id),
         )));
+        apply_pending_adaptive_state(state);
     }
 }
 
@@ -1670,6 +1676,50 @@ fn sync_session_state_to_workspace(
     ws.session_goal = state.session_goal.clone();
     ws.pinned_skills = state.pinned_skills.iter().cloned().collect();
     ws.discovered_skills = state.discovered_skills.iter().cloned().collect();
+
+    // Persist adaptive engine state (anti-flap, experiment, tuned config)
+    if let Some(obs) = &state.observability_session {
+        if let Ok(guard) = obs.read() {
+            ws.last_scenario_change_turn = guard.last_scenario_change_turn;
+            ws.last_token_budget_direction = guard.last_token_budget_direction;
+            ws.last_token_budget_change_turn = guard.last_token_budget_change_turn;
+            ws.active_experiment_id = guard.active_experiment_id.clone();
+            ws.active_variant = guard.active_variant.clone();
+            ws.tuned_config_json = serde_json::to_string(&guard.config).ok();
+        }
+    }
+}
+
+/// Apply persisted adaptive engine state to a newly created ObservabilitySession.
+/// Called when pending_adaptive_state was stashed during workspace restore and the
+/// ObservabilitySession is now available to receive it.
+fn apply_pending_adaptive_state(state: &mut ReplState) {
+    let adaptive = match state.pending_adaptive_state.take() {
+        Some(a) => a,
+        None => return,
+    };
+    let obs = match &state.observability_session {
+        Some(o) => o,
+        None => return,
+    };
+    if let Ok(mut guard) = obs.write() {
+        guard.last_scenario_change_turn = adaptive.last_scenario_change_turn;
+        guard.last_token_budget_direction = adaptive.last_token_budget_direction;
+        guard.last_token_budget_change_turn = adaptive.last_token_budget_change_turn;
+        if adaptive.active_experiment_id.is_some() {
+            guard.active_experiment_id = adaptive.active_experiment_id;
+            guard.active_variant = adaptive.active_variant;
+        }
+        // Restore tuned RuntimeConfig (merge on top of freshly loaded defaults)
+        if let Some(json) = &adaptive.tuned_config_json {
+            if let Ok(saved_config) =
+                serde_json::from_str::<astra_runtime::runtime_config::RuntimeConfig>(json)
+            {
+                let current = std::mem::take(&mut guard.config);
+                guard.config = current.merge(saved_config);
+            }
+        }
+    }
 }
 
 fn latest_context_trace_signal(state: &ReplState) -> Option<ContextTraceSignal> {

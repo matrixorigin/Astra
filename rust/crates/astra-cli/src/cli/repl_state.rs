@@ -38,6 +38,19 @@ pub(crate) struct SkillDevState {
     pub dir: std::path::PathBuf,
 }
 
+/// Adaptive engine state persisted between sessions.
+/// Holds anti-flap dampening, experiment enrollment, and tuned config so the
+/// adaptive engine doesn't oscillate or lose progress on session restart.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct PersistedAdaptiveState {
+    pub last_scenario_change_turn: Option<u32>,
+    pub last_token_budget_direction: i8,
+    pub last_token_budget_change_turn: Option<u32>,
+    pub active_experiment_id: Option<String>,
+    pub active_variant: Option<String>,
+    pub tuned_config_json: Option<String>,
+}
+
 // NOTE: ReplState is per-session and NOT shared across sessions. In future
 // server/multi-session mode, ensure each session gets its own ReplState
 // instance to prevent cross-session data leakage (permissions, history, tokens).
@@ -226,6 +239,8 @@ pub(crate) struct ReplState {
             std::sync::RwLock<astra_runtime::observability_integration::ObservabilitySession>,
         >,
     >,
+    /// Adaptive state restored from workspace, applied when ObservabilitySession is created.
+    pub pending_adaptive_state: Option<PersistedAdaptiveState>,
 
     // ── A/B Testing (M4) ──
     /// Shared experiment store for A/B testing.
@@ -357,6 +372,7 @@ impl Default for ReplState {
             // Observability: hub is created at REPL startup, session on first turn
             observability_hub: None,
             observability_session: None,
+            pending_adaptive_state: None,
             experiment_store: std::sync::Arc::new(std::sync::RwLock::new(
                 astra_runtime::ab_testing::ExperimentStore::new(),
             )),

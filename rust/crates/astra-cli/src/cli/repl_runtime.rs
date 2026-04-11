@@ -557,6 +557,23 @@ pub(crate) fn initialize_repl_state(
                 state.session_goal = ws.session_goal;
                 state.pinned_skills = ws.pinned_skills.into_iter().collect();
                 state.discovered_skills = ws.discovered_skills.into_iter().collect();
+
+                // Stash adaptive engine state for application when ObservabilitySession is created
+                if ws.last_scenario_change_turn.is_some()
+                    || ws.last_token_budget_direction != 0
+                    || ws.active_experiment_id.is_some()
+                    || ws.tuned_config_json.is_some()
+                {
+                    state.pending_adaptive_state =
+                        Some(super::repl_state::PersistedAdaptiveState {
+                            last_scenario_change_turn: ws.last_scenario_change_turn,
+                            last_token_budget_direction: ws.last_token_budget_direction,
+                            last_token_budget_change_turn: ws.last_token_budget_change_turn,
+                            active_experiment_id: ws.active_experiment_id,
+                            active_variant: ws.active_variant,
+                            tuned_config_json: ws.tuned_config_json,
+                        });
+                }
             }
             Err(e) => {
                 eprintln!("  ⚠ Failed to restore workspace state for session {sid}: {e}");

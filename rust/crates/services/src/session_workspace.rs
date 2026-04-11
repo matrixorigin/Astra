@@ -267,6 +267,26 @@ pub struct WorkspaceMetadata {
     /// Skills discovered during this session.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub discovered_skills: Vec<String>,
+
+    // ─── Adaptive engine state (for resume without oscillation) ───
+    /// Last turn where a scenario change occurred (anti-flap cooldown).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_scenario_change_turn: Option<u32>,
+    /// Direction of the last token-budget change: +1 (increase), -1 (decrease), 0 (none).
+    #[serde(default)]
+    pub last_token_budget_direction: i8,
+    /// Turn where the last token-budget direction change occurred.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_token_budget_change_turn: Option<u32>,
+    /// Active A/B experiment ID (if enrolled in an experiment).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_experiment_id: Option<String>,
+    /// Active A/B experiment variant (if enrolled).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_variant: Option<String>,
+    /// Tuned RuntimeConfig (JSON). Persisted so auto-tuning adjustments survive restarts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tuned_config_json: Option<String>,
 }
 
 impl WorkspaceMetadata {
@@ -351,6 +371,12 @@ impl WorkspaceMetadata {
             session_goal: None,
             pinned_skills: Vec::new(),
             discovered_skills: Vec::new(),
+            last_scenario_change_turn: None,
+            last_token_budget_direction: 0,
+            last_token_budget_change_turn: None,
+            active_experiment_id: None,
+            active_variant: None,
+            tuned_config_json: None,
         }
     }
     pub fn with_context(
@@ -390,6 +416,12 @@ impl WorkspaceMetadata {
             session_goal: None,
             pinned_skills: Vec::new(),
             discovered_skills: Vec::new(),
+            last_scenario_change_turn: None,
+            last_token_budget_direction: 0,
+            last_token_budget_change_turn: None,
+            active_experiment_id: None,
+            active_variant: None,
+            tuned_config_json: None,
         }
     }
 
@@ -960,5 +992,66 @@ mod tests {
 
         // Cleanup
         let _ = std::fs::remove_dir_all(workspace_dir_for(&sid));
+    }
+
+    #[test]
+    fn workspace_adaptive_state_round_trip() {
+        let mut ws =
+            WorkspaceMetadata::with_context("adapt-sess", "gpt-4", "/tmp", Some("feature-x"));
+        ws.last_scenario_change_turn = Some(12);
+        ws.last_token_budget_direction = -1;
+        ws.last_token_budget_change_turn = Some(10);
+        ws.active_experiment_id = Some("exp-001".to_string());
+        ws.active_variant = Some("treatment-a".to_string());
+        ws.tuned_config_json = Some(r#"{"max_tokens":4096}"#.to_string());
+
+        let yaml = serde_yaml::to_string(&ws).unwrap();
+        let parsed: WorkspaceMetadata = serde_yaml::from_str(&yaml).unwrap();
+
+        assert_eq!(parsed.last_scenario_change_turn, Some(12));
+        assert_eq!(parsed.last_token_budget_direction, -1);
+        assert_eq!(parsed.last_token_budget_change_turn, Some(10));
+        assert_eq!(parsed.active_experiment_id.as_deref(), Some("exp-001"));
+        assert_eq!(parsed.active_variant.as_deref(), Some("treatment-a"));
+        assert_eq!(
+            parsed.tuned_config_json.as_deref(),
+            Some(r#"{"max_tokens":4096}"#)
+        );
+    }
+
+    #[test]
+    fn workspace_adaptive_state_defaults_on_missing_fields() {
+        // YAML from older versions without adaptive fields should deserialize cleanly
+        let yaml = "session_id: s\ncwd: /tmp\nmodel: m\ncreated_at: '2025-01-01T00:00:00Z'\nupdated_at: '2025-01-01T00:00:00Z'\nturn_count: 5\ntotal_tokens_in: 100\ntotal_tokens_out: 50\nstatus: active\n";
+        let ws: WorkspaceMetadata = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(ws.last_scenario_change_turn, None);
+        assert_eq!(ws.last_token_budget_direction, 0);
+        assert_eq!(ws.last_token_budget_change_turn, None);
+        assert_eq!(ws.active_experiment_id, None);
+        assert_eq!(ws.active_variant, None);
+        assert_eq!(ws.tuned_config_json, None);
+    }
+
+    #[test]
+    fn workspace_adaptive_state_omitted_when_default() {
+        let ws = WorkspaceMetadata::with_context("s", "m", "/tmp", None);
+        let yaml = serde_yaml::to_string(&ws).unwrap();
+        assert!(
+            !yaml.contains("last_scenario_change_turn"),
+            "should omit None fields"
+        );
+        assert!(
+            !yaml.contains("last_token_budget_change_turn"),
+            "should omit None fields"
+        );
+        assert!(
+            !yaml.contains("active_experiment_id"),
+            "should omit None fields"
+        );
+        assert!(!yaml.contains("active_variant"), "should omit None fields");
+        assert!(
+            !yaml.contains("tuned_config_json"),
+            "should omit None fields"
+        );
     }
 }
