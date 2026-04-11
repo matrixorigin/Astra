@@ -1873,7 +1873,7 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                         .unwrap_or(0);
                     if let Some(event) = cache_detector.detect_break(&fp, cache_read) {
                         let causes: Vec<String> = event.causes.iter().map(|c| c.to_string()).collect();
-                        eprintln!("[cache_diagnostics] cache break: {} | {}", 
+                        eprintln!("[cache_diagnostics] cache break: {} | {}",
                             causes.join(", "), cache_detector.stats_summary());
                     }
                 }

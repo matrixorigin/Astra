@@ -23,7 +23,9 @@ pub enum CacheBreakCause {
     ModelChanged,
     ProviderChanged,
     /// Cache TTL expired (inferred from time gap + fingerprint unchanged).
-    TtlExpired { gap_seconds: u64 },
+    TtlExpired {
+        gap_seconds: u64,
+    },
 }
 
 impl std::fmt::Display for CacheBreakCause {

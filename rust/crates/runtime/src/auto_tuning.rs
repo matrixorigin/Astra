@@ -92,6 +92,45 @@ pub enum SignalType {
     TaskFailure { reason: String },
 }
 
+impl SignalType {
+    // Canonical type names used in `SignalAccumulation` triggers and
+    // `count_signals`.  Keep these in sync with `type_name()`.
+    pub const NAME_RETRY: &'static str = "retry";
+    pub const NAME_CORRECTION: &'static str = "correction";
+    pub const NAME_INTERRUPTION: &'static str = "interruption";
+    pub const NAME_ACCEPTANCE: &'static str = "acceptance";
+    pub const NAME_QUICK_FOLLOW_UP: &'static str = "quick_follow_up";
+    pub const NAME_LONG_PAUSE: &'static str = "long_pause";
+    pub const NAME_THUMBS_RATING: &'static str = "thumbs_rating";
+    pub const NAME_STAR_RATING: &'static str = "star_rating";
+    pub const NAME_TEXT_FEEDBACK: &'static str = "text_feedback";
+    pub const NAME_HIGH_TOKEN_USAGE: &'static str = "high_token_usage";
+    pub const NAME_TOOL_CHURN: &'static str = "tool_churn";
+    pub const NAME_FOCUS_DRIFT: &'static str = "focus_drift";
+    pub const NAME_TASK_SUCCESS: &'static str = "task_success";
+    pub const NAME_TASK_FAILURE: &'static str = "task_failure";
+
+    /// Canonical string name for this signal type, used for accumulation matching.
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            Self::Retry { .. } => Self::NAME_RETRY,
+            Self::Correction => Self::NAME_CORRECTION,
+            Self::Interruption => Self::NAME_INTERRUPTION,
+            Self::Acceptance => Self::NAME_ACCEPTANCE,
+            Self::QuickFollowUp { .. } => Self::NAME_QUICK_FOLLOW_UP,
+            Self::LongPause { .. } => Self::NAME_LONG_PAUSE,
+            Self::ThumbsRating { .. } => Self::NAME_THUMBS_RATING,
+            Self::StarRating { .. } => Self::NAME_STAR_RATING,
+            Self::TextFeedback { .. } => Self::NAME_TEXT_FEEDBACK,
+            Self::HighTokenUsage { .. } => Self::NAME_HIGH_TOKEN_USAGE,
+            Self::ToolChurn { .. } => Self::NAME_TOOL_CHURN,
+            Self::FocusDrift => Self::NAME_FOCUS_DRIFT,
+            Self::TaskSuccess => Self::NAME_TASK_SUCCESS,
+            Self::TaskFailure { .. } => Self::NAME_TASK_FAILURE,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Sentiment {
@@ -406,23 +445,7 @@ impl FeedbackAggregator {
 }
 
 fn signal_type_matches(signal: &SignalType, type_name: &str) -> bool {
-    let signal_name = match signal {
-        SignalType::Retry { .. } => "retry",
-        SignalType::Correction => "correction",
-        SignalType::Interruption => "interruption",
-        SignalType::Acceptance => "acceptance",
-        SignalType::QuickFollowUp { .. } => "quick_follow_up",
-        SignalType::LongPause { .. } => "long_pause",
-        SignalType::ThumbsRating { .. } => "thumbs_rating",
-        SignalType::StarRating { .. } => "star_rating",
-        SignalType::TextFeedback { .. } => "text_feedback",
-        SignalType::HighTokenUsage { .. } => "high_token_usage",
-        SignalType::ToolChurn { .. } => "tool_churn",
-        SignalType::FocusDrift => "focus_drift",
-        SignalType::TaskSuccess => "task_success",
-        SignalType::TaskFailure { .. } => "task_failure",
-    };
-    signal_name == type_name
+    signal.type_name() == type_name
 }
 
 // ─── Auto-Tuning Engine ─────────────────────────────────────────────────────
@@ -740,7 +763,7 @@ impl AutoTuningEngine {
                 if signals.len() < *min_samples as usize {
                     return false;
                 }
-                let retries = aggregator.count_signals("retry", window);
+                let retries = aggregator.count_signals(SignalType::NAME_RETRY, window);
                 let total = signals.len() as f64;
                 (retries as f64 / total) > *threshold
             }
@@ -1078,7 +1101,7 @@ pub fn default_rules() -> Vec<EvolutionRule> {
         EvolutionRule::new(
             "correction-raise-strictness",
             EvolutionTrigger::SignalAccumulation {
-                signal_type: "Correction".to_string(),
+                signal_type: SignalType::NAME_CORRECTION.to_string(),
                 count: 2,
                 window_secs: 3600,
             },
@@ -1096,7 +1119,7 @@ pub fn default_rules() -> Vec<EvolutionRule> {
         EvolutionRule::new(
             "churn-expand-memory",
             EvolutionTrigger::SignalAccumulation {
-                signal_type: "ToolChurn".to_string(),
+                signal_type: SignalType::NAME_TOOL_CHURN.to_string(),
                 count: 1,
                 window_secs: 600,
             },
@@ -1113,7 +1136,7 @@ pub fn default_rules() -> Vec<EvolutionRule> {
         EvolutionRule::new(
             "drift-trim-history",
             EvolutionTrigger::SignalAccumulation {
-                signal_type: "FocusDrift".to_string(),
+                signal_type: SignalType::NAME_FOCUS_DRIFT.to_string(),
                 count: 1,
                 window_secs: 600,
             },
@@ -1159,6 +1182,55 @@ pub fn default_rules() -> Vec<EvolutionRule> {
         )
         .with_name("Compress earlier on high token usage")
         .with_cooldown(Duration::from_secs(300)),
+        // ── Engagement surface ──
+        // Rapid follow-ups → reduce history preservation (user is iterating fast)
+        EvolutionRule::new(
+            "quick-followup-trim-history",
+            EvolutionTrigger::SignalAccumulation {
+                signal_type: SignalType::NAME_QUICK_FOLLOW_UP.to_string(),
+                count: 3,
+                window_secs: 600,
+            },
+            EvolutionAction::AdjustConfig {
+                path: "compression.preserve_recent_turns".to_string(),
+                delta: -1.0,
+                min: Some(1.0),
+                max: Some(10.0),
+            },
+        )
+        .with_name("Trim history on rapid follow-ups")
+        .with_cooldown(Duration::from_secs(300)),
+        // Long pauses → expand memory retrieval (user may need broader context)
+        EvolutionRule::new(
+            "long-pause-expand-memory",
+            EvolutionTrigger::SignalAccumulation {
+                signal_type: SignalType::NAME_LONG_PAUSE.to_string(),
+                count: 2,
+                window_secs: 1800,
+            },
+            EvolutionAction::AdjustConfig {
+                path: "memory.retrieval_top_k".to_string(),
+                delta: 2.0,
+                min: Some(3.0),
+                max: Some(15.0),
+            },
+        )
+        .with_name("Expand memory on long pauses")
+        .with_cooldown(Duration::from_secs(600)),
+        // ── Pattern drift surface ──
+        // Pattern confidence drop → alert + expand exploration
+        EvolutionRule::new(
+            "pattern-drift-alert",
+            EvolutionTrigger::PatternDrift {
+                confidence_drop: 0.3,
+            },
+            EvolutionAction::Alert {
+                message: "Pattern confidence drift detected (>0.3 drop)".to_string(),
+                severity: AlertSeverity::Warning,
+            },
+        )
+        .with_name("Alert on pattern drift")
+        .with_cooldown(Duration::from_secs(1800)),
     ]
 }
 
@@ -1326,13 +1398,100 @@ mod tests {
     #[test]
     fn test_default_rules() {
         let rules = default_rules();
-        assert_eq!(rules.len(), 8);
+        assert_eq!(rules.len(), 11);
         assert!(rules.iter().any(|r| r.id == "low-success-boost-confidence"));
         assert!(rules.iter().any(|r| r.id == "correction-raise-strictness"));
         assert!(rules.iter().any(|r| r.id == "churn-expand-memory"));
         assert!(rules.iter().any(|r| r.id == "drift-trim-history"));
         assert!(rules.iter().any(|r| r.id == "high-tokens-reduce-budget"));
         assert!(rules.iter().any(|r| r.id == "high-tokens-compress-earlier"));
+        assert!(rules.iter().any(|r| r.id == "quick-followup-trim-history"));
+        assert!(rules.iter().any(|r| r.id == "long-pause-expand-memory"));
+        assert!(rules.iter().any(|r| r.id == "pattern-drift-alert"));
+    }
+
+    #[test]
+    fn signal_type_name_constants_are_consistent() {
+        // Verify type_name() returns the constant for every variant.
+        assert_eq!(
+            SignalType::Retry { count: 1 }.type_name(),
+            SignalType::NAME_RETRY
+        );
+        assert_eq!(
+            SignalType::Correction.type_name(),
+            SignalType::NAME_CORRECTION
+        );
+        assert_eq!(
+            SignalType::QuickFollowUp { delay_ms: 100 }.type_name(),
+            SignalType::NAME_QUICK_FOLLOW_UP
+        );
+        assert_eq!(
+            SignalType::LongPause { delay_ms: 60000 }.type_name(),
+            SignalType::NAME_LONG_PAUSE
+        );
+        assert_eq!(
+            SignalType::StarRating { stars: 4 }.type_name(),
+            SignalType::NAME_STAR_RATING
+        );
+        assert_eq!(
+            SignalType::TextFeedback {
+                sentiment: Sentiment::Positive
+            }
+            .type_name(),
+            SignalType::NAME_TEXT_FEEDBACK
+        );
+        assert_eq!(
+            SignalType::FocusDrift.type_name(),
+            SignalType::NAME_FOCUS_DRIFT
+        );
+    }
+
+    #[test]
+    fn quick_followup_rule_triggers_on_accumulated_signals() {
+        let engine = AutoTuningEngine::new();
+        for rule in default_rules() {
+            engine.add_rule(rule);
+        }
+        let config = RuntimeConfig::default();
+
+        // Record 3 quick follow-up signals within the window
+        for _ in 0..3 {
+            engine.record_feedback(FeedbackSignal::new(SignalType::QuickFollowUp {
+                delay_ms: 500,
+            }));
+        }
+
+        let result = engine.evaluate(&config);
+        assert!(
+            result
+                .iter()
+                .any(|(r, _)| r.id == "quick-followup-trim-history"),
+            "Quick follow-up rule should trigger on 3+ signals"
+        );
+    }
+
+    #[test]
+    fn long_pause_rule_triggers_on_accumulated_signals() {
+        let engine = AutoTuningEngine::new();
+        for rule in default_rules() {
+            engine.add_rule(rule);
+        }
+        let config = RuntimeConfig::default();
+
+        // Record 2 long pause signals within the window
+        for _ in 0..2 {
+            engine.record_feedback(FeedbackSignal::new(SignalType::LongPause {
+                delay_ms: 120_000,
+            }));
+        }
+
+        let result = engine.evaluate(&config);
+        assert!(
+            result
+                .iter()
+                .any(|(r, _)| r.id == "long-pause-expand-memory"),
+            "Long pause rule should trigger on 2+ signals"
+        );
     }
 
     #[test]
