@@ -26,6 +26,8 @@ pub struct ChatTurnSseAccum {
     pub cache_creation_tokens: u64,
     pub has_usage: bool,
     pub error_message: Option<String>,
+    /// System prompt token estimate from runtime (via `context_meta` SSE event).
+    pub system_prompt_tokens: Option<u32>,
 }
 
 /// Deferred edge work from `tool_request` / `approval_required` events.
@@ -186,6 +188,11 @@ fn apply_one_event(
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown error");
             accum.error_message = Some(format!("Error: {msg}"));
+        }
+        "context_meta" => {
+            if let Some(t) = event.get("system_prompt_tokens").and_then(|v| v.as_u64()) {
+                accum.system_prompt_tokens = Some(t as u32);
+            }
         }
         "run_started" => {
             if let Some(rid) = event.get("run_id").and_then(|v| v.as_str()) {

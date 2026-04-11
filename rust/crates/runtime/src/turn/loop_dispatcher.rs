@@ -223,6 +223,7 @@ mod tests {
                         has_tool_calls: false,
                         explain_turns: vec![],
                         error_message: None,
+                        system_prompt_tokens: None,
                     },
                     ttft_ms: Some(42),
                     edge_tool_round: vec![],

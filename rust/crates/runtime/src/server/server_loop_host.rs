@@ -459,6 +459,7 @@ impl ServerAgenticLoopHost {
             run_id: None,
             explain_turns: Vec::new(),
             error_message: None,
+            system_prompt_tokens: None,
         }
     }
 }

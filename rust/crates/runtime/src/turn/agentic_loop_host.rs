@@ -2667,6 +2667,18 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
         // ─── Step 2: Ingest turn stream into loop state ─────────────────
         let snap =
             agentic_turn_stream_snapshot_from_sse_accum(&turn_result.accum, turn_result.ttft_ms);
+
+        // Update trace collector with runtime-measured system prompt tokens.
+        if let Some(spt) = turn_result.accum.system_prompt_tokens {
+            if let Some(ref collector) = state.telemetry.turn_trace_collector {
+                collector.record_token_budget(
+                    crate::turn::context_assembly_trace::TokenBudgetTrace {
+                        system_prompt_tokens: spt,
+                        ..Default::default()
+                    },
+                );
+            }
+        }
         let edge_len = turn_result.edge_tool_round.len();
         let quiet = host.is_quiet();
         match map_ingest_outcome_to_iteration_control(ingest_agentic_turn_stream(

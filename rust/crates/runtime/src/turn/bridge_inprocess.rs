@@ -1528,6 +1528,27 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                 } else {
                     // Add cache breakpoint on last conversation message for Anthropic
                     add_message_cache_breakpoint(&mut llm_messages, &cache_cfg);
+
+                    // Emit system prompt token count so CLI can record precise breakdown.
+                    let sys_prompt_tokens: usize = llm_messages.iter()
+                        .take_while(|m| m.get("role").and_then(Value::as_str) == Some("system"))
+                        .map(|m| {
+                            match m.get("content") {
+                                Some(v) if v.is_string() =>
+                                    crate::prompts::estimate_str_tokens(v.as_str().unwrap_or("")),
+                                Some(v) if v.is_array() =>
+                                    v.as_array().unwrap().iter()
+                                        .filter_map(|b| b.get("text").and_then(Value::as_str))
+                                        .map(crate::prompts::estimate_str_tokens)
+                                        .sum(),
+                                _ => 0,
+                            }
+                        })
+                        .sum();
+                    yield render_sse(&json!({
+                        "type": "context_meta",
+                        "system_prompt_tokens": sys_prompt_tokens,
+                    }));
                     let mut client_stopped = false;
                     let llm_stream = match call_llm_stream(
                         &llm_messages,

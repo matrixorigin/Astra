@@ -444,10 +444,9 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
         let user_message_tokens = prompts::estimate_str_tokens(ctx.message) as u32;
 
         // System prompt tokens: the system prompt is assembled by the runtime
-        // (bridge_inprocess.rs), not present in ctx.messages. Use the calibrated
-        // default (~52KB prompt ≈ 14000 tokens). The runtime's record_token_budget
-        // will NOT overwrite this since it sends system_prompt_tokens=0.
-        let system_prompt_tokens = prompts::DEFAULT_SYSTEM_PROMPT_TOKENS as u32;
+        // (bridge_inprocess.rs) and sent back via `context_meta` SSE event.
+        // Use 0 here as placeholder — runtime will overwrite via record_token_budget.
+        let system_prompt_tokens = 0u32;
 
         // Memory tokens are tracked in memory retrieval trace, use 0 here
         // (would need to be passed from memory boost search results)
@@ -846,7 +845,6 @@ mod tests {
     }
     #[test]
     fn msg_content_extracts_string_and_array_formats() {
-        use astra_runtime::prompts::estimate_str_tokens;
         use serde_json::Value;
 
         // Helper mirrors the closure in prepare_chat_turn_payload.
@@ -878,9 +876,17 @@ mod tests {
         // Null/missing content
         let null_msg = json!({"role": "assistant", "content": null});
         assert!(msg_content(&null_msg).is_empty());
+    }
 
-        // System prompt uses calibrated constant (not extracted from messages)
-        assert_eq!(astra_runtime::prompts::DEFAULT_SYSTEM_PROMPT_TOKENS, 14_000);
+    #[test]
+    fn context_meta_sse_event_sets_system_prompt_tokens() {
+        use astra_runtime::turn::chat_turn_sse_dispatch::{
+            ChatTurnSseAccum, dispatch_chat_turn_sse_event_block,
+        };
+        let mut accum = ChatTurnSseAccum::default();
+        let sse = "data: {\"type\":\"context_meta\",\"system_prompt_tokens\":5432}\n\n";
+        dispatch_chat_turn_sse_event_block(sse, &mut accum, &mut vec![]);
+        assert_eq!(accum.system_prompt_tokens, Some(5432));
     }
 }
 
