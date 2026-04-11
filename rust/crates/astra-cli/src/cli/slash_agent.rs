@@ -29,13 +29,26 @@ struct DelegationSubRunSummary {
     sub_run_id: String,
     agent_id: String,
     status: String,
+    retry_of: Option<String>,
+    attempt: u32,
+    retry_reason: Option<String>,
     error: Option<String>,
     output_preview: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct DelegationRetrySummary {
+    original_run_id: String,
+    retry_run_id: String,
+    agent_id: String,
+    attempt: u32,
+    reason: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct DelegationHistoryEntry {
     delegation_id: String,
+    parent_run_id: Option<String>,
     pattern: String,
     agent_ids: Vec<String>,
     total_sub_runs: usize,
@@ -44,6 +57,7 @@ struct DelegationHistoryEntry {
     retry_count: usize,
     status: String,
     aggregated_output_preview: Option<String>,
+    retries: Vec<DelegationRetrySummary>,
     sub_runs: Vec<DelegationSubRunSummary>,
     last_seen_index: usize,
 }
@@ -120,6 +134,12 @@ fn show_history(ctx: &AgentCommandContext) {
             entry.succeeded.to_string().green(),
             entry.failed.to_string().red()
         );
+        if let Some(parent_run_id) = &entry.parent_run_id {
+            eprintln!(
+                "    {}",
+                format!("parent run: {}", parent_run_id.as_str()).dim()
+            );
+        }
         if let Some(preview) = &entry.aggregated_output_preview {
             eprintln!("    {}", preview.as_str().cyan());
         }
@@ -972,6 +992,14 @@ fn print_delegation_section(entries: &[DelegationHistoryEntry]) {
             entry.failed.to_string().red()
         );
         eprintln!("    {}", format!("status: {}", entry.status).dim());
+        if let Some(parent_run_id) = &entry.parent_run_id {
+            eprintln!(
+                "    {}",
+                format!("parent run: {}", shorten_run_id(parent_run_id))
+                    .dim()
+                    .italic()
+            );
+        }
         if entry.retry_count > 0 {
             eprintln!(
                 "    {}",
@@ -988,7 +1016,7 @@ fn render_delegation_tree(entries: &[DelegationHistoryEntry]) -> Vec<String> {
     let mut lines = Vec::new();
     for entry in entries {
         lines.push(format!(
-            "{} {} [{}{}]",
+            "{} {} [{}{}]{}",
             sub_run_status_icon(&entry.status),
             entry.delegation_id,
             entry.pattern,
@@ -1000,7 +1028,12 @@ fn render_delegation_tree(entries: &[DelegationHistoryEntry]) -> Vec<String> {
                 )
             } else {
                 String::new()
-            }
+            },
+            entry
+                .parent_run_id
+                .as_ref()
+                .map(|parent_run_id| format!(" ← parent {}", shorten_run_id(parent_run_id)))
+                .unwrap_or_default()
         ));
         for (idx, sub_run) in entry.sub_runs.iter().enumerate() {
             let branch = if idx + 1 == entry.sub_runs.len() {
@@ -1013,7 +1046,7 @@ fn render_delegation_tree(entries: &[DelegationHistoryEntry]) -> Vec<String> {
                 branch,
                 sub_run_status_icon(&sub_run.status),
                 sub_run.agent_id,
-                sub_run.status
+                sub_run_tree_label(sub_run)
             ));
         }
     }
@@ -1152,6 +1185,46 @@ fn sub_run_status_icon(status: &str) -> &'static str {
     }
 }
 
+fn shorten_run_id(run_id: &str) -> String {
+    run_id[..8.min(run_id.len())].to_string()
+}
+
+fn hydrate_retry_metadata(entry: &mut DelegationHistoryEntry) {
+    let retry_by_run: HashMap<_, _> = entry
+        .retries
+        .iter()
+        .map(|retry| (retry.retry_run_id.clone(), retry.clone()))
+        .collect();
+    for sub_run in &mut entry.sub_runs {
+        sub_run.attempt = 1;
+        sub_run.retry_of = None;
+        sub_run.retry_reason = None;
+        if let Some(retry) = retry_by_run.get(&sub_run.sub_run_id) {
+            sub_run.retry_of = Some(retry.original_run_id.clone());
+            sub_run.attempt = retry.attempt.max(1);
+            if !retry.reason.is_empty() {
+                sub_run.retry_reason = Some(retry.reason.clone());
+            }
+        }
+    }
+}
+
+fn sub_run_tree_label(sub_run: &DelegationSubRunSummary) -> String {
+    let mut label = format!(
+        "{} | run {}",
+        sub_run.status,
+        shorten_run_id(&sub_run.sub_run_id)
+    );
+    if let Some(retry_of) = &sub_run.retry_of {
+        label.push_str(&format!(
+            ", retry #{} of {}",
+            sub_run.attempt.max(1),
+            shorten_run_id(retry_of)
+        ));
+    }
+    label
+}
+
 fn load_recent_delegations(session_id: Option<&str>) -> Vec<DelegationHistoryEntry> {
     let Some(session_id) = session_id else {
         return Vec::new();
@@ -1182,6 +1255,10 @@ fn load_recent_delegations(session_id: Option<&str>) -> Vec<DelegationHistoryEnt
         entry.last_seen_index = idx;
         match event.event_type {
             JournalEventType::DelegationStarted => {
+                entry.parent_run_id = metadata
+                    .get("parent_run_id")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string);
                 entry.pattern = metadata
                     .get("pattern")
                     .and_then(|value| value.as_str())
@@ -1222,6 +1299,9 @@ fn load_recent_delegations(session_id: Option<&str>) -> Vec<DelegationHistoryEnt
                         .and_then(|value| value.as_str())
                         .unwrap_or("?")
                         .to_string(),
+                    retry_of: None,
+                    attempt: 1,
+                    retry_reason: None,
                     error: metadata
                         .get("error")
                         .and_then(|value| value.as_str())
@@ -1243,6 +1323,41 @@ fn load_recent_delegations(session_id: Option<&str>) -> Vec<DelegationHistoryEnt
             }
             JournalEventType::DelegationRetry => {
                 entry.retry_count = entry.retry_count.saturating_add(1);
+                let retry = DelegationRetrySummary {
+                    original_run_id: metadata
+                        .get("original_run_id")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    retry_run_id: metadata
+                        .get("retry_run_id")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    agent_id: metadata
+                        .get("agent_id")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("?")
+                        .to_string(),
+                    attempt: metadata
+                        .get("attempt")
+                        .and_then(|value| value.as_u64())
+                        .unwrap_or(2) as u32,
+                    reason: metadata
+                        .get("reason")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                };
+                if let Some(existing) = entry
+                    .retries
+                    .iter_mut()
+                    .find(|existing| existing.retry_run_id == retry.retry_run_id)
+                {
+                    *existing = retry;
+                } else {
+                    entry.retries.push(retry);
+                }
                 if entry.status.is_empty() {
                     entry.status = "running".to_string();
                 }
@@ -1280,6 +1395,9 @@ fn load_recent_delegations(session_id: Option<&str>) -> Vec<DelegationHistoryEnt
         }
     }
     let mut entries: Vec<_> = delegations.into_values().collect();
+    for entry in &mut entries {
+        hydrate_retry_metadata(entry);
+    }
     entries.sort_by_key(|entry| Reverse(entry.last_seen_index));
     entries
 }
@@ -1461,6 +1579,10 @@ fn render_delegation_status_lines(
     let mut lines = vec![
         format!("Pattern: {}", entry.pattern),
         format!(
+            "Parent run: {}",
+            entry.parent_run_id.as_deref().unwrap_or("unknown")
+        ),
+        format!(
             "Agents: {}",
             if entry.agent_ids.is_empty() {
                 "?".to_string()
@@ -1532,6 +1654,26 @@ fn render_delegation_status_lines(
         }
     }
 
+    if !entry.retries.is_empty() {
+        lines.push(String::new());
+        lines.push("🔁 Retry lineage".to_string());
+        for retry in &entry.retries {
+            lines.push(format!(
+                "  {}: {} -> {} (retry #{})",
+                retry.agent_id,
+                retry.original_run_id,
+                retry.retry_run_id,
+                retry.attempt.max(1)
+            ));
+            if !retry.reason.is_empty() {
+                lines.push(format!(
+                    "    reason: {}",
+                    truncate_display(&retry.reason, 160)
+                ));
+            }
+        }
+    }
+
     let lifecycle_lines: Vec<_> = events
         .iter()
         .filter_map(format_delegation_event_brief)
@@ -1551,13 +1693,26 @@ fn render_delegation_status_lines(
         lines.push(String::new());
         lines.push("📦 Sub-runs".to_string());
         for sub_run in &entry.sub_runs {
-            lines.push(format!(
+            let mut header = format!(
                 "  {} {} [{}]",
                 sub_run_status_icon(&sub_run.status),
                 sub_run.agent_id,
                 sub_run.status
-            ));
+            );
+            if sub_run.retry_of.is_some() {
+                header.push_str(&format!(" retry #{}", sub_run.attempt.max(1)));
+            }
+            lines.push(header);
             lines.push(format!("    run: {}", sub_run.sub_run_id));
+            if let Some(retry_of) = &sub_run.retry_of {
+                lines.push(format!("    retry of: {}", retry_of));
+            }
+            if let Some(retry_reason) = &sub_run.retry_reason {
+                lines.push(format!(
+                    "    retry reason: {}",
+                    truncate_display(retry_reason, 160)
+                ));
+            }
             if let Some(preview) = &sub_run.output_preview {
                 lines.push(format!("    output: {}", truncate_display(preview, 160)));
             }
@@ -1669,9 +1824,9 @@ mod tests {
                 "del-1",
                 "run-1",
                 "coder",
-                "completed",
+                "failed",
+                Some("needs retry"),
                 None,
-                Some("implemented fix"),
             ))
             .unwrap();
         writer
@@ -1686,13 +1841,24 @@ mod tests {
             ))
             .unwrap();
         writer
+            .append(&JournalEvent::delegation_sub_run_completed(
+                Some(&sid),
+                "del-1",
+                "run-2",
+                "coder",
+                "completed",
+                None,
+                Some("implemented fix"),
+            ))
+            .unwrap();
+        writer
             .append(&JournalEvent::delegation_completed(
                 Some(&sid),
                 "del-1",
                 "fan_out",
                 2,
-                2,
-                0,
+                1,
+                1,
                 "completed",
                 Some("merged final answer"),
             ))
@@ -1701,6 +1867,7 @@ mod tests {
         let delegations = load_recent_delegations(Some(&sid));
         assert_eq!(delegations.len(), 1);
         assert_eq!(delegations[0].delegation_id, "del-1");
+        assert_eq!(delegations[0].parent_run_id.as_deref(), Some("run-parent"));
         assert_eq!(delegations[0].agent_ids, vec!["coder", "reviewer"]);
         assert_eq!(delegations[0].retry_count, 1);
         assert_eq!(delegations[0].status, "completed");
@@ -1708,10 +1875,19 @@ mod tests {
             delegations[0].aggregated_output_preview.as_deref(),
             Some("merged final answer")
         );
-        assert_eq!(delegations[0].sub_runs.len(), 1);
+        assert_eq!(delegations[0].sub_runs.len(), 2);
         assert_eq!(
-            delegations[0].sub_runs[0].output_preview.as_deref(),
+            delegations[0].sub_runs[1].output_preview.as_deref(),
             Some("implemented fix")
+        );
+        assert_eq!(
+            delegations[0].sub_runs[1].retry_of.as_deref(),
+            Some("run-1")
+        );
+        assert_eq!(delegations[0].sub_runs[1].attempt, 2);
+        assert_eq!(
+            delegations[0].sub_runs[1].retry_reason.as_deref(),
+            Some("needs another pass")
         );
     }
 
@@ -1759,9 +1935,10 @@ mod tests {
     }
 
     #[test]
-    fn render_delegation_tree_includes_subruns() {
+    fn render_delegation_tree_includes_parent_and_retry_annotations() {
         let lines = render_delegation_tree(&[DelegationHistoryEntry {
             delegation_id: "del-1".to_string(),
+            parent_run_id: Some("run-parent".to_string()),
             pattern: "fan_out".to_string(),
             status: "completed".to_string(),
             sub_runs: vec![
@@ -1769,6 +1946,9 @@ mod tests {
                     sub_run_id: "run-1".to_string(),
                     agent_id: "coder".to_string(),
                     status: "completed".to_string(),
+                    retry_of: None,
+                    attempt: 1,
+                    retry_reason: None,
                     error: None,
                     output_preview: None,
                 },
@@ -1776,6 +1956,9 @@ mod tests {
                     sub_run_id: "run-2".to_string(),
                     agent_id: "reviewer".to_string(),
                     status: "failed".to_string(),
+                    retry_of: Some("run-1".to_string()),
+                    attempt: 2,
+                    retry_reason: Some("oops".to_string()),
                     error: Some("oops".to_string()),
                     output_preview: None,
                 },
@@ -1784,8 +1967,10 @@ mod tests {
         }]);
         assert_eq!(lines.len(), 3);
         assert!(lines[0].contains("del-1"));
+        assert!(lines[0].contains("parent"));
         assert!(lines[1].contains("coder"));
         assert!(lines[2].contains("reviewer"));
+        assert!(lines[2].contains("retry #2"));
     }
 
     #[test]
@@ -1837,6 +2022,7 @@ mod tests {
     fn render_delegation_status_lines_highlights_parent_wait_and_failures() {
         let entry = DelegationHistoryEntry {
             delegation_id: "del-1".to_string(),
+            parent_run_id: Some("run-parent".to_string()),
             pattern: "fan_out".to_string(),
             agent_ids: vec!["coder".to_string(), "reviewer".to_string()],
             total_sub_runs: 2,
@@ -1845,10 +2031,20 @@ mod tests {
             retry_count: 1,
             status: "running".to_string(),
             aggregated_output_preview: None,
+            retries: vec![DelegationRetrySummary {
+                original_run_id: "run-1".to_string(),
+                retry_run_id: "run-2".to_string(),
+                agent_id: "reviewer".to_string(),
+                attempt: 2,
+                reason: "needs another pass".to_string(),
+            }],
             sub_runs: vec![DelegationSubRunSummary {
                 sub_run_id: "run-2".to_string(),
                 agent_id: "reviewer".to_string(),
                 status: "failed".to_string(),
+                retry_of: Some("run-1".to_string()),
+                attempt: 2,
+                retry_reason: Some("needs another pass".to_string()),
                 error: Some("permission denied".to_string()),
                 output_preview: None,
             }],
@@ -1874,9 +2070,12 @@ mod tests {
         ];
 
         let rendered = render_delegation_status_lines(&entry, &events).join("\n");
+        assert!(rendered.contains("Parent run: run-parent"));
         assert!(rendered.contains("Parent agent is paused"));
         assert!(rendered.contains("Waiting for aggregated output"));
         assert!(rendered.contains("Retries: 1"));
+        assert!(rendered.contains("Retry lineage"));
+        assert!(rendered.contains("run-1 -> run-2"));
         assert!(rendered.contains("permission denied"));
         assert!(rendered.contains("Recent lifecycle"));
         assert!(rendered.contains("retry #2"));
@@ -1886,6 +2085,7 @@ mod tests {
     fn render_delegation_status_lines_falls_back_to_single_success_output() {
         let entry = DelegationHistoryEntry {
             delegation_id: "del-2".to_string(),
+            parent_run_id: None,
             pattern: "sequential".to_string(),
             agent_ids: vec!["coder".to_string()],
             total_sub_runs: 1,
@@ -1894,10 +2094,14 @@ mod tests {
             retry_count: 0,
             status: "completed".to_string(),
             aggregated_output_preview: None,
+            retries: vec![],
             sub_runs: vec![DelegationSubRunSummary {
                 sub_run_id: "run-1".to_string(),
                 agent_id: "coder".to_string(),
                 status: "completed".to_string(),
+                retry_of: None,
+                attempt: 1,
+                retry_reason: None,
                 error: None,
                 output_preview: Some("single-agent final answer".to_string()),
             }],
