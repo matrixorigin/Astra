@@ -1517,6 +1517,20 @@ pub(super) async fn handle_info_command(
                 "yellow" => bar_str.yellow(),
                 _ => bar_str.red(),
             };
+            let est_pressure = if budget.compact_trigger() > 0 {
+                (history_tokens as f64 / budget.compact_trigger() as f64).min(1.0)
+            } else {
+                0.0
+            };
+            let (status_icon, status_label, status_hint) =
+                describe_context_pressure(usage_pct, est_pressure);
+            eprintln!(
+                "  {:<12}  {} {}",
+                "status".cyan(),
+                status_icon,
+                status_label.bold()
+            );
+            eprintln!("  {:<12}  {}", "what it means".cyan(), status_hint.dim());
             eprintln!("  {:<12}  {bar_display}", "usage".cyan());
 
             // ── Breakdown ──
@@ -1524,24 +1538,18 @@ pub(super) async fn handle_info_command(
             let free = limit.saturating_sub(history_tokens);
             eprintln!(
                 "  {:<12}  {}",
-                "breakdown".cyan(),
+                "history".cyan(),
                 format!(
-                    "History ~{}k │ Free ~{}k │ {} messages",
+                    "~{}k tokens across {} messages; ~{}k tokens still free",
                     history_tokens / 1000,
-                    free / 1000,
-                    state.history.len() * 2
+                    state.history.len() * 2,
+                    free / 1000
                 )
                 .dim()
             );
 
             // ── Compaction tier ──
             let compact_trigger_k = budget.compact_trigger() / 1000;
-            // Estimate pressure from current token usage vs trigger threshold
-            let est_pressure = if budget.compact_trigger() > 0 {
-                (history_tokens as f64 / budget.compact_trigger() as f64).min(1.0)
-            } else {
-                0.0
-            };
             let tier_emoji = if est_pressure < 0.5 {
                 "🟢"
             } else if est_pressure < 0.85 {
@@ -1560,7 +1568,7 @@ pub(super) async fn handle_info_command(
                 "  {:<12}  {}",
                 "compaction".cyan(),
                 format!(
-                    "{tier_emoji} {tier_label}  (trigger ~{compact_trigger_k}k, keep {} turns)",
+                    "{tier_emoji} {tier_label}  (starts near ~{compact_trigger_k}k; keep {} recent turns)",
                     budget.keep_recent_turns
                 )
                 .dim()
@@ -1583,20 +1591,27 @@ pub(super) async fn handle_info_command(
 
             // ── Attention ──
             if let Some(ref anchor) = state.continuation_anchor {
-                let display: String = if anchor.chars().count() > 60 {
-                    format!("{}…", anchor.chars().take(60).collect::<String>())
-                } else {
-                    anchor.clone()
-                };
-                eprintln!("  {:<12}  {}", "anchor".cyan(), display.dim());
+                let parsed = parse_continuation_anchor(anchor);
+                if let Some(task) = parsed.task.as_deref() {
+                    eprintln!("  {:<12}  {}", "task".cyan(), truncate_str(task, 80).dim());
+                }
+                if let Some(direction) = parsed.direction.as_deref() {
+                    eprintln!(
+                        "  {:<12}  {}",
+                        "direction".cyan(),
+                        truncate_str(direction, 80).dim()
+                    );
+                }
+                if parsed.task.is_none() && parsed.direction.is_none() {
+                    eprintln!(
+                        "  {:<12}  {}",
+                        "focus".cyan(),
+                        truncate_str(anchor, 80).dim()
+                    );
+                }
             }
             if let Some(ref goal) = state.session_goal {
-                let display: String = if goal.chars().count() > 60 {
-                    format!("{}…", goal.chars().take(60).collect::<String>())
-                } else {
-                    goal.clone()
-                };
-                eprintln!("  {:<12}  {}", "goal".cyan(), display.dim());
+                eprintln!("  {:<12}  {}", "goal".cyan(), truncate_str(goal, 80).dim());
             }
 
             eprintln!("  {}", "─".repeat(56).cyan().dim());
@@ -1829,6 +1844,56 @@ pub(super) async fn handle_info_command(
     Ok(())
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct ContinuationAnchorParts {
+    task: Option<String>,
+    direction: Option<String>,
+}
+
+fn parse_continuation_anchor(anchor: &str) -> ContinuationAnchorParts {
+    let mut task = None;
+    let mut direction = None;
+
+    for line in anchor
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        if let Some(rest) = line.strip_prefix("Latest user task: ") {
+            task = Some(rest.to_string());
+        } else if let Some(rest) = line.strip_prefix("Latest assistant direction: ") {
+            direction = Some(rest.to_string());
+        }
+    }
+
+    ContinuationAnchorParts { task, direction }
+}
+
+fn describe_context_pressure(
+    usage_pct: f64,
+    est_pressure: f64,
+) -> (&'static str, &'static str, &'static str) {
+    if est_pressure < 0.5 && usage_pct < 60.0 {
+        (
+            "🟢",
+            "Healthy",
+            "Plenty of room left. Short follow-ups like '继续' should work well.",
+        )
+    } else if est_pressure < 0.85 && usage_pct < 85.0 {
+        (
+            "🟡",
+            "Getting full",
+            "Still usable, but older turns may compact soon if the thread keeps growing.",
+        )
+    } else {
+        (
+            "🔴",
+            "Near compaction",
+            "You can continue, but expect older context to be summarized or compressed soon.",
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1962,5 +2027,38 @@ mod tests {
             parse_review_git_target("abc123"),
             ReviewGitTarget::Rev("abc123")
         );
+    }
+
+    #[test]
+    fn parse_continuation_anchor_extracts_task_and_direction() {
+        let parsed = parse_continuation_anchor(
+            "Latest user task: debug Chinese input drops\nLatest assistant direction: inspect prompt redraw path",
+        );
+        assert_eq!(parsed.task.as_deref(), Some("debug Chinese input drops"));
+        assert_eq!(
+            parsed.direction.as_deref(),
+            Some("inspect prompt redraw path")
+        );
+    }
+
+    #[test]
+    fn parse_continuation_anchor_handles_task_only() {
+        let parsed = parse_continuation_anchor("Latest user task: fix auth");
+        assert_eq!(parsed.task.as_deref(), Some("fix auth"));
+        assert_eq!(parsed.direction, None);
+    }
+
+    #[test]
+    fn describe_context_pressure_reports_healthy() {
+        let (_, label, hint) = describe_context_pressure(5.0, 0.1);
+        assert_eq!(label, "Healthy");
+        assert!(hint.contains("Plenty of room"));
+    }
+
+    #[test]
+    fn describe_context_pressure_reports_near_compaction() {
+        let (_, label, hint) = describe_context_pressure(90.0, 0.95);
+        assert_eq!(label, "Near compaction");
+        assert!(hint.contains("summarized or compressed"));
     }
 }
