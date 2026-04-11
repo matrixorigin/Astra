@@ -224,6 +224,7 @@ mod tests {
                         explain_turns: vec![],
                         error_message: None,
                         system_prompt_tokens: None,
+                        system_prompt_breakdown: None,
                     },
                     ttft_ms: Some(42),
                     edge_tool_round: vec![],

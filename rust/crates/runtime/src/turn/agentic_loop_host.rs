@@ -2668,15 +2668,23 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
         let snap =
             agentic_turn_stream_snapshot_from_sse_accum(&turn_result.accum, turn_result.ttft_ms);
 
-        // Update trace collector with runtime-measured system prompt tokens.
-        if let Some(spt) = turn_result.accum.system_prompt_tokens {
-            if let Some(ref collector) = state.telemetry.turn_trace_collector {
+        // Update trace collector with runtime-measured system prompt tokens + breakdown.
+        if let Some(ref collector) = state.telemetry.turn_trace_collector {
+            if let Some(spt) = turn_result.accum.system_prompt_tokens {
                 collector.record_token_budget(
                     crate::turn::context_assembly_trace::TokenBudgetTrace {
                         system_prompt_tokens: spt,
                         ..Default::default()
                     },
                 );
+            }
+            if let Some(ref breakdown_json) = turn_result.accum.system_prompt_breakdown {
+                if let Ok(breakdown) = serde_json::from_value::<
+                    crate::turn::context_assembly_trace::SystemPromptBreakdown,
+                >(breakdown_json.clone())
+                {
+                    collector.record_system_prompt(breakdown);
+                }
             }
         }
         let edge_len = turn_result.edge_tool_round.len();

@@ -348,7 +348,7 @@ fn build_system_message(
     confidence: f64,
     task_type: Option<&str>,
     cache_cfg: &PromptCacheConfig,
-) -> (Value, Option<Value>) {
+) -> (Value, Option<Value>, Vec<prompts::PromptSection>) {
     let key = section_cache_key(tool_names, task_type, confidence);
 
     // Try cache for the stable (Global + Session) sections
@@ -449,6 +449,7 @@ fn build_system_message(
                 "content": blocks,
             }),
             None,
+            sections,
         )
     } else {
         // OpenAI-compatible: split stable / dynamic into separate system messages
@@ -466,7 +467,7 @@ fn build_system_message(
                 "content": profile_desc,
             }))
         };
-        (primary, dynamic)
+        (primary, dynamic, sections)
     }
 }
 
@@ -1345,7 +1346,7 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
             // Build provider-aware system message with static/dynamic boundary.
             // Anthropic gets multi-block content with cache_control on stable sections;
             // OpenAI/others get two messages: stable prefix (cacheable) + dynamic per-turn.
-            let (system_msg, dynamic_msg) = build_system_message(
+            let (system_msg, dynamic_msg, prompt_sections) = build_system_message(
                 &tool_names,
                 &dynamic_desc,
                 selection_confidence,
@@ -1529,25 +1530,21 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                     // Add cache breakpoint on last conversation message for Anthropic
                     add_message_cache_breakpoint(&mut llm_messages, &cache_cfg);
 
-                    // Emit system prompt token count so CLI can record precise breakdown.
-                    let sys_prompt_tokens: usize = llm_messages.iter()
-                        .take_while(|m| m.get("role").and_then(Value::as_str) == Some("system"))
-                        .map(|m| {
-                            match m.get("content") {
-                                Some(v) if v.is_string() =>
-                                    crate::prompts::estimate_str_tokens(v.as_str().unwrap_or("")),
-                                Some(v) if v.is_array() =>
-                                    v.as_array().unwrap().iter()
-                                        .filter_map(|b| b.get("text").and_then(Value::as_str))
-                                        .map(crate::prompts::estimate_str_tokens)
-                                        .sum(),
-                                _ => 0,
-                            }
-                        })
-                        .sum();
+                    // Emit system prompt breakdown so CLI can record precise per-component trace.
+                    let breakdown = prompts::build_system_prompt_trace(
+                        &prompt_sections, vec![], vec![],
+                    );
                     yield render_sse(&json!({
                         "type": "context_meta",
-                        "system_prompt_tokens": sys_prompt_tokens,
+                        "system_prompt_tokens": breakdown.total_tokens,
+                        "system_prompt_breakdown": {
+                            "base_persona_tokens": breakdown.base_persona_tokens,
+                            "environment_tokens": breakdown.environment_tokens,
+                            "user_preferences_tokens": breakdown.user_preferences_tokens,
+                            "skills_injected": breakdown.skills_injected,
+                            "repository_memories": breakdown.repository_memories,
+                            "total_tokens": breakdown.total_tokens,
+                        },
                     }));
                     let mut client_stopped = false;
                     let llm_stream = match call_llm_stream(
@@ -2563,7 +2560,7 @@ mod tests {
             std::env::remove_var("MO_PROMPT_CACHE_DISABLED");
         }
 
-        let (msg, _) = build_system_message(
+        let (msg, _, _) = build_system_message(
             &["bash", "read_file"],
             "cwd: /test",
             0.8,
@@ -2615,7 +2612,7 @@ mod tests {
             std::env::remove_var("MO_PROMPT_CACHE_DISABLED");
         }
 
-        let (msg, _) = build_system_message(
+        let (msg, _, _) = build_system_message(
             &["bash", "read_file"],
             "cwd: /test",
             0.8,
@@ -2652,7 +2649,7 @@ mod tests {
             std::env::set_var("MO_PROMPT_CACHE_DISABLED", "1");
         }
 
-        let (msg, _) = build_system_message(
+        let (msg, _, _) = build_system_message(
             &["bash"],
             "cwd: /test",
             0.8,
@@ -2676,7 +2673,7 @@ mod tests {
 
     #[test]
     fn build_system_message_openai_has_string_content() {
-        let (msg, dynamic) = build_system_message(
+        let (msg, dynamic, _) = build_system_message(
             &["bash", "read_file"],
             "cwd: /test",
             0.8,
@@ -2702,7 +2699,7 @@ mod tests {
     #[test]
     fn build_system_message_claude_model_triggers_anthropic_format() {
         // Even if provider is not "anthropic", claude model name should trigger it
-        let (msg, _) = build_system_message(
+        let (msg, _, _) = build_system_message(
             &["bash"],
             "",
             0.8,
@@ -3108,7 +3105,7 @@ mod tests {
         }
 
         // Layer 1: System message with cache_control
-        let (sys, _) = build_system_message(
+        let (sys, _, _) = build_system_message(
             &["bash", "read_file"],
             "cwd: /test",
             0.8,
@@ -3161,7 +3158,7 @@ mod tests {
         }
 
         // Layer 1: system message
-        let (sys, _) = build_system_message(
+        let (sys, _, _) = build_system_message(
             &["bash"],
             "cwd: /test",
             0.8,
@@ -3218,7 +3215,7 @@ mod tests {
         for i in 0..34 {
             let tool_name = format!("tool_{i}");
             let tools: Vec<&str> = vec![tool_name.as_str()];
-            let (_msg, _) = build_system_message(
+            let (_msg, _, _) = build_system_message(
                 &tools,
                 "",
                 0.8,
@@ -3499,7 +3496,7 @@ mod tests {
             "github_list_prs",
             "github_get_issue",
         ];
-        let (msg, _) = build_system_message(
+        let (msg, _, _) = build_system_message(
             &tools,
             "profile",
             0.8,
@@ -3526,7 +3523,7 @@ mod tests {
             std::env::remove_var("MO_PROMPT_CACHE_DISABLED");
         }
 
-        let (msg, _) = build_system_message(
+        let (msg, _, _) = build_system_message(
             &["bash", "read_file", "memory_store"],
             "profile",
             0.8,
@@ -3565,14 +3562,14 @@ mod tests {
             std::env::remove_var("MO_PROMPT_CACHE_DISABLED");
         }
 
-        let (msg1, _) = build_system_message(
+        let (msg1, _, _) = build_system_message(
             &["bash", "read_file"],
             "p1",
             0.8,
             None,
             &PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514"),
         );
-        let (msg2, _) = build_system_message(
+        let (msg2, _, _) = build_system_message(
             &["bash", "git_diff", "memory_store"],
             "p2",
             0.5,
@@ -3630,14 +3627,14 @@ mod tests {
         }
 
         // Simulate two turns in the same session (same tools, different profile)
-        let (msg_turn1, _) = build_system_message(
+        let (msg_turn1, _, _) = build_system_message(
             &["bash", "read_file", "git_diff"],
             "turn1 profile",
             0.8,
             None,
             &PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514"),
         );
-        let (msg_turn2, _) = build_system_message(
+        let (msg_turn2, _, _) = build_system_message(
             &["bash", "read_file", "git_diff"],
             "turn2 profile",
             0.8,
@@ -3684,14 +3681,14 @@ mod tests {
     fn openai_stable_prefix_across_turns() {
         let _lock = CACHE_ENV_MUTEX.lock().unwrap();
 
-        let (msg1, dyn1) = build_system_message(
+        let (msg1, dyn1, _) = build_system_message(
             &["bash", "read_file"],
             "turn1 profile",
             0.8,
             None,
             &PromptCacheConfig::latch("openai", "gpt-4o"),
         );
-        let (msg2, dyn2) = build_system_message(
+        let (msg2, dyn2, _) = build_system_message(
             &["bash", "read_file"],
             "turn2 profile",
             0.8,
@@ -3726,14 +3723,14 @@ mod tests {
     fn openai_global_prefix_stable_across_tool_sets() {
         let _lock = CACHE_ENV_MUTEX.lock().unwrap();
 
-        let (msg1, _) = build_system_message(
+        let (msg1, _, _) = build_system_message(
             &["bash"],
             "",
             0.8,
             None,
             &PromptCacheConfig::latch("openai", "gpt-4o"),
         );
-        let (msg2, _) = build_system_message(
+        let (msg2, _, _) = build_system_message(
             &["bash", "git_diff", "memory_store", "find_definition"],
             "",
             0.8,
@@ -3766,7 +3763,7 @@ mod tests {
         }
 
         let tools = vec!["bash", "read_file", "memory_store", "git_diff"];
-        let (msg, _) = build_system_message(
+        let (msg, _, _) = build_system_message(
             &tools,
             "",
             0.8,
@@ -3815,21 +3812,21 @@ mod tests {
         }
 
         let tools = vec!["bash", "read_file"];
-        let (msg_none, _) = build_system_message(
+        let (msg_none, _, _) = build_system_message(
             &tools,
             "",
             0.8,
             None,
             &PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514"),
         );
-        let (msg_review, _) = build_system_message(
+        let (msg_review, _, _) = build_system_message(
             &tools,
             "",
             0.8,
             Some("code_review"),
             &PromptCacheConfig::latch("anthropic", "claude-sonnet-4-20250514"),
         );
-        let (msg_debug, _) = build_system_message(
+        let (msg_debug, _, _) = build_system_message(
             &tools,
             "",
             0.8,

@@ -28,6 +28,8 @@ pub struct ChatTurnSseAccum {
     pub error_message: Option<String>,
     /// System prompt token estimate from runtime (via `context_meta` SSE event).
     pub system_prompt_tokens: Option<u32>,
+    /// Detailed system prompt breakdown from runtime (via `context_meta` SSE event).
+    pub system_prompt_breakdown: Option<Value>,
 }
 
 /// Deferred edge work from `tool_request` / `approval_required` events.
@@ -192,6 +194,9 @@ fn apply_one_event(
         "context_meta" => {
             if let Some(t) = event.get("system_prompt_tokens").and_then(|v| v.as_u64()) {
                 accum.system_prompt_tokens = Some(t as u32);
+            }
+            if let Some(b) = event.get("system_prompt_breakdown") {
+                accum.system_prompt_breakdown = Some(b.clone());
             }
         }
         "run_started" => {
