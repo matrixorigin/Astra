@@ -797,6 +797,95 @@ pub fn all_tool_schemas() -> Vec<Value> {
         json!({
             "type": "function",
             "function": {
+                "name": "adjust_config",
+                "description": "Adjust a bounded runtime config value during this session. Uses a governor with per-turn mutation and drift limits.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "enum": [
+                                "compression.compression_threshold",
+                                "memory.retrieval_top_k",
+                                "tool_selection.max_tools",
+                                "tool_selection.tool_budget_tokens",
+                                "token_budget.max_turn_input_tokens",
+                                "token_budget.tools_reserve",
+                                "verification.strictness"
+                            ],
+                            "description": "Which config path to adjust"
+                        },
+                        "value": {
+                            "description": "New value for the path (number/integer depending on the field)"
+                        },
+                        "force": {
+                            "type": "boolean",
+                            "description": "Override drift or mutation governor once when true"
+                        }
+                    },
+                    "required": ["path", "value"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "prioritize_tool",
+                "description": "Pin a tool as preferred for this session. Removes it from the deprioritized set.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "tool": {"type": "string", "description": "Tool name to prioritize"}
+                    },
+                    "required": ["tool"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "deprioritize_tool",
+                "description": "Mark a tool as deprioritized for this session. Removes it from the pinned set.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "tool": {"type": "string", "description": "Tool name to deprioritize"}
+                    },
+                    "required": ["tool"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "set_goal",
+                "description": "Set or replace the session goal used by goal tracking and self-awareness.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "goal": {"type": "string", "description": "Goal statement for the current session"}
+                    },
+                    "required": ["goal"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "compress_context",
+                "description": "Record a manual context compression request for this session.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "reason": {"type": "string", "description": "Optional reason for manual compression"}
+                    },
+                    "required": []
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
                 "name": "web_fetch",
                 "description": "Fetch a URL and return its content (truncated to ~10KB by default). Use for reading web pages, APIs, documentation, or any HTTP resource. Safer and simpler than bash+curl. Set max_bytes to fetch more content.",
                 "parameters": {

@@ -1,6 +1,10 @@
 //! Scenario router — selects an [`ExecutionProfile`] per task based on detected
 //! scenario, pattern-library suggestions, and active A/B experiments.
 //!
+//! **Deprecated**: This module is superseded by `SelfModel` + LLM reasoning.
+//! The LLM uses self-awareness context to adapt its behavior per-turn rather than
+//! having a programmatic router select configuration profiles.
+//!
 //! The router is stateless: it reads from `PatternLibrary` and `ExperimentStore`
 //! but does not mutate them. Mutation (recording outcomes, creating experiments)
 //! is handled by the agentic loop and [`ExplorationEngine`].
@@ -14,9 +18,16 @@ use crate::runtime_config::RuntimeConfig;
 use crate::user_profile::{Scenario, ScenarioDetector};
 
 /// Produces an [`ExecutionProfile`] for each task.
+///
+/// **Deprecated**: Superseded by `SelfModel` self-awareness reasoning.
+#[deprecated(
+    since = "0.9.0",
+    note = "Superseded by SelfModel + LLM reasoning. See self_model.rs."
+)]
 #[derive(Default)]
 pub struct ScenarioRouter;
 
+#[allow(deprecated)]
 impl ScenarioRouter {
     /// Create a new stateless scenario router.
     pub fn new() -> Self {
@@ -108,6 +119,10 @@ impl ScenarioRouter {
 
 /// Map a task type to a likely scenario (fallback when ScenarioDetector has
 /// insufficient signal).
+#[deprecated(
+    since = "0.9.0",
+    note = "Superseded by SelfModel + LLM reasoning. See self_model.rs."
+)]
 pub fn scenario_from_task_type(task_type: crate::pipeline::routing::TaskType) -> Option<Scenario> {
     use crate::pipeline::routing::TaskType;
     match task_type {
@@ -125,6 +140,7 @@ pub fn scenario_from_task_type(task_type: crate::pipeline::routing::TaskType) ->
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
     use crate::ab_testing::{Experiment, MetricDefinition, Variant};

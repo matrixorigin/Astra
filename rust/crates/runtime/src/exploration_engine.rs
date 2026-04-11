@@ -1,5 +1,8 @@
 //! Exploration engine — turns low-confidence pattern-library areas into A/B
 //! experiments and concludes mature experiments once enough evidence exists.
+//!
+//! **Deprecated**: Superseded by `SelfModel` + LLM reasoning. The LLM decides
+//! when and how to explore based on its self-awareness context.
 
 use std::time::Duration;
 
@@ -12,6 +15,10 @@ use crate::pipeline::pattern::{ExplorationOpportunity, ExplorationReason, Patter
 use crate::pipeline::routing::{DomainHint, TaskType, domain_hint_to_label};
 
 /// Result of concluding a mature experiment.
+#[deprecated(
+    since = "0.9.0",
+    note = "Superseded by SelfModel + LLM reasoning. See self_model.rs."
+)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExperimentConclusion {
     pub experiment_id: String,
@@ -19,6 +26,12 @@ pub struct ExperimentConclusion {
 }
 
 /// Creates and concludes exploration experiments.
+///
+/// **Deprecated**: Superseded by `SelfModel` self-awareness reasoning.
+#[deprecated(
+    since = "0.9.0",
+    note = "Superseded by SelfModel + LLM reasoning. See self_model.rs."
+)]
 #[derive(Debug, Clone)]
 pub struct ExplorationEngine {
     confidence_threshold: f64,
@@ -26,6 +39,7 @@ pub struct ExplorationEngine {
     min_samples_per_variant: u32,
 }
 
+#[allow(deprecated)]
 impl Default for ExplorationEngine {
     fn default() -> Self {
         Self {
@@ -36,6 +50,7 @@ impl Default for ExplorationEngine {
     }
 }
 
+#[allow(deprecated)]
 impl ExplorationEngine {
     /// Create an exploration engine with the given thresholds.
     ///
@@ -263,6 +278,7 @@ fn reason_tag(reason: &ExplorationReason) -> &'static str {
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
     use crate::ab_testing::ExperimentOutcome;

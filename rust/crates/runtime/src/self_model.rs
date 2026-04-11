@@ -164,6 +164,7 @@ impl SelfModel {
     pub fn snapshot(
         tool_names: &[&str],
         pinned_tools: &[String],
+        manual_deprioritized_tools: &[String],
         skills: &[String],
         tool_health: Option<&ToolHealthTracker>,
         turn_number: u32,
@@ -201,8 +202,14 @@ impl SelfModel {
             }
             // Sort by name for stability
             tool_health_summaries.sort_by(|a, b| a.name.cmp(&b.name));
-            deprioritized.sort();
         }
+
+        for tool in manual_deprioritized_tools {
+            if !deprioritized.contains(tool) {
+                deprioritized.push(tool.clone());
+            }
+        }
+        deprioritized.sort();
 
         let capabilities = CapabilityView {
             total_tools: tool_names.len(),
@@ -594,6 +601,7 @@ mod tests {
             &["bash", "read_file", "write_file"],
             &[],
             &[],
+            &[],
             None,
             3,
             None,
@@ -625,6 +633,7 @@ mod tests {
         };
         let model = SelfModel::snapshot(
             &["bash"],
+            &[],
             &[],
             &[],
             None,
@@ -666,6 +675,7 @@ mod tests {
             &["bash", "web_search"],
             &[],
             &[],
+            &[],
             Some(&health),
             1,
             None,
@@ -701,6 +711,7 @@ mod tests {
         let model = SelfModel::snapshot(
             &["bash", "read_file", "write_file", "grep", "glob"],
             &[],
+            &[],
             &["debugging".to_string()],
             None,
             5,
@@ -733,6 +744,7 @@ mod tests {
             &["bash", "read_file"],
             &["bash".to_string()],
             &[],
+            &[],
             None,
             10,
             None,
@@ -763,6 +775,7 @@ mod tests {
             .map(|_| FeedbackSignal::new(SignalType::Acceptance))
             .collect();
         let model = SelfModel::snapshot(
+            &[],
             &[],
             &[],
             &[],

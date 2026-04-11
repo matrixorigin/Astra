@@ -81,6 +81,8 @@ mod file_state;
 mod lsp_tools;
 #[path = "edge_tools/notebook_edit.rs"]
 mod notebook_edit;
+#[path = "edge_tools/self_mod_tools.rs"]
+mod self_mod_tools;
 #[path = "edge_tools/task_mgmt.rs"]
 mod task_mgmt;
 #[path = "edge_tools/web_search.rs"]
@@ -369,6 +371,13 @@ pub struct ToolExecutor {
             std::sync::RwLock<astra_runtime::observability_integration::ObservabilitySession>,
         >,
     >,
+    /// Self-modification pinned tool preferences (manual override hints).
+    self_mod_pinned_tools: std::sync::Mutex<Vec<String>>,
+    /// Self-modification deprioritized tool preferences (manual override hints).
+    self_mod_deprioritized_tools: std::sync::Mutex<Vec<String>>,
+    /// Per-turn mutation accounting for adjust_config governor.
+    /// (turn_number, mutations_applied_on_turn)
+    self_mod_mutation_counter: std::sync::Mutex<(u32, u32)>,
 }
 
 impl ToolExecutor {
@@ -414,6 +423,9 @@ impl ToolExecutor {
             agent_id: None,
             send_message_context: None,
             observability_session: None,
+            self_mod_pinned_tools: std::sync::Mutex::new(Vec::new()),
+            self_mod_deprioritized_tools: std::sync::Mutex::new(Vec::new()),
+            self_mod_mutation_counter: std::sync::Mutex::new((0, 0)),
         }
     }
 
@@ -736,6 +748,11 @@ impl ToolExecutor {
             "memory_purge" => self.memoria_call("purge", args).await,
             "memory_correct" => self.memoria_call("correct", args).await,
             "memory_profile" => self.memoria_call("profile", args).await,
+            "adjust_config" => self.adjust_config(args),
+            "prioritize_tool" => self.prioritize_tool(args),
+            "deprioritize_tool" => self.deprioritize_tool(args),
+            "set_goal" => self.set_goal(args),
+            "compress_context" => self.compress_context(args),
             "get_agent_info" => {
                 let dimension = args
                     .get("dimension")
@@ -912,7 +929,8 @@ impl ToolExecutor {
                 "Unknown tool: {name}. Available tools: bash, read_file, write_file, str_replace, \
                  list_dir, grep, glob, symbols, find_definition, find_references, git_status, \
                  git_diff, git_log, git_show, git_blame, call_graph, run_build_test, web_fetch, \
-                 mo_query, memory_search, memory_profile, ask_user, task_create, task_list, \
+                 mo_query, memory_search, memory_profile, adjust_config, prioritize_tool, \
+                 deprioritize_tool, set_goal, compress_context, ask_user, task_create, task_list, \
                  task_get, task_update, task_stop, sleep, tool_search, web_search, send_message, \
                  spawn_agent, share_context, query_context, context_analysis, \
                  diagnose, lsp, env, notebook_edit, config, powershell, brief"
@@ -1084,12 +1102,22 @@ impl ToolExecutor {
     }
 
     /// Build a SelfModel snapshot from available observability session data.
-    fn build_self_model_snapshot(&self) -> Option<astra_runtime::self_model::SelfModel> {
+    pub fn build_self_model_snapshot(&self) -> Option<astra_runtime::self_model::SelfModel> {
         let obs_session = self.observability_session.as_ref()?;
         let session = obs_session.read().ok()?;
 
         let tool_name_strs = self.tool_names();
         let tool_name_refs: Vec<&str> = tool_name_strs.iter().map(|s| s.as_str()).collect();
+        let pinned_tools = self
+            .self_mod_pinned_tools
+            .lock()
+            .map(|v| v.clone())
+            .unwrap_or_default();
+        let deprioritized_tools = self
+            .self_mod_deprioritized_tools
+            .lock()
+            .map(|v| v.clone())
+            .unwrap_or_default();
 
         let elapsed = session.started_at.elapsed().as_secs();
 
@@ -1107,7 +1135,8 @@ impl ToolExecutor {
 
         Some(astra_runtime::self_model::SelfModel::snapshot(
             &tool_name_refs,
-            &[],  // pinned_tools — not accessible from ToolExecutor
+            &pinned_tools,
+            &deprioritized_tools,
             &[],  // skills — not accessible from ToolExecutor
             None, // tool health — lives on TurnGuard, not here
             session.turn_number,
@@ -1162,6 +1191,7 @@ mod tests {
     mod notebook_tests;
     mod sandbox_tests;
     mod schema_tests;
+    mod self_mod_tests;
     mod task_tests;
     mod tool_search_tests;
     mod utf16_tests;

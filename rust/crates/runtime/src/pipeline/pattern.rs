@@ -3,6 +3,10 @@
 //! Records which tool combinations succeed or fail for each task type and domain,
 //! then suggests the best patterns for similar future queries.
 //!
+//! **Note**: The pattern recording and drift signals remain active, but the
+//! L3 adaptive suggestion/exploration layer is being deprecated in favor of
+//! `SelfModel` + LLM reasoning.
+//!
 //! # Learning flow
 //!
 //! 1. User asks "show me PRs for matrixorigin" → routes to Fetch + GitHub
@@ -269,6 +273,7 @@ fn pattern_key(signature: &str, task_type: TaskType) -> String {
     format!("{signature}@{task_type:?}")
 }
 
+#[allow(deprecated)]
 impl PatternLibrary {
     pub fn new() -> Self {
         Self::default()
@@ -427,6 +432,10 @@ impl PatternLibrary {
     /// Returns up to `limit` patterns sorted by time-decayed score (descending).
     /// If domain is Some, only returns patterns matching that domain.
     /// Stale patterns are ranked lower even if historically successful.
+    #[deprecated(
+        since = "0.9.0",
+        note = "Superseded by SelfModel + LLM reasoning. Keep pattern recording, but let the model reason over self-awareness instead of precomputed suggestions."
+    )]
     pub fn suggest(
         &self,
         task_type: TaskType,
@@ -469,6 +478,10 @@ impl PatternLibrary {
     ///
     /// Returns up to `limit` patterns, with the exploration slot (if triggered)
     /// replacing the last regular suggestion.
+    #[deprecated(
+        since = "0.9.0",
+        note = "Superseded by SelfModel + LLM reasoning. Use self-awareness-driven exploration instead of epsilon-greedy pattern hints."
+    )]
     pub fn suggest_with_exploration(
         &self,
         task_type: TaskType,
@@ -791,6 +804,10 @@ impl PatternLibrary {
     /// Returns suggestions for tool combinations to try when the system has
     /// low confidence in a particular area. Unlike epsilon-greedy (which
     /// rediscovers old patterns), this identifies gaps in coverage.
+    #[deprecated(
+        since = "0.9.0",
+        note = "Superseded by SelfModel + LLM reasoning. Use self-awareness-driven exploration instead of programmatic opportunity generation."
+    )]
     pub fn exploration_opportunities(&self) -> Vec<ExplorationOpportunity> {
         let mut opportunities = Vec::new();
 
@@ -1001,6 +1018,7 @@ pub struct LearningSummary {
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
 

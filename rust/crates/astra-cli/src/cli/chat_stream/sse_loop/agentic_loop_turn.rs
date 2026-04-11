@@ -515,6 +515,20 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
         ctx.skill_agent_type.as_deref(),
     );
 
+    // ─── SelfModel: inject self-awareness text into edge_profile ───
+    if let Some(self_model) = ctx.executor.build_self_model_snapshot() {
+        let text = self_model.to_system_prompt_section();
+        if text.len() > 30 {
+            if let Some(root) = payload.as_object_mut()
+                && let Some(ep) = root.get_mut("edge_profile")
+                && let Some(ep_obj) = ep.as_object_mut()
+            {
+                ep_obj.insert("self_awareness_text".to_string(), json!(text));
+            }
+        }
+    }
+    log_chat_turn_timing_phase(timing, "self_awareness_inject", &mut mark);
+
     // ─── Record token budget estimate to trace collector (M1 observability) ───
     if let Some(collector) = ctx.telem.trace_collector {
         let schema_tokens = selected_tool_tokens_total;
