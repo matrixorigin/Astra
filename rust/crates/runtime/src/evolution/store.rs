@@ -46,7 +46,8 @@ impl EvolutionStore {
         let now = now_epoch();
         let before = proposals.len();
         proposals.retain(|p| {
-            p.status != StoredStatus::Pending || now.saturating_sub(p.created_at) < PROPOSAL_TTL_SECS
+            p.status != StoredStatus::Pending
+                || now.saturating_sub(p.created_at) < PROPOSAL_TTL_SECS
         });
         // If we expired any, save the cleaned list.
         if proposals.len() < before {
@@ -118,11 +119,7 @@ impl EvolutionStore {
         result
     }
 
-    fn save_proposals(
-        &self,
-        skill_name: &str,
-        proposals: &[StoredProposal],
-    ) -> Result<(), String> {
+    fn save_proposals(&self, skill_name: &str, proposals: &[StoredProposal]) -> Result<(), String> {
         let path = self.evolutions_path(skill_name);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
@@ -253,9 +250,7 @@ impl StoredProposal {
             EvolutionAxis::Pattern { signature, .. } => {
                 ("pattern".to_string(), None, None, Some(signature.clone()))
             }
-            EvolutionAxis::Calibration { .. } => {
-                ("calibration".to_string(), None, None, None)
-            }
+            EvolutionAxis::Calibration { .. } => ("calibration".to_string(), None, None, None),
             EvolutionAxis::Entity { entity, .. } => {
                 ("entity".to_string(), None, None, Some(entity.clone()))
             }

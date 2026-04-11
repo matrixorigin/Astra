@@ -31,10 +31,7 @@ impl EvolutionService {
     }
 
     /// Create with a pattern library reference for drift detection.
-    pub fn with_pattern_library(
-        mut self,
-        lib: Arc<std::sync::Mutex<PatternLibrary>>,
-    ) -> Self {
+    pub fn with_pattern_library(mut self, lib: Arc<std::sync::Mutex<PatternLibrary>>) -> Self {
         self.pattern_library = Some(lib);
         self
     }
@@ -405,9 +402,20 @@ mod tests {
 
         let svc = EvolutionService::new().with_pattern_library(lib);
         let (auto, _) = svc.flush().await;
-        // If drift was detected and critical, we should get a Demote proposal.
-        // The exact result depends on whether the drift threshold is met.
-        // At minimum, the flush should not panic.
-        let _ = auto;
+        // Drift signals should produce Demote proposals if critical threshold met.
+        // Even if the library's threshold doesn't flag it as critical, no panic.
+        for p in &auto {
+            assert!(
+                matches!(
+                    p.axis,
+                    EvolutionAxis::Pattern {
+                        action: PatternAction::Demote,
+                        ..
+                    }
+                ),
+                "drift proposals should be Demote"
+            );
+            assert_eq!(p.status, ApprovalStatus::AutoApplied);
+        }
     }
 }

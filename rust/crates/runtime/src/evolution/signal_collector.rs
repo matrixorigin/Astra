@@ -98,10 +98,7 @@ impl SignalCollector {
         }
         let signal = EvolutionSignal::UserCorrection {
             correction_text: truncate(msg, MAX_SNIPPET_LEN),
-            prior_assistant_text: truncate(
-                prior_assistant.unwrap_or(""),
-                MAX_SNIPPET_LEN,
-            ),
+            prior_assistant_text: truncate(prior_assistant.unwrap_or(""), MAX_SNIPPET_LEN),
             skill_context: active_skill.map(String::from),
             turn_id: turn_id.to_string(),
         };
@@ -211,7 +208,12 @@ mod tests {
     #[test]
     fn detects_chinese_correction() {
         let mut c = SignalCollector::new();
-        c.on_user_message("不对，应该用另一个方法", Some("I used method A"), None, "t1");
+        c.on_user_message(
+            "不对，应该用另一个方法",
+            Some("I used method A"),
+            None,
+            "t1",
+        );
         assert_eq!(c.signals().len(), 1);
         match &c.signals()[0] {
             EvolutionSignal::UserCorrection {

@@ -51,7 +51,10 @@ impl EvolutionSignal {
             } => {
                 tool_name.hash(&mut h);
                 // First 100 chars of error for dedup (same as Jiuwenclaw, but typed).
-                error_snippet.get(..100).unwrap_or(error_snippet).hash(&mut h);
+                error_snippet
+                    .get(..100)
+                    .unwrap_or(error_snippet)
+                    .hash(&mut h);
             }
             Self::UserCorrection {
                 correction_text, ..

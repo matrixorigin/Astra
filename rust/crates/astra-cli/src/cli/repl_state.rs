@@ -246,7 +246,8 @@ pub(crate) struct ReplState {
 
     // ── Evolution ──
     /// Shared evolution service for multi-axis self-evolution.
-    pub evolution_service: Option<std::sync::Arc<astra_runtime::evolution::service::EvolutionService>>,
+    pub evolution_service:
+        Option<std::sync::Arc<astra_runtime::evolution::service::EvolutionService>>,
 }
 
 impl Default for ReplState {

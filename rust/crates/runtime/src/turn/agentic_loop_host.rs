@@ -3267,10 +3267,7 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
 
         // ── Feed tool results into evolution signal collector ──
         if let Some(ref evo) = state.evolution_service {
-            let turn_id = state
-                .current_run_id
-                .as_deref()
-                .unwrap_or("unknown");
+            let turn_id = state.current_run_id.as_deref().unwrap_or("unknown");
             // Determine active skill from the most recently invoked skill.
             let active_skill: Option<String> = state
                 .skills

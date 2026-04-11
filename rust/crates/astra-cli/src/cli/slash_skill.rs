@@ -1527,25 +1527,39 @@ Follow these steps:
                                 .into_iter()
                                 .next()
                                 .unwrap_or_else(|| {
-                                    std::env::current_dir()
+                                    let fallback = std::env::current_dir()
                                         .unwrap_or_default()
                                         .join(".astra")
-                                        .join("skills")
+                                        .join("skills");
+                                    eprintln!(
+                                        "  {} No skill search paths configured, using {}",
+                                        "⚠".yellow(),
+                                        fallback.display()
+                                    );
+                                    fallback
                                 });
                             let store =
                                 astra_runtime::evolution::store::EvolutionStore::new(skills_dir);
-                            match store.apply_skill_diff(skill_name, section, diff) {
-                                Ok(_) => {
-                                    eprintln!(
-                                        "  {} Applied diff to {}/SKILL.md § {}",
-                                        "✓".green(),
-                                        skill_name,
-                                        section.heading()
-                                    );
-                                    let _ = store.mark_applied(skill_name, &p.id);
-                                }
-                                Err(e) => {
-                                    eprintln!("  {} Failed to apply diff: {}", "✗".red(), e);
+                            // Persist state first to prevent duplicate application on restart.
+                            if let Err(e) = store.mark_applied(skill_name, &p.id) {
+                                eprintln!("  {} Failed to persist approval: {}", "✗".red(), e);
+                            } else {
+                                match store.apply_skill_diff(skill_name, section, diff) {
+                                    Ok(_) => {
+                                        eprintln!(
+                                            "  {} Applied diff to {}/SKILL.md § {}",
+                                            "✓".green(),
+                                            skill_name,
+                                            section.heading()
+                                        );
+                                    }
+                                    Err(e) => {
+                                        eprintln!(
+                                            "  {} Failed to apply diff (proposal already marked applied): {}",
+                                            "✗".red(),
+                                            e
+                                        );
+                                    }
                                 }
                             }
                         }

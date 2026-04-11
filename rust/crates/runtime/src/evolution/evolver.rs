@@ -58,9 +58,7 @@ pub fn generate_fast_proposals(signals: &[EvolutionSignal]) -> Vec<EvolutionProp
                             action: PatternAction::Block,
                         },
                         confidence: 0.9,
-                        reasoning: format!(
-                            "Tool chain stalled {stall_count} consecutive rounds"
-                        ),
+                        reasoning: format!("Tool chain stalled {stall_count} consecutive rounds"),
                         created_at: now,
                         status: ApprovalStatus::AutoApplied,
                     });
@@ -255,6 +253,10 @@ mod tests {
             },
         ];
         let proposals = generate_fast_proposals(&signals);
-        assert_eq!(proposals.len(), 1, "only PatternDrift should produce a proposal");
+        assert_eq!(
+            proposals.len(),
+            1,
+            "only PatternDrift should produce a proposal"
+        );
     }
 }

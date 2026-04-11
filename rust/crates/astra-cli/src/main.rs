@@ -1351,7 +1351,7 @@ mod tests {
             observability_session: None,
             file_journal: None,
             turn_index: 0,
-                    evolution_service: None,
+            evolution_service: None,
         })
         .await
         .unwrap();
@@ -1417,7 +1417,7 @@ mod tests {
             observability_session: None,
             file_journal: None,
             turn_index: 0,
-                    evolution_service: None,
+            evolution_service: None,
         })
         .await;
         assert!(result.is_err());
@@ -1499,7 +1499,7 @@ mod tests {
             observability_session: None,
             file_journal: None,
             turn_index: 0,
-                    evolution_service: None,
+            evolution_service: None,
         })
         .await
         .unwrap();

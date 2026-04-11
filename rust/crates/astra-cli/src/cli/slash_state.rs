@@ -462,7 +462,7 @@ pub(super) async fn handle_state_command(
                             observability_session: None,
                             file_journal: None,
                             turn_index: 0,
-                    evolution_service: state.evolution_service.clone(),
+                            evolution_service: state.evolution_service.clone(),
                         })
                         .await;
 
@@ -544,7 +544,7 @@ pub(super) async fn handle_state_command(
                                     observability_session: None,
                                     file_journal: None,
                                     turn_index: 0,
-                    evolution_service: state.evolution_service.clone(),
+                                    evolution_service: state.evolution_service.clone(),
                                 })
                                 .await;
                                 if let Ok(sr2) = synth_result {
