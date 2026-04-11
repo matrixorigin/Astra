@@ -1607,6 +1607,102 @@ Follow these steps:
             }
         }
 
+        "reflect" => {
+            let evo = match &state.evolution_service {
+                Some(e) => e,
+                None => {
+                    eprintln!("  {} Evolution service not initialized", "✗".red());
+                    return Ok(());
+                }
+            };
+
+            let session_id = state.session_id.as_deref().unwrap_or("unknown");
+            let turns_completed = state.turn;
+            let scenario = state.observability_session.as_ref().and_then(|sess| {
+                let s = sess.read().ok()?;
+                s.current_scenario().map(|sc| format!("{:?}", sc))
+            });
+            let total_tokens = state.total_prompt_tokens + state.total_completion_tokens;
+            let token_util = if turns_completed > 0 && total_tokens > 0 {
+                // Rough utilization: average tokens per turn / 200k reference budget
+                (total_tokens as f64 / turns_completed as f64) / 200_000.0
+            } else {
+                0.0
+            };
+
+            // Build tool stats from persisted tool health entries
+            let tool_stats: Vec<astra_runtime::liquid::reflection::ToolStat> = state
+                .tool_health_entries
+                .iter()
+                .map(|e| astra_runtime::liquid::reflection::ToolStat {
+                    tool_name: e.name.clone(),
+                    calls: e.total_calls as u32,
+                    failures: e.total_failures as u32,
+                    avg_latency_ms: 0, // latency not tracked in ToolHealthEntry
+                })
+                .collect();
+
+            // Flush to get LLM signals
+            let (_fast, llm_signals) = evo.flush().await;
+
+            if llm_signals.is_empty() && sub_arg != "force" {
+                eprintln!(
+                    "  {} No signals requiring LLM reflection. Use {} to force.",
+                    "ℹ".cyan(),
+                    "/skill reflect force".cyan()
+                );
+                return Ok(());
+            }
+
+            let ctx = evo.build_reflection_context(
+                session_id,
+                turns_completed,
+                scenario.as_deref(),
+                token_util,
+                &llm_signals,
+                tool_stats,
+                None,
+            );
+
+            let (system_prompt, user_prompt) = evo.build_reflection_prompt(&ctx);
+
+            eprintln!(
+                "\n{}",
+                "─── Reflection ───────────────────────────────────"
+                    .bold()
+                    .cyan()
+            );
+            eprintln!(
+                "  🔍 Building reflection from {} signals, {} turns",
+                ctx.signals.len(),
+                ctx.turns_completed
+            );
+
+            eprintln!("  {}", "Context:".yellow());
+            for sig in &ctx.signals {
+                eprintln!("    [{}] {}", sig.kind.as_str().cyan(), sig.detail.as_str().dim());
+            }
+
+            if sub_arg == "prompt" {
+                eprintln!("\n  {}", "System prompt:".yellow());
+                eprintln!("{}", system_prompt.dim());
+                eprintln!("\n  {}", "User prompt:".yellow());
+                eprintln!("{}", user_prompt.dim());
+                return Ok(());
+            }
+
+            eprintln!(
+                "\n  {} Reflection prompt ready ({} chars).",
+                "✓".green(),
+                system_prompt.len() + user_prompt.len()
+            );
+            eprintln!(
+                "  💡 To see full prompt: {}",
+                "/skill reflect prompt".cyan()
+            );
+            eprintln!("  💡 Proposals will appear in: {}", "/skill evolve".cyan());
+        }
+
         _ => {
             eprintln!(
                 "{}",
