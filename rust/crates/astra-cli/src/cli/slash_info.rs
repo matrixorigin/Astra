@@ -1655,9 +1655,58 @@ pub(super) async fn handle_info_command(
             }
 
             eprintln!("  {}", "─".repeat(56).cyan().dim());
+
+            // Inline last turn's actual component breakdown if available
+            if let Some(ref obs) = state.observability_session {
+                let guard = obs.read().unwrap_or_else(|e| e.into_inner());
+                if let Some(trace) = guard.context_traces.last() {
+                    let tb = &trace.token_budget;
+                    if tb.total_used > 0 {
+                        eprintln!(
+                            "\n  {}  ({})",
+                            "Last turn actual allocation:".bold().cyan(),
+                            trace.turn_id.as_str().dim()
+                        );
+                        let components: &[(&str, u32)] = &[
+                            ("system_prompt", tb.system_prompt_tokens),
+                            ("history", tb.history_tokens),
+                            ("memory", tb.memory_tokens),
+                            ("tool_schemas", tb.tool_schema_tokens),
+                            ("user_message", tb.user_message_tokens),
+                        ];
+                        for (label, tokens) in components {
+                            if *tokens > 0 {
+                                let pct = (*tokens as f64 / tb.total_used as f64 * 100.0) as u32;
+                                eprintln!(
+                                    "    {:<16} {:>6} ({:>2}%)",
+                                    format!("{label}:").dim(),
+                                    tokens.to_string().cyan(),
+                                    pct
+                                );
+                            }
+                        }
+                        let pressure_str = format!("{:.0}%", tb.budget_pressure * 100.0);
+                        let pressure_colored = if tb.budget_pressure > 0.9 {
+                            pressure_str.red().to_string()
+                        } else if tb.budget_pressure > 0.7 {
+                            pressure_str.yellow().to_string()
+                        } else {
+                            pressure_str.green().to_string()
+                        };
+                        eprintln!(
+                            "    {:<16} {} / {} ({})",
+                            "total:".dim(),
+                            tb.total_used.to_string().cyan().bold(),
+                            tb.max_tokens.to_string().dim(),
+                            pressure_colored
+                        );
+                    }
+                }
+            }
+
             eprintln!(
                 "  {}",
-                "Use /context breakdown for last turn's actual token allocation".dim()
+                "Use /context breakdown for full details".dim()
             );
             eprintln!();
         }
