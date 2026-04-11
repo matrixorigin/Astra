@@ -89,6 +89,7 @@ pub mod evolution;
 pub mod execution_profile;
 pub mod exploration_engine;
 pub mod introspection;
+pub mod liquid;
 pub mod matrix_cloud_runtime;
 pub mod observability_integration;
 pub mod output_style;
