@@ -938,7 +938,10 @@ fn get_config_value(config: &RuntimeConfig, path: &str) -> Option<serde_json::Va
         "memory.retrieval_top_k" => Some(serde_json::json!(config.memory.retrieval_top_k)),
         "memory.min_relevance_score" => Some(serde_json::json!(config.memory.min_relevance_score)),
         "verification.strictness" => Some(serde_json::json!(config.verification.strictness)),
-        _ => None,
+        other => {
+            astra_core::agent_warn!("config", "Unknown config path for read: {}", other);
+            None
+        }
     }
 }
 
@@ -1007,7 +1010,9 @@ fn apply_config_value(config: &mut RuntimeConfig, path: &str, value: &serde_json
                 );
             }
         }
-        _ => {}
+        other => {
+            astra_core::agent_warn!("config", "Unknown config path for write: {}", other);
+        }
     }
 }
 
