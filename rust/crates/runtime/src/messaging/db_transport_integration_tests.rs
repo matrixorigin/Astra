@@ -428,6 +428,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn current_claim_fetch_excludes_preexisting_claimed_rows() {
+        skip_without_db!(pool);
+
+        let transport =
+            DatabaseTransport::new(pool.clone()).with_poll_interval(Duration::from_millis(50));
+
+        let sender = addr("run-db-claim-scope-a", "alice");
+        let receiver = addr("run-db-claim-scope-b", "bob");
+        let consumer_id = format!("{}@{}", receiver.agent_id, receiver.run_id);
+
+        transport.register(sender.clone(), None).await.unwrap();
+        transport.register(receiver.clone(), None).await.unwrap();
+
+        let mut stream = transport.subscribe(&receiver).await.unwrap();
+
+        let stale = AgentMessage::new(
+            sender.clone(),
+            MessageTarget::Direct {
+                address: receiver.clone(),
+            },
+            MessagePayload::Text {
+                content: "stale-claimed".into(),
+                summary: None,
+            },
+        );
+
+        sqlx::query(
+            "INSERT INTO agent_message_queue
+             (message_id, from_run_id, from_agent_id, to_run_id, to_agent_id,
+              delegation_id, is_broadcast, payload_json, timestamp_ms, ttl_ms,
+              status, claimed_by, claimed_at_ms, attempt_count)
+             VALUES (?, ?, ?, ?, ?, NULL, FALSE, ?, ?, NULL, 'claimed', ?, ?, 1)",
+        )
+        .bind(&stale.id)
+        .bind(&sender.run_id)
+        .bind(&sender.agent_id)
+        .bind(&receiver.run_id)
+        .bind(&receiver.agent_id)
+        .bind(serde_json::to_string(&stale).unwrap())
+        .bind(chrono::Utc::now().timestamp_millis() - 5_000)
+        .bind(&consumer_id)
+        .bind(chrono::Utc::now().timestamp_millis() - 5_000)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let fresh = Arc::new(AgentMessage::new(
+            sender.clone(),
+            MessageTarget::Direct {
+                address: receiver.clone(),
+            },
+            MessagePayload::Text {
+                content: "fresh-claim".into(),
+                summary: None,
+            },
+        ));
+        transport.send(fresh.clone()).await.unwrap();
+
+        let received = tokio::time::timeout(Duration::from_secs(2), stream.recv())
+            .await
+            .expect("timeout waiting for claimed message")
+            .expect("stream closed");
+
+        match &received.payload {
+            MessagePayload::Text { content, .. } => {
+                assert_eq!(
+                    content, "fresh-claim",
+                    "poll fetch should only return messages claimed in the current cycle"
+                );
+            }
+            other => panic!("expected Text, got: {other:?}"),
+        }
+
+        let extra = tokio::time::timeout(Duration::from_millis(300), stream.recv()).await;
+        assert!(
+            extra.is_err(),
+            "stale preexisting claimed row should not be re-fetched in the same poll cycle"
+        );
+
+        cleanup(&pool).await;
+    }
+
+    #[tokio::test]
     async fn expired_broadcast_messages_are_marked_failed() {
         skip_without_db!(pool);
 

@@ -508,11 +508,14 @@ async fn poll_loop(
                 let fetch_result = query(
                     "SELECT id, CAST(id AS CHAR) AS row_id_text, message_id, payload_json FROM agent_message_queue
                      WHERE to_run_id = ? AND to_agent_id = ? AND status = 'claimed' AND claimed_by = ?
-                     ORDER BY id ASC",
+                       AND claimed_at_ms = ?
+                     ORDER BY id ASC LIMIT ?",
                 )
                 .bind(&addr.run_id)
                 .bind(&addr.agent_id)
                 .bind(&consumer_id)
+                .bind(now_ms)
+                .bind(POLL_BATCH_SIZE)
                 .fetch_all(&pool)
                 .await;
 
