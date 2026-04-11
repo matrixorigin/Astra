@@ -481,6 +481,13 @@ pub struct AgenticLoopState {
     /// Optional step signal collector for within-turn outcome tracking.
     pub step_signal_collector: Option<crate::liquid::step_signals::StepSignalCollector>,
 
+    // ── Tool selection budget override ──
+    /// Scenario-driven override for the tool selection token budget.
+    /// When `Some(n)` with n > 0, the host should use this instead of the
+    /// registry's default budget (800 tokens) when building the selection context.
+    /// Set by `apply_adaptive_execution_profile` from `config.tool_selection.tool_budget_tokens`.
+    pub tool_budget_override: Option<u32>,
+
     // ── Auto-reflection ──
     /// Accumulated LLM-routed evolution signals awaiting reflection.
     /// Filled during tuning cycles; drained when threshold is met and
@@ -640,6 +647,15 @@ fn apply_adaptive_execution_profile(state: &mut AgenticLoopState) {
     }
     state.max_turn_input_tokens = session_guard.config.token_budget.max_turn_input_tokens as u64;
 
+    // Propagate scenario-driven tool budget override to AgenticLoopState so the
+    // CLI host can pass it to build_agentic_tool_selection_context.
+    let cfg_budget = session_guard.config.tool_selection.tool_budget_tokens;
+    state.tool_budget_override = if cfg_budget > 0 {
+        Some(cfg_budget)
+    } else {
+        None
+    };
+
     // Collect attribution data while lock is held.
     let turn = session_guard.turn_number;
     let scenario_name = profile
@@ -685,6 +701,15 @@ fn apply_adaptive_execution_profile(state: &mut AgenticLoopState) {
             "tool_selection.max_tools".to_string(),
             old_config.tool_selection.max_tools.to_string(),
             profile.config.tool_selection.max_tools.to_string(),
+        ));
+    }
+    if old_config.tool_selection.tool_budget_tokens
+        != profile.config.tool_selection.tool_budget_tokens
+    {
+        config_changes.push((
+            "tool_selection.tool_budget_tokens".to_string(),
+            old_config.tool_selection.tool_budget_tokens.to_string(),
+            profile.config.tool_selection.tool_budget_tokens.to_string(),
         ));
     }
     if (old_config.compression.compression_threshold
@@ -4277,6 +4302,7 @@ mod tests {
             permission_handler: None,
             tactical_adapter: None,
             step_signal_collector: None,
+            tool_budget_override: None,
             pending_reflection_signals: Vec::new(),
         }
     }

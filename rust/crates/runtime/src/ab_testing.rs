@@ -205,6 +205,11 @@ pub(crate) fn apply_config_diff(config: &mut RuntimeConfig, key: &str, value: &s
                 config.tool_selection.max_tools = (n as u32).clamp(1, 256);
             }
         }
+        "tool_selection.tool_budget_tokens" => {
+            if let Some(n) = value.as_u64() {
+                config.tool_selection.tool_budget_tokens = (n as u32).clamp(0, 5000);
+            }
+        }
         "learning.exploration_rate" => {
             if let Some(n) = value.as_f64() {
                 config.learning.exploration_rate = n.clamp(0.0, 1.0);

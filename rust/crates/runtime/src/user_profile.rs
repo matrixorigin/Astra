@@ -165,6 +165,11 @@ fn apply_preference_override(config: &mut RuntimeConfig, key: &str, value: &serd
                 config.tool_selection.max_tools = v as u32;
             }
         }
+        "tool_selection.tool_budget_tokens" => {
+            if let Some(v) = value.as_u64() {
+                config.tool_selection.tool_budget_tokens = (v as u32).clamp(0, 5000);
+            }
+        }
         "token_budget.max_prompt_tokens" => {
             if let Some(v) = value.as_u64() {
                 config.token_budget.max_prompt_tokens = v as u32;
@@ -407,6 +412,7 @@ impl Scenario {
                 detail_level: Verbosity::Verbose,
                 memory_top_k: Some(7),
                 verification_strictness: Some(0.7),
+                tool_budget_tokens: 900,
             },
             Scenario::Debugging => ScenarioStrategy {
                 max_tools_per_turn: 5,
@@ -414,6 +420,7 @@ impl Scenario {
                 detail_level: Verbosity::Debug,
                 memory_top_k: Some(8),
                 verification_strictness: None,
+                tool_budget_tokens: 1100,
             },
             Scenario::Exploration => ScenarioStrategy {
                 max_tools_per_turn: 6,
@@ -421,6 +428,7 @@ impl Scenario {
                 detail_level: Verbosity::Normal,
                 memory_top_k: Some(10),
                 verification_strictness: None,
+                tool_budget_tokens: 1000,
             },
             Scenario::Planning => ScenarioStrategy {
                 max_tools_per_turn: 2,
@@ -428,6 +436,7 @@ impl Scenario {
                 detail_level: Verbosity::Verbose,
                 memory_top_k: None,
                 verification_strictness: None,
+                tool_budget_tokens: 600,
             },
             Scenario::Implementation => ScenarioStrategy {
                 max_tools_per_turn: 4,
@@ -435,6 +444,7 @@ impl Scenario {
                 detail_level: Verbosity::Normal,
                 memory_top_k: None,
                 verification_strictness: Some(0.6),
+                tool_budget_tokens: 1200,
             },
             Scenario::Refactoring => ScenarioStrategy {
                 max_tools_per_turn: 4,
@@ -442,6 +452,7 @@ impl Scenario {
                 detail_level: Verbosity::Verbose,
                 memory_top_k: Some(7),
                 verification_strictness: Some(0.65),
+                tool_budget_tokens: 1100,
             },
             Scenario::Testing => ScenarioStrategy {
                 max_tools_per_turn: 5,
@@ -449,6 +460,7 @@ impl Scenario {
                 detail_level: Verbosity::Normal,
                 memory_top_k: None,
                 verification_strictness: Some(0.55),
+                tool_budget_tokens: 1000,
             },
             Scenario::Documentation => ScenarioStrategy {
                 max_tools_per_turn: 3,
@@ -456,6 +468,7 @@ impl Scenario {
                 detail_level: Verbosity::Verbose,
                 memory_top_k: None,
                 verification_strictness: None,
+                tool_budget_tokens: 600,
             },
             Scenario::DevOps => ScenarioStrategy {
                 max_tools_per_turn: 4,
@@ -463,6 +476,7 @@ impl Scenario {
                 detail_level: Verbosity::Normal,
                 memory_top_k: None,
                 verification_strictness: Some(0.6),
+                tool_budget_tokens: 900,
             },
             Scenario::Learning => ScenarioStrategy {
                 max_tools_per_turn: 4,
@@ -470,6 +484,7 @@ impl Scenario {
                 detail_level: Verbosity::Verbose,
                 memory_top_k: Some(10),
                 verification_strictness: None,
+                tool_budget_tokens: 700,
             },
         }
     }
@@ -485,6 +500,10 @@ pub struct ScenarioStrategy {
     pub memory_top_k: Option<u32>,
     /// Suggested verification strictness override (None = use default).
     pub verification_strictness: Option<f64>,
+    /// Scenario-driven override for the tool selection token budget.
+    /// 0 = use registry default. Non-zero values override the per-turn budget,
+    /// allowing scenarios like Implementation to include more tool schemas.
+    pub tool_budget_tokens: u32,
 }
 
 // ─── Scenario Detector ──────────────────────────────────────────────────────

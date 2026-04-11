@@ -337,6 +337,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             permission_handler: None,
             tactical_adapter: None,
             step_signal_collector: None,
+            tool_budget_override: None,
             pending_reflection_signals: Vec::new(),
         };
 

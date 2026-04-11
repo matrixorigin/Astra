@@ -133,6 +133,8 @@ struct PrepareChatTurnRequest<'a> {
     skill_effort: Option<String>,
     /// Agent type hint from skill activation.
     skill_agent_type: Option<String>,
+    /// Scenario-driven override for the tool selection token budget.
+    tool_budget_override: Option<u32>,
 }
 
 async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
@@ -273,6 +275,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
             restricted_vec.clone(),
             ctx.file_context.to_vec(),
             false,
+            ctx.tool_budget_override,
         );
         touch_prep_ui_phase(&ctx.prep_ui_phase, "Thinking…");
         let sel_result = ctx
@@ -341,6 +344,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
             restricted_vec,
             ctx.file_context.to_vec(),
             true,
+            ctx.tool_budget_override,
         );
         touch_prep_ui_phase(&ctx.prep_ui_phase, "Thinking…");
         let sel_result = ctx
@@ -606,6 +610,8 @@ pub(crate) struct ChatTurnSseFetchRequest<'a> {
     pub skill_effort: Option<String>,
     /// Agent type hint from skill activation.
     pub skill_agent_type: Option<String>,
+    /// Scenario-driven override for the tool selection token budget.
+    pub tool_budget_override: Option<u32>,
 }
 
 /// stderr prep line + timing toggles for [`fetch_chat_turn_sse`].
@@ -726,6 +732,7 @@ pub(crate) async fn fetch_chat_turn_sse(
         skill_resolver,
         skill_effort,
         skill_agent_type,
+        tool_budget_override,
     } = ctx;
 
     let ui = chat_turn_sse_fetch_ui(
@@ -771,6 +778,7 @@ pub(crate) async fn fetch_chat_turn_sse(
             prep_ui_phase: ui.prep_ui_phase.clone(),
             skill_effort,
             skill_agent_type,
+            tool_budget_override,
         },
     )
     .await?;

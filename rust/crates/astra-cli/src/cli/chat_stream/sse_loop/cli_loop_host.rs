@@ -185,6 +185,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             skill_resolver: state.skills.resolver.clone(),
             skill_effort: state.skills.effort.as_ref().map(|e| e.to_string()),
             skill_agent_type: state.skills.agent_type.clone(),
+            tool_budget_override: state.tool_budget_override,
         })
         .await?;
 

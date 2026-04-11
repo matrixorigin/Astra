@@ -891,6 +891,9 @@ fn get_config_value(config: &RuntimeConfig, path: &str) -> Option<serde_json::Va
             config.tool_selection.confidence_threshold
         )),
         "tool_selection.max_tools" => Some(serde_json::json!(config.tool_selection.max_tools)),
+        "tool_selection.tool_budget_tokens" => {
+            Some(serde_json::json!(config.tool_selection.tool_budget_tokens))
+        }
         "token_budget.max_prompt_tokens" => {
             Some(serde_json::json!(config.token_budget.max_prompt_tokens))
         }
@@ -926,6 +929,11 @@ fn apply_config_value(config: &mut RuntimeConfig, path: &str, value: &serde_json
         "tool_selection.max_tools" => {
             if let Some(v) = value.as_u64() {
                 config.tool_selection.max_tools = (v as u32).clamp(1, 256);
+            }
+        }
+        "tool_selection.tool_budget_tokens" => {
+            if let Some(v) = value.as_u64() {
+                config.tool_selection.tool_budget_tokens = (v as u32).clamp(0, 5000);
             }
         }
         "token_budget.max_prompt_tokens" => {

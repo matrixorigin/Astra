@@ -644,11 +644,13 @@ impl ToolSelector for TfIdfSelector {
         // ── Phase 4: Select tools via RoutingDecision path ──
         // Apply budget pressure: reduce effective budget under token pressure.
         // pressure=0.0 → full budget, pressure=1.0 → 30% budget.
+        // Enforce a minimum floor so pressure can never starve tool selection.
+        const MINIMUM_TOOL_BUDGET: u32 = 300;
         let effective_budget = if ctx.budget_pressure > 0.0 {
             let scale = 1.0 - ctx.budget_pressure.clamp(0.0, 1.0) * 0.7;
-            (ctx.budget_tokens as f64 * scale) as u32
+            ((ctx.budget_tokens as f64 * scale) as u32).max(MINIMUM_TOOL_BUDGET)
         } else {
-            ctx.budget_tokens
+            ctx.budget_tokens.max(MINIMUM_TOOL_BUDGET)
         };
 
         let tracker_guard: Option<std::sync::MutexGuard<'_, ToolQualityTracker>> =

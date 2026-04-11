@@ -298,6 +298,13 @@ pub struct ToolSelectionConfig {
     /// Maximum tokens for tool schemas.
     #[serde(default = "default_max_tool_schema_tokens")]
     pub max_tool_schema_tokens: u32,
+
+    /// Scenario-driven override for the tool selection token budget.
+    /// 0 = use registry default (800 tokens). Non-zero values override the
+    /// `DEFAULT_TOOL_BUDGET_TOKENS` constant in the tool selector, allowing
+    /// scenarios to allocate more or fewer tokens for dynamic tool schemas.
+    #[serde(default)]
+    pub tool_budget_tokens: u32,
 }
 
 fn default_max_tools() -> u32 {
@@ -322,6 +329,7 @@ impl Default for ToolSelectionConfig {
             recent_tool_boost: default_recent_tool_boost(),
             use_learned_patterns: default_true(),
             max_tool_schema_tokens: default_max_tool_schema_tokens(),
+            tool_budget_tokens: 0,
         }
     }
 }
@@ -834,6 +842,7 @@ impl RuntimeConfig {
             recent_tool_boost,
             use_learned_patterns,
             max_tool_schema_tokens,
+            tool_budget_tokens,
         } = tool_selection;
         merge_if_non_default(
             &mut self.tool_selection.max_tools,
@@ -864,6 +873,11 @@ impl RuntimeConfig {
             &mut self.tool_selection.max_tool_schema_tokens,
             max_tool_schema_tokens,
             default_max_tool_schema_tokens(),
+        );
+        merge_if_non_default(
+            &mut self.tool_selection.tool_budget_tokens,
+            tool_budget_tokens,
+            0,
         );
 
         let LearningConfig {
@@ -1241,6 +1255,7 @@ mod tests {
                 recent_tool_boost: 0.4,
                 use_learned_patterns: false,
                 max_tool_schema_tokens: 22000,
+                tool_budget_tokens: 0,
             },
             learning: LearningConfig {
                 enabled: false,

@@ -484,6 +484,7 @@ pub(crate) async fn stream_chat_sse(
         permission_handler: None,
         tactical_adapter: None,
         step_signal_collector: None,
+        tool_budget_override: None,
         pending_reflection_signals: Vec::new(),
     };
 

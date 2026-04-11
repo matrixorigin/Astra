@@ -63,6 +63,7 @@ impl ExecutionProfile {
     ///
     /// Maps [`ScenarioStrategy`] hints to concrete `RuntimeConfig` parameters:
     /// - `max_tools_per_turn` → `tool_selection.max_tools`
+    /// - `tool_budget_tokens` → `tool_selection.tool_budget_tokens` (controls actual tool selection budget)
     /// - `prefer_read_only` → `tool_selection.confidence_threshold` boost
     /// - Higher detail scenarios get more token budget for history
     /// - `memory_top_k` → `memory.retrieval_top_k` (if set by scenario)
@@ -72,6 +73,11 @@ impl ExecutionProfile {
         let strategy = scenario.strategy_hints();
 
         self.config.tool_selection.max_tools = strategy.max_tools_per_turn as u32;
+
+        // Wire scenario tool budget into config so it reaches the tool selector.
+        if strategy.tool_budget_tokens > 0 {
+            self.config.tool_selection.tool_budget_tokens = strategy.tool_budget_tokens;
+        }
 
         if strategy.prefer_read_only {
             self.config.tool_selection.confidence_threshold =
@@ -258,5 +264,18 @@ mod tests {
         profile.apply_scenario(Scenario::CodeReview);
         // CodeReview wants 0.7, but max is 0.6
         assert!((profile.config.verification.strictness - 0.6).abs() < 0.01);
+    }
+
+    #[test]
+    fn apply_scenario_sets_tool_budget_tokens() {
+        let mut profile = ExecutionProfile::from_base(RuntimeConfig::default());
+        assert_eq!(profile.config.tool_selection.tool_budget_tokens, 0);
+
+        profile.apply_scenario(Scenario::Implementation);
+        assert_eq!(profile.config.tool_selection.tool_budget_tokens, 1200);
+
+        let mut profile2 = ExecutionProfile::from_base(RuntimeConfig::default());
+        profile2.apply_scenario(Scenario::Planning);
+        assert_eq!(profile2.config.tool_selection.tool_budget_tokens, 600);
     }
 }
