@@ -1707,7 +1707,7 @@ fn sync_session_state_to_workspace(
 /// Apply persisted adaptive engine state to a newly created ObservabilitySession.
 /// Called when pending_adaptive_state was stashed during workspace restore and the
 /// ObservabilitySession is now available to receive it.
-fn apply_pending_adaptive_state(state: &mut ReplState) {
+pub(super) fn apply_pending_adaptive_state(state: &mut ReplState) {
     let adaptive = match state.pending_adaptive_state.take() {
         Some(a) => a,
         None => return,

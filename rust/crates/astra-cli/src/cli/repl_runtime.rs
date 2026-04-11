@@ -603,6 +603,20 @@ pub(crate) fn initialize_repl_state(
         astra_runtime::observability_integration::ObservabilityHub::with_storage(obs_path),
     ));
 
+    // Create an early observability session so the very first turn can record
+    // context assembly traces.  The session_id will be "pending" until the
+    // server assigns a real one; handle_turn_result re-creates the session
+    // with the real ID on the first turn completion.
+    if let Some(ref hub) = state.observability_hub {
+        let user_id = state
+            .ingestion_user_id
+            .clone()
+            .unwrap_or_else(|| "anonymous".to_string());
+        state.observability_session = Some(hub.start_session(&user_id, "pending"));
+        // Apply any adaptive state stashed during workspace restore.
+        super::repl_turn::apply_pending_adaptive_state(state);
+    }
+
     // Restore persisted feedback aggregator state (if any)
     if let Some(ref hub) = state.observability_hub {
         if let Err(e) = astra_runtime::auto_tuning::load_feedback("default", hub.tuning()) {

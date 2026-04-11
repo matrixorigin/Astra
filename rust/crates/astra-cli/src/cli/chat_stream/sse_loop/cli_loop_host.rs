@@ -74,10 +74,9 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
     ) -> Result<HostTurnResult, String> {
         let assembly_start = Instant::now();
 
-        // Create trace collector for this turn if observability is active.
-        if state.telemetry.observability_session.is_some()
-            && state.telemetry.turn_trace_collector.is_none()
-        {
+        // Create trace collector for this turn (always, so /context breakdown works
+        // even on the first turn before the observability session is created).
+        if state.telemetry.turn_trace_collector.is_none() {
             let turn_num = state.max_turns - state.remaining_turns;
             let turn_id = format!("turn-{turn_num}");
             let session_id = state.current_session_id.clone().unwrap_or_default();

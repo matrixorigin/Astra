@@ -1883,16 +1883,22 @@ impl StreamRenderState {
     ) {
         let output_summary = self.format_output_summary(tool, output, status);
         let duration_suffix = format_duration_suffix(duration_ms);
-        // Cursor-style format: original description with result appended
-        let (icon, line) = if status == "error" {
+        // Get smart icon based on status and output analysis.
+        let (icon, is_warning) = tool_completion_icon(tool, status, output, duration_ms);
+        let extra_line = if status == "error" {
             let err_msg = output_summary.unwrap_or_else(|| "failed".to_string());
-            (theme::icon_err(), format!("    {}", err_msg.red()))
+            format!("    {}", err_msg.red())
+        } else if is_warning {
+            // Show warning context in yellow.
+            match output_summary {
+                Some(summary) => format!("    {}", summary.yellow()),
+                None => String::new(),
+            }
         } else {
-            let summary_line = match output_summary {
+            match output_summary {
                 Some(summary) => format!("    {}", summary.dim()),
                 None => String::new(),
-            };
-            (theme::icon_ok(), summary_line)
+            }
         };
         if self.md.is_some() {
             self.stop_tool_stderr_running();
@@ -1900,14 +1906,10 @@ impl StreamRenderState {
             let styled_desc = style_tool_description(tool, &description);
             let dur_display = format!("{}", duration_suffix.dim());
             let mut out_lines = 1usize;
-            if status == "error" {
-                eprintln!("  {} {}{}", theme::icon_err(), styled_desc, dur_display);
-            } else {
-                eprintln!("  {} {}{}", theme::icon_ok(), styled_desc, dur_display);
-            }
-            if !line.is_empty() {
-                eprintln!("{line}");
-                out_lines = out_lines.saturating_add(line.matches('\n').count() + 1);
+            eprintln!("  {} {}{}", icon, styled_desc, dur_display);
+            if !extra_line.is_empty() {
+                eprintln!("{extra_line}");
+                out_lines = out_lines.saturating_add(extra_line.matches('\n').count() + 1);
             }
             self.stderr_lines = self.stderr_lines.saturating_add(out_lines);
             return;
@@ -1919,10 +1921,10 @@ impl StreamRenderState {
         let mut g = self.tool_ui.lock().unwrap_or_else(|e| e.into_inner());
         if idx < g.lines.len() {
             g.lines[idx] = format!("  {icon} {styled_desc}{dur_display}");
-            if !line.is_empty() {
+            if !extra_line.is_empty() {
                 let insert_pos = idx + 1;
                 if insert_pos <= g.lines.len() {
-                    g.lines.insert(insert_pos, line);
+                    g.lines.insert(insert_pos, extra_line);
                 }
             }
             let lines = g.lines.clone();
@@ -1946,15 +1948,21 @@ impl StreamRenderState {
         let styled_desc = style_tool_description(tool, &description);
         let dur_display = format!("{}", duration_suffix.dim());
 
-        let (icon, extra_line) = if status == "error" {
+        // Get smart icon based on status and output analysis.
+        let (icon, is_warning) = tool_completion_icon(tool, status, output, duration_ms);
+        let extra_line = if status == "error" {
             let err_msg = output_summary.unwrap_or_else(|| "failed".to_string());
-            (theme::icon_err(), format!("    {}", err_msg.red()))
+            format!("    {}", err_msg.red())
+        } else if is_warning {
+            match output_summary {
+                Some(summary) => format!("    {}", summary.yellow()),
+                None => String::new(),
+            }
         } else {
-            let summary_line = match output_summary {
+            match output_summary {
                 Some(summary) => format!("    {}", summary.dim()),
                 None => String::new(),
-            };
-            (theme::icon_ok(), summary_line)
+            }
         };
 
         let mut out_lines = 1usize;
@@ -2281,6 +2289,63 @@ impl StreamRenderState {
         g.region.clear();
         g.lines.clear();
     }
+}
+
+/// Determine tool completion icon based on status, output, and execution context.
+/// Returns (icon_string, is_warning) where is_warning indicates warning-level result.
+fn tool_completion_icon(tool: &str, status: &str, output: &str, duration_ms: u64) -> (String, bool) {
+    if status == "error" {
+        return (theme::icon_err(), false);
+    }
+
+    // Check for warning conditions.
+    let trimmed = output.trim();
+
+    // 1. Empty output for tools that should produce something.
+    let expects_output = matches!(
+        tool,
+        "read_file" | "view_file" | "grep" | "glob" | "bash" | "shell"
+    );
+    if expects_output && trimmed.is_empty() {
+        return (theme::icon_warn(), true);
+    }
+
+    // 2. "No matches" or empty results from search tools.
+    if matches!(tool, "grep" | "glob") {
+        if trimmed.is_empty()
+            || trimmed == "[]"
+            || trimmed.starts_with("No matches")
+            || trimmed.starts_with("No files")
+        {
+            return (theme::icon_warn(), true);
+        }
+    }
+
+    // 3. Truncated output (warning prefix in output).
+    if trimmed.contains("[truncated") || trimmed.contains("⚠ WARNING:") {
+        return (theme::icon_warn(), true);
+    }
+
+    // 4. Slow execution (>30s for most tools, >60s for bash).
+    let slow_threshold_ms = if matches!(tool, "bash" | "shell" | "run_build_test") {
+        60_000
+    } else {
+        30_000
+    };
+    if duration_ms > slow_threshold_ms {
+        return (theme::icon_warn(), true);
+    }
+
+    // 5. Partial success indicators in bash output.
+    if matches!(tool, "bash" | "shell") {
+        let lower = trimmed.to_lowercase();
+        if lower.contains("warning:") && !lower.contains("error:") {
+            return (theme::icon_warn(), true);
+        }
+    }
+
+    // Default: success.
+    (theme::icon_ok(), false)
 }
 
 /// Format error message for tool failures with helpful context.
