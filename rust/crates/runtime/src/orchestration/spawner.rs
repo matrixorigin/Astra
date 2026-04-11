@@ -278,6 +278,25 @@ impl DynamicAgentSpawner {
         }
     }
 
+    /// Create a new spawner with a shared progress broadcaster.
+    ///
+    /// Use this when delegation sub-runs also need to emit to the same broadcaster.
+    pub fn with_broadcaster(
+        mailbox_router: Arc<AgentMailboxRouter>,
+        progress_broadcaster: Arc<ProgressBroadcaster>,
+    ) -> Self {
+        Self {
+            mailbox_router,
+            active_agents: Arc::new(RwLock::new(HashMap::new())),
+            progress_broadcaster,
+            context_cache: Arc::new(SharedContextCache::default()),
+            executor: None,
+            session_id: None,
+            agent_registry: super::team_config::AgentRegistry::builtins_only(),
+            completed_agents: Arc::new(RwLock::new(Vec::new())),
+        }
+    }
+
     /// Create a new spawner with a custom context cache.
     pub fn with_context_cache(
         mailbox_router: Arc<AgentMailboxRouter>,

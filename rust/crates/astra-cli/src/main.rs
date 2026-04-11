@@ -434,6 +434,11 @@ async fn initialize_multi_agent_runtime(
         tracker.clone(),
     ));
 
+    // Create shared progress broadcaster — used by both delegation sub-runs and spawned agents
+    // so all events are visible in /agent watch and /agent logs.
+    let progress_broadcaster =
+        std::sync::Arc::new(astra_runtime::orchestration::ProgressBroadcaster::default());
+
     let delegate_executor = delegate_subrun::CliDelegateSubRunExecutor::new(
         api.clone(),
         token.clone(),
@@ -443,7 +448,8 @@ async fn initialize_multi_agent_runtime(
         None,
     )
     .with_skill_resolver(skill_resolver.clone())
-    .with_skill_search(state.skill_search.clone());
+    .with_skill_search(state.skill_search.clone())
+    .with_progress_broadcaster(progress_broadcaster.clone());
 
     let engine = astra_runtime::server::delegation_engine::DelegationEngine::with_executor(
         registry,
@@ -465,8 +471,11 @@ async fn initialize_multi_agent_runtime(
     .with_skill_search(state.skill_search.clone());
 
     state.agent_spawner = Some(std::sync::Arc::new(
-        astra_runtime::orchestration::DynamicAgentSpawner::new(mailbox_router)
-            .with_executor(std::sync::Arc::new(spawn_executor)),
+        astra_runtime::orchestration::DynamicAgentSpawner::with_broadcaster(
+            mailbox_router,
+            progress_broadcaster,
+        )
+        .with_executor(std::sync::Arc::new(spawn_executor)),
     ));
 }
 

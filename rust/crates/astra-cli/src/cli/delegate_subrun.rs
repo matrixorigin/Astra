@@ -106,6 +106,8 @@ pub(crate) struct CliDelegateSubRunExecutor {
     skill_search: SkillSearchSettings,
     progress_tx:
         Option<tokio::sync::mpsc::UnboundedSender<super::skill_subrun::SubRunProgressEvent>>,
+    /// Global progress broadcaster for emitting events visible in /agent watch.
+    progress_broadcaster: Option<Arc<astra_runtime::orchestration::ProgressBroadcaster>>,
 }
 
 impl CliDelegateSubRunExecutor {
@@ -127,6 +129,7 @@ impl CliDelegateSubRunExecutor {
             skill_resolver: None,
             skill_search: SkillSearchSettings::default(),
             progress_tx: None,
+            progress_broadcaster: None,
         }
     }
 
@@ -148,6 +151,14 @@ impl CliDelegateSubRunExecutor {
         tx: tokio::sync::mpsc::UnboundedSender<super::skill_subrun::SubRunProgressEvent>,
     ) -> Self {
         self.progress_tx = Some(tx);
+        self
+    }
+
+    pub fn with_progress_broadcaster(
+        mut self,
+        broadcaster: Arc<astra_runtime::orchestration::ProgressBroadcaster>,
+    ) -> Self {
+        self.progress_broadcaster = Some(broadcaster);
         self
     }
 }
@@ -293,6 +304,10 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             },
             messaging: MessagingState {
                 mailbox: config.mailbox,
+                progress_emitter: self
+                    .progress_broadcaster
+                    .as_ref()
+                    .map(|b| b.for_agent(profile.agent_id.clone())),
                 ..Default::default()
             },
             cancellation: CancellationState {
