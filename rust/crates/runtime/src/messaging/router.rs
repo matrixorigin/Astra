@@ -294,8 +294,16 @@ impl AgentMailboxRouter {
 
     /// Unregister an agent (typically on completion or failure).
     pub async fn unregister(&self, addr: &AgentAddress) -> Result<(), MailboxError> {
-        self.address_registry.write().await.remove(&addr.run_id);
-        self.agent_id_index.write().await.remove(&addr.agent_id);
+        {
+            // Keep lock ordering consistent with register() to avoid cross-lock races.
+            let mut reg = self.address_registry.write().await;
+            let mut idx = self.agent_id_index.write().await;
+
+            reg.remove(&addr.run_id);
+            if idx.get(&addr.agent_id) == Some(addr) {
+                idx.remove(&addr.agent_id);
+            }
+        }
         self.transport.unregister(addr).await
     }
 
@@ -769,5 +777,52 @@ mod tests {
         let root_mb = router.register(root, None).await.unwrap();
 
         assert!(!root_mb.has_parent().await);
+    }
+
+    #[tokio::test]
+    async fn unregister_old_run_keeps_current_agent_id_mapping() {
+        let transport = Arc::new(InProcessTransport::new());
+        let router = Arc::new(AgentMailboxRouter::new(transport, tracker()));
+
+        let sender = addr("r0", "sender");
+        let old = addr("r-old", "worker");
+        let current = addr("r-new", "worker");
+
+        let _sender_mailbox = router.register(sender.clone(), None).await.unwrap();
+        let _old_mailbox = router.register(old.clone(), None).await.unwrap();
+        let mut current_mailbox = router.register(current.clone(), None).await.unwrap();
+
+        let send_to_agent_id_only = |content: &str| {
+            AgentMessage::new(
+                sender.clone(),
+                MessageTarget::Direct {
+                    address: AgentAddress::new("", "worker"),
+                },
+                MessagePayload::Text {
+                    content: content.into(),
+                    summary: None,
+                },
+            )
+        };
+
+        router.send(send_to_agent_id_only("before")).await.unwrap();
+        let first = current_mailbox
+            .try_recv()
+            .expect("should resolve to current run");
+        match &first.payload {
+            MessagePayload::Text { content, .. } => assert_eq!(content, "before"),
+            other => panic!("expected text, got {other:?}"),
+        }
+
+        router.unregister(&old).await.unwrap();
+
+        router.send(send_to_agent_id_only("after")).await.unwrap();
+        let second = current_mailbox
+            .try_recv()
+            .expect("stale unregister must not remove current mapping");
+        match &second.payload {
+            MessagePayload::Text { content, .. } => assert_eq!(content, "after"),
+            other => panic!("expected text, got {other:?}"),
+        }
     }
 }
