@@ -318,6 +318,13 @@ pub struct ToolSelectionConfig {
     pub max_identical_tool_calls: u32,
 }
 
+impl ToolSelectionConfig {
+    /// Resolved max identical tool calls (0 → default of 2).
+    pub fn effective_max_identical_calls(&self) -> u32 {
+        if self.max_identical_tool_calls > 0 { self.max_identical_tool_calls } else { 2 }
+    }
+}
+
 fn default_max_tools() -> u32 {
     30
 }

@@ -98,6 +98,7 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
     idempotency_cache: &mut InMemoryIdempotencyCache,
     semantic_dedup: &mut SemanticDedup,
     call_counts: &mut HashMap<String, u32>,
+    max_identical_calls: u32,
     tool_call_records: &mut Vec<ToolCallRecord>,
     tool_event_hooks: &crate::skills::hooks::ToolEventHookRegistry,
     term: &mut dyn HeadlessRoundTerminal,
@@ -148,14 +149,7 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
     let mut consumed_edge = vec![false; edge_tool_round.len()];
     let by_sig: &HashMap<String, String> = edge_callback_outputs;
 
-    /// Max times the same (tool, args) signature can execute across the entire session.
-    const DEFAULT_MAX_IDENTICAL_CALLS: u32 = 2;
-
-    let max_identical = {
-        let cfg = crate::runtime_config::RuntimeConfig::load();
-        let v = cfg.tool_selection.max_identical_tool_calls;
-        if v > 0 { v } else { DEFAULT_MAX_IDENTICAL_CALLS }
-    };
+    let max_identical = max_identical_calls;
 
     for item in &indices {
         if let Some((aborted_count, aborted_tools)) =

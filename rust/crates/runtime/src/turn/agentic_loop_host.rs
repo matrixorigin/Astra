@@ -387,6 +387,8 @@ pub struct AgenticLoopState {
     /// Session-level call counter: `dedup_signature → count`.
     /// Hard-caps repeated identical calls across all rounds.
     pub call_counts: HashMap<String, u32>,
+    /// Resolved max identical tool calls (from config, computed once at init).
+    pub max_identical_tool_calls: u32,
 
     // ── Sub-states ──
     pub skills: SkillState,
@@ -3714,6 +3716,7 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                 &mut state.idempotency_cache,
                 &mut state.semantic_dedup,
                 &mut state.call_counts,
+                state.max_identical_tool_calls,
                 &mut state.stall.tool_call_records,
                 &state.skills.tool_event_hooks,
                 &mut term_adapter,
@@ -4410,6 +4413,7 @@ mod tests {
             idempotency_cache: InMemoryIdempotencyCache::new(),
             semantic_dedup: SemanticDedup::new(0.95),
             call_counts: HashMap::new(),
+            max_identical_tool_calls: crate::runtime_config::RuntimeConfig::load().tool_selection.effective_max_identical_calls(),
             stall: Default::default(),
             telemetry: Default::default(),
             skills: SkillState {
