@@ -14,6 +14,7 @@ use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
+use crate::pipeline::pattern::PatternLibrary;
 use crate::runtime_config::RuntimeConfig;
 
 // ─── Feedback Signals ───────────────────────────────────────────────────────
@@ -505,6 +506,15 @@ impl AutoTuningEngine {
 
     /// Evaluate all rules and return triggered actions.
     pub fn evaluate(&self, config: &RuntimeConfig) -> Vec<(EvolutionRule, EvolutionAction)> {
+        self.evaluate_with_patterns(config, None)
+    }
+
+    /// Evaluate rules with optional pattern library for drift detection.
+    pub fn evaluate_with_patterns(
+        &self,
+        config: &RuntimeConfig,
+        pattern_library: Option<&PatternLibrary>,
+    ) -> Vec<(EvolutionRule, EvolutionAction)> {
         if !*self.enabled.read().unwrap_or_else(|e| e.into_inner()) {
             return Vec::new();
         }
@@ -534,7 +544,7 @@ impl AutoTuningEngine {
             }
 
             // Evaluate trigger
-            if self.evaluate_trigger(&rule.trigger, &aggregator, config) {
+            if self.evaluate_trigger(&rule.trigger, &aggregator, config, pattern_library) {
                 triggered.push((rule.clone(), rule.action.clone()));
             }
         }
@@ -580,6 +590,16 @@ impl AutoTuningEngine {
     /// Run one evaluation cycle: evaluate and execute.
     pub fn run_cycle(&self, config: &mut RuntimeConfig) -> Vec<RuleExecution> {
         let actions = self.evaluate(config);
+        self.execute_actions(config, actions)
+    }
+
+    /// Run one evaluation cycle with pattern drift detection.
+    pub fn run_cycle_with_patterns(
+        &self,
+        config: &mut RuntimeConfig,
+        pattern_library: Option<&PatternLibrary>,
+    ) -> Vec<RuleExecution> {
+        let actions = self.evaluate_with_patterns(config, pattern_library);
         self.execute_actions(config, actions)
     }
 
@@ -644,6 +664,7 @@ impl AutoTuningEngine {
         trigger: &EvolutionTrigger,
         aggregator: &FeedbackAggregator,
         _config: &RuntimeConfig,
+        pattern_library: Option<&PatternLibrary>,
     ) -> bool {
         match trigger {
             EvolutionTrigger::LowSuccessRate {
@@ -699,9 +720,14 @@ impl AutoTuningEngine {
                 aggregator.negative_streak() >= *count
             }
 
-            EvolutionTrigger::PatternDrift { confidence_drop: _ } => {
-                // Would need integration with PatternLibrary
-                false
+            EvolutionTrigger::PatternDrift { confidence_drop } => {
+                // Check if any pattern has drifted by the threshold amount
+                let Some(lib) = pattern_library else {
+                    return false;
+                };
+                // Find maximum drift score across all patterns
+                let max_drift = lib.max_drift_score();
+                max_drift >= *confidence_drop
             }
 
             EvolutionTrigger::SignalAccumulation {

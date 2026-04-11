@@ -529,8 +529,17 @@ impl ObservabilityHub {
     // ─── Auto-Tuning Cycle ──────────────────────────────────────────────────
 
     /// Run one auto-tuning cycle and return executed rules.
+    ///
+    /// Uses pattern library (if attached) for drift detection triggers.
     pub fn run_tuning_cycle(&self, config: &mut RuntimeConfig) -> Vec<String> {
-        let executions = self.tuning_engine.run_cycle(config);
+        // Get pattern library reference for drift detection
+        let pattern_lib_guard = self.pattern_library();
+        let pattern_lib_lock = pattern_lib_guard.as_ref().map(|arc| arc.lock().ok());
+        let pattern_lib_ref = pattern_lib_lock.as_ref().and_then(|opt| opt.as_deref());
+
+        let executions = self
+            .tuning_engine
+            .run_cycle_with_patterns(config, pattern_lib_ref);
         executions.into_iter().map(|e| e.rule_id).collect()
     }
 

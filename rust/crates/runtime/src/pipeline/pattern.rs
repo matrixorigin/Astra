@@ -607,6 +607,22 @@ impl PatternLibrary {
         self.patterns.is_empty()
     }
 
+    /// Returns the maximum drift score across all patterns.
+    ///
+    /// Drift score ranges from 0.0 (no drift) to 1.0 (severe drift).
+    /// Returns 0.0 if no patterns have enough observations for drift detection.
+    pub fn max_drift_score(&self) -> f64 {
+        self.patterns
+            .values()
+            .filter_map(|p| p.drift_score())
+            .fold(0.0_f64, |max, score| max.max(score))
+    }
+
+    /// Returns all patterns currently drifting (drift_score >= 1.0).
+    pub fn drifting_patterns(&self) -> Vec<&ToolChainPattern> {
+        self.patterns.values().filter(|p| p.is_drifting()).collect()
+    }
+
     /// Export all patterns for persistence.
     pub fn export(&self) -> Vec<ToolChainPattern> {
         self.patterns.values().cloned().collect()
