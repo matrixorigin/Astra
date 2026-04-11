@@ -1469,8 +1469,28 @@ impl ConditionalEventHandler for SlashStartCompleteHandler {
                 RlKeyEvent(RlKeyCode::Down, _) => {
                     subcmd_nav!(1);
                 }
-                RlKeyEvent(RlKeyCode::Tab, _) | RlKeyEvent(RlKeyCode::Enter, _) => {
-                    // Accept selected subcommand
+                RlKeyEvent(RlKeyCode::Tab, _) => {
+                    // Tab = complete the subcommand and allow further editing
+                    // Current line is like "/skill " or "/skill d", we need to complete to "/skill dev "
+                    if get_subcmd_parent().is_some() {
+                        if let Some(subcmd) = subcmd_picker_selected_command() {
+                            let filter = get_subcmd_filter().unwrap_or_default();
+                            // Compute what to insert: the part of subcmd not yet typed
+                            let suffix = if subcmd.starts_with(&filter) {
+                                format!("{} ", &subcmd[filter.len()..])
+                            } else {
+                                format!("{} ", subcmd)
+                            };
+                            clear_subcmd_overlay();
+                            // Insert at cursor (which is at end of line)
+                            return Some(RlCmd::Insert(1, suffix));
+                        }
+                    }
+                    clear_subcmd_overlay();
+                    return None;
+                }
+                RlKeyEvent(RlKeyCode::Enter, _) => {
+                    // Enter = execute the command immediately
                     if let Some(parent) = get_subcmd_parent() {
                         if let Some(subcmd) = subcmd_picker_selected_command() {
                             let full_cmd = format!("{} {}", parent, subcmd);
