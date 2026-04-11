@@ -946,6 +946,23 @@ where
                             true,
                         ),
                     ))));
+                    if let Some(bridge_state) = pending_bridge_state.take() {
+                        yield Ok(Bytes::from(render_sse_json(serde_json::Value::Object(
+                            if force_max_rounds_completion {
+                                build_max_rounds_turn_complete_event(
+                                    &bridge_state,
+                                    trusted_execution_state.as_ref(),
+                                    pending_followup_user_message.as_deref(),
+                                )
+                            } else {
+                                build_turn_complete_event_from_bridge_state(
+                                    &bridge_state,
+                                    trusted_execution_state.as_ref(),
+                                    pending_followup_user_message.as_deref(),
+                                )
+                            },
+                        ))));
+                    }
                     return;
                 }
             }
@@ -1694,7 +1711,11 @@ mod tests {
         let text = String::from_utf8(body.to_vec()).expect("utf8");
         let warning_pos = text.find("\"type\":\"warning\"").expect("warning event");
         let error_pos = text.find("\"type\":\"error\"").expect("error event");
+        let turn_complete_pos = text
+            .find("\"type\":\"turn_complete\"")
+            .expect("turn_complete event");
         assert!(warning_pos < error_pos);
+        assert!(error_pos < turn_complete_pos);
         assert!(text.contains("\"code\":\"UPSTREAM_ERROR\""));
     }
 
