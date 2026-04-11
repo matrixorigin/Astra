@@ -246,16 +246,34 @@ fn filtered_subcmd_rows(parent: &str, filter: Option<&str>) -> Vec<(&'static str
     let Some(subs) = command_registry::subcommand_completions(parent) else {
         return vec![];
     };
-    let mut rows: Vec<(&'static str, &'static str)> = subs.to_vec();
     if let Some(f) = filter.filter(|f| !f.is_empty()) {
         let f_lower = f.to_ascii_lowercase();
-        rows.retain(|(name, desc)| {
-            name.to_ascii_lowercase().starts_with(&f_lower)
-                || desc.to_ascii_lowercase().contains(&f_lower)
-        });
+        let mut scored: Vec<(usize, &'static str, &'static str)> = subs
+            .iter()
+            .filter_map(|(name, desc)| {
+                token_fuzzy_match(name, f)
+                    .map(|score| (score, *name, *desc))
+                    .or_else(|| {
+                        desc.to_ascii_lowercase()
+                            .contains(&f_lower)
+                            .then_some((0, *name, *desc))
+                    })
+            })
+            .collect();
+        scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
+        return scored
+            .into_iter()
+            .map(|(_, name, desc)| (name, desc))
+            .collect();
     }
+
+    let mut rows: Vec<(&'static str, &'static str)> = subs.to_vec();
     rows.sort_by(|a, b| a.0.cmp(b.0));
     rows
+}
+
+fn subcmd_completion_line(parent: &str, subcmd: &str) -> String {
+    format!("{parent} {subcmd} ")
 }
 
 fn subcmd_picker_selected_command() -> Option<&'static str> {
@@ -1580,17 +1598,14 @@ impl ConditionalEventHandler for SlashStartCompleteHandler {
                     // Tab = complete the subcommand and allow further editing
                     // Current line is like "/skill " or "/skill d", we need to complete to "/skill dev "
                     if get_subcmd_parent().is_some() {
-                        if let Some(subcmd) = subcmd_picker_selected_command() {
-                            let filter = get_subcmd_filter().unwrap_or_default();
-                            // Compute what to insert: the part of subcmd not yet typed
-                            let suffix = if subcmd.starts_with(&filter) {
-                                format!("{} ", &subcmd[filter.len()..])
-                            } else {
-                                format!("{} ", subcmd)
-                            };
+                        if let Some(parent) = get_subcmd_parent()
+                            && let Some(subcmd) = subcmd_picker_selected_command()
+                        {
                             clear_subcmd_overlay();
-                            // Insert at cursor (which is at end of line)
-                            return Some(RlCmd::Insert(1, suffix));
+                            return Some(RlCmd::Replace(
+                                RlMovement::WholeLine,
+                                Some(subcmd_completion_line(&parent, subcmd)),
+                            ));
                         }
                     }
                     clear_subcmd_overlay();
@@ -2759,6 +2774,21 @@ mod tests {
         assert!(rows.iter().any(|(cmd, _)| *cmd == "/plan step"));
         assert!(rows.iter().any(|(cmd, _)| *cmd == "/plan status"));
         assert!(rows.iter().any(|(cmd, _)| *cmd == "/plan show"));
+    }
+
+    #[test]
+    fn filtered_subcmd_rows_support_fuzzy_matches() {
+        let rows = filtered_subcmd_rows("/stats", Some("hsty"));
+        assert!(!rows.is_empty());
+        assert_eq!(rows[0].0, "history");
+    }
+
+    #[test]
+    fn subcmd_completion_line_replaces_partial_token() {
+        assert_eq!(
+            subcmd_completion_line("/stats", "history"),
+            "/stats history "
+        );
     }
 
     // ── Pending-execute lifecycle ────────────────────────────────────────

@@ -1379,7 +1379,10 @@ mod tests {
             {"name": "small-expensive", "context_window": 8000, "pricing_prompt": 0.01, "is_active": true},
             {"name": "large-cheap", "context_window": 1000000, "pricing_prompt": 0.0001, "is_active": true},
         ]);
-        assert_eq!(cheapest_model_from_json(&body).as_deref(), Some("large-cheap"));
+        assert_eq!(
+            cheapest_model_from_json(&body).as_deref(),
+            Some("large-cheap")
+        );
     }
 
     #[test]
