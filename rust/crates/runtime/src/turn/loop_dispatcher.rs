@@ -184,6 +184,7 @@ impl Default for LoopDispatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use crate::pipeline::step_protocol::InMemoryIdempotencyCache;
     use crate::pipeline::step_recorder::StepRecorder;
     use crate::semantic_dedup::SemanticDedup;
@@ -275,6 +276,7 @@ mod tests {
             step_recorder: StepRecorder::new("test", "run"),
             idempotency_cache: InMemoryIdempotencyCache::new(),
             semantic_dedup: SemanticDedup::new(0.75),
+            call_counts: HashMap::new(),
             stall: Default::default(),
             telemetry: Default::default(),
             skills: Default::default(),

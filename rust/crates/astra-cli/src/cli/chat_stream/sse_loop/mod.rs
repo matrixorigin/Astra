@@ -8,7 +8,7 @@ mod agentic_loop_turn;
 mod agentic_sse_loop;
 mod cli_loop_host;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -388,6 +388,7 @@ pub(crate) async fn stream_chat_sse(
         semantic_dedup: SemanticDedup::new(
             astra_runtime::semantic_dedup::DEFAULT_SIMILARITY_THRESHOLD,
         ),
+        call_counts: HashMap::new(),
         stall: StallTrackingState {
             turn_sigs: Vec::new(),
             turn_tool_names: Vec::new(),

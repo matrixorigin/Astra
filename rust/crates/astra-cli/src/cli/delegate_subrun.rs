@@ -283,6 +283,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             semantic_dedup: SemanticDedup::new(
                 astra_runtime::semantic_dedup::DEFAULT_SIMILARITY_THRESHOLD,
             ),
+            call_counts: HashMap::new(),
             stall: Default::default(),
             telemetry: Default::default(),
             skills: SkillState {

@@ -1224,6 +1224,7 @@ mod tests {
             step_recorder: StepRecorder::new("test-session", "test-task"),
             idempotency_cache: InMemoryIdempotencyCache::new(),
             semantic_dedup: SemanticDedup::new(0.75),
+            call_counts: HashMap::new(),
             stall: Default::default(),
             telemetry: Default::default(),
             skills: Default::default(),

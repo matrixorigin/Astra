@@ -8,7 +8,7 @@
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
 
     use async_trait::async_trait;
@@ -155,6 +155,7 @@ mod tests {
             step_recorder: StepRecorder::new("test-session", "test-task"),
             idempotency_cache: InMemoryIdempotencyCache::new(),
             semantic_dedup: SemanticDedup::new(0.95),
+            call_counts: HashMap::new(),
             stall: Default::default(),
             telemetry: Default::default(),
             skills: Default::default(),
@@ -617,6 +618,7 @@ mod tests {
             &mut step_recorder,
             &mut idempotency_cache,
             &mut semantic_dedup,
+            &mut std::collections::HashMap::new(),
             &mut tool_call_records,
             &tool_event_hooks,
             &mut term,
@@ -731,6 +733,7 @@ mod tests {
             &mut step_recorder,
             &mut idempotency_cache,
             &mut semantic_dedup,
+            &mut std::collections::HashMap::new(),
             &mut tool_call_records,
             &tool_event_hooks,
             &mut term,
@@ -845,6 +848,7 @@ mod tests {
             &mut step_recorder,
             &mut idempotency_cache,
             &mut semantic_dedup,
+            &mut std::collections::HashMap::new(),
             &mut tool_call_records,
             &tool_event_hooks,
             &mut term,

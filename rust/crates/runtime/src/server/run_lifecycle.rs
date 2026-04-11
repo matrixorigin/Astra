@@ -279,6 +279,7 @@ impl AgenticRunLifecycleService {
             step_recorder: StepRecorder::new(session_id, run_id),
             idempotency_cache: InMemoryIdempotencyCache::new(),
             semantic_dedup: SemanticDedup::new(0.75),
+            call_counts: HashMap::new(),
             stall: Default::default(),
             telemetry: Default::default(),
             skills: SkillState {
@@ -1000,6 +1001,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             step_recorder: StepRecorder::new(&config.session_id, &config.run_id),
             idempotency_cache: InMemoryIdempotencyCache::new(),
             semantic_dedup: SemanticDedup::new(0.75),
+            call_counts: HashMap::new(),
             stall: Default::default(),
             telemetry: Default::default(),
             skills: SkillState {

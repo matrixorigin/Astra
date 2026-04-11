@@ -3,7 +3,7 @@
 //! Runs spawned agents using the same agentic loop infrastructure as delegation.
 
 use async_trait::async_trait;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -193,6 +193,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             semantic_dedup: SemanticDedup::new(
                 astra_runtime::semantic_dedup::DEFAULT_SIMILARITY_THRESHOLD,
             ),
+            call_counts: HashMap::new(),
             stall: Default::default(),
             telemetry: Default::default(),
             skills: SkillState {

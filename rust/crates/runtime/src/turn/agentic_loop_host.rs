@@ -384,6 +384,9 @@ pub struct AgenticLoopState {
     // ── Dedup + caching ──
     pub idempotency_cache: InMemoryIdempotencyCache,
     pub semantic_dedup: SemanticDedup,
+    /// Session-level call counter: `dedup_signature → count`.
+    /// Hard-caps repeated identical calls across all rounds.
+    pub call_counts: HashMap<String, u32>,
 
     // ── Sub-states ──
     pub skills: SkillState,
@@ -3710,6 +3713,7 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                 &mut state.step_recorder,
                 &mut state.idempotency_cache,
                 &mut state.semantic_dedup,
+                &mut state.call_counts,
                 &mut state.stall.tool_call_records,
                 &state.skills.tool_event_hooks,
                 &mut term_adapter,
@@ -4405,6 +4409,7 @@ mod tests {
             step_recorder: StepRecorder::new("test-session", "test-task"),
             idempotency_cache: InMemoryIdempotencyCache::new(),
             semantic_dedup: SemanticDedup::new(0.95),
+            call_counts: HashMap::new(),
             stall: Default::default(),
             telemetry: Default::default(),
             skills: SkillState {

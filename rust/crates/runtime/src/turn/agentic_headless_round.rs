@@ -97,6 +97,7 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
     step_recorder: &mut StepRecorder,
     idempotency_cache: &mut InMemoryIdempotencyCache,
     semantic_dedup: &mut SemanticDedup,
+    call_counts: &mut HashMap<String, u32>,
     tool_call_records: &mut Vec<ToolCallRecord>,
     tool_event_hooks: &crate::skills::hooks::ToolEventHookRegistry,
     term: &mut dyn HeadlessRoundTerminal,
@@ -141,12 +142,14 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
 
     let indices = opening.indices;
     let tool_count = opening.tool_count;
-    let mut seen_calls: HashSet<String> = HashSet::new();
     step_recorder.begin_act(tool_count);
     let step_deadline =
         HeadlessStepDeadline::from_scheduling_timeout_ms(step_recorder.scheduling().timeout_ms);
     let mut consumed_edge = vec![false; edge_tool_round.len()];
     let by_sig: &HashMap<String, String> = edge_callback_outputs;
+
+    /// Max times the same (tool, args) signature can execute across the entire session.
+    const MAX_IDENTICAL_CALLS: u32 = 2;
 
     for item in &indices {
         if let Some((aborted_count, aborted_tools)) =
@@ -178,7 +181,9 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
         } = slot;
 
         let call_sig = tool_dedup_signature(&name, &args);
-        if !seen_calls.insert(call_sig.clone()) {
+        let count = call_counts.entry(call_sig.clone()).or_insert(0);
+        *count += 1;
+        if *count > MAX_IDENTICAL_CALLS {
             let (tool_msg, tr) = headless_openai_duplicate_within_turn_pair(&id, &name);
             messages.push(tool_msg);
             tool_results.push(tr);
@@ -186,6 +191,7 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
                 name.clone(),
                 make_args_preview(&name, &args),
             ));
+            turn_guard.health.record_cache_hit(&name);
             continue;
         }
 

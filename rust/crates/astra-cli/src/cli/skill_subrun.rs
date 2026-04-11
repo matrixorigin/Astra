@@ -6,7 +6,7 @@
 //! using the same API and tool infrastructure as the parent conversation.
 
 use async_trait::async_trait;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -445,6 +445,7 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             semantic_dedup: SemanticDedup::new(
                 astra_runtime::semantic_dedup::DEFAULT_SIMILARITY_THRESHOLD,
             ),
+            call_counts: HashMap::new(),
             stall: Default::default(),
             telemetry: Default::default(),
             skills: SkillState {
