@@ -199,27 +199,32 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
         let memory_hits = ctx.executor.memory_boost_search(ctx.message, 5).await;
         let mem_latency_ms = mem_start.elapsed().as_millis() as u64;
         record_first_latency_ms_since(ctx.telem.first_memoria_ms, mem_start);
+
+        // Always record memory retrieval trace, even when no hits (for observability)
+        let memory_contents: Vec<String> = memory_hits
+            .iter()
+            .map(|h| h.content.clone())
+            .collect();
+        let ranked = if memory_contents.is_empty() {
+            Vec::new()
+        } else {
+            astra_runtime::turn::retrieval::rank_memory_results(ctx.message, &memory_contents)
+        };
+        if let Some(collector) = ctx.telem.trace_collector {
+            collector.record_memory_retrieval(
+                ctx.message,
+                memory_contents.len() as u32,
+                &ranked,
+                mem_latency_ms,
+            );
+        }
+
         if !memory_hits.is_empty() {
-            let memory_contents: Vec<String> =
-                memory_hits.iter().map(|h| h.content.clone()).collect();
             for content in &memory_contents {
                 for repo in extract_repos_from_memory(content) {
                     ctx.executor.add_preferred_repo(&repo);
                 }
             }
-            let ranked =
-                astra_runtime::turn::retrieval::rank_memory_results(ctx.message, &memory_contents);
-
-            // Record memory retrieval trace (M1 observability)
-            if let Some(collector) = ctx.telem.trace_collector {
-                collector.record_memory_retrieval(
-                    ctx.message,
-                    memory_contents.len() as u32,
-                    &ranked,
-                    mem_latency_ms,
-                );
-            }
-
             astra_runtime::turn::retrieval::append_boost_terms_from_ranked_memory(
                 &mut boost_terms,
                 ctx.message,

@@ -76,17 +76,13 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
     ) -> Result<HostTurnResult, String> {
         let assembly_start = Instant::now();
 
-        // Create trace collector for this turn (always, so /context breakdown works
-        // even on the first turn before the observability session is created).
-        if state.telemetry.turn_trace_collector.is_none() {
-            let turn_id = format!("turn-{}", self.repl_turn_index);
-            let session_id = state.current_session_id.clone().unwrap_or_default();
-            state.telemetry.turn_trace_collector = Some(
-                astra_runtime::turn::turn_trace_collector::TurnTraceCollector::new(
-                    turn_id, session_id,
-                ),
-            );
-        }
+        // Create a fresh trace collector for each turn (so /context breakdown reflects
+        // this turn only, not accumulated values from prior turns).
+        let turn_id = format!("turn-{}", self.repl_turn_index);
+        let session_id = state.current_session_id.clone().unwrap_or_default();
+        state.telemetry.turn_trace_collector = Some(
+            astra_runtime::turn::turn_trace_collector::TurnTraceCollector::new(turn_id, session_id),
+        );
         let pre_clear = std::mem::take(&mut self.pending_clear_lines);
 
         // If a skill activation overrode the model, use that; otherwise fall back to host default.
