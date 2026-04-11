@@ -23,9 +23,8 @@ use std::time::Instant;
 
 use super::context_assembly_trace::{
     CompressionMethod, ContextAssemblyTrace, ContextAssemblyTraceBuilder, DecisionExplanation,
-    HistorySelectionTrace, MemoryInjection, MemoryRetrievalTrace, SkillInjection,
-    SystemPromptBreakdown, TokenBudgetTrace, ToolSelectionTrace,
-    build_history_trace_from_compression, build_memory_trace_from_retrieval,
+    HistorySelectionTrace, MemoryRetrievalTrace, SystemPromptBreakdown, TokenBudgetTrace,
+    ToolSelectionTrace, build_history_trace_from_compression, build_memory_trace_from_retrieval,
     build_tool_trace_from_selection,
 };
 
@@ -322,6 +321,7 @@ impl Clone for TurnTraceCollector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::context_assembly_trace::{MemoryInjection, SkillInjection};
 
     #[test]
     fn test_collector_basic_flow() {

@@ -396,7 +396,7 @@ mod tests {
         store.register(experiment.clone());
 
         // Promote the treatment variant as a baseline.
-        baselines.promote_winner(&experiment, "treatment");
+        let _ = baselines.promote_winner(&experiment, "treatment");
 
         // Verify baseline exists.
         assert!(baselines.resolve(TaskType::Code, None).is_some());

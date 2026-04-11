@@ -9253,7 +9253,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
 
         // Promote treatment as baseline (simulating a real winner decision).
         if let Some(exp) = exp_store.get(&exp_id) {
-            baselines.promote_winner(&exp, "treatment-low-success");
+            let _ = baselines.promote_winner(&exp, "treatment-low-success");
         }
         assert!(
             baselines.resolve(TaskType::Fetch, None).is_some(),
@@ -9274,7 +9274,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
             .build();
         abort_exp.start();
         exp_store.register(abort_exp.clone());
-        baselines.promote_winner(&abort_exp, "risky");
+        let _ = baselines.promote_winner(&abort_exp, "risky");
         assert!(baselines.resolve(TaskType::Code, None).is_some());
 
         let (cancelled, rollbacks) =

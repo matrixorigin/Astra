@@ -411,7 +411,7 @@ mod tests {
             .with_tag("task_type:code")
             .with_tag("domain:any")
             .build();
-        store.promote_winner(&exp_a, "treatment-a");
+        let _ = store.promote_winner(&exp_a, "treatment-a");
 
         let exp_b = Experiment::new("exp-b")
             .with_variant(Variant::control())
@@ -423,7 +423,7 @@ mod tests {
             .with_tag("task_type:fetch")
             .with_tag("domain:any")
             .build();
-        store.promote_winner(&exp_b, "treatment-b");
+        let _ = store.promote_winner(&exp_b, "treatment-b");
 
         // Both are active.
         assert!(store.resolve(TaskType::Code, None).is_some());
