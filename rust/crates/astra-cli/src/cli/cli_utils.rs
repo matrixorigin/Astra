@@ -184,9 +184,9 @@ pub(super) fn eprint_api_error(status: u16, context: &str) {
 pub(super) fn eprint_request_error<E: std::fmt::Display>(error: &E) {
     use crossterm::style::Stylize;
     let err_str = error.to_string().to_lowercase();
-    
+
     eprintln!("  {} Request failed: {}", theme::icon_err(), error);
-    
+
     // Provide hints based on common error patterns
     let hint = if err_str.contains("connection refused") || err_str.contains("connrefused") {
         Some("Server may be down — check if the service is running")
@@ -194,14 +194,15 @@ pub(super) fn eprint_request_error<E: std::fmt::Display>(error: &E) {
         Some("Request timed out — check network or try again")
     } else if err_str.contains("dns") || err_str.contains("resolve") {
         Some("DNS lookup failed — check your network connection")
-    } else if err_str.contains("ssl") || err_str.contains("tls") || err_str.contains("certificate") {
+    } else if err_str.contains("ssl") || err_str.contains("tls") || err_str.contains("certificate")
+    {
         Some("TLS/SSL error — check certificates or system time")
     } else if err_str.contains("reset") || err_str.contains("closed") {
         Some("Connection was reset — server may have restarted")
     } else {
         None
     };
-    
+
     if let Some(h) = hint {
         eprintln!("      {}", h.dim());
     }
