@@ -41,6 +41,8 @@ pub struct InProcessMetrics {
 pub struct InProcessTransport {
     /// Direct message senders keyed by agent address.
     inboxes: RwLock<HashMap<AgentAddress, mpsc::Sender<Arc<AgentMessage>>>>,
+    /// Initial direct receivers keyed by agent address until the first subscribe().
+    pending_receivers: RwLock<HashMap<AgentAddress, mpsc::Receiver<Arc<AgentMessage>>>>,
     /// Broadcast senders keyed by delegation ID.
     broadcasts: RwLock<HashMap<String, broadcast::Sender<Arc<AgentMessage>>>>,
     /// Maps agent addresses to their delegation group (for broadcast subscription).
@@ -55,6 +57,7 @@ impl InProcessTransport {
     pub fn new() -> Self {
         Self {
             inboxes: RwLock::new(HashMap::new()),
+            pending_receivers: RwLock::new(HashMap::new()),
             broadcasts: RwLock::new(HashMap::new()),
             memberships: RwLock::new(HashMap::new()),
             is_shutdown: AtomicBool::new(false),
@@ -102,11 +105,11 @@ impl MessageTransport for InProcessTransport {
         addr: AgentAddress,
         delegation_id: Option<String>,
     ) -> Result<(), MailboxError> {
-        let (tx, _rx) = mpsc::channel(DIRECT_CHANNEL_CAPACITY);
-
-        // Store the sender; subscribe() creates a fresh channel and replaces it.
-
-        self.inboxes.write().await.insert(addr.clone(), tx);
+        let (tx, rx) = mpsc::channel(DIRECT_CHANNEL_CAPACITY);
+        let mut inboxes = self.inboxes.write().await;
+        let mut pending_receivers = self.pending_receivers.write().await;
+        pending_receivers.insert(addr.clone(), rx);
+        inboxes.insert(addr.clone(), tx);
 
         if let Some(did) = delegation_id {
             self.ensure_broadcast(&did).await;
@@ -117,7 +120,10 @@ impl MessageTransport for InProcessTransport {
     }
 
     async fn unregister(&self, addr: &AgentAddress) -> Result<(), MailboxError> {
-        self.inboxes.write().await.remove(addr);
+        let mut inboxes = self.inboxes.write().await;
+        let mut pending_receivers = self.pending_receivers.write().await;
+        inboxes.remove(addr);
+        pending_receivers.remove(addr);
         // Extract the delegation_id in a separate statement so the write guard
         // is dropped before we acquire a read lock below.
         let did = self.memberships.write().await.remove(addr);
@@ -132,15 +138,20 @@ impl MessageTransport for InProcessTransport {
     }
 
     async fn subscribe(&self, addr: &AgentAddress) -> Result<Box<dyn MessageStream>, MailboxError> {
-        // Create a fresh channel and replace the sender in inboxes.
-        let (tx, rx) = mpsc::channel(DIRECT_CHANNEL_CAPACITY);
-        {
-            let mut inboxes = self.inboxes.write().await;
+        // The first subscribe() should attach the receiver created during register()
+        // so messages sent during mailbox registration are preserved.
+        let mut inboxes = self.inboxes.write().await;
+        let mut pending_receivers = self.pending_receivers.write().await;
+        let rx = if let Some(rx) = pending_receivers.remove(addr) {
+            rx
+        } else {
+            let (tx, rx) = mpsc::channel(DIRECT_CHANNEL_CAPACITY);
             if !inboxes.contains_key(addr) {
                 return Err(MailboxError::AgentNotFound(addr.clone()));
             }
             inboxes.insert(addr.clone(), tx);
-        }
+            rx
+        };
 
         // Subscribe to broadcast if agent is in a delegation group.
         let broadcast_rx = {
@@ -215,7 +226,10 @@ impl MessageTransport for InProcessTransport {
     async fn shutdown(&self) -> Result<(), MailboxError> {
         self.is_shutdown.store(true, Ordering::Relaxed);
         // Close all direct channels by dropping senders.
-        self.inboxes.write().await.clear();
+        let mut inboxes = self.inboxes.write().await;
+        let mut pending_receivers = self.pending_receivers.write().await;
+        inboxes.clear();
+        pending_receivers.clear();
         // Close all broadcast channels.
         self.broadcasts.write().await.clear();
         Ok(())
@@ -512,5 +526,27 @@ mod tests {
             dropped > 0,
             "should have dropped some messages due to backpressure"
         );
+    }
+
+    #[tokio::test]
+    async fn send_before_initial_subscribe_is_buffered() {
+        let transport = InProcessTransport::new();
+        let a = addr("r1", "a");
+        let b = addr("r2", "b");
+
+        transport.register(a.clone(), None).await.unwrap();
+        transport.register(b.clone(), None).await.unwrap();
+
+        let msg = text_msg(a.clone(), b.clone(), "queued before subscribe");
+        transport.send(msg).await.unwrap();
+
+        let mut stream_b = transport.subscribe(&b).await.unwrap();
+        let received = stream_b
+            .try_recv()
+            .expect("message queued before subscribe");
+        match &received.payload {
+            MessagePayload::Text { content, .. } => assert_eq!(content, "queued before subscribe"),
+            other => panic!("expected text payload, got {other:?}"),
+        }
     }
 }

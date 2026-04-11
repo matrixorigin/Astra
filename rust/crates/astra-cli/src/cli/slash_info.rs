@@ -2010,15 +2010,28 @@ fn print_context_breakdown(
             ];
             for (sub, t) in subs {
                 if *t > 0 {
-                    eprintln!("    {:<14} {:>5}", format!("└ {sub}").dim(), t.to_string().dim());
+                    eprintln!(
+                        "    {:<14} {:>5}",
+                        format!("└ {sub}").dim(),
+                        t.to_string().dim()
+                    );
                 }
             }
             for sk in &sp.skills_injected {
-                eprintln!("    {:<14} {:>5}", format!("└ skill:{}", sk.skill_name).dim(), sk.tokens.to_string().dim());
+                eprintln!(
+                    "    {:<14} {:>5}",
+                    format!("└ skill:{}", sk.skill_name).dim(),
+                    sk.tokens.to_string().dim()
+                );
             }
             for mem in &sp.repository_memories {
                 let preview: String = mem.content_preview.chars().take(30).collect();
-                eprintln!("    {:<14} {:>5}  {}", format!("└ memory").dim(), mem.tokens.to_string().dim(), preview.dim());
+                eprintln!(
+                    "    {:<14} {:>5}  {}",
+                    format!("└ memory").dim(),
+                    mem.tokens.to_string().dim(),
+                    preview.dim()
+                );
             }
         }
 
@@ -2031,20 +2044,38 @@ fn print_context_breakdown(
                     _ => "?",
                 };
                 let tc = if tr.has_tool_calls { " 🔧" } else { "" };
-                eprintln!("    {:<14} {:>5}", format!("└ t{} {role_char}{tc}", tr.turn_index).dim(), tr.tokens.to_string().dim());
+                eprintln!(
+                    "    {:<14} {:>5}",
+                    format!("└ t{} {role_char}{tc}", tr.turn_index).dim(),
+                    tr.tokens.to_string().dim()
+                );
             }
             if !hist.turns_dropped.is_empty() {
-                eprintln!("    {}", format!("└ {} turns dropped", hist.turns_dropped.len()).dim());
+                eprintln!(
+                    "    {}",
+                    format!("└ {} turns dropped", hist.turns_dropped.len()).dim()
+                );
             }
             if hist.compression_ratio > 0.0 && hist.compression_ratio < 1.0 {
-                eprintln!("    {}", format!("└ compressed {:.0}%", (1.0 - hist.compression_ratio) * 100.0).dim());
+                eprintln!(
+                    "    {}",
+                    format!(
+                        "└ compressed {:.0}%",
+                        (1.0 - hist.compression_ratio) * 100.0
+                    )
+                    .dim()
+                );
             }
         }
 
         // Sub-components for tool_schemas
         if *label == "tool_schemas" && !tools.tools_selected.is_empty() {
             for ts in &tools.tools_selected {
-                eprintln!("    {:<14} {:>5}", format!("└ {}", ts.tool_name).dim(), ts.tokens.to_string().dim());
+                eprintln!(
+                    "    {:<14} {:>5}",
+                    format!("└ {}", ts.tool_name).dim(),
+                    ts.tokens.to_string().dim()
+                );
             }
         }
     }

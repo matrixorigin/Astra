@@ -320,8 +320,8 @@ impl Clone for TurnTraceCollector {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::context_assembly_trace::{MemoryInjection, SkillInjection};
+    use super::*;
 
     #[test]
     fn test_collector_basic_flow() {
