@@ -1,5 +1,6 @@
 //! Adaptive baseline store — persists promoted experiment winners and reapplies
 //! them as durable per-scope baselines.
+#![allow(deprecated)]
 
 use std::collections::HashMap;
 use std::path::PathBuf;

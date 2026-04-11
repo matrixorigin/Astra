@@ -3,6 +3,7 @@
 //!
 //! **Deprecated**: Superseded by `SelfModel` + LLM reasoning. The LLM decides
 //! when and how to explore based on its self-awareness context.
+#![allow(deprecated)]
 
 use std::time::Duration;
 
