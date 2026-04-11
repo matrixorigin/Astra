@@ -128,6 +128,7 @@ impl ToolHealthTracker {
         health.total_calls += 1;
         // Empty results don't increment consecutive_failures or total_failures
         // but they break the success streak
+        health.consecutive_successes = 0;
         // Mark dirty for delta sync
         self.dirty_tools.insert(tool_name.to_string());
     }
@@ -862,6 +863,36 @@ mod tests {
 
         tracker.record_failure("bash");
         assert_eq!(tracker.get("bash").unwrap().consecutive_successes, 0);
+    }
+
+    #[test]
+    fn empty_result_breaks_rehabilitation_stability_window() {
+        let mut tracker = ToolHealthTracker::new();
+        for _ in 0..3 {
+            tracker.record_failure("bash");
+        }
+        tracker.record_success("bash"); // rehabilitates, rehab_count=1, successes=1
+        for _ in 0..3 {
+            tracker.record_success("bash");
+        }
+        assert_eq!(tracker.get("bash").unwrap().consecutive_successes, 4);
+        assert_eq!(tracker.get("bash").unwrap().rehabilitation_count, 1);
+
+        tracker.record_empty("bash");
+        assert_eq!(
+            tracker.get("bash").unwrap().consecutive_successes,
+            0,
+            "empty result must break the stability window"
+        );
+        assert_eq!(tracker.get("bash").unwrap().rehabilitation_count, 1);
+
+        tracker.record_success("bash");
+        assert_eq!(tracker.get("bash").unwrap().consecutive_successes, 1);
+        assert_eq!(
+            tracker.get("bash").unwrap().rehabilitation_count,
+            1,
+            "a single post-empty success must not clear flaky history"
+        );
     }
 
     #[test]
