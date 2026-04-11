@@ -2,6 +2,9 @@
 
 use super::*;
 use repl_runtime::PipelineModules;
+use session_guard::{
+    install_session_panic_hook, install_sigterm_handler, subscribe_shutdown_signal,
+};
 
 pub(crate) struct ReplStartupArtifacts {
     pub selector: Box<dyn tool_selector::ToolSelector>,
@@ -10,6 +13,7 @@ pub(crate) struct ReplStartupArtifacts {
     pub edge_heartbeat_task: Option<tokio::task::JoinHandle<()>>,
     pub skill_quality_path: std::path::PathBuf,
     pub pinned_skills_path: std::path::PathBuf,
+    pub shutdown_signal_rx: tokio::sync::watch::Receiver<Option<session_guard::ShutdownSignal>>,
 }
 
 pub(crate) async fn complete_repl_startup(
@@ -21,8 +25,9 @@ pub(crate) async fn complete_repl_startup(
 ) -> ReplStartupArtifacts {
     // Install panic hook to write session_end on unexpected crashes.
     install_session_panic_hook();
-    // Install SIGTERM handler so `kill <pid>` writes session_end before exit.
+    // Install signal handlers so SIGTERM/SIGHUP can drain through normal REPL shutdown.
     install_sigterm_handler();
+    let shutdown_signal_rx = subscribe_shutdown_signal();
 
     // Apply resume session if requested (-c or -r)
     if let Some(sid) = resume_session_id {
@@ -226,10 +231,6 @@ pub(crate) async fn complete_repl_startup(
             Err(_) => None,
         };
         if let Some(ref mc) = state.matrix_runtime {
-            set_sigterm_runtime(mc.clone());
-        }
-
-        if let Some(ref mc) = state.matrix_runtime {
             let pool = mc.shared_pool().get().clone();
             let user_id = std::env::var("MO_USER_ID").unwrap_or_else(|_| "local".to_string());
             let mo_team_store = astra_services::team_persistence::MatrixOneTeamStore::new(pool);
@@ -316,5 +317,6 @@ pub(crate) async fn complete_repl_startup(
         edge_heartbeat_task,
         skill_quality_path,
         pinned_skills_path,
+        shutdown_signal_rx,
     }
 }

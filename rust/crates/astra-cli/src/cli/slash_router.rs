@@ -432,16 +432,6 @@ pub(super) async fn handle_slash_command(
 
         "/exit" | "/quit" => {
             eprintln!("{}", "  Goodbye.".dim());
-            finalize_session(state).await;
-            if state.turn > 0
-                && let Some(ref sid) = state.session_id
-            {
-                let short = prefix_chars(sid, 8);
-                eprintln!(
-                    "{}",
-                    format!("  Session {short}… saved. To resume: /resume {sid}").dim()
-                );
-            }
             return Ok(true);
         }
 

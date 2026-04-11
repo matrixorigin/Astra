@@ -110,6 +110,8 @@ mod project_instructions;
 mod prompt_input;
 #[path = "cli/readline_actor.rs"]
 mod readline_actor;
+#[path = "cli/repl_exit.rs"]
+mod repl_exit;
 #[path = "cli/repl_runtime.rs"]
 mod repl_runtime;
 #[path = "cli/repl_startup.rs"]
@@ -214,7 +216,8 @@ use permission_manager::PermissionManager;
 #[cfg(test)]
 use picker_echo::build_picker_submission_echo;
 use picker_echo::{replace_picker_submission_echo, should_clear_picker_submission_echo};
-use prompt_input::{normalize_repl_input, wait_for_prompt_input};
+use prompt_input::{PromptInput, normalize_repl_input, wait_for_prompt_input};
+use repl_exit::{ReplExit, finalize_repl_exit};
 use repl_startup::complete_repl_startup;
 use startup_trace::StartupTracer;
 #[cfg(test)]
@@ -232,9 +235,7 @@ use repl_ui::{
     is_slash_picker_active, print_keyboard_shortcuts, print_slash_commands, resolve_slash_command,
     suggest_commands,
 };
-use session_guard::{
-    install_session_panic_hook, install_sigterm_handler, set_sigterm_runtime, update_panic_guard,
-};
+use session_guard::update_panic_guard;
 use slash_account::handle_account_command;
 use slash_bug::handle_bug_command;
 use slash_debug::handle_debug_command;
@@ -312,13 +313,14 @@ async fn run_chat_repl(
         mut edge_heartbeat_task,
         skill_quality_path,
         pinned_skills_path,
+        mut shutdown_signal_rx,
     } = complete_repl_startup(&mut state, &mut tracer, api, profile, resume_session_id).await;
 
     // Print startup trace summary if enabled
     tracer.finish();
 
     // ── Main loop ─────────────────────────────────────────────────────────────
-    loop {
+    let repl_exit = loop {
         flush_idle_agent_messages_between_prompts(&mut state);
         let plan_terminal = flush_plan_updates_between_prompts(&mut state);
         sync_plan_run_task_progress(&mut state).await;
@@ -370,383 +372,419 @@ async fn run_chat_repl(
         // tracking for wide (CJK) characters, causing the last character to
         // visually disappear. Plan updates are buffered and flushed between
         // prompts instead.
-        let (readline_result, pending_execute) =
-            wait_for_prompt_input(&mut state, &mut readline, prompt_str.clone()).await;
+        let prompt_input = wait_for_prompt_input(
+            &mut state,
+            &mut readline,
+            prompt_str.clone(),
+            &mut shutdown_signal_rx,
+        )
+        .await;
 
         // ── Process readline result ──────────────────────────────────
-        match readline_result {
-            Ok(line) => {
+        match prompt_input {
+            PromptInput::Shutdown(signal) => {
                 clear_slash_overlay();
-                let line = normalize_repl_input(&line);
-                if line.is_empty() {
-                    continue;
-                }
-                readline.add_history(line.clone());
-
-                // ── Handle pending approval from background plan executor ──
-                if let Some(tx) = state.pending_approval.take() {
-                    let trimmed = line.trim().to_lowercase();
-                    let approved = trimmed == "y" || trimmed == "yes" || trimmed == "a";
-                    let autorun = trimmed == "!" || trimmed == "all" || trimmed == "yolo";
-                    let denied = trimmed == "n" || trimmed == "no";
-                    if approved || autorun || denied {
-                        let _ = tx.send(approved || autorun);
-                        if autorun {
-                            state
-                                .perm_manager
-                                .set_mode(permission_manager::PermissionMode::Auto);
-                            eprintln!(
-                                "  {} {} All tools auto-approved for this session.",
-                                "⚡".yellow(),
-                                "Auto-run enabled!".bold().yellow()
-                            );
-                            eprintln!(
-                                "  {}",
-                                "  Use /allow prompt to restore confirmation prompts.".dim()
-                            );
-                        } else if approved {
-                            eprintln!("  {} Approved", theme::icon_ok());
-                        } else {
-                            eprintln!("  {} Denied", theme::icon_err());
-                        }
+                eprintln!(
+                    "\n  {} Received {}. Shutting down gracefully...",
+                    theme::icon_warn(),
+                    signal.label().bold()
+                );
+                break ReplExit::Shutdown(signal);
+            }
+            PromptInput::Readline(readline_result, pending_execute) => match readline_result {
+                Ok(line) => {
+                    clear_slash_overlay();
+                    let line = normalize_repl_input(&line);
+                    if line.is_empty() {
                         continue;
-                    } else {
-                        // Unrecognized — treat as deny and fall through
-                        let _ = tx.send(false);
-                        eprintln!(
-                            "  {} Unrecognized response, treating as denied",
-                            theme::icon_err()
-                        );
-                        // Fall through to normal input handling
                     }
-                }
+                    readline.add_history(line.clone());
 
-                if line.starts_with('/') {
-                    if should_clear_picker_submission_echo(&line, pending_execute.as_deref()) {
-                        replace_picker_submission_echo(
-                            &prompt_str,
-                            pending_execute.as_deref().unwrap_or(&line),
-                        );
-                    }
-                    // If Enter was pressed in the picker, the selected command is
-                    // stored in pending-execute (captured by readline actor thread).
-                    let dispatch_line_owned = pending_execute.unwrap_or_else(|| line.clone());
-                    let dispatch_line = dispatch_line_owned.as_str();
-                    let should_exit = handle_slash_command(
-                        dispatch_line,
-                        api,
-                        profile,
-                        &mut state,
-                        current_token.as_deref(),
-                        &*selector,
-                    )
-                    .await?;
-                    if should_exit {
-                        break;
-                    }
-                    // Merge learning snapshot if /resume deposited one
-                    if let Some(json) = state.learning_snapshot.take() {
-                        merge_learning_snapshot(
-                            &json,
-                            &pipeline_modules.entity_graph,
-                            &pipeline_modules.pattern_library,
-                            &pipeline_modules.calibrator,
-                        );
-                    }
-
-                    // If /plan auto triggered execution, start the background executor
-                    if state.executing_plan.is_some() && state.plan_mode.is_none() {
-                        start_and_monitor_plan(&mut state, current_token.as_deref(), api, profile)
-                            .await?;
-                    }
-                } else if state.plan_mode.is_some() {
-                    // Plan mode: handle input as plan editing
-                    if let Err(e) = handle_plan_mode_input(
-                        line.clone(),
-                        current_token.as_deref(),
-                        &mut state,
-                        api,
-                    )
-                    .await
-                    {
-                        state.plan_resume_pending = false;
-                        return Err(e);
-                    }
-
-                    // If plan execution was just triggered, start the executor (blocking).
-                    if state.executing_plan.is_some() {
-                        start_and_monitor_plan(&mut state, current_token.as_deref(), api, profile)
-                            .await?;
-                    } else if state.plan_resume_pending {
-                        // Resume was sent to a paused executor — re-enter blocking monitor.
-                        state.plan_resume_pending = false;
-                        run_blocking_plan_monitor(&mut state).await;
-                    }
-                } else if (state.executing_plan.is_some() || state.plan_handle.is_some())
-                    && plan_decompose::is_resume_command(&line)
-                {
-                    // Resume paused plan execution
-                    eprintln!();
-                    eprintln!("{}  Resuming plan execution...", "▶".cyan());
-                    if let Some(ref handle) = state.plan_handle {
-                        let _ = handle.send_command(plan_executor::PlanCommand::Resume {
-                            corrections: if state.plan_execution_corrections.is_empty() {
-                                None
+                    // ── Handle pending approval from background plan executor ──
+                    if let Some(tx) = state.pending_approval.take() {
+                        let trimmed = line.trim().to_lowercase();
+                        let approved = trimmed == "y" || trimmed == "yes" || trimmed == "a";
+                        let autorun = trimmed == "!" || trimmed == "all" || trimmed == "yolo";
+                        let denied = trimmed == "n" || trimmed == "no";
+                        if approved || autorun || denied {
+                            let _ = tx.send(approved || autorun);
+                            if autorun {
+                                state
+                                    .perm_manager
+                                    .set_mode(permission_manager::PermissionMode::Auto);
+                                eprintln!(
+                                    "  {} {} All tools auto-approved for this session.",
+                                    "⚡".yellow(),
+                                    "Auto-run enabled!".bold().yellow()
+                                );
+                                eprintln!(
+                                    "  {}",
+                                    "  Use /allow prompt to restore confirmation prompts.".dim()
+                                );
+                            } else if approved {
+                                eprintln!("  {} Approved", theme::icon_ok());
                             } else {
-                                Some(std::mem::take(&mut state.plan_execution_corrections))
-                            },
-                        });
-                        // Re-enter blocking monitor until done/paused/error
-                        run_blocking_plan_monitor(&mut state).await;
-                    } else {
-                        start_and_monitor_plan(&mut state, current_token.as_deref(), api, profile)
-                            .await?;
+                                eprintln!("  {} Denied", theme::icon_err());
+                            }
+                            continue;
+                        } else {
+                            // Unrecognized — treat as deny and fall through
+                            let _ = tx.send(false);
+                            eprintln!(
+                                "  {} Unrecognized response, treating as denied",
+                                theme::icon_err()
+                            );
+                            // Fall through to normal input handling
+                        }
                     }
-                } else {
-                    let has_paused_plan =
-                        state.executing_plan.is_some() || state.plan_handle.is_some();
-                    if has_paused_plan {
-                        if let Some(action) = plan_decompose::parse_plan_paused_user_line(&line) {
-                            match action {
-                                plan_decompose::PlanPausedUserAction::ClearCorrections => {
-                                    state.plan_execution_corrections.clear();
-                                    eprintln!("{}", "  Cleared stacked operator guidance.".dim());
+
+                    if line.starts_with('/') {
+                        if should_clear_picker_submission_echo(&line, pending_execute.as_deref()) {
+                            replace_picker_submission_echo(
+                                &prompt_str,
+                                pending_execute.as_deref().unwrap_or(&line),
+                            );
+                        }
+                        // If Enter was pressed in the picker, the selected command is
+                        // stored in pending-execute (captured by readline actor thread).
+                        let dispatch_line_owned = pending_execute.unwrap_or_else(|| line.clone());
+                        let dispatch_line = dispatch_line_owned.as_str();
+                        let should_exit = handle_slash_command(
+                            dispatch_line,
+                            api,
+                            profile,
+                            &mut state,
+                            current_token.as_deref(),
+                            &*selector,
+                        )
+                        .await?;
+                        if should_exit {
+                            break ReplExit::Command;
+                        }
+                        // Merge learning snapshot if /resume deposited one
+                        if let Some(json) = state.learning_snapshot.take() {
+                            merge_learning_snapshot(
+                                &json,
+                                &pipeline_modules.entity_graph,
+                                &pipeline_modules.pattern_library,
+                                &pipeline_modules.calibrator,
+                            );
+                        }
+
+                        // If /plan auto triggered execution, start the background executor
+                        if state.executing_plan.is_some() && state.plan_mode.is_none() {
+                            start_and_monitor_plan(
+                                &mut state,
+                                current_token.as_deref(),
+                                api,
+                                profile,
+                            )
+                            .await?;
+                        }
+                    } else if state.plan_mode.is_some() {
+                        // Plan mode: handle input as plan editing
+                        if let Err(e) = handle_plan_mode_input(
+                            line.clone(),
+                            current_token.as_deref(),
+                            &mut state,
+                            api,
+                        )
+                        .await
+                        {
+                            state.plan_resume_pending = false;
+                            return Err(e);
+                        }
+
+                        // If plan execution was just triggered, start the executor (blocking).
+                        if state.executing_plan.is_some() {
+                            start_and_monitor_plan(
+                                &mut state,
+                                current_token.as_deref(),
+                                api,
+                                profile,
+                            )
+                            .await?;
+                        } else if state.plan_resume_pending {
+                            // Resume was sent to a paused executor — re-enter blocking monitor.
+                            state.plan_resume_pending = false;
+                            run_blocking_plan_monitor(&mut state).await;
+                        }
+                    } else if (state.executing_plan.is_some() || state.plan_handle.is_some())
+                        && plan_decompose::is_resume_command(&line)
+                    {
+                        // Resume paused plan execution
+                        eprintln!();
+                        eprintln!("{}  Resuming plan execution...", "▶".cyan());
+                        if let Some(ref handle) = state.plan_handle {
+                            let _ = handle.send_command(plan_executor::PlanCommand::Resume {
+                                corrections: if state.plan_execution_corrections.is_empty() {
+                                    None
+                                } else {
+                                    Some(std::mem::take(&mut state.plan_execution_corrections))
+                                },
+                            });
+                            // Re-enter blocking monitor until done/paused/error
+                            run_blocking_plan_monitor(&mut state).await;
+                        } else {
+                            start_and_monitor_plan(
+                                &mut state,
+                                current_token.as_deref(),
+                                api,
+                                profile,
+                            )
+                            .await?;
+                        }
+                    } else {
+                        let has_paused_plan =
+                            state.executing_plan.is_some() || state.plan_handle.is_some();
+                        if has_paused_plan {
+                            if let Some(action) = plan_decompose::parse_plan_paused_user_line(&line)
+                            {
+                                match action {
+                                    plan_decompose::PlanPausedUserAction::ClearCorrections => {
+                                        state.plan_execution_corrections.clear();
+                                        eprintln!(
+                                            "{}",
+                                            "  Cleared stacked operator guidance.".dim()
+                                        );
+                                    }
+                                    plan_decompose::PlanPausedUserAction::Correction(s) => {
+                                        state.plan_execution_corrections.push(s);
+                                        eprintln!(
+                                            "{}  Recorded guidance ({}). It will prefix each upcoming subtask. Type continue when ready.",
+                                            "💡".cyan(),
+                                            state.plan_execution_corrections.len(),
+                                        );
+                                    }
+                                    plan_decompose::PlanPausedUserAction::Rewind(anchor) => {
+                                        if let Some(plan) = state.executing_plan.as_mut() {
+                                            match plan_decompose::resolve_rewind_start_index(
+                                                plan, &anchor,
+                                            ) {
+                                                Ok(idx) => {
+                                                    let reset =
+                                                        plan_decompose::rewind_plan_from_subtask(
+                                                            plan, idx,
+                                                        );
+                                                    eprintln!(
+                                                        "{}  Rewound from step {} — {} subtask(s) set back to pending. Type continue to resume.",
+                                                        "↩".cyan(),
+                                                        idx + 1,
+                                                        reset,
+                                                    );
+                                                }
+                                                Err(e) => {
+                                                    eprintln!(
+                                                        "{}",
+                                                        format!("  {} {e}", theme::icon_err())
+                                                            .red()
+                                                    );
+                                                }
+                                            }
+                                        } else {
+                                            eprintln!(
+                                                "  {} Rewind not available while plan is held by the executor. Type continue first.",
+                                                theme::icon_warn()
+                                            );
+                                        }
+                                    }
                                 }
-                                plan_decompose::PlanPausedUserAction::Correction(s) => {
-                                    state.plan_execution_corrections.push(s);
+                                continue;
+                            }
+                            // Paused plan: any other non-resume line abandons and becomes normal chat
+                            let had_executor = state.plan_handle.is_some();
+                            plan_interaction::shutdown_plan_executor(&mut state);
+                            let plan = state.executing_plan.take();
+                            state.plan_execution_corrections.clear();
+                            match plan.as_ref() {
+                                Some(p) => {
+                                    let (done, total) = (p.items_done(), p.subtasks.len());
+                                    if done < total as u32 {
+                                        eprintln!(
+                                            "{}  Plan abandoned ({}/{} done). Processing as normal chat.",
+                                            "·".dim(),
+                                            done,
+                                            total
+                                        );
+                                    }
+                                }
+                                None if had_executor => {
                                     eprintln!(
-                                        "{}  Recorded guidance ({}). It will prefix each upcoming subtask. Type continue when ready.",
-                                        "💡".cyan(),
-                                        state.plan_execution_corrections.len(),
+                                        "{}  Plan abandoned (executor was cancelled; in-memory progress was not available). Processing as normal chat.",
+                                        "·".dim(),
                                     );
                                 }
-                                plan_decompose::PlanPausedUserAction::Rewind(anchor) => {
-                                    if let Some(plan) = state.executing_plan.as_mut() {
-                                        match plan_decompose::resolve_rewind_start_index(
-                                            plan, &anchor,
-                                        ) {
-                                            Ok(idx) => {
-                                                let reset =
-                                                    plan_decompose::rewind_plan_from_subtask(
-                                                        plan, idx,
-                                                    );
-                                                eprintln!(
-                                                    "{}  Rewound from step {} — {} subtask(s) set back to pending. Type continue to resume.",
-                                                    "↩".cyan(),
-                                                    idx + 1,
-                                                    reset,
-                                                );
-                                            }
-                                            Err(e) => {
-                                                eprintln!(
-                                                    "{}",
-                                                    format!("  {} {e}", theme::icon_err()).red()
-                                                );
-                                            }
-                                        }
-                                    } else {
-                                        eprintln!(
-                                            "  {} Rewind not available while plan is held by the executor. Type continue first.",
-                                            theme::icon_warn()
+                                None => {}
+                            }
+                        }
+
+                        // Auto plan detection: suggest plan mode for complex tasks
+                        let mut should_proceed_normal = true;
+                        let line_for_plan = line.clone(); // Clone early to avoid borrow issues
+                        if let Some(reason) = plan_decompose::should_suggest_plan_mode(&line) {
+                            eprintln!();
+                            eprintln!("{}  {}", "📋".yellow(), reason);
+                            eprintln!(
+                                "{}  This task might benefit from planning. Enter plan mode? (y/n)",
+                                "💡".cyan()
+                            );
+
+                            // Read user response
+                            let mut response = String::new();
+                            if std::io::stdin().read_line(&mut response).is_ok() {
+                                let resp = response.trim().to_lowercase();
+                                if resp == "y" || resp == "yes" || resp == "是" {
+                                    // Enter plan mode with the goal
+                                    let project_root = std::env::current_dir()
+                                        .unwrap_or_else(|_| std::path::PathBuf::from("."));
+                                    let context = plan_decompose::analyze_project(&project_root);
+                                    let goal_display = line_for_plan.clone();
+                                    let plan_state = plan_decompose::PlanModeState::new(
+                                        line_for_plan.clone(),
+                                        context,
+                                    );
+
+                                    eprintln!();
+                                    eprintln!(
+                                        "{}  Entering plan mode for: {}",
+                                        "📋".green(),
+                                        goal_display.cyan()
+                                    );
+                                    eprintln!("{}  Generating plan...", "⋯".dim());
+
+                                    // Trigger plan generation (set goal, plan will be generated in plan mode)
+                                    state.plan_mode = Some(plan_state);
+                                    should_proceed_normal = false;
+
+                                    // Call handle_plan_mode_input to generate the plan
+                                    handle_plan_mode_input(
+                                        line_for_plan,
+                                        current_token.as_deref(),
+                                        &mut state,
+                                        api,
+                                    )
+                                    .await?;
+                                } else {
+                                    eprintln!("{}  Proceeding with normal chat...", "→".dim());
+                                }
+                            }
+                        }
+
+                        if should_proceed_normal {
+                            handle_chat_input(
+                                line,
+                                current_token.as_deref(),
+                                &mut state,
+                                ReplTurnContext {
+                                    api,
+                                    profile,
+                                    selector: &*selector,
+                                },
+                            )
+                            .await?;
+                        }
+
+                        // Keep panic guard in sync with current session state.
+                        if let Some(ref sid) = state.session_id {
+                            update_panic_guard(sid, state.turn);
+                        }
+
+                        // Periodic learning sync: push to cloud at checkpoint boundaries
+                        // to prevent data loss on crash (every CHECKPOINT_INTERVAL turns)
+                        if state.matrix_runtime.is_some()
+                            && state.turn > 0
+                            && state.turn.is_multiple_of(
+                                astra_services::session_checkpoint::CHECKPOINT_INTERVAL,
+                            )
+                        {
+                            // Use delta push at checkpoints to reduce sync bandwidth.
+                            // Final session-end sync still uses full push for convergence.
+                            if let Some(new_version) = try_cloud_push_delta(
+                                &profile_name_str,
+                                &pipeline_modules.entity_graph,
+                                &pipeline_modules.pattern_library,
+                                &pipeline_modules.calibrator,
+                                &state.tool_health_entries,
+                                &mut state.synced_tool_health_entries,
+                                state.cloud_learning_version,
+                            )
+                            .await
+                            {
+                                state.cloud_learning_version = Some(new_version);
+                                // Update orchestrator envelope to reflect the push
+                                if let Some(ref mc) = state.matrix_runtime {
+                                    let orch = mc.sync_orchestrator_lock().await;
+                                    if let Some(mut env) =
+                                        orch.envelope(astra_services::SyncDomain::Learning)
+                                    {
+                                        env.mark_synced(new_version as u64);
+                                        orch.update_envelope(
+                                            astra_services::SyncDomain::Learning,
+                                            env,
                                         );
                                     }
                                 }
                             }
-                            continue;
+                            // On conflict, we skip this push — the final push at session end
+                            // will resolve conflicts via pull-merge-push cycle
                         }
-                        // Paused plan: any other non-resume line abandons and becomes normal chat
-                        let had_executor = state.plan_handle.is_some();
-                        plan_interaction::shutdown_plan_executor(&mut state);
-                        let plan = state.executing_plan.take();
-                        state.plan_execution_corrections.clear();
-                        match plan.as_ref() {
-                            Some(p) => {
-                                let (done, total) = (p.items_done(), p.subtasks.len());
-                                if done < total as u32 {
-                                    eprintln!(
-                                        "{}  Plan abandoned ({}/{} done). Processing as normal chat.",
-                                        "·".dim(),
-                                        done,
-                                        total
-                                    );
-                                }
-                            }
-                            None if had_executor => {
-                                eprintln!(
-                                    "{}  Plan abandoned (executor was cancelled; in-memory progress was not available). Processing as normal chat.",
-                                    "·".dim(),
-                                );
-                            }
-                            None => {}
-                        }
-                    }
 
-                    // Auto plan detection: suggest plan mode for complex tasks
-                    let mut should_proceed_normal = true;
-                    let line_for_plan = line.clone(); // Clone early to avoid borrow issues
-                    if let Some(reason) = plan_decompose::should_suggest_plan_mode(&line) {
-                        eprintln!();
-                        eprintln!("{}  {}", "📋".yellow(), reason);
-                        eprintln!(
-                            "{}  This task might benefit from planning. Enter plan mode? (y/n)",
-                            "💡".cyan()
-                        );
-
-                        // Read user response
-                        let mut response = String::new();
-                        if std::io::stdin().read_line(&mut response).is_ok() {
-                            let resp = response.trim().to_lowercase();
-                            if resp == "y" || resp == "yes" || resp == "是" {
-                                // Enter plan mode with the goal
-                                let project_root = std::env::current_dir()
-                                    .unwrap_or_else(|_| std::path::PathBuf::from("."));
-                                let context = plan_decompose::analyze_project(&project_root);
-                                let goal_display = line_for_plan.clone();
-                                let plan_state = plan_decompose::PlanModeState::new(
-                                    line_for_plan.clone(),
-                                    context,
-                                );
-
-                                eprintln!();
-                                eprintln!(
-                                    "{}  Entering plan mode for: {}",
-                                    "📋".green(),
-                                    goal_display.cyan()
-                                );
-                                eprintln!("{}  Generating plan...", "⋯".dim());
-
-                                // Trigger plan generation (set goal, plan will be generated in plan mode)
-                                state.plan_mode = Some(plan_state);
-                                should_proceed_normal = false;
-
-                                // Call handle_plan_mode_input to generate the plan
-                                handle_plan_mode_input(
-                                    line_for_plan,
-                                    current_token.as_deref(),
-                                    &mut state,
-                                    api,
-                                )
-                                .await?;
-                            } else {
-                                eprintln!("{}  Proceeding with normal chat...", "→".dim());
-                            }
-                        }
-                    }
-
-                    if should_proceed_normal {
-                        handle_chat_input(
-                            line,
-                            current_token.as_deref(),
-                            &mut state,
-                            ReplTurnContext {
-                                api,
-                                profile,
-                                selector: &*selector,
-                            },
-                        )
-                        .await?;
-                    }
-
-                    // Keep panic guard in sync with current session state.
-                    if let Some(ref sid) = state.session_id {
-                        update_panic_guard(sid, state.turn);
-                    }
-
-                    // Periodic learning sync: push to cloud at checkpoint boundaries
-                    // to prevent data loss on crash (every CHECKPOINT_INTERVAL turns)
-                    if state.matrix_runtime.is_some()
-                        && state.turn > 0
-                        && state
-                            .turn
-                            .is_multiple_of(astra_services::session_checkpoint::CHECKPOINT_INTERVAL)
-                    {
-                        // Use delta push at checkpoints to reduce sync bandwidth.
-                        // Final session-end sync still uses full push for convergence.
-                        if let Some(new_version) = try_cloud_push_delta(
-                            &profile_name_str,
-                            &pipeline_modules.entity_graph,
-                            &pipeline_modules.pattern_library,
-                            &pipeline_modules.calibrator,
-                            &state.tool_health_entries,
-                            &mut state.synced_tool_health_entries,
-                            state.cloud_learning_version,
-                        )
-                        .await
-                        {
-                            state.cloud_learning_version = Some(new_version);
-                            // Update orchestrator envelope to reflect the push
-                            if let Some(ref mc) = state.matrix_runtime {
-                                let orch = mc.sync_orchestrator_lock().await;
-                                if let Some(mut env) =
-                                    orch.envelope(astra_services::SyncDomain::Learning)
-                                {
-                                    env.mark_synced(new_version as u64);
-                                    orch.update_envelope(astra_services::SyncDomain::Learning, env);
-                                }
-                            }
-                        }
-                        // On conflict, we skip this push — the final push at session end
-                        // will resolve conflicts via pull-merge-push cycle
-                    }
-
-                    // --max-budget enforcement: check accumulated cost against budget limit
-                    if state.max_budget_limit > 0.0 {
-                        let current_cost = slash_stats::cost_for_tokens(
-                            state.total_prompt_tokens,
-                            state.total_completion_tokens,
-                            state.total_cache_read_tokens,
-                            state.total_cache_creation_tokens,
-                            &state.cached_pricing,
-                        );
-                        state.total_session_cost = current_cost;
-                        if current_cost >= state.max_budget_limit {
-                            eprintln!(
-                                "\n  {} Session budget reached: {} / {} limit. Exiting.",
-                                theme::icon_warn(),
-                                slash_stats::format_cost(current_cost).bold(),
-                                slash_stats::format_cost(state.max_budget_limit),
+                        // --max-budget enforcement: check accumulated cost against budget limit
+                        if state.max_budget_limit > 0.0 {
+                            let current_cost = slash_stats::cost_for_tokens(
+                                state.total_prompt_tokens,
+                                state.total_completion_tokens,
+                                state.total_cache_read_tokens,
+                                state.total_cache_creation_tokens,
+                                &state.cached_pricing,
                             );
-                            break;
+                            state.total_session_cost = current_cost;
+                            if current_cost >= state.max_budget_limit {
+                                eprintln!(
+                                    "\n  {} Session budget reached: {} / {} limit. Exiting.",
+                                    theme::icon_warn(),
+                                    slash_stats::format_cost(current_cost).bold(),
+                                    slash_stats::format_cost(state.max_budget_limit),
+                                );
+                                break ReplExit::BudgetLimit;
+                            }
+                        }
+
+                        if let Some(signal) = *shutdown_signal_rx.borrow() {
+                            clear_slash_overlay();
+                            eprintln!(
+                                "\n  {} Received {}. Shutting down gracefully...",
+                                theme::icon_warn(),
+                                signal.label().bold()
+                            );
+                            break ReplExit::Shutdown(signal);
                         }
                     }
                 }
-            }
-            Err(ReadlineError::Interrupted) => {
-                clear_slash_overlay();
-                eprintln!("^C");
-            }
-            Err(ReadlineError::Eof) => {
-                clear_slash_overlay();
-                eprintln!("{}", "\nGoodbye.".dim());
-                finalize_session(&state).await;
-                // Show resume hint if session had any turns
-                if state.turn > 0
-                    && let Some(ref sid) = state.session_id
-                {
-                    let short = prefix_chars(sid, 8);
+                Err(ReadlineError::Interrupted) => {
+                    clear_slash_overlay();
+                    eprintln!("^C");
+                }
+                Err(ReadlineError::Eof) => {
+                    clear_slash_overlay();
+                    eprintln!("{}", "\nGoodbye.".dim());
+                    break ReplExit::Eof;
+                }
+                Err(e) => {
+                    clear_slash_overlay();
                     eprintln!(
-                        "{}",
-                        format!("  Session {short}… saved. To resume: /resume {sid}").dim()
+                        "  {} {}",
+                        theme::icon_err(),
+                        "Input error — exiting session.".red()
                     );
+                    eprintln!("{}", format!("  ({e})").dim());
+                    break ReplExit::InputError;
                 }
-                if state.session_id.is_some() {
-                    let _ = clear_profile_last_session(profile);
-                }
-                break;
-            }
-            Err(e) => {
-                clear_slash_overlay();
-                eprintln!(
-                    "  {} {}",
-                    theme::icon_err(),
-                    "Input error — exiting session.".red()
-                );
-                eprintln!("{}", format!("  ({e})").dim());
-                finalize_session(&state).await;
-                break;
-            }
+            },
         }
-    }
+    };
+
+    finalize_repl_exit(&state, profile, repl_exit).await;
 
     // Save cross-session learning state (including tool health)
     {
@@ -861,7 +899,6 @@ async fn run_chat_repl(
 use project_instructions::{
     discover_project_instructions, format_project_instructions, resolve_system_prompt,
 };
-use session_cleanup::finalize_session;
 
 // ════════════════════════════════════════════════════════════════ main ════
 
@@ -1607,6 +1644,7 @@ mod tests {
             .await
             .unwrap();
         assert!(exit);
+        finalize_repl_exit(&state, None, ReplExit::Command).await;
 
         // Verify session_end was written to journal
         let events = session_journal::read_journal(&sid).unwrap();
@@ -1646,6 +1684,7 @@ mod tests {
             .await
             .unwrap();
         assert!(exit);
+        finalize_repl_exit(&state, None, ReplExit::Command).await;
 
         let events = session_journal::read_journal(&sid).unwrap();
         let has_session_end = events

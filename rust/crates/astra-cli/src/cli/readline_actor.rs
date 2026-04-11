@@ -23,6 +23,9 @@ use rustyline::{Editor, error::ReadlineError, history::FileHistory};
 
 use crate::repl_ui::ReplHelper;
 
+#[cfg(unix)]
+use std::os::unix::thread::{JoinHandleExt, RawPthread};
+
 /// Messages sent from the main async loop → readline thread.
 enum ReadlineRequest {
     /// Read a line with the given prompt string.
@@ -51,6 +54,8 @@ pub(super) enum ReadlineResponse {
 pub(super) struct ReadlineActor {
     req_tx: std::sync::mpsc::Sender<ReadlineRequest>,
     resp_rx: tokio::sync::mpsc::UnboundedReceiver<ReadlineResponse>,
+    #[cfg(unix)]
+    pthread: RawPthread,
 }
 
 impl ReadlineActor {
@@ -65,14 +70,22 @@ impl ReadlineActor {
         let (req_tx, req_rx) = std::sync::mpsc::channel::<ReadlineRequest>();
         let (resp_tx, resp_rx) = tokio::sync::mpsc::unbounded_channel::<ReadlineResponse>();
 
-        std::thread::Builder::new()
+        let handle = std::thread::Builder::new()
             .name("readline".into())
             .spawn(move || {
                 readline_thread_main(editor, req_rx, resp_tx);
             })
             .map_err(|e| format!("failed to spawn readline thread: {e}"))?;
 
-        Ok(Self { req_tx, resp_rx })
+        #[cfg(unix)]
+        let pthread = handle.as_pthread_t();
+
+        Ok(Self {
+            req_tx,
+            resp_rx,
+            #[cfg(unix)]
+            pthread,
+        })
     }
 
     /// Request the thread to read a line with the given prompt.
@@ -97,6 +110,14 @@ impl ReadlineActor {
     /// Tell the readline thread to save history and shut down.
     pub fn shutdown(&self, hist_path: PathBuf) {
         let _ = self.req_tx.send(ReadlineRequest::Shutdown(hist_path));
+    }
+
+    /// Interrupt an in-flight readline call so the thread can process shutdown.
+    pub fn interrupt(&self) {
+        #[cfg(unix)]
+        unsafe {
+            let _ = nix::libc::pthread_kill(self.pthread, nix::libc::SIGINT);
+        }
     }
 }
 

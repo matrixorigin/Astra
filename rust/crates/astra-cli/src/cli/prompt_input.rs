@@ -6,18 +6,26 @@ use super::{
     ReplState,
     idle_agent_messages::flush_idle_agent_messages_between_prompts,
     readline_actor::{ReadlineActor, ReadlineResponse},
+    session_guard::ShutdownSignal,
 };
 
 enum PromptWaitOutcome {
     Readline(Result<String, ReadlineError>, Option<String>),
     IdleAgentMessage(Option<std::sync::Arc<astra_runtime::messaging::AgentMessage>>),
+    Shutdown(ShutdownSignal),
+}
+
+pub(crate) enum PromptInput {
+    Readline(Result<String, ReadlineError>, Option<String>),
+    Shutdown(ShutdownSignal),
 }
 
 pub(crate) async fn wait_for_prompt_input(
     state: &mut ReplState,
     readline: &mut ReadlineActor,
     prompt_str: String,
-) -> (Result<String, ReadlineError>, Option<String>) {
+    shutdown_signal_rx: &mut tokio::sync::watch::Receiver<Option<ShutdownSignal>>,
+) -> PromptInput {
     readline.request_readline(prompt_str);
 
     let result = loop {
@@ -30,20 +38,48 @@ pub(crate) async fn wait_for_prompt_input(
                     None => PromptWaitOutcome::Readline(Err(ReadlineError::Eof), None),
                 },
                 message = mailbox.recv() => PromptWaitOutcome::IdleAgentMessage(message),
+                changed = shutdown_signal_rx.changed() => {
+                    match changed {
+                        Ok(()) => match *shutdown_signal_rx.borrow() {
+                            Some(signal) => {
+                                // Wake the blocking readline thread so it can consume the
+                                // queued shutdown request and persist history before exit.
+                                readline.interrupt();
+                                PromptWaitOutcome::Shutdown(signal)
+                            }
+                            None => continue,
+                        },
+                        Err(_) => continue,
+                    }
+                }
             }
         } else {
-            match readline.recv().await {
-                Some(ReadlineResponse::Line {
-                    result,
-                    pending_execute,
-                }) => PromptWaitOutcome::Readline(result, pending_execute),
-                None => PromptWaitOutcome::Readline(Err(ReadlineError::Eof), None),
+            tokio::select! {
+                result = readline.recv() => match result {
+                    Some(ReadlineResponse::Line {
+                        result,
+                        pending_execute,
+                    }) => PromptWaitOutcome::Readline(result, pending_execute),
+                    None => PromptWaitOutcome::Readline(Err(ReadlineError::Eof), None),
+                },
+                changed = shutdown_signal_rx.changed() => {
+                    match changed {
+                        Ok(()) => match *shutdown_signal_rx.borrow() {
+                            Some(signal) => {
+                                readline.interrupt();
+                                PromptWaitOutcome::Shutdown(signal)
+                            }
+                            None => continue,
+                        },
+                        Err(_) => continue,
+                    }
+                }
             }
         };
 
         match outcome {
             PromptWaitOutcome::Readline(result, pending_execute) => {
-                break (result, pending_execute);
+                break PromptInput::Readline(result, pending_execute);
             }
             PromptWaitOutcome::IdleAgentMessage(Some(message)) => {
                 state.pending_idle_agent_messages.push(message);
@@ -51,6 +87,7 @@ pub(crate) async fn wait_for_prompt_input(
             PromptWaitOutcome::IdleAgentMessage(None) => {
                 state.root_mailbox = None;
             }
+            PromptWaitOutcome::Shutdown(signal) => break PromptInput::Shutdown(signal),
         }
     };
 

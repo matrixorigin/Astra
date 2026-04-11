@@ -1,7 +1,22 @@
 //! Panic-safe and signal-safe session guard helpers.
 
 use astra_services::session_journal;
-use std::sync::OnceLock;
+use std::sync::{Once, OnceLock};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ShutdownSignal {
+    Sigterm,
+    Sighup,
+}
+
+impl ShutdownSignal {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Sigterm => "SIGTERM",
+            Self::Sighup => "SIGHUP",
+        }
+    }
+}
 
 /// Session context stored globally so the panic/signal hooks can write `session_end`.
 struct PanicSessionGuard {
@@ -11,14 +26,27 @@ struct PanicSessionGuard {
 
 static PANIC_SESSION_GUARD: std::sync::Mutex<Option<PanicSessionGuard>> =
     std::sync::Mutex::new(None);
-
-/// Global reference to the MatrixCloudRuntime so the SIGTERM handler can flush
-/// ingestion before exit. Set once when the REPL creates the runtime.
-static SIGTERM_RUNTIME: OnceLock<std::sync::Arc<astra_runtime::MatrixCloudRuntime>> =
+static SHUTDOWN_SIGNAL_TX: OnceLock<tokio::sync::watch::Sender<Option<ShutdownSignal>>> =
     OnceLock::new();
+static SHUTDOWN_SIGNAL_HANDLER_INSTALLED: Once = Once::new();
+
+fn shutdown_signal_sender() -> &'static tokio::sync::watch::Sender<Option<ShutdownSignal>> {
+    SHUTDOWN_SIGNAL_TX.get_or_init(|| {
+        let (tx, _rx) = tokio::sync::watch::channel(None);
+        tx
+    })
+}
+
+fn publish_shutdown_signal(signal: ShutdownSignal) {
+    let _ = shutdown_signal_sender().send(Some(signal));
+}
+
+pub(crate) fn subscribe_shutdown_signal() -> tokio::sync::watch::Receiver<Option<ShutdownSignal>> {
+    shutdown_signal_sender().subscribe()
+}
 
 /// Best-effort write of `session_end` to journal from the global guard.
-/// Safe to call from panic hooks and signal handlers (no async, no cloud).
+/// Safe to call from panic hooks and emergency paths (no async, no cloud).
 fn emergency_session_end() {
     if let Ok(guard) = PANIC_SESSION_GUARD.lock() {
         if let Some(ref ctx) = *guard {
@@ -41,36 +69,29 @@ pub(crate) fn install_session_panic_hook() {
     }));
 }
 
-/// Install a SIGTERM handler that writes `session_end` and flushes ingestion before exit.
+/// Install signal handlers that request a graceful REPL shutdown.
 /// Must be called inside a tokio runtime.
 pub(crate) fn install_sigterm_handler() {
-    tokio::spawn(async {
-        #[cfg(unix)]
-        {
-            use tokio::signal::unix::{SignalKind, signal};
-            if let Ok(mut sigterm) = signal(SignalKind::terminate()) {
-                sigterm.recv().await;
-                emergency_session_end();
-                if let Some(mc) = SIGTERM_RUNTIME.get() {
-                    mc.shutdown_ingestion_and_wait().await;
+    SHUTDOWN_SIGNAL_HANDLER_INSTALLED.call_once(|| {
+        tokio::spawn(async {
+            #[cfg(unix)]
+            {
+                use tokio::signal::unix::{SignalKind, signal};
+                if let Ok(mut sigterm) = signal(SignalKind::terminate()) {
+                    sigterm.recv().await;
+                    publish_shutdown_signal(ShutdownSignal::Sigterm);
                 }
-                std::process::exit(0);
             }
-        }
+        });
+        #[cfg(unix)]
+        tokio::spawn(async {
+            use tokio::signal::unix::{SignalKind, signal};
+            if let Ok(mut sighup) = signal(SignalKind::hangup()) {
+                sighup.recv().await;
+                publish_shutdown_signal(ShutdownSignal::Sighup);
+            }
+        });
     });
-    #[cfg(unix)]
-    tokio::spawn(async {
-        use tokio::signal::unix::{SignalKind, signal};
-        if let Ok(mut sighup) = signal(SignalKind::hangup()) {
-            sighup.recv().await;
-            emergency_session_end();
-            std::process::exit(0);
-        }
-    });
-}
-
-pub(crate) fn set_sigterm_runtime(runtime: std::sync::Arc<astra_runtime::MatrixCloudRuntime>) {
-    let _ = SIGTERM_RUNTIME.set(runtime);
 }
 
 /// Update the global panic guard with current session state.
@@ -87,5 +108,29 @@ pub(crate) fn update_panic_guard(session_id: &str, turn: u32) {
 pub(crate) fn clear_panic_guard() {
     if let Ok(mut guard) = PANIC_SESSION_GUARD.lock() {
         *guard = None;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn publish_shutdown_signal_updates_subscribers() {
+        let _ = shutdown_signal_sender().send(None);
+        let mut rx = subscribe_shutdown_signal();
+
+        publish_shutdown_signal(ShutdownSignal::Sigterm);
+
+        rx.changed().await.unwrap();
+        assert_eq!(*rx.borrow(), Some(ShutdownSignal::Sigterm));
+
+        let _ = shutdown_signal_sender().send(None);
+    }
+
+    #[test]
+    fn shutdown_signal_labels_are_stable() {
+        assert_eq!(ShutdownSignal::Sigterm.label(), "SIGTERM");
+        assert_eq!(ShutdownSignal::Sighup.label(), "SIGHUP");
     }
 }
