@@ -1420,9 +1420,9 @@ mod tests {
     #[test]
     fn catalog_summary_is_compact() {
         let summary = build_catalog_summary();
-        // Should be under 1000 chars (~250 tokens)
+        // Should be under ~700 tokens (2800 chars with added delegate + trigger expansions)
         assert!(
-            summary.len() < 2500,
+            summary.len() < 2800,
             "catalog summary too long: {} chars",
             summary.len()
         );
