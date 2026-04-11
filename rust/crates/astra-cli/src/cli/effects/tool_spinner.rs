@@ -54,7 +54,11 @@ impl ToolRunningLineSpinner {
             Some((cur, total)) if total > 1 => {
                 let prefix = format!("[{}/{}] ", cur, total);
                 let remaining = w.saturating_sub(16 + prefix.len()).max(20);
-                format!("{}{}", prefix, truncate_cli_status_detail(&description, remaining))
+                format!(
+                    "{}{}",
+                    prefix,
+                    truncate_cli_status_detail(&description, remaining)
+                )
             }
             _ => truncate_cli_status_detail(&description, w.saturating_sub(16).max(30)),
         };

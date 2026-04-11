@@ -908,7 +908,11 @@ impl SseStreamHost for CliSseStreamHost<'_> {
 
         // Collect concurrent-safe requests (preserving order) and run sequential ones first.
         let mut seq_done = 0usize;
-        let seq_total = requests.iter().enumerate().filter(|(i, _)| !conc_flags[*i]).count();
+        let seq_total = requests
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !conc_flags[*i])
+            .count();
         let mut conc_reqs: Vec<(usize, &ToolBatchRequest)> = Vec::with_capacity(conc_count);
         for (i, req) in requests.iter().enumerate() {
             if conc_flags[i] {
@@ -1101,8 +1105,13 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             if use_grouped_spinner {
                 // Grouped mode: print completion line directly (no spinner update).
                 if !self.quiet && !self.suppress_intermediate_output {
-                    self.render
-                        .tool_done_inline(&req.tool, &req.args, status, duration_ms, &output);
+                    self.render.tool_done_inline(
+                        &req.tool,
+                        &req.args,
+                        status,
+                        duration_ms,
+                        &output,
+                    );
                 }
             } else if let Some(idx) = ui_indices[pos] {
                 self.render

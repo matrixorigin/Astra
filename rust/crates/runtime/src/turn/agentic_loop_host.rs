@@ -1454,15 +1454,13 @@ fn finalize_turn_trace(state: &mut AgenticLoopState) {
     } else {
         state.telemetry.first_budget_pressure
     };
-    collector.record_token_budget(
-        crate::turn::context_assembly_trace::TokenBudgetTrace {
-            max_tokens: max as u32,
-            total_used: measured as u32,
-            budget_pressure,
-            compression_triggered: state.budget_wrapup_injected,
-            ..Default::default()
-        },
-    );
+    collector.record_token_budget(crate::turn::context_assembly_trace::TokenBudgetTrace {
+        max_tokens: max as u32,
+        total_used: measured as u32,
+        budget_pressure,
+        compression_triggered: state.budget_wrapup_injected,
+        ..Default::default()
+    });
     let trace = collector.finalize();
     if let Some(ref session) = state.telemetry.observability_session {
         let mut guard = session.write().unwrap_or_else(|e| e.into_inner());
@@ -9785,16 +9783,20 @@ print(json.dumps({'context': 'user said: ' + msg}))
 
         // Turn 0
         state.last_measured_prompt_tokens = Some(20_000);
-        state.telemetry.turn_trace_collector = Some(
-            crate::turn::turn_trace_collector::TurnTraceCollector::new("turn-0".to_string(), "s1".to_string()),
-        );
+        state.telemetry.turn_trace_collector =
+            Some(crate::turn::turn_trace_collector::TurnTraceCollector::new(
+                "turn-0".to_string(),
+                "s1".to_string(),
+            ));
         finalize_turn_trace(&mut state);
 
         // Turn 1
         state.last_measured_prompt_tokens = Some(30_000);
-        state.telemetry.turn_trace_collector = Some(
-            crate::turn::turn_trace_collector::TurnTraceCollector::new("turn-1".to_string(), "s1".to_string()),
-        );
+        state.telemetry.turn_trace_collector =
+            Some(crate::turn::turn_trace_collector::TurnTraceCollector::new(
+                "turn-1".to_string(),
+                "s1".to_string(),
+            ));
         finalize_turn_trace(&mut state);
 
         let guard = session.read().unwrap();
