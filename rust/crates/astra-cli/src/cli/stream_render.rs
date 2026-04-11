@@ -133,6 +133,8 @@ impl<'a> CliSseStreamHost<'a> {
 
     /// Push text to the active renderer (markdown or raw stdout).
     fn render_text(&mut self, s: &str) {
+        // Track output bytes for live token estimation
+        self.render.output_bytes = self.render.output_bytes.saturating_add(s.len());
         if let Some(pane) = self.render.thinking_pane.take() {
             let summary = pane.summary_line();
             self.render.clear_thinking_with_summary(pane, &summary);
@@ -1183,6 +1185,8 @@ pub(super) struct StreamRenderState {
     /// Avoids broken in-place redraw when other stderr lines (e.g. project context) were printed first,
     /// and keeps plan decomposition output readable. Reasoning is still accumulated for the API.
     suppress_reasoning_viewport: bool,
+    /// Accumulated output bytes for live token estimation.
+    output_bytes: usize,
 }
 
 impl StreamRenderState {
@@ -1214,6 +1218,7 @@ impl StreamRenderState {
             tool_stderr_running: None,
             tool_stdout_anim: None,
             suppress_reasoning_viewport,
+            output_bytes: 0,
         }
     }
 
@@ -1292,6 +1297,8 @@ impl StreamRenderState {
         if chunk.is_empty() || self.suppress_reasoning_viewport {
             return;
         }
+        // Track output bytes for token estimation
+        self.output_bytes = self.output_bytes.saturating_add(chunk.len());
         self.thinking_start.get_or_insert_with(Instant::now);
         let rows = thinking_viewport_rows();
         // ThinkingPreviewPane and StreamingMarkdown both use stdout (TerminalRegion).
@@ -1305,17 +1312,21 @@ impl StreamRenderState {
                 self.thinking_pane = Some(ThinkingPreviewPane::new(rows, self.term_width));
             }
             if let Some(pane) = &mut self.thinking_pane {
+                // Feed output bytes to pane for live token display
+                pane.set_output_bytes(self.output_bytes);
                 pane.push_chunk(chunk);
             }
         }
     }
 
-    /// Refresh the thinking pane header (elapsed time) without new content.
+    /// Refresh the thinking pane header (elapsed time + token count) without new content.
     fn tick_thinking_pane(&mut self) {
         if let Some(pane) = &mut self.thinking_pane {
             if let Some(md) = &mut self.md {
                 md.pause_unstable();
             }
+            // Update output bytes so token counter refreshes
+            pane.set_output_bytes(self.output_bytes);
             pane.tick();
         }
     }

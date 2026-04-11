@@ -30,6 +30,8 @@ pub struct ThinkingPreviewPane {
     /// Region for diff-based updates (stdout).
     region: TerminalRegion,
     start: Instant,
+    /// Accumulated output bytes for token estimation (~4 chars/token).
+    output_bytes: usize,
 }
 
 impl ThinkingPreviewPane {
@@ -41,7 +43,13 @@ impl ThinkingPreviewPane {
             buffer: String::new(),
             region: TerminalRegion::new(),
             start: Instant::now(),
+            output_bytes: 0,
         }
+    }
+
+    /// Set output bytes for token estimation (cumulative from StreamRenderState).
+    pub fn set_output_bytes(&mut self, bytes: usize) {
+        self.output_bytes = bytes;
     }
 
     /// Push a chunk of reasoning content and redraw.
@@ -77,10 +85,20 @@ impl ThinkingPreviewPane {
             visual[visual.len() - cap..].to_vec()
         };
         let elapsed = self.start.elapsed().as_secs_f64();
-        let header = if hidden > 0 {
-            format!("Thinking… ({hidden} rows hidden, {elapsed:.1}s)")
+        // Estimate tokens: ~4 chars/token for English, ~2 chars/token for CJK
+        let est_tokens = self.output_bytes / 4;
+        let tokens_str = if est_tokens > 1000 {
+            format!("~{:.1}k tok", est_tokens as f64 / 1000.0)
+        } else if est_tokens > 0 {
+            format!("~{est_tokens} tok")
         } else {
-            format!("Thinking… ({elapsed:.1}s)")
+            String::new()
+        };
+        let header = match (hidden > 0, !tokens_str.is_empty()) {
+            (true, true) => format!("Thinking… ({hidden}↑, {tokens_str}, {elapsed:.1}s)"),
+            (true, false) => format!("Thinking… ({hidden} rows hidden, {elapsed:.1}s)"),
+            (false, true) => format!("Thinking… ({tokens_str}, {elapsed:.1}s)"),
+            (false, false) => format!("Thinking… ({elapsed:.1}s)"),
         };
         (header, body)
     }
