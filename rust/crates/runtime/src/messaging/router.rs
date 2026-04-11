@@ -281,7 +281,28 @@ impl AgentMailboxRouter {
             idx.insert(addr.agent_id.clone(), addr.clone());
         }
 
-        let stream = self.transport.subscribe(&addr).await?;
+        let stream = match self.transport.subscribe(&addr).await {
+            Ok(stream) => stream,
+            Err(err) => {
+                {
+                    let mut reg = self.address_registry.write().await;
+                    let mut idx = self.agent_id_index.write().await;
+                    if reg.get(&addr.run_id) == Some(&addr) {
+                        reg.remove(&addr.run_id);
+                    }
+                    if idx.get(&addr.agent_id) == Some(&addr) {
+                        idx.remove(&addr.agent_id);
+                    }
+                }
+                if let Err(unregister_err) = self.transport.unregister(&addr).await {
+                    eprintln!(
+                        "  ⚠ messaging: failed to roll back transport registration for {} after subscribe error: {:?}",
+                        addr, unregister_err
+                    );
+                }
+                return Err(err);
+            }
+        };
 
         Ok(AgentMailbox {
             address: addr,
@@ -407,6 +428,8 @@ mod tests {
     use super::*;
     use crate::messaging::in_process::InProcessTransport;
     use crate::messaging::types::{MessagePayload, MessageTarget};
+    use async_trait::async_trait;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
     fn tracker() -> Arc<DelegationTracker> {
         Arc::new(DelegationTracker::new())
@@ -414,6 +437,48 @@ mod tests {
 
     fn addr(run: &str, agent: &str) -> AgentAddress {
         AgentAddress::new(run, agent)
+    }
+
+    #[derive(Default)]
+    struct FailingSubscribeTransport {
+        registered: AtomicUsize,
+        unregistered: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl MessageTransport for FailingSubscribeTransport {
+        async fn register(
+            &self,
+            _addr: AgentAddress,
+            _delegation_id: Option<String>,
+        ) -> Result<(), MailboxError> {
+            self.registered.fetch_add(1, AtomicOrdering::Relaxed);
+            Ok(())
+        }
+
+        async fn unregister(&self, _addr: &AgentAddress) -> Result<(), MailboxError> {
+            self.unregistered.fetch_add(1, AtomicOrdering::Relaxed);
+            Ok(())
+        }
+
+        async fn subscribe(
+            &self,
+            _addr: &AgentAddress,
+        ) -> Result<Box<dyn MessageStream>, MailboxError> {
+            Err(MailboxError::Transport("subscribe failed".into()))
+        }
+
+        async fn send(&self, _msg: Arc<AgentMessage>) -> Result<(), MailboxError> {
+            unreachable!("send is not used in this test")
+        }
+
+        async fn broadcast(
+            &self,
+            _delegation_id: &str,
+            _msg: Arc<AgentMessage>,
+        ) -> Result<(), MailboxError> {
+            unreachable!("broadcast is not used in this test")
+        }
     }
 
     #[tokio::test]
@@ -824,5 +889,22 @@ mod tests {
             MessagePayload::Text { content, .. } => assert_eq!(content, "after"),
             other => panic!("expected text, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn register_rolls_back_state_when_subscribe_fails() {
+        let transport = Arc::new(FailingSubscribeTransport::default());
+        let router = Arc::new(AgentMailboxRouter::new(transport.clone(), tracker()));
+        let broken = addr("r-broken", "worker");
+
+        let err = match router.register(broken, None).await {
+            Ok(_) => panic!("register should fail when subscribe fails"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, MailboxError::Transport(_)));
+        assert_eq!(transport.registered.load(AtomicOrdering::Relaxed), 1);
+        assert_eq!(transport.unregistered.load(AtomicOrdering::Relaxed), 1);
+        assert!(router.address_registry.read().await.is_empty());
+        assert!(router.agent_id_index.read().await.is_empty());
     }
 }

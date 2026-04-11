@@ -1362,4 +1362,61 @@ mod tests {
         let result = transport.subscribe(&a).await;
         assert!(result.is_err(), "subscribe without register should fail");
     }
+
+    #[tokio::test]
+    async fn shutdown_rejects_new_local_operations() {
+        skip_without_db!(pool);
+
+        let transport =
+            DatabaseTransport::new(pool.clone()).with_poll_interval(Duration::from_millis(50));
+
+        let sender = addr("run-db-shutdown-reject-a", "alice");
+        let receiver = addr("run-db-shutdown-reject-b", "bob");
+
+        transport.register(sender.clone(), None).await.unwrap();
+        transport.shutdown().await.unwrap();
+
+        let register_err = transport
+            .register(receiver.clone(), None)
+            .await
+            .unwrap_err();
+        assert!(matches!(register_err, MailboxError::Transport(_)));
+
+        let subscribe_err = match transport.subscribe(&sender).await {
+            Ok(_) => panic!("subscribe should fail after shutdown"),
+            Err(err) => err,
+        };
+        assert!(matches!(subscribe_err, MailboxError::Transport(_)));
+
+        let direct = Arc::new(AgentMessage::new(
+            sender.clone(),
+            MessageTarget::Direct {
+                address: receiver.clone(),
+            },
+            MessagePayload::Text {
+                content: "after shutdown".into(),
+                summary: None,
+            },
+        ));
+        let send_err = transport.send(direct).await.unwrap_err();
+        assert!(matches!(send_err, MailboxError::Transport(_)));
+
+        let broadcast = Arc::new(AgentMessage::new(
+            sender,
+            MessageTarget::Broadcast {
+                delegation_id: "shutdown-del".into(),
+            },
+            MessagePayload::Text {
+                content: "after shutdown".into(),
+                summary: None,
+            },
+        ));
+        let broadcast_err = transport
+            .broadcast("shutdown-del", broadcast)
+            .await
+            .unwrap_err();
+        assert!(matches!(broadcast_err, MailboxError::Transport(_)));
+
+        cleanup(&pool).await;
+    }
 }

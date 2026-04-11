@@ -244,6 +244,10 @@ impl DatabaseTransport {
         &self.metrics
     }
 
+    fn is_shutdown(&self) -> bool {
+        *self.shutdown_rx.borrow()
+    }
+
     /// Acknowledge a message — marks it as 'acked' in the database.
     ///
     /// Called by the receiver after processing the message.
@@ -369,6 +373,9 @@ impl MessageTransport for DatabaseTransport {
         addr: AgentAddress,
         delegation_id: Option<String>,
     ) -> Result<(), MailboxError> {
+        if self.is_shutdown() {
+            return Err(MailboxError::Transport("transport is shut down".into()));
+        }
         self.registrations.write().await.insert(addr, delegation_id);
         self.ensure_cleanup_scheduler_started();
         Ok(())
@@ -383,6 +390,9 @@ impl MessageTransport for DatabaseTransport {
     }
 
     async fn subscribe(&self, addr: &AgentAddress) -> Result<Box<dyn MessageStream>, MailboxError> {
+        if self.is_shutdown() {
+            return Err(MailboxError::Transport("transport is shut down".into()));
+        }
         let regs = self.registrations.read().await;
         let delegation_id = regs
             .get(addr)
@@ -412,6 +422,9 @@ impl MessageTransport for DatabaseTransport {
     }
 
     async fn send(&self, msg: Arc<AgentMessage>) -> Result<(), MailboxError> {
+        if self.is_shutdown() {
+            return Err(MailboxError::Transport("transport is shut down".into()));
+        }
         match &msg.to {
             super::types::MessageTarget::Direct { .. } => {}
             _ => {
@@ -441,6 +454,9 @@ impl MessageTransport for DatabaseTransport {
         delegation_id: &str,
         msg: Arc<AgentMessage>,
     ) -> Result<(), MailboxError> {
+        if self.is_shutdown() {
+            return Err(MailboxError::Transport("transport is shut down".into()));
+        }
         let stored_msg = if matches!(&msg.to, super::types::MessageTarget::Broadcast { .. }) {
             (*msg).clone()
         } else {

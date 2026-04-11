@@ -105,6 +105,9 @@ impl MessageTransport for InProcessTransport {
         addr: AgentAddress,
         delegation_id: Option<String>,
     ) -> Result<(), MailboxError> {
+        if self.is_shutdown.load(Ordering::Relaxed) {
+            return Err(MailboxError::Transport("transport is shut down".into()));
+        }
         let (tx, rx) = mpsc::channel(DIRECT_CHANNEL_CAPACITY);
         let mut inboxes = self.inboxes.write().await;
         let mut pending_receivers = self.pending_receivers.write().await;
@@ -138,6 +141,9 @@ impl MessageTransport for InProcessTransport {
     }
 
     async fn subscribe(&self, addr: &AgentAddress) -> Result<Box<dyn MessageStream>, MailboxError> {
+        if self.is_shutdown.load(Ordering::Relaxed) {
+            return Err(MailboxError::Transport("transport is shut down".into()));
+        }
         // The first subscribe() should attach the receiver created during register()
         // so messages sent during mailbox registration are preserved.
         let mut inboxes = self.inboxes.write().await;
@@ -526,6 +532,18 @@ mod tests {
             MessagePayload::Signal(AgentSignal::Heartbeat),
         ));
         assert!(transport.broadcast("del", msg).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn shutdown_prevents_new_registrations() {
+        let transport = InProcessTransport::new();
+        let a = addr("r1", "a");
+
+        transport.shutdown().await.unwrap();
+
+        let err = transport.register(a, None).await.unwrap_err();
+        assert!(matches!(err, MailboxError::Transport(_)));
+        assert_eq!(transport.agent_count().await, 0);
     }
 
     #[tokio::test]
