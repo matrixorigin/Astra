@@ -1503,15 +1503,26 @@ impl StreamRenderState {
             "git_diff" => {
                 let staged = args.get("staged").and_then(Value::as_bool).unwrap_or(false);
                 let path = args.get("path").and_then(Value::as_str);
-                match (staged, path) {
-                    (true, Some(p)) => {
-                        format!("Git diff --staged {}", shorten_path(p, path_budget(18)))
+                let base_ref = args.get("base_ref").and_then(Value::as_str);
+                let git_ref = args.get("ref").and_then(Value::as_str);
+                if let Some(base) = base_ref {
+                    let tip = git_ref.unwrap_or("HEAD");
+                    let range = format!("{base}..{tip}");
+                    match path {
+                        Some(p) => format!("Git diff {} -- {}", range, shorten_path(p, path_budget(20))),
+                        None => format!("Git diff {range}"),
                     }
-                    (true, None) => "Git diff --staged".to_string(),
-                    (false, Some(p)) => {
-                        format!("Git diff {}", shorten_path(p, path_budget(10)))
+                } else {
+                    match (staged, path) {
+                        (true, Some(p)) => {
+                            format!("Git diff --staged {}", shorten_path(p, path_budget(18)))
+                        }
+                        (true, None) => "Git diff --staged".to_string(),
+                        (false, Some(p)) => {
+                            format!("Git diff {}", shorten_path(p, path_budget(10)))
+                        }
+                        _ => "Git diff".to_string(),
                     }
-                    _ => "Git diff".to_string(),
                 }
             }
             "git_blame" => {
@@ -1682,11 +1693,21 @@ impl StreamRenderState {
             "git_diff" => {
                 let staged = args.get("staged").and_then(Value::as_bool).unwrap_or(false);
                 let path = args.get("path").and_then(Value::as_str);
-                match (staged, path) {
-                    (true, Some(p)) => Some(format!("--staged {}", truncate_line(p, 45))),
-                    (true, None) => Some("--staged".to_string()),
-                    (false, Some(p)) => Some(truncate_line(p, 60)),
-                    _ => None,
+                let base_ref = args.get("base_ref").and_then(Value::as_str);
+                let git_ref = args.get("ref").and_then(Value::as_str);
+                if let Some(base) = base_ref {
+                    let tip = git_ref.unwrap_or("HEAD");
+                    match path {
+                        Some(p) => Some(format!("{base}..{tip} -- {}", truncate_line(p, 40))),
+                        None => Some(format!("{base}..{tip}")),
+                    }
+                } else {
+                    match (staged, path) {
+                        (true, Some(p)) => Some(format!("--staged {}", truncate_line(p, 45))),
+                        (true, None) => Some("--staged".to_string()),
+                        (false, Some(p)) => Some(truncate_line(p, 60)),
+                        _ => None,
+                    }
                 }
             }
             "git_commit" => args

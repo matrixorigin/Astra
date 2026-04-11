@@ -33,6 +33,15 @@ pub struct AgentMailbox {
 }
 
 impl AgentMailbox {
+    /// True if this agent has a parent in the delegation hierarchy.
+    pub async fn has_parent(&self) -> bool {
+        self.router
+            .delegation_tracker
+            .get_parent(&self.address.run_id)
+            .await
+            .is_some()
+    }
+
     /// Clone the shared router so tools can send additional messages in-turn.
     pub fn router(&self) -> Arc<AgentMailboxRouter> {
         self.router.clone()
@@ -733,5 +742,43 @@ mod tests {
             child_mailbox.try_recv().is_none(),
             "protocol-error response should not leak into the mailbox buffer"
         );
+    }
+
+    #[tokio::test]
+    async fn has_parent_true_for_child() {
+        let transport = Arc::new(InProcessTransport::new());
+        let dt = tracker();
+        let router = Arc::new(AgentMailboxRouter::new(transport, dt.clone()));
+
+        let parent = addr("r0", "orchestrator");
+        let child = addr("r1", "worker");
+
+        let _parent_mb = router.register(parent.clone(), None).await.unwrap();
+        let child_mb = router.register(child.clone(), None).await.unwrap();
+
+        use crate::server::delegation_engine::{SubRunRecord, SubRunState};
+        dt.record_sub_run(SubRunRecord {
+            run_id: "r1".into(),
+            parent_run_id: "r0".into(),
+            delegation_id: "del".into(),
+            agent_id: "worker".into(),
+            depth: 1,
+            state: SubRunState::Created,
+            retry_of: None,
+        })
+        .await;
+
+        assert!(child_mb.has_parent().await);
+    }
+
+    #[tokio::test]
+    async fn has_parent_false_for_root() {
+        let transport = Arc::new(InProcessTransport::new());
+        let router = Arc::new(AgentMailboxRouter::new(transport, tracker()));
+
+        let root = addr("r0", "orchestrator");
+        let root_mb = router.register(root, None).await.unwrap();
+
+        assert!(!root_mb.has_parent().await);
     }
 }

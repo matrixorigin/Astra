@@ -3452,18 +3452,23 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                     );
                 }
 
-                // Send progress update to parent agent (best-effort).
+                // Send progress update to parent agent (best-effort, skip for root).
                 if let Some(ref mailbox) = state.messaging.mailbox {
-                    if let Err(e) = mailbox
-                        .send_progress(
-                            turn_index as u32,
-                            state.total_tool_calls,
-                            "turn_complete",
-                            None,
-                        )
-                        .await
-                    {
-                        astra_core::agent_warn!("mailbox", "Failed to send turn progress: {e}");
+                    if mailbox.has_parent().await {
+                        if let Err(e) = mailbox
+                            .send_progress(
+                                turn_index as u32,
+                                state.total_tool_calls,
+                                "turn_complete",
+                                None,
+                            )
+                            .await
+                        {
+                            astra_core::agent_warn!(
+                                "mailbox",
+                                "Failed to send turn progress: {e}"
+                            );
+                        }
                     }
                 }
 

@@ -126,6 +126,16 @@ fn fmt_git_tool(name: &str, obj: &Map<String, Value>) -> Option<String> {
         "git_diff" => {
             let path = obj.get("path").and_then(|v| v.as_str());
             let staged = obj.get("staged").and_then(|v| v.as_bool()).unwrap_or(false);
+            let base_ref = obj.get("base_ref").and_then(|v| v.as_str());
+            let git_ref = obj.get("ref").and_then(|v| v.as_str());
+            if let Some(base) = base_ref {
+                let tip = git_ref.unwrap_or("HEAD");
+                let range = format!("{base}..{tip}");
+                return match path {
+                    Some(p) => Some(format!("{range} -- {p}")),
+                    None => Some(range),
+                };
+            }
             let suffix = if staged { " (staged)" } else { "" };
             match path {
                 Some(p) => Some(format!("{p}{suffix}")),
@@ -398,6 +408,21 @@ mod tests {
     fn tool_call_detail_git_diff_staged() {
         let detail = tool_call_detail("git_diff", &json!({"staged": true}));
         assert_eq!(detail.as_deref(), Some("working tree (staged)"));
+    }
+
+    #[test]
+    fn tool_call_detail_git_diff_range() {
+        let detail = tool_call_detail("git_diff", &json!({"base_ref": "HEAD~5", "ref": "HEAD"}));
+        assert_eq!(detail.as_deref(), Some("HEAD~5..HEAD"));
+    }
+
+    #[test]
+    fn tool_call_detail_git_diff_range_with_path() {
+        let detail = tool_call_detail(
+            "git_diff",
+            &json!({"base_ref": "HEAD~3", "ref": "HEAD", "path": "src/main.rs"}),
+        );
+        assert_eq!(detail.as_deref(), Some("HEAD~3..HEAD -- src/main.rs"));
     }
 
     #[test]

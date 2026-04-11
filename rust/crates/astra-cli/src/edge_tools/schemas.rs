@@ -192,11 +192,12 @@ pub fn all_tool_schemas() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "git_diff",
-                "description": "Show git diff of working tree / index vs HEAD (or two-tree diff when `ref` is set without `path`). For commit review use git_show. Use stat_only:true for `git diff --stat`-style per-file line counts without full hunks — prefer this over bash.",
+                "description": "Show git diff of working tree / index vs HEAD (or two-tree diff when `ref` is set without `path`). Supports commit ranges via `base_ref`..`ref` (e.g., base_ref:\"HEAD~5\" ref:\"HEAD\"). For commit review use git_show. Use stat_only:true for `git diff --stat`-style per-file line counts without full hunks — prefer this over bash.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "ref": {"type": "string", "description": "Git ref to diff against (optional). With `path`: diff working tree vs this ref for that path. Without `path`: diff between this ref and HEAD (two-tree)."},
+                        "ref": {"type": "string", "description": "Git ref to diff against (optional). With `path`: diff working tree vs this ref for that path. Without `path`: diff between this ref and HEAD (two-tree). With `base_ref`: the tip of the range."},
+                        "base_ref": {"type": "string", "description": "Base ref for range diff (optional). When set, produces `base_ref..ref` diff (e.g., base_ref:\"HEAD~5\" with ref:\"HEAD\"). If ref is omitted, defaults to HEAD as tip."},
                         "staged": {"type": "boolean", "description": "Show staged changes vs HEAD (default false). Do not combine with `ref`."},
                         "path": {"type": "string", "description": "Limit diff to one file (optional)"},
                         "stat_only": {"type": "boolean", "description": "If true, return only per-file insert/delete counts (--stat). Default false (full unified diff)."}

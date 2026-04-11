@@ -24,6 +24,20 @@ fn reject_path_traversal(file: &str) -> Result<(), String> {
     }
 }
 
+/// Reject git ref strings containing shell metacharacters.
+fn reject_shell_meta(ref_str: &str) -> Result<(), String> {
+    if ref_str
+        .chars()
+        .any(|c| matches!(c, ';' | '|' | '&' | '$' | '`' | '(' | ')' | '{' | '}' | '<' | '>' | '!' | '\n'))
+    {
+        Err(format!(
+            "Error: git ref contains disallowed characters: {ref_str}"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 fn tool_output_limit() -> usize {
     super::tool_output_limit()
 }
@@ -599,6 +613,7 @@ pub(crate) fn git_blame(project_root: &Path, args: &Value) -> String {
 fn git_diff_stat_cli(project_root: &Path, args: &Value, limit: usize) -> String {
     let staged = args.get("staged").and_then(Value::as_bool).unwrap_or(false);
     let git_ref = args.get("ref").and_then(Value::as_str);
+    let base_ref = args.get("base_ref").and_then(Value::as_str);
     let path_filter = args.get("path").and_then(Value::as_str);
 
     if staged && git_ref.is_some() {
@@ -606,7 +621,16 @@ fn git_diff_stat_cli(project_root: &Path, args: &Value, limit: usize) -> String 
     }
 
     let mut parts: Vec<String> = vec!["diff".into()];
-    if staged {
+    if let Some(base) = base_ref {
+        if let Err(e) = reject_shell_meta(base) {
+            return e;
+        }
+        let tip = git_ref.unwrap_or("HEAD");
+        if let Err(e) = reject_shell_meta(tip) {
+            return e;
+        }
+        parts.push(format!("{base}..{tip}"));
+    } else if staged {
         parts.push("--cached".into());
     } else if let Some(r) = git_ref {
         parts.push(r.to_string());
@@ -653,11 +677,33 @@ pub(crate) fn git_diff(
 
     let staged = args.get("staged").and_then(Value::as_bool).unwrap_or(false);
     let git_ref = args.get("ref").and_then(Value::as_str);
+    let base_ref = args.get("base_ref").and_then(Value::as_str);
     let path_filter = args.get("path").and_then(Value::as_str);
     if let Some(p) = path_filter {
         if let Err(e) = reject_path_traversal(p) {
             return e;
         }
+    }
+
+    // Range diff: base_ref..ref (e.g., HEAD~5..HEAD)
+    if let Some(base) = base_ref {
+        if let Err(e) = reject_shell_meta(base) {
+            return e;
+        }
+        let tip = git_ref.unwrap_or("HEAD");
+        if let Err(e) = reject_shell_meta(tip) {
+            return e;
+        }
+        let range = format!("{base}..{tip}");
+        let mut cli_args = vec!["diff", &range, "--no-ext-diff", "--no-color"];
+        let path_owned;
+        if let Some(p) = path_filter {
+            cli_args.push("--");
+            path_owned = p.to_string();
+            cli_args.push(&path_owned);
+        }
+        return diff_via_git_cli(project_root, &cli_args, limit)
+            .unwrap_or_else(|| "No changes".to_string());
     }
 
     // If a ref is given, do a tree-to-tree diff (HEAD vs ref)
@@ -2221,6 +2267,88 @@ mod tests {
             0,
         );
         assert!(result.contains("not both"), "{result}");
+    }
+
+    #[test]
+    fn git_diff_base_ref_range() {
+        let root = repo_root();
+        let result = git_diff(&root, &json!({"base_ref": "HEAD~3", "ref": "HEAD"}), 0.0, 0);
+        assert!(
+            result.contains("diff --git") || result == "No changes",
+            "range diff should produce output: {result}"
+        );
+    }
+
+    #[test]
+    fn git_diff_base_ref_defaults_tip_to_head() {
+        let root = repo_root();
+        let result = git_diff(&root, &json!({"base_ref": "HEAD~1"}), 0.0, 0);
+        assert!(
+            !result.starts_with("Error:"),
+            "base_ref without ref should default tip to HEAD: {result}"
+        );
+    }
+
+    #[test]
+    fn git_diff_base_ref_with_path() {
+        let root = repo_root();
+        let result = git_diff(
+            &root,
+            &json!({"base_ref": "HEAD~2", "ref": "HEAD", "path": "Cargo.toml"}),
+            0.0,
+            0,
+        );
+        assert!(
+            !result.starts_with("Error:"),
+            "range diff with path filter should work: {result}"
+        );
+    }
+
+    #[test]
+    fn git_diff_base_ref_stat_only() {
+        let root = repo_root();
+        let result = git_diff(
+            &root,
+            &json!({"base_ref": "HEAD~3", "ref": "HEAD", "stat_only": true}),
+            0.0,
+            0,
+        );
+        assert!(
+            !result.starts_with("Error:"),
+            "range stat diff should work: {result}"
+        );
+    }
+
+    #[test]
+    fn git_diff_base_ref_rejects_shell_injection() {
+        let root = repo_root();
+        let result = git_diff(
+            &root,
+            &json!({"base_ref": "HEAD; rm -rf /"}),
+            0.0,
+            0,
+        );
+        assert!(
+            result.contains("disallowed"),
+            "shell meta in base_ref should be rejected: {result}"
+        );
+    }
+
+    #[test]
+    fn reject_shell_meta_allows_valid_refs() {
+        assert!(super::reject_shell_meta("HEAD~5").is_ok());
+        assert!(super::reject_shell_meta("main").is_ok());
+        assert!(super::reject_shell_meta("v1.0.0").is_ok());
+        assert!(super::reject_shell_meta("feature/my-branch").is_ok());
+        assert!(super::reject_shell_meta("HEAD^2").is_ok());
+    }
+
+    #[test]
+    fn reject_shell_meta_blocks_injection() {
+        assert!(super::reject_shell_meta("HEAD; echo pwned").is_err());
+        assert!(super::reject_shell_meta("HEAD|cat /etc/passwd").is_err());
+        assert!(super::reject_shell_meta("$(whoami)").is_err());
+        assert!(super::reject_shell_meta("HEAD`id`").is_err());
     }
 
     // ─── git_show enhanced tests ────────────────────────────────────────────
