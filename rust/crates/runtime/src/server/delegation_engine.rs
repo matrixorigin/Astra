@@ -1722,11 +1722,13 @@ impl DelegationEngine {
             None
         };
 
-        let mut handles: Vec<(
-            tokio::task::JoinHandle<(Result<AgentResult, String>, String, String)>,
-            String,
-            String,
-        )> = Vec::new();
+        // Use JoinSet for abort-on-drop semantics: if caller times out before
+        // collecting all results, remaining tasks are aborted automatically.
+        let mut join_set: tokio::task::JoinSet<(Result<AgentResult, String>, String, String)> =
+            tokio::task::JoinSet::new();
+        // Track agent_id/run_id for panic recovery (JoinSet doesn't preserve spawn order)
+        let mut id_map: HashMap<tokio::task::Id, (String, String)> = HashMap::new();
+
         for config in configs {
             let executor = self.executor.clone();
             let run_engine = self.run_engine.clone();
@@ -1737,7 +1739,7 @@ impl DelegationEngine {
             // Capture identity before moving config into the closure (panic context)
             let captured_agent_id = config.agent_profile.agent_id.clone();
             let captured_run_id = config.run_id.clone();
-            let handle = tokio::spawn(async move {
+            let abort_handle = join_set.spawn(async move {
                 let _permit = match sem {
                     Some(ref s) => Some(s.acquire().await.expect("semaphore closed")),
                     None => None,
@@ -1798,12 +1800,12 @@ impl DelegationEngine {
                 tracker.complete_sub_run(&run_id, final_state).await;
                 (result, agent_id, run_id)
             });
-            handles.push((handle, captured_agent_id, captured_run_id));
+            id_map.insert(abort_handle.id(), (captured_agent_id, captured_run_id));
         }
 
         let mut results = Vec::new();
-        for (handle, panic_agent_id, panic_run_id) in handles {
-            match handle.await {
+        while let Some(join_result) = join_set.join_next().await {
+            match join_result {
                 Ok((Ok(result), _, _)) => results.push(result),
                 Ok((Err(e), agent_id, run_id)) => {
                     results.push(AgentResult {
@@ -1818,7 +1820,11 @@ impl DelegationEngine {
                     });
                 }
                 Err(e) => {
-                    // JoinError (panic) — use captured identity instead of "unknown"
+                    // JoinError (panic) — look up identity from id_map using task ID
+                    let (panic_agent_id, panic_run_id) = id_map
+                        .get(&e.id())
+                        .cloned()
+                        .unwrap_or_else(|| ("unknown".to_string(), "unknown".to_string()));
                     astra_core::log_persist!(
                         self.run_engine
                             .persist_status(
