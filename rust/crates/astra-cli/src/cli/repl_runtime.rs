@@ -604,9 +604,8 @@ pub(crate) fn initialize_repl_state(
     ));
 
     // Create an early observability session so the very first turn can record
-    // context assembly traces.  The session_id will be "pending" until the
-    // server assigns a real one; handle_turn_result re-creates the session
-    // with the real ID on the first turn completion.
+    // context assembly traces.  The session keeps this "pending" ID for its
+    // lifetime — handle_turn_result skips re-creation since is_none() is false.
     if let Some(ref hub) = state.observability_hub {
         let user_id = state
             .ingestion_user_id
