@@ -788,9 +788,17 @@ mod tests {
         let a = addr("run-db-unreg", "agent");
         transport.register(a.clone(), None).await.unwrap();
         assert_eq!(transport.agent_count().await, 1);
+        let mut stream = transport.subscribe(&a).await.unwrap();
 
         transport.unregister(&a).await.unwrap();
         assert_eq!(transport.agent_count().await, 0);
+        let closed = tokio::time::timeout(Duration::from_millis(500), stream.recv())
+            .await
+            .expect("stream should close promptly after unregister");
+        assert!(
+            closed.is_none(),
+            "unregister should terminate the active poll loop and close the stream"
+        );
 
         cleanup(&pool).await;
     }

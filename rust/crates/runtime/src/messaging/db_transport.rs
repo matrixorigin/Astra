@@ -135,7 +135,7 @@ pub struct DatabaseTransport {
     /// Maximum delivery attempts before marking as 'failed'.
     max_delivery_attempts: u32,
     /// Tracks registered agents and their delegation group.
-    registrations: RwLock<HashMap<AgentAddress, Option<String>>>,
+    registrations: Arc<RwLock<HashMap<AgentAddress, Option<String>>>>,
     /// Shutdown signal: when sent, all poll tasks stop.
     shutdown_tx: watch::Sender<bool>,
     shutdown_rx: watch::Receiver<bool>,
@@ -163,7 +163,7 @@ impl DatabaseTransport {
             poll_interval: DEFAULT_POLL_INTERVAL,
             visibility_timeout: DEFAULT_VISIBILITY_TIMEOUT,
             max_delivery_attempts: DEFAULT_MAX_DELIVERY_ATTEMPTS,
-            registrations: RwLock::new(HashMap::new()),
+            registrations: Arc::new(RwLock::new(HashMap::new())),
             shutdown_tx,
             shutdown_rx,
             metrics: Arc::new(TransportMetrics::default()),
@@ -373,6 +373,7 @@ impl MessageTransport for DatabaseTransport {
         let (tx, rx) = mpsc::unbounded_channel();
         let poll_task = tokio::spawn(poll_loop(
             self.pool.clone(),
+            Arc::clone(&self.registrations),
             addr.clone(),
             delegation_id,
             self.poll_interval,
@@ -465,6 +466,7 @@ impl MessageTransport for DatabaseTransport {
 /// respects the shutdown signal.
 async fn poll_loop(
     pool: Pool<MySql>,
+    registrations: Arc<RwLock<HashMap<AgentAddress, Option<String>>>>,
     addr: AgentAddress,
     delegation_id: Option<String>,
     interval: Duration,
@@ -480,6 +482,9 @@ async fn poll_loop(
     loop {
         // Check shutdown signal or receiver drop.
         if *shutdown_rx.borrow() || tx.is_closed() {
+            break;
+        }
+        if !registrations.read().await.contains_key(&addr) {
             break;
         }
 
