@@ -8950,6 +8950,157 @@ print(json.dumps({'context': 'user said: ' + msg}))
         // No panic, no corruption — all rules composed successfully
     }
 
+    /// Full-loop replay test covering:
+    /// signal emission → tuning cycle → experiment creation → conclusion → baseline promotion → abort/rollback
+    #[test]
+    fn replay_full_adaptive_cycle_with_experiment_lifecycle() {
+        use crate::ab_testing::{ExperimentOutcome, ExperimentStore};
+        use crate::adaptive_baselines::AdaptiveBaselineStore;
+        use crate::exploration_engine::ExplorationEngine;
+        use crate::pipeline::routing::TaskType;
+
+        let hub = make_hub();
+        let session = make_session();
+        let mut state = make_state();
+        state.telemetry.observability_hub = Some(hub.clone());
+        state.telemetry.observability_session = Some(session.clone());
+        state.current_session_id = Some("replay-test".into());
+        state.current_run_id = Some("run-replay".into());
+
+        {
+            let mut guard = session.write().unwrap();
+            guard.config.context_window.adaptive = true;
+            guard.config.token_budget.max_turn_input_tokens = 100_000;
+        }
+        state.max_turn_input_tokens = 100_000;
+
+        // --- Phase 1: Generate mixed signals over 10 turns ---
+        let success: Result<AgenticLoopOutcome, String> = Ok(AgenticLoopOutcome::Completed);
+        let failure: Result<AgenticLoopOutcome, String> =
+            Ok(AgenticLoopOutcome::Error("test error".into()));
+
+        for i in 0..10 {
+            let outcome = if i % 3 == 0 { &failure } else { &success };
+            simulate_turn(
+                &mut state,
+                &session,
+                "analyze the code structure",
+                &["view", "grep"],
+                60_000 + (i as u64 * 3_000),
+                outcome,
+            );
+        }
+
+        // Verify signals were recorded: should have mix of successes and failures
+        let config = crate::runtime_config::RuntimeConfig::default();
+        hub.tuning()
+            .add_rule(crate::auto_tuning::EvolutionRule::new(
+                "check-signals",
+                crate::auto_tuning::EvolutionTrigger::LowSuccessRate {
+                    threshold: 0.9,
+                    window_secs: 3600,
+                    min_samples: 3,
+                },
+                crate::auto_tuning::EvolutionAction::Alert {
+                    message: "low success".into(),
+                    severity: crate::auto_tuning::AlertSeverity::Warning,
+                },
+            ));
+        let triggered = hub.tuning().evaluate(&config);
+        assert!(
+            !triggered.is_empty(),
+            "mixed success/failure should trigger low-success rule"
+        );
+
+        // --- Phase 2: Exercise experiment lifecycle separately ---
+        let exp_store = ExperimentStore::new();
+        let baselines = AdaptiveBaselineStore::new();
+        let exploration = ExplorationEngine::new(0.5, 3, 1);
+
+        // Manually seed a pattern library with low-confidence area
+        let mut pattern_lib = crate::pipeline::pattern::PatternLibrary::default();
+        for _ in 0..5 {
+            pattern_lib.record_outcome(
+                &["view".to_string()],
+                TaskType::Fetch,
+                None,
+                false,
+                0.2,
+                None,
+            );
+        }
+
+        // Create experiments from pattern opportunities
+        let created = exploration.check_and_create_experiments(&pattern_lib, &exp_store);
+        assert!(
+            !created.is_empty(),
+            "should create experiment for low-confidence area"
+        );
+        let exp_id = created[0].id.clone();
+
+        // Record outcomes for the experiment
+        exp_store.record_outcome(
+            &exp_id,
+            ExperimentOutcome::new("u1", "control")
+                .with_metric("success_rate", 0.3)
+                .with_success(false),
+        );
+        exp_store.record_outcome(
+            &exp_id,
+            ExperimentOutcome::new("u2", "treatment-low-success")
+                .with_metric("success_rate", 0.9)
+                .with_success(true),
+        );
+
+        // Conclude mature experiments
+        let conclusions = exploration.conclude_mature_experiments(&exp_store);
+        assert_eq!(conclusions.len(), 1);
+        assert_eq!(conclusions[0].experiment_id, exp_id);
+        // With only 2 data points, statistical analysis may return NoSignificantDifference.
+        // The important thing is the experiment was concluded.
+
+        // Promote treatment as baseline (simulating a real winner decision).
+        if let Some(exp) = exp_store.get(&exp_id) {
+            baselines.promote_winner(&exp, "treatment-low-success");
+        }
+        assert!(
+            baselines.resolve(TaskType::Fetch, None).is_some(),
+            "baseline should be promoted"
+        );
+
+        // --- Phase 3: Abort experiment → rollback baseline ---
+        // Create a new experiment for abort testing
+        let mut abort_exp = crate::ab_testing::Experiment::new("exp-abort-replay")
+            .with_variant(crate::ab_testing::Variant::control())
+            .with_variant(
+                crate::ab_testing::Variant::new("risky")
+                    .with_traffic(0.5)
+                    .with_config_diff("max_tools", serde_json::json!(99)),
+            )
+            .with_tag("task_type:code")
+            .with_tag("domain:any")
+            .build();
+        abort_exp.start();
+        exp_store.register(abort_exp.clone());
+        baselines.promote_winner(&abort_exp, "risky");
+        assert!(baselines.resolve(TaskType::Code, None).is_some());
+
+        let (cancelled, rollbacks) =
+            exploration.abort_experiment("exp-abort-replay", &exp_store, &baselines);
+        assert!(cancelled);
+        assert_eq!(rollbacks.len(), 1);
+        assert!(
+            baselines.resolve(TaskType::Code, None).is_none(),
+            "baseline should be rolled back after abort"
+        );
+
+        // Original Fetch baseline should still exist
+        assert!(
+            baselines.resolve(TaskType::Fetch, None).is_some(),
+            "unrelated baseline should survive abort"
+        );
+    }
+
     #[test]
     fn retry_signal_emitted_on_consecutive_identical_tool_calls() {
         let hub = make_hub();
