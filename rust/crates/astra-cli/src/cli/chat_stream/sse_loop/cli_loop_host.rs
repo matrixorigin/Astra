@@ -64,6 +64,8 @@ pub(crate) struct CliAgenticLoopHost<'a> {
     /// Root-level messaging context used when the current turn has no mailbox.
     pub root_send_message_context:
         Option<crate::edge_tools::agent_messaging::SendMessageRuntimeContext>,
+    /// REPL turn counter (0-based) for correct turn_id in trace collector.
+    pub repl_turn_index: u32,
 }
 
 #[async_trait]
@@ -77,8 +79,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
         // Create trace collector for this turn (always, so /context breakdown works
         // even on the first turn before the observability session is created).
         if state.telemetry.turn_trace_collector.is_none() {
-            let turn_num = state.max_turns - state.remaining_turns;
-            let turn_id = format!("turn-{turn_num}");
+            let turn_id = format!("turn-{}", self.repl_turn_index);
             let session_id = state.current_session_id.clone().unwrap_or_default();
             state.telemetry.turn_trace_collector = Some(
                 astra_runtime::turn::turn_trace_collector::TurnTraceCollector::new(

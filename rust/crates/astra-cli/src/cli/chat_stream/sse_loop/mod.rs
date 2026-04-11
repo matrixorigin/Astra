@@ -276,6 +276,7 @@ pub(crate) async fn stream_chat_sse(
         stream_event_tx: p.stream_event_tx,
         approval_request_tx: p.approval_request_tx,
         root_send_message_context,
+        repl_turn_index: p.turn_index,
     };
 
     let bare_mode = std::env::var("ASTRA_BARE")

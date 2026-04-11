@@ -32,6 +32,8 @@ pub struct ThinkingPreviewPane {
     start: Instant,
     /// Accumulated output bytes for token estimation (~4 chars/token).
     output_bytes: usize,
+    /// Estimated cost in USD (updated from usage SSE events).
+    estimated_cost: Option<f64>,
 }
 
 impl ThinkingPreviewPane {
@@ -44,12 +46,18 @@ impl ThinkingPreviewPane {
             region: TerminalRegion::new(),
             start: Instant::now(),
             output_bytes: 0,
+            estimated_cost: None,
         }
     }
 
     /// Set output bytes for token estimation (cumulative from StreamRenderState).
     pub fn set_output_bytes(&mut self, bytes: usize) {
         self.output_bytes = bytes;
+    }
+
+    /// Set estimated cost in USD (from usage SSE + pricing data).
+    pub fn set_estimated_cost(&mut self, cost: f64) {
+        self.estimated_cost = Some(cost);
     }
 
     /// Push a chunk of reasoning content and redraw.
@@ -94,12 +102,26 @@ impl ThinkingPreviewPane {
         } else {
             String::new()
         };
-        let header = match (hidden > 0, !tokens_str.is_empty()) {
-            (true, true) => format!("Thinking… ({hidden}↑, {tokens_str}, {elapsed:.1}s)"),
-            (true, false) => format!("Thinking… ({hidden} rows hidden, {elapsed:.1}s)"),
-            (false, true) => format!("Thinking… ({tokens_str}, {elapsed:.1}s)"),
-            (false, false) => format!("Thinking… ({elapsed:.1}s)"),
+        // Format cost if available.
+        let cost_str = match self.estimated_cost {
+            Some(c) if c >= 0.01 => format!("${:.2}", c),
+            Some(c) if c >= 0.001 => format!("${:.3}", c),
+            Some(c) if c > 0.0 => format!("${:.4}", c),
+            _ => String::new(),
         };
+        // Build header with available info: (hidden↑, ~Xk tok, $Y.YY, Xs)
+        let mut parts = Vec::new();
+        if hidden > 0 {
+            parts.push(format!("{hidden}↑"));
+        }
+        if !tokens_str.is_empty() {
+            parts.push(tokens_str);
+        }
+        if !cost_str.is_empty() {
+            parts.push(cost_str);
+        }
+        parts.push(format!("{elapsed:.1}s"));
+        let header = format!("Thinking… ({})", parts.join(", "));
         (header, body)
     }
 
