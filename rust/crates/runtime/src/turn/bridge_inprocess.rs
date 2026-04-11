@@ -1340,6 +1340,14 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                 .or_else(|| prompts::detect_task_type(user_content_for_signal));
             let profile_with_hints = format!("{profile_desc}{skill_hint}{learned_context_hint}");
 
+            // ── Self-awareness section (injected by CLI via edge_profile) ──
+            let self_awareness_hint = edge_profile
+                .get("self_awareness_text")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(|text| format!("\n\n{text}"))
+                .unwrap_or_default();
+
             // ── Memory lifecycle: detect tracking/store signals in user input ──
             // Injects a priority hint into the system prompt so the LLM stores
             // the user's interest immediately rather than exploring the codebase.
@@ -1356,8 +1364,8 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                 String::new()
             };
 
-            // Build per-turn dynamic content (profile + skills + memory signal)
-            let dynamic_desc = format!("{profile_with_hints}{memory_signal_hint}");
+            // Build per-turn dynamic content (profile + skills + memory signal + self-awareness)
+            let dynamic_desc = format!("{profile_with_hints}{memory_signal_hint}{self_awareness_hint}");
 
             // Build provider-aware system message with static/dynamic boundary.
             // Anthropic gets multi-block content with cache_control on stable sections;

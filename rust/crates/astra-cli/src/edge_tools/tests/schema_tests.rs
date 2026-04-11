@@ -66,6 +66,11 @@ fn tool_schemas_include_core_tools() {
         "github_repo_stats",
         "memory_store",
         "memory_search",
+        "adjust_config",
+        "prioritize_tool",
+        "deprioritize_tool",
+        "set_goal",
+        "compress_context",
         "reflect",
         "run_chain",
     ] {

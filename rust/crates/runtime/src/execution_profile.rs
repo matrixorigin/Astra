@@ -1,9 +1,11 @@
 //! Execution profile — runtime configuration snapshot with scenario + experiment context.
 //!
+//! **Deprecated**: This module is superseded by `SelfModel` self-awareness.
+//! Rather than pre-computing configuration profiles, the LLM receives runtime
+//! state via the self-awareness prompt section and reasons about adaptation.
+//!
 //! An `ExecutionProfile` bundles a [`RuntimeConfig`] with the detected scenario,
-//! active experiment variant, and pattern-library boost terms. It is produced by
-//! [`ScenarioRouter`](crate::scenario_router::ScenarioRouter) before each turn and
-//! consumed by the agentic loop to configure tool selection, token budgets, etc.
+//! active experiment variant, and pattern-library boost terms.
 
 use serde::{Deserialize, Serialize};
 
@@ -11,6 +13,12 @@ use crate::runtime_config::RuntimeConfig;
 use crate::user_profile::Scenario;
 
 /// A runtime configuration snapshot enriched with adaptive context.
+///
+/// **Deprecated**: Superseded by `SelfModel` self-awareness reasoning.
+#[deprecated(
+    since = "0.9.0",
+    note = "Superseded by SelfModel + LLM reasoning. See self_model.rs."
+)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutionProfile {
     /// The tuned runtime configuration for this execution.
@@ -45,6 +53,7 @@ fn default_confidence() -> f64 {
     1.0
 }
 
+#[allow(deprecated)]
 impl ExecutionProfile {
     /// Create a baseline profile from the given config (no scenario, no experiment).
     pub fn from_base(config: RuntimeConfig) -> Self {
@@ -138,6 +147,7 @@ impl ExecutionProfile {
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
 

@@ -1,5 +1,13 @@
 //! A/B Testing Framework — compare runtime configurations and strategies.
 //!
+//! **Deprecated**: This module is largely superseded by `SelfModel` + LLM reasoning.
+//! The experiment lifecycle management and statistical analysis infrastructure
+//! were designed for automated A/B testing of configurations, which is no longer
+//! needed when the LLM can reason about its own behavior using self-awareness.
+//!
+//! Note: `ExperimentStore` and `ExperimentOutcome` are still used by the
+//! `ExplorationEngine` which is also deprecated.
+//!
 //! This module enables:
 //! - Defining experiments with multiple variants
 //! - Traffic allocation (percentage-based, user-based, or hash-based)
@@ -40,6 +48,12 @@ use crate::lock_ext::RwLockExt;
 // ─── Experiment Definition ───────────────────────────────────────────────────
 
 /// An A/B test experiment.
+///
+/// **Deprecated**: Superseded by `SelfModel` self-awareness reasoning.
+#[deprecated(
+    since = "0.9.0",
+    note = "Superseded by SelfModel + LLM reasoning. See self_model.rs."
+)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Experiment {
     /// Unique experiment ID.
@@ -386,6 +400,7 @@ impl Default for ExperimentStatus {
 
 // ─── Experiment Builder ──────────────────────────────────────────────────────
 
+#[allow(deprecated)]
 impl Experiment {
     /// Create a new experiment.
     #[allow(clippy::new_ret_no_self)]
@@ -489,10 +504,12 @@ fn simple_hash(user_id: &str, experiment_id: &str) -> u64 {
 }
 
 /// Builder for experiments.
+#[allow(deprecated)]
 pub struct ExperimentBuilder {
     experiment: Experiment,
 }
 
+#[allow(deprecated)]
 impl ExperimentBuilder {
     fn new(id: impl Into<String>) -> Self {
         let id = id.into();
@@ -650,12 +667,19 @@ impl ExperimentOutcome {
 /// **WARNING**: This store is volatile — all data is lost on process restart.
 /// For durable experiment state, pair with the adaptive baseline persistence
 /// layer (see `AdaptiveBaselineStore`).
+///
+/// **Deprecated**: Superseded by `SelfModel` self-awareness reasoning.
+#[deprecated(
+    since = "0.9.0",
+    note = "Superseded by SelfModel + LLM reasoning. See self_model.rs."
+)]
 #[derive(Default)]
 pub struct ExperimentStore {
     experiments: Arc<RwLock<HashMap<String, Experiment>>>,
     outcomes: Arc<RwLock<HashMap<String, Vec<ExperimentOutcome>>>>,
 }
 
+#[allow(deprecated)]
 impl ExperimentStore {
     /// Create a new store.
     pub fn new() -> Self {
@@ -882,8 +906,10 @@ pub enum Recommendation {
 }
 
 /// Analyzer for experiments.
+#[allow(deprecated)]
 pub struct ExperimentAnalyzer;
 
+#[allow(deprecated)]
 impl ExperimentAnalyzer {
     /// Analyze an experiment.
     pub fn analyze(experiment: &Experiment, outcomes: &[ExperimentOutcome]) -> ExperimentAnalysis {
@@ -1160,6 +1186,7 @@ fn normal_cdf(x: f64) -> f64 {
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
 
