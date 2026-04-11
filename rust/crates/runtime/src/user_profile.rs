@@ -15,6 +15,7 @@ use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
+use crate::lock_ext::RwLockExt;
 use crate::runtime_config::RuntimeConfig;
 
 // ─── User Profile ───────────────────────────────────────────────────────────
@@ -349,6 +350,7 @@ pub enum ResponseLength {
 }
 
 impl ResponseLength {
+    /// Return the system-prompt directive for this response length.
     pub fn prompt_instruction(&self) -> &'static str {
         match self {
             ResponseLength::Short => "Keep responses under 100 words.",
@@ -520,6 +522,7 @@ pub struct ScenarioDetector {
 }
 
 impl ScenarioDetector {
+    /// Create a new scenario detector with default confidence threshold (0.6).
     pub fn new() -> Self {
         Self {
             recent_queries: Vec::new(),
@@ -793,7 +796,7 @@ impl UserProfileStore {
         if path.exists() {
             if let Ok(data) = std::fs::read_to_string(&path) {
                 if let Ok(profiles) = serde_json::from_str::<HashMap<String, UserProfile>>(&data) {
-                    *store.profiles.write().unwrap_or_else(|e| e.into_inner()) = profiles;
+                    *store.profiles.write_or_recover() = profiles;
                 }
             }
         }
@@ -803,7 +806,7 @@ impl UserProfileStore {
 
     /// Get or create a user profile.
     pub fn get_or_create(&self, user_id: &str) -> UserProfile {
-        let mut profiles = self.profiles.write().unwrap_or_else(|e| e.into_inner());
+        let mut profiles = self.profiles.write_or_recover();
         if let Some(profile) = profiles.get(user_id) {
             return profile.clone();
         }
@@ -867,7 +870,7 @@ impl UserProfileStore {
                     return;
                 }
             }
-            let profiles = self.profiles.read().unwrap_or_else(|e| e.into_inner());
+            let profiles = self.profiles.read_or_recover();
             if let Ok(data) = serde_json::to_string_pretty(&*profiles) {
                 let tmp = path.with_extension("tmp");
                 if let Err(e) = std::fs::write(&tmp, &data) {
@@ -891,6 +894,7 @@ pub struct UserProfileManager {
 }
 
 impl UserProfileManager {
+    /// Create a new profile manager backed by the given store.
     pub fn new(store: Arc<UserProfileStore>) -> Self {
         Self {
             store,
@@ -910,7 +914,7 @@ impl UserProfileManager {
 
     /// Record a user query and update scenario detection.
     pub fn observe_query(&self, user_id: &str, query: &str) {
-        let mut detectors = self.detectors.write().unwrap_or_else(|e| e.into_inner());
+        let mut detectors = self.detectors.write_or_recover();
         let detector = detectors.entry(user_id.to_string()).or_default();
         detector.observe_query(query);
 
@@ -929,7 +933,7 @@ impl UserProfileManager {
 
     /// Record a tool call.
     pub fn observe_tool(&self, user_id: &str, tool_name: &str) {
-        let mut detectors = self.detectors.write().unwrap_or_else(|e| e.into_inner());
+        let mut detectors = self.detectors.write_or_recover();
         let detector = detectors.entry(user_id.to_string()).or_default();
         detector.observe_tool(tool_name);
 

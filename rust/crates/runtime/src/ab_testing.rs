@@ -35,6 +35,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime};
 
+use crate::lock_ext::RwLockExt;
+
 // ─── Experiment Definition ───────────────────────────────────────────────────
 
 /// An A/B test experiment.
@@ -662,7 +664,7 @@ impl ExperimentStore {
 
     /// Register an experiment.
     pub fn register(&self, experiment: Experiment) {
-        let mut experiments = self.experiments.write().unwrap_or_else(|e| e.into_inner());
+        let mut experiments = self.experiments.write_or_recover();
         experiments.insert(experiment.id.clone(), experiment);
     }
 
@@ -687,7 +689,7 @@ impl ExperimentStore {
 
     /// Record an outcome.
     pub fn record_outcome(&self, experiment_id: &str, outcome: ExperimentOutcome) {
-        let mut outcomes = self.outcomes.write().unwrap_or_else(|e| e.into_inner());
+        let mut outcomes = self.outcomes.write_or_recover();
         outcomes
             .entry(experiment_id.to_string())
             .or_default()
@@ -718,7 +720,7 @@ impl ExperimentStore {
     ///
     /// Returns true if state changed, false otherwise.
     pub fn enable_experiment(&self, experiment_id: &str) -> bool {
-        let mut experiments = self.experiments.write().unwrap_or_else(|e| e.into_inner());
+        let mut experiments = self.experiments.write_or_recover();
         if let Some(exp) = experiments.get_mut(experiment_id) {
             let old_status = exp.status.clone();
             exp.start();
@@ -732,7 +734,7 @@ impl ExperimentStore {
     ///
     /// Returns true if state changed, false otherwise.
     pub fn disable_experiment(&self, experiment_id: &str) -> bool {
-        let mut experiments = self.experiments.write().unwrap_or_else(|e| e.into_inner());
+        let mut experiments = self.experiments.write_or_recover();
         if let Some(exp) = experiments.get_mut(experiment_id) {
             let old_status = exp.status.clone();
             exp.pause();
@@ -746,7 +748,7 @@ impl ExperimentStore {
     ///
     /// Returns true if state changed, false otherwise.
     pub fn stop_experiment(&self, experiment_id: &str) -> bool {
-        let mut experiments = self.experiments.write().unwrap_or_else(|e| e.into_inner());
+        let mut experiments = self.experiments.write_or_recover();
         if let Some(exp) = experiments.get_mut(experiment_id) {
             let old_status = exp.status.clone();
             exp.stop();
@@ -760,7 +762,7 @@ impl ExperimentStore {
     ///
     /// Returns true if state changed, false otherwise.
     pub fn cancel_experiment(&self, experiment_id: &str) -> bool {
-        let mut experiments = self.experiments.write().unwrap_or_else(|e| e.into_inner());
+        let mut experiments = self.experiments.write_or_recover();
         if let Some(exp) = experiments.get_mut(experiment_id) {
             let old_status = exp.status.clone();
             exp.cancel();

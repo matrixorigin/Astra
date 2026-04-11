@@ -14,6 +14,7 @@ use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
+use crate::lock_ext::RwLockExt;
 use crate::pipeline::pattern::PatternLibrary;
 use crate::runtime_config::RuntimeConfig;
 
@@ -33,6 +34,7 @@ pub struct FeedbackSignal {
 }
 
 impl FeedbackSignal {
+    /// Create a new feedback signal of the given type, timestamped to now.
     pub fn new(signal_type: SignalType) -> Self {
         Self {
             signal_type,
@@ -42,11 +44,13 @@ impl FeedbackSignal {
         }
     }
 
+    /// Associate this signal with a specific turn.
     pub fn with_turn(mut self, turn_id: impl Into<String>) -> Self {
         self.turn_id = Some(turn_id.into());
         self
     }
 
+    /// Attach arbitrary context metadata to this signal.
     pub fn with_context(mut self, key: impl Into<String>, value: serde_json::Value) -> Self {
         self.context.insert(key.into(), value);
         self
@@ -161,6 +165,7 @@ pub struct EvolutionRule {
 }
 
 impl EvolutionRule {
+    /// Create a new evolution rule with the given trigger and action. Default cooldown: 1 hour.
     pub fn new(id: impl Into<String>, trigger: EvolutionTrigger, action: EvolutionAction) -> Self {
         let id = id.into();
         Self {
@@ -169,21 +174,24 @@ impl EvolutionRule {
             trigger,
             action,
             rollback_condition: None,
-            cooldown: Duration::from_secs(3600), // 1 hour default
+            cooldown: Duration::from_secs(3600),
             enabled: true,
         }
     }
 
+    /// Set a human-readable display name (defaults to the rule ID).
     pub fn with_name(mut self, name: impl Into<String>) -> Self {
         self.name = name.into();
         self
     }
 
+    /// Attach a rollback condition that reverts this rule's action when met.
     pub fn with_rollback(mut self, condition: RollbackCondition) -> Self {
         self.rollback_condition = Some(condition);
         self
     }
 
+    /// Override the default cooldown period between consecutive triggers.
     pub fn with_cooldown(mut self, cooldown: Duration) -> Self {
         self.cooldown = cooldown;
         self
@@ -298,6 +306,7 @@ impl Default for FeedbackAggregator {
 }
 
 impl FeedbackAggregator {
+    /// Create a new aggregator with default window (24 h, 1000 signals max).
     pub fn new() -> Self {
         Self {
             signals: VecDeque::new(),
@@ -482,6 +491,7 @@ impl Default for AutoTuningEngine {
 }
 
 impl AutoTuningEngine {
+    /// Create a new auto-tuning engine with no rules and an empty aggregator.
     pub fn new() -> Self {
         Self {
             rules: RwLock::new(Vec::new()),
@@ -502,7 +512,7 @@ impl AutoTuningEngine {
 
     /// Remove a rule by ID.
     pub fn remove_rule(&self, rule_id: &str) -> bool {
-        let mut rules = self.rules.write().unwrap_or_else(|e| e.into_inner());
+        let mut rules = self.rules.write_or_recover();
         let len_before = rules.len();
         rules.retain(|r| r.id != rule_id);
         rules.len() < len_before
@@ -551,12 +561,12 @@ impl AutoTuningEngine {
         config: &RuntimeConfig,
         pattern_library: Option<&PatternLibrary>,
     ) -> Vec<(EvolutionRule, EvolutionAction)> {
-        if !*self.enabled.read().unwrap_or_else(|e| e.into_inner()) {
+        if !*self.enabled.read_or_recover() {
             return Vec::new();
         }
 
-        let rules = self.rules.read().unwrap_or_else(|e| e.into_inner());
-        let aggregator = self.aggregator.read().unwrap_or_else(|e| e.into_inner());
+        let rules = self.rules.read_or_recover();
+        let aggregator = self.aggregator.read_or_recover();
         let last_triggered = self
             .last_triggered
             .read()
@@ -594,7 +604,7 @@ impl AutoTuningEngine {
         config: &mut RuntimeConfig,
         actions: Vec<(EvolutionRule, EvolutionAction)>,
     ) -> Vec<RuleExecution> {
-        let mut executions_store = self.executions.write().unwrap_or_else(|e| e.into_inner());
+        let mut executions_store = self.executions.write_or_recover();
         let mut last_triggered = self
             .last_triggered
             .write()
@@ -658,9 +668,9 @@ impl AutoTuningEngine {
     /// Check if any rollback conditions are met and perform rollbacks.
     pub fn check_rollbacks(&self, config: &mut RuntimeConfig) -> Vec<String> {
         let mut rolled_back = Vec::new();
-        let aggregator = self.aggregator.read().unwrap_or_else(|e| e.into_inner());
-        let rules = self.rules.read().unwrap_or_else(|e| e.into_inner());
-        let mut executions = self.executions.write().unwrap_or_else(|e| e.into_inner());
+        let aggregator = self.aggregator.read_or_recover();
+        let rules = self.rules.read_or_recover();
+        let mut executions = self.executions.write_or_recover();
 
         for execution in executions.iter_mut() {
             if execution.rolled_back {
@@ -690,12 +700,12 @@ impl AutoTuningEngine {
 
     /// Enable or disable the entire auto-tuning system.
     pub fn set_enabled(&self, enabled: bool) {
-        *self.enabled.write().unwrap_or_else(|e| e.into_inner()) = enabled;
+        *self.enabled.write_or_recover() = enabled;
     }
 
     /// Check if auto-tuning is enabled.
     pub fn is_enabled(&self) -> bool {
-        *self.enabled.read().unwrap_or_else(|e| e.into_inner())
+        *self.enabled.read_or_recover()
     }
 
     /// Get execution history.
@@ -708,7 +718,7 @@ impl AutoTuningEngine {
 
     /// Get all rules.
     pub fn get_rules(&self) -> Vec<EvolutionRule> {
-        self.rules.read().unwrap_or_else(|e| e.into_inner()).clone()
+        self.rules.read_or_recover().clone()
     }
 
     fn evaluate_trigger(
@@ -895,7 +905,7 @@ impl AutoTuningEngine {
 
     /// Serialize the feedback aggregator state for persistence.
     pub fn save_aggregator(&self) -> Result<Vec<u8>, String> {
-        let agg = self.aggregator.read().unwrap_or_else(|e| e.into_inner());
+        let agg = self.aggregator.read_or_recover();
         serde_json::to_vec_pretty(&*agg).map_err(|e| format!("serialize aggregator: {e}"))
     }
 
@@ -903,7 +913,7 @@ impl AutoTuningEngine {
     pub fn load_aggregator(&self, data: &[u8]) -> Result<(), String> {
         let loaded: FeedbackAggregator =
             serde_json::from_slice(data).map_err(|e| format!("deserialize aggregator: {e}"))?;
-        *self.aggregator.write().unwrap_or_else(|e| e.into_inner()) = loaded;
+        *self.aggregator.write_or_recover() = loaded;
         Ok(())
     }
 }
