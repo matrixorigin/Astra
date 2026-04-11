@@ -938,6 +938,104 @@ fn extract_json_str(line: &str, needle: &str) -> Option<String> {
     Some(rest[..end].replace("\\\"", "\"").replace("\\n", " "))
 }
 
+// ── Session listing with metadata ────────────────────────────────────────────
+
+/// Metadata for session listing (mtime, size, staleness).
+#[derive(Debug, Clone)]
+pub struct SessionListMeta {
+    pub session_id: String,
+    /// Journal file modification time.
+    pub last_modified: std::time::SystemTime,
+    /// Journal file size in bytes.
+    pub journal_bytes: u64,
+    /// Total disk usage: journal + workspace dir (recursive).
+    pub total_bytes: u64,
+    /// Turn count (fast count).
+    pub turns: u32,
+}
+
+impl SessionListMeta {
+    /// Check if this session is stale (older than `max_age`).
+    pub fn is_stale(&self, max_age: std::time::Duration) -> bool {
+        let cutoff = std::time::SystemTime::now()
+            .checked_sub(max_age)
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        self.last_modified < cutoff
+    }
+
+    /// Get the age of this session (time since last modified).
+    pub fn age(&self) -> std::time::Duration {
+        self.last_modified
+            .elapsed()
+            .unwrap_or(std::time::Duration::ZERO)
+    }
+}
+
+/// List sessions with metadata, sorted by most recent first.
+///
+/// `limit` — max number of sessions to return.
+/// Returns session IDs with mtime and size info for display purposes.
+pub fn list_sessions_with_meta(limit: usize) -> std::io::Result<Vec<SessionListMeta>> {
+    use std::cmp::Reverse;
+    use std::collections::BinaryHeap;
+
+    let dir = journal_dir();
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    // Min-heap of (mtime, sid) — keeps only the `limit` newest entries
+    let mut heap: BinaryHeap<Reverse<(std::time::SystemTime, String, u64)>> = BinaryHeap::new();
+    for entry in std::fs::read_dir(&dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if let Some(sid) = name.strip_suffix(".jsonl") {
+            // Skip test-generated sessions
+            if sid.starts_with("test-") || sid.starts_with("new-sess-") {
+                continue;
+            }
+            let meta = entry.metadata().ok();
+            let mtime = meta
+                .as_ref()
+                .and_then(|m| m.modified().ok())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            let size = meta.map(|m| m.len()).unwrap_or(0);
+            if heap.len() < limit {
+                heap.push(Reverse((mtime, sid.to_string(), size)));
+            } else if let Some(&Reverse((min_time, _, _))) = heap.peek()
+                && mtime > min_time
+            {
+                heap.pop();
+                heap.push(Reverse((mtime, sid.to_string(), size)));
+            }
+        }
+    }
+
+    // Extract and sort by newest first
+    let mut items: Vec<_> = heap.into_iter().map(|Reverse(item)| item).collect();
+    items.sort_by(|a, b| b.0.cmp(&a.0));
+
+    // Enrich with total size and turn count (done after limit for efficiency)
+    let result: Vec<SessionListMeta> = items
+        .into_iter()
+        .map(|(mtime, sid, journal_bytes)| {
+            let ws_dir = crate::session_workspace::workspace_dir_for(&sid);
+            let ws_bytes = dir_size_recursive(&ws_dir);
+            let turns = count_turns(&sid);
+            SessionListMeta {
+                session_id: sid,
+                last_modified: mtime,
+                journal_bytes,
+                total_bytes: journal_bytes + ws_bytes,
+                turns,
+            }
+        })
+        .collect();
+
+    Ok(result)
+}
+
 // ── Session cleanup / lifecycle ──────────────────────────────────────────────
 
 /// Metadata about a session that's a candidate for cleanup.

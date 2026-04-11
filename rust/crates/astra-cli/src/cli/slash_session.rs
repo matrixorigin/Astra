@@ -269,6 +269,8 @@ fn handle_session_list(sub_arg: &str, state: &ReplState) {
     let mut filter_completed = false;
     let mut filter_here = false;
     let mut filter_project = false;
+    let mut filter_stale = false;
+    let mut show_size = false;
     let mut search_term: Option<String> = None;
 
     for part in sub_arg.split_whitespace() {
@@ -278,17 +280,24 @@ fn handle_session_list(sub_arg: &str, state: &ReplState) {
             "--completed" | "--done" => filter_completed = true,
             "--here" | "--cwd" => filter_here = true,
             "--project" | "--repo" => filter_project = true,
+            "--stale" | "--old" => filter_stale = true,
+            "--size" | "-s" => show_size = true,
             _ if !part.starts_with('-') => search_term = Some(part.to_lowercase()),
             other => {
                 eprintln!("{}", format!("  Unknown option: {other}").red());
                 eprintln!(
                     "  {}",
-                    "Usage: /session list [--all|--active|--completed|--here|--project] [search]"
+                    "Usage: /session list [--all|--active|--completed|--here|--project|--stale|--size] [search]"
                         .dim()
                 );
                 return;
             }
         }
+    }
+
+    // If --stale is used, also show size info for cleanup context
+    if filter_stale {
+        show_size = true;
     }
 
     // Get current cwd and git root for filtering
@@ -302,9 +311,9 @@ fn handle_session_list(sub_arg: &str, state: &ReplState) {
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
 
-    // Load sessions by recency
+    // Load sessions by recency with metadata (includes mtime, size)
     let limit = if show_all { 500 } else { 50 }; // scan more than display for filtering
-    let sessions = match session_journal::list_sessions_by_time(limit) {
+    let sessions_meta = match session_journal::list_sessions_with_meta(limit) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("{}", format!("  ✗ {e}").red());
@@ -312,7 +321,7 @@ fn handle_session_list(sub_arg: &str, state: &ReplState) {
         }
     };
 
-    if sessions.is_empty() {
+    if sessions_meta.is_empty() {
         eprintln!("{}", "  No journal files yet.".dim());
         eprintln!(
             "  {}",
@@ -321,27 +330,37 @@ fn handle_session_list(sub_arg: &str, state: &ReplState) {
         return;
     }
 
+    // Stale threshold: 30 days
+    let stale_threshold = std::time::Duration::from_secs(30 * 86400);
+
     // Build session list with metadata for filtering/searching
     struct SessionEntry {
         sid: String,
         ws: Option<session_workspace::WorkspaceMetadata>,
         hint: String,
+        total_bytes: u64,
+        is_stale: bool,
     }
 
-    let mut entries: Vec<SessionEntry> = sessions
+    let mut entries: Vec<SessionEntry> = sessions_meta
         .iter()
-        .map(|sid| {
-            let ws = session_workspace::read_workspace(sid).ok();
-            let hint = workspace_summary_line(sid);
+        .map(|meta| {
+            let ws = session_workspace::read_workspace(&meta.session_id).ok();
+            let hint = workspace_summary_line(&meta.session_id);
             SessionEntry {
-                sid: sid.clone(),
+                sid: meta.session_id.clone(),
                 ws,
                 hint,
+                total_bytes: meta.total_bytes,
+                is_stale: meta.is_stale(stale_threshold),
             }
         })
         .collect();
 
     // Apply filters
+    if filter_stale {
+        entries.retain(|e| e.is_stale);
+    }
     if filter_active {
         entries.retain(|e| {
             e.ws.as_ref()
@@ -453,6 +472,9 @@ fn handle_session_list(sub_arg: &str, state: &ReplState) {
         if filter_completed {
             parts.push("completed only");
         }
+        if filter_stale {
+            parts.push("stale (>30d)");
+        }
         if filter_here {
             parts.push("this dir");
         }
@@ -473,7 +495,13 @@ fn handle_session_list(sub_arg: &str, state: &ReplState) {
     // Display entries with numbered shortcuts
     let current = state.session_id.as_deref().unwrap_or("");
     let mut shortcuts: Vec<String> = Vec::new();
+    let mut total_size: u64 = 0;
+    let mut stale_count = 0;
     for (idx, entry) in entries.iter().take(display_limit).enumerate() {
+        total_size += entry.total_bytes;
+        if entry.is_stale {
+            stale_count += 1;
+        }
         let marker = if entry.sid == current {
             " ← current"
         } else {
@@ -492,11 +520,28 @@ fn handle_session_list(sub_arg: &str, state: &ReplState) {
         } else {
             "    ".to_string()
         };
+        // Build size/stale suffix
+        let extra = {
+            let mut parts = Vec::new();
+            if show_size {
+                parts.push(human_bytes(entry.total_bytes));
+            }
+            if entry.is_stale && !filter_stale {
+                // Show stale indicator when not already filtering by stale
+                parts.push("⏳ stale".to_string());
+            }
+            if parts.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", parts.join(", "))
+            }
+        };
         eprintln!(
-            "  {}{}  {}{}",
+            "  {}{}  {}{}{}",
             num_label.dim(),
             sid_short.cyan(),
             entry.hint.as_str().dim(),
+            extra.yellow(),
             marker.green()
         );
     }
@@ -512,23 +557,49 @@ fn handle_session_list(sub_arg: &str, state: &ReplState) {
         );
     }
 
-    // Summary
+    // Summary with total size and stale info
+    let size_info = if show_size || total_size > 100 * 1024 * 1024 {
+        // Show size if requested or if total > 100MB
+        format!(", {}", human_bytes(total_size))
+    } else {
+        String::new()
+    };
+    let stale_info = if stale_count > 0 && !filter_stale {
+        format!(", {} stale", stale_count)
+    } else {
+        String::new()
+    };
     if total > showing {
         eprintln!(
-            "  {} {} (showing {}; use --all for more)",
+            "  {} {} (showing {}{}{}; use --all for more)",
             total.to_string().dim(),
             "sessions match",
-            showing
+            showing,
+            size_info,
+            stale_info
         );
     } else {
         eprintln!(
-            "  {} {}",
+            "  {} {}{}{}",
             total.to_string().dim(),
             if total == 1 {
                 "session"
             } else {
                 "sessions"
-            }
+            },
+            size_info,
+            stale_info
+        );
+    }
+    // Cleanup hint if many stale sessions
+    if stale_count >= 5 && !filter_stale {
+        eprintln!(
+            "  {}",
+            format!(
+                "Hint: {} stale sessions found. Use /session cleanup to free disk space.",
+                stale_count
+            )
+            .yellow()
         );
     }
     eprintln!();
@@ -620,7 +691,13 @@ fn handle_session_switch(sub_arg: &str, state: &mut ReplState) {
     // Restore session state
     let st = crate::repl_runtime::session_state_from_journal(&session_id);
     state.session_id = Some(session_id.clone());
-    state.journal = session_journal::JournalWriter::new(&session_id).ok();
+    state.journal = match session_journal::JournalWriter::new(&session_id) {
+        Ok(j) => Some(j),
+        Err(e) => {
+            eprintln!("  ⚠ Journal unavailable for this session: {e}");
+            None
+        }
+    };
     state.history = st.history;
     state.turn = st.turn;
     state.total_prompt_tokens = st.total_prompt_tokens;
