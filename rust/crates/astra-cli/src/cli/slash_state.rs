@@ -136,9 +136,7 @@ pub(super) async fn handle_state_command(
                         }
                     }
                     // Save to redo stack
-                    state
-                        .redo_stack
-                        .push((user_msg, assistant_msg, state.turn));
+                    state.redo_stack.push((user_msg, assistant_msg, state.turn));
                     state.turn = state.turn.saturating_sub(1);
                 }
             }
