@@ -24,6 +24,15 @@ use super::delegation_engine::{DelegationEngine, DelegationTracker};
 use super::run_engine::RunEngine;
 use super::worktree_isolation::{MergeResult, RepoLock, WorktreeManager};
 
+/// Log a warning when a best-effort persistence operation fails.
+macro_rules! warn_persist {
+    ($op:expr, $label:expr) => {
+        if let Err(e) = $op {
+            astra_core::agent_warn!("orchestrator", "{}: {e}", $label);
+        }
+    };
+}
+
 // ─── Types ──────────────────────────────────────────────────────────────────
 
 /// Progress phases emitted during team execution.
@@ -204,19 +213,21 @@ impl TeamExecutionOrchestrator {
         }
 
         // Emit preparation event
-        let _ = self
-            .run_engine
-            .append_event(
-                &parent_run_id,
-                serde_json::json!({
-                    "event_type": "team_prepare",
-                    "team_name": team_name,
-                    "coordination": format!("{:?}", team.coordination),
-                    "member_count": team.members.len(),
-                    "worktree_mode": format!("{:?}", team.worktree_mode),
-                }),
-            )
-            .await;
+        warn_persist!(
+            self.run_engine
+                .append_event(
+                    &parent_run_id,
+                    serde_json::json!({
+                        "event_type": "team_prepare",
+                        "team_name": team_name,
+                        "coordination": format!("{:?}", team.coordination),
+                        "member_count": team.members.len(),
+                        "worktree_mode": format!("{:?}", team.worktree_mode),
+                    }),
+                )
+                .await,
+            "Failed to run_engine.append_event"
+        );
 
         // Resolve members → profiles using the new resolve_team with registry lookup
         let registry = self.profile_registry.read().await;
@@ -224,10 +235,12 @@ impl TeamExecutionOrchestrator {
             Ok(r) => r,
             Err(e) => {
                 drop(registry);
-                let _ = self
-                    .run_engine
-                    .persist_status(&parent_run_id, "failed", None, Some(&e))
-                    .await;
+                warn_persist!(
+                    self.run_engine
+                        .persist_status(&parent_run_id, "failed", None, Some(&e))
+                        .await,
+                    "Failed to run_engine.persist_status"
+                );
                 return self.fail_report(
                     team_name,
                     "",
@@ -241,10 +254,12 @@ impl TeamExecutionOrchestrator {
         let delegation_id = request.delegation_id.clone();
 
         // Record execution start (Phase 1 complete, entering execution)
-        let _ = self
-            .team_store
-            .record_execution_start(&delegation_id, &team.team_id, &self.config.user_id, task)
-            .await;
+        warn_persist!(
+            self.team_store
+                .record_execution_start(&delegation_id, &team.team_id, &self.config.user_id, task)
+                .await,
+            "Failed to team_store.record_execution_start"
+        );
 
         self.emit_progress(ExecutionPhase::Preparing {
             team_name: team_name.to_string(),
@@ -316,10 +331,17 @@ impl TeamExecutionOrchestrator {
                         });
                     }
                     Err(e) => {
-                        let _ = self
-                            .run_engine
-                            .persist_status(&parent_run_id, "failed", None, Some(&e.to_string()))
-                            .await;
+                        warn_persist!(
+                            self.run_engine
+                                .persist_status(
+                                    &parent_run_id,
+                                    "failed",
+                                    None,
+                                    Some(&e.to_string())
+                                )
+                                .await,
+                            "Failed to run_engine.persist_status"
+                        );
                         return self.fail_report(
                             team_name,
                             &delegation_id,
@@ -339,26 +361,30 @@ impl TeamExecutionOrchestrator {
             "worktree_mode": format!("{:?}", team.worktree_mode),
         })
         .to_string();
-        let _ = self
-            .run_engine
-            .persist_checkpoint(&parent_run_id, &checkpoint)
-            .await;
+        warn_persist!(
+            self.run_engine
+                .persist_checkpoint(&parent_run_id, &checkpoint)
+                .await,
+            "Failed to run_engine.persist_checkpoint"
+        );
 
         // ── Phase 2: Execute ────────────────────────────────────────────
         self.emit_progress(ExecutionPhase::Executing {
             delegation_id: delegation_id.clone(),
         });
 
-        let _ = self
-            .run_engine
-            .append_event(
-                &parent_run_id,
-                serde_json::json!({
-                    "event_type": "team_execute_start",
-                    "delegation_id": &delegation_id,
-                }),
-            )
-            .await;
+        warn_persist!(
+            self.run_engine
+                .append_event(
+                    &parent_run_id,
+                    serde_json::json!({
+                        "event_type": "team_execute_start",
+                        "delegation_id": &delegation_id,
+                    }),
+                )
+                .await,
+            "Failed to run_engine.append_event"
+        );
 
         let budget_timeout = team
             .budget
@@ -452,10 +478,12 @@ impl TeamExecutionOrchestrator {
         let delegation_result = match delegation_outcome {
             Ok(r) => r,
             Err(e) => {
-                let _ = self
-                    .run_engine
-                    .persist_status(&parent_run_id, "failed", None, Some(&e))
-                    .await;
+                warn_persist!(
+                    self.run_engine
+                        .persist_status(&parent_run_id, "failed", None, Some(&e))
+                        .await,
+                    "Failed to run_engine.persist_status"
+                );
                 if let Some(ref mut mgr) = worktree_mgr {
                     if let Err(ce) = mgr.cleanup().await {
                         eprintln!(
@@ -498,10 +526,12 @@ impl TeamExecutionOrchestrator {
 
         // Persist token usage from delegation results
         let (total_prompt, total_completion, total_tools) = sum_usage(&delegation_result);
-        let _ = self
-            .run_engine
-            .persist_usage(&parent_run_id, total_prompt, total_completion, total_tools)
-            .await;
+        warn_persist!(
+            self.run_engine
+                .persist_usage(&parent_run_id, total_prompt, total_completion, total_tools)
+                .await,
+            "Failed to run_engine.persist_usage"
+        );
 
         // Check token budget (post-execution — tokens are only known after completion)
         let total_tokens = total_prompt + total_completion;
@@ -510,32 +540,36 @@ impl TeamExecutionOrchestrator {
             .as_ref()
             .filter(|b| b.max_tokens > 0 && total_tokens > b.max_tokens);
         if let Some(b) = exceeded_budget {
-            let _ = self
-                .run_engine
+            warn_persist!(
+                self.run_engine
+                    .append_event(
+                        &parent_run_id,
+                        serde_json::json!({
+                            "event_type": "team_budget_exceeded",
+                            "budget_max_tokens": b.max_tokens,
+                            "actual_tokens": total_tokens,
+                            "enforcement": "post_execution",
+                        }),
+                    )
+                    .await,
+                "Failed to run_engine.append_event"
+            );
+        }
+
+        warn_persist!(
+            self.run_engine
                 .append_event(
                     &parent_run_id,
                     serde_json::json!({
-                        "event_type": "team_budget_exceeded",
-                        "budget_max_tokens": b.max_tokens,
-                        "actual_tokens": total_tokens,
-                        "enforcement": "post_execution",
+                        "event_type": "team_execute_complete",
+                        "agent_results": delegation_result.agent_results.len(),
+                        "total_prompt_tokens": total_prompt,
+                        "total_completion_tokens": total_completion,
                     }),
                 )
-                .await;
-        }
-
-        let _ = self
-            .run_engine
-            .append_event(
-                &parent_run_id,
-                serde_json::json!({
-                    "event_type": "team_execute_complete",
-                    "agent_results": delegation_result.agent_results.len(),
-                    "total_prompt_tokens": total_prompt,
-                    "total_completion_tokens": total_completion,
-                }),
-            )
-            .await;
+                .await,
+            "Failed to run_engine.append_event"
+        );
 
         // ── Phase 3: Merge ──────────────────────────────────────────────
         self.emit_progress(ExecutionPhase::Merging {
@@ -603,10 +637,12 @@ impl TeamExecutionOrchestrator {
         });
 
         // Persist final run status
-        let _ = self
-            .run_engine
-            .persist_status(&parent_run_id, &status.to_string(), None, error.as_deref())
-            .await;
+        warn_persist!(
+            self.run_engine
+                .persist_status(&parent_run_id, &status.to_string(), None, error.as_deref())
+                .await,
+            "Failed to run_engine.persist_status"
+        );
 
         // Record execution completion (started in Phase 1)
         let result_summary = serde_json::json!({
@@ -617,27 +653,31 @@ impl TeamExecutionOrchestrator {
             "has_conflicts": has_conflicts,
             "merged_learning_patterns": merged_learning.as_ref().map(|l| l.consensus_patterns.len()).unwrap_or(0),
         });
-        let _ = self
-            .team_store
-            .record_execution_complete(
-                &delegation_id,
-                &status.to_string(),
-                Some(&result_summary.to_string()),
-            )
-            .await;
+        warn_persist!(
+            self.team_store
+                .record_execution_complete(
+                    &delegation_id,
+                    &status.to_string(),
+                    Some(&result_summary.to_string()),
+                )
+                .await,
+            "Failed to team_store.record_execution_complete"
+        );
 
         // Final event
-        let _ = self
-            .run_engine
-            .append_event(
-                &parent_run_id,
-                serde_json::json!({
-                    "event_type": "team_complete",
-                    "status": status.to_string(),
-                    "has_conflicts": has_conflicts,
-                }),
-            )
-            .await;
+        warn_persist!(
+            self.run_engine
+                .append_event(
+                    &parent_run_id,
+                    serde_json::json!({
+                        "event_type": "team_complete",
+                        "status": status.to_string(),
+                        "has_conflicts": has_conflicts,
+                    }),
+                )
+                .await,
+            "Failed to run_engine.append_event"
+        );
 
         // Cleanup worktrees
         if let Some(ref mut mgr) = worktree_mgr {

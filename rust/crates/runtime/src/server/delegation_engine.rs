@@ -443,7 +443,9 @@ impl DelegationTracker {
             Some(sid.as_str()),
         );
         event.metadata = Some(metadata);
-        let _ = writer.append(&event);
+        if let Err(e) = writer.append(&event) {
+            astra_core::agent_warn!("delegation", "Failed to write journal event: {e}");
+        }
     }
 
     /// Rebuild in-memory hierarchy from durable run records.
@@ -1260,10 +1262,16 @@ impl DelegationEngine {
                         .await;
 
                     // Transition retry to Running before execution
-                    let _ = self
+                    if let Err(e) = self
                         .tracker
                         .transition_state(&retry_run_id, SubRunState::Running)
-                        .await;
+                        .await
+                    {
+                        astra_core::agent_warn!(
+                            "delegation",
+                            "Retry transition to Running failed for {retry_run_id}: {e:?}"
+                        );
+                    }
 
                     let retry_cancel = retry_config.cancel_token.clone();
                     let retry_agent_id = retry_config.agent_profile.agent_id.clone();
@@ -1516,7 +1524,9 @@ impl DelegationEngine {
     /// Write a journal event (best-effort, non-blocking).
     fn write_journal_event(session_id: &str, event: astra_services::session_journal::JournalEvent) {
         if let Ok(writer) = astra_services::session_journal::JournalWriter::new(session_id) {
-            let _ = writer.append(&event);
+            if let Err(e) = writer.append(&event) {
+                astra_core::agent_warn!("delegation", "Failed to write journal event: {e}");
+            }
         }
     }
 
@@ -1577,10 +1587,16 @@ impl DelegationEngine {
                 .await;
 
             // Transition Created → Running
-            let _ = self
+            if let Err(e) = self
                 .tracker
                 .transition_state(&sub_run_id, SubRunState::Running)
-                .await;
+                .await
+            {
+                astra_core::agent_warn!(
+                    "delegation",
+                    "Fan-out: transition to Running failed for {sub_run_id}: {e:?}"
+                );
+            }
 
             self.run_engine
                 .persist_status(&sub_run_id, STATUS_RUNNING, Some("agent_execution"), None)
@@ -1944,10 +1960,16 @@ impl DelegationEngine {
                 .await;
 
             // Transition Created → Running
-            let _ = self
+            if let Err(e) = self
                 .tracker
                 .transition_state(&sub_run_id, SubRunState::Running)
-                .await;
+                .await
+            {
+                astra_core::agent_warn!(
+                    "delegation",
+                    "Sequential: transition to Running failed for {sub_run_id}: {e:?}"
+                );
+            }
 
             self.run_engine
                 .persist_status(&sub_run_id, STATUS_RUNNING, Some("agent_execution"), None)
@@ -2209,10 +2231,16 @@ impl DelegationEngine {
                     retry_of: None,
                 })
                 .await;
-            let _ = self
+            if let Err(e) = self
                 .tracker
                 .transition_state(&prod_run_id, SubRunState::Running)
-                .await;
+                .await
+            {
+                astra_core::agent_warn!(
+                    "delegation",
+                    "Adversarial: transition to Running failed for producer {prod_run_id}: {e:?}"
+                );
+            }
             self.run_engine
                 .persist_status(&prod_run_id, STATUS_RUNNING, Some("produce"), None)
                 .await?;
@@ -2401,10 +2429,16 @@ impl DelegationEngine {
                     retry_of: None,
                 })
                 .await;
-            let _ = self
+            if let Err(e) = self
                 .tracker
                 .transition_state(&rev_run_id, SubRunState::Running)
-                .await;
+                .await
+            {
+                astra_core::agent_warn!(
+                    "delegation",
+                    "Adversarial: transition to Running failed for reviewer {rev_run_id}: {e:?}"
+                );
+            }
             self.run_engine
                 .persist_status(&rev_run_id, STATUS_RUNNING, Some("review"), None)
                 .await?;
@@ -2603,14 +2637,26 @@ impl DelegationEngine {
                     retry_of: None,
                 })
                 .await;
-            let _ = self
+            if let Err(e) = self
                 .tracker
                 .transition_state(&run_id, SubRunState::Running)
-                .await;
-            let _ = self
+                .await
+            {
+                astra_core::agent_warn!(
+                    "delegation",
+                    "Fork: transition to Running failed for {run_id}: {e:?}"
+                );
+            }
+            if let Err(e) = self
                 .run_engine
                 .persist_status(&run_id, "running", Some("fork"), None)
-                .await;
+                .await
+            {
+                astra_core::agent_warn!(
+                    "delegation",
+                    "Fork: failed to persist running status for {run_id}: {e}"
+                );
+            }
             let pause_flag = self.tracker.register_pause_flag(&run_id).await;
 
             let fork_mailbox = if let Some(router) = &self.mailbox_router {
@@ -2715,15 +2761,27 @@ impl DelegationEngine {
                 };
                 let final_state = match &result {
                     Ok(r) => {
-                        let _ = run_engine
+                        if let Err(e) = run_engine
                             .persist_status(&run_id, &r.status, None, r.error.as_deref())
-                            .await;
+                            .await
+                        {
+                            astra_core::agent_warn!(
+                                "delegation",
+                                "Fork: failed to persist final status for {run_id}: {e}"
+                            );
+                        }
                         SubRunState::from_str(&r.status).unwrap_or(SubRunState::Failed)
                     }
                     Err(e) => {
-                        let _ = run_engine
+                        if let Err(pe) = run_engine
                             .persist_status(&run_id, "failed", None, Some(e))
-                            .await;
+                            .await
+                        {
+                            astra_core::agent_warn!(
+                                "delegation",
+                                "Fork: failed to persist error status for {run_id}: {pe}"
+                            );
+                        }
                         SubRunState::Failed
                     }
                 };
@@ -2750,7 +2808,7 @@ impl DelegationEngine {
                 }),
                 Err(e) => {
                     // JoinError (panic) — use captured identity
-                    let _ = self
+                    if let Err(e2) = self
                         .run_engine
                         .persist_status(
                             &panic_run_id,
@@ -2758,7 +2816,13 @@ impl DelegationEngine {
                             None,
                             Some(&format!("fork task panicked: {e}")),
                         )
-                        .await;
+                        .await
+                    {
+                        astra_core::agent_warn!(
+                            "delegation",
+                            "Fork: failed to persist panic status for {panic_run_id}: {e2}"
+                        );
+                    }
                     self.tracker
                         .complete_sub_run(&panic_run_id, SubRunState::Failed)
                         .await;
