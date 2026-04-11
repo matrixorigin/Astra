@@ -644,6 +644,24 @@ pub fn build_system_prompt_sections_with_style(
     sections
 }
 
+/// Build a dynamic self-awareness prompt section from a [`SelfModel`] snapshot.
+///
+/// Returns a `CacheScope::None` section (changes every turn) containing the
+/// compact self-awareness summary. Returns `None` if the self-model has no
+/// meaningful state to surface (e.g., turn 0 with no goal or signals).
+pub fn self_awareness_prompt_section(
+    self_model: &crate::self_model::SelfModel,
+) -> Option<PromptSection> {
+    let text = self_model.to_system_prompt_section();
+    if text.trim().len() <= "## Self-Awareness".len() + 5 {
+        return None;
+    }
+    Some(PromptSection {
+        text,
+        scope: CacheScope::None,
+    })
+}
+
 /// Flatten sections into a single string (backward-compatible convenience).
 pub fn sections_to_string(sections: &[PromptSection]) -> String {
     sections

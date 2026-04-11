@@ -100,6 +100,7 @@ pub mod plan_decompose;
 pub mod prompts;
 pub mod runtime_config;
 pub mod scenario_router;
+pub mod self_model;
 pub mod server;
 pub mod sync_adapters;
 pub mod tool_registry;
