@@ -560,7 +560,10 @@ pub static COMMANDS: &[CommandMeta] = &[
         "/context",
         "Context window / budget summary",
         CommandGroup::Observability,
-    ),
+    )
+    .with_subcommands(&[
+        ("breakdown", "Per-component token breakdown for last turn"),
+    ]),
     CommandMeta::new(
         "/rewind",
         "Rewind conversation to an earlier turn",
