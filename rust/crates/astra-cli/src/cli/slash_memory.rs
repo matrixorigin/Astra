@@ -1351,7 +1351,7 @@ pub(super) async fn handle_memory_domain_command(
                             }
                         }
                         Ok(r) => {
-                            eprintln!("  {} LLM call failed ({})", theme::icon_err(), r.status());
+                            cli_utils::eprint_api_error(r.status().as_u16(), "LLM call failed");
                         }
                         Err(e) => {
                             eprintln!("  {} Request failed: {}", theme::icon_err(), e);
@@ -1606,7 +1606,7 @@ async fn _old_handle_plan_mode_input(
                 }
             }
             Ok(r) => {
-                eprintln!("  {} LLM call failed ({})", theme::icon_err(), r.status());
+                cli_utils::eprint_api_error(r.status().as_u16(), "LLM call failed");
             }
             Err(e) => {
                 eprintln!("  {} Request failed: {}", theme::icon_err(), e);
@@ -1739,7 +1739,7 @@ async fn _old_handle_plan_mode_input(
                         }
                     }
                     Ok(r) => {
-                        eprintln!("  {} LLM call failed ({})", theme::icon_err(), r.status());
+                        cli_utils::eprint_api_error(r.status().as_u16(), "LLM call failed");
                     }
                     Err(e) => {
                         eprintln!("  {} Request failed: {}", theme::icon_err(), e);

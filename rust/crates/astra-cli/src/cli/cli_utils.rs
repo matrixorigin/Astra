@@ -137,23 +137,26 @@ pub(super) fn read_api_error(status: u16, body: &str) -> String {
     format_error_with_context(status, &compact_or_raw(body))
 }
 
+/// Get a helpful hint for an HTTP status code.
+pub(super) fn status_hint(status: u16) -> Option<&'static str> {
+    match status {
+        400 => Some("Bad request — check your input"),
+        401 => Some("Authentication required — try /login"),
+        403 => Some("Permission denied — check your access rights"),
+        404 => Some("Resource not found"),
+        408 | 504 => Some("Request timed out — try again"),
+        429 => Some("Rate limited — wait a moment and retry"),
+        500 => Some("Server error — this is a bug, please report it"),
+        502 | 503 => Some("Service temporarily unavailable — try again shortly"),
+        _ => None,
+    }
+}
+
 /// Format error with helpful context based on status code
 fn format_error_with_context(status: u16, message: &str) -> String {
-    let hint = match status {
-        400 => "Bad request — check your input",
-        401 => "Authentication required — try /login",
-        403 => "Permission denied — check your access rights",
-        404 => "Resource not found",
-        408 | 504 => "Request timed out — try again",
-        429 => "Rate limited — wait a moment and retry",
-        500 => "Server error — this is a bug, please report it",
-        502 | 503 => "Service temporarily unavailable — try again shortly",
-        _ => "",
-    };
-    if hint.is_empty() {
-        format!("request failed ({status}): {message}")
-    } else {
-        format!("request failed ({status}): {message}\n  Hint: {hint}")
+    match status_hint(status) {
+        Some(hint) => format!("request failed ({status}): {message}\n  Hint: {hint}"),
+        None => format!("request failed ({status}): {message}"),
     }
 }
 
@@ -163,6 +166,15 @@ pub(super) fn map_thin_err(e: astra_thin_client::ThinClientError) -> String {
             read_api_error(status.as_u16(), &body)
         }
         other => other.to_string(),
+    }
+}
+
+/// Print an LLM/API call failure message with optional hint
+pub(super) fn eprint_api_error(status: u16, context: &str) {
+    use crossterm::style::Stylize;
+    eprintln!("  {} {} ({})", theme::icon_err(), context, status);
+    if let Some(hint) = status_hint(status) {
+        eprintln!("      {}", hint.dim());
     }
 }
 

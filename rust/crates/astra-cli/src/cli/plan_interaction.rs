@@ -994,7 +994,7 @@ pub async fn handle_plan_mode_input(
             }
         }
         Ok(r) => {
-            eprintln!("  {} LLM call failed ({})", theme::icon_err(), r.status());
+            cli_utils::eprint_api_error(r.status().as_u16(), "LLM call failed");
         }
         Err(e) => {
             eprintln!("  {} Request failed: {e}", theme::icon_err());
@@ -1668,7 +1668,7 @@ async fn handle_goal_submission(
             }
         }
         Ok(r) => {
-            eprintln!("  {} LLM call failed ({})", theme::icon_err(), r.status());
+            cli_utils::eprint_api_error(r.status().as_u16(), "LLM call failed");
         }
         Err(e) => {
             eprintln!("  {} Request failed: {}", theme::icon_err(), e);
