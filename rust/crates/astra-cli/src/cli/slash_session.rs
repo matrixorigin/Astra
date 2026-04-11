@@ -470,9 +470,10 @@ fn handle_session_list(sub_arg: &str, state: &ReplState) {
     };
     eprintln!("  {}", format!("{sort_info}{filter_info}").dim());
 
-    // Display entries
+    // Display entries with numbered shortcuts
     let current = state.session_id.as_deref().unwrap_or("");
-    for entry in entries.iter().take(display_limit) {
+    let mut shortcuts: Vec<String> = Vec::new();
+    for (idx, entry) in entries.iter().take(display_limit).enumerate() {
         let marker = if entry.sid == current {
             " ← current"
         } else {
@@ -484,11 +485,30 @@ fn handle_session_list(sub_arg: &str, state: &ReplState) {
         } else {
             &entry.sid
         };
+        // Show numbered shortcut for first 9 entries
+        let num_label = if idx < 9 {
+            shortcuts.push(entry.sid.clone());
+            format!("[{}] ", idx + 1)
+        } else {
+            "    ".to_string()
+        };
         eprintln!(
-            "  {}  {}{}",
+            "  {}{}  {}{}",
+            num_label.dim(),
             sid_short.cyan(),
             entry.hint.as_str().dim(),
             marker.green()
+        );
+    }
+
+    // Store shortcuts for /session switch
+    if !shortcuts.is_empty() {
+        LAST_SESSION_LIST.with(|cell| {
+            *cell.borrow_mut() = shortcuts;
+        });
+        eprintln!(
+            "  {}",
+            "Tip: /session switch <N> to resume by number".dim()
         );
     }
 
@@ -512,6 +532,109 @@ fn handle_session_list(sub_arg: &str, state: &ReplState) {
         );
     }
     eprintln!();
+}
+
+// Thread-local storage for session list shortcuts
+thread_local! {
+    static LAST_SESSION_LIST: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Get session ID from shortcut number (1-indexed)
+fn get_session_shortcut(num: usize) -> Option<String> {
+    LAST_SESSION_LIST.with(|cell| {
+        cell.borrow().get(num.saturating_sub(1)).cloned()
+    })
+}
+
+/// Handle `/session switch <N>` - quick switch to session by number from last list
+fn handle_session_switch(sub_arg: &str, state: &mut ReplState) {
+    let arg = sub_arg.trim();
+    
+    if arg.is_empty() {
+        eprintln!(
+            "  {}",
+            "Usage: /session switch <N> (use number from /session list)".dim()
+        );
+        return;
+    }
+    
+    // Parse number
+    let num: usize = match arg.parse() {
+        Ok(n) if n >= 1 && n <= 9 => n,
+        _ => {
+            eprintln!("{}", format!("  Invalid number: {arg} (use 1-9)").red());
+            return;
+        }
+    };
+    
+    // Get session ID from shortcuts
+    let session_id = match get_session_shortcut(num) {
+        Some(sid) => sid,
+        None => {
+            eprintln!(
+                "  {}",
+                format!("No session at position {num}. Run /session list first.").yellow()
+            );
+            return;
+        }
+    };
+    
+    // Show preview and confirm
+    let ws = session_workspace::read_workspace(&session_id).ok();
+    
+    let short_id = &session_id[..8.min(session_id.len())];
+    let summary = ws.as_ref()
+        .and_then(|w| w.summary.clone())
+        .map(|s| {
+            let truncated: String = s.chars().take(50).collect();
+            if s.chars().count() > 50 { format!("{truncated}…") } else { truncated }
+        })
+        .unwrap_or_else(|| "(no summary)".to_string());
+    
+    let turns = ws.as_ref()
+        .map(|w| w.turn_count)
+        .unwrap_or_else(|| session_journal::count_turns(&session_id));
+    
+    eprintln!(
+        "\n  {} {}  {}  {} turns",
+        format!("[{num}]").cyan().bold(),
+        short_id.cyan(),
+        summary.dim(),
+        turns
+    );
+    
+    // Quick confirm
+    eprint!("  {} ", "Switch to this session? [Y/n]:".bold());
+    std::io::Write::flush(&mut std::io::stderr()).ok();
+    let mut input = String::new();
+    if std::io::stdin().read_line(&mut input).is_ok() {
+        let answer = input.trim().to_lowercase();
+        if !answer.is_empty() && answer != "y" && answer != "yes" {
+            eprintln!("{}", "  Cancelled.".dim());
+            return;
+        }
+    } else {
+        return;
+    }
+    
+    // Restore session state
+    let st = crate::repl_runtime::session_state_from_journal(&session_id);
+    state.session_id = Some(session_id.clone());
+    state.journal = session_journal::JournalWriter::new(&session_id).ok();
+    state.history = st.history;
+    state.turn = st.turn;
+    state.total_prompt_tokens = st.total_prompt_tokens;
+    state.total_completion_tokens = st.total_completion_tokens;
+    state.recent_tools = st.recent_tools;
+    state.last_turn_event = None;
+    state.run_id = None;
+    
+    eprintln!(
+        "  {} Switched to session {} ({} turns loaded)",
+        theme::icon_ok(),
+        short_id.cyan(),
+        state.turn
+    );
 }
 
 pub(super) fn resolve_journal_target_session(
@@ -1645,6 +1768,9 @@ pub(super) fn handle_session_command(arg: &str, state: &mut ReplState) {
         "cleanup" => {
             handle_session_cleanup(sub_arg, state);
         }
+        "switch" | "sw" => {
+            handle_session_switch(sub_arg, state);
+        }
         "verify" | "sync" | "status" => {
             handle_session_verify(state);
         }
@@ -1658,7 +1784,7 @@ pub(super) fn handle_session_command(arg: &str, state: &mut ReplState) {
             eprintln!("{}", format!("  Unknown subcommand: {other}").red());
             eprintln!(
                 "  {}",
-                "Usage: /session [history|context|list|errors|export|fork|cleanup|verify|drift|adaptive] …"
+                "Usage: /session [list|switch|history|context|errors|export|fork|cleanup|verify|drift|adaptive] …"
                     .dim()
             );
         }
