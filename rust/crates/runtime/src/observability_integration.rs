@@ -241,6 +241,10 @@ impl ObservabilitySession {
 
     /// Record a context assembly trace.
     pub fn record_context_trace(&mut self, trace: ContextAssemblyTrace) {
+        const MAX_CONTEXT_TRACES: usize = 50;
+        if self.context_traces.len() >= MAX_CONTEXT_TRACES {
+            self.context_traces.drain(..1);
+        }
         self.context_traces.push(trace);
     }
 
@@ -1230,5 +1234,27 @@ mod tests {
         let guard = session.read().unwrap();
         assert_eq!(guard.context_traces.len(), 3);
         assert_eq!(guard.context_traces[2].turn_id, "turn-2");
+    }
+
+    #[test]
+    fn context_traces_bounded_at_50() {
+        let hub = ObservabilityHub::new();
+        let session = hub.start_session("u1", "s1");
+
+        for i in 0..60 {
+            let trace = crate::turn::context_assembly_trace::ContextAssemblyTrace {
+                turn_id: format!("turn-{i}"),
+                session_id: "s1".into(),
+                ..Default::default()
+            };
+            let mut guard = session.write().unwrap();
+            on_context_assembled(&mut guard, trace);
+        }
+
+        let guard = session.read().unwrap();
+        assert_eq!(guard.context_traces.len(), 50);
+        // Oldest traces evicted, newest retained
+        assert_eq!(guard.context_traces[0].turn_id, "turn-10");
+        assert_eq!(guard.context_traces[49].turn_id, "turn-59");
     }
 }
