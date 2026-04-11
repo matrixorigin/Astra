@@ -1315,6 +1315,13 @@ fn print_turn_status_line(state: &ReplState, result: &StreamResult, turn_start: 
 
     parts.push(elapsed_str);
 
+    // TTFT (Time To First Token) - valuable for understanding API latency
+    if let Some(ttft) = result.ttft_ms {
+        if ttft > 0 {
+            parts.push(format!("ttft:{ttft}ms"));
+        }
+    }
+
     if result.tool_calls_count > 0 {
         parts.push(format!(
             "{} tool{}",
