@@ -30,180 +30,210 @@ pub fn merge_tool_results_into_history(
 ) -> BTreeSet<String> {
     let mut consumed = BTreeSet::new();
 
-    if let Some(tool_results) = tool_results {
-        let mut pending = Map::new();
-        for tool_result in tool_results {
-            let Some(object) = tool_result.as_object() else {
-                continue;
-            };
-            let tool_call_id = object
-                .get("tool_call_id")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            if !tool_call_id.is_empty() && !pending.contains_key(tool_call_id) {
-                pending.insert(tool_call_id.to_string(), tool_result.clone());
-            }
+    // Phase 1: Build index of assistant messages with tool_calls
+    // This avoids repeated linear scans through history
+    struct AssistantBlock {
+        #[allow(dead_code)] // Retained for debugging/future use
+        index: usize,
+        tool_call_ids: Vec<String>,
+        block_end: usize,
+        // Map tool_call_id -> (follow_index, is_placeholder)
+        existing_tools: std::collections::HashMap<String, (usize, bool)>,
+    }
+
+    let mut assistant_blocks: Vec<AssistantBlock> = Vec::new();
+    let mut i = 0;
+    while i < history.len() {
+        let is_assistant = history[i]
+            .as_object()
+            .map(|m| m.get("role").and_then(Value::as_str) == Some("assistant"))
+            .unwrap_or(false);
+
+        if !is_assistant {
+            i += 1;
+            continue;
         }
 
-        let mut inserts: Vec<(usize, Value)> = Vec::new();
-        for index in 0..history.len() {
-            let Some(message) = history[index].as_object() else {
-                continue;
-            };
-            if message.get("role").and_then(Value::as_str) != Some("assistant") {
-                continue;
-            }
-            let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array).cloned()
-            else {
-                continue;
-            };
+        let tool_calls = history[i]
+            .get("tool_calls")
+            .and_then(Value::as_array)
+            .cloned();
 
-            let mut block_end = index + 1;
-            for follow_index in (index + 1)..history.len() {
-                if role_at(history, follow_index) == Some("tool") {
-                    block_end = follow_index + 1;
-                } else {
-                    break;
-                }
-            }
+        let Some(tool_calls) = tool_calls else {
+            i += 1;
+            continue;
+        };
 
-            let mut existing: Map<String, Value> = Map::new();
-            for (i, item) in history[(index + 1)..block_end].iter().enumerate() {
-                let follow_index = index + 1 + i;
-                let Some(tool_msg) = item.as_object() else {
-                    continue;
-                };
+        let tool_call_ids: Vec<String> = tool_calls
+            .iter()
+            .filter_map(|tc| tc.get("id").and_then(Value::as_str))
+            .map(ToOwned::to_owned)
+            .collect();
+
+        // Find block_end: consecutive tool messages after this assistant
+        let mut block_end = i + 1;
+        let mut existing_tools = std::collections::HashMap::new();
+
+        for follow_index in (i + 1)..history.len() {
+            if role_at(history, follow_index) != Some("tool") {
+                break;
+            }
+            block_end = follow_index + 1;
+
+            if let Some(tool_msg) = history[follow_index].as_object() {
                 let tool_call_id = tool_msg
                     .get("tool_call_id")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
-                if tool_call_id.is_empty() {
-                    continue;
+                if !tool_call_id.is_empty() {
+                    let is_placeholder = tool_msg
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .map(|c| c.contains("[not executed"))
+                        .unwrap_or(false);
+                    existing_tools.insert(tool_call_id.to_string(), (follow_index, is_placeholder));
                 }
-                let is_placeholder = tool_msg
-                    .get("content")
-                    .and_then(Value::as_str)
-                    .map(|content| content.contains("[not executed"))
-                    .unwrap_or(false);
-                existing.insert(
-                    tool_call_id.to_string(),
-                    json!({
-                        "index": follow_index,
-                        "is_placeholder": is_placeholder,
-                    }),
-                );
             }
+        }
 
+        assistant_blocks.push(AssistantBlock {
+            index: i,
+            tool_call_ids,
+            block_end,
+            existing_tools,
+        });
+
+        i = block_end; // Skip to after the tool block
+    }
+
+    // Phase 2: Process tool_results using the pre-built index
+    if let Some(tool_results) = tool_results {
+        // Build pending map: tool_call_id -> tool_result
+        let mut pending: std::collections::HashMap<String, &Value> =
+            std::collections::HashMap::with_capacity(tool_results.len());
+        for tool_result in tool_results {
+            if let Some(id) = tool_result
+                .as_object()
+                .and_then(|o| o.get("tool_call_id"))
+                .and_then(Value::as_str)
+            {
+                if !id.is_empty() {
+                    pending.entry(id.to_string()).or_insert(tool_result);
+                }
+            }
+        }
+
+        let mut inserts: Vec<(usize, Value)> = Vec::new();
+
+        for block in &assistant_blocks {
+            let mut insert_at = block.block_end;
+
+            for tool_call_id in &block.tool_call_ids {
+                let Some(result) = pending.get(tool_call_id) else {
+                    continue;
+                };
+
+                if let Some(&(existing_index, is_placeholder)) =
+                    block.existing_tools.get(tool_call_id)
+                {
+                    // Update placeholder in-place
+                    if is_placeholder {
+                        if let Some(message) = history
+                            .get_mut(existing_index)
+                            .and_then(Value::as_object_mut)
+                        {
+                            message.insert(
+                                "content".to_string(),
+                                Value::String(result_content(result)),
+                            );
+                        }
+                    }
+                    consumed.insert(tool_call_id.clone());
+                } else {
+                    // Insert new tool result
+                    inserts.push((
+                        insert_at,
+                        json!({
+                            "role": "tool",
+                            "tool_call_id": tool_call_id,
+                            "content": result_content(result),
+                        }),
+                    ));
+                    consumed.insert(tool_call_id.clone());
+                    insert_at += 1;
+                }
+            }
+        }
+
+        // Insert in reverse order to maintain correct indices
+        for (position, tool_msg) in inserts.into_iter().rev() {
+            history.insert(position, tool_msg);
+        }
+    }
+
+    // Phase 3: Heal missing tool responses (add placeholders)
+    // Re-scan since history may have changed
+    let mut heals: Vec<(usize, Value)> = Vec::new();
+    let mut i = 0;
+    while i < history.len() {
+        let Some(message) = history[i].as_object() else {
+            i += 1;
+            continue;
+        };
+        if message.get("role").and_then(Value::as_str) != Some("assistant") {
+            i += 1;
+            continue;
+        }
+        let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array).cloned() else {
+            i += 1;
+            continue;
+        };
+
+        let expected: BTreeSet<String> = tool_calls
+            .iter()
+            .filter_map(|tc| tc.get("id").and_then(Value::as_str))
+            .map(ToOwned::to_owned)
+            .collect();
+
+        let mut found = BTreeSet::new();
+        let mut block_end = i + 1;
+        for follow_index in (i + 1)..history.len() {
+            if role_at(history, follow_index) != Some("tool") {
+                break;
+            }
+            block_end = follow_index + 1;
+            if let Some(tool_call_id) = history[follow_index]
+                .get("tool_call_id")
+                .and_then(Value::as_str)
+            {
+                found.insert(tool_call_id.to_string());
+            }
+        }
+
+        let missing: Vec<String> = expected.difference(&found).cloned().collect();
+        if !missing.is_empty() {
+            let missing_set: BTreeSet<&str> = missing.iter().map(String::as_str).collect();
             let mut insert_at = block_end;
             for tool_call in &tool_calls {
                 let tool_call_id = tool_call
                     .get("id")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
-                if tool_call_id.is_empty() || !pending.contains_key(tool_call_id) {
-                    continue;
-                }
-
-                if let Some(existing_entry) = existing.get(tool_call_id) {
-                    let existing_index = existing_entry
-                        .get("index")
-                        .and_then(Value::as_u64)
-                        .unwrap_or_default() as usize;
-                    let is_placeholder = existing_entry
-                        .get("is_placeholder")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false);
-                    if is_placeholder
-                        && let Some(message) = history
-                            .get_mut(existing_index)
-                            .and_then(Value::as_object_mut)
-                    {
-                        message.insert(
-                            "content".to_string(),
-                            Value::String(result_content(
-                                pending
-                                    .get(tool_call_id)
-                                    .expect("pending tool_result exists"),
-                            )),
-                        );
-                    }
-                    consumed.insert(tool_call_id.to_string());
-                } else {
-                    inserts.push((
+                if missing_set.contains(tool_call_id) {
+                    heals.push((
                         insert_at,
                         json!({
                             "role": "tool",
                             "tool_call_id": tool_call_id,
-                            "content": result_content(
-                                pending.get(tool_call_id).expect("pending tool_result exists")
-                            ),
+                            "content": "[not executed -- edge disconnected]",
                         }),
                     ));
-                    consumed.insert(tool_call_id.to_string());
                     insert_at += 1;
                 }
             }
         }
 
-        for (position, tool_msg) in inserts.into_iter().rev() {
-            history.insert(position, tool_msg);
-        }
-    }
-
-    let mut heals: Vec<(usize, Value)> = Vec::new();
-    for index in 0..history.len() {
-        let Some(message) = history[index].as_object() else {
-            continue;
-        };
-        if message.get("role").and_then(Value::as_str) != Some("assistant") {
-            continue;
-        }
-        let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array).cloned() else {
-            continue;
-        };
-
-        let expected = tool_calls
-            .iter()
-            .filter_map(|tool_call| tool_call.get("id").and_then(Value::as_str))
-            .map(ToOwned::to_owned)
-            .collect::<BTreeSet<_>>();
-        let mut found = BTreeSet::new();
-        for follow_index in (index + 1)..history.len() {
-            if role_at(history, follow_index) == Some("tool") {
-                if let Some(tool_call_id) = history[follow_index]
-                    .get("tool_call_id")
-                    .and_then(Value::as_str)
-                {
-                    found.insert(tool_call_id.to_string());
-                }
-            } else {
-                break;
-            }
-        }
-
-        let missing = expected.difference(&found).cloned().collect::<Vec<_>>();
-        if missing.is_empty() {
-            continue;
-        }
-
-        let mut insert_at = index + 1 + found.len();
-        for tool_call in &tool_calls {
-            let tool_call_id = tool_call
-                .get("id")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            if missing.iter().any(|missing_id| missing_id == tool_call_id) {
-                heals.push((
-                    insert_at,
-                    json!({
-                        "role": "tool",
-                        "tool_call_id": tool_call_id,
-                        "content": "[not executed -- edge disconnected]",
-                    }),
-                ));
-                insert_at += 1;
-            }
-        }
+        i = block_end;
     }
 
     for (position, placeholder) in heals.into_iter().rev() {
