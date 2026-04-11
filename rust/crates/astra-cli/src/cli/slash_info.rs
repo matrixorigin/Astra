@@ -1493,10 +1493,7 @@ pub(super) async fn handle_info_command(
                         print_context_breakdown(trace);
                     }
                 } else {
-                    eprintln!(
-                        "{}",
-                        "  No observability session active.".yellow()
-                    );
+                    eprintln!("{}", "  No observability session active.".yellow());
                 }
                 return Ok(());
             }
@@ -1962,12 +1959,17 @@ fn parse_continuation_anchor(anchor: &str) -> ContinuationAnchorParts {
     ContinuationAnchorParts { task, direction }
 }
 
-fn print_context_breakdown(trace: &astra_runtime::turn::context_assembly_trace::ContextAssemblyTrace) {
+fn print_context_breakdown(
+    trace: &astra_runtime::turn::context_assembly_trace::ContextAssemblyTrace,
+) {
     eprintln!(
         "\n{}",
-        format!("─── Context Breakdown — {} ──────────────────", trace.turn_id)
-            .bold()
-            .cyan()
+        format!(
+            "─── Context Breakdown — {} ──────────────────",
+            trace.turn_id
+        )
+        .bold()
+        .cyan()
     );
 
     let tb = &trace.token_budget;
@@ -2013,7 +2015,11 @@ fn print_context_breakdown(trace: &astra_runtime::turn::context_assembly_trace::
         tb.total_used.to_string().cyan().bold(),
         tb.max_tokens.to_string().dim(),
         pressure_colored,
-        if tb.compression_triggered { " compressed" } else { "" }
+        if tb.compression_triggered {
+            " compressed"
+        } else {
+            ""
+        }
     );
 
     // Skills injected

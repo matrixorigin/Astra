@@ -1212,7 +1212,10 @@ mod tests {
         let guard = session.read().unwrap();
         assert_eq!(guard.context_traces.len(), 1);
         assert_eq!(guard.context_traces[0].turn_id, "turn-0");
-        assert_eq!(guard.context_traces[0].token_budget.system_prompt_tokens, 14_000);
+        assert_eq!(
+            guard.context_traces[0].token_budget.system_prompt_tokens,
+            14_000
+        );
         assert_eq!(guard.context_traces[0].token_budget.total_used, 22_200);
     }
 

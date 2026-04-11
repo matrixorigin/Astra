@@ -1634,7 +1634,6 @@ fn report_turn_failure(
             }));
         }
 
-
         let _ = journal.append(&err_event);
         enqueue_ingestion(state, &err_event);
         state.last_turn_event = Some(err_event);

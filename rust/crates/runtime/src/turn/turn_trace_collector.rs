@@ -362,9 +362,24 @@ mod tests {
         use crate::observability_integration::{ObservabilityHub, on_context_assembled};
 
         let collector = TurnTraceCollector::new("turn-0", "sess-1");
-        collector.record_token_budget_estimate(14_000, 5_000, 500, 3_000, 200, 22_700, 128_000, 0.18);
-        collector.record_tool_selection(&["bash".into(), "view".into()], "tfidf", 0.85, 3000, 0, 0, 40, 12);
-        collector.record_memory_retrieval("rust error handling", 5, &[("use thiserror".into(), 0.9)], 25);
+        collector
+            .record_token_budget_estimate(14_000, 5_000, 500, 3_000, 200, 22_700, 128_000, 0.18);
+        collector.record_tool_selection(
+            &["bash".into(), "view".into()],
+            "tfidf",
+            0.85,
+            3000,
+            0,
+            0,
+            40,
+            12,
+        );
+        collector.record_memory_retrieval(
+            "rust error handling",
+            5,
+            &[("use thiserror".into(), 0.9)],
+            25,
+        );
 
         let trace = collector.finalize();
         assert_eq!(trace.token_budget.system_prompt_tokens, 14_000);

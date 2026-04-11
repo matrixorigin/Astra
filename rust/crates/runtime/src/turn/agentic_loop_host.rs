@@ -3863,7 +3863,8 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                     if let Some(ref session) = state.telemetry.observability_session {
                         let mut guard = session.write().unwrap_or_else(|e| e.into_inner());
                         crate::observability_integration::on_context_assembled(
-                            &mut guard, trace.clone(),
+                            &mut guard,
+                            trace.clone(),
                         );
                     }
 
