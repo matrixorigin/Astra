@@ -54,6 +54,8 @@ use serde::{Deserialize, Serialize};
 
 #[path = "cli/agent_loader.rs"]
 mod agent_loader;
+#[path = "cli/agent_runtime.rs"]
+mod agent_runtime;
 #[path = "cli/auth_flow.rs"]
 mod auth_flow;
 #[path = "cli/chat_stream/mod.rs"]
@@ -78,10 +80,14 @@ mod delegate_subrun;
 mod diff_presenter;
 #[path = "cli/durable_bridge.rs"]
 mod durable_bridge;
+#[path = "cli/dynamic_completions.rs"]
+mod dynamic_completions;
 #[path = "cli/edge_lifecycle.rs"]
 mod edge_lifecycle;
 #[path = "cli/effects/mod.rs"]
 mod effects;
+#[path = "cli/idle_agent_messages.rs"]
+mod idle_agent_messages;
 #[path = "cli/journal_digest.rs"]
 mod journal_digest;
 #[path = "cli/mock_llm.rs"]
@@ -110,6 +116,8 @@ mod repl_turn;
 mod repl_ui;
 #[path = "cli/session_cleanup.rs"]
 mod session_cleanup;
+#[path = "cli/session_guard.rs"]
+mod session_guard;
 #[path = "cli/skill_subrun.rs"]
 mod skill_subrun;
 #[path = "cli/slash_account.rs"]
@@ -177,6 +185,7 @@ mod terminal_region;
 #[path = "cli/theme.rs"]
 mod theme;
 
+use agent_runtime::initialize_multi_agent_runtime;
 use astra_runtime::turn::chat_turn_heuristics::{
     is_session_not_found_error, looks_like_live_query_with_context,
 };
@@ -188,7 +197,11 @@ use cli_utils::{
     resumable_last_session_id, save_credentials, truncate_str, urlencoding,
 };
 use command_router::{ExitCode, execute_cli_command, run_print_mode};
+use dynamic_completions::refresh_dynamic_completions;
+#[cfg(test)]
+use dynamic_completions::truncate_skill_desc_for_completion;
 use edge_lifecycle::register_and_start_heartbeat;
+use idle_agent_messages::flush_idle_agent_messages_between_prompts;
 use permission_manager::PermissionManager;
 #[cfg(test)]
 use stream_render::{StreamRenderState, TurnResult, dispatch_turn_event_block};
@@ -204,6 +217,9 @@ use repl_ui::{
     ReplHelper, SlashStartCompleteHandler, clear_slash_overlay, history_path,
     is_slash_picker_active, print_keyboard_shortcuts, print_slash_commands, resolve_slash_command,
     suggest_commands,
+};
+use session_guard::{
+    install_session_panic_hook, install_sigterm_handler, set_sigterm_runtime, update_panic_guard,
 };
 use slash_account::handle_account_command;
 use slash_bug::handle_bug_command;
@@ -283,95 +299,6 @@ impl StartupTracer {
     }
 }
 
-// ── Panic-safe & signal-safe session guard ────────────────────────────────────
-// On panic or SIGTERM, writes a `session_end` event to the local journal
-// so the session file is properly closed even on unexpected crashes.
-
-/// Session context stored globally so the panic/signal hooks can write `session_end`.
-struct PanicSessionGuard {
-    session_id: String,
-    turn: u32,
-}
-
-static PANIC_SESSION_GUARD: std::sync::Mutex<Option<PanicSessionGuard>> =
-    std::sync::Mutex::new(None);
-
-/// Global reference to the MatrixCloudRuntime so the SIGTERM handler can flush
-/// ingestion before exit. Set once when the REPL creates the runtime.
-static SIGTERM_RUNTIME: OnceLock<std::sync::Arc<astra_runtime::MatrixCloudRuntime>> =
-    OnceLock::new();
-
-/// Best-effort write of `session_end` to journal from the global guard.
-/// Safe to call from panic hooks and signal handlers (no async, no cloud).
-fn emergency_session_end() {
-    if let Ok(guard) = PANIC_SESSION_GUARD.lock() {
-        if let Some(ref ctx) = *guard {
-            let end_event =
-                session_journal::JournalEvent::session_end(Some(ctx.session_id.as_str()), ctx.turn);
-            if let Ok(writer) = session_journal::JournalWriter::new(&ctx.session_id) {
-                let _ = writer.append(&end_event);
-            }
-        }
-    }
-}
-
-/// Install a panic hook that writes `session_end` to the local journal.
-/// Called once at startup before the REPL loop.
-fn install_session_panic_hook() {
-    let default_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        emergency_session_end();
-        default_hook(info);
-    }));
-}
-
-/// Install a SIGTERM handler that writes `session_end` and flushes ingestion before exit.
-/// Must be called inside a tokio runtime.
-fn install_sigterm_handler() {
-    // SIGTERM: graceful shutdown (e.g. `kill <pid>`)
-    tokio::spawn(async {
-        #[cfg(unix)]
-        {
-            use tokio::signal::unix::{SignalKind, signal};
-            if let Ok(mut sigterm) = signal(SignalKind::terminate()) {
-                sigterm.recv().await;
-                emergency_session_end();
-                if let Some(mc) = SIGTERM_RUNTIME.get() {
-                    mc.shutdown_ingestion_and_wait().await;
-                }
-                std::process::exit(0);
-            }
-        }
-    });
-    // SIGHUP: terminal closed — write session_end before process dies.
-    #[cfg(unix)]
-    tokio::spawn(async {
-        use tokio::signal::unix::{SignalKind, signal};
-        if let Ok(mut sighup) = signal(SignalKind::hangup()) {
-            sighup.recv().await;
-            emergency_session_end();
-            std::process::exit(0);
-        }
-    });
-}
-
-/// Update the global panic guard with current session state.
-fn update_panic_guard(session_id: &str, turn: u32) {
-    if let Ok(mut guard) = PANIC_SESSION_GUARD.lock() {
-        *guard = Some(PanicSessionGuard {
-            session_id: session_id.to_string(),
-            turn,
-        });
-    }
-}
-
-/// Clear the panic guard (e.g., on graceful exit after session_end is already written).
-fn clear_panic_guard() {
-    if let Ok(mut guard) = PANIC_SESSION_GUARD.lock() {
-        *guard = None;
-    }
-}
-
 // CLI argument structs moved to cli/cli_args.rs
 use cli_args::*;
 
@@ -379,6 +306,8 @@ use cli_args::*;
 pub(crate) use streaming_types::{PartialTurnData, StreamResult, TurnFailure, VerdictEvent};
 
 // REPL state moved to cli/repl_state.rs
+#[cfg(test)]
+use idle_agent_messages::drain_root_mailbox_into_idle_queue;
 use plan_monitor::{
     finalize_plan_run_task_after_executor, flush_plan_updates_between_prompts,
     run_blocking_plan_monitor, sync_plan_run_task_progress,
@@ -389,230 +318,6 @@ use plan_runtime::start_and_monitor_plan;
 pub(crate) use repl_state::{ExplainMode, ReplState, SkillDevState};
 
 // ═══════════════════════════════════════════════ Output Styles ═════════════
-
-async fn build_turn_skill_resolver(
-    unified_skill_registry: std::sync::Arc<astra_runtime::skills::UnifiedSkillRegistry>,
-) -> Option<std::sync::Arc<dyn astra_runtime::turn::skill_tool::SkillResolver>> {
-    if unified_skill_registry.is_empty() {
-        let _ = unified_skill_registry.discover_all().await;
-    }
-
-    let inner_resolver = std::sync::Arc::new(astra_runtime::skills::UnifiedSkillResolver::new(
-        unified_skill_registry,
-    ));
-    let adapter = astra_runtime::skills::registry::LegacySkillResolverAdapter::new(inner_resolver);
-    let skills = astra_runtime::turn::skill_tool::SkillResolver::available_skills(&adapter);
-    if skills.is_empty() {
-        None
-    } else {
-        Some(std::sync::Arc::new(adapter)
-            as std::sync::Arc<
-                dyn astra_runtime::turn::skill_tool::SkillResolver,
-            >)
-    }
-}
-
-async fn initialize_multi_agent_runtime(
-    state: &mut ReplState,
-    api: &astra_thin_client::ThinClient,
-    token: String,
-) {
-    let project_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let skill_resolver = build_turn_skill_resolver(state.unified_skill_registry.clone()).await;
-
-    let mut registry = astra_services::AgentProfileRegistry::new();
-    delegate_subrun::register_default_agents(&mut registry);
-    let custom_count = agent_loader::load_and_merge(&project_root, &mut registry);
-    if custom_count > 0 {
-        eprintln!("  loaded {custom_count} custom agent(s) from .astra/agents/");
-    }
-    let registry = std::sync::Arc::new(tokio::sync::RwLock::new(registry));
-
-    let run_store = std::sync::Arc::new(astra_services::runs::InMemoryRunStateStore::default());
-    let tracker =
-        std::sync::Arc::new(astra_runtime::server::delegation_engine::DelegationTracker::new());
-    let transport = std::sync::Arc::new(astra_runtime::messaging::InProcessTransport::new());
-    let mailbox_router = std::sync::Arc::new(astra_runtime::messaging::AgentMailboxRouter::new(
-        transport,
-        tracker.clone(),
-    ));
-
-    // Create shared progress broadcaster — used by both delegation sub-runs and spawned agents
-    // so all events are visible in /agent watch and /agent logs.
-    let progress_broadcaster =
-        std::sync::Arc::new(astra_runtime::orchestration::ProgressBroadcaster::default());
-
-    let delegate_executor = delegate_subrun::CliDelegateSubRunExecutor::new(
-        api.clone(),
-        token.clone(),
-        state.model.clone(),
-        project_root.clone(),
-        state.perm_manager.mode(),
-        None,
-    )
-    .with_skill_resolver(skill_resolver.clone())
-    .with_skill_search(state.skill_search.clone())
-    .with_progress_broadcaster(progress_broadcaster.clone());
-
-    let engine = astra_runtime::server::delegation_engine::DelegationEngine::with_executor(
-        registry,
-        std::sync::Arc::new(astra_runtime::server::run_engine::RunEngine::new(run_store)),
-        tracker,
-        std::sync::Arc::new(delegate_executor),
-    )
-    .with_mailbox_router(mailbox_router.clone());
-    state.delegation_engine = Some(std::sync::Arc::new(engine));
-
-    let spawn_executor = spawn_subrun::CliSpawnAgentExecutor::new(
-        api.clone(),
-        token,
-        project_root,
-        state.perm_manager.mode(),
-        None,
-    )
-    .with_skill_resolver(skill_resolver)
-    .with_skill_search(state.skill_search.clone());
-
-    state.agent_spawner = Some(std::sync::Arc::new(
-        astra_runtime::orchestration::DynamicAgentSpawner::with_broadcaster(
-            mailbox_router,
-            progress_broadcaster,
-        )
-        .with_executor(std::sync::Arc::new(spawn_executor)),
-    ));
-}
-
-/// Truncate skill description for readline completion (≤39 chars + `…` when longer).
-///
-/// Do not slice by byte index: descriptions may contain multi-byte Unicode (em dash, CJK, …).
-fn truncate_skill_desc_for_completion(description: &str) -> String {
-    const MAX_CHARS: usize = 39;
-    let mut iter = description.chars();
-    let preview: String = iter.by_ref().take(MAX_CHARS).collect();
-    if iter.next().is_some() {
-        format!("{preview}…")
-    } else {
-        description.to_string()
-    }
-}
-
-/// Refresh dynamic Tab-completion data (skill names, MCP server names) from
-/// the current REPL state so the readline completer offers them.
-async fn refresh_dynamic_completions(state: &ReplState) {
-    // Skill names from UnifiedSkillRegistry
-    let skill_entries: Vec<(String, String)> = {
-        let manifests = state.unified_skill_registry.all_manifests();
-        manifests
-            .into_iter()
-            .map(|m| {
-                let desc = truncate_skill_desc_for_completion(m.description.as_str());
-                (m.name, desc)
-            })
-            .collect()
-    };
-    repl_ui::update_skill_completions(skill_entries);
-
-    // MCP server names
-    let mcp_entries: Vec<(String, String)> = {
-        let mgr = state.mcp_manager.read().await;
-        mgr.server_states()
-            .into_iter()
-            .map(|(name, st)| (name.to_string(), format!("{:?}", st)))
-            .collect()
-    };
-    repl_ui::update_mcp_completions(mcp_entries);
-}
-
-fn drain_root_mailbox_into_idle_queue(state: &mut ReplState) {
-    let Some(mailbox) = state.root_mailbox.as_mut() else {
-        return;
-    };
-    while let Some(message) = mailbox.try_recv() {
-        state.pending_idle_agent_messages.push(message);
-    }
-}
-
-fn format_idle_agent_message_payload(payload: &astra_runtime::messaging::MessagePayload) -> String {
-    use astra_runtime::messaging::{AgentSignal, MessagePayload, RequestType};
-
-    match payload {
-        MessagePayload::Text { content, summary } => {
-            summary.clone().unwrap_or_else(|| content.clone())
-        }
-        MessagePayload::Progress {
-            turn_index,
-            tool_calls,
-            status,
-            detail,
-        } => {
-            let detail = detail
-                .as_ref()
-                .map(|text| format!(" — {text}"))
-                .unwrap_or_default();
-            format!("progress turn {turn_index}, {tool_calls} tool calls: {status}{detail}")
-        }
-        MessagePayload::Request { request_type, data } => {
-            let request = match request_type {
-                RequestType::Shutdown => "shutdown".to_string(),
-                RequestType::ToolPermission => "tool_permission".to_string(),
-                RequestType::ContextShare => "context_share".to_string(),
-                RequestType::Custom(name) => format!("custom:{name}"),
-            };
-            if data.is_null() {
-                format!("request {request}")
-            } else {
-                format!("request {request}: {data}")
-            }
-        }
-        MessagePayload::Response {
-            request_id,
-            accepted,
-            data,
-        } => {
-            let data = data
-                .as_ref()
-                .map(|value| format!(": {value}"))
-                .unwrap_or_default();
-            format!(
-                "response to {request_id}: {}{data}",
-                if *accepted { "accepted" } else { "rejected" }
-            )
-        }
-        MessagePayload::Signal(signal) => match signal {
-            AgentSignal::Heartbeat => "heartbeat".to_string(),
-            AgentSignal::Idle => "idle".to_string(),
-            AgentSignal::Stalled { reason } => format!("stalled: {reason}"),
-            AgentSignal::Completed { output } => format!("completed: {output}"),
-            AgentSignal::Failed { error } => format!("failed: {error}"),
-        },
-        MessagePayload::Ack { message_id } => format!("acknowledged {message_id}"),
-        MessagePayload::Nack { message_id, reason } => {
-            let reason = reason
-                .as_ref()
-                .map(|text| format!(": {text}"))
-                .unwrap_or_default();
-            format!("rejected {message_id}{reason}")
-        }
-    }
-}
-
-fn flush_idle_agent_messages_between_prompts(state: &mut ReplState) {
-    drain_root_mailbox_into_idle_queue(state);
-    if state.pending_idle_agent_messages.is_empty() {
-        return;
-    }
-
-    let pending = std::mem::take(&mut state.pending_idle_agent_messages);
-    for message in pending {
-        let payload = format_idle_agent_message_payload(&message.payload);
-        eprintln!(
-            "\n  {} {} {}",
-            "mail".cyan(),
-            format!("{} -> main", message.from.agent_id).bold(),
-            payload
-        );
-    }
-}
 
 // ═══════════════════════════════════════════════════ Learning Merge ═══════
 // Cloud sync moved to cli/cloud_sync.rs
@@ -884,7 +589,7 @@ async fn run_chat_repl(
         };
         // Register runtime in global so SIGTERM handler can flush ingestion.
         if let Some(ref mc) = state.matrix_runtime {
-            let _ = SIGTERM_RUNTIME.set(mc.clone());
+            set_sigterm_runtime(mc.clone());
         }
 
         // Upgrade team persistence to MatrixOne-backed when pool is available

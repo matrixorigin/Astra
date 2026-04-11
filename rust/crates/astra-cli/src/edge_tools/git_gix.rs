@@ -26,10 +26,12 @@ fn reject_path_traversal(file: &str) -> Result<(), String> {
 
 /// Reject git ref strings containing shell metacharacters.
 fn reject_shell_meta(ref_str: &str) -> Result<(), String> {
-    if ref_str
-        .chars()
-        .any(|c| matches!(c, ';' | '|' | '&' | '$' | '`' | '(' | ')' | '{' | '}' | '<' | '>' | '!' | '\n'))
-    {
+    if ref_str.chars().any(|c| {
+        matches!(
+            c,
+            ';' | '|' | '&' | '$' | '`' | '(' | ')' | '{' | '}' | '<' | '>' | '!' | '\n'
+        )
+    }) {
         Err(format!(
             "Error: git ref contains disallowed characters: {ref_str}"
         ))
@@ -2322,12 +2324,7 @@ mod tests {
     #[test]
     fn git_diff_base_ref_rejects_shell_injection() {
         let root = repo_root();
-        let result = git_diff(
-            &root,
-            &json!({"base_ref": "HEAD; rm -rf /"}),
-            0.0,
-            0,
-        );
+        let result = git_diff(&root, &json!({"base_ref": "HEAD; rm -rf /"}), 0.0, 0);
         assert!(
             result.contains("disallowed"),
             "shell meta in base_ref should be rejected: {result}"

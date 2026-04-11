@@ -78,7 +78,10 @@ pub fn semantic_call_key(tool_name: &str, args: &Value) -> Option<String> {
             let git_ref = arg_str(args, "ref").unwrap_or("HEAD");
             let base_ref = arg_str(args, "base_ref").unwrap_or("");
             let staged = args.get("staged").and_then(Value::as_bool).unwrap_or(false);
-            Some(format!("git_diff:{}..{}:staged={}", base_ref, git_ref, staged))
+            Some(format!(
+                "git_diff:{}..{}:staged={}",
+                base_ref, git_ref, staged
+            ))
         }
         "git_log" => {
             let n = args.get("n").and_then(Value::as_u64).unwrap_or(10);
@@ -940,7 +943,10 @@ mod tests {
     fn git_diff_key_includes_base_ref() {
         let k1 = semantic_call_key("git_diff", &json!({"base_ref": "HEAD~5", "ref": "HEAD"}));
         let k2 = semantic_call_key("git_diff", &json!({"ref": "HEAD"}));
-        assert_ne!(k1, k2, "range diff should have different key from single-ref diff");
+        assert_ne!(
+            k1, k2,
+            "range diff should have different key from single-ref diff"
+        );
     }
 
     #[test]

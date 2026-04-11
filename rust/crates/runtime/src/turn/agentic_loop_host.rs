@@ -3477,10 +3477,7 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                             )
                             .await
                         {
-                            astra_core::agent_warn!(
-                                "mailbox",
-                                "Failed to send turn progress: {e}"
-                            );
+                            astra_core::agent_warn!("mailbox", "Failed to send turn progress: {e}");
                         }
                     }
                 }

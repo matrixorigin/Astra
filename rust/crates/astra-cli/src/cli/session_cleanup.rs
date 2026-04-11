@@ -13,9 +13,9 @@ use crossterm::style::Stylize;
 use std::path::Path;
 
 use super::ReplState;
-use super::clear_panic_guard;
 use super::edge_tools;
 use super::repl_turn::enqueue_ingestion_pub;
+use super::session_guard::clear_panic_guard;
 use super::theme;
 
 /// Finalize a REPL session: journal end event, persist state, extract learnings.

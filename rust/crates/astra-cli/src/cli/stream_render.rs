@@ -1509,7 +1509,9 @@ impl StreamRenderState {
                     let tip = git_ref.unwrap_or("HEAD");
                     let range = format!("{base}..{tip}");
                     match path {
-                        Some(p) => format!("Git diff {} -- {}", range, shorten_path(p, path_budget(20))),
+                        Some(p) => {
+                            format!("Git diff {} -- {}", range, shorten_path(p, path_budget(20)))
+                        }
                         None => format!("Git diff {range}"),
                     }
                 } else {
