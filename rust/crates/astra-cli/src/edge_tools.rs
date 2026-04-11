@@ -741,34 +741,106 @@ impl ToolExecutor {
                     .get("dimension")
                     .and_then(|v| v.as_str())
                     .unwrap_or("all");
-                let info = match dimension {
-                    "capability" => serde_json::json!({
-                        "tools": self.tool_names(),
-                        "tool_count": self.tool_count(),
-                        "model": "see /model",
-                        "note": "For full capability info including model/token budget, ask the server via /session"
-                    }),
-                    "state" => serde_json::json!({
-                        "note": "Runtime state is managed by the edge CLI. Use /session for current session info."
-                    }),
-                    "context_snapshot" | "context_trend" => serde_json::json!({
-                        "note": "Context window data is available from the server. Check the explain output (/explain) for token breakdown."
-                    }),
+
+                // Build a SelfModel from available observability data.
+                let self_model = self.build_self_model_snapshot();
+
+                match dimension {
+                    "capability" => {
+                        if let Some(ref model) = self_model {
+                            serde_json::json!({
+                                "tools": model.capabilities.tool_names,
+                                "tool_count": model.capabilities.total_tools,
+                                "deprioritized_tools": model.capabilities.deprioritized_tools,
+                                "skills": model.capabilities.skills,
+                                "pinned_tools": model.capabilities.pinned_tools,
+                                "tool_health": model.capabilities.tool_health.iter().map(|t| {
+                                    serde_json::json!({
+                                        "name": t.name,
+                                        "total_calls": t.total_calls,
+                                        "success_rate": t.success_rate,
+                                        "deprioritized": t.deprioritized,
+                                    })
+                                }).collect::<Vec<_>>(),
+                            })
+                            .to_string()
+                        } else {
+                            serde_json::json!({
+                                "tools": self.tool_names(),
+                                "tool_count": self.tool_count(),
+                            })
+                            .to_string()
+                        }
+                    }
+                    "state" => {
+                        if let Some(ref model) = self_model {
+                            serde_json::json!({
+                                "turn": model.state.turn_number,
+                                "token_budget": model.state.token_budget,
+                                "scenario": model.state.scenario,
+                                "active_experiment": model.state.active_experiment,
+                                "session_elapsed_secs": model.state.session_elapsed_secs,
+                                "correction_count": model.state.correction_count,
+                                "compression_count": model.state.compression_count,
+                                "recent_signals": model.recent_signals,
+                            })
+                            .to_string()
+                        } else {
+                            serde_json::json!({
+                                "note": "No observability session available."
+                            })
+                            .to_string()
+                        }
+                    }
+                    "goals" => {
+                        if let Some(ref model) = self_model {
+                            serde_json::json!({
+                                "session_goal": model.goals.session_goal,
+                                "progress": model.goals.progress,
+                                "recent_milestones": model.goals.recent_milestones,
+                                "milestone_count": model.goals.milestone_count,
+                            })
+                            .to_string()
+                        } else {
+                            serde_json::json!({
+                                "note": "No goal tracker available."
+                            })
+                            .to_string()
+                        }
+                    }
+                    "context_snapshot" | "context_trend" => {
+                        if let Some(ref model) = self_model {
+                            serde_json::json!({
+                                "token_budget": model.state.token_budget,
+                                "compression_count": model.state.compression_count,
+                            })
+                            .to_string()
+                        } else {
+                            serde_json::json!({
+                                "note": "Context window data not available. Use /explain for token breakdown."
+                            }).to_string()
+                        }
+                    }
                     "identity" => serde_json::json!({
                         "name": "astra",
                         "version": env!("CARGO_PKG_VERSION"),
                         "runtime": "Rust edge CLI",
-                        "note": "Cloud-side identity (model, system prompt) is server-managed."
-                    }),
-                    _ => serde_json::json!({
-                        "tools_available": self.tool_names(),
-                        "tool_count": self.tool_count(),
-                        "runtime": "astra Rust CLI",
-                        "version": env!("CARGO_PKG_VERSION"),
-                        "note": "For full agent info including memory, context, model details, the server provides richer data."
-                    }),
-                };
-                info.to_string()
+                    })
+                    .to_string(),
+                    "all" | _ => {
+                        if let Some(ref model) = self_model {
+                            model.to_detailed_text()
+                        } else {
+                            serde_json::json!({
+                                "tools_available": self.tool_names(),
+                                "tool_count": self.tool_count(),
+                                "runtime": "astra Rust CLI",
+                                "version": env!("CARGO_PKG_VERSION"),
+                            })
+                            .to_string()
+                        }
+                    }
+                }
             }
             "reflect" => {
                 let focus = args.get("focus").and_then(|v| v.as_str()).unwrap_or("auto");
@@ -1009,6 +1081,48 @@ impl ToolExecutor {
 
     fn tool_count(&self) -> usize {
         all_tool_schemas().len()
+    }
+
+    /// Build a SelfModel snapshot from available observability session data.
+    fn build_self_model_snapshot(&self) -> Option<astra_runtime::self_model::SelfModel> {
+        let obs_session = self.observability_session.as_ref()?;
+        let session = obs_session.read().ok()?;
+
+        let tool_name_strs = self.tool_names();
+        let tool_name_refs: Vec<&str> = tool_name_strs.iter().map(|s| s.as_str()).collect();
+
+        let elapsed = session.started_at.elapsed().as_secs();
+
+        // Latest token budget from context traces.
+        let latest_budget = session.context_traces.last().map(|ct| &ct.token_budget);
+
+        // Goal information.
+        let goal_text = session.goal_tracker.as_ref().map(|gt| gt.goal());
+        let goal_progress = session.goal_tracker.as_ref().map(|gt| gt.progress());
+        let milestones: Option<Vec<_>> = session
+            .goal_tracker
+            .as_ref()
+            .map(|gt| gt.milestones().to_vec());
+        let milestone_slice = milestones.as_deref();
+
+        Some(astra_runtime::self_model::SelfModel::snapshot(
+            &tool_name_refs,
+            &[],  // pinned_tools — not accessible from ToolExecutor
+            &[],  // skills — not accessible from ToolExecutor
+            None, // tool health — lives on TurnGuard, not here
+            session.turn_number,
+            latest_budget,
+            None, // scenario — requires ScenarioDetector state
+            session.active_experiment_id.as_deref(),
+            elapsed,
+            session.user_corrections.len(),
+            session.compressed_turns.len(),
+            goal_text,
+            goal_progress.as_ref(),
+            milestone_slice,
+            &[], // recent signals — accessible via ObservabilityHub, not session
+            &session.config,
+        ))
     }
 }
 

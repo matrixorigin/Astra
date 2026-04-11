@@ -820,8 +820,8 @@ pub fn all_tool_schemas() -> Vec<Value> {
                     "properties": {
                         "dimension": {
                             "type": "string",
-                            "enum": ["capability", "state", "memory", "identity", "context_snapshot", "context_trend", "all"],
-                            "description": "Which dimension to query. 'context_snapshot': token usage for current turn. 'context_trend': growth across recent turns. 'capability': what tools/skills are available. 'state': current session state. 'all': everything."
+                            "enum": ["capability", "state", "goals", "memory", "identity", "context_snapshot", "context_trend", "all"],
+                            "description": "Which dimension to query. 'capability': tools, skills, tool health. 'state': turn, tokens, scenario, signals. 'goals': session goal, progress, milestones. 'context_snapshot': token budget this turn. 'context_trend': growth across turns. 'identity': agent name/version. 'all': comprehensive self-model view."
                         }
                     },
                     "required": ["dimension"]
