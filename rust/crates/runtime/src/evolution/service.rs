@@ -374,11 +374,13 @@ mod tests {
         use crate::pipeline::pattern::PatternLibrary;
 
         let lib = Arc::new(std::sync::Mutex::new(PatternLibrary::default()));
-        // Record enough outcomes to trigger drift detection.
+        // Need historical rate >> recent rate to trigger drift.
+        // 20 successes pushes historical high, then 10 failures fills the
+        // recent window (size 10) with all failures → recent_rate ≈ 0.0,
+        // historical_rate ≈ 0.67, drift_score = (0.67-0.0)/0.25 = 2.68 → clamped to 1.0.
         {
             let mut l = lib.lock().unwrap();
-            // 6 successes then 4 failures → drift
-            for _ in 0..6 {
+            for _ in 0..20 {
                 l.record_outcome(
                     &["bash".to_string()],
                     TaskType::Code,
@@ -388,7 +390,7 @@ mod tests {
                     None,
                 );
             }
-            for _ in 0..4 {
+            for _ in 0..10 {
                 l.record_outcome(
                     &["bash".to_string()],
                     TaskType::Code,
@@ -402,20 +404,18 @@ mod tests {
 
         let svc = EvolutionService::new().with_pattern_library(lib);
         let (auto, _) = svc.flush().await;
-        // Drift signals should produce Demote proposals if critical threshold met.
-        // Even if the library's threshold doesn't flag it as critical, no panic.
-        for p in &auto {
-            assert!(
-                matches!(
-                    p.axis,
-                    EvolutionAxis::Pattern {
-                        action: PatternAction::Demote,
-                        ..
-                    }
-                ),
-                "drift proposals should be Demote"
-            );
-            assert_eq!(p.status, ApprovalStatus::AutoApplied);
-        }
+        // Critical drift should produce exactly one Demote proposal.
+        assert_eq!(auto.len(), 1, "expected one drift proposal");
+        assert!(
+            matches!(
+                auto[0].axis,
+                EvolutionAxis::Pattern {
+                    action: PatternAction::Demote,
+                    ..
+                }
+            ),
+            "drift proposal should be Demote"
+        );
+        assert_eq!(auto[0].status, ApprovalStatus::AutoApplied);
     }
 }
