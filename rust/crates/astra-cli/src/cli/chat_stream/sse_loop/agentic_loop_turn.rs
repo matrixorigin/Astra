@@ -428,8 +428,12 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
         // Estimate user message tokens
         let user_message_tokens = prompts::estimate_str_tokens(ctx.message) as u32;
 
-        // System prompt tokens (default estimate if not passed explicitly)
-        let system_prompt_tokens = 14_000u32; // Same as DEFAULT_SYSTEM_PROMPT in context.rs
+        // System prompt tokens (first message is always the system prompt)
+        let system_prompt_tokens = ctx
+            .messages
+            .first()
+            .map(|m| prompts::estimate_str_tokens(&m.to_string()) as u32)
+            .unwrap_or(0);
 
         // Memory tokens are tracked in memory retrieval trace, use 0 here
         // (would need to be passed from memory boost search results)
