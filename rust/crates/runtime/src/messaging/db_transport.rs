@@ -525,7 +525,7 @@ async fn poll_loop(
             Ok(result) if result.rows_affected() > 0 => {
                 // Fetch the messages we just claimed.
                 let fetch_result = query(
-                    "SELECT id, payload_json FROM agent_message_queue
+                    "SELECT id, message_id, payload_json FROM agent_message_queue
                      WHERE to_run_id = ? AND to_agent_id = ? AND status = 'claimed' AND claimed_by = ?
                      ORDER BY id ASC",
                 )
@@ -537,9 +537,23 @@ async fn poll_loop(
 
                 if let Ok(rows) = fetch_result {
                     for row in rows {
-                        let row_id: i64 = match row.try_get("id") {
-                            Ok(id) => id,
-                            Err(_) => continue,
+                        let message_id: Option<String> = row.try_get("message_id").ok();
+                        let row_id = match row.try_get("id") {
+                            Ok(id) => Some(id),
+                            Err(e) => {
+                                had_error = true;
+                                metrics
+                                    .poll_errors
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                eprintln!(
+                                    "  ⚠ messaging: failed to extract direct row id for {}@{} (message_id: {}): {:?}",
+                                    addr.agent_id,
+                                    addr.run_id,
+                                    message_id.as_deref().unwrap_or("<unavailable>"),
+                                    e
+                                );
+                                None
+                            }
                         };
                         let json: String = match row.try_get("payload_json") {
                             Ok(j) => j,
@@ -547,7 +561,14 @@ async fn poll_loop(
                                 metrics
                                     .messages_dropped
                                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                match mark_direct_failed(&pool, row_id).await {
+                                match mark_direct_failed_by_identity(
+                                    &pool,
+                                    row_id,
+                                    message_id.as_deref(),
+                                    &consumer_id,
+                                )
+                                .await
+                                {
                                     Ok(()) => {}
                                     Err(e) => {
                                         had_error = true;
@@ -555,8 +576,12 @@ async fn poll_loop(
                                             .poll_errors
                                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                         eprintln!(
-                                            "  ⚠ messaging: failed to dead-letter undecodable direct row {} for {}@{}: {:?}",
-                                            row_id, addr.agent_id, addr.run_id, e
+                                            "  ⚠ messaging: failed to dead-letter undecodable direct row (row_id: {:?}, message_id: {}) for {}@{}: {:?}",
+                                            row_id,
+                                            message_id.as_deref().unwrap_or("<unavailable>"),
+                                            addr.agent_id,
+                                            addr.run_id,
+                                            e
                                         );
                                     }
                                 }
@@ -577,7 +602,14 @@ async fn poll_loop(
                                 metrics
                                     .messages_dropped
                                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                match mark_direct_failed(&pool, row_id).await {
+                                match mark_direct_failed_by_identity(
+                                    &pool,
+                                    row_id,
+                                    message_id.as_deref(),
+                                    &consumer_id,
+                                )
+                                .await
+                                {
                                     Ok(()) => {}
                                     Err(e) => {
                                         had_error = true;
@@ -585,8 +617,12 @@ async fn poll_loop(
                                             .poll_errors
                                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                         eprintln!(
-                                            "  ⚠ messaging: failed to dead-letter direct row {} for {}@{}: {:?}",
-                                            row_id, addr.agent_id, addr.run_id, e
+                                            "  ⚠ messaging: failed to dead-letter direct row (row_id: {:?}, message_id: {}) for {}@{}: {:?}",
+                                            row_id,
+                                            message_id.as_deref().unwrap_or("<unavailable>"),
+                                            addr.agent_id,
+                                            addr.run_id,
+                                            e
                                         );
                                     }
                                 }
@@ -625,7 +661,7 @@ async fn poll_loop(
         //    Broadcasts use cursor-based reading (all agents see every broadcast).
         if let Some(ref did) = delegation_id {
             let broadcast_result = query(
-                "SELECT id, payload_json FROM agent_message_queue
+                "SELECT id, message_id, payload_json FROM agent_message_queue
                  WHERE delegation_id = ? AND is_broadcast = TRUE AND id > ? AND status IN ('pending', 'claimed')
                  ORDER BY id ASC LIMIT ?",
             )
@@ -637,10 +673,52 @@ async fn poll_loop(
 
             if let Ok(rows) = broadcast_result {
                 for row in rows {
-                    let row_id: i64 = match row.try_get("id") {
-                        Ok(id) => id,
-                        Err(_) => continue,
+                    let message_id: Option<String> = row.try_get("message_id").ok();
+                    let row_id = match row.try_get("id") {
+                        Ok(id) => Some(id),
+                        Err(e) => {
+                            had_error = true;
+                            metrics
+                                .poll_errors
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            eprintln!(
+                                "  ⚠ messaging: failed to extract broadcast row id for delegation {} (message_id: {}): {:?}",
+                                did,
+                                message_id.as_deref().unwrap_or("<unavailable>"),
+                                e
+                            );
+                            None
+                        }
                     };
+                    if row_id.is_none() {
+                        metrics
+                            .messages_dropped
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        match mark_broadcast_failed_by_identity(
+                            &pool,
+                            None,
+                            message_id.as_deref(),
+                            did,
+                        )
+                        .await
+                        {
+                            Ok(()) => continue,
+                            Err(e) => {
+                                had_error = true;
+                                metrics
+                                    .poll_errors
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                eprintln!(
+                                    "  ⚠ messaging: failed to dead-letter broadcast row without id (message_id: {}) for delegation {}: {:?}",
+                                    message_id.as_deref().unwrap_or("<unavailable>"),
+                                    did,
+                                    e
+                                );
+                                break;
+                            }
+                        }
+                    }
+                    let row_id = row_id.expect("checked above");
                     let json: String = match row.try_get("payload_json") {
                         Ok(j) => j,
                         Err(_) => {
@@ -751,6 +829,40 @@ async fn mark_broadcast_failed(pool: &Pool<MySql>, row_id: i64) -> Result<(), sq
     Ok(())
 }
 
+async fn mark_broadcast_failed_by_message_id(
+    pool: &Pool<MySql>,
+    message_id: &str,
+    delegation_id: &str,
+) -> Result<(), sqlx::Error> {
+    query(
+        "UPDATE agent_message_queue
+         SET status = 'failed', claimed_by = NULL, claimed_at_ms = NULL
+         WHERE message_id = ? AND delegation_id = ? AND is_broadcast = TRUE AND status IN ('pending', 'claimed')",
+    )
+    .bind(message_id)
+    .bind(delegation_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+async fn mark_broadcast_failed_by_identity(
+    pool: &Pool<MySql>,
+    row_id: Option<i64>,
+    message_id: Option<&str>,
+    delegation_id: &str,
+) -> Result<(), sqlx::Error> {
+    match (row_id, message_id) {
+        (Some(row_id), _) => mark_broadcast_failed(pool, row_id).await,
+        (None, Some(message_id)) => {
+            mark_broadcast_failed_by_message_id(pool, message_id, delegation_id).await
+        }
+        (None, None) => Err(sqlx::Error::Protocol(
+            "missing row_id and message_id for broadcast failure path".into(),
+        )),
+    }
+}
+
 async fn mark_direct_failed(pool: &Pool<MySql>, row_id: i64) -> Result<(), sqlx::Error> {
     query(
         "UPDATE agent_message_queue
@@ -761,6 +873,40 @@ async fn mark_direct_failed(pool: &Pool<MySql>, row_id: i64) -> Result<(), sqlx:
     .execute(pool)
     .await?;
     Ok(())
+}
+
+async fn mark_direct_failed_by_message_id(
+    pool: &Pool<MySql>,
+    message_id: &str,
+    consumer_id: &str,
+) -> Result<(), sqlx::Error> {
+    query(
+        "UPDATE agent_message_queue
+         SET status = 'failed', claimed_by = NULL, claimed_at_ms = NULL
+         WHERE message_id = ? AND is_broadcast = FALSE AND status = 'claimed' AND claimed_by = ?",
+    )
+    .bind(message_id)
+    .bind(consumer_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+async fn mark_direct_failed_by_identity(
+    pool: &Pool<MySql>,
+    row_id: Option<i64>,
+    message_id: Option<&str>,
+    consumer_id: &str,
+) -> Result<(), sqlx::Error> {
+    match (row_id, message_id) {
+        (Some(row_id), _) => mark_direct_failed(pool, row_id).await,
+        (None, Some(message_id)) => {
+            mark_direct_failed_by_message_id(pool, message_id, consumer_id).await
+        }
+        (None, None) => Err(sqlx::Error::Protocol(
+            "missing row_id and message_id for direct failure path".into(),
+        )),
+    }
 }
 
 // ─── DatabaseMessageStream ──────────────────────────────────────────────────
