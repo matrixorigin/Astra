@@ -148,9 +148,36 @@ impl TurnTraceCollector {
     }
 
     /// Record token budget allocation.
+    ///
+    /// Merges with any existing estimate: preserves non-zero component breakdowns
+    /// from `record_token_budget_estimate` while updating measured totals.
     pub fn record_token_budget(&self, budget: TokenBudgetTrace) {
         if let Ok(mut state) = self.inner.write() {
-            state.token_budget = Some(budget);
+            if let Some(ref mut existing) = state.token_budget {
+                // Preserve CLI-estimated component breakdown; overwrite measured fields.
+                existing.total_used = budget.total_used;
+                existing.max_tokens = budget.max_tokens;
+                existing.budget_pressure = budget.budget_pressure;
+                existing.compression_triggered = budget.compression_triggered;
+                // Only overwrite component fields if the new budget has non-zero values.
+                if budget.system_prompt_tokens > 0 {
+                    existing.system_prompt_tokens = budget.system_prompt_tokens;
+                }
+                if budget.history_tokens > 0 {
+                    existing.history_tokens = budget.history_tokens;
+                }
+                if budget.memory_tokens > 0 {
+                    existing.memory_tokens = budget.memory_tokens;
+                }
+                if budget.tool_schema_tokens > 0 {
+                    existing.tool_schema_tokens = budget.tool_schema_tokens;
+                }
+                if budget.user_message_tokens > 0 {
+                    existing.user_message_tokens = budget.user_message_tokens;
+                }
+            } else {
+                state.token_budget = Some(budget);
+            }
         }
     }
 
@@ -362,22 +389,28 @@ mod tests {
     }
 
     #[test]
-    fn record_token_budget_estimate_does_not_overwrite_existing() {
+    fn record_token_budget_merges_preserving_estimates() {
         let collector = TurnTraceCollector::new("turn-0", "s1");
-        // First: estimate
+        // First: CLI records component estimates
         collector.record_token_budget_estimate(14_000, 5_000, 0, 3_000, 200, 22_200, 128_000, 0.17);
-        // Then: runtime sets actual measured total
+        // Then: runtime overwrites measured totals (with zero component fields)
         collector.record_token_budget(TokenBudgetTrace {
             max_tokens: 128_000,
-            total_used: 25_000, // actual measured
+            total_used: 25_000,
             budget_pressure: 0.20,
             compression_triggered: true,
             ..Default::default()
         });
 
         let trace = collector.finalize();
-        // Runtime's record_token_budget overwrites everything
+        // Measured fields overwritten by runtime
         assert_eq!(trace.token_budget.total_used, 25_000);
+        assert_eq!(trace.token_budget.budget_pressure, 0.20);
         assert!(trace.token_budget.compression_triggered);
+        // Component estimates preserved (runtime sent zeros)
+        assert_eq!(trace.token_budget.system_prompt_tokens, 14_000);
+        assert_eq!(trace.token_budget.history_tokens, 5_000);
+        assert_eq!(trace.token_budget.tool_schema_tokens, 3_000);
+        assert_eq!(trace.token_budget.user_message_tokens, 200);
     }
 }

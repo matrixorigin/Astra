@@ -3726,8 +3726,20 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                     // Persist to journal (best-effort).
                     if collector.has_data() {
                         let turn_number = (state.max_turns - state.remaining_turns) as u32;
-                        if let Err(e) = collector.finalize_and_persist(turn_number) {
-                            eprintln!("trace persist: {e}");
+                        if let Some(ref sid) = state.current_session_id {
+                            if let Ok(writer) =
+                                astra_services::session_journal::JournalWriter::new(sid)
+                            {
+                                let event =
+                                    astra_services::session_journal::JournalEvent::context_assembly_recorded(
+                                        Some(sid),
+                                        turn_number,
+                                        trace.to_json_value(),
+                                    );
+                                if let Err(e) = writer.append(&event) {
+                                    eprintln!("trace persist: {e}");
+                                }
+                            }
                         }
                     }
                 }
