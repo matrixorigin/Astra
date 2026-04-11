@@ -433,23 +433,21 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
             }
         };
 
-        // Estimate history tokens from messages (excluding system prompt)
+        // Estimate history tokens from messages (ctx.messages = history + user, no system prompt)
         let history_tokens: u32 = ctx
             .messages
             .iter()
-            .skip(1) // Skip system prompt
             .map(|m| prompts::estimate_str_tokens(&msg_content(m)) as u32)
             .sum();
 
         // Estimate user message tokens
         let user_message_tokens = prompts::estimate_str_tokens(ctx.message) as u32;
 
-        // System prompt tokens (first message is always the system prompt)
-        let system_prompt_tokens = ctx
-            .messages
-            .first()
-            .map(|m| prompts::estimate_str_tokens(&msg_content(m)) as u32)
-            .unwrap_or(0);
+        // System prompt tokens: the system prompt is assembled by the runtime
+        // (bridge_inprocess.rs), not present in ctx.messages. Use the calibrated
+        // default (~52KB prompt ≈ 14000 tokens). The runtime's record_token_budget
+        // will NOT overwrite this since it sends system_prompt_tokens=0.
+        let system_prompt_tokens = prompts::DEFAULT_SYSTEM_PROMPT_TOKENS as u32;
 
         // Memory tokens are tracked in memory retrieval trace, use 0 here
         // (would need to be passed from memory boost search results)
@@ -847,7 +845,7 @@ mod tests {
         assert_eq!(payload["agent_type"], json!("coder"));
     }
     #[test]
-    fn system_prompt_estimate_scales_with_content() {
+    fn msg_content_extracts_string_and_array_formats() {
         use astra_runtime::prompts::estimate_str_tokens;
         use serde_json::Value;
 
@@ -867,23 +865,22 @@ mod tests {
         };
 
         // String content (OpenAI format)
-        let str_msg = json!({"role": "system", "content": "You are a helpful assistant."});
-        let str_tokens = estimate_str_tokens(&msg_content(&str_msg)) as u32;
-        assert!(str_tokens > 0 && str_tokens < 100, "string: {str_tokens}");
+        let str_msg = json!({"role": "user", "content": "hello world"});
+        assert!(!msg_content(&str_msg).is_empty());
 
         // Array content (Anthropic format)
-        let arr_msg = json!({"role": "system", "content": [
-            {"type": "text", "text": "You are a helpful assistant."},
-            {"type": "text", "text": " Follow instructions carefully."}
+        let arr_msg = json!({"role": "user", "content": [
+            {"type": "text", "text": "hello "},
+            {"type": "text", "text": "world"}
         ]});
-        let arr_tokens = estimate_str_tokens(&msg_content(&arr_msg)) as u32;
-        assert!(arr_tokens > str_tokens, "array {arr_tokens} should > string {str_tokens}");
+        assert_eq!(msg_content(&arr_msg), "hello world");
 
-        // Long content should scale, never be the old hardcoded 14000
-        let long_msg = json!({"role": "system", "content": "x".repeat(40000)});
-        let long_tokens = estimate_str_tokens(&msg_content(&long_msg)) as u32;
-        assert!(long_tokens > 5000, "long: {long_tokens}");
-        assert_ne!(long_tokens, 14_000);
+        // Null/missing content
+        let null_msg = json!({"role": "assistant", "content": null});
+        assert!(msg_content(&null_msg).is_empty());
+
+        // System prompt uses calibrated constant (not extracted from messages)
+        assert_eq!(astra_runtime::prompts::DEFAULT_SYSTEM_PROMPT_TOKENS, 14_000);
     }
 }
 

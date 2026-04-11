@@ -55,6 +55,9 @@ pub fn estimate_tokens(messages: &[serde_json::Value]) -> usize {
 ///
 /// This produces more accurate compaction-tier decisions, especially under
 /// CJK-heavy conversations where the old estimate was 50% too low.
+/// Calibrated default: the full system prompt (~52 KB) is approximately 14 000 tokens.
+pub const DEFAULT_SYSTEM_PROMPT_TOKENS: usize = 14_000;
+
 pub fn estimate_tokens_precise(
     messages: &[serde_json::Value],
     schema_token_total: usize,
@@ -62,15 +65,11 @@ pub fn estimate_tokens_precise(
 ) -> usize {
     const PER_MESSAGE_OVERHEAD: usize = 4;
     const MODEL_FRAMING: usize = 300; // JSON wrappers, role tokens, separators
-    // Calibrated: the full system prompt (~52 KB) is approximately 14 000 tokens.
-    // The old 1 200 estimate caused premature compaction by underreporting
-    // context usage by ~12 800 tokens.
-    const DEFAULT_SYSTEM_PROMPT: usize = 14_000;
 
     let sys_tokens = if system_prompt_tokens > 0 {
         system_prompt_tokens
     } else {
-        DEFAULT_SYSTEM_PROMPT
+        DEFAULT_SYSTEM_PROMPT_TOKENS
     };
 
     let message_tokens: usize = messages
