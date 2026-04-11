@@ -604,6 +604,12 @@ async fn collect_llm_stream(
                         );
                     }
                     if let Some(args) = func.get("arguments").and_then(Value::as_str) {
+                        accumulated_bytes += args.len();
+                        if accumulated_bytes > MAX_STREAM_ACCUMULATION_BYTES {
+                            return Err(StreamCollectError::Transport(format!(
+                                "stream tool-call arguments exceeded {MAX_STREAM_ACCUMULATION_BYTES} byte limit"
+                            )));
+                        }
                         let existing = f
                             .entry("arguments".to_string())
                             .or_insert_with(|| Value::String(String::new()));

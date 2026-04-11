@@ -232,7 +232,8 @@ impl CloudLlmJudge {
 
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
         // Validate URL has a proper protocol to prevent SSRF / malformed requests.
-        if !url.starts_with("http://") && !url.starts_with("https://") {
+        let url_lower = url.trim().to_lowercase();
+        if !url_lower.starts_with("http://") && !url_lower.starts_with("https://") {
             return Err(format!(
                 "Invalid base_url: must start with http:// or https://, got: {url}"
             ));

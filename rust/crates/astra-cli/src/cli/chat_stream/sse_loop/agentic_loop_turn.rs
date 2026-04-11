@@ -459,8 +459,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
                     .and_then(|v| v.as_str())
                     .unwrap_or("unknown")
                     .to_string();
-                let has_tool_calls = m.get("tool_calls").is_some()
-                    || role == "tool";
+                let has_tool_calls = m.get("tool_calls").is_some() || role == "tool";
                 let tokens = prompts::estimate_str_tokens(&msg_content(m)) as u32;
                 astra_runtime::turn::context_assembly_trace::TurnRetention {
                     turn_index: i as u32,

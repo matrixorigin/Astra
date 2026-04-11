@@ -476,7 +476,10 @@ pub fn write_workspace(metadata: &WorkspaceMetadata) -> std::io::Result<()> {
         }
         file.sync_all()?;
     }
-    std::fs::rename(&tmp, &path)?;
+    if let Err(e) = std::fs::rename(&tmp, &path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
     Ok(())
 }
 

@@ -501,7 +501,16 @@ mod tests {
     #[test]
     fn patch_tool_tokens_updates_per_tool_costs() {
         let collector = TurnTraceCollector::new("turn-0", "s1");
-        collector.record_tool_selection(&["bash".into(), "grep".into()], "tfidf", 0.8, 0, 0, 0, 10, 5);
+        collector.record_tool_selection(
+            &["bash".into(), "grep".into()],
+            "tfidf",
+            0.8,
+            0,
+            0,
+            0,
+            10,
+            5,
+        );
         collector.patch_tool_tokens(&[("bash".into(), 350), ("grep".into(), 280)]);
         let trace = collector.finalize();
         assert_eq!(trace.tools.tools_selected[0].tool_name, "bash");
@@ -515,10 +524,16 @@ mod tests {
         let collector = TurnTraceCollector::new("turn-0", "s1");
         let turns = vec![
             super::super::context_assembly_trace::TurnRetention {
-                turn_index: 0, role: "user".into(), tokens: 50, has_tool_calls: false,
+                turn_index: 0,
+                role: "user".into(),
+                tokens: 50,
+                has_tool_calls: false,
             },
             super::super::context_assembly_trace::TurnRetention {
-                turn_index: 1, role: "assistant".into(), tokens: 800, has_tool_calls: true,
+                turn_index: 1,
+                role: "assistant".into(),
+                tokens: 800,
+                has_tool_calls: true,
             },
         ];
         collector.set_history_retained(&turns);

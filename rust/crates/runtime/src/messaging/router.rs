@@ -263,8 +263,8 @@ impl AgentMailboxRouter {
             let mut reg = self.address_registry.write().await;
             let mut idx = self.agent_id_index.write().await;
 
-            reg.insert(addr.run_id.clone(), addr.clone());
-
+            // Insert new address — but first clean up any stale entry for this agent_id
+            // to avoid a window where both old and new run_ids coexist.
             if let Some(existing) = idx.get(&addr.agent_id) {
                 if existing == &addr {
                     // Already registered with same address — no-op.
@@ -275,11 +275,10 @@ impl AgentMailboxRouter {
                     );
                     // Clean up stale entry from address_registry (both locks held).
                     reg.remove(&existing.run_id.clone());
-                    idx.insert(addr.agent_id.clone(), addr.clone());
                 }
-            } else {
-                idx.insert(addr.agent_id.clone(), addr.clone());
             }
+            reg.insert(addr.run_id.clone(), addr.clone());
+            idx.insert(addr.agent_id.clone(), addr.clone());
         }
 
         let stream = self.transport.subscribe(&addr).await?;
