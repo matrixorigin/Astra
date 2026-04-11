@@ -303,7 +303,9 @@ pub struct MessagingState {
     /// progress updates are sent to the parent at turn end.
     pub mailbox: Option<crate::messaging::router::AgentMailbox>,
     /// Tracks messages that require acknowledgment and handles retries.
-    pub ack_tracker: Option<crate::messaging::ack_tracker::PendingAckTracker>,
+    pub ack_tracker: Option<std::sync::Arc<crate::messaging::ack_tracker::PendingAckTracker>>,
+    /// Background retry/dead-letter sweep for ack-tracked messages.
+    pub ack_sweep_task: Option<crate::messaging::ack_tracker::AckSweepHandle>,
     /// Dead letter queue for permanently failed messages.
     pub dead_letter_queue: Option<std::sync::Arc<crate::messaging::dead_letter::DeadLetterQueue>>,
     /// Unified messaging metrics (optional, shared across agents in a delegation).
@@ -2461,7 +2463,32 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                         }
                         crate::messaging::types::MessagePayload::Nack { message_id, reason } => {
                             if let Some(ref tracker) = state.messaging.ack_tracker {
-                                tracker.reject(message_id, reason.clone()).await;
+                                if let Some(crate::messaging::ack_tracker::AckOutcome::Rejected {
+                                    message,
+                                    ..
+                                }) = tracker.reject(message_id, reason.clone()).await
+                                {
+                                    eprintln!(
+                                        "  ⚠ messaging: nack for message {}: {}",
+                                        message_id,
+                                        reason.as_deref().unwrap_or("no reason")
+                                    );
+                                    if let Some(ref dlq) = state.messaging.dead_letter_queue {
+                                        dlq.store(
+                                            Arc::clone(&message),
+                                            crate::messaging::dead_letter::DeadLetterReason::Rejected {
+                                                reason: reason.clone(),
+                                            },
+                                            1,
+                                        )
+                                        .await;
+                                    }
+                                    if let Some(ref metrics) = state.messaging.metrics {
+                                        metrics
+                                            .dead_letters
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    }
+                                }
                             }
                             if let Some(ref metrics) = state.messaging.metrics {
                                 metrics
@@ -2550,81 +2577,6 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                         "role": "system",
                         "content": mailbox_text,
                     }));
-                }
-            }
-        }
-
-        // Sweep ack tracker for timed-out messages (retry or fail).
-        if let Some(ref tracker) = state.messaging.ack_tracker {
-            let outcomes = tracker.sweep().await;
-            let retry_msgs = tracker.get_retry_messages(&outcomes).await;
-            // Re-send retry messages and track retries.
-            for retry_msg in &retry_msgs {
-                if let Some(ref mut mb) = state.messaging.mailbox {
-                    if let Err(e) = mb.send((**retry_msg).clone()).await {
-                        astra_core::agent_warn!("mailbox", "Failed to send retry message: {e}");
-                    }
-                }
-                if let Some(ref metrics) = state.messaging.metrics {
-                    metrics
-                        .retries
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
-            }
-            // Log failures and store in dead-letter queue.
-            for outcome in &outcomes {
-                if let crate::messaging::ack_tracker::AckOutcome::Failed {
-                    message_id,
-                    attempts,
-                    message,
-                } = outcome
-                {
-                    eprintln!(
-                        "  ⚠ messaging: ack timeout exhausted for message {} after {} attempts",
-                        message_id, attempts
-                    );
-                    if let Some(ref dlq) = state.messaging.dead_letter_queue {
-                        dlq.store(
-                            Arc::clone(message),
-                            crate::messaging::dead_letter::DeadLetterReason::AckTimeout {
-                                attempts: *attempts,
-                            },
-                            *attempts,
-                        )
-                        .await;
-                    }
-                    if let Some(ref metrics) = state.messaging.metrics {
-                        metrics
-                            .dead_letters
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    }
-                }
-                if let crate::messaging::ack_tracker::AckOutcome::Rejected {
-                    message_id,
-                    reason,
-                    message,
-                } = outcome
-                {
-                    eprintln!(
-                        "  ⚠ messaging: nack for message {}: {}",
-                        message_id,
-                        reason.as_deref().unwrap_or("no reason")
-                    );
-                    if let Some(ref dlq) = state.messaging.dead_letter_queue {
-                        dlq.store(
-                            Arc::clone(message),
-                            crate::messaging::dead_letter::DeadLetterReason::Rejected {
-                                reason: reason.clone(),
-                            },
-                            1,
-                        )
-                        .await;
-                    }
-                    if let Some(ref metrics) = state.messaging.metrics {
-                        metrics
-                            .dead_letters
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    }
                 }
             }
         }
@@ -3204,6 +3156,17 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                         // Track ack-requiring messages.
                         if let Some(tracked_msg) = send_result.tracked_message {
                             if let Some(ref tracker) = state.messaging.ack_tracker {
+                                if state.messaging.ack_sweep_task.is_none() {
+                                    if let Some(ref mailbox) = state.messaging.mailbox {
+                                        state.messaging.ack_sweep_task =
+                                            Some(crate::messaging::ack_tracker::start_sweep_task(
+                                                Arc::clone(tracker),
+                                                mailbox.router(),
+                                                state.messaging.dead_letter_queue.clone(),
+                                                state.messaging.metrics.clone(),
+                                            ));
+                                    }
+                                }
                                 tracker.track(tracked_msg).await;
                             }
                         }

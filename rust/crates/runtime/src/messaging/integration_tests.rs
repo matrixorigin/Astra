@@ -575,6 +575,72 @@ mod tests {
         assert_eq!(tracker.pending_count().await, 0);
     }
 
+    #[tokio::test]
+    async fn ack_sweep_task_retries_and_dead_letters_while_idle() {
+        use crate::messaging::ack_tracker::{AckConfig, PendingAckTracker, start_sweep_task};
+        use crate::messaging::dead_letter::DeadLetterQueue;
+
+        let (_router, parent, children, _dt) = setup_delegation(1, "del-ack-sweep").await;
+
+        let tracker = Arc::new(PendingAckTracker::with_config(AckConfig {
+            ack_timeout: std::time::Duration::from_millis(40),
+            max_retries: 2,
+            sweep_interval: std::time::Duration::from_millis(10),
+        }));
+        let dlq = Arc::new(DeadLetterQueue::new());
+        let _sweeper = start_sweep_task(
+            tracker.clone(),
+            children[0].router(),
+            Some(dlq.clone()),
+            None,
+        );
+
+        let msg = AgentMessage::new(
+            children[0].address.clone(),
+            MessageTarget::Parent,
+            MessagePayload::Text {
+                content: "retry me while idle".to_string(),
+                summary: None,
+            },
+        )
+        .with_ack_required();
+
+        let msg = Arc::new(msg);
+        children[0].send((*msg).clone()).await.unwrap();
+        tracker.track(msg.clone()).await;
+
+        let first = tokio::time::timeout(std::time::Duration::from_secs(1), parent.recv())
+            .await
+            .expect("initial delivery should arrive")
+            .expect("parent mailbox should stay open");
+        match &first.payload {
+            MessagePayload::Text { content, .. } => assert_eq!(content, "retry me while idle"),
+            other => panic!("expected text payload, got {other:?}"),
+        }
+
+        let retry = tokio::time::timeout(std::time::Duration::from_secs(1), parent.recv())
+            .await
+            .expect("retry delivery should arrive without turn-loop sweep")
+            .expect("parent mailbox should stay open");
+        match &retry.payload {
+            MessagePayload::Text { content, .. } => assert_eq!(content, "retry me while idle"),
+            other => panic!("expected retry text payload, got {other:?}"),
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+
+        assert_eq!(tracker.pending_count().await, 0);
+        assert_eq!(dlq.count().await, 1);
+        let dead_letters = dlq.list().await;
+        assert_eq!(dead_letters[0].message.id, msg.id);
+        match &dead_letters[0].reason {
+            crate::messaging::dead_letter::DeadLetterReason::AckTimeout { attempts } => {
+                assert_eq!(*attempts, 2);
+            }
+            other => panic!("expected AckTimeout, got: {other:?}"),
+        }
+    }
+
     // ─── Dead Letter Queue integration tests ─────────────────────────────────
 
     #[tokio::test]

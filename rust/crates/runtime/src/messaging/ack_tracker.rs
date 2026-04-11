@@ -104,6 +104,15 @@ pub struct PendingAckTracker {
     failed: RwLock<Vec<AckOutcome>>,
 }
 
+/// Abort the sweep task when the handle is dropped.
+pub struct AckSweepHandle(tokio::task::JoinHandle<()>);
+
+impl Drop for AckSweepHandle {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 impl Default for PendingAckTracker {
     fn default() -> Self {
         Self::new()
@@ -147,14 +156,21 @@ impl PendingAckTracker {
     }
 
     /// Process an incoming nack — removes from pending and records failure.
-    pub async fn reject(&self, message_id: &str, reason: Option<String>) {
-        if let Some(entry) = self.pending.write().await.remove(message_id) {
-            self.failed.write().await.push(AckOutcome::Rejected {
-                message_id: message_id.to_string(),
-                reason,
-                message: entry.message,
-            });
+    pub async fn reject(&self, message_id: &str, reason: Option<String>) -> Option<AckOutcome> {
+        let outcome =
+            self.pending
+                .write()
+                .await
+                .remove(message_id)
+                .map(|entry| AckOutcome::Rejected {
+                    message_id: message_id.to_string(),
+                    reason,
+                    message: entry.message,
+                });
+        if let Some(ref rejected) = outcome {
+            self.failed.write().await.push(rejected.clone());
         }
+        outcome
     }
 
     /// Sweep for timed-out messages. Returns messages that need retry and
@@ -247,6 +263,77 @@ impl PendingAckTracker {
     pub async fn clear_failed(&self) {
         self.failed.write().await.clear();
     }
+
+    /// Configured interval for sweeping timed-out acknowledgments.
+    pub fn sweep_interval(&self) -> Duration {
+        self.config.sweep_interval
+    }
+}
+
+pub fn start_sweep_task(
+    tracker: Arc<PendingAckTracker>,
+    router: Arc<super::router::AgentMailboxRouter>,
+    dead_letter_queue: Option<Arc<super::dead_letter::DeadLetterQueue>>,
+    metrics: Option<Arc<super::metrics::MessagingMetrics>>,
+) -> AckSweepHandle {
+    let sweep_interval = tracker.sweep_interval();
+    let task = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(sweep_interval).await;
+
+            let outcomes = tracker.sweep().await;
+            if outcomes.is_empty() {
+                continue;
+            }
+
+            let retry_msgs = tracker.get_retry_messages(&outcomes).await;
+            for retry_msg in &retry_msgs {
+                if let Err(e) = router.send((**retry_msg).clone()).await {
+                    astra_core::agent_warn!("mailbox", "Failed to send retry message: {e}");
+                    if let Some(ref metrics) = metrics {
+                        metrics
+                            .send_errors
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+                if let Some(ref metrics) = metrics {
+                    metrics
+                        .retries
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+
+            for outcome in &outcomes {
+                if let AckOutcome::Failed {
+                    message_id,
+                    attempts,
+                    message,
+                } = outcome
+                {
+                    eprintln!(
+                        "  ⚠ messaging: ack timeout exhausted for message {} after {} attempts",
+                        message_id, attempts
+                    );
+                    if let Some(ref dlq) = dead_letter_queue {
+                        dlq.store(
+                            Arc::clone(message),
+                            super::dead_letter::DeadLetterReason::AckTimeout {
+                                attempts: *attempts,
+                            },
+                            *attempts,
+                        )
+                        .await;
+                    }
+                    if let Some(ref metrics) = metrics {
+                        metrics
+                            .dead_letters
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+    });
+    AckSweepHandle(task)
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
