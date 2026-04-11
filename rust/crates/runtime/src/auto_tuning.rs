@@ -577,6 +577,7 @@ impl AutoTuningEngine {
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .record(signal);
+        self.persist();
     }
 
     /// Return the retained feedback signal window for inspection/testing.
@@ -1435,12 +1436,15 @@ impl DelegationOutcomeTracker {
                 return;
             }
         }
-        let map = match self.data.read() {
-            Ok(m) => m,
-            Err(_) => return,
-        };
-        let Ok(data) = serde_json::to_vec_pretty(&*map) else {
-            return;
+        let data = {
+            let map = match self.data.read() {
+                Ok(m) => m,
+                Err(_) => return,
+            };
+            let Ok(data) = serde_json::to_vec_pretty(&*map) else {
+                return;
+            };
+            data
         };
         let tmp = path.with_extension("tmp");
         if let Err(err) = std::fs::write(&tmp, data) {
@@ -1927,6 +1931,27 @@ mod tests {
         let engine = AutoTuningEngine::new();
         engine.record_feedback(FeedbackSignal::new(SignalType::TaskSuccess));
         engine.persist(); // Should not panic or error.
+    }
+
+    #[test]
+    fn tuning_engine_record_feedback_persists_immediately() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tuning-auto.json");
+
+        let engine = AutoTuningEngine::with_storage(path.clone());
+        engine.record_feedback(FeedbackSignal::new(SignalType::TaskSuccess));
+
+        assert!(
+            path.exists(),
+            "record_feedback should persist when storage is configured"
+        );
+
+        let reloaded = AutoTuningEngine::with_storage(path);
+        assert_eq!(reloaded.recent_signals().len(), 1);
+        assert!(matches!(
+            reloaded.recent_signals()[0].signal_type,
+            SignalType::TaskSuccess
+        ));
     }
 
     // ── Tool Health Signal Type Tests ──
