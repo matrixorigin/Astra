@@ -1537,6 +1537,10 @@ async fn run_chat_repl(
                 if line.starts_with('/') {
                     if should_clear_picker_submission_echo(&line, pending_execute.as_deref()) {
                         clear_picker_submission_echo();
+                        // Re-echo the actual command so the line isn't blank
+                        if let Some(ref cmd) = pending_execute {
+                            eprintln!("{}", cmd.as_str().dim());
+                        }
                     }
                     // If Enter was pressed in the picker, the selected command is
                     // stored in pending-execute (captured by readline actor thread).
