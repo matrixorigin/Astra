@@ -13,7 +13,7 @@
 use super::*;
 use astra_runtime::auto_tuning::{
     AlertSeverity, AutoTuningEngine, EvolutionAction, EvolutionRule, EvolutionTrigger,
-    FeedbackSignal, RollbackCondition, RuleExecution, SignalType,
+    FeedbackSignal, RollbackCondition, RuleExecution, Sentiment, SignalType,
 };
 use astra_runtime::runtime_config::RuntimeConfig;
 use std::io::Write;
@@ -366,6 +366,9 @@ fn cmd_feedback<W: Write>(
     writeln!(w, "    - correction   User corrected output")?;
     writeln!(w, "    - thumbs_up    Positive feedback")?;
     writeln!(w, "    - thumbs_down  Negative feedback")?;
+    writeln!(w, "    - star_1..5    Star rating (1-5)")?;
+    writeln!(w, "    - positive     Positive text feedback")?;
+    writeln!(w, "    - negative     Negative text feedback")?;
     writeln!(w, "    - accept       User accepted output")?;
     writeln!(w, "    - interrupt    User interrupted agent")?;
     writeln!(w, "    - drift        Agent lost focus")?;
@@ -542,6 +545,7 @@ fn cmd_record<W: Write>(args: &[&str], ctx: TuningCommandContext<'_, W>) -> std:
         writeln!(w, "Signal types:")?;
         writeln!(w, "  success, failure, retry, correction")?;
         writeln!(w, "  thumbs_up, thumbs_down, accept")?;
+        writeln!(w, "  star_1..star_5, feedback_positive, feedback_negative")?;
         return Ok(());
     }
 
@@ -559,6 +563,26 @@ fn cmd_record<W: Write>(args: &[&str], ctx: TuningCommandContext<'_, W>) -> std:
         "accept" | "acceptance" => SignalType::Acceptance,
         "interrupt" | "interruption" => SignalType::Interruption,
         "drift" => SignalType::FocusDrift,
+        s if s.starts_with("star_") => {
+            let stars: u8 = s
+                .strip_prefix("star_")
+                .and_then(|n| n.parse().ok())
+                .unwrap_or(0);
+            if !(1..=5).contains(&stars) {
+                writeln!(w, "{} Star rating must be 1-5", "✗".red())?;
+                return Ok(());
+            }
+            SignalType::StarRating { stars }
+        }
+        "feedback_positive" | "positive" => SignalType::TextFeedback {
+            sentiment: Sentiment::Positive,
+        },
+        "feedback_negative" | "negative" => SignalType::TextFeedback {
+            sentiment: Sentiment::Negative,
+        },
+        "feedback_neutral" | "neutral" => SignalType::TextFeedback {
+            sentiment: Sentiment::Neutral,
+        },
         other => {
             writeln!(w, "{} Unknown signal type: {}", "✗".red(), other)?;
             return Ok(());
