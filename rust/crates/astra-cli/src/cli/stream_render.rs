@@ -958,8 +958,14 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         // ── Phase 1: Pre-execution UI setup (sequential, &mut self) ──
         // For parallel tools, clear progress indicator (they all run together).
         self.render.tool_batch_progress = None;
+
+        // Markdown mode: show single grouped spinner for parallel tools.
+        // Non-markdown mode: show individual lines that can update in place.
+        let parallel_count = conc_reqs.len();
+        let use_grouped_spinner = self.render.md.is_some() && parallel_count > 1;
+
         let mut ui_indices: Vec<Option<usize>> = Vec::with_capacity(conc_reqs.len());
-        for (_, req) in &conc_reqs {
+        for (i, (_, req)) in conc_reqs.iter().enumerate() {
             // Forward tool-started event.
             let desc = self.render.format_tool_description(&req.tool, &req.args);
             if let Some(tx) = &self.stream_event_tx {
@@ -987,8 +993,20 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 }
             }
             self.render.stop_thinking();
+
+            // In grouped mode, only start spinner once for all parallel tools.
             let tool_idx = if !self.quiet && !self.suppress_intermediate_output {
-                Some(self.render.tool_start(&req.tool, &req.args))
+                if use_grouped_spinner {
+                    if i == 0 {
+                        // Start grouped spinner for first tool only.
+                        Some(self.render.tool_start_parallel_group(parallel_count))
+                    } else {
+                        // Other tools share the group spinner (no individual display).
+                        None
+                    }
+                } else {
+                    Some(self.render.tool_start(&req.tool, &req.args))
+                }
             } else {
                 None
             };
@@ -1050,6 +1068,11 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         }
 
         // ── Phase 3: Post-execution (sequential, &mut self) ──
+        // Stop grouped spinner if we used one.
+        if use_grouped_spinner {
+            self.render.stop_tool_stderr_running();
+        }
+
         for (pos, (output, duration_ms)) in outputs.into_iter().enumerate() {
             let (orig_idx, req) = conc_reqs[pos];
             let status = cloud_tool_result_status_label(&output);
@@ -1075,7 +1098,13 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             }
 
             // Tool-done UI.
-            if let Some(idx) = ui_indices[pos] {
+            if use_grouped_spinner {
+                // Grouped mode: print completion line directly (no spinner update).
+                if !self.quiet && !self.suppress_intermediate_output {
+                    self.render
+                        .tool_done_inline(&req.tool, &req.args, status, duration_ms, &output);
+                }
+            } else if let Some(idx) = ui_indices[pos] {
                 self.render
                     .tool_done(idx, &req.tool, &req.args, status, duration_ms, &output);
             }
@@ -1441,6 +1470,21 @@ impl StreamRenderState {
             description, // Plain text for spinner animation
         ));
         idx
+    }
+
+    /// Start a grouped spinner for N tools running in parallel.
+    /// Shows: `⬢ Running N tools in parallel… Xs ⣾`
+    fn tool_start_parallel_group(&mut self, count: usize) -> usize {
+        self.stop_tool_stderr_running();
+        let description = format!("Running {} tools in parallel", count);
+        if io::stderr().is_terminal() {
+            self.tool_stderr_running = Some(ToolRunningLineSpinner::start(description));
+        } else {
+            let line = format!("  {} {} …", "⬢".cyan(), description.dim());
+            eprintln!("{line}");
+            self.stderr_lines += 1;
+        }
+        0 // Index not used for grouped spinner
     }
 
     /// Format a Cursor-style tool description: "Grepped pattern in path", "Read file lines X-Y"
@@ -1884,6 +1928,42 @@ impl StreamRenderState {
             let lines = g.lines.clone();
             g.region.update(lines);
         }
+    }
+
+    /// Print tool completion directly (for grouped parallel tools).
+    /// Unlike `tool_done`, doesn't try to update a specific line index.
+    fn tool_done_inline(
+        &mut self,
+        tool: &str,
+        args: &Value,
+        status: &str,
+        duration_ms: u64,
+        output: &str,
+    ) {
+        let output_summary = self.format_output_summary(tool, output, status);
+        let duration_suffix = format_duration_suffix(duration_ms);
+        let description = self.format_tool_description_with_output(tool, args, Some(output));
+        let styled_desc = style_tool_description(tool, &description);
+        let dur_display = format!("{}", duration_suffix.dim());
+
+        let (icon, extra_line) = if status == "error" {
+            let err_msg = output_summary.unwrap_or_else(|| "failed".to_string());
+            (theme::icon_err(), format!("    {}", err_msg.red()))
+        } else {
+            let summary_line = match output_summary {
+                Some(summary) => format!("    {}", summary.dim()),
+                None => String::new(),
+            };
+            (theme::icon_ok(), summary_line)
+        };
+
+        let mut out_lines = 1usize;
+        eprintln!("  {} {}{}", icon, styled_desc, dur_display);
+        if !extra_line.is_empty() {
+            eprintln!("{extra_line}");
+            out_lines = out_lines.saturating_add(extra_line.matches('\n').count() + 1);
+        }
+        self.stderr_lines = self.stderr_lines.saturating_add(out_lines);
     }
 
     /// Format a detailed summary of tool output.
