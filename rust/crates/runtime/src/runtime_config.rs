@@ -633,6 +633,12 @@ impl Default for ContextWindowConfig {
     }
 }
 
+fn merge_if_non_default<T: PartialEq>(slot: &mut T, incoming: T, default: T) {
+    if incoming != default {
+        *slot = incoming;
+    }
+}
+
 // ─── Configuration Loading ───────────────────────────────────────────────────
 
 impl RuntimeConfig {
@@ -678,17 +684,352 @@ impl RuntimeConfig {
 
     /// Merge another config into this one (other takes precedence).
     pub fn merge(mut self, other: RuntimeConfig) -> Self {
-        // Simple field-by-field merge (could be more sophisticated)
-        if other.compression.max_history_tokens != default_max_history_tokens() {
-            self.compression.max_history_tokens = other.compression.max_history_tokens;
-        }
-        if other.compression.compression_threshold != default_compression_threshold() {
-            self.compression.compression_threshold = other.compression.compression_threshold;
-        }
-        if other.compression.strategy != CompressionStrategy::default() {
-            self.compression.strategy = other.compression.strategy;
-        }
-        // ... more fields as needed
+        let RuntimeConfig {
+            version,
+            compression,
+            memory,
+            tool_selection,
+            learning,
+            telemetry,
+            token_budget,
+            verification,
+            memory_pressure,
+            context_window,
+        } = other;
+
+        merge_if_non_default(&mut self.version, version, default_config_version());
+
+        let CompressionConfig {
+            max_history_tokens,
+            compression_threshold,
+            preserve_tool_calls,
+            preserve_recent_turns,
+            max_tool_result_length,
+            strategy,
+        } = compression;
+        merge_if_non_default(
+            &mut self.compression.max_history_tokens,
+            max_history_tokens,
+            default_max_history_tokens(),
+        );
+        merge_if_non_default(
+            &mut self.compression.compression_threshold,
+            compression_threshold,
+            default_compression_threshold(),
+        );
+        merge_if_non_default(
+            &mut self.compression.preserve_tool_calls,
+            preserve_tool_calls,
+            default_true(),
+        );
+        merge_if_non_default(
+            &mut self.compression.preserve_recent_turns,
+            preserve_recent_turns,
+            default_preserve_recent_turns(),
+        );
+        merge_if_non_default(
+            &mut self.compression.max_tool_result_length,
+            max_tool_result_length,
+            default_max_tool_result_length(),
+        );
+        merge_if_non_default(
+            &mut self.compression.strategy,
+            strategy,
+            CompressionStrategy::default(),
+        );
+
+        let MemoryConfig {
+            retrieval_top_k,
+            min_relevance_score,
+            session_weight,
+            long_term_weight,
+            max_memory_tokens,
+            include_repository_memories,
+            strategy,
+        } = memory;
+        merge_if_non_default(
+            &mut self.memory.retrieval_top_k,
+            retrieval_top_k,
+            default_retrieval_top_k(),
+        );
+        merge_if_non_default(
+            &mut self.memory.min_relevance_score,
+            min_relevance_score,
+            default_min_relevance_score(),
+        );
+        merge_if_non_default(
+            &mut self.memory.session_weight,
+            session_weight,
+            default_session_weight(),
+        );
+        merge_if_non_default(
+            &mut self.memory.long_term_weight,
+            long_term_weight,
+            default_long_term_weight(),
+        );
+        merge_if_non_default(
+            &mut self.memory.max_memory_tokens,
+            max_memory_tokens,
+            default_max_memory_tokens(),
+        );
+        merge_if_non_default(
+            &mut self.memory.include_repository_memories,
+            include_repository_memories,
+            default_true(),
+        );
+        merge_if_non_default(
+            &mut self.memory.strategy,
+            strategy,
+            MemoryStrategy::default(),
+        );
+
+        let ToolSelectionConfig {
+            max_tools,
+            confidence_threshold,
+            prefer_recent_tools,
+            recent_tool_boost,
+            use_learned_patterns,
+            max_tool_schema_tokens,
+        } = tool_selection;
+        merge_if_non_default(
+            &mut self.tool_selection.max_tools,
+            max_tools,
+            default_max_tools(),
+        );
+        merge_if_non_default(
+            &mut self.tool_selection.confidence_threshold,
+            confidence_threshold,
+            default_tool_confidence_threshold(),
+        );
+        merge_if_non_default(
+            &mut self.tool_selection.prefer_recent_tools,
+            prefer_recent_tools,
+            default_true(),
+        );
+        merge_if_non_default(
+            &mut self.tool_selection.recent_tool_boost,
+            recent_tool_boost,
+            default_recent_tool_boost(),
+        );
+        merge_if_non_default(
+            &mut self.tool_selection.use_learned_patterns,
+            use_learned_patterns,
+            default_true(),
+        );
+        merge_if_non_default(
+            &mut self.tool_selection.max_tool_schema_tokens,
+            max_tool_schema_tokens,
+            default_max_tool_schema_tokens(),
+        );
+
+        let LearningConfig {
+            enabled,
+            entity_decay_half_life_days,
+            pattern_decay_half_life_days,
+            min_calibration_samples,
+            exploration_rate,
+            progressive_calibration,
+        } = learning;
+        merge_if_non_default(&mut self.learning.enabled, enabled, default_true());
+        merge_if_non_default(
+            &mut self.learning.entity_decay_half_life_days,
+            entity_decay_half_life_days,
+            default_entity_decay_half_life(),
+        );
+        merge_if_non_default(
+            &mut self.learning.pattern_decay_half_life_days,
+            pattern_decay_half_life_days,
+            default_pattern_decay_half_life(),
+        );
+        merge_if_non_default(
+            &mut self.learning.min_calibration_samples,
+            min_calibration_samples,
+            default_min_calibration_samples(),
+        );
+        merge_if_non_default(
+            &mut self.learning.exploration_rate,
+            exploration_rate,
+            default_exploration_rate(),
+        );
+        merge_if_non_default(
+            &mut self.learning.progressive_calibration,
+            progressive_calibration,
+            default_true(),
+        );
+
+        let TelemetryConfig {
+            capture_context_traces,
+            capture_tool_traces,
+            capture_explanations,
+            max_traces_in_memory,
+            persist_to_journal,
+        } = telemetry;
+        merge_if_non_default(
+            &mut self.telemetry.capture_context_traces,
+            capture_context_traces,
+            default_true(),
+        );
+        merge_if_non_default(
+            &mut self.telemetry.capture_tool_traces,
+            capture_tool_traces,
+            default_true(),
+        );
+        merge_if_non_default(
+            &mut self.telemetry.capture_explanations,
+            capture_explanations,
+            false,
+        );
+        merge_if_non_default(
+            &mut self.telemetry.max_traces_in_memory,
+            max_traces_in_memory,
+            default_max_traces_in_memory(),
+        );
+        merge_if_non_default(
+            &mut self.telemetry.persist_to_journal,
+            persist_to_journal,
+            default_true(),
+        );
+
+        let TokenBudgetConfig {
+            max_prompt_tokens,
+            max_turn_input_tokens,
+            system_prompt_reserve,
+            tools_reserve,
+        } = token_budget;
+        merge_if_non_default(
+            &mut self.token_budget.max_prompt_tokens,
+            max_prompt_tokens,
+            0,
+        );
+        merge_if_non_default(
+            &mut self.token_budget.max_turn_input_tokens,
+            max_turn_input_tokens,
+            default_max_turn_input_tokens(),
+        );
+        merge_if_non_default(
+            &mut self.token_budget.system_prompt_reserve,
+            system_prompt_reserve,
+            default_system_prompt_reserve(),
+        );
+        merge_if_non_default(
+            &mut self.token_budget.tools_reserve,
+            tools_reserve,
+            default_tools_reserve(),
+        );
+
+        let VerificationConfig {
+            adaptive,
+            strictness,
+            min_strictness,
+            max_strictness,
+            increase_on_correction,
+            increase_on_drift,
+        } = verification;
+        merge_if_non_default(&mut self.verification.adaptive, adaptive, default_true());
+        merge_if_non_default(
+            &mut self.verification.strictness,
+            strictness,
+            default_verification_strictness(),
+        );
+        merge_if_non_default(
+            &mut self.verification.min_strictness,
+            min_strictness,
+            default_verification_min(),
+        );
+        merge_if_non_default(
+            &mut self.verification.max_strictness,
+            max_strictness,
+            default_verification_max(),
+        );
+        merge_if_non_default(
+            &mut self.verification.increase_on_correction,
+            increase_on_correction,
+            default_true(),
+        );
+        merge_if_non_default(
+            &mut self.verification.increase_on_drift,
+            increase_on_drift,
+            false,
+        );
+
+        let MemoryPressureConfig {
+            adaptive,
+            retrieval_min,
+            retrieval_max,
+            expand_on_churn,
+            expand_on_drift,
+            expand_on_correction,
+        } = memory_pressure;
+        merge_if_non_default(
+            &mut self.memory_pressure.adaptive,
+            adaptive,
+            default_true(),
+        );
+        merge_if_non_default(
+            &mut self.memory_pressure.retrieval_min,
+            retrieval_min,
+            default_retrieval_min(),
+        );
+        merge_if_non_default(
+            &mut self.memory_pressure.retrieval_max,
+            retrieval_max,
+            default_retrieval_max(),
+        );
+        merge_if_non_default(
+            &mut self.memory_pressure.expand_on_churn,
+            expand_on_churn,
+            default_true(),
+        );
+        merge_if_non_default(
+            &mut self.memory_pressure.expand_on_drift,
+            expand_on_drift,
+            default_true(),
+        );
+        merge_if_non_default(
+            &mut self.memory_pressure.expand_on_correction,
+            expand_on_correction,
+            false,
+        );
+
+        let ContextWindowConfig {
+            adaptive,
+            dynamic_compression,
+            compression_threshold_min,
+            compression_threshold_max,
+            remaining_turn_factor,
+            error_recovery_reserve,
+        } = context_window;
+        merge_if_non_default(
+            &mut self.context_window.adaptive,
+            adaptive,
+            default_true(),
+        );
+        merge_if_non_default(
+            &mut self.context_window.dynamic_compression,
+            dynamic_compression,
+            default_true(),
+        );
+        merge_if_non_default(
+            &mut self.context_window.compression_threshold_min,
+            compression_threshold_min,
+            default_compression_threshold_min(),
+        );
+        merge_if_non_default(
+            &mut self.context_window.compression_threshold_max,
+            compression_threshold_max,
+            default_compression_threshold_max(),
+        );
+        merge_if_non_default(
+            &mut self.context_window.remaining_turn_factor,
+            remaining_turn_factor,
+            default_remaining_turn_factor(),
+        );
+        merge_if_non_default(
+            &mut self.context_window.error_recovery_reserve,
+            error_recovery_reserve,
+            default_error_recovery_reserve(),
+        );
+
         self
     }
 
@@ -812,5 +1153,144 @@ mod tests {
         assert!(toml.contains("[verification]"));
         assert!(toml.contains("[memory_pressure]"));
         assert!(toml.contains("[context_window]"));
+    }
+
+    #[test]
+    fn test_merge_applies_non_default_fields_across_sections() {
+        let merged = RuntimeConfig::default().merge(RuntimeConfig {
+            version: "2.0".to_string(),
+            compression: CompressionConfig {
+                max_history_tokens: 12345,
+                compression_threshold: 0.65,
+                preserve_tool_calls: false,
+                preserve_recent_turns: 7,
+                max_tool_result_length: 9000,
+                strategy: CompressionStrategy::Aggressive,
+            },
+            memory: MemoryConfig {
+                retrieval_top_k: 9,
+                min_relevance_score: 0.55,
+                session_weight: 1.25,
+                long_term_weight: 0.6,
+                max_memory_tokens: 8192,
+                include_repository_memories: false,
+                strategy: MemoryStrategy::Comprehensive,
+            },
+            tool_selection: ToolSelectionConfig {
+                max_tools: 12,
+                confidence_threshold: 0.7,
+                prefer_recent_tools: false,
+                recent_tool_boost: 0.4,
+                use_learned_patterns: false,
+                max_tool_schema_tokens: 22000,
+            },
+            learning: LearningConfig {
+                enabled: false,
+                entity_decay_half_life_days: 10,
+                pattern_decay_half_life_days: 20,
+                min_calibration_samples: 8,
+                exploration_rate: 0.25,
+                progressive_calibration: false,
+            },
+            telemetry: TelemetryConfig {
+                capture_context_traces: false,
+                capture_tool_traces: false,
+                capture_explanations: true,
+                max_traces_in_memory: 42,
+                persist_to_journal: false,
+            },
+            token_budget: TokenBudgetConfig {
+                max_prompt_tokens: 16000,
+                max_turn_input_tokens: 32000,
+                system_prompt_reserve: 2000,
+                tools_reserve: 6000,
+            },
+            verification: VerificationConfig {
+                adaptive: false,
+                strictness: 0.75,
+                min_strictness: 0.3,
+                max_strictness: 0.95,
+                increase_on_correction: false,
+                increase_on_drift: true,
+            },
+            memory_pressure: MemoryPressureConfig {
+                adaptive: false,
+                retrieval_min: 4,
+                retrieval_max: 20,
+                expand_on_churn: false,
+                expand_on_drift: false,
+                expand_on_correction: true,
+            },
+            context_window: ContextWindowConfig {
+                adaptive: false,
+                dynamic_compression: false,
+                compression_threshold_min: 0.45,
+                compression_threshold_max: 0.98,
+                remaining_turn_factor: 0.5,
+                error_recovery_reserve: 12000,
+            },
+        });
+
+        assert_eq!(merged.version, "2.0");
+        assert_eq!(merged.compression.max_history_tokens, 12345);
+        assert!((merged.compression.compression_threshold - 0.65).abs() < 0.001);
+        assert!(!merged.compression.preserve_tool_calls);
+        assert_eq!(merged.compression.preserve_recent_turns, 7);
+        assert_eq!(merged.compression.max_tool_result_length, 9000);
+        assert_eq!(merged.compression.strategy, CompressionStrategy::Aggressive);
+
+        assert_eq!(merged.memory.retrieval_top_k, 9);
+        assert!((merged.memory.min_relevance_score - 0.55).abs() < 0.001);
+        assert!((merged.memory.session_weight - 1.25).abs() < 0.001);
+        assert!((merged.memory.long_term_weight - 0.6).abs() < 0.001);
+        assert_eq!(merged.memory.max_memory_tokens, 8192);
+        assert!(!merged.memory.include_repository_memories);
+        assert_eq!(merged.memory.strategy, MemoryStrategy::Comprehensive);
+
+        assert_eq!(merged.tool_selection.max_tools, 12);
+        assert!((merged.tool_selection.confidence_threshold - 0.7).abs() < 0.001);
+        assert!(!merged.tool_selection.prefer_recent_tools);
+        assert!((merged.tool_selection.recent_tool_boost - 0.4).abs() < 0.001);
+        assert!(!merged.tool_selection.use_learned_patterns);
+        assert_eq!(merged.tool_selection.max_tool_schema_tokens, 22000);
+
+        assert!(!merged.learning.enabled);
+        assert_eq!(merged.learning.entity_decay_half_life_days, 10);
+        assert_eq!(merged.learning.pattern_decay_half_life_days, 20);
+        assert_eq!(merged.learning.min_calibration_samples, 8);
+        assert!((merged.learning.exploration_rate - 0.25).abs() < 0.001);
+        assert!(!merged.learning.progressive_calibration);
+
+        assert!(!merged.telemetry.capture_context_traces);
+        assert!(!merged.telemetry.capture_tool_traces);
+        assert!(merged.telemetry.capture_explanations);
+        assert_eq!(merged.telemetry.max_traces_in_memory, 42);
+        assert!(!merged.telemetry.persist_to_journal);
+
+        assert_eq!(merged.token_budget.max_prompt_tokens, 16000);
+        assert_eq!(merged.token_budget.max_turn_input_tokens, 32000);
+        assert_eq!(merged.token_budget.system_prompt_reserve, 2000);
+        assert_eq!(merged.token_budget.tools_reserve, 6000);
+
+        assert!(!merged.verification.adaptive);
+        assert!((merged.verification.strictness - 0.75).abs() < 0.001);
+        assert!((merged.verification.min_strictness - 0.3).abs() < 0.001);
+        assert!((merged.verification.max_strictness - 0.95).abs() < 0.001);
+        assert!(!merged.verification.increase_on_correction);
+        assert!(merged.verification.increase_on_drift);
+
+        assert!(!merged.memory_pressure.adaptive);
+        assert_eq!(merged.memory_pressure.retrieval_min, 4);
+        assert_eq!(merged.memory_pressure.retrieval_max, 20);
+        assert!(!merged.memory_pressure.expand_on_churn);
+        assert!(!merged.memory_pressure.expand_on_drift);
+        assert!(merged.memory_pressure.expand_on_correction);
+
+        assert!(!merged.context_window.adaptive);
+        assert!(!merged.context_window.dynamic_compression);
+        assert!((merged.context_window.compression_threshold_min - 0.45).abs() < 0.001);
+        assert!((merged.context_window.compression_threshold_max - 0.98).abs() < 0.001);
+        assert!((merged.context_window.remaining_turn_factor - 0.5).abs() < 0.001);
+        assert_eq!(merged.context_window.error_recovery_reserve, 12000);
     }
 }

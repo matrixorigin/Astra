@@ -514,10 +514,7 @@ pub(super) async fn handle_memory_domain_command(
                             }
                         }
                         Ok(resp) => {
-                            eprintln!(
-                                "{}",
-                                format!("  ✗ LLM call failed ({})", resp.status()).red()
-                            );
+                            cli_utils::eprint_api_error(resp.status().as_u16(), "LLM call failed");
                             // Fallback: show the prompt for manual execution
                             eprintln!();
                             eprintln!("{}  Generated decomposition prompt:", "📋".yellow());
@@ -535,7 +532,7 @@ pub(super) async fn handle_memory_domain_command(
                             );
                         }
                         Err(e) => {
-                            eprintln!("{}", format!("  ✗ Request failed: {e}").red());
+                            cli_utils::eprint_request_error(&e);
                         }
                     }
                 }
@@ -634,10 +631,10 @@ pub(super) async fn handle_memory_domain_command(
                             }
                         }
                         Ok(r) => {
-                            eprintln!("{}", format!("  ✗ LLM call failed ({})", r.status()).red());
+                            cli_utils::eprint_api_error(r.status().as_u16(), "LLM call failed");
                         }
                         Err(e) => {
-                            eprintln!("{}", format!("  ✗ Request failed: {e}").red());
+                            cli_utils::eprint_request_error(&e);
                         }
                     }
                 }
@@ -1354,7 +1351,7 @@ pub(super) async fn handle_memory_domain_command(
                             cli_utils::eprint_api_error(r.status().as_u16(), "LLM call failed");
                         }
                         Err(e) => {
-                            eprintln!("  {} Request failed: {}", theme::icon_err(), e);
+                            cli_utils::eprint_request_error(&e);
                         }
                     }
 
@@ -1472,10 +1469,10 @@ pub(super) async fn handle_memory_domain_command(
                             }
                         }
                         Ok(r) => {
-                            eprintln!("{}", format!("  ✗ LLM call failed ({})", r.status()).red());
+                            cli_utils::eprint_api_error(r.status().as_u16(), "LLM call failed");
                         }
                         Err(e) => {
-                            eprintln!("{}", format!("  ✗ Request failed: {e}").red());
+                            cli_utils::eprint_request_error(&e);
                         }
                     }
                 }
@@ -1609,7 +1606,7 @@ async fn _old_handle_plan_mode_input(
                 cli_utils::eprint_api_error(r.status().as_u16(), "LLM call failed");
             }
             Err(e) => {
-                eprintln!("  {} Request failed: {}", theme::icon_err(), e);
+                cli_utils::eprint_request_error(&e);
             }
         }
 
@@ -1742,7 +1739,7 @@ async fn _old_handle_plan_mode_input(
                         cli_utils::eprint_api_error(r.status().as_u16(), "LLM call failed");
                     }
                     Err(e) => {
-                        eprintln!("  {} Request failed: {}", theme::icon_err(), e);
+                        cli_utils::eprint_request_error(&e);
                     }
                 }
 
@@ -2025,10 +2022,12 @@ async fn _old_handle_plan_mode_input(
             }
         }
         Ok(r) => {
-            eprintln!("\r  ✗ LLM call failed ({})", r.status());
+            eprint!("\r");
+            cli_utils::eprint_api_error(r.status().as_u16(), "LLM call failed");
         }
         Err(e) => {
-            eprintln!("\r  ✗ Request failed: {e}");
+            eprint!("\r");
+            cli_utils::eprint_request_error(&e);
         }
     }
 
