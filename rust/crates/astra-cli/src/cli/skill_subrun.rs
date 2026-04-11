@@ -37,6 +37,48 @@ use super::stream_render::{EdgeSseContext, consume_turn_sse};
 
 const SUBRUN_MAX_TURNS: usize = 25;
 
+/// Approximate chars-per-token ratio for budget estimation.
+const CHARS_PER_TOKEN: usize = 4;
+
+/// Max estimated input tokens before old tool results get trimmed.
+/// Keeps subrun context well under the 80K default `max_turn_input_tokens`.
+const SUBRUN_TRIM_TOKEN_BUDGET: usize = 60_000;
+
+/// After trimming, keep this many chars of each old tool result as a preview.
+const TRIMMED_PREVIEW_CHARS: usize = 200;
+
+/// Trim old tool-result content in `messages` when estimated tokens exceed
+/// the budget.  Preserves the most recent `keep_recent` tool-result messages
+/// intact; older ones get their content replaced with a short preview.
+fn trim_subrun_messages(messages: &mut [Value], keep_recent: usize) {
+    let estimated_chars: usize = messages
+        .iter()
+        .filter_map(|m| m.get("content").and_then(|c| c.as_str()).map(|s| s.len()))
+        .sum();
+    if estimated_chars / CHARS_PER_TOKEN <= SUBRUN_TRIM_TOKEN_BUDGET {
+        return;
+    }
+
+    // Find tool-result messages (role=tool) and trim all but the last `keep_recent`.
+    let tool_indices: Vec<usize> = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.get("role").and_then(|r| r.as_str()) == Some("tool"))
+        .map(|(i, _)| i)
+        .collect();
+
+    let trim_count = tool_indices.len().saturating_sub(keep_recent);
+    for &idx in &tool_indices[..trim_count] {
+        if let Some(content) = messages[idx].get("content").and_then(|c| c.as_str()) {
+            if content.len() > TRIMMED_PREVIEW_CHARS + 50 {
+                let preview: String = content.chars().take(TRIMMED_PREVIEW_CHARS).collect();
+                messages[idx]["content"] =
+                    json!(format!("{preview}\n\n[… trimmed — {} chars total]", content.len()));
+            }
+        }
+    }
+}
+
 // ─── SubRunHost ──────────────────────────────────────────────────────────────
 
 /// Minimal agentic loop host for fork sub-runs.
@@ -145,6 +187,9 @@ impl AgenticLoopHost for SubRunHost {
             .model_override
             .as_deref()
             .or(self.model.as_deref());
+
+        // Trim old tool results to prevent unbounded context growth.
+        trim_subrun_messages(&mut state.messages, 4);
 
         let mut payload = chat_turn_base_payload(ChatTurnBasePayloadInput {
             messages: &state.messages,
@@ -608,5 +653,36 @@ mod tests {
         host.inject_tool_schema(schema);
         assert!(host.valid_tool_names.contains("test_tool"));
         assert_eq!(host.all_schemas.len(), 1);
+    }
+
+    #[test]
+    fn trim_subrun_messages_noop_under_budget() {
+        let mut msgs = vec![
+            json!({"role": "system", "content": "You are helpful."}),
+            json!({"role": "user", "content": "Do something."}),
+            json!({"role": "tool", "content": "short result"}),
+        ];
+        let before = msgs.clone();
+        trim_subrun_messages(&mut msgs, 4);
+        assert_eq!(msgs, before);
+    }
+
+    #[test]
+    fn trim_subrun_messages_trims_old_tool_results() {
+        let big = "x".repeat(SUBRUN_TRIM_TOKEN_BUDGET * CHARS_PER_TOKEN);
+        let mut msgs = vec![
+            json!({"role": "system", "content": "sys"}),
+            json!({"role": "tool", "content": big}),   // old — should be trimmed
+            json!({"role": "tool", "content": "recent1"}),
+            json!({"role": "tool", "content": "recent2"}),
+        ];
+        trim_subrun_messages(&mut msgs, 2);
+        // Old tool result should be trimmed
+        let trimmed = msgs[1]["content"].as_str().unwrap();
+        assert!(trimmed.contains("[… trimmed"));
+        assert!(trimmed.len() < 500);
+        // Recent ones untouched
+        assert_eq!(msgs[2]["content"].as_str().unwrap(), "recent1");
+        assert_eq!(msgs[3]["content"].as_str().unwrap(), "recent2");
     }
 }
