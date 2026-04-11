@@ -816,7 +816,7 @@ fn slash_inline_hint(line: &str) -> Option<String> {
     None
 }
 
-fn prompt_inline_hint(line: &str) -> Option<String> {
+pub(super) fn prompt_inline_hint(line: &str) -> Option<String> {
     if line.is_empty()
         && !is_slash_picker_active()
         && let Some(hint) = get_followup_prompt_hint()
@@ -824,6 +824,13 @@ fn prompt_inline_hint(line: &str) -> Option<String> {
         return Some(hint);
     }
     slash_inline_hint(line)
+}
+
+fn followup_tab_accept_command(line: &str, active: bool) -> Option<RlCmd> {
+    if !active && line.is_empty() {
+        return get_followup_prompt_hint().map(|hint| RlCmd::Insert(1, hint));
+    }
+    None
 }
 
 fn apply_accepted_slash_edit(edit: AcceptedSlashEdit) -> RlCmd {
@@ -1730,9 +1737,9 @@ impl ConditionalEventHandler for SlashStartCompleteHandler {
                     return Some(RlCmd::Move(RlMovement::EndOfLine));
                 }
             }
-            RlKeyEvent(RlKeyCode::Tab, _) if !active && ctx.line().is_empty() => {
-                if let Some(hint) = get_followup_prompt_hint() {
-                    return Some(RlCmd::Insert(1, hint));
+            RlKeyEvent(RlKeyCode::Tab, _) => {
+                if let Some(cmd) = followup_tab_accept_command(ctx.line(), active) {
+                    return Some(cmd);
                 }
             }
             // Tab with `/cmd ` to trigger subcmd picker
@@ -2089,6 +2096,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn prompt_inline_hint_uses_followup_suggestion_on_empty_line() {
         set_followup_prompt_hint(Some("run the tests".to_string()));
         assert_eq!(prompt_inline_hint(""), Some("run the tests".to_string()));
@@ -2096,9 +2104,33 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn prompt_inline_hint_keeps_slash_completion_when_typing_command() {
         set_followup_prompt_hint(Some("run the tests".to_string()));
         assert_eq!(prompt_inline_hint("/he"), slash_inline_hint("/he"));
+        clear_followup_prompt_hint();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn followup_tab_accept_command_inserts_hint_on_empty_line() {
+        set_followup_prompt_hint(Some("run the tests".to_string()));
+        assert!(
+            matches!(
+                followup_tab_accept_command("", false),
+                Some(RlCmd::Insert(1, text)) if text == "run the tests"
+            ),
+            "Tab on an empty prompt should accept the follow-up hint"
+        );
+        clear_followup_prompt_hint();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn followup_tab_accept_command_skips_nonempty_or_active_prompt() {
+        set_followup_prompt_hint(Some("run the tests".to_string()));
+        assert_eq!(followup_tab_accept_command("x", false), None);
+        assert_eq!(followup_tab_accept_command("", true), None);
         clear_followup_prompt_hint();
     }
 

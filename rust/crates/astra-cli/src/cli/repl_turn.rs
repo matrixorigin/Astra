@@ -3102,6 +3102,77 @@ mod tests {
         }
     }
 
+    fn test_selector() -> tool_selector::TfIdfSelector {
+        let registry = tool_registry::ToolRegistry::new(edge_tools::all_tool_schemas());
+        tool_selector::TfIdfSelector::new(registry)
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn apply_turn_success_sets_prompt_hint_for_followup() {
+        let (_tmp, _g) = isolated_sessions_dir();
+        super::repl_ui::clear_followup_prompt_hint();
+
+        let selector = test_selector();
+        let mut state = ReplState::default();
+        let mut result = stub_stream_result("Updated the code.");
+        result.tools_used = vec!["str_replace".to_string()];
+
+        apply_turn_success(
+            &mut state,
+            &selector,
+            None,
+            "fix the bug",
+            result,
+            Instant::now(),
+        );
+
+        assert_eq!(
+            state
+                .pending_followup_suggestion
+                .as_ref()
+                .map(|suggestion| suggestion.text.as_str()),
+            Some("run the tests")
+        );
+        assert_eq!(
+            super::repl_ui::prompt_inline_hint(""),
+            Some("run the tests".to_string())
+        );
+
+        super::repl_ui::clear_followup_prompt_hint();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn apply_turn_success_clears_stale_prompt_hint_when_suppressed() {
+        let (_tmp, _g) = isolated_sessions_dir();
+        super::repl_ui::set_followup_prompt_hint(Some("stale hint".to_string()));
+
+        let selector = test_selector();
+        let mut state = ReplState {
+            plan_mode: Some(plan_decompose::PlanModeState::new(
+                "goal".to_string(),
+                plan_decompose::ProjectContext::default(),
+            )),
+            ..Default::default()
+        };
+        let result = stub_stream_result("Plan updated.");
+
+        apply_turn_success(
+            &mut state,
+            &selector,
+            None,
+            "continue",
+            result,
+            Instant::now(),
+        );
+
+        assert!(state.pending_followup_suggestion.is_none());
+        assert_eq!(super::repl_ui::prompt_inline_hint(""), None);
+
+        super::repl_ui::clear_followup_prompt_hint();
+    }
+
     /// Verifies build_continuation_anchor truncates long content to 220 chars
     /// and formats correctly for both user and assistant parts.
     #[test]
