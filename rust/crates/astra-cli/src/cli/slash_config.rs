@@ -19,6 +19,7 @@ pub fn handle_config_command(arg: &str) {
     match subcommand {
         "show" | "" => show_config(),
         "paths" => show_paths(),
+        "sources" => show_sources(),
         "export" => {
             let path = parts.get(1).map(|s| PathBuf::from(*s));
             export_config(path);
@@ -163,6 +164,125 @@ fn show_config() {
     println!(
         "\n{}",
         "Use `/config paths` to see configuration file locations.".dim()
+    );
+    println!(
+        "{}",
+        "Use `/config sources` to see where each value came from.".dim()
+    );
+}
+
+/// Show where each non-default configuration value originated.
+fn show_sources() {
+    let defaults = RuntimeConfig::default();
+
+    // Check which config files exist
+    let user_config_path = dirs::home_dir().map(|h| h.join(".astra/config/runtime.toml"));
+    let user_exists = user_config_path.as_ref().is_some_and(|p| p.exists());
+
+    let project_config_path = std::env::current_dir()
+        .map(|d| d.join(".astra/config/runtime.toml"))
+        .ok();
+    let project_exists = project_config_path.as_ref().is_some_and(|p| p.exists());
+
+    // Final merged config
+    let final_config = RuntimeConfig::load();
+
+    println!(
+        "\n{}",
+        "Configuration Sources (showing non-default values)".bold().cyan()
+    );
+    println!("{}", "═".repeat(55).dim());
+    println!(
+        "  {} = default, {} = user, {} = project, {} = env",
+        "D".dim(),
+        "U".blue(),
+        "P".magenta(),
+        "E".green()
+    );
+
+    let mut shown_any = false;
+
+    // Helper to determine likely source of a value
+    let source_for = |env_var: &str| -> String {
+        if std::env::var(env_var).is_ok() {
+            format!("{} env", "E".green())
+        } else if project_exists {
+            format!("{} project", "P".magenta())
+        } else if user_exists {
+            format!("{} user", "U".blue())
+        } else {
+            format!("{} (unknown)", "?".dim())
+        }
+    };
+
+    // Compression
+    if final_config.compression.max_history_tokens != defaults.compression.max_history_tokens {
+        shown_any = true;
+        println!(
+            "  • {} = {} [{}]",
+            "compression.max_history_tokens".cyan(),
+            final_config.compression.max_history_tokens.to_string().yellow(),
+            source_for("MO_MAX_HISTORY_TOKENS")
+        );
+    }
+
+    if (final_config.compression.compression_threshold - defaults.compression.compression_threshold)
+        .abs()
+        > 0.001
+    {
+        shown_any = true;
+        println!(
+            "  • {} = {} [{}]",
+            "compression.compression_threshold".cyan(),
+            format!("{:.2}", final_config.compression.compression_threshold).yellow(),
+            source_for("MO_COMPRESSION_THRESHOLD")
+        );
+    }
+
+    // Memory
+    if final_config.memory.retrieval_top_k != defaults.memory.retrieval_top_k {
+        shown_any = true;
+        println!(
+            "  • {} = {} [{}]",
+            "memory.retrieval_top_k".cyan(),
+            final_config.memory.retrieval_top_k.to_string().yellow(),
+            source_for("MO_RETRIEVAL_TOP_K")
+        );
+    }
+
+    // Token budget
+    if final_config.token_budget.max_turn_input_tokens != defaults.token_budget.max_turn_input_tokens
+    {
+        shown_any = true;
+        println!(
+            "  • {} = {} [{}]",
+            "token_budget.max_turn_input_tokens".cyan(),
+            final_config.token_budget.max_turn_input_tokens.to_string().yellow(),
+            source_for("MO_MAX_TURN_INPUT_TOKENS")
+        );
+    }
+
+    // Telemetry
+    if final_config.telemetry.capture_context_traces != defaults.telemetry.capture_context_traces {
+        shown_any = true;
+        println!(
+            "  • {} = {} [{}]",
+            "telemetry.capture_context_traces".cyan(),
+            final_config.telemetry.capture_context_traces.to_string().yellow(),
+            source_for("MO_CAPTURE_TRACES")
+        );
+    }
+
+    if !shown_any {
+        println!(
+            "\n{}",
+            "  All settings are at their default values.".dim()
+        );
+    }
+
+    println!(
+        "\n{}",
+        "Priority: env > project > user > defaults".dim()
     );
 }
 
@@ -359,11 +479,20 @@ fn print_help() {
   /config               Show current configuration
   /config show          Show current configuration  
   /config paths         Show configuration file paths
+  /config sources       Show where each non-default value came from
   /config export [path] Export configuration to file (or stdout)
   /config diff          Show differences from defaults
 
+{hierarchy}
+  Priority (higher overrides lower):
+  1. Environment variables (MO_*)
+  2. Project-level: .astra/config/runtime.toml
+  3. User-level: ~/.astra/config/runtime.toml  
+  4. Built-in defaults
+
 {examples}
   /config                       View all settings
+  /config sources               See value origins (user/project/env)
   /config export ./my-config.toml   Save to file
   /config diff                  See what's changed from defaults
 
@@ -373,6 +502,7 @@ fn print_help() {
 "#,
         title = "Runtime Configuration Management".bold().cyan(),
         usage = "Usage:".bold(),
+        hierarchy = "Configuration Hierarchy:".bold(),
         examples = "Examples:".bold(),
         env = "Environment Variables:".bold(),
     );

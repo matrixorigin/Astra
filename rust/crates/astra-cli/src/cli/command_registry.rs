@@ -292,6 +292,14 @@ const TUNING_SUBCOMMANDS: &[(&str, &str)] = &[
     ("status", "Show tuning status (default)"),
 ];
 
+const CONFIG_SUBCOMMANDS: &[(&str, &str)] = &[
+    ("diff", "Show differences from defaults"),
+    ("export", "Export configuration to file"),
+    ("paths", "Show config file paths"),
+    ("show", "Show current configuration"),
+    ("sources", "Show where each value came from"),
+];
+
 const HELP_SUBCOMMANDS: &[(&str, &str)] = &[("keys", "Keyboard shortcuts")];
 
 // ── The unified command registry ────────────────────────────────────────────
@@ -521,6 +529,12 @@ pub static COMMANDS: &[CommandMeta] = &[
         CommandGroup::Observability,
     )
     .with_subcommands(TUNING_SUBCOMMANDS),
+    CommandMeta::new(
+        "/config",
+        "Runtime config: show|paths|sources|diff|export [path]",
+        CommandGroup::Observability,
+    )
+    .with_subcommands(CONFIG_SUBCOMMANDS),
     CommandMeta::new(
         "/sync",
         "Cloud sync status and push",
