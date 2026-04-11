@@ -3422,7 +3422,10 @@ mod tests {
 
     #[test]
     fn classify_turn_error_timeout() {
-        assert_eq!(classify_turn_error("Request timed out after 30s"), "timeout");
+        assert_eq!(
+            classify_turn_error("Request timed out after 30s"),
+            "timeout"
+        );
         assert_eq!(classify_turn_error("connection timeout"), "timeout");
         assert_eq!(classify_turn_error("TIMEOUT waiting for LLM"), "timeout");
     }
@@ -3430,8 +3433,14 @@ mod tests {
     #[test]
     fn classify_turn_error_rate_limit() {
         assert_eq!(classify_turn_error("Rate limit exceeded"), "rate_limit");
-        assert_eq!(classify_turn_error("HTTP 429: too many requests"), "rate_limit");
-        assert_eq!(classify_turn_error("Too many requests, retry later"), "rate_limit");
+        assert_eq!(
+            classify_turn_error("HTTP 429: too many requests"),
+            "rate_limit"
+        );
+        assert_eq!(
+            classify_turn_error("Too many requests, retry later"),
+            "rate_limit"
+        );
     }
 
     #[test]
@@ -3450,9 +3459,15 @@ mod tests {
 
     #[test]
     fn classify_turn_error_server() {
-        assert_eq!(classify_turn_error("Internal Server Error 500"), "server_error");
+        assert_eq!(
+            classify_turn_error("Internal Server Error 500"),
+            "server_error"
+        );
         assert_eq!(classify_turn_error("502 Bad Gateway"), "server_error");
-        assert_eq!(classify_turn_error("503 Service Unavailable"), "server_error");
+        assert_eq!(
+            classify_turn_error("503 Service Unavailable"),
+            "server_error"
+        );
     }
 
     #[test]

@@ -5,8 +5,11 @@ use tokio::sync::Mutex;
 
 use super::evolver;
 use super::signal_collector::SignalCollector;
-use super::types::*;
+use super::types::{
+    ApprovalStatus, EvolutionProposal, EvolutionSignal, ToolResultContext, TurnSummary,
+};
 
+use crate::liquid::reflection::ReflectionEngine;
 use crate::pipeline::pattern::PatternLibrary;
 
 /// Orchestrates the evolution lifecycle: collect → propose → apply.
@@ -18,6 +21,8 @@ pub struct EvolutionService {
     applied_log: Mutex<Vec<EvolutionProposal>>,
     /// Optional pattern library for drift detection during flush.
     pattern_library: Option<Arc<std::sync::Mutex<PatternLibrary>>>,
+    /// Cached reflection engine (stateless — reusable across calls).
+    reflection_engine: ReflectionEngine,
 }
 
 impl EvolutionService {
@@ -27,6 +32,7 @@ impl EvolutionService {
             pending_proposals: Mutex::new(Vec::new()),
             applied_log: Mutex::new(Vec::new()),
             pattern_library: None,
+            reflection_engine: ReflectionEngine::new(),
         }
     }
 
@@ -210,8 +216,7 @@ impl EvolutionService {
         &self,
         ctx: &crate::liquid::reflection::ReflectionContext,
     ) -> (String, String) {
-        let engine = crate::liquid::reflection::ReflectionEngine::new();
-        engine.build_prompt(ctx)
+        self.reflection_engine.build_prompt(ctx)
     }
 
     /// Parse an LLM response and queue the resulting proposals as pending.
@@ -222,9 +227,10 @@ impl EvolutionService {
         llm_response: &str,
         ctx: &crate::liquid::reflection::ReflectionContext,
     ) -> Result<usize, String> {
-        let engine = crate::liquid::reflection::ReflectionEngine::new();
-        let parsed = engine.parse_response(llm_response)?;
-        let proposals = engine.convert_proposals(&parsed.proposals, ctx);
+        let parsed = self.reflection_engine.parse_response(llm_response)?;
+        let proposals = self
+            .reflection_engine
+            .convert_proposals(&parsed.proposals, ctx);
         let count = proposals.len();
         let mut pending = self.pending_proposals.lock().await;
         for p in proposals {
@@ -242,6 +248,9 @@ pub fn new_shared() -> Arc<EvolutionService> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::evolution::types::{
+        ApprovalStatus, EvolutionAxis, PatternAction, SkillDiff, SkillSection,
+    };
     use crate::pipeline::routing::{DomainHint, TaskType};
 
     fn tool_failure_signal(tool: &str, skill: Option<&str>) -> EvolutionSignal {

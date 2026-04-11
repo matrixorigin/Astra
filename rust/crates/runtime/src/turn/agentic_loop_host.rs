@@ -2094,7 +2094,7 @@ async fn maybe_trigger_auto_reflection(state: &mut AgenticLoopState) {
     let signals: Vec<_> = state.pending_reflection_signals.drain(..).collect();
 
     let session_id = state.current_session_id.as_deref().unwrap_or("unknown");
-    let turns = state.remaining_turns as u32;
+    let turns_completed = (state.max_turns - state.remaining_turns) as u32;
 
     let scenario = state
         .telemetry
@@ -2107,13 +2107,13 @@ async fn maybe_trigger_auto_reflection(state: &mut AgenticLoopState) {
     let token_util = {
         let total = state.total_prompt + state.total_completion;
         let budget = state.max_turn_input_tokens.max(1) as f64;
-        let effective_turns = turns.max(1) as f64;
+        let effective_turns = turns_completed.max(1) as f64;
         total as f64 / (budget * effective_turns)
     };
 
     let ctx = evo.build_reflection_context(
         session_id,
-        turns,
+        turns_completed,
         scenario.as_deref(),
         token_util,
         &signals,
@@ -3948,12 +3948,20 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                     state.telemetry.observability_session.as_ref(),
                 ) {
                     let total_ms = turn_start_time.elapsed().as_millis() as u64;
+                    let ctx_asm_ms = (llm_wall_start - turn_start_time).as_millis() as u64;
+                    let tool_exec_ms: u64 = turn_result
+                        .edge_tool_round
+                        .iter()
+                        .map(|e| e.duration_ms)
+                        .sum();
                     let timing = crate::observability_integration::TurnTiming {
                         turn: turn_index as u32,
-                        context_assembly_ms: 0, // TODO: measure separately
+                        context_assembly_ms: ctx_asm_ms,
                         ttft_ms: turn_result.ttft_ms.unwrap_or(0) as u64,
-                        llm_total_ms: total_ms,
-                        tool_execution_ms: 0, // TODO: measure separately
+                        llm_total_ms: total_ms
+                            .saturating_sub(ctx_asm_ms)
+                            .saturating_sub(tool_exec_ms),
+                        tool_execution_ms: tool_exec_ms,
                         total_ms,
                     };
                     let mut session_guard = session.write().unwrap_or_else(|e| e.into_inner());

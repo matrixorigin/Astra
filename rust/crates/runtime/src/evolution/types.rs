@@ -35,6 +35,8 @@ pub enum EvolutionSignal {
         stall_count: u32,
         turn_id: String,
     },
+    /// An LLM-driven reflection generated evolution proposals.
+    LlmReflection { context_id: String },
 }
 
 impl EvolutionSignal {
@@ -71,6 +73,9 @@ impl EvolutionSignal {
             }
             Self::RepeatedStall { tool_chain, .. } => {
                 tool_chain.hash(&mut h);
+            }
+            Self::LlmReflection { context_id } => {
+                context_id.hash(&mut h);
             }
         }
         h.finish()

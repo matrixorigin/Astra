@@ -196,6 +196,12 @@ impl SignalSummary {
                 skill_context: None,
                 turn_id: turn_id.clone(),
             },
+            EvolutionSignal::LlmReflection { context_id } => Self {
+                kind: "LlmReflection".into(),
+                detail: format!("reflection:{}", context_id),
+                skill_context: None,
+                turn_id: String::new(),
+            },
         }
     }
 }
@@ -204,7 +210,8 @@ fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
     } else {
-        format!("{}…", &s[..max])
+        let end = s.floor_char_boundary(max);
+        format!("{}…", &s[..end])
     }
 }
 
@@ -377,10 +384,13 @@ impl ReflectionEngine {
                 raw.axis.hash(&mut h);
                 h.finish()
             }),
-            signal: EvolutionSignal::RepeatedStall {
-                tool_chain: vec!["llm-reflection".into()],
-                stall_count: 0,
-                turn_id: String::new(),
+            signal: EvolutionSignal::LlmReflection {
+                context_id: format!("reflect-{:x}", {
+                    use std::hash::{Hash, Hasher};
+                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    raw.description.hash(&mut h);
+                    h.finish()
+                }),
             },
             axis,
             confidence: raw.confidence,

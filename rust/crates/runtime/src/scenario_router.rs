@@ -224,7 +224,15 @@ mod tests {
         exp.start();
         store.register(exp);
 
-        let profile = router.select(&config, &routing, &detector, None, None, Some(&store), "user-1");
+        let profile = router.select(
+            &config,
+            &routing,
+            &detector,
+            None,
+            None,
+            Some(&store),
+            "user-1",
+        );
 
         // User should be enrolled in some variant
         assert!(profile.is_in_experiment());
@@ -247,7 +255,15 @@ mod tests {
         exp.stop();
         store.register(exp);
 
-        let profile = router.select(&config, &routing, &detector, None, None, Some(&store), "user-1");
+        let profile = router.select(
+            &config,
+            &routing,
+            &detector,
+            None,
+            None,
+            Some(&store),
+            "user-1",
+        );
         assert!(!profile.is_in_experiment());
     }
 
@@ -303,7 +319,15 @@ mod tests {
             None,
         );
 
-        let profile = router.select(&config, &routing, &detector, None, Some(&library), None, "user-1");
+        let profile = router.select(
+            &config,
+            &routing,
+            &detector,
+            None,
+            Some(&library),
+            None,
+            "user-1",
+        );
 
         assert!(profile.boost_terms.contains(&"view".to_string()));
         assert!(profile.boost_terms.contains(&"grep".to_string()));
@@ -329,7 +353,15 @@ mod tests {
             .build();
         baselines.promote_winner(&experiment, "winner").unwrap();
 
-        let profile = router.select(&config, &routing, &detector, Some(&baselines), None, None, "user-1");
+        let profile = router.select(
+            &config,
+            &routing,
+            &detector,
+            Some(&baselines),
+            None,
+            None,
+            "user-1",
+        );
 
         assert_eq!(profile.config.memory.retrieval_top_k, 9);
     }

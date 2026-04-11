@@ -1701,10 +1701,7 @@ pub(super) async fn handle_info_command(
                 }
             }
 
-            eprintln!(
-                "  {}",
-                "Use /context breakdown for full details".dim()
-            );
+            eprintln!("  {}", "Use /context breakdown for full details".dim());
             eprintln!();
         }
 

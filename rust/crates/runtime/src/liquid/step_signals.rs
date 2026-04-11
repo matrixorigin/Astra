@@ -1,8 +1,6 @@
 //! Step-level signal collector — tracks per-tool-call outcomes within a turn
 //! and surfaces adaptation triggers when pressure thresholds are breached.
 
-use std::time::Instant;
-
 /// Record of a single tool call outcome (within-turn granularity).
 #[derive(Debug, Clone)]
 pub struct StepOutcome {
@@ -66,7 +64,6 @@ pub struct StepSignalCollector {
     total_tokens_used: u64,
     /// Per-tool failure streak: tool_name → consecutive failures without success.
     tool_failure_counts: std::collections::HashMap<String, u32>,
-    _started_at: Instant,
 }
 
 impl StepSignalCollector {
@@ -78,7 +75,6 @@ impl StepSignalCollector {
             consecutive_errors: 0,
             total_tokens_used: 0,
             tool_failure_counts: std::collections::HashMap::new(),
-            _started_at: Instant::now(),
         }
     }
 
@@ -154,7 +150,6 @@ impl StepSignalCollector {
         self.total_tokens_used = 0;
         self.tool_failure_counts.clear();
         self.turn_token_budget = new_budget;
-        self._started_at = Instant::now();
     }
 
     pub fn outcomes(&self) -> &[StepOutcome] {

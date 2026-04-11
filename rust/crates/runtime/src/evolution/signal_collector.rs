@@ -107,8 +107,8 @@ impl SignalCollector {
 
     /// Process turn-end summary and detect stalls.
     pub fn on_turn_end(&mut self, summary: &TurnSummary<'_>) {
-        // Stall detection is delegated to the caller (TurnState::detect_stall).
-        // This method is a hook for future turn-level signals.
+        // Placeholder: stall detection is delegated to TurnState::detect_stall.
+        // Future turn-level signals (e.g. latency spikes, context overflow) go here.
         let _ = summary;
     }
 

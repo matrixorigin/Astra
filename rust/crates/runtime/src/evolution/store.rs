@@ -226,6 +226,7 @@ impl StoredProposal {
             EvolutionSignal::UserCorrection { .. } => "user_correction",
             EvolutionSignal::PatternDrift { .. } => "pattern_drift",
             EvolutionSignal::RepeatedStall { .. } => "repeated_stall",
+            EvolutionSignal::LlmReflection { .. } => "llm_reflection",
         }
         .to_string();
 
