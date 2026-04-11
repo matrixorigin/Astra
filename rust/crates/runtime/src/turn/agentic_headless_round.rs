@@ -149,7 +149,13 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
     let by_sig: &HashMap<String, String> = edge_callback_outputs;
 
     /// Max times the same (tool, args) signature can execute across the entire session.
-    const MAX_IDENTICAL_CALLS: u32 = 2;
+    const DEFAULT_MAX_IDENTICAL_CALLS: u32 = 2;
+
+    let max_identical = {
+        let cfg = crate::runtime_config::RuntimeConfig::load();
+        let v = cfg.tool_selection.max_identical_tool_calls;
+        if v > 0 { v } else { DEFAULT_MAX_IDENTICAL_CALLS }
+    };
 
     for item in &indices {
         if let Some((aborted_count, aborted_tools)) =
@@ -183,14 +189,14 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
         let call_sig = tool_dedup_signature(&name, &args);
         let count = call_counts.entry(call_sig.clone()).or_insert(0);
         *count += 1;
-        if *count > MAX_IDENTICAL_CALLS {
+        if *count > max_identical {
             // Hard cap: return cached result if available, otherwise short stub.
             let idem_key = IdempotencyKey::semantic(&name, &args);
             if let Some(cached) = idempotency_cache.check(&idem_key) {
                 let body = format!(
-                    "{}\n\n⛔ This is a cached repeat (call #{} for identical args). \
+                    "{}\n\n⛔ This is a cached repeat (call #{} for identical args, limit: {}). \
                      Do NOT call this tool again with the same arguments.",
-                    cached.output, *count
+                    cached.output, *count, max_identical
                 );
                 let (tool_msg, tr) =
                     headless_idempotency_hit_openai_pair(&id, &name, &body);
@@ -206,6 +212,13 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
                 make_args_preview(&name, &args),
             ));
             turn_guard.health.record_cache_hit(&name);
+            agent_warn!(
+                "dedup",
+                "Hard cap: tool '{}' call #{} (limit: {})",
+                name,
+                *count,
+                max_identical
+            );
             continue;
         }
 

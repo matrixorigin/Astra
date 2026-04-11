@@ -311,6 +311,11 @@ pub struct ToolSelectionConfig {
     /// Example: "qwen3.5-flash", "qwen-flash"
     #[serde(default)]
     pub selector_model: Option<String>,
+
+    /// Max times the same (tool, args) can execute across a session.
+    /// 0 = use default (2). Prevents infinite loops from ignored dedup hints.
+    #[serde(default)]
+    pub max_identical_tool_calls: u32,
 }
 
 fn default_max_tools() -> u32 {
@@ -337,6 +342,7 @@ impl Default for ToolSelectionConfig {
             max_tool_schema_tokens: default_max_tool_schema_tokens(),
             tool_budget_tokens: 0,
             selector_model: None,
+            max_identical_tool_calls: 0,
         }
     }
 }
@@ -851,6 +857,7 @@ impl RuntimeConfig {
             max_tool_schema_tokens,
             tool_budget_tokens,
             selector_model,
+            max_identical_tool_calls,
         } = tool_selection;
         merge_if_non_default(
             &mut self.tool_selection.max_tools,
@@ -890,6 +897,11 @@ impl RuntimeConfig {
         if selector_model.is_some() {
             self.tool_selection.selector_model = selector_model;
         }
+        merge_if_non_default(
+            &mut self.tool_selection.max_identical_tool_calls,
+            max_identical_tool_calls,
+            0,
+        );
 
         let LearningConfig {
             enabled,
@@ -1268,6 +1280,7 @@ mod tests {
                 max_tool_schema_tokens: 22000,
                 tool_budget_tokens: 0,
                 selector_model: None,
+                max_identical_tool_calls: 0,
             },
             learning: LearningConfig {
                 enabled: false,
