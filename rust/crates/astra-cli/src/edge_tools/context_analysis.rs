@@ -48,14 +48,25 @@ impl ToolExecutor {
                 let turn = args.get("turn").and_then(|v| v.as_i64()).unwrap_or(-1);
                 let idx = resolve_turn_idx(turn, traces.len());
                 match idx {
-                    Some(i) => analyze_turn(&traces[i], i, traces.len()).to_string(),
+                    Some(i) => analyze_turn(
+                        &traces[i],
+                        i,
+                        traces.len(),
+                        &session.fuzzy_match_events,
+                    )
+                    .to_string(),
                     None => json!({
                         "error": format!("Invalid turn {}. Available: 1–{} or -1 for latest.", turn, traces.len())
                     })
                     .to_string(),
                 }
             }
-            "session" => analyze_session(traces, &session.turn_timings).to_string(),
+            "session" => analyze_session(
+                traces,
+                &session.turn_timings,
+                &session.fuzzy_match_events,
+            )
+            .to_string(),
             "compare" => {
                 let t1 = args.get("turn_a").and_then(|v| v.as_i64()).unwrap_or(1);
                 let t2 = args.get("turn_b").and_then(|v| v.as_i64()).unwrap_or(-1);
@@ -104,6 +115,7 @@ fn analyze_turn(
     trace: &astra_runtime::turn::context_assembly_trace::ContextAssemblyTrace,
     idx: usize,
     total_turns: usize,
+    fuzzy_events: &[astra_runtime::observability_integration::FuzzyMatchEvent],
 ) -> Value {
     let tb = &trace.token_budget;
     let sp = &trace.system_prompt;
@@ -112,6 +124,29 @@ fn analyze_turn(
     let tools = &trace.tools;
 
     let total = tb.total_used.max(1) as f64;
+    let turn_number = (idx + 1) as u32;
+    let turn_fuzzy_events: Vec<_> = fuzzy_events
+        .iter()
+        .filter(|event| event.turn == turn_number)
+        .collect();
+    let fuzzy_matches = turn_fuzzy_events
+        .iter()
+        .filter(|event| {
+            event.outcome == astra_runtime::observability_integration::FuzzyMatchOutcome::Matched
+        })
+        .count();
+    let fuzzy_ambiguous = turn_fuzzy_events
+        .iter()
+        .filter(|event| {
+            event.outcome == astra_runtime::observability_integration::FuzzyMatchOutcome::Ambiguous
+        })
+        .count();
+    let fuzzy_not_found = turn_fuzzy_events
+        .iter()
+        .filter(|event| {
+            event.outcome == astra_runtime::observability_integration::FuzzyMatchOutcome::NotFound
+        })
+        .count();
 
     // System prompt sub-components
     let mut system_components = vec![
@@ -268,6 +303,17 @@ fn analyze_turn(
             "confidence": format!("{:.2}", e.confidence),
             "reasoning": e.reasoning.chars().take(120).collect::<String>(),
         })).collect::<Vec<_>>(),
+        "fuzzy_matching": {
+            "events": turn_fuzzy_events.len(),
+            "matched": fuzzy_matches,
+            "ambiguous": fuzzy_ambiguous,
+            "not_found": fuzzy_not_found,
+            "detail": turn_fuzzy_events.iter().map(|event| json!({
+                "path": event.path,
+                "strategy": event.strategy,
+                "outcome": format!("{:?}", event.outcome),
+            })).collect::<Vec<_>>(),
+        },
     })
 }
 
@@ -275,7 +321,10 @@ fn analyze_turn(
 fn analyze_session(
     traces: &[astra_runtime::turn::context_assembly_trace::ContextAssemblyTrace],
     timings: &[astra_runtime::observability_integration::TurnTiming],
+    fuzzy_events: &[astra_runtime::observability_integration::FuzzyMatchEvent],
 ) -> Value {
+    use std::collections::BTreeMap;
+
     use astra_runtime::turn::context_assembly_trace::TraceAggregation;
 
     let agg = TraceAggregation::from_traces(traces);
@@ -349,6 +398,31 @@ fn analyze_session(
         .map(|t| t.token_budget.budget_pressure)
         .fold(0.0f64, f64::max);
 
+    let fuzzy_matched = fuzzy_events
+        .iter()
+        .filter(|event| {
+            event.outcome == astra_runtime::observability_integration::FuzzyMatchOutcome::Matched
+        })
+        .count();
+    let fuzzy_ambiguous = fuzzy_events
+        .iter()
+        .filter(|event| {
+            event.outcome == astra_runtime::observability_integration::FuzzyMatchOutcome::Ambiguous
+        })
+        .count();
+    let fuzzy_not_found = fuzzy_events
+        .iter()
+        .filter(|event| {
+            event.outcome == astra_runtime::observability_integration::FuzzyMatchOutcome::NotFound
+        })
+        .count();
+    let mut fuzzy_by_strategy = BTreeMap::<String, usize>::new();
+    for event in fuzzy_events.iter().filter(|event| {
+        event.outcome == astra_runtime::observability_integration::FuzzyMatchOutcome::Matched
+    }) {
+        *fuzzy_by_strategy.entry(event.strategy.clone()).or_default() += 1;
+    }
+
     json!({
         "session_summary": {
             "total_turns": n,
@@ -356,6 +430,16 @@ fn analyze_session(
             "peak_budget_pressure": format!("{:.0}%", peak_pressure * 100.0),
             "compression_events": compression_events.len(),
             "total_timing_ms": timings.iter().map(|t| t.total_ms).sum::<u64>(),
+        },
+        "fuzzy_matching": {
+            "events": fuzzy_events.len(),
+            "matched": fuzzy_matched,
+            "ambiguous": fuzzy_ambiguous,
+            "not_found": fuzzy_not_found,
+            "by_strategy": fuzzy_by_strategy.into_iter().map(|(strategy, count)| json!({
+                "strategy": strategy,
+                "count": count,
+            })).collect::<Vec<_>>(),
         },
         "averages": {
             "system_prompt": format!("{:.0}", agg.avg_system_prompt_tokens),

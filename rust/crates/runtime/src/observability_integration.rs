@@ -85,6 +85,9 @@ pub struct ObservabilitySession {
     /// Turn timing data.
     pub turn_timings: Vec<TurnTiming>,
 
+    /// Fuzzy str_replace matching telemetry for this session.
+    pub fuzzy_match_events: Vec<FuzzyMatchEvent>,
+
     /// Goal completion tracker (initialized on first user query).
     pub goal_tracker: Option<GoalTracker>,
 
@@ -119,6 +122,22 @@ pub struct TurnTiming {
     pub llm_total_ms: u64,
     pub tool_execution_ms: u64,
     pub total_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FuzzyMatchOutcome {
+    Matched,
+    NotFound,
+    Ambiguous,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FuzzyMatchEvent {
+    pub turn: u32,
+    pub path: String,
+    pub strategy: String,
+    pub outcome: FuzzyMatchOutcome,
 }
 
 impl ObservabilitySession {
@@ -174,6 +193,7 @@ impl ObservabilitySession {
             started_at: Instant::now(),
             last_query_at: None,
             turn_timings: Vec::new(),
+            fuzzy_match_events: Vec::new(),
             goal_tracker: None,
             last_reported_drift_turn: None,
             last_scenario_change_turn: None,
@@ -205,6 +225,7 @@ impl ObservabilitySession {
             started_at: Instant::now(),
             last_query_at: None,
             turn_timings: Vec::new(),
+            fuzzy_match_events: Vec::new(),
             goal_tracker: None,
             last_reported_drift_turn: None,
             last_scenario_change_turn: None,
@@ -232,6 +253,20 @@ impl ObservabilitySession {
     pub fn record_turn_timing(&mut self, timing: TurnTiming) {
         self.turn_timings.push(timing);
         self.turn_number += 1;
+    }
+
+    pub fn record_fuzzy_match_event(
+        &mut self,
+        path: impl Into<String>,
+        strategy: impl Into<String>,
+        outcome: FuzzyMatchOutcome,
+    ) {
+        self.fuzzy_match_events.push(FuzzyMatchEvent {
+            turn: self.turn_number + 1,
+            path: path.into(),
+            strategy: strategy.into(),
+            outcome,
+        });
     }
 
     /// Record a query for drift analysis.
@@ -563,6 +598,7 @@ impl ObservabilityHub {
             detected_scenario: session.profile.current_scenario,
             context_traces: session.context_traces.len() as u32,
             decisions_explained: session.decision_explanations.len() as u32,
+            fuzzy_match_events: session.fuzzy_match_events.len() as u32,
         })
     }
 
@@ -752,6 +788,7 @@ pub struct SessionSummary {
     pub detected_scenario: Option<Scenario>,
     pub context_traces: u32,
     pub decisions_explained: u32,
+    pub fuzzy_match_events: u32,
 }
 
 const QUICK_FOLLOW_UP_MAX_DELAY_MS: u64 = 20_000;

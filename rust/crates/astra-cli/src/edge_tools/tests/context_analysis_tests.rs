@@ -1,4 +1,5 @@
 use super::*;
+use astra_runtime::observability_integration::{FuzzyMatchEvent, FuzzyMatchOutcome};
 use astra_runtime::observability_integration::TurnTiming;
 use astra_runtime::turn::context_assembly_trace::*;
 use serde_json::json;
@@ -119,6 +120,29 @@ fn make_executor_with_session(
         let mut guard = session_arc.write().unwrap();
         guard.context_traces = traces;
         guard.turn_timings = timings;
+    }
+    executor.observability_session = Some(session_arc);
+
+    (dir, executor)
+}
+
+fn make_executor_with_session_and_fuzzy(
+    traces: Vec<ContextAssemblyTrace>,
+    timings: Vec<TurnTiming>,
+    fuzzy_match_events: Vec<FuzzyMatchEvent>,
+) -> (tempfile::TempDir, ToolExecutor) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut executor = ToolExecutor::new(dir.path());
+
+    let session =
+        astra_runtime::observability_integration::ObservabilitySession::new_simple("test-session");
+
+    let session_arc = std::sync::Arc::new(std::sync::RwLock::new(session));
+    {
+        let mut guard = session_arc.write().unwrap();
+        guard.context_traces = traces;
+        guard.turn_timings = timings;
+        guard.fuzzy_match_events = fuzzy_match_events;
     }
     executor.observability_session = Some(session_arc);
 
@@ -285,6 +309,37 @@ fn context_analysis_turn_budget_pressure() {
     assert_eq!(budget["compression_triggered"], true);
 }
 
+#[test]
+fn context_analysis_turn_includes_fuzzy_matching() {
+    let trace = sample_trace("T1", 1600, 500, 0.85);
+    let fuzzy_events = vec![
+        FuzzyMatchEvent {
+            turn: 1,
+            path: "src/main.rs".to_string(),
+            strategy: "line-number-stripped".to_string(),
+            outcome: FuzzyMatchOutcome::Matched,
+        },
+        FuzzyMatchEvent {
+            turn: 1,
+            path: "src/main.rs".to_string(),
+            strategy: "none".to_string(),
+            outcome: FuzzyMatchOutcome::NotFound,
+        },
+    ];
+    let (_dir, executor) = make_executor_with_session_and_fuzzy(vec![trace], vec![], fuzzy_events);
+
+    let result = executor.context_analysis(&json!({"mode": "turn"}));
+    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+
+    assert_eq!(parsed["fuzzy_matching"]["events"], 2);
+    assert_eq!(parsed["fuzzy_matching"]["matched"], 1);
+    assert_eq!(parsed["fuzzy_matching"]["not_found"], 1);
+    assert_eq!(
+        parsed["fuzzy_matching"]["detail"][0]["strategy"],
+        "line-number-stripped"
+    );
+}
+
 // ─── Turn mode: zero tokens edge case ────────────────────────────────────────
 
 #[test]
@@ -395,6 +450,46 @@ fn context_analysis_session_no_timings() {
     // Timing defaults to 0
     let first_turn = &parsed["per_turn"][0];
     assert_eq!(first_turn["timing_ms"], 0);
+}
+
+#[test]
+fn context_analysis_session_includes_fuzzy_matching_summary() {
+    let t1 = sample_trace("T1", 1600, 500, 0.3);
+    let t2 = sample_trace("T2", 2000, 800, 0.6);
+    let fuzzy_events = vec![
+        FuzzyMatchEvent {
+            turn: 1,
+            path: "src/main.rs".to_string(),
+            strategy: "line-number-stripped".to_string(),
+            outcome: FuzzyMatchOutcome::Matched,
+        },
+        FuzzyMatchEvent {
+            turn: 1,
+            path: "src/main.rs".to_string(),
+            strategy: "quote-normalized".to_string(),
+            outcome: FuzzyMatchOutcome::Ambiguous,
+        },
+        FuzzyMatchEvent {
+            turn: 2,
+            path: "src/lib.rs".to_string(),
+            strategy: "exact".to_string(),
+            outcome: FuzzyMatchOutcome::Matched,
+        },
+    ];
+    let (_dir, executor) =
+        make_executor_with_session_and_fuzzy(vec![t1, t2], vec![], fuzzy_events);
+
+    let result = executor.context_analysis(&json!({"mode": "session"}));
+    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+
+    assert_eq!(parsed["fuzzy_matching"]["events"], 3);
+    assert_eq!(parsed["fuzzy_matching"]["matched"], 2);
+    assert_eq!(parsed["fuzzy_matching"]["ambiguous"], 1);
+    assert_eq!(parsed["fuzzy_matching"]["by_strategy"][0]["strategy"], "exact");
+    assert_eq!(
+        parsed["fuzzy_matching"]["by_strategy"][1]["strategy"],
+        "line-number-stripped"
+    );
 }
 
 // ─── Compare mode ────────────────────────────────────────────────────────────

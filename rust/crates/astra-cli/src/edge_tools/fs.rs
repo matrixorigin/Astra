@@ -85,6 +85,22 @@ pub(crate) fn is_dangerous_write_target(rel_path: &str) -> Option<&'static str> 
 }
 
 impl ToolExecutor {
+    fn record_fuzzy_match_event(
+        &self,
+        path: &Path,
+        strategy: &str,
+        outcome: astra_runtime::observability_integration::FuzzyMatchOutcome,
+    ) {
+        let Some(session) = &self.observability_session else {
+            return;
+        };
+        let mut session = match session.write() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        session.record_fuzzy_match_event(path.display().to_string(), strategy, outcome);
+    }
+
     /// Resolve path with explicit error when sandbox blocks it.
     pub(crate) fn resolve_checked(&self, path: &str) -> Result<PathBuf, String> {
         if is_unc_path(path) {
@@ -743,80 +759,19 @@ impl ToolExecutor {
         };
         let count = content.matches(old_str).count();
         if count == 0 {
-            // Fallback: try matching with normalized curly/smart quotes.
-            // LLMs and copy-paste from docs/web often produce curly quotes
-            // (U+2018/2019/201C/201D) that don't match the file's ASCII quotes.
-            let norm_count = count_with_quote_normalization(&content, old_str);
-            if norm_count == 1 {
-                // Found exactly one match after quote normalization
-                if let Some(actual) = find_with_quote_normalization(&content, old_str) {
-                    let new_content = content.replacen(actual, new_str, 1);
-                    if dry_run {
-                        return unified_diff(&content, &new_content, &path);
-                    }
-                    // Defense-in-depth: re-check staleness right before writing.
-                    if let Err(e) = self.check_staleness(&path) {
-                        return format!("Error: Pre-write staleness check failed: {e}");
-                    }
-                    // Journal: snapshot before-state for undo
-                    let turn_idx = self
-                        .journal_turn_index
-                        .load(std::sync::atomic::Ordering::Relaxed);
-                    let journal_call_id = format!("str_replace_quote_norm:{}", path.display());
-                    if let Ok(mut journal) = self.file_journal.lock() {
-                        journal.record_before_patch(&path, &journal_call_id, turn_idx);
-                    }
-                    match fs::write(&path, &new_content) {
-                        Ok(_) => {
-                            self.record_write_with_content(&path, &new_content);
-                            // Journal: record after-state
-                            if let Ok(mut journal) = self.file_journal.lock() {
-                                journal.record_after(
-                                    &path,
-                                    &journal_call_id,
-                                    new_content.as_bytes(),
-                                );
-                            }
-                            let format_result = auto_format_file(&path, &self.project_root);
-                            if format_result.is_some() {
-                                self.record_write(&path);
-                            }
-                            let mut result = String::from(
-                                "Replaced successfully (matched after normalizing curly quotes → ASCII)\n",
-                            );
-                            let old_lines: Vec<&str> = actual.lines().collect();
-                            let new_lines: Vec<&str> = new_str.lines().collect();
-                            if old_lines.len().max(new_lines.len()) <= 10 {
-                                for l in &old_lines {
-                                    result.push_str(&format!("- {l}\n"));
-                                }
-                                for l in &new_lines {
-                                    result.push_str(&format!("+ {l}\n"));
-                                }
-                            }
-                            if let Some(fmt_note) = format_result {
-                                result.push_str(&format!("\n{fmt_note}"));
-                            }
-                            append_str_replace_cli_unified_diff(
-                                &mut result,
-                                &content,
-                                &new_content,
-                                &path,
-                            );
-                            if let Some(diag) = self.inline_lsp_diagnostics(&path) {
-                                result.push_str(&diag);
-                            }
-                            return result;
-                        }
-                        Err(e) => return format!("Error writing file: {e}"),
-                    }
-                }
-            } else if norm_count > 1 {
+            let norm_count = super::fuzzy_replacer::quote_normalized_match_count(&content, old_str);
+            if norm_count > 1 {
+                self.record_fuzzy_match_event(
+                    &path,
+                    "quote-normalized",
+                    astra_runtime::observability_integration::FuzzyMatchOutcome::Ambiguous,
+                );
                 return format!(
                     "Error: old_str found {norm_count} times (after normalizing curly quotes) — must be unique.\n\
                      Hint: Add more surrounding context to old_str to make it unique.\n"
                 );
             }
+
             // Fuzzy cascade: try progressively looser matching strategies
             if let Some(fuzzy_match) =
                 super::fuzzy_replacer::fuzzy_find_replacement(&content, old_str, replace_all)
@@ -828,6 +783,11 @@ impl ToolExecutor {
                     content.replacen(actual, new_str, 1)
                 };
                 if dry_run {
+                    self.record_fuzzy_match_event(
+                        &path,
+                        fuzzy_match.strategy,
+                        astra_runtime::observability_integration::FuzzyMatchOutcome::Matched,
+                    );
                     return unified_diff(&content, &new_content, &path);
                 }
                 if let Err(e) = self.check_staleness(&path) {
@@ -837,7 +797,11 @@ impl ToolExecutor {
                 let turn_idx = self
                     .journal_turn_index
                     .load(std::sync::atomic::Ordering::Relaxed);
-                let journal_call_id = format!("str_replace_fuzzy:{}", path.display());
+                let journal_call_id = if fuzzy_match.strategy == "quote-normalized" {
+                    format!("str_replace_quote_norm:{}", path.display())
+                } else {
+                    format!("str_replace_fuzzy:{}", path.display())
+                };
                 if let Ok(mut journal) = self.file_journal.lock() {
                     journal.record_before_patch(&path, &journal_call_id, turn_idx);
                 }
@@ -852,10 +816,16 @@ impl ToolExecutor {
                         if format_result.is_some() {
                             self.record_write(&path);
                         }
-                        let mut result = format!(
-                            "Replaced successfully (matched via {})\n",
-                            fuzzy_match.strategy
-                        );
+                        let mut result = if fuzzy_match.strategy == "quote-normalized" {
+                            String::from(
+                                "Replaced successfully (matched after normalizing curly quotes → ASCII)\n",
+                            )
+                        } else {
+                            format!(
+                                "Replaced successfully (matched via {})\n",
+                                fuzzy_match.strategy
+                            )
+                        };
                         let old_lines: Vec<&str> = fuzzy_match.actual.lines().collect();
                         let new_lines: Vec<&str> = new_str.lines().collect();
                         if old_lines.len().max(new_lines.len()) <= 10 {
@@ -878,14 +848,29 @@ impl ToolExecutor {
                         if let Some(diag) = self.inline_lsp_diagnostics(&path) {
                             result.push_str(&diag);
                         }
+                        self.record_fuzzy_match_event(
+                            &path,
+                            fuzzy_match.strategy,
+                            astra_runtime::observability_integration::FuzzyMatchOutcome::Matched,
+                        );
                         return result;
                     }
                     Err(e) => return format!("Error writing file: {e}"),
                 }
             }
+            self.record_fuzzy_match_event(
+                &path,
+                "none",
+                astra_runtime::observability_integration::FuzzyMatchOutcome::NotFound,
+            );
             return str_replace_not_found_hint(&content, old_str);
         }
         if count > 1 && !replace_all {
+            self.record_fuzzy_match_event(
+                &path,
+                "exact",
+                astra_runtime::observability_integration::FuzzyMatchOutcome::Ambiguous,
+            );
             return str_replace_ambiguous_hint(&content, old_str, count);
         }
 
@@ -897,6 +882,11 @@ impl ToolExecutor {
 
         // Dry run: show unified diff without writing
         if dry_run {
+            self.record_fuzzy_match_event(
+                &path,
+                "exact",
+                astra_runtime::observability_integration::FuzzyMatchOutcome::Matched,
+            );
             return unified_diff(&content, &new_content, &path);
         }
 
@@ -973,6 +963,11 @@ impl ToolExecutor {
                 if let Some(diag) = self.inline_lsp_diagnostics(&path) {
                     result.push_str(&diag);
                 }
+                self.record_fuzzy_match_event(
+                    &path,
+                    "exact",
+                    astra_runtime::observability_integration::FuzzyMatchOutcome::Matched,
+                );
                 result
             }
             Err(e) => format!("Error writing file: {e}"),
@@ -1955,46 +1950,6 @@ fn add_line_numbers(content: &str, start_line: usize) -> String {
         .join("\n")
 }
 
-// ─── Quote normalization for str_replace fuzzy matching ──────────────────────
-
-/// Normalize curly/smart quotes to straight ASCII quotes.
-/// Handles: ' ' → '  and  " " → "
-fn normalize_quotes(s: &str) -> String {
-    s.replace(['\u{2018}', '\u{2019}'], "'") // curly single → straight
-        .replace(['\u{201C}', '\u{201D}'], "\"") // curly double → straight
-}
-
-/// Find the actual substring in `content` that matches `search` after quote
-/// normalization. Returns the original bytes from `content` (preserving the
-/// file's actual quote characters), or `None` if no match.
-fn find_with_quote_normalization<'a>(content: &'a str, search: &str) -> Option<&'a str> {
-    let norm_search = normalize_quotes(search);
-    let norm_content = normalize_quotes(content);
-
-    let norm_byte_start = norm_content.find(&norm_search)?;
-    // Convert byte offset in normalized → char offset (same in both since
-    // normalization maps each char 1:1, only byte widths differ).
-    let char_start = norm_content[..norm_byte_start].chars().count();
-    let char_len = norm_search.chars().count();
-
-    // Map char offset back to byte positions in the original content.
-    let byte_start = content.char_indices().nth(char_start).map(|(i, _)| i)?;
-    let byte_end = content
-        .char_indices()
-        .nth(char_start + char_len)
-        .map(|(i, _)| i)
-        .unwrap_or(content.len());
-
-    Some(&content[byte_start..byte_end])
-}
-
-/// Count occurrences of `search` in `content` after normalizing curly quotes.
-fn count_with_quote_normalization(content: &str, search: &str) -> usize {
-    let norm_search = normalize_quotes(search);
-    let norm_content = normalize_quotes(content);
-    norm_content.matches(&norm_search).count()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2475,33 +2430,6 @@ type Handler interface {
         assert_eq!(result, "3\tc\n4\td");
     }
 
-    // ── quote normalization ──────────────────────────────────────────────────
-
-    #[test]
-    fn normalize_quotes_curly_to_straight() {
-        assert_eq!(
-            normalize_quotes("say \u{201C}hello\u{201D}"),
-            "say \"hello\""
-        );
-        assert_eq!(normalize_quotes("it\u{2019}s"), "it's");
-    }
-
-    #[test]
-    fn find_with_quote_normalization_basic() {
-        let content = "let x = \u{201C}hello\u{201D};";
-        let search = "\"hello\"";
-        let found = find_with_quote_normalization(content, search);
-        assert!(found.is_some(), "should find after normalization");
-        // The returned string should be the ORIGINAL curly quotes from content
-        assert_eq!(found.unwrap(), "\u{201C}hello\u{201D}");
-    }
-
-    #[test]
-    fn find_with_quote_normalization_no_match() {
-        let content = "let x = 42;";
-        assert!(find_with_quote_normalization(content, "\"hello\"").is_none());
-    }
-
     #[test]
     fn str_replace_with_curly_quotes() {
         let dir = tempfile::tempdir().unwrap();
@@ -2528,6 +2456,48 @@ type Handler interface {
         // Verify actual file content
         let actual = std::fs::read_to_string(&file_path).unwrap();
         assert_eq!(actual, "let x = \"world\";");
+    }
+
+    #[test]
+    fn str_replace_with_line_number_prefixed_old_str() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("numbered.rs");
+        std::fs::write(&file_path, "fn main() {\n    println!(\"hello\");\n}\n").unwrap();
+
+        let executor = test_executor_in(dir.path());
+        executor.read_file(&serde_json::json!({"path": "numbered.rs"}));
+        let result = executor.str_replace(&serde_json::json!({
+            "path": "numbered.rs",
+            "old_str": "1. fn main() {\n2.     println!(\"hello\");\n3. }",
+            "new_str": "fn main() {\n    println!(\"world\");\n}"
+        }));
+        assert!(
+            result.contains("matched via line-number-stripped"),
+            "should use line-number stripping: {result}"
+        );
+        let actual = std::fs::read_to_string(&file_path).unwrap();
+        assert_eq!(actual, "fn main() {\n    println!(\"world\");\n}\n");
+    }
+
+    #[test]
+    fn str_replace_with_sequence_similarity_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("similar.rs");
+        std::fs::write(&file_path, "let count = 1;\nprintln!(\"hello\");\n").unwrap();
+
+        let executor = test_executor_in(dir.path());
+        executor.read_file(&serde_json::json!({"path": "similar.rs"}));
+        let result = executor.str_replace(&serde_json::json!({
+            "path": "similar.rs",
+            "old_str": "let count = 2;\nprintln!(\"hullo\");",
+            "new_str": "let count = 3;\nprintln!(\"world\");"
+        }));
+        assert!(
+            result.contains("matched via sequence-similarity"),
+            "should use sequence similarity fallback: {result}"
+        );
+        let actual = std::fs::read_to_string(&file_path).unwrap();
+        assert_eq!(actual, "let count = 3;\nprintln!(\"world\");\n");
     }
 
     // ── read_file large file truncation hint ─────────────────────────────────

@@ -58,6 +58,8 @@ fn show_summary(
     >,
     state: &ReplState,
 ) {
+    use astra_runtime::observability_integration::FuzzyMatchOutcome;
+
     let session_guard = session.read().unwrap_or_else(|e| e.into_inner());
 
     eprintln!(
@@ -146,6 +148,53 @@ fn show_summary(
         "queries_tracked:".dim(),
         session_guard.recent_queries.len().to_string().cyan()
     );
+
+    if !session_guard.fuzzy_match_events.is_empty() {
+        let matched = session_guard
+            .fuzzy_match_events
+            .iter()
+            .filter(|event| event.outcome == FuzzyMatchOutcome::Matched)
+            .count();
+        let ambiguous = session_guard
+            .fuzzy_match_events
+            .iter()
+            .filter(|event| event.outcome == FuzzyMatchOutcome::Ambiguous)
+            .count();
+        let not_found = session_guard
+            .fuzzy_match_events
+            .iter()
+            .filter(|event| event.outcome == FuzzyMatchOutcome::NotFound)
+            .count();
+        let mut by_strategy = std::collections::BTreeMap::<String, usize>::new();
+        for event in session_guard
+            .fuzzy_match_events
+            .iter()
+            .filter(|event| event.outcome == FuzzyMatchOutcome::Matched)
+        {
+            *by_strategy.entry(event.strategy.clone()).or_default() += 1;
+        }
+
+        eprintln!(
+            "  {:<18} {}",
+            "fuzzy_events:".dim(),
+            session_guard.fuzzy_match_events.len().to_string().cyan()
+        );
+        eprintln!(
+            "  {:<18} {} matched · {} ambiguous · {} misses",
+            "fuzzy_stats:".dim(),
+            matched.to_string().cyan(),
+            ambiguous.to_string().yellow(),
+            not_found.to_string().red()
+        );
+        if !by_strategy.is_empty() {
+            let strategies = by_strategy
+                .into_iter()
+                .map(|(strategy, count)| format!("{strategy}:{count}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            eprintln!("  {:<18} {}", "fuzzy_by_strategy:".dim(), strategies.cyan());
+        }
+    }
 
     // Active experiment
     if let Some(ref variant) = session_guard.active_variant {

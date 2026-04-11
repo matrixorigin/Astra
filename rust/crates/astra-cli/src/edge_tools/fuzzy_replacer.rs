@@ -5,11 +5,14 @@
 //! try progressively looser matching to auto-fix the replacement.
 //!
 //! Cascade order:
+//!   0. LineNumberStrippedReplacer — strip read_file-style line-number prefixes
+//!   0.5 QuoteNormalizedReplacer — normalize curly quotes to ASCII
 //!   1. LineTrimmedReplacer — trim each line before comparing
 //!   2. BlockAnchorReplacer — anchor first+last line, Levenshtein middle
 //!   3. WhitespaceNormalizedReplacer — collapse all whitespace
 //!   4. IndentationFlexibleReplacer — remove common indent, compare dedented
 //!   5. EscapeNormalizedReplacer — handle \n \t \' \" etc.
+//!   6. SequenceSimilarityReplacer — sliding-window similarity fallback
 //!
 //! Each replacer returns the *actual* substring from the file content that
 //! should be replaced, so the caller can do `content.replacen(actual, new_str, 1)`.
@@ -35,6 +38,10 @@ pub(crate) fn fuzzy_find_replacement<'a>(
     // Each returns Vec of actual content substrings that match.
     type Strategy = (&'static str, fn(&str, &str) -> Vec<String>);
     let strategies: &[Strategy] = &[
+        ("line-number-stripped", |c, s| {
+            line_number_stripped_find(c, s)
+        }),
+        ("quote-normalized", |c, s| quote_normalized_find(c, s)),
         ("line-trimmed", |c, s| line_trimmed_find(c, s)),
         ("block-anchor", |c, s| block_anchor_find(c, s)),
         ("whitespace-normalized", |c, s| {
@@ -44,6 +51,7 @@ pub(crate) fn fuzzy_find_replacement<'a>(
             indentation_flexible_find(c, s)
         }),
         ("escape-normalized", |c, s| escape_normalized_find(c, s)),
+        ("sequence-similarity", |c, s| sequence_similarity_find(c, s)),
     ];
 
     for (name, strategy_fn) in strategies {
@@ -76,6 +84,120 @@ pub(crate) fn fuzzy_find_replacement<'a>(
         // 0 matches → try next; >1 matches → ambiguous, try next
     }
     None
+}
+
+// ─── Strategy 0: LineNumberStrippedReplacer ──────────────────────────────────
+
+/// Match after stripping line-number prefixes from old_str lines.
+/// Handles: LLM copying `read_file` output that includes `123. ` or `42: ` prefixes.
+/// Only activates if ≥50% of non-empty old_str lines have a line-number prefix.
+fn line_number_stripped_find(content: &str, old_str: &str) -> Vec<String> {
+    let search_lines: Vec<&str> = old_str.lines().collect();
+    if search_lines.is_empty() {
+        return vec![];
+    }
+
+    // Count how many non-empty lines have a line-number prefix
+    let non_empty: Vec<&&str> = search_lines
+        .iter()
+        .filter(|l| !l.trim().is_empty())
+        .collect();
+    if non_empty.is_empty() {
+        return vec![];
+    }
+
+    let prefixed_count = non_empty
+        .iter()
+        .filter(|l| has_line_number_prefix(l))
+        .count();
+
+    // Only activate if ≥50% of non-empty lines have prefixes
+    if prefixed_count * 2 < non_empty.len() {
+        return vec![];
+    }
+
+    // Strip prefixes and reconstruct
+    let stripped: String = search_lines
+        .iter()
+        .map(|l| strip_line_number_prefix(l))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // Try exact match with stripped version
+    let mut results = Vec::new();
+    let mut search_start = 0;
+    while let Some(pos) = content[search_start..].find(&stripped) {
+        let abs_pos = search_start + pos;
+        results.push(content[abs_pos..abs_pos + stripped.len()].to_string());
+        search_start = abs_pos + 1;
+        if results.len() > 2 {
+            break;
+        }
+    }
+    results
+}
+
+/// Check if a line starts with a line-number prefix pattern.
+/// Matches: `123. `, `42: `, `100| `, `  7. `, `15.` (with optional trailing space)
+fn has_line_number_prefix(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    let mut chars = trimmed.chars().peekable();
+
+    // Must start with a digit
+    if !chars.peek().is_some_and(|c| c.is_ascii_digit()) {
+        return false;
+    }
+
+    // Consume digits
+    while chars.peek().is_some_and(|c| c.is_ascii_digit()) {
+        chars.next();
+    }
+
+    // Must be followed by one of: . : |
+    matches!(chars.peek(), Some('.' | ':' | '|'))
+}
+
+/// Strip the line-number prefix from a line, preserving remaining content.
+fn strip_line_number_prefix(line: &str) -> &str {
+    let leading_ws = line.len() - line.trim_start().len();
+    let trimmed = &line[leading_ws..];
+
+    let mut idx = 0;
+    let bytes = trimmed.as_bytes();
+
+    // Skip digits
+    while idx < bytes.len() && bytes[idx].is_ascii_digit() {
+        idx += 1;
+    }
+
+    // Skip delimiter (. : |)
+    if idx < bytes.len() && matches!(bytes[idx], b'.' | b':' | b'|') {
+        idx += 1;
+    } else {
+        // No delimiter found — return original
+        return line;
+    }
+
+    // Skip optional single space after delimiter
+    if idx < bytes.len() && bytes[idx] == b' ' {
+        idx += 1;
+    }
+
+    &trimmed[idx..]
+}
+
+// ─── Strategy 0.5: QuoteNormalizedReplacer ──────────────────────────────────
+
+/// Match after normalizing curly/smart quotes to ASCII quotes.
+/// Handles: LLMs and copy-paste from docs/web often producing U+2018/2019/201C/201D.
+fn quote_normalized_find(content: &str, old_str: &str) -> Vec<String> {
+    if quote_normalized_match_count(content, old_str) != 1 {
+        return vec![];
+    }
+
+    quote_normalized_actual(content, old_str)
+        .map(|actual| vec![actual.to_string()])
+        .unwrap_or_default()
 }
 
 // ─── Strategy 1: LineTrimmedReplacer ────────────────────────────────────────
@@ -320,7 +442,132 @@ fn escape_normalized_find(content: &str, old_str: &str) -> Vec<String> {
     results
 }
 
+// ─── Strategy 6: SequenceSimilarityReplacer ──────────────────────────────────
+
+/// Match by scoring line-by-line similarity across a sliding window.
+/// Handles: LLM hallucinating small changes across multiple lines (variable names,
+/// values, comments) where no single structural anchor matches exactly.
+/// This is the broadest and most expensive strategy — runs last in the cascade.
+fn sequence_similarity_find(content: &str, old_str: &str) -> Vec<String> {
+    const SIMILARITY_THRESHOLD: f64 = 0.85;
+
+    let content_lines: Vec<&str> = content.lines().collect();
+    let mut search_lines: Vec<&str> = old_str.lines().collect();
+
+    // Need at least 2 lines for meaningful similarity
+    if search_lines.len() < 2 {
+        return vec![];
+    }
+
+    // Remove trailing empty line (common in LLM output)
+    if search_lines.last().is_some_and(|l| l.trim().is_empty()) {
+        search_lines.pop();
+    }
+    if search_lines.len() < 2 || content_lines.len() < search_lines.len() {
+        return vec![];
+    }
+
+    struct ScoredBlock {
+        start: usize,
+        similarity: f64,
+    }
+
+    let mut candidates: Vec<ScoredBlock> = Vec::new();
+
+    for i in 0..=content_lines.len() - search_lines.len() {
+        let mut total_sim = 0.0;
+        let mut scored_lines = 0;
+
+        for (j, search_line) in search_lines.iter().enumerate() {
+            let content_line = content_lines[i + j];
+            let a = content_line.trim();
+            let b = search_line.trim();
+
+            // Empty line matches empty line perfectly
+            if a.is_empty() && b.is_empty() {
+                total_sim += 1.0;
+                scored_lines += 1;
+                continue;
+            }
+
+            let max_len = a.len().max(b.len());
+            if max_len == 0 {
+                total_sim += 1.0;
+                scored_lines += 1;
+                continue;
+            }
+
+            let dist = levenshtein(a, b);
+            let sim = 1.0 - (dist as f64 / max_len as f64);
+            total_sim += sim;
+            scored_lines += 1;
+        }
+
+        if scored_lines == 0 {
+            continue;
+        }
+
+        let avg_sim = total_sim / scored_lines as f64;
+        if avg_sim >= SIMILARITY_THRESHOLD {
+            candidates.push(ScoredBlock {
+                start: i,
+                similarity: avg_sim,
+            });
+        }
+    }
+
+    if candidates.is_empty() {
+        return vec![];
+    }
+
+    // Return best match only if it's clearly the winner
+    candidates.sort_by(|a, b| {
+        b.similarity
+            .partial_cmp(&a.similarity)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    // If multiple candidates are very close in score (within 0.02), it's ambiguous
+    if candidates.len() > 1 && (candidates[0].similarity - candidates[1].similarity) < 0.02 {
+        return vec![];
+    }
+
+    let best = &candidates[0];
+    let block: String = content_lines[best.start..best.start + search_lines.len()].join("\n");
+    vec![block]
+}
+
 // ─── Helper functions ───────────────────────────────────────────────────────
+
+fn normalize_quotes(s: &str) -> String {
+    s.replace(['\u{2018}', '\u{2019}'], "'")
+        .replace(['\u{201C}', '\u{201D}'], "\"")
+}
+
+fn quote_normalized_actual<'a>(content: &'a str, search: &str) -> Option<&'a str> {
+    let norm_search = normalize_quotes(search);
+    let norm_content = normalize_quotes(content);
+    let pos = norm_content.find(&norm_search)?;
+
+    let mut content_indices: Vec<usize> = content.char_indices().map(|(i, _)| i).collect();
+    content_indices.push(content.len());
+    let mut norm_indices: Vec<usize> = norm_content.char_indices().map(|(i, _)| i).collect();
+    norm_indices.push(norm_content.len());
+    let start_char = norm_indices
+        .partition_point(|&i| i <= pos)
+        .saturating_sub(1);
+    let end_pos = pos + norm_search.len();
+    let end_char = norm_indices.partition_point(|&i| i < end_pos);
+    let content_start = *content_indices.get(start_char)?;
+    let content_end = *content_indices.get(end_char)?;
+    Some(&content[content_start..content_end])
+}
+
+pub(crate) fn quote_normalized_match_count(content: &str, search: &str) -> usize {
+    let norm_search = normalize_quotes(search);
+    let norm_content = normalize_quotes(content);
+    norm_content.matches(&norm_search).count()
+}
 
 /// Collapse all whitespace to single spaces and trim.
 fn normalize_ws(s: &str) -> String {
@@ -451,6 +698,79 @@ mod tests {
         assert_eq!(levenshtein("abc", ""), 3);
     }
 
+    // ─── LineNumberStrippedReplacer ────────────────────────────────────────
+
+    #[test]
+    fn has_line_number_prefix_recognizes_supported_prefixes() {
+        assert!(has_line_number_prefix("1. hello"));
+        assert!(has_line_number_prefix("42: world"));
+        assert!(has_line_number_prefix("  7| test"));
+        assert!(has_line_number_prefix("15."));
+    }
+
+    #[test]
+    fn has_line_number_prefix_rejects_non_prefixes() {
+        assert!(!has_line_number_prefix("hello"));
+        assert!(!has_line_number_prefix("v1.2.3"));
+        assert!(!has_line_number_prefix("  abc: test"));
+    }
+
+    #[test]
+    fn strip_line_number_prefix_removes_prefix() {
+        assert_eq!(strip_line_number_prefix("12. hello"), "hello");
+        assert_eq!(strip_line_number_prefix("  42: world"), "world");
+        assert_eq!(strip_line_number_prefix("7| value"), "value");
+        assert_eq!(strip_line_number_prefix("no prefix"), "no prefix");
+    }
+
+    #[test]
+    fn line_number_stripped_finds_exact_match() {
+        let content = "fn demo() {\n    println!(\"hi\");\n}";
+        let search = "1. fn demo() {\n2.     println!(\"hi\");\n3. }";
+        let matches = line_number_stripped_find(content, search);
+        assert_eq!(matches, vec![content.to_string()]);
+    }
+
+    #[test]
+    fn line_number_stripped_requires_majority_prefixed_lines() {
+        let content = "fn demo() {\n    println!(\"hi\");\n}";
+        let search = "1. fn demo() {\n    println!(\"hi\");\n}";
+        let matches = line_number_stripped_find(content, search);
+        assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn line_number_stripped_handles_colon_and_pipe_prefixes() {
+        let content = "alpha\nbeta\ngamma";
+        let search = "10: alpha\n11| beta\n12: gamma";
+        let matches = line_number_stripped_find(content, search);
+        assert_eq!(matches, vec![content.to_string()]);
+    }
+
+    #[test]
+    fn normalize_quotes_curly_to_straight() {
+        assert_eq!(
+            normalize_quotes("say \u{201C}hello\u{201D}"),
+            "say \"hello\""
+        );
+        assert_eq!(normalize_quotes("it\u{2019}s"), "it's");
+    }
+
+    #[test]
+    fn quote_normalized_actual_returns_original_slice() {
+        let content = "let x = \u{201C}hello\u{201D};";
+        let search = "\"hello\"";
+        let found = quote_normalized_actual(content, search);
+        assert_eq!(found, Some("\u{201C}hello\u{201D}"));
+    }
+
+    #[test]
+    fn quote_normalized_match_count_handles_curly_quotes() {
+        let content = "let x = \"hello\";\nlet y = \"hello\";";
+        let search = "let x = \u{201C}hello\u{201D};";
+        assert_eq!(quote_normalized_match_count(content, search), 1);
+    }
+
     // ─── LineTrimmedReplacer ────────────────────────────────────────────────
 
     #[test]
@@ -562,6 +882,33 @@ mod tests {
         assert!(matches.is_empty()); // No escapes → skip strategy
     }
 
+    // ─── SequenceSimilarityReplacer ────────────────────────────────────────
+
+    #[test]
+    fn sequence_similarity_matches_near_block_without_exact_anchors() {
+        let content = "let count = 1;\nprintln!(\"hello\");";
+        let search = "let count = 2;\nprintln!(\"hullo\");";
+        let matches = sequence_similarity_find(content, search);
+        assert_eq!(matches, vec![content.to_string()]);
+    }
+
+    #[test]
+    fn sequence_similarity_below_threshold_returns_none() {
+        let content = "let count = 1;\nprintln!(\"hello\");";
+        let search = "totally different\ncompletely unrelated";
+        let matches = sequence_similarity_find(content, search);
+        assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn sequence_similarity_ambiguous_returns_none() {
+        let content =
+            "let count = 1;\nprintln!(\"hello\");\n\nlet count = 1;\nprintln!(\"hello\");";
+        let search = "let count = 2;\nprintln!(\"hullo\");";
+        let matches = sequence_similarity_find(content, search);
+        assert!(matches.is_empty());
+    }
+
     // ─── unescape_str ──────────────────────────────────────────────────────
 
     #[test]
@@ -620,5 +967,23 @@ mod tests {
         let result = fuzzy_find_replacement(content, search, false);
         // All strategies should find 2 matches → None
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn cascade_uses_line_number_stripped_before_other_strategies() {
+        let content = "fn demo() {\n    println!(\"hi\");\n}";
+        let search = "1. fn demo() {\n2.     println!(\"hi\");\n3. }";
+        let result = fuzzy_find_replacement(content, search, false).unwrap();
+        assert_eq!(result.strategy, "line-number-stripped");
+        assert_eq!(result.actual, content);
+    }
+
+    #[test]
+    fn cascade_uses_sequence_similarity_as_last_resort() {
+        let content = "let count = 1;\nprintln!(\"hello\");";
+        let search = "let count = 2;\nprintln!(\"hullo\");";
+        let result = fuzzy_find_replacement(content, search, false).unwrap();
+        assert_eq!(result.strategy, "sequence-similarity");
+        assert_eq!(result.actual, content);
     }
 }
