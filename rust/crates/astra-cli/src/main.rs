@@ -174,6 +174,8 @@ mod slash_tuning;
 mod spawn_subrun;
 #[path = "cli/sse_utils.rs"]
 mod sse_utils;
+#[path = "cli/startup_trace.rs"]
+mod startup_trace;
 #[path = "cli/stream_render.rs"]
 mod stream_render;
 #[path = "cli/streaming_md.rs"]
@@ -203,6 +205,7 @@ use dynamic_completions::truncate_skill_desc_for_completion;
 use edge_lifecycle::register_and_start_heartbeat;
 use idle_agent_messages::flush_idle_agent_messages_between_prompts;
 use permission_manager::PermissionManager;
+use startup_trace::StartupTracer;
 #[cfg(test)]
 use stream_render::{StreamRenderState, TurnResult, dispatch_turn_event_block};
 
@@ -233,71 +236,6 @@ use slash_session::handle_session_command;
 use slash_session::resolve_journal_target_session;
 use slash_skill::handle_skill_command;
 use slash_state::{StateCommandContext, handle_state_command};
-
-// ── Startup tracer for --startup-trace ────────────────────────────────────────
-
-/// Simple tracer for measuring startup phase durations.
-struct StartupTracer {
-    enabled: bool,
-    start: std::time::Instant,
-    last: std::time::Instant,
-    phases: Vec<(&'static str, std::time::Duration)>,
-}
-
-impl StartupTracer {
-    fn new() -> Self {
-        let enabled = std::env::var("ASTRA_STARTUP_TRACE")
-            .map(|v| v == "1")
-            .unwrap_or(false);
-        let now = std::time::Instant::now();
-        Self {
-            enabled,
-            start: now,
-            last: now,
-            phases: Vec::new(),
-        }
-    }
-
-    fn phase(&mut self, name: &'static str) {
-        if !self.enabled {
-            return;
-        }
-        let now = std::time::Instant::now();
-        let dur = now.duration_since(self.last);
-        self.phases.push((name, dur));
-        self.last = now;
-    }
-
-    fn finish(&self) {
-        if !self.enabled {
-            return;
-        }
-        let total = self.start.elapsed();
-        eprintln!();
-        eprintln!("  {} {}", "⏱".cyan(), "Startup Timing".bold().cyan());
-        eprintln!("  {}", "─".repeat(50).dim());
-        for (name, dur) in &self.phases {
-            let ms = dur.as_millis();
-            let bar = if ms > 100 {
-                "█".repeat((ms / 20) as usize).yellow()
-            } else {
-                "█".repeat((ms / 20).max(1) as usize).dim()
-            };
-            eprintln!("  {:30} {:>6}ms {}", name, ms, bar);
-        }
-        eprintln!("  {}", "─".repeat(50).dim());
-        let total_ms = total.as_millis();
-        let status = if total_ms < 200 {
-            "✓".green()
-        } else if total_ms < 500 {
-            "⚠".yellow()
-        } else {
-            "✗".red()
-        };
-        eprintln!("  {:30} {:>6}ms {}", "Total".bold(), total_ms, status);
-        eprintln!();
-    }
-}
 
 // CLI argument structs moved to cli/cli_args.rs
 use cli_args::*;

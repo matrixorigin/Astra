@@ -1162,7 +1162,10 @@ fn build_watch_snapshot(
 
     // Add overall summary at the top when there are delegations
     if !delegations.is_empty() {
-        let total_subruns: usize = delegations.iter().map(|d| d.total_sub_runs.max(d.sub_runs.len())).sum();
+        let total_subruns: usize = delegations
+            .iter()
+            .map(|d| d.total_sub_runs.max(d.sub_runs.len()))
+            .sum();
         let done_subruns: usize = delegations
             .iter()
             .flat_map(|d| &d.sub_runs)
