@@ -276,8 +276,8 @@ mod tests {
         p.buffer = "a\nb\nc\nd".into();
         let (h, b) = p.build_frame();
         assert!(
-            h.contains("2 rows hidden"),
-            "header should show hidden row count"
+            h.contains("2↑"),
+            "header should show hidden row count: {h}"
         );
         assert_eq!(b, vec!["c".to_string(), "d".to_string()]);
     }

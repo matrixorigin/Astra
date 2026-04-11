@@ -417,12 +417,20 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
         let budget = prompts::budget_for_model(ctx.model);
         let max_tokens = budget.model_limit as u32;
 
+        // Helper: extract content string from a message Value for estimation.
+        let msg_content = |m: &Value| -> String {
+            m.get("content")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string()
+        };
+
         // Estimate history tokens from messages (excluding system prompt)
         let history_tokens: u32 = ctx
             .messages
             .iter()
             .skip(1) // Skip system prompt
-            .map(|m| prompts::estimate_str_tokens(&m.to_string()) as u32)
+            .map(|m| prompts::estimate_str_tokens(&msg_content(m)) as u32)
             .sum();
 
         // Estimate user message tokens
@@ -432,7 +440,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
         let system_prompt_tokens = ctx
             .messages
             .first()
-            .map(|m| prompts::estimate_str_tokens(&m.to_string()) as u32)
+            .map(|m| prompts::estimate_str_tokens(&msg_content(m)) as u32)
             .unwrap_or(0);
 
         // Memory tokens are tracked in memory retrieval trace, use 0 here
