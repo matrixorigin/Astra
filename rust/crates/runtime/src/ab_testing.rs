@@ -228,7 +228,9 @@ pub(crate) fn apply_config_diff(config: &mut RuntimeConfig, key: &str, value: &s
                 );
             }
         }
-        _ => {}
+        _ => {
+            astra_core::agent_warn!("config", "Unknown experiment config_diff key: {}", key);
+        }
     }
 }
 
@@ -571,6 +573,12 @@ impl ExperimentBuilder {
         if total > 0.0 && (total - 1.0).abs() > 0.01 {
             for variant in &mut self.experiment.variants {
                 variant.traffic_percentage /= total;
+            }
+        } else if total == 0.0 && !self.experiment.variants.is_empty() {
+            // Distribute equally when all variants have zero traffic
+            let share = 1.0 / self.experiment.variants.len() as f64;
+            for variant in &mut self.experiment.variants {
+                variant.traffic_percentage = share;
             }
         }
         self.experiment
@@ -993,21 +1001,24 @@ impl ExperimentAnalyzer {
         };
         let std_dev = variance.sqrt();
 
-        let median = if n.is_multiple_of(2) {
+        // Safety: n > 0 guaranteed by the early return above.
+        let median = if n % 2 == 0 {
             (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0
         } else {
             sorted[n / 2]
         };
 
         let p95_idx = ((n as f64 * 0.95).ceil() as usize).min(n - 1);
+        let min = sorted.first().copied().unwrap_or(0.0);
+        let max = sorted.last().copied().unwrap_or(0.0);
 
         MetricStats {
             name: name.to_string(),
             mean,
             std_dev,
             median,
-            min: sorted[0],
-            max: sorted[n - 1],
+            min,
+            max,
             p95: sorted[p95_idx],
             count: n,
         }
