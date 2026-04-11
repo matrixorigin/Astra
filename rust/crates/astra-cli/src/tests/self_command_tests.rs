@@ -10,6 +10,15 @@ fn cli_self_snapshot_subcommand() {
 }
 
 #[test]
+fn cli_self_reflect_subcommand() {
+    let cli = Cli::try_parse_from(["astra", "self", "reflect"]).unwrap();
+    assert!(matches!(
+        cli.command,
+        Some(Command::SelfInspect(SelfCmd::Reflect(_)))
+    ));
+}
+
+#[test]
 fn cli_self_mutate_preview_parses() {
     let cli = Cli::try_parse_from([
         "astra",

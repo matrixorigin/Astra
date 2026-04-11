@@ -776,13 +776,46 @@ impl ToolExecutor {
                 let focus = args.get("focus").and_then(|v| v.as_str()).unwrap_or("auto");
                 let question = args.get("question").and_then(|v| v.as_str()).unwrap_or("");
                 let last_n = args.get("last_n").and_then(|v| v.as_i64()).unwrap_or(20);
-                serde_json::json!({
-                    "status": "reflect_requires_session",
-                    "focus": focus,
-                    "question": question,
-                    "last_n": last_n,
-                    "note": "Reflect data comes from the server API. Use /reflect command for direct access."
-                }).to_string()
+                if let Some(session_id) = self
+                    .active_session_id
+                    .as_deref()
+                    .filter(|id| !id.is_empty())
+                {
+                    let limit = usize::try_from(last_n.max(1)).unwrap_or(20);
+                    match crate::self_command::render_surface_for_session(
+                        session_id, "reflect", limit,
+                    )
+                    .await
+                    {
+                        Ok(surface) => match serde_json::from_str::<serde_json::Value>(&surface) {
+                            Ok(mut value) => {
+                                if let Some(map) = value.as_object_mut() {
+                                    map.insert("focus".to_string(), serde_json::json!(focus));
+                                    map.insert("question".to_string(), serde_json::json!(question));
+                                    map.insert("last_n".to_string(), serde_json::json!(last_n));
+                                }
+                                value.to_string()
+                            }
+                            Err(_) => surface.to_string(),
+                        },
+                        Err(error) => serde_json::json!({
+                            "status": "reflect_unavailable",
+                            "focus": focus,
+                            "question": question,
+                            "last_n": last_n,
+                            "error": error,
+                        })
+                        .to_string(),
+                    }
+                } else {
+                    serde_json::json!({
+                        "status": "reflect_requires_session",
+                        "focus": focus,
+                        "question": question,
+                        "last_n": last_n,
+                        "note": "Reflect data comes from the server API. Use /reflect command for direct access."
+                    }).to_string()
+                }
             }
             "run_chain" => {
                 match serde_json::from_value::<astra_runtime::tool_registry::ToolChain>(

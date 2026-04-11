@@ -11,6 +11,7 @@
 //!   real-time triggers.
 //! - All reflection is async and non-blocking — it never stalls the main loop.
 
+use astra_services::session_journal::ToolCallRecord;
 use serde::{Deserialize, Serialize};
 
 use crate::evolution::types::{
@@ -68,6 +69,49 @@ pub struct ToolStat {
     pub calls: u32,
     pub failures: u32,
     pub avg_latency_ms: u64,
+}
+
+impl ToolStat {
+    /// Aggregate raw tool call records into a compact per-tool summary.
+    pub fn summarize_records(records: &[ToolCallRecord], max_tools: usize) -> Vec<Self> {
+        if max_tools == 0 || records.is_empty() {
+            return Vec::new();
+        }
+
+        let mut by_tool: std::collections::HashMap<String, (u32, u32, u64)> =
+            std::collections::HashMap::new();
+        for record in records {
+            let entry = by_tool.entry(record.name.clone()).or_insert((0, 0, 0));
+            entry.0 += 1;
+            if !record.ok {
+                entry.1 += 1;
+            }
+            entry.2 += record.ms;
+        }
+
+        let mut stats: Vec<Self> = by_tool
+            .into_iter()
+            .map(|(tool_name, (calls, failures, total_latency_ms))| Self {
+                tool_name,
+                calls,
+                failures,
+                avg_latency_ms: if calls > 0 {
+                    total_latency_ms / calls as u64
+                } else {
+                    0
+                },
+            })
+            .collect();
+        stats.sort_by(|a, b| {
+            b.failures
+                .cmp(&a.failures)
+                .then_with(|| b.calls.cmp(&a.calls))
+                .then_with(|| b.avg_latency_ms.cmp(&a.avg_latency_ms))
+                .then_with(|| a.tool_name.cmp(&b.tool_name))
+        });
+        stats.truncate(max_tools);
+        stats
+    }
 }
 
 impl ReflectionContext {
@@ -519,6 +563,49 @@ mod tests {
         assert!(rendered.contains("UserCorrection"));
         assert!(rendered.contains("PatternDrift"));
         assert!(rendered.contains("IncreaseVerification"));
+    }
+
+    #[test]
+    fn summarize_records_aggregates_and_limits_tool_stats() {
+        let records = vec![
+            ToolCallRecord {
+                name: "bash".into(),
+                ok: false,
+                ms: 200,
+                error: Some("permission denied".into()),
+                input_bytes: Some(10),
+                output_bytes: Some(5),
+                args_preview: None,
+                result_preview: None,
+            },
+            ToolCallRecord {
+                name: "bash".into(),
+                ok: true,
+                ms: 100,
+                error: None,
+                input_bytes: Some(8),
+                output_bytes: Some(20),
+                args_preview: None,
+                result_preview: None,
+            },
+            ToolCallRecord {
+                name: "web_fetch".into(),
+                ok: false,
+                ms: 50,
+                error: Some("timeout".into()),
+                input_bytes: Some(4),
+                output_bytes: Some(0),
+                args_preview: None,
+                result_preview: None,
+            },
+        ];
+
+        let stats = ToolStat::summarize_records(&records, 1);
+        assert_eq!(stats.len(), 1);
+        assert_eq!(stats[0].tool_name, "bash");
+        assert_eq!(stats[0].calls, 2);
+        assert_eq!(stats[0].failures, 1);
+        assert_eq!(stats[0].avg_latency_ms, 150);
     }
 
     #[test]

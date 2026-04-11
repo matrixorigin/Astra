@@ -540,6 +540,7 @@ impl AgenticRunLifecycleService {
             step_signal_collector: None,
             tool_budget_override: None,
             pending_reflection_signals: Vec::new(),
+            recent_tactical_actions: Vec::new(),
         }
     }
 
@@ -1205,6 +1206,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             step_signal_collector: None,
             tool_budget_override: None,
             pending_reflection_signals: Vec::new(),
+            recent_tactical_actions: Vec::new(),
         };
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut loop_state).await;

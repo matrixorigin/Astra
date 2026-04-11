@@ -501,6 +501,9 @@ pub struct AgenticLoopState {
     /// Filled during tuning cycles; drained when threshold is met and
     /// reflection prompt is injected.
     pub pending_reflection_signals: Vec<crate::evolution::types::EvolutionSignal>,
+    /// Recent tactical adaptations applied while the current reflection window
+    /// was accumulating. Drained into the next auto-reflection context.
+    pub recent_tactical_actions: Vec<String>,
 }
 
 /// Consecutive same-category error turns before forcing a strategy change.
@@ -669,6 +672,19 @@ fn apply_tactical_actions(
                 hint_parts.push(format!("🐢 {reason}{suffix}"));
             }
             crate::liquid::tactical::TacticalAction::NoOp => {}
+        }
+    }
+
+    if !hint_parts.is_empty() {
+        state
+            .recent_tactical_actions
+            .extend(hint_parts.iter().cloned());
+        let overflow = state
+            .recent_tactical_actions
+            .len()
+            .saturating_sub(MAX_RECENT_TACTICAL_ACTIONS);
+        if overflow > 0 {
+            state.recent_tactical_actions.drain(..overflow);
         }
     }
 
@@ -2413,6 +2429,45 @@ fn maybe_run_tuning_cycle(state: &mut AgenticLoopState) {
 
 /// Minimum accumulated LLM-routed signals before auto-reflection triggers.
 const AUTO_REFLECTION_SIGNAL_THRESHOLD: usize = 3;
+const AUTO_REFLECTION_TOOL_WINDOW: usize = 24;
+const AUTO_REFLECTION_TOOL_STAT_LIMIT: usize = 8;
+const MAX_RECENT_TACTICAL_ACTIONS: usize = 8;
+
+fn build_auto_reflection_tool_stats(
+    state: &AgenticLoopState,
+) -> Vec<crate::liquid::reflection::ToolStat> {
+    let start = state
+        .stall
+        .tool_call_records
+        .len()
+        .saturating_sub(AUTO_REFLECTION_TOOL_WINDOW);
+    crate::liquid::reflection::ToolStat::summarize_records(
+        &state.stall.tool_call_records[start..],
+        AUTO_REFLECTION_TOOL_STAT_LIMIT,
+    )
+}
+
+fn build_auto_reflection_experiment_summary(
+    state: &AgenticLoopState,
+) -> Option<crate::liquid::reflection::ExperimentSummary> {
+    state
+        .telemetry
+        .observability_session
+        .as_ref()
+        .and_then(|session| session.read().ok())
+        .and_then(
+            |session| match (&session.active_experiment_id, &session.active_variant) {
+                (Some(experiment_id), Some(variant)) => {
+                    Some(crate::liquid::reflection::ExperimentSummary {
+                        experiment_id: experiment_id.clone(),
+                        variant: variant.clone(),
+                        samples: session.turn_number,
+                    })
+                }
+                _ => None,
+            },
+        )
+}
 
 /// After a tuning cycle, flush evolution signals and accumulate LLM-routed
 /// ones on the state.  When the accumulated count reaches the threshold,
@@ -2454,6 +2509,9 @@ async fn maybe_trigger_auto_reflection(state: &mut AgenticLoopState) {
         let effective_turns = turns_completed.max(1) as f64;
         total as f64 / (budget * effective_turns)
     };
+    let tool_stats = build_auto_reflection_tool_stats(state);
+    let recent_tactical_actions = std::mem::take(&mut state.recent_tactical_actions);
+    let active_experiment = build_auto_reflection_experiment_summary(state);
 
     let ctx = evo.build_reflection_context(
         session_id,
@@ -2461,8 +2519,9 @@ async fn maybe_trigger_auto_reflection(state: &mut AgenticLoopState) {
         scenario.as_deref(),
         token_util,
         &signals,
-        Vec::new(), // tool stats assembled separately
-        None,
+        tool_stats,
+        recent_tactical_actions,
+        active_experiment,
     );
 
     let (_system_prompt, user_prompt) = evo.build_reflection_prompt(&ctx);
@@ -4581,6 +4640,7 @@ mod tests {
             step_signal_collector: None,
             tool_budget_override: None,
             pending_reflection_signals: Vec::new(),
+            recent_tactical_actions: Vec::new(),
         }
     }
 
@@ -10328,6 +10388,82 @@ print(json.dumps({'context': 'user said: ' + msg}))
             state.messages.len() > msg_count,
             "System message should be injected"
         );
+    }
+
+    #[tokio::test]
+    async fn auto_reflection_summarizes_recent_tools_and_tactical_actions() {
+        let mut state = make_state();
+        state.current_session_id = Some("sess-reflect".into());
+        state.evolution_service = Some(std::sync::Arc::new(
+            crate::evolution::service::EvolutionService::new(),
+        ));
+
+        for i in 0..AUTO_REFLECTION_SIGNAL_THRESHOLD {
+            state.pending_reflection_signals.push(
+                crate::evolution::types::EvolutionSignal::RepeatedStall {
+                    tool_chain: vec![format!("tool_{i}")],
+                    stall_count: 3,
+                    turn_id: format!("t{i}"),
+                },
+            );
+        }
+        state.stall.tool_call_records = vec![
+            ToolCallRecord {
+                name: "bash".into(),
+                ok: false,
+                ms: 200,
+                error: Some("permission denied".into()),
+                input_bytes: Some(12),
+                output_bytes: Some(0),
+                args_preview: None,
+                result_preview: None,
+            },
+            ToolCallRecord {
+                name: "bash".into(),
+                ok: true,
+                ms: 100,
+                error: None,
+                input_bytes: Some(8),
+                output_bytes: Some(20),
+                args_preview: None,
+                result_preview: None,
+            },
+            ToolCallRecord {
+                name: "web_fetch".into(),
+                ok: true,
+                ms: 40,
+                error: None,
+                input_bytes: Some(5),
+                output_bytes: Some(50),
+                args_preview: None,
+                result_preview: None,
+            },
+        ];
+        state.recent_tactical_actions = vec![
+            "⚠️ verify outputs more strictly".into(),
+            "📊 Token usage high".into(),
+        ];
+
+        let session = std::sync::Arc::new(std::sync::RwLock::new(
+            crate::observability_integration::ObservabilitySession::new_simple("sess-reflect"),
+        ));
+        {
+            let mut guard = session.write().unwrap();
+            guard.active_experiment_id = Some("exp-123".into());
+            guard.active_variant = Some("variant-b".into());
+            guard.turn_number = 4;
+        }
+        state.telemetry.observability_session = Some(session);
+
+        maybe_trigger_auto_reflection(&mut state).await;
+
+        let content = state.messages.last().unwrap()["content"].as_str().unwrap();
+        assert!(content.contains("Tool statistics:"));
+        assert!(content.contains("bash — calls=2, failures=1, avg_ms=150"));
+        assert!(content.contains("Active experiment: exp-123 (variant=variant-b, samples=4)"));
+        assert!(content.contains("Recent tactical actions:"));
+        assert!(content.contains("verify outputs more strictly"));
+        assert!(state.recent_tactical_actions.is_empty());
     }
 
     // ── finalize_turn_trace tests ───────────────────────────────────────

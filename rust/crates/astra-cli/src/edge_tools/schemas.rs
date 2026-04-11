@@ -909,8 +909,8 @@ pub fn all_tool_schemas() -> Vec<Value> {
                     "properties": {
                         "dimension": {
                             "type": "string",
-                            "enum": ["capability", "state", "goals", "memory", "identity", "context_snapshot", "context_trend", "snapshot", "profile", "goal", "trace", "budget", "signals", "health", "journal", "verify", "all"],
-                            "description": "Which dimension to query. When a session id is wired, the persistent self surfaces are the source of truth: 'snapshot', 'profile', 'goal', 'trace', 'budget', 'signals', 'health', 'journal', 'verify', and legacy views like 'capability', 'state', 'goals', 'context_snapshot', 'context_trend', 'identity', 'all' are compatibility aliases onto that persisted state."
+                            "enum": ["capability", "state", "goals", "memory", "identity", "context_snapshot", "context_trend", "snapshot", "reflect", "profile", "goal", "trace", "budget", "signals", "health", "journal", "verify", "all"],
+                            "description": "Which dimension to query. When a session id is wired, the persistent self surfaces are the source of truth: 'snapshot', 'reflect', 'profile', 'goal', 'trace', 'budget', 'signals', 'health', 'journal', 'verify', and legacy views like 'capability', 'state', 'goals', 'context_snapshot', 'context_trend', 'identity', 'all' are compatibility aliases onto that persisted state."
                         }
                     },
                     "required": ["dimension"]
@@ -921,7 +921,7 @@ pub fn all_tool_schemas() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "reflect",
-                "description": "Diagnose past tool execution: why a tool failed, why results were unexpected, why a specific tool was or wasn't selected, performance bottlenecks. Analyzes the event trail from previous turns. Call this when asked to diagnose, debug, or explain past behavior.",
+                "description": "Diagnose past tool execution: why a tool failed, why results were unexpected, why a specific tool was or wasn't selected, performance bottlenecks. When a live session id is available this reconstructs a local liquid reflection view from persistent self state; otherwise it falls back to the server-backed /reflect path. Call this when asked to diagnose, debug, or explain past behavior.",
                 "parameters": {
                     "type": "object",
                     "properties": {

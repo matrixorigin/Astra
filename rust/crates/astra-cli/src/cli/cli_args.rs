@@ -649,11 +649,13 @@ pub(crate) enum SessionCmd {
 
 #[derive(Subcommand, Debug)]
 #[command(
-    after_help = "Examples:\n  astra self snapshot\n  astra self profile 550e8400-e29b-41d4-a716-446655440000\n  astra self mutate preview --path verification.strictness --value 0.8\n  astra self mutate apply --session-id 550e8400-e29b-41d4-a716-446655440000 --path tool_selection.tool_budget_tokens --value 900"
+    after_help = "Examples:\n  astra self snapshot\n  astra self reflect\n  astra self profile 550e8400-e29b-41d4-a716-446655440000\n  astra self mutate preview --path verification.strictness --value 0.8\n  astra self mutate apply --session-id 550e8400-e29b-41d4-a716-446655440000 --path tool_selection.tool_budget_tokens --value 900"
 )]
 pub(crate) enum SelfCmd {
     /// Full persistent self snapshot for a session
     Snapshot(SelfSessionArgs),
+    /// Liquid reflection summary reconstructed from persistent local state
+    Reflect(SelfSessionArgs),
     /// Core self-model profile (capabilities, state, goals, constraints)
     Profile(SelfSessionArgs),
     /// Goal and plan state for a session

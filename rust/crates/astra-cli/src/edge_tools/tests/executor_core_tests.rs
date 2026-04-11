@@ -1,4 +1,7 @@
 use super::*;
+use astra_services::session_journal::{self, JournalDirGuard, JournalEvent, JournalEventType};
+use astra_services::session_workspace::{self, ContextTraceSignal, WorkspaceMetadata};
+use chrono::Utc;
 
 // ── ToolExecutor ──────────────────────────────────────────────────────────
 
@@ -38,6 +41,102 @@ async fn execute_reflect_returns_placeholder() {
     let executor = test_executor();
     let result = executor.execute("reflect", &json!({"focus": "auto"})).await;
     assert!(result.contains("reflect_requires_session"), "got: {result}");
+}
+
+#[tokio::test]
+async fn execute_reflect_uses_local_surface_with_session() {
+    let temp = tempfile::tempdir().unwrap();
+    let _guard = JournalDirGuard::new(temp.path());
+    let session_id = "executor-reflect-session";
+    let mut ws = WorkspaceMetadata::with_context(session_id, "gpt-5.4", "/repo", Some("main"));
+    ws.turn_count = 3;
+    ws.last_context_trace = Some(ContextTraceSignal {
+        turn_id: "turn-3".to_string(),
+        captured_at: Some(Utc::now().to_rfc3339()),
+        tool_selection: None,
+        memory: None,
+        history: None,
+        budget: Some(
+            astra_services::session_workspace::ContextTraceBudgetSignal {
+                max_tokens: 10000,
+                total_used: 8500,
+                budget_pressure: 0.85,
+                compression_triggered: false,
+            },
+        ),
+        timing: None,
+        explanations: vec![],
+    });
+    session_workspace::write_workspace(&ws).unwrap();
+
+    session_journal::JournalWriter::new(session_id)
+        .unwrap()
+        .append(&JournalEvent {
+            event_type: JournalEventType::TurnError,
+            ts: Utc::now().to_rfc3339(),
+            session_id: Some(session_id.to_string()),
+            turn: Some(3),
+            model: Some("gpt-5.4".to_string()),
+            user_input: Some("debug".to_string()),
+            assistant_output: None,
+            tool_count: Some(1),
+            tokens_in: Some(10),
+            tokens_out: Some(20),
+            duration_ms: Some(100),
+            error: Some("bash failed".to_string()),
+            config_key: None,
+            config_value: None,
+            turns_compacted: None,
+            facts_stored: None,
+            tools_selected: Some(vec!["bash".to_string()]),
+            selected_skills: None,
+            tools_used: Some(vec!["bash".to_string()]),
+            tool_calls: Some(vec![session_journal::ToolCallRecord {
+                name: "bash".to_string(),
+                ok: false,
+                ms: 100,
+                error: Some("command failed".to_string()),
+                input_bytes: None,
+                output_bytes: None,
+                args_preview: None,
+                result_preview: None,
+            }]),
+            budget_used: Some(8500),
+            budget_pressure: Some(0.85),
+            stall_type: None,
+            metadata: None,
+            plan_subtask_id: None,
+            ttft_ms: None,
+            context_ms: None,
+            selector_strategy: None,
+            selector_ms: None,
+            selector_tokens_in: None,
+            selector_tokens_out: None,
+            cache_read_tokens: None,
+            cache_creation_tokens: None,
+            memoria_ms: None,
+            session_lineage: None,
+            coordination: None,
+            edge_policy: None,
+            selection_trace: None,
+            context_assembly_trace: None,
+            selector_confidence: None,
+            routing_domain_hint: None,
+            entity_learn_skipped_no_domain: false,
+        })
+        .unwrap();
+
+    let executor = ToolExecutor::new(temp.path().to_path_buf()).with_active_session_id(session_id);
+    let result = executor
+        .execute("reflect", &json!({"focus": "performance"}))
+        .await;
+    let value: serde_json::Value = serde_json::from_str(&result).unwrap();
+    assert_eq!(value["session_id"], session_id);
+    assert_eq!(value["focus"], "performance");
+    assert_eq!(
+        value["reflection_context"]["tool_stats"][0]["tool_name"],
+        "bash"
+    );
 }
 
 #[test]

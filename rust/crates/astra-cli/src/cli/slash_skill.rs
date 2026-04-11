@@ -1661,6 +1661,7 @@ Follow these steps:
                 token_util,
                 &llm_signals,
                 tool_stats,
+                vec![],
                 None,
             );
 

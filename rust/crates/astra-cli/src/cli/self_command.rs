@@ -115,6 +115,14 @@ struct SignalsResponse {
 }
 
 #[derive(Debug, Serialize)]
+struct ReflectResponse {
+    session_id: String,
+    reflection_context: astra_runtime::liquid::reflection::ReflectionContext,
+    prompt_preview: String,
+    recent_turns: Vec<EventPreview>,
+}
+
+#[derive(Debug, Serialize)]
 struct TraceResponse {
     session_id: String,
     compact_trace: Option<ContextTraceSignal>,
@@ -205,6 +213,14 @@ pub(crate) async fn execute_self_command(
             render_surface_for_session(
                 &resolve_session_id(args.session_id.as_deref(), profile)?,
                 "snapshot",
+                20,
+            )
+            .await
+        }
+        SelfCmd::Reflect(args) => {
+            render_surface_for_session(
+                &resolve_session_id(args.session_id.as_deref(), profile)?,
+                "reflect",
                 20,
             )
             .await
@@ -302,6 +318,7 @@ pub(crate) async fn render_surface_for_session(
 pub(crate) fn agent_info_surface_alias(dimension: &str) -> Option<&'static str> {
     match dimension {
         "snapshot" => Some("snapshot"),
+        "reflect" => Some("reflect"),
         "profile" => Some("profile"),
         "goal" => Some("goal"),
         "trace" => Some("trace"),
@@ -326,6 +343,7 @@ fn render_surface_from_artifacts(
 ) -> Result<String, String> {
     match surface {
         "snapshot" => to_json(&build_snapshot_response(artifacts)?),
+        "reflect" => to_json(&build_reflect_response(artifacts, journal_limit)),
         "profile" => to_json(&ProfileResponse {
             session_id: artifacts.session_id.clone(),
             identity: identity_view(),
@@ -513,6 +531,30 @@ fn build_snapshot_response(artifacts: &SessionArtifacts) -> Result<SnapshotRespo
             recent_failures: recent_tool_failures(&artifacts.journal_events, 8),
         },
     })
+}
+
+fn build_reflect_response(artifacts: &SessionArtifacts, journal_limit: usize) -> ReflectResponse {
+    let context = build_persistent_reflection_context(artifacts, journal_limit.max(1));
+    let prompt_preview = context.render_prompt_section();
+    ReflectResponse {
+        session_id: artifacts.session_id.clone(),
+        reflection_context: context,
+        prompt_preview,
+        recent_turns: recent_event_previews(
+            &artifacts.journal_events,
+            journal_limit.min(12).max(1),
+            &[
+                JournalEventType::Turn,
+                JournalEventType::TurnError,
+                JournalEventType::Error,
+                JournalEventType::StallDetected,
+                JournalEventType::DriftDetected,
+                JournalEventType::AdaptiveScenarioApplied,
+                JournalEventType::AdaptivePerTurnApplied,
+                JournalEventType::AdaptiveExperimentEnrolled,
+            ],
+        ),
+    }
 }
 
 fn build_self_model(artifacts: &SessionArtifacts) -> Result<SelfModel, String> {
@@ -1169,6 +1211,48 @@ fn latest_scenario(events: &[JournalEvent]) -> Option<Scenario> {
     })
 }
 
+fn build_persistent_reflection_context(
+    artifacts: &SessionArtifacts,
+    signal_limit: usize,
+) -> astra_runtime::liquid::reflection::ReflectionContext {
+    const REFLECTION_TOOL_RECORD_LIMIT: usize = 24;
+    const REFLECTION_TOOL_STAT_LIMIT: usize = 8;
+    const REFLECTION_TACTICAL_ACTION_LIMIT: usize = 8;
+
+    let mut context =
+        astra_runtime::liquid::reflection::ReflectionContext::new(artifacts.session_id.clone());
+    let journal_turn_count = artifacts
+        .journal_events
+        .iter()
+        .filter_map(|event| event.turn)
+        .max()
+        .unwrap_or_default();
+    context.turns_completed = artifacts
+        .workspace
+        .as_ref()
+        .map(|ws| ws.turn_count)
+        .or_else(|| {
+            artifacts
+                .restored
+                .as_ref()
+                .map(|restored| restored.turn_count)
+        })
+        .unwrap_or(journal_turn_count)
+        .max(journal_turn_count);
+    context.scenario =
+        latest_scenario(&artifacts.journal_events).map(|scenario| format!("{scenario:?}"));
+    context.token_utilisation = reflection_token_utilisation(artifacts);
+    context.tool_stats = astra_runtime::liquid::reflection::ToolStat::summarize_records(
+        &recent_tool_records(&artifacts.journal_events, REFLECTION_TOOL_RECORD_LIMIT),
+        REFLECTION_TOOL_STAT_LIMIT,
+    );
+    context.recent_tactical_actions =
+        recent_tactical_actions(&artifacts.journal_events, REFLECTION_TACTICAL_ACTION_LIMIT);
+    context.signals = recent_reflection_signals(&artifacts.journal_events, signal_limit);
+    context.active_experiment = active_reflection_experiment(artifacts, context.turns_completed);
+    context
+}
+
 fn parse_scenario(input: &str) -> Option<Scenario> {
     match input.trim().to_ascii_lowercase().as_str() {
         "code_review" | "codereview" | "code-review" => Some(Scenario::CodeReview),
@@ -1183,6 +1267,223 @@ fn parse_scenario(input: &str) -> Option<Scenario> {
         "learning" | "learn" => Some(Scenario::Learning),
         _ => None,
     }
+}
+
+fn reflection_token_utilisation(artifacts: &SessionArtifacts) -> f64 {
+    if let Some(pressure) = artifacts
+        .workspace
+        .as_ref()
+        .and_then(|ws| ws.last_context_trace.as_ref())
+        .and_then(|trace| trace.budget.as_ref())
+        .map(|budget| budget.budget_pressure)
+    {
+        return pressure;
+    }
+
+    artifacts
+        .journal_events
+        .iter()
+        .rev()
+        .find_map(|event| event.budget_pressure)
+        .unwrap_or_default()
+}
+
+fn recent_tool_records(
+    events: &[JournalEvent],
+    max_records: usize,
+) -> Vec<astra_services::session_journal::ToolCallRecord> {
+    let mut records = Vec::new();
+    for event in events.iter().rev() {
+        let Some(tool_calls) = event.tool_calls.as_ref() else {
+            continue;
+        };
+        for call in tool_calls.iter().rev() {
+            records.push(call.clone());
+            if records.len() >= max_records {
+                return records;
+            }
+        }
+    }
+    records
+}
+
+fn recent_tactical_actions(events: &[JournalEvent], limit: usize) -> Vec<String> {
+    let mut actions = Vec::new();
+    for event in events.iter().rev() {
+        if event.event_type != JournalEventType::AdaptivePerTurnApplied {
+            continue;
+        }
+        let Some(metadata) = event.metadata.as_ref() else {
+            continue;
+        };
+        if let Some(triggers) = metadata
+            .get("triggers")
+            .and_then(serde_json::Value::as_array)
+        {
+            for trigger in triggers {
+                if let Some(trigger) = trigger.as_str() {
+                    actions.push(trigger.to_string());
+                    if actions.len() >= limit {
+                        return actions;
+                    }
+                }
+            }
+        }
+        if let Some(changes) = metadata
+            .get("changes")
+            .and_then(serde_json::Value::as_array)
+        {
+            for change in changes {
+                let Some(key) = change.get("key").and_then(serde_json::Value::as_str) else {
+                    continue;
+                };
+                let from = change
+                    .get("from")
+                    .map(compact_json_value)
+                    .unwrap_or_else(|| "unknown".to_string());
+                let to = change
+                    .get("to")
+                    .map(compact_json_value)
+                    .unwrap_or_else(|| "unknown".to_string());
+                actions.push(format!("{key}: {from} -> {to}"));
+                if actions.len() >= limit {
+                    return actions;
+                }
+            }
+        }
+    }
+    actions
+}
+
+fn recent_reflection_signals(
+    events: &[JournalEvent],
+    limit: usize,
+) -> Vec<astra_runtime::liquid::reflection::SignalSummary> {
+    let mut signals = Vec::new();
+    for event in events.iter().rev() {
+        let turn_id = event
+            .turn
+            .map(|turn| format!("turn-{turn}"))
+            .unwrap_or_else(|| "session".to_string());
+        let skill_context = event
+            .selected_skills
+            .as_ref()
+            .and_then(|skills| skills.first().cloned());
+        match event.event_type {
+            JournalEventType::Turn | JournalEventType::TurnError | JournalEventType::Error => {
+                if let Some(tool_calls) = event.tool_calls.as_ref() {
+                    for call in tool_calls.iter().filter(|call| !call.ok) {
+                        let detail = call
+                            .error
+                            .as_deref()
+                            .map(|error| format!("{} failed: {}", call.name, truncate(error, 160)))
+                            .unwrap_or_else(|| format!("{} failed", call.name));
+                        signals.push(astra_runtime::liquid::reflection::SignalSummary {
+                            kind: "ToolFailure".to_string(),
+                            detail,
+                            skill_context: skill_context.clone(),
+                            turn_id: turn_id.clone(),
+                        });
+                        if signals.len() >= limit {
+                            return signals;
+                        }
+                    }
+                }
+                if let Some(error) = event.error.as_deref() {
+                    signals.push(astra_runtime::liquid::reflection::SignalSummary {
+                        kind: "TurnError".to_string(),
+                        detail: truncate(error, 160),
+                        skill_context,
+                        turn_id,
+                    });
+                    if signals.len() >= limit {
+                        return signals;
+                    }
+                }
+            }
+            JournalEventType::StallDetected => {
+                let detail = event
+                    .tools_used
+                    .as_ref()
+                    .filter(|tools| !tools.is_empty())
+                    .map(|tools| format!("tools repeated: {}", tools.join(", ")))
+                    .or_else(|| event.stall_type.clone())
+                    .unwrap_or_else(|| "stall detected".to_string());
+                signals.push(astra_runtime::liquid::reflection::SignalSummary {
+                    kind: "StallDetected".to_string(),
+                    detail: truncate(&detail, 160),
+                    skill_context,
+                    turn_id,
+                });
+                if signals.len() >= limit {
+                    return signals;
+                }
+            }
+            JournalEventType::DriftDetected => {
+                let detail = event
+                    .metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.get("detail"))
+                    .map(compact_json_value)
+                    .unwrap_or_else(|| "focus drift detected".to_string());
+                signals.push(astra_runtime::liquid::reflection::SignalSummary {
+                    kind: "DriftDetected".to_string(),
+                    detail: truncate(&detail, 160),
+                    skill_context,
+                    turn_id,
+                });
+                if signals.len() >= limit {
+                    return signals;
+                }
+            }
+            _ => {}
+        }
+    }
+    signals
+}
+
+fn active_reflection_experiment(
+    artifacts: &SessionArtifacts,
+    turns_completed: u32,
+) -> Option<astra_runtime::liquid::reflection::ExperimentSummary> {
+    let workspace_experiment = artifacts
+        .workspace
+        .as_ref()
+        .and_then(|ws| ws.active_experiment_id.clone());
+    let workspace_variant = artifacts
+        .workspace
+        .as_ref()
+        .and_then(|ws| ws.active_variant.clone());
+    let journal_enrollment = latest_experiment_enrollment(&artifacts.journal_events);
+    let experiment_id = workspace_experiment.or_else(|| journal_enrollment.0.clone())?;
+    let variant = workspace_variant.or_else(|| journal_enrollment.1.clone())?;
+    Some(astra_runtime::liquid::reflection::ExperimentSummary {
+        experiment_id,
+        variant,
+        samples: turns_completed,
+    })
+}
+
+fn latest_experiment_enrollment(events: &[JournalEvent]) -> (Option<String>, Option<String>) {
+    events
+        .iter()
+        .rev()
+        .find(|event| event.event_type == JournalEventType::AdaptiveExperimentEnrolled)
+        .and_then(|event| event.metadata.as_ref())
+        .map(|metadata| {
+            (
+                metadata
+                    .get("experiment_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+                metadata
+                    .get("variant")
+                    .or_else(|| metadata.get("variant_id"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+            )
+        })
+        .unwrap_or((None, None))
 }
 
 fn token_budget_from_trace(trace: &ContextTraceSignal) -> Option<TokenBudgetTrace> {
@@ -1404,6 +1705,14 @@ fn truncate(input: &str, max_chars: usize) -> String {
     }
 }
 
+fn compact_json_value(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Null => "null".to_string(),
+        serde_json::Value::String(inner) => truncate(inner, 80),
+        _ => truncate(&value.to_string(), 80),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1544,5 +1853,236 @@ mod tests {
         );
         assert_eq!(value["trace"]["compact_trace"]["turn_id"], "turn-7");
         assert_eq!(value["journal"]["total_events"], 1);
+    }
+
+    #[tokio::test]
+    async fn reflect_reconstructs_local_liquid_context() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(temp.path());
+        let session_id = "self-reflect-session";
+        let mut ws = WorkspaceMetadata::with_context(session_id, "gpt-5.4", "/repo", Some("main"));
+        ws.turn_count = 9;
+        ws.active_experiment_id = Some("exp-liquid".to_string());
+        ws.active_variant = Some("treatment-a".to_string());
+        ws.last_context_trace = Some(ContextTraceSignal {
+            turn_id: "turn-9".to_string(),
+            captured_at: Some(Utc::now().to_rfc3339()),
+            tool_selection: None,
+            memory: None,
+            history: None,
+            budget: Some(
+                astra_services::session_workspace::ContextTraceBudgetSignal {
+                    max_tokens: 10000,
+                    total_used: 9100,
+                    budget_pressure: 0.91,
+                    compression_triggered: true,
+                },
+            ),
+            timing: None,
+            explanations: vec!["token pressure rising".to_string()],
+        });
+        session_workspace::write_workspace(&ws).unwrap();
+
+        let writer = session_journal::JournalWriter::new(session_id).unwrap();
+        writer
+            .append(&JournalEvent {
+                event_type: JournalEventType::AdaptiveScenarioApplied,
+                ts: Utc::now().to_rfc3339(),
+                session_id: Some(session_id.to_string()),
+                turn: Some(8),
+                model: None,
+                user_input: None,
+                assistant_output: None,
+                tool_count: None,
+                tokens_in: None,
+                tokens_out: None,
+                duration_ms: None,
+                error: None,
+                config_key: None,
+                config_value: None,
+                turns_compacted: None,
+                facts_stored: None,
+                tools_selected: None,
+                selected_skills: None,
+                tools_used: None,
+                tool_calls: None,
+                budget_used: None,
+                budget_pressure: None,
+                stall_type: None,
+                metadata: Some(serde_json::json!({"scenario": "debugging"})),
+                plan_subtask_id: None,
+                ttft_ms: None,
+                context_ms: None,
+                selector_strategy: None,
+                selector_ms: None,
+                selector_tokens_in: None,
+                selector_tokens_out: None,
+                cache_read_tokens: None,
+                cache_creation_tokens: None,
+                memoria_ms: None,
+                session_lineage: None,
+                coordination: None,
+                edge_policy: None,
+                selection_trace: None,
+                context_assembly_trace: None,
+                selector_confidence: None,
+                routing_domain_hint: None,
+                entity_learn_skipped_no_domain: false,
+            })
+            .unwrap();
+        writer
+            .append(&JournalEvent {
+                event_type: JournalEventType::AdaptivePerTurnApplied,
+                ts: Utc::now().to_rfc3339(),
+                session_id: Some(session_id.to_string()),
+                turn: Some(9),
+                model: None,
+                user_input: None,
+                assistant_output: None,
+                tool_count: None,
+                tokens_in: None,
+                tokens_out: None,
+                duration_ms: None,
+                error: None,
+                config_key: None,
+                config_value: None,
+                turns_compacted: None,
+                facts_stored: None,
+                tools_selected: None,
+                selected_skills: None,
+                tools_used: None,
+                tool_calls: None,
+                budget_used: None,
+                budget_pressure: None,
+                stall_type: None,
+                metadata: Some(serde_json::json!({
+                    "triggers": ["high token pressure"],
+                    "changes": [{
+                        "key": "verification.strictness",
+                        "from": 0.6,
+                        "to": 0.7
+                    }]
+                })),
+                plan_subtask_id: None,
+                ttft_ms: None,
+                context_ms: None,
+                selector_strategy: None,
+                selector_ms: None,
+                selector_tokens_in: None,
+                selector_tokens_out: None,
+                cache_read_tokens: None,
+                cache_creation_tokens: None,
+                memoria_ms: None,
+                session_lineage: None,
+                coordination: None,
+                edge_policy: None,
+                selection_trace: None,
+                context_assembly_trace: None,
+                selector_confidence: None,
+                routing_domain_hint: None,
+                entity_learn_skipped_no_domain: false,
+            })
+            .unwrap();
+        writer
+            .append(&JournalEvent {
+                event_type: JournalEventType::TurnError,
+                ts: Utc::now().to_rfc3339(),
+                session_id: Some(session_id.to_string()),
+                turn: Some(9),
+                model: Some("gpt-5.4".to_string()),
+                user_input: Some("fix the bug".to_string()),
+                assistant_output: None,
+                tool_count: Some(2),
+                tokens_in: Some(20),
+                tokens_out: Some(40),
+                duration_ms: Some(120),
+                error: Some("timed out waiting for test".to_string()),
+                config_key: None,
+                config_value: None,
+                turns_compacted: None,
+                facts_stored: None,
+                tools_selected: Some(vec!["bash".to_string(), "rg".to_string()]),
+                selected_skills: Some(vec!["goal-driven-evolution".to_string()]),
+                tools_used: Some(vec!["bash".to_string(), "rg".to_string()]),
+                tool_calls: Some(vec![
+                    ToolCallRecord {
+                        name: "bash".to_string(),
+                        ok: false,
+                        ms: 120,
+                        error: Some("command timed out".to_string()),
+                        input_bytes: None,
+                        output_bytes: None,
+                        args_preview: None,
+                        result_preview: None,
+                    },
+                    ToolCallRecord {
+                        name: "rg".to_string(),
+                        ok: true,
+                        ms: 12,
+                        error: None,
+                        input_bytes: None,
+                        output_bytes: None,
+                        args_preview: None,
+                        result_preview: None,
+                    },
+                ]),
+                budget_used: Some(9100),
+                budget_pressure: Some(0.91),
+                stall_type: None,
+                metadata: None,
+                plan_subtask_id: None,
+                ttft_ms: None,
+                context_ms: None,
+                selector_strategy: Some("tfidf".to_string()),
+                selector_ms: None,
+                selector_tokens_in: None,
+                selector_tokens_out: None,
+                cache_read_tokens: None,
+                cache_creation_tokens: None,
+                memoria_ms: None,
+                session_lineage: None,
+                coordination: None,
+                edge_policy: None,
+                selection_trace: None,
+                context_assembly_trace: Some(serde_json::json!({"tokens": 9100})),
+                selector_confidence: Some(0.8),
+                routing_domain_hint: Some("code".to_string()),
+                entity_learn_skipped_no_domain: false,
+            })
+            .unwrap();
+
+        let body = execute_self_command(
+            &SelfCmd::Reflect(SelfSessionArgs {
+                session_id: Some(session_id.to_string()),
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["reflection_context"]["scenario"], "Debugging");
+        assert_eq!(
+            value["reflection_context"]["active_experiment"]["experiment_id"],
+            "exp-liquid"
+        );
+        assert_eq!(
+            value["reflection_context"]["tool_stats"][0]["tool_name"],
+            "bash"
+        );
+        assert_eq!(
+            value["reflection_context"]["signals"][0]["kind"],
+            "ToolFailure"
+        );
+        assert_eq!(
+            value["reflection_context"]["recent_tactical_actions"][0],
+            "high token pressure"
+        );
+        assert!(
+            value["prompt_preview"]
+                .as_str()
+                .unwrap()
+                .contains("Recent tactical actions")
+        );
     }
 }

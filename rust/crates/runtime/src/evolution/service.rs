@@ -206,6 +206,7 @@ impl EvolutionService {
         token_utilisation: f64,
         llm_signals: &[EvolutionSignal],
         tool_stats: Vec<crate::liquid::reflection::ToolStat>,
+        recent_tactical_actions: Vec<String>,
         active_experiment: Option<crate::liquid::reflection::ExperimentSummary>,
     ) -> crate::liquid::reflection::ReflectionContext {
         let mut ctx = crate::liquid::reflection::ReflectionContext::new(session_id);
@@ -214,6 +215,7 @@ impl EvolutionService {
         ctx.token_utilisation = token_utilisation;
         ctx.add_signals(llm_signals);
         ctx.tool_stats = tool_stats;
+        ctx.recent_tactical_actions = recent_tactical_actions;
         ctx.active_experiment = active_experiment;
         ctx
     }
@@ -522,6 +524,7 @@ mod tests {
                 failures: 2,
                 avg_latency_ms: 150,
             }],
+            vec!["IncreaseVerification".into()],
             None,
         );
 
@@ -531,12 +534,13 @@ mod tests {
         assert!((ctx.token_utilisation - 0.42).abs() < 0.01);
         assert_eq!(ctx.signals.len(), 1);
         assert_eq!(ctx.tool_stats.len(), 1);
+        assert_eq!(ctx.recent_tactical_actions, vec!["IncreaseVerification"]);
     }
 
     #[tokio::test]
     async fn build_reflection_prompt_produces_valid_pair() {
         let svc = EvolutionService::new();
-        let ctx = svc.build_reflection_context("sess-1", 3, None, 0.1, &[], vec![], None);
+        let ctx = svc.build_reflection_context("sess-1", 3, None, 0.1, &[], vec![], vec![], None);
         let (system, user) = svc.build_reflection_prompt(&ctx);
         assert!(system.contains("execution improvement advisor"));
         assert!(user.contains("sess-1"));
@@ -545,8 +549,16 @@ mod tests {
     #[tokio::test]
     async fn ingest_reflection_response_queues_proposals() {
         let svc = EvolutionService::new();
-        let ctx =
-            svc.build_reflection_context("sess-1", 10, Some("CodeReview"), 0.5, &[], vec![], None);
+        let ctx = svc.build_reflection_context(
+            "sess-1",
+            10,
+            Some("CodeReview"),
+            0.5,
+            &[],
+            vec![],
+            vec![],
+            None,
+        );
 
         let llm_response = r#"{
             "proposals": [
@@ -581,7 +593,7 @@ mod tests {
     #[tokio::test]
     async fn ingest_reflection_bad_json_returns_error() {
         let svc = EvolutionService::new();
-        let ctx = svc.build_reflection_context("s", 1, None, 0.0, &[], vec![], None);
+        let ctx = svc.build_reflection_context("s", 1, None, 0.0, &[], vec![], vec![], None);
         let result = svc.ingest_reflection_response("not json", &ctx).await;
         assert!(result.is_err());
     }
@@ -589,7 +601,7 @@ mod tests {
     #[tokio::test]
     async fn ingest_then_approve_proposal() {
         let svc = EvolutionService::new();
-        let ctx = svc.build_reflection_context("s", 1, None, 0.0, &[], vec![], None);
+        let ctx = svc.build_reflection_context("s", 1, None, 0.0, &[], vec![], vec![], None);
 
         let llm = r#"{"proposals": [{"axis": "pattern", "description": "Boost", "confidence": 0.9, "details": {"signature": "a", "action": "boost"}}], "summary": "ok"}"#;
         svc.ingest_reflection_response(llm, &ctx).await.unwrap();
