@@ -226,8 +226,7 @@ fn recover_tool_call_args(rest: &str) -> String {
     }
 
     // Strip leading delimiters: `)`, `}`, `(`, `{`, `:` that are syntax noise
-    let cleaned = rest
-        .trim_start_matches([')', '(', '}', '{', ':', ' ']);
+    let cleaned = rest.trim_start_matches([')', '(', '}', '{', ':', ' ']);
 
     // If what remains looks like JSON (starts with { after cleanup), try to parse it
     if let Some(json_start) = rest.find('{') {

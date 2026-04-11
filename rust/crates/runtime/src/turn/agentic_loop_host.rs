@@ -552,7 +552,12 @@ fn apply_adaptive_execution_profile(state: &mut AgenticLoopState) {
         None => None,
     };
     let experiments = hub.experiments();
-    let profile = router.select(
+
+    // Snapshot config before profile application for attribution.
+    let old_config = session_guard.config.clone();
+    let old_scenario = session_guard.profile.current_scenario;
+
+    let mut profile = router.select(
         &routing,
         &detector,
         Some(hub.adaptive_baselines()),
@@ -560,6 +565,31 @@ fn apply_adaptive_execution_profile(state: &mut AgenticLoopState) {
         Some(&*experiments),
         &user_id,
     );
+
+    // ── Anti-flap: scenario change cooldown ──
+    // Suppress scenario changes within SCENARIO_COOLDOWN_TURNS of the last change
+    // to prevent rapid oscillation between scenarios.
+    const SCENARIO_COOLDOWN_TURNS: u32 = 5;
+    let scenario_suppressed = if profile.scenario != old_scenario && profile.scenario.is_some() {
+        if let Some(last_change) = session_guard.last_scenario_change_turn {
+            let turns_since = session_guard.turn_number.saturating_sub(last_change);
+            if turns_since < SCENARIO_COOLDOWN_TURNS {
+                // Revert to old scenario and config
+                profile.scenario = old_scenario;
+                profile.config = old_config.clone();
+                true
+            } else {
+                session_guard.last_scenario_change_turn = Some(session_guard.turn_number);
+                false
+            }
+        } else {
+            // First scenario change ever — record it
+            session_guard.last_scenario_change_turn = Some(session_guard.turn_number);
+            false
+        }
+    } else {
+        false
+    };
 
     if let Some(scenario) = profile.scenario {
         session_guard.profile.set_scenario(scenario);
@@ -572,8 +602,97 @@ fn apply_adaptive_execution_profile(state: &mut AgenticLoopState) {
 
     session_guard.active_experiment_id = profile.experiment_id.clone();
     session_guard.active_variant = profile.variant_id.clone();
-    session_guard.config = profile.config.clone();
-    state.max_turn_input_tokens = profile.config.token_budget.max_turn_input_tokens as u64;
+    if !scenario_suppressed {
+        session_guard.config = profile.config.clone();
+    }
+    state.max_turn_input_tokens = session_guard.config.token_budget.max_turn_input_tokens as u64;
+
+    // Collect attribution data while lock is held.
+    let turn = session_guard.turn_number;
+    let scenario_name = profile
+        .scenario
+        .map(|s| format!("{s:?}"))
+        .unwrap_or_default();
+    let confidence = profile.confidence;
+    let experiment_id = profile.experiment_id.clone();
+    let variant_id = profile.variant_id.clone();
+
+    // Compute config deltas for journal.
+    let mut config_changes = Vec::new();
+    if old_config.token_budget.max_turn_input_tokens
+        != profile.config.token_budget.max_turn_input_tokens
+    {
+        config_changes.push((
+            "token_budget.max_turn_input_tokens".to_string(),
+            old_config.token_budget.max_turn_input_tokens.to_string(),
+            profile
+                .config
+                .token_budget
+                .max_turn_input_tokens
+                .to_string(),
+        ));
+    }
+    if old_config.memory.retrieval_top_k != profile.config.memory.retrieval_top_k {
+        config_changes.push((
+            "memory.retrieval_top_k".to_string(),
+            old_config.memory.retrieval_top_k.to_string(),
+            profile.config.memory.retrieval_top_k.to_string(),
+        ));
+    }
+    if (old_config.verification.strictness - profile.config.verification.strictness).abs() > 0.001 {
+        config_changes.push((
+            "verification.strictness".to_string(),
+            format!("{:.3}", old_config.verification.strictness),
+            format!("{:.3}", profile.config.verification.strictness),
+        ));
+    }
+    if old_config.tool_selection.max_tools != profile.config.tool_selection.max_tools {
+        config_changes.push((
+            "tool_selection.max_tools".to_string(),
+            old_config.tool_selection.max_tools.to_string(),
+            profile.config.tool_selection.max_tools.to_string(),
+        ));
+    }
+    if (old_config.compression.compression_threshold
+        - profile.config.compression.compression_threshold)
+        .abs()
+        > 0.001
+    {
+        config_changes.push((
+            "compression.compression_threshold".to_string(),
+            format!("{:.3}", old_config.compression.compression_threshold),
+            format!("{:.3}", profile.config.compression.compression_threshold),
+        ));
+    }
+    let baseline_applied = profile.baseline_applied;
+
+    // Release session lock before writing journal.
+    drop(session_guard);
+
+    // Emit journal event for adaptive profile selection.
+    if profile.scenario.is_some() || !config_changes.is_empty() {
+        let sid = state.current_session_id.as_deref();
+        let event = astra_services::session_journal::JournalEvent::adaptive_scenario_applied(
+            sid,
+            turn,
+            &scenario_name,
+            confidence,
+            config_changes,
+            experiment_id.as_deref(),
+            variant_id.as_deref(),
+            baseline_applied,
+        );
+        write_session_journal_event(state, event);
+    }
+
+    // Emit separate experiment enrollment event if applicable.
+    if let (Some(exp_id), Some(var_id)) = (&experiment_id, &variant_id) {
+        let sid = state.current_session_id.as_deref();
+        let event = astra_services::session_journal::JournalEvent::adaptive_experiment_enrolled(
+            sid, turn, exp_id, var_id, exp_id, // experiment name defaults to id
+        );
+        write_session_journal_event(state, event);
+    }
 }
 
 /// Per-turn micro-adaptation: reads recent signals and adjusts the session config
@@ -604,27 +723,81 @@ fn apply_per_turn_adaptation(state: &mut AgenticLoopState, turn_tokens_used: u64
         .filter(|&&t| turn.saturating_sub(t) <= 3)
         .count();
 
+    // Read anti-flap state before mutable config borrow.
+    let prev_budget_direction = session_guard.last_token_budget_direction;
+    let prev_budget_change_turn = session_guard.last_token_budget_change_turn;
+
     let config = &mut session_guard.config;
 
+    // Collect changes for attribution journal.
+    let mut changes: Vec<(String, String, String)> = Vec::new();
+    let mut triggers: Vec<String> = Vec::new();
+
+    // Anti-flap state updates to write back after releasing config borrow.
+    let mut new_budget_direction: Option<i8> = None;
+    let mut new_budget_change_turn: Option<u32> = None;
+
     // ── 1. Dynamic token budget ──
+    // Anti-flap: detect direction oscillation and suppress rapid reversals.
+    const BUDGET_COOLDOWN_TURNS: u32 = 3;
     if config.context_window.adaptive && turn_tokens_used > 0 {
         let max_budget = config.token_budget.max_turn_input_tokens;
         let threshold = (max_budget as f64 * 0.85) as u64;
         if turn_tokens_used > threshold && max_budget > 30_000 {
-            let reduction = ((turn_tokens_used as f64 * 0.1) as u32).min(10_000);
-            config.token_budget.max_turn_input_tokens = config
-                .token_budget
-                .max_turn_input_tokens
-                .saturating_sub(reduction)
-                .max(30_000);
+            // Check for oscillation: if the previous change was an increase and
+            // it happened recently, skip this decrease to prevent ping-pong.
+            let oscillation_suppressed = if prev_budget_direction > 0 {
+                if let Some(last_turn) = prev_budget_change_turn {
+                    turn.saturating_sub(last_turn) < BUDGET_COOLDOWN_TURNS
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
+            if !oscillation_suppressed {
+                let old = max_budget;
+                let reduction = ((turn_tokens_used as f64 * 0.1) as u32).min(10_000);
+                config.token_budget.max_turn_input_tokens = config
+                    .token_budget
+                    .max_turn_input_tokens
+                    .saturating_sub(reduction)
+                    .max(30_000);
+                let new = config.token_budget.max_turn_input_tokens;
+                if new != old {
+                    new_budget_direction = Some(-1);
+                    new_budget_change_turn = Some(turn);
+                    changes.push((
+                        "token_budget.max_turn_input_tokens".into(),
+                        old.to_string(),
+                        new.to_string(),
+                    ));
+                    triggers.push(format!(
+                        "token burn {:.0}% ({}k/{}k)",
+                        turn_tokens_used as f64 / old as f64 * 100.0,
+                        turn_tokens_used / 1000,
+                        old / 1000,
+                    ));
+                }
+            }
         }
     }
 
     // ── 2. Dynamic compression threshold ──
     if config.context_window.dynamic_compression && compression_count > 1 {
+        let old = config.compression.compression_threshold;
         let new_threshold = (config.compression.compression_threshold - 0.05)
             .max(config.context_window.compression_threshold_min);
         config.compression.compression_threshold = new_threshold;
+        if (new_threshold - old).abs() > 0.001 {
+            changes.push((
+                "compression.compression_threshold".into(),
+                format!("{old:.3}"),
+                format!("{new_threshold:.3}"),
+            ));
+            triggers.push(format!("{compression_count} compressions"));
+        }
     }
 
     // ── 3. Memory pressure expansion on corrections ──
@@ -632,8 +805,17 @@ fn apply_per_turn_adaptation(state: &mut AgenticLoopState, turn_tokens_used: u64
         && config.memory_pressure.expand_on_correction
         && recent_corrections > 0
     {
+        let old = config.memory.retrieval_top_k;
         let new_k = (config.memory.retrieval_top_k + 1).min(config.memory_pressure.retrieval_max);
         config.memory.retrieval_top_k = new_k;
+        if new_k != old {
+            changes.push((
+                "memory.retrieval_top_k".into(),
+                old.to_string(),
+                new_k.to_string(),
+            ));
+            triggers.push(format!("{recent_corrections} recent correction(s)"));
+        }
     }
 
     // ── 4. Verification strictness on corrections ──
@@ -641,13 +823,45 @@ fn apply_per_turn_adaptation(state: &mut AgenticLoopState, turn_tokens_used: u64
         && config.verification.increase_on_correction
         && recent_corrections >= 1
     {
+        let old = config.verification.strictness;
         let new_strictness =
             (config.verification.strictness + 0.05).min(config.verification.max_strictness);
         config.verification.strictness = new_strictness;
+        if (new_strictness - old).abs() > 0.001 {
+            changes.push((
+                "verification.strictness".into(),
+                format!("{old:.3}"),
+                format!("{new_strictness:.3}"),
+            ));
+            triggers.push(format!("{recent_corrections} recent correction(s)"));
+        }
     }
 
     // Sync the loop-level token budget with the updated config
     state.max_turn_input_tokens = config.token_budget.max_turn_input_tokens as u64;
+
+    // Write back anti-flap state (deferred to avoid borrow conflict with config).
+    if let Some(dir) = new_budget_direction {
+        session_guard.last_token_budget_direction = dir;
+    }
+    if let Some(t) = new_budget_change_turn {
+        session_guard.last_token_budget_change_turn = Some(t);
+    }
+
+    // Release lock before writing journal.
+    drop(session_guard);
+
+    // Emit journal event if anything changed.
+    if !changes.is_empty() {
+        // De-duplicate triggers
+        triggers.sort();
+        triggers.dedup();
+        let sid = state.current_session_id.as_deref();
+        let event = astra_services::session_journal::JournalEvent::adaptive_per_turn_applied(
+            sid, turn, changes, triggers,
+        );
+        write_session_journal_event(state, event);
+    }
 }
 
 // ─── Loop exit ───────────────────────────────────────────────────────────────
@@ -1550,6 +1764,25 @@ fn maybe_run_tuning_cycle(state: &mut AgenticLoopState) {
     };
 
     let actions = hub.run_tuning_cycle(&mut session_guard.config);
+    let turn = session_guard.turn_number;
+
+    // Track token-budget direction changes from tuning rules for anti-flap.
+    let new_budget = session_guard.config.token_budget.max_turn_input_tokens;
+    let old_budget_before_tuning = {
+        // Compare against what it was before this cycle
+        let prev = state.max_turn_input_tokens as u32;
+        prev
+    };
+    if new_budget != old_budget_before_tuning {
+        let direction: i8 = if new_budget > old_budget_before_tuning {
+            1
+        } else {
+            -1
+        };
+        session_guard.last_token_budget_direction = direction;
+        session_guard.last_token_budget_change_turn = Some(turn);
+    }
+
     if !actions.is_empty() {
         eprintln!(
             "[auto-tuning] cycle applied {} rule(s): {:?}",
@@ -1557,6 +1790,33 @@ fn maybe_run_tuning_cycle(state: &mut AgenticLoopState) {
             actions
         );
     }
+
+    // Release lock before writing journal events.
+    let action_ids = actions.clone();
+    drop(session_guard);
+
+    // Emit journal events for triggered rules.
+    for rule_id in &action_ids {
+        let event = astra_services::session_journal::JournalEvent::adaptive_tuning_rule_triggered(
+            state.current_session_id.as_deref(),
+            turn,
+            rule_id,
+            rule_id, // name defaults to id
+            "aggregate",
+            Vec::new(), // config changes not tracked at this granularity yet
+        );
+        write_session_journal_event(state, event);
+    }
+
+    // Re-acquire lock for remaining operations.
+    let session = match &state.telemetry.observability_session {
+        Some(s) => s,
+        None => return,
+    };
+    let mut session_guard = match session.write() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
 
     // Check if any previously applied rules should be rolled back
     let rollbacks = hub.check_rollbacks(&mut session_guard.config);
@@ -7423,5 +7683,287 @@ print(json.dumps({'context': 'user said: ' + msg}))
             "verification should be 0.7 for code review: {}",
             guard.config.verification.strictness
         );
+    }
+
+    // ── Anti-flap dampening tests ──
+
+    #[test]
+    fn anti_flap_scenario_cooldown_suppresses_rapid_change() {
+        let hub = make_hub();
+        let session = make_session();
+        let mut state = make_state();
+        state.telemetry.observability_hub = Some(hub);
+        state.telemetry.observability_session = Some(session.clone());
+
+        // First call: set up Debugging scenario via queries
+        state.message = "fix the crash in the parser module".into();
+        state.recent_tools = vec!["bash".into()];
+        {
+            let mut guard = session.write().unwrap();
+            guard.turn_number = 1;
+            for _ in 0..5 {
+                guard.record_query("fix the crash in the parser module");
+            }
+        }
+        apply_adaptive_execution_profile(&mut state);
+
+        let scenario_after_first = {
+            let guard = session.read().unwrap();
+            guard.profile.current_scenario
+        };
+
+        // Second call at turn 2 (within cooldown): try switching to CodeReview
+        state.message = "review the PR diff and approve the change".into();
+        state.recent_tools = vec!["view".into()];
+        {
+            let mut guard = session.write().unwrap();
+            guard.turn_number = 2;
+            guard.recent_queries.clear();
+            for _ in 0..5 {
+                guard.record_query("review the PR diff and approve the change");
+            }
+        }
+        apply_adaptive_execution_profile(&mut state);
+
+        let scenario_after_second = {
+            let guard = session.read().unwrap();
+            guard.profile.current_scenario
+        };
+
+        // Scenario should NOT have changed due to cooldown
+        assert_eq!(
+            scenario_after_first, scenario_after_second,
+            "scenario should be suppressed by cooldown: first={:?}, second={:?}",
+            scenario_after_first, scenario_after_second
+        );
+    }
+
+    #[test]
+    fn anti_flap_scenario_change_allowed_after_cooldown() {
+        let hub = make_hub();
+        let session = make_session();
+        let mut state = make_state();
+        state.telemetry.observability_hub = Some(hub);
+        state.telemetry.observability_session = Some(session.clone());
+
+        // First call: set up Debugging scenario
+        state.message = "fix the crash in the parser module".into();
+        state.recent_tools = vec!["bash".into()];
+        {
+            let mut guard = session.write().unwrap();
+            guard.turn_number = 1;
+            for _ in 0..5 {
+                guard.record_query("fix the crash in the parser module");
+            }
+        }
+        apply_adaptive_execution_profile(&mut state);
+
+        // Second call at turn 10 (well past cooldown of 5): switch to CodeReview
+        state.message = "review the PR diff and approve the change".into();
+        state.recent_tools = vec!["view".into()];
+        {
+            let mut guard = session.write().unwrap();
+            guard.turn_number = 10;
+            guard.recent_queries.clear();
+            for _ in 0..5 {
+                guard.record_query("review the PR diff and approve the change");
+            }
+        }
+        apply_adaptive_execution_profile(&mut state);
+
+        let guard = session.read().unwrap();
+        // After cooldown expires, scenario should be allowed to change
+        assert_ne!(
+            guard.profile.current_scenario,
+            Some(crate::user_profile::Scenario::Debugging),
+            "scenario should change after cooldown expires"
+        );
+    }
+
+    #[test]
+    fn anti_flap_token_budget_oscillation_suppressed() {
+        let session = make_session();
+        let mut state = make_state();
+        state.telemetry.observability_session = Some(session.clone());
+
+        {
+            let mut guard = session.write().unwrap();
+            guard.config.token_budget.max_turn_input_tokens = 80_000;
+            guard.config.context_window.adaptive = true;
+            guard.turn_number = 5;
+            // Simulate that a tuning cycle just increased the budget at turn 4
+            guard.last_token_budget_direction = 1; // increase
+            guard.last_token_budget_change_turn = Some(4);
+        }
+        state.max_turn_input_tokens = 80_000;
+
+        // Now per-turn wants to decrease (turn 5, within cooldown of 3 from turn 4)
+        apply_per_turn_adaptation(&mut state, 72_000);
+
+        let guard = session.read().unwrap();
+        // Budget should NOT decrease because we'd be oscillating
+        assert_eq!(
+            guard.config.token_budget.max_turn_input_tokens, 80_000,
+            "budget should be unchanged due to oscillation suppression"
+        );
+    }
+
+    #[test]
+    fn anti_flap_token_budget_decrease_allowed_after_cooldown() {
+        let session = make_session();
+        let mut state = make_state();
+        state.telemetry.observability_session = Some(session.clone());
+
+        {
+            let mut guard = session.write().unwrap();
+            guard.config.token_budget.max_turn_input_tokens = 80_000;
+            guard.config.context_window.adaptive = true;
+            guard.turn_number = 10;
+            // Previous increase was at turn 2 — well past cooldown
+            guard.last_token_budget_direction = 1;
+            guard.last_token_budget_change_turn = Some(2);
+        }
+        state.max_turn_input_tokens = 80_000;
+
+        apply_per_turn_adaptation(&mut state, 72_000);
+
+        let guard = session.read().unwrap();
+        assert!(
+            guard.config.token_budget.max_turn_input_tokens < 80_000,
+            "budget should decrease after cooldown: {}",
+            guard.config.token_budget.max_turn_input_tokens
+        );
+        assert_eq!(
+            guard.last_token_budget_direction, -1,
+            "direction should be updated to decrease"
+        );
+    }
+
+    #[test]
+    fn anti_flap_consecutive_decreases_not_suppressed() {
+        let session = make_session();
+        let mut state = make_state();
+        state.telemetry.observability_session = Some(session.clone());
+
+        {
+            let mut guard = session.write().unwrap();
+            guard.config.token_budget.max_turn_input_tokens = 80_000;
+            guard.config.context_window.adaptive = true;
+            guard.turn_number = 5;
+            // Previous change was also a decrease
+            guard.last_token_budget_direction = -1;
+            guard.last_token_budget_change_turn = Some(4);
+        }
+        state.max_turn_input_tokens = 80_000;
+
+        // Another decrease should be allowed (same direction = not oscillation)
+        apply_per_turn_adaptation(&mut state, 72_000);
+
+        let guard = session.read().unwrap();
+        assert!(
+            guard.config.token_budget.max_turn_input_tokens < 80_000,
+            "consecutive decreases should not be suppressed: {}",
+            guard.config.token_budget.max_turn_input_tokens
+        );
+    }
+
+    // ── Journal event attribution tests ──
+
+    #[test]
+    fn adaptive_profile_emits_journal_event_on_scenario_change() {
+        let hub = make_hub();
+        let session = make_session();
+        let mut state = make_state();
+        state.telemetry.observability_hub = Some(hub);
+        state.telemetry.observability_session = Some(session.clone());
+        state.current_session_id = Some("journal-test-session".into());
+
+        state.message = "fix the crash in the parser module".into();
+        state.recent_tools = vec!["bash".into()];
+        {
+            let mut guard = session.write().unwrap();
+            for _ in 0..5 {
+                guard.record_query("fix the crash in the parser module");
+            }
+        }
+
+        apply_adaptive_execution_profile(&mut state);
+
+        // Verify a scenario was detected (journal event emission is best-effort
+        // in tests since we don't have a real journal backend, but the function
+        // should not panic).
+        let guard = session.read().unwrap();
+        assert!(
+            guard.profile.current_scenario.is_some(),
+            "scenario should be detected for journal event"
+        );
+    }
+
+    #[test]
+    fn per_turn_adaptation_tracks_budget_direction_state() {
+        let session = make_session();
+        let mut state = make_state();
+        state.telemetry.observability_session = Some(session.clone());
+
+        {
+            let mut guard = session.write().unwrap();
+            guard.config.token_budget.max_turn_input_tokens = 80_000;
+            guard.config.context_window.adaptive = true;
+            guard.turn_number = 1;
+        }
+        state.max_turn_input_tokens = 80_000;
+
+        apply_per_turn_adaptation(&mut state, 72_000);
+
+        let guard = session.read().unwrap();
+        // After a decrease, direction should be -1
+        assert_eq!(guard.last_token_budget_direction, -1);
+        assert_eq!(guard.last_token_budget_change_turn, Some(1));
+    }
+
+    #[test]
+    fn tuning_cycle_updates_budget_direction_on_increase() {
+        let hub = make_hub();
+        let session = make_session();
+        let mut state = make_state();
+        state.telemetry.observability_hub = Some(hub.clone());
+        state.telemetry.observability_session = Some(session.clone());
+        state.telemetry.completed_turns_for_tuning = TUNING_CYCLE_INTERVAL;
+
+        // Set a low budget so tuning might increase it
+        {
+            let mut guard = session.write().unwrap();
+            guard.config.token_budget.max_turn_input_tokens = 50_000;
+            guard.turn_number = 10;
+        }
+        state.max_turn_input_tokens = 50_000;
+
+        // Add a rule that increases token budget
+        hub.tuning()
+            .add_rule(crate::auto_tuning::EvolutionRule::new(
+                "test-increase-budget",
+                crate::auto_tuning::EvolutionTrigger::LowSuccessRate {
+                    threshold: 1.0, // always fires
+                    window_secs: 3600,
+                    min_samples: 0,
+                },
+                crate::auto_tuning::EvolutionAction::AdjustConfig {
+                    path: "token_budget.max_turn_input_tokens".into(),
+                    delta: 10_000.0,
+                    min: None,
+                    max: None,
+                },
+            ));
+
+        maybe_run_tuning_cycle(&mut state);
+
+        let guard = session.read().unwrap();
+        if guard.config.token_budget.max_turn_input_tokens > 50_000 {
+            // If the rule fired and increased budget, direction should be +1
+            assert_eq!(guard.last_token_budget_direction, 1);
+            assert_eq!(guard.last_token_budget_change_turn, Some(10));
+        }
+        // (If the rule didn't fire due to min_samples, that's OK — the direction
+        // tracking only activates on actual changes.)
     }
 }

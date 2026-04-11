@@ -52,7 +52,7 @@ mod tests {
         let m = chat_turn_http_error_with_compact_body(400, "  x  ", |s| s.trim().to_string());
         assert!(m.contains("API Error (400): x"));
     }
-    
+
     #[test]
     fn no_hint_for_unknown_status() {
         let m = chat_turn_http_error_user_message(418, "teapot");

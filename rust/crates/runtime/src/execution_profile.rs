@@ -35,6 +35,10 @@ pub struct ExecutionProfile {
     /// Overall confidence in this profile selection (0.0–1.0).
     #[serde(default = "default_confidence")]
     pub confidence: f64,
+
+    /// Whether a durable adaptive baseline was applied to this profile.
+    #[serde(default)]
+    pub baseline_applied: bool,
 }
 
 fn default_confidence() -> f64 {
@@ -51,6 +55,7 @@ impl ExecutionProfile {
             variant_id: None,
             boost_terms: Vec::new(),
             confidence: 1.0,
+            baseline_applied: false,
         }
     }
 

@@ -1028,6 +1028,112 @@ pub(super) fn handle_session_command(arg: &str, state: &mut ReplState) {
                                     evidence_count,
                                 );
                             }
+                            session_journal::JournalEventType::AdaptiveScenarioApplied => {
+                                let scenario = evt
+                                    .metadata
+                                    .as_ref()
+                                    .and_then(|m| m.get("scenario"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("unknown");
+                                let confidence = evt
+                                    .metadata
+                                    .as_ref()
+                                    .and_then(|m| m.get("confidence"))
+                                    .and_then(|v| v.as_f64())
+                                    .unwrap_or(0.0);
+                                let n_changes = evt
+                                    .metadata
+                                    .as_ref()
+                                    .and_then(|m| m.get("config_changes"))
+                                    .and_then(|v| v.as_array())
+                                    .map(|a| a.len())
+                                    .unwrap_or(0);
+                                eprintln!(
+                                    "  {} {} T{} adaptive profile → {} (conf {:.2}, {} config changes)",
+                                    ts_short.dim(),
+                                    "⚙".cyan(),
+                                    evt.turn.unwrap_or(0),
+                                    scenario,
+                                    confidence,
+                                    n_changes,
+                                );
+                            }
+                            session_journal::JournalEventType::AdaptivePerTurnApplied => {
+                                let n_changes = evt
+                                    .metadata
+                                    .as_ref()
+                                    .and_then(|m| m.get("changes"))
+                                    .and_then(|v| v.as_array())
+                                    .map(|a| a.len())
+                                    .unwrap_or(0);
+                                let triggers = evt
+                                    .metadata
+                                    .as_ref()
+                                    .and_then(|m| m.get("triggers"))
+                                    .and_then(|v| v.as_array())
+                                    .map(|a| {
+                                        a.iter()
+                                            .filter_map(|t| t.as_str())
+                                            .collect::<Vec<_>>()
+                                            .join(", ")
+                                    })
+                                    .unwrap_or_default();
+                                if n_changes > 0 {
+                                    eprintln!(
+                                        "  {} {} T{} per-turn adapt: {} changes ({})",
+                                        ts_short.dim(),
+                                        "↻".cyan(),
+                                        evt.turn.unwrap_or(0),
+                                        n_changes,
+                                        triggers,
+                                    );
+                                }
+                            }
+                            session_journal::JournalEventType::AdaptiveExperimentEnrolled => {
+                                let exp = evt
+                                    .metadata
+                                    .as_ref()
+                                    .and_then(|m| m.get("experiment_name"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("?");
+                                let variant = evt
+                                    .metadata
+                                    .as_ref()
+                                    .and_then(|m| m.get("variant_id"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("?");
+                                eprintln!(
+                                    "  {} {} T{} experiment enrolled: {} → variant {}",
+                                    ts_short.dim(),
+                                    "🧪".cyan(),
+                                    evt.turn.unwrap_or(0),
+                                    exp,
+                                    variant,
+                                );
+                            }
+                            session_journal::JournalEventType::AdaptiveTuningRuleTriggered => {
+                                let rule = evt
+                                    .metadata
+                                    .as_ref()
+                                    .and_then(|m| m.get("rule_name"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("?");
+                                let n_changes = evt
+                                    .metadata
+                                    .as_ref()
+                                    .and_then(|m| m.get("config_changes"))
+                                    .and_then(|v| v.as_array())
+                                    .map(|a| a.len())
+                                    .unwrap_or(0);
+                                eprintln!(
+                                    "  {} {} T{} tuning rule: {} ({} changes)",
+                                    ts_short.dim(),
+                                    "⚡".yellow(),
+                                    evt.turn.unwrap_or(0),
+                                    rule,
+                                    n_changes,
+                                );
+                            }
                         }
                     }
                     // Summary stats
@@ -1319,11 +1425,14 @@ pub(super) fn handle_session_command(arg: &str, state: &mut ReplState) {
         "drift" => {
             handle_session_drift(sub_arg, state);
         }
+        "adaptive" | "profile" | "tuning" => {
+            handle_session_adaptive(sub_arg, state);
+        }
         other => {
             eprintln!("{}", format!("  Unknown subcommand: {other}").red());
             eprintln!(
                 "  {}",
-                "Usage: /session [history|context|list|errors|export|fork|cleanup|verify|drift] …"
+                "Usage: /session [history|context|list|errors|export|fork|cleanup|verify|drift|adaptive] …"
                     .dim()
             );
         }
@@ -1745,6 +1854,35 @@ fn build_export_markdown(session_id: &str, events: &[session_journal::JournalEve
                     "### Adaptive baseline promoted\n- **Time:** {ts_short}\n- **Scope:** {task_type} / {domain}\n- **Winner:** {variant}\n- **Experiment:** {experiment}\n\n"
                 ));
             }
+            session_journal::JournalEventType::AdaptiveScenarioApplied => {
+                let meta = evt.metadata.as_ref();
+                let scenario = meta
+                    .and_then(|m| m.get("scenario"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?");
+                let confidence = meta
+                    .and_then(|m| m.get("confidence"))
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0);
+                md.push_str(&format!(
+                    "### Adaptive scenario applied\n- **Time:** {ts_short}\n- **Scenario:** {scenario} (confidence {confidence:.2})\n\n"
+                ));
+            }
+            session_journal::JournalEventType::AdaptivePerTurnApplied => {
+                let n = evt
+                    .metadata
+                    .as_ref()
+                    .and_then(|m| m.get("changes"))
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.len())
+                    .unwrap_or(0);
+                if n > 0 {
+                    md.push_str(&format!(
+                        "### Per-turn adaptation (T{})\n- **Time:** {ts_short}\n- **Changes:** {n}\n\n",
+                        evt.turn.unwrap_or(0),
+                    ));
+                }
+            }
             _ => {}
         }
     }
@@ -2029,6 +2167,241 @@ fn format_age_days(d: std::time::Duration) -> String {
     } else {
         format!("{days} days")
     }
+}
+
+// ── Session adaptive inspection ─────────────────────────────────────────────
+
+/// Display current adaptive execution state: scenario, experiment, recent
+/// per-turn adaptations, and tuning rule history from the session journal.
+///
+/// Usage: /session adaptive [--verbose]
+fn handle_session_adaptive(_arg: &str, state: &ReplState) {
+    use astra_services::session_journal;
+
+    eprintln!(
+        "\n{}",
+        "─── Adaptive Execution State ─────────────────────"
+            .bold()
+            .cyan()
+    );
+
+    // 1. Current scenario + experiment from ObservabilitySession.
+    if let Some(obs) = &state.observability_session {
+        if let Ok(guard) = obs.read() {
+            let scenario = guard
+                .profile
+                .current_scenario
+                .map(|s| format!("{s:?}"))
+                .unwrap_or_else(|| "none".to_string());
+            eprintln!("  {} Scenario: {}", "▸".cyan(), scenario.bold());
+
+            if let Some(exp) = &guard.active_experiment_id {
+                let var = guard.active_variant.as_deref().unwrap_or("?");
+                eprintln!("  {} Experiment: {} → variant {}", "▸".cyan(), exp, var);
+            } else {
+                eprintln!("  {} Experiment: {}", "▸".cyan(), "none".dim());
+            }
+
+            eprintln!("  {} Config snapshot:", "▸".cyan(),);
+            eprintln!(
+                "      token_budget.max_turn_input_tokens = {}",
+                guard.config.token_budget.max_turn_input_tokens
+            );
+            eprintln!(
+                "      memory.retrieval_top_k             = {}",
+                guard.config.memory.retrieval_top_k
+            );
+            eprintln!(
+                "      verification.strictness             = {:.3}",
+                guard.config.verification.strictness
+            );
+            eprintln!(
+                "      compression.compression_threshold   = {:.3}",
+                guard.config.compression.compression_threshold
+            );
+            eprintln!(
+                "      tool_selection.max_tools            = {}",
+                guard.config.tool_selection.max_tools
+            );
+        }
+    } else {
+        eprintln!("  {}", "No active observability session.".dim());
+    }
+
+    // 2. Recent adaptive events from journal.
+    let session_id = match &state.session_id {
+        Some(id) => id.to_string(),
+        None => {
+            eprintln!("\n  {}", "No active session for journal lookup.".dim());
+            eprintln!();
+            return;
+        }
+    };
+
+    match session_journal::read_journal(&session_id) {
+        Ok(events) => {
+            let adaptive_events: Vec<_> = events
+                .iter()
+                .filter(|e| {
+                    matches!(
+                        e.event_type,
+                        session_journal::JournalEventType::AdaptiveScenarioApplied
+                            | session_journal::JournalEventType::AdaptivePerTurnApplied
+                            | session_journal::JournalEventType::AdaptiveExperimentEnrolled
+                            | session_journal::JournalEventType::AdaptiveTuningRuleTriggered
+                            | session_journal::JournalEventType::AdaptiveBaselinePromoted
+                    )
+                })
+                .collect();
+
+            if adaptive_events.is_empty() {
+                eprintln!("\n  {}", "No adaptive events recorded yet.".dim());
+            } else {
+                eprintln!(
+                    "\n  {} {} adaptive event(s) in journal:",
+                    "▸".cyan(),
+                    adaptive_events.len()
+                );
+                // Show last 10 events.
+                let start = adaptive_events.len().saturating_sub(10);
+                for evt in &adaptive_events[start..] {
+                    let ts = chrono::DateTime::parse_from_rfc3339(&evt.ts)
+                        .ok()
+                        .map(|dt: chrono::DateTime<chrono::FixedOffset>| {
+                            dt.format("%H:%M:%S").to_string()
+                        })
+                        .unwrap_or_else(|| "??:??:??".into());
+                    let turn = evt.turn.unwrap_or(0);
+                    match evt.event_type {
+                        session_journal::JournalEventType::AdaptiveScenarioApplied => {
+                            let scenario = evt
+                                .metadata
+                                .as_ref()
+                                .and_then(|m| m.get("scenario"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("?");
+                            let confidence = evt
+                                .metadata
+                                .as_ref()
+                                .and_then(|m| m.get("confidence"))
+                                .and_then(|v| v.as_f64())
+                                .unwrap_or(0.0);
+                            let n = evt
+                                .metadata
+                                .as_ref()
+                                .and_then(|m| m.get("config_changes"))
+                                .and_then(|v| v.as_array())
+                                .map(|a| a.len())
+                                .unwrap_or(0);
+                            eprintln!(
+                                "    {} T{:>2} {} profile → {} (conf {:.2}, {} changes)",
+                                ts.dim(),
+                                turn,
+                                "⚙".cyan(),
+                                scenario,
+                                confidence,
+                                n
+                            );
+                        }
+                        session_journal::JournalEventType::AdaptivePerTurnApplied => {
+                            let n = evt
+                                .metadata
+                                .as_ref()
+                                .and_then(|m| m.get("changes"))
+                                .and_then(|v| v.as_array())
+                                .map(|a| a.len())
+                                .unwrap_or(0);
+                            let triggers = evt
+                                .metadata
+                                .as_ref()
+                                .and_then(|m| m.get("triggers"))
+                                .and_then(|v| v.as_array())
+                                .map(|a| {
+                                    a.iter()
+                                        .filter_map(|t| t.as_str())
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                })
+                                .unwrap_or_default();
+                            eprintln!(
+                                "    {} T{:>2} {} per-turn: {} changes ({})",
+                                ts.dim(),
+                                turn,
+                                "↻".cyan(),
+                                n,
+                                triggers
+                            );
+                        }
+                        session_journal::JournalEventType::AdaptiveExperimentEnrolled => {
+                            let exp = evt
+                                .metadata
+                                .as_ref()
+                                .and_then(|m| m.get("experiment_name"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("?");
+                            let var = evt
+                                .metadata
+                                .as_ref()
+                                .and_then(|m| m.get("variant_id"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("?");
+                            eprintln!(
+                                "    {} T{:>2} {} enrolled: {} → {}",
+                                ts.dim(),
+                                turn,
+                                "🧪".cyan(),
+                                exp,
+                                var
+                            );
+                        }
+                        session_journal::JournalEventType::AdaptiveTuningRuleTriggered => {
+                            let rule = evt
+                                .metadata
+                                .as_ref()
+                                .and_then(|m| m.get("rule_name"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("?");
+                            eprintln!(
+                                "    {} T{:>2} {} rule: {}",
+                                ts.dim(),
+                                turn,
+                                "⚡".yellow(),
+                                rule
+                            );
+                        }
+                        session_journal::JournalEventType::AdaptiveBaselinePromoted => {
+                            let scope = evt
+                                .metadata
+                                .as_ref()
+                                .and_then(|m| m.get("task_type"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("?");
+                            let var = evt
+                                .metadata
+                                .as_ref()
+                                .and_then(|m| m.get("variant_id"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("?");
+                            eprintln!(
+                                "    {} T{:>2} {} baseline promoted: {} → {}",
+                                ts.dim(),
+                                turn,
+                                "🏆".cyan(),
+                                scope,
+                                var
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("  {}", format!("Failed to read journal: {e}").red());
+        }
+    }
+
+    eprintln!();
 }
 
 // ── Session verify / sync status ────────────────────────────────────────────

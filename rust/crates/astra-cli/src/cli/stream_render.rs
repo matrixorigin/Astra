@@ -2146,17 +2146,14 @@ fn format_tool_error_summary(tool: &str, output: &str) -> String {
         "bash" | "shell" | "run_build_test" => {
             // For bash errors, try to find the most informative part
             // Common patterns: "command not found", "No such file", "Permission denied"
-            if let Some(line) = output
-                .lines()
-                .find(|l| {
-                    let lower = l.to_lowercase();
-                    lower.contains("error:")
-                        || lower.contains("failed")
-                        || lower.contains("not found")
-                        || lower.contains("permission denied")
-                        || lower.contains("no such file")
-                })
-            {
+            if let Some(line) = output.lines().find(|l| {
+                let lower = l.to_lowercase();
+                lower.contains("error:")
+                    || lower.contains("failed")
+                    || lower.contains("not found")
+                    || lower.contains("permission denied")
+                    || lower.contains("no such file")
+            }) {
                 return truncate_line(line.trim(), 80);
             }
             // Fall back to last non-empty line (often contains the actual error)
@@ -2178,7 +2175,10 @@ fn format_tool_error_summary(tool: &str, output: &str) -> String {
         "edit" | "write_file" | "create_file" => {
             if output_trimmed.contains("No match found") || output_trimmed.contains("not found") {
                 // Extract what wasn't found if possible
-                if let Some(line) = output.lines().find(|l| l.contains("old_str") || l.contains("pattern")) {
+                if let Some(line) = output
+                    .lines()
+                    .find(|l| l.contains("old_str") || l.contains("pattern"))
+                {
                     return truncate_line(line.trim(), 80);
                 }
                 return "Pattern not found in file".to_string();

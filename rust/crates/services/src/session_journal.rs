@@ -675,6 +675,14 @@ pub enum JournalEventType {
     ContextAssemblyRecorded,
     /// Focus drift detected during a turn (severity, cause, evidence).
     DriftDetected,
+    /// Scenario detected and adaptive profile applied for this session.
+    AdaptiveScenarioApplied,
+    /// Per-turn micro-adaptation adjusted config values.
+    AdaptivePerTurnApplied,
+    /// Experiment enrollment — session assigned to an experiment variant.
+    AdaptiveExperimentEnrolled,
+    /// Tuning rule evaluated and triggered a config change.
+    AdaptiveTuningRuleTriggered,
 }
 
 /// Writer that appends events to a session journal file.
@@ -1977,9 +1985,100 @@ impl JournalEvent {
         }));
         evt
     }
-}
 
-/// Truncate a string to max chars (for journal size control).
+    /// Adaptive scenario applied — emitted once per session when the adaptive
+    /// profile selects a scenario and applies config adjustments.
+    pub fn adaptive_scenario_applied(
+        session_id: Option<&str>,
+        turn: u32,
+        scenario: &str,
+        confidence: f64,
+        config_changes: Vec<(String, String, String)>, // (key, from, to)
+        experiment_id: Option<&str>,
+        variant_id: Option<&str>,
+        baseline_applied: bool,
+    ) -> Self {
+        let mut evt = Self::base(JournalEventType::AdaptiveScenarioApplied, session_id);
+        evt.turn = Some(turn);
+        let changes: Vec<serde_json::Value> = config_changes
+            .iter()
+            .map(|(k, from, to)| serde_json::json!({"key": k, "from": from, "to": to}))
+            .collect();
+        evt.metadata = Some(serde_json::json!({
+            "scenario": scenario,
+            "confidence": confidence,
+            "config_changes": changes,
+            "experiment_id": experiment_id,
+            "variant_id": variant_id,
+            "baseline_applied": baseline_applied,
+        }));
+        evt
+    }
+
+    /// Per-turn micro-adaptation applied — emitted when per-turn adaptation
+    /// modifies runtime config based on immediate signals.
+    pub fn adaptive_per_turn_applied(
+        session_id: Option<&str>,
+        turn: u32,
+        changes: Vec<(String, String, String)>, // (key, from, to)
+        triggers: Vec<String>,                  // reason strings
+    ) -> Self {
+        let mut evt = Self::base(JournalEventType::AdaptivePerTurnApplied, session_id);
+        evt.turn = Some(turn);
+        let change_vals: Vec<serde_json::Value> = changes
+            .iter()
+            .map(|(k, from, to)| serde_json::json!({"key": k, "from": from, "to": to}))
+            .collect();
+        evt.metadata = Some(serde_json::json!({
+            "changes": change_vals,
+            "triggers": triggers,
+        }));
+        evt
+    }
+
+    /// Experiment enrollment — session assigned to a variant.
+    pub fn adaptive_experiment_enrolled(
+        session_id: Option<&str>,
+        turn: u32,
+        experiment_id: &str,
+        variant_id: &str,
+        experiment_name: &str,
+    ) -> Self {
+        let mut evt = Self::base(JournalEventType::AdaptiveExperimentEnrolled, session_id);
+        evt.turn = Some(turn);
+        evt.metadata = Some(serde_json::json!({
+            "experiment_id": experiment_id,
+            "variant_id": variant_id,
+            "experiment_name": experiment_name,
+        }));
+        evt
+    }
+
+    /// Tuning rule triggered — emitted when an evolution rule fires and
+    /// modifies runtime config.
+    pub fn adaptive_tuning_rule_triggered(
+        session_id: Option<&str>,
+        turn: u32,
+        rule_id: &str,
+        rule_name: &str,
+        signal_type: &str,
+        config_changes: Vec<(String, String, String)>, // (key, from, to)
+    ) -> Self {
+        let mut evt = Self::base(JournalEventType::AdaptiveTuningRuleTriggered, session_id);
+        evt.turn = Some(turn);
+        let changes: Vec<serde_json::Value> = config_changes
+            .iter()
+            .map(|(k, from, to)| serde_json::json!({"key": k, "from": from, "to": to}))
+            .collect();
+        evt.metadata = Some(serde_json::json!({
+            "rule_id": rule_id,
+            "rule_name": rule_name,
+            "signal_type": signal_type,
+            "config_changes": changes,
+        }));
+        evt
+    }
+}
 fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()

@@ -90,6 +90,17 @@ pub struct ObservabilitySession {
 
     /// Last drift origin turn already emitted as a signal/journal event.
     last_reported_drift_turn: Option<u32>,
+
+    // ── Anti-flap dampening state ──
+    /// The turn at which the last scenario change occurred.
+    pub last_scenario_change_turn: Option<u32>,
+
+    /// Previous direction of per-turn token budget adjustments (+1 = increase, -1 = decrease).
+    /// Used to prevent oscillation.
+    pub last_token_budget_direction: i8,
+
+    /// Turn at which the last per-turn token budget change occurred.
+    pub last_token_budget_change_turn: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -165,6 +176,9 @@ impl ObservabilitySession {
             turn_timings: Vec::new(),
             goal_tracker: None,
             last_reported_drift_turn: None,
+            last_scenario_change_turn: None,
+            last_token_budget_direction: 0,
+            last_token_budget_change_turn: None,
         }
     }
 
@@ -193,6 +207,9 @@ impl ObservabilitySession {
             turn_timings: Vec::new(),
             goal_tracker: None,
             last_reported_drift_turn: None,
+            last_scenario_change_turn: None,
+            last_token_budget_direction: 0,
+            last_token_budget_change_turn: None,
         }
     }
 

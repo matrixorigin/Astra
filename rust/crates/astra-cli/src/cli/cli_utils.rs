@@ -126,7 +126,9 @@ pub(super) fn read_api_error(status: u16, body: &str) -> String {
     // Try to extract user-friendly message from JSON error response
     if let Ok(json) = serde_json::from_str::<serde_json::Value>(body) {
         // Common API error formats: {"error": "..."} or {"message": "..."} or {"detail": "..."}
-        if let Some(msg) = json.get("error").and_then(|v| v.as_str())
+        if let Some(msg) = json
+            .get("error")
+            .and_then(|v| v.as_str())
             .or_else(|| json.get("message").and_then(|v| v.as_str()))
             .or_else(|| json.get("detail").and_then(|v| v.as_str()))
         {

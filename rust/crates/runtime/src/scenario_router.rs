@@ -51,7 +51,12 @@ impl ScenarioRouter {
 
         // 2. Apply promoted adaptive baselines for this task/domain.
         if let Some(store) = adaptive_baselines {
-            store.apply_to_config(routing.task_type, routing.domain_hint, &mut profile.config);
+            if store
+                .apply_to_config(routing.task_type, routing.domain_hint, &mut profile.config)
+                .is_some()
+            {
+                profile.baseline_applied = true;
+            }
         }
 
         // 3. Pattern library boost terms
