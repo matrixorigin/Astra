@@ -304,20 +304,14 @@ async fn run_chat_repl(
 
     let mut state = initialize_repl_state(profile, initial_model);
     tracer.phase("state_init");
-    let skill_quality_path = dirs::config_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join("astra")
-        .join("skill_quality.json");
-    let pinned_skills_path = dirs::config_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join("astra")
-        .join("pinned_skills.json");
 
     let repl_startup::ReplStartupArtifacts {
         selector,
         pipeline_modules,
         profile_name_str,
         mut edge_heartbeat_task,
+        skill_quality_path,
+        pinned_skills_path,
     } = complete_repl_startup(&mut state, &mut tracer, api, profile, resume_session_id).await;
 
     // Print startup trace summary if enabled

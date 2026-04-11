@@ -8,6 +8,8 @@ pub(crate) struct ReplStartupArtifacts {
     pub pipeline_modules: PipelineModules,
     pub profile_name_str: String,
     pub edge_heartbeat_task: Option<tokio::task::JoinHandle<()>>,
+    pub skill_quality_path: std::path::PathBuf,
+    pub pinned_skills_path: std::path::PathBuf,
 }
 
 pub(crate) async fn complete_repl_startup(
@@ -312,5 +314,7 @@ pub(crate) async fn complete_repl_startup(
         pipeline_modules,
         profile_name_str,
         edge_heartbeat_task,
+        skill_quality_path,
+        pinned_skills_path,
     }
 }
