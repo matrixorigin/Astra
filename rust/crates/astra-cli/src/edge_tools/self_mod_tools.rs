@@ -46,8 +46,8 @@ impl ToolExecutor {
         }
 
         let ceiling = constraints.config_drift_ceiling;
-        let mut old_value: Option<Value> = None;
-        let mut new_value: Option<Value> = None;
+        let mut old_value: Option<Value>;
+        let mut new_value: Option<Value>;
         let mut drift: Option<f64> = None;
 
         let parse_u32 = |v: &Value| v.as_u64().and_then(|n| u32::try_from(n).ok());
