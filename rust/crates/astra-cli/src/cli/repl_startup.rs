@@ -1,0 +1,316 @@
+//! REPL startup/setup orchestration extracted from `run_chat_repl`.
+
+use super::*;
+use repl_runtime::PipelineModules;
+
+pub(crate) struct ReplStartupArtifacts {
+    pub selector: Box<dyn tool_selector::ToolSelector>,
+    pub pipeline_modules: PipelineModules,
+    pub profile_name_str: String,
+    pub edge_heartbeat_task: Option<tokio::task::JoinHandle<()>>,
+}
+
+pub(crate) async fn complete_repl_startup(
+    state: &mut ReplState,
+    tracer: &mut StartupTracer,
+    api: &astra_thin_client::ThinClient,
+    profile: Option<&str>,
+    resume_session_id: Option<&str>,
+) -> ReplStartupArtifacts {
+    // Install panic hook to write session_end on unexpected crashes.
+    install_session_panic_hook();
+    // Install SIGTERM handler so `kill <pid>` writes session_end before exit.
+    install_sigterm_handler();
+
+    // Apply resume session if requested (-c or -r)
+    if let Some(sid) = resume_session_id {
+        state.session_id = Some(sid.to_string());
+        eprintln!(
+            "{}",
+            format!("  Resuming session {}", truncate_str(sid, 12)).cyan()
+        );
+    }
+
+    // --session-id: override with explicit session UUID
+    if let Ok(sid) = std::env::var("ASTRA_SESSION_ID") {
+        state.session_id = Some(sid.clone());
+        eprintln!(
+            "{}",
+            format!("  Using session {}", truncate_str(&sid, 12)).cyan()
+        );
+    }
+
+    // --name: set session display name
+    if let Ok(name) = std::env::var("ASTRA_SESSION_NAME") {
+        state.session_name = Some(name);
+    }
+
+    // --yes: warn about auto-approve mode
+    if state.perm_manager.mode() == permission_manager::PermissionMode::Auto {
+        eprintln!(
+            "{}",
+            "  ⚠ Auto-approve mode: all tool calls will execute without confirmation.".yellow()
+        );
+    }
+
+    // Load project instructions from .astra/instructions.md (unless --no-instructions)
+    let no_instructions = std::env::var("ASTRA_NO_INSTRUCTIONS")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    if !no_instructions && let Some(instructions) = discover_project_instructions() {
+        let lines = instructions.lines().count();
+        eprintln!(
+            "  {} {}",
+            theme::icon_ok(),
+            format!("Loaded project instructions ({lines} lines)").dim()
+        );
+        state.project_instructions = Some(instructions);
+    }
+
+    // Session lifecycle maintenance: compress old journals and delete expired sessions.
+    // Non-blocking, best-effort — errors are silently ignored.
+    {
+        let ttl_days: u64 = std::env::var("ASTRA_SESSION_TTL_DAYS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(30);
+        let compress_days: u64 = std::env::var("ASTRA_JOURNAL_COMPRESS_DAYS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(7);
+        let maint = session_journal::run_session_maintenance(ttl_days, compress_days);
+        if maint.sessions_deleted > 0 || maint.journals_compressed > 0 {
+            let mut parts = Vec::new();
+            if maint.sessions_deleted > 0 {
+                parts.push(format!(
+                    "{} expired sessions removed",
+                    maint.sessions_deleted
+                ));
+            }
+            if maint.journals_compressed > 0 {
+                parts.push(format!("{} journals compressed", maint.journals_compressed));
+            }
+            eprintln!("  {} {}", theme::icon_ok(), parts.join(", ").dim());
+        }
+    }
+
+    // Load persisted skill quality data from previous sessions
+    let skill_quality_path = dirs::config_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("astra")
+        .join("skill_quality.json");
+    state.skill_quality_tracker =
+        astra_runtime::skills::quality::SkillQualityTracker::load(&skill_quality_path);
+
+    // Load pinned skills from previous sessions
+    let pinned_skills_path = dirs::config_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("astra")
+        .join("pinned_skills.json");
+    if let Ok(data) = std::fs::read_to_string(&pinned_skills_path) {
+        match serde_json::from_str::<std::collections::HashSet<String>>(&data) {
+            Ok(set) => state.pinned_skills = set,
+            Err(e) => eprintln!("⚠ Failed to parse pinned_skills.json: {e}"),
+        }
+    }
+    tracer.phase("config_load");
+
+    // Session-scoped quality tracker: tools that work well get boosted over time
+    let quality_tracker = std::sync::Arc::new(std::sync::Mutex::new(
+        tool_registry::ToolQualityTracker::new(),
+    ));
+    // Session-scoped confidence calibrator: thresholds adapt to correction rates
+    let confidence_calibrator =
+        std::sync::Arc::new(astra_runtime::turn::routing_metrics::ConfidenceCalibrator::default());
+    let (selector, pipeline_modules) = create_tool_selector_with_quality(
+        api,
+        profile,
+        Some(quality_tracker),
+        Some(confidence_calibrator),
+    );
+    tracer.phase("tool_selector");
+
+    // Load cross-session learning state (entity graph, patterns, calibration, tool health)
+    let profile_name = profile.unwrap_or("default");
+    let (cross_session_health_entries, cloud_pull_result, pref_keys_after_pull) = {
+        let loaded = astra_runtime::pipeline::persistence::load_learning_state(
+            profile_name,
+            &pipeline_modules.entity_graph,
+            &pipeline_modules.pattern_library,
+            &pipeline_modules.calibrator,
+        );
+        if loaded {
+            eprintln!(
+                "  {} {}",
+                theme::icon_ok(),
+                "Loaded learning state from prior sessions".dim()
+            );
+        }
+        let mut cross_session_health_entries =
+            astra_runtime::pipeline::persistence::load_tool_health(profile_name);
+        state.synced_tool_health_entries =
+            astra_runtime::pipeline::persistence::load_synced_tool_health(profile_name);
+        if !cross_session_health_entries.is_empty() {
+            eprintln!(
+                "{}",
+                format!(
+                    "  ✓ Restored tool health ({} tools tracked)",
+                    cross_session_health_entries.len()
+                )
+                .dim()
+            );
+        }
+        let cloud_pull_result = try_cloud_pull(
+            profile_name,
+            &pipeline_modules.entity_graph,
+            &pipeline_modules.pattern_library,
+            &pipeline_modules.calibrator,
+        )
+        .await;
+        state.cloud_learning_version = cloud_pull_result.version;
+        if !cloud_pull_result.tool_health.is_empty() {
+            let (merged, cloud_wins, cloud_only) =
+                astra_runtime::pipeline::persistence::merge_tool_health(
+                    &cross_session_health_entries,
+                    &cloud_pull_result.tool_health,
+                );
+            cross_session_health_entries = merged;
+            if cloud_wins > 0 || cloud_only > 0 {
+                let mut parts = Vec::new();
+                if cloud_wins > 0 {
+                    parts.push(format!("{cloud_wins} updated from cloud"));
+                }
+                if cloud_only > 0 {
+                    parts.push(format!("{cloud_only} new from cloud"));
+                }
+                eprintln!(
+                    "{}",
+                    format!("  ✓ Merged tool health: {}", parts.join(", ")).dim()
+                );
+            }
+        }
+        let pref_keys = try_cloud_pull_preferences(state).await;
+        (cross_session_health_entries, cloud_pull_result, pref_keys)
+    };
+    tracer.phase("learning_state");
+
+    state.tool_health_entries = cross_session_health_entries.clone();
+    if state.synced_tool_health_entries.is_empty() {
+        state.synced_tool_health_entries = cross_session_health_entries;
+    }
+
+    {
+        let settings = astra_runtime::matrix_settings_from_env();
+        state.matrix_runtime = match SharedPool::new(&settings).await {
+            Ok(pool) => {
+                let user_id = std::env::var("MO_USER_ID").unwrap_or_else(|_| "local".to_string());
+                let th =
+                    std::sync::Arc::new(std::sync::Mutex::new(state.tool_health_entries.clone()));
+                let lease = std::sync::Arc::new(astra_services::TaskLeaseHoldCache::default());
+                Some(std::sync::Arc::new(
+                    astra_runtime::MatrixCloudRuntime::attach(
+                        pool,
+                        profile.unwrap_or("default"),
+                        &user_id,
+                        pipeline_modules.entity_graph.clone(),
+                        pipeline_modules.pattern_library.clone(),
+                        pipeline_modules.calibrator.clone(),
+                        th,
+                        state.cloud_learning_version,
+                        lease,
+                    ),
+                ))
+            }
+            Err(_) => None,
+        };
+        if let Some(ref mc) = state.matrix_runtime {
+            set_sigterm_runtime(mc.clone());
+        }
+
+        if let Some(ref mc) = state.matrix_runtime {
+            let pool = mc.shared_pool().get().clone();
+            let user_id = std::env::var("MO_USER_ID").unwrap_or_else(|_| "local".to_string());
+            let mo_team_store = astra_services::team_persistence::MatrixOneTeamStore::new(pool);
+            if let Err(e) = mo_team_store.ensure_builtins(&user_id).await {
+                eprintln!("  {} team store builtins: {e}", theme::icon_warn());
+            }
+            state.team_store = std::sync::Arc::new(mo_team_store);
+        }
+    }
+    tracer.phase("matrix_pool");
+
+    state.pattern_library = Some(pipeline_modules.pattern_library.clone());
+    state.entity_graph = Some(pipeline_modules.entity_graph.clone());
+    state.calibrator = Some(pipeline_modules.calibrator.clone());
+    if let Some(hub) = &state.observability_hub {
+        hub.attach_pattern_library(pipeline_modules.pattern_library.clone());
+    }
+    state.unified_skill_registry = pipeline_modules.unified_skill_registry.clone();
+    state.mcp_manager = pipeline_modules.mcp_manager.clone();
+
+    append_cloud_pull_sync_journal(
+        state,
+        profile_name,
+        "repl_startup",
+        &cloud_pull_result,
+        &pref_keys_after_pull,
+    );
+
+    let profile_name_str = profile_name.to_string();
+
+    if let Some(token) = current_access_token(profile) {
+        let has_models = check_server_has_models(api, &token).await;
+        if !has_models {
+            state.model = Some("⚠ none".to_string());
+        }
+    }
+    tracer.phase("model_check");
+
+    print_repl_banner(profile, state);
+    tracer.phase("banner");
+
+    if let Ok(proxy) = std::env::var("http_proxy").or_else(|_| std::env::var("HTTP_PROXY"))
+        && !proxy.is_empty()
+    {
+        eprintln!(
+            "  {}  {} {}",
+            theme::icon_warn(),
+            "HTTP proxy detected:".yellow(),
+            proxy.dim()
+        );
+        eprintln!(
+            "     {}",
+            "Agent bypasses proxy for local calls. For curl: use --noproxy '*'".dim()
+        );
+    }
+
+    let mut edge_heartbeat_task: Option<tokio::task::JoinHandle<()>> = None;
+    if let Some(ref tok) = current_access_token(profile) {
+        edge_heartbeat_task = register_and_start_heartbeat(api, tok).await;
+    }
+    tracer.phase("edge_heartbeat");
+
+    if state.model.as_deref() == Some("⚠ none") {
+        eprintln!(
+            "  {}  {}",
+            theme::icon_warn(),
+            "No LLM model configured on server. Run: astra-admin model add".yellow()
+        );
+        eprintln!();
+        state.model = None;
+    }
+
+    tracer.phase("completions_deferred");
+
+    if let Some(token) = current_access_token(profile) {
+        initialize_multi_agent_runtime(state, api, token).await;
+    }
+    tracer.phase("multi_agent_runtime");
+
+    ReplStartupArtifacts {
+        selector,
+        pipeline_modules,
+        profile_name_str,
+        edge_heartbeat_task,
+    }
+}
