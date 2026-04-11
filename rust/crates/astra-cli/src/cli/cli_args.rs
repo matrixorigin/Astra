@@ -655,7 +655,7 @@ pub(crate) enum SelfCmd {
     /// Full persistent self snapshot for a session
     Snapshot(SelfSessionArgs),
     /// Liquid reflection summary reconstructed from persistent local state
-    Reflect(SelfSessionArgs),
+    Reflect(SelfReflectArgs),
     /// Core self-model profile (capabilities, state, goals, constraints)
     Profile(SelfSessionArgs),
     /// Goal and plan state for a session
@@ -681,6 +681,21 @@ pub(crate) enum SelfCmd {
 pub(crate) struct SelfSessionArgs {
     /// Session id or unique prefix (defaults to the most recent resumable session)
     pub session_id: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct SelfReflectArgs {
+    /// Session id or unique prefix (defaults to the most recent resumable session)
+    pub session_id: Option<String>,
+    /// Reflection focus to prioritize in the local surface
+    #[arg(long, default_value = "auto", value_parser = ["auto", "skill_failure", "unexpected_result", "data_quality", "tool_selection", "history", "performance"])]
+    pub focus: String,
+    /// Optional concrete question to keep in the reflection prompt preview
+    #[arg(long)]
+    pub question: Option<String>,
+    /// Maximum number of recent events to use for the reflection window
+    #[arg(long, default_value_t = 20)]
+    pub last_n: usize,
 }
 
 #[derive(Args, Debug)]

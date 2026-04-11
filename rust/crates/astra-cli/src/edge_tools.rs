@@ -782,22 +782,15 @@ impl ToolExecutor {
                     .filter(|id| !id.is_empty())
                 {
                     let limit = usize::try_from(last_n.max(1)).unwrap_or(20);
-                    match crate::self_command::render_surface_for_session(
-                        session_id, "reflect", limit,
+                    match crate::self_command::render_reflect_surface_for_session(
+                        session_id,
+                        limit,
+                        Some(focus),
+                        Some(question),
                     )
                     .await
                     {
-                        Ok(surface) => match serde_json::from_str::<serde_json::Value>(&surface) {
-                            Ok(mut value) => {
-                                if let Some(map) = value.as_object_mut() {
-                                    map.insert("focus".to_string(), serde_json::json!(focus));
-                                    map.insert("question".to_string(), serde_json::json!(question));
-                                    map.insert("last_n".to_string(), serde_json::json!(last_n));
-                                }
-                                value.to_string()
-                            }
-                            Err(_) => surface.to_string(),
-                        },
+                        Ok(surface) => surface,
                         Err(error) => serde_json::json!({
                             "status": "reflect_unavailable",
                             "focus": focus,

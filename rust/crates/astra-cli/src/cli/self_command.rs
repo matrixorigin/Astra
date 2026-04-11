@@ -6,6 +6,7 @@ use serde::Serialize;
 
 use crate::cli_args::{
     SelfCmd, SelfJournalArgs, SelfMutateCmd, SelfMutateConfigArgs, SelfMutateGoalArgs,
+    SelfReflectArgs,
 };
 use crate::cli_utils::resumable_last_session_id;
 use astra_runtime::auto_tuning::{FeedbackSignal, SignalType};
@@ -117,6 +118,8 @@ struct SignalsResponse {
 #[derive(Debug, Serialize)]
 struct ReflectResponse {
     session_id: String,
+    focus: String,
+    question: Option<String>,
     reflection_context: astra_runtime::liquid::reflection::ReflectionContext,
     prompt_preview: String,
     recent_turns: Vec<EventPreview>,
@@ -217,11 +220,17 @@ pub(crate) async fn execute_self_command(
             )
             .await
         }
-        SelfCmd::Reflect(args) => {
-            render_surface_for_session(
-                &resolve_session_id(args.session_id.as_deref(), profile)?,
-                "reflect",
-                20,
+        SelfCmd::Reflect(SelfReflectArgs {
+            session_id,
+            focus,
+            question,
+            last_n,
+        }) => {
+            render_reflect_surface_for_session(
+                &resolve_session_id(session_id.as_deref(), profile)?,
+                *last_n,
+                Some(focus.as_str()),
+                question.as_deref(),
             )
             .await
         }
@@ -315,6 +324,23 @@ pub(crate) async fn render_surface_for_session(
     render_surface_from_artifacts(surface, &artifacts, journal_limit)
 }
 
+pub(crate) async fn render_reflect_surface_for_session(
+    session_id: &str,
+    journal_limit: usize,
+    focus: Option<&str>,
+    question: Option<&str>,
+) -> Result<String, String> {
+    let artifacts = load_artifacts(session_id.to_string()).await?;
+    to_json(&build_reflect_response(
+        &artifacts,
+        journal_limit.max(1),
+        normalize_reflect_focus(focus),
+        question
+            .map(str::trim)
+            .filter(|question| !question.is_empty()),
+    ))
+}
+
 pub(crate) fn agent_info_surface_alias(dimension: &str) -> Option<&'static str> {
     match dimension {
         "snapshot" => Some("snapshot"),
@@ -343,7 +369,12 @@ fn render_surface_from_artifacts(
 ) -> Result<String, String> {
     match surface {
         "snapshot" => to_json(&build_snapshot_response(artifacts)?),
-        "reflect" => to_json(&build_reflect_response(artifacts, journal_limit)),
+        "reflect" => to_json(&build_reflect_response(
+            artifacts,
+            journal_limit,
+            "auto",
+            None,
+        )),
         "profile" => to_json(&ProfileResponse {
             session_id: artifacts.session_id.clone(),
             identity: identity_view(),
@@ -533,26 +564,25 @@ fn build_snapshot_response(artifacts: &SessionArtifacts) -> Result<SnapshotRespo
     })
 }
 
-fn build_reflect_response(artifacts: &SessionArtifacts, journal_limit: usize) -> ReflectResponse {
-    let context = build_persistent_reflection_context(artifacts, journal_limit.max(1));
+fn build_reflect_response(
+    artifacts: &SessionArtifacts,
+    journal_limit: usize,
+    focus: &str,
+    question: Option<&str>,
+) -> ReflectResponse {
+    let context =
+        build_persistent_reflection_context(artifacts, journal_limit.max(1), focus, question);
     let prompt_preview = context.render_prompt_section();
     ReflectResponse {
         session_id: artifacts.session_id.clone(),
+        focus: focus.to_string(),
+        question: question.map(str::to_string),
         reflection_context: context,
         prompt_preview,
-        recent_turns: recent_event_previews(
+        recent_turns: focused_recent_event_previews(
             &artifacts.journal_events,
-            journal_limit.min(12).max(1),
-            &[
-                JournalEventType::Turn,
-                JournalEventType::TurnError,
-                JournalEventType::Error,
-                JournalEventType::StallDetected,
-                JournalEventType::DriftDetected,
-                JournalEventType::AdaptiveScenarioApplied,
-                JournalEventType::AdaptivePerTurnApplied,
-                JournalEventType::AdaptiveExperimentEnrolled,
-            ],
+            journal_limit,
+            focus,
         ),
     }
 }
@@ -1214,6 +1244,8 @@ fn latest_scenario(events: &[JournalEvent]) -> Option<Scenario> {
 fn build_persistent_reflection_context(
     artifacts: &SessionArtifacts,
     signal_limit: usize,
+    focus: &str,
+    question: Option<&str>,
 ) -> astra_runtime::liquid::reflection::ReflectionContext {
     const REFLECTION_TOOL_RECORD_LIMIT: usize = 24;
     const REFLECTION_TOOL_STAT_LIMIT: usize = 8;
@@ -1242,13 +1274,21 @@ fn build_persistent_reflection_context(
     context.scenario =
         latest_scenario(&artifacts.journal_events).map(|scenario| format!("{scenario:?}"));
     context.token_utilisation = reflection_token_utilisation(artifacts);
-    context.tool_stats = astra_runtime::liquid::reflection::ToolStat::summarize_records(
-        &recent_tool_records(&artifacts.journal_events, REFLECTION_TOOL_RECORD_LIMIT),
-        REFLECTION_TOOL_STAT_LIMIT,
+    context.tool_stats = focus_tool_stats(
+        astra_runtime::liquid::reflection::ToolStat::summarize_records(
+            &recent_tool_records(&artifacts.journal_events, REFLECTION_TOOL_RECORD_LIMIT),
+            REFLECTION_TOOL_STAT_LIMIT,
+        ),
+        focus,
     );
-    context.recent_tactical_actions =
-        recent_tactical_actions(&artifacts.journal_events, REFLECTION_TACTICAL_ACTION_LIMIT);
-    context.signals = recent_reflection_signals(&artifacts.journal_events, signal_limit);
+    context.recent_tactical_actions = focus_tactical_actions(
+        recent_tactical_actions(&artifacts.journal_events, REFLECTION_TACTICAL_ACTION_LIMIT),
+        focus,
+    );
+    context.signals = focus_reflection_signals(
+        recent_reflection_signals(&artifacts.journal_events, signal_limit, question),
+        focus,
+    );
     context.active_experiment = active_reflection_experiment(artifacts, context.turns_completed);
     context
 }
@@ -1267,6 +1307,68 @@ fn parse_scenario(input: &str) -> Option<Scenario> {
         "learning" | "learn" => Some(Scenario::Learning),
         _ => None,
     }
+}
+
+fn normalize_reflect_focus(focus: Option<&str>) -> &'static str {
+    match focus.unwrap_or("auto").trim().to_ascii_lowercase().as_str() {
+        "skill_failure" => "skill_failure",
+        "unexpected_result" => "unexpected_result",
+        "data_quality" => "data_quality",
+        "tool_selection" => "tool_selection",
+        "history" => "history",
+        "performance" => "performance",
+        _ => "auto",
+    }
+}
+
+fn focused_recent_event_previews(
+    events: &[JournalEvent],
+    journal_limit: usize,
+    focus: &str,
+) -> Vec<EventPreview> {
+    let event_types: &[JournalEventType] = match focus {
+        "skill_failure" => &[
+            JournalEventType::TurnError,
+            JournalEventType::Error,
+            JournalEventType::StallDetected,
+            JournalEventType::VerificationCompleted,
+            JournalEventType::Turn,
+        ],
+        "performance" => &[
+            JournalEventType::Turn,
+            JournalEventType::TurnError,
+            JournalEventType::StallDetected,
+            JournalEventType::AdaptivePerTurnApplied,
+        ],
+        "tool_selection" => &[
+            JournalEventType::Turn,
+            JournalEventType::AdaptiveScenarioApplied,
+            JournalEventType::AdaptivePerTurnApplied,
+            JournalEventType::AdaptiveExperimentEnrolled,
+        ],
+        "history" => &[
+            JournalEventType::Turn,
+            JournalEventType::TurnError,
+            JournalEventType::Error,
+            JournalEventType::StallDetected,
+            JournalEventType::DriftDetected,
+            JournalEventType::AdaptiveScenarioApplied,
+            JournalEventType::AdaptivePerTurnApplied,
+            JournalEventType::AdaptiveExperimentEnrolled,
+            JournalEventType::VerificationCompleted,
+        ],
+        _ => &[
+            JournalEventType::Turn,
+            JournalEventType::TurnError,
+            JournalEventType::Error,
+            JournalEventType::StallDetected,
+            JournalEventType::DriftDetected,
+            JournalEventType::AdaptiveScenarioApplied,
+            JournalEventType::AdaptivePerTurnApplied,
+            JournalEventType::AdaptiveExperimentEnrolled,
+        ],
+    };
+    recent_event_previews(events, journal_limit.min(12).max(1), event_types)
 }
 
 fn reflection_token_utilisation(artifacts: &SessionArtifacts) -> f64 {
@@ -1358,8 +1460,17 @@ fn recent_tactical_actions(events: &[JournalEvent], limit: usize) -> Vec<String>
 fn recent_reflection_signals(
     events: &[JournalEvent],
     limit: usize,
+    question: Option<&str>,
 ) -> Vec<astra_runtime::liquid::reflection::SignalSummary> {
     let mut signals = Vec::new();
+    if let Some(question) = question.filter(|question| !question.is_empty()) {
+        signals.push(astra_runtime::liquid::reflection::SignalSummary {
+            kind: "Question".to_string(),
+            detail: truncate(question, 160),
+            skill_context: None,
+            turn_id: "user".to_string(),
+        });
+    }
     for event in events.iter().rev() {
         let turn_id = event
             .turn
@@ -1440,6 +1551,108 @@ fn recent_reflection_signals(
         }
     }
     signals
+}
+
+fn focus_tool_stats(
+    mut tool_stats: Vec<astra_runtime::liquid::reflection::ToolStat>,
+    focus: &str,
+) -> Vec<astra_runtime::liquid::reflection::ToolStat> {
+    match focus {
+        "performance" => tool_stats.sort_by(|a, b| {
+            b.avg_latency_ms
+                .cmp(&a.avg_latency_ms)
+                .then_with(|| b.failures.cmp(&a.failures))
+                .then_with(|| b.calls.cmp(&a.calls))
+                .then_with(|| a.tool_name.cmp(&b.tool_name))
+        }),
+        "tool_selection" => tool_stats.sort_by(|a, b| {
+            b.calls
+                .cmp(&a.calls)
+                .then_with(|| b.failures.cmp(&a.failures))
+                .then_with(|| b.avg_latency_ms.cmp(&a.avg_latency_ms))
+                .then_with(|| a.tool_name.cmp(&b.tool_name))
+        }),
+        _ => {}
+    }
+    tool_stats
+}
+
+fn focus_tactical_actions(actions: Vec<String>, focus: &str) -> Vec<String> {
+    let filtered = match focus {
+        "performance" => actions
+            .into_iter()
+            .filter(|action| {
+                let lower = action.to_ascii_lowercase();
+                lower.contains("token")
+                    || lower.contains("latency")
+                    || lower.contains("compression")
+                    || lower.contains("budget")
+            })
+            .collect::<Vec<_>>(),
+        "tool_selection" => actions
+            .into_iter()
+            .filter(|action| {
+                let lower = action.to_ascii_lowercase();
+                lower.contains("tool") || lower.contains("selection")
+            })
+            .collect::<Vec<_>>(),
+        _ => actions,
+    };
+    if filtered.is_empty() {
+        recent_default_actions(focus)
+    } else {
+        filtered
+    }
+}
+
+fn recent_default_actions(focus: &str) -> Vec<String> {
+    match focus {
+        "performance" => vec!["prioritize latency, timeout, and token pressure".to_string()],
+        "tool_selection" => {
+            vec!["inspect selected vs used tools before changing routing".to_string()]
+        }
+        "skill_failure" => {
+            vec!["trace the most recent failed tool/verification path first".to_string()]
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn focus_reflection_signals(
+    signals: Vec<astra_runtime::liquid::reflection::SignalSummary>,
+    focus: &str,
+) -> Vec<astra_runtime::liquid::reflection::SignalSummary> {
+    let original = signals.clone();
+    let filtered = match focus {
+        "performance" => signals
+            .into_iter()
+            .filter(|signal| {
+                let kind = signal.kind.to_ascii_lowercase();
+                let detail = signal.detail.to_ascii_lowercase();
+                kind.contains("question")
+                    || kind.contains("stall")
+                    || detail.contains("timeout")
+                    || detail.contains("latency")
+                    || detail.contains("token")
+            })
+            .collect::<Vec<_>>(),
+        "skill_failure" => signals
+            .into_iter()
+            .filter(|signal| {
+                let kind = signal.kind.to_ascii_lowercase();
+                kind.contains("question")
+                    || kind.contains("toolfailure")
+                    || kind.contains("turnerror")
+                    || kind.contains("stall")
+            })
+            .collect::<Vec<_>>(),
+        _ => return signals,
+    };
+    if filtered.is_empty() {
+        original
+    } else {
+        filtered
+    }
 }
 
 fn active_reflection_experiment(
@@ -1716,7 +1929,7 @@ fn compact_json_value(value: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli_args::SelfSessionArgs;
+    use crate::cli_args::{SelfReflectArgs, SelfSessionArgs};
     use astra_services::session_journal::{JournalDirGuard, ToolCallRecord};
 
     #[test]
@@ -2052,8 +2265,11 @@ mod tests {
             .unwrap();
 
         let body = execute_self_command(
-            &SelfCmd::Reflect(SelfSessionArgs {
+            &SelfCmd::Reflect(SelfReflectArgs {
                 session_id: Some(session_id.to_string()),
+                focus: "performance".to_string(),
+                question: Some("why was bash slow?".to_string()),
+                last_n: 20,
             }),
             None,
         )
@@ -2061,6 +2277,8 @@ mod tests {
         .unwrap();
 
         let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["focus"], "performance");
+        assert_eq!(value["question"], "why was bash slow?");
         assert_eq!(value["reflection_context"]["scenario"], "Debugging");
         assert_eq!(
             value["reflection_context"]["active_experiment"]["experiment_id"],
@@ -2072,7 +2290,7 @@ mod tests {
         );
         assert_eq!(
             value["reflection_context"]["signals"][0]["kind"],
-            "ToolFailure"
+            "Question"
         );
         assert_eq!(
             value["reflection_context"]["recent_tactical_actions"][0],
@@ -2082,7 +2300,7 @@ mod tests {
             value["prompt_preview"]
                 .as_str()
                 .unwrap()
-                .contains("Recent tactical actions")
+                .contains("Question")
         );
     }
 }

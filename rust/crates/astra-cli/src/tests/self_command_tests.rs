@@ -11,11 +11,26 @@ fn cli_self_snapshot_subcommand() {
 
 #[test]
 fn cli_self_reflect_subcommand() {
-    let cli = Cli::try_parse_from(["astra", "self", "reflect"]).unwrap();
-    assert!(matches!(
-        cli.command,
-        Some(Command::SelfInspect(SelfCmd::Reflect(_)))
-    ));
+    let cli = Cli::try_parse_from([
+        "astra",
+        "self",
+        "reflect",
+        "--focus",
+        "performance",
+        "--question",
+        "why was bash slow?",
+        "--last-n",
+        "12",
+    ])
+    .unwrap();
+    match cli.command {
+        Some(Command::SelfInspect(SelfCmd::Reflect(args))) => {
+            assert_eq!(args.focus, "performance");
+            assert_eq!(args.question.as_deref(), Some("why was bash slow?"));
+            assert_eq!(args.last_n, 12);
+        }
+        other => panic!("unexpected command: {other:?}"),
+    }
 }
 
 #[test]

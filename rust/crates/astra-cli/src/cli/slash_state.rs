@@ -717,8 +717,13 @@ pub(super) async fn handle_state_command(
                 }
             };
             let (requested_focus, requested_question) = parse_reflect_args(arg);
-            if let Ok(body) =
-                crate::self_command::render_surface_for_session(&sid, "reflect", 20).await
+            if let Ok(body) = crate::self_command::render_reflect_surface_for_session(
+                &sid,
+                20,
+                requested_focus.as_deref(),
+                requested_question.as_deref(),
+            )
+            .await
             {
                 render_reflect_report(
                     &body,
