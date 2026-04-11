@@ -268,6 +268,7 @@ pub(crate) struct ReplState {
         Option<std::sync::Arc<astra_runtime::evolution::service::EvolutionService>>,
 }
 
+#[allow(deprecated)]
 impl Default for ReplState {
     fn default() -> Self {
         Self {
