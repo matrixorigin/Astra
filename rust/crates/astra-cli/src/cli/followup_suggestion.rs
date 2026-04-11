@@ -1,7 +1,7 @@
 use super::{ReplState, StreamResult};
-pub(crate) use astra_runtime::turn::followup_suggestion::{
-    FollowupSuggestion, FollowupSuggestionKind,
-};
+pub(crate) use astra_runtime::turn::followup_suggestion::FollowupSuggestion;
+#[cfg(test)]
+use astra_runtime::turn::followup_suggestion::FollowupSuggestionKind;
 
 pub(crate) fn suggest_followup(
     line: &str,

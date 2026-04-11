@@ -380,20 +380,23 @@ pub static COMMANDS: &[CommandMeta] = &[
         "Colored git diff (staged, stat, show <rev>, …)",
         CommandGroup::Workspace,
     )
-    .with_subcommands(DIFF_SUBCOMMANDS),
+    .with_subcommands(DIFF_SUBCOMMANDS)
+    .with_arg_hint("[staged|unstaged|stat|show <rev>]"),
     CommandMeta::new(
         "/review",
         "LLM review of git changes: /review [latest|<rev>|working]",
         CommandGroup::Workspace,
     )
-    .with_subcommands(REVIEW_SUBCOMMANDS),
+    .with_subcommands(REVIEW_SUBCOMMANDS)
+    .with_arg_hint("[latest|<rev>|working]"),
     // ── Session & plan ───────────────────────────────────────────────────
     CommandMeta::new(
         "/session",
         "Session: history|errors|export|fork|list|cleanup|verify",
         CommandGroup::SessionPlan,
     )
-    .with_subcommands(SESSION_SUBCOMMANDS),
+    .with_subcommands(SESSION_SUBCOMMANDS)
+    .with_arg_hint("[history|errors|export|fork|list|cleanup|verify]"),
     CommandMeta::new(
         "/session history",
         "Session journal-style history",
@@ -434,7 +437,8 @@ pub static COMMANDS: &[CommandMeta] = &[
         "Structured plan: go|step|pause|resume|exit|show|help",
         CommandGroup::SessionPlan,
     )
-    .with_subcommands(PLAN_SUBCOMMANDS),
+    .with_subcommands(PLAN_SUBCOMMANDS)
+    .with_arg_hint("[go|step|pause|resume|exit|show|help]"),
     CommandMeta::new(
         "/plan go",
         "Execute plan (auto mode)",
@@ -482,13 +486,15 @@ pub static COMMANDS: &[CommandMeta] = &[
         "Memoria: list, search <q>, inspect <id>, …",
         CommandGroup::MemoryTasks,
     )
-    .with_subcommands(MEMORY_SUBCOMMANDS),
+    .with_subcommands(MEMORY_SUBCOMMANDS)
+    .with_arg_hint("[list|search <q>|inspect <id>]"),
     CommandMeta::new(
         "/task",
         "Tasks: list, add, done, status, run <prompt>, result <id>",
         CommandGroup::MemoryTasks,
     )
-    .with_subcommands(TASK_SUBCOMMANDS),
+    .with_subcommands(TASK_SUBCOMMANDS)
+    .with_arg_hint("[list|add <title>|done <id>|status <id>|run <prompt>|result <id>]"),
     // ── Observability ─────────────────────────────────────────────────────
     CommandMeta::new(
         "/explain",
@@ -505,7 +511,8 @@ pub static COMMANDS: &[CommandMeta] = &[
         "Summarize & trim history (quick | no-memoria, …)",
         CommandGroup::Observability,
     )
-    .with_subcommands(COMPACT_SUBCOMMANDS),
+    .with_subcommands(COMPACT_SUBCOMMANDS)
+    .with_arg_hint("[quick|no-memoria|summary-only]"),
     CommandMeta::new(
         "/reflect",
         "Reflect on session (modes: skill_failure, performance, …)",
@@ -527,12 +534,14 @@ pub static COMMANDS: &[CommandMeta] = &[
         "Session analytics: /stats [history|tools|cost|health|learn]",
         CommandGroup::Observability,
     )
-    .with_subcommands(STATS_SUBCOMMANDS),
+    .with_subcommands(STATS_SUBCOMMANDS)
+    .with_arg_hint("[cost|health|history|learn|tools]"),
     CommandMeta::new(
         "/lsp",
         "LSP backend status: /lsp [status]",
         CommandGroup::Observability,
-    ),
+    )
+    .with_arg_hint("[status]"),
     CommandMeta::new(
         "/telemetry",
         "Session telemetry: turns, drift, decisions, profile",
@@ -543,19 +552,22 @@ pub static COMMANDS: &[CommandMeta] = &[
         "Auto-tuning: status, history, config, reset",
         CommandGroup::Observability,
     )
-    .with_subcommands(TUNING_SUBCOMMANDS),
+    .with_subcommands(TUNING_SUBCOMMANDS)
+    .with_arg_hint("[status|history|config|reset]"),
     CommandMeta::new(
         "/config",
         "Runtime config: show|paths|sources|diff|export [path]",
         CommandGroup::Observability,
     )
-    .with_subcommands(CONFIG_SUBCOMMANDS),
+    .with_subcommands(CONFIG_SUBCOMMANDS)
+    .with_arg_hint("[show|paths|sources|diff|export [path]]"),
     CommandMeta::new(
         "/sync",
         "Cloud sync status and push",
         CommandGroup::Observability,
     )
-    .with_subcommands(SYNC_SUBCOMMANDS),
+    .with_subcommands(SYNC_SUBCOMMANDS)
+    .with_arg_hint("[log|push|pull]"),
     CommandMeta::new(
         "/context",
         "Context window / budget summary",
@@ -574,40 +586,46 @@ pub static COMMANDS: &[CommandMeta] = &[
         "A/B testing: list, start, stop, analyze experiments",
         CommandGroup::Observability,
     )
-    .with_subcommands(EXPERIMENT_SUBCOMMANDS),
+    .with_subcommands(EXPERIMENT_SUBCOMMANDS)
+    .with_arg_hint("[list|create|show|start|stop|status|analyze] [name]"),
     // ── Skills ────────────────────────────────────────────────────────────
     CommandMeta::new(
         "/skill",
         "Skills: list|info|search|surfacing|health|new|test|dev|system|…",
         CommandGroup::Skills,
     )
-    .with_subcommands(SKILL_SUBCOMMANDS),
+    .with_subcommands(SKILL_SUBCOMMANDS)
+    .with_arg_hint("[list|info|search|new|test|dev|feedback|…]"),
     // ── MCP ───────────────────────────────────────────────────────────────
     CommandMeta::new(
         "/mcp",
         "MCP: status|servers|prompts|resources|add|remove|ping|complete|…",
         CommandGroup::Mcp,
     )
-    .with_subcommands(MCP_SUBCOMMANDS),
+    .with_subcommands(MCP_SUBCOMMANDS)
+    .with_arg_hint("[status|servers|prompts|resources|add|remove|ping|…]"),
     // ── Team & account ───────────────────────────────────────────────────
     CommandMeta::new(
         "/team",
         "Teams: list|info|create|add-member|context|run|history|snapshot|restore|delete|help",
         CommandGroup::TeamAccount,
     )
-    .with_subcommands(TEAM_SUBCOMMANDS),
+    .with_subcommands(TEAM_SUBCOMMANDS)
+    .with_arg_hint("[list|info|create|add-member|context|run|…]"),
     CommandMeta::new(
         "/agent",
         "Spawned agents: list, status, stop, logs",
         CommandGroup::TeamAccount,
     )
-    .with_subcommands(AGENT_SUBCOMMANDS),
+    .with_subcommands(AGENT_SUBCOMMANDS)
+    .with_arg_hint("[list|status|stop|logs|help]"),
     CommandMeta::new(
         "/messaging",
         "Inter-agent messaging: metrics, dlq, status",
         CommandGroup::TeamAccount,
     )
-    .with_subcommands(MESSAGING_SUBCOMMANDS),
+    .with_subcommands(MESSAGING_SUBCOMMANDS)
+    .with_arg_hint("[metrics|dlq|status|help]"),
     CommandMeta::new(
         "/login",
         "Authenticate with the API",
@@ -630,7 +648,8 @@ pub static COMMANDS: &[CommandMeta] = &[
         "Permission mode: /allow [auto|prompt|deny|all|rules]",
         CommandGroup::System,
     )
-    .with_subcommands(ALLOW_SUBCOMMANDS),
+    .with_subcommands(ALLOW_SUBCOMMANDS)
+    .with_arg_hint("[auto|prompt|deny|all|rules]"),
     CommandMeta::new(
         "/yolo",
         "Auto-approve all tools (alias for /allow auto)",
@@ -642,24 +661,28 @@ pub static COMMANDS: &[CommandMeta] = &[
         "Project instructions: /instructions [show|reload|off]",
         CommandGroup::System,
     )
-    .with_subcommands(INSTRUCTIONS_SUBCOMMANDS),
+    .with_subcommands(INSTRUCTIONS_SUBCOMMANDS)
+    .with_arg_hint("[show|reload|off]"),
     CommandMeta::new(
         "/style",
         "Output theme: default | minimal | colorful | high-contrast",
         CommandGroup::System,
     )
-    .with_subcommands(STYLE_SUBCOMMANDS),
+    .with_subcommands(STYLE_SUBCOMMANDS)
+    .with_arg_hint("[list|default|minimal|colorful|high-contrast]"),
     CommandMeta::new(
         "/diagnostics",
         "Binary, API, auth, environment checks",
         CommandGroup::System,
-    ),
+    )
+    .with_arg_hint("— run all checks"),
     // Note: /lsp is in Observability group, not duplicated here
     CommandMeta::new(
         "/bug",
         "Generate bug report: /bug [copy|save]",
         CommandGroup::System,
-    ),
+    )
+    .with_arg_hint("[copy|save]"),
 ];
 
 // ── Query functions ─────────────────────────────────────────────────────────
@@ -757,6 +780,14 @@ pub fn commands_by_group(group: CommandGroup) -> impl Iterator<Item = &'static C
 /// Get all commands as (name, description) tuples for backward compatibility.
 pub fn command_tuples() -> Vec<(&'static str, &'static str)> {
     COMMANDS.iter().map(|m| (m.name, m.description)).collect()
+}
+
+/// Get argument hint for a command (e.g., "/model" → "<name>").
+pub fn get_arg_hint(command: &str) -> Option<&'static str> {
+    COMMANDS
+        .iter()
+        .find(|m| m.name == command)
+        .and_then(|m| m.arg_hint)
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
@@ -868,5 +899,22 @@ mod tests {
             tuples.iter().any(|(cmd, _)| *cmd == "/help"),
             "tuples should contain /help"
         );
+    }
+
+    #[test]
+    fn get_arg_hint_from_registry() {
+        // Commands with arg_hint defined in registry
+        assert_eq!(get_arg_hint("/model"), Some("<name>"));
+        assert_eq!(get_arg_hint("/undo"), Some("[N]"));
+        assert_eq!(get_arg_hint("/resume"), Some("[session_id]"));
+
+        // Commands with subcommands should also have arg hints
+        assert!(get_arg_hint("/session").is_some());
+        assert!(get_arg_hint("/skill").is_some());
+        assert!(get_arg_hint("/team").is_some());
+
+        // Command without arg_hint should return None
+        assert!(get_arg_hint("/clear").is_none());
+        assert!(get_arg_hint("/nonexistent").is_none());
     }
 }

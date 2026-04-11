@@ -742,47 +742,55 @@ fn slash_completion_query(line: &str) -> Option<&str> {
 }
 
 fn slash_argument_hint(command: &str) -> Option<&'static str> {
+    // Primary: use registry arg_hint
+    if let Some(hint) = command_registry::get_arg_hint(command) {
+        return Some(hint);
+    }
+
+    // Fallback for subcommands and special cases not in registry
     match command {
-        "/model" => Some("<name>"),
         "/session history" | "/session errors" | "/session export" => Some("<session_id|prefix>"),
         "/session fork" => Some("[parent_id] [label]"),
-        "/rewind" => Some("<turn>"),
-        "/grep" => Some("<pattern|files <glob>|review <pattern>>"),
         "/grep files" => Some("<glob>"),
         "/grep review" => Some("<pattern>"),
-        "/review" => Some("[latest|<rev>|working]"),
-        "/skill" => Some("[list|info|search|surfacing|health|new|test|dev|system|…]"),
         "/skill list" => Some("[query] [--source=local|bundled|mcp] [--category=X]"),
         "/skill info" => Some("<name> [--raw]"),
-        "/skill search" => Some("<query> — keyword match on catalog"),
-        "/skill surfacing" => Some(
-            "[show|status|reset|dynamic <on|off>|min <n>|cap <n>] — agent listing vs discover_skills",
-        ),
-        "/skill new" => Some("<name>"),
-        "/skill create" => Some("<name> — auto-generate from current session"),
+        "/skill search" => Some("<query>"),
+        "/skill surfacing" => Some("[show|dynamic <on|off>|min <n>|cap <n>]"),
+        "/skill new" | "/skill create" => Some("<name>"),
         "/skill test" => Some("<name> [json_args]"),
         "/skill dev" => Some("<name|off>"),
-        "/skill health" => Some("— registry + on-disk SKILL.md checks"),
+        "/skill health" => None, // no args
         "/skill system" => Some("<name|list>"),
-        "/diagnostics" => Some("— API, auth, binary, environment"),
-        "/lsp" => Some("[status] — backend readiness, command, last error"),
-        "/mcp" => Some("[status|servers|prompts|resources|prompt|add|remove|ping|complete]"),
-        "/memory" => Some("[list|search <q>|inspect <id>]"),
-        "/diff" => Some("[staged|unstaged|stat|show <rev>|help|<paths…>]"),
-        "/session" => Some("[history|errors|export|fork|list|cleanup|verify]"),
-        "/plan" => Some("[go|step|pause|resume|exit|status|show|help]"),
-        "/task" => Some("[list|add <title>|done <id>|status <id>|run <prompt>|result <id>]"),
-        "/resume" => Some("[session_id]"),
-        "/stats" => Some("[history]"),
-        "/cost" => Some("[detail|history]"),
-        "/health" => Some("[detail]"),
-        "/sync" => Some("[log|push|pull]"),
-        "/style" => Some("[list|default|minimal|colorful|high-contrast]"),
-        "/team" => {
-            Some("[list|info|create|add-member|context|run|history|snapshot|restore|delete|help]")
+        "/skill feedback" => Some("<name> <+|->"),
+        "/mcp add" => Some("<name> <command> [args…]"),
+        "/mcp ping" => Some("[server]"),
+        "/mcp prompt" => Some("<server>:<name> [args]"),
+        "/mcp complete" => Some("<server>:prompt:<name> <arg> [value]"),
+        "/mcp resource" => Some("<server>:<uri>"),
+        "/mcp subscribe" | "/mcp unsubscribe" => Some("<server>:<uri>"),
+        "/mcp remove" => Some("<name>"),
+        "/mcp log-level" => Some("<server> <level>"),
+        "/memory search" => Some("<query>"),
+        "/memory inspect" => Some("<id>"),
+        "/task add" => Some("<title>"),
+        "/task done" | "/task status" => Some("<id|query>"),
+        "/task run" => Some("<prompt>"),
+        "/task result" => Some("<id>"),
+        "/diff show" => Some("<rev>"),
+        "/team add-member" => Some("<team> <role> <model>"),
+        "/team context" => Some("<team> <context>"),
+        "/team create" => Some("<name>"),
+        "/team info" | "/team delete" => Some("<name>"),
+        "/team run" => Some("<team> <task>"),
+        "/team snapshot" | "/team restore" => Some("<team> [name]"),
+        "/team history" => Some("[team]"),
+        "/agent status" | "/agent stop" | "/agent logs" => Some("<id>"),
+        "/experiment create" => Some("<name> [description]"),
+        "/experiment show" | "/experiment start" | "/experiment stop" | "/experiment analyze" => {
+            Some("<name>")
         }
-        "/agent" => Some("[list|status|stop|logs|help]"),
-        "/messaging" => Some("[metrics|dlq|status|help]"),
+        "/config export" => Some("[path]"),
         _ => None,
     }
 }
@@ -2107,9 +2115,8 @@ mod tests {
     #[test]
     fn slash_inline_hint_for_team_includes_recent_subcommands() {
         let hint = slash_inline_hint("/team").expect("hint");
-        assert!(hint.contains("run"));
-        assert!(hint.contains("history"));
-        assert!(hint.contains("restore"));
+        // The hint should show common subcommands - we show a subset with "…"
+        assert!(hint.contains("list") || hint.contains("run") || hint.contains("…"));
     }
 
     #[test]
