@@ -129,9 +129,15 @@ pub fn ingest_agentic_turn_stream(
     }
     let round_has_edge_work = !snap.tool_calls.is_empty() || edge_round_len > 0;
 
-    if !snap.full_text.is_empty() && !round_has_edge_work {
+    // Always preserve LLM text output. When tool calls follow, the text is
+    // intermediate (e.g. partial analysis before more tool use). The last
+    // round's text wins as the final answer; intermediate text is accumulated
+    // so it isn't lost if the session ends mid-loop.
+    if !snap.full_text.is_empty() {
         *st.final_text = snap.full_text.to_string();
+    }
 
+    if !snap.full_text.is_empty() && !round_has_edge_work {
         let guard = apply_response_guards(st.final_text.as_str(), snap.tool_calls, &[], message);
         if let Some(replacement) = guard.replacement {
             agent_warn!("response_guard", "Guard triggered, replacing LLM output");
@@ -532,13 +538,13 @@ mod tests {
     }
 
     #[test]
-    fn tool_turn_draft_text_does_not_replace_final_text() {
+    fn tool_turn_draft_text_preserves_intermediate_output() {
         let tcs = vec![json!({"name": "bash", "arguments": {}})];
         let snap = AgenticTurnStreamSnapshot {
             ttft_ms: None,
             session_id: &None,
             run_id: &None,
-            full_text: "draft summary that should not stick",
+            full_text: "intermediate analysis before tool calls",
             tool_calls: &tcs,
             prompt_tokens: 1,
             completion_tokens: 2,
@@ -559,7 +565,9 @@ mod tests {
             pack.ingest_mut(),
         );
         assert_eq!(out, AgenticTurnIngestOutcome::HasToolCalls);
-        assert_eq!(pack.final_text, "previous stable answer");
+        // Intermediate text is preserved so it isn't lost if the session
+        // ends mid-loop (e.g. on error or force-stop after tool calls).
+        assert_eq!(pack.final_text, "intermediate analysis before tool calls");
     }
 
     // ─── Factual retry injection tests ──────────────────────────────────────
