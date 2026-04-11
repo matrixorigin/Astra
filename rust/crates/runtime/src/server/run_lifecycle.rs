@@ -943,6 +943,33 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         limit: u32,
         offset: u32,
     ) -> Result<RunListRecord, (StatusCode, Json<ErrorResponse>)> {
+        if let Some(engine) = &self.run_engine {
+            let (durable_runs, total) = engine
+                .list_user_runs(&user_id, limit, offset)
+                .await
+                .map_err(|error| {
+                    error_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        format!("Failed to list durable run state: {error}"),
+                    )
+                })?;
+            let runs = self.runs.read().await;
+            let page = durable_runs
+                .iter()
+                .map(|run| {
+                    runs.get(&run.run_id)
+                        .map(|live| Self::status_record(live))
+                        .unwrap_or_else(|| Self::durable_status_record(run))
+                })
+                .collect();
+            return Ok(RunListRecord {
+                runs: page,
+                total,
+                limit,
+                offset,
+            });
+        }
+
         let runs = self.runs.read().await;
         let all: Vec<RunStatusRecord> = runs
             .values()
@@ -2045,6 +2072,25 @@ mod tests {
             events,
             AgenticRunLifecycleService::format_run_events(&durable.events[1..], 1)
         );
+    }
+
+    #[tokio::test]
+    async fn list_runs_falls_back_to_durable_store_on_cache_miss() {
+        let svc = test_service_with_engine();
+        let first = ok(svc
+            .stream_chat("user-1".into(), test_request("first"))
+            .await);
+        let second = ok(svc
+            .stream_chat("user-1".into(), test_request("second"))
+            .await);
+
+        svc.runs.write().await.remove(&first.run_id);
+
+        let runs = ok(svc.list_runs("user-1".into(), 10, 0).await);
+        let run_ids: Vec<_> = runs.runs.iter().map(|run| run.run_id.as_str()).collect();
+        assert_eq!(runs.total, 2);
+        assert!(run_ids.contains(&first.run_id.as_str()));
+        assert!(run_ids.contains(&second.run_id.as_str()));
     }
 
     #[tokio::test]
