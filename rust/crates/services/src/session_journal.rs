@@ -1124,24 +1124,36 @@ pub fn delete_session(session_id: &str) -> std::io::Result<u64> {
 }
 
 /// Recursively compute total size of a directory (best-effort, ignores errors).
+/// 
+/// Safeguards:
+/// - Maximum depth of 10 levels to prevent deep traversal
+/// - Maximum 1000 entries per call to prevent hangs on huge directories
 fn dir_size_recursive(path: &std::path::Path) -> u64 {
     if !path.is_dir() {
         return 0;
     }
-    walkdir(path)
+    walkdir_bounded(path, 0)
 }
 
-fn walkdir(path: &std::path::Path) -> u64 {
+/// Max depth for recursive directory traversal (10 levels should cover most workspaces).
+const MAX_WALKDIR_DEPTH: u32 = 10;
+/// Max entries to process per directory (prevents hangs on huge flat directories).
+const MAX_ENTRIES_PER_DIR: usize = 1000;
+
+fn walkdir_bounded(path: &std::path::Path, depth: u32) -> u64 {
+    if depth > MAX_WALKDIR_DEPTH {
+        return 0; // Stop at max depth
+    }
     let mut total = 0u64;
     if let Ok(entries) = std::fs::read_dir(path) {
-        for entry in entries.flatten() {
+        for entry in entries.take(MAX_ENTRIES_PER_DIR).flatten() {
             let Ok(meta) = entry.metadata() else {
                 continue;
             };
             if meta.is_file() {
                 total += meta.len();
             } else if meta.is_dir() {
-                total += walkdir(&entry.path());
+                total += walkdir_bounded(&entry.path(), depth + 1);
             }
         }
     }
