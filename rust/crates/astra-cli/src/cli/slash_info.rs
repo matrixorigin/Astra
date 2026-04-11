@@ -1,5 +1,16 @@
 use super::*;
 
+// ── Context status thresholds ────────────────────────────────────────────────
+// Used for color-coding pressure indicators in /info and context displays.
+/// Pressure below this is "healthy" (green).
+const PRESSURE_HEALTHY_THRESHOLD: f64 = 0.5;
+/// Pressure below this (but above healthy) is "getting full" (yellow).
+const PRESSURE_WARNING_THRESHOLD: f64 = 0.85;
+/// Usage percentage below this is "healthy" (green).
+const USAGE_HEALTHY_PCT: f64 = 60.0;
+/// Usage percentage below this (but above healthy) is "getting full" (yellow).
+const USAGE_WARNING_PCT: f64 = 85.0;
+
 fn format_bytes(bytes: u32) -> String {
     if bytes >= 1024 * 1024 {
         format!("{:.1}MB", bytes as f64 / (1024.0 * 1024.0))
@@ -1550,16 +1561,16 @@ pub(super) async fn handle_info_command(
 
             // ── Compaction tier ──
             let compact_trigger_k = budget.compact_trigger() / 1000;
-            let tier_emoji = if est_pressure < 0.5 {
+            let tier_emoji = if est_pressure < PRESSURE_HEALTHY_THRESHOLD {
                 "🟢"
-            } else if est_pressure < 0.85 {
+            } else if est_pressure < PRESSURE_WARNING_THRESHOLD {
                 "🟡"
             } else {
                 "🔴"
             };
-            let tier_label = if est_pressure < 0.5 {
+            let tier_label = if est_pressure < PRESSURE_HEALTHY_THRESHOLD {
                 "Normal"
-            } else if est_pressure < 0.85 {
+            } else if est_pressure < PRESSURE_WARNING_THRESHOLD {
                 "Approaching compact"
             } else {
                 "Near compact trigger"
@@ -1873,13 +1884,13 @@ fn describe_context_pressure(
     usage_pct: f64,
     est_pressure: f64,
 ) -> (&'static str, &'static str, &'static str) {
-    if est_pressure < 0.5 && usage_pct < 60.0 {
+    if est_pressure < PRESSURE_HEALTHY_THRESHOLD && usage_pct < USAGE_HEALTHY_PCT {
         (
             "🟢",
             "Healthy",
             "Plenty of room left. Short follow-ups like '继续' should work well.",
         )
-    } else if est_pressure < 0.85 && usage_pct < 85.0 {
+    } else if est_pressure < PRESSURE_WARNING_THRESHOLD && usage_pct < USAGE_WARNING_PCT {
         (
             "🟡",
             "Getting full",
