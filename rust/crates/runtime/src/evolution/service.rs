@@ -127,7 +127,13 @@ impl EvolutionService {
 
     /// Get all pending proposals awaiting user approval.
     pub async fn pending(&self) -> Vec<EvolutionProposal> {
-        self.pending_proposals.lock().await.clone()
+        let mut v = self.pending_proposals.lock().await.clone();
+        // Higher impact × confidence first.
+        v.sort_by(|a, b| {
+            let score = |p: &EvolutionProposal| p.confidence;
+            score(b).partial_cmp(&score(a)).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        v
     }
 
     /// Approve a proposal by ID. Returns the proposal if found.
