@@ -50,6 +50,23 @@ fn rate_limit_cooldown() -> &'static PerModelCooldown {
     COOLDOWN.get_or_init(PerModelCooldown::new)
 }
 
+// ── Global HTTP Client ───────────────────────────────────────────────────────
+
+/// Global HTTP client for LLM requests (connection pooling, reuse).
+fn global_llm_client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .no_proxy()
+            .connect_timeout(llm_connect_timeout())
+            // Use a generous timeout; per-request timeout handled via tokio::time::timeout
+            .timeout(std::time::Duration::from_secs(LLM_TOTAL_BUDGET_S + 60))
+            .pool_max_idle_per_host(4)
+            .build()
+            .expect("failed to build global LLM HTTP client")
+    })
+}
+
 #[cfg(test)]
 fn reset_rate_limit_cooldown_for_tests() {
     rate_limit_cooldown().reset_for_tests();
@@ -137,6 +154,7 @@ pub(crate) struct LlmCallResult {
     pub finish_reason: Option<String>,
 }
 
+#[allow(dead_code)] // May be used for per-request timeout in the future
 fn turn_timeout_s() -> f64 {
     astra_core::RuntimeLimits::global().turn_timeout_s
 }
@@ -266,12 +284,7 @@ pub(crate) async fn call_llm_and_collect(
 
     let started = Instant::now();
     let total_budget = llm_total_budget();
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .connect_timeout(llm_connect_timeout())
-        .timeout(std::time::Duration::from_secs(turn_timeout_s() as u64 + 10))
-        .build()
-        .map_err(|e| e.to_string())?;
+    let client = global_llm_client();
 
     let mut body = json!({
         "model": model_name,
