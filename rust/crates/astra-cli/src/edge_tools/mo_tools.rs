@@ -19,6 +19,8 @@ use super::*;
 
 // ─── MatrixOne connection helper ────────────────────────────────────────────
 
+const MO_CONNECT_TIMEOUT_SECS: u32 = 5;
+
 /// Cached account name — queried once via `SELECT current_account_name()`.
 fn mo_current_account() -> &'static str {
     use std::sync::OnceLock;
@@ -78,6 +80,7 @@ fn mo_mysql_cmd(database: Option<&str>) -> Command {
         .arg(format!("-u{}", user))
         .env("MYSQL_PWD", &password) // pass via env, not CLI (hidden from ps)
         .arg(&db)
+        .arg(format!("--connect-timeout={MO_CONNECT_TIMEOUT_SECS}"))
         .arg("--table"); // Pretty-print results
     cmd
 }
@@ -597,6 +600,11 @@ mod tests {
 
     #[test]
     fn mo_query_allows_destructive_with_opt_in() {
+        let _guard = env_guard();
+        unsafe {
+            std::env::set_var("MATRIXONE_HOST", "127.0.0.1");
+            std::env::set_var("MATRIXONE_PORT", "1");
+        }
         let executor = ToolExecutor::new(std::env::temp_dir());
         // This will fail at the mysql connection level, but NOT at the safety check
         let result = executor.mo_query(
@@ -607,6 +615,10 @@ mod tests {
             !result.contains("blocked"),
             "should not block with opt-in: {result}"
         );
+        unsafe {
+            std::env::remove_var("MATRIXONE_HOST");
+            std::env::remove_var("MATRIXONE_PORT");
+        }
     }
 
     // ── SQL safety bypass prevention ──
