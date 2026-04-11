@@ -512,14 +512,8 @@ async fn handle_cancel_run(
         .cancel_run(run_id.to_string(), conn.user.user_id.clone())
         .await
     {
-        Ok(_record) => {
-            send_msg(
-                socket,
-                &WsServerMessage::RunCancelled {
-                    run_id: run_id.to_string(),
-                },
-            )
-            .await;
+        Ok(record) => {
+            send_msg(socket, &cancel_run_outcome_message(&record)).await;
         }
         Err((_status, err)) => {
             send_msg(
@@ -578,6 +572,27 @@ fn ws_text_frame_exceeds_limit(text: &str) -> bool {
 
 fn run_status_is_terminal(status: &str) -> bool {
     matches!(status, STATUS_COMPLETED | STATUS_FAILED | STATUS_CANCELLED)
+}
+
+fn cancel_run_outcome_message(record: &astra_services::runs::CancelRunRecord) -> WsServerMessage {
+    match record.status.as_str() {
+        STATUS_CANCELLED => WsServerMessage::RunCancelled {
+            run_id: record.run_id.clone(),
+        },
+        status if run_status_is_terminal(status) => WsServerMessage::RunFinished {
+            run_id: record.run_id.clone(),
+            status: status.to_string(),
+            error: None,
+        },
+        status => WsServerMessage::Error {
+            message: format!(
+                "Cancel request did not stop run {}; current status is '{}'",
+                record.run_id, status
+            ),
+            code: "CANCEL_NOOP".into(),
+            retryable: false,
+        },
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1482,6 +1497,62 @@ mod tests {
         assert!(run_status_is_terminal(STATUS_CANCELLED));
         assert!(!run_status_is_terminal("running"));
         assert!(!run_status_is_terminal("paused"));
+    }
+
+    #[test]
+    fn cancel_run_outcome_message_uses_run_cancelled_for_cancelled_status() {
+        let record = astra_services::runs::CancelRunRecord {
+            run_id: "run-1".into(),
+            status: STATUS_CANCELLED.into(),
+        };
+
+        match cancel_run_outcome_message(&record) {
+            WsServerMessage::RunCancelled { run_id } => assert_eq!(run_id, "run-1"),
+            other => panic!("expected RunCancelled, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cancel_run_outcome_message_uses_run_finished_for_terminal_noops() {
+        let record = astra_services::runs::CancelRunRecord {
+            run_id: "run-1".into(),
+            status: STATUS_COMPLETED.into(),
+        };
+
+        match cancel_run_outcome_message(&record) {
+            WsServerMessage::RunFinished {
+                run_id,
+                status,
+                error,
+            } => {
+                assert_eq!(run_id, "run-1");
+                assert_eq!(status, STATUS_COMPLETED);
+                assert!(error.is_none());
+            }
+            other => panic!("expected RunFinished, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cancel_run_outcome_message_reports_non_terminal_noops() {
+        let record = astra_services::runs::CancelRunRecord {
+            run_id: "run-1".into(),
+            status: STATUS_PAUSED.into(),
+        };
+
+        match cancel_run_outcome_message(&record) {
+            WsServerMessage::Error {
+                message,
+                code,
+                retryable,
+            } => {
+                assert!(message.contains("run-1"));
+                assert!(message.contains(STATUS_PAUSED));
+                assert_eq!(code, "CANCEL_NOOP");
+                assert!(!retryable);
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
     }
 
     #[test]
