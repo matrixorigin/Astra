@@ -844,9 +844,13 @@ fn print_turn_trace(ev: &session_journal::JournalEvent, journal_seq: Option<u32>
                 }
                 _ => String::new(),
             };
+            let display = super::stream_render::format_tool_display_from_preview(
+                &tc.name,
+                tc.args_preview.as_deref(),
+            );
             eprintln!(
                 "    {:<12} {:>6}ms {:>3}%  {}{}{}",
-                tc.name.as_str().cyan(),
+                display.cyan(),
                 tc.ms,
                 pct,
                 bar,
@@ -983,26 +987,18 @@ fn print_turn_trace(ev: &session_journal::JournalEvent, journal_seq: Option<u32>
                 (None, None) => String::new(),
             };
 
+            let display = super::stream_render::format_tool_display_from_preview(
+                &tc.name,
+                tc.args_preview.as_deref(),
+            );
             eprintln!(
                 "    {} {} {} {}{}",
                 format!("[{:>5}ms]", offset).dim(),
                 branch.dim(),
                 status,
-                tc.name.as_str().cyan(),
+                display.cyan(),
                 io_info.dim()
             );
-
-            // Show args preview if available
-            if let Some(ref args) = tc.args_preview {
-                let sub_branch = if is_last { "   " } else { "│  " };
-                let args_truncated = truncate_str(args, 59);
-                eprintln!(
-                    "    {}    {} {}",
-                    " ".repeat(8),
-                    sub_branch.dim(),
-                    args_truncated.dim()
-                );
-            }
 
             if let Some(ref err) = tc.error {
                 let err_preview = truncate_str(err, 50);
