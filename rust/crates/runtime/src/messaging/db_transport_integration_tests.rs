@@ -279,6 +279,71 @@ mod tests {
         cleanup(&pool).await;
     }
 
+    #[tokio::test]
+    async fn expired_broadcast_messages_are_marked_failed() {
+        skip_without_db!(pool);
+
+        let transport =
+            DatabaseTransport::new(pool.clone()).with_poll_interval(Duration::from_millis(50));
+
+        let leader = addr("run-db-bcast-ttl-lead", "leader");
+        let worker = addr("run-db-bcast-ttl-worker", "worker");
+        let del = "del-db-bcast-ttl";
+
+        transport
+            .register(leader.clone(), Some(del.into()))
+            .await
+            .unwrap();
+        transport
+            .register(worker.clone(), Some(del.into()))
+            .await
+            .unwrap();
+
+        let mut stream_worker = transport.subscribe(&worker).await.unwrap();
+
+        let msg = AgentMessage::new(
+            leader.clone(),
+            MessageTarget::Broadcast {
+                delegation_id: del.into(),
+            },
+            MessagePayload::Text {
+                content: "expired-broadcast".into(),
+                summary: None,
+            },
+        )
+        .with_ttl(Duration::ZERO);
+        let message_id = msg.id.clone();
+        transport.broadcast(del, Arc::new(msg)).await.unwrap();
+
+        let receive = tokio::time::timeout(Duration::from_millis(300), stream_worker.recv()).await;
+        assert!(
+            receive.is_err(),
+            "expired broadcast should not be delivered"
+        );
+
+        let status = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let row =
+                    sqlx::query("SELECT status FROM agent_message_queue WHERE message_id = ?")
+                        .bind(&message_id)
+                        .fetch_one(&pool)
+                        .await
+                        .unwrap();
+                let status: String = row.try_get("status").unwrap();
+                if status == "failed" {
+                    break status;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("expired broadcast should eventually be dead-lettered");
+
+        assert_eq!(status, "failed");
+
+        cleanup(&pool).await;
+    }
+
     // ── Cleanup Utilities ───────────────────────────────────────────────────
 
     #[tokio::test]

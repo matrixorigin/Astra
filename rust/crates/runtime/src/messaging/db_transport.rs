@@ -604,22 +604,59 @@ async fn poll_loop(
                     let json: String = match row.try_get("payload_json") {
                         Ok(j) => j,
                         Err(_) => {
-                            last_broadcast_id = last_broadcast_id.max(row_id);
+                            metrics
+                                .messages_dropped
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            match mark_broadcast_failed(&pool, row_id).await {
+                                Ok(()) => {
+                                    last_broadcast_id = last_broadcast_id.max(row_id);
+                                }
+                                Err(e) => {
+                                    had_error = true;
+                                    metrics
+                                        .poll_errors
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    eprintln!(
+                                        "  ⚠ messaging: failed to dead-letter undecodable broadcast row {} for delegation {}: {:?}",
+                                        row_id, did, e
+                                    );
+                                }
+                            }
                             continue;
                         }
                     };
 
-                    if let Ok(msg) = serde_json::from_str::<AgentMessage>(&json) {
-                        if !msg.is_expired() {
+                    match serde_json::from_str::<AgentMessage>(&json) {
+                        Ok(msg) if !msg.is_expired() => {
                             metrics
                                 .messages_received
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             if tx.send(Arc::new(msg)).is_err() {
                                 return;
                             }
+                            last_broadcast_id = last_broadcast_id.max(row_id);
+                        }
+                        Ok(_) | Err(_) => {
+                            metrics
+                                .messages_dropped
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            match mark_broadcast_failed(&pool, row_id).await {
+                                Ok(()) => {
+                                    last_broadcast_id = last_broadcast_id.max(row_id);
+                                }
+                                Err(e) => {
+                                    had_error = true;
+                                    metrics
+                                        .poll_errors
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    eprintln!(
+                                        "  ⚠ messaging: failed to dead-letter broadcast row {} for delegation {}: {:?}",
+                                        row_id, did, e
+                                    );
+                                }
+                            }
                         }
                     }
-                    last_broadcast_id = last_broadcast_id.max(row_id);
                 }
             } else {
                 had_error = true;
@@ -660,6 +697,18 @@ async fn poll_loop(
             }
         }
     }
+}
+
+async fn mark_broadcast_failed(pool: &Pool<MySql>, row_id: i64) -> Result<(), sqlx::Error> {
+    query(
+        "UPDATE agent_message_queue
+         SET status = 'failed', claimed_by = NULL, claimed_at_ms = NULL
+         WHERE id = ? AND is_broadcast = TRUE AND status IN ('pending', 'claimed')",
+    )
+    .bind(row_id)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 // ─── DatabaseMessageStream ──────────────────────────────────────────────────
