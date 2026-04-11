@@ -709,10 +709,6 @@ pub(super) async fn handle_state_command(
         }
 
         "/reflect" => {
-            let Some(tok) = token else {
-                eprintln!("{}", "  Not logged in. Use /login.".yellow());
-                return Ok(());
-            };
             let sid = match state.session_id.as_deref() {
                 Some(s) => s.to_string(),
                 None => {
@@ -720,37 +716,50 @@ pub(super) async fn handle_state_command(
                     return Ok(());
                 }
             };
-            let known_focuses = [
-                "auto",
-                "skill_failure",
-                "unexpected_result",
-                "data_quality",
-                "tool_selection",
-                "history",
-                "performance",
-            ];
+            let (requested_focus, requested_question) = parse_reflect_args(arg);
+            if let Ok(body) =
+                crate::self_command::render_surface_for_session(&sid, "reflect", 20).await
+            {
+                render_reflect_report(
+                    &body,
+                    &sid,
+                    requested_focus.as_deref(),
+                    requested_question.as_deref(),
+                );
+                return Ok(());
+            }
+
+            let Some(tok) = token else {
+                eprintln!(
+                    "{}",
+                    "  Reflect needs either local session artifacts or a logged-in server session."
+                        .yellow()
+                );
+                return Ok(());
+            };
             let mut rel = astra_thin_client::paths::chat_session_reflect(&sid)
                 .trim_start_matches('/')
                 .to_string();
             let mut query_parts: Vec<String> = Vec::new();
-            let mut parts2 = arg.splitn(2, ' ');
-            let first = parts2.next().unwrap_or("").trim();
-            let rest = parts2.next().unwrap_or("").trim();
-            if known_focuses.contains(&first) {
-                if !first.is_empty() {
-                    query_parts.push(format!("focus={}", first));
-                }
-                if !rest.is_empty() {
-                    query_parts.push(format!("question={}", urlencoding(rest)));
-                }
-            } else if !arg.is_empty() {
-                query_parts.push(format!("question={}", urlencoding(arg)));
+            if let Some(focus) = requested_focus.as_deref().filter(|focus| *focus != "auto") {
+                query_parts.push(format!("focus={focus}"));
+            }
+            if let Some(question) = requested_question
+                .as_deref()
+                .filter(|question| !question.is_empty())
+            {
+                query_parts.push(format!("question={}", urlencoding(question)));
             }
             if !query_parts.is_empty() {
                 rel = format!("{rel}?{}", query_parts.join("&"));
             }
             match api.get_authed_path_text(tok, &rel).await {
-                Ok(body) => render_reflect_report(&body, &sid),
+                Ok(body) => render_reflect_report(
+                    &body,
+                    &sid,
+                    requested_focus.as_deref(),
+                    requested_question.as_deref(),
+                ),
                 Err(astra_thin_client::ThinClientError::Api {
                     status,
                     body: err_body,
@@ -769,12 +778,51 @@ pub(super) async fn handle_state_command(
     Ok(())
 }
 
-/// Render a `ReflectReport` JSON as a compact, colored terminal report.
-fn render_reflect_report(body: &str, session_id: &str) {
+fn parse_reflect_args(arg: &str) -> (Option<String>, Option<String>) {
+    let known_focuses = [
+        "auto",
+        "skill_failure",
+        "unexpected_result",
+        "data_quality",
+        "tool_selection",
+        "history",
+        "performance",
+    ];
+    let mut parts = arg.splitn(2, ' ');
+    let first = parts.next().unwrap_or("").trim();
+    let rest = parts.next().unwrap_or("").trim();
+    if known_focuses.contains(&first) {
+        let focus = (!first.is_empty()).then(|| first.to_string());
+        let question = (!rest.is_empty()).then(|| rest.to_string());
+        (focus, question)
+    } else if arg.trim().is_empty() {
+        (Some("auto".to_string()), None)
+    } else {
+        (Some("auto".to_string()), Some(arg.trim().to_string()))
+    }
+}
+
+fn is_local_reflect_report(report: &serde_json::Value) -> bool {
+    report.get("reflection_context").is_some()
+}
+
+/// Render either the local liquid reflection surface or a server `ReflectReport`
+/// as a compact, colored terminal report.
+fn render_reflect_report(
+    body: &str,
+    session_id: &str,
+    requested_focus: Option<&str>,
+    requested_question: Option<&str>,
+) {
     let Ok(report) = serde_json::from_str::<serde_json::Value>(body) else {
         print_json_or_raw(body);
         return;
     };
+
+    if is_local_reflect_report(&report) {
+        render_local_reflect_report(&report, session_id, requested_focus, requested_question);
+        return;
+    }
 
     let overview = &report["overview"];
     let short_sid = prefix_chars(session_id, 8);
@@ -945,9 +993,177 @@ fn render_reflect_report(body: &str, session_id: &str) {
     }
 }
 
+fn render_local_reflect_report(
+    report: &serde_json::Value,
+    session_id: &str,
+    requested_focus: Option<&str>,
+    requested_question: Option<&str>,
+) {
+    let short_sid = prefix_chars(session_id, 8);
+    let context = &report["reflection_context"];
+    let turns_completed = context["turns_completed"].as_u64().unwrap_or(0);
+    let scenario = context["scenario"].as_str().unwrap_or("unknown");
+    let token_utilisation = context["token_utilisation"].as_f64().unwrap_or(0.0) * 100.0;
+
+    eprintln!(
+        "{}",
+        format!("🔍 Liquid Reflection — {short_sid}").cyan().bold()
+    );
+    eprintln!("{}", "─────────────────────────────────────".dim());
+    eprintln!(
+        "  {} {} turns, scenario {}, token {:.0}%",
+        "Overview:".bold(),
+        turns_completed,
+        scenario,
+        token_utilisation
+    );
+
+    if let Some(focus) = requested_focus.filter(|focus| !focus.is_empty()) {
+        eprintln!("  {} {}", "Focus:".bold(), focus);
+    }
+    if let Some(question) = requested_question.filter(|question| !question.is_empty()) {
+        eprintln!("  {} {}", "Question:".bold(), question);
+    }
+    if let Some(experiment) = context["active_experiment"].as_object() {
+        let experiment_id = experiment
+            .get("experiment_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        let variant = experiment
+            .get("variant")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        let samples = experiment
+            .get("samples")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        eprintln!(
+            "  {} {} / {} ({} samples)",
+            "Experiment:".bold(),
+            experiment_id,
+            variant,
+            samples
+        );
+    }
+
+    if let Some(tool_stats) = context["tool_stats"]
+        .as_array()
+        .filter(|stats| !stats.is_empty())
+    {
+        eprintln!();
+        eprintln!("  {}", "Tool pressure:".bold());
+        for stat in tool_stats.iter().take(6) {
+            let tool_name = stat["tool_name"].as_str().unwrap_or("unknown");
+            let calls = stat["calls"].as_u64().unwrap_or(0);
+            let failures = stat["failures"].as_u64().unwrap_or(0);
+            let avg_latency_ms = stat["avg_latency_ms"].as_u64().unwrap_or(0);
+            let line =
+                format!("{tool_name}: {calls} calls, {failures} failures, avg {avg_latency_ms}ms");
+            if failures > 0 {
+                eprintln!("  ⚠️ {}", line.yellow());
+            } else {
+                eprintln!("  • {line}");
+            }
+        }
+    }
+
+    if let Some(signals) = context["signals"]
+        .as_array()
+        .filter(|signals| !signals.is_empty())
+    {
+        eprintln!();
+        eprintln!("  {}", "Signals:".bold());
+        for signal in signals.iter().take(6) {
+            let kind = signal["kind"].as_str().unwrap_or("signal");
+            let detail = signal["detail"].as_str().unwrap_or("");
+            let turn_id = signal["turn_id"].as_str().unwrap_or("session");
+            eprintln!("  • {} [{}] {}", kind.bold(), turn_id.dim(), detail);
+        }
+    }
+
+    if let Some(actions) = context["recent_tactical_actions"]
+        .as_array()
+        .filter(|actions| !actions.is_empty())
+    {
+        eprintln!();
+        eprintln!("  {}", "Recent tactical actions:".bold());
+        for action in actions.iter().take(6).filter_map(serde_json::Value::as_str) {
+            eprintln!("  • {action}");
+        }
+    }
+
+    if let Some(turns) = report["recent_turns"]
+        .as_array()
+        .filter(|turns| !turns.is_empty())
+    {
+        eprintln!();
+        eprintln!("  {}", "Recent events:".bold());
+        for event in turns.iter().take(4) {
+            let event_type = event["event_type"].as_str().unwrap_or("event");
+            let turn = event["turn"]
+                .as_u64()
+                .map(|turn| format!("turn-{turn}"))
+                .unwrap_or_else(|| "session".to_string());
+            let detail = event["error"]
+                .as_str()
+                .or_else(|| event["user_input_preview"].as_str())
+                .or_else(|| event["assistant_output_preview"].as_str())
+                .unwrap_or("");
+            if detail.is_empty() {
+                eprintln!("  • {} [{}]", event_type, turn.dim());
+            } else {
+                eprintln!("  • {} [{}] {}", event_type, turn.dim(), detail);
+            }
+        }
+    }
+
+    if let Some(prompt_preview) = report["prompt_preview"]
+        .as_str()
+        .filter(|preview| !preview.is_empty())
+    {
+        eprintln!();
+        eprintln!("  {}", "Prompt preview:".bold());
+        for line in prompt_preview.lines().take(14) {
+            eprintln!("    {}", line.dim());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_reflect_args_splits_focus_and_question() {
+        let (focus, question) = parse_reflect_args("performance why was bash slow");
+        assert_eq!(focus.as_deref(), Some("performance"));
+        assert_eq!(question.as_deref(), Some("why was bash slow"));
+    }
+
+    #[test]
+    fn parse_reflect_args_treats_freeform_as_question() {
+        let (focus, question) = parse_reflect_args("why was bash slow");
+        assert_eq!(focus.as_deref(), Some("auto"));
+        assert_eq!(question.as_deref(), Some("why was bash slow"));
+    }
+
+    #[test]
+    fn local_reflect_shape_is_detected() {
+        let local = serde_json::json!({
+            "session_id": "s1",
+            "reflection_context": {
+                "turns_completed": 3
+            }
+        });
+        let server = serde_json::json!({
+            "session_id": "s1",
+            "overview": {
+                "total_events": 3
+            }
+        });
+        assert!(is_local_reflect_report(&local));
+        assert!(!is_local_reflect_report(&server));
+    }
 
     // ── /undo tests ──
 
