@@ -9721,4 +9721,79 @@ print(json.dumps({'context': 'user said: ' + msg}))
             "System message should be injected"
         );
     }
+
+    // ── finalize_turn_trace tests ───────────────────────────────────────
+
+    #[test]
+    fn finalize_turn_trace_feeds_observability_session() {
+        let mut state = make_state();
+        let hub = crate::observability_integration::ObservabilityHub::new();
+        let session = hub.start_session("u1", "s1");
+        state.telemetry.observability_session = Some(session.clone());
+        state.max_turn_input_tokens = 100_000;
+        state.last_measured_prompt_tokens = Some(25_000);
+
+        // Create collector with some data
+        let collector = crate::turn::turn_trace_collector::TurnTraceCollector::new(
+            "turn-0".to_string(),
+            "s1".to_string(),
+        );
+        collector.record_token_budget_estimate(14_000, 5_000, 0, 3_000, 200, 22_200, 100_000, 0.22);
+        state.telemetry.turn_trace_collector = Some(collector);
+
+        finalize_turn_trace(&mut state);
+
+        // Collector consumed
+        assert!(state.telemetry.turn_trace_collector.is_none());
+        // Trace fed to observability session
+        let guard = session.read().unwrap();
+        assert_eq!(guard.context_traces.len(), 1);
+        let trace = &guard.context_traces[0];
+        assert_eq!(trace.turn_id, "turn-0");
+        // CLI estimates preserved (merge semantics)
+        assert_eq!(trace.token_budget.system_prompt_tokens, 14_000);
+        assert_eq!(trace.token_budget.history_tokens, 5_000);
+        // Runtime measured values applied
+        assert_eq!(trace.token_budget.total_used, 25_000);
+        assert_eq!(trace.token_budget.max_tokens, 100_000);
+        assert!((trace.token_budget.budget_pressure - 0.25).abs() < 0.01);
+    }
+
+    #[test]
+    fn finalize_turn_trace_noop_when_no_collector() {
+        let mut state = make_state();
+        assert!(state.telemetry.turn_trace_collector.is_none());
+        // Should not panic
+        finalize_turn_trace(&mut state);
+    }
+
+    #[test]
+    fn finalize_turn_trace_updates_on_consecutive_turns() {
+        let mut state = make_state();
+        let hub = crate::observability_integration::ObservabilityHub::new();
+        let session = hub.start_session("u1", "s1");
+        state.telemetry.observability_session = Some(session.clone());
+        state.max_turn_input_tokens = 100_000;
+
+        // Turn 0
+        state.last_measured_prompt_tokens = Some(20_000);
+        state.telemetry.turn_trace_collector = Some(
+            crate::turn::turn_trace_collector::TurnTraceCollector::new("turn-0".to_string(), "s1".to_string()),
+        );
+        finalize_turn_trace(&mut state);
+
+        // Turn 1
+        state.last_measured_prompt_tokens = Some(30_000);
+        state.telemetry.turn_trace_collector = Some(
+            crate::turn::turn_trace_collector::TurnTraceCollector::new("turn-1".to_string(), "s1".to_string()),
+        );
+        finalize_turn_trace(&mut state);
+
+        let guard = session.read().unwrap();
+        assert_eq!(guard.context_traces.len(), 2);
+        assert_eq!(guard.context_traces[0].turn_id, "turn-0");
+        assert_eq!(guard.context_traces[0].token_budget.total_used, 20_000);
+        assert_eq!(guard.context_traces[1].turn_id, "turn-1");
+        assert_eq!(guard.context_traces[1].token_budget.total_used, 30_000);
+    }
 }
