@@ -153,15 +153,27 @@ impl MessageTransport for InProcessTransport {
             rx
         };
 
-        // Subscribe to broadcast if agent is in a delegation group.
-        let broadcast_rx = {
-            let memberships = self.memberships.read().await;
-            if let Some(did) = memberships.get(addr) {
-                let broadcasts = self.broadcasts.read().await;
-                broadcasts.get(did).map(|tx| tx.subscribe())
-            } else {
-                None
-            }
+        // Snapshot delegation membership while this subscribe still owns the
+        // direct-mailbox state; if the broadcast channel disappears afterward,
+        // fail fast instead of silently returning a stream with no broadcasts.
+        let delegation_id = self.memberships.read().await.get(addr).cloned();
+        drop(pending_receivers);
+        drop(inboxes);
+
+        let broadcast_rx = if let Some(did) = delegation_id {
+            let broadcasts = self.broadcasts.read().await;
+            Some(
+                broadcasts
+                    .get(&did)
+                    .ok_or_else(|| {
+                        MailboxError::Transport(format!(
+                            "broadcast group not found for registered agent: {did}"
+                        ))
+                    })?
+                    .subscribe(),
+            )
+        } else {
+            None
         };
 
         Ok(Box::new(InProcessStream {
@@ -459,6 +471,25 @@ mod tests {
         // Unregister last — broadcast should be cleaned up.
         transport.unregister(&b).await.unwrap();
         assert!(!transport.broadcasts.read().await.contains_key(del));
+    }
+
+    #[tokio::test]
+    async fn subscribe_fails_when_membership_loses_broadcast_channel() {
+        let transport = InProcessTransport::new();
+        let a = addr("r1", "a");
+        let del = "del-missing";
+
+        transport
+            .register(a.clone(), Some(del.into()))
+            .await
+            .unwrap();
+        transport.broadcasts.write().await.remove(del);
+
+        let err = match transport.subscribe(&a).await {
+            Ok(_) => panic!("subscribe should fail when broadcast channel is missing"),
+            Err(err) => err,
+        };
+        assert!(matches!(err, MailboxError::Transport(_)));
     }
 
     #[tokio::test]
