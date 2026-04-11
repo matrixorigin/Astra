@@ -55,6 +55,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use sqlx::mysql::MySqlRow;
 use sqlx::{MySql, Pool, Row, query};
 use tokio::sync::{RwLock, mpsc, watch};
 
@@ -505,7 +506,7 @@ async fn poll_loop(
             Ok(result) if result.rows_affected() > 0 => {
                 // Fetch the messages we just claimed.
                 let fetch_result = query(
-                    "SELECT id, message_id, payload_json FROM agent_message_queue
+                    "SELECT id, CAST(id AS CHAR) AS row_id_text, message_id, payload_json FROM agent_message_queue
                      WHERE to_run_id = ? AND to_agent_id = ? AND status = 'claimed' AND claimed_by = ?
                      ORDER BY id ASC",
                 )
@@ -518,7 +519,7 @@ async fn poll_loop(
                 if let Ok(rows) = fetch_result {
                     for row in rows {
                         let message_id: Option<String> = row.try_get("message_id").ok();
-                        let row_id = match row.try_get("id") {
+                        let row_id = match extract_queue_row_id(&row) {
                             Ok(id) => Some(id),
                             Err(e) => {
                                 had_error = true;
@@ -670,7 +671,7 @@ async fn poll_loop(
         //    Broadcasts use cursor-based reading (all agents see every broadcast).
         if let Some(ref did) = delegation_id {
             let broadcast_result = query(
-                "SELECT id, message_id, payload_json FROM agent_message_queue
+                "SELECT id, CAST(id AS CHAR) AS row_id_text, message_id, payload_json FROM agent_message_queue
                  WHERE delegation_id = ? AND is_broadcast = TRUE AND id > ? AND status IN ('pending', 'claimed')
                  ORDER BY id ASC LIMIT ?",
             )
@@ -683,7 +684,7 @@ async fn poll_loop(
             if let Ok(rows) = broadcast_result {
                 for row in rows {
                     let message_id: Option<String> = row.try_get("message_id").ok();
-                    let row_id = match row.try_get("id") {
+                    let row_id = match extract_queue_row_id(&row) {
                         Ok(id) => Some(id),
                         Err(e) => {
                             had_error = true;
@@ -1106,6 +1107,25 @@ async fn reclaim_stale_in_pool(
     Ok(reclaimed.rows_affected())
 }
 
+fn extract_queue_row_id(row: &MySqlRow) -> Result<i64, sqlx::Error> {
+    match row.try_get("id") {
+        Ok(id) => Ok(id),
+        Err(primary_err) => match row
+            .try_get::<Option<String>, _>("row_id_text")
+            .ok()
+            .flatten()
+            .and_then(|value| parse_row_id_text_fallback(&value))
+        {
+            Some(id) => Ok(id),
+            None => Err(primary_err),
+        },
+    }
+}
+
+fn parse_row_id_text_fallback(value: &str) -> Option<i64> {
+    value.parse::<i64>().ok()
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1149,6 +1169,16 @@ mod tests {
         let restored: AgentMessage = serde_json::from_str(&json).unwrap();
         assert_eq!(restored.id, msg.id);
         assert_eq!(restored.from.run_id, "run-1");
+    }
+
+    #[test]
+    fn parse_row_id_text_fallback_accepts_numeric_ids() {
+        assert_eq!(super::parse_row_id_text_fallback("42"), Some(42));
+    }
+
+    #[test]
+    fn parse_row_id_text_fallback_rejects_non_numeric_ids() {
+        assert_eq!(super::parse_row_id_text_fallback("not-a-row-id"), None);
     }
 
     #[test]
