@@ -147,6 +147,280 @@ fn slash_second_token_completions(line: &str, pos: usize) -> Option<(usize, Vec<
     build_second_token_pairs(&entries, &partial_lower, arg_start)
 }
 
+// ── Subcommand picker state ─────────────────────────────────────────────────
+// Similar to the main slash picker, but for subcommands after `/cmd `.
+
+static SUBCMD_OVERLAY_LINES: OnceLock<Mutex<u16>> = OnceLock::new();
+static SUBCMD_PICKER_SELECTED: OnceLock<Mutex<usize>> = OnceLock::new();
+static SUBCMD_PARENT_CMD: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+static SUBCMD_FILTER: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+static SUBCMD_PENDING_EXECUTE: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+
+fn subcmd_overlay_lines() -> &'static Mutex<u16> {
+    SUBCMD_OVERLAY_LINES.get_or_init(|| Mutex::new(0))
+}
+fn subcmd_picker_selected() -> &'static Mutex<usize> {
+    SUBCMD_PICKER_SELECTED.get_or_init(|| Mutex::new(0))
+}
+fn subcmd_parent_cmd() -> &'static Mutex<Option<String>> {
+    SUBCMD_PARENT_CMD.get_or_init(|| Mutex::new(None))
+}
+fn subcmd_filter() -> &'static Mutex<Option<String>> {
+    SUBCMD_FILTER.get_or_init(|| Mutex::new(None))
+}
+fn subcmd_pending_execute() -> &'static Mutex<Option<String>> {
+    SUBCMD_PENDING_EXECUTE.get_or_init(|| Mutex::new(None))
+}
+
+pub(super) fn is_subcmd_picker_active() -> bool {
+    subcmd_overlay_lines()
+        .lock()
+        .map(|g| *g > 0)
+        .unwrap_or(false)
+}
+
+fn get_subcmd_picker_selected() -> usize {
+    subcmd_picker_selected().lock().map(|g| *g).unwrap_or(0)
+}
+fn set_subcmd_picker_selected(selected: usize) {
+    if let Ok(mut g) = subcmd_picker_selected().lock() {
+        *g = selected;
+    }
+}
+fn get_subcmd_parent() -> Option<String> {
+    subcmd_parent_cmd().lock().ok().and_then(|g| g.clone())
+}
+fn set_subcmd_parent(cmd: Option<String>) {
+    if let Ok(mut g) = subcmd_parent_cmd().lock() {
+        *g = cmd;
+    }
+}
+fn get_subcmd_filter() -> Option<String> {
+    subcmd_filter().lock().ok().and_then(|g| g.clone())
+}
+fn set_subcmd_filter(filter: Option<String>) {
+    if let Ok(mut g) = subcmd_filter().lock() {
+        *g = filter;
+    }
+}
+fn set_subcmd_pending_execute(cmd: Option<String>) {
+    if let Ok(mut g) = subcmd_pending_execute().lock() {
+        *g = cmd;
+    }
+}
+pub(super) fn take_subcmd_pending_execute() -> Option<String> {
+    subcmd_pending_execute()
+        .lock()
+        .ok()
+        .and_then(|mut g| g.take())
+}
+
+/// Parse line to detect subcommand context: `/cmd ` or `/cmd sub...`
+/// Returns (parent_cmd, subcommand_filter) if applicable
+fn parse_subcmd_context(line: &str) -> Option<(&'static str, String)> {
+    if !line.starts_with('/') {
+        return None;
+    }
+    let space_idx = line.find(' ')?;
+    let cmd_part = &line[..space_idx];
+    let resolved = resolve_slash_command(cmd_part).ok()?;
+    let subs = command_registry::subcommand_completions(resolved)?;
+    if subs.is_empty() {
+        return None;
+    }
+    let rest = &line[space_idx + 1..];
+    // If there's another space, we're past subcommand selection
+    if rest.contains(' ') {
+        return None;
+    }
+    Some((resolved, rest.to_string()))
+}
+
+fn filtered_subcmd_rows(
+    parent: &str,
+    filter: Option<&str>,
+) -> Vec<(&'static str, &'static str)> {
+    let Some(subs) = command_registry::subcommand_completions(parent) else {
+        return vec![];
+    };
+    let mut rows: Vec<(&'static str, &'static str)> = subs.to_vec();
+    if let Some(f) = filter.filter(|f| !f.is_empty()) {
+        let f_lower = f.to_ascii_lowercase();
+        rows.retain(|(name, desc)| {
+            name.to_ascii_lowercase().starts_with(&f_lower)
+                || desc.to_ascii_lowercase().contains(&f_lower)
+        });
+    }
+    rows.sort_by(|a, b| a.0.cmp(b.0));
+    rows
+}
+
+fn subcmd_picker_selected_command() -> Option<&'static str> {
+    let parent = get_subcmd_parent()?;
+    let filter = get_subcmd_filter();
+    let rows = filtered_subcmd_rows(&parent, filter.as_deref());
+    let selected = get_subcmd_picker_selected();
+    rows.get(selected).map(|(cmd, _)| *cmd)
+}
+
+fn move_subcmd_picker_selection(delta: isize) -> Option<&'static str> {
+    let parent = get_subcmd_parent()?;
+    let filter = get_subcmd_filter();
+    let rows = filtered_subcmd_rows(&parent, filter.as_deref());
+    if rows.is_empty() {
+        set_subcmd_picker_selected(0);
+        return None;
+    }
+    let len = rows.len() as isize;
+    let current = get_subcmd_picker_selected() as isize;
+    let next = (current + delta).rem_euclid(len) as usize;
+    set_subcmd_picker_selected(next);
+    Some(rows[next].0)
+}
+
+pub(super) fn clear_subcmd_overlay() {
+    let Ok(mut guard) = subcmd_overlay_lines().lock() else {
+        return;
+    };
+    if *guard == 0 {
+        return;
+    }
+    execute!(
+        io::stdout(),
+        cursor::MoveUp(*guard),
+        cursor::MoveToColumn(0),
+        terminal::Clear(terminal::ClearType::FromCursorDown)
+    )
+    .ok();
+    *guard = 0;
+    set_subcmd_picker_selected(0);
+    set_subcmd_parent(None);
+    set_subcmd_filter(None);
+}
+
+fn render_subcmd_overlay_header(parent: &str, inner_width: usize) -> String {
+    let title = format!(" {} subcommands ", parent);
+    let title_width = title.chars().count();
+    let pad = inner_width.saturating_sub(title_width);
+    format!(
+        "{}{}{}{}",
+        "╭".cyan(),
+        title.cyan().bold(),
+        "─".repeat(pad).cyan(),
+        "╮".cyan()
+    )
+}
+
+fn render_subcmd_overlay_footer(total: usize, inner_width: usize) -> String {
+    let summary = format!(
+        " {} options  ·  ↑↓ select  ·  Tab/Enter accept  ·  Esc close ",
+        total
+    );
+    let summary_width = summary.chars().count();
+    let pad = inner_width.saturating_sub(summary_width);
+    format!(
+        "{}{}{}{}",
+        "╰".cyan(),
+        summary.dim(),
+        "─".repeat(pad).cyan(),
+        "╯".cyan()
+    )
+}
+
+pub(super) fn render_subcmd_overlay(parent: &str, filter: Option<&str>) {
+    let rows = filtered_subcmd_rows(parent, filter);
+    let mut selected = get_subcmd_picker_selected();
+    if rows.is_empty() {
+        selected = 0;
+    } else if selected >= rows.len() {
+        selected = rows.len() - 1;
+    }
+    set_subcmd_picker_selected(selected);
+
+    // Erase previous overlay
+    {
+        let Ok(mut guard) = subcmd_overlay_lines().lock() else {
+            return;
+        };
+        if *guard > 0 {
+            execute!(
+                io::stdout(),
+                cursor::MoveUp(*guard),
+                cursor::MoveToColumn(0),
+                terminal::Clear(terminal::ClearType::FromCursorDown)
+            )
+            .ok();
+            *guard = 0;
+        }
+    }
+
+    let visible_limit = 8usize;
+    let total = rows.len();
+    if total == 0 {
+        return;
+    }
+
+    let start = if total <= visible_limit {
+        0
+    } else if selected >= total - (visible_limit / 2) {
+        total - visible_limit
+    } else {
+        selected.saturating_sub(visible_limit / 2)
+    };
+    let end = (start + visible_limit).min(total);
+
+    let command_width = rows[start..end]
+        .iter()
+        .map(|(cmd, _)| cmd.chars().count())
+        .max()
+        .unwrap_or(12)
+        .max(12);
+
+    let inner_width = rows[start..end]
+        .iter()
+        .map(|(cmd, desc)| cmd.chars().count() + 3 + desc.chars().count() + 2)
+        .max()
+        .unwrap_or(40)
+        .max(40);
+
+    let mut printed: u16 = 0;
+
+    println!("{}", render_subcmd_overlay_header(parent, inner_width));
+    printed += 1;
+
+    for (idx, (cmd, desc)) in rows[start..end].iter().enumerate() {
+        let abs = start + idx;
+        let is_selected = abs == selected;
+        let content = if is_selected {
+            format!(
+                "{} {:<command_width$} {}",
+                "❯".cyan().bold(),
+                cmd.cyan().bold(),
+                desc.bold()
+            )
+        } else {
+            format!("  {:<command_width$} {}", cmd.dim(), desc.dim())
+        };
+        let pad = inner_width.saturating_sub(visible_width(&content));
+        let border = if is_selected {
+            "┃".cyan().bold()
+        } else {
+            "│".cyan().dim()
+        };
+        println!("{}{}{}{}", border, content, " ".repeat(pad), border);
+        printed += 1;
+    }
+
+    println!("{}", render_subcmd_overlay_footer(total, inner_width));
+    printed += 1;
+
+    if let Ok(mut g) = subcmd_overlay_lines().lock() {
+        *g = printed;
+    }
+    set_subcmd_parent(Some(parent.to_string()));
+    set_subcmd_filter(filter.map(|s| s.to_string()));
+}
+
 /// Parse the command line to determine the dynamic key and partial token.
 fn parse_second_token_context(line: &str, pos: usize) -> Option<(DynKey, String, usize)> {
     let pos = pos.min(line.len());
@@ -1152,8 +1426,9 @@ impl ConditionalEventHandler for SlashStartCompleteHandler {
         let slash_query = slash_completion_query(&current_line);
         let in_slash = slash_query.is_some();
         let active = is_slash_picker_active();
+        let subcmd_active = is_subcmd_picker_active();
 
-        // ── Helper: navigate picker and replace input line ──────────────
+        // ── Helper: navigate slash picker ───────────────────────────────
         macro_rules! nav {
             ($delta:expr) => {{
                 let filter = get_slash_filter();
@@ -1167,21 +1442,181 @@ impl ConditionalEventHandler for SlashStartCompleteHandler {
             }};
         }
 
-        match key {
-            RlKeyEvent(RlKeyCode::Char(' '), _)
-                if in_slash && active && ctx.pos() == ctx.line().len() =>
-            {
-                let current = ctx.line();
-                let selected = picker_selected_command();
-                clear_slash_overlay();
-                if let Some(edit) = accepted_slash_edit(current, selected, true) {
-                    return Some(match edit {
-                        AcceptedSlashEdit::InsertSuffix(text) => RlCmd::Insert(1, text),
-                        AcceptedSlashEdit::ReplaceWholeLine(line) => {
-                            RlCmd::Replace(RlMovement::WholeLine, Some(line))
+        // ── Helper: navigate subcmd picker ──────────────────────────────
+        macro_rules! subcmd_nav {
+            ($delta:expr) => {{
+                if let Some(parent) = get_subcmd_parent() {
+                    let filter = get_subcmd_filter();
+                    let _ = move_subcmd_picker_selection($delta);
+                    render_subcmd_overlay(&parent, filter.as_deref());
+                    return Some(RlCmd::Noop);
+                }
+            }};
+        }
+
+        // ═══════════════════════════════════════════════════════════════
+        // Subcommand picker handling (higher priority when active)
+        // ═══════════════════════════════════════════════════════════════
+        if subcmd_active {
+            match key {
+                RlKeyEvent(RlKeyCode::Up, _) => {
+                    subcmd_nav!(-1);
+                }
+                RlKeyEvent(RlKeyCode::Down, _) => {
+                    subcmd_nav!(1);
+                }
+                RlKeyEvent(RlKeyCode::Tab, _) | RlKeyEvent(RlKeyCode::Enter, _) => {
+                    // Accept selected subcommand
+                    if let Some(parent) = get_subcmd_parent() {
+                        if let Some(subcmd) = subcmd_picker_selected_command() {
+                            let full_cmd = format!("{} {}", parent, subcmd);
+                            clear_subcmd_overlay();
+                            set_subcmd_pending_execute(Some(full_cmd.clone()));
+                            return Some(RlCmd::Replace(RlMovement::WholeLine, Some(full_cmd)));
                         }
-                        AcceptedSlashEdit::KeepLine => RlCmd::Move(RlMovement::EndOfLine),
-                    });
+                    }
+                    clear_subcmd_overlay();
+                    return None;
+                }
+                RlKeyEvent(RlKeyCode::Esc, _) => {
+                    // Close picker, keep current line
+                    clear_subcmd_overlay();
+                    return Some(RlCmd::Noop);
+                }
+                RlKeyEvent(RlKeyCode::BackTab, _) => {
+                    subcmd_nav!(-1);
+                }
+                RlKeyEvent(RlKeyCode::Char('n'), m) if m.contains(RlModifiers::CTRL) => {
+                    subcmd_nav!(1);
+                }
+                RlKeyEvent(RlKeyCode::Char('p'), m) if m.contains(RlModifiers::CTRL) => {
+                    subcmd_nav!(-1);
+                }
+                // Typing updates the filter
+                RlKeyEvent(RlKeyCode::Char(c), mods)
+                    if !mods.contains(RlModifiers::CTRL) && !mods.contains(RlModifiers::ALT) =>
+                {
+                    if ctx.pos() == ctx.line().len() {
+                        let mut line = ctx.line().to_string();
+                        line.push(*c);
+                        if let Some((parent, filter)) = parse_subcmd_context(&line) {
+                            set_subcmd_picker_selected(0);
+                            let filter_opt = if filter.is_empty() {
+                                None
+                            } else {
+                                Some(filter.as_str())
+                            };
+                            render_subcmd_overlay(parent, filter_opt);
+                        } else {
+                            clear_subcmd_overlay();
+                        }
+                    }
+                    return None; // let rustyline insert the char
+                }
+                RlKeyEvent(RlKeyCode::Backspace, _) => {
+                    if ctx.pos() == ctx.line().len() && !ctx.line().is_empty() {
+                        let mut line = ctx.line().to_string();
+                        line.pop();
+                        if let Some((parent, filter)) = parse_subcmd_context(&line) {
+                            set_subcmd_picker_selected(0);
+                            let filter_opt = if filter.is_empty() {
+                                None
+                            } else {
+                                Some(filter.as_str())
+                            };
+                            render_subcmd_overlay(parent, filter_opt);
+                        } else {
+                            clear_subcmd_overlay();
+                        }
+                    }
+                    return None;
+                }
+                _ => {
+                    clear_subcmd_overlay();
+                    return None;
+                }
+            }
+        }
+
+        // ═══════════════════════════════════════════════════════════════
+        // Main slash picker handling
+        // ═══════════════════════════════════════════════════════════════
+        match key {
+            // Space after a slash command with subcommands → show subcmd picker
+            RlKeyEvent(RlKeyCode::Char(' '), _) if ctx.pos() == ctx.line().len() => {
+                let mut projected = ctx.line().to_string();
+                projected.push(' ');
+                if let Some((parent, filter)) = parse_subcmd_context(&projected) {
+                    if in_slash && active {
+                        // First accept the slash picker selection
+                        let selected = picker_selected_command();
+                        clear_slash_overlay();
+                        if let Some(edit) = accepted_slash_edit(ctx.line(), selected, true) {
+                            match edit {
+                                AcceptedSlashEdit::InsertSuffix(text) => {
+                                    // After inserting, show subcmd picker
+                                    let full_line = format!("{}{}", ctx.line(), text);
+                                    if let Some((p, f)) = parse_subcmd_context(&full_line) {
+                                        set_subcmd_picker_selected(0);
+                                        render_subcmd_overlay(
+                                            p,
+                                            if f.is_empty() { None } else { Some(&f) },
+                                        );
+                                    }
+                                    return Some(RlCmd::Insert(1, text));
+                                }
+                                AcceptedSlashEdit::ReplaceWholeLine(line) => {
+                                    if let Some((p, f)) = parse_subcmd_context(&line) {
+                                        set_subcmd_picker_selected(0);
+                                        render_subcmd_overlay(
+                                            p,
+                                            if f.is_empty() { None } else { Some(&f) },
+                                        );
+                                    }
+                                    return Some(RlCmd::Replace(RlMovement::WholeLine, Some(line)));
+                                }
+                                AcceptedSlashEdit::KeepLine => {
+                                    // Already at a valid command, show subcmd picker
+                                    set_subcmd_picker_selected(0);
+                                    render_subcmd_overlay(
+                                        parent,
+                                        if filter.is_empty() {
+                                            None
+                                        } else {
+                                            Some(&filter)
+                                        },
+                                    );
+                                    return None; // let space be inserted
+                                }
+                            }
+                        }
+                    } else {
+                        // Not in slash picker, but input like `/session ` should show subcmd picker
+                        set_subcmd_picker_selected(0);
+                        render_subcmd_overlay(
+                            parent,
+                            if filter.is_empty() {
+                                None
+                            } else {
+                                Some(&filter)
+                            },
+                        );
+                        return None; // let space be inserted
+                    }
+                } else if in_slash && active {
+                    // Normal space handling for slash picker without subcommands
+                    let current = ctx.line();
+                    let selected = picker_selected_command();
+                    clear_slash_overlay();
+                    if let Some(edit) = accepted_slash_edit(current, selected, true) {
+                        return Some(match edit {
+                            AcceptedSlashEdit::InsertSuffix(text) => RlCmd::Insert(1, text),
+                            AcceptedSlashEdit::ReplaceWholeLine(line) => {
+                                RlCmd::Replace(RlMovement::WholeLine, Some(line))
+                            }
+                            AcceptedSlashEdit::KeepLine => RlCmd::Move(RlMovement::EndOfLine),
+                        });
+                    }
                 }
                 return None;
             }
@@ -1252,9 +1687,38 @@ impl ConditionalEventHandler for SlashStartCompleteHandler {
                             clear_slash_overlay();
                             return Some(RlCmd::Move(RlMovement::EndOfLine));
                         }
-                        _ => {
+                        AcceptedSlashEdit::InsertSuffix(text) => {
                             clear_slash_overlay();
-                            return Some(apply_accepted_slash_edit(edit));
+                            // Check if completed command has subcommands
+                            let projected = format!("{}{}", current, text);
+                            if let Some((parent, filter)) = parse_subcmd_context(&projected) {
+                                set_subcmd_picker_selected(0);
+                                render_subcmd_overlay(
+                                    parent,
+                                    if filter.is_empty() {
+                                        None
+                                    } else {
+                                        Some(&filter)
+                                    },
+                                );
+                            }
+                            return Some(RlCmd::Insert(1, text));
+                        }
+                        AcceptedSlashEdit::ReplaceWholeLine(line) => {
+                            clear_slash_overlay();
+                            // Check if completed command has subcommands
+                            if let Some((parent, filter)) = parse_subcmd_context(&line) {
+                                set_subcmd_picker_selected(0);
+                                render_subcmd_overlay(
+                                    parent,
+                                    if filter.is_empty() {
+                                        None
+                                    } else {
+                                        Some(&filter)
+                                    },
+                                );
+                            }
+                            return Some(RlCmd::Replace(RlMovement::WholeLine, Some(line)));
                         }
                     }
                 }
@@ -1269,6 +1733,23 @@ impl ConditionalEventHandler for SlashStartCompleteHandler {
             RlKeyEvent(RlKeyCode::Tab, _) if !active && ctx.line().is_empty() => {
                 if let Some(hint) = get_followup_prompt_hint() {
                     return Some(RlCmd::Insert(1, hint));
+                }
+            }
+            // Tab with `/cmd ` to trigger subcmd picker
+            RlKeyEvent(RlKeyCode::Tab, _)
+                if !active && ctx.pos() == ctx.line().len() && ctx.line().contains(' ') =>
+            {
+                if let Some((parent, filter)) = parse_subcmd_context(ctx.line()) {
+                    set_subcmd_picker_selected(0);
+                    render_subcmd_overlay(
+                        parent,
+                        if filter.is_empty() {
+                            None
+                        } else {
+                            Some(&filter)
+                        },
+                    );
+                    return Some(RlCmd::Noop);
                 }
             }
             RlKeyEvent(RlKeyCode::BackTab, _) if in_slash && active => {

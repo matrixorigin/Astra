@@ -145,7 +145,7 @@ fn readline_thread_main(
     req_rx: std::sync::mpsc::Receiver<ReadlineRequest>,
     resp_tx: tokio::sync::mpsc::UnboundedSender<ReadlineResponse>,
 ) {
-    use crate::repl_ui::take_slash_pending_execute;
+    use crate::repl_ui::{take_slash_pending_execute, take_subcmd_pending_execute};
 
     while let Ok(req) = req_rx.recv() {
         match req {
@@ -154,7 +154,8 @@ fn readline_thread_main(
 
                 // Capture slash picker result on THIS thread (where the
                 // event handler set it via global state).
-                let pending = take_slash_pending_execute();
+                // Check subcmd picker first (more specific), then slash picker
+                let pending = take_subcmd_pending_execute().or_else(take_slash_pending_execute);
 
                 let _ = resp_tx.send(ReadlineResponse::Line {
                     result,
