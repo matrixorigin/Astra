@@ -1620,14 +1620,33 @@ fn report_turn_failure(
         if !failure.partial.tools_used.is_empty() {
             err_event.tools_used = Some(failure.partial.tools_used.clone());
         }
-        if !failure.partial.stall_events.is_empty() || !failure.partial.verdict_events.is_empty() {
+        // Always populate metadata for post-mortem analysis.
+        {
+            let error_lower = failure.error.to_lowercase();
+            let error_category = if error_lower.contains("timeout") || error_lower.contains("timed out") {
+                "timeout"
+            } else if error_lower.contains("rate limit") || error_lower.contains("429") || error_lower.contains("too many") {
+                "rate_limit"
+            } else if error_lower.contains("connection") || error_lower.contains("network") || error_lower.contains("dns") {
+                "network"
+            } else if error_lower.contains("auth") || error_lower.contains("401") || error_lower.contains("403") {
+                "auth"
+            } else if error_lower.contains("500") || error_lower.contains("502") || error_lower.contains("503") {
+                "server_error"
+            } else {
+                "unknown"
+            };
             err_event.metadata = Some(serde_json::json!({
-                "error_type": "turn_failure",
+                "error_category": error_category,
                 "stall_count": failure.partial.stall_events.len(),
                 "verdict_count": failure.partial.verdict_events.len(),
                 "has_checkpoint": failure.partial.last_heavy_checkpoint.is_some(),
+                "partial_tokens_in": failure.partial.prompt_tokens,
+                "partial_tokens_out": failure.partial.completion_tokens,
+                "partial_tool_calls": failure.partial.tool_calls_count,
             }));
         }
+
 
         let _ = journal.append(&err_event);
         enqueue_ingestion(state, &err_event);
