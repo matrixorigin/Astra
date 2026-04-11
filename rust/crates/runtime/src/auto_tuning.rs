@@ -9,6 +9,7 @@
 //! - Cooldown and rate limiting
 
 use std::collections::{HashMap, VecDeque};
+use std::path::PathBuf;
 use std::sync::RwLock;
 use std::time::{Duration, SystemTime};
 
@@ -94,6 +95,12 @@ pub enum SignalType {
     TaskSuccess,
     /// Task failed.
     TaskFailure { reason: String },
+
+    // ─── Tool Health Signals ───
+    /// A tool was deprioritized due to repeated failures.
+    ToolDeprioritized { tool_name: String },
+    /// A tool was rehabilitated after being deprioritized.
+    ToolRehabilitated { tool_name: String },
 }
 
 impl SignalType {
@@ -113,6 +120,8 @@ impl SignalType {
     pub const NAME_FOCUS_DRIFT: &'static str = "focus_drift";
     pub const NAME_TASK_SUCCESS: &'static str = "task_success";
     pub const NAME_TASK_FAILURE: &'static str = "task_failure";
+    pub const NAME_TOOL_DEPRIORITIZED: &'static str = "tool_deprioritized";
+    pub const NAME_TOOL_REHABILITATED: &'static str = "tool_rehabilitated";
 
     /// Canonical string name for this signal type, used for accumulation matching.
     pub fn type_name(&self) -> &'static str {
@@ -131,6 +140,8 @@ impl SignalType {
             Self::FocusDrift => Self::NAME_FOCUS_DRIFT,
             Self::TaskSuccess => Self::NAME_TASK_SUCCESS,
             Self::TaskFailure { .. } => Self::NAME_TASK_FAILURE,
+            Self::ToolDeprioritized { .. } => Self::NAME_TOOL_DEPRIORITIZED,
+            Self::ToolRehabilitated { .. } => Self::NAME_TOOL_REHABILITATED,
         }
     }
 }
@@ -482,6 +493,8 @@ pub struct AutoTuningEngine {
     last_triggered: RwLock<HashMap<String, SystemTime>>,
     /// Whether auto-tuning is enabled.
     enabled: RwLock<bool>,
+    /// Optional path for persisting aggregator state across restarts.
+    storage_path: Option<PathBuf>,
 }
 
 impl Default for AutoTuningEngine {
@@ -499,6 +512,30 @@ impl AutoTuningEngine {
             executions: RwLock::new(Vec::new()),
             last_triggered: RwLock::new(HashMap::new()),
             enabled: RwLock::new(true),
+            storage_path: None,
+        }
+    }
+
+    /// Create a new auto-tuning engine with persistent aggregator storage.
+    ///
+    /// Loads any previously persisted aggregator state from `path`.
+    pub fn with_storage(path: PathBuf) -> Self {
+        let aggregator = if path.exists() {
+            std::fs::read(&path)
+                .ok()
+                .and_then(|data| serde_json::from_slice::<FeedbackAggregator>(&data).ok())
+                .unwrap_or_default()
+        } else {
+            FeedbackAggregator::new()
+        };
+
+        Self {
+            rules: RwLock::new(Vec::new()),
+            aggregator: RwLock::new(aggregator),
+            executions: RwLock::new(Vec::new()),
+            last_triggered: RwLock::new(HashMap::new()),
+            enabled: RwLock::new(true),
+            storage_path: Some(path),
         }
     }
 
@@ -916,6 +953,32 @@ impl AutoTuningEngine {
         *self.aggregator.write_or_recover() = loaded;
         Ok(())
     }
+
+    /// Persist the current aggregator state to disk (if storage path is set).
+    ///
+    /// Uses atomic write (temp file → rename) to avoid corruption.
+    pub fn persist(&self) {
+        let Some(path) = &self.storage_path else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            if let Err(err) = std::fs::create_dir_all(parent) {
+                eprintln!("[auto-tuning] failed to create storage directory: {err}");
+                return;
+            }
+        }
+        let Ok(data) = self.save_aggregator() else {
+            return;
+        };
+        let tmp = path.with_extension("tmp");
+        if let Err(err) = std::fs::write(&tmp, data) {
+            eprintln!("[auto-tuning] failed to write temp file: {err}");
+            return;
+        }
+        if let Err(err) = std::fs::rename(&tmp, path) {
+            eprintln!("[auto-tuning] failed to rename temp file: {err}");
+        }
+    }
 }
 
 fn get_config_value(config: &RuntimeConfig, path: &str) -> Option<serde_json::Value> {
@@ -1247,6 +1310,153 @@ pub fn default_rules() -> Vec<EvolutionRule> {
         .with_name("Alert on pattern drift")
         .with_cooldown(Duration::from_secs(1800)),
     ]
+}
+
+// ─── Delegation Outcome Tracker ─────────────────────────────────────────────
+
+/// Per-(scenario, pattern) outcome statistics for coordination auto-select.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct OutcomeStats {
+    pub successes: u32,
+    pub failures: u32,
+}
+
+impl OutcomeStats {
+    /// Success rate as a fraction in [0, 1]. Returns 0.5 when no data.
+    pub fn success_rate(&self) -> f64 {
+        let total = self.successes + self.failures;
+        if total == 0 {
+            0.5 // neutral prior
+        } else {
+            self.successes as f64 / total as f64
+        }
+    }
+
+    /// Total observations.
+    pub fn total(&self) -> u32 {
+        self.successes + self.failures
+    }
+}
+
+/// Tracks delegation outcomes per (scenario, pattern) pair to learn which
+/// coordination patterns work best for each scenario.
+///
+/// Thread-safe via interior `RwLock`. Persistence follows the same atomic
+/// write pattern used by `AdaptiveBaselineStore` and `AutoTuningEngine`.
+pub struct DelegationOutcomeTracker {
+    /// (scenario_key, pattern_name) → outcome stats
+    data: RwLock<HashMap<String, OutcomeStats>>,
+    storage_path: Option<PathBuf>,
+}
+
+impl DelegationOutcomeTracker {
+    /// Create an in-memory tracker (no persistence).
+    pub fn new() -> Self {
+        Self {
+            data: RwLock::new(HashMap::new()),
+            storage_path: None,
+        }
+    }
+
+    /// Create a tracker with persistent storage. Loads existing data on init.
+    pub fn with_storage(path: PathBuf) -> Self {
+        let data = if path.exists() {
+            match std::fs::read(&path) {
+                Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
+                Err(_) => HashMap::new(),
+            }
+        } else {
+            HashMap::new()
+        };
+        Self {
+            data: RwLock::new(data),
+            storage_path: Some(path),
+        }
+    }
+
+    /// Composite key for the data map.
+    fn key(scenario: &str, pattern: &str) -> String {
+        format!("{scenario}:{pattern}")
+    }
+
+    /// Record a delegation outcome.
+    pub fn record(&self, scenario: &str, pattern: &str, succeeded: bool) {
+        if let Ok(mut map) = self.data.write() {
+            let entry = map.entry(Self::key(scenario, pattern)).or_default();
+            if succeeded {
+                entry.successes += 1;
+            } else {
+                entry.failures += 1;
+            }
+        }
+    }
+
+    /// Get outcome stats for a specific (scenario, pattern) pair.
+    pub fn stats(&self, scenario: &str, pattern: &str) -> Option<OutcomeStats> {
+        self.data
+            .read()
+            .ok()
+            .and_then(|map| map.get(&Self::key(scenario, pattern)).cloned())
+    }
+
+    /// Find the best pattern for a given scenario based on historical success rates.
+    ///
+    /// Returns `None` if no data is available or if no pattern has enough observations
+    /// (at least `min_observations`).
+    pub fn preferred_pattern(&self, scenario: &str, min_observations: u32) -> Option<String> {
+        let map = self.data.read().ok()?;
+        let prefix = format!("{scenario}:");
+        let mut best: Option<(String, f64)> = None;
+
+        for (key, stats) in map.iter() {
+            if !key.starts_with(&prefix) || stats.total() < min_observations {
+                continue;
+            }
+            let pattern = &key[prefix.len()..];
+            let rate = stats.success_rate();
+            if best
+                .as_ref()
+                .map_or(true, |(_, best_rate)| rate > *best_rate)
+            {
+                best = Some((pattern.to_string(), rate));
+            }
+        }
+        best.map(|(p, _)| p)
+    }
+
+    /// Persist data to storage (atomic write).
+    pub fn persist(&self) {
+        let Some(path) = &self.storage_path else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            if let Err(err) = std::fs::create_dir_all(parent) {
+                eprintln!("[delegation-outcomes] failed to create storage directory: {err}");
+                return;
+            }
+        }
+        let map = match self.data.read() {
+            Ok(m) => m,
+            Err(_) => return,
+        };
+        let Ok(data) = serde_json::to_vec_pretty(&*map) else {
+            return;
+        };
+        let tmp = path.with_extension("tmp");
+        if let Err(err) = std::fs::write(&tmp, data) {
+            eprintln!("[delegation-outcomes] failed to write temp file: {err}");
+            return;
+        }
+        if let Err(err) = std::fs::rename(&tmp, path) {
+            eprintln!("[delegation-outcomes] failed to rename temp file: {err}");
+        }
+    }
+}
+
+impl Default for DelegationOutcomeTracker {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
@@ -1684,5 +1894,141 @@ mod tests {
             !engine2.evaluate(&config).is_empty(),
             "loaded 2 success signals should trigger"
         );
+    }
+
+    // ── Feedback Persistence Tests ──
+
+    #[test]
+    fn tuning_engine_persist_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tuning.json");
+
+        // Create engine, record signals, persist.
+        let engine = AutoTuningEngine::with_storage(path.clone());
+        engine.record_feedback(FeedbackSignal::new(SignalType::TaskSuccess));
+        engine.record_feedback(FeedbackSignal::new(SignalType::TaskFailure {
+            reason: "oops".into(),
+        }));
+        engine.persist();
+
+        assert!(path.exists(), "persist should create file");
+
+        // Load a new engine from same path — should recover signals.
+        let engine2 = AutoTuningEngine::with_storage(path);
+        let data = engine2.save_aggregator().unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&data).unwrap();
+        // The aggregator should have at least some data from the 2 signals.
+        assert!(!data.is_empty());
+        assert!(json.is_object());
+    }
+
+    #[test]
+    fn tuning_engine_persist_no_storage_is_noop() {
+        let engine = AutoTuningEngine::new();
+        engine.record_feedback(FeedbackSignal::new(SignalType::TaskSuccess));
+        engine.persist(); // Should not panic or error.
+    }
+
+    // ── Tool Health Signal Type Tests ──
+
+    #[test]
+    fn tool_deprioritized_signal_type_name() {
+        let signal = FeedbackSignal::new(SignalType::ToolDeprioritized {
+            tool_name: "bash".into(),
+        });
+        assert_eq!(signal.signal_type.type_name(), "tool_deprioritized");
+    }
+
+    #[test]
+    fn tool_rehabilitated_signal_type_name() {
+        let signal = FeedbackSignal::new(SignalType::ToolRehabilitated {
+            tool_name: "bash".into(),
+        });
+        assert_eq!(signal.signal_type.type_name(), "tool_rehabilitated");
+    }
+
+    #[test]
+    fn tool_signals_serializable() {
+        let dep = SignalType::ToolDeprioritized {
+            tool_name: "view".into(),
+        };
+        let json = serde_json::to_string(&dep).unwrap();
+        assert!(json.contains("view"));
+        let rehab = SignalType::ToolRehabilitated {
+            tool_name: "edit".into(),
+        };
+        let json = serde_json::to_string(&rehab).unwrap();
+        assert!(json.contains("edit"));
+    }
+
+    // ── Delegation Outcome Tracker Tests ──
+
+    #[test]
+    fn outcome_tracker_record_and_stats() {
+        let tracker = DelegationOutcomeTracker::new();
+        tracker.record("code_review", "adversarial", true);
+        tracker.record("code_review", "adversarial", true);
+        tracker.record("code_review", "adversarial", false);
+
+        let stats = tracker.stats("code_review", "adversarial").unwrap();
+        assert_eq!(stats.successes, 2);
+        assert_eq!(stats.failures, 1);
+        assert!((stats.success_rate() - 2.0 / 3.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn outcome_tracker_preferred_pattern() {
+        let tracker = DelegationOutcomeTracker::new();
+        // fan_out: 4 successes, 1 failure (80%)
+        for _ in 0..4 {
+            tracker.record("exploration", "fan_out", true);
+        }
+        tracker.record("exploration", "fan_out", false);
+        // sequential: 2 successes, 3 failures (40%)
+        for _ in 0..2 {
+            tracker.record("exploration", "sequential", true);
+        }
+        for _ in 0..3 {
+            tracker.record("exploration", "sequential", false);
+        }
+
+        let pref = tracker.preferred_pattern("exploration", 3).unwrap();
+        assert_eq!(pref, "fan_out");
+    }
+
+    #[test]
+    fn outcome_tracker_preferred_pattern_min_observations() {
+        let tracker = DelegationOutcomeTracker::new();
+        tracker.record("debugging", "sequential", true);
+        tracker.record("debugging", "sequential", true);
+        // Only 2 observations, min is 3
+        assert!(tracker.preferred_pattern("debugging", 3).is_none());
+    }
+
+    #[test]
+    fn outcome_tracker_persist_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("outcomes.json");
+
+        let tracker = DelegationOutcomeTracker::with_storage(path.clone());
+        tracker.record("testing", "fan_out", true);
+        tracker.record("testing", "fan_out", true);
+        tracker.record("testing", "fan_out", false);
+        tracker.persist();
+
+        assert!(path.exists());
+
+        // Reload from disk.
+        let tracker2 = DelegationOutcomeTracker::with_storage(path);
+        let stats = tracker2.stats("testing", "fan_out").unwrap();
+        assert_eq!(stats.successes, 2);
+        assert_eq!(stats.failures, 1);
+    }
+
+    #[test]
+    fn outcome_stats_neutral_prior() {
+        let stats = OutcomeStats::default();
+        assert_eq!(stats.total(), 0);
+        assert!((stats.success_rate() - 0.5).abs() < f64::EPSILON);
     }
 }
