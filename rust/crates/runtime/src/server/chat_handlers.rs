@@ -55,11 +55,7 @@ pub(super) async fn chat_stream_handler(
             sse_json_response(events)
         }
         Err((status, error))
-            if status == StatusCode::NOT_IMPLEMENTED
-                && error
-                    .0
-                    .detail
-                    .contains("Run lifecycle service not configured") =>
+            if astra_services::runs::is_run_lifecycle_unconfigured_error(status, &error.0) =>
         {
             // Fallback path: route /chat/stream through chat-turn bridge when lifecycle
             // service isn't wired yet. This preserves CLI usability during cutover.
@@ -367,6 +363,11 @@ mod tests {
 mod chat_stream_bridge_fallback_tests {
     use std::sync::Arc;
 
+    use astra_core::error_response_coded;
+    use astra_services::runs::{
+        CancelRunRecord, ChatRequestData, ChatRunRecord, ChatStreamRecord, RunLifecycleService,
+        RunListRecord, RunStatusRecord,
+    };
     use async_trait::async_trait;
     use axum::{
         Json,
@@ -552,6 +553,70 @@ mod chat_stream_bridge_fallback_tests {
         capture: Capture,
     }
 
+    #[derive(Clone)]
+    struct StubOtherNotImplementedLifecycle;
+
+    #[async_trait]
+    impl RunLifecycleService for StubOtherNotImplementedLifecycle {
+        async fn create_run(
+            &self,
+            _user_id: String,
+            _request: ChatRequestData,
+        ) -> Result<ChatRunRecord, (StatusCode, Json<ErrorResponse>)> {
+            Err(error_response_coded(
+                StatusCode::NOT_IMPLEMENTED,
+                "Run lifecycle service not configured",
+                "different_not_implemented",
+            ))
+        }
+
+        async fn stream_chat(
+            &self,
+            _user_id: String,
+            _request: ChatRequestData,
+        ) -> Result<ChatStreamRecord, (StatusCode, Json<ErrorResponse>)> {
+            Err(error_response_coded(
+                StatusCode::NOT_IMPLEMENTED,
+                "Run lifecycle service not configured",
+                "different_not_implemented",
+            ))
+        }
+
+        async fn get_run_status(
+            &self,
+            _run_id: String,
+            _user_id: String,
+        ) -> Result<RunStatusRecord, (StatusCode, Json<ErrorResponse>)> {
+            unreachable!()
+        }
+
+        async fn stream_run(
+            &self,
+            _run_id: String,
+            _user_id: String,
+            _last_index: u32,
+        ) -> Result<Vec<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+            unreachable!()
+        }
+
+        async fn cancel_run(
+            &self,
+            _run_id: String,
+            _user_id: String,
+        ) -> Result<CancelRunRecord, (StatusCode, Json<ErrorResponse>)> {
+            unreachable!()
+        }
+
+        async fn list_runs(
+            &self,
+            _user_id: String,
+            _limit: u32,
+            _offset: u32,
+        ) -> Result<RunListRecord, (StatusCode, Json<ErrorResponse>)> {
+            unreachable!()
+        }
+    }
+
     #[async_trait]
     impl ChatTurnBridge for StubChatTurnBridge {
         async fn forward(
@@ -629,6 +694,45 @@ mod chat_stream_bridge_fallback_tests {
         assert_eq!(forwarded["model"], "demo-model");
         assert_eq!(forwarded["messages"][0]["role"], "user");
         assert_eq!(forwarded["messages"][0]["content"], "hi");
+    }
+
+    #[tokio::test]
+    async fn chat_stream_does_not_fall_back_for_other_not_implemented_errors() {
+        let capture = Capture::default();
+        let app = build_app(
+            AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
+                .with_auth_service(Arc::new(StubAuthService))
+                .with_session_service(Arc::new(StubSessionService))
+                .with_run_lifecycle_service(Arc::new(StubOtherNotImplementedLifecycle))
+                .with_chat_turn_bridge_secret("test-secret")
+                .with_chat_turn_bridge(Arc::new(StubChatTurnBridge {
+                    capture: capture.clone(),
+                })),
+        );
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/chat/stream")
+                    .header("authorization", "Bearer good-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"message":"hi","session_id":"s1","model":"demo-model"}"#,
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("response should be returned");
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .expect("body should be readable");
+        let text = String::from_utf8(body.to_vec()).expect("sse should be utf8");
+        assert!(text.contains("\"type\":\"error\""));
+        assert!(!text.contains("\"type\":\"text_delta\""));
+        assert!(capture.body.lock().await.is_none());
     }
 
     #[tokio::test]

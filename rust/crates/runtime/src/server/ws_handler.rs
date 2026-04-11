@@ -472,7 +472,9 @@ async fn handle_chat_message(
             stream_run_over_websocket(socket, state, conn, &run.run_id).await;
             conn.active_run_id = None;
         }
-        Err((status, _err)) if status == StatusCode::NOT_IMPLEMENTED => {
+        Err((status, err))
+            if astra_services::runs::is_run_lifecycle_unconfigured_error(status, &err.0) =>
+        {
             // Lifecycle service not configured — fall back to bridge
             handle_chat_message_via_bridge(
                 socket,

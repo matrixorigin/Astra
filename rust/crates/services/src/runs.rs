@@ -1,6 +1,13 @@
-use astra_core::{ErrorResponse, error_response};
+use astra_core::{ErrorResponse, error_response, error_response_coded};
 use async_trait::async_trait;
 use axum::{Json, http::StatusCode};
+
+pub const RUN_LIFECYCLE_UNCONFIGURED_ERROR_CODE: &str = "run_lifecycle_unconfigured";
+
+pub fn is_run_lifecycle_unconfigured_error(status: StatusCode, error: &ErrorResponse) -> bool {
+    status == StatusCode::NOT_IMPLEMENTED
+        && error.error_code.as_deref() == Some(RUN_LIFECYCLE_UNCONFIGURED_ERROR_CODE)
+}
 
 #[async_trait]
 pub trait RunLifecycleService: Send + Sync {
@@ -464,9 +471,10 @@ impl RunLifecycleService for UnconfiguredRunLifecycleService {
         _user_id: String,
         _request: ChatRequestData,
     ) -> Result<ChatRunRecord, (StatusCode, Json<ErrorResponse>)> {
-        Err(error_response(
+        Err(error_response_coded(
             StatusCode::NOT_IMPLEMENTED,
             "Run lifecycle service not configured",
+            RUN_LIFECYCLE_UNCONFIGURED_ERROR_CODE,
         ))
     }
 
@@ -475,9 +483,10 @@ impl RunLifecycleService for UnconfiguredRunLifecycleService {
         _user_id: String,
         _request: ChatRequestData,
     ) -> Result<ChatStreamRecord, (StatusCode, Json<ErrorResponse>)> {
-        Err(error_response(
+        Err(error_response_coded(
             StatusCode::NOT_IMPLEMENTED,
             "Run lifecycle service not configured",
+            RUN_LIFECYCLE_UNCONFIGURED_ERROR_CODE,
         ))
     }
 
@@ -486,9 +495,10 @@ impl RunLifecycleService for UnconfiguredRunLifecycleService {
         _run_id: String,
         _user_id: String,
     ) -> Result<RunStatusRecord, (StatusCode, Json<ErrorResponse>)> {
-        Err(error_response(
+        Err(error_response_coded(
             StatusCode::NOT_IMPLEMENTED,
             "Run lifecycle service not configured",
+            RUN_LIFECYCLE_UNCONFIGURED_ERROR_CODE,
         ))
     }
 
@@ -498,9 +508,10 @@ impl RunLifecycleService for UnconfiguredRunLifecycleService {
         _user_id: String,
         _last_index: u32,
     ) -> Result<Vec<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-        Err(error_response(
+        Err(error_response_coded(
             StatusCode::NOT_IMPLEMENTED,
             "Run lifecycle service not configured",
+            RUN_LIFECYCLE_UNCONFIGURED_ERROR_CODE,
         ))
     }
 
@@ -509,9 +520,10 @@ impl RunLifecycleService for UnconfiguredRunLifecycleService {
         _run_id: String,
         _user_id: String,
     ) -> Result<CancelRunRecord, (StatusCode, Json<ErrorResponse>)> {
-        Err(error_response(
+        Err(error_response_coded(
             StatusCode::NOT_IMPLEMENTED,
             "Run lifecycle service not configured",
+            RUN_LIFECYCLE_UNCONFIGURED_ERROR_CODE,
         ))
     }
 
@@ -521,9 +533,10 @@ impl RunLifecycleService for UnconfiguredRunLifecycleService {
         _limit: u32,
         _offset: u32,
     ) -> Result<RunListRecord, (StatusCode, Json<ErrorResponse>)> {
-        Err(error_response(
+        Err(error_response_coded(
             StatusCode::NOT_IMPLEMENTED,
             "Run lifecycle service not configured",
+            RUN_LIFECYCLE_UNCONFIGURED_ERROR_CODE,
         ))
     }
 }
@@ -687,5 +700,31 @@ mod tests {
         let out = transform_run_event_for_client(json!({"event_type": "text_delta"}));
         assert_eq!(out["type"], "text_delta");
         assert_eq!(out["content"], "");
+    }
+
+    #[tokio::test]
+    async fn unconfigured_service_uses_stable_error_code() {
+        let service = UnconfiguredRunLifecycleService;
+        let err = service
+            .create_run(
+                "u1".to_string(),
+                ChatRequestData {
+                    message: "hi".to_string(),
+                    session_id: None,
+                    agent_id: None,
+                    model: None,
+                    skill_search: None,
+                    context: None,
+                    max_candidates: 25,
+                    explain: false,
+                },
+            )
+            .await
+            .expect_err("service should be unconfigured");
+        assert!(is_run_lifecycle_unconfigured_error(err.0, &err.1.0));
+        assert_eq!(
+            err.1.0.error_code.as_deref(),
+            Some(RUN_LIFECYCLE_UNCONFIGURED_ERROR_CODE)
+        );
     }
 }
