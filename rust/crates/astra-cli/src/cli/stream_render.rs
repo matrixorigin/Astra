@@ -444,6 +444,20 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                                 pm.record_approval(&t, true);
                             }
                             result
+                        } else if self.quiet {
+                            // Sub-run mode (no terminal): auto-deny permission requests.
+                            // This prevents silent hangs where a background agent waits
+                            // forever for user input that can never come.
+                            //
+                            // The tool will get a denial result and the agent can either:
+                            // - Use an alternative approach
+                            // - Report the permission issue in its output
+                            astra_core::agent_warn!(
+                                "permission",
+                                "Auto-denied {t} in sub-run mode (no interactive terminal): {reason}"
+                            );
+                            pm.record_approval(&t, false);
+                            false
                         } else {
                             // Normal interactive mode: prompt on a blocking thread so we
                             // don't freeze the async SSE consumer.  Rustyline is inactive
@@ -588,6 +602,14 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                                         pm.record_approval(&sandbox_tool_key, true);
                                     }
                                     grant
+                                } else if self.quiet {
+                                    // Sub-run mode: auto-deny sandbox expansion
+                                    astra_core::agent_warn!(
+                                        "permission",
+                                        "Auto-denied sandbox expansion {sandbox_tool_key} in sub-run mode: {reason}"
+                                    );
+                                    pm.record_approval(&sandbox_tool_key, false);
+                                    false
                                 } else {
                                     // Interactive mode: prompt directly
                                     self.render.stop_tool_stderr_running();
