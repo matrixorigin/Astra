@@ -74,7 +74,7 @@ pub(crate) async fn initialize_multi_agent_runtime(
     .with_mailbox_router(mailbox_router.clone());
     state.delegation_engine = Some(std::sync::Arc::new(engine));
 
-    let spawn_executor = spawn_subrun::CliSpawnAgentExecutor::new(
+    let mut spawn_executor = spawn_subrun::CliSpawnAgentExecutor::new(
         api.clone(),
         token,
         project_root,
@@ -83,6 +83,9 @@ pub(crate) async fn initialize_multi_agent_runtime(
     )
     .with_skill_resolver(skill_resolver)
     .with_skill_search(state.skill_search.clone());
+    if let Some(session_id) = state.session_id.clone() {
+        spawn_executor = spawn_executor.with_active_session_id(session_id);
+    }
 
     state.agent_spawner = Some(std::sync::Arc::new(
         astra_runtime::orchestration::DynamicAgentSpawner::with_broadcaster(

@@ -909,8 +909,8 @@ pub fn all_tool_schemas() -> Vec<Value> {
                     "properties": {
                         "dimension": {
                             "type": "string",
-                            "enum": ["capability", "state", "goals", "memory", "identity", "context_snapshot", "context_trend", "all"],
-                            "description": "Which dimension to query. 'capability': tools, skills, tool health. 'state': turn, tokens, scenario, signals. 'goals': session goal, progress, milestones. 'context_snapshot': token budget this turn. 'context_trend': growth across turns. 'identity': agent name/version. 'all': comprehensive self-model view."
+                            "enum": ["capability", "state", "goals", "memory", "identity", "context_snapshot", "context_trend", "snapshot", "profile", "goal", "trace", "budget", "signals", "health", "journal", "verify", "all"],
+                            "description": "Which dimension to query. When a session id is wired, the persistent self surfaces are the source of truth: 'snapshot', 'profile', 'goal', 'trace', 'budget', 'signals', 'health', 'journal', 'verify', and legacy views like 'capability', 'state', 'goals', 'context_snapshot', 'context_trend', 'identity', 'all' are compatibility aliases onto that persisted state."
                         }
                     },
                     "required": ["dimension"]

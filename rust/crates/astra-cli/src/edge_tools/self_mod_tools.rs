@@ -5,6 +5,7 @@ use serde_json::{Value, json};
 use super::ToolExecutor;
 
 impl ToolExecutor {
+    #[allow(unused_assignments)]
     pub(super) fn adjust_config(&self, args: &Value) -> String {
         let path = match args.get("path").and_then(Value::as_str) {
             Some(p) if !p.trim().is_empty() => p.trim(),
@@ -257,6 +258,22 @@ impl ToolExecutor {
             }
         }
 
+        if let Some(session_id) = self.active_session_id.as_deref()
+            && let Some(ref persisted_value) = new_value
+            && let Err(error) = crate::self_command::persist_config_override(
+                session_id,
+                path,
+                persisted_value.clone(),
+            )
+        {
+            return json!({
+                "error": "failed_to_persist_config_override",
+                "path": path,
+                "detail": error,
+            })
+            .to_string();
+        }
+
         counter.1 += 1;
         json!({
             "status": "ok",
@@ -295,6 +312,23 @@ impl ToolExecutor {
         pinned.sort();
         deprioritized.retain(|t| t != &tool);
 
+        if let Some(session_id) = self.active_session_id.as_deref()
+            && let Err(error) =
+                crate::self_command::persist_tool_preferences(session_id, &pinned, &deprioritized)
+        {
+            pinned.retain(|t| t != &tool);
+            if !deprioritized.contains(&tool) {
+                deprioritized.push(tool.clone());
+                deprioritized.sort();
+            }
+            return json!({
+                "error": "failed_to_persist_tool_preferences",
+                "detail": error,
+                "tool": tool,
+            })
+            .to_string();
+        }
+
         json!({
             "status": "ok",
             "prioritized_tool": tool,
@@ -327,6 +361,23 @@ impl ToolExecutor {
         deprioritized.sort();
         pinned.retain(|t| t != &tool);
 
+        if let Some(session_id) = self.active_session_id.as_deref()
+            && let Err(error) =
+                crate::self_command::persist_tool_preferences(session_id, &pinned, &deprioritized)
+        {
+            deprioritized.retain(|t| t != &tool);
+            if !pinned.contains(&tool) {
+                pinned.push(tool.clone());
+                pinned.sort();
+            }
+            return json!({
+                "error": "failed_to_persist_tool_preferences",
+                "detail": error,
+                "tool": tool,
+            })
+            .to_string();
+        }
+
         json!({
             "status": "ok",
             "deprioritized_tool": tool,
@@ -350,6 +401,17 @@ impl ToolExecutor {
                 return json!({"error": "Failed to acquire observability session"}).to_string();
             }
         };
+
+        if let Some(session_id) = self.active_session_id.as_deref()
+            && let Err(error) = crate::self_command::persist_goal_override(session_id, goal)
+        {
+            return json!({
+                "error": "failed_to_persist_goal",
+                "detail": error,
+                "goal": goal,
+            })
+            .to_string();
+        }
 
         session.goal_tracker = Some(GoalTracker::new(goal));
         session.original_query = Some(goal.to_string());
@@ -382,6 +444,20 @@ impl ToolExecutor {
         } else {
             session.turn_number
         };
+
+        if let Some(session_id) = self.active_session_id.as_deref()
+            && let Err(error) =
+                crate::self_command::persist_manual_compression(session_id, turn, reason)
+        {
+            return json!({
+                "error": "failed_to_persist_manual_compression",
+                "detail": error,
+                "turn": turn,
+                "reason": reason,
+            })
+            .to_string();
+        }
+
         session.record_compression(turn);
 
         json!({

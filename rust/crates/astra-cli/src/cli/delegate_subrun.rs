@@ -191,13 +191,18 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             &self.project_root,
         );
 
+        let mut executor = edge_tools::ToolExecutor::new(&effective_root)
+            .with_cloud(self.api.api_origin(), &self.token);
+        if !config.session_id.trim().is_empty() {
+            executor = executor.with_active_session_id(config.session_id.clone());
+        }
+
         let mut host = SubRunHost {
             api: self.api.clone(),
             token: self.token.clone(),
             model: effective_model,
             project_root: effective_root.clone(),
-            executor: edge_tools::ToolExecutor::new(&effective_root)
-                .with_cloud(self.api.api_origin(), &self.token),
+            executor,
             all_schemas,
             valid_tool_names: valid_tool_names.clone(),
             perm_manager,

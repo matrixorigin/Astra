@@ -267,6 +267,12 @@ pub struct WorkspaceMetadata {
     /// Skills discovered during this session.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub discovered_skills: Vec<String>,
+    /// Tools manually pinned by self-modification actions for this session.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pinned_tools: Vec<String>,
+    /// Tools manually deprioritized by self-modification actions for this session.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deprioritized_tools: Vec<String>,
 
     // ─── Adaptive engine state (for resume without oscillation) ───
     /// Last turn where a scenario change occurred (anti-flap cooldown).
@@ -371,6 +377,8 @@ impl WorkspaceMetadata {
             session_goal: None,
             pinned_skills: Vec::new(),
             discovered_skills: Vec::new(),
+            pinned_tools: Vec::new(),
+            deprioritized_tools: Vec::new(),
             last_scenario_change_turn: None,
             last_token_budget_direction: 0,
             last_token_budget_change_turn: None,
@@ -416,6 +424,8 @@ impl WorkspaceMetadata {
             session_goal: None,
             pinned_skills: Vec::new(),
             discovered_skills: Vec::new(),
+            pinned_tools: Vec::new(),
+            deprioritized_tools: Vec::new(),
             last_scenario_change_turn: None,
             last_token_budget_direction: 0,
             last_token_budget_change_turn: None,
@@ -724,6 +734,8 @@ mod tests {
         ws.record_turn(100, 50);
         ws.record_checkpoint();
         ws.mark_completed(Some("Done"));
+        ws.pinned_tools = vec!["bash".into()];
+        ws.deprioritized_tools = vec!["web_fetch".into()];
 
         let yaml = serde_yaml::to_string(&ws).unwrap();
         let parsed: WorkspaceMetadata = serde_yaml::from_str(&yaml).unwrap();
@@ -732,6 +744,8 @@ mod tests {
         assert_eq!(parsed.checkpoints, vec![1]);
         assert_eq!(parsed.status, "completed");
         assert_eq!(parsed.summary, Some("Done".to_string()));
+        assert_eq!(parsed.pinned_tools, vec!["bash".to_string()]);
+        assert_eq!(parsed.deprioritized_tools, vec!["web_fetch".to_string()]);
     }
 
     #[test]
@@ -1038,6 +1052,8 @@ mod tests {
         assert_eq!(ws.active_experiment_id, None);
         assert_eq!(ws.active_variant, None);
         assert_eq!(ws.tuned_config_json, None);
+        assert!(ws.pinned_tools.is_empty());
+        assert!(ws.deprioritized_tools.is_empty());
     }
 
     #[test]
@@ -1060,6 +1076,11 @@ mod tests {
         assert!(
             !yaml.contains("tuned_config_json"),
             "should omit None fields"
+        );
+        assert!(!yaml.contains("pinned_tools"), "should omit empty vectors");
+        assert!(
+            !yaml.contains("deprioritized_tools"),
+            "should omit empty vectors"
         );
     }
 }

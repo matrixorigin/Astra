@@ -110,6 +110,10 @@ pub(crate) enum Command {
     #[command(alias = "sessions")]
     #[command(subcommand)]
     Session(SessionCmd),
+    /// Introspect persistent agent state
+    #[command(name = "self")]
+    #[command(subcommand)]
+    SelfInspect(SelfCmd),
     /// Inspect available models
     #[command(alias = "models")]
     #[command(subcommand)]
@@ -641,6 +645,82 @@ pub(crate) enum SessionCmd {
     Close(SessionShowArgs),
     /// Delete a session record
     Delete(SessionShowArgs),
+}
+
+#[derive(Subcommand, Debug)]
+#[command(
+    after_help = "Examples:\n  astra self snapshot\n  astra self profile 550e8400-e29b-41d4-a716-446655440000\n  astra self mutate preview --path verification.strictness --value 0.8\n  astra self mutate apply --session-id 550e8400-e29b-41d4-a716-446655440000 --path tool_selection.tool_budget_tokens --value 900"
+)]
+pub(crate) enum SelfCmd {
+    /// Full persistent self snapshot for a session
+    Snapshot(SelfSessionArgs),
+    /// Core self-model profile (capabilities, state, goals, constraints)
+    Profile(SelfSessionArgs),
+    /// Goal and plan state for a session
+    Goal(SelfSessionArgs),
+    /// Latest context-assembly trace and selector context
+    Trace(SelfSessionArgs),
+    /// Budget and pressure view for the effective runtime config
+    Budget(SelfSessionArgs),
+    /// Recent adaptive and feedback-like signals
+    Signals(SelfSessionArgs),
+    /// Session-scoped tool health and blocked tool state
+    Health(SelfSessionArgs),
+    /// Recent journal events
+    Journal(SelfJournalArgs),
+    /// Validate persisted self state and tuned config invariants
+    Verify(SelfSessionArgs),
+    /// Preview or apply persistent self mutations
+    #[command(subcommand)]
+    Mutate(SelfMutateCmd),
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct SelfSessionArgs {
+    /// Session id or unique prefix (defaults to the most recent resumable session)
+    pub session_id: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct SelfJournalArgs {
+    /// Session id or unique prefix (defaults to the most recent resumable session)
+    pub session_id: Option<String>,
+    /// Maximum number of recent events to return
+    #[arg(long, default_value_t = 20)]
+    pub limit: usize,
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum SelfMutateCmd {
+    /// Preview a RuntimeConfig mutation without persisting it
+    Preview(SelfMutateConfigArgs),
+    /// Apply a RuntimeConfig mutation to persisted session state
+    Apply(SelfMutateConfigArgs),
+    /// Set the persisted session goal text
+    Goal(SelfMutateGoalArgs),
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct SelfMutateConfigArgs {
+    /// Session id or unique prefix (defaults to the most recent resumable session)
+    #[arg(long)]
+    pub session_id: Option<String>,
+    /// Dotted RuntimeConfig path (for example: verification.strictness)
+    #[arg(long)]
+    pub path: String,
+    /// New value as JSON (falls back to a raw string when not valid JSON)
+    #[arg(long)]
+    pub value: String,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct SelfMutateGoalArgs {
+    /// Session id or unique prefix (defaults to the most recent resumable session)
+    #[arg(long)]
+    pub session_id: Option<String>,
+    /// New session goal text
+    #[arg(long)]
+    pub text: String,
 }
 
 #[derive(Args, Debug)]

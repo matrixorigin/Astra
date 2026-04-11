@@ -125,6 +125,8 @@ mod repl_state;
 mod repl_turn;
 #[path = "cli/repl_ui.rs"]
 mod repl_ui;
+#[path = "cli/self_command.rs"]
+mod self_command;
 #[path = "cli/session_cleanup.rs"]
 mod session_cleanup;
 #[path = "cli/session_guard.rs"]
@@ -1260,6 +1262,7 @@ mod tests {
     mod preamble_tests;
     mod repl_tests;
     mod resume_tests;
+    mod self_command_tests;
     mod slash_command_tests;
     mod stats_tools_tests;
     // ── auth_flow ─────────────────────────────────────────────────────────

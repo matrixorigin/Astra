@@ -41,6 +41,7 @@ pub struct CliSpawnAgentExecutor {
     cancel_token: Option<Arc<tokio_util::sync::CancellationToken>>,
     skill_resolver: Option<Arc<dyn astra_runtime::turn::skill_tool::SkillResolver>>,
     skill_search: SkillSearchSettings,
+    active_session_id: Option<String>,
 }
 
 impl CliSpawnAgentExecutor {
@@ -59,6 +60,7 @@ impl CliSpawnAgentExecutor {
             cancel_token,
             skill_resolver: None,
             skill_search: SkillSearchSettings::default(),
+            active_session_id: None,
         }
     }
 
@@ -72,6 +74,11 @@ impl CliSpawnAgentExecutor {
 
     pub fn with_skill_search(mut self, skill_search: SkillSearchSettings) -> Self {
         self.skill_search = skill_search;
+        self
+    }
+
+    pub fn with_active_session_id(mut self, session_id: impl Into<String>) -> Self {
+        self.active_session_id = Some(session_id.into());
         self
     }
 }
@@ -98,13 +105,18 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
         // Use the working directory from config (may be a worktree)
         let effective_root = config.working_dir.clone();
 
+        let mut executor = edge_tools::ToolExecutor::new(&effective_root)
+            .with_cloud(self.api.api_origin(), &self.token);
+        if let Some(session_id) = self.active_session_id.as_deref() {
+            executor = executor.with_active_session_id(session_id.to_string());
+        }
+
         let mut host = SubRunHost {
             api: self.api.clone(),
             token: self.token.clone(),
             model: Some(config.model.clone()),
             project_root: effective_root.clone(),
-            executor: edge_tools::ToolExecutor::new(&effective_root)
-                .with_cloud(self.api.api_origin(), &self.token),
+            executor,
             all_schemas,
             valid_tool_names: valid_tool_names.clone(),
             perm_manager,

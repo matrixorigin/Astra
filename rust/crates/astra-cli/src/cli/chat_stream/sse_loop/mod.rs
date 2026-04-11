@@ -91,6 +91,11 @@ pub(crate) async fn stream_chat_sse(
     let mut executor = {
         let ex =
             edge_tools::ToolExecutor::new(&project_root).with_cloud(p.api.api_origin(), p.token);
+        let ex = if let Some(session_id) = p.session_id {
+            ex.with_active_session_id(session_id.to_string())
+        } else {
+            ex
+        };
         // Wire session-scoped file journal for cross-turn undo support
         let ex = if let Some(ref journal) = p.file_journal {
             ex.with_shared_file_journal(journal.clone())
@@ -313,18 +318,20 @@ pub(crate) async fn stream_chat_sse(
 
     // Build skill executor — fork sub-runs inherit the resolver for nesting.
     let skill_executor: Option<Arc<dyn astra_runtime::skills::SkillExecutor>> = {
-        let subrun_exec = Arc::new(
-            crate::skill_subrun::CliSkillSubRunExecutor::new(
-                p.api.clone(),
-                p.token.to_string(),
-                p.model.map(|m| m.to_string()),
-                project_root.clone(),
-                parent_perm_mode,
-                parent_cancel_token,
-            )
-            .with_skill_resolver(skill_resolver.clone())
-            .with_skill_search(p.skill_search.clone()),
-        );
+        let mut subrun_exec = crate::skill_subrun::CliSkillSubRunExecutor::new(
+            p.api.clone(),
+            p.token.to_string(),
+            p.model.map(|m| m.to_string()),
+            project_root.clone(),
+            parent_perm_mode,
+            parent_cancel_token,
+        )
+        .with_skill_resolver(skill_resolver.clone())
+        .with_skill_search(p.skill_search.clone());
+        if let Some(session_id) = p.session_id {
+            subrun_exec = subrun_exec.with_active_session_id(session_id.to_string());
+        }
+        let subrun_exec = Arc::new(subrun_exec);
         let isolated = Arc::new(astra_runtime::skills::executor::IsolatedSkillExecutor::new(
             subrun_exec,
         ));

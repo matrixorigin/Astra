@@ -1058,6 +1058,12 @@ pub(super) async fn execute_cli_command(
             Ok(ExitCode::Success)
         }
 
+        Some(Command::SelfInspect(cmd)) => {
+            let body = crate::self_command::execute_self_command(&cmd, profile.as_deref()).await?;
+            print_json_or_raw(&body);
+            Ok(ExitCode::Success)
+        }
+
         Some(Command::Model(ModelCmd::List)) => {
             let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
             let body = api.get_models_text(&token).await.map_err(map_thin_err)?;

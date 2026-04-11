@@ -298,6 +298,8 @@ pub(crate) struct CliSkillSubRunExecutor {
     skill_resolver: Option<std::sync::Arc<dyn astra_runtime::turn::skill_tool::SkillResolver>>,
     /// Same surfacing policy as the parent loop / session state.
     skill_search: SkillSearchSettings,
+    /// Parent interactive session id for self-introspection persistence.
+    active_session_id: Option<String>,
 }
 
 impl CliSkillSubRunExecutor {
@@ -318,6 +320,7 @@ impl CliSkillSubRunExecutor {
             cancel_token,
             skill_resolver: None,
             skill_search: SkillSearchSettings::default(),
+            active_session_id: None,
         }
     }
 
@@ -332,6 +335,11 @@ impl CliSkillSubRunExecutor {
 
     pub fn with_skill_search(mut self, skill_search: SkillSearchSettings) -> Self {
         self.skill_search = skill_search;
+        self
+    }
+
+    pub fn with_active_session_id(mut self, session_id: impl Into<String>) -> Self {
+        self.active_session_id = Some(session_id.into());
         self
     }
 }
@@ -359,13 +367,18 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
         let perm_manager =
             PermissionManager::with_project_mode(self.permission_mode, &self.project_root);
 
+        let mut executor = edge_tools::ToolExecutor::new(&self.project_root)
+            .with_cloud(self.api.api_origin(), &self.token);
+        if let Some(session_id) = self.active_session_id.as_deref() {
+            executor = executor.with_active_session_id(session_id.to_string());
+        }
+
         let mut host = SubRunHost {
             api: self.api.clone(),
             token: self.token.clone(),
             model: effective_model,
             project_root: self.project_root.clone(),
-            executor: edge_tools::ToolExecutor::new(&self.project_root)
-                .with_cloud(self.api.api_origin(), &self.token),
+            executor,
             all_schemas,
             valid_tool_names: valid_tool_names.clone(),
             perm_manager,
