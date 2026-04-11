@@ -1015,8 +1015,30 @@ fn print_delegation_section(entries: &[DelegationHistoryEntry]) {
 fn render_delegation_tree(entries: &[DelegationHistoryEntry]) -> Vec<String> {
     let mut lines = Vec::new();
     for entry in entries {
+        // Build aggregated progress summary: "3/5 done, 1 failed"
+        let done_count = entry
+            .sub_runs
+            .iter()
+            .filter(|s| s.status == "completed" || s.status == "partial")
+            .count();
+        let failed_count = entry
+            .sub_runs
+            .iter()
+            .filter(|s| s.status == "failed" || s.status == "cancelled")
+            .count();
+        let total = entry.total_sub_runs.max(entry.sub_runs.len());
+        let progress = if total > 0 {
+            let mut parts = vec![format!("{}/{}", done_count, total)];
+            if failed_count > 0 {
+                parts.push(format!("{} failed", failed_count));
+            }
+            format!(" ({})", parts.join(", "))
+        } else {
+            String::new()
+        };
+
         lines.push(format!(
-            "{} {} [{}{}]{}",
+            "{} {} [{}{}]{}{}",
             sub_run_status_icon(&entry.status),
             entry.delegation_id,
             entry.pattern,
@@ -1029,6 +1051,7 @@ fn render_delegation_tree(entries: &[DelegationHistoryEntry]) -> Vec<String> {
             } else {
                 String::new()
             },
+            progress,
             entry
                 .parent_run_id
                 .as_ref()
@@ -1136,6 +1159,40 @@ fn build_watch_snapshot(
     delegations: &[DelegationHistoryEntry],
 ) -> String {
     let mut lines = Vec::new();
+
+    // Add overall summary at the top when there are delegations
+    if !delegations.is_empty() {
+        let total_subruns: usize = delegations.iter().map(|d| d.total_sub_runs.max(d.sub_runs.len())).sum();
+        let done_subruns: usize = delegations
+            .iter()
+            .flat_map(|d| &d.sub_runs)
+            .filter(|s| s.status == "completed" || s.status == "partial")
+            .count();
+        let failed_subruns: usize = delegations
+            .iter()
+            .flat_map(|d| &d.sub_runs)
+            .filter(|s| s.status == "failed" || s.status == "cancelled")
+            .count();
+        let running_subruns: usize = delegations
+            .iter()
+            .flat_map(|d| &d.sub_runs)
+            .filter(|s| s.status == "running" || s.status == "created")
+            .count();
+
+        let mut summary_parts = vec![format!("{} delegations", delegations.len())];
+        if total_subruns > 0 {
+            summary_parts.push(format!("{}/{} sub-runs done", done_subruns, total_subruns));
+        }
+        if running_subruns > 0 {
+            summary_parts.push(format!("{} running", running_subruns));
+        }
+        if failed_subruns > 0 {
+            summary_parts.push(format!("{} failed", failed_subruns));
+        }
+        lines.push(format!("  📊 {}", summary_parts.join(" • ")));
+        lines.push(String::new());
+    }
+
     if !agents.is_empty() {
         lines.push(format!("  Spawned agents ({})", agents.len()));
         let forest = AgentTreeNode::build_forest(agents);
