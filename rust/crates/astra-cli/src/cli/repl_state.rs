@@ -243,6 +243,10 @@ pub(crate) struct ReplState {
     // ── Auto-Tuning (M6) ──
     /// Auto-tuning engine for adaptive learning.
     pub auto_tuning_engine: std::sync::Arc<astra_runtime::auto_tuning::AutoTuningEngine>,
+
+    // ── Evolution ──
+    /// Shared evolution service for multi-axis self-evolution.
+    pub evolution_service: Option<std::sync::Arc<astra_runtime::evolution::service::EvolutionService>>,
 }
 
 impl Default for ReplState {
@@ -370,6 +374,7 @@ impl Default for ReplState {
                 }
                 std::sync::Arc::new(engine)
             },
+            evolution_service: None,
         }
     }
 }

@@ -562,6 +562,7 @@ async fn maybe_auto_compact(
         observability_session: obs_session,
         file_journal: Some(state.file_journal.clone()),
         turn_index: state.turn,
+                    evolution_service: state.evolution_service.clone(),
     })
     .await;
 
@@ -827,6 +828,7 @@ async fn run_chat_turn(
             observability_session: obs_session,
             file_journal: Some(state.file_journal.clone()),
             turn_index: state.turn,
+                    evolution_service: state.evolution_service.clone(),
         }) => TurnAttempt::Completed(Box::new(result)),
         _ = tokio::signal::ctrl_c() => {
             // Trigger cancellation to interrupt any in-flight SSE streaming.

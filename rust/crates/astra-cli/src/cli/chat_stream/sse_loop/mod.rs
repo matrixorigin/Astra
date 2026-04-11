@@ -469,7 +469,7 @@ pub(crate) async fn stream_chat_sse(
         delegation_engine: p.delegation_engine,
         project_context,
         checkpoint_gate: None,
-        evolution_service: None,
+        evolution_service: p.evolution_service.clone(),
         data_snapshot_provider: None,
         last_composite_snapshot: None,
         last_measured_prompt_tokens: None,

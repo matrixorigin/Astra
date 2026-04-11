@@ -3233,6 +3233,7 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
             turn_result.edge_tool_round.as_slice()
         };
 
+        let evo_records_before = state.stall.tool_call_records.len();
         {
             let valid_tool_names = host.valid_tool_names().clone();
             let mut term_adapter = HostTerminalAdapter(host);
@@ -3278,7 +3279,7 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                 .max_by_key(|(_, v)| v.invoked_at_turn)
                 .map(|(name, _)| name.clone());
             let active_skill_ref = active_skill.as_deref();
-            for rec in &state.stall.tool_call_records {
+            for rec in &state.stall.tool_call_records[evo_records_before..] {
                 let is_error = !rec.ok;
                 let ctx = crate::evolution::types::ToolResultContext {
                     tool_name: &rec.name,

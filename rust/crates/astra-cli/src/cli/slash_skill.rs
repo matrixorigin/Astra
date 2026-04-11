@@ -1436,6 +1436,146 @@ Follow these steps:
             );
         }
 
+        "evolve" => {
+            let evo = match &state.evolution_service {
+                Some(e) => e,
+                None => {
+                    eprintln!("  {} Evolution service not initialized", "✗".red());
+                    return Ok(());
+                }
+            };
+            if sub_arg.is_empty() {
+                // Show evolution status
+                let signal_count = evo.signal_count().await;
+                let pending = evo.pending().await;
+                let applied = evo.applied().await;
+                eprintln!(
+                    "\n{}",
+                    "─── Evolution Status ─────────────────────────────"
+                        .bold()
+                        .cyan()
+                );
+                eprintln!(
+                    "  {:<20} {}",
+                    "buffered signals:".dim(),
+                    signal_count.to_string().cyan()
+                );
+                eprintln!(
+                    "  {:<20} {}",
+                    "pending proposals:".dim(),
+                    pending.len().to_string().cyan()
+                );
+                eprintln!(
+                    "  {:<20} {}",
+                    "applied proposals:".dim(),
+                    applied.len().to_string().cyan()
+                );
+                if !pending.is_empty() {
+                    eprintln!("\n  {}", "Pending proposals:".yellow());
+                    for p in &pending {
+                        let axis = match &p.axis {
+                            astra_runtime::evolution::types::EvolutionAxis::Skill {
+                                skill_name,
+                                section,
+                                ..
+                            } => format!("skill:{}/{}", skill_name, section.heading()),
+                            astra_runtime::evolution::types::EvolutionAxis::Pattern {
+                                signature,
+                                ..
+                            } => format!("pattern:{signature}"),
+                            astra_runtime::evolution::types::EvolutionAxis::Calibration {
+                                ..
+                            } => "calibration".into(),
+                            astra_runtime::evolution::types::EvolutionAxis::Entity {
+                                entity,
+                                ..
+                            } => format!("entity:{entity}"),
+                        };
+                        eprintln!(
+                            "    {} {} (confidence: {:.0}%)",
+                            p.id.as_str().dim(),
+                            axis.cyan(),
+                            p.confidence * 100.0
+                        );
+                        eprintln!("      {}", p.reasoning.as_str().dim());
+                    }
+                    eprintln!(
+                        "\n  {}",
+                        "Use /skill evolve approve <id> or /skill evolve reject <id>".dim()
+                    );
+                }
+                if !applied.is_empty() {
+                    let recent: Vec<_> = applied.iter().rev().take(5).collect();
+                    eprintln!("\n  {}", "Recent applied (last 5):".green());
+                    for p in recent {
+                        eprintln!("    {} {}", p.id.as_str().dim(), p.reasoning.as_str().dim());
+                    }
+                }
+            } else if let Some(id) = sub_arg.strip_prefix("approve ") {
+                let id = id.trim();
+                match evo.approve(id).await {
+                    Some(p) => {
+                        eprintln!("  {} Approved: {}", "✓".green(), p.id);
+                        // If it's a skill diff, apply it
+                        if let astra_runtime::evolution::types::EvolutionAxis::Skill {
+                            ref skill_name,
+                            ref section,
+                            ref diff,
+                        } = p.axis
+                        {
+                            let skills_dir = astra_runtime::skills::loader::skill_search_paths()
+                                .into_iter()
+                                .next()
+                                .unwrap_or_else(|| {
+                                    std::env::current_dir()
+                                        .unwrap_or_default()
+                                        .join(".astra")
+                                        .join("skills")
+                                });
+                            let store =
+                                astra_runtime::evolution::store::EvolutionStore::new(skills_dir);
+                            match store.apply_skill_diff(skill_name, section, diff) {
+                                Ok(_) => {
+                                    eprintln!(
+                                        "  {} Applied diff to {}/SKILL.md § {}",
+                                        "✓".green(),
+                                        skill_name,
+                                        section.heading()
+                                    );
+                                    let _ = store.mark_applied(skill_name, &p.id);
+                                }
+                                Err(e) => {
+                                    eprintln!("  {} Failed to apply diff: {}", "✗".red(), e);
+                                }
+                            }
+                        }
+                    }
+                    None => {
+                        eprintln!("  {} No pending proposal with id '{}'", "✗".red(), id);
+                    }
+                }
+            } else if let Some(id) = sub_arg.strip_prefix("reject ") {
+                let id = id.trim();
+                match evo.reject(id).await {
+                    Some(_) => eprintln!("  {} Rejected: {}", "✓".green(), id),
+                    None => {
+                        eprintln!("  {} No pending proposal with id '{}'", "✗".red(), id)
+                    }
+                }
+            } else {
+                eprintln!("  {}", "Usage:".yellow());
+                eprintln!("    {}       Show evolution status", "/skill evolve".cyan());
+                eprintln!(
+                    "    {}  Approve a proposal",
+                    "/skill evolve approve <id>".cyan()
+                );
+                eprintln!(
+                    "    {}   Reject a proposal",
+                    "/skill evolve reject <id>".cyan()
+                );
+            }
+        }
+
         _ => {
             eprintln!(
                 "{}",

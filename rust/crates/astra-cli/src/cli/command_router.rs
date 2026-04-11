@@ -257,6 +257,13 @@ async fn execute_repl_bridge_command(
     state.pattern_library = Some(pipeline_modules.pattern_library.clone());
     state.entity_graph = Some(pipeline_modules.entity_graph.clone());
     state.calibrator = Some(pipeline_modules.calibrator.clone());
+
+    // Initialize evolution service with pattern library for drift detection.
+    {
+        let evo = astra_runtime::evolution::service::EvolutionService::new()
+            .with_pattern_library(pipeline_modules.pattern_library.clone());
+        state.evolution_service = Some(std::sync::Arc::new(evo));
+    }
     if let Some(hub) = &state.observability_hub {
         hub.attach_pattern_library(pipeline_modules.pattern_library.clone());
     }
@@ -433,6 +440,7 @@ pub(super) async fn execute_cli_command(
                 observability_session: None,
                 file_journal: None,
                 turn_index: 0,
+                    evolution_service: None,
             })
             .await
             {
@@ -477,6 +485,7 @@ pub(super) async fn execute_cli_command(
                         observability_session: None,
                         file_journal: None,
                         turn_index: 0,
+                    evolution_service: None,
                     })
                     .await
                     .map_err(|f| f.error)?
@@ -862,6 +871,7 @@ pub(super) async fn execute_cli_command(
                 observability_session: None,
                 file_journal: None,
                 turn_index: 0,
+                    evolution_service: None,
             })
             .await
             {
@@ -906,6 +916,7 @@ pub(super) async fn execute_cli_command(
                         observability_session: None,
                         file_journal: None,
                         turn_index: 0,
+                    evolution_service: None,
                     })
                     .await
                     .map_err(|f| f.error)?
@@ -1366,6 +1377,7 @@ pub(super) async fn run_print_mode(
         observability_session: None,
         file_journal: None,
         turn_index: 0,
+                    evolution_service: None,
     })
     .await
     {
@@ -1412,6 +1424,7 @@ pub(super) async fn run_print_mode(
                 observability_session: None,
                 file_journal: None,
                 turn_index: 0,
+                    evolution_service: None,
             })
             .await
             .map_err(|f| f.error)?

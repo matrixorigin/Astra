@@ -14,7 +14,7 @@ pub struct EvolutionService {
     collector: Mutex<SignalCollector>,
     /// Proposals generated but not yet applied (skill axis, pending user approval).
     pending_proposals: Mutex<Vec<EvolutionProposal>>,
-    /// Applied proposals log (for audit/display).
+    /// Applied proposals log (for audit/display). Bounded to last 100.
     applied_log: Mutex<Vec<EvolutionProposal>>,
     /// Optional pattern library for drift detection during flush.
     pattern_library: Option<Arc<std::sync::Mutex<PatternLibrary>>>,
@@ -111,6 +111,12 @@ impl EvolutionService {
             let mut log = self.applied_log.lock().await;
             for p in &fast {
                 log.push(p.clone());
+            }
+            // Bound the log to prevent unbounded growth.
+            const MAX_APPLIED_LOG: usize = 100;
+            if log.len() > MAX_APPLIED_LOG {
+                let excess = log.len() - MAX_APPLIED_LOG;
+                log.drain(..excess);
             }
         }
 

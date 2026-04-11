@@ -133,4 +133,7 @@ pub(crate) struct ChatTurnParams<'a> {
     >,
     /// Current REPL turn number — used to tag journal entries for undo.
     pub(crate) turn_index: u32,
+    /// Shared evolution service for multi-axis self-evolution.
+    pub(crate) evolution_service:
+        Option<Arc<astra_runtime::evolution::service::EvolutionService>>,
 }
