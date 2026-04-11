@@ -1161,6 +1161,19 @@ fn pattern_from_name(
                 timeout_sec: timeout,
             },
         ),
+        "pipeline" => Some(
+            astra_services::coordination::CoordinationPattern::Pipeline {
+                stages: agents
+                    .iter()
+                    .cloned()
+                    .map(|agent_id| astra_services::coordination::PipelineStage {
+                        agent_id,
+                        output_transform: None,
+                    })
+                    .collect(),
+                timeout_sec: timeout,
+            },
+        ),
         "adversarial" if agents.len() >= 2 => Some(
             astra_services::coordination::CoordinationPattern::AdversarialReview {
                 producer_id: agents[0].clone(),
@@ -5204,6 +5217,25 @@ mod tests {
     }
 
     #[test]
+    fn pattern_from_name_pipeline() {
+        let agents = vec!["plan".to_string(), "verify".to_string()];
+        let args = json!({"timeout": 45});
+        let pattern = super::pattern_from_name("pipeline", &agents, &args).unwrap();
+        match pattern {
+            astra_services::coordination::CoordinationPattern::Pipeline {
+                stages,
+                timeout_sec,
+            } => {
+                assert_eq!(timeout_sec, 45);
+                assert_eq!(stages.len(), 2);
+                assert_eq!(stages[0].agent_id, "plan");
+                assert_eq!(stages[1].agent_id, "verify");
+            }
+            _ => panic!("expected Pipeline"),
+        }
+    }
+
+    #[test]
     fn pattern_from_name_unknown_returns_none() {
         let agents = vec!["a".to_string()];
         let args = json!({});
@@ -5231,6 +5263,30 @@ mod tests {
             "history should override scenario heuristic"
         );
         assert_eq!(policy["selection_source"], "outcome_history");
+    }
+
+    #[test]
+    fn select_default_uses_pipeline_history_when_available() {
+        let args = json!({"agents": ["plan", "verify"]});
+        let adaptive_context = super::DelegationAdaptiveContext {
+            scenario: Some(crate::user_profile::Scenario::Testing),
+            preferred_pattern: Some("pipeline".to_string()),
+        };
+        let (pattern, policy) = super::select_default_coordination_pattern(
+            &args,
+            "run staged verification",
+            Some(&adaptive_context),
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                pattern,
+                astra_services::coordination::CoordinationPattern::Pipeline { .. }
+            ),
+            "history should restore learned pipeline preference"
+        );
+        assert_eq!(policy["selection_source"], "outcome_history");
+        assert_eq!(policy["selected_pattern"], "pipeline");
     }
 
     #[test]
