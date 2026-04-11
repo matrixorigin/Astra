@@ -394,6 +394,7 @@ impl MessageTransport for DatabaseTransport {
             addr.clone(),
             delegation_id,
             self.poll_interval,
+            self.max_delivery_attempts,
             tx,
             self.shutdown_rx.clone(),
             Arc::clone(&self.metrics),
@@ -502,6 +503,7 @@ async fn poll_loop(
     addr: AgentAddress,
     delegation_id: Option<String>,
     interval: Duration,
+    max_delivery_attempts: u32,
     tx: mpsc::UnboundedSender<Arc<AgentMessage>>,
     mut shutdown_rx: watch::Receiver<bool>,
     metrics: Arc<TransportMetrics>,
@@ -645,7 +647,34 @@ async fn poll_loop(
                                     .messages_received
                                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 if tx.send(Arc::new(msg)).is_err() {
+                                    metrics
+                                        .poll_errors
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    if let Err(e) = release_claimed_for_consumer_in_pool(
+                                        &pool,
+                                        &consumer_id,
+                                        max_delivery_attempts,
+                                    )
+                                    .await
+                                    {
+                                        eprintln!(
+                                            "  ⚠ messaging: failed to release direct claims after closed channel for {}@{}: {:?}",
+                                            addr.agent_id, addr.run_id, e
+                                        );
+                                    }
                                     return;
+                                }
+                                let row_id = row_id.expect("checked above");
+                                if let Err(e) = mark_direct_acked(&pool, row_id, &consumer_id).await
+                                {
+                                    had_error = true;
+                                    metrics
+                                        .poll_errors
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    eprintln!(
+                                        "  ⚠ messaging: failed to ack delivered direct row {} for {}@{}: {:?}",
+                                        row_id, addr.agent_id, addr.run_id, e
+                                    );
                                 }
                             }
                             Ok(_) | Err(_) => {
@@ -922,6 +951,23 @@ async fn mark_direct_failed(pool: &Pool<MySql>, row_id: i64) -> Result<(), sqlx:
          WHERE id = ? AND is_broadcast = FALSE AND status IN ('pending', 'claimed')",
     )
     .bind(row_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+async fn mark_direct_acked(
+    pool: &Pool<MySql>,
+    row_id: i64,
+    consumer_id: &str,
+) -> Result<(), sqlx::Error> {
+    query(
+        "UPDATE agent_message_queue
+         SET status = 'acked', claimed_by = NULL, claimed_at_ms = NULL
+         WHERE id = ? AND is_broadcast = FALSE AND status = 'claimed' AND claimed_by = ?",
+    )
+    .bind(row_id)
+    .bind(consumer_id)
     .execute(pool)
     .await?;
     Ok(())

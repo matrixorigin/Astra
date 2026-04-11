@@ -98,6 +98,7 @@ mod tests {
                 summary: None,
             },
         ));
+        let message_id = msg.id.clone();
         transport.send(msg).await.unwrap();
 
         // Wait for poll to deliver.
@@ -113,6 +114,30 @@ mod tests {
             }
             other => panic!("expected Text, got: {other:?}"),
         }
+
+        let status = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let row =
+                    sqlx::query("SELECT status, claimed_by, claimed_at_ms FROM agent_message_queue WHERE message_id = ?")
+                        .bind(&message_id)
+                        .fetch_one(&pool)
+                        .await
+                        .unwrap();
+                let status: String = row.try_get("status").unwrap();
+                let claimed_by: Option<String> = row.try_get("claimed_by").unwrap();
+                let claimed_at_ms: Option<i64> = row.try_get("claimed_at_ms").unwrap();
+                if status == "acked" {
+                    assert!(claimed_by.is_none());
+                    assert!(claimed_at_ms.is_none());
+                    break status;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("delivered direct message should eventually be acked");
+
+        assert_eq!(status, "acked");
 
         cleanup(&pool).await;
     }
