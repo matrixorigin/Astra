@@ -21,7 +21,7 @@ use std::time::Instant;
 // CLI formatting utilities
 use super::cli_formatting::{
     colorize_diff_summary, extract_cli_diff_block, format_byte_size, format_duration_suffix,
-    highlight_code_line, shorten_path, truncate_line,
+    shorten_path, truncate_line,
 };
 
 // Effects module types
@@ -716,6 +716,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             let output_summary = self
                 .render
                 .format_output_summary(tool, &output, status)
+                .map(|summary| summary.text)
                 .unwrap_or_default();
             let tool_description = self.render.format_tool_description(tool, args);
             let _ = tx.send(super::chat_stream::StreamEvent::ToolCompleted {
@@ -1086,6 +1087,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 let output_summary = self
                     .render
                     .format_output_summary(&req.tool, &output, status)
+                    .map(|summary| summary.text)
                     .unwrap_or_default();
                 let desc = self.render.format_tool_description(&req.tool, &req.args);
                 let _ = tx.send(super::chat_stream::StreamEvent::ToolCompleted {
@@ -1244,6 +1246,19 @@ pub(super) struct StreamRenderState {
     output_bytes: usize,
     /// Tool batch progress: (current_index, total_count). None when not in batch.
     tool_batch_progress: Option<(usize, usize)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolOutputSummaryKind {
+    Error,
+    Structural,
+    Preview,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ToolOutputSummary {
+    kind: ToolOutputSummaryKind,
+    text: String,
 }
 
 impl StreamRenderState {
@@ -1895,17 +1910,28 @@ impl StreamRenderState {
         // Get smart icon based on status and output analysis.
         let (icon, is_warning) = tool_completion_icon(tool, status, output, duration_ms);
         let extra_line = if status == "error" {
-            let err_msg = output_summary.unwrap_or_else(|| "failed".to_string());
+            let err_msg = output_summary
+                .as_ref()
+                .map(|summary| summary.text.clone())
+                .unwrap_or_else(|| "failed".to_string());
             format!("    {}", err_msg.red())
         } else if is_warning {
             // Show warning context in yellow.
             match output_summary {
-                Some(summary) => format!("    {}", summary.yellow()),
+                Some(summary) => match summary.kind {
+                    ToolOutputSummaryKind::Preview
+                    | ToolOutputSummaryKind::Structural
+                    | ToolOutputSummaryKind::Error => format!("    {}", summary.text.yellow()),
+                },
                 None => String::new(),
             }
         } else {
             match output_summary {
-                Some(summary) => format!("    {}", summary.dim()),
+                Some(summary) => match summary.kind {
+                    ToolOutputSummaryKind::Preview
+                    | ToolOutputSummaryKind::Structural
+                    | ToolOutputSummaryKind::Error => format!("    {}", summary.text.dim()),
+                },
                 None => String::new(),
             }
         };
@@ -1960,16 +1986,27 @@ impl StreamRenderState {
         // Get smart icon based on status and output analysis.
         let (icon, is_warning) = tool_completion_icon(tool, status, output, duration_ms);
         let extra_line = if status == "error" {
-            let err_msg = output_summary.unwrap_or_else(|| "failed".to_string());
+            let err_msg = output_summary
+                .as_ref()
+                .map(|summary| summary.text.clone())
+                .unwrap_or_else(|| "failed".to_string());
             format!("    {}", err_msg.red())
         } else if is_warning {
             match output_summary {
-                Some(summary) => format!("    {}", summary.yellow()),
+                Some(summary) => match summary.kind {
+                    ToolOutputSummaryKind::Preview
+                    | ToolOutputSummaryKind::Structural
+                    | ToolOutputSummaryKind::Error => format!("    {}", summary.text.yellow()),
+                },
                 None => String::new(),
             }
         } else {
             match output_summary {
-                Some(summary) => format!("    {}", summary.dim()),
+                Some(summary) => match summary.kind {
+                    ToolOutputSummaryKind::Preview
+                    | ToolOutputSummaryKind::Structural
+                    | ToolOutputSummaryKind::Error => format!("    {}", summary.text.dim()),
+                },
                 None => String::new(),
             }
         };
@@ -1983,11 +2020,28 @@ impl StreamRenderState {
         self.stderr_lines = self.stderr_lines.saturating_add(out_lines);
     }
 
-    /// Format a detailed summary of tool output.
-    /// Returns multiple lines for richer context — Cursor-style.
-    fn format_output_summary(&self, tool: &str, output: &str, status: &str) -> Option<String> {
+    /// Format tool output for completion UI.
+    /// Preview-like outputs are collapsed to one-line metadata by default,
+    /// while structural summaries and errors keep their extra detail.
+    fn format_output_summary(
+        &self,
+        tool: &str,
+        output: &str,
+        status: &str,
+    ) -> Option<ToolOutputSummary> {
+        let structural = |text: String| ToolOutputSummary {
+            kind: ToolOutputSummaryKind::Structural,
+            text,
+        };
+        let preview = |text: String| ToolOutputSummary {
+            kind: ToolOutputSummaryKind::Preview,
+            text,
+        };
         if status == "error" {
-            return Some(format_tool_error_summary(tool, output));
+            return Some(ToolOutputSummary {
+                kind: ToolOutputSummaryKind::Error,
+                text: format_tool_error_summary(tool, output),
+            });
         }
         let line_count = output.lines().count();
         let byte_size = output.len();
@@ -1996,26 +2050,20 @@ impl StreamRenderState {
                 if output.trim().is_empty() {
                     return None;
                 }
-                // Show first few meaningful lines of output
-                let meaningful: Vec<&str> = output
+                let meaningful_count = output
                     .lines()
                     .map(|l| l.trim())
                     .filter(|l| !l.is_empty())
-                    .take(3)
-                    .collect();
-                if meaningful.is_empty() {
+                    .count();
+                if meaningful_count == 0 {
                     return None;
                 }
-                let mut parts: Vec<String> =
-                    meaningful.iter().map(|l| truncate_line(l, 60)).collect();
-                let remaining = line_count.saturating_sub(3);
-                if remaining > 0 {
-                    parts.push(format!("… +{remaining} more lines"));
-                }
-                Some(parts.join("\n    "))
+                Some(preview(format!(
+                    "{} captured",
+                    pluralize_with_count(meaningful_count, "line", "lines")
+                )))
             }
             "read_file" | "view_file" => {
-                // Show first few lines of file content (like Cursor/Claude Code)
                 // Only skip our metadata lines, not code that happens to start with '['
                 let is_metadata = |l: &&str| {
                     l.starts_with("[Auto-expanded")
@@ -2037,39 +2085,24 @@ impl StreamRenderState {
                     .collect();
 
                 if content_lines.is_empty() {
-                    return Some(format!(
+                    return Some(structural(format!(
                         "{line_count} lines, {}",
                         format_byte_size(byte_size)
-                    ));
+                    )));
                 }
-
-                let mut parts: Vec<String> = content_lines
-                    .iter()
-                    .map(|l| {
-                        let truncated = truncate_line(l, 65);
-                        highlight_code_line(&truncated)
-                    })
-                    .collect();
-                let remaining = total_content_lines.saturating_sub(content_lines.len());
-                if remaining > 0 {
-                    parts.push(format!("{}", format!("… +{remaining} more lines").dim()));
-                }
-                Some(parts.join("\n    "))
+                Some(preview(format!(
+                    "{} read ({})",
+                    pluralize_with_count(total_content_lines, "file line", "file lines"),
+                    format_byte_size(byte_size)
+                )))
             }
             "git_log" => {
-                // Show first few commit summaries
-                let commits: Vec<&str> = output
-                    .lines()
-                    .filter(|l| !l.trim().is_empty())
-                    .take(3)
-                    .collect();
                 let total = output.lines().filter(|l| !l.trim().is_empty()).count();
-                let mut parts: Vec<String> = commits.iter().map(|l| truncate_line(l, 60)).collect();
-                let remaining = total.saturating_sub(3);
-                if remaining > 0 {
-                    parts.push(format!("… +{remaining} more"));
+                if total == 0 {
+                    None
+                } else {
+                    Some(preview(pluralize_with_count(total, "commit", "commits")))
                 }
-                Some(parts.join("\n    "))
             }
             "git_show" | "git_diff" => {
                 // Ignore diff file headers (`+++ b/…`, `--- a/…`) so counts match real hunks.
@@ -2102,7 +2135,7 @@ impl StreamRenderState {
                     format!("{line_count} lines")
                 };
                 if files.is_empty() {
-                    Some(stat)
+                    Some(structural(stat))
                 } else {
                     let mut summary = format!("{stat} in {total_files} file(s)");
                     for f in &files {
@@ -2112,7 +2145,7 @@ impl StreamRenderState {
                     if remaining > 0 {
                         summary.push_str(&format!("\n      … +{remaining} more"));
                     }
-                    Some(summary)
+                    Some(structural(summary))
                 }
             }
             "grep" | "search" => {
@@ -2128,45 +2161,23 @@ impl StreamRenderState {
                         }
                     }
                 }
-                // Show actual match content (first 5 matches with highlighting)
-                let preview_lines: Vec<String> = match_lines
-                    .iter()
-                    .take(5)
-                    .map(|line| {
-                        // Parse "file:line:content" or "file:content" format
-                        let truncated = truncate_line(line, 65);
-                        highlight_code_line(&truncated)
-                    })
-                    .collect();
-
                 if files.is_empty() {
-                    Some(format!("{total} matches"))
+                    Some(preview(pluralize_with_count(total, "match", "matches")))
                 } else {
                     let file_count = files.len();
-                    let mut summary = format!("{total} matches in {file_count} file(s)");
-                    for line in &preview_lines {
-                        summary.push_str(&format!("\n    {line}"));
-                    }
-                    let remaining = total.saturating_sub(5);
-                    if remaining > 0 {
-                        summary.push_str(&format!(
-                            "\n    {}",
-                            format!("… +{remaining} more matches").dim()
-                        ));
-                    }
-                    Some(summary)
+                    Some(preview(format!("{total} matches in {file_count} file(s)")))
                 }
             }
             "write_file" | "str_replace" | "multi_edit" | "delete_file" => {
                 if tool == "delete_file" {
-                    return Some("deleted".to_string());
+                    return Some(structural("deleted".to_string()));
                 }
                 // str_replace: sentinel-wrapped diff; write_file: JSON `_cli_unified_diff` (same as headless preview).
                 let diff_block = extract_cli_diff_block(output);
                 if let Some(ref diff) = diff_block {
                     let colored = colorize_diff_summary(diff.as_ref(), 5);
                     if !colored.is_empty() {
-                        return Some(colored);
+                        return Some(structural(colored));
                     }
                 }
                 // Fallback: check if output itself looks like a diff
@@ -2176,7 +2187,7 @@ impl StreamRenderState {
                 {
                     let colored = colorize_diff_summary(output, 5);
                     if !colored.is_empty() {
-                        return Some(colored);
+                        return Some(structural(colored));
                     }
                 }
                 if tool == "write_file"
@@ -2185,23 +2196,23 @@ impl StreamRenderState {
                 {
                     let bytes =
                         v.get("bytes_written").and_then(|b| b.as_u64()).unwrap_or(0) as usize;
-                    return Some(format!("{} written", format_byte_size(bytes)));
+                    return Some(structural(format!("{} written", format_byte_size(bytes))));
                 }
                 if output.trim().is_empty() {
-                    Some("done".to_string())
+                    Some(structural("done".to_string()))
                 } else {
-                    Some(truncate_line(output.trim(), 60))
+                    Some(structural(truncate_line(output.trim(), 60)))
                 }
             }
             "list_dir" => {
                 let entries = output.lines().filter(|l| !l.trim().is_empty()).count();
-                Some(format!("{entries} entries"))
+                Some(structural(format!("{entries} entries")))
             }
             "glob" => {
                 let files: Vec<&str> = output.lines().filter(|l| !l.trim().is_empty()).collect();
                 let total = files.len();
                 if total == 0 {
-                    Some("no matches".to_string())
+                    Some(structural("no matches".to_string()))
                 } else {
                     // Show file paths with dim styling for directory parts
                     let shown: Vec<String> = files
@@ -2231,60 +2242,50 @@ impl StreamRenderState {
                         summary
                             .push_str(&format!("\n    {}", format!("… +{remaining} more").dim()));
                     }
-                    Some(summary)
+                    Some(structural(summary))
                 }
             }
-            // Skill tool — show first few meaningful output lines
             "skill" => {
                 if output.trim().is_empty() {
                     return None;
                 }
-                let meaningful: Vec<&str> = output
+                let meaningful_count = output
                     .lines()
                     .map(|l| l.trim())
                     .filter(|l| !l.is_empty())
-                    .take(3)
-                    .collect();
-                if meaningful.is_empty() {
+                    .count();
+                if meaningful_count == 0 {
                     return None;
                 }
-                let mut parts: Vec<String> =
-                    meaningful.iter().map(|l| truncate_line(l, 60)).collect();
-                let remaining = line_count.saturating_sub(3);
-                if remaining > 0 {
-                    parts.push(format!("… +{remaining} more lines"));
-                }
-                Some(parts.join("\n    "))
+                Some(preview(format!(
+                    "{} captured",
+                    pluralize_with_count(meaningful_count, "output line", "output lines")
+                )))
             }
-            // MCP tools — show first few output lines (same as bash/skill)
             other if other.starts_with("mcp_") => {
                 if output.trim().is_empty() {
                     return None;
                 }
-                let meaningful: Vec<&str> = output
+                let meaningful_count = output
                     .lines()
                     .map(|l| l.trim())
                     .filter(|l| !l.is_empty())
-                    .take(3)
-                    .collect();
-                if meaningful.is_empty() {
+                    .count();
+                if meaningful_count == 0 {
                     return None;
                 }
-                let mut parts: Vec<String> =
-                    meaningful.iter().map(|l| truncate_line(l, 60)).collect();
-                let remaining = line_count.saturating_sub(3);
-                if remaining > 0 {
-                    parts.push(format!("… +{remaining} more lines"));
-                }
-                Some(parts.join("\n    "))
+                Some(preview(format!(
+                    "{} captured",
+                    pluralize_with_count(meaningful_count, "output line", "output lines")
+                )))
             }
             _ => {
                 if line_count > 1 {
-                    Some(format!("{line_count} lines"))
+                    Some(structural(format!("{line_count} lines")))
                 } else if output.trim().is_empty() {
                     None
                 } else {
-                    Some(truncate_line(output.trim(), 60))
+                    Some(structural(truncate_line(output.trim(), 60)))
                 }
             }
         }
@@ -2297,6 +2298,14 @@ impl StreamRenderState {
         let mut g = self.tool_ui.lock().unwrap_or_else(|e| e.into_inner());
         g.region.clear();
         g.lines.clear();
+    }
+}
+
+fn pluralize_with_count(count: usize, singular: &str, plural: &str) -> String {
+    if count == 1 {
+        format!("1 {singular}")
+    } else {
+        format!("{count} {plural}")
     }
 }
 
@@ -2987,15 +2996,14 @@ mod tests {
     // ── Skill/MCP output summary tests ──
 
     #[test]
-    fn skill_output_summary_shows_lines() {
+    fn skill_output_summary_collapses_preview_lines() {
         let r = StreamRenderState::new();
         let output = "Result line 1\nResult line 2\nResult line 3\nLine 4\nLine 5";
         let summary = r.format_output_summary("skill", output, "ok");
         assert!(summary.is_some());
         let s = summary.unwrap();
-        assert!(s.contains("Result line 1"));
-        assert!(s.contains("Result line 2"));
-        assert!(s.contains("… +2 more lines"));
+        assert_eq!(s.kind, ToolOutputSummaryKind::Preview);
+        assert_eq!(s.text, "5 output lines captured");
     }
 
     #[test]
@@ -3009,14 +3017,14 @@ mod tests {
     }
 
     #[test]
-    fn mcp_output_summary_shows_lines() {
+    fn mcp_output_summary_collapses_preview_lines() {
         let r = StreamRenderState::new();
         let output = "Found 3 repos\nrepo1\nrepo2\nrepo3";
         let summary = r.format_output_summary("mcp_github_search", output, "ok");
         assert!(summary.is_some());
         let s = summary.unwrap();
-        assert!(s.contains("Found 3 repos"));
-        assert!(s.contains("repo1"));
+        assert_eq!(s.kind, ToolOutputSummaryKind::Preview);
+        assert_eq!(s.text, "4 output lines captured");
     }
 
     #[test]
@@ -3026,5 +3034,45 @@ mod tests {
             r.format_output_summary("mcp_github_search", "", "ok")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn bash_output_summary_collapses_preview_lines() {
+        let r = StreamRenderState::new();
+        let summary = r
+            .format_output_summary("bash", "line 1\nline 2\nline 3\nline 4", "ok")
+            .expect("summary");
+        assert_eq!(summary.kind, ToolOutputSummaryKind::Preview);
+        assert_eq!(summary.text, "4 lines captured");
+    }
+
+    #[test]
+    fn grep_output_summary_keeps_only_match_counts() {
+        let r = StreamRenderState::new();
+        let output = "src/a.rs:10:foo\nsrc/a.rs:11:foo\nsrc/b.rs:8:foo";
+        let summary = r
+            .format_output_summary("grep", output, "ok")
+            .expect("summary");
+        assert_eq!(summary.kind, ToolOutputSummaryKind::Preview);
+        assert_eq!(summary.text, "3 matches in 2 file(s)");
+    }
+
+    #[test]
+    fn git_diff_output_summary_stays_structural() {
+        let r = StreamRenderState::new();
+        let output = "\
+diff --git a/src/a.rs b/src/a.rs\n\
+--- a/src/a.rs\n\
++++ b/src/a.rs\n\
+@@ -1 +1 @@\n\
+-old\n\
++new\n";
+        let summary = r
+            .format_output_summary("git_diff", output, "ok")
+            .expect("summary");
+        assert_eq!(summary.kind, ToolOutputSummaryKind::Structural);
+        assert!(summary.text.contains("+1"));
+        assert!(summary.text.contains("-1"));
+        assert!(summary.text.contains("src/a.rs"));
     }
 }
