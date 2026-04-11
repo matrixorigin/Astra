@@ -43,6 +43,9 @@ const TOOL_RESULT_AUDIT_CHARS: usize = 4000;
 /// Safety limit for SSE frame buffer. Prevents OOM if a client is slow or a
 /// response is unexpectedly large. 16 MB accommodates any realistic SSE stream.
 const MAX_SSE_BUFFER_BYTES: usize = 16 * 1024 * 1024;
+/// Cap buffered non-SSE error bodies so upstream 5xx/JSON responses cannot
+/// force unbounded memory growth while we normalize them into a local SSE error.
+const MAX_BRIDGE_ERROR_BODY_BYTES: usize = 16 * 1024;
 
 fn synthesized_session_info_event(session_id: &str, run_id: Option<&str>) -> serde_json::Value {
     let mut event = serde_json::json!({
@@ -116,6 +119,37 @@ fn bridge_error_sse_response(status: StatusCode, message: impl Into<String>) -> 
             ),
     });
     sse_stream_response(StatusCode::OK, Body::from(render_sse_json(event)))
+}
+
+async fn read_bridge_error_body_excerpt<S, E>(mut stream: S, max_bytes: usize) -> String
+where
+    S: futures_util::Stream<Item = Result<Bytes, E>> + Unpin,
+{
+    use futures_util::StreamExt;
+
+    let mut collected = Vec::new();
+    let mut truncated = false;
+    while let Some(chunk) = stream.next().await {
+        let Ok(chunk) = chunk else {
+            break;
+        };
+        let remaining = max_bytes.saturating_sub(collected.len());
+        if remaining == 0 {
+            truncated = true;
+            break;
+        }
+        if chunk.len() > remaining {
+            collected.extend_from_slice(&chunk[..remaining]);
+            truncated = true;
+            break;
+        }
+        collected.extend_from_slice(&chunk);
+    }
+    let mut text = String::from_utf8_lossy(&collected).into_owned();
+    if truncated {
+        text.push_str("\n… [truncated]");
+    }
+    text
 }
 
 fn build_max_rounds_turn_complete_event(
@@ -334,7 +368,11 @@ impl ChatTurnBridge for HttpChatTurnBridge {
             self.circuit_breaker.record_failure();
         }
         if !is_sse {
-            let error_body = response.text().await.unwrap_or_default();
+            let error_body = read_bridge_error_body_excerpt(
+                response.bytes_stream(),
+                MAX_BRIDGE_ERROR_BODY_BYTES,
+            )
+            .await;
             return Ok(bridge_error_sse_response(
                 status,
                 bridge_error_sse_message(status, &error_body),
@@ -1120,6 +1158,24 @@ mod tests {
         let (is_success, should_trip_breaker) = bridge_http_response_health(StatusCode::OK, false);
         assert!(!is_success);
         assert!(should_trip_breaker);
+    }
+
+    #[tokio::test]
+    async fn non_sse_error_body_excerpt_is_capped() {
+        use futures_util::stream;
+
+        let chunk = "x".repeat((MAX_BRIDGE_ERROR_BODY_BYTES / 2) + 10);
+        let text = read_bridge_error_body_excerpt(
+            stream::iter(vec![
+                Ok::<Bytes, std::io::Error>(Bytes::from(chunk.clone())),
+                Ok::<Bytes, std::io::Error>(Bytes::from(chunk)),
+            ]),
+            MAX_BRIDGE_ERROR_BODY_BYTES,
+        )
+        .await;
+
+        assert!(text.len() <= MAX_BRIDGE_ERROR_BODY_BYTES + "\n… [truncated]".len());
+        assert!(text.ends_with("\n… [truncated]"));
     }
 
     #[tokio::test]
