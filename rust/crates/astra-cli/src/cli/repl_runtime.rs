@@ -523,7 +523,7 @@ pub(super) fn build_repl_editor() -> Result<(Editor<ReplHelper, FileHistory>, Pa
     Ok((editor, hist_path))
 }
 
-pub(super) fn initialize_repl_state(
+pub(crate) fn initialize_repl_state(
     profile: Option<&str>,
     initial_model: Option<&str>,
 ) -> ReplState {
@@ -552,10 +552,15 @@ pub(super) fn initialize_repl_state(
         }
 
         // Restore session-level state from workspace.yaml (goal, pinned/discovered skills)
-        if let Ok(ws) = astra_services::session_workspace::read_workspace(sid) {
-            state.session_goal = ws.session_goal;
-            state.pinned_skills = ws.pinned_skills.into_iter().collect();
-            state.discovered_skills = ws.discovered_skills.into_iter().collect();
+        match astra_services::session_workspace::read_workspace(sid) {
+            Ok(ws) => {
+                state.session_goal = ws.session_goal;
+                state.pinned_skills = ws.pinned_skills.into_iter().collect();
+                state.discovered_skills = ws.discovered_skills.into_iter().collect();
+            }
+            Err(e) => {
+                eprintln!("  ⚠ Failed to restore workspace state for session {sid}: {e}");
+            }
         }
     }
     if let Some(m) = initial_model {

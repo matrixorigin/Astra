@@ -1,4 +1,5 @@
 use super::*;
+use crate::cli_utils::{CredentialsFile, Profile, save_credentials};
 
 // ── slash_task::find_task_by_query ────────────────────────────────────────────────────
 
@@ -160,6 +161,77 @@ total_tokens_out: 3
 
     // Note: The user ownership check in handle_resume_command only verifies
     // that the journal exists, not that the user owns it. This is a known limitation.
+}
+
+#[tokio::test]
+async fn resume_initialize_repl_state_restores_workspace_session_state() {
+    let _creds = isolate_credentials();
+
+    let sid = format!("test-session-state-{}", uuid::Uuid::new_v4());
+
+    let writer = session_journal::JournalWriter::new(&sid).unwrap();
+    writer
+        .append(&session_journal::JournalEvent::session_start(
+            Some(&sid),
+            Some("gpt-4o"),
+        ))
+        .unwrap();
+    writer
+        .append(&session_journal::JournalEvent::turn(
+            Some(&sid),
+            1,
+            None,
+            "resume this session",
+            "ok",
+            0,
+            5,
+            3,
+            50,
+        ))
+        .unwrap();
+    drop(writer);
+
+    let mut ws = astra_services::session_workspace::WorkspaceMetadata::with_context(
+        &sid,
+        "gpt-4o",
+        "/tmp",
+        Some("main"),
+    );
+    ws.turn_count = 1;
+    ws.total_tokens_in = 5;
+    ws.total_tokens_out = 3;
+    ws.session_goal = Some("ship session restore".to_string());
+    ws.pinned_skills = vec![
+        "session-lifecycle".to_string(),
+        "goal-driven-evolution".to_string(),
+    ];
+    ws.discovered_skills = vec![
+        "episodic-memory".to_string(),
+        "knowledge-graph-reasoning".to_string(),
+    ];
+    astra_services::session_workspace::write_workspace(&ws).unwrap();
+
+    let mut creds = CredentialsFile::default();
+    creds.profiles.insert(
+        "default".to_string(),
+        Profile {
+            last_session_id: Some(sid.clone()),
+            ..Default::default()
+        },
+    );
+    save_credentials(&creds).unwrap();
+
+    let state = repl_runtime::initialize_repl_state(None, None);
+    assert_eq!(state.session_id, Some(sid));
+    assert_eq!(state.session_goal.as_deref(), Some("ship session restore"));
+    assert!(state.pinned_skills.contains("session-lifecycle"));
+    assert!(state.pinned_skills.contains("goal-driven-evolution"));
+    assert!(state.discovered_skills.contains("episodic-memory"));
+    assert!(
+        state
+            .discovered_skills
+            .contains("knowledge-graph-reasoning")
+    );
 }
 
 // ── Learning snapshot restoration ────────────────────────────────────────
