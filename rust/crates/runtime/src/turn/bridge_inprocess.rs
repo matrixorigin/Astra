@@ -1531,8 +1531,39 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                     add_message_cache_breakpoint(&mut llm_messages, &cache_cfg);
 
                     // Emit system prompt breakdown so CLI can record precise per-component trace.
+                    let skill_injections: Vec<crate::turn::context_assembly_trace::SkillInjection> =
+                        edge_profile
+                            .get("active_skills")
+                            .and_then(Value::as_array)
+                            .map(|arr| {
+                                let names: Vec<&str> = arr.iter().filter_map(Value::as_str).collect();
+                                if names.is_empty() {
+                                    vec![]
+                                } else {
+                                    // Total tokens for the skill hint section, split evenly
+                                    let hint_tokens = prompts::estimate_str_tokens(&skill_hint) as u32;
+                                    let per = hint_tokens / names.len().max(1) as u32;
+                                    names.iter().map(|name| crate::turn::context_assembly_trace::SkillInjection {
+                                        skill_name: name.to_string(),
+                                        skill_version: None,
+                                        tokens: per,
+                                        selection_reason: "active_output_skill".into(),
+                                    }).collect()
+                                }
+                            })
+                            .unwrap_or_default();
+                    let memory_injections: Vec<crate::turn::context_assembly_trace::MemoryInjection> =
+                        memory_preview.iter().enumerate().map(|(i, line)| {
+                            crate::turn::context_assembly_trace::MemoryInjection {
+                                memory_id: format!("prefetch-{i}"),
+                                memory_type: "hybrid_retrieval".into(),
+                                tokens: prompts::estimate_str_tokens(line) as u32,
+                                relevance_score: 0.0,
+                                content_preview: line.chars().take(100).collect(),
+                            }
+                        }).collect();
                     let breakdown = prompts::build_system_prompt_trace(
-                        &prompt_sections, vec![], vec![],
+                        &prompt_sections, skill_injections, memory_injections,
                     );
                     yield render_sse(&json!({
                         "type": "context_meta",
