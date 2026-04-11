@@ -236,10 +236,7 @@ fn parse_subcmd_context(line: &str) -> Option<(&'static str, String)> {
     Some((resolved, rest.to_string()))
 }
 
-fn filtered_subcmd_rows(
-    parent: &str,
-    filter: Option<&str>,
-) -> Vec<(&'static str, &'static str)> {
+fn filtered_subcmd_rows(parent: &str, filter: Option<&str>) -> Vec<(&'static str, &'static str)> {
     let Some(subs) = command_registry::subcommand_completions(parent) else {
         return vec![];
     };
@@ -1737,7 +1734,7 @@ impl ConditionalEventHandler for SlashStartCompleteHandler {
                     return Some(RlCmd::Move(RlMovement::EndOfLine));
                 }
             }
-            RlKeyEvent(RlKeyCode::Tab, _) => {
+            RlKeyEvent(RlKeyCode::Tab, _) if !active && ctx.line().is_empty() => {
                 if let Some(cmd) = followup_tab_accept_command(ctx.line(), active) {
                     return Some(cmd);
                 }
