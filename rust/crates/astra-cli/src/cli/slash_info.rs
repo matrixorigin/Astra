@@ -1970,6 +1970,10 @@ fn print_context_breakdown(
     );
 
     let tb = &trace.token_budget;
+    let sp = &trace.system_prompt;
+    let hist = &trace.history;
+    let tools = &trace.tools;
+
     let components: &[(&str, u32)] = &[
         ("system_prompt", tb.system_prompt_tokens),
         ("history", tb.history_tokens),
@@ -1996,6 +2000,53 @@ fn print_context_breakdown(
             pct,
             bar.dim()
         );
+
+        // Sub-components for system_prompt
+        if *label == "system_prompt" && sp.total_tokens > 0 {
+            let subs: &[(&str, u32)] = &[
+                ("base_persona", sp.base_persona_tokens),
+                ("environment", sp.environment_tokens),
+                ("preferences", sp.user_preferences_tokens),
+            ];
+            for (sub, t) in subs {
+                if *t > 0 {
+                    eprintln!("    {:<14} {:>5}", format!("└ {sub}").dim(), t.to_string().dim());
+                }
+            }
+            for sk in &sp.skills_injected {
+                eprintln!("    {:<14} {:>5}", format!("└ skill:{}", sk.skill_name).dim(), sk.tokens.to_string().dim());
+            }
+            for mem in &sp.repository_memories {
+                let preview: String = mem.content_preview.chars().take(30).collect();
+                eprintln!("    {:<14} {:>5}  {}", format!("└ memory").dim(), mem.tokens.to_string().dim(), preview.dim());
+            }
+        }
+
+        // Sub-components for history
+        if *label == "history" && !hist.turns_retained.is_empty() {
+            for tr in &hist.turns_retained {
+                let role_char = match tr.role.as_str() {
+                    "user" => "U",
+                    "assistant" => "A",
+                    _ => "?",
+                };
+                let tc = if tr.has_tool_calls { " 🔧" } else { "" };
+                eprintln!("    {:<14} {:>5}", format!("└ t{} {role_char}{tc}", tr.turn_index).dim(), tr.tokens.to_string().dim());
+            }
+            if !hist.turns_dropped.is_empty() {
+                eprintln!("    {}", format!("└ {} turns dropped", hist.turns_dropped.len()).dim());
+            }
+            if hist.compression_ratio > 0.0 && hist.compression_ratio < 1.0 {
+                eprintln!("    {}", format!("└ compressed {:.0}%", (1.0 - hist.compression_ratio) * 100.0).dim());
+            }
+        }
+
+        // Sub-components for tool_schemas
+        if *label == "tool_schemas" && !tools.tools_selected.is_empty() {
+            for ts in &tools.tools_selected {
+                eprintln!("    {:<14} {:>5}", format!("└ {}", ts.tool_name).dim(), ts.tokens.to_string().dim());
+            }
+        }
     }
 
     let pressure_str = format!("{:.0}%", tb.budget_pressure * 100.0);
@@ -2019,42 +2070,24 @@ fn print_context_breakdown(
         }
     );
 
-    // Skills injected
-    if !trace.system_prompt.skills_injected.is_empty() {
-        eprintln!("\n  {}", "Skills:".bold());
-        for sk in &trace.system_prompt.skills_injected {
-            eprintln!(
-                "    {} {} ({} tok) — {}",
-                "•".dim(),
-                sk.skill_name.clone().cyan(),
-                sk.tokens,
-                sk.selection_reason.clone().dim()
-            );
-        }
-    }
-
-    // Tool selection
-    let ts = &trace.tools;
-    if !ts.tools_selected.is_empty() {
+    // Tool selection summary
+    if !tools.tools_selected.is_empty() {
         eprintln!(
             "\n  {} {} tools via {} (conf={:.0}%)",
             "Tools:".bold(),
-            ts.tools_selected.len(),
-            ts.selection_strategy.clone().dim(),
-            ts.selection_confidence * 100.0
+            tools.tools_selected.len(),
+            tools.selection_strategy.clone().dim(),
+            tools.selection_confidence * 100.0
         );
     }
-
-    // Memory
-    let mem = &trace.memory;
-    if mem.candidates_considered > 0 {
+    if trace.memory.candidates_considered > 0 {
         eprintln!(
             "\n  {} {} considered → {} selected ({} tok, {}ms)",
             "Memory:".bold(),
-            mem.candidates_considered,
-            mem.memories_selected.len(),
-            mem.total_tokens,
-            mem.retrieval_latency_ms
+            trace.memory.candidates_considered,
+            trace.memory.memories_selected.len(),
+            trace.memory.total_tokens,
+            trace.memory.retrieval_latency_ms
         );
     }
 
