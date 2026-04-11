@@ -1007,6 +1007,14 @@ impl InProcessChatTurnBridge {
     }
 }
 
+fn inprocess_session_info_event(session_id: &str, run_id: &str) -> Value {
+    json!({
+        "type": "session_info",
+        "session_id": session_id,
+        "run_id": run_id,
+    })
+}
+
 #[async_trait::async_trait]
 impl ChatTurnBridge for InProcessChatTurnBridge {
     async fn forward(
@@ -1103,7 +1111,7 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                 .map(|t| crate::turn::llm_client::CancelOnClientDisconnect::new(t.clone()));
             let turn_started = Instant::now();
             // Emit session_info first
-            yield render_sse(&json!({"type": "session_info", "session_id": session_id}));
+            yield render_sse(&inprocess_session_info_event(&session_id, &turn_chain_id));
 
             let bridge_e2e = bridge_e2e_capture;
             let use_e2e_llm = bridge_e2e.as_ref().map(|r| !r.is_empty()).unwrap_or(false);
@@ -4047,6 +4055,14 @@ mod tests {
             header_str(&headers, "x-mo-user-id").as_deref(),
             Some("user-123")
         );
+    }
+
+    #[test]
+    fn inprocess_session_info_event_includes_run_id() {
+        let event = inprocess_session_info_event("sess-1", "run-1");
+        assert_eq!(event["type"], "session_info");
+        assert_eq!(event["session_id"], "sess-1");
+        assert_eq!(event["run_id"], "run-1");
     }
 
     #[test]
