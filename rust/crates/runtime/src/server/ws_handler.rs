@@ -617,7 +617,8 @@ fn next_run_stream_index(event: &Value, current: u32) -> u32 {
 
 fn lifecycle_event_to_ws_payload(event: &Value) -> Option<Value> {
     match event.get("event_type").and_then(Value::as_str) {
-        Some("run_started" | "run_finished") => None,
+        Some("run_started") => None,
+        Some("run_finished") => usage_payload_from_run_finished(event),
         Some(_) => {
             let mut payload = astra_services::runs::transform_run_event_for_client(event.clone());
             if let Some(index) = event.get("index").cloned()
@@ -629,6 +630,32 @@ fn lifecycle_event_to_ws_payload(event: &Value) -> Option<Value> {
         }
         None => Some(event.clone()),
     }
+}
+
+fn usage_payload_from_run_finished(event: &Value) -> Option<Value> {
+    let data = event.get("data")?.as_object()?;
+    let mut payload =
+        serde_json::Map::from_iter([("type".to_string(), Value::String("usage".to_string()))]);
+    let mut has_usage = false;
+
+    for key in [
+        "prompt_tokens",
+        "completion_tokens",
+        "cache_read_tokens",
+        "cache_creation_tokens",
+        "tool_call_count",
+    ] {
+        if let Some(value) = data.get(key).cloned() {
+            payload.insert(key.to_string(), value);
+            has_usage = true;
+        }
+    }
+
+    if let Some(index) = event.get("index").cloned() {
+        payload.insert("index".to_string(), index);
+    }
+
+    has_usage.then(|| Value::Object(payload))
 }
 
 async fn best_effort_cancel_run(state: &AppState, conn: &WsConnection, run_id: &str) {
@@ -1583,14 +1610,32 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_event_to_ws_payload_skips_wrapped_events() {
+    fn lifecycle_event_to_ws_payload_skips_run_started_and_preserves_terminal_usage() {
         let run_started = serde_json::json!({"event_type": "run_started", "data": {}});
-        let run_finished = serde_json::json!({"event_type": "run_finished", "data": {}});
+        let run_finished = serde_json::json!({
+            "event_type": "run_finished",
+            "data": {
+                "prompt_tokens": 7,
+                "completion_tokens": 3,
+                "tool_call_count": 2,
+                "cancelled": true
+            },
+            "index": 5
+        });
         let text_delta = serde_json::json!({"type": "text_delta", "content": "hi", "index": 2});
         let agent_progress = serde_json::json!({"event_type": "agent_progress", "data": {"agent_id": "a1"}, "index": 4});
 
         assert!(lifecycle_event_to_ws_payload(&run_started).is_none());
-        assert!(lifecycle_event_to_ws_payload(&run_finished).is_none());
+        assert_eq!(
+            lifecycle_event_to_ws_payload(&run_finished).unwrap(),
+            serde_json::json!({
+                "type": "usage",
+                "prompt_tokens": 7,
+                "completion_tokens": 3,
+                "tool_call_count": 2,
+                "index": 5
+            })
+        );
         assert_eq!(
             lifecycle_event_to_ws_payload(&text_delta).unwrap()["type"],
             "text_delta"
