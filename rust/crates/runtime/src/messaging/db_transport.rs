@@ -243,11 +243,18 @@ impl DatabaseTransport {
     /// Acknowledge a message — marks it as 'acked' in the database.
     ///
     /// Called by the receiver after processing the message.
-    pub async fn ack_message(&self, message_id: &str) -> Result<bool, MailboxError> {
+    pub async fn ack_message(
+        &self,
+        message_id: &str,
+        consumer_id: &str,
+    ) -> Result<bool, MailboxError> {
         let result = query(
-            "UPDATE agent_message_queue SET status = 'acked' WHERE message_id = ? AND status = 'claimed'",
+            "UPDATE agent_message_queue
+             SET status = 'acked', claimed_by = NULL, claimed_at_ms = NULL
+             WHERE message_id = ? AND status = 'claimed' AND claimed_by = ?",
         )
         .bind(message_id)
+        .bind(consumer_id)
         .execute(&self.pool)
         .await
         .map_err(|e| MailboxError::Transport(format!("ack: {e}")))?;
@@ -255,11 +262,18 @@ impl DatabaseTransport {
     }
 
     /// Negatively acknowledge a message — marks it as 'failed' in the database.
-    pub async fn nack_message(&self, message_id: &str) -> Result<bool, MailboxError> {
+    pub async fn nack_message(
+        &self,
+        message_id: &str,
+        consumer_id: &str,
+    ) -> Result<bool, MailboxError> {
         let result = query(
-            "UPDATE agent_message_queue SET status = 'failed' WHERE message_id = ? AND status = 'claimed'",
+            "UPDATE agent_message_queue
+             SET status = 'failed', claimed_by = NULL, claimed_at_ms = NULL
+             WHERE message_id = ? AND status = 'claimed' AND claimed_by = ?",
         )
         .bind(message_id)
+        .bind(consumer_id)
         .execute(&self.pool)
         .await
         .map_err(|e| MailboxError::Transport(format!("nack: {e}")))?;

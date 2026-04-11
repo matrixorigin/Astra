@@ -428,6 +428,170 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ack_message_requires_matching_consumer_and_clears_claim_metadata() {
+        skip_without_db!(pool);
+
+        let transport =
+            DatabaseTransport::new(pool.clone()).with_poll_interval(Duration::from_millis(50));
+
+        let sender = addr("run-db-ack-a", "alice");
+        let receiver = addr("run-db-ack-b", "bob");
+        let right_consumer = format!("{}@{}", receiver.agent_id, receiver.run_id);
+        let wrong_consumer = "mallory@run-db-ack-z";
+
+        transport.register(sender.clone(), None).await.unwrap();
+        transport.register(receiver.clone(), None).await.unwrap();
+
+        let msg = Arc::new(AgentMessage::new(
+            sender.clone(),
+            MessageTarget::Direct {
+                address: receiver.clone(),
+            },
+            MessagePayload::Text {
+                content: "ack me".into(),
+                summary: None,
+            },
+        ));
+        let message_id = msg.id.clone();
+        transport.send(msg).await.unwrap();
+
+        sqlx::query(
+            "UPDATE agent_message_queue
+             SET status = 'claimed', claimed_by = ?, claimed_at_ms = ?
+             WHERE message_id = ?",
+        )
+        .bind(&right_consumer)
+        .bind(chrono::Utc::now().timestamp_millis())
+        .bind(&message_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert!(
+            !transport
+                .ack_message(&message_id, wrong_consumer)
+                .await
+                .unwrap(),
+            "wrong consumer must not ack someone else's claim"
+        );
+
+        let row = sqlx::query(
+            "SELECT status, claimed_by, claimed_at_ms
+             FROM agent_message_queue
+             WHERE message_id = ?",
+        )
+        .bind(&message_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let status: String = row.try_get("status").unwrap();
+        let claimed_by: Option<String> = row.try_get("claimed_by").unwrap();
+        let claimed_at_ms: Option<i64> = row.try_get("claimed_at_ms").unwrap();
+        assert_eq!(status, "claimed");
+        assert_eq!(claimed_by.as_deref(), Some(right_consumer.as_str()));
+        assert!(claimed_at_ms.is_some());
+
+        assert!(
+            transport
+                .ack_message(&message_id, &right_consumer)
+                .await
+                .unwrap()
+        );
+
+        let row = sqlx::query(
+            "SELECT status, claimed_by, claimed_at_ms
+             FROM agent_message_queue
+             WHERE message_id = ?",
+        )
+        .bind(&message_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let status: String = row.try_get("status").unwrap();
+        let claimed_by: Option<String> = row.try_get("claimed_by").unwrap();
+        let claimed_at_ms: Option<i64> = row.try_get("claimed_at_ms").unwrap();
+        assert_eq!(status, "acked");
+        assert!(claimed_by.is_none());
+        assert!(claimed_at_ms.is_none());
+
+        cleanup(&pool).await;
+    }
+
+    #[tokio::test]
+    async fn nack_message_requires_matching_consumer_and_clears_claim_metadata() {
+        skip_without_db!(pool);
+
+        let transport =
+            DatabaseTransport::new(pool.clone()).with_poll_interval(Duration::from_millis(50));
+
+        let sender = addr("run-db-nack-a", "alice");
+        let receiver = addr("run-db-nack-b", "bob");
+        let right_consumer = format!("{}@{}", receiver.agent_id, receiver.run_id);
+        let wrong_consumer = "mallory@run-db-nack-z";
+
+        transport.register(sender.clone(), None).await.unwrap();
+        transport.register(receiver.clone(), None).await.unwrap();
+
+        let msg = Arc::new(AgentMessage::new(
+            sender.clone(),
+            MessageTarget::Direct {
+                address: receiver.clone(),
+            },
+            MessagePayload::Text {
+                content: "nack me".into(),
+                summary: None,
+            },
+        ));
+        let message_id = msg.id.clone();
+        transport.send(msg).await.unwrap();
+
+        sqlx::query(
+            "UPDATE agent_message_queue
+             SET status = 'claimed', claimed_by = ?, claimed_at_ms = ?
+             WHERE message_id = ?",
+        )
+        .bind(&right_consumer)
+        .bind(chrono::Utc::now().timestamp_millis())
+        .bind(&message_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert!(
+            !transport
+                .nack_message(&message_id, wrong_consumer)
+                .await
+                .unwrap(),
+            "wrong consumer must not nack someone else's claim"
+        );
+
+        assert!(
+            transport
+                .nack_message(&message_id, &right_consumer)
+                .await
+                .unwrap()
+        );
+
+        let row = sqlx::query(
+            "SELECT status, claimed_by, claimed_at_ms
+             FROM agent_message_queue
+             WHERE message_id = ?",
+        )
+        .bind(&message_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let status: String = row.try_get("status").unwrap();
+        let claimed_by: Option<String> = row.try_get("claimed_by").unwrap();
+        let claimed_at_ms: Option<i64> = row.try_get("claimed_at_ms").unwrap();
+        assert_eq!(status, "failed");
+        assert!(claimed_by.is_none());
+        assert!(claimed_at_ms.is_none());
+
+        cleanup(&pool).await;
+    }
+
+    #[tokio::test]
     async fn current_claim_fetch_excludes_preexisting_claimed_rows() {
         skip_without_db!(pool);
 
