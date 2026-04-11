@@ -261,9 +261,9 @@ pub fn find_suggestions<'a>(input: &str, candidates: &[&'a str], limit: usize) -
 ///     Try: /model to see available models
 /// ```
 pub fn format_not_found_error(
-    entity_type: &str,   // "Model", "Session", "Skill", etc.
-    name: &str,          // The name that wasn't found
-    suggestions: &[&str], // Fuzzy-matched candidates
+    entity_type: &str,          // "Model", "Session", "Skill", etc.
+    name: &str,                 // The name that wasn't found
+    suggestions: &[&str],       // Fuzzy-matched candidates
     hint_command: Option<&str>, // e.g. "/model", "/session list"
 ) {
     eprintln!(
@@ -331,7 +331,11 @@ pub fn format_permission_error(operation: &str, reason: Option<&str>) {
         eprintln!("    {}", r.dim());
     }
 
-    eprintln!("    {} {}", "Try:".dim(), "/allow to adjust permission mode".cyan());
+    eprintln!(
+        "    {} {}",
+        "Try:".dim(),
+        "/allow to adjust permission mode".cyan()
+    );
 }
 
 /// Format a connection/API error with troubleshooting steps.
@@ -344,14 +348,22 @@ pub fn format_permission_error(operation: &str, reason: Option<&str>) {
 ///     • Try: /diagnostics to troubleshoot
 /// ```
 pub fn format_api_error(error: &str, endpoint: Option<&str>) {
-    eprintln!("  {} API request failed: {}", theme::icon_err(), error.red());
+    eprintln!(
+        "  {} API request failed: {}",
+        theme::icon_err(),
+        error.red()
+    );
 
     if let Some(ep) = endpoint {
         eprintln!("    {} {}", "Endpoint:".dim(), ep);
     }
 
     eprintln!("    {} Check your internet connection", "•".dim());
-    eprintln!("    {} {}", "Try:".dim(), "/diagnostics to troubleshoot".cyan());
+    eprintln!(
+        "    {} {}",
+        "Try:".dim(),
+        "/diagnostics to troubleshoot".cyan()
+    );
 }
 
 /// Format a configuration error with fix suggestions.
@@ -363,9 +375,17 @@ pub fn format_api_error(error: &str, endpoint: Option<&str>) {
 ///     Try: /config reset to restore defaults
 /// ```
 pub fn format_config_error(file: &str, detail: &str) {
-    eprintln!("  {} Configuration error in {}", theme::icon_err(), file.red());
+    eprintln!(
+        "  {} Configuration error in {}",
+        theme::icon_err(),
+        file.red()
+    );
     eprintln!("    {}", detail.dim());
-    eprintln!("    {} {}", "Try:".dim(), "/config reset to restore defaults".cyan());
+    eprintln!(
+        "    {} {}",
+        "Try:".dim(),
+        "/config reset to restore defaults".cyan()
+    );
 }
 
 /// Format a generic error with optional context and suggestion.
@@ -491,7 +511,11 @@ mod tests {
 
     #[test]
     fn suggest_models_wrapper() {
-        let models = vec!["gpt-4".to_string(), "gpt-4o".to_string(), "claude-3".to_string()];
+        let models = vec![
+            "gpt-4".to_string(),
+            "gpt-4o".to_string(),
+            "claude-3".to_string(),
+        ];
         let suggestions = suggest_models("gpt", &models);
         assert!(suggestions.contains(&"gpt-4".to_string()));
     }

@@ -31,7 +31,8 @@ use crate::FernetTokenEncryptor;
 use crate::MatrixOneSettings;
 use crate::pipeline::step_recorder::StepRecorder;
 use crate::turn::agentic_loop_host::{
-    AgenticLoopOutcome, AgenticLoopState, run_agentic_loop_with_host,
+    AgenticLoopOutcome, AgenticLoopState, CancellationState, MessagingState, SkillState,
+    StopHookState, run_agentic_loop_with_host,
 };
 
 use astra_core::{
@@ -278,58 +279,35 @@ impl AgenticRunLifecycleService {
             step_recorder: StepRecorder::new(session_id, run_id),
             idempotency_cache: InMemoryIdempotencyCache::new(),
             semantic_dedup: SemanticDedup::new(0.75),
-            turn_sigs: Vec::new(),
-            turn_tool_names: Vec::new(),
-            stall_events: Vec::new(),
-            intent_tool_turns: Vec::new(),
-            verdict_events: Vec::new(),
-            last_heavy_checkpoint: None,
-            tool_call_records: Vec::new(),
-            forced_factual_retry: false,
-            explain_turns: Vec::new(),
-            first_ttft_ms: None,
-            all_tools_used: std::collections::HashSet::new(),
-            first_selection_report: None,
-            first_budget_pressure: 0.0,
-            first_context_assembly_ms: None,
-            first_memoria_ms: None,
-            first_selector_ms: None,
-            first_selector_strategy: None,
-            first_selector_confidence: None,
-            selector_tokens_in: 0,
-            selector_tokens_out: 0,
-            all_selected_skills: Vec::new(),
+            stall: Default::default(),
+            telemetry: Default::default(),
+            skills: SkillState {
+                registry_for_activation: skill_registry,
+                resolver: skill_resolver,
+                quality_tracker: crate::skills::quality::SkillQualityTracker::new(),
+                improvement_tracker: crate::skills::improvement::ImprovementTracker::new(),
+                search: skill_search,
+                tool_event_hooks,
+                session_event_hooks,
+                ..Default::default()
+            },
+            hooks: StopHookState {
+                stop_hooks: hook_sets.stop_hooks,
+                teammate_idle_hooks: hook_sets.teammate_idle_hooks,
+                workspace_root_hint,
+                ..Default::default()
+            },
+            cancellation: Default::default(),
+            messaging: Default::default(),
+            error_recovery: Default::default(),
             message: request.message.clone(),
             recent_tools: Vec::new(),
             task_profile,
             api: astra_thin_client::ThinClient::new("http://127.0.0.1:1", None)
                 .expect("valid dummy URL"),
             api_token: String::new(),
-            cancel_flag: None,
-            cancel_token: None,
             delegation_engine: None,
-            skill_registry_for_activation: skill_registry,
-            skill_resolver,
-            skill_executor: None, // fork execution requires CLI; inline skills work
-            skill_model_override: None,
-            skill_effort: None,
-            skill_agent_type: None,
-            skill_allowed_tools: None,
-            skill_sandbox_policy: None,
-            skill_quality_tracker: crate::skills::quality::SkillQualityTracker::new(),
-            skill_improvement_tracker: crate::skills::improvement::ImprovementTracker::new(),
-            pinned_skills: std::collections::HashSet::new(),
-            discovered_skills: std::collections::HashSet::new(),
-            skill_search,
-            tool_event_hooks,
-            session_event_hooks,
-            stop_hooks: hook_sets.stop_hooks,
-            stop_hook_runs: 0,
-            teammate_idle_hooks: hook_sets.teammate_idle_hooks,
-            teammate_idle_hook_runs: 0,
-            workspace_root_hint,
-            consecutive_same_error: 0,
-            last_error_category: None,
+            project_context: None,
             checkpoint_gate: None,
             data_snapshot_provider: None,
             last_composite_snapshot: None,
@@ -338,21 +316,9 @@ impl AgenticRunLifecycleService {
             max_turn_input_tokens: astra_core::RuntimeLimits::global().max_turn_input_tokens,
             budget_wrapup_injected: false,
             thinking_budget_tokens: None,
-            skill_listing_message: None,
-            invoked_skills: std::collections::HashMap::new(),
             recent_file_reads: Vec::new(),
-            turn_trace_collector: None,
-            project_context: None,
-            mailbox: None,
-            ack_tracker: None,
-            dead_letter_queue: None,
-            messaging_metrics: None,
-            progress_emitter: None,
             permission_context: None,
             permission_handler: None,
-            observability_session: None,
-            observability_hub: None,
-            completed_turns_for_tuning: 0,
         }
     }
 
@@ -452,8 +418,8 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         let edge_profile = Self::extract_edge_profile(&request);
         let mut host = self.build_host(&user_id, &session_id, &request, edge_tools, edge_profile);
         let mut loop_state = self.build_initial_state(&request, &session_id, &run_id);
-        loop_state.cancel_flag = Some(cancel_flag);
-        loop_state.cancel_token = Some(llm_cancel_token);
+        loop_state.cancellation.flag = Some(cancel_flag);
+        loop_state.cancellation.token = Some(llm_cancel_token);
         loop_state.delegation_engine = self.delegation_engine.clone();
 
         // Clone handles we need inside the spawned task.
@@ -466,7 +432,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
 
             // Fire SessionEnd hooks (best-effort, non-blocking).
             crate::skills::hooks::fire_session_end(
-                &loop_state.session_event_hooks,
+                &loop_state.skills.session_event_hooks,
                 loop_state.current_session_id.as_deref().unwrap_or(""),
             )
             .await;
@@ -519,11 +485,13 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 }
                 Err(err) => {
                     let user_cancelled = loop_state
-                        .cancel_flag
+                        .cancellation
+                        .flag
                         .as_ref()
                         .is_some_and(|f| f.load(Ordering::Relaxed))
                         || loop_state
-                            .cancel_token
+                            .cancellation
+                            .token
                             .as_ref()
                             .is_some_and(|t| t.is_cancelled())
                         || err.contains("LLM call cancelled");
@@ -621,7 +589,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
 
         // Fire SessionEnd hooks (best-effort).
         crate::skills::hooks::fire_session_end(
-            &state.session_event_hooks,
+            &state.skills.session_event_hooks,
             state.current_session_id.as_deref().unwrap_or(""),
         )
         .await;
@@ -1026,58 +994,41 @@ impl SubRunExecutor for ServerSubRunExecutor {
             step_recorder: StepRecorder::new(&config.session_id, &config.run_id),
             idempotency_cache: InMemoryIdempotencyCache::new(),
             semantic_dedup: SemanticDedup::new(0.75),
-            turn_sigs: Vec::new(),
-            turn_tool_names: Vec::new(),
-            stall_events: Vec::new(),
-            intent_tool_turns: Vec::new(),
-            verdict_events: Vec::new(),
-            last_heavy_checkpoint: None,
-            tool_call_records: Vec::new(),
-            forced_factual_retry: false,
-            explain_turns: Vec::new(),
-            first_ttft_ms: None,
-            all_tools_used: std::collections::HashSet::new(),
-            first_selection_report: None,
-            first_budget_pressure: 0.0,
-            first_context_assembly_ms: None,
-            first_memoria_ms: None,
-            first_selector_ms: None,
-            first_selector_strategy: None,
-            first_selector_confidence: None,
-            selector_tokens_in: 0,
-            selector_tokens_out: 0,
-            all_selected_skills: Vec::new(),
+            stall: Default::default(),
+            telemetry: Default::default(),
+            skills: SkillState {
+                registry_for_activation: skill_registry,
+                resolver: skill_resolver,
+                quality_tracker: crate::skills::quality::SkillQualityTracker::new(),
+                improvement_tracker: crate::skills::improvement::ImprovementTracker::new(),
+                search: skill_search_from_context(&config.context),
+                tool_event_hooks,
+                session_event_hooks,
+                ..Default::default()
+            },
+            hooks: StopHookState {
+                stop_hooks: hook_sets.stop_hooks,
+                teammate_idle_hooks: hook_sets.teammate_idle_hooks,
+                workspace_root_hint,
+                ..Default::default()
+            },
+            cancellation: CancellationState {
+                flag: config.pause_flag.clone(),
+                token: None,
+            },
+            messaging: MessagingState {
+                mailbox: config.mailbox,
+                ..Default::default()
+            },
+            error_recovery: Default::default(),
             message: full_task,
             recent_tools: Vec::new(),
             task_profile,
             api: astra_thin_client::ThinClient::new("http://127.0.0.1:1", None)
                 .expect("valid dummy URL"),
             api_token: String::new(),
-            cancel_flag: config.pause_flag.clone(),
-            cancel_token: None,
             delegation_engine: None,
-            skill_registry_for_activation: skill_registry,
-            skill_resolver,
-            skill_executor: None, // fork execution requires CLI; inline skills work
-            skill_model_override: None,
-            skill_effort: None,
-            skill_agent_type: None,
-            skill_allowed_tools: None,
-            skill_sandbox_policy: None,
-            skill_quality_tracker: crate::skills::quality::SkillQualityTracker::new(),
-            skill_improvement_tracker: crate::skills::improvement::ImprovementTracker::new(),
-            pinned_skills: std::collections::HashSet::new(),
-            discovered_skills: std::collections::HashSet::new(),
-            skill_search: skill_search_from_context(&config.context),
-            tool_event_hooks,
-            session_event_hooks,
-            stop_hooks: hook_sets.stop_hooks,
-            stop_hook_runs: 0,
-            teammate_idle_hooks: hook_sets.teammate_idle_hooks,
-            teammate_idle_hook_runs: 0,
-            workspace_root_hint,
-            consecutive_same_error: 0,
-            last_error_category: None,
+            project_context: None,
             checkpoint_gate: config.checkpoint_gate.clone(),
             data_snapshot_provider: None,
             last_composite_snapshot: None,
@@ -1086,28 +1037,16 @@ impl SubRunExecutor for ServerSubRunExecutor {
             max_turn_input_tokens: astra_core::RuntimeLimits::global().max_turn_input_tokens,
             budget_wrapup_injected: false,
             thinking_budget_tokens: None,
-            skill_listing_message: None,
-            invoked_skills: std::collections::HashMap::new(),
             recent_file_reads: Vec::new(),
-            turn_trace_collector: None,
-            project_context: None,
-            mailbox: config.mailbox,
-            ack_tracker: None,
-            dead_letter_queue: None,
-            messaging_metrics: None,
-            progress_emitter: None,
             permission_context: None,
             permission_handler: None,
-            observability_session: None,
-            observability_hub: None,
-            completed_turns_for_tuning: 0,
         };
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut loop_state).await;
 
         // Fire SessionEnd hooks (best-effort).
         crate::skills::hooks::fire_session_end(
-            &loop_state.session_event_hooks,
+            &loop_state.skills.session_event_hooks,
             loop_state.current_session_id.as_deref().unwrap_or(""),
         )
         .await;
@@ -1462,7 +1401,7 @@ mod tests {
         assert_eq!(state.max_turns, 5);
         assert_eq!(state.remaining_turns, 5);
         assert_eq!(state.message, "write a test");
-        assert!(state.cancel_token.is_none());
+        assert!(state.cancellation.token.is_none());
     }
 
     #[test]
@@ -1497,10 +1436,10 @@ mod tests {
         );
 
         let state = svc.build_initial_state(&req, "s", "r");
-        assert_eq!(state.stop_hooks.len(), 1);
-        assert_eq!(state.stop_hooks[0].label, "cloud_hook");
+        assert_eq!(state.hooks.stop_hooks.len(), 1);
+        assert_eq!(state.hooks.stop_hooks[0].label, "cloud_hook");
         assert_eq!(
-            state.workspace_root_hint.as_deref(),
+            state.hooks.workspace_root_hint.as_deref(),
             Some(dir.path().to_str().unwrap())
         );
     }

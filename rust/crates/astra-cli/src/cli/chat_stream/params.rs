@@ -128,8 +128,9 @@ pub(crate) struct ChatTurnParams<'a> {
         Arc<std::sync::RwLock<astra_runtime::observability_integration::ObservabilitySession>>,
     >,
     /// Session-scoped file edit journal — shared with ToolExecutors for undo support.
-    pub(crate) file_journal:
-        Option<std::sync::Arc<std::sync::Mutex<astra_runtime::turn::file_edit_journal::FileEditJournal>>>,
+    pub(crate) file_journal: Option<
+        std::sync::Arc<std::sync::Mutex<astra_runtime::turn::file_edit_journal::FileEditJournal>>,
+    >,
     /// Current REPL turn number — used to tag journal entries for undo.
     pub(crate) turn_index: u32,
 }

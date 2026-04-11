@@ -341,7 +341,8 @@ pub struct ToolExecutor {
         Option<std::sync::Arc<tokio::sync::RwLock<crate::mcp_client::McpClientManager>>>,
     /// File edit journal — records before-state of every file write for undo.
     /// Wrapped in Arc so the REPL session can share the journal across turns.
-    pub file_journal: std::sync::Arc<std::sync::Mutex<astra_runtime::turn::file_edit_journal::FileEditJournal>>,
+    pub file_journal:
+        std::sync::Arc<std::sync::Mutex<astra_runtime::turn::file_edit_journal::FileEditJournal>>,
     /// Current turn index for file journal entries. Set externally per-turn.
     pub journal_turn_index: std::sync::atomic::AtomicU32,
     /// Active worktree session state. When set, `effective_project_root()` returns
@@ -431,7 +432,9 @@ impl ToolExecutor {
     /// Use a shared file edit journal (session-scoped) instead of the default.
     pub fn with_shared_file_journal(
         mut self,
-        journal: std::sync::Arc<std::sync::Mutex<astra_runtime::turn::file_edit_journal::FileEditJournal>>,
+        journal: std::sync::Arc<
+            std::sync::Mutex<astra_runtime::turn::file_edit_journal::FileEditJournal>,
+        >,
     ) -> Self {
         self.file_journal = journal;
         self

@@ -42,7 +42,7 @@ fn rate_limit_cooldown() -> &'static PerModelCooldown {
 }
 
 fn llm_cancel_for_state(state: &AgenticLoopState) -> LlmCancel<'_> {
-    match (&state.cancel_flag, &state.cancel_token) {
+    match (&state.cancellation.flag, &state.cancellation.token) {
         (Some(f), Some(t)) => LlmCancel::FlagAndToken(f.as_ref(), t.as_ref()),
         (Some(f), None) => LlmCancel::Flag(f.as_ref()),
         (None, Some(t)) => LlmCancel::Token(t.as_ref()),
@@ -402,9 +402,9 @@ impl ServerAgenticLoopHost {
 
         // Post-compaction: re-inject invoked skill instructions (truncated)
         // so the LLM retains skill context after history summarization.
-        if !state.invoked_skills.is_empty() {
+        if !state.skills.invoked.is_empty() {
             let mut builder = crate::turn::cloud::attachments::AttachmentBuilder::new();
-            let mut skills: Vec<_> = state.invoked_skills.values().collect();
+            let mut skills: Vec<_> = state.skills.invoked.values().collect();
             skills.sort_by(|a, b| b.invoked_at_turn.cmp(&a.invoked_at_turn));
             for skill in skills {
                 builder.add_skill(&skill.name, &skill.content);
@@ -425,7 +425,7 @@ impl ServerAgenticLoopHost {
         }
 
         // Ephemeral skill listing: injected per-turn, not stored in state.messages.
-        if let Some(ref listing) = state.skill_listing_message {
+        if let Some(ref listing) = state.skills.listing_message {
             llm_messages.push(listing.clone());
         }
 
@@ -474,7 +474,8 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         // ── 1. Resolve LLM model ────────────────────────────────────────
         // Skill-level model override takes precedence over the host-level one.
         let effective_model_override = state
-            .skill_model_override
+            .skills
+            .model_override
             .as_deref()
             .or(self.model_override.as_deref());
         let pool_ref = self.shared_pool.as_ref().map(|sp| sp.get());
@@ -575,13 +576,13 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
 
         // Append skill-level hints (effort, agent_type) when active.
         let mut system_prompt = system_prompt;
-        if let Some(ref effort) = state.skill_effort {
+        if let Some(ref effort) = state.skills.effort {
             system_prompt.push_str(&format!(
                 "\n\n## Effort Level\nThe active skill requests effort level: **{effort}**. \
                  Adjust thoroughness accordingly.",
             ));
         }
-        if let Some(ref agent_type) = state.skill_agent_type {
+        if let Some(ref agent_type) = state.skills.agent_type {
             system_prompt.push_str(&format!(
                 "\n\n## Agent Type\nYou are acting as a **{agent_type}** agent for this skill.",
             ));
@@ -1221,58 +1222,20 @@ mod tests {
             step_recorder: StepRecorder::new("test-session", "test-task"),
             idempotency_cache: InMemoryIdempotencyCache::new(),
             semantic_dedup: SemanticDedup::new(0.75),
-            turn_sigs: Vec::new(),
-            turn_tool_names: Vec::new(),
-            stall_events: Vec::new(),
-            intent_tool_turns: Vec::new(),
-            verdict_events: Vec::new(),
-            last_heavy_checkpoint: None,
-            tool_call_records: Vec::new(),
-            forced_factual_retry: false,
-            explain_turns: Vec::new(),
-            first_ttft_ms: None,
-            all_tools_used: HashSet::new(),
-            first_selection_report: None,
-            first_budget_pressure: 0.0,
-            first_context_assembly_ms: None,
-            first_memoria_ms: None,
-            first_selector_ms: None,
-            first_selector_strategy: None,
-            first_selector_confidence: None,
-            selector_tokens_in: 0,
-            selector_tokens_out: 0,
-            all_selected_skills: Vec::new(),
+            stall: Default::default(),
+            telemetry: Default::default(),
+            skills: Default::default(),
+            hooks: Default::default(),
+            cancellation: Default::default(),
+            messaging: Default::default(),
+            error_recovery: Default::default(),
             message: "test query".to_string(),
             recent_tools: Vec::new(),
             task_profile: TaskExecutionProfile::default(),
             api: astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
             api_token: "test-token".to_string(),
-            cancel_flag: None,
-            cancel_token: None,
             delegation_engine: None,
-            skill_registry_for_activation: None,
-            skill_resolver: None,
-            skill_executor: None,
-            skill_model_override: None,
-            skill_effort: None,
-            skill_agent_type: None,
-            skill_allowed_tools: None,
-            skill_sandbox_policy: None,
-            skill_quality_tracker: crate::skills::quality::SkillQualityTracker::new(),
-            skill_improvement_tracker: crate::skills::improvement::ImprovementTracker::new(),
-            pinned_skills: std::collections::HashSet::new(),
-            discovered_skills: std::collections::HashSet::new(),
-            skill_search: astra_core::SkillSearchSettings::default(),
-            tool_event_hooks: crate::skills::hooks::ToolEventHookRegistry::default(),
-            session_event_hooks: crate::skills::hooks::SessionEventHookRegistry::default(),
-            stop_hooks: Vec::new(),
-            stop_hook_runs: 0,
-            teammate_idle_hooks: Vec::new(),
-            teammate_idle_hook_runs: 0,
-            workspace_root_hint: None,
             project_context: None,
-            consecutive_same_error: 0,
-            last_error_category: None,
             checkpoint_gate: None,
             data_snapshot_provider: None,
             last_composite_snapshot: None,
@@ -1281,20 +1244,9 @@ mod tests {
             max_turn_input_tokens: 0,
             budget_wrapup_injected: false,
             thinking_budget_tokens: None,
-            skill_listing_message: None,
-            invoked_skills: std::collections::HashMap::new(),
             recent_file_reads: Vec::new(),
-            turn_trace_collector: None,
-            mailbox: None,
-            ack_tracker: None,
-            dead_letter_queue: None,
-            messaging_metrics: None,
-            progress_emitter: None,
             permission_context: None,
             permission_handler: None,
-            observability_session: None,
-            observability_hub: None,
-            completed_turns_for_tuning: 0,
         }
     }
     #[tokio::test]
@@ -1346,7 +1298,7 @@ mod tests {
         assert!(state.has_any_usage);
         assert_eq!(state.total_prompt, 500);
         assert_eq!(state.total_completion, 200);
-        assert!(state.first_ttft_ms.is_some());
+        assert!(state.telemetry.first_ttft_ms.is_some());
     }
 
     #[tokio::test]
@@ -1473,8 +1425,8 @@ mod tests {
         let mut s = create_test_state();
         let flag = Arc::new(AtomicBool::new(true));
         let token = Arc::new(CancellationToken::new());
-        s.cancel_flag = Some(flag.clone());
-        s.cancel_token = Some(token);
+        s.cancellation.flag = Some(flag.clone());
+        s.cancellation.token = Some(token);
         assert!(super::llm_cancel_for_state(&s).is_triggered());
         assert!(flag.load(Ordering::SeqCst));
     }
@@ -1485,7 +1437,7 @@ mod tests {
 
         let mut s = create_test_state();
         let token = Arc::new(CancellationToken::new());
-        s.cancel_token = Some(token.clone());
+        s.cancellation.token = Some(token.clone());
         assert!(!super::llm_cancel_for_state(&s).is_triggered());
         token.cancel();
         assert!(super::llm_cancel_for_state(&s).is_triggered());

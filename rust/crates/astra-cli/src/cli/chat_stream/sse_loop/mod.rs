@@ -20,7 +20,10 @@ use astra_runtime::{
     plan_decompose::CHAT_PLAN_ONLY_SYSTEM,
     semantic_dedup::SemanticDedup,
     tool_registry::ToolRegistry,
-    turn::agentic_loop_host::{AgenticLoopState, run_agentic_loop_with_host},
+    turn::agentic_loop_host::{
+        AgenticLoopState, CancellationState, ErrorRecoveryState, MessagingState, SkillState,
+        StallTrackingState, StopHookState, TelemetryState, run_agentic_loop_with_host,
+    },
     turn::agentic_turn_telemetry::step_recorder_chat_ephemeral_run_id,
     turn::chat_history_openai::openai_messages_from_repl_history,
     turn::chat_turn_heuristics::infer_task_execution_profile,
@@ -90,7 +93,8 @@ pub(crate) async fn stream_chat_sse(
             ex
         };
         // Set turn index so journal entries are tagged for undo
-        ex.journal_turn_index.store(p.turn_index, std::sync::atomic::Ordering::Relaxed);
+        ex.journal_turn_index
+            .store(p.turn_index, std::sync::atomic::Ordering::Relaxed);
         let ex = if let Some(ref mgr) = p.mcp_manager {
             ex.with_mcp_manager(mgr.clone())
         } else {
@@ -379,66 +383,87 @@ pub(crate) async fn stream_chat_sse(
         semantic_dedup: SemanticDedup::new(
             astra_runtime::semantic_dedup::DEFAULT_SIMILARITY_THRESHOLD,
         ),
-        turn_sigs: Vec::new(),
-        turn_tool_names: Vec::new(),
-        stall_events: Vec::new(),
-        intent_tool_turns: Vec::new(),
-        verdict_events: Vec::new(),
-        last_heavy_checkpoint: None,
-        tool_call_records: Vec::new(),
-        forced_factual_retry: false,
-        explain_turns: Vec::new(),
-        first_ttft_ms: None,
-        all_tools_used: HashSet::new(),
-        first_selection_report: None,
-        first_budget_pressure: 0.0,
-        first_context_assembly_ms: None,
-        first_memoria_ms: None,
-        first_selector_ms: None,
-        first_selector_strategy: None,
-        first_selector_confidence: None,
-        selector_tokens_in: 0,
-        selector_tokens_out: 0,
-        all_selected_skills: Vec::new(),
+        stall: StallTrackingState {
+            turn_sigs: Vec::new(),
+            turn_tool_names: Vec::new(),
+            events: Vec::new(),
+            intent_tool_turns: Vec::new(),
+            verdict_events: Vec::new(),
+            last_heavy_checkpoint: None,
+            tool_call_records: Vec::new(),
+            forced_factual_retry: false,
+        },
+        telemetry: TelemetryState {
+            explain_turns: Vec::new(),
+            first_ttft_ms: None,
+            all_tools_used: HashSet::new(),
+            first_selection_report: None,
+            first_budget_pressure: 0.0,
+            first_context_assembly_ms: None,
+            first_memoria_ms: None,
+            first_selector_ms: None,
+            first_selector_strategy: None,
+            first_selector_confidence: None,
+            selector_tokens_in: 0,
+            selector_tokens_out: 0,
+            all_selected_skills: Vec::new(),
+            observability_session: p.observability_session.clone(),
+            observability_hub: p.observability_hub.clone(),
+            turn_trace_collector: None,
+            completed_turns_for_tuning: 0,
+        },
+        skills: SkillState {
+            registry_for_activation: Some(Arc::clone(&p.unified_skill_registry)),
+            resolver: skill_resolver,
+            executor: skill_executor,
+            quality_tracker: p.skill_quality_tracker.clone(),
+            improvement_tracker: astra_runtime::skills::improvement::ImprovementTracker::new(),
+            pinned: std::collections::HashSet::new(),
+            discovered: discovered_skills,
+            search: p.skill_search.clone(),
+            tool_event_hooks: if bare_mode {
+                Default::default()
+            } else {
+                astra_runtime::skills::hooks::load_tool_event_hooks(&project_root)
+            },
+            session_event_hooks: if bare_mode {
+                Default::default()
+            } else {
+                astra_runtime::skills::hooks::load_session_event_hooks(&project_root)
+            },
+            listing_message: None,
+            invoked: std::collections::HashMap::new(),
+            ..Default::default()
+        },
+        hooks: StopHookState {
+            stop_hooks: hook_sets.stop_hooks,
+            stop_hook_runs: 0,
+            teammate_idle_hooks: hook_sets.teammate_idle_hooks,
+            teammate_idle_hook_runs: 0,
+            workspace_root_hint: Some(project_root.to_string_lossy().into_owned()),
+        },
+        messaging: MessagingState {
+            mailbox: root_mailbox,
+            ack_tracker: None,
+            dead_letter_queue: None,
+            metrics: p.messaging_metrics.clone(),
+            progress_emitter: None,
+        },
+        cancellation: CancellationState {
+            flag: None,
+            token: p.cancel_token.clone(),
+        },
+        error_recovery: ErrorRecoveryState {
+            consecutive_same_error: 0,
+            last_error_category: None,
+        },
         message: p.message.to_string(),
         recent_tools: p.recent_tools.to_vec(),
         task_profile,
         api: p.api.clone(),
         api_token: p.token.to_string(),
-        cancel_flag: None,
-        cancel_token: p.cancel_token.clone(),
         delegation_engine: p.delegation_engine,
-        skill_registry_for_activation: Some(Arc::clone(&p.unified_skill_registry)),
-        skill_resolver,
-        skill_executor,
-        skill_model_override: None,
-        skill_effort: None,
-        skill_agent_type: None,
-        skill_allowed_tools: None,
-        skill_sandbox_policy: None,
-        skill_quality_tracker: p.skill_quality_tracker.clone(),
-        skill_improvement_tracker: astra_runtime::skills::improvement::ImprovementTracker::new(),
-        pinned_skills: std::collections::HashSet::new(),
-        discovered_skills,
-        skill_search: p.skill_search.clone(),
-        tool_event_hooks: if bare_mode {
-            Default::default()
-        } else {
-            astra_runtime::skills::hooks::load_tool_event_hooks(&project_root)
-        },
-        session_event_hooks: if bare_mode {
-            Default::default()
-        } else {
-            astra_runtime::skills::hooks::load_session_event_hooks(&project_root)
-        },
-        stop_hooks: hook_sets.stop_hooks,
-        stop_hook_runs: 0,
-        teammate_idle_hooks: hook_sets.teammate_idle_hooks,
-        teammate_idle_hook_runs: 0,
-        workspace_root_hint: Some(project_root.to_string_lossy().into_owned()),
         project_context,
-        consecutive_same_error: 0,
-        last_error_category: None,
         checkpoint_gate: None,
         data_snapshot_provider: None,
         last_composite_snapshot: None,
@@ -447,20 +472,9 @@ pub(crate) async fn stream_chat_sse(
         max_turn_input_tokens: RuntimeLimits::global().max_turn_input_tokens,
         budget_wrapup_injected: false,
         thinking_budget_tokens: None,
-        skill_listing_message: None,
-        invoked_skills: std::collections::HashMap::new(),
         recent_file_reads: Vec::new(),
-        turn_trace_collector: None,
-        mailbox: root_mailbox,
-        ack_tracker: None,
-        dead_letter_queue: None,
-        messaging_metrics: p.messaging_metrics.clone(),
-        progress_emitter: None,
         permission_context: None,
         permission_handler: None,
-        observability_session: p.observability_session.clone(),
-        observability_hub: p.observability_hub.clone(),
-        completed_turns_for_tuning: 0,
     };
 
     // ─── Run the runtime loop ────────────────────────────────────────────
@@ -469,23 +483,23 @@ pub(crate) async fn stream_chat_sse(
         s.stop_clear();
     }
     if let Err(e) = run_agentic_loop_with_host(&mut host, &mut state).await {
-        finalize_root_mailbox(p.root_mailbox_slot, &mut state.mailbox).await;
+        finalize_root_mailbox(p.root_mailbox_slot, &mut state.messaging.mailbox).await;
         if let Some(shared) = p.discovered_skills {
-            *shared = state.discovered_skills;
+            *shared = state.skills.discovered;
         }
         return Err(crate::TurnFailure {
             error: e,
             partial: crate::PartialTurnData {
-                tool_call_records: std::mem::take(&mut state.tool_call_records),
-                tools_used: state.all_tools_used.iter().cloned().collect(),
-                stall_events: std::mem::take(&mut state.stall_events),
-                verdict_events: std::mem::take(&mut state.verdict_events),
+                tool_call_records: std::mem::take(&mut state.stall.tool_call_records),
+                tools_used: state.telemetry.all_tools_used.iter().cloned().collect(),
+                stall_events: std::mem::take(&mut state.stall.events),
+                verdict_events: std::mem::take(&mut state.stall.verdict_events),
                 prompt_tokens: state.total_prompt,
                 completion_tokens: state.total_completion,
                 tool_calls_count: state.total_tool_calls,
                 tool_health_export: state.turn_guard.health.export_merged(p.tool_health_entries),
                 session_id: state.current_session_id.clone(),
-                last_heavy_checkpoint: state.last_heavy_checkpoint.take(),
+                last_heavy_checkpoint: state.stall.last_heavy_checkpoint.take(),
                 partial_text: std::mem::take(&mut state.final_text),
             },
         });
@@ -493,11 +507,11 @@ pub(crate) async fn stream_chat_sse(
 
     // ─── Finalize ────────────────────────────────────────────────────────
     // Merge skill quality data back to session-scoped tracker
-    *p.skill_quality_tracker = state.skill_quality_tracker.clone();
+    *p.skill_quality_tracker = state.skills.quality_tracker.clone();
     if let Some(shared) = p.discovered_skills {
-        *shared = state.discovered_skills.clone();
+        *shared = state.skills.discovered.clone();
     }
-    finalize_root_mailbox(p.root_mailbox_slot, &mut state.mailbox).await;
+    finalize_root_mailbox(p.root_mailbox_slot, &mut state.messaging.mailbox).await;
 
     eprint_stream_loop_sidecars(StreamLoopSidecarEprint {
         explain: p.explain,
@@ -505,8 +519,8 @@ pub(crate) async fn stream_chat_sse(
         verbose_mode: p.verbose_mode,
         start,
         model: p.model,
-        explain_turns: &state.explain_turns,
-        verdict_events: &state.verdict_events,
+        explain_turns: &state.telemetry.explain_turns,
+        verdict_events: &state.stall.verdict_events,
         has_any_usage: state.has_any_usage,
         total_prompt: state.total_prompt,
         total_completion: state.total_completion,
@@ -523,24 +537,24 @@ pub(crate) async fn stream_chat_sse(
         cache_read_tokens: state.total_cache_read,
         cache_creation_tokens: state.total_cache_creation,
         tool_calls_count: state.total_tool_calls,
-        first_selection_report: state.first_selection_report,
-        selected_skills: state.all_selected_skills,
-        tools_used: state.all_tools_used,
-        tool_call_records: state.tool_call_records,
-        budget_pressure: state.first_budget_pressure,
-        stall_events: state.stall_events,
-        verdict_events: state.verdict_events,
+        first_selection_report: state.telemetry.first_selection_report,
+        selected_skills: state.telemetry.all_selected_skills,
+        tools_used: state.telemetry.all_tools_used,
+        tool_call_records: state.stall.tool_call_records,
+        budget_pressure: state.telemetry.first_budget_pressure,
+        stall_events: state.stall.events,
+        verdict_events: state.stall.verdict_events,
         step_recorder: &state.step_recorder,
         turn_guard: &state.turn_guard,
-        last_heavy_checkpoint: state.last_heavy_checkpoint,
-        ttft_ms: state.first_ttft_ms,
-        context_ms: state.first_context_assembly_ms,
-        selector_strategy: state.first_selector_strategy,
-        selector_ms: state.first_selector_ms,
-        selector_confidence: state.first_selector_confidence,
-        selector_tokens_in: state.selector_tokens_in,
-        selector_tokens_out: state.selector_tokens_out,
-        memoria_ms: state.first_memoria_ms,
+        last_heavy_checkpoint: state.stall.last_heavy_checkpoint,
+        ttft_ms: state.telemetry.first_ttft_ms,
+        context_ms: state.telemetry.first_context_assembly_ms,
+        selector_strategy: state.telemetry.first_selector_strategy,
+        selector_ms: state.telemetry.first_selector_ms,
+        selector_confidence: state.telemetry.first_selector_confidence,
+        selector_tokens_in: state.telemetry.selector_tokens_in,
+        selector_tokens_out: state.telemetry.selector_tokens_out,
+        memoria_ms: state.telemetry.first_memoria_ms,
         routing_domain_hint: None,
         entity_learn_skipped_no_domain: false,
     }))

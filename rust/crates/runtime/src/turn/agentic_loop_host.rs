@@ -148,6 +148,208 @@ pub trait AgenticLoopHost: Send {
     fn inject_tool_schema(&mut self, _schema: Value) {}
 }
 
+// ─── Loop state sub-structs ──────────────────────────────────────────────────
+
+/// Skill-related state for the agentic loop.
+pub struct SkillState {
+    /// Unified skill registry for conditional activation via file paths.
+    /// When set, edge tool file paths are recorded for conditional skill activation.
+    pub registry_for_activation: Option<Arc<crate::skills::UnifiedSkillRegistry>>,
+    /// Optional skill resolver for executing skills as tool calls.
+    /// When set, the loop injects a `skill` tool schema and intercepts
+    /// `skill` calls, returning resolved instructions as tool results.
+    pub resolver: Option<Arc<dyn crate::turn::skill_tool::SkillResolver>>,
+    /// Optional skill executor for fork-context skills. When set, skills with
+    /// `execution_context: Fork` are executed via this executor (sub-agent loop).
+    pub executor: Option<Arc<dyn crate::skills::traits::SkillExecutor>>,
+    /// Model override from the most recently activated skill.
+    /// When set, the host should use this model instead of the default.
+    pub model_override: Option<String>,
+    /// Effort level override from the most recently activated skill.
+    pub effort: Option<crate::skills::manifest::EffortLevel>,
+    /// Agent type hint from the most recently activated skill.
+    pub agent_type: Option<String>,
+    /// Tool allow-list from the most recently activated skill.
+    /// When non-empty, only these tools (plus `skill` itself) should be available.
+    /// The host converts this allow-list to additions in `restricted_tools`.
+    pub allowed_tools: Option<HashSet<String>>,
+    /// Sandbox policy derived from the most recently activated skill's trust tier.
+    /// When set, tool execution should apply these restrictions (path boundaries,
+    /// env filtering, network control, timeouts).
+    pub sandbox_policy: Option<crate::tool_sandbox::SandboxPolicy>,
+    /// Per-skill quality metrics accumulated during the session.
+    /// Used to boost high-performing skills in selection priority.
+    pub quality_tracker: crate::skills::quality::SkillQualityTracker,
+    /// Skill auto-improvement tracker — detects user corrections and proposes SKILL.md rewrites.
+    pub improvement_tracker: crate::skills::improvement::ImprovementTracker,
+    /// Skills pinned by the user — always included in budget (never truncated).
+    pub pinned: std::collections::HashSet<String>,
+    /// Canonical skill names surfaced via `discover_skills` this session.
+    pub discovered: HashSet<String>,
+    /// Skill catalog surfacing for this request / session.
+    pub search: astra_core::SkillSearchSettings,
+    /// Skill listing message (available skill names + descriptions).
+    /// Stored here instead of in `messages` so hosts can inject it ephemerally
+    /// into each LLM request without bloating the persistent conversation history.
+    /// Hosts should prepend this to the messages array when building the payload.
+    pub listing_message: Option<Value>,
+    /// Skills invoked during this session, keyed by canonical name.
+    /// Used for same-session dedup and post-compaction re-injection.
+    pub invoked: std::collections::HashMap<String, crate::turn::skill_tool::InvokedSkill>,
+    /// Tool event hooks (PreToolUse/PostToolUse) for intercepting tool calls.
+    /// Loaded from `.astra/hooks.json` or skill frontmatter.
+    pub tool_event_hooks: crate::skills::hooks::ToolEventHookRegistry,
+    /// Session event hooks (SessionStart, SessionEnd, etc.).
+    /// Loaded from `.astra/hooks.json` alongside tool event hooks.
+    pub session_event_hooks: crate::skills::hooks::SessionEventHookRegistry,
+}
+
+impl Default for SkillState {
+    fn default() -> Self {
+        Self {
+            registry_for_activation: None,
+            resolver: None,
+            executor: None,
+            model_override: None,
+            effort: None,
+            agent_type: None,
+            allowed_tools: None,
+            sandbox_policy: None,
+            quality_tracker: Default::default(),
+            improvement_tracker: Default::default(),
+            pinned: HashSet::new(),
+            discovered: HashSet::new(),
+            search: Default::default(),
+            listing_message: None,
+            invoked: HashMap::new(),
+            tool_event_hooks: Default::default(),
+            session_event_hooks: Default::default(),
+        }
+    }
+}
+
+/// Telemetry and observability state for the agentic loop.
+#[derive(Default)]
+pub struct TelemetryState {
+    /// Explain data collected per turn.
+    pub explain_turns: Vec<Value>,
+    /// Time-to-first-token for the first LLM turn (ms).
+    pub first_ttft_ms: Option<u64>,
+    /// All tool names used across all turns.
+    pub all_tools_used: HashSet<String>,
+    /// Selection report from the first turn's skill selector.
+    pub first_selection_report: Option<SelectionReport>,
+    /// Budget pressure value from the first turn.
+    pub first_budget_pressure: f64,
+    /// Context assembly duration from the first turn (ms).
+    pub first_context_assembly_ms: Option<u64>,
+    /// Memoria retrieval duration from the first turn (ms).
+    pub first_memoria_ms: Option<u64>,
+    /// Selector duration from the first turn (ms).
+    pub first_selector_ms: Option<u64>,
+    /// Selector strategy from the first turn.
+    pub first_selector_strategy: Option<String>,
+    /// Selector confidence from the first turn.
+    pub first_selector_confidence: Option<f64>,
+    /// Cumulative selector input tokens.
+    pub selector_tokens_in: u64,
+    /// Cumulative selector output tokens.
+    pub selector_tokens_out: u64,
+    /// All skill names selected across all turns.
+    pub all_selected_skills: Vec<String>,
+    /// Optional observability session for context tracing, drift detection, and auto-tuning.
+    /// When set, hooks are called at turn start/end, tool selection, etc.
+    pub observability_session: Option<
+        std::sync::Arc<std::sync::RwLock<crate::observability_integration::ObservabilitySession>>,
+    >,
+    /// Shared observability hub for profile/experiment management.
+    /// Typically set at session init and shared across agents.
+    pub observability_hub:
+        Option<std::sync::Arc<crate::observability_integration::ObservabilityHub>>,
+    /// Optional turn trace collector for detailed context assembly observability.
+    /// When set, records system prompt, history, memory, and tool selection traces.
+    /// Created at turn start, finalized at turn end.
+    pub turn_trace_collector: Option<crate::turn::turn_trace_collector::TurnTraceCollector>,
+    /// Number of turns completed in this loop invocation (for tuning cycle trigger).
+    pub completed_turns_for_tuning: u32,
+}
+
+/// Stall and verdict tracking state for the agentic loop.
+#[derive(Default)]
+pub struct StallTrackingState {
+    /// Per-turn tool-call dedup signatures.
+    pub turn_sigs: Vec<BTreeSet<String>>,
+    /// Per-turn tool name sets.
+    pub turn_tool_names: Vec<HashSet<String>>,
+    /// Stall events: `(description, turn_number)`.
+    pub events: Vec<(String, u32)>,
+    /// Per-turn intent+tool pairs for stall analysis.
+    pub intent_tool_turns: Vec<(Vec<String>, String)>,
+    /// Verdict audit trail.
+    pub verdict_events: Vec<AgenticVerdictAuditEvent>,
+    /// Last heavy checkpoint for step resumption.
+    pub last_heavy_checkpoint: Option<StepCheckpoint>,
+    /// Tool call records for session journal.
+    pub tool_call_records: Vec<ToolCallRecord>,
+    /// Whether a factual-retry was forced this loop.
+    pub forced_factual_retry: bool,
+}
+
+/// Inter-agent messaging state for the agentic loop.
+#[derive(Default)]
+pub struct MessagingState {
+    /// Optional mailbox for receiving messages from other agents.
+    /// When set, incoming messages are drained at each turn start and
+    /// progress updates are sent to the parent at turn end.
+    pub mailbox: Option<crate::messaging::router::AgentMailbox>,
+    /// Tracks messages that require acknowledgment and handles retries.
+    pub ack_tracker: Option<crate::messaging::ack_tracker::PendingAckTracker>,
+    /// Dead letter queue for permanently failed messages.
+    pub dead_letter_queue: Option<std::sync::Arc<crate::messaging::dead_letter::DeadLetterQueue>>,
+    /// Unified messaging metrics (optional, shared across agents in a delegation).
+    pub metrics: Option<std::sync::Arc<crate::messaging::metrics::MessagingMetrics>>,
+    /// Optional progress emitter for broadcasting turn events to UI/subscribers.
+    /// When set, the loop emits `TurnCompleted` events after each turn.
+    pub progress_emitter: Option<crate::orchestration::AgentProgressEmitter>,
+}
+
+/// Stop-hook and teammate-idle-hook state for the agentic loop.
+#[derive(Default)]
+pub struct StopHookState {
+    /// Verification commands run before the loop is allowed to complete.
+    /// For plan subtasks, populated from declarative `when: task_completed` hooks.
+    /// If any hook fails, its output is injected and the loop continues.
+    pub stop_hooks: Vec<crate::turn::stop_hooks::StopHook>,
+    /// How many times stop hooks have fired (prevents infinite hook loops).
+    pub stop_hook_runs: u32,
+    /// Hooks with `when: teammate_idle` — injected once after a `delegate` round returns.
+    pub teammate_idle_hooks: Vec<crate::turn::stop_hooks::StopHook>,
+    /// How many times teammate-idle hooks have fired (at most once per loop).
+    pub teammate_idle_hook_runs: u32,
+    /// Edge/chat project root (`git_root` or `cwd`) for enriching `delegate` sub-run context
+    /// so server-side sub-runs load `.astra/stop-hooks.yaml` from the same tree.
+    pub workspace_root_hint: Option<String>,
+}
+
+/// Cancellation state for the agentic loop.
+#[derive(Default)]
+pub struct CancellationState {
+    /// Shared flag checked between turns. Set externally (e.g. by cancel_run).
+    pub flag: Option<Arc<AtomicBool>>,
+    /// Optional token cancelled with user cancel for immediate LLM/stream wake.
+    pub token: Option<Arc<CancellationToken>>,
+}
+
+/// Error recovery state for the agentic loop.
+#[derive(Default)]
+pub struct ErrorRecoveryState {
+    /// Consecutive turns where the same error category dominated.
+    /// Reset when a turn succeeds or a different error category appears.
+    pub consecutive_same_error: u32,
+    /// The error category from the last turn (for streak detection).
+    pub last_error_category: Option<crate::turn::error_recovery::ErrorCategory>,
+}
+
 // ─── Loop state ──────────────────────────────────────────────────────────────
 
 /// Cross-turn state managed by the runtime loop.
@@ -181,30 +383,14 @@ pub struct AgenticLoopState {
     pub idempotency_cache: InMemoryIdempotencyCache,
     pub semantic_dedup: SemanticDedup,
 
-    // ── Stall + verdict tracking ──
-    pub turn_sigs: Vec<BTreeSet<String>>,
-    pub turn_tool_names: Vec<HashSet<String>>,
-    pub stall_events: Vec<(String, u32)>,
-    pub intent_tool_turns: Vec<(Vec<String>, String)>,
-    pub verdict_events: Vec<AgenticVerdictAuditEvent>,
-    pub last_heavy_checkpoint: Option<StepCheckpoint>,
-    pub tool_call_records: Vec<ToolCallRecord>,
-    pub forced_factual_retry: bool,
-
-    // ── Explain + telemetry ──
-    pub explain_turns: Vec<Value>,
-    pub first_ttft_ms: Option<u64>,
-    pub all_tools_used: HashSet<String>,
-    pub first_selection_report: Option<SelectionReport>,
-    pub first_budget_pressure: f64,
-    pub first_context_assembly_ms: Option<u64>,
-    pub first_memoria_ms: Option<u64>,
-    pub first_selector_ms: Option<u64>,
-    pub first_selector_strategy: Option<String>,
-    pub first_selector_confidence: Option<f64>,
-    pub selector_tokens_in: u64,
-    pub selector_tokens_out: u64,
-    pub all_selected_skills: Vec<String>,
+    // ── Sub-states ──
+    pub skills: SkillState,
+    pub telemetry: TelemetryState,
+    pub stall: StallTrackingState,
+    pub messaging: MessagingState,
+    pub hooks: StopHookState,
+    pub cancellation: CancellationState,
+    pub error_recovery: ErrorRecoveryState,
 
     // ── Host-provided context (read-only by runtime) ──
     pub message: String,
@@ -215,90 +401,11 @@ pub struct AgenticLoopState {
     pub api: astra_thin_client::ThinClient,
     pub api_token: String,
 
-    // ── Cancellation ──
-    /// Shared flag checked between turns. Set externally (e.g. by cancel_run).
-    pub cancel_flag: Option<Arc<AtomicBool>>,
-    /// Optional token cancelled with user cancel for immediate LLM/stream wake.
-    pub cancel_token: Option<Arc<CancellationToken>>,
-
     // ── Delegation ──
     /// Optional delegation engine for multi-agent coordination.
     /// When set, the loop intercepts `delegate` tool calls and routes them
     /// through the delegation engine instead of the headless tool round.
     pub delegation_engine: Option<Arc<crate::server::delegation_engine::DelegationEngine>>,
-
-    // ── Skills ──
-    /// Unified skill registry for conditional activation via file paths.
-    /// When set, edge tool file paths are recorded for conditional skill activation.
-    pub skill_registry_for_activation: Option<Arc<crate::skills::UnifiedSkillRegistry>>,
-    /// Optional skill resolver for executing skills as tool calls.
-    /// When set, the loop injects a `skill` tool schema and intercepts
-    /// `skill` calls, returning resolved instructions as tool results.
-    pub skill_resolver: Option<Arc<dyn crate::turn::skill_tool::SkillResolver>>,
-    /// Optional skill executor for fork-context skills. When set, skills with
-    /// `execution_context: Fork` are executed via this executor (sub-agent loop).
-    pub skill_executor: Option<Arc<dyn crate::skills::traits::SkillExecutor>>,
-    /// Model override from the most recently activated skill.
-    /// When set, the host should use this model instead of the default.
-    pub skill_model_override: Option<String>,
-    /// Effort level override from the most recently activated skill.
-    pub skill_effort: Option<crate::skills::manifest::EffortLevel>,
-    /// Agent type hint from the most recently activated skill.
-    pub skill_agent_type: Option<String>,
-    /// Tool allow-list from the most recently activated skill.
-    /// When non-empty, only these tools (plus `skill` itself) should be available.
-    /// The host converts this allow-list to additions in `restricted_tools`.
-    pub skill_allowed_tools: Option<HashSet<String>>,
-    /// Sandbox policy derived from the most recently activated skill's trust tier.
-    /// When set, tool execution should apply these restrictions (path boundaries,
-    /// env filtering, network control, timeouts).
-    pub skill_sandbox_policy: Option<crate::tool_sandbox::SandboxPolicy>,
-    /// Per-skill quality metrics accumulated during the session.
-    /// Used to boost high-performing skills in selection priority.
-    pub skill_quality_tracker: crate::skills::quality::SkillQualityTracker,
-    /// Skill auto-improvement tracker — detects user corrections and proposes SKILL.md rewrites.
-    pub skill_improvement_tracker: crate::skills::improvement::ImprovementTracker,
-    /// Skills pinned by the user — always included in budget (never truncated).
-    pub pinned_skills: std::collections::HashSet<String>,
-    /// Canonical skill names surfaced via `discover_skills` this session.
-    pub discovered_skills: HashSet<String>,
-    /// Skill catalog surfacing for this request / session.
-    pub skill_search: astra_core::SkillSearchSettings,
-
-    /// Tool event hooks (PreToolUse/PostToolUse) for intercepting tool calls.
-    /// Loaded from `.astra/hooks.json` or skill frontmatter.
-    pub tool_event_hooks: crate::skills::hooks::ToolEventHookRegistry,
-
-    /// Session event hooks (SessionStart, SessionEnd, etc.).
-    /// Loaded from `.astra/hooks.json` alongside tool event hooks.
-    pub session_event_hooks: crate::skills::hooks::SessionEventHookRegistry,
-
-    // ── Stop hooks ──
-    /// Verification commands run before the loop is allowed to complete.
-    /// For plan subtasks, populated from declarative `when: task_completed` hooks.
-    /// If any hook fails, its output is injected and the loop continues.
-    pub stop_hooks: Vec<crate::turn::stop_hooks::StopHook>,
-    /// How many times stop hooks have fired (prevents infinite hook loops).
-    pub stop_hook_runs: u32,
-    /// Hooks with `when: teammate_idle` — injected once after a `delegate` round returns.
-    pub teammate_idle_hooks: Vec<crate::turn::stop_hooks::StopHook>,
-    /// How many times teammate-idle hooks have fired (at most once per loop).
-    pub teammate_idle_hook_runs: u32,
-    /// Edge/chat project root (`git_root` or `cwd`) for enriching `delegate` sub-run context
-    /// so server-side sub-runs load `.astra/stop-hooks.yaml` from the same tree.
-    pub workspace_root_hint: Option<String>,
-
-    // ── Error budget ──
-    /// Consecutive turns where the same error category dominated.
-    /// Reset when a turn succeeds or a different error category appears.
-    pub consecutive_same_error: u32,
-    /// The error category from the last turn (for streak detection).
-    pub last_error_category: Option<crate::turn::error_recovery::ErrorCategory>,
-
-    // ── Mid-execution checkpoint gate ──
-    /// Optional checkpoint gate checked every N turns during delegation sub-runs.
-    /// When the gate returns `false`, the loop aborts with `Cancelled`.
-    pub checkpoint_gate: Option<Arc<dyn crate::server::delegation_engine::CheckpointGate>>,
 
     // ── Composite Snapshot ──
     /// Optional data snapshot provider for building composite snapshots.
@@ -327,17 +434,7 @@ pub struct AgenticLoopState {
     /// When Some, passed to the API request so the server constrains thinking output.
     pub thinking_budget_tokens: Option<u32>,
 
-    // ── Ephemeral skill listing ──
-    /// Skill listing message (available skill names + descriptions).
-    /// Stored here instead of in `messages` so hosts can inject it ephemerally
-    /// into each LLM request without bloating the persistent conversation history.
-    /// Hosts should prepend this to the messages array when building the payload.
-    pub skill_listing_message: Option<Value>,
-
-    /// Skills invoked during this session, keyed by canonical name.
-    /// Used for same-session dedup and post-compaction re-injection.
-    pub invoked_skills: std::collections::HashMap<String, crate::turn::skill_tool::InvokedSkill>,
-
+    // ── Recently accessed files ──
     /// Recently accessed file paths tracked for post-compaction restoration.
     /// Each entry is `(absolute_path, turn_number)`. The list is bounded to
     /// the most recent [`MAX_TRACKED_FILE_READS`] entries. After compaction,
@@ -345,29 +442,10 @@ pub struct AgenticLoopState {
     /// awareness of recently-read code.
     pub recent_file_reads: Vec<(String, u32)>,
 
+    // ── Cross-session project context ──
     /// Pre-computed cross-session project context (P2 knowledge backflow).
     /// Set once at session init; `None` for sub-runs or when the feature is disabled.
     pub project_context: Option<String>,
-
-    // ── Inter-agent messaging ──
-    /// Optional mailbox for receiving messages from other agents.
-    /// When set, incoming messages are drained at each turn start and
-    /// progress updates are sent to the parent at turn end.
-    pub mailbox: Option<crate::messaging::router::AgentMailbox>,
-
-    /// Tracks messages that require acknowledgment and handles retries.
-    pub ack_tracker: Option<crate::messaging::ack_tracker::PendingAckTracker>,
-
-    /// Dead letter queue for permanently failed messages.
-    pub dead_letter_queue: Option<std::sync::Arc<crate::messaging::dead_letter::DeadLetterQueue>>,
-
-    /// Unified messaging metrics (optional, shared across agents in a delegation).
-    pub messaging_metrics: Option<std::sync::Arc<crate::messaging::metrics::MessagingMetrics>>,
-
-    // ── Progress reporting ──
-    /// Optional progress emitter for broadcasting turn events to UI/subscribers.
-    /// When set, the loop emits `TurnCompleted` events after each turn.
-    pub progress_emitter: Option<crate::orchestration::AgentProgressEmitter>,
 
     // ── Permission sync ──
     /// Optional permission sync context for runtime permission management.
@@ -380,26 +458,10 @@ pub struct AgenticLoopState {
     /// When set, incoming PermissionRequest messages are handled automatically.
     pub permission_handler: Option<crate::orchestration::PermissionRequestHandler>,
 
-    // ── Observability (M1-M6 integration) ──
-    /// Optional observability session for context tracing, drift detection, and auto-tuning.
-    /// When set, hooks are called at turn start/end, tool selection, etc.
-    pub observability_session: Option<
-        std::sync::Arc<std::sync::RwLock<crate::observability_integration::ObservabilitySession>>,
-    >,
-
-    /// Shared observability hub for profile/experiment management.
-    /// Typically set at session init and shared across agents.
-    pub observability_hub:
-        Option<std::sync::Arc<crate::observability_integration::ObservabilityHub>>,
-
-    /// Optional turn trace collector for detailed context assembly observability.
-    /// When set, records system prompt, history, memory, and tool selection traces.
-    /// Created at turn start, finalized at turn end.
-    pub turn_trace_collector: Option<crate::turn::turn_trace_collector::TurnTraceCollector>,
-
-    // ── Auto-tuning feedback loop ──
-    /// Number of turns completed in this loop invocation (for tuning cycle trigger).
-    pub completed_turns_for_tuning: u32,
+    // ── Mid-execution checkpoint gate ──
+    /// Optional checkpoint gate checked every N turns during delegation sub-runs.
+    /// When the gate returns `false`, the loop aborts with `Cancelled`.
+    pub checkpoint_gate: Option<Arc<dyn crate::server::delegation_engine::CheckpointGate>>,
 }
 
 /// Consecutive same-category error turns before forcing a strategy change.
@@ -421,7 +483,7 @@ fn record_edge_tool_observability(
     state: &mut AgenticLoopState,
     edge_tool_round: &[EdgeToolExecResult],
 ) {
-    if let Some(session) = &state.observability_session {
+    if let Some(session) = &state.telemetry.observability_session {
         for edge_result in edge_tool_round {
             session
                 .write()
@@ -434,8 +496,9 @@ fn record_edge_tool_observability(
         }
     }
 
-    if let Some(hub) = &state.observability_hub {
+    if let Some(hub) = &state.telemetry.observability_hub {
         let user_id = state
+            .telemetry
             .observability_session
             .as_ref()
             .map(|s| s.read().unwrap_or_else(|e| e.into_inner()).user_id.clone())
@@ -447,7 +510,10 @@ fn record_edge_tool_observability(
 }
 
 fn apply_adaptive_execution_profile(state: &mut AgenticLoopState) {
-    let (hub, session) = match (&state.observability_hub, &state.observability_session) {
+    let (hub, session) = match (
+        &state.telemetry.observability_hub,
+        &state.telemetry.observability_session,
+    ) {
         (Some(hub), Some(session)) => (hub, session),
         _ => return,
     };
@@ -962,7 +1028,7 @@ fn try_write_heavy_checkpoint(state: &mut AgenticLoopState) {
     let _ = step_checkpoint::write_composite_snapshot_index(sid, &index);
 
     state.last_composite_snapshot = Some(snapshot);
-    state.last_heavy_checkpoint = Some(cp);
+    state.stall.last_heavy_checkpoint = Some(cp);
 }
 
 /// Build a full composite snapshot asynchronously (with data provider).
@@ -1107,7 +1173,7 @@ fn record_loop_completion_feedback(
 ) {
     use crate::auto_tuning::{FeedbackSignal, SignalType};
 
-    let hub = match &state.observability_hub {
+    let hub = match &state.telemetry.observability_hub {
         Some(h) => h,
         None => return,
     };
@@ -1159,7 +1225,7 @@ fn record_loop_completion_feedback(
 
     // ── 3. Tool churn signal ──
     let tool_calls = state.total_tool_calls;
-    let unique_tools = state.all_tools_used.len() as u32;
+    let unique_tools = state.telemetry.all_tools_used.len() as u32;
     // High tool calls with low unique tools suggests repetitive/failing usage.
     if tool_calls > 10 && unique_tools > 0 && (tool_calls / unique_tools) > 5 {
         hub.record_feedback(
@@ -1172,7 +1238,12 @@ fn record_loop_completion_feedback(
     }
 
     // ── 4. Tool-level failure signals ──
-    let failed_tools: u32 = state.tool_call_records.iter().filter(|r| !r.ok).count() as u32;
+    let failed_tools: u32 = state
+        .stall
+        .tool_call_records
+        .iter()
+        .filter(|r| !r.ok)
+        .count() as u32;
     if failed_tools > 0 && tool_calls > 0 {
         let failure_rate = failed_tools as f64 / tool_calls as f64;
         if failure_rate > 0.3 {
@@ -1190,7 +1261,7 @@ fn record_loop_completion_feedback(
     }
 
     // ── 5. Skill quality signals ──
-    for (name, entry) in state.skill_quality_tracker.all_entries() {
+    for (name, entry) in state.skills.quality_tracker.all_entries() {
         if entry.invocations == 0 {
             continue;
         }
@@ -1223,17 +1294,17 @@ fn record_loop_completion_feedback(
 /// Every `TUNING_CYCLE_INTERVAL` turns, evaluates all registered evolution rules
 /// and applies any triggered actions to the session's RuntimeConfig.
 fn maybe_run_tuning_cycle(state: &mut AgenticLoopState) {
-    if state.completed_turns_for_tuning < TUNING_CYCLE_INTERVAL {
+    if state.telemetry.completed_turns_for_tuning < TUNING_CYCLE_INTERVAL {
         return;
     }
-    state.completed_turns_for_tuning = 0;
+    state.telemetry.completed_turns_for_tuning = 0;
 
-    let hub = match &state.observability_hub {
+    let hub = match &state.telemetry.observability_hub {
         Some(h) => h,
         None => return,
     };
 
-    let session = match &state.observability_session {
+    let session = match &state.telemetry.observability_session {
         Some(s) => s,
         None => return,
     };
@@ -1311,13 +1382,14 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
 ) -> Result<AgenticLoopOutcome, String> {
     // ─── Preamble: fire SessionStart hooks ───────────────────────────────
     if state
+        .skills
         .session_event_hooks
         .has_event(crate::skills::hooks::SessionEvent::SessionStart)
     {
         let session_id = state.current_session_id.as_deref().unwrap_or("");
         let user_msg = state.message.as_str();
         let hook_output = crate::skills::hooks::evaluate_session_hooks(
-            &state.session_event_hooks,
+            &state.skills.session_event_hooks,
             crate::skills::hooks::SessionEvent::SessionStart,
             session_id,
             Some(user_msg),
@@ -1345,7 +1417,7 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
     }
 
     // ─── Preamble: auto-inject send_message tool when mailbox is available ────
-    if state.mailbox.is_some() {
+    if state.messaging.mailbox.is_some() {
         host.inject_tool_schema(crate::messaging::send_tool::send_message_tool_schema());
     }
 
@@ -1353,21 +1425,21 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
     // Register the skill tool schema once so the LLM knows the `skill` tool exists.
     // The skill listing is refreshed per-turn below (skills may change at runtime
     // via hot-reload or MCP server connect/disconnect).
-    if let Some(resolver) = &state.skill_resolver {
+    if let Some(resolver) = &state.skills.resolver {
         let full = resolver.available_skills();
         if !full.is_empty() {
             let (visible, open_skill_name) = crate::turn::skill_tool::visible_skills_for_host_turn(
                 &full,
                 state.message.as_str(),
-                &state.skill_quality_tracker,
-                &state.pinned_skills,
-                &state.discovered_skills,
-                &state.skill_search,
+                &state.skills.quality_tracker,
+                &state.skills.pinned,
+                &state.skills.discovered,
+                &state.skills.search,
             );
             host.inject_tool_schema(crate::turn::skill_tool::skill_tool_schema(
                 &visible,
-                Some(&state.skill_quality_tracker),
-                Some(&state.pinned_skills),
+                Some(&state.skills.quality_tracker),
+                Some(&state.skills.pinned),
                 open_skill_name,
             ));
             if open_skill_name {
@@ -1391,11 +1463,13 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
     for turn_index in 0..state.max_turns {
         // ─── Cancel check (cooperative) ─────────────────────────────────
         if state
-            .cancel_flag
+            .cancellation
+            .flag
             .as_ref()
             .is_some_and(|f| f.load(Ordering::Relaxed))
             || state
-                .cancel_token
+                .cancellation
+                .token
                 .as_ref()
                 .is_some_and(|t| t.is_cancelled())
         {
@@ -1414,8 +1488,10 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
         // ─── Observability: turn start hook ──────────────────────────────
         // Record query for scenario detection and drift analysis.
         let turn_start_time = std::time::Instant::now();
-        if let (Some(hub), Some(session)) = (&state.observability_hub, &state.observability_session)
-        {
+        if let (Some(hub), Some(session)) = (
+            &state.telemetry.observability_hub,
+            &state.telemetry.observability_session,
+        ) {
             let session_id = state.current_session_id.as_deref().unwrap_or("");
             let user_id = {
                 let s = session.read().unwrap_or_else(|e| e.into_inner());
@@ -1433,14 +1509,16 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
         // ─── Turn trace collector ──────────────────────────────────────────
         // Create a collector for detailed context assembly traces.
         // Observability session presence enables trace collection.
-        if state.observability_session.is_some() && state.turn_trace_collector.is_none() {
+        if state.telemetry.observability_session.is_some()
+            && state.telemetry.turn_trace_collector.is_none()
+        {
             let capture = std::env::var("MO_CAPTURE_TRACES")
                 .map(|v| v == "1" || v.to_lowercase() == "true")
                 .unwrap_or(true);
             if capture {
                 let turn_id = format!("turn-{}", turn_index);
                 let session_id = state.current_session_id.clone().unwrap_or_default();
-                state.turn_trace_collector = Some(
+                state.telemetry.turn_trace_collector = Some(
                     crate::turn::turn_trace_collector::TurnTraceCollector::new(turn_id, session_id),
                 );
             }
@@ -1458,7 +1536,7 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
         // message so the LLM is aware of coordination context.
         // Cap per turn to prevent slow starts.
         const MAX_MAILBOX_DRAIN_PER_TURN: usize = 64;
-        if let Some(ref mut mailbox) = state.mailbox {
+        if let Some(ref mut mailbox) = state.messaging.mailbox {
             let (pending, has_more) = mailbox.drain_bounded(MAX_MAILBOX_DRAIN_PER_TURN);
             if !pending.is_empty() {
                 let mut parts = Vec::with_capacity(pending.len());
@@ -1468,10 +1546,10 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                     // Route Ack/Nack to our tracker (control messages, not shown to LLM).
                     match &msg.payload {
                         crate::messaging::types::MessagePayload::Ack { message_id } => {
-                            if let Some(ref tracker) = state.ack_tracker {
+                            if let Some(ref tracker) = state.messaging.ack_tracker {
                                 tracker.acknowledge(message_id).await;
                             }
-                            if let Some(ref metrics) = state.messaging_metrics {
+                            if let Some(ref metrics) = state.messaging.metrics {
                                 metrics
                                     .acks_received
                                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1482,10 +1560,10 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                             continue;
                         }
                         crate::messaging::types::MessagePayload::Nack { message_id, reason } => {
-                            if let Some(ref tracker) = state.ack_tracker {
+                            if let Some(ref tracker) = state.messaging.ack_tracker {
                                 tracker.reject(message_id, reason.clone()).await;
                             }
-                            if let Some(ref metrics) = state.messaging_metrics {
+                            if let Some(ref metrics) = state.messaging.metrics {
                                 metrics
                                     .nacks_received
                                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1500,7 +1578,7 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                     }
 
                     // Track received message.
-                    if let Some(ref metrics) = state.messaging_metrics {
+                    if let Some(ref metrics) = state.messaging.metrics {
                         metrics
                             .messages_received
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1510,7 +1588,7 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                     if msg.requires_ack {
                         let ack_reply = msg.make_ack(mailbox.address.clone());
                         let _ = mailbox.send(ack_reply).await;
-                        if let Some(ref metrics) = state.messaging_metrics {
+                        if let Some(ref metrics) = state.messaging.metrics {
                             metrics
                                 .acks_sent
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1570,15 +1648,15 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
         }
 
         // Sweep ack tracker for timed-out messages (retry or fail).
-        if let Some(ref tracker) = state.ack_tracker {
+        if let Some(ref tracker) = state.messaging.ack_tracker {
             let outcomes = tracker.sweep().await;
             let retry_msgs = tracker.get_retry_messages(&outcomes).await;
             // Re-send retry messages and track retries.
             for retry_msg in &retry_msgs {
-                if let Some(ref mut mb) = state.mailbox {
+                if let Some(ref mut mb) = state.messaging.mailbox {
                     let _ = mb.send((**retry_msg).clone()).await;
                 }
-                if let Some(ref metrics) = state.messaging_metrics {
+                if let Some(ref metrics) = state.messaging.metrics {
                     metrics
                         .retries
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1596,7 +1674,7 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                         "  ⚠ messaging: ack timeout exhausted for message {} after {} attempts",
                         message_id, attempts
                     );
-                    if let Some(ref dlq) = state.dead_letter_queue {
+                    if let Some(ref dlq) = state.messaging.dead_letter_queue {
                         dlq.store(
                             Arc::clone(message),
                             crate::messaging::dead_letter::DeadLetterReason::AckTimeout {
@@ -1606,7 +1684,7 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                         )
                         .await;
                     }
-                    if let Some(ref metrics) = state.messaging_metrics {
+                    if let Some(ref metrics) = state.messaging.metrics {
                         metrics
                             .dead_letters
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1623,7 +1701,7 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                         message_id,
                         reason.as_deref().unwrap_or("no reason")
                     );
-                    if let Some(ref dlq) = state.dead_letter_queue {
+                    if let Some(ref dlq) = state.messaging.dead_letter_queue {
                         dlq.store(
                             Arc::clone(message),
                             crate::messaging::dead_letter::DeadLetterReason::Rejected {
@@ -1633,7 +1711,7 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                         )
                         .await;
                     }
-                    if let Some(ref metrics) = state.messaging_metrics {
+                    if let Some(ref metrics) = state.messaging.metrics {
                         metrics
                             .dead_letters
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1643,24 +1721,24 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
         }
 
         // ─── Refresh ephemeral skill listing (picks up hot-reload changes) ──
-        if let Some(resolver) = &state.skill_resolver {
+        if let Some(resolver) = &state.skills.resolver {
             let full = resolver.available_skills();
-            state.skill_listing_message = if full.is_empty() {
+            state.skills.listing_message = if full.is_empty() {
                 None
             } else {
                 let (visible, open_skill_name) =
                     crate::turn::skill_tool::visible_skills_for_host_turn(
                         &full,
                         state.message.as_str(),
-                        &state.skill_quality_tracker,
-                        &state.pinned_skills,
-                        &state.discovered_skills,
-                        &state.skill_search,
+                        &state.skills.quality_tracker,
+                        &state.skills.pinned,
+                        &state.skills.discovered,
+                        &state.skills.search,
                     );
                 Some(crate::turn::skill_tool::skill_listing_system_message(
                     &visible,
-                    Some(&state.skill_quality_tracker),
-                    Some(&state.pinned_skills),
+                    Some(&state.skills.quality_tracker),
+                    Some(&state.skills.pinned),
                     open_skill_name,
                 ))
             };
@@ -1690,12 +1768,12 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
         }
 
         // ─── Step 1: Host executes the turn (payload → HTTP → SSE) ──────
-        if let Some(ref emitter) = state.progress_emitter {
+        if let Some(ref emitter) = state.messaging.progress_emitter {
             emitter.llm_call_started(turn_index as u32);
         }
         let llm_wall_start = std::time::Instant::now();
         let turn_result = host.execute_turn(state).await?;
-        if let Some(ref emitter) = state.progress_emitter {
+        if let Some(ref emitter) = state.messaging.progress_emitter {
             emitter.llm_call_completed(
                 turn_index as u32,
                 turn_result.ttft_ms,
@@ -1717,7 +1795,7 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
             quiet,
             AgenticTurnIngestMut {
                 task_profile: state.task_profile,
-                first_ttft_ms: &mut state.first_ttft_ms,
+                first_ttft_ms: &mut state.telemetry.first_ttft_ms,
                 current_session_id: &mut state.current_session_id,
                 current_run_id: &mut state.current_run_id,
                 final_text: &mut state.final_text,
@@ -1727,9 +1805,9 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                 total_cache_creation: &mut state.total_cache_creation,
                 total_tool_calls: &mut state.total_tool_calls,
                 step_recorder: &mut state.step_recorder,
-                all_tools_used: &mut state.all_tools_used,
+                all_tools_used: &mut state.telemetry.all_tools_used,
                 has_any_usage: &mut state.has_any_usage,
-                forced_factual_retry: &mut state.forced_factual_retry,
+                forced_factual_retry: &mut state.stall.forced_factual_retry,
                 messages: &mut state.messages,
                 last_measured_prompt_tokens: &mut state.last_measured_prompt_tokens,
                 consecutive_context_window_errors: &mut state.consecutive_context_window_errors,
@@ -1770,7 +1848,7 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                         state.total_tool_calls, e,
                     );
                     // ─── Observability: turn end hook (rate limit path) ───
-                    if let Some(ref session) = state.observability_session {
+                    if let Some(ref session) = state.telemetry.observability_session {
                         let total_ms = turn_start_time.elapsed().as_millis() as u64;
                         let timing = crate::observability_integration::TurnTiming {
                             turn: turn_index as u32,
@@ -1798,11 +1876,11 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                 // Runtime does not inspect results; it trusts the LLM's tool cycle.
                 // Inject whenever `stop_hooks` is non-empty (declarative and/or auto-detect).
                 // Read-only turns omit auto-detect but may still carry declarative hooks.
-                if state.stop_hook_runs == 0
+                if state.hooks.stop_hook_runs == 0
                     && let Some(prompt) =
-                        crate::turn::stop_hooks::build_stop_hook_prompt(&state.stop_hooks)
+                        crate::turn::stop_hooks::build_stop_hook_prompt(&state.hooks.stop_hooks)
                 {
-                    state.stop_hook_runs = 1;
+                    state.hooks.stop_hook_runs = 1;
                     if !quiet {
                         host.emit_headless_line(
                             HeadlessStderrStyle::Yellow,
@@ -1814,7 +1892,7 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                     continue;
                 }
                 // ─── Observability: turn end hook (no tool calls path) ───
-                if let Some(ref session) = state.observability_session {
+                if let Some(ref session) = state.telemetry.observability_session {
                     let total_ms = turn_start_time.elapsed().as_millis() as u64;
                     let timing = crate::observability_integration::TurnTiming {
                         turn: turn_index as u32,
@@ -1868,7 +1946,7 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                             );
                         }
                         // ─── Observability: turn end hook (budget exceeded) ───
-                        if let Some(ref session) = state.observability_session {
+                        if let Some(ref session) = state.telemetry.observability_session {
                             let total_ms = turn_start_time.elapsed().as_millis() as u64;
                             let timing = crate::observability_integration::TurnTiming {
                                 turn: turn_index as u32,
@@ -1914,7 +1992,7 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
 
         // ─── Observability: tool selection hook ──────────────────────────
         // Record which tools the LLM chose for this turn (before execution).
-        if let Some(session) = &state.observability_session {
+        if let Some(session) = &state.telemetry.observability_session {
             let selected_tools: Vec<String> = turn_result
                 .edge_tool_round
                 .iter()
@@ -1930,7 +2008,7 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                     timestamp: std::time::SystemTime::now(),
                     decision_type: crate::turn::decision_explainer::DecisionType::ToolSelection {
                         selected_tools: selected_tools.clone(),
-                        total_available: state.all_tools_used.len() as u32,
+                        total_available: state.telemetry.all_tools_used.len() as u32,
                     },
                     inputs: vec![crate::turn::decision_explainer::ExplainableInput {
                         name: "user_query".to_string(),
@@ -1954,7 +2032,7 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
         }
 
         // ─── Trace collector: record tool selection ──────────────────────
-        if let Some(ref collector) = state.turn_trace_collector {
+        if let Some(ref collector) = state.telemetry.turn_trace_collector {
             let selected_tools: Vec<String> = turn_result
                 .edge_tool_round
                 .iter()
@@ -1963,15 +2041,16 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
             collector.record_tool_selection(
                 &selected_tools,
                 state
+                    .telemetry
                     .first_selector_strategy
                     .as_deref()
                     .unwrap_or("unknown"),
-                state.first_selector_confidence.unwrap_or(0.0),
+                state.telemetry.first_selector_confidence.unwrap_or(0.0),
                 state.total_prompt as u32, // budget approximation
-                state.selector_tokens_in,
-                state.selector_tokens_out,
-                state.all_tools_used.len() as u32,
-                state.first_selector_ms.unwrap_or(0),
+                state.telemetry.selector_tokens_in,
+                state.telemetry.selector_tokens_out,
+                state.telemetry.all_tools_used.len() as u32,
+                state.telemetry.first_selector_ms.unwrap_or(0),
             );
         }
 
@@ -1980,9 +2059,9 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
             turn_index,
             &turn_result.accum.tool_calls,
             &turn_result.edge_tool_round,
-            &mut state.turn_sigs,
-            &mut state.turn_tool_names,
-            &mut state.stall_events,
+            &mut state.stall.turn_sigs,
+            &mut state.stall.turn_tool_names,
+            &mut state.stall.events,
             &mut state.turn_guard,
         );
 
@@ -2002,7 +2081,7 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                         );
                 }
                 let _ = crate::skills::hooks::evaluate_session_hooks(
-                    &state.session_event_hooks,
+                    &state.skills.session_event_hooks,
                     crate::skills::hooks::SessionEvent::SubagentStart,
                     state.current_session_id.as_deref().unwrap_or(""),
                     None,
@@ -2015,8 +2094,8 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                 state.current_run_id.as_deref().unwrap_or("unknown"),
                 state.current_session_id.as_deref().unwrap_or("unknown"),
                 "orchestrator",
-                state.workspace_root_hint.as_deref(),
-                &state.skill_search,
+                state.hooks.workspace_root_hint.as_deref(),
+                &state.skills.search,
             )
             .await
         } else {
@@ -2087,7 +2166,7 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                 // Record delegation results in journal so session analysis
                 // shows actual sub-agent output instead of the static
                 // "acknowledged" placeholder from the edge executor.
-                state.tool_call_records.push(ToolCallRecord {
+                state.stall.tool_call_records.push(ToolCallRecord {
                     name: DELEGATE_TOOL_NAME.to_string(),
                     ok: !result.summary.starts_with("Delegation failed:")
                         && !result.summary.starts_with("Invalid delegation request:"),
@@ -2109,11 +2188,12 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
         }
 
         if !delegation_results.is_empty()
-            && state.teammate_idle_hook_runs == 0
-            && let Some(prompt) =
-                crate::turn::stop_hooks::build_teammate_idle_hook_prompt(&state.teammate_idle_hooks)
+            && state.hooks.teammate_idle_hook_runs == 0
+            && let Some(prompt) = crate::turn::stop_hooks::build_teammate_idle_hook_prompt(
+                &state.hooks.teammate_idle_hooks,
+            )
         {
-            state.teammate_idle_hook_runs = 1;
+            state.hooks.teammate_idle_hook_runs = 1;
             if !quiet {
                 host.emit_headless_line(
                     HeadlessStderrStyle::Yellow,
@@ -2134,7 +2214,7 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
         // If the agent has a mailbox, intercept send_message tool calls and
         // route them through the messaging system.
         let post_send_tool_calls;
-        let effective_tool_calls = if let Some(ref mailbox) = state.mailbox {
+        let effective_tool_calls = if let Some(ref mailbox) = state.messaging.mailbox {
             let mut msg_results: Vec<(String, String)> = Vec::new();
             let mut remaining = Vec::new();
             for tc in effective_tool_calls {
@@ -2148,7 +2228,7 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                         if send_result.tracked_message.is_some()
                             || !send_result.display.starts_with("Error:")
                         {
-                            if let Some(ref metrics) = state.messaging_metrics {
+                            if let Some(ref metrics) = state.messaging.metrics {
                                 metrics
                                     .messages_sent
                                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2156,7 +2236,7 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                         }
                         // Track ack-requiring messages.
                         if let Some(tracked_msg) = send_result.tracked_message {
-                            if let Some(ref tracker) = state.ack_tracker {
+                            if let Some(ref tracker) = state.messaging.ack_tracker {
                                 tracker.track(tracked_msg).await;
                             }
                         }
@@ -2190,11 +2270,11 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
         // If a skill resolver is wired, intercept "skill" tool calls and
         // return resolved instructions as tool results.
         let (mut skill_results, post_skill_tool_calls);
-        let effective_tool_calls = if let Some(resolver) = &state.skill_resolver {
+        let effective_tool_calls = if let Some(resolver) = &state.skills.resolver {
             // Build runtime context for skill execution
             let mut extra = std::collections::HashMap::new();
 
-            if let Some(ref root) = state.workspace_root_hint {
+            if let Some(ref root) = state.hooks.workspace_root_hint {
                 let root_path = std::path::Path::new(root.as_str());
 
                 // Detect git branch
@@ -2260,9 +2340,10 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
             if !depri.is_empty() {
                 extra.insert("deprioritized_tools".into(), depri.join(", "));
             }
-            if !state.stall_events.is_empty() {
+            if !state.stall.events.is_empty() {
                 let stalls: Vec<String> = state
-                    .stall_events
+                    .stall
+                    .events
                     .iter()
                     .map(|(kind, turn)| format!("{}@t{}", kind, turn))
                     .collect();
@@ -2289,8 +2370,8 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
             let skill_ctx = crate::turn::skill_tool::SkillContext {
                 session_id: state.current_session_id.clone(),
                 session_dir,
-                work_dir: state.workspace_root_hint.clone(),
-                available_tools: state.all_tools_used.iter().cloned().collect(),
+                work_dir: state.hooks.workspace_root_hint.clone(),
+                available_tools: state.telemetry.all_tools_used.iter().cloned().collect(),
                 extra,
             };
 
@@ -2299,10 +2380,10 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
             let (visible_for_mask, _) = crate::turn::skill_tool::visible_skills_for_host_turn(
                 &full_catalog,
                 state.message.as_str(),
-                &state.skill_quality_tracker,
-                &state.pinned_skills,
-                &state.discovered_skills,
-                &state.skill_search,
+                &state.skills.quality_tracker,
+                &state.skills.pinned,
+                &state.skills.discovered,
+                &state.skills.search,
             );
             let discover_exclude =
                 crate::turn::skill_tool::skill_mask_names_lowercase(&visible_for_mask);
@@ -2323,7 +2404,7 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                                 .map(String::from)
                         });
                     if let Some(ref name) = skill_name {
-                        if let Some(prev) = state.invoked_skills.get(name.as_str()) {
+                        if let Some(prev) = state.skills.invoked.get(name.as_str()) {
                             let call_id = tc.get("id").and_then(Value::as_str).unwrap_or("unknown");
                             dedup_results.push((
                                 call_id.to_string(),
@@ -2346,9 +2427,9 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                     resolver.as_ref(),
                     &full_catalog,
                     &discover_exclude,
-                    &mut state.discovered_skills,
-                    state.skill_executor.as_ref(),
-                    Some(&mut state.skill_quality_tracker),
+                    &mut state.skills.discovered,
+                    state.skills.executor.as_ref(),
+                    Some(&mut state.skills.quality_tracker),
                     Some(&composition_ctx),
                     &skill_ctx,
                 )
@@ -2374,7 +2455,7 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                         });
                     if let Some(name) = name {
                         if crate::turn::skill_tool::is_skill_call(tc) {
-                            state.invoked_skills.insert(
+                            state.skills.invoked.insert(
                                 name.clone(),
                                 crate::turn::skill_tool::InvokedSkill {
                                     name,
@@ -2440,16 +2521,16 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
             // present in the new activation are cleared so stale overrides
             // from a prior skill don't persist indefinitely.
             if let Some(act) = activation {
-                state.skill_model_override =
+                state.skills.model_override =
                     act.model_override.filter(|m| is_valid_model_string(m));
-                state.skill_allowed_tools = if act.allowed_tools.is_empty() {
+                state.skills.allowed_tools = if act.allowed_tools.is_empty() {
                     None
                 } else {
                     Some(act.allowed_tools.into_iter().collect())
                 };
-                state.skill_effort = act.effort;
-                state.skill_agent_type = act.agent_type;
-                state.skill_sandbox_policy = act.sandbox_policy;
+                state.skills.effort = act.effort;
+                state.skills.agent_type = act.agent_type;
+                state.skills.sandbox_policy = act.sandbox_policy;
             }
 
             &post_skill_tool_calls
@@ -2528,20 +2609,20 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                 &mut state.step_recorder,
                 &mut state.idempotency_cache,
                 &mut state.semantic_dedup,
-                &mut state.tool_call_records,
-                &state.tool_event_hooks,
+                &mut state.stall.tool_call_records,
+                &state.skills.tool_event_hooks,
                 &mut term_adapter,
-                state.mailbox.as_mut(),
+                state.messaging.mailbox.as_mut(),
                 state.permission_context.as_ref(),
-                state.progress_emitter.as_ref(),
+                state.messaging.progress_emitter.as_ref(),
             )
             .await;
         }
 
         // ── Emit progress events for permission-denied tools so
         //    parent/UI subscribers learn about blocked operations.
-        if let Some(ref emitter) = state.progress_emitter {
-            for rec in &state.tool_call_records {
+        if let Some(ref emitter) = state.messaging.progress_emitter {
+            for rec in &state.stall.tool_call_records {
                 if let Some(ref err) = rec.error {
                     if err.starts_with("blocked_tool:") {
                         emitter.permission_denied(
@@ -2555,7 +2636,7 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
         }
 
         append_explain_turn_batch(
-            &mut state.explain_turns,
+            &mut state.telemetry.explain_turns,
             turn_result.accum.explain_turns.as_slice(),
         );
 
@@ -2592,7 +2673,7 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
         // Record file paths from edge tool executions so path-conditional
         // skills can activate dynamically. When new skills activate, refresh
         // the `skill` tool schema with the expanded skill list.
-        if let Some(ref registry) = state.skill_registry_for_activation {
+        if let Some(ref registry) = state.skills.registry_for_activation {
             let mut any_newly_activated = false;
             for edge_result in &turn_result.edge_tool_round {
                 if let Some(path) =
@@ -2613,22 +2694,22 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                 }
             }
             if any_newly_activated {
-                if let Some(resolver) = &state.skill_resolver {
+                if let Some(resolver) = &state.skills.resolver {
                     let full = resolver.available_skills();
                     if !full.is_empty() {
                         let (visible, open_skill_name) =
                             crate::turn::skill_tool::visible_skills_for_host_turn(
                                 &full,
                                 state.message.as_str(),
-                                &state.skill_quality_tracker,
-                                &state.pinned_skills,
-                                &state.discovered_skills,
-                                &state.skill_search,
+                                &state.skills.quality_tracker,
+                                &state.skills.pinned,
+                                &state.skills.discovered,
+                                &state.skills.search,
                             );
                         host.inject_tool_schema(crate::turn::skill_tool::skill_tool_schema(
                             &visible,
-                            Some(&state.skill_quality_tracker),
-                            Some(&state.pinned_skills),
+                            Some(&state.skills.quality_tracker),
+                            Some(&state.skills.pinned),
                             open_skill_name,
                         ));
                         if open_skill_name {
@@ -2666,14 +2747,15 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                     })
                     .max_by_key(|(_, delta)| *delta)
                     .map(|(cat, _)| cat);
-                if dominant == state.last_error_category {
-                    state.consecutive_same_error += 1;
+                if dominant == state.error_recovery.last_error_category {
+                    state.error_recovery.consecutive_same_error += 1;
                 } else {
-                    state.consecutive_same_error = 1;
-                    state.last_error_category = dominant;
+                    state.error_recovery.consecutive_same_error = 1;
+                    state.error_recovery.last_error_category = dominant;
                 }
-                if state.consecutive_same_error >= CONSECUTIVE_ERROR_BUDGET {
+                if state.error_recovery.consecutive_same_error >= CONSECUTIVE_ERROR_BUDGET {
                     let cat_name = state
+                        .error_recovery
                         .last_error_category
                         .map(|c| format!("{c:?}"))
                         .unwrap_or_else(|| "Unknown".into());
@@ -2685,15 +2767,15 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                              STOP repeating the same strategy. You MUST try a fundamentally \
                              different approach: different tool, different file, different \
                              method. If you cannot make progress, explain what's blocking you.",
-                            n = state.consecutive_same_error,
+                            n = state.error_recovery.consecutive_same_error,
                         )
                     }));
-                    state.consecutive_same_error = 0; // Reset after nudge
+                    state.error_recovery.consecutive_same_error = 0; // Reset after nudge
                 }
             } else {
                 // Successful turn — reset streak.
-                state.consecutive_same_error = 0;
-                state.last_error_category = None;
+                state.error_recovery.consecutive_same_error = 0;
+                state.error_recovery.last_error_category = None;
             }
         }
 
@@ -2709,7 +2791,7 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                     Ok(true) => { /* continue */ }
                     Ok(false) => {
                         // ─── Observability: turn end hook (gate cancelled) ───
-                        if let Some(ref session) = state.observability_session {
+                        if let Some(ref session) = state.telemetry.observability_session {
                             let total_ms = turn_start_time.elapsed().as_millis() as u64;
                             let timing = crate::observability_integration::TurnTiming {
                                 turn: turn_index as u32,
@@ -2743,11 +2825,11 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                 turn_index: turn_index as u32,
                 message: &state.message,
                 tool_calls_for_guard: &tool_calls_for_guard,
-                intent_tool_turns: &mut state.intent_tool_turns,
+                intent_tool_turns: &mut state.stall.intent_tool_turns,
                 messages: &mut state.messages,
-                stall_events: &mut state.stall_events,
+                stall_events: &mut state.stall.events,
                 turn_guard: &mut state.turn_guard,
-                verdict_events: &mut state.verdict_events,
+                verdict_events: &mut state.stall.verdict_events,
                 restricted_tools: &mut state.restricted_tools,
                 remaining_turns: &mut state.remaining_turns,
                 step_recorder: &mut state.step_recorder,
@@ -2755,7 +2837,7 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                 max_turns: state.max_turns,
                 loop_turn: turn_index,
                 recent_tools: &state.recent_tools,
-                last_heavy_checkpoint: &mut state.last_heavy_checkpoint,
+                last_heavy_checkpoint: &mut state.stall.last_heavy_checkpoint,
             },
         )) {
             AgenticPostToolIterationControl::Abort(e) => return Err(e),
@@ -2764,7 +2846,7 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
             }
             AgenticPostToolIterationControl::ProceedEndTurn => {
                 // Emit progress event for subscribers (UI, monitors).
-                if let Some(ref emitter) = state.progress_emitter {
+                if let Some(ref emitter) = state.messaging.progress_emitter {
                     let tool_calls_this_turn =
                         state.total_tool_calls.saturating_sub(if turn_index > 0 {
                             state.total_tool_calls
@@ -2789,7 +2871,7 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                 }
 
                 // Send progress update to parent agent (best-effort).
-                if let Some(ref mailbox) = state.mailbox {
+                if let Some(ref mailbox) = state.messaging.mailbox {
                     let _ = mailbox
                         .send_progress(
                             turn_index as u32,
@@ -2802,7 +2884,7 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
 
                 // ─── Observability: turn end hook ────────────────────────
                 // Capture timing and feed to auto-tuning.
-                if let Some(ref session) = state.observability_session {
+                if let Some(ref session) = state.telemetry.observability_session {
                     let total_ms = turn_start_time.elapsed().as_millis() as u64;
                     let timing = crate::observability_integration::TurnTiming {
                         turn: turn_index as u32,
@@ -2818,14 +2900,14 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
 
                 // ─── Finalize turn trace collector ────────────────────────
                 // Persist context assembly trace to session journal (best-effort).
-                if let Some(ref collector) = state.turn_trace_collector {
+                if let Some(ref collector) = state.telemetry.turn_trace_collector {
                     // Compute budget pressure from last measured tokens.
                     let measured = state.last_measured_prompt_tokens.unwrap_or(0);
                     let max = state.max_turn_input_tokens;
                     let budget_pressure = if max > 0 {
                         measured as f64 / max as f64
                     } else {
-                        state.first_budget_pressure
+                        state.telemetry.first_budget_pressure
                     };
 
                     // Record token budget before finalizing.
@@ -2851,12 +2933,12 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                     }
                 }
                 // Clear collector for next turn.
-                state.turn_trace_collector = None;
+                state.telemetry.turn_trace_collector = None;
 
                 state.step_recorder.end_turn(false);
 
                 // ── Auto-tuning: count completed turns & periodic cycle ──
-                state.completed_turns_for_tuning += 1;
+                state.telemetry.completed_turns_for_tuning += 1;
                 maybe_run_tuning_cycle(state);
             }
         }
@@ -3106,57 +3188,24 @@ mod tests {
             step_recorder: StepRecorder::new("test-session", "test-task"),
             idempotency_cache: InMemoryIdempotencyCache::new(),
             semantic_dedup: SemanticDedup::new(0.95),
-            turn_sigs: Vec::new(),
-            turn_tool_names: Vec::new(),
-            stall_events: Vec::new(),
-            intent_tool_turns: Vec::new(),
-            verdict_events: Vec::new(),
-            last_heavy_checkpoint: None,
-            tool_call_records: Vec::new(),
-            forced_factual_retry: false,
-            explain_turns: Vec::new(),
-            first_ttft_ms: None,
-            all_tools_used: HashSet::new(),
-            first_selection_report: None,
-            first_budget_pressure: 0.0,
-            first_context_assembly_ms: None,
-            first_memoria_ms: None,
-            first_selector_ms: None,
-            first_selector_strategy: None,
-            first_selector_confidence: None,
-            selector_tokens_in: 0,
-            selector_tokens_out: 0,
-            all_selected_skills: Vec::new(),
+            stall: Default::default(),
+            telemetry: Default::default(),
+            skills: SkillState {
+                quality_tracker: crate::skills::quality::SkillQualityTracker::new(),
+                improvement_tracker: crate::skills::improvement::ImprovementTracker::new(),
+                ..Default::default()
+            },
+            hooks: Default::default(),
+            messaging: Default::default(),
+            cancellation: Default::default(),
+            error_recovery: Default::default(),
             message: "test query".to_string(),
             recent_tools: Vec::new(),
             task_profile: TaskExecutionProfile::default(),
             api: astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
             api_token: String::new(),
-            cancel_flag: None,
-            cancel_token: None,
             delegation_engine: None,
-            skill_registry_for_activation: None,
-            skill_resolver: None,
-            skill_executor: None,
-            skill_model_override: None,
-            skill_effort: None,
-            skill_agent_type: None,
-            skill_allowed_tools: None,
-            skill_sandbox_policy: None,
-            skill_quality_tracker: crate::skills::quality::SkillQualityTracker::new(),
-            skill_improvement_tracker: crate::skills::improvement::ImprovementTracker::new(),
-            pinned_skills: std::collections::HashSet::new(),
-            discovered_skills: HashSet::new(),
-            skill_search: astra_core::SkillSearchSettings::default(),
-            tool_event_hooks: crate::skills::hooks::ToolEventHookRegistry::default(),
-            session_event_hooks: crate::skills::hooks::SessionEventHookRegistry::default(),
-            stop_hooks: Vec::new(),
-            stop_hook_runs: 0,
-            teammate_idle_hooks: Vec::new(),
-            teammate_idle_hook_runs: 0,
-            workspace_root_hint: None,
-            consecutive_same_error: 0,
-            last_error_category: None,
+            project_context: None,
             checkpoint_gate: None,
             data_snapshot_provider: None,
             last_composite_snapshot: None,
@@ -3165,21 +3214,9 @@ mod tests {
             max_turn_input_tokens: 0,
             budget_wrapup_injected: false,
             thinking_budget_tokens: None,
-            skill_listing_message: None,
-            invoked_skills: std::collections::HashMap::new(),
             recent_file_reads: Vec::new(),
-            turn_trace_collector: None,
-            project_context: None,
-            mailbox: None,
-            ack_tracker: None,
-            dead_letter_queue: None,
-            messaging_metrics: None,
-            progress_emitter: None,
             permission_context: None,
             permission_handler: None,
-            observability_session: None,
-            observability_hub: None,
-            completed_turns_for_tuning: 0,
         }
     }
 
@@ -3217,7 +3254,7 @@ mod tests {
             guard.turn_number = 1;
             guard.record_query("run tests for authentication flow");
         }
-        state.observability_session = Some(session.clone());
+        state.telemetry.observability_session = Some(session.clone());
 
         let edge_tools = vec![
             make_edge_tool_with_status("bash", "ok", "test result: ok. 24 passed; 0 failed"),
@@ -3257,7 +3294,7 @@ mod tests {
         let mut host = MockHost::new(vec![text_result("hi", 10, 5, Some(42))]);
         let mut state = make_state();
         let _ = run_agentic_loop_with_host(&mut host, &mut state).await;
-        assert_eq!(state.first_ttft_ms, Some(42));
+        assert_eq!(state.telemetry.first_ttft_ms, Some(42));
     }
 
     // ── Multi-turn flow tests ───────────────────────────────────────────────
@@ -3326,10 +3363,10 @@ mod tests {
             text_result("result", 10, 5, Some(200)),
         ]);
         let mut state = make_state();
-        assert!(state.first_ttft_ms.is_none());
+        assert!(state.telemetry.first_ttft_ms.is_none());
 
         let _ = run_agentic_loop_with_host(&mut host, &mut state).await;
-        assert_eq!(state.first_ttft_ms, Some(100)); // NOT 200
+        assert_eq!(state.telemetry.first_ttft_ms, Some(100)); // NOT 200
     }
 
     // ── Boundary condition tests ────────────────────────────────────────────
@@ -3382,8 +3419,8 @@ mod tests {
         // Turn 1 state preserved
         assert_eq!(state.total_prompt, 20);
         assert_eq!(state.total_completion, 10);
-        assert_eq!(state.first_ttft_ms, Some(50));
-        assert!(state.all_tools_used.contains("bash"));
+        assert_eq!(state.telemetry.first_ttft_ms, Some(50));
+        assert!(state.telemetry.all_tools_used.contains("bash"));
         // Both turns decremented remaining_turns
         assert_eq!(state.remaining_turns, 3); // 5→4→3
     }
@@ -3420,9 +3457,9 @@ mod tests {
         let mut state = make_state();
 
         let _ = run_agentic_loop_with_host(&mut host, &mut state).await;
-        assert!(state.all_tools_used.contains("bash"));
-        assert!(state.all_tools_used.contains("read_file"));
-        assert_eq!(state.all_tools_used.len(), 2);
+        assert!(state.telemetry.all_tools_used.contains("bash"));
+        assert!(state.telemetry.all_tools_used.contains("read_file"));
+        assert_eq!(state.telemetry.all_tools_used.len(), 2);
     }
 
     #[tokio::test]
@@ -3501,8 +3538,8 @@ mod tests {
 
         let _ = run_agentic_loop_with_host(&mut host, &mut state).await;
         // The headless round should record tool executions
-        assert!(!state.tool_call_records.is_empty());
-        assert_eq!(state.tool_call_records[0].ms, 10);
+        assert!(!state.stall.tool_call_records.is_empty());
+        assert_eq!(state.stall.tool_call_records[0].ms, 10);
     }
 
     #[tokio::test]
@@ -3544,7 +3581,7 @@ mod tests {
         assert!(outcome.is_ok());
         assert_eq!(host.current_turn, 2);
         // Tool should be in all_tools_used
-        assert!(state.all_tools_used.contains("bash"));
+        assert!(state.telemetry.all_tools_used.contains("bash"));
     }
 
     // ── Server tool_call tests ──────────────────────────────────────────────
@@ -3573,7 +3610,7 @@ mod tests {
         assert!(outcome.is_ok());
         assert_eq!(host.current_turn, 2);
         assert_eq!(state.final_text, "Analyzed the file.");
-        assert!(state.all_tools_used.contains("read_file"));
+        assert!(state.telemetry.all_tools_used.contains("read_file"));
         assert_eq!(state.total_prompt, 35);
         assert_eq!(state.total_completion, 15);
     }
@@ -3592,8 +3629,8 @@ mod tests {
 
         let _ = run_agentic_loop_with_host(&mut host, &mut state).await;
         // turn_sigs and turn_tool_names should have entries from both tool turns
-        assert!(state.turn_sigs.len() >= 2);
-        assert!(state.turn_tool_names.len() >= 2);
+        assert!(state.stall.turn_sigs.len() >= 2);
+        assert!(state.stall.turn_tool_names.len() >= 2);
     }
 
     // ── Edge case: has_any_usage tracking ───────────────────────────────────
@@ -3614,7 +3651,7 @@ mod tests {
     async fn cancel_flag_none_does_not_cancel() {
         let mut host = MockHost::new(vec![text_result("ok", 10, 5, Some(42))]);
         let mut state = make_state();
-        state.cancel_flag = None; // default
+        state.cancellation.flag = None; // default
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(matches!(outcome, Ok(AgenticLoopOutcome::Completed)));
         assert_eq!(state.final_text, "ok");
@@ -3625,7 +3662,7 @@ mod tests {
         let flag = Arc::new(AtomicBool::new(false));
         let mut host = MockHost::new(vec![text_result("ok", 10, 5, Some(42))]);
         let mut state = make_state();
-        state.cancel_flag = Some(flag);
+        state.cancellation.flag = Some(flag);
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(matches!(outcome, Ok(AgenticLoopOutcome::Completed)));
         assert_eq!(state.final_text, "ok");
@@ -3636,7 +3673,7 @@ mod tests {
         let flag = Arc::new(AtomicBool::new(true));
         let mut host = MockHost::new(vec![text_result("should not run", 10, 5, Some(42))]);
         let mut state = make_state();
-        state.cancel_flag = Some(flag);
+        state.cancellation.flag = Some(flag);
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(matches!(outcome, Ok(AgenticLoopOutcome::Cancelled)));
         // No turns executed — host never called
@@ -3655,7 +3692,7 @@ mod tests {
             text_result("should not run", 10, 5, Some(42)),
         ]);
         let mut state = make_state();
-        state.cancel_flag = Some(flag_clone);
+        state.cancellation.flag = Some(flag_clone);
 
         // Set cancel flag before loop starts — simulates cancel arriving
         flag.store(true, Ordering::Relaxed);
@@ -4752,7 +4789,7 @@ mod tests {
         state
             .messages
             .push(json!({"role": "user", "content": "hello"}));
-        state.skill_resolver = Some(Arc::new(resolver));
+        state.skills.resolver = Some(Arc::new(resolver));
 
         let _ = run_agentic_loop_with_host(&mut host, &mut state).await;
 
@@ -4791,7 +4828,7 @@ mod tests {
         state
             .messages
             .push(json!({"role": "user", "content": "use the test skill"}));
-        state.skill_resolver = Some(Arc::new(resolver));
+        state.skills.resolver = Some(Arc::new(resolver));
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(outcome.is_ok());
@@ -4822,13 +4859,13 @@ mod tests {
         state
             .messages
             .push(json!({"role": "user", "content": "use skill"}));
-        state.skill_resolver = Some(Arc::new(resolver));
+        state.skills.resolver = Some(Arc::new(resolver));
 
         let _ = run_agentic_loop_with_host(&mut host, &mut state).await;
 
         // Model override should be set after skill activation
         assert_eq!(
-            state.skill_model_override.as_deref(),
+            state.skills.model_override.as_deref(),
             Some("claude-sonnet-4-20250514")
         );
     }
@@ -4846,12 +4883,12 @@ mod tests {
         state
             .messages
             .push(json!({"role": "user", "content": "use skill"}));
-        state.skill_resolver = Some(Arc::new(resolver));
+        state.skills.resolver = Some(Arc::new(resolver));
 
         let _ = run_agentic_loop_with_host(&mut host, &mut state).await;
 
         // Invalid model string should be rejected
-        assert!(state.skill_model_override.is_none());
+        assert!(state.skills.model_override.is_none());
     }
 
     #[tokio::test]
@@ -4868,11 +4905,11 @@ mod tests {
         state
             .messages
             .push(json!({"role": "user", "content": "use skill"}));
-        state.skill_resolver = Some(Arc::new(resolver));
+        state.skills.resolver = Some(Arc::new(resolver));
 
         let _ = run_agentic_loop_with_host(&mut host, &mut state).await;
 
-        let allowed = state.skill_allowed_tools.as_ref().unwrap();
+        let allowed = state.skills.allowed_tools.as_ref().unwrap();
         assert!(allowed.contains("bash"));
         assert!(allowed.contains("grep"));
         assert_eq!(allowed.len(), 2);
@@ -4882,8 +4919,8 @@ mod tests {
     async fn unrestricted_skill_clears_prior_overrides() {
         // Simulate: first skill sets overrides, second skill is unrestricted
         let mut state = make_state();
-        state.skill_model_override = Some("old-model".into());
-        state.skill_allowed_tools = Some(["bash".into()].into_iter().collect());
+        state.skills.model_override = Some("old-model".into());
+        state.skills.allowed_tools = Some(["bash".into()].into_iter().collect());
 
         // An unrestricted skill (no model, no tools) should clear both
         let resolver = StubSkillResolver::new(); // no model, no tools
@@ -4896,13 +4933,13 @@ mod tests {
         state
             .messages
             .push(json!({"role": "user", "content": "use skill"}));
-        state.skill_resolver = Some(Arc::new(resolver));
+        state.skills.resolver = Some(Arc::new(resolver));
 
         let _ = run_agentic_loop_with_host(&mut host, &mut state).await;
 
         // Both should be cleared
-        assert!(state.skill_model_override.is_none());
-        assert!(state.skill_allowed_tools.is_none());
+        assert!(state.skills.model_override.is_none());
+        assert!(state.skills.allowed_tools.is_none());
     }
 
     #[tokio::test]
@@ -4921,7 +4958,7 @@ mod tests {
         state
             .messages
             .push(json!({"role": "user", "content": "use skill"}));
-        state.skill_resolver = Some(Arc::new(resolver));
+        state.skills.resolver = Some(Arc::new(resolver));
 
         // Pre-condition: restricted_tools is empty
         assert!(state.restricted_tools.is_empty());
@@ -4934,7 +4971,7 @@ mod tests {
         // host's job in execute_turn(). This test verifies the runtime doesn't
         // pollute restricted_tools.
         // The skill_allowed_tools field IS set (for the host to use):
-        let allowed = state.skill_allowed_tools.as_ref().unwrap();
+        let allowed = state.skills.allowed_tools.as_ref().unwrap();
         assert!(allowed.contains("bash"));
     }
 
@@ -5006,7 +5043,7 @@ mod tests {
         // Skill listing should be stored on the field, not pushed into messages.
         let mut state = make_state();
         state.messages = vec![json!({"role": "user", "content": "hi"})];
-        state.skill_listing_message = Some(json!({
+        state.skills.listing_message = Some(json!({
             "role": "system",
             "content": "<available_skills>...</available_skills>"
         }));
@@ -5015,13 +5052,13 @@ mod tests {
         assert_eq!(state.messages.len(), 1);
         assert_eq!(state.messages[0]["role"], "user");
         // But the listing should be available for ephemeral injection
-        assert!(state.skill_listing_message.is_some());
+        assert!(state.skills.listing_message.is_some());
     }
 
     #[test]
     fn skill_listing_message_defaults_to_none() {
         let state = make_state();
-        assert!(state.skill_listing_message.is_none());
+        assert!(state.skills.listing_message.is_none());
     }
 
     #[test]
@@ -5093,7 +5130,7 @@ mod tests {
         let mut host = MockHost::new(vec![text_result("Hello!", 10, 5, Some(42))]);
         let mut state = make_state();
         state.messages = vec![json!({"role": "user", "content": "hi"})];
-        state.skill_listing_message = Some(json!({
+        state.skills.listing_message = Some(json!({
             "role": "system",
             "content": "skill listing content"
         }));
@@ -5120,7 +5157,7 @@ mod tests {
         let mut state = make_state();
 
         // Initial: no listing
-        assert!(state.skill_listing_message.is_none());
+        assert!(state.skills.listing_message.is_none());
 
         // Simulate first refresh with 1 skill
         let skills_v1 = vec![SkillToolInfo {
@@ -5133,9 +5170,9 @@ mod tests {
             tags: vec![],
             triggers: vec![],
         }];
-        state.skill_listing_message =
+        state.skills.listing_message =
             Some(skill_listing_system_message(&skills_v1, None, None, false));
-        let v1_content = state.skill_listing_message.as_ref().unwrap()["content"]
+        let v1_content = state.skills.listing_message.as_ref().unwrap()["content"]
             .as_str()
             .unwrap()
             .to_string();
@@ -5164,9 +5201,9 @@ mod tests {
                 triggers: vec![],
             },
         ];
-        state.skill_listing_message =
+        state.skills.listing_message =
             Some(skill_listing_system_message(&skills_v2, None, None, false));
-        let v2_content = state.skill_listing_message.as_ref().unwrap()["content"]
+        let v2_content = state.skills.listing_message.as_ref().unwrap()["content"]
             .as_str()
             .unwrap()
             .to_string();
@@ -5221,7 +5258,7 @@ mod tests {
     #[test]
     fn invoked_skills_defaults_to_empty() {
         let state = make_state();
-        assert!(state.invoked_skills.is_empty());
+        assert!(state.skills.invoked.is_empty());
     }
 
     #[tokio::test]
@@ -5244,7 +5281,7 @@ mod tests {
         state
             .messages
             .push(json!({"role": "user", "content": "use skill twice"}));
-        state.skill_resolver = Some(Arc::new(resolver));
+        state.skills.resolver = Some(Arc::new(resolver));
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(outcome.is_ok());
@@ -5287,8 +5324,8 @@ mod tests {
         );
 
         // Skill should be tracked
-        assert!(state.invoked_skills.contains_key("test-skill"));
-        assert_eq!(state.invoked_skills["test-skill"].invoked_at_turn, 1);
+        assert!(state.skills.invoked.contains_key("test-skill"));
+        assert_eq!(state.skills.invoked["test-skill"].invoked_at_turn, 1);
     }
 
     #[tokio::test]
@@ -5312,7 +5349,7 @@ mod tests {
         state
             .messages
             .push(json!({"role": "user", "content": "use both skills"}));
-        state.skill_resolver = Some(Arc::new(resolver));
+        state.skills.resolver = Some(Arc::new(resolver));
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(outcome.is_ok());
@@ -5343,7 +5380,7 @@ mod tests {
         );
 
         // Both tracked
-        assert_eq!(state.invoked_skills.len(), 2);
+        assert_eq!(state.skills.invoked.len(), 2);
     }
 
     #[test]
@@ -5352,7 +5389,7 @@ mod tests {
         use crate::turn::skill_tool::InvokedSkill;
 
         let mut state = make_state();
-        state.invoked_skills.insert(
+        state.skills.invoked.insert(
             "review-changes".into(),
             InvokedSkill {
                 name: "review-changes".into(),
@@ -5363,7 +5400,7 @@ mod tests {
 
         // Simulate post-compaction re-injection
         let mut builder = AttachmentBuilder::new();
-        let mut skills: Vec<_> = state.invoked_skills.values().collect();
+        let mut skills: Vec<_> = state.skills.invoked.values().collect();
         skills.sort_by(|a, b| b.invoked_at_turn.cmp(&a.invoked_at_turn));
         for skill in skills {
             builder.add_skill(&skill.name, &skill.content);
@@ -5444,7 +5481,7 @@ mod tests {
         state
             .messages
             .push(json!({"role": "user", "content": "use the test skill"}));
-        state.skill_resolver = Some(Arc::new(resolver));
+        state.skills.resolver = Some(Arc::new(resolver));
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(outcome.is_ok());
@@ -5513,7 +5550,7 @@ mod tests {
         state
             .messages
             .push(json!({"role": "user", "content": "use the test skill"}));
-        state.skill_resolver = Some(Arc::new(resolver));
+        state.skills.resolver = Some(Arc::new(resolver));
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(outcome.is_ok());
@@ -5590,7 +5627,7 @@ mod tests {
         state
             .messages
             .push(json!({"role": "user", "content": "use skill"}));
-        state.skill_resolver = Some(Arc::new(resolver));
+        state.skills.resolver = Some(Arc::new(resolver));
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(outcome.is_ok());
@@ -5654,7 +5691,7 @@ mod tests {
         state
             .messages
             .push(json!({"role": "user", "content": "use skill"}));
-        state.skill_resolver = Some(Arc::new(resolver));
+        state.skills.resolver = Some(Arc::new(resolver));
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(outcome.is_ok());
@@ -5698,7 +5735,7 @@ mod tests {
         state
             .messages
             .push(json!({"role": "user", "content": "use skill"}));
-        state.skill_resolver = Some(Arc::new(resolver));
+        state.skills.resolver = Some(Arc::new(resolver));
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(outcome.is_ok());
@@ -5772,7 +5809,7 @@ mod tests {
         state
             .messages
             .push(json!({"role": "user", "content": "use skill"}));
-        state.skill_resolver = Some(Arc::new(resolver));
+        state.skills.resolver = Some(Arc::new(resolver));
 
         // Should not panic
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
@@ -6002,7 +6039,7 @@ mod tests {
         host = host.with_valid_tools(&["bash"]);
 
         let mut state = make_state();
-        state.session_event_hooks = hooks;
+        state.skills.session_event_hooks = hooks;
         state.current_session_id = Some("test-session-123".to_string());
         state.message = "hello".to_string();
         state
@@ -6055,7 +6092,7 @@ mod tests {
 
         let mut host = MockHost::new(vec![text_result("done", 10, 5, Some(10))]);
         let mut state = make_state();
-        state.session_event_hooks = hooks;
+        state.skills.session_event_hooks = hooks;
         state
             .messages
             .push(json!({"role": "user", "content": "test"}));
@@ -6101,7 +6138,7 @@ mod tests {
 
         let mut host = MockHost::new(vec![text_result("ok", 10, 5, Some(10))]);
         let mut state = make_state();
-        state.session_event_hooks = hooks;
+        state.skills.session_event_hooks = hooks;
         state
             .messages
             .push(json!({"role": "user", "content": "hi"}));
@@ -6137,7 +6174,7 @@ mod tests {
 
         let mut host = MockHost::new(vec![text_result("Hello!", 10, 5, Some(10))]);
         let mut state = make_state();
-        state.session_event_hooks = hooks;
+        state.skills.session_event_hooks = hooks;
         state
             .messages
             .push(json!({"role": "user", "content": "hello"}));
@@ -6203,7 +6240,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
 
         let mut host = MockHost::new(vec![text_result("ok", 10, 5, Some(10))]);
         let mut state = make_state();
-        state.session_event_hooks = hooks;
+        state.skills.session_event_hooks = hooks;
         state.message = "analyze my code".to_string();
         state
             .messages
@@ -6237,7 +6274,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
 
         let mut host = MockHost::new(vec![text_result("done", 10, 5, Some(10))]);
         let mut state = make_state();
-        state.session_event_hooks = hooks;
+        state.skills.session_event_hooks = hooks;
         state
             .messages
             .push(json!({"role": "user", "content": "test"}));
@@ -6306,7 +6343,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
     fn feedback_records_task_success_on_completed() {
         let hub = make_hub();
         let mut state = make_state();
-        state.observability_hub = Some(hub.clone());
+        state.telemetry.observability_hub = Some(hub.clone());
         state.current_run_id = Some("run-1".into());
 
         let result = Ok(AgenticLoopOutcome::Completed);
@@ -6362,7 +6399,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
     fn feedback_records_task_failure_on_error() {
         let hub = make_hub();
         let mut state = make_state();
-        state.observability_hub = Some(hub.clone());
+        state.telemetry.observability_hub = Some(hub.clone());
 
         let result: Result<AgenticLoopOutcome, String> = Err("something broke".into());
         record_loop_completion_feedback(&mut state, &result);
@@ -6393,7 +6430,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
     fn feedback_records_interruption_on_cancel() {
         let hub = make_hub();
         let mut state = make_state();
-        state.observability_hub = Some(hub.clone());
+        state.telemetry.observability_hub = Some(hub.clone());
 
         let result = Ok(AgenticLoopOutcome::Cancelled);
         record_loop_completion_feedback(&mut state, &result);
@@ -6424,7 +6461,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
     fn feedback_records_high_token_usage() {
         let hub = make_hub();
         let mut state = make_state();
-        state.observability_hub = Some(hub.clone());
+        state.telemetry.observability_hub = Some(hub.clone());
         state.total_prompt = 40_000;
         state.total_completion = 20_000; // total = 60k > 50k threshold
 
@@ -6453,9 +6490,9 @@ print(json.dumps({'context': 'user said: ' + msg}))
     fn feedback_records_tool_churn() {
         let hub = make_hub();
         let mut state = make_state();
-        state.observability_hub = Some(hub.clone());
+        state.telemetry.observability_hub = Some(hub.clone());
         state.total_tool_calls = 30;
-        state.all_tools_used = ["bash"].iter().map(|s| s.to_string()).collect();
+        state.telemetry.all_tools_used = ["bash"].iter().map(|s| s.to_string()).collect();
         // ratio = 30/1 = 30 > 5 threshold
 
         let result = Ok(AgenticLoopOutcome::Completed);
@@ -6496,16 +6533,16 @@ print(json.dumps({'context': 'user said: ' + msg}))
 
         let hub = make_hub();
         let mut state = make_state();
-        state.observability_hub = Some(hub.clone());
+        state.telemetry.observability_hub = Some(hub.clone());
 
-        state.skill_quality_tracker.record_outcome(&SkillOutcome {
+        state.skills.quality_tracker.record_outcome(&SkillOutcome {
             skill_name: "good-skill".into(),
             tokens_used: 100,
             duration_ms: 50,
             all_required_passed: true,
             partial: false,
         });
-        state.skill_quality_tracker.record_outcome(&SkillOutcome {
+        state.skills.quality_tracker.record_outcome(&SkillOutcome {
             skill_name: "bad-skill".into(),
             tokens_used: 200,
             duration_ms: 100,
@@ -6545,8 +6582,8 @@ print(json.dumps({'context': 'user said: ' + msg}))
         let hub = make_hub();
         let session = make_session();
         let mut state = make_state();
-        state.observability_hub = Some(hub.clone());
-        state.observability_session = Some(session.clone());
+        state.telemetry.observability_hub = Some(hub.clone());
+        state.telemetry.observability_session = Some(session.clone());
 
         hub.tuning().add_rule(
             crate::auto_tuning::EvolutionRule::new(
@@ -6574,10 +6611,10 @@ print(json.dumps({'context': 'user said: ' + msg}))
         }
 
         // Below interval — should NOT trigger.
-        state.completed_turns_for_tuning = TUNING_CYCLE_INTERVAL - 1;
+        state.telemetry.completed_turns_for_tuning = TUNING_CYCLE_INTERVAL - 1;
         maybe_run_tuning_cycle(&mut state);
         assert_eq!(
-            state.completed_turns_for_tuning,
+            state.telemetry.completed_turns_for_tuning,
             TUNING_CYCLE_INTERVAL - 1,
             "counter should not reset below interval"
         );
@@ -6587,10 +6624,10 @@ print(json.dumps({'context': 'user said: ' + msg}))
         );
 
         // At interval — SHOULD trigger.
-        state.completed_turns_for_tuning = TUNING_CYCLE_INTERVAL;
+        state.telemetry.completed_turns_for_tuning = TUNING_CYCLE_INTERVAL;
         maybe_run_tuning_cycle(&mut state);
         assert_eq!(
-            state.completed_turns_for_tuning, 0,
+            state.telemetry.completed_turns_for_tuning, 0,
             "counter should reset after cycle"
         );
         assert!(
@@ -6603,11 +6640,11 @@ print(json.dumps({'context': 'user said: ' + msg}))
     fn tuning_cycle_skips_without_session() {
         let hub = make_hub();
         let mut state = make_state();
-        state.observability_hub = Some(hub.clone());
-        state.completed_turns_for_tuning = TUNING_CYCLE_INTERVAL;
+        state.telemetry.observability_hub = Some(hub.clone());
+        state.telemetry.completed_turns_for_tuning = TUNING_CYCLE_INTERVAL;
         maybe_run_tuning_cycle(&mut state);
         // Counter is reset (passes threshold check) but no cycle runs (no session).
-        assert_eq!(state.completed_turns_for_tuning, 0);
+        assert_eq!(state.telemetry.completed_turns_for_tuning, 0);
     }
 
     #[test]
@@ -6615,8 +6652,8 @@ print(json.dumps({'context': 'user said: ' + msg}))
         let hub = make_hub();
         let session = make_session();
         let mut state = make_state();
-        state.observability_hub = Some(hub);
-        state.observability_session = Some(session.clone());
+        state.telemetry.observability_hub = Some(hub);
+        state.telemetry.observability_session = Some(session.clone());
         state.message = "fix the bug in the parser".into();
         state.recent_tools = vec!["bash".into(), "view".into()];
 
@@ -6642,8 +6679,8 @@ print(json.dumps({'context': 'user said: ' + msg}))
         let hub = make_hub();
         let session = make_session();
         let mut state = make_state();
-        state.observability_hub = Some(hub.clone());
-        state.observability_session = Some(session.clone());
+        state.telemetry.observability_hub = Some(hub.clone());
+        state.telemetry.observability_session = Some(session.clone());
         state.message = "implement the feature".into();
 
         let mut experiment = crate::ab_testing::Experiment::new("exp-router")
@@ -6677,9 +6714,9 @@ print(json.dumps({'context': 'user said: ' + msg}))
         let hub = make_hub();
         let session = make_session();
         let mut state = make_state();
-        state.observability_hub = Some(hub.clone());
-        state.observability_session = Some(session);
-        state.completed_turns_for_tuning = TUNING_CYCLE_INTERVAL;
+        state.telemetry.observability_hub = Some(hub.clone());
+        state.telemetry.observability_session = Some(session);
+        state.telemetry.completed_turns_for_tuning = TUNING_CYCLE_INTERVAL;
 
         let mut experiment = crate::ab_testing::Experiment::new("exp-mature")
             .with_variant(crate::ab_testing::Variant::control())
@@ -6718,9 +6755,9 @@ print(json.dumps({'context': 'user said: ' + msg}))
         let hub = make_hub();
         let session = make_session();
         let mut state = make_state();
-        state.observability_hub = Some(hub.clone());
-        state.observability_session = Some(session);
-        state.completed_turns_for_tuning = TUNING_CYCLE_INTERVAL;
+        state.telemetry.observability_hub = Some(hub.clone());
+        state.telemetry.observability_session = Some(session);
+        state.telemetry.completed_turns_for_tuning = TUNING_CYCLE_INTERVAL;
 
         let pattern_library = std::sync::Arc::new(std::sync::Mutex::new(
             crate::pipeline::pattern::PatternLibrary::default(),

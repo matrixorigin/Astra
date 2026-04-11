@@ -749,7 +749,9 @@ pub fn skill_listing_system_message(
                 .get(name)
                 .map(|c| format!("\n  <category>{c}</category>"))
                 .unwrap_or_default();
-            lines.push(format!("<skill>\n  <name>{name}</name>{category_line}\n</skill>"));
+            lines.push(format!(
+                "<skill>\n  <name>{name}</name>{category_line}\n</skill>"
+            ));
         }
     }
     lines.push("</available_skills>".to_string());

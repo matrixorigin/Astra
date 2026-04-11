@@ -338,12 +338,7 @@ impl ToolExecutor {
     /// (file unchanged). Returns true when the requested `start..end` is a
     /// subset of the union of all prior reads — the content is already in
     /// the conversation context.
-    pub(super) fn is_range_already_read(
-        &self,
-        path: &Path,
-        start: u64,
-        end: u64,
-    ) -> bool {
+    pub(super) fn is_range_already_read(&self, path: &Path, start: u64, end: u64) -> bool {
         if std::env::var("MO_DEDUP_DISABLED").is_ok_and(|v| v == "1" || v == "true") {
             return false;
         }

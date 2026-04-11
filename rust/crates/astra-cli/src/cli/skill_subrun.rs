@@ -18,7 +18,8 @@ use astra_runtime::{
     semantic_dedup::SemanticDedup,
     turn::agentic_headless_round::HeadlessStderrStyle,
     turn::agentic_loop_host::{
-        AgenticLoopHost, AgenticLoopState, HostTurnResult, run_agentic_loop_with_host,
+        AgenticLoopHost, AgenticLoopState, CancellationState, HostTurnResult, SkillState,
+        StopHookState, run_agentic_loop_with_host,
     },
     turn::chat_turn_heuristics::infer_task_execution_profile,
     turn::chat_turn_payload::{
@@ -130,17 +131,18 @@ impl AgenticLoopHost for SubRunHost {
         state: &mut AgenticLoopState,
     ) -> Result<HostTurnResult, String> {
         self.executor
-            .set_send_message_context(state.mailbox.as_ref().map(|mailbox| {
+            .set_send_message_context(state.messaging.mailbox.as_ref().map(|mailbox| {
                 crate::edge_tools::agent_messaging::SendMessageRuntimeContext {
                     agent_id: mailbox.address.agent_id.clone(),
                     router: mailbox.router(),
-                    metrics: state.messaging_metrics.clone(),
+                    metrics: state.messaging.metrics.clone(),
                     delegation_id: mailbox.delegation_id.clone(),
                 }
             }));
 
         let effective_model = state
-            .skill_model_override
+            .skills
+            .model_override
             .as_deref()
             .or(self.model.as_deref());
 
@@ -170,7 +172,7 @@ impl AgenticLoopHost for SubRunHost {
             payload["agent_type"] = json!(agent_type);
         }
         payload["skill_search"] =
-            serde_json::to_value(&state.skill_search).unwrap_or_else(|_| json!({}));
+            serde_json::to_value(&state.skills.search).unwrap_or_else(|_| json!({}));
 
         // Attach tool schemas directly (no selector).
         astra_runtime::turn::agentic_prepare_payload::apply_selector_hints_then_attach_filtered_edge_tools(
@@ -443,65 +445,38 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             semantic_dedup: SemanticDedup::new(
                 astra_runtime::semantic_dedup::DEFAULT_SIMILARITY_THRESHOLD,
             ),
-            turn_sigs: Vec::new(),
-            turn_tool_names: Vec::new(),
-            stall_events: Vec::new(),
-            intent_tool_turns: Vec::new(),
-            verdict_events: Vec::new(),
-            last_heavy_checkpoint: None,
-            tool_call_records: Vec::new(),
-            forced_factual_retry: false,
-            explain_turns: Vec::new(),
-            first_ttft_ms: None,
-            all_tools_used: HashSet::new(),
-            first_selection_report: None,
-            first_budget_pressure: 0.0,
-            first_context_assembly_ms: None,
-            first_memoria_ms: None,
-            first_selector_ms: None,
-            first_selector_strategy: None,
-            first_selector_confidence: None,
-            selector_tokens_in: 0,
-            selector_tokens_out: 0,
-            all_selected_skills: Vec::new(),
+            stall: Default::default(),
+            telemetry: Default::default(),
+            skills: SkillState {
+                resolver: self.skill_resolver.clone(),
+                quality_tracker: astra_runtime::skills::quality::SkillQualityTracker::new(),
+                improvement_tracker: astra_runtime::skills::improvement::ImprovementTracker::new(),
+                search: self.skill_search.clone(),
+                tool_event_hooks: astra_runtime::skills::hooks::load_tool_event_hooks(
+                    &self.project_root,
+                ),
+                session_event_hooks: astra_runtime::skills::hooks::load_session_event_hooks(
+                    &self.project_root,
+                ),
+                ..Default::default()
+            },
+            hooks: StopHookState {
+                workspace_root_hint: Some(self.project_root.to_string_lossy().into_owned()),
+                ..Default::default()
+            },
+            messaging: Default::default(),
+            cancellation: CancellationState {
+                flag: None,
+                token: self.cancel_token.clone(),
+            },
+            error_recovery: Default::default(),
             message: task_context.to_string(),
             recent_tools: Vec::new(),
             task_profile: infer_task_execution_profile(task_context),
             api: self.api.clone(),
             api_token: self.token.clone(),
-            cancel_flag: None,
-            cancel_token: self.cancel_token.clone(),
             delegation_engine: None,
-            skill_registry_for_activation: None,
-            skill_resolver: self.skill_resolver.clone(),
-            skill_executor: None, // no recursive forking
-            skill_model_override: None,
-            skill_effort: None,
-            skill_agent_type: None,
-            skill_allowed_tools: None,
-            skill_sandbox_policy: None,
-            // Fresh tracker — sub-run metrics are intentionally not propagated
-            // back to the parent session's tracker.
-            skill_quality_tracker: astra_runtime::skills::quality::SkillQualityTracker::new(),
-            skill_improvement_tracker: astra_runtime::skills::improvement::ImprovementTracker::new(
-            ),
-            pinned_skills: std::collections::HashSet::new(),
-            discovered_skills: std::collections::HashSet::new(),
-            skill_search: self.skill_search.clone(),
-            tool_event_hooks: astra_runtime::skills::hooks::load_tool_event_hooks(
-                &self.project_root,
-            ),
-            session_event_hooks: astra_runtime::skills::hooks::load_session_event_hooks(
-                &self.project_root,
-            ),
-            stop_hooks: Vec::new(),
-            stop_hook_runs: 0,
-            teammate_idle_hooks: Vec::new(),
-            teammate_idle_hook_runs: 0,
-            workspace_root_hint: Some(self.project_root.to_string_lossy().into_owned()),
-            project_context: None, // skill subruns don't inject cross-session context
-            consecutive_same_error: 0,
-            last_error_category: None,
+            project_context: None,
             checkpoint_gate: None,
             data_snapshot_provider: None,
             last_composite_snapshot: None,
@@ -510,20 +485,9 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             max_turn_input_tokens: astra_core::RuntimeLimits::global().max_turn_input_tokens,
             budget_wrapup_injected: false,
             thinking_budget_tokens: None,
-            skill_listing_message: None,
-            invoked_skills: std::collections::HashMap::new(),
             recent_file_reads: Vec::new(),
-            turn_trace_collector: None,
-            mailbox: None,
-            ack_tracker: None,
-            dead_letter_queue: None,
-            messaging_metrics: None,
-            progress_emitter: None,
             permission_context: None,
             permission_handler: None,
-            observability_session: None,
-            observability_hub: None,
-            completed_turns_for_tuning: 0,
         };
 
         if let Err(err) = run_agentic_loop_with_host(&mut host, &mut state).await {

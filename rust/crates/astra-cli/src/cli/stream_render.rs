@@ -1502,11 +1502,17 @@ impl StreamRenderState {
             }
             "find_definition" => {
                 let symbol = args.get("symbol").and_then(Value::as_str).unwrap_or("");
-                format!("Find definition of {}", truncate_line(symbol, path_budget(20)))
+                format!(
+                    "Find definition of {}",
+                    truncate_line(symbol, path_budget(20))
+                )
             }
             "find_references" => {
                 let symbol = args.get("symbol").and_then(Value::as_str).unwrap_or("");
-                format!("Find references to {}", truncate_line(symbol, path_budget(19)))
+                format!(
+                    "Find references to {}",
+                    truncate_line(symbol, path_budget(19))
+                )
             }
             "symbol_search" => {
                 let symbol = args.get("symbol").and_then(Value::as_str).unwrap_or("");
@@ -1550,7 +1556,10 @@ impl StreamRenderState {
             }
             "memory_search" => {
                 let query = args.get("query").and_then(Value::as_str).unwrap_or("");
-                format!("Searching memory: \"{}\"", truncate_line(query, path_budget(20)))
+                format!(
+                    "Searching memory: \"{}\"",
+                    truncate_line(query, path_budget(20))
+                )
             }
             "memory_purge" => "Purging memory".to_string(),
             "memory_correct" => "Correcting memory".to_string(),
@@ -1561,7 +1570,10 @@ impl StreamRenderState {
                     .get("skill_name")
                     .and_then(Value::as_str)
                     .unwrap_or("unknown");
-                format!("Running skill: {}", truncate_line(skill_name, path_budget(16)))
+                format!(
+                    "Running skill: {}",
+                    truncate_line(skill_name, path_budget(16))
+                )
             }
             other if other.starts_with("mcp_") => {
                 let rest = &other[4..];

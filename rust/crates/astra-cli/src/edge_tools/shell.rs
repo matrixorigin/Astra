@@ -2030,14 +2030,21 @@ mod tests {
     fn bash_git_diff_range_auto_truncated() {
         let executor = test_executor();
         // Multi-commit range diff → auto-piped through head -c, not blocked
-        let result =
-            executor.bash(&serde_json::json!({"command": "git diff HEAD~5..HEAD 2>/dev/null || true"}));
-        // Should NOT contain "built-in" (we no longer hard-block)
-        assert!(!result.contains("built-in"), "should run, not block: {result}");
-        // --stat is untouched (no head -c appended)
         let result = executor
-            .bash(&serde_json::json!({"command": "git diff HEAD~3..HEAD --stat 2>/dev/null || true"}));
-        assert!(!result.contains("built-in"), "stat should be allowed: {result}");
+            .bash(&serde_json::json!({"command": "git diff HEAD~5..HEAD 2>/dev/null || true"}));
+        // Should NOT contain "built-in" (we no longer hard-block)
+        assert!(
+            !result.contains("built-in"),
+            "should run, not block: {result}"
+        );
+        // --stat is untouched (no head -c appended)
+        let result = executor.bash(
+            &serde_json::json!({"command": "git diff HEAD~3..HEAD --stat 2>/dev/null || true"}),
+        );
+        assert!(
+            !result.contains("built-in"),
+            "stat should be allowed: {result}"
+        );
     }
 
     #[test]

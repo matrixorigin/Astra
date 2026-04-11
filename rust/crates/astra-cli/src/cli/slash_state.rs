@@ -81,8 +81,7 @@ pub(super) async fn handle_state_command(
                                         "📝",
                                     astra_runtime::turn::file_edit_journal::EditType::Create =>
                                         "🆕",
-                                    astra_runtime::turn::file_edit_journal::EditType::Patch =>
-                                        "✏️",
+                                    astra_runtime::turn::file_edit_journal::EditType::Patch => "✏️",
                                 },
                                 path.display(),
                                 count,

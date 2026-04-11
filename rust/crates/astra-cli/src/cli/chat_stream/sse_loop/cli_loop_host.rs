@@ -76,13 +76,13 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
         let pre_clear = std::mem::take(&mut self.pending_clear_lines);
 
         // If a skill activation overrode the model, use that; otherwise fall back to host default.
-        let effective_model = state.skill_model_override.as_deref().or(self.model);
+        let effective_model = state.skills.model_override.as_deref().or(self.model);
 
         // Skill-scoped restrictions: computed fresh each turn from skill_allowed_tools
         // and applied transiently (removed after the turn) so they don't accumulate
         // in the permanent restricted_tools set.
         let skill_scoped_restrictions: HashSet<String> =
-            if let Some(ref allowed) = state.skill_allowed_tools {
+            if let Some(ref allowed) = state.skills.allowed_tools {
                 self.valid_tool_names
                     .iter()
                     .filter(|name| {
@@ -102,20 +102,21 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
         // Propagate skill sandbox policy to the tool executor for this turn.
         // Saved/restored so it doesn't persist after the skill deactivates.
         let prev_sandbox = self.executor.sandbox_policy.take();
-        if let Some(ref policy) = state.skill_sandbox_policy {
+        if let Some(ref policy) = state.skills.sandbox_policy {
             self.executor.sandbox_policy = Some(policy.clone());
         } else {
             self.executor.sandbox_policy = prev_sandbox.clone();
         }
         self.executor.set_send_message_context(
             state
+                .messaging
                 .mailbox
                 .as_ref()
                 .map(
                     |mailbox| crate::edge_tools::agent_messaging::SendMessageRuntimeContext {
                         agent_id: mailbox.address.agent_id.clone(),
                         router: mailbox.router(),
-                        metrics: state.messaging_metrics.clone(),
+                        metrics: state.messaging.metrics.clone(),
                         delegation_id: mailbox.delegation_id.clone(),
                     },
                 )
@@ -140,7 +141,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             selector: self.selector,
             registry: &self.registry,
             messages: state.messages.as_slice(),
-            ephemeral_prefix: state.skill_listing_message.as_ref(),
+            ephemeral_prefix: state.skills.listing_message.as_ref(),
             current_session_id: state.current_session_id.as_deref(),
             tool_results: state.tool_results.as_slice(),
             all_schemas: &self.all_schemas,
@@ -150,30 +151,30 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             file_context: &self.file_context,
             assembly_start,
             telem: PrepareTurnTelemetry {
-                first_memoria_ms: &mut state.first_memoria_ms,
-                first_selector_ms: &mut state.first_selector_ms,
-                first_selector_strategy: &mut state.first_selector_strategy,
-                first_selector_confidence: &mut state.first_selector_confidence,
-                selector_tokens_in: &mut state.selector_tokens_in,
-                selector_tokens_out: &mut state.selector_tokens_out,
-                first_selection_report: &mut state.first_selection_report,
-                first_budget_pressure: &mut state.first_budget_pressure,
-                first_context_assembly_ms: &mut state.first_context_assembly_ms,
-                all_selected_skills: &mut state.all_selected_skills,
+                first_memoria_ms: &mut state.telemetry.first_memoria_ms,
+                first_selector_ms: &mut state.telemetry.first_selector_ms,
+                first_selector_strategy: &mut state.telemetry.first_selector_strategy,
+                first_selector_confidence: &mut state.telemetry.first_selector_confidence,
+                selector_tokens_in: &mut state.telemetry.selector_tokens_in,
+                selector_tokens_out: &mut state.telemetry.selector_tokens_out,
+                first_selection_report: &mut state.telemetry.first_selection_report,
+                first_budget_pressure: &mut state.telemetry.first_budget_pressure,
+                first_context_assembly_ms: &mut state.telemetry.first_context_assembly_ms,
+                all_selected_skills: &mut state.telemetry.all_selected_skills,
                 trace_collector: None, // TODO: wire from session config when enabled
             },
             perm_manager: self.perm_manager,
-            skill_search: &state.skill_search,
+            skill_search: &state.skills.search,
             pre_clear_lines: pre_clear,
             is_plan_subtask: self.is_plan_subtask,
             plan_subtask_id: self.plan_subtask_id,
-            cancel_token: state.cancel_token.as_deref(),
+            cancel_token: state.cancellation.token.as_deref(),
             plan_assemble_line_release: self.plan_assemble_line_release.clone(),
             stream_event_tx: self.stream_event_tx.clone(),
             approval_request_tx: self.approval_request_tx.clone(),
-            skill_resolver: state.skill_resolver.clone(),
-            skill_effort: state.skill_effort.as_ref().map(|e| e.to_string()),
-            skill_agent_type: state.skill_agent_type.clone(),
+            skill_resolver: state.skills.resolver.clone(),
+            skill_effort: state.skills.effort.as_ref().map(|e| e.to_string()),
+            skill_agent_type: state.skills.agent_type.clone(),
         })
         .await?;
 

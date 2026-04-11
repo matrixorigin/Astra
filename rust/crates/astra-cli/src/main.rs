@@ -736,7 +736,8 @@ async fn handle_slash_command(
             if let Some(tok) = token {
                 match api.get_models_text(tok).await {
                     Ok(body) => {
-                        let value: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+                        let value: serde_json::Value =
+                            serde_json::from_str(&body).unwrap_or_default();
                         let models = value
                             .as_array()
                             .cloned()
@@ -746,10 +747,12 @@ async fn handle_slash_command(
                         let available: Vec<String> = models
                             .iter()
                             .filter_map(|m| {
-                                let name = m.get("name")
+                                let name = m
+                                    .get("name")
                                     .or_else(|| m.get("model_name"))
                                     .and_then(|v| v.as_str())?;
-                                let active = m.get("active").and_then(|v| v.as_bool()).unwrap_or(true);
+                                let active =
+                                    m.get("active").and_then(|v| v.as_bool()).unwrap_or(true);
                                 if active { Some(name.to_string()) } else { None }
                             })
                             .collect();

@@ -13,13 +13,15 @@ use astra_runtime::{
     pipeline::step_protocol::InMemoryIdempotencyCache,
     pipeline::step_recorder::StepRecorder,
     semantic_dedup::SemanticDedup,
-    turn::agentic_loop_host::{AgenticLoopOutcome, AgenticLoopState, run_agentic_loop_with_host},
+    turn::agentic_loop_host::{
+        AgenticLoopOutcome, AgenticLoopState, CancellationState, MessagingState, SkillState,
+        StopHookState, run_agentic_loop_with_host,
+    },
     turn::chat_turn_heuristics::infer_task_execution_profile,
     turn::tool_schema_prune::openai_tool_names_from_schemas,
     turn::turn_guard::TurnGuard,
 };
 use serde_json::json;
-use std::collections::HashMap;
 
 use super::edge_tools;
 use super::permission_manager::PermissionMode;
@@ -191,61 +193,42 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             semantic_dedup: SemanticDedup::new(
                 astra_runtime::semantic_dedup::DEFAULT_SIMILARITY_THRESHOLD,
             ),
-            turn_sigs: Vec::new(),
-            turn_tool_names: Vec::new(),
-            stall_events: Vec::new(),
-            intent_tool_turns: Vec::new(),
-            verdict_events: Vec::new(),
-            last_heavy_checkpoint: None,
-            tool_call_records: Vec::new(),
-            forced_factual_retry: false,
-            explain_turns: Vec::new(),
-            first_ttft_ms: None,
-            all_tools_used: HashSet::new(),
-            first_selection_report: None,
-            first_budget_pressure: 0.0,
-            first_context_assembly_ms: None,
-            first_memoria_ms: None,
-            first_selector_ms: None,
-            first_selector_confidence: None,
-            first_selector_strategy: None,
-            selector_tokens_in: 0,
-            selector_tokens_out: 0,
-            all_selected_skills: Vec::new(),
+            stall: Default::default(),
+            telemetry: Default::default(),
+            skills: SkillState {
+                resolver: self.skill_resolver.clone(),
+                quality_tracker: astra_runtime::skills::quality::SkillQualityTracker::new(),
+                improvement_tracker: astra_runtime::skills::improvement::ImprovementTracker::new(),
+                search: self.skill_search.clone(),
+                tool_event_hooks: astra_runtime::skills::hooks::load_tool_event_hooks(
+                    &effective_root,
+                ),
+                session_event_hooks: astra_runtime::skills::hooks::load_session_event_hooks(
+                    &effective_root,
+                ),
+                ..Default::default()
+            },
+            hooks: StopHookState {
+                workspace_root_hint: Some(effective_root.to_string_lossy().into_owned()),
+                ..Default::default()
+            },
+            messaging: MessagingState {
+                mailbox: config.mailbox,
+                progress_emitter: config.progress_emitter,
+                ..Default::default()
+            },
+            cancellation: CancellationState {
+                flag: None,
+                token: self.cancel_token.clone(),
+            },
+            error_recovery: Default::default(),
             message: config.task.clone(),
             recent_tools: Vec::new(),
             task_profile,
             api: self.api.clone(),
             api_token: self.token.clone(),
-            cancel_flag: None,
-            cancel_token: self.cancel_token.clone(),
-            delegation_engine: None, // no recursive delegation from spawned agents
-            skill_registry_for_activation: None,
-            skill_resolver: self.skill_resolver.clone(),
-            skill_executor: None,
-            skill_model_override: None,
-            skill_effort: None,
-            skill_agent_type: None,
-            skill_allowed_tools: None,
-            skill_sandbox_policy: None,
-            skill_quality_tracker: astra_runtime::skills::quality::SkillQualityTracker::new(),
-            skill_improvement_tracker: astra_runtime::skills::improvement::ImprovementTracker::new(
-            ),
-            pinned_skills: HashSet::new(),
-            discovered_skills: HashSet::new(),
-            skill_search: self.skill_search.clone(),
-            tool_event_hooks: astra_runtime::skills::hooks::load_tool_event_hooks(&effective_root),
-            session_event_hooks: astra_runtime::skills::hooks::load_session_event_hooks(
-                &effective_root,
-            ),
-            stop_hooks: Vec::new(),
-            stop_hook_runs: 0,
-            teammate_idle_hooks: Vec::new(),
-            teammate_idle_hook_runs: 0,
-            workspace_root_hint: Some(effective_root.to_string_lossy().into_owned()),
-            project_context: None, // subruns don't inject cross-session context
-            consecutive_same_error: 0,
-            last_error_category: None,
+            delegation_engine: None,
+            project_context: None,
             checkpoint_gate: None,
             data_snapshot_provider: None,
             last_composite_snapshot: None,
@@ -254,26 +237,15 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             max_turn_input_tokens: astra_core::RuntimeLimits::global().max_turn_input_tokens,
             budget_wrapup_injected: false,
             thinking_budget_tokens: None,
-            skill_listing_message: None,
-            invoked_skills: HashMap::new(),
             recent_file_reads: Vec::new(),
-            turn_trace_collector: None,
-            mailbox: config.mailbox,
-            ack_tracker: None,
-            dead_letter_queue: None,
-            messaging_metrics: None,
-            progress_emitter: config.progress_emitter,
             permission_context: config.permission_context,
-            permission_handler: None, // Child agents don't handle permission requests
-            observability_session: None,
-            observability_hub: None,
-            completed_turns_for_tuning: 0,
+            permission_handler: None,
         };
 
         // Inherit skills from parent: pre-populate discovered skills
         if !config.inherited_skills.is_empty() {
             for skill_name in &config.inherited_skills {
-                state.discovered_skills.insert(skill_name.clone());
+                state.skills.discovered.insert(skill_name.clone());
             }
         }
 

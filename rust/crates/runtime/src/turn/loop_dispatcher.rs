@@ -132,7 +132,7 @@ impl LoopResult {
             total_tool_calls: state.total_tool_calls,
             session_id: state.current_session_id.clone(),
             run_id: state.current_run_id.clone(),
-            tools_used: state.all_tools_used.clone(),
+            tools_used: state.telemetry.all_tools_used.clone(),
         }
     }
 }
@@ -273,58 +273,20 @@ mod tests {
             step_recorder: StepRecorder::new("test", "run"),
             idempotency_cache: InMemoryIdempotencyCache::new(),
             semantic_dedup: SemanticDedup::new(0.75),
-            turn_sigs: Vec::new(),
-            turn_tool_names: Vec::new(),
-            stall_events: Vec::new(),
-            intent_tool_turns: Vec::new(),
-            verdict_events: Vec::new(),
-            last_heavy_checkpoint: None,
-            tool_call_records: Vec::new(),
-            forced_factual_retry: false,
-            explain_turns: Vec::new(),
-            first_ttft_ms: None,
-            all_tools_used: HashSet::new(),
-            first_selection_report: None,
-            first_budget_pressure: 0.0,
-            first_context_assembly_ms: None,
-            first_memoria_ms: None,
-            first_selector_ms: None,
-            first_selector_strategy: None,
-            first_selector_confidence: None,
-            selector_tokens_in: 0,
-            selector_tokens_out: 0,
-            all_selected_skills: Vec::new(),
+            stall: Default::default(),
+            telemetry: Default::default(),
+            skills: Default::default(),
+            hooks: Default::default(),
+            messaging: Default::default(),
+            cancellation: Default::default(),
+            error_recovery: Default::default(),
             message: message.to_string(),
             recent_tools: Vec::new(),
             task_profile: TaskExecutionProfile::default(),
             api: astra_thin_client::ThinClient::new("http://localhost:1", None).unwrap(),
             api_token: "test".to_string(),
-            cancel_flag: None,
-            cancel_token: None,
             delegation_engine: None,
-            skill_registry_for_activation: None,
-            skill_resolver: None,
-            skill_executor: None,
-            skill_model_override: None,
-            skill_effort: None,
-            skill_agent_type: None,
-            skill_allowed_tools: None,
-            skill_sandbox_policy: None,
-            skill_quality_tracker: crate::skills::quality::SkillQualityTracker::new(),
-            skill_improvement_tracker: crate::skills::improvement::ImprovementTracker::new(),
-            pinned_skills: std::collections::HashSet::new(),
-            discovered_skills: std::collections::HashSet::new(),
-            skill_search: astra_core::SkillSearchSettings::default(),
-            tool_event_hooks: crate::skills::hooks::ToolEventHookRegistry::default(),
-            session_event_hooks: crate::skills::hooks::SessionEventHookRegistry::default(),
-            stop_hooks: Vec::new(),
-            stop_hook_runs: 0,
-            teammate_idle_hooks: Vec::new(),
-            teammate_idle_hook_runs: 0,
-            workspace_root_hint: None,
             project_context: None,
-            consecutive_same_error: 0,
-            last_error_category: None,
             checkpoint_gate: None,
             data_snapshot_provider: None,
             last_composite_snapshot: None,
@@ -333,20 +295,9 @@ mod tests {
             max_turn_input_tokens: 0,
             budget_wrapup_injected: false,
             thinking_budget_tokens: None,
-            skill_listing_message: None,
-            invoked_skills: std::collections::HashMap::new(),
             recent_file_reads: Vec::new(),
-            turn_trace_collector: None,
-            mailbox: None,
-            ack_tracker: None,
-            dead_letter_queue: None,
-            messaging_metrics: None,
-            progress_emitter: None,
             permission_context: None,
             permission_handler: None,
-            observability_session: None,
-            observability_hub: None,
-            completed_turns_for_tuning: 0,
         }
     }
 
@@ -373,7 +324,7 @@ mod tests {
         let mut host = TestHost::completed_after_one_turn("never reached");
         let mut state = test_state("cancel me");
         let flag = Arc::new(AtomicBool::new(true));
-        state.cancel_flag = Some(flag);
+        state.cancellation.flag = Some(flag);
         let outcome = dispatcher.dispatch(&mut host, &mut state).await;
         assert!(matches!(outcome, DispatchOutcome::Cancelled));
     }
@@ -385,7 +336,7 @@ mod tests {
         let mut state = test_state("cancel via token");
         let token = Arc::new(CancellationToken::new());
         token.cancel();
-        state.cancel_token = Some(token);
+        state.cancellation.token = Some(token);
         let outcome = dispatcher.dispatch(&mut host, &mut state).await;
         assert!(matches!(outcome, DispatchOutcome::Cancelled));
     }
@@ -429,7 +380,7 @@ mod tests {
         state.total_tool_calls = 3;
         state.current_session_id = Some("s1".into());
         state.current_run_id = Some("r1".into());
-        state.all_tools_used.insert("bash".into());
+        state.telemetry.all_tools_used.insert("bash".into());
         let result = LoopResult::from_state(&state);
         assert_eq!(result.final_text, "output");
         assert_eq!(result.total_prompt_tokens, 200);

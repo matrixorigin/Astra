@@ -155,57 +155,20 @@ mod tests {
             step_recorder: StepRecorder::new("test-session", "test-task"),
             idempotency_cache: InMemoryIdempotencyCache::new(),
             semantic_dedup: SemanticDedup::new(0.95),
-            turn_sigs: Vec::new(),
-            turn_tool_names: Vec::new(),
-            stall_events: Vec::new(),
-            intent_tool_turns: Vec::new(),
-            verdict_events: Vec::new(),
-            last_heavy_checkpoint: None,
-            tool_call_records: Vec::new(),
-            forced_factual_retry: false,
-            explain_turns: Vec::new(),
-            first_ttft_ms: None,
-            all_tools_used: HashSet::new(),
-            first_selection_report: None,
-            first_budget_pressure: 0.0,
-            first_context_assembly_ms: None,
-            first_memoria_ms: None,
-            first_selector_ms: None,
-            first_selector_strategy: None,
-            first_selector_confidence: None,
-            selector_tokens_in: 0,
-            selector_tokens_out: 0,
-            all_selected_skills: Vec::new(),
+            stall: Default::default(),
+            telemetry: Default::default(),
+            skills: Default::default(),
+            hooks: Default::default(),
+            cancellation: Default::default(),
+            messaging: Default::default(),
+            error_recovery: Default::default(),
             message: "test query".to_string(),
             recent_tools: Vec::new(),
             task_profile: TaskExecutionProfile::default(),
             api: astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
             api_token: String::new(),
-            cancel_flag: None,
-            cancel_token: None,
             delegation_engine: None,
-            skill_registry_for_activation: None,
-            skill_resolver: None,
-            skill_executor: None,
-            skill_model_override: None,
-            skill_effort: None,
-            skill_agent_type: None,
-            skill_allowed_tools: None,
-            skill_sandbox_policy: None,
-            skill_quality_tracker: crate::skills::quality::SkillQualityTracker::new(),
-            skill_improvement_tracker: crate::skills::improvement::ImprovementTracker::new(),
-            pinned_skills: HashSet::new(),
-            discovered_skills: HashSet::new(),
-            skill_search: astra_core::SkillSearchSettings::default(),
-            tool_event_hooks: crate::skills::hooks::ToolEventHookRegistry::default(),
-            session_event_hooks: crate::skills::hooks::SessionEventHookRegistry::default(),
-            stop_hooks: Vec::new(),
-            stop_hook_runs: 0,
-            teammate_idle_hooks: Vec::new(),
-            teammate_idle_hook_runs: 0,
-            workspace_root_hint: None,
-            consecutive_same_error: 0,
-            last_error_category: None,
+            project_context: None,
             checkpoint_gate: None,
             data_snapshot_provider: None,
             last_composite_snapshot: None,
@@ -214,21 +177,9 @@ mod tests {
             max_turn_input_tokens: 0,
             budget_wrapup_injected: false,
             thinking_budget_tokens: None,
-            skill_listing_message: None,
-            invoked_skills: std::collections::HashMap::new(),
             recent_file_reads: Vec::new(),
-            turn_trace_collector: None,
-            project_context: None,
-            mailbox: None,
-            ack_tracker: None,
-            dead_letter_queue: None,
-            messaging_metrics: None,
-            progress_emitter: None,
             permission_context: None,
             permission_handler: None,
-            observability_session: None,
-            observability_hub: None,
-            completed_turns_for_tuning: 0,
         }
     }
 
@@ -275,7 +226,7 @@ mod tests {
 
         let mut host = MockHost::new(vec![text_result("done")]);
         let mut state = make_state();
-        state.mailbox = Some(child_mb);
+        state.messaging.mailbox = Some(child_mb);
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(outcome.is_ok());
@@ -348,7 +299,7 @@ mod tests {
 
         let mut host = MockHost::new(vec![text_result("Working on auth.")]);
         let mut state = make_state();
-        state.mailbox = Some(child_mb);
+        state.messaging.mailbox = Some(child_mb);
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(outcome.is_ok());
@@ -394,7 +345,7 @@ mod tests {
         .with_valid_tools(&["send_message"]);
 
         let mut state = make_state();
-        state.mailbox = Some(child_mb);
+        state.messaging.mailbox = Some(child_mb);
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(outcome.is_ok());
@@ -479,7 +430,7 @@ mod tests {
         .with_valid_tools(&["send_message", "bash"]);
 
         let mut state = make_state();
-        state.mailbox = Some(child_mb);
+        state.messaging.mailbox = Some(child_mb);
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(outcome.is_ok());
@@ -499,7 +450,7 @@ mod tests {
 
         // bash tool should still have been processed (2 turns = tool + final text).
         assert_eq!(host.current_turn, 2);
-        assert!(state.all_tools_used.contains("bash"));
+        assert!(state.telemetry.all_tools_used.contains("bash"));
     }
 
     #[tokio::test]
@@ -543,7 +494,7 @@ mod tests {
         .with_valid_tools(&["read_file"]);
 
         let mut state = make_state();
-        state.mailbox = Some(child_mb);
+        state.messaging.mailbox = Some(child_mb);
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(outcome.is_ok());
@@ -576,7 +527,7 @@ mod tests {
 
         let mut host = MockHost::new(vec![text_result("Handled request.")]);
         let mut state = make_state();
-        state.mailbox = Some(parent_mb);
+        state.messaging.mailbox = Some(parent_mb);
         state.permission_context = Some(Arc::new(tokio::sync::RwLock::new(
             PermissionSyncContext::root(PermissionMode::Auto),
         )));
