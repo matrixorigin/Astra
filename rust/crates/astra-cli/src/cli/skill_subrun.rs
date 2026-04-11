@@ -492,6 +492,7 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             permission_handler: None,
             tactical_adapter: None,
             step_signal_collector: None,
+            pending_reflection_signals: Vec::new(),
         };
 
         if let Err(err) = run_agentic_loop_with_host(&mut host, &mut state).await {

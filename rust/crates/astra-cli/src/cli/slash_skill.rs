@@ -1680,7 +1680,11 @@ Follow these steps:
 
             eprintln!("  {}", "Context:".yellow());
             for sig in &ctx.signals {
-                eprintln!("    [{}] {}", sig.kind.as_str().cyan(), sig.detail.as_str().dim());
+                eprintln!(
+                    "    [{}] {}",
+                    sig.kind.as_str().cyan(),
+                    sig.detail.as_str().dim()
+                );
             }
 
             if sub_arg == "prompt" {

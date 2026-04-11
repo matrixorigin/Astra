@@ -337,6 +337,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             permission_handler: None,
             tactical_adapter: None,
             step_signal_collector: None,
+            pending_reflection_signals: Vec::new(),
         };
 
         let loop_result = run_agentic_loop_with_host(&mut host, &mut state).await;

@@ -480,6 +480,12 @@ pub struct AgenticLoopState {
     pub tactical_adapter: Option<crate::liquid::tactical::TacticalAdapter>,
     /// Optional step signal collector for within-turn outcome tracking.
     pub step_signal_collector: Option<crate::liquid::step_signals::StepSignalCollector>,
+
+    // ── Auto-reflection ──
+    /// Accumulated LLM-routed evolution signals awaiting reflection.
+    /// Filled during tuning cycles; drained when threshold is met and
+    /// reflection prompt is injected.
+    pub pending_reflection_signals: Vec<crate::evolution::types::EvolutionSignal>,
 }
 
 /// Consecutive same-category error turns before forcing a strategy change.
@@ -2015,6 +2021,81 @@ fn maybe_run_tuning_cycle(state: &mut AgenticLoopState) {
             );
         }
     }
+}
+
+/// Minimum accumulated LLM-routed signals before auto-reflection triggers.
+const AUTO_REFLECTION_SIGNAL_THRESHOLD: usize = 3;
+
+/// After a tuning cycle, flush evolution signals and accumulate LLM-routed
+/// ones on the state.  When the accumulated count reaches the threshold,
+/// build a compact reflection prompt and inject it as a system message so
+/// the LLM can self-reflect on the next turn.
+async fn maybe_trigger_auto_reflection(state: &mut AgenticLoopState) {
+    let evo = match &state.evolution_service {
+        Some(e) => Arc::clone(e),
+        None => return,
+    };
+
+    let (_fast, llm_signals) = evo.flush().await;
+
+    if !llm_signals.is_empty() {
+        state.pending_reflection_signals.extend(llm_signals);
+    }
+
+    if state.pending_reflection_signals.len() < AUTO_REFLECTION_SIGNAL_THRESHOLD {
+        return;
+    }
+
+    // Drain pending signals and build reflection context.
+    let signals: Vec<_> = state.pending_reflection_signals.drain(..).collect();
+
+    let session_id = state.current_session_id.as_deref().unwrap_or("unknown");
+    let turns = state.remaining_turns as u32;
+
+    let scenario = state
+        .telemetry
+        .observability_session
+        .as_ref()
+        .and_then(|s| s.read().ok())
+        .and_then(|s| s.current_scenario())
+        .map(|sc| format!("{:?}", sc));
+
+    let token_util = {
+        let total = state.total_prompt + state.total_completion;
+        let budget = state.max_turn_input_tokens.max(1) as f64;
+        let effective_turns = turns.max(1) as f64;
+        total as f64 / (budget * effective_turns)
+    };
+
+    let ctx = evo.build_reflection_context(
+        session_id,
+        turns,
+        scenario.as_deref(),
+        token_util,
+        &signals,
+        Vec::new(), // tool stats assembled separately
+        None,
+    );
+
+    let (_system_prompt, user_prompt) = evo.build_reflection_prompt(&ctx);
+
+    // Inject a compact hint as a system message.
+    let hint = format!(
+        "[auto-reflection] {} signal(s) accumulated. Reflection summary:\n{}",
+        ctx.signals.len(),
+        ctx.render_prompt_section()
+    );
+
+    state.messages.push(serde_json::json!({
+        "role": "system",
+        "content": hint,
+    }));
+
+    eprintln!(
+        "[liquid] auto-reflection triggered ({} signals, {} chars prompt)",
+        ctx.signals.len(),
+        user_prompt.len()
+    );
 }
 
 fn write_session_journal_event(
@@ -3896,6 +3977,7 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                 // ── Auto-tuning: count completed turns & periodic cycle ──
                 state.telemetry.completed_turns_for_tuning += 1;
                 maybe_run_tuning_cycle(state);
+                maybe_trigger_auto_reflection(state).await;
 
                 // ── Per-turn micro-adaptation ──
                 let turn_tokens = state.last_measured_prompt_tokens.unwrap_or(0);
@@ -4181,6 +4263,7 @@ mod tests {
             permission_handler: None,
             tactical_adapter: None,
             step_signal_collector: None,
+            pending_reflection_signals: Vec::new(),
         }
     }
 
@@ -9520,5 +9603,129 @@ print(json.dumps({'context': 'user said: ' + msg}))
         let should_enter =
             state.step_signal_collector.is_some() || state.tactical_adapter.is_some();
         assert!(!should_enter, "Neither field set — block should be skipped");
+    }
+
+    // ── L2.5 Auto-reflection tests ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn auto_reflection_skips_without_evolution_service() {
+        let mut state = make_state();
+        assert!(state.evolution_service.is_none());
+        assert!(state.pending_reflection_signals.is_empty());
+
+        // Should be a no-op — no panic, no messages added.
+        let msg_count = state.messages.len();
+        maybe_trigger_auto_reflection(&mut state).await;
+        assert_eq!(state.messages.len(), msg_count);
+        assert!(state.pending_reflection_signals.is_empty());
+    }
+
+    #[tokio::test]
+    async fn auto_reflection_accumulates_below_threshold() {
+        let mut state = make_state();
+
+        // Add fewer signals than threshold.
+        state.pending_reflection_signals.push(
+            crate::evolution::types::EvolutionSignal::RepeatedStall {
+                tool_chain: vec!["test".into()],
+                stall_count: 5,
+                turn_id: "t1".into(),
+            },
+        );
+        assert_eq!(state.pending_reflection_signals.len(), 1);
+
+        // Without evolution service, signals stay.
+        let msg_count = state.messages.len();
+        maybe_trigger_auto_reflection(&mut state).await;
+        assert_eq!(state.messages.len(), msg_count);
+        // Signals are NOT drained (no evo service to flush).
+        assert_eq!(state.pending_reflection_signals.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn auto_reflection_triggers_at_threshold() {
+        let mut state = make_state();
+
+        // Create an evolution service.
+        let evo = std::sync::Arc::new(crate::evolution::service::EvolutionService::new());
+        state.evolution_service = Some(evo.clone());
+
+        // Pre-load signals at threshold.
+        for i in 0..AUTO_REFLECTION_SIGNAL_THRESHOLD {
+            state.pending_reflection_signals.push(
+                crate::evolution::types::EvolutionSignal::RepeatedStall {
+                    tool_chain: vec![format!("tool_{i}")],
+                    stall_count: 3,
+                    turn_id: format!("t{i}"),
+                },
+            );
+        }
+        assert_eq!(
+            state.pending_reflection_signals.len(),
+            AUTO_REFLECTION_SIGNAL_THRESHOLD
+        );
+
+        let msg_count = state.messages.len();
+        maybe_trigger_auto_reflection(&mut state).await;
+
+        // Signals should be drained.
+        assert!(
+            state.pending_reflection_signals.is_empty(),
+            "Signals should be drained after reflection"
+        );
+        // A system message should be injected.
+        assert_eq!(
+            state.messages.len(),
+            msg_count + 1,
+            "One system message should be added"
+        );
+        let last = state.messages.last().unwrap();
+        assert_eq!(last["role"], "system");
+        let content = last["content"].as_str().unwrap();
+        assert!(
+            content.contains("auto-reflection"),
+            "Message should contain auto-reflection marker"
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_reflection_flushes_evo_signals() {
+        let mut state = make_state();
+        let evo = std::sync::Arc::new(crate::evolution::service::EvolutionService::new());
+        state.evolution_service = Some(evo.clone());
+
+        // Feed a signal that passes needs_llm (ToolFailure with skill_context).
+        evo.add_signal(crate::evolution::types::EvolutionSignal::ToolFailure {
+            tool_name: "bash".into(),
+            error_snippet: "permission denied".into(),
+            skill_context: Some("deploy_script".into()),
+            turn_id: "t0".into(),
+        })
+        .await;
+
+        // Pre-load enough on state so that pre-loaded + flushed >= threshold.
+        for i in 0..(AUTO_REFLECTION_SIGNAL_THRESHOLD - 1) {
+            state.pending_reflection_signals.push(
+                crate::evolution::types::EvolutionSignal::ToolFailure {
+                    tool_name: format!("tool_{i}"),
+                    error_snippet: "err".into(),
+                    skill_context: Some("sk".into()),
+                    turn_id: format!("t{}", i + 1),
+                },
+            );
+        }
+
+        let msg_count = state.messages.len();
+        maybe_trigger_auto_reflection(&mut state).await;
+
+        // Should have triggered: pre-loaded + flushed >= threshold.
+        assert!(
+            state.pending_reflection_signals.is_empty(),
+            "All signals drained"
+        );
+        assert!(
+            state.messages.len() > msg_count,
+            "System message should be injected"
+        );
     }
 }

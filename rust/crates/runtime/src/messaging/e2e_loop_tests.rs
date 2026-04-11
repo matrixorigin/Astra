@@ -184,6 +184,7 @@ mod tests {
             permission_handler: None,
             tactical_adapter: None,
             step_signal_collector: None,
+            pending_reflection_signals: Vec::new(),
         }
     }
 

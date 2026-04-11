@@ -244,6 +244,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             permission_handler: None,
             tactical_adapter: None,
             step_signal_collector: None,
+            pending_reflection_signals: Vec::new(),
         };
 
         // Inherit skills from parent: pre-populate discovered skills

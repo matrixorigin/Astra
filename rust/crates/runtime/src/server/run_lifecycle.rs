@@ -323,6 +323,7 @@ impl AgenticRunLifecycleService {
             permission_handler: None,
             tactical_adapter: None,
             step_signal_collector: None,
+            pending_reflection_signals: Vec::new(),
         }
     }
 
@@ -1048,6 +1049,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             permission_handler: None,
             tactical_adapter: None,
             step_signal_collector: None,
+            pending_reflection_signals: Vec::new(),
         };
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut loop_state).await;
