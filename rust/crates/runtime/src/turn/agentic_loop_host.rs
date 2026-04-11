@@ -675,6 +675,37 @@ fn apply_tactical_actions(
     hint_parts
 }
 
+fn carry_forward_tactical_runtime_mutations(
+    state: &AgenticLoopState,
+    previous_config: &crate::runtime_config::RuntimeConfig,
+    next_config: &mut crate::runtime_config::RuntimeConfig,
+) {
+    next_config.verification.strictness = next_config
+        .verification
+        .strictness
+        .max(previous_config.verification.strictness);
+    next_config.compression.compression_threshold = next_config
+        .compression
+        .compression_threshold
+        .min(previous_config.compression.compression_threshold);
+
+    if let Some(tool_budget) = state.tool_budget_override {
+        next_config.tool_selection.tool_budget_tokens =
+            match next_config.tool_selection.tool_budget_tokens {
+                0 => tool_budget,
+                current => current.min(tool_budget),
+            };
+    }
+
+    if state.max_turn_input_tokens > 0 {
+        let preserved_turn_budget = state.max_turn_input_tokens.min(u32::MAX as u64) as u32;
+        next_config.token_budget.max_turn_input_tokens = next_config
+            .token_budget
+            .max_turn_input_tokens
+            .min(preserved_turn_budget);
+    }
+}
+
 fn apply_adaptive_execution_profile(state: &mut AgenticLoopState) {
     let (hub, session) = match (
         &state.telemetry.observability_hub,
@@ -766,6 +797,8 @@ fn apply_adaptive_execution_profile(state: &mut AgenticLoopState) {
             .profile
             .enroll_experiment(experiment_id.clone());
     }
+
+    carry_forward_tactical_runtime_mutations(state, &old_config, &mut profile.config);
 
     session_guard.active_experiment_id = profile.experiment_id.clone();
     session_guard.active_variant = profile.variant_id.clone();
@@ -10033,6 +10066,69 @@ print(json.dumps({'context': 'user said: ' + msg}))
             guard.config.token_budget.max_turn_input_tokens as u64
         );
         assert!(!hints.is_empty());
+    }
+
+    #[test]
+    fn tactical_budget_mutations_survive_next_adaptive_profile_application() {
+        use crate::liquid::tactical::TacticalAction;
+
+        let hub = make_hub();
+        let session = make_session();
+        let mut state = make_state();
+        state.telemetry.observability_hub = Some(hub);
+        state.telemetry.observability_session = Some(session.clone());
+        state.message = "fix the failing bug in the parser".into();
+
+        {
+            let mut guard = session.write().unwrap();
+            for _ in 0..5 {
+                guard.record_query("fix the failing bug in the parser");
+            }
+            guard.config.context_window.adaptive = true;
+            guard.config.tool_selection.tool_budget_tokens = 1100;
+            guard.config.token_budget.max_turn_input_tokens = 100_000;
+            guard.config.compression.compression_threshold = 0.8;
+            guard.config.context_window.compression_threshold_min = 0.5;
+        }
+
+        apply_tactical_actions(
+            &mut state,
+            &[
+                TacticalAction::TokenBudgetWarning {
+                    used: 90_000,
+                    budget: 100_000,
+                },
+                TacticalAction::ThrottleHint {
+                    reason: "latency spike".into(),
+                },
+            ],
+        );
+
+        let lowered_tool_budget = state.tool_budget_override.expect("tool budget override");
+        let lowered_turn_budget = state.max_turn_input_tokens;
+        assert!(lowered_tool_budget < 1100);
+        assert!(lowered_turn_budget < 100_000);
+
+        apply_adaptive_execution_profile(&mut state);
+
+        let guard = session.read().unwrap();
+        assert_eq!(
+            state.tool_budget_override,
+            Some(lowered_tool_budget),
+            "scenario profile should not wipe tactical tool budget reductions"
+        );
+        assert_eq!(
+            state.max_turn_input_tokens, lowered_turn_budget,
+            "scenario profile should not wipe tactical turn budget reductions"
+        );
+        assert_eq!(
+            guard.config.tool_selection.tool_budget_tokens, lowered_tool_budget,
+            "session config should retain tactical tool budget reductions across turns"
+        );
+        assert_eq!(
+            guard.config.token_budget.max_turn_input_tokens, lowered_turn_budget as u32,
+            "session config should retain tactical turn budget reductions across turns"
+        );
     }
 
     #[test]
