@@ -2302,7 +2302,12 @@ impl StreamRenderState {
 
 /// Determine tool completion icon based on status, output, and execution context.
 /// Returns (icon_string, is_warning) where is_warning indicates warning-level result.
-fn tool_completion_icon(tool: &str, status: &str, output: &str, duration_ms: u64) -> (String, bool) {
+fn tool_completion_icon(
+    tool: &str,
+    status: &str,
+    output: &str,
+    duration_ms: u64,
+) -> (String, bool) {
     if status == "error" {
         return (theme::icon_err(), false);
     }

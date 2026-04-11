@@ -275,10 +275,7 @@ mod tests {
         let mut p = ThinkingPreviewPane::new(2, 80);
         p.buffer = "a\nb\nc\nd".into();
         let (h, b) = p.build_frame();
-        assert!(
-            h.contains("2↑"),
-            "header should show hidden row count: {h}"
-        );
+        assert!(h.contains("2↑"), "header should show hidden row count: {h}");
         assert_eq!(b, vec!["c".to_string(), "d".to_string()]);
     }
 

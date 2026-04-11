@@ -2544,13 +2544,17 @@ total_tokens_out: 500
     fn stats_no_active_session_does_not_panic() {
         // state with no session_id → should not panic
         let state = super::ReplState::default();
-        tokio::runtime::Runtime::new().unwrap().block_on(slash_stats::handle_stats_command("", &state)); // current session mode, no session
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(slash_stats::handle_stats_command("", &state)); // current session mode, no session
     }
 
     #[test]
     fn stats_history_no_sessions_does_not_panic() {
         let state = super::ReplState::default();
-        tokio::runtime::Runtime::new().unwrap().block_on(slash_stats::handle_stats_command("history", &state));
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(slash_stats::handle_stats_command("history", &state));
     }
 
     #[test]
@@ -2611,7 +2615,9 @@ total_tokens_out: 500
             session_id: Some(sid),
             ..Default::default()
         };
-        tokio::runtime::Runtime::new().unwrap().block_on(slash_stats::handle_stats_command("", &state));
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(slash_stats::handle_stats_command("", &state));
     }
 
     #[test]

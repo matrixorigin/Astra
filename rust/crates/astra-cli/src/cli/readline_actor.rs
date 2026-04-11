@@ -25,6 +25,13 @@ use crate::repl_ui::ReplHelper;
 
 #[cfg(unix)]
 use std::os::unix::thread::{JoinHandleExt, RawPthread};
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle;
+
+#[cfg(windows)]
+unsafe extern "system" {
+    fn CancelSynchronousIo(hThread: *mut std::ffi::c_void) -> i32;
+}
 
 /// Messages sent from the main async loop → readline thread.
 enum ReadlineRequest {
@@ -54,6 +61,7 @@ pub(super) enum ReadlineResponse {
 pub(super) struct ReadlineActor {
     req_tx: std::sync::mpsc::Sender<ReadlineRequest>,
     resp_rx: tokio::sync::mpsc::UnboundedReceiver<ReadlineResponse>,
+    thread_handle: Option<std::thread::JoinHandle<()>>,
     #[cfg(unix)]
     pthread: RawPthread,
 }
@@ -83,6 +91,7 @@ impl ReadlineActor {
         Ok(Self {
             req_tx,
             resp_rx,
+            thread_handle: Some(handle),
             #[cfg(unix)]
             pthread,
         })
@@ -108,8 +117,11 @@ impl ReadlineActor {
     }
 
     /// Tell the readline thread to save history and shut down.
-    pub fn shutdown(&self, hist_path: PathBuf) {
+    pub fn shutdown(&mut self, hist_path: PathBuf) {
         let _ = self.req_tx.send(ReadlineRequest::Shutdown(hist_path));
+        if let Some(handle) = self.thread_handle.take() {
+            let _ = handle.join();
+        }
     }
 
     /// Interrupt an in-flight readline call so the thread can process shutdown.
@@ -117,6 +129,12 @@ impl ReadlineActor {
         #[cfg(unix)]
         unsafe {
             let _ = nix::libc::pthread_kill(self.pthread, nix::libc::SIGINT);
+        }
+        #[cfg(windows)]
+        if let Some(ref handle) = self.thread_handle {
+            unsafe {
+                let _ = CancelSynchronousIo(handle.as_raw_handle() as *mut std::ffi::c_void);
+            }
         }
     }
 }
