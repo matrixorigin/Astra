@@ -201,10 +201,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
         record_first_latency_ms_since(ctx.telem.first_memoria_ms, mem_start);
 
         // Always record memory retrieval trace, even when no hits (for observability)
-        let memory_contents: Vec<String> = memory_hits
-            .iter()
-            .map(|h| h.content.clone())
-            .collect();
+        let memory_contents: Vec<String> = memory_hits.iter().map(|h| h.content.clone()).collect();
         let ranked = if memory_contents.is_empty() {
             Vec::new()
         } else {
