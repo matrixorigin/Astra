@@ -457,7 +457,15 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
             out
         }
         "keepalive" => serde_json::json!({ "type": "ping" }),
-        _ => serde_json::json!({ "type": event_type }),
+        _ => {
+            let mut out = serde_json::json!({ "type": event_type });
+            if let Some(obj) = out.as_object_mut() {
+                for (k, v) in &data {
+                    obj.insert(k.clone(), v.clone());
+                }
+            }
+            out
+        }
     }
 }
 
@@ -687,6 +695,17 @@ mod tests {
     fn unknown_event_type_passthrough() {
         let out = transform_run_event_for_client(make_event("custom_event", json!({})));
         assert_eq!(out["type"], "custom_event");
+    }
+
+    #[test]
+    fn unknown_event_type_preserves_data_fields() {
+        let out = transform_run_event_for_client(make_event(
+            "team_prepare",
+            json!({"delegation_id": "d1", "phase": "prepare"}),
+        ));
+        assert_eq!(out["type"], "team_prepare");
+        assert_eq!(out["delegation_id"], "d1");
+        assert_eq!(out["phase"], "prepare");
     }
 
     #[test]
