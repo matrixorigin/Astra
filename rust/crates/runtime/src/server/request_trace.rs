@@ -1,4 +1,8 @@
 //! Per-request trace id: `x-request-id` header echo + JSON error body enrichment.
+//!
+//! For `4xx`/`5xx` with `Content-Type: application/json`, the middleware may:
+//! - Fill `request_id` on [`astra_core::ErrorResponse`] bodies, or
+//! - Insert `request_id` on top-level JSON **objects** that omit it (generic errors).
 
 use axum::body::Body;
 use axum::extract::Request;
@@ -45,11 +49,90 @@ fn resolve_request_id(headers: &HeaderMap) -> String {
     }
 }
 
+/// `application/json` or `application/json; charset=...` without allocating a full lowercase copy.
+fn response_media_type_is_json(headers: &HeaderMap) -> bool {
+    headers
+        .get(CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|ct| {
+            let mime = ct.split(';').next().unwrap_or("").trim();
+            mime.eq_ignore_ascii_case("application/json")
+        })
+        .unwrap_or(false)
+}
+
+fn synthetic_error_bytes(request_id: &str, code: &'static str, detail: &'static str) -> Vec<u8> {
+    let fb = astra_core::ErrorResponse::new(detail)
+        .with_error_code(code)
+        .with_request_id(request_id.to_string());
+    serde_json::to_vec(&fb).unwrap_or_else(|_| {
+        br#"{"detail":"internal server error","error_code":"body_buffer_failed"}"#.to_vec()
+    })
+}
+
+fn json_body_needs_request_id(obj: &serde_json::Map<String, serde_json::Value>) -> bool {
+    match obj.get("request_id") {
+        None | Some(serde_json::Value::Null) => true,
+        Some(serde_json::Value::String(s)) if s.is_empty() => true,
+        _ => false,
+    }
+}
+
+/// Returns `Some(new_body)` when the payload was rewritten; `None` to keep `collected` as-is.
+fn try_enrich_json_body(collected: &[u8], request_id: &str) -> Option<Vec<u8>> {
+    if let Ok(err_in) = serde_json::from_slice::<astra_core::ErrorResponse>(collected) {
+        if err_in.request_id.is_some() {
+            return None;
+        }
+        let mut err = err_in;
+        err.request_id = Some(request_id.to_string());
+        return match serde_json::to_vec(&err) {
+            Ok(bytes) => Some(bytes),
+            Err(e) => {
+                tracing::warn!(
+                    target: "astra_runtime::request_trace",
+                    error = %e,
+                    "serialize enriched ErrorResponse failed; using synthetic body"
+                );
+                Some(synthetic_error_bytes(
+                    request_id,
+                    "error_response_encode_failed",
+                    "error response could not be re-encoded for request tracing",
+                ))
+            }
+        };
+    }
+
+    let mut v: serde_json::Value = serde_json::from_slice(collected).ok()?;
+    let obj = v.as_object_mut()?;
+    if !json_body_needs_request_id(obj) {
+        return None;
+    }
+    obj.insert(
+        "request_id".into(),
+        serde_json::Value::String(request_id.to_string()),
+    );
+    match serde_json::to_vec(&v) {
+        Ok(bytes) => Some(bytes),
+        Err(e) => {
+            tracing::warn!(
+                target: "astra_runtime::request_trace",
+                error = %e,
+                "serialize generic JSON error with request_id failed; using synthetic body"
+            );
+            Some(synthetic_error_bytes(
+                request_id,
+                "generic_json_encode_failed",
+                "error response could not be re-encoded for request tracing",
+            ))
+        }
+    }
+}
+
 /// Ensures every request has a `RequestTrace` extension and echoes `x-request-id`.
 ///
-/// For `4xx`/`5xx` responses with `Content-Type: application/json`, if the body
-/// deserializes as [`astra_core::ErrorResponse`] and `request_id` is unset, the
-/// middleware injects the current request id so clients can correlate with logs.
+/// For `4xx`/`5xx` responses with `Content-Type: application/json`, attempts to attach
+/// `request_id` to structured error bodies (see module docs).
 pub async fn request_trace_middleware(mut req: Request, next: Next) -> Response {
     let request_id = resolve_request_id(req.headers());
 
@@ -69,14 +152,7 @@ pub async fn request_trace_middleware(mut req: Request, next: Next) -> Response 
         return res;
     }
 
-    let is_json = res
-        .headers()
-        .get(CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .map(|ct| ct.to_ascii_lowercase().starts_with("application/json"))
-        .unwrap_or(false);
-
-    if !is_json {
+    if !response_media_type_is_json(res.headers()) {
         return res;
     }
 
@@ -91,28 +167,18 @@ pub async fn request_trace_middleware(mut req: Request, next: Next) -> Response 
                 status = %parts.status,
                 "failed to buffer JSON error response body; returning synthetic payload"
             );
-            let fallback = astra_core::ErrorResponse::new(
+            let bytes = synthetic_error_bytes(
+                &request_id,
+                "body_buffer_failed",
                 "error response body could not be buffered for request tracing",
-            )
-            .with_error_code("body_buffer_failed")
-            .with_request_id(request_id.clone());
-            let bytes = serde_json::to_vec(&fallback).unwrap_or_else(|_| {
-                br#"{"detail":"internal server error","error_code":"body_buffer_failed"}"#
-                    .to_vec()
-            });
+            );
             return Response::from_parts(parts, Body::from(bytes));
         }
     };
 
-    if let Ok(mut err) = serde_json::from_slice::<astra_core::ErrorResponse>(&collected) {
-        if err.request_id.is_none() {
-            err.request_id = Some(request_id);
-        }
-        if let Ok(bytes) = serde_json::to_vec(&err) {
-            return Response::from_parts(parts, Body::from(bytes));
-        }
+    if let Some(bytes) = try_enrich_json_body(&collected, &request_id) {
+        return Response::from_parts(parts, Body::from(bytes));
     }
-
     Response::from_parts(parts, Body::from(collected))
 }
 
@@ -205,7 +271,6 @@ mod tests {
     #[tokio::test]
     async fn unsafe_request_id_is_replaced() {
         let app = test_app();
-        // Slashes are not allowed by [`is_safe_request_id_token`]; header value is still valid HTTP.
         let req = Request::builder()
             .uri("/err")
             .header("x-request-id", "bad/id")
@@ -214,5 +279,75 @@ mod tests {
         let res = app.oneshot(req).await.unwrap();
         let rid = res.headers().get("x-request-id").unwrap().to_str().unwrap();
         assert!(uuid::Uuid::parse_str(rid).is_ok());
+    }
+
+    #[tokio::test]
+    async fn skips_body_rewrite_on_success_json() {
+        let app = Router::new()
+            .route(
+                "/ok",
+                get(|| async { Json(serde_json::json!({ "status": "ok" })) }),
+            )
+            .layer(axum::middleware::from_fn(request_trace_middleware));
+        let req = Request::builder()
+            .uri("/ok")
+            .body(Body::empty())
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert!(res.headers().get("x-request-id").is_some());
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v, serde_json::json!({ "status": "ok" }));
+        assert!(v.get("request_id").is_none());
+    }
+
+    #[tokio::test]
+    async fn injects_request_id_into_generic_json_object_error() {
+        let app = Router::new()
+            .route(
+                "/err",
+                get(|| async {
+                    (
+                        StatusCode::NOT_FOUND,
+                        Json(serde_json::json!({ "message": "nope" })),
+                    )
+                }),
+            )
+            .layer(axum::middleware::from_fn(request_trace_middleware));
+        let req = Request::builder()
+            .uri("/err")
+            .body(Body::empty())
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        let hdr = res
+            .headers()
+            .get("x-request-id")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["message"], "nope");
+        assert_eq!(v["request_id"].as_str().unwrap(), hdr.as_str());
+    }
+
+    #[tokio::test]
+    async fn skips_non_json_error_body() {
+        let app = Router::new()
+            .route(
+                "/txt",
+                get(|| async { (StatusCode::NOT_FOUND, "plain-not-found") }),
+            )
+            .layer(axum::middleware::from_fn(request_trace_middleware));
+        let req = Request::builder()
+            .uri("/txt")
+            .body(Body::empty())
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&bytes[..], b"plain-not-found");
     }
 }
