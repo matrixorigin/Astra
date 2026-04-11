@@ -75,7 +75,8 @@ fn merged_metadata_from_journal_event(
 ) -> Option<serde_json::Value> {
     let has_extra = event.session_lineage.is_some()
         || event.coordination.is_some()
-        || event.edge_policy.is_some();
+        || event.edge_policy.is_some()
+        || event.context_assembly_trace.is_some();
     if !has_extra && event.metadata.is_none() {
         return None;
     }
@@ -102,6 +103,9 @@ fn merged_metadata_from_journal_event(
         && let Ok(v) = serde_json::to_value(p)
     {
         obj.insert("edge_policy".to_string(), v);
+    }
+    if let Some(ref trace) = event.context_assembly_trace {
+        obj.insert("context_assembly_trace".to_string(), trace.clone());
     }
     Some(serde_json::Value::Object(obj))
 }
@@ -1435,5 +1439,58 @@ mod tests {
             source.contains("self.rx.try_recv()"),
             "shutdown branch must drain channel via try_recv before flush_batch_once"
         );
+    }
+
+    #[test]
+    fn context_assembly_recorded_ingests_trace_in_metadata() {
+        use crate::session_journal::JournalEvent;
+        let trace = serde_json::json!({
+            "turn_id": "turn-0",
+            "session_id": "sess-1",
+            "system_prompt": {
+                "base_persona_tokens": 8000,
+                "environment_tokens": 300,
+                "user_preferences_tokens": 100,
+                "skills_injected": [],
+                "repository_memories": [],
+                "total_tokens": 8400,
+            },
+            "token_budget": {
+                "system_prompt_tokens": 8400,
+                "history_tokens": 500,
+                "total_used": 10000,
+                "max_tokens": 128000,
+            },
+        });
+        let journal = JournalEvent::context_assembly_recorded(Some("sess-1"), 0, trace.clone());
+        let ingestion = IngestionEvent::from_journal_event(&journal, "user-x");
+
+        assert_eq!(ingestion.session_id, "sess-1");
+        assert!(
+            ingestion.event_type.contains("context_assembly"),
+            "event_type should contain context_assembly: {}",
+            ingestion.event_type
+        );
+        let meta = ingestion.metadata.expect("should have metadata");
+        let cat = meta
+            .get("context_assembly_trace")
+            .expect("should have context_assembly_trace in metadata");
+        assert_eq!(cat["turn_id"], "turn-0");
+        assert_eq!(cat["system_prompt"]["base_persona_tokens"], 8000);
+        assert_eq!(cat["token_budget"]["total_used"], 10000);
+    }
+
+    #[test]
+    fn context_assembly_trace_absent_no_metadata_pollution() {
+        let mut event = make_turn_event();
+        event.context_assembly_trace = None;
+        let ingestion = IngestionEvent::from_journal_event(&event, "user-y");
+        // Turn events without context_assembly_trace should not have it in metadata
+        if let Some(ref meta) = ingestion.metadata {
+            assert!(
+                meta.get("context_assembly_trace").is_none(),
+                "should not have context_assembly_trace when absent"
+            );
+        }
     }
 }
