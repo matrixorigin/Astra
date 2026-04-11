@@ -1014,7 +1014,12 @@ fn try_write_heavy_checkpoint(state: &mut AgenticLoopState) {
         return;
     };
     let cp = StepCheckpoint::Heavy(Box::new(heavy));
-    let _ = step_checkpoint::write_step_checkpoint(sid, ckpt_num, &cp);
+    if let Err(e) = step_checkpoint::write_step_checkpoint(sid, ckpt_num, &cp) {
+        astra_core::agent_warn!(
+            "checkpoint",
+            "Failed to write step checkpoint {ckpt_num}: {e}"
+        );
+    }
 
     let turn = (state.max_turns - state.remaining_turns) as u32;
     let snapshot = astra_core::composite_snapshot::CompositeSnapshotBuilder::new(sid.clone(), turn)
@@ -1025,7 +1030,9 @@ fn try_write_heavy_checkpoint(state: &mut AgenticLoopState) {
 
     let mut index = step_checkpoint::read_composite_snapshot_index(sid).unwrap_or_default();
     index.snapshots.push(snapshot.clone());
-    let _ = step_checkpoint::write_composite_snapshot_index(sid, &index);
+    if let Err(e) = step_checkpoint::write_composite_snapshot_index(sid, &index) {
+        astra_core::agent_warn!("checkpoint", "Failed to write snapshot index: {e}");
+    }
 
     state.last_composite_snapshot = Some(snapshot);
     state.stall.last_heavy_checkpoint = Some(cp);
@@ -1098,7 +1105,12 @@ async fn build_full_composite_snapshot(
 
     let mut index = step_checkpoint::read_composite_snapshot_index(sid).unwrap_or_default();
     index.snapshots.push(snapshot.clone());
-    let _ = step_checkpoint::write_composite_snapshot_index(sid, &index);
+    if let Err(e) = step_checkpoint::write_composite_snapshot_index(sid, &index) {
+        astra_core::agent_warn!(
+            "checkpoint",
+            "Failed to write composite snapshot index: {e}"
+        );
+    }
 
     state.last_composite_snapshot = Some(snapshot.clone());
     Some(snapshot)
@@ -1587,7 +1599,9 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                     // Auto-ack: if the sender requested ack, send one back.
                     if msg.requires_ack {
                         let ack_reply = msg.make_ack(mailbox.address.clone());
-                        let _ = mailbox.send(ack_reply).await;
+                        if let Err(e) = mailbox.send(ack_reply).await {
+                            astra_core::agent_warn!("mailbox", "Failed to send ack: {e}");
+                        }
                         if let Some(ref metrics) = state.messaging.metrics {
                             metrics
                                 .acks_sent
@@ -1600,7 +1614,12 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                     {
                         let response_msg =
                             response.to_message(&mailbox.address, &msg.from, &correlation_id);
-                        let _ = mailbox.send(response_msg).await;
+                        if let Err(e) = mailbox.send(response_msg).await {
+                            astra_core::agent_warn!(
+                                "mailbox",
+                                "Failed to send permission response: {e}"
+                            );
+                        }
                         continue;
                     }
 
@@ -1654,7 +1673,9 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
             // Re-send retry messages and track retries.
             for retry_msg in &retry_msgs {
                 if let Some(ref mut mb) = state.messaging.mailbox {
-                    let _ = mb.send((**retry_msg).clone()).await;
+                    if let Err(e) = mb.send((**retry_msg).clone()).await {
+                        astra_core::agent_warn!("mailbox", "Failed to send retry message: {e}");
+                    }
                 }
                 if let Some(ref metrics) = state.messaging.metrics {
                     metrics
@@ -2872,14 +2893,17 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
 
                 // Send progress update to parent agent (best-effort).
                 if let Some(ref mailbox) = state.messaging.mailbox {
-                    let _ = mailbox
+                    if let Err(e) = mailbox
                         .send_progress(
                             turn_index as u32,
                             state.total_tool_calls,
                             "turn_complete",
                             None,
                         )
-                        .await;
+                        .await
+                    {
+                        astra_core::agent_warn!("mailbox", "Failed to send turn progress: {e}");
+                    }
                 }
 
                 // ─── Observability: turn end hook ────────────────────────
