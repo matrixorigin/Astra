@@ -13,7 +13,7 @@ use astra_runtime::auto_tuning::{FeedbackSignal, SignalType};
 use astra_runtime::liquid::reflection::{
     GoalSummary as ReflectionGoalSummary, HealthSummary as ReflectionHealthSummary,
     ReflectionEventSummary, VerificationSummary as ReflectionVerificationSummary,
-    summarize_recent_performance_deltas,
+    summarize_recent_adaptation_impacts, summarize_recent_performance_deltas,
 };
 use astra_runtime::runtime_config::RuntimeConfig;
 use astra_runtime::self_model::{ConstraintSet, SelfModel};
@@ -520,6 +520,7 @@ async fn build_reflect_response(
         verification,
         health,
         recent_performance_deltas,
+        recent_adaptation_impacts,
         recent_evaluation_events,
         recent_adaptations,
         recent_adaptation_outcomes,
@@ -533,6 +534,7 @@ async fn build_reflect_response(
         verification,
         health,
         recent_performance_deltas,
+        recent_adaptation_impacts,
         recent_evaluation_events,
         recent_adaptations,
         recent_adaptation_outcomes,
@@ -559,6 +561,7 @@ async fn load_reflection_self_evidence(
     Option<ReflectionGoalSummary>,
     Option<ReflectionVerificationSummary>,
     Option<ReflectionHealthSummary>,
+    Vec<ReflectionEventSummary>,
     Vec<ReflectionEventSummary>,
     Vec<ReflectionEventSummary>,
     Vec<ReflectionEventSummary>,
@@ -591,6 +594,16 @@ async fn load_reflection_self_evidence(
         .as_ref()
         .map(|snapshot| summarize_recent_performance_deltas(&snapshot.recent_steps, 4))
         .unwrap_or_default();
+    let recent_adaptation_impacts = snapshot
+        .as_ref()
+        .map(|snapshot| {
+            summarize_recent_adaptation_impacts(
+                &snapshot.recent_steps,
+                &snapshot.evolution.records,
+                3,
+            )
+        })
+        .unwrap_or_default();
     let recent_evaluation_events =
         reflection_recent_evaluation_events(goal_surface.as_ref(), verification_surface.as_ref());
     let recent_adaptations = reflection_recent_adaptations(snapshot.as_ref());
@@ -600,6 +613,7 @@ async fn load_reflection_self_evidence(
         verification_surface.map(reflection_verification_summary),
         health_surface.and_then(reflection_health_summary),
         recent_performance_deltas,
+        recent_adaptation_impacts,
         recent_evaluation_events,
         recent_adaptations,
         recent_adaptation_outcomes,
@@ -1595,6 +1609,7 @@ fn build_persistent_reflection_context(
     verification: Option<ReflectionVerificationSummary>,
     health: Option<ReflectionHealthSummary>,
     recent_performance_deltas: Vec<ReflectionEventSummary>,
+    recent_adaptation_impacts: Vec<ReflectionEventSummary>,
     recent_evaluation_events: Vec<ReflectionEventSummary>,
     recent_adaptations: Vec<ReflectionEventSummary>,
     recent_adaptation_outcomes: Vec<ReflectionEventSummary>,
@@ -1646,6 +1661,7 @@ fn build_persistent_reflection_context(
     context.verification = verification;
     context.health = health;
     context.recent_performance_deltas = recent_performance_deltas;
+    context.recent_adaptation_impacts = recent_adaptation_impacts;
     context.recent_evaluation_events = recent_evaluation_events;
     context.recent_adaptations = recent_adaptations;
     context.recent_adaptation_outcomes = recent_adaptation_outcomes;
@@ -2788,6 +2804,10 @@ mod tests {
             "Regressed"
         );
         assert_eq!(
+            value["reflection_context"]["recent_adaptation_impacts"][0]["kind"],
+            "Regressed"
+        );
+        assert_eq!(
             value["reflection_context"]["recent_evaluation_events"][0]["kind"],
             "Verification"
         );
@@ -2836,6 +2856,12 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("Recent performance deltas:")
+        );
+        assert!(
+            value["prompt_preview"]
+                .as_str()
+                .unwrap()
+                .contains("Recent adaptation impacts:")
         );
         assert!(
             value["prompt_preview"]
