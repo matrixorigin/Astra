@@ -459,11 +459,55 @@ pub struct DecisionMetrics {
     pub noise_filtered_quality_samples: i64,
 }
 
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct NumericInterval {
+    pub point: f64,
+    pub lower: f64,
+    pub upper: f64,
+}
+
+impl NumericInterval {
+    pub const ZERO: Self = Self {
+        point: 0.0,
+        lower: 0.0,
+        upper: 0.0,
+    };
+
+    pub fn new(point: f64, lower: f64, upper: f64) -> Self {
+        let point = if point.is_finite() {
+            point.max(0.0)
+        } else {
+            0.0
+        };
+        let lower = if lower.is_finite() {
+            lower.max(0.0).min(point)
+        } else {
+            0.0
+        };
+        let upper = if upper.is_finite() {
+            upper.max(point)
+        } else {
+            point
+        };
+        Self {
+            point,
+            lower,
+            upper,
+        }
+    }
+
+    pub fn exact(point: f64) -> Self {
+        Self::new(point, point, point)
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SessionMetrics {
     pub unique_sessions: i64,
     pub avg_turns_per_session: f64,
+    pub avg_turns_per_session_interval: NumericInterval,
     pub noise_filtered_avg_turns_per_session: f64,
+    pub noise_filtered_avg_turns_per_session_interval: NumericInterval,
     pub noise_filtered_session_count: i64,
 }
 

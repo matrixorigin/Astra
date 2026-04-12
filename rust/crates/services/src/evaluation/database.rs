@@ -191,6 +191,27 @@ fn sampled_confidence_interval(point: f64, sample_count: i64) -> ConfidenceInter
     ConfidenceInterval::symmetric(point.clamp(0.0, 1.0), margin)
 }
 
+fn numeric_mean_interval(samples: &[f64]) -> NumericInterval {
+    if samples.is_empty() {
+        return NumericInterval::ZERO;
+    }
+    let mean = average_scores(samples);
+    if samples.len() == 1 {
+        return NumericInterval::exact(mean);
+    }
+    let variance = samples
+        .iter()
+        .map(|value| {
+            let delta = *value - mean;
+            delta * delta
+        })
+        .sum::<f64>()
+        / (samples.len() - 1) as f64;
+    let std_error = variance.max(0.0).sqrt() / (samples.len() as f64).sqrt();
+    let margin = 1.96 * std_error;
+    NumericInterval::new(mean, mean - margin, mean + margin)
+}
+
 fn noise_filtered_indices(values: &[f64]) -> Vec<usize> {
     if values.is_empty() {
         return Vec::new();
@@ -422,11 +443,18 @@ fn summarize_decision_metrics(total_decisions: i64, quality_scores: &[f64]) -> D
 }
 
 fn summarize_session_metrics(turn_counts: &[f64]) -> SessionMetrics {
+    let filtered_indices = noise_filtered_indices(turn_counts);
+    let filtered_turn_counts: Vec<f64> = filtered_indices
+        .iter()
+        .map(|index| turn_counts[*index])
+        .collect();
     let noise_filtered = noise_filtered_average(turn_counts);
     SessionMetrics {
         unique_sessions: turn_counts.len() as i64,
         avg_turns_per_session: average_scores(turn_counts),
+        avg_turns_per_session_interval: numeric_mean_interval(turn_counts),
         noise_filtered_avg_turns_per_session: noise_filtered.average,
+        noise_filtered_avg_turns_per_session_interval: numeric_mean_interval(&filtered_turn_counts),
         noise_filtered_session_count: noise_filtered.sample_count,
     }
 }
@@ -2130,6 +2158,30 @@ mod tests {
     }
 
     #[test]
+    fn numeric_mean_interval_zero_samples_is_zero() {
+        assert_eq!(
+            numeric_mean_interval(&[]).point,
+            NumericInterval::ZERO.point
+        );
+        assert_eq!(
+            numeric_mean_interval(&[]).lower,
+            NumericInterval::ZERO.lower
+        );
+        assert_eq!(
+            numeric_mean_interval(&[]).upper,
+            NumericInterval::ZERO.upper
+        );
+    }
+
+    #[test]
+    fn numeric_mean_interval_preserves_unbounded_scale() {
+        let interval = numeric_mean_interval(&[6.0, 8.0, 10.0, 12.0]);
+        assert!((interval.point - 9.0).abs() < 0.0001);
+        assert!(interval.upper > 1.0);
+        assert!(interval.lower >= 0.0);
+    }
+
+    #[test]
     fn complement_interval_flips_bounds() {
         let interval = ConfidenceInterval::new(0.8, 0.7, 0.9);
         let complement = complement_interval(interval);
@@ -2226,6 +2278,17 @@ mod tests {
         assert_eq!(metrics.noise_filtered_session_count, 4);
         assert!(metrics.noise_filtered_avg_turns_per_session < metrics.avg_turns_per_session);
         assert!((metrics.noise_filtered_avg_turns_per_session - 7.5).abs() < 0.0001);
+        assert!(
+            (metrics.avg_turns_per_session_interval.point - metrics.avg_turns_per_session).abs()
+                < 0.0001
+        );
+        assert!(
+            (metrics.noise_filtered_avg_turns_per_session_interval.point
+                - metrics.noise_filtered_avg_turns_per_session)
+                .abs()
+                < 0.0001
+        );
+        assert!(metrics.avg_turns_per_session_interval.upper > 1.0);
     }
 
     #[test]
