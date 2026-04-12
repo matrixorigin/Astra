@@ -197,6 +197,12 @@ pub struct CrossSessionStats {
     pub avg_turns_per_session: f64,
     pub avg_tokens_per_session: f64,
     pub tool_error_rate: f64,
+    pub total_mutations: u32,
+    pub ready_mutations: u32,
+    pub approval_required_mutations: u32,
+    pub applied_mutations: u32,
+    pub reverted_mutations: u32,
+    pub blocked_mutations: u32,
     pub top_tools: Vec<ToolUsageBrief>,
     pub top_models: Vec<ModelUsageBrief>,
 }
@@ -989,32 +995,10 @@ impl SessionAuditService for DatabaseSessionAuditService {
                     .ok()
                     .and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok())
                     .unwrap_or(serde_json::Value::Null);
-                let mutation_id = metadata
-                    .get("mutation_id")
-                    .and_then(serde_json::Value::as_str)?;
-                let state = metadata
-                    .get("state")
-                    .cloned()
-                    .and_then(|value| serde_json::from_value::<StagedMutationState>(value).ok())?;
-                if !matches!(
-                    state,
-                    StagedMutationState::Applied
-                        | StagedMutationState::Reverted
-                        | StagedMutationState::Blocked
-                ) {
-                    return None;
-                }
-                Some(MutationStateOverride {
-                    mutation_id: mutation_id.to_string(),
-                    state,
-                    note: metadata
-                        .get("note")
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::trim)
-                        .filter(|note| !note.is_empty())
-                        .map(ToString::to_string),
-                    created_at: row.try_get("created_at").unwrap_or_default(),
-                })
+                parse_mutation_state_override(
+                    &metadata,
+                    row.try_get("created_at").unwrap_or_default(),
+                )
             })
             .collect::<Vec<_>>();
 
@@ -1276,6 +1260,79 @@ impl SessionAuditService for DatabaseSessionAuditService {
             })
             .collect();
 
+        let mut mutation_where_parts: Vec<String> = vec!["s.user_id = ?".into()];
+        let mut mutation_bind_values: Vec<String> = vec![user_id.into()];
+        if let Some(ref since) = params.since {
+            mutation_where_parts.push("d.created_at >= ?".into());
+            mutation_bind_values.push(since.clone());
+        }
+        if let Some(ref until) = params.until {
+            mutation_where_parts.push("d.created_at <= ?".into());
+            mutation_bind_values.push(until.clone());
+        }
+        let mutation_where_clause = mutation_where_parts.join(" AND ");
+        let decisions_sql = format!(
+            "SELECT d.decision_id, d.session_id, CAST(d.decision_output AS CHAR) AS decision_output \
+             FROM ctx_decision_audits d \
+             JOIN agent_sessions s ON s.session_id = d.session_id \
+             WHERE {mutation_where_clause} AND d.decision_type = 'tool_selection' \
+             ORDER BY d.created_at ASC"
+        );
+        let mut dq = sqlx::query(&decisions_sql);
+        for v in &mutation_bind_values {
+            dq = dq.bind(v);
+        }
+        let decision_rows = dq.fetch_all(&pool).await.map_err(internal_error)?;
+        let mutation_decisions = decision_rows
+            .into_iter()
+            .map(|row| {
+                let decision_output = row
+                    .try_get::<String, _>("decision_output")
+                    .ok()
+                    .and_then(|value| serde_json::from_str(&value).ok())
+                    .unwrap_or(serde_json::Value::Null);
+                PersistedMutationDecision {
+                    decision_id: row.try_get("decision_id").unwrap_or_default(),
+                    session_id: row.try_get("session_id").unwrap_or_default(),
+                    decision_output,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let overrides_sql = format!(
+            "SELECT e.session_id, CAST(e.metadata AS CHAR) AS metadata, e.created_at \
+             FROM agent_events e \
+             WHERE {where_clause} AND e.event_type = 'mutation_state' \
+             ORDER BY e.created_at ASC"
+        );
+        let mut oq = sqlx::query(&overrides_sql);
+        for v in &bind_values {
+            oq = oq.bind(v);
+        }
+        let override_rows = oq.fetch_all(&pool).await.map_err(internal_error)?;
+        let mutation_overrides = override_rows
+            .into_iter()
+            .filter_map(|row| {
+                let metadata = row
+                    .try_get::<String, _>("metadata")
+                    .ok()
+                    .and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok())
+                    .unwrap_or(serde_json::Value::Null);
+                parse_mutation_state_override(
+                    &metadata,
+                    row.try_get("created_at").unwrap_or_default(),
+                )
+                .map(|override_entry| {
+                    (
+                        row.try_get("session_id").unwrap_or_default(),
+                        override_entry,
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        let mutation_stats =
+            aggregate_cross_session_mutation_stats(mutation_decisions, mutation_overrides);
+
         let sc = session_count.max(1) as f64;
         Ok(CrossSessionStats {
             session_count,
@@ -1293,6 +1350,12 @@ impl SessionAuditService for DatabaseSessionAuditService {
             } else {
                 0.0
             },
+            total_mutations: mutation_stats.total_mutations,
+            ready_mutations: mutation_stats.ready_mutations,
+            approval_required_mutations: mutation_stats.approval_required_mutations,
+            applied_mutations: mutation_stats.applied_mutations,
+            reverted_mutations: mutation_stats.reverted_mutations,
+            blocked_mutations: mutation_stats.blocked_mutations,
             top_tools,
             top_models,
         })
@@ -1552,6 +1615,92 @@ fn build_mutation_scoreboard(
     MutationScoreboard::new(scoreboard.scoreboard_id, scoreboard.session_id, mutations)
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct MutationStatsAggregate {
+    total_mutations: u32,
+    ready_mutations: u32,
+    approval_required_mutations: u32,
+    applied_mutations: u32,
+    reverted_mutations: u32,
+    blocked_mutations: u32,
+}
+
+fn parse_mutation_state_override(
+    metadata: &serde_json::Value,
+    created_at: String,
+) -> Option<MutationStateOverride> {
+    let mutation_id = metadata
+        .get("mutation_id")
+        .and_then(serde_json::Value::as_str)?;
+    let state = metadata
+        .get("state")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<StagedMutationState>(value).ok())?;
+    if !matches!(
+        state,
+        StagedMutationState::Applied | StagedMutationState::Reverted | StagedMutationState::Blocked
+    ) {
+        return None;
+    }
+    Some(MutationStateOverride {
+        mutation_id: mutation_id.to_string(),
+        state,
+        note: metadata
+            .get("note")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|note| !note.is_empty())
+            .map(ToString::to_string),
+        created_at,
+    })
+}
+
+fn aggregate_cross_session_mutation_stats(
+    decisions: Vec<PersistedMutationDecision>,
+    overrides: Vec<(String, MutationStateOverride)>,
+) -> MutationStatsAggregate {
+    let mut decisions_by_session =
+        std::collections::HashMap::<String, Vec<PersistedMutationDecision>>::new();
+    for decision in decisions {
+        decisions_by_session
+            .entry(decision.session_id.clone())
+            .or_default()
+            .push(decision);
+    }
+
+    let mut overrides_by_session =
+        std::collections::HashMap::<String, Vec<MutationStateOverride>>::new();
+    for (session_id, override_entry) in overrides {
+        overrides_by_session
+            .entry(session_id)
+            .or_default()
+            .push(override_entry);
+    }
+
+    let mut session_ids = decisions_by_session
+        .keys()
+        .cloned()
+        .collect::<std::collections::HashSet<_>>();
+    session_ids.extend(overrides_by_session.keys().cloned());
+
+    let mut aggregate = MutationStatsAggregate::default();
+    for session_id in session_ids {
+        let scoreboard = build_mutation_scoreboard(
+            &session_id,
+            decisions_by_session.remove(&session_id).unwrap_or_default(),
+            overrides_by_session.remove(&session_id).unwrap_or_default(),
+        );
+        aggregate.total_mutations += scoreboard.total_mutations;
+        aggregate.ready_mutations += scoreboard.ready_mutations;
+        aggregate.approval_required_mutations += scoreboard.approval_required_mutations;
+        aggregate.applied_mutations += scoreboard.applied_mutations;
+        aggregate.reverted_mutations += scoreboard.reverted_mutations;
+        aggregate.blocked_mutations += scoreboard.blocked_mutations;
+    }
+
+    aggregate
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1725,6 +1874,12 @@ mod tests {
             avg_turns_per_session: 15.0,
             avg_tokens_per_session: 80_000.0,
             tool_error_rate: 0.075,
+            total_mutations: 12,
+            ready_mutations: 4,
+            approval_required_mutations: 3,
+            applied_mutations: 2,
+            reverted_mutations: 1,
+            blocked_mutations: 2,
             top_tools: vec![ToolUsageBrief {
                 name: "bash".into(),
                 call_count: 100,
@@ -1739,6 +1894,7 @@ mod tests {
         let json = serde_json::to_string(&stats).unwrap();
         assert!(json.contains("\"session_count\":10"));
         assert!(json.contains("\"total_turns\":150"));
+        assert!(json.contains("\"total_mutations\":12"));
         assert!(json.contains("\"top_tools\":["));
         assert!(json.contains("\"top_models\":["));
     }
@@ -1757,6 +1913,12 @@ mod tests {
             avg_turns_per_session: 0.0,
             avg_tokens_per_session: 0.0,
             tool_error_rate: 0.0,
+            total_mutations: 0,
+            ready_mutations: 0,
+            approval_required_mutations: 0,
+            applied_mutations: 0,
+            reverted_mutations: 0,
+            blocked_mutations: 0,
             top_tools: vec![],
             top_models: vec![],
         };
@@ -2023,12 +2185,19 @@ mod tests {
             avg_turns_per_session: 10.0,
             avg_tokens_per_session: 8000.0,
             tool_error_rate: 0.025,
+            total_mutations: 9,
+            ready_mutations: 3,
+            approval_required_mutations: 2,
+            applied_mutations: 2,
+            reverted_mutations: 1,
+            blocked_mutations: 1,
             top_tools: vec![],
             top_models: vec![],
         };
         let json = serde_json::to_string(&stats).unwrap();
         let restored: CrossSessionStats = serde_json::from_str(&json).unwrap();
         assert_eq!(restored.session_count, 10);
+        assert_eq!(restored.total_mutations, 9);
         assert!((restored.tool_error_rate - 0.025).abs() < 0.001);
     }
 
@@ -2184,5 +2353,84 @@ mod tests {
             scoreboard.mutations[0].state_updated_at.as_deref(),
             Some("2026-04-12T12:05:00Z")
         );
+    }
+
+    #[test]
+    fn aggregate_cross_session_mutation_stats_sums_per_session_scoreboards() {
+        let stats = aggregate_cross_session_mutation_stats(
+            vec![
+                PersistedMutationDecision {
+                    decision_id: "decision-1".into(),
+                    session_id: "session-1".into(),
+                    decision_output: serde_json::json!({
+                        "turn": 1,
+                        "mutation_objective_score": {
+                            "quality": {"point": 0.90, "lower": 0.90, "upper": 0.90},
+                            "reward_hacking_risk": {"point": 0.05, "lower": 0.05, "upper": 0.05},
+                            "causal_support": {"point": 0.90, "lower": 0.90, "upper": 0.90},
+                            "was_corrected": false
+                        },
+                        "action_profiles": [
+                            {
+                                "tool_call_id": "call-1",
+                                "tool_name": "edit_file",
+                                "arguments": {"path": "src/lib.rs"},
+                                "profile": {
+                                    "bounded": true,
+                                    "reversible": true,
+                                    "requires_pre_state": false,
+                                    "action_category": "write",
+                                    "compensation_kind": "restore_file",
+                                    "compensation_summary": "restore prior contents"
+                                }
+                            }
+                        ]
+                    }),
+                },
+                PersistedMutationDecision {
+                    decision_id: "decision-2".into(),
+                    session_id: "session-2".into(),
+                    decision_output: serde_json::json!({
+                        "turn": 2,
+                        "mutation_objective_score": {
+                            "quality": {"point": 0.75, "lower": 0.75, "upper": 0.75},
+                            "reward_hacking_risk": {"point": 0.15, "lower": 0.15, "upper": 0.15},
+                            "causal_support": {"point": 0.70, "lower": 0.70, "upper": 0.70},
+                            "was_corrected": false
+                        },
+                        "action_profiles": [
+                            {
+                                "tool_call_id": "call-2",
+                                "tool_name": "bash",
+                                "arguments": {"command": "git commit -m x"},
+                                "profile": {
+                                    "bounded": false,
+                                    "reversible": true,
+                                    "requires_pre_state": false,
+                                    "action_category": "execute",
+                                    "compensation_kind": "git_revert_commit",
+                                    "compensation_summary": "revert the commit"
+                                }
+                            }
+                        ]
+                    }),
+                },
+            ],
+            vec![(
+                "session-2".into(),
+                MutationStateOverride {
+                    mutation_id: "decision-2:call-2".into(),
+                    state: StagedMutationState::Applied,
+                    note: Some("applied globally".into()),
+                    created_at: "2026-04-12T12:00:00Z".into(),
+                },
+            )],
+        );
+
+        assert_eq!(stats.total_mutations, 2);
+        assert_eq!(stats.ready_mutations, 1);
+        assert_eq!(stats.applied_mutations, 1);
+        assert_eq!(stats.approval_required_mutations, 0);
+        assert_eq!(stats.blocked_mutations, 0);
     }
 }
