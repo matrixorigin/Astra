@@ -132,4 +132,18 @@ mod tests {
             json!({"type": "error", "message": "boom", "code": "RUN_ERROR", "index": 8})
         );
     }
+
+    #[test]
+    fn transform_stream_run_events_for_client_maps_tool_result_to_tool_call_end() {
+        let transformed = transform_stream_run_events_for_client(vec![json!({
+            "event_type": "tool_result",
+            "data": {"call_id": "call-1", "result": "ok"},
+            "index": 9
+        })]);
+
+        assert_eq!(
+            transformed[0],
+            json!({"type": "tool_call_end", "call_id": "call-1", "result": "ok", "index": 9})
+        );
+    }
 }

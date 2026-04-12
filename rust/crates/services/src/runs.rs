@@ -396,7 +396,7 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
             "call_id": data.get("call_id").cloned().unwrap_or(serde_json::Value::String(String::new())),
         }),
         "tool_result" => serde_json::json!({
-            "type": "tool_result",
+            "type": "tool_call_end",
             "call_id": data.get("call_id").cloned().unwrap_or(serde_json::Value::String(String::new())),
             "result": data.get("result").cloned().unwrap_or(serde_json::Value::String(String::new())),
         }),
@@ -620,7 +620,7 @@ mod tests {
             "tool_result",
             json!({"call_id": "c1", "result": "ok"}),
         ));
-        assert_eq!(out["type"], "tool_result");
+        assert_eq!(out["type"], "tool_call_end");
         assert_eq!(out["call_id"], "c1");
     }
 
