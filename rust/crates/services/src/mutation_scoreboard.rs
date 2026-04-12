@@ -269,6 +269,10 @@ pub struct StagedMutation {
     pub objective: MutationObjectiveScore,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verifier: Option<MutationVerifierSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verifier_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verifier_gap: Option<String>,
     pub compensation: MutationCompensationPolicy,
     pub judgment: MutationJudgment,
 }
@@ -304,6 +308,8 @@ impl StagedMutation {
             state_updated_at: None,
             objective,
             verifier,
+            verifier_source: None,
+            verifier_gap: None,
             compensation,
             judgment,
         }
@@ -459,7 +465,7 @@ fn staged_mutations_from_persisted_decision(
             } else {
                 format!("{}:{tool_call_id}", decision.decision_id)
             };
-            Some(StagedMutation::new(
+            let mut mutation = StagedMutation::new(
                 mutation_id,
                 decision.session_id.clone(),
                 turn_index,
@@ -477,7 +483,16 @@ fn staged_mutations_from_persisted_decision(
                     .get("verifier")
                     .and_then(MutationVerifierSummary::from_value),
                 compensation,
-            ))
+            );
+            mutation.verifier_source = action_profile
+                .get("verifier_source")
+                .and_then(Value::as_str)
+                .map(ToString::to_string);
+            mutation.verifier_gap = action_profile
+                .get("verifier_gap")
+                .and_then(Value::as_str)
+                .map(ToString::to_string);
+            Some(mutation)
         })
         .collect()
 }
@@ -689,6 +704,7 @@ mod tests {
                             "tool_call_id": "call-1",
                             "tool_name": "write_file",
                             "arguments": {"path": "src/lib.rs"},
+                            "verifier_source": "tool_result",
                             "verifier": {
                                 "all_required_passed": true,
                                 "criteria_total": 2,
@@ -728,6 +744,11 @@ mod tests {
                 .map(|summary| summary.criteria_passed),
             Some(2)
         );
+        assert_eq!(
+            scoreboard.mutations[0].verifier_source.as_deref(),
+            Some("tool_result")
+        );
+        assert_eq!(scoreboard.mutations[0].verifier_gap.as_deref(), None);
         assert_eq!(scoreboard.approval_required_mutations, 1);
     }
 }

@@ -563,8 +563,26 @@ fn build_hook_db_persist_from_payload(
                 && let Some(summary) = tool_verification_summaries.get(tool_call_id)
             {
                 action_profile.insert("verifier".to_string(), summary.clone());
+                action_profile.insert(
+                    "verifier_source".to_string(),
+                    serde_json::Value::String("tool_result".to_string()),
+                );
             } else if let Some(summary) = turn_verification_summary.as_ref() {
                 action_profile.insert("verifier".to_string(), summary.clone());
+                action_profile.insert(
+                    "verifier_source".to_string(),
+                    serde_json::Value::String("turn_journal".to_string()),
+                );
+            } else {
+                let verifier_gap = if tool_calls.len() > 1 {
+                    "ambiguous_multi_action_turn"
+                } else {
+                    "no_verifier_signal"
+                };
+                action_profile.insert(
+                    "verifier_gap".to_string(),
+                    serde_json::Value::String(verifier_gap.to_string()),
+                );
             }
             serde_json::Value::Object(action_profile)
         })
@@ -2714,6 +2732,10 @@ mod inprocess_hook_contract_tests {
             audit.decision_output["action_profiles"][0]["verifier"]["failing_criteria"],
             json!(["tests"])
         );
+        assert_eq!(
+            audit.decision_output["action_profiles"][0]["verifier_source"],
+            json!("tool_result")
+        );
     }
 
     #[tokio::test]
@@ -2768,6 +2790,44 @@ mod inprocess_hook_contract_tests {
             audit.decision_output["action_profiles"][0]["verifier"]["failing_criteria"],
             json!(["integration-tests"])
         );
+        assert_eq!(
+            audit.decision_output["action_profiles"][0]["verifier_source"],
+            json!("turn_journal")
+        );
+    }
+
+    #[tokio::test]
+    async fn hook_marks_missing_verifier_signal_for_single_action_turns() {
+        let hook_writer = RecordingHookDbWriter::default();
+        let reflection_store = RecordingReflectionStateStore::default();
+        let lesson_writer = RecordingReflectionLessonWriter::default();
+        let observer = RecordingObserverWorker::default();
+
+        run_bridge_hook_side_effects(
+            Some(build_hook_payload_with_single_tool_and_no_verifier(6)),
+            Arc::new(hook_writer.clone()),
+            Arc::new(reflection_store),
+            Arc::new(lesson_writer),
+            Arc::new(observer),
+            None,
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let plans = hook_writer.plans.lock().await;
+        let audit = plans[0]
+            .decision_audit
+            .as_ref()
+            .expect("decision_audit missing");
+        assert!(
+            audit.decision_output["action_profiles"][0]
+                .get("verifier")
+                .is_none()
+        );
+        assert_eq!(
+            audit.decision_output["action_profiles"][0]["verifier_gap"],
+            json!("no_verifier_signal")
+        );
     }
 
     #[tokio::test]
@@ -2819,6 +2879,14 @@ mod inprocess_hook_contract_tests {
             audit.decision_output["action_profiles"][1]
                 .get("verifier")
                 .is_none()
+        );
+        assert_eq!(
+            audit.decision_output["action_profiles"][0]["verifier_gap"],
+            json!("ambiguous_multi_action_turn")
+        );
+        assert_eq!(
+            audit.decision_output["action_profiles"][1]["verifier_gap"],
+            json!("ambiguous_multi_action_turn")
         );
     }
 
