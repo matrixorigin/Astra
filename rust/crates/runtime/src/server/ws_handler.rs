@@ -9,7 +9,7 @@
 //! **Client → Server** (JSON text frames):
 //! ```text
 //! {"type": "auth", "token": "Bearer ..."}
-//! {"type": "message", "content": "...", "session_id": "...", "model": "...", "skill_search": {...}, "max_candidates": 25, "explain": false}
+//! {"type": "message", "content": "...", "session_id": "...", "agent_id": "...", "model": "...", "skill_search": {...}, "max_candidates": 25, "explain": false}
 //! {"type": "cancel_run", "run_id": "..."}
 //! {"type": "pause_run", "run_id": "..."}
 //! {"type": "resume_run", "run_id": "..."}
@@ -83,6 +83,8 @@ pub(super) enum WsClientMessage {
         content: String,
         #[serde(default)]
         session_id: Option<String>,
+        #[serde(default)]
+        agent_id: Option<String>,
         #[serde(default)]
         model: Option<String>,
         #[serde(default)]
@@ -392,6 +394,7 @@ async fn message_loop(socket: &mut WebSocket, state: &AppState, mut conn: WsConn
                             Ok(WsClientMessage::ChatMessage {
                                 content,
                                 session_id,
+                                agent_id,
                                 model,
                                 skill_search,
                                 context,
@@ -404,6 +407,7 @@ async fn message_loop(socket: &mut WebSocket, state: &AppState, mut conn: WsConn
                                     &mut conn,
                                     &content,
                                     session_id,
+                                    agent_id,
                                     model,
                                     skill_search,
                                     context,
@@ -492,6 +496,7 @@ async fn handle_chat_message(
     conn: &mut WsConnection,
     content: &str,
     requested_session_id: Option<String>,
+    agent_id: Option<String>,
     model: Option<String>,
     skill_search: Option<astra_core::SkillSearchSettings>,
     context: Option<serde_json::Map<String, serde_json::Value>>,
@@ -506,6 +511,7 @@ async fn handle_chat_message(
     let should_clear_pending_session_id =
         requested_session_id.is_some() || conn.pending_session_id.is_some();
     let request_session_id = chat_request_session_id(conn, requested_session_id);
+    let fallback_agent_id = agent_id.clone();
     let fallback_model = model.clone();
     let fallback_skill_search = skill_search.clone();
     let fallback_context = context.clone();
@@ -514,6 +520,7 @@ async fn handle_chat_message(
     let mut request = build_ws_chat_request(
         content,
         request_session_id,
+        agent_id,
         model,
         skill_search,
         context,
@@ -582,6 +589,7 @@ async fn handle_chat_message(
                 content,
                 resolved_session_id,
                 request_session_id_is_trusted,
+                fallback_agent_id,
                 fallback_model,
                 fallback_skill_search,
                 fallback_context,
@@ -698,6 +706,7 @@ async fn handle_tool_approval(
 fn build_bridge_chat_payload(
     session_id: Option<String>,
     content: &str,
+    agent_id: Option<String>,
     model: Option<String>,
     skill_search: Option<astra_core::SkillSearchSettings>,
     context: Option<serde_json::Map<String, serde_json::Value>>,
@@ -706,6 +715,7 @@ fn build_bridge_chat_payload(
 ) -> Value {
     serde_json::json!({
         "session_id": session_id,
+        "agent_id": agent_id,
         "model": model,
         "skill_search": skill_search,
         "context": context,
@@ -721,6 +731,7 @@ fn build_bridge_chat_payload(
 fn build_ws_chat_request(
     content: &str,
     session_id: Option<String>,
+    agent_id: Option<String>,
     model: Option<String>,
     skill_search: Option<astra_core::SkillSearchSettings>,
     context: Option<serde_json::Map<String, serde_json::Value>>,
@@ -730,7 +741,7 @@ fn build_ws_chat_request(
     astra_services::runs::ChatRequestData {
         message: content.to_string(),
         session_id,
-        agent_id: None,
+        agent_id,
         model,
         skill_search,
         context,
@@ -1186,6 +1197,7 @@ async fn handle_chat_message_via_bridge(
     content: &str,
     request_session_id: Option<String>,
     request_session_id_is_trusted: bool,
+    agent_id: Option<String>,
     model: Option<String>,
     skill_search: Option<astra_core::SkillSearchSettings>,
     context: Option<serde_json::Map<String, serde_json::Value>>,
@@ -1205,6 +1217,7 @@ async fn handle_chat_message_via_bridge(
     let payload = build_bridge_chat_payload(
         bridge_payload_session_id,
         content,
+        agent_id,
         model,
         skill_search,
         context,
@@ -1923,12 +1936,13 @@ mod tests {
 
     #[test]
     fn parse_chat_message() {
-        let json = r#"{"type": "message", "content": "hello", "session_id": "s1", "skill_search": {"dynamic_surface": false, "min_catalog_size": 12, "surface_cap": 20}, "max_candidates": 3, "explain": true}"#;
+        let json = r#"{"type": "message", "content": "hello", "session_id": "s1", "agent_id": "agent-1", "skill_search": {"dynamic_surface": false, "min_catalog_size": 12, "surface_cap": 20}, "max_candidates": 3, "explain": true}"#;
         let msg: WsClientMessage = serde_json::from_str(json).unwrap();
         match msg {
             WsClientMessage::ChatMessage {
                 content,
                 session_id,
+                agent_id,
                 model,
                 skill_search,
                 context,
@@ -1937,6 +1951,7 @@ mod tests {
             } => {
                 assert_eq!(content, "hello");
                 assert_eq!(session_id, Some("s1".into()));
+                assert_eq!(agent_id.as_deref(), Some("agent-1"));
                 assert!(model.is_none());
                 assert_eq!(
                     skill_search,
@@ -1961,12 +1976,14 @@ mod tests {
         match msg {
             WsClientMessage::ChatMessage {
                 content,
+                agent_id,
                 skill_search,
                 max_candidates,
                 explain,
                 ..
             } => {
                 assert_eq!(content, "你好");
+                assert!(agent_id.is_none());
                 assert!(skill_search.is_none());
                 assert_eq!(max_candidates, default_ws_max_candidates());
                 assert!(!explain);
@@ -1976,7 +1993,7 @@ mod tests {
     }
 
     #[test]
-    fn bridge_payload_preserves_runtime_knobs() {
+    fn bridge_payload_preserves_runtime_request_fields() {
         let mut context = serde_json::Map::new();
         context.insert("edge_tools".into(), serde_json::json!([{"name": "bash"}]));
         context.insert("mode".into(), serde_json::json!("headless"));
@@ -1984,6 +2001,7 @@ mod tests {
         let payload = build_bridge_chat_payload(
             Some("session-1".into()),
             "hello",
+            Some("agent-1".into()),
             Some("gpt-5.4".into()),
             Some(astra_core::SkillSearchSettings {
                 dynamic_surface: false,
@@ -1996,6 +2014,7 @@ mod tests {
         );
 
         assert_eq!(payload["session_id"], "session-1");
+        assert_eq!(payload["agent_id"], "agent-1");
         assert_eq!(payload["model"], "gpt-5.4");
         assert_eq!(payload["skill_search"]["dynamic_surface"], false);
         assert_eq!(payload["skill_search"]["min_catalog_size"], 12);
@@ -2008,10 +2027,11 @@ mod tests {
     }
 
     #[test]
-    fn ws_chat_request_preserves_runtime_knobs() {
+    fn ws_chat_request_preserves_runtime_request_fields() {
         let request = build_ws_chat_request(
             "hello",
             Some("session-1".into()),
+            Some("agent-1".into()),
             Some("gpt-5.4".into()),
             Some(astra_core::SkillSearchSettings {
                 dynamic_surface: false,
@@ -2028,6 +2048,7 @@ mod tests {
 
         assert_eq!(request.message, "hello");
         assert_eq!(request.session_id.as_deref(), Some("session-1"));
+        assert_eq!(request.agent_id.as_deref(), Some("agent-1"));
         assert_eq!(request.model.as_deref(), Some("gpt-5.4"));
         assert_eq!(
             request.skill_search,
