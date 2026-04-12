@@ -366,6 +366,8 @@ mod tests {
             user_feedback_score: None,
             reward_hacking_risk: 0.0,
             reward_hacking_flags: Vec::new(),
+            causal_support_score: 1.0,
+            causal_support_flags: Vec::new(),
         };
         let _ = writer.record_outcome(outcome).await;
     }
@@ -387,6 +389,8 @@ mod tests {
                 user_feedback_score: None,
                 reward_hacking_risk: 0.0,
                 reward_hacking_flags: Vec::new(),
+                causal_support_score: 1.0,
+                causal_support_flags: Vec::new(),
             };
             let _ = writer.record_outcome(outcome).await;
         }

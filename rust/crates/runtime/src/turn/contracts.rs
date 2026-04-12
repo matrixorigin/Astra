@@ -217,6 +217,11 @@ pub struct TurnLearningOutcome {
     pub reward_hacking_risk: f64,
     /// Human-readable reasons for the reward-hacking risk score.
     pub reward_hacking_flags: Vec<String>,
+    /// Confidence that the turn has corroborating causal support from tool
+    /// evidence rather than a spurious success correlation.
+    pub causal_support_score: f64,
+    /// Human-readable reasons for weakened causal support.
+    pub causal_support_flags: Vec<String>,
 }
 
 /// Trait for recording turn outcomes into pipeline learning modules.
