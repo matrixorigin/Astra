@@ -205,9 +205,7 @@ pub use astra_services::{
     },
 };
 
-pub(crate) use astra_services::runs::{
-    RunMutationRecord, UnconfiguredRunLifecycleService, transform_run_event_for_client,
-};
+pub(crate) use astra_services::runs::{RunMutationRecord, UnconfiguredRunLifecycleService};
 
 // ── Re-exports: runtime app state ────────────────────────────────────────────
 

@@ -1,7 +1,7 @@
 use super::*;
 use astra_services::runs::transform_run_event_for_client;
 
-fn transform_stream_run_events_for_client(
+pub(super) fn transform_stream_run_events_for_client(
     run_id: &str,
     events: Vec<serde_json::Value>,
 ) -> Vec<serde_json::Value> {

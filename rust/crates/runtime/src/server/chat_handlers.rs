@@ -1,4 +1,5 @@
 use super::*;
+use super::run_handlers::transform_stream_run_events_for_client;
 
 /// Safely convert a string to a HeaderValue, returning an SSE error response on failure.
 #[allow(clippy::result_large_err)]
@@ -46,12 +47,10 @@ pub(super) async fn chat_stream_handler(
                 "session_id": stream.session_id,
                 "run_id": stream.run_id,
             })];
-            events.extend(
-                stream
-                    .events
-                    .into_iter()
-                    .map(transform_run_event_for_client),
-            );
+            events.extend(transform_stream_run_events_for_client(
+                &stream.run_id,
+                stream.events,
+            ));
             sse_json_response(events)
         }
         Err((status, error))
@@ -556,6 +555,9 @@ mod chat_stream_bridge_fallback_tests {
     #[derive(Clone)]
     struct StubOtherNotImplementedLifecycle;
 
+    #[derive(Clone)]
+    struct StubConfiguredLifecycle;
+
     #[async_trait]
     impl RunLifecycleService for StubOtherNotImplementedLifecycle {
         async fn create_run(
@@ -580,6 +582,72 @@ mod chat_stream_bridge_fallback_tests {
                 "Run lifecycle service not configured",
                 "different_not_implemented",
             ))
+        }
+
+        async fn get_run_status(
+            &self,
+            _run_id: String,
+            _user_id: String,
+        ) -> Result<RunStatusRecord, (StatusCode, Json<ErrorResponse>)> {
+            unreachable!()
+        }
+
+        async fn stream_run(
+            &self,
+            _run_id: String,
+            _user_id: String,
+            _last_index: u32,
+        ) -> Result<Vec<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+            unreachable!()
+        }
+
+        async fn cancel_run(
+            &self,
+            _run_id: String,
+            _user_id: String,
+        ) -> Result<CancelRunRecord, (StatusCode, Json<ErrorResponse>)> {
+            unreachable!()
+        }
+
+        async fn list_runs(
+            &self,
+            _user_id: String,
+            _limit: u32,
+            _offset: u32,
+        ) -> Result<RunListRecord, (StatusCode, Json<ErrorResponse>)> {
+            unreachable!()
+        }
+    }
+
+    #[async_trait]
+    impl RunLifecycleService for StubConfiguredLifecycle {
+        async fn create_run(
+            &self,
+            _user_id: String,
+            _request: ChatRequestData,
+        ) -> Result<ChatRunRecord, (StatusCode, Json<ErrorResponse>)> {
+            unreachable!()
+        }
+
+        async fn stream_chat(
+            &self,
+            _user_id: String,
+            _request: ChatRequestData,
+        ) -> Result<ChatStreamRecord, (StatusCode, Json<ErrorResponse>)> {
+            Ok(ChatStreamRecord {
+                session_id: "s-live".to_string(),
+                run_id: "run-live".to_string(),
+                events: vec![
+                    serde_json::json!({
+                        "event_type": "run_error",
+                        "data": {"error": "boom"}
+                    }),
+                    serde_json::json!({
+                        "event_type": "run_finished",
+                        "data": {"prompt_tokens": 7, "completion_tokens": 3, "tool_call_count": 2}
+                    }),
+                ],
+            })
         }
 
         async fn get_run_status(
@@ -694,6 +762,43 @@ mod chat_stream_bridge_fallback_tests {
         assert_eq!(forwarded["model"], "demo-model");
         assert_eq!(forwarded["messages"][0]["role"], "user");
         assert_eq!(forwarded["messages"][0]["content"], "hi");
+    }
+
+    #[tokio::test]
+    async fn chat_stream_uses_client_run_event_shape_for_live_lifecycle_streams() {
+        let app = build_app(
+            AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
+                .with_auth_service(Arc::new(StubAuthService))
+                .with_session_service(Arc::new(StubSessionService))
+                .with_run_lifecycle_service(Arc::new(StubConfiguredLifecycle)),
+        );
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/chat/stream")
+                    .header("authorization", "Bearer good-token")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"message":"hi"}"#))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("response should be returned");
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .expect("body should be readable");
+        let text = String::from_utf8(body.to_vec()).expect("sse should be utf8");
+        assert!(text.contains("\"type\":\"session_info\""));
+        assert!(text.contains("\"run_id\":\"run-live\""));
+        assert!(text.contains("\"type\":\"usage\""));
+        assert!(text.contains("\"prompt_tokens\":7"));
+        assert!(text.contains("\"completion_tokens\":3"));
+        assert!(text.contains("\"type\":\"run_finished\""));
+        assert!(text.contains("\"status\":\"failed\""));
+        assert!(text.contains("\"error\":\"boom\""));
     }
 
     #[tokio::test]
