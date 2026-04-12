@@ -145,21 +145,22 @@
 - **Drift detection** (`core/drift.rs`, `auto_tuning.rs`): DriftCause (5 types), DriftEvidence (6 types), auto-tuning rules for drift-triggered history trimming.
 - **Pattern drift alert** (`auto_tuning.rs:1302`): Alert when pattern confidence drops >0.3.
 - **SQL safety** (`mo_tools.rs`): Blocks destructive SQL operations.
+- **Shared SafetyMiddleware preflight** (`turn/safety_middleware.rs`, `tool_safety_guard.rs`): Centralized request-time guard chain now screens destructive SQL and prompt-injection-style shell obfuscation before live edge tool execution.
 - **Permission gating**: Three-tier permission model with inherited restrictions.
 - **Stall detection** (`stall.rs`): Detects repeated identical tool calls, empty-name bursts.
 - **Symlink safety, path validation**: Guards against path traversal attacks.
 - **Evaluation gate** (`evaluation/`): Quality gates that can block deployment.
 
 ### Gaps
-- **No anti-reward hacking**: No mechanism to detect or prevent agents gaming the evaluation system (e.g., repeating cheap successful actions to inflate scores).
+- **Reward-hacking guard is learning-boundary only**: Suspicious turns stop reinforcing learned success, but live execution still relies on stall/permission controls rather than an active runtime throttle.
 - **No model parameter drift detection**: System detects behavioral drift but not weight/embedding drift in fine-tuned models.
 - **No anti-hallucinated causality**: No validation that learned patterns reflect true causal relationships vs. spurious correlations.
 - **No adversarial testing framework**: No red-team/fuzzing infrastructure for systematically probing safety boundaries.
-- **Safety checks are scattered**: No centralized safety middleware; checks are ad-hoc in individual tools.
+- **Middleware is still thin**: Centralized guards currently cover request-time SQL/shell preflight, but post-tool validation and broader adversarial guard expansion are still scattered.
 
 ### Priority Actions
-1. Implement centralized `SafetyMiddleware` that intercepts all tool calls with pluggable guard chain.
-2. Add reward-hacking detector: flag when score increases correlate with action repetition rather than genuine progress.
+1. Expand centralized `SafetyMiddleware` beyond request-time preflight into broader post-tool/output validation.
+2. Add anti-hallucinated-causality checks plus adversarial testing coverage for learned patterns.
 
 ---
 
@@ -173,7 +174,7 @@
 | 4. Evaluation | ⬛⬛⬜⬜⬜ 35% | EvaluationService 16 methods | Most routes unimplemented |
 | 5. Credit | ⬛⬜⬜⬜⬜ 25% | causal_chain_id on events | No diff-based scoring |
 | 6. Search | ⬛⬛⬜⬜⬜ 35% | SchedulingContract + TeamOrch | No proposal diversity |
-| 7. Safety | ⬛⬛⬜⬜⬜ 40% | Drift detection + permission | No centralized middleware |
+| 7. Safety | ⬛⬛⬛⬜⬜ 50% | Drift detection + middleware | No anti-hallucinated causality |
 
 ## Recommended Build Order
 
@@ -182,5 +183,5 @@
 3. **Evaluation Layer** (depends on Observation) — Implement 501 routes, confidence intervals
 4. **Action Space** (depends on State) — CompensationAction, transaction boundaries
 5. **Credit Assignment** (depends on State + Evaluation) — StateDiffComputer, contribution scoring
-6. **Safety Layer** (depends on Action + Evaluation) — Centralized middleware
+6. **Safety Layer** (depends on Action + Evaluation) — Expand middleware + causal safeguards
 7. **Search Control** (depends on all above) — Proposal diversity, offline scheduler

@@ -1,5 +1,8 @@
 use astra_runtime::tool_registry::ToolChain;
 use astra_runtime::turn::cloud_approval_policy::{CloudGatedToolKind, cloud_gated_tool_kind};
+use astra_runtime::turn::safety_middleware::{
+    SafetyMiddlewareDecision, evaluate_tool_safety_request,
+};
 use astra_runtime::turn::stall::{
     SERVER_STALL_WINDOW, detect_server_stall, record_server_tool_signatures,
 };
@@ -7,7 +10,9 @@ use serde_json::{Value, json};
 
 pub(crate) const MAX_RUN_CHAIN_STEPS: usize = 16;
 pub(crate) const MAX_RUN_CHAIN_MUTATING_STEPS: usize = 8;
-const DESTRUCTIVE_KEYWORDS: &[&str] = &["DROP", "DELETE", "TRUNCATE", "ALTER", "GRANT", "REVOKE"];
+pub(crate) use astra_runtime::turn::safety_middleware::check_sql_safety;
+#[cfg(test)]
+pub(crate) use astra_runtime::turn::safety_middleware::strip_sql_comments;
 
 pub(crate) struct ToolSafetyGuard;
 
@@ -27,26 +32,10 @@ impl ToolSafetyGuard {
     }
 
     pub(crate) fn check_dispatch(name: &str, args: &Value) -> Result<(), String> {
-        match name {
-            "mo_query" => Self::check_mo_query(args),
-            _ => Ok(()),
+        match evaluate_tool_safety_request(name, args) {
+            SafetyMiddlewareDecision::Allow => Ok(()),
+            SafetyMiddlewareDecision::Deny(reason) => Err(reason),
         }
-    }
-
-    pub(crate) fn check_mo_query(args: &Value) -> Result<(), String> {
-        let Some(sql) = args.get("sql").and_then(Value::as_str) else {
-            return Ok(());
-        };
-        let allow_destructive = args
-            .get("allow_destructive")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        if !allow_destructive && let Some(kind) = check_sql_safety(sql) {
-            return Err(format!(
-                "Error: {kind} statements are blocked by default. Pass \"allow_destructive\": true to confirm execution."
-            ));
-        }
-        Ok(())
     }
 
     pub(crate) fn check_chain(chain: &ToolChain) -> Result<(), String> {
@@ -101,55 +90,6 @@ fn is_mutating_tool(name: &str) -> bool {
         cloud_gated_tool_kind(name),
         Some(CloudGatedToolKind::Write | CloudGatedToolKind::Execute)
     )
-}
-
-pub(crate) fn strip_sql_comments(sql: &str) -> String {
-    let mut out = String::with_capacity(sql.len());
-    let mut chars = sql.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '-' && chars.peek() == Some(&'-') {
-            for ch in chars.by_ref() {
-                if ch == '\n' {
-                    out.push(' ');
-                    break;
-                }
-            }
-        } else if c == '/' && chars.peek() == Some(&'*') {
-            chars.next();
-            let mut depth = 1u32;
-            while depth > 0 {
-                match chars.next() {
-                    Some('/') if chars.peek() == Some(&'*') => {
-                        chars.next();
-                        depth += 1;
-                    }
-                    Some('*') if chars.peek() == Some(&'/') => {
-                        chars.next();
-                        depth -= 1;
-                    }
-                    None => break,
-                    _ => {}
-                }
-            }
-            out.push(' ');
-        } else {
-            out.push(c);
-        }
-    }
-    out
-}
-
-pub(crate) fn check_sql_safety(sql: &str) -> Option<&'static str> {
-    let stripped = strip_sql_comments(sql).to_uppercase();
-    for stmt in stripped.split(';') {
-        let first_word = stmt.split_whitespace().next().unwrap_or("");
-        for &kw in DESTRUCTIVE_KEYWORDS {
-            if first_word == kw {
-                return Some(kw);
-            }
-        }
-    }
-    None
 }
 
 #[cfg(test)]
@@ -227,5 +167,19 @@ mod tests {
             decision,
             crate::permission_manager::PermissionDecision::NeedApproval { .. }
         ));
+    }
+
+    #[test]
+    fn check_request_blocks_obfuscated_shell_command() {
+        let decision =
+            ToolSafetyGuard::check_request(None, "bash", &json!({"command": "eval \"$PAYLOAD\""}));
+
+        match decision {
+            crate::permission_manager::PermissionDecision::Deny(reason) => {
+                assert!(reason.contains("shell_obfuscation"));
+                assert!(reason.contains("eval"));
+            }
+            other => panic!("expected deny, got: {other:?}"),
+        }
     }
 }

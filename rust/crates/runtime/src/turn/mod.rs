@@ -75,6 +75,7 @@ pub mod result_quality;
 pub mod retrieval;
 pub mod routing;
 pub mod routing_metrics;
+pub mod safety_middleware;
 pub(crate) mod services;
 pub mod session_cache;
 pub mod skill_instructions_merge;
