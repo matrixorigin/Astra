@@ -103,6 +103,8 @@ pub fn ensure_tool_call_ids(tool_calls: &[Value]) -> std::borrow::Cow<'_, [Value
 }
 
 /// Parse flat `/chat/turn` tool-call JSON: top-level `id`, `name`, `arguments` (object or JSON string).
+/// Also handles OpenAI format (`function.name` / `function.arguments`) produced by
+/// `normalize_tool_call_for_accum` — see test `parse_flat_tool_call_openai_format`.
 pub fn parse_flat_tool_call_event(tc: &Value) -> (String, String, Value) {
     let id = tc
         .get("id")

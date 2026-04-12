@@ -264,8 +264,9 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
             turn_guard.health.record_cache_hit(&name);
             agent_warn!(
                 "dedup",
-                "Hard cap: tool '{}' call #{} (limit: {})",
+                "Hard cap: tool '{}' (id={}) call #{} (limit: {})",
                 name,
+                id,
                 *count,
                 max_identical
             );

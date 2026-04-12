@@ -476,6 +476,7 @@ impl ServerAgenticLoopHost {
             error_message: None,
             system_prompt_tokens: None,
             system_prompt_breakdown: None,
+            ..Default::default()
         }
     }
 }

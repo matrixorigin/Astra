@@ -18,6 +18,8 @@ pub struct ChatTurnSseAccum {
     /// Thinking / reasoning chunks (for models that stream reasoning separately).
     pub reasoning_content: String,
     pub tool_calls: Vec<Value>,
+    /// Index from tool_call id → position in `tool_calls` for O(1) merge on `tool_call` events.
+    pub(crate) tool_call_id_index: std::collections::HashMap<String, usize>,
     pub explain_turns: Vec<Value>,
     pub has_tool_calls: bool,
     pub prompt_tokens: u64,
@@ -150,20 +152,23 @@ fn apply_one_event(
         "tool_call_start" => {
             effects.push(SseRenderEffect::StopThinkingSpinner);
             if let Some(tool_call) = normalize_tool_call_for_accum(event) {
+                let id = tool_call.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let idx = accum.tool_calls.len();
                 accum.tool_calls.push(tool_call);
+                if !id.is_empty() {
+                    accum.tool_call_id_index.insert(id, idx);
+                }
             }
         }
         "tool_call" => {
             if let Some(tool_call) = normalize_tool_call_for_accum(event) {
                 let tc_id = tool_call.get("id").and_then(|v| v.as_str()).unwrap_or("");
-                // Merge into existing entry with same id (from tool_call_start),
-                // otherwise append as new.
                 if !tc_id.is_empty() {
-                    if let Some(existing) = accum.tool_calls.iter_mut().find(|tc| {
-                        tc.get("id").and_then(|v| v.as_str()).unwrap_or("") == tc_id
-                    }) {
-                        *existing = tool_call;
+                    if let Some(&idx) = accum.tool_call_id_index.get(tc_id) {
+                        accum.tool_calls[idx] = tool_call;
                     } else {
+                        let idx = accum.tool_calls.len();
+                        accum.tool_call_id_index.insert(tc_id.to_string(), idx);
                         accum.tool_calls.push(tool_call);
                     }
                 } else {

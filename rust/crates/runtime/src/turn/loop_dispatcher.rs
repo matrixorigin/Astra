@@ -226,6 +226,7 @@ mod tests {
                         error_message: None,
                         system_prompt_tokens: None,
                         system_prompt_breakdown: None,
+                        ..Default::default()
                     },
                     ttft_ms: Some(42),
                     edge_tool_round: vec![],
