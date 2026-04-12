@@ -196,6 +196,19 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
         // burst from inflating call_counts and flooding the context.
         if name.is_empty() {
             consecutive_empty_name = consecutive_empty_name.saturating_add(1);
+            // Log the raw tool call so we can diagnose *why* the name is empty
+            // (e.g. OpenAI-format function.name not parsed, or truly missing).
+            let raw_tc = match item {
+                super::headless_tool_assembly::HeadlessRoundToolIdx::ServerToolCall(i) => {
+                    tool_calls.get(*i).map(|v| v.to_string())
+                }
+                _ => None,
+            };
+            agent_warn!(
+                "step",
+                "Empty tool name in slot {item:?} (id={id}), raw tool_call: {}",
+                raw_tc.as_deref().unwrap_or("(synthetic edge)")
+            );
             let err_msg = unknown_local_tool_error_message(&name, valid_tool_names);
             if !quiet {
                 term.emit_line(

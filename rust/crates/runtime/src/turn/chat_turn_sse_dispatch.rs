@@ -155,7 +155,20 @@ fn apply_one_event(
         }
         "tool_call" => {
             if let Some(tool_call) = normalize_tool_call_for_accum(event) {
-                accum.tool_calls.push(tool_call);
+                let tc_id = tool_call.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                // Merge into existing entry with same id (from tool_call_start),
+                // otherwise append as new.
+                if !tc_id.is_empty() {
+                    if let Some(existing) = accum.tool_calls.iter_mut().find(|tc| {
+                        tc.get("id").and_then(|v| v.as_str()).unwrap_or("") == tc_id
+                    }) {
+                        *existing = tool_call;
+                    } else {
+                        accum.tool_calls.push(tool_call);
+                    }
+                } else {
+                    accum.tool_calls.push(tool_call);
+                }
             }
         }
         "tool_request" => {
@@ -1260,5 +1273,54 @@ mod tests {
         assert_eq!(a.tool_calls.len(), 1);
         let id = a.tool_calls[0]["id"].as_str().unwrap();
         assert!(!id.is_empty(), "missing tool_call id must be replaced with a synthetic UUID");
+    }
+
+    /// tool_call event with same id as prior tool_call_start must merge (update),
+    /// not duplicate. Qwen-plus sends tool_call_start with partial args, then
+    /// tool_call with complete args for the same call_id.
+    #[test]
+    fn tool_call_merges_into_existing_tool_call_start() {
+        let mut a = ChatTurnSseAccum::default();
+        let mut p = vec![];
+        // tool_call_start arrives first with partial arguments
+        dispatch_chat_turn_sse_event_block(
+            &sse(
+                "tool_call_start",
+                ",\"call_id\":\"tc-1\",\"tool\":\"git_log\",\"arguments\":\"{\\\"n\"",
+            ),
+            &mut a,
+            &mut p,
+        );
+        assert_eq!(a.tool_calls.len(), 1);
+        // tool_call arrives with complete arguments — same id
+        dispatch_chat_turn_sse_event_block(
+            &sse(
+                "tool_call",
+                ",\"id\":\"tc-1\",\"name\":\"git_log\",\"arguments\":{\"n\":5}",
+            ),
+            &mut a,
+            &mut p,
+        );
+        // Must still be 1 entry, not 2
+        assert_eq!(a.tool_calls.len(), 1, "tool_call should merge, not duplicate");
+        assert_eq!(a.tool_calls[0]["id"].as_str(), Some("tc-1"));
+        assert_eq!(
+            a.tool_calls[0]["function"]["arguments"].as_str(),
+            Some("{\"n\":5}")
+        );
+    }
+
+    /// tool_call with a new id (no prior tool_call_start) appends normally.
+    #[test]
+    fn tool_call_without_prior_start_appends() {
+        let mut a = ChatTurnSseAccum::default();
+        let mut p = vec![];
+        dispatch_chat_turn_sse_event_block(
+            &sse("tool_call", ",\"id\":\"tc-new\",\"name\":\"bash\",\"arguments\":{}"),
+            &mut a,
+            &mut p,
+        );
+        assert_eq!(a.tool_calls.len(), 1);
+        assert_eq!(a.tool_calls[0]["id"].as_str(), Some("tc-new"));
     }
 }

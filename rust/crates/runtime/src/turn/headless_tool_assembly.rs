@@ -110,15 +110,25 @@ pub fn parse_flat_tool_call_event(tc: &Value) -> (String, String, Value) {
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
         .unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
-    let name = tc
-        .get("name")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    let args_raw = tc
-        .get("arguments")
-        .cloned()
-        .unwrap_or(Value::Object(Default::default()));
+
+    // Support both flat format (name/arguments at top level) and
+    // OpenAI format (function.name / function.arguments nested).
+    let (name, args_raw) = if let Some(func) = tc.get("function").and_then(Value::as_object) {
+        let n = func.get("name").and_then(Value::as_str).unwrap_or("");
+        let a = func
+            .get("arguments")
+            .cloned()
+            .unwrap_or(Value::Object(Default::default()));
+        (n.to_string(), a)
+    } else {
+        let n = tc.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        let a = tc
+            .get("arguments")
+            .cloned()
+            .unwrap_or(Value::Object(Default::default()));
+        (n.to_string(), a)
+    };
+
     let args = match args_raw {
         Value::String(s) => {
             serde_json::from_str::<Value>(&s).unwrap_or_else(|_| Value::Object(Default::default()))
@@ -929,5 +939,61 @@ mod tests {
 
         assert_eq!(assistant_id, result_id,
             "assistant tool_call id and tool result id must match after ensure_tool_call_ids");
+    }
+
+    /// parse_flat_tool_call_event must handle OpenAI format (function.name/arguments)
+    /// — this is the format produced by normalize_tool_call_for_accum and stored
+    /// in accum.tool_calls. Regression test for the qwen-plus infinite loop.
+    #[test]
+    fn parse_flat_tool_call_openai_format() {
+        let tc = json!({
+            "id": "call_abc",
+            "type": "function",
+            "function": {
+                "name": "git_log",
+                "arguments": "{\"n\":5}"
+            }
+        });
+        let (id, name, args) = parse_flat_tool_call_event(&tc);
+        assert_eq!(id, "call_abc");
+        assert_eq!(name, "git_log");
+        assert_eq!(args, json!({"n": 5}));
+    }
+
+    /// OpenAI format with empty function.name should still return empty
+    /// (not panic or return a different field).
+    #[test]
+    fn parse_flat_tool_call_openai_format_empty_name() {
+        let tc = json!({
+            "id": "call_xyz",
+            "type": "function",
+            "function": {
+                "name": "",
+                "arguments": "{}"
+            }
+        });
+        let (_, name, _) = parse_flat_tool_call_event(&tc);
+        assert_eq!(name, "");
+    }
+
+    /// resolve_headless_tool_slot must extract name from OpenAI-format tool calls
+    /// in accum.tool_calls. This is the end-to-end path that was broken.
+    #[test]
+    fn resolve_headless_slot_openai_format_extracts_name() {
+        let server = vec![json!({
+            "id": "call_1",
+            "type": "function",
+            "function": {
+                "name": "git_show",
+                "arguments": "{\"commit\":\"abc\"}"
+            }
+        })];
+        let slot = resolve_headless_tool_slot(
+            HeadlessRoundToolIdx::ServerToolCall(0),
+            &server,
+            |_| panic!("edge lookup not used"),
+        );
+        assert_eq!(slot.name, "git_show");
+        assert_eq!(slot.args, json!({"commit": "abc"}));
     }
 }
