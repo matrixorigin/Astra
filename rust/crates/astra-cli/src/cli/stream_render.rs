@@ -37,18 +37,66 @@ pub(super) use super::effects::{
     Spinner, ThinkingPreviewPane, ToolRunningLineSpinner, TtftWaitLineSpinner,
 };
 
+/// Controls how terminal output is rendered during an agentic loop turn.
+///
+/// Replaces the previous scatter of `quiet`, `suppress_intermediate_output`,
+/// and `hide_streaming_assistant_text` booleans with a single typed policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RenderPolicy {
+    /// Full interactive streaming: text deltas, spinners, tool progress, and
+    /// headless lines all visible.
+    Stream,
+    /// Plan decomposition: suppress assistant `text_delta`, but show reasoning
+    /// in the thinking viewport.  Tool UI and headless lines are still visible.
+    PlanDecompose,
+    /// Suppress all intermediate work (spinners, text, tool UI, headless
+    /// lines).  If the turn has no tool calls, the final text is rendered
+    /// one-shot at stream completion.
+    FinalOnly,
+    /// Complete silence: no terminal output at all.
+    Silent,
+}
+
+impl RenderPolicy {
+    /// True when no terminal output should be produced.
+    pub fn is_silent(self) -> bool {
+        matches!(self, Self::Silent)
+    }
+
+    /// True when streaming text deltas should be suppressed.
+    pub fn suppress_text(self) -> bool {
+        !matches!(self, Self::Stream)
+    }
+
+    /// True when tool UI (spinners, progress) should be suppressed.
+    pub fn suppress_tool_ui(self) -> bool {
+        matches!(self, Self::FinalOnly | Self::Silent)
+    }
+
+    /// True when headless-round terminal lines should be suppressed.
+    pub fn suppress_headless(self) -> bool {
+        matches!(self, Self::FinalOnly | Self::Silent)
+    }
+
+    /// True when thinking spinner and preview should still be shown.
+    pub fn show_thinking(self) -> bool {
+        !self.is_silent()
+    }
+
+    /// True when the thinking viewport receives reasoning-delta content
+    /// instead of the main text area (plan decompose mode).
+    pub fn reasoning_to_viewport(self) -> bool {
+        matches!(self, Self::PlanDecompose)
+    }
+}
+
 /// When set, SSE `tool_request` / `approval_required` are handled and posted to the cloud API.
 pub(super) struct EdgeSseContext<'a> {
     pub api: &'a astra_thin_client::ThinClient,
     pub token: &'a str,
     pub executor_id: &'a str,
     pub executor: &'a mut crate::edge_tools::ToolExecutor,
-    pub quiet: bool,
-    pub suppress_intermediate_output: bool,
-    /// Skip `StreamText` effects only (reasoning preview / spinners still run).
-    pub hide_streaming_assistant_text: bool,
-    /// When hiding assistant text (plan-only), still show `reasoning_delta` in the thinking viewport.
-    pub show_reasoning_preview: bool,
+    pub render_policy: RenderPolicy,
     pub perm_manager: Option<&'a mut crate::permission_manager::PermissionManager>,
     /// Optional cancellation token to abort SSE stream on auth failure.
     pub cancel_token: Option<&'a tokio_util::sync::CancellationToken>,
@@ -77,9 +125,7 @@ struct CliSseStreamHost<'a> {
     token: &'a str,
     executor_id: &'a str,
     executor: &'a mut crate::edge_tools::ToolExecutor,
-    quiet: bool,
-    suppress_intermediate_output: bool,
-    hide_streaming_assistant_text: bool,
+    render_policy: RenderPolicy,
     perm_manager: Option<&'a mut crate::permission_manager::PermissionManager>,
     render: StreamRenderState,
     /// Once this turn has emitted or requested tool work, hide any further prose
@@ -107,20 +153,15 @@ struct CliSseStreamHost<'a> {
 
 impl<'a> CliSseStreamHost<'a> {
     fn from_edge_ctx(ctx: EdgeSseContext<'a>, term_width: usize, render_md: bool) -> Self {
+        let suppress_reasoning = ctx.render_policy == RenderPolicy::Silent;
         Self {
             api: ctx.api,
             token: ctx.token,
             executor_id: ctx.executor_id,
             executor: ctx.executor,
-            quiet: ctx.quiet,
-            suppress_intermediate_output: ctx.suppress_intermediate_output,
-            hide_streaming_assistant_text: ctx.hide_streaming_assistant_text,
+            render_policy: ctx.render_policy,
             perm_manager: ctx.perm_manager,
-            render: StreamRenderState::with_term_width(
-                term_width,
-                render_md,
-                ctx.hide_streaming_assistant_text && !ctx.show_reasoning_preview,
-            ),
+            render: StreamRenderState::with_term_width(term_width, render_md, suppress_reasoning),
             tool_work_detected: false,
             edge_tool_round: Vec::new(),
             xml_tag_buffer: String::new(),
@@ -268,7 +309,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         if let Some(tx) = &self.stream_event_tx {
             let _ = tx.send(super::chat_stream::StreamEvent::WaitingForModel);
         }
-        if self.quiet {
+        if self.render_policy.is_silent() {
             return;
         }
         self.render.start_waiting_for_model();
@@ -285,7 +326,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
     }
 
     fn on_idle_tick(&mut self) {
-        if self.quiet {
+        if self.render_policy.is_silent() {
             return;
         }
         self.render.tick_thinking_pane();
@@ -313,25 +354,27 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             }
         }
 
-        if self.quiet || self.suppress_intermediate_output {
-            // In suppress mode, still render thinking preview (spinner +
-            // reasoning chunks) so the user sees progress.  Only suppress
-            // StreamText which is intermediate draft prose.
-            if self.quiet {
+        let policy = self.render_policy;
+        match policy {
+            RenderPolicy::Silent => return,
+            RenderPolicy::FinalOnly => {
+                // Suppress StreamText but still render thinking preview
+                // (spinner + reasoning chunks) so the user sees progress.
+                for effect in &effects {
+                    match effect {
+                        SseRenderEffect::StartThinkingSpinner => self.render.start_thinking(),
+                        SseRenderEffect::StopThinkingSpinner => self.render.stop_thinking(),
+                        SseRenderEffect::ThinkingPreviewChunk(s) => {
+                            self.render.push_thinking_preview_chunk(s);
+                        }
+                        SseRenderEffect::StreamText(_) => {} // suppressed
+                    }
+                }
                 return;
             }
-            for effect in &effects {
-                match effect {
-                    SseRenderEffect::StartThinkingSpinner => self.render.start_thinking(),
-                    SseRenderEffect::StopThinkingSpinner => self.render.stop_thinking(),
-                    SseRenderEffect::ThinkingPreviewChunk(s) => {
-                        self.render.push_thinking_preview_chunk(s);
-                    }
-                    SseRenderEffect::StreamText(_) => {} // suppressed
-                }
-            }
-            return;
+            RenderPolicy::PlanDecompose | RenderPolicy::Stream => {}
         }
+
         let mut i = 0usize;
         while i < effects.len() {
             match &effects[i] {
@@ -339,7 +382,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     // `text_delta` emits Stop then StreamText; in plan-only mode we stream the
                     // assistant body into the reasoning viewport — skipping Stop avoids clearing
                     // the pane on every token.
-                    let skip = self.hide_streaming_assistant_text
+                    let skip = policy == RenderPolicy::PlanDecompose
                         && i + 1 < effects.len()
                         && matches!(&effects[i + 1], SseRenderEffect::StreamText(_));
                     if !skip {
@@ -348,7 +391,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     i += 1;
                 }
                 SseRenderEffect::StreamText(s) => {
-                    if self.hide_streaming_assistant_text {
+                    if policy == RenderPolicy::PlanDecompose {
                         // Plan decompose mode: don't show the raw JSON body in
                         // the thinking preview.  Only genuine <thinking> content
                         // (via ThinkingPreviewChunk) should appear there.
@@ -422,7 +465,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         // not fight the running-tool spinner (`\r` on the same fd).
         self.render.stop_thinking();
         // Show tool as running (in-place updatable via TerminalRegion).
-        let tool_idx = if !self.quiet && !self.suppress_intermediate_output {
+        let tool_idx = if !self.render_policy.suppress_tool_ui() {
             Some(self.render.tool_start(tool, args))
         } else {
             None
@@ -472,7 +515,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                         pm.record_approval(&t, true);
                     }
                     result
-                } else if self.quiet {
+                } else if self.render_policy.is_silent() {
                     astra_core::agent_warn!(
                         "permission",
                         "Auto-denied {t} in sub-run mode (no interactive terminal): {reason}"
@@ -620,7 +663,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                                         pm.record_approval(&sandbox_tool_key, true);
                                     }
                                     grant
-                                } else if self.quiet {
+                                } else if self.render_policy.is_silent() {
                                     // Sub-run mode: auto-deny sandbox expansion
                                     astra_core::agent_warn!(
                                         "permission",
@@ -785,13 +828,13 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 if let Some(token) = self.cancel_token {
                     token.cancel();
                 }
-                if !self.quiet {
+                if !self.render_policy.is_silent() {
                     eprintln!(
                         "{}",
                         "Session expired. Please re-authenticate with `astra auth login`.".red()
                     );
                 }
-            } else if !self.quiet && !self.suppress_intermediate_output {
+            } else if !self.render_policy.suppress_tool_ui() {
                 eprintln!("{}", edge_sse_post_tool_result_fail_line(e).yellow());
             }
         }
@@ -825,7 +868,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         self.render.stop_thinking();
         let decision = match &mut self.perm_manager {
             Some(pm) => {
-                pm.resolve_cloud_approval_async(tool, detail, self.quiet)
+                pm.resolve_cloud_approval_async(tool, detail, self.render_policy.is_silent())
                     .await
             }
             None => astra_thin_client::ApprovalDecision::Deny,
@@ -854,13 +897,13 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 if let Some(token) = self.cancel_token {
                     token.cancel();
                 }
-                if !self.quiet {
+                if !self.render_policy.is_silent() {
                     eprintln!(
                         "{}",
                         "Session expired. Please re-authenticate with `astra auth login`.".red()
                     );
                 }
-            } else if !self.quiet && !self.suppress_intermediate_output {
+            } else if !self.render_policy.suppress_tool_ui() {
                 eprintln!("{}", edge_sse_post_approval_fail_line(e).yellow());
             }
         }
@@ -1023,7 +1066,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             self.render.stop_thinking();
 
             // In grouped mode, only start spinner once for all parallel tools.
-            let tool_idx = if !self.quiet && !self.suppress_intermediate_output {
+            let tool_idx = if !self.render_policy.suppress_tool_ui() {
                 if use_grouped_spinner {
                     if i == 0 {
                         // Start grouped spinner for first tool only.
@@ -1129,7 +1172,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             // Tool-done UI.
             if use_grouped_spinner {
                 // Grouped mode: print completion line directly (no spinner update).
-                if !self.quiet && !self.suppress_intermediate_output {
+                if !self.render_policy.suppress_tool_ui() {
                     self.render.tool_done_inline(
                         &req.tool,
                         &req.args,
@@ -1175,7 +1218,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     if let Some(token) = self.cancel_token {
                         token.cancel();
                     }
-                    if !self.quiet {
+                    if !self.render_policy.is_silent() {
                         eprintln!(
                             "{}",
                             "Session expired. Please re-authenticate with `astra auth login`."
@@ -1183,7 +1226,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                         );
                     }
                     break;
-                } else if !self.quiet && !self.suppress_intermediate_output {
+                } else if !self.render_policy.suppress_tool_ui() {
                     eprintln!("{}", edge_sse_post_tool_result_fail_line(e).yellow());
                 }
             }
@@ -2528,9 +2571,9 @@ pub(crate) fn format_tool_display_from_preview(name: &str, args_preview: Option<
 fn apply_sse_render_effects(
     effects: Vec<SseRenderEffect>,
     render: &mut StreamRenderState,
-    quiet: bool,
+    policy: RenderPolicy,
 ) {
-    if quiet {
+    if policy.is_silent() {
         return;
     }
     for effect in effects {
@@ -2556,7 +2599,10 @@ fn apply_sse_render_effects(
 /// Delegates protocol parsing to runtime's [`consume_sse_stream_cancellable`]; CLI-specific
 /// rendering, tool execution, and approval prompts are handled by [`CliSseStreamHost`].
 ///
-/// When `quiet` is true, all terminal output is suppressed but result.full_text is still captured.
+/// Terminal output is controlled by `render_policy`:
+/// - [`RenderPolicy::Silent`]: no terminal output at all.
+/// - [`RenderPolicy::FinalOnly`]: suppressed during streaming; one-shot render if final turn.
+/// - [`RenderPolicy::Stream`] / [`RenderPolicy::PlanDecompose`]: full or plan-mode rendering.
 ///
 /// If `cancel_token` is provided, the stream can be cancelled mid-flight by triggering the token.
 #[allow(clippy::too_many_arguments)]
@@ -2565,8 +2611,7 @@ pub(super) async fn consume_turn_sse(
     resp: astra_thin_client::HttpResponse,
     render_md: bool,
     term_width: usize,
-    quiet: bool,
-    suppress_intermediate_output: bool,
+    render_policy: RenderPolicy,
     edge: Option<EdgeSseContext<'_>>,
     pre_clear_lines: usize,
     cancel_token: Option<&tokio_util::sync::CancellationToken>,
@@ -2588,7 +2633,7 @@ pub(super) async fn consume_turn_sse(
             let mut host = CliSseStreamHost::from_edge_ctx(
                 ctx,
                 term_width,
-                render_md && !suppress_intermediate_output,
+                render_md && !render_policy.suppress_text(),
             );
             // pre_clear_lines only applies to non-md fallback path.
             if host.render.md.is_none() {
@@ -2604,7 +2649,7 @@ pub(super) async fn consume_turn_sse(
         } else {
             let mut render = StreamRenderState::with_term_width(
                 term_width,
-                render_md && !suppress_intermediate_output,
+                render_md && !render_policy.suppress_text(),
                 false,
             );
             if render.md.is_none() {
@@ -2627,12 +2672,12 @@ pub(super) async fn consume_turn_sse(
     super::streaming_md::strip_xml_tags_inplace(&mut result.full_text);
     super::streaming_md::strip_leading_narration(&mut result.full_text);
 
-    if quiet || suppress_intermediate_output {
-        // quiet: never render anything.
-        // suppress_intermediate_output: streaming text was suppressed, but if
-        // this is the final turn (no tool calls) we still need to render the
-        // assistant's answer.  Tool turns are discarded either way.
-        if quiet {
+    if render_policy.suppress_text() {
+        // Silent: never render anything.
+        // FinalOnly: streaming text was suppressed, but if this is the final
+        // turn (no tool calls) we still need to render the assistant's answer.
+        // PlanDecompose: text was not rendered to stdout; caller handles it.
+        if render_policy.is_silent() || render_policy == RenderPolicy::PlanDecompose {
             return result;
         }
         let has_any_tool_work = result.has_tool_calls || !result.edge_tool_round.is_empty();
@@ -2717,11 +2762,11 @@ pub(super) fn dispatch_turn_event_block(
     block: &str,
     result: &mut TurnResult,
     render: &mut StreamRenderState,
-    quiet: bool,
+    policy: RenderPolicy,
     pending_edge: &mut Vec<ChatTurnEdgePending>,
 ) {
     let effects = dispatch_chat_turn_sse_event_block(block, &mut result.core, pending_edge);
-    apply_sse_render_effects(effects, render, quiet);
+    apply_sse_render_effects(effects, render, policy);
 }
 
 #[cfg(test)]
@@ -2742,7 +2787,7 @@ mod tests {
             sse("text_delta", ",\"content\":\"hello \""),
             sse("text_delta", ",\"content\":\"world\""),
         );
-        dispatch_turn_event_block(&block, &mut r, &mut s, true, &mut vec![]);
+        dispatch_turn_event_block(&block, &mut r, &mut s, RenderPolicy::Silent, &mut vec![]);
         assert_eq!(r.full_text, "hello world");
     }
 
@@ -2752,7 +2797,7 @@ mod tests {
         let mut s = StreamRenderState::new();
         let mut pending = Vec::new();
         let block = "data: {\"type\":\"tool_request\",\"request_id\":\"tr-1\",\"tool\":\"bash\",\"args\":{\"command\":\"echo x\"}}\n\n";
-        dispatch_turn_event_block(block, &mut r, &mut s, true, &mut pending);
+        dispatch_turn_event_block(block, &mut r, &mut s, RenderPolicy::Silent, &mut pending);
         assert_eq!(pending.len(), 1);
         match &pending[0] {
             ChatTurnEdgePending::ToolRequest {
@@ -2774,7 +2819,7 @@ mod tests {
         let mut s = StreamRenderState::new();
         let mut pending = Vec::new();
         let block = "data: {\"type\":\"approval_required\",\"request_id\":\"ap-1\",\"tool\":\"write_file\",\"path\":\"src/x.rs\",\"detail\":\"src/x.rs\"}\n\n";
-        dispatch_turn_event_block(block, &mut r, &mut s, true, &mut pending);
+        dispatch_turn_event_block(block, &mut r, &mut s, RenderPolicy::Silent, &mut pending);
         assert_eq!(pending.len(), 1);
         match &pending[0] {
             ChatTurnEdgePending::ApprovalRequired {
@@ -2816,7 +2861,7 @@ mod tests {
             sse("text_delta", ",\"content\":\"draft review text\""),
             sse("turn_complete", ",\"has_tool_calls\":true"),
         );
-        dispatch_turn_event_block(&block, &mut r, &mut s, true, &mut vec![]);
+        dispatch_turn_event_block(&block, &mut r, &mut s, RenderPolicy::Silent, &mut vec![]);
         assert_eq!(r.full_text, "draft review text");
         assert!(r.has_tool_calls);
         // The gate must suppress re-render for this result.
@@ -2832,7 +2877,7 @@ mod tests {
             sse("text_delta", ",\"content\":\"final answer\""),
             sse("turn_complete", ",\"has_tool_calls\":false"),
         );
-        dispatch_turn_event_block(&block, &mut r, &mut s, true, &mut vec![]);
+        dispatch_turn_event_block(&block, &mut r, &mut s, RenderPolicy::Silent, &mut vec![]);
         assert_eq!(r.full_text, "final answer");
         assert!(!r.has_tool_calls);
         assert!(should_rerender_text(r.has_tool_calls));

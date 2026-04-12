@@ -5,7 +5,13 @@ fn dispatch_turn_event_collects_explain_events() {
     let mut result = TurnResult::new();
     let block = "data: {\"type\":\"explain\",\"total_ms\":7,\"tools_selected\":1,\"tools_available\":2,\"tool_selection\":null,\"tool_selection_fallback\":null,\"steps\":[]}\n\n";
     let mut render = StreamRenderState::new();
-    dispatch_turn_event_block(block, &mut result, &mut render, false, &mut vec![]);
+    dispatch_turn_event_block(
+        block,
+        &mut result,
+        &mut render,
+        RenderPolicy::Stream,
+        &mut vec![],
+    );
     assert_eq!(result.explain_turns.len(), 1);
     assert_eq!(
         result.explain_turns[0].get("type").and_then(|v| v.as_str()),
@@ -19,7 +25,13 @@ fn dispatch_thinking_delta_captures_reasoning_content() {
     let mut render = StreamRenderState::new();
     // thinking_delta (Kimi-k2.5 / Moonshot style)
     let block = "data: {\"type\":\"thinking_delta\",\"content\":\"Let me think...\"}\n\n";
-    dispatch_turn_event_block(block, &mut result, &mut render, false, &mut vec![]);
+    dispatch_turn_event_block(
+        block,
+        &mut result,
+        &mut render,
+        RenderPolicy::Stream,
+        &mut vec![],
+    );
     assert_eq!(result.reasoning_content, "Let me think...");
 }
 
@@ -29,7 +41,13 @@ fn dispatch_reasoning_delta_captures_reasoning_content() {
     let mut render = StreamRenderState::new();
     // reasoning_delta (DeepSeek-R1 style)
     let block = "data: {\"type\":\"reasoning_delta\",\"content\":\"Step 1: search PRs\"}\n\n";
-    dispatch_turn_event_block(block, &mut result, &mut render, false, &mut vec![]);
+    dispatch_turn_event_block(
+        block,
+        &mut result,
+        &mut render,
+        RenderPolicy::Stream,
+        &mut vec![],
+    );
     assert_eq!(result.reasoning_content, "Step 1: search PRs");
 }
 
@@ -39,7 +57,13 @@ fn dispatch_reasoning_message_content_captures_reasoning_content() {
     let mut render = StreamRenderState::new();
     let block =
         "data: {\"type\":\"reasoning_message_content\",\"content\":\"Step 1: search PRs\"}\n\n";
-    dispatch_turn_event_block(block, &mut result, &mut render, false, &mut vec![]);
+    dispatch_turn_event_block(
+        block,
+        &mut result,
+        &mut render,
+        RenderPolicy::Stream,
+        &mut vec![],
+    );
     assert_eq!(result.reasoning_content, "Step 1: search PRs");
 }
 
@@ -51,7 +75,13 @@ fn dispatch_thinking_delta_accumulates_across_events() {
         "data: {\"type\":\"thinking_delta\",\"content\":\"part1\"}\n\n",
         "data: {\"type\":\"thinking_delta\",\"content\":\" part2\"}\n\n",
     );
-    dispatch_turn_event_block(block, &mut result, &mut render, false, &mut vec![]);
+    dispatch_turn_event_block(
+        block,
+        &mut result,
+        &mut render,
+        RenderPolicy::Stream,
+        &mut vec![],
+    );
     assert_eq!(result.reasoning_content, "part1 part2");
 }
 
@@ -213,7 +243,13 @@ fn quiet_dispatch_captures_text_without_output() {
     let block = "data: {\"type\":\"text_delta\",\"content\":\"hello world\"}\n\n";
     let mut result = TurnResult::new();
     let mut render = StreamRenderState::new();
-    dispatch_turn_event_block(block, &mut result, &mut render, true, &mut vec![]);
+    dispatch_turn_event_block(
+        block,
+        &mut result,
+        &mut render,
+        RenderPolicy::Silent,
+        &mut vec![],
+    );
     assert_eq!(result.full_text, "hello world");
 }
 

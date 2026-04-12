@@ -227,7 +227,7 @@ use repl_exit::{ReplExit, finalize_repl_exit};
 use repl_startup::complete_repl_startup;
 use startup_trace::StartupTracer;
 #[cfg(test)]
-use stream_render::{StreamRenderState, TurnResult, dispatch_turn_event_block};
+use stream_render::{RenderPolicy, StreamRenderState, TurnResult, dispatch_turn_event_block};
 
 use plan_interaction::{handle_plan_mode_input, plan_execution_ui_active};
 use repl_runtime::{
@@ -1379,14 +1379,12 @@ mod tests {
             history: &[],
             perm_manager: &mut pm,
             verbose_mode: false,
-            quiet: true,
-            suppress_intermediate_output: false,
+            render_policy: crate::stream_render::RenderPolicy::Silent,
             selector: &selector,
             recent_tools: &[],
             tool_health_entries: &[],
             unified_skill_registry: astra_runtime::skills::empty_unified_registry(),
             plan_only_chat: false,
-            hide_streaming_assistant_text: false,
             is_plan_subtask: false,
             plan_subtask_id: None,
             delegation_engine: None,
@@ -1445,14 +1443,12 @@ mod tests {
             history: &[],
             perm_manager: &mut pm,
             verbose_mode: false,
-            quiet: true,
-            suppress_intermediate_output: false,
+            render_policy: crate::stream_render::RenderPolicy::Silent,
             selector: &selector,
             recent_tools: &[],
             tool_health_entries: &[],
             unified_skill_registry: astra_runtime::skills::empty_unified_registry(),
             plan_only_chat: false,
-            hide_streaming_assistant_text: false,
             is_plan_subtask: false,
             plan_subtask_id: None,
             delegation_engine: None,
@@ -1527,14 +1523,12 @@ mod tests {
             history: &[],
             perm_manager: &mut pm,
             verbose_mode: false,
-            quiet: true,
-            suppress_intermediate_output: false,
+            render_policy: crate::stream_render::RenderPolicy::Silent,
             selector: &selector,
             recent_tools: &[],
             tool_health_entries: &[],
             unified_skill_registry: astra_runtime::skills::empty_unified_registry(),
             plan_only_chat: false,
-            hide_streaming_assistant_text: false,
             is_plan_subtask: false,
             plan_subtask_id: None,
             delegation_engine: None,

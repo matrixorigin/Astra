@@ -67,10 +67,7 @@ pub(crate) struct ChatTurnParams<'a> {
     pub(crate) history: &'a [(String, String)],
     pub(crate) perm_manager: &'a mut PermissionManager,
     pub(crate) verbose_mode: bool,
-    pub(crate) quiet: bool,
-    /// When true, suppress incremental UI (spinner/tool status/draft markdown)
-    /// and only surface the final accumulated answer after the loop completes.
-    pub(crate) suppress_intermediate_output: bool,
+    pub(crate) render_policy: super::super::stream_render::RenderPolicy,
     pub(crate) selector: &'a dyn ToolSelector,
     pub(crate) recent_tools: &'a [String],
     pub(crate) tool_health_entries: &'a [ToolHealthEntry],
@@ -79,9 +76,6 @@ pub(crate) struct ChatTurnParams<'a> {
         &'a std::sync::Arc<astra_runtime::skills::UnifiedSkillRegistry>,
     /// When true, omit edge tools and inject plan-only system instructions (CLI `/plan on`).
     pub(crate) plan_only_chat: bool,
-    /// When true, do not stream `text_delta` to stdout/markdown (still fills `full_text` for parsing).
-    /// Used for dedicated `/plan` LLM turns so raw plan JSON is not painted; caller prints `format_plan`.
-    pub(crate) hide_streaming_assistant_text: bool,
     /// When true, this turn is executing a plan subtask — `when: task_completed` stop hooks apply.
     pub(crate) is_plan_subtask: bool,
     /// Sent on `/chat/turn` JSON so cloud can classify the turn like local `is_plan_subtask`.

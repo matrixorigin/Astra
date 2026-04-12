@@ -30,7 +30,7 @@ use crate::{
     edge_tools::ToolExecutor,
     effects::ChatTurnPrepLineGuard,
     permission_manager::PermissionManager,
-    stream_render::{EdgeSseContext, consume_turn_sse},
+    stream_render::{EdgeSseContext, RenderPolicy, consume_turn_sse},
 };
 
 use super::agentic_loop_turn::{
@@ -48,9 +48,7 @@ pub(crate) struct CliAgenticLoopHost<'a> {
     pub explain: ExplainMode,
     pub render_md: bool,
     pub term_width: usize,
-    pub quiet: bool,
-    pub suppress_intermediate_output: bool,
-    pub hide_streaming_assistant_text: bool,
+    pub render_policy: RenderPolicy,
     pub message: &'a str,
     pub history: &'a [(String, String)],
     pub recent_tools: &'a [String],
@@ -151,9 +149,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             explain: self.explain,
             render_md: self.render_md,
             term_width: self.term_width,
-            quiet: self.quiet,
-            suppress_intermediate_output: self.suppress_intermediate_output,
-            hide_streaming_assistant_text: self.hide_streaming_assistant_text,
+            render_policy: self.render_policy,
             message: self.message,
             history: self.history,
             recent_tools: self.recent_tools,
@@ -266,17 +262,13 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             resp,
             false,
             self.term_width,
-            true,
-            true,
+            RenderPolicy::Silent,
             Some(EdgeSseContext {
                 api: self.api,
                 token: self.token,
                 executor_id: "auto-reflection",
                 executor: &mut self.executor,
-                quiet: true,
-                suppress_intermediate_output: true,
-                hide_streaming_assistant_text: true,
-                show_reasoning_preview: false,
+                render_policy: RenderPolicy::Silent,
                 perm_manager: Some(self.perm_manager),
                 cancel_token: state.cancellation.token.as_deref(),
                 stream_event_tx: None,
@@ -307,7 +299,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
         if let Some(tx) = &self.stream_event_tx {
             let _ = tx.send(super::super::StreamEvent::StatusLine(line.clone()));
         }
-        if self.suppress_intermediate_output {
+        if self.render_policy.suppress_headless() {
             return;
         }
         match style {
@@ -342,7 +334,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
     }
 
     fn is_quiet(&self) -> bool {
-        self.quiet
+        self.render_policy.is_silent()
     }
 
     fn valid_tool_names(&self) -> &HashSet<String> {

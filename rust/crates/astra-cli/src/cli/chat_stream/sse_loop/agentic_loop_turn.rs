@@ -51,7 +51,8 @@ use crate::{
     edge_tools::ToolExecutor,
     permission_manager::PermissionManager,
     stream_render::{
-        ChatPrepPhaseLabel, ChatTurnPrepLineGuard, EdgeSseContext, TurnResult, consume_turn_sse,
+        ChatPrepPhaseLabel, ChatTurnPrepLineGuard, EdgeSseContext, RenderPolicy, TurnResult,
+        consume_turn_sse,
     },
 };
 
@@ -631,10 +632,7 @@ pub(crate) struct ChatTurnSseFetchRequest<'a> {
     pub explain: ExplainMode,
     pub render_md: bool,
     pub term_width: usize,
-    pub quiet: bool,
-    pub suppress_intermediate_output: bool,
-    /// When true, do not paint assistant `text_delta` (plan JSON etc.); `full_text` still accumulates.
-    pub hide_streaming_assistant_text: bool,
+    pub render_policy: RenderPolicy,
     pub message: &'a str,
     pub history: &'a [(String, String)],
     pub recent_tools: &'a [String],
@@ -688,8 +686,7 @@ struct ChatTurnSseFetchUi {
 }
 
 fn chat_turn_sse_fetch_ui(
-    quiet: bool,
-    suppress_intermediate_output: bool,
+    render_policy: RenderPolicy,
     plan_assemble_line_release: Option<&Arc<AtomicBool>>,
 ) -> ChatTurnSseFetchUi {
     let timing = chat_turn_timing_stderr_enabled();
@@ -703,8 +700,7 @@ fn chat_turn_sse_fetch_ui(
     // Normal chat: one stderr status line during payload + HTTP (plan mode uses the outer
     // `PlanAssembleLineSpinner` + `plan_assemble_line_release` instead). Disabled with timing
     // stderr lines to avoid `\r` / `eprintln!` fighting.
-    let show_prep_line = !quiet
-        && !suppress_intermediate_output
+    let show_prep_line = !render_policy.suppress_text()
         && std::io::stderr().is_terminal()
         && !timing
         && plan_assemble_line_release.is_none();
@@ -765,9 +761,7 @@ pub(crate) async fn fetch_chat_turn_sse(
         explain,
         render_md,
         term_width,
-        quiet,
-        suppress_intermediate_output,
-        hide_streaming_assistant_text,
+        render_policy,
         message,
         history,
         recent_tools,
@@ -801,16 +795,12 @@ pub(crate) async fn fetch_chat_turn_sse(
         tool_budget_override,
     } = ctx;
 
-    let ui = chat_turn_sse_fetch_ui(
-        quiet,
-        suppress_intermediate_output,
-        plan_assemble_line_release.as_ref(),
-    );
+    let ui = chat_turn_sse_fetch_ui(render_policy, plan_assemble_line_release.as_ref());
 
     let (resp, prep_line) = chat_turn_post_payload_after_prepare(
         api,
         token,
-        quiet,
+        render_policy.is_silent(),
         &ui,
         PrepareChatTurnRequest {
             messages,
@@ -866,17 +856,12 @@ pub(crate) async fn fetch_chat_turn_sse(
         flag.store(true, Ordering::Release);
     }
 
-    let show_reasoning_preview = hide_streaming_assistant_text;
-
     let edge_ctx = EdgeSseContext {
         api,
         token,
         executor_id: edge_executor_instance_id(),
         executor,
-        quiet,
-        suppress_intermediate_output,
-        hide_streaming_assistant_text,
-        show_reasoning_preview,
+        render_policy,
         perm_manager: Some(perm_manager),
         cancel_token,
         stream_event_tx,
@@ -890,8 +875,7 @@ pub(crate) async fn fetch_chat_turn_sse(
         resp,
         render_md,
         term_width,
-        quiet,
-        suppress_intermediate_output,
+        render_policy,
         Some(edge_ctx),
         pre_clear_lines,
         cancel_token,

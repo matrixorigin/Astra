@@ -33,7 +33,7 @@ use serde_json::{Value, json};
 use super::edge_tools;
 use super::effects::ChatTurnPrepLineGuard;
 use super::permission_manager::{PermissionManager, PermissionMode};
-use super::stream_render::{EdgeSseContext, consume_turn_sse};
+use super::stream_render::{EdgeSseContext, RenderPolicy, consume_turn_sse};
 
 const SUBRUN_MAX_TURNS: usize = 25;
 
@@ -208,10 +208,7 @@ impl AgenticLoopHost for SubRunHost {
             token: &self.token,
             executor_id: "subrun",
             executor: &mut self.executor,
-            quiet: true,
-            suppress_intermediate_output: true,
-            hide_streaming_assistant_text: false,
-            show_reasoning_preview: false,
+            render_policy: RenderPolicy::Silent,
             perm_manager: Some(&mut self.perm_manager),
             cancel_token: self.cancel_token.as_ref().map(|t| t.as_ref()),
             stream_event_tx: None,
@@ -225,8 +222,7 @@ impl AgenticLoopHost for SubRunHost {
             resp,
             false, // render_md
             80,    // term_width
-            true,  // quiet
-            true,  // suppress_intermediate_output
+            RenderPolicy::Silent,
             Some(edge_ctx),
             0,                                              // pre_clear_lines
             self.cancel_token.as_ref().map(|t| t.as_ref()), // propagate parent cancel
