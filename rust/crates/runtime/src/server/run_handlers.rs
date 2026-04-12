@@ -1,7 +1,10 @@
 use super::*;
 use astra_services::runs::transform_run_event_for_client;
 
-fn transform_stream_run_events_for_client(events: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
+fn transform_stream_run_events_for_client(
+    run_id: &str,
+    events: Vec<serde_json::Value>,
+) -> Vec<serde_json::Value> {
     let mut transformed_events = Vec::with_capacity(events.len());
     let mut pending_run_error: Option<String> = None;
 
@@ -64,6 +67,15 @@ fn transform_stream_run_events_for_client(events: Vec<serde_json::Value>) -> Vec
         }
 
         let mut transformed = transform_run_event_for_client(event);
+        if (event_type == "run_started" || event_type == "run_finished")
+            && let Some(obj) = transformed.as_object_mut()
+            && !obj.contains_key("run_id")
+        {
+            obj.insert(
+                "run_id".to_string(),
+                serde_json::Value::String(run_id.to_string()),
+            );
+        }
         if event_type == "run_finished"
             && let Some(obj) = transformed.as_object_mut()
         {
@@ -125,10 +137,10 @@ pub(super) async fn stream_run_handler(
 
     match state
         .run_lifecycle_service
-        .stream_run(run_id, user.user_id, query.last_index)
+        .stream_run(run_id.clone(), user.user_id, query.last_index)
         .await
     {
-        Ok(events) => sse_json_response(transform_stream_run_events_for_client(events)),
+        Ok(events) => sse_json_response(transform_stream_run_events_for_client(&run_id, events)),
         Err((status, error)) => sse_error_response(status, error.0.detail),
     }
 }
@@ -192,7 +204,7 @@ mod tests {
 
     #[test]
     fn transform_stream_run_events_for_client_uses_client_protocol_shape() {
-        let transformed = transform_stream_run_events_for_client(vec![
+        let transformed = transform_stream_run_events_for_client("run-123", vec![
             json!({
                 "event_type": "text_delta",
                 "data": {"chunk": "hello"},
@@ -217,7 +229,7 @@ mod tests {
 
     #[test]
     fn transform_stream_run_events_for_client_maps_tool_result_to_tool_call_end() {
-        let transformed = transform_stream_run_events_for_client(vec![json!({
+        let transformed = transform_stream_run_events_for_client("run-123", vec![json!({
             "event_type": "tool_result",
             "data": {"call_id": "call-1", "result": "ok"},
             "index": 9
@@ -231,7 +243,7 @@ mod tests {
 
     #[test]
     fn transform_stream_run_events_for_client_emits_usage_and_terminal_status() {
-        let transformed = transform_stream_run_events_for_client(vec![
+        let transformed = transform_stream_run_events_for_client("run-123", vec![
             json!({
                 "event_type": "run_error",
                 "data": {"error": "boom"},
@@ -259,7 +271,7 @@ mod tests {
         );
         assert_eq!(
             transformed[2],
-            json!({"type": "run_finished", "status": "failed", "error": "boom", "index": 11})
+            json!({"type": "run_finished", "run_id": "run-123", "status": "failed", "error": "boom", "index": 11})
         );
         assert_eq!(
             transformed[3],
@@ -267,7 +279,21 @@ mod tests {
         );
         assert_eq!(
             transformed[4],
-            json!({"type": "run_finished", "status": "cancelled", "index": 12})
+            json!({"type": "run_finished", "run_id": "run-123", "status": "cancelled", "index": 12})
+        );
+    }
+
+    #[test]
+    fn transform_stream_run_events_for_client_injects_run_id_into_run_started() {
+        let transformed = transform_stream_run_events_for_client("run-123", vec![json!({
+            "event_type": "run_started",
+            "data": {},
+            "index": 1
+        })]);
+
+        assert_eq!(
+            transformed[0],
+            json!({"type": "run_started", "run_id": "run-123", "index": 1})
         );
     }
 }
