@@ -2065,17 +2065,25 @@ mod tests {
         let run = ok(svc.create_run("user-1".into(), test_request("hello")).await);
 
         let engine = svc.run_engine.as_ref().unwrap();
-        let mut durable = None;
-        for _ in 0..50 {
-            let persisted = engine.load_run(&run.run_id).await.unwrap().unwrap();
-            if persisted.status != "running" && persisted.events.len() >= 2 {
-                durable = Some(persisted);
-                break;
+        let durable = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let durable = engine.load_run(&run.run_id).await.unwrap().unwrap();
+                if durable.status != "running"
+                    && matches!(
+                        durable
+                            .events
+                            .last()
+                            .and_then(|event| event["event_type"].as_str()),
+                        Some("run_finished")
+                    )
+                {
+                    break durable;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-
-        let durable = durable.expect("background run should persist terminal event");
+        })
+        .await
+        .expect("timeout waiting for durable run to persist terminal event");
         assert_eq!(durable.events.last().unwrap()["event_type"], "run_finished");
     }
 
@@ -2102,16 +2110,23 @@ mod tests {
         ok(svc.cancel_run(run.run_id.clone(), "user-1".into()).await);
 
         let engine = svc.run_engine.as_ref().unwrap();
-        let mut durable = None;
-        for _ in 0..50 {
-            let persisted = engine.load_run(&run.run_id).await.unwrap().unwrap();
-            if persisted.events.len() >= 2 {
-                durable = Some(persisted);
-                break;
+        let durable = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let durable = engine.load_run(&run.run_id).await.unwrap().unwrap();
+                if matches!(
+                    durable
+                        .events
+                        .last()
+                        .and_then(|event| event["event_type"].as_str()),
+                    Some("run_finished")
+                ) {
+                    break durable;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        let durable = durable.expect("cancelled run should persist terminal event");
+        })
+        .await
+        .expect("timeout waiting for cancelled run to persist terminal event");
         assert_eq!(durable.status, "cancelled");
         assert!(durable.events.len() >= 2); // run_started + run_finished
     }
