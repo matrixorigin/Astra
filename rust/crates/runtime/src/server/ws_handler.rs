@@ -594,10 +594,7 @@ async fn handle_chat_message(
 
             send_msg(
                 socket,
-                &WsServerMessage::SessionInfo {
-                    session_id: run.session_id.clone(),
-                    run_id: Some(run.run_id.clone()),
-                },
+                &session_info_message(run.session_id.clone(), Some(run.run_id.clone())),
             )
             .await;
 
@@ -1510,6 +1507,10 @@ fn bridge_run_started_explain(explain: bool) -> Option<Value> {
     explain.then(|| serde_json::json!({"mode": "background"}))
 }
 
+fn session_info_message(session_id: String, run_id: Option<String>) -> WsServerMessage {
+    WsServerMessage::SessionInfo { session_id, run_id }
+}
+
 fn bind_prepared_bridge_identity(
     conn: &mut WsConnection,
     trusted_session_id: Option<&str>,
@@ -1549,6 +1550,7 @@ fn bridge_forward_error_messages(
         bind_prepared_bridge_identity(conn, trusted_session_id, turn_chain_id)
     {
         vec![
+            session_info_message(session_id.clone(), Some(run_id.clone())),
             bridge_run_started_message(session_id, run_id.clone(), explain),
             ws_error_from_status(status, error_message.clone()),
             WsServerMessage::RunFinished {
@@ -1556,6 +1558,13 @@ fn bridge_forward_error_messages(
                 status: STATUS_FAILED.to_string(),
                 error: Some(error_message),
             },
+        ]
+    } else if let Some(session_id) = trusted_session_id {
+        conn.session_id = Some(session_id.to_string());
+        conn.pending_session_id = None;
+        vec![
+            session_info_message(session_id.to_string(), None),
+            ws_error_from_status(status, error_message),
         ]
     } else {
         vec![ws_error_from_status(status, error_message)]
@@ -2701,8 +2710,15 @@ mod tests {
         assert_eq!(conn.pending_session_id, None);
         assert_eq!(conn.active_run_id.as_deref(), Some("run-1"));
         assert_eq!(conn.bridge_prepared_run_id.as_deref(), Some("run-1"));
-        assert_eq!(messages.len(), 3);
+        assert_eq!(messages.len(), 4);
         match &messages[0] {
+            WsServerMessage::SessionInfo { session_id, run_id } => {
+                assert_eq!(session_id, "sess-1");
+                assert_eq!(run_id.as_deref(), Some("run-1"));
+            }
+            other => panic!("expected SessionInfo, got {other:?}"),
+        }
+        match &messages[1] {
             WsServerMessage::RunStarted {
                 run_id,
                 session_id,
@@ -2714,7 +2730,7 @@ mod tests {
             }
             other => panic!("expected RunStarted, got {other:?}"),
         }
-        match &messages[1] {
+        match &messages[2] {
             WsServerMessage::Error {
                 message,
                 code,
@@ -2726,7 +2742,7 @@ mod tests {
             }
             other => panic!("expected Error, got {other:?}"),
         }
-        match &messages[2] {
+        match &messages[3] {
             WsServerMessage::RunFinished {
                 run_id,
                 status,
@@ -2781,8 +2797,15 @@ mod tests {
         assert_eq!(conn.pending_session_id, None);
         assert_eq!(conn.active_run_id, None);
         assert_eq!(conn.bridge_prepared_run_id, None);
-        assert_eq!(messages.len(), 1);
-        assert!(matches!(messages[0], WsServerMessage::Error { .. }));
+        assert_eq!(messages.len(), 2);
+        match &messages[0] {
+            WsServerMessage::SessionInfo { session_id, run_id } => {
+                assert_eq!(session_id, "sess-1");
+                assert!(run_id.is_none());
+            }
+            other => panic!("expected SessionInfo, got {other:?}"),
+        }
+        assert!(matches!(messages[1], WsServerMessage::Error { .. }));
     }
 
     #[test]
