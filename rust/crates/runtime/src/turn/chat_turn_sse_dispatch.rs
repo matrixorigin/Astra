@@ -243,7 +243,9 @@ pub fn dispatch_chat_turn_sse_event_block(
 }
 
 /// Buffers lossy UTF-8 from a `/chat/turn` body stream, yields complete blank-line SSE blocks, and
-/// records [`ChatTurnSseFramer::ttft_ms`] on the first `text_delta` / `content_block_delta` payload.
+/// records [`ChatTurnSseFramer::ttft_ms`] on the first text or reasoning payload
+/// (`text_delta`, `content_block_delta`, `thinking_delta`, `reasoning_delta`,
+/// `reasoning_message_content`).
 #[derive(Debug)]
 pub struct ChatTurnSseFramer {
     sse: SseBlankLineUtf8Buf,
