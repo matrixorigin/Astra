@@ -259,7 +259,14 @@ If cloud-synced data structures changed:
 complete. While you are still making tool calls to gather information, output NOTHING as text.
 The review box below must be your FINAL text output — no tool calls after it.**
 
-```
+**⚠ NEVER wrap the review box in markdown code fences (triple backticks).** Output the
+box-drawing characters directly — they render correctly without code fences. Code fences
+cause rendering leakage in non-TTY / piped output modes.
+
+**⚠ Gather ALL information BEFORE writing.** If you realize mid-review you need more data,
+make the tool calls SILENTLY (no text output) before starting the review box. Any text you
+produce between tool calls will be discarded and wastes tokens.
+
 ╔══════════════════════════════════════════════════════════════╗
 ║  📝 Code Review: {target_description}                        ║
 ║  Scope: {n} files, +{added}/-{removed} lines                ║
@@ -284,7 +291,6 @@ The review box below must be your FINAL text output — no tool calls after it.*
 ║  └─ Semver: {major/minor/patch}                              ║
 ║                                                              ║
 ╚══════════════════════════════════════════════════════════════╝
-```
 
 ### Issue Severity Guide
 

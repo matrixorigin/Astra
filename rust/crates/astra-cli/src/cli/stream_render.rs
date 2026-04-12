@@ -159,6 +159,12 @@ impl<'a> CliSseStreamHost<'a> {
     fn from_edge_ctx(ctx: EdgeSseContext<'a>, term_width: usize, render_md: bool) -> Self {
         let suppress_reasoning =
             ctx.render_policy == RenderPolicy::Silent || ctx.skill_continuation;
+        // Buffer text from the start when:
+        // 1. Skill continuation — suppress intermediate prose between skill iterations
+        // 2. Non-TTY (piped/redirected) — partial text cannot be cleared by ANSI escapes,
+        //    so we buffer everything and render one-shot at finalization.  Trade-off:
+        //    `tee` users lose streaming, but partial text no longer leaks permanently.
+        let buffer_from_start = ctx.skill_continuation || !io::stdout().is_terminal();
         Self {
             api: ctx.api,
             token: ctx.token,
@@ -167,10 +173,7 @@ impl<'a> CliSseStreamHost<'a> {
             render_policy: ctx.render_policy,
             perm_manager: ctx.perm_manager,
             render: StreamRenderState::with_term_width(term_width, render_md, suppress_reasoning),
-            // Skill continuation: buffer text from the start so intermediate prose
-            // never reaches the terminal.  The finalization path renders the buffer
-            // one-shot if this turns out to be the final (no-tool) turn.
-            tool_work_detected: ctx.skill_continuation,
+            tool_work_detected: buffer_from_start,
             edge_tool_round: Vec::new(),
             xml_tag_buffer: String::new(),
             cancel_token: ctx.cancel_token,
