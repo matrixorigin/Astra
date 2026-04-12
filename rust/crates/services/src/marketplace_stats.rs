@@ -12,6 +12,8 @@ use astra_core::{
     ErrorResponse, MatrixOneSettings, SharedPool, connect_matrixone, error_response, internal_error,
 };
 
+use crate::pagination::clamp_marketplace_search_offset;
+
 // ── Data types ───────────────────────────────────────────────────────────────
 
 /// Anonymous quality report submitted by a user.
@@ -217,7 +219,7 @@ impl MarketplaceStatsService for DatabaseMarketplaceStatsService {
             .limit
             .unwrap_or(DEFAULT_SEARCH_LIMIT)
             .min(MAX_SEARCH_RESULTS);
-        let offset = search.offset.unwrap_or(0);
+        let offset = clamp_marketplace_search_offset(search.offset.unwrap_or(0));
 
         // Build dynamic WHERE clauses
         let mut conditions = Vec::new();
@@ -457,5 +459,13 @@ mod tests {
         assert_eq!(r.skill_name, back.skill_name);
         assert_eq!(r.ranking_score, back.ranking_score);
         assert_eq!(r.active_users_7d, back.active_users_7d);
+    }
+
+    #[test]
+    fn skill_search_limit_clamps_to_max_results() {
+        let lim = Some(u32::MAX)
+            .unwrap_or(DEFAULT_SEARCH_LIMIT)
+            .min(MAX_SEARCH_RESULTS);
+        assert_eq!(lim, MAX_SEARCH_RESULTS);
     }
 }

@@ -1,13 +1,13 @@
 use super::encryption::FernetTokenEncryptor;
 use super::jwt::decode_jwt_claims;
-use crate::admin::AdminAuditReader;
 use crate::admin::{
-    AdminAuditFilter, AdminAuditRecord, AdminAuthorizer, AdminFeedbackStatsFilter,
+    AdminAuditFilter, AdminAuditReader, AdminAuditRecord, AdminAuthorizer, AdminFeedbackStatsFilter,
     AdminFeedbackStatsReader, AdminFeedbackStatsRecord, AdminInitRecord, AdminInitializer,
     AdminTokenCreateRequestData, AdminTokenFilter, AdminTokenReader, AdminTokenRecord,
     AdminTokenWriter, AdminUserRoleManager, AdminUserRoleRecord, AdminUserRoleRequestData,
     AuthenticatedUser,
 };
+use crate::pagination::clamp_admin_audit_limit;
 use astra_core::{
     ErrorResponse, JwtSettings, MatrixOneSettings, SharedPool, bearer_token, connect_matrixone,
     error_response, internal_error,
@@ -491,9 +491,10 @@ impl AdminTokenWriter for DatabaseAdminTokenWriter {
 impl AdminAuditReader for DatabaseAdminAuditReader {
     async fn list_audit_logs(
         &self,
-        filter: AdminAuditFilter,
+        mut filter: AdminAuditFilter,
     ) -> Result<Vec<AdminAuditRecord>, (StatusCode, Json<ErrorResponse>)> {
         let pool = self.get_pool().await.map_err(internal_error)?;
+        filter.limit = clamp_admin_audit_limit(filter.limit);
         let mut query_builder = QueryBuilder::<MySql>::new(
             "SELECT log_id, user_id, action, resource_type, resource_id, \
              IFNULL(CAST(details AS CHAR), 'null') AS details_json, \

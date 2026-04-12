@@ -19,6 +19,7 @@ pub mod learning_merge;
 pub mod marketplace;
 pub mod marketplace_stats;
 pub mod models;
+pub mod pagination;
 pub mod multi_agent;
 pub mod mutation_scoreboard;
 pub mod protocol;

@@ -8,6 +8,8 @@ use astra_core::{
     ErrorResponse, MatrixOneSettings, SharedPool, connect_matrixone, error_response, internal_error,
 };
 
+use crate::pagination::clamp_api_list_pagination;
+
 // ── Data types ───────────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug, PartialEq)]
@@ -206,9 +208,11 @@ impl DecisionService for DatabaseDecisionService {
 
     async fn list_decisions(
         &self,
-        filter: DecisionListFilter,
+        mut filter: DecisionListFilter,
     ) -> Result<DecisionListRecord, (StatusCode, Json<ErrorResponse>)> {
         let pool = self.get_pool().await.map_err(internal_error)?;
+
+        (filter.limit, filter.offset) = clamp_api_list_pagination(filter.limit, filter.offset);
 
         let mut count_qb = QueryBuilder::<MySql>::new(
             "SELECT COUNT(d.decision_id) AS total FROM ctx_decision_audits d \
@@ -486,6 +490,7 @@ impl From<DecisionListRecord> for DecisionListResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pagination::{MAX_API_LIST_LIMIT, clamp_api_list_pagination};
 
     #[test]
     fn decision_list_query_defaults() {
@@ -499,5 +504,11 @@ mod tests {
     #[test]
     fn default_decision_limit_value() {
         assert_eq!(default_decision_limit(), 50);
+    }
+
+    #[test]
+    fn list_decisions_paging_contract_matches_shared_clamp() {
+        let (limit, _) = clamp_api_list_pagination(u32::MAX, 0);
+        assert_eq!(limit, MAX_API_LIST_LIMIT);
     }
 }

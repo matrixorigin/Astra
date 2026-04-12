@@ -8,6 +8,8 @@ use astra_core::{
     ErrorResponse, MatrixOneSettings, SharedPool, connect_matrixone, error_response, internal_error,
 };
 
+use crate::pagination::clamp_api_list_pagination;
+
 const MAX_CAUSAL_CHAIN_EVENTS: i64 = 500;
 
 // ── Data types ───────────────────────────────────────────────────────────────
@@ -332,9 +334,11 @@ impl EventService for DatabaseEventService {
 
     async fn list_events(
         &self,
-        filter: EventListFilter,
+        mut filter: EventListFilter,
     ) -> Result<EventListRecord, (StatusCode, Json<ErrorResponse>)> {
         let pool = self.get_pool().await.map_err(internal_error)?;
+
+        (filter.limit, filter.offset) = clamp_api_list_pagination(filter.limit, filter.offset);
 
         let mut count_qb = QueryBuilder::<MySql>::new(
             "SELECT COUNT(event_id) AS total FROM agent_events WHERE user_id = ",
@@ -473,6 +477,7 @@ impl EventService for DatabaseEventService {
         offset: u32,
     ) -> Result<EventListRecord, (StatusCode, Json<ErrorResponse>)> {
         let pool = self.get_pool().await.map_err(internal_error)?;
+        let (limit, offset) = clamp_api_list_pagination(limit, offset);
 
         let session_row = query("SELECT user_id FROM agent_sessions WHERE session_id = ?")
             .bind(&session_id)
@@ -721,6 +726,7 @@ impl From<EventListRecord> for EventListResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pagination::{MAX_API_LIST_LIMIT, MAX_API_LIST_OFFSET, clamp_api_list_pagination};
 
     // --- metadata_tool_name ---
 
@@ -847,6 +853,13 @@ mod tests {
         let q: SessionEventQuery = serde_json::from_str("{}").unwrap();
         assert_eq!(q.limit, 100);
         assert_eq!(q.offset, 0);
+    }
+
+    #[test]
+    fn list_events_paging_contract_matches_shared_clamp() {
+        let (limit, offset) = clamp_api_list_pagination(u32::MAX, u32::MAX);
+        assert_eq!(limit, MAX_API_LIST_LIMIT);
+        assert_eq!(offset, MAX_API_LIST_OFFSET);
     }
 
     #[test]

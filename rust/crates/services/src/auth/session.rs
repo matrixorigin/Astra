@@ -1,3 +1,4 @@
+use crate::pagination::{MAX_API_LIST_OFFSET, clamp_api_list_pagination};
 use crate::storage::{log_session_audit, session_record_from_row};
 use astra_core::{
     ErrorResponse, MatrixOneSettings, SharedPool, connect_matrixone, error_response, internal_error,
@@ -200,9 +201,11 @@ impl SessionService for DatabaseSessionService {
 
     async fn list_sessions(
         &self,
-        filter: SessionListFilter,
+        mut filter: SessionListFilter,
     ) -> Result<SessionListRecord, (StatusCode, Json<ErrorResponse>)> {
         let pool = self.get_pool().await.map_err(internal_error)?;
+
+        (filter.limit, filter.offset) = clamp_api_list_pagination(filter.limit, filter.offset);
 
         let mut count_query = QueryBuilder::<MySql>::new(
             "SELECT COUNT(session_id) AS total FROM agent_sessions WHERE user_id = ",
@@ -420,6 +423,7 @@ impl SessionService for DatabaseSessionService {
             ));
         }
         let limit = limit.min(MAX_SESSION_ACTIVITY_ROWS);
+        let offset = offset.min(MAX_API_LIST_OFFSET);
 
         let count_row = query(
             "SELECT COUNT(*) as cnt FROM auth_audit_logs \
