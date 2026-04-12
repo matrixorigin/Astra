@@ -1017,6 +1017,23 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
     .await?;
 
     query(
+        "CREATE TABLE IF NOT EXISTS eval_training_datasets (
+            dataset_id        VARCHAR(36) PRIMARY KEY,
+            user_id           VARCHAR(36) NOT NULL,
+            request_json      JSON NULL,
+            dataset_json      LONGTEXT NOT NULL,
+            sample_count      INT NOT NULL DEFAULT 0,
+            quality_threshold DECIMAL(5,4) NOT NULL DEFAULT 0.7000,
+            status            VARCHAR(32) NOT NULL DEFAULT 'ready',
+            created_at        DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at        DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+            INDEX idx_eval_training_datasets_user_created (user_id, created_at)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    query(
         "CREATE TABLE IF NOT EXISTS eval_user_feedback (
             feedback_id   VARCHAR(36) PRIMARY KEY,
             user_id       VARCHAR(36) NOT NULL,

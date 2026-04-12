@@ -265,33 +265,35 @@ async fn memory_health_and_metrics_use_mock_memoria() {
 }
 
 #[tokio::test]
-async fn memoria_stubbed_evaluation_routes_return_501() {
+async fn memoria_stubbed_evaluation_routes_surface_expected_errors() {
     let memoria_base_url = start_mock_memoria_health().await;
     let app = build_memoria_backed_app(memoria_base_url);
 
     let cases = [
-        ("GET", "/evaluation/drift", body::Body::empty(), false),
+        (
+            "GET",
+            "/evaluation/drift",
+            body::Body::empty(),
+            false,
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
         (
             "GET",
             "/evaluation/quality/trend?model=gpt-4",
             body::Body::empty(),
             false,
+            StatusCode::NOT_IMPLEMENTED,
         ),
         (
             "GET",
             "/evaluation/slo/dashboard",
             body::Body::empty(),
             false,
-        ),
-        (
-            "POST",
-            "/evaluation/training-data/extract",
-            body::Body::from(r#"{}"#),
-            true,
+            StatusCode::INTERNAL_SERVER_ERROR,
         ),
     ];
-    for (method, uri, b, json_ct) in cases {
+    for (method, uri, b, json_ct, expected_status) in cases {
         let resp = oneshot_eval(app.clone(), method, uri, b, json_ct).await;
-        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED, "{method} {uri}");
+        assert_eq!(resp.status(), expected_status, "{method} {uri}");
     }
 }

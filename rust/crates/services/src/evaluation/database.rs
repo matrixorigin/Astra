@@ -14,6 +14,7 @@ use astra_core::{
 
 const MAX_EVALUATION_ROWS: i32 = 200;
 const MAX_EVALUATION_DAYS: i32 = 365;
+const MAX_EXTRACT_SAMPLES: i32 = 1000;
 const DEFAULT_DRIFT_WINDOW_DAYS: i32 = 30;
 const DRIFT_INFO_DELTA: f64 = 0.05;
 const DRIFT_WARNING_DELTA: f64 = 0.10;
@@ -28,6 +29,10 @@ fn clamp_eval_limit(limit: i32) -> i32 {
 
 fn clamp_eval_days(days: i32) -> i32 {
     days.clamp(1, MAX_EVALUATION_DAYS)
+}
+
+fn clamp_extract_limit(limit: i32) -> i32 {
+    limit.clamp(1, MAX_EXTRACT_SAMPLES)
 }
 
 fn classify_drift_severity(delta: f64) -> Option<DriftSeverity> {
@@ -105,6 +110,32 @@ struct CalibrationSummary {
     adjustment_reason: String,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+struct ExtractedTrainingDataRequest {
+    days: i32,
+    min_quality: f64,
+    max_samples: i32,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct ExtractedTrainingSample {
+    session_id: String,
+    quality_score: f64,
+    step_count: i64,
+    avg_selector_confidence: Option<f64>,
+    selector_trace_count: i64,
+    quality_updated_at: Option<String>,
+    latest_context_trace_at: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct ExtractedTrainingDataset {
+    schema_version: u32,
+    extracted_at: String,
+    request: ExtractedTrainingDataRequest,
+    samples: Vec<ExtractedTrainingSample>,
+}
+
 fn average_scores(scores: &[f64]) -> f64 {
     if scores.is_empty() {
         0.0
@@ -126,6 +157,15 @@ fn complement_interval(interval: ConfidenceInterval) -> ConfidenceInterval {
         1.0 - interval.point,
         1.0 - interval.upper,
         1.0 - interval.lower,
+    )
+}
+
+fn context_trace_confidence_expr(alias: &str) -> String {
+    format!(
+        "COALESCE(\
+            CAST(JSON_UNQUOTE(JSON_EXTRACT({alias}.metadata, '$.tool_selection.selection_confidence')) AS DOUBLE), \
+            CAST(JSON_UNQUOTE(JSON_EXTRACT({alias}.metadata, '$.selection_confidence')) AS DOUBLE)\
+        )"
     )
 }
 
@@ -176,6 +216,10 @@ fn summarize_calibration(
         adjustment_multiplier,
         adjustment_reason,
     }
+}
+
+fn training_dataset_status(sample_count: usize) -> &'static str {
+    if sample_count == 0 { "empty" } else { "ready" }
 }
 
 fn summarize_gate_validation(
@@ -533,10 +577,7 @@ impl EvaluationService for DatabaseEvaluationService {
     ) -> ServiceResult<CalibrationResponse> {
         let pool = self.get_pool().await.map_err(internal_error)?;
         let days = clamp_eval_days(days);
-        let confidence_expr = "COALESCE(\
-                CAST(JSON_UNQUOTE(JSON_EXTRACT(ev.metadata, '$.tool_selection.selection_confidence')) AS DOUBLE), \
-                CAST(JSON_UNQUOTE(JSON_EXTRACT(ev.metadata, '$.selection_confidence')) AS DOUBLE)\
-            )";
+        let confidence_expr = context_trace_confidence_expr("ev");
         let agent_filter = if agent_id.is_some() {
             "AND ev.agent_id = ?"
         } else {
@@ -1127,12 +1168,103 @@ impl EvaluationService for DatabaseEvaluationService {
 
     async fn extract_training_data(
         &self,
-        _user_id: &str,
-        _request: TrainingDataExtractRequest,
+        user_id: &str,
+        request: TrainingDataExtractRequest,
     ) -> ServiceResult<TrainingDataExtractResponse> {
-        Err(not_implemented(
-            "Evaluation training data extraction is not implemented yet",
-        ))
+        let pool = self.get_pool().await.map_err(internal_error)?;
+        let days = clamp_eval_days(request.days);
+        let min_quality = request.min_quality.clamp(0.0, 1.0);
+        let max_samples = clamp_extract_limit(request.max_samples);
+        let confidence_expr = context_trace_confidence_expr("ev");
+        let trace_count_expr =
+            format!("SUM(CASE WHEN {confidence_expr} IS NOT NULL THEN 1 ELSE 0 END)");
+        let sql = format!(
+            "SELECT qa.target_id AS session_id, \
+                    MAX(CAST(qa.score AS DOUBLE)) AS quality_score, \
+                    MAX(COALESCE(qa.step_count, 0)) AS step_count, \
+                    AVG({confidence_expr}) AS avg_selector_confidence, \
+                    {trace_count_expr} AS selector_trace_count, \
+                    DATE_FORMAT(MAX(qa.updated_at), '%Y-%m-%dT%H:%i:%s') AS quality_updated_at, \
+                    DATE_FORMAT(MAX(ev.created_at), '%Y-%m-%dT%H:%i:%s') AS latest_context_trace_at \
+             FROM eval_quality_assessments qa \
+             LEFT JOIN agent_events ev \
+               ON ev.session_id = qa.target_id \
+              AND ev.user_id = qa.user_id \
+              AND ev.event_type = 'context_trace_signal' \
+              AND ev.created_at >= DATE_SUB(NOW(), INTERVAL ? DAY) \
+             WHERE qa.user_id = ? \
+               AND qa.level = 'session' \
+               AND qa.updated_at >= DATE_SUB(NOW(), INTERVAL ? DAY) \
+               AND qa.score >= ? \
+               AND qa.updated_at = ( \
+                   SELECT MAX(q2.updated_at) \
+                   FROM eval_quality_assessments q2 \
+                   WHERE q2.user_id = qa.user_id \
+                     AND q2.level = 'session' \
+                     AND q2.target_id = qa.target_id \
+               ) \
+             GROUP BY qa.target_id \
+             ORDER BY quality_score DESC, MAX(qa.updated_at) DESC \
+             LIMIT ?"
+        );
+        let rows = query(&sql)
+            .bind(days)
+            .bind(user_id)
+            .bind(days)
+            .bind(min_quality)
+            .bind(max_samples)
+            .fetch_all(&pool)
+            .await
+            .map_err(internal_error)?;
+
+        let samples = rows
+            .iter()
+            .map(|row| ExtractedTrainingSample {
+                session_id: row.try_get("session_id").unwrap_or_default(),
+                quality_score: row.try_get("quality_score").unwrap_or(0.0),
+                step_count: row.try_get("step_count").unwrap_or(0),
+                avg_selector_confidence: row.try_get("avg_selector_confidence").ok(),
+                selector_trace_count: row.try_get("selector_trace_count").unwrap_or(0),
+                quality_updated_at: row.try_get("quality_updated_at").ok(),
+                latest_context_trace_at: row.try_get("latest_context_trace_at").ok(),
+            })
+            .collect::<Vec<_>>();
+        let dataset_id = uuid::Uuid::now_v7().to_string();
+        let status = training_dataset_status(samples.len()).to_string();
+        let request_payload = ExtractedTrainingDataRequest {
+            days,
+            min_quality,
+            max_samples,
+        };
+        let dataset_payload = ExtractedTrainingDataset {
+            schema_version: 1,
+            extracted_at: now_iso(),
+            request: request_payload.clone(),
+            samples,
+        };
+
+        query(
+            "INSERT INTO eval_training_datasets \
+             (dataset_id, user_id, request_json, dataset_json, sample_count, quality_threshold, status) \
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&dataset_id)
+        .bind(user_id)
+        .bind(serde_json::to_string(&request_payload).map_err(internal_error)?)
+        .bind(serde_json::to_string(&dataset_payload).map_err(internal_error)?)
+        .bind(dataset_payload.samples.len() as i64)
+        .bind(min_quality)
+        .bind(&status)
+        .execute(&pool)
+        .await
+        .map_err(internal_error)?;
+
+        Ok(TrainingDataExtractResponse {
+            dataset_id,
+            samples_extracted: dataset_payload.samples.len() as i64,
+            quality_threshold: min_quality,
+            status,
+        })
     }
 
     async fn export_training_data(
@@ -1184,6 +1316,13 @@ mod tests {
         assert_eq!(clamp_eval_days(999), MAX_EVALUATION_DAYS);
         assert_eq!(clamp_eval_days(1), 1);
         assert_eq!(clamp_eval_days(365), 365);
+    }
+
+    #[test]
+    fn clamp_extract_limit_boundaries() {
+        assert_eq!(clamp_extract_limit(0), 1);
+        assert_eq!(clamp_extract_limit(500), 500);
+        assert_eq!(clamp_extract_limit(5000), MAX_EXTRACT_SAMPLES);
     }
 
     #[test]
@@ -1430,6 +1569,12 @@ mod tests {
         let interval = ConfidenceInterval::new(0.8, 0.7, 0.9);
         let complement = complement_interval(interval);
         assert_eq!(complement, ConfidenceInterval::new(0.2, 0.1, 0.3));
+    }
+
+    #[test]
+    fn training_dataset_status_matches_sample_count() {
+        assert_eq!(training_dataset_status(0), "empty");
+        assert_eq!(training_dataset_status(3), "ready");
     }
 
     #[test]
