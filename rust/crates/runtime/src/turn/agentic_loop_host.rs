@@ -4150,10 +4150,19 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
             &remaining_tool_calls
         };
 
+        // Normalize tool_call ids early: replace empty/missing ids with synthetic
+        // UUIDs so all downstream code (send_message, skill, headless round) sees
+        // consistent ids. Without this, APIs that return empty ids (e.g. kimi-k2.5)
+        // cause mismatches between assistant tool_calls and tool result messages.
+        let normalized_tool_calls =
+            super::headless_tool_assembly::ensure_tool_call_ids(effective_tool_calls);
+        let effective_tool_calls: &[Value] = &normalized_tool_calls;
+
         // ─── Step 3b½: send_message interception ────────────────────────
         // If the agent has a mailbox, intercept send_message tool calls and
         // route them through the messaging system.
         let post_send_tool_calls;
+        let mut pre_resolved_results: Vec<(String, String)> = Vec::new();
         let effective_tool_calls = if let Some(ref mailbox) = state.messaging.mailbox {
             let mut msg_results: Vec<(String, String)> = Vec::new();
             let mut remaining = Vec::new();
@@ -4202,16 +4211,11 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                     remaining.push(tc.clone());
                 }
             }
-            for (call_id, result_text) in &msg_results {
-                let tool_msg = serde_json::json!({
-                    "role": "tool",
-                    "tool_call_id": call_id,
-                    "content": result_text,
-                });
-                state.messages.push(tool_msg.clone());
-                state.tool_results.push(tool_msg);
-            }
+            // send_message results are collected into pre_resolved_results, not
+            // pushed to messages/tool_results here. The headless round injects
+            // them after the assistant message in correct ordering.
             post_send_tool_calls = remaining;
+            pre_resolved_results.extend(msg_results);
             &post_send_tool_calls
         } else {
             effective_tool_calls
@@ -4356,7 +4360,9 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                         });
                     if let Some(ref name) = skill_name {
                         if let Some(prev) = state.skills.invoked.get(name.as_str()) {
-                            let call_id = tc.get("id").and_then(Value::as_str).unwrap_or("unknown");
+                            let call_id = tc.get("id").and_then(Value::as_str)
+                                .filter(|s| !s.is_empty())
+                                .unwrap_or("unknown");
                             dedup_results.push(crate::turn::skill_tool::InterceptedToolResult {
                                 tool_call_id: call_id.to_string(),
                                 tool_name: crate::turn::skill_tool::SKILL_TOOL_NAME.to_string(),
@@ -4495,28 +4501,11 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
             &post_skill_tool_calls
         };
 
-        // Inject skill results into messages + tool_results
+        // Collect skill results into pre_resolved_results (not messages).
+        // The headless round will inject them after the assistant message
+        // into both messages and tool_results in correct ordering.
         for result in &skill_results {
-            let tool_msg = serde_json::json!({
-                "role": "tool",
-                "tool_call_id": result.tool_call_id,
-                "content": result.result,
-            });
-            state.messages.push(tool_msg.clone());
-            let mut tool_result = serde_json::json!({
-                "tool_call_id": result.tool_call_id,
-                "name": result.tool_name,
-                "result": result.result,
-            });
-            if let Some(summary) = &result.verification_summary
-                && let Some(obj) = tool_result.as_object_mut()
-            {
-                obj.insert(
-                    "verification_summary".to_string(),
-                    serde_json::to_value(summary).unwrap_or(serde_json::Value::Null),
-                );
-            }
-            state.tool_results.push(tool_result);
+            pre_resolved_results.push((result.tool_call_id.clone(), result.result.clone()));
         }
 
         // ─── Step 4: Headless tool round ────────────────────────────────
@@ -4585,6 +4574,7 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                 state.messaging.mailbox.as_mut(),
                 state.permission_context.as_ref(),
                 state.messaging.progress_emitter.as_ref(),
+                &pre_resolved_results,
             )
             .await;
         }

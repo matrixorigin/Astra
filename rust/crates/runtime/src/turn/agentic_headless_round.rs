@@ -109,6 +109,10 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
         >,
     >,
     progress_emitter: Option<&crate::orchestration::AgentProgressEmitter>,
+    // Tool results resolved by upstream interception layers (skill, send_message)
+    // before the headless round. Injected immediately after the assistant message
+    // to maintain correct ordering: assistant(tool_calls) → tool(pre_resolved) → tool(executed).
+    pre_resolved_results: &[(String, String)],
 ) {
     const PERMISSION_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
     const PERMISSION_REQUEST_TIMEOUT_BACKGROUND: Duration = Duration::from_secs(5);
@@ -146,6 +150,18 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
         force_reasoning,
     );
     messages.push(opening.assistant_message);
+
+    // Inject pre-resolved tool results (from skill/send_message interception)
+    // immediately after the assistant message, before headless tool execution.
+    // This guarantees correct ordering: assistant(tool_calls) → tool(pre_resolved) → tool(executed).
+    let mut pre_resolved_ids: HashSet<&str> = HashSet::new();
+    for (call_id, result_text) in pre_resolved_results {
+        pre_resolved_ids.insert(call_id.as_str());
+        let (tool_msg, tr) =
+            openai_tool_roundtrip_values(call_id, "pre_resolved", result_text);
+        messages.push(tool_msg);
+        tool_results.push(tr);
+    }
 
     let indices = opening.indices;
     let tool_count = opening.tool_count;
@@ -189,6 +205,12 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
             args,
             synthetic_edge_index: synthetic_idx,
         } = slot;
+
+        // Skip tool calls that were already resolved by upstream interception
+        // layers (skill, send_message). Their results are already in messages.
+        if pre_resolved_ids.contains(id.as_str()) {
+            continue;
+        }
 
         // Reject empty tool names immediately — some models emit tool_call
         // objects with a missing/empty name field.  Treating these as
@@ -548,10 +570,12 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
             );
         }
 
-        // Skip redundant display for edge tools only when NOT in sub-run mode.
-        // In sub-run mode (quiet=false but SSE stream is suppressed), edge tools
-        // are the only tools executed, so we must emit them for progress visibility.
-        if !quiet {
+        // Skip redundant display for edge tools — they were already shown during
+        // the SSE tool round in the CLI.  Only emit headless status lines for
+        // server-side (non-edge) tools, or when running in sub-run / quiet-false
+        // mode where the SSE stream is suppressed and edge tools are the only
+        // source of progress.
+        if !quiet && !is_edge_tool {
             let duration_str = format_headless_tool_duration(Duration::from_millis(executed_ms));
             let detail = tool_call_detail(&name, &args);
             let summary = if !is_err {

@@ -631,6 +631,7 @@ mod tests {
             None,
             Some(&permission_context),
             None,
+            &[],
         )
         .await;
 
@@ -697,6 +698,7 @@ mod tests {
             None,
             None,
             None,
+            &[],
         )
         .await;
 
@@ -719,6 +721,107 @@ mod tests {
             assistant_tc_id, tool_result_id,
             "assistant tool_call id and tool result tool_call_id must match"
         );
+    }
+
+    /// Regression test for session 4a9c9697: skill + non-skill tool calls in
+    /// the same turn caused tool results to appear BEFORE the assistant message
+    /// in the conversation history. kimi-k2.5 (and other strict APIs) rejected
+    /// this with 400 "tool_call_id is not found".
+    ///
+    /// pre_resolved_results ensures skill results are injected AFTER the
+    /// assistant message: assistant(tool_calls) → tool(skill) → tool(executed).
+    #[tokio::test]
+    async fn pre_resolved_results_injected_after_assistant_message() {
+        let tool_calls = vec![
+            json!({
+                "id": "call_skill",
+                "type": "function",
+                "function": { "name": "skill", "arguments": r#"{"skill_name":"review"}"# }
+            }),
+            json!({
+                "id": "call_bash",
+                "type": "function",
+                "function": { "name": "bash", "arguments": r#"{"command":"echo hi"}"# }
+            }),
+        ];
+
+        let mut messages = Vec::new();
+        let mut tool_results = Vec::new();
+        let valid_tool_names = HashSet::from(["bash".to_string(), "skill".to_string()]);
+        let mut restricted_tools = HashSet::new();
+        let mut turn_guard = TurnGuard::new();
+        let mut step_recorder = StepRecorder::new("test-session", "pre-resolved");
+        let mut idempotency_cache = InMemoryIdempotencyCache::new();
+        let mut semantic_dedup = SemanticDedup::new(0.95);
+        let mut tool_call_records = Vec::new();
+        let tool_event_hooks = crate::skills::hooks::ToolEventHookRegistry::default();
+        let mut term = NoopHeadlessTerminal;
+        let edge_callback_outputs = std::collections::HashMap::new();
+        let edge_tool_round: Vec<EdgeToolExecResult> = Vec::new();
+
+        // Simulate: skill interception resolved call_skill before headless round
+        let pre_resolved = vec![
+            ("call_skill".to_string(), "Skill instructions here".to_string()),
+        ];
+
+        run_agentic_headless_tool_round(
+            0,
+            true,
+            &astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
+            "",
+            None,
+            &tool_calls,
+            &edge_tool_round,
+            "",
+            &edge_callback_outputs,
+            &mut messages,
+            &mut tool_results,
+            &valid_tool_names,
+            &mut restricted_tools,
+            &mut turn_guard,
+            &mut step_recorder,
+            &mut idempotency_cache,
+            &mut semantic_dedup,
+            &mut std::collections::HashMap::new(),
+            2,
+            &mut tool_call_records,
+            &tool_event_hooks,
+            &mut term,
+            None,
+            None,
+            None,
+            &pre_resolved,
+        )
+        .await;
+
+        // messages[0] = assistant with tool_calls [call_skill, call_bash]
+        // messages[1] = tool result for call_skill (pre-resolved)
+        // messages[2] = tool result for call_bash (headless-executed)
+        assert!(
+            messages.len() >= 3,
+            "expected assistant + tool results, got {}: {:#?}",
+            messages.len(),
+            messages.iter().map(|m| {
+                let role = m["role"].as_str().unwrap_or("?");
+                let tcid = m.get("tool_call_id").and_then(|v| v.as_str()).unwrap_or("");
+                format!("{}({})", role, tcid)
+            }).collect::<Vec<_>>()
+        );
+        assert_eq!(messages[0]["role"], "assistant", "first message must be assistant");
+        assert_eq!(
+            messages[0]["tool_calls"].as_array().map(|a| a.len()),
+            Some(2),
+            "assistant must have both tool_calls"
+        );
+
+        // Pre-resolved skill result must come right after assistant
+        assert_eq!(messages[1]["role"], "tool");
+        assert_eq!(messages[1]["tool_call_id"], "call_skill");
+        assert_eq!(messages[1]["content"], "Skill instructions here");
+
+        // Headless-executed bash result comes after
+        assert_eq!(messages[2]["role"], "tool");
+        assert_eq!(messages[2]["tool_call_id"], "call_bash");
     }
 
     #[tokio::test]
@@ -786,6 +889,7 @@ mod tests {
             None,
             None,
             None,
+            &[],
         )
         .await;
 
@@ -902,6 +1006,7 @@ mod tests {
             Some(&mut child_mb),
             Some(&child_permission_ctx),
             None,
+            &[],
         )
         .await;
 
@@ -1018,6 +1123,7 @@ mod tests {
             Some(&mut child_mb),
             Some(&child_permission_ctx),
             None,
+            &[],
         )
         .await;
 
@@ -1092,6 +1198,7 @@ mod tests {
             None,
             None,
             None,
+            &[],
         )
         .await;
 
