@@ -170,6 +170,42 @@ fn reasoning_done_sse_bytes_if_needed(reasoning: &str) -> Option<Bytes> {
     (!reasoning.is_empty()).then(|| render_sse(&json!({"type": "reasoning_done"})))
 }
 
+fn tool_call_start_event(tool_call: &mut Map<String, Value>) -> Option<Value> {
+    let function = tool_call.get("function").and_then(Value::as_object)?;
+    let tool = function
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|name| is_valid_tool_name(name))?
+        .to_string();
+    let arguments = function
+        .get("arguments")
+        .and_then(Value::as_str)
+        .filter(|args| !args.is_empty())
+        .map(std::string::ToString::to_string);
+    let call_id = tool_call
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(std::string::ToString::to_string)
+        .unwrap_or_else(|| {
+            let id = Uuid::now_v7().to_string();
+            tool_call.insert("id".to_string(), Value::String(id.clone()));
+            id
+        });
+
+    let mut event = json!({
+        "type": "tool_call_start",
+        "tool": tool,
+        "call_id": call_id,
+    });
+    if let Some(arguments) = arguments
+        && let Some(obj) = event.as_object_mut()
+    {
+        obj.insert("arguments".to_string(), Value::String(arguments));
+    }
+    Some(event)
+}
+
 fn extend_forward_from_validated_sse_block(
     block: &str,
     saw_inprocess_summary: &mut bool,
@@ -697,7 +733,8 @@ async fn call_llm_stream(
                                     )
                                     .await
                                     {
-                                        Ok(result) => {
+                                        Ok(mut result) => {
+                                            ensure_tool_call_ids(&mut result.tool_calls);
                                             full_text = result.full_text.clone();
                                             reasoning = result.reasoning.clone();
                                             usage = result.usage.clone();
@@ -716,13 +753,11 @@ async fn call_llm_stream(
                                                 yield render_sse(&json!({"type":"reasoning_delta","content": result.reasoning}));
                                             }
                                             for tc in &result.tool_calls {
-                                                if let Some(name) = tc
-                                                    .get("function")
-                                                    .and_then(|f| f.get("name"))
-                                                    .and_then(Value::as_str)
-                                                    && !name.is_empty()
-                                                {
-                                                    yield render_sse(&json!({"type":"tool_call_start","name": name}));
+                                                if let Some(obj) = tc.as_object() {
+                                                    let mut tc = obj.clone();
+                                                    if let Some(event) = tool_call_start_event(&mut tc) {
+                                                        yield render_sse(&event);
+                                                    }
                                                 }
                                             }
                                             let prompt = result.usage.get("prompt").and_then(Value::as_i64);
@@ -839,17 +874,27 @@ async fn call_llm_stream(
                                         && !id.is_empty() {
                                             entry.insert("id".to_string(), Value::String(id.to_string()));
                                         }
-                                    if let Some(func) = tc.get("function").and_then(Value::as_object) {
-                                        let f = entry
-                                            .entry("function".to_string())
-                                            .or_insert_with(|| json!({}));
-                                        let Some(f) = f.as_object_mut() else { continue; };
-                                        if let Some(name) = func.get("name").and_then(Value::as_str)
+                                        if let Some(func) = tc.get("function").and_then(Value::as_object) {
+                                            let f = entry
+                                                .entry("function".to_string())
+                                                .or_insert_with(|| json!({}));
+                                            let Some(f) = f.as_object_mut() else { continue; };
+                                            if let Some(args) = func.get("arguments").and_then(Value::as_str) {
+                                                let existing = f
+                                                    .entry("arguments".to_string())
+                                                    .or_insert_with(|| Value::String(String::new()));
+                                                if let Value::String(s) = existing {
+                                                    s.push_str(args);
+                                                }
+                                            }
+                                            if let Some(name) = func.get("name").and_then(Value::as_str)
                                             && is_valid_tool_name(name) {
                                                 let is_new = f.get("name").and_then(Value::as_str).unwrap_or("").is_empty();
                                                 f.insert("name".to_string(), Value::String(name.to_string()));
                                                 if is_new {
-                                                    yield render_sse(&json!({"type": "tool_call_start", "name": name}));
+                                                    if let Some(event) = tool_call_start_event(entry) {
+                                                        yield render_sse(&event);
+                                                    }
                                                 }
                                             } else if let Some(bad_name) = func.get("name").and_then(Value::as_str) {
                                                 astra_core::agent_warn!(
@@ -857,17 +902,9 @@ async fn call_llm_stream(
                                                     "dropped malformed tool_call with invalid name: {bad_name:?}"
                                                 );
                                             }
-                                        if let Some(args) = func.get("arguments").and_then(Value::as_str) {
-                                            let existing = f
-                                                .entry("arguments".to_string())
-                                                .or_insert_with(|| Value::String(String::new()));
-                                            if let Value::String(s) = existing {
-                                                s.push_str(args);
-                                            }
                                         }
                                     }
                                 }
-                            }
                         }
                     }
                 }
@@ -4383,5 +4420,41 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn tool_call_start_event_preserves_protocol_fields() {
+        let mut tool_call = Map::from_iter([
+            ("id".to_string(), Value::String("call-1".to_string())),
+            (
+                "function".to_string(),
+                json!({"name": "bash", "arguments": "{\"command\":\"ls\"}"}),
+            ),
+        ]);
+        let event = tool_call_start_event(&mut tool_call).unwrap();
+        assert_eq!(
+            event,
+            json!({
+                "type": "tool_call_start",
+                "tool": "bash",
+                "call_id": "call-1",
+                "arguments": "{\"command\":\"ls\"}",
+            })
+        );
+    }
+
+    #[test]
+    fn tool_call_start_event_fills_missing_call_id() {
+        let mut tool_call = Map::from_iter([(
+            "function".to_string(),
+            json!({"name": "bash", "arguments": "{}"}),
+        )]);
+        let event = tool_call_start_event(&mut tool_call).unwrap();
+        let call_id = event
+            .get("call_id")
+            .and_then(Value::as_str)
+            .expect("call_id");
+        assert!(!call_id.is_empty());
+        assert_eq!(tool_call.get("id").and_then(Value::as_str), Some(call_id));
     }
 }

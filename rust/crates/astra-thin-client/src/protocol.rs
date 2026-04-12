@@ -171,6 +171,7 @@ pub enum StreamEvent {
     ToolCallStart {
         tool: Value,
         call_id: Value,
+        arguments: Option<Value>,
     },
     ToolCallEnd {
         call_id: Value,
@@ -332,6 +333,7 @@ pub fn classify_stream_event(value: Value) -> Result<StreamEvent, crate::error::
         "tool_call_start" => StreamEvent::ToolCallStart {
             tool: obj.get("tool").cloned().unwrap_or(Value::Null),
             call_id: obj.get("call_id").cloned().unwrap_or(Value::Null),
+            arguments: obj.get("arguments").cloned(),
         },
         "tool_call_end" | "tool_result" => StreamEvent::ToolCallEnd {
             call_id: obj.get("call_id").cloned().unwrap_or(Value::Null),
@@ -572,6 +574,28 @@ mod tests {
                 assert_eq!(args["command"], "ls");
             }
             e => panic!("unexpected {e:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_tool_call_start_preserves_arguments() {
+        let value = serde_json::json!({
+            "type":"tool_call_start",
+            "tool":"bash",
+            "call_id":"c1",
+            "arguments":"{\"command\":\"ls\"}"
+        });
+        match classify_stream_event(value).unwrap() {
+            StreamEvent::ToolCallStart {
+                tool,
+                call_id,
+                arguments,
+            } => {
+                assert_eq!(tool, "bash");
+                assert_eq!(call_id, "c1");
+                assert_eq!(arguments, Some(Value::String("{\"command\":\"ls\"}".to_string())));
+            }
+            other => panic!("unexpected {other:?}"),
         }
     }
 

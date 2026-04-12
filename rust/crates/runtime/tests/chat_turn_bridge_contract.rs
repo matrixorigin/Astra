@@ -360,7 +360,7 @@ data: {\"type\":\"turn_complete\",\"has_tool_calls\":false}\n\n",
 
 async fn tool_call_start_internal_turn() -> Response {
     sse_ok(
-        "data: {\"type\":\"tool_call_start\",\"name\":\"bash\",\"ignored\":true}\n\n\
+        "data: {\"type\":\"tool_call_start\",\"tool\":\"bash\",\"call_id\":\"tc1\",\"arguments\":\"{\\\"command\\\":\\\"ls\\\"}\",\"ignored\":true}\n\n\
 data: {\"type\":\"turn_complete\",\"has_tool_calls\":false}\n\n",
     )
 }
@@ -3042,7 +3042,9 @@ async fn http_chat_turn_bridge_rebuilds_sanitized_upstream_events() {
                 frames[1],
                 serde_json::json!({
                     "type": "tool_call_start",
-                    "name": "bash"
+                    "tool": "bash",
+                    "call_id": "tc1",
+                    "arguments": "{\"command\":\"ls\"}"
                 }),
                 "{l}"
             );

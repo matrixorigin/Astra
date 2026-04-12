@@ -400,6 +400,7 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
             "type": "tool_call_start",
             "tool": data.get("tool").cloned().unwrap_or(serde_json::Value::String(String::new())),
             "call_id": data.get("call_id").cloned().unwrap_or(serde_json::Value::String(String::new())),
+            "arguments": data.get("arguments").cloned().unwrap_or(serde_json::Value::Null),
         }),
         "tool_result" => serde_json::json!({
             "type": "tool_call_end",
@@ -644,11 +645,12 @@ mod tests {
     fn tool_call_start() {
         let out = transform_run_event_for_client(make_event(
             "tool_call_start",
-            json!({"tool": "bash", "call_id": "c1"}),
+            json!({"tool": "bash", "call_id": "c1", "arguments": "{\"command\":\"ls\"}"}),
         ));
         assert_eq!(out["type"], "tool_call_start");
         assert_eq!(out["tool"], "bash");
         assert_eq!(out["call_id"], "c1");
+        assert_eq!(out["arguments"], "{\"command\":\"ls\"}");
     }
 
     #[test]
