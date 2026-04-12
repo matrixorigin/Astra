@@ -42,6 +42,19 @@ function sseResponse(events: Record<string, unknown>[], status = 200) {
   };
 }
 
+function sseResponseText(text: string, status = 200) {
+  const chunk = Buffer.from(text);
+  const reader = makeReader(chunk.length > 0 ? [chunk] : []);
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    statusText: 'OK',
+    body: { getReader: () => reader },
+    text: () => Promise.resolve(text),
+    headers: new Map([['content-type', 'text/event-stream']]),
+  };
+}
+
 function failResponse(status: number, body = '') {
   return {
     ok: false,
@@ -204,6 +217,24 @@ describe('useChatStream', () => {
     });
 
     expect(result.current.followupSuggestion).toBe('server says push it');
+  });
+
+  it('processes a final buffered turn_complete without trailing delimiter', async () => {
+    fetchMock.mockResolvedValueOnce(
+      sseResponseText(
+        'data: {"type":"text_delta","content":"Patched and verified."}\n\n' +
+          'data: {"type":"turn_complete","followup_suggestion":"tail says ship it"}',
+      ),
+    );
+
+    const { result } = renderHook(() => useChatStream(baseConfig));
+
+    await act(async () => {
+      result.current.sendMessage('Hello');
+      await new Promise((r) => setTimeout(r, 50));
+    });
+
+    expect(result.current.followupSuggestion).toBe('tail says ship it');
   });
 
   it('sets connectionState to error on fetch failure', async () => {

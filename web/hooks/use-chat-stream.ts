@@ -370,6 +370,19 @@ export function useChatStream(config: ChatConfig): UseChatStreamReturn {
           const reader = response.body.getReader();
           const decoder = new TextDecoder();
           let buffer = '';
+          const processSSEPart = (part: string) => {
+            for (const line of part.split('\n')) {
+              const trimmed = line.trim();
+              if (trimmed.startsWith('data: ')) {
+                try {
+                  const event = JSON.parse(trimmed.slice(6)) as StreamEvent;
+                  processEvent(event);
+                } catch {
+                  // Non-JSON data line
+                }
+              }
+            }
+          };
 
           for (;;) {
             const { done, value } = await reader.read();
@@ -380,18 +393,13 @@ export function useChatStream(config: ChatConfig): UseChatStreamReturn {
             buffer = parts.pop() ?? '';
 
             for (const part of parts) {
-              for (const line of part.split('\n')) {
-                const trimmed = line.trim();
-                if (trimmed.startsWith('data: ')) {
-                  try {
-                    const event = JSON.parse(trimmed.slice(6)) as StreamEvent;
-                    processEvent(event);
-                  } catch {
-                    // Non-JSON data line
-                  }
-                }
-              }
+              processSSEPart(part);
             }
+          }
+
+          buffer += decoder.decode();
+          if (buffer.trim().length > 0) {
+            processSSEPart(buffer);
           }
 
           setIsStreaming(false);

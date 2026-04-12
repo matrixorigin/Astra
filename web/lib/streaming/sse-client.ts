@@ -115,6 +115,10 @@ export class SSEClient {
         throw err;
       }
     } finally {
+      buffer += decoder.decode();
+      if (buffer.trim().length > 0) {
+        this.processSSEChunk(buffer);
+      }
       reader.releaseLock();
     }
 
