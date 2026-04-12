@@ -9,7 +9,7 @@
 //! **Client → Server** (JSON text frames):
 //! ```text
 //! {"type": "auth", "token": "Bearer ..."}
-//! {"type": "message", "content": "...", "session_id": "...", "model": "..."}
+//! {"type": "message", "content": "...", "session_id": "...", "model": "...", "skill_search": {...}, "max_candidates": 25, "explain": false}
 //! {"type": "cancel_run", "run_id": "..."}
 //! {"type": "pause_run", "run_id": "..."}
 //! {"type": "resume_run", "run_id": "..."}
@@ -62,6 +62,11 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 /// Poll cadence for background lifecycle runs streamed over WebSocket.
 const RUN_STREAM_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
+/// Preserve the historical websocket candidate budget unless callers opt in explicitly.
+fn default_ws_max_candidates() -> u32 {
+    25
+}
+
 // ─── Client Message Types ────────────────────────────────────────────────────
 
 /// Messages sent from browser client to server.
@@ -81,7 +86,13 @@ pub(super) enum WsClientMessage {
         #[serde(default)]
         model: Option<String>,
         #[serde(default)]
+        skill_search: Option<astra_core::SkillSearchSettings>,
+        #[serde(default)]
         context: Option<serde_json::Map<String, serde_json::Value>>,
+        #[serde(default = "default_ws_max_candidates")]
+        max_candidates: u32,
+        #[serde(default)]
+        explain: bool,
     },
 
     /// Cancel an active run.
@@ -382,10 +393,22 @@ async fn message_loop(socket: &mut WebSocket, state: &AppState, mut conn: WsConn
                                 content,
                                 session_id,
                                 model,
+                                skill_search,
                                 context,
+                                max_candidates,
+                                explain,
                             }) => {
                                 handle_chat_message(
-                                    socket, state, &mut conn, &content, session_id, model, context,
+                                    socket,
+                                    state,
+                                    &mut conn,
+                                    &content,
+                                    session_id,
+                                    model,
+                                    skill_search,
+                                    context,
+                                    max_candidates,
+                                    explain,
                                 )
                                 .await;
                             }
@@ -470,10 +493,11 @@ async fn handle_chat_message(
     content: &str,
     requested_session_id: Option<String>,
     model: Option<String>,
+    skill_search: Option<astra_core::SkillSearchSettings>,
     context: Option<serde_json::Map<String, serde_json::Value>>,
+    max_candidates: u32,
+    explain: bool,
 ) {
-    use astra_services::runs::ChatRequestData;
-
     // Keep explicit per-message session routing local to this request until
     // session resolution succeeds. That avoids poisoning the bound WS
     // connection state with an empty or unknown session_id on failed requests.
@@ -483,17 +507,19 @@ async fn handle_chat_message(
         requested_session_id.is_some() || conn.pending_session_id.is_some();
     let request_session_id = chat_request_session_id(conn, requested_session_id);
     let fallback_model = model.clone();
+    let fallback_skill_search = skill_search.clone();
     let fallback_context = context.clone();
-    let mut request = ChatRequestData {
-        message: content.to_string(),
-        session_id: request_session_id,
-        agent_id: None,
+    let fallback_max_candidates = max_candidates;
+    let fallback_explain = explain;
+    let mut request = build_ws_chat_request(
+        content,
+        request_session_id,
         model,
-        skill_search: None,
+        skill_search,
         context,
-        max_candidates: 25,
-        explain: false,
-    };
+        max_candidates,
+        explain,
+    );
     request.session_id = match resolve_or_create_chat_session_id(
         state,
         &conn.user,
@@ -557,7 +583,10 @@ async fn handle_chat_message(
                 resolved_session_id,
                 request_session_id_is_trusted,
                 fallback_model,
+                fallback_skill_search,
                 fallback_context,
+                fallback_max_candidates,
+                fallback_explain,
             )
             .await;
         }
@@ -670,17 +699,44 @@ fn build_bridge_chat_payload(
     session_id: Option<String>,
     content: &str,
     model: Option<String>,
+    skill_search: Option<astra_core::SkillSearchSettings>,
     context: Option<serde_json::Map<String, serde_json::Value>>,
+    max_candidates: u32,
+    explain: bool,
 ) -> Value {
     serde_json::json!({
         "session_id": session_id,
         "model": model,
+        "skill_search": skill_search,
         "context": context,
+        "max_candidates": max_candidates,
+        "explain": explain,
         "messages": [{
             "role": "user",
             "content": content
         }]
     })
+}
+
+fn build_ws_chat_request(
+    content: &str,
+    session_id: Option<String>,
+    model: Option<String>,
+    skill_search: Option<astra_core::SkillSearchSettings>,
+    context: Option<serde_json::Map<String, serde_json::Value>>,
+    max_candidates: u32,
+    explain: bool,
+) -> astra_services::runs::ChatRequestData {
+    astra_services::runs::ChatRequestData {
+        message: content.to_string(),
+        session_id,
+        agent_id: None,
+        model,
+        skill_search,
+        context,
+        max_candidates,
+        explain,
+    }
 }
 
 fn build_ws_bridge_headers(
@@ -1131,7 +1187,10 @@ async fn handle_chat_message_via_bridge(
     request_session_id: Option<String>,
     request_session_id_is_trusted: bool,
     model: Option<String>,
+    skill_search: Option<astra_core::SkillSearchSettings>,
     context: Option<serde_json::Map<String, serde_json::Value>>,
+    max_candidates: u32,
+    explain: bool,
 ) {
     let (bridge_payload_session_id, trusted_session_id_override) =
         resolve_bridge_payload_session_id(
@@ -1143,7 +1202,15 @@ async fn handle_chat_message_via_bridge(
         .await;
 
     // Build the bridge request body (same format as /chat/turn)
-    let payload = build_bridge_chat_payload(bridge_payload_session_id, content, model, context);
+    let payload = build_bridge_chat_payload(
+        bridge_payload_session_id,
+        content,
+        model,
+        skill_search,
+        context,
+        max_candidates,
+        explain,
+    );
 
     let body = match serde_json::to_vec(&payload) {
         Ok(b) => Bytes::from(b),
@@ -1856,19 +1923,32 @@ mod tests {
 
     #[test]
     fn parse_chat_message() {
-        let json = r#"{"type": "message", "content": "hello", "session_id": "s1"}"#;
+        let json = r#"{"type": "message", "content": "hello", "session_id": "s1", "skill_search": {"dynamic_surface": false, "min_catalog_size": 12, "surface_cap": 20}, "max_candidates": 3, "explain": true}"#;
         let msg: WsClientMessage = serde_json::from_str(json).unwrap();
         match msg {
             WsClientMessage::ChatMessage {
                 content,
                 session_id,
                 model,
+                skill_search,
                 context,
+                max_candidates,
+                explain,
             } => {
                 assert_eq!(content, "hello");
                 assert_eq!(session_id, Some("s1".into()));
                 assert!(model.is_none());
+                assert_eq!(
+                    skill_search,
+                    Some(astra_core::SkillSearchSettings {
+                        dynamic_surface: false,
+                        min_catalog_size: 12,
+                        surface_cap: 20,
+                    })
+                );
                 assert!(context.is_none());
+                assert_eq!(max_candidates, 3);
+                assert!(explain);
             }
             _ => panic!("expected ChatMessage"),
         }
@@ -1879,13 +1959,24 @@ mod tests {
         let json = r#"{"type": "message", "content": "你好"}"#;
         let msg: WsClientMessage = serde_json::from_str(json).unwrap();
         match msg {
-            WsClientMessage::ChatMessage { content, .. } => assert_eq!(content, "你好"),
+            WsClientMessage::ChatMessage {
+                content,
+                skill_search,
+                max_candidates,
+                explain,
+                ..
+            } => {
+                assert_eq!(content, "你好");
+                assert!(skill_search.is_none());
+                assert_eq!(max_candidates, default_ws_max_candidates());
+                assert!(!explain);
+            }
             _ => panic!("expected ChatMessage"),
         }
     }
 
     #[test]
-    fn bridge_payload_preserves_model_and_context() {
+    fn bridge_payload_preserves_runtime_knobs() {
         let mut context = serde_json::Map::new();
         context.insert("edge_tools".into(), serde_json::json!([{"name": "bash"}]));
         context.insert("mode".into(), serde_json::json!("headless"));
@@ -1894,14 +1985,61 @@ mod tests {
             Some("session-1".into()),
             "hello",
             Some("gpt-5.4".into()),
+            Some(astra_core::SkillSearchSettings {
+                dynamic_surface: false,
+                min_catalog_size: 12,
+                surface_cap: 20,
+            }),
             Some(context.clone()),
+            3,
+            true,
         );
 
         assert_eq!(payload["session_id"], "session-1");
         assert_eq!(payload["model"], "gpt-5.4");
+        assert_eq!(payload["skill_search"]["dynamic_surface"], false);
+        assert_eq!(payload["skill_search"]["min_catalog_size"], 12);
+        assert_eq!(payload["skill_search"]["surface_cap"], 20);
         assert_eq!(payload["context"], serde_json::Value::Object(context));
+        assert_eq!(payload["max_candidates"], 3);
+        assert_eq!(payload["explain"], true);
         assert_eq!(payload["messages"][0]["role"], "user");
         assert_eq!(payload["messages"][0]["content"], "hello");
+    }
+
+    #[test]
+    fn ws_chat_request_preserves_runtime_knobs() {
+        let request = build_ws_chat_request(
+            "hello",
+            Some("session-1".into()),
+            Some("gpt-5.4".into()),
+            Some(astra_core::SkillSearchSettings {
+                dynamic_surface: false,
+                min_catalog_size: 12,
+                surface_cap: 20,
+            }),
+            Some(serde_json::Map::from_iter([(
+                "cwd".to_string(),
+                serde_json::Value::String("/tmp".into()),
+            )])),
+            7,
+            true,
+        );
+
+        assert_eq!(request.message, "hello");
+        assert_eq!(request.session_id.as_deref(), Some("session-1"));
+        assert_eq!(request.model.as_deref(), Some("gpt-5.4"));
+        assert_eq!(
+            request.skill_search,
+            Some(astra_core::SkillSearchSettings {
+                dynamic_surface: false,
+                min_catalog_size: 12,
+                surface_cap: 20,
+            })
+        );
+        assert_eq!(request.context.as_ref().unwrap()["cwd"], "/tmp");
+        assert_eq!(request.max_candidates, 7);
+        assert!(request.explain);
     }
 
     #[test]
