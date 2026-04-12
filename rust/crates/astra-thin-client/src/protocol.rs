@@ -168,7 +168,7 @@ pub enum StreamEvent {
         tool: Value,
         call_id: Value,
     },
-    ToolResult {
+    ToolCallEnd {
         call_id: Value,
         result: Value,
     },
@@ -291,7 +291,7 @@ pub fn classify_stream_event(value: Value) -> Result<StreamEvent, crate::error::
             tool: obj.get("tool").cloned().unwrap_or(Value::Null),
             call_id: obj.get("call_id").cloned().unwrap_or(Value::Null),
         },
-        "tool_result" => StreamEvent::ToolResult {
+        "tool_call_end" | "tool_result" => StreamEvent::ToolCallEnd {
             call_id: obj.get("call_id").cloned().unwrap_or(Value::Null),
             result: obj.get("result").cloned().unwrap_or(Value::Null),
         },
@@ -494,6 +494,22 @@ mod tests {
                 assert_eq!(args["command"], "ls");
             }
             e => panic!("unexpected {e:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_tool_call_end_and_legacy_tool_result() {
+        for value in [
+            serde_json::json!({"type":"tool_call_end","call_id":"c1","result":"ok"}),
+            serde_json::json!({"type":"tool_result","call_id":"c2","result":"legacy"}),
+        ] {
+            match classify_stream_event(value).unwrap() {
+                StreamEvent::ToolCallEnd { call_id, result } => {
+                    assert!(call_id == "c1" || call_id == "c2");
+                    assert!(result == "ok" || result == "legacy");
+                }
+                other => panic!("unexpected {other:?}"),
+            }
         }
     }
 
