@@ -4157,6 +4157,11 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
         let normalized_tool_calls =
             super::headless_tool_assembly::ensure_tool_call_ids(effective_tool_calls);
         let effective_tool_calls: &[Value] = &normalized_tool_calls;
+        // Keep a reference to the full set of tool_calls (pre-interception) for
+        // building the assistant message. Interception layers (send_message, skill)
+        // may filter effective_tool_calls down to a subset, but the assistant
+        // message must contain ALL tool_calls so every tool result has a matching id.
+        let all_tool_calls: &[Value] = &normalized_tool_calls;
 
         // ─── Step 3b½: send_message interception ────────────────────────
         // If the agent has a mailbox, intercept send_message tool calls and
@@ -4225,7 +4230,7 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
         // If a skill resolver is wired, intercept "skill" tool calls and
         // return resolved instructions as tool results.
         let (mut skill_results, post_skill_tool_calls);
-        let effective_tool_calls = if let Some(resolver) = &state.skills.resolver {
+        let _effective_tool_calls = if let Some(resolver) = &state.skills.resolver {
             // Build runtime context for skill execution
             let mut extra = std::collections::HashMap::new();
 
@@ -4554,7 +4559,7 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                 &state.api,
                 &state.api_token,
                 state.current_session_id.as_ref(),
-                effective_tool_calls,
+                all_tool_calls,
                 edge_round_for_headless,
                 turn_result.accum.reasoning_content.as_str(),
                 &edge_callback_outputs,
