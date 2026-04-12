@@ -141,7 +141,7 @@ fn apply_one_event(
                         .and_then(|v| v.as_str())
                         .map(std::string::ToString::to_string)
                 });
-            if !request_id.is_empty() {
+            if !request_id.is_empty() && !tool.is_empty() {
                 edge_pending.push(ChatTurnEdgePending::ApprovalRequired {
                     request_id,
                     tool,
@@ -787,6 +787,18 @@ mod tests {
         let mut pending = vec![];
         dispatch_chat_turn_sse_event_block(
             &sse("approval_required", ",\"tool\":\"write_file\""),
+            &mut a,
+            &mut pending,
+        );
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn approval_required_missing_tool_not_pushed() {
+        let mut a = ChatTurnSseAccum::default();
+        let mut pending = vec![];
+        dispatch_chat_turn_sse_event_block(
+            &sse("approval_required", ",\"request_id\":\"r1\""),
             &mut a,
             &mut pending,
         );
