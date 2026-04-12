@@ -790,22 +790,27 @@ pub fn is_skill_call(tool_call: &Value) -> bool {
         == Some(SKILL_TOOL_NAME)
 }
 
+/// Parse tool call arguments from either stringified JSON (OpenAI) or direct
+/// object (Anthropic) format into a `Value`.
+pub fn extract_tool_args(tool_call: &Value) -> Option<Value> {
+    let args = tool_call
+        .get("function")
+        .and_then(|f| f.get("arguments"))?;
+    if let Some(s) = args.as_str() {
+        serde_json::from_str::<Value>(s).ok()
+    } else if args.is_object() {
+        Some(args.clone())
+    } else {
+        None
+    }
+}
+
 /// Extract the `skill_name` from a skill tool call's arguments.
 ///
 /// Handles both stringified JSON (OpenAI: `"arguments": "{\"skill_name\":...}"`)
 /// and direct JSON object (Anthropic: `"arguments": {"skill_name":...}`) formats.
 pub fn extract_skill_name(tool_call: &Value) -> Option<String> {
-    let args = tool_call
-        .get("function")
-        .and_then(|f| f.get("arguments"))?;
-    let parsed = if let Some(s) = args.as_str() {
-        serde_json::from_str::<Value>(s).ok()?
-    } else if args.is_object() {
-        args.clone()
-    } else {
-        return None;
-    };
-    parsed
+    extract_tool_args(tool_call)?
         .get("skill_name")
         .and_then(Value::as_str)
         .map(String::from)
@@ -919,14 +924,10 @@ pub async fn partition_discover_and_execute_skills(
             .unwrap_or("unknown")
             .to_string();
 
-        let args_str = tc
-            .get("function")
-            .and_then(|f| f.get("arguments"))
-            .and_then(Value::as_str)
-            .unwrap_or("{}");
+        let args = extract_tool_args(&tc);
 
-        let result = match serde_json::from_str::<Value>(args_str) {
-            Ok(args) => {
+        let result = match args {
+            Some(args) => {
                 let query = args.get("query").and_then(Value::as_str).unwrap_or("");
                 let (text, discovered) = execute_discover_skills(
                     query,
@@ -947,7 +948,7 @@ pub async fn partition_discover_and_execute_skills(
                 }
                 text
             }
-            Err(e) => format!("Invalid discover_skills arguments: {e}"),
+            None => "Invalid discover_skills arguments: expected object or JSON string".to_string(),
         };
 
         combined_results.push(InterceptedToolResult {
@@ -1027,14 +1028,10 @@ pub async fn partition_and_execute_skills(
             .unwrap_or_default()
             .to_string();
 
-        let args_str = tc
-            .get("function")
-            .and_then(|f| f.get("arguments"))
-            .and_then(Value::as_str)
-            .unwrap_or("{}");
+        let args = extract_tool_args(&tc);
 
-        let result = match serde_json::from_str::<Value>(args_str) {
-            Ok(args) => {
+        let result = match args {
+            Some(args) => {
                 let skill_name = args.get("skill_name").and_then(Value::as_str).unwrap_or("");
 
                 let task_hint = args.get("task").and_then(Value::as_str).unwrap_or("");
@@ -1081,10 +1078,10 @@ pub async fn partition_and_execute_skills(
                     verification_summary: verification.and_then(|outcome| outcome.summary),
                 }
             }
-            Err(e) => InterceptedToolResult {
+            None => InterceptedToolResult {
                 tool_call_id: call_id,
                 tool_name,
-                result: format!("Invalid skill arguments: {e}"),
+                result: "Invalid skill arguments: expected object or JSON string".to_string(),
                 verification_summary: None,
             },
         };
@@ -1896,6 +1893,33 @@ mod tests {
     fn extract_skill_name_returns_none_for_missing_args() {
         let tc = serde_json::json!({"id": "x"});
         assert_eq!(extract_skill_name(&tc), None);
+    }
+
+    #[test]
+    fn extract_tool_args_stringified() {
+        let tc = serde_json::json!({
+            "function": { "name": "bash", "arguments": "{\"command\": \"ls\"}" }
+        });
+        let args = extract_tool_args(&tc).unwrap();
+        assert_eq!(args.get("command").and_then(Value::as_str), Some("ls"));
+    }
+
+    #[test]
+    fn extract_tool_args_object() {
+        let tc = serde_json::json!({
+            "function": { "name": "skill", "arguments": {"skill_name": "review"} }
+        });
+        let args = extract_tool_args(&tc).unwrap();
+        assert_eq!(
+            args.get("skill_name").and_then(Value::as_str),
+            Some("review")
+        );
+    }
+
+    #[test]
+    fn extract_tool_args_missing() {
+        assert!(extract_tool_args(&serde_json::json!({})).is_none());
+        assert!(extract_tool_args(&serde_json::json!({"function": {}})).is_none());
     }
 
     #[tokio::test]
