@@ -1707,62 +1707,15 @@ impl ConditionalEventHandler for SlashStartCompleteHandler {
                 let mut projected = ctx.line().to_string();
                 projected.push(' ');
                 if let Some((parent, filter)) = parse_subcmd_context(&projected) {
-                    if in_slash && active {
-                        // First accept the slash picker selection
-                        let selected = picker_selected_command();
+                    if active {
                         clear_slash_overlay();
-                        if let Some(edit) = accepted_slash_edit(ctx.line(), selected, true) {
-                            match edit {
-                                AcceptedSlashEdit::InsertSuffix(text) => {
-                                    // After inserting, show subcmd picker
-                                    let full_line = format!("{}{}", ctx.line(), text);
-                                    if let Some((p, f)) = parse_subcmd_context(&full_line) {
-                                        set_subcmd_picker_selected(0);
-                                        render_subcmd_overlay(
-                                            p,
-                                            if f.is_empty() { None } else { Some(&f) },
-                                        );
-                                    }
-                                    return Some(RlCmd::Insert(1, text));
-                                }
-                                AcceptedSlashEdit::ReplaceWholeLine(line) => {
-                                    if let Some((p, f)) = parse_subcmd_context(&line) {
-                                        set_subcmd_picker_selected(0);
-                                        render_subcmd_overlay(
-                                            p,
-                                            if f.is_empty() { None } else { Some(&f) },
-                                        );
-                                    }
-                                    return Some(RlCmd::Replace(RlMovement::WholeLine, Some(line)));
-                                }
-                                AcceptedSlashEdit::KeepLine => {
-                                    // Already at a valid command, show subcmd picker
-                                    set_subcmd_picker_selected(0);
-                                    render_subcmd_overlay(
-                                        parent,
-                                        if filter.is_empty() {
-                                            None
-                                        } else {
-                                            Some(&filter)
-                                        },
-                                    );
-                                    return None; // let space be inserted
-                                }
-                            }
-                        }
-                    } else {
-                        // Not in slash picker, but input like `/session ` should show subcmd picker
-                        set_subcmd_picker_selected(0);
-                        render_subcmd_overlay(
-                            parent,
-                            if filter.is_empty() {
-                                None
-                            } else {
-                                Some(&filter)
-                            },
-                        );
-                        return None; // let space be inserted
                     }
+                    set_subcmd_picker_selected(0);
+                    render_subcmd_overlay(
+                        parent,
+                        if filter.is_empty() { None } else { Some(&filter) },
+                    );
+                    return None; // let space be inserted
                 } else if in_slash && active {
                     // Normal space handling for slash picker without subcommands
                     let current = ctx.line();
