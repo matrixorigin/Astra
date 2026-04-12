@@ -164,6 +164,7 @@ pub enum StreamEvent {
         content: Value,
     },
     ThinkingDone,
+    ReasoningDone,
     ToolCallStart {
         tool: Value,
         call_id: Value,
@@ -287,6 +288,7 @@ pub fn classify_stream_event(value: Value) -> Result<StreamEvent, crate::error::
             content: obj.get("content").cloned().unwrap_or(Value::Null),
         },
         "thinking_done" => StreamEvent::ThinkingDone,
+        "reasoning_done" => StreamEvent::ReasoningDone,
         "tool_call_start" => StreamEvent::ToolCallStart {
             tool: obj.get("tool").cloned().unwrap_or(Value::Null),
             call_id: obj.get("call_id").cloned().unwrap_or(Value::Null),
@@ -510,6 +512,14 @@ mod tests {
                 }
                 other => panic!("unexpected {other:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn classify_reasoning_done() {
+        match classify_stream_event(serde_json::json!({"type":"reasoning_done"})).unwrap() {
+            StreamEvent::ReasoningDone => {}
+            other => panic!("unexpected {other:?}"),
         }
     }
 

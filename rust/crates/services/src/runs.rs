@@ -389,7 +389,7 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
             "type": "thinking_delta",
             "content": data.get("chunk").cloned().unwrap_or(serde_json::Value::String(String::new())),
         }),
-        "thinking_done" => serde_json::json!({ "type": "thinking_done" }),
+        "thinking_done" | "reasoning_done" => serde_json::json!({ "type": event_type }),
         "tool_call_start" => serde_json::json!({
             "type": "tool_call_start",
             "tool": data.get("tool").cloned().unwrap_or(serde_json::Value::String(String::new())),
@@ -601,6 +601,12 @@ mod tests {
     fn thinking_done() {
         let out = transform_run_event_for_client(make_event("thinking_done", json!({})));
         assert_eq!(out["type"], "thinking_done");
+    }
+
+    #[test]
+    fn reasoning_done() {
+        let out = transform_run_event_for_client(make_event("reasoning_done", json!({})));
+        assert_eq!(out["type"], "reasoning_done");
     }
 
     #[test]
