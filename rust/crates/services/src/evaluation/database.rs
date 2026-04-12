@@ -436,8 +436,10 @@ fn summarize_gate_validation(
 
     let baseline_end = scores_desc.len().min(window * 2);
     let baseline = &scores_desc[recent_end..baseline_end];
-    let recent_avg = average_scores(recent);
-    let baseline_avg = average_scores(baseline);
+    let recent_filtered = noise_filtered_average(recent);
+    let baseline_filtered = noise_filtered_average(baseline);
+    let recent_avg = recent_filtered.average;
+    let baseline_avg = baseline_filtered.average;
     let error_count = recent
         .iter()
         .filter(|score| **score < LOOP_QUALITY_THRESHOLD)
@@ -468,9 +470,33 @@ fn summarize_gate_validation(
         ));
     }
 
+    let filtering_note = if baseline.is_empty() {
+        if recent_filtered.sample_count < recent.len() as i64 {
+            format!(
+                " Noise filter kept {} of {} recent scores.",
+                recent_filtered.sample_count,
+                recent.len()
+            )
+        } else {
+            String::new()
+        }
+    } else if recent_filtered.sample_count < recent.len() as i64
+        || baseline_filtered.sample_count < baseline.len() as i64
+    {
+        format!(
+            " Noise filter kept {} of {} recent and {} of {} baseline scores.",
+            recent_filtered.sample_count,
+            recent.len(),
+            baseline_filtered.sample_count,
+            baseline.len()
+        )
+    } else {
+        String::new()
+    };
+
     let details = if baseline.is_empty() {
         format!(
-            "{} Validated {} recent session scores with no baseline window; recent avg {:.3}, error rate {:.1}% (threshold {:.1}%).",
+            "{} Validated {} recent session scores with no baseline window; recent avg {:.3}, error rate {:.1}% (threshold {:.1}%).{}",
             if passed {
                 "Gate passed."
             } else {
@@ -479,11 +505,12 @@ fn summarize_gate_validation(
             recent.len(),
             recent_avg,
             error_rate * 100.0,
-            error_rate_threshold * 100.0
+            error_rate_threshold * 100.0,
+            filtering_note
         )
     } else {
         format!(
-            "{} Validated {} recent vs {} baseline session scores; recent avg {:.3}, baseline avg {:.3}, delta {:.3} (threshold {:.3}), error rate {:.1}% (threshold {:.1}%).{}",
+            "{} Validated {} recent vs {} baseline session scores; recent avg {:.3}, baseline avg {:.3}, delta {:.3} (threshold {:.3}), error rate {:.1}% (threshold {:.1}%).{}{}",
             if passed {
                 "Gate passed."
             } else {
@@ -497,6 +524,7 @@ fn summarize_gate_validation(
             score_regression_threshold,
             error_rate * 100.0,
             error_rate_threshold * 100.0,
+            filtering_note,
             if reasons.is_empty() {
                 String::new()
             } else {
@@ -2113,6 +2141,20 @@ mod tests {
         assert!(summary.passed);
         assert!((summary.error_rate - 0.0).abs() < 1e-9);
         assert!((summary.score_delta - 0.05).abs() < 1e-9);
+    }
+
+    #[test]
+    fn summarize_gate_validation_uses_noise_filtered_score_delta() {
+        let summary = summarize_gate_validation(
+            &[0.83, 0.82, 0.81, 0.80, 0.20, 0.82, 0.81, 0.80, 0.79, 0.80],
+            5,
+            0.25,
+            -0.05,
+        );
+        assert_eq!(summary.sessions_tested, 5);
+        assert!(summary.passed);
+        assert!(summary.score_delta > 0.0);
+        assert!(summary.details.contains("Noise filter kept 4 of 5 recent"));
     }
 
     #[test]
