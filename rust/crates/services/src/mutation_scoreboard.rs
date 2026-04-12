@@ -78,6 +78,14 @@ fn interval_ceiling(value: f64, interval: Option<&ValueInterval>) -> f64 {
     interval.map_or(value, |interval| interval.upper)
 }
 
+fn complement_confidence_interval(interval: ConfidenceInterval) -> ConfidenceInterval {
+    ConfidenceInterval::new(
+        1.0 - interval.point,
+        1.0 - interval.upper,
+        1.0 - interval.lower,
+    )
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MutationObjectiveScore {
     pub quality: ConfidenceInterval,
@@ -125,9 +133,7 @@ impl MutationObjectiveScore {
     pub fn retention_score(&self) -> ConfidenceInterval {
         let mut score = self
             .quality
-            .min(ConfidenceInterval::exact(
-                1.0 - self.reward_hacking_risk.point,
-            ))
+            .min(complement_confidence_interval(self.reward_hacking_risk))
             .min(self.causal_support);
         if let Some(feedback) = self.user_feedback {
             score = score.min(feedback);
@@ -879,6 +885,22 @@ mod tests {
         let objective =
             MutationObjectiveScore::from_learning_signal(0.92, Some(81), 0.15, 0.74, true);
         assert_eq!(objective.retention_score(), ConfidenceInterval::exact(0.25));
+    }
+
+    #[test]
+    fn retention_score_preserves_reward_hacking_interval_bounds() {
+        let objective = MutationObjectiveScore::new(
+            ConfidenceInterval::exact(0.95),
+            None,
+            ConfidenceInterval::new(0.20, 0.10, 0.40),
+            ConfidenceInterval::exact(0.90),
+            false,
+        );
+
+        assert_eq!(
+            objective.retention_score(),
+            ConfidenceInterval::new(0.80, 0.60, 0.90)
+        );
     }
 
     #[test]
