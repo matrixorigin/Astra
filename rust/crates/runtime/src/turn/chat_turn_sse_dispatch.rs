@@ -162,6 +162,9 @@ fn apply_one_event(
             if let Some(sid) = event.get("session_id").and_then(|v| v.as_str()) {
                 accum.session_id = Some(sid.to_string());
             }
+            if let Some(rid) = event.get("run_id").and_then(|v| v.as_str()) {
+                accum.run_id = Some(rid.to_string());
+            }
         }
         "usage" => {
             let prompt = event.get("prompt_tokens").and_then(|v| v.as_u64());
@@ -389,11 +392,12 @@ mod tests {
     fn session_info_captured() {
         let mut a = ChatTurnSseAccum::default();
         dispatch_chat_turn_sse_event_block(
-            &sse("session_info", ",\"session_id\":\"abc-123\""),
+            &sse("session_info", ",\"session_id\":\"abc-123\",\"run_id\":\"run-123\""),
             &mut a,
             &mut vec![],
         );
         assert_eq!(a.session_id.as_deref(), Some("abc-123"));
+        assert_eq!(a.run_id.as_deref(), Some("run-123"));
     }
 
     #[test]
