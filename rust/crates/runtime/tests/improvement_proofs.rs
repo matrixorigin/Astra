@@ -2336,6 +2336,7 @@ mod state_convergence {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn cross_device_merge_preserves_all_knowledge() {
         // Simulate: device A learns about GitHub, device B learns about Database
         let (eg_a, pl_a, cal_a) = make_modules();
@@ -3635,6 +3636,7 @@ mod learning_improves_selection {
     /// Full lifecycle: session 1 learns patterns → persist → session 2 restores →
     /// pattern suggestions available for matching task types.
     #[test]
+    #[allow(deprecated)]
     fn cross_session_pattern_learning_carries_over() {
         // Session 1: learn a successful git pattern
         let (eg1, pl1, cal1) = make_modules();
@@ -3675,6 +3677,7 @@ mod learning_improves_selection {
     /// Verify that all three learning modules compose: entity + pattern + calibration
     /// all survive a full export→import cycle with data intact.
     #[test]
+    #[allow(deprecated)]
     fn full_learning_pipeline_roundtrip() {
         let (eg1, pl1, cal1) = make_modules();
 
@@ -4679,6 +4682,7 @@ mod security_safety_gaps {
     /// NEW: boost_terms_for() (which calls suggest internally) IS wired
     ///      in production. This test proves the mechanism works.
     #[test]
+    #[allow(deprecated)]
     fn pattern_library_suggest_returns_relevant() {
         use astra_runtime::pipeline::pattern::PatternLibrary;
         use astra_runtime::pipeline::routing::TaskType;

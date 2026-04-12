@@ -375,6 +375,36 @@ async fn post_json(
     (status, json)
 }
 
+fn assert_contract_json(actual: &serde_json::Value, expected: &serde_json::Value, label: &str) {
+    if let Some(expected_obj) = expected.as_object()
+        && expected_obj.contains_key("detail")
+        && !expected_obj.contains_key("request_id")
+    {
+        let actual_obj = actual
+            .as_object()
+            .unwrap_or_else(|| panic!("{label}: actual response should be a JSON object"));
+        let request_id = actual_obj
+            .get("request_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_else(|| panic!("{label}: error response should include request_id"));
+        assert!(
+            Uuid::parse_str(request_id).is_ok(),
+            "{label}: request_id should be a UUID"
+        );
+
+        let mut normalized_actual = actual_obj.clone();
+        normalized_actual.remove("request_id");
+        assert_eq!(
+            serde_json::Value::Object(normalized_actual),
+            *expected,
+            "{label}"
+        );
+        return;
+    }
+
+    assert_eq!(actual, expected, "{label}");
+}
+
 fn build_request(method: &str, path: &str, headers: &[(&str, &str)]) -> Request<body::Body> {
     let mut builder = Request::builder().method(method).uri(path);
     for (name, value) in headers {
@@ -406,11 +436,11 @@ async fn admin_routes_require_auth() {
 
     let (status, json) = read_json(app.clone(), "/admin/tokens", &[]).await;
     assert_eq!(status.as_u16(), contract.auth_error.status);
-    assert_eq!(json, contract.auth_error.json);
+    assert_contract_json(&json, &contract.auth_error.json, "admin_tokens_auth_error");
 
     let (status, json) = post_json(app, "/admin/init", &[], serde_json::json!({})).await;
     assert_eq!(status.as_u16(), contract.auth_error.status);
-    assert_eq!(json, contract.auth_error.json);
+    assert_contract_json(&json, &contract.auth_error.json, "admin_init_auth_error");
 }
 
 #[tokio::test]
@@ -426,7 +456,11 @@ async fn admin_init_variants_match_shared_contract() {
     )
     .await;
     assert_eq!(status.as_u16(), contract.admin_forbidden.status);
-    assert_eq!(json, contract.admin_forbidden.json);
+    assert_contract_json(
+        &json,
+        &contract.admin_forbidden.json,
+        "admin_init_forbidden",
+    );
 
     let (status, json) = post_json(
         app,
@@ -436,7 +470,7 @@ async fn admin_init_variants_match_shared_contract() {
     )
     .await;
     assert_eq!(status.as_u16(), contract.admin_init.status);
-    assert_eq!(json, contract.admin_init.json);
+    assert_contract_json(&json, &contract.admin_init.json, "admin_init_success");
 }
 
 #[tokio::test]
@@ -447,7 +481,11 @@ async fn admin_routes_reject_non_admin_user_token() {
 
     let (status, json) = read_json(app.clone(), "/admin/tokens", user).await;
     assert_eq!(status.as_u16(), contract.admin_forbidden.status);
-    assert_eq!(json, contract.admin_forbidden.json);
+    assert_contract_json(
+        &json,
+        &contract.admin_forbidden.json,
+        "admin_tokens_non_admin_forbidden",
+    );
 
     let (status, json) = post_json(
         app,
@@ -457,7 +495,11 @@ async fn admin_routes_reject_non_admin_user_token() {
     )
     .await;
     assert_eq!(status.as_u16(), contract.admin_forbidden.status);
-    assert_eq!(json, contract.admin_forbidden.json);
+    assert_contract_json(
+        &json,
+        &contract.admin_forbidden.json,
+        "admin_token_create_non_admin_forbidden",
+    );
 }
 
 #[tokio::test]
@@ -547,7 +589,7 @@ async fn admin_feedback_stats_variants_match_shared_contract() {
     ] {
         let (status, json) = read_json(app.clone(), path, auth).await;
         assert_eq!(status.as_u16(), expected.status, "{label}");
-        assert_eq!(json, expected.json, "{label}");
+        assert_contract_json(&json, &expected.json, label);
     }
 }
 
@@ -577,7 +619,7 @@ async fn admin_role_grant_variants_match_shared_contract() {
         )
         .await;
         assert_eq!(status.as_u16(), q.status, "{label}");
-        assert_eq!(json, q.json, "{label}");
+        assert_contract_json(&json, &q.json, label);
     }
 }
 
@@ -607,7 +649,7 @@ async fn admin_role_revoke_variants_match_shared_contract() {
         )
         .await;
         assert_eq!(status.as_u16(), q.status, "{label}");
-        assert_eq!(json, q.json, "{label}");
+        assert_contract_json(&json, &q.json, label);
     }
 }
 
@@ -627,7 +669,7 @@ async fn admin_tokens_variants_match_shared_contract() {
     ] {
         let (status, json) = read_json(app.clone(), path, auth).await;
         assert_eq!(status.as_u16(), expected.status, "{label}");
-        assert_eq!(json, expected.json, "{label}");
+        assert_contract_json(&json, &expected.json, label);
     }
 }
 
@@ -647,6 +689,6 @@ async fn admin_audit_variants_match_shared_contract() {
     ] {
         let (status, json) = read_json(app.clone(), path, auth).await;
         assert_eq!(status.as_u16(), expected.status, "{label}");
-        assert_eq!(json, expected.json, "{label}");
+        assert_contract_json(&json, &expected.json, label);
     }
 }

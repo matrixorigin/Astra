@@ -252,7 +252,13 @@ mod recency_cross_contamination {
     fn general_cross_domain_negligible() {
         let query = "我有哪些记忆？";
 
-        for recent_tool in &["git_diff", "github_ci_status", "github_list_prs", "git_log"] {
+        for recent_tool in &[
+            "git_diff",
+            "github_ci_status",
+            "github_list_prs",
+            "github_list_issues",
+            "git_log",
+        ] {
             let with = filter_ctx(query, &[recent_tool]);
             let without = filter(query);
             let s_with = tool_score(&with, recent_tool).unwrap_or(0.0);

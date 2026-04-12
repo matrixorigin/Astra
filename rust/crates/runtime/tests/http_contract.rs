@@ -9,6 +9,7 @@ use axum::{
 use chrono::DateTime;
 use serde::Deserialize;
 use tower::util::ServiceExt;
+use uuid::Uuid;
 
 #[derive(Deserialize)]
 struct ResponseContract {
@@ -118,6 +119,36 @@ async fn post_json(
     (status, json)
 }
 
+fn assert_contract_json(actual: &serde_json::Value, expected: &serde_json::Value, label: &str) {
+    if let Some(expected_obj) = expected.as_object()
+        && expected_obj.contains_key("detail")
+        && !expected_obj.contains_key("request_id")
+    {
+        let actual_obj = actual
+            .as_object()
+            .unwrap_or_else(|| panic!("{label}: actual response should be a JSON object"));
+        let request_id = actual_obj
+            .get("request_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_else(|| panic!("{label}: error response should include request_id"));
+        assert!(
+            Uuid::parse_str(request_id).is_ok(),
+            "{label}: request_id should be a UUID"
+        );
+
+        let mut normalized_actual = actual_obj.clone();
+        normalized_actual.remove("request_id");
+        assert_eq!(
+            serde_json::Value::Object(normalized_actual),
+            *expected,
+            "{label}"
+        );
+        return;
+    }
+
+    assert_eq!(actual, expected, "{label}");
+}
+
 fn build_request(
     method: &str,
     path: &str,
@@ -141,7 +172,7 @@ async fn root_matches_shared_contract() {
     let (status, json) = read_json(build_test_app(true), "/").await;
 
     assert_eq!(status.as_u16(), contract.root.status);
-    assert_eq!(json, contract.root.json);
+    assert_contract_json(&json, &contract.root.json, "root");
 }
 
 #[tokio::test]
@@ -151,7 +182,7 @@ async fn healthy_state_matches_shared_contract() {
     let (status, json) = read_json(build_test_app(true), "/health").await;
 
     assert_eq!(status.as_u16(), contract.health.healthy.status);
-    assert_eq!(json, contract.health.healthy.json);
+    assert_contract_json(&json, &contract.health.healthy.json, "health_healthy");
 }
 
 #[tokio::test]
@@ -161,7 +192,7 @@ async fn unhealthy_state_matches_shared_contract() {
     let (status, json) = read_json(build_test_app(false), "/health").await;
 
     assert_eq!(status.as_u16(), contract.health.unhealthy.status);
-    assert_eq!(json, contract.health.unhealthy.json);
+    assert_contract_json(&json, &contract.health.unhealthy.json, "health_unhealthy");
 }
 
 #[tokio::test]
@@ -189,7 +220,7 @@ async fn learning_routes_require_auth() {
     for path in ["/api/v1/learning/signals", "/api/v1/learning/stats"] {
         let (status, json) = read_json(app.clone(), path).await;
         assert_eq!(status.as_u16(), contract.auth_error.status, "{path}");
-        assert_eq!(json, contract.auth_error.json, "{path}");
+        assert_contract_json(&json, &contract.auth_error.json, path);
     }
 
     let (status, json) = post_json(
@@ -200,7 +231,11 @@ async fn learning_routes_require_auth() {
     )
     .await;
     assert_eq!(status.as_u16(), contract.auth_error.status);
-    assert_eq!(json, contract.auth_error.json);
+    assert_contract_json(
+        &json,
+        &contract.auth_error.json,
+        "learning_trigger_auth_error",
+    );
 }
 
 #[tokio::test]
@@ -212,11 +247,11 @@ async fn learning_routes_match_shared_contract_when_authenticated() {
     let (status, json) =
         read_json_with_headers(app.clone(), "/api/v1/learning/signals", auth).await;
     assert_eq!(status.as_u16(), contract.learning_signals.status);
-    assert_eq!(json, contract.learning_signals.json);
+    assert_contract_json(&json, &contract.learning_signals.json, "learning_signals");
 
     let (status, json) = read_json_with_headers(app.clone(), "/api/v1/learning/stats", auth).await;
     assert_eq!(status.as_u16(), contract.learning_stats.status);
-    assert_eq!(json, contract.learning_stats.json);
+    assert_contract_json(&json, &contract.learning_stats.json, "learning_stats");
 
     let (status, json) = post_json(
         app,
@@ -226,7 +261,7 @@ async fn learning_routes_match_shared_contract_when_authenticated() {
     )
     .await;
     assert_eq!(status.as_u16(), contract.learning_trigger.status);
-    assert_eq!(json, contract.learning_trigger.json);
+    assert_contract_json(&json, &contract.learning_trigger.json, "learning_trigger");
 }
 
 #[tokio::test]
