@@ -83,6 +83,10 @@ fn build_drift_signal(
             previous_scores.len() as i64,
         ),
         delta,
+        delta_interval: sampled_value_interval(
+            delta,
+            current_scores.len().min(previous_scores.len()) as i64,
+        ),
         noise_filtered_current_avg: current_noise_filtered.average,
         noise_filtered_current_avg_interval: sampled_confidence_interval(
             current_noise_filtered.average,
@@ -94,6 +98,12 @@ fn build_drift_signal(
             previous_noise_filtered.sample_count,
         ),
         noise_filtered_delta,
+        noise_filtered_delta_interval: sampled_value_interval(
+            noise_filtered_delta,
+            current_noise_filtered
+                .sample_count
+                .min(previous_noise_filtered.sample_count),
+        ),
         noise_filtered_sample_count: current_noise_filtered
             .sample_count
             .min(previous_noise_filtered.sample_count),
@@ -126,6 +136,7 @@ struct GateValidationSummary {
     sessions_tested: i64,
     error_rate: f64,
     score_delta: f64,
+    score_delta_interval: ValueInterval,
     passed: bool,
     details: String,
 }
@@ -137,7 +148,9 @@ struct CalibrationSummary {
     mean_quality: f64,
     mean_quality_interval: ConfidenceInterval,
     calibration_error: f64,
+    calibration_error_interval: ValueInterval,
     bias: f64,
+    bias_interval: ValueInterval,
     sample_count: i64,
     adjustment_multiplier: f64,
     adjustment_reason: String,
@@ -189,6 +202,14 @@ fn sampled_confidence_interval(point: f64, sample_count: i64) -> ConfidenceInter
     }
     let margin = (0.5 / (sample_count as f64).sqrt()).clamp(0.05, 0.25);
     ConfidenceInterval::symmetric(point.clamp(0.0, 1.0), margin)
+}
+
+fn sampled_value_interval(point: f64, sample_count: i64) -> ValueInterval {
+    if sample_count <= 0 {
+        return ValueInterval::ZERO;
+    }
+    let margin = (0.5 / (sample_count as f64).sqrt()).clamp(0.05, 0.25);
+    ValueInterval::new(point, point - margin, point + margin)
 }
 
 fn numeric_mean_interval(samples: &[f64]) -> NumericInterval {
@@ -295,7 +316,9 @@ fn summarize_calibration(
             mean_quality: 0.0,
             mean_quality_interval: ConfidenceInterval::ZERO,
             calibration_error: 0.0,
+            calibration_error_interval: ValueInterval::ZERO,
             bias: 0.0,
+            bias_interval: ValueInterval::ZERO,
             sample_count: 0,
             adjustment_multiplier: 1.0,
             adjustment_reason: "No session calibration samples available.".into(),
@@ -314,7 +337,9 @@ fn summarize_calibration(
         mean_quality,
         mean_quality_interval: sampled_confidence_interval(mean_quality, sample_count),
         calibration_error,
+        calibration_error_interval: sampled_value_interval(calibration_error, sample_count),
         bias,
+        bias_interval: sampled_value_interval(bias, sample_count),
         sample_count,
         adjustment_multiplier,
         adjustment_reason,
@@ -702,6 +727,7 @@ fn summarize_gate_validation(
             sessions_tested: 0,
             error_rate: 0.0,
             score_delta: 0.0,
+            score_delta_interval: ValueInterval::ZERO,
             passed: false,
             details: "No session quality scores available for gate validation.".into(),
         };
@@ -722,6 +748,16 @@ fn summarize_gate_validation(
         0.0
     } else {
         recent_avg - baseline_avg
+    };
+    let score_delta_interval = if baseline.is_empty() {
+        ValueInterval::ZERO
+    } else {
+        sampled_value_interval(
+            score_delta,
+            recent_filtered
+                .sample_count
+                .min(baseline_filtered.sample_count),
+        )
     };
 
     let error_ok = error_rate <= error_rate_threshold;
@@ -810,6 +846,7 @@ fn summarize_gate_validation(
         sessions_tested: recent.len() as i64,
         error_rate,
         score_delta,
+        score_delta_interval,
         passed,
         details,
     }
@@ -1052,6 +1089,10 @@ impl EvaluationService for DatabaseEvaluationService {
                     error_rate,
                     error_rate_interval: sampled_confidence_interval(error_rate, sessions_tested),
                     score_delta: r.try_get("score_delta").unwrap_or(0.0),
+                    score_delta_interval: sampled_value_interval(
+                        r.try_get("score_delta").unwrap_or(0.0),
+                        sessions_tested,
+                    ),
                     passed: r.try_get::<i8, _>("passed").unwrap_or(0) != 0,
                     created_at: r.try_get("created_at").ok(),
                 }
@@ -1130,7 +1171,9 @@ impl EvaluationService for DatabaseEvaluationService {
             mean_quality: summary.mean_quality,
             mean_quality_interval: summary.mean_quality_interval,
             calibration_error: summary.calibration_error,
+            calibration_error_interval: summary.calibration_error_interval,
             bias: summary.bias,
+            bias_interval: summary.bias_interval,
             sample_count: summary.sample_count,
             adjustment_multiplier: summary.adjustment_multiplier,
             adjustment_reason: summary.adjustment_reason,
@@ -1140,7 +1183,10 @@ impl EvaluationService for DatabaseEvaluationService {
             noise_filtered_mean_quality: noise_filtered_summary.mean_quality,
             noise_filtered_mean_quality_interval: noise_filtered_summary.mean_quality_interval,
             noise_filtered_calibration_error: noise_filtered_summary.calibration_error,
+            noise_filtered_calibration_error_interval: noise_filtered_summary
+                .calibration_error_interval,
             noise_filtered_bias: noise_filtered_summary.bias,
+            noise_filtered_bias_interval: noise_filtered_summary.bias_interval,
             noise_filtered_sample_count: noise_filtered_summary.sample_count,
             noise_filtered_adjustment_multiplier: noise_filtered_summary.adjustment_multiplier,
             noise_filtered_adjustment_reason: noise_filtered_summary.adjustment_reason,
@@ -1247,6 +1293,7 @@ impl EvaluationService for DatabaseEvaluationService {
                 summary.sessions_tested,
             ),
             score_delta: summary.score_delta,
+            score_delta_interval: summary.score_delta_interval,
             passed: summary.passed,
             details: summary.details,
         })
@@ -1923,6 +1970,10 @@ mod tests {
         assert_eq!(signal.template_id, None);
         assert!((signal.delta + 0.23).abs() < 1e-9);
         assert!((signal.noise_filtered_delta + 0.23).abs() < 1e-9);
+        assert!((signal.delta_interval.point - signal.delta).abs() < 1e-9);
+        assert!(
+            (signal.noise_filtered_delta_interval.point - signal.noise_filtered_delta).abs() < 1e-9
+        );
         assert_eq!(signal.severity, DriftSeverity::Critical);
         assert_eq!(signal.sample_count, 5);
         assert_eq!(signal.noise_filtered_sample_count, 5);
@@ -2155,6 +2206,22 @@ mod tests {
         assert_eq!(interval.point, 0.9);
         assert!(interval.lower >= 0.0);
         assert!(interval.upper <= 1.0);
+    }
+
+    #[test]
+    fn sampled_value_interval_zero_samples_is_zero() {
+        let interval = sampled_value_interval(-0.2, 0);
+        assert_eq!(interval.point, ValueInterval::ZERO.point);
+        assert_eq!(interval.lower, ValueInterval::ZERO.lower);
+        assert_eq!(interval.upper, ValueInterval::ZERO.upper);
+    }
+
+    #[test]
+    fn sampled_value_interval_supports_negative_points() {
+        let interval = sampled_value_interval(-0.2, 16);
+        assert!((interval.point + 0.2).abs() < 0.0001);
+        assert!(interval.lower < 0.0);
+        assert!(interval.upper > interval.point);
     }
 
     #[test]
@@ -2403,6 +2470,10 @@ mod tests {
         assert!((summary.bias - 0.2).abs() < 0.001);
         assert!(summary.mean_confidence_interval.lower <= summary.mean_confidence);
         assert!(summary.mean_quality_interval.upper >= summary.mean_quality);
+        assert!(
+            (summary.calibration_error_interval.point - summary.calibration_error).abs() < 0.001
+        );
+        assert!((summary.bias_interval.point - summary.bias).abs() < 0.001);
         assert!(summary.adjustment_multiplier < 1.0);
         assert!(summary.adjustment_reason.contains("Overconfident"));
     }
@@ -2551,6 +2622,7 @@ mod tests {
         assert_eq!(summary.sessions_tested, 5);
         assert!(summary.passed);
         assert!(summary.score_delta > 0.0);
+        assert!((summary.score_delta_interval.point - summary.score_delta).abs() < 0.0001);
         assert!(summary.details.contains("Noise filter kept 4 of 5 recent"));
     }
 

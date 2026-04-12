@@ -296,11 +296,13 @@ pub struct DriftSignalResponse {
     pub previous_avg: f64,
     pub previous_avg_interval: ConfidenceInterval,
     pub delta: f64,
+    pub delta_interval: ValueInterval,
     pub noise_filtered_current_avg: f64,
     pub noise_filtered_current_avg_interval: ConfidenceInterval,
     pub noise_filtered_previous_avg: f64,
     pub noise_filtered_previous_avg_interval: ConfidenceInterval,
     pub noise_filtered_delta: f64,
+    pub noise_filtered_delta_interval: ValueInterval,
     pub noise_filtered_sample_count: i64,
     pub severity: DriftSeverity,
     pub sample_count: i64,
@@ -321,6 +323,7 @@ pub struct GateResultResponse {
     pub error_rate: f64,
     pub error_rate_interval: ConfidenceInterval,
     pub score_delta: f64,
+    pub score_delta_interval: ValueInterval,
     pub passed: bool,
     pub created_at: Option<String>,
 }
@@ -338,7 +341,9 @@ pub struct CalibrationResponse {
     pub mean_quality: f64,
     pub mean_quality_interval: ConfidenceInterval,
     pub calibration_error: f64,
+    pub calibration_error_interval: ValueInterval,
     pub bias: f64,
+    pub bias_interval: ValueInterval,
     pub sample_count: i64,
     pub adjustment_multiplier: f64,
     pub adjustment_reason: String,
@@ -347,7 +352,9 @@ pub struct CalibrationResponse {
     pub noise_filtered_mean_quality: f64,
     pub noise_filtered_mean_quality_interval: ConfidenceInterval,
     pub noise_filtered_calibration_error: f64,
+    pub noise_filtered_calibration_error_interval: ValueInterval,
     pub noise_filtered_bias: f64,
+    pub noise_filtered_bias_interval: ValueInterval,
     pub noise_filtered_sample_count: i64,
     pub noise_filtered_adjustment_multiplier: f64,
     pub noise_filtered_adjustment_reason: String,
@@ -376,6 +383,7 @@ pub struct GateValidateResponse {
     pub error_rate: f64,
     pub error_rate_interval: ConfidenceInterval,
     pub score_delta: f64,
+    pub score_delta_interval: ValueInterval,
     pub passed: bool,
     pub details: String,
 }
@@ -459,7 +467,7 @@ pub struct DecisionMetrics {
     pub noise_filtered_quality_samples: i64,
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, Serialize, PartialEq)]
 pub struct NumericInterval {
     pub point: f64,
     pub lower: f64,
@@ -483,6 +491,44 @@ impl NumericInterval {
             lower.max(0.0).min(point)
         } else {
             0.0
+        };
+        let upper = if upper.is_finite() {
+            upper.max(point)
+        } else {
+            point
+        };
+        Self {
+            point,
+            lower,
+            upper,
+        }
+    }
+
+    pub fn exact(point: f64) -> Self {
+        Self::new(point, point, point)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq)]
+pub struct ValueInterval {
+    pub point: f64,
+    pub lower: f64,
+    pub upper: f64,
+}
+
+impl ValueInterval {
+    pub const ZERO: Self = Self {
+        point: 0.0,
+        lower: 0.0,
+        upper: 0.0,
+    };
+
+    pub fn new(point: f64, lower: f64, upper: f64) -> Self {
+        let point = if point.is_finite() { point } else { 0.0 };
+        let lower = if lower.is_finite() {
+            lower.min(point)
+        } else {
+            point
         };
         let upper = if upper.is_finite() {
             upper.max(point)
