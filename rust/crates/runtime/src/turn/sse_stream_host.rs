@@ -791,8 +791,8 @@ mod tests {
         let events = format!(
             "{}{}",
             sse_event(
-                "tool_call",
-                ",\"id\":\"tc-1\",\"name\":\"bash\",\"args\":\"{\\\"command\\\":\\\"ls\\\"}\""
+                "tool_call_start",
+                ",\"call_id\":\"tc-1\",\"tool\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"ls\\\"}\""
             ),
             sse_event("turn_complete", ",\"has_tool_calls\":true"),
         );
@@ -808,6 +808,10 @@ mod tests {
         assert!(abort.is_none());
         assert!(result.accum.has_tool_calls);
         assert_eq!(result.accum.tool_calls.len(), 1);
+        assert_eq!(
+            result.accum.tool_calls[0]["function"]["name"].as_str(),
+            Some("bash")
+        );
     }
 
     #[tokio::test]

@@ -1177,13 +1177,33 @@ pub enum AgenticLoopOutcome {
 
 pub const DELEGATE_TOOL_NAME: &str = "delegate";
 
+fn tool_call_name(tool_call: &Value) -> Option<&str> {
+    tool_call.get("name").and_then(Value::as_str).or_else(|| {
+        tool_call
+            .get("function")
+            .and_then(|f| f.get("name"))
+            .and_then(Value::as_str)
+    })
+}
+
+fn tool_call_arguments_value(tool_call: &Value) -> Value {
+    tool_call
+        .get("arguments")
+        .or_else(|| tool_call.get("args"))
+        .cloned()
+        .or_else(|| {
+            tool_call
+                .get("function")
+                .and_then(|f| f.get("arguments"))
+                .and_then(Value::as_str)
+                .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+        })
+        .unwrap_or_else(|| serde_json::json!({}))
+}
+
 /// Check if a tool call is a delegation call.
 fn is_delegation_call(tool_call: &Value) -> bool {
-    tool_call
-        .get("function")
-        .and_then(|f| f.get("name"))
-        .and_then(Value::as_str)
-        == Some(DELEGATE_TOOL_NAME)
+    tool_call_name(tool_call) == Some(DELEGATE_TOOL_NAME)
 }
 
 /// Parse delegation arguments from a tool call.
@@ -3593,11 +3613,8 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                     .iter()
                     .map(|tc| {
                         let id = tc.get("id").and_then(Value::as_str).unwrap_or("");
-                        let name = tc.get("name").and_then(Value::as_str).unwrap_or("delegate");
-                        let args = tc
-                            .get("arguments")
-                            .cloned()
-                            .unwrap_or(serde_json::json!({}));
+                        let name = tool_call_name(tc).unwrap_or("delegate");
+                        let args = tool_call_arguments_value(tc);
                         serde_json::json!({
                             "id": id,
                             "type": "function",
@@ -5413,6 +5430,32 @@ mod tests {
     fn is_delegation_call_rejects_missing_function() {
         let malformed = json!({"id": "call_000"});
         assert!(!super::is_delegation_call(&malformed));
+    }
+
+    #[test]
+    fn is_delegation_call_accepts_legacy_top_level_shape() {
+        let delegate = json!({
+            "id": "call_legacy",
+            "name": "delegate",
+            "arguments": {"task": "review"}
+        });
+        assert!(super::is_delegation_call(&delegate));
+    }
+
+    #[test]
+    fn tool_call_arguments_value_parses_canonical_argument_string() {
+        let tool_call = json!({
+            "id": "call_123",
+            "type": "function",
+            "function": {
+                "name": "delegate",
+                "arguments": "{\"task\":\"review\",\"agents\":[\"reviewer\"]}"
+            }
+        });
+        assert_eq!(
+            super::tool_call_arguments_value(&tool_call),
+            json!({"task":"review","agents":["reviewer"]})
+        );
     }
 
     #[test]

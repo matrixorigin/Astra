@@ -57,6 +57,60 @@ pub enum SseRenderEffect {
     StreamText(String),
 }
 
+fn normalize_tool_call_for_accum(event: &Value) -> Option<Value> {
+    let call_id = event
+        .get("id")
+        .or_else(|| event.get("call_id"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+
+    if let Some(function) = event.get("function").and_then(Value::as_object) {
+        let name = function.get("name").and_then(Value::as_str).unwrap_or("");
+        let arguments = function
+            .get("arguments")
+            .cloned()
+            .unwrap_or_else(|| Value::String("{}".to_string()));
+        if !name.is_empty() {
+            return Some(serde_json::json!({
+                "id": call_id,
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": arguments,
+                }
+            }));
+        }
+    }
+
+    let name = event
+        .get("name")
+        .or_else(|| event.get("tool"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if name.is_empty() {
+        return None;
+    }
+
+    let raw_arguments = event
+        .get("arguments")
+        .or_else(|| event.get("args"))
+        .cloned()
+        .unwrap_or_else(|| Value::Object(Default::default()));
+    let arguments = match raw_arguments {
+        Value::String(text) => Value::String(text),
+        other => Value::String(serde_json::to_string(&other).unwrap_or_else(|_| "{}".to_string())),
+    };
+
+    Some(serde_json::json!({
+        "id": call_id,
+        "type": "function",
+        "function": {
+            "name": name,
+            "arguments": arguments,
+        }
+    }))
+}
+
 fn apply_one_event(
     event: &Value,
     accum: &mut ChatTurnSseAccum,
@@ -93,9 +147,14 @@ fn apply_one_event(
         }
         "tool_call_start" => {
             effects.push(SseRenderEffect::StopThinkingSpinner);
+            if let Some(tool_call) = normalize_tool_call_for_accum(event) {
+                accum.tool_calls.push(tool_call);
+            }
         }
         "tool_call" => {
-            accum.tool_calls.push(event.clone());
+            if let Some(tool_call) = normalize_tool_call_for_accum(event) {
+                accum.tool_calls.push(tool_call);
+            }
         }
         "tool_request" => {
             let request_id = event
@@ -432,6 +491,26 @@ mod tests {
         );
         assert_eq!(a.tool_calls.len(), 1);
         assert_eq!(a.tool_calls[0]["function"]["name"].as_str(), Some("bash"));
+    }
+
+    #[test]
+    fn tool_call_start_collected_in_canonical_shape() {
+        let mut a = ChatTurnSseAccum::default();
+        dispatch_chat_turn_sse_event_block(
+            &sse(
+                "tool_call_start",
+                ",\"call_id\":\"tc-1\",\"tool\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"ls\\\"}\"",
+            ),
+            &mut a,
+            &mut vec![],
+        );
+        assert_eq!(a.tool_calls.len(), 1);
+        assert_eq!(a.tool_calls[0]["id"].as_str(), Some("tc-1"));
+        assert_eq!(a.tool_calls[0]["function"]["name"].as_str(), Some("bash"));
+        assert_eq!(
+            a.tool_calls[0]["function"]["arguments"].as_str(),
+            Some("{\"command\":\"ls\"}")
+        );
     }
 
     #[test]
