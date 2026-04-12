@@ -1356,20 +1356,14 @@ async fn handle_chat_message_via_bridge(
     match response {
         Ok(resp) => {
             let run_started_explain = bridge_run_started_explain(explain);
-            if let Some((session_id, run_id)) = bind_prepared_bridge_identity(
+            let preamble_messages = bridge_success_preamble_messages(
                 conn,
                 prepared_trusted_session_id.as_deref(),
                 prepared_turn_chain_id.as_deref(),
-            ) {
-                send_msg(
-                    socket,
-                    &bridge_run_started_message(
-                        session_id,
-                        run_id,
-                        run_started_explain.as_ref(),
-                    ),
-                )
-                .await;
+                run_started_explain.as_ref(),
+            );
+            for message in &preamble_messages {
+                send_msg(socket, message).await;
             }
 
             let terminal_status = stream_sse_response_as_ws(
@@ -1379,6 +1373,7 @@ async fn handle_chat_message_via_bridge(
                 resp,
                 Some(client_cancel),
                 run_started_explain,
+                !preamble_messages.is_empty(),
             )
             .await;
             if let Some(run_id) = conn.active_run_id.clone() {
@@ -1538,6 +1533,24 @@ fn bridge_run_started_message(
     }
 }
 
+fn bridge_success_preamble_messages(
+    conn: &mut WsConnection,
+    trusted_session_id: Option<&str>,
+    turn_chain_id: Option<&str>,
+    explain: Option<&Value>,
+) -> Vec<WsServerMessage> {
+    if let Some((session_id, run_id)) =
+        bind_prepared_bridge_identity(conn, trusted_session_id, turn_chain_id)
+    {
+        vec![
+            session_info_message(session_id.clone(), Some(run_id.clone())),
+            bridge_run_started_message(session_id, run_id, explain),
+        ]
+    } else {
+        Vec::new()
+    }
+}
+
 fn bridge_forward_error_messages(
     conn: &mut WsConnection,
     trusted_session_id: Option<&str>,
@@ -1546,19 +1559,16 @@ fn bridge_forward_error_messages(
     status: StatusCode,
     error_message: String,
 ) -> Vec<WsServerMessage> {
-    if let Some((session_id, run_id)) =
-        bind_prepared_bridge_identity(conn, trusted_session_id, turn_chain_id)
-    {
-        vec![
-            session_info_message(session_id.clone(), Some(run_id.clone())),
-            bridge_run_started_message(session_id, run_id.clone(), explain),
-            ws_error_from_status(status, error_message.clone()),
-            WsServerMessage::RunFinished {
-                run_id,
-                status: STATUS_FAILED.to_string(),
-                error: Some(error_message),
-            },
-        ]
+    let mut messages =
+        bridge_success_preamble_messages(conn, trusted_session_id, turn_chain_id, explain);
+    if let Some(run_id) = conn.active_run_id.clone() {
+        messages.push(ws_error_from_status(status, error_message.clone()));
+        messages.push(WsServerMessage::RunFinished {
+            run_id,
+            status: STATUS_FAILED.to_string(),
+            error: Some(error_message),
+        });
+        messages
     } else if let Some(session_id) = trusted_session_id {
         conn.session_id = Some(session_id.to_string());
         conn.pending_session_id = None;
@@ -1568,6 +1578,18 @@ fn bridge_forward_error_messages(
         ]
     } else {
         vec![ws_error_from_status(status, error_message)]
+    }
+}
+
+fn should_suppress_initial_bridge_session_info(
+    suppress_session_info: &mut bool,
+    event: &Value,
+) -> bool {
+    if *suppress_session_info && event.get("type").and_then(Value::as_str) == Some("session_info") {
+        *suppress_session_info = false;
+        true
+    } else {
+        false
     }
 }
 
@@ -1683,6 +1705,7 @@ async fn stream_sse_response_as_ws(
     response: Response,
     cancel: Option<Arc<CancellationToken>>,
     run_started_explain: Option<Value>,
+    suppress_initial_session_info: bool,
 ) -> BridgeWsTerminalStatus {
     let (_parts, body) = response.into_parts();
     let mut stream = body.into_data_stream();
@@ -1691,6 +1714,7 @@ async fn stream_sse_response_as_ws(
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut saw_turn_complete = false;
     let mut terminal_error: Option<String> = None;
+    let mut suppress_initial_session_info = suppress_initial_session_info;
 
     loop {
         tokio::select! {
@@ -1831,6 +1855,12 @@ async fn stream_sse_response_as_ws(
                                 }
                             };
                             for event in events {
+                                if should_suppress_initial_bridge_session_info(
+                                    &mut suppress_initial_session_info,
+                                    &event,
+                                ) {
+                                    continue;
+                                }
                                 let adopted_run_id = sync_conn_state_from_stream_event(conn, &event);
                                 if let Some(run_started) = synthetic_bridge_run_started(
                                     conn,
@@ -2669,6 +2699,54 @@ mod tests {
     }
 
     #[test]
+    fn bridge_success_preamble_messages_emit_session_info_before_run_started() {
+        let mut conn = WsConnection {
+            user: AuthUserRecord {
+                user_id: "u1".into(),
+                username: "alice".into(),
+                email: "alice@example.com".into(),
+                display_name: Some("Alice".into()),
+            },
+            authorization: "Bearer test-token".into(),
+            session_id: None,
+            pending_session_id: Some("pending-session".into()),
+            active_run_id: None,
+            bridge_prepared_run_id: None,
+        };
+        let explain = bridge_run_started_explain(true);
+
+        let messages = bridge_success_preamble_messages(
+            &mut conn,
+            Some("sess-1"),
+            Some("run-1"),
+            explain.as_ref(),
+        );
+
+        assert_eq!(conn.session_id.as_deref(), Some("sess-1"));
+        assert_eq!(conn.pending_session_id, None);
+        assert_eq!(conn.active_run_id.as_deref(), Some("run-1"));
+        assert_eq!(conn.bridge_prepared_run_id.as_deref(), Some("run-1"));
+        assert_eq!(messages.len(), 2);
+        assert!(matches!(
+            &messages[0],
+            WsServerMessage::SessionInfo {
+                session_id,
+                run_id
+            } if session_id == "sess-1" && run_id.as_deref() == Some("run-1")
+        ));
+        assert!(matches!(
+            &messages[1],
+            WsServerMessage::RunStarted {
+                run_id,
+                session_id,
+                explain
+            } if run_id == "run-1"
+                && session_id == "sess-1"
+                && explain == &Some(serde_json::json!({"mode": "background"}))
+        ));
+    }
+
+    #[test]
     fn bridge_forward_error_messages_preserve_trusted_run_identity() {
         let mut conn = WsConnection {
             user: AuthUserRecord {
@@ -2806,6 +2884,34 @@ mod tests {
             other => panic!("expected SessionInfo, got {other:?}"),
         }
         assert!(matches!(messages[1], WsServerMessage::Error { .. }));
+    }
+
+    #[test]
+    fn suppress_initial_bridge_session_info_only_once() {
+        let mut suppress = true;
+        let session_info = serde_json::json!({
+            "type": "session_info",
+            "session_id": "sess-1",
+            "run_id": "run-1"
+        });
+        let text_delta = serde_json::json!({
+            "type": "text_delta",
+            "content": "hi"
+        });
+
+        assert!(should_suppress_initial_bridge_session_info(
+            &mut suppress,
+            &session_info,
+        ));
+        assert!(!suppress);
+        assert!(!should_suppress_initial_bridge_session_info(
+            &mut suppress,
+            &session_info,
+        ));
+        assert!(!should_suppress_initial_bridge_session_info(
+            &mut suppress,
+            &text_delta,
+        ));
     }
 
     #[test]
