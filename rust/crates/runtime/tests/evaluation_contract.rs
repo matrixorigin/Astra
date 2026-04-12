@@ -262,6 +262,8 @@ async fn memory_health_and_metrics_use_mock_memoria() {
     assert_eq!(json["total_memories"], 12);
     assert_eq!(json["stale_count"], 2);
     assert_eq!(json["avg_confidence"], 0.6666666666666666);
+    assert_eq!(json["noise_filtered_avg_confidence"], 0.6666666666666666);
+    assert_eq!(json["noise_filtered_confidence_samples"], 12);
 }
 
 #[tokio::test]

@@ -499,6 +499,9 @@ pub struct MemoryMetricsResponse {
     pub total_memories: i64,
     pub avg_confidence: f64,
     pub avg_confidence_interval: ConfidenceInterval,
+    pub noise_filtered_avg_confidence: f64,
+    pub noise_filtered_avg_confidence_interval: ConfidenceInterval,
+    pub noise_filtered_confidence_samples: i64,
     pub stale_count: i64,
 }
 

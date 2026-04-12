@@ -431,6 +431,148 @@ fn summarize_session_metrics(turn_counts: &[f64]) -> SessionMetrics {
     }
 }
 
+fn weighted_average_scores(samples: &[(f64, i64)]) -> f64 {
+    let total_weight: i64 = samples.iter().map(|(_, weight)| (*weight).max(0)).sum();
+    if total_weight <= 0 {
+        return 0.0;
+    }
+    samples
+        .iter()
+        .map(|(value, weight)| *value * (*weight).max(0) as f64)
+        .sum::<f64>()
+        / total_weight as f64
+}
+
+fn weighted_percentile(sorted_samples: &[(f64, i64)], fraction: f64) -> f64 {
+    if sorted_samples.is_empty() {
+        return 0.0;
+    }
+    let total_weight: i64 = sorted_samples
+        .iter()
+        .map(|(_, weight)| (*weight).max(0))
+        .sum();
+    if total_weight <= 0 {
+        return sorted_samples
+            .last()
+            .map(|(value, _)| *value)
+            .unwrap_or(0.0);
+    }
+    let target = fraction.clamp(0.0, 1.0) * (total_weight - 1) as f64;
+    let mut cumulative = 0.0;
+    for (value, weight) in sorted_samples {
+        cumulative += (*weight).max(0) as f64;
+        if cumulative > target {
+            return *value;
+        }
+    }
+    sorted_samples
+        .last()
+        .map(|(value, _)| *value)
+        .unwrap_or(0.0)
+}
+
+fn weighted_noise_filtered_average(samples: &[(f64, i64)]) -> NoiseFilteredAverage {
+    let normalized: Vec<(f64, i64)> = samples
+        .iter()
+        .copied()
+        .filter(|(_, weight)| *weight > 0)
+        .collect();
+    if normalized.is_empty() {
+        return NoiseFilteredAverage {
+            average: 0.0,
+            sample_count: 0,
+        };
+    }
+
+    let raw = NoiseFilteredAverage {
+        average: weighted_average_scores(&normalized),
+        sample_count: normalized.iter().map(|(_, weight)| *weight).sum(),
+    };
+    if normalized.len() < 5 {
+        return raw;
+    }
+
+    let mut sorted = normalized;
+    sorted.sort_by(|left, right| left.0.total_cmp(&right.0));
+    let q1 = weighted_percentile(&sorted, 0.25);
+    let q3 = weighted_percentile(&sorted, 0.75);
+    let iqr = q3 - q1;
+
+    let filtered: Vec<(f64, i64)> = if iqr <= f64::EPSILON {
+        let median = weighted_percentile(&sorted, 0.5);
+        let retained: Vec<(f64, i64)> = sorted
+            .iter()
+            .copied()
+            .filter(|(value, _)| (*value - median).abs() <= ZERO_IQR_NOISE_BAND)
+            .collect();
+        if retained.len() >= 3 && retained.len() < sorted.len() {
+            retained
+        } else {
+            return raw;
+        }
+    } else {
+        let lower = q1 - 1.5 * iqr;
+        let upper = q3 + 1.5 * iqr;
+        let retained: Vec<(f64, i64)> = sorted
+            .into_iter()
+            .filter(|(value, _)| *value >= lower && *value <= upper)
+            .collect();
+        if retained.len() >= 3 {
+            retained
+        } else {
+            return raw;
+        }
+    };
+
+    NoiseFilteredAverage {
+        average: weighted_average_scores(&filtered),
+        sample_count: filtered.iter().map(|(_, weight)| *weight).sum(),
+    }
+}
+
+fn memory_confidence_samples(analyze: &Value) -> Vec<(f64, i64)> {
+    analyze
+        .as_object()
+        .map(|by_type| {
+            by_type
+                .values()
+                .filter_map(|stats| {
+                    Some((
+                        stats.get("avg_confidence").and_then(|v| v.as_f64())?,
+                        stats.get("total").and_then(|v| v.as_i64())?,
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn summarize_memory_metrics(
+    total_memories: i64,
+    stale_count: i64,
+    confidence_samples: &[(f64, i64)],
+) -> MemoryMetricsResponse {
+    let weighted_count: i64 = confidence_samples
+        .iter()
+        .map(|(_, weight)| (*weight).max(0))
+        .sum();
+    let avg_confidence = weighted_average_scores(confidence_samples);
+    let noise_filtered = weighted_noise_filtered_average(confidence_samples);
+
+    MemoryMetricsResponse {
+        total_memories,
+        avg_confidence,
+        avg_confidence_interval: sampled_confidence_interval(avg_confidence, weighted_count),
+        noise_filtered_avg_confidence: noise_filtered.average,
+        noise_filtered_avg_confidence_interval: sampled_confidence_interval(
+            noise_filtered.average,
+            noise_filtered.sample_count,
+        ),
+        noise_filtered_confidence_samples: noise_filtered.sample_count,
+        stale_count,
+    }
+}
+
 fn summarize_calibration_samples(samples: &[(f64, f64)]) -> CalibrationSummary {
     let mean_confidence = average_scores(
         &samples
@@ -1490,32 +1632,13 @@ impl EvaluationService for DatabaseEvaluationService {
             .get("stale_working_memories")
             .and_then(|v| v.as_i64())
             .unwrap_or(0);
+        let confidence_samples = memory_confidence_samples(&analyze);
 
-        let mut weighted_confidence_sum = 0.0f64;
-        let mut weighted_count = 0i64;
-        if let Some(by_type) = analyze.as_object() {
-            for stats in by_type.values() {
-                let total = stats.get("total").and_then(|v| v.as_i64()).unwrap_or(0);
-                let avg_conf = stats
-                    .get("avg_confidence")
-                    .and_then(|v| v.as_f64())
-                    .unwrap_or(0.0);
-                weighted_confidence_sum += avg_conf * total as f64;
-                weighted_count += total;
-            }
-        }
-        let avg_confidence = if weighted_count > 0 {
-            weighted_confidence_sum / weighted_count as f64
-        } else {
-            0.0
-        };
-
-        Ok(MemoryMetricsResponse {
+        Ok(summarize_memory_metrics(
             total_memories,
-            avg_confidence,
-            avg_confidence_interval: sampled_confidence_interval(avg_confidence, weighted_count),
             stale_count,
-        })
+            &confidence_samples,
+        ))
     }
 
     async fn extract_training_data(
@@ -2103,6 +2226,40 @@ mod tests {
         assert_eq!(metrics.noise_filtered_session_count, 4);
         assert!(metrics.noise_filtered_avg_turns_per_session < metrics.avg_turns_per_session);
         assert!((metrics.noise_filtered_avg_turns_per_session - 7.5).abs() < 0.0001);
+    }
+
+    #[test]
+    fn weighted_noise_filtered_average_small_sample_keeps_all_weights() {
+        let filtered = weighted_noise_filtered_average(&[(0.8, 4), (0.6, 8)]);
+        assert_eq!(filtered.sample_count, 12);
+        assert!((filtered.average - 0.6666666667).abs() < 0.0001);
+    }
+
+    #[test]
+    fn weighted_noise_filtered_average_drops_confidence_outlier_bucket() {
+        let filtered = weighted_noise_filtered_average(&[
+            (0.79, 10),
+            (0.80, 10),
+            (0.81, 10),
+            (0.82, 10),
+            (0.10, 1),
+        ]);
+        assert_eq!(filtered.sample_count, 40);
+        assert!((filtered.average - 0.805).abs() < 0.0001);
+    }
+
+    #[test]
+    fn summarize_memory_metrics_uses_weighted_filtered_confidence() {
+        let metrics = summarize_memory_metrics(
+            41,
+            3,
+            &[(0.79, 10), (0.80, 10), (0.81, 10), (0.82, 10), (0.10, 1)],
+        );
+        assert_eq!(metrics.total_memories, 41);
+        assert_eq!(metrics.stale_count, 3);
+        assert_eq!(metrics.noise_filtered_confidence_samples, 40);
+        assert!(metrics.noise_filtered_avg_confidence > metrics.avg_confidence);
+        assert!((metrics.noise_filtered_avg_confidence - 0.805).abs() < 0.0001);
     }
 
     #[test]
