@@ -173,6 +173,7 @@ pub(super) async fn prepare_chat_turn_bridge_body(
     state: &AppState,
     user: &AuthUserRecord,
     body: Bytes,
+    trusted_session_id_override: Option<&str>,
 ) -> Result<PreparedChatTurnBridgeRequest, (StatusCode, Json<ErrorResponse>)> {
     let Ok(mut request) = serde_json::from_slice::<ChatTurnRequestBody>(&body) else {
         return Ok(PreparedChatTurnBridgeRequest::passthrough(body));
@@ -191,6 +192,9 @@ pub(super) async fn prepare_chat_turn_bridge_body(
                 Some(session_id),
                 normalize_session_created_at_for_bridge(&session.created_at),
             )
+        } else if let Some(session_id) = trusted_session_id_override {
+            request.set_session_id(session_id);
+            (Some(session_id.to_string()), None)
         } else {
             let agent_id = request.agent_id_str();
             let metadata = agent_id.as_ref().map(|agent_id| {
@@ -489,7 +493,30 @@ fn same_tool_names(left: &[serde_json::Value], right: &[serde_json::Value]) -> b
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
     use serde_json::json;
+    use std::sync::Arc;
+
+    use crate::{AppState, AuthUserRecord, HealthChecker, ServiceInfo};
+
+    #[derive(Clone)]
+    struct StubHealthChecker;
+
+    #[async_trait]
+    impl HealthChecker for StubHealthChecker {
+        async fn database_healthy(&self) -> bool {
+            true
+        }
+    }
+
+    fn test_user() -> AuthUserRecord {
+        AuthUserRecord {
+            user_id: "u1".to_string(),
+            username: "test-user".to_string(),
+            email: "u1@example.test".to_string(),
+            display_name: None,
+        }
+    }
 
     fn tool_value(name: &str) -> serde_json::Value {
         json!({ "function": { "name": name } })
@@ -575,6 +602,32 @@ mod tests {
         let (status, body) = normalize_chat_turn_session_error(input);
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body.0.detail, msg);
+    }
+
+    #[tokio::test]
+    async fn prepare_body_uses_trusted_session_override_when_body_omits_session_id() {
+        let state = AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker));
+        let body = Bytes::from(
+            serde_json::to_vec(&json!({
+                "messages": [{"role": "user", "content": "hello"}]
+            }))
+            .expect("body should serialize"),
+        );
+
+        let prepared =
+            prepare_chat_turn_bridge_body(&state, &test_user(), body, Some("bound-session"))
+                .await
+                .expect("trusted override should bypass unconfigured session service");
+
+        assert_eq!(
+            prepared.trusted_session_id.as_deref(),
+            Some("bound-session")
+        );
+        assert!(prepared.turn_chain_id.is_some());
+        assert!(prepared.user_query_event_id.is_some());
+        let payload: serde_json::Value =
+            serde_json::from_slice(&prepared.body).expect("prepared body should be valid json");
+        assert_eq!(payload["session_id"], "bound-session");
     }
 
     // ── same_tool_names ─────────────────────────────────────────────

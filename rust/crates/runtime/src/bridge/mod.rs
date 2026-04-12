@@ -344,13 +344,13 @@ impl ChatTurnBridge for UnavailableChatTurnBridge {
         _turn_session_activity_writer: Arc<dyn TurnSessionActivityWriter>,
         _client_cancel: Option<Arc<CancellationToken>>,
     ) -> Result<Response, (StatusCode, String)> {
-        let (trusted_session_id, _trusted_turn_chain_id) = trusted_bridge_identity(headers);
+        let (trusted_session_id, trusted_turn_chain_id) = trusted_bridge_identity(headers);
         Ok(bridge_error_sse_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "chat turn bridge disabled. Configure CHAT_TURN_BRIDGE_URL to a reachable /internal/chat/turn endpoint (example: compatible chat-turn bridge service), then restart API."
                 .to_string(),
             trusted_session_id.as_deref(),
-            None,
+            trusted_turn_chain_id.as_deref(),
         ))
     }
 }
@@ -415,7 +415,7 @@ impl ChatTurnBridge for HttpChatTurnBridge {
                     StatusCode::BAD_GATEWAY,
                     error.to_string(),
                     trusted_session_id.as_deref(),
-                    None,
+                    trusted_turn_chain_id.as_deref(),
                 ));
             }
         };
@@ -448,7 +448,7 @@ impl ChatTurnBridge for HttpChatTurnBridge {
                 status,
                 bridge_error_sse_message(status, &error_body),
                 trusted_session_id.as_deref(),
-                None,
+                trusted_turn_chain_id.as_deref(),
             ));
         }
         let filtered_stream = filter_bridge_state_events(
@@ -1474,7 +1474,7 @@ mod tests {
 
         assert!(text.contains("\"type\":\"session_info\""));
         assert!(text.contains("\"session_id\":\"sess-1\""));
-        assert!(!text.contains("\"run_id\":"));
+        assert!(text.contains("\"run_id\":\"run-1\""));
         assert!(text.contains("\"type\":\"error\""));
         assert!(text.contains("\"code\":\"UPSTREAM_ERROR\""));
     }
@@ -1489,9 +1489,52 @@ mod tests {
 
         assert!(text.contains("\"type\":\"session_info\""));
         assert!(text.contains("\"session_id\":\"sess-1\""));
-        assert!(!text.contains("\"run_id\":"));
+        assert!(text.contains("\"run_id\":\"run-1\""));
         assert!(text.contains("\"type\":\"error\""));
         assert!(text.contains("chat turn bridge disabled"));
+    }
+
+    #[tokio::test]
+    async fn non_sse_error_response_preserves_trusted_session_info() {
+        use axum::Router;
+        use axum::http::header;
+        use axum::routing::post;
+        use tokio::net::TcpListener;
+        use tokio::sync::Mutex;
+
+        let app = Router::new().route(
+            "/",
+            post(|| async {
+                (
+                    StatusCode::BAD_GATEWAY,
+                    [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                    "upstream exploded",
+                )
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener should have address");
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test server should run");
+        });
+
+        let cache = Arc::new(Mutex::new(SessionCache::default()));
+        let bridge = HttpChatTurnBridge::new(format!("http://{addr}/"), cache);
+
+        let response = forward_with_noop_writers(&bridge, &trusted_identity_headers())
+            .await
+            .expect("non-sse error should normalize to SSE");
+        let text = response_text(response).await;
+
+        assert!(text.contains("\"type\":\"session_info\""));
+        assert!(text.contains("\"session_id\":\"sess-1\""));
+        assert!(text.contains("\"run_id\":\"run-1\""));
+        assert!(text.contains("\"type\":\"error\""));
+        assert!(text.contains("\"code\":\"UPSTREAM_ERROR\""));
     }
 
     #[tokio::test]

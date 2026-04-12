@@ -1176,16 +1176,20 @@ async fn handle_chat_message_via_bridge(
     );
 
     // Prepare request through bridge_prep (session validation, etc.)
-    let mut prepared = match prepare_chat_turn_bridge_body(state, &conn.user, body).await {
+    let prepared = match prepare_chat_turn_bridge_body(
+        state,
+        &conn.user,
+        body,
+        trusted_session_id_override.as_deref(),
+    )
+    .await
+    {
         Ok(r) => r,
         Err((status, error)) => {
             send_msg(socket, &ws_error_from_status(status, error.0.detail)).await;
             return;
         }
     };
-    if prepared.trusted_session_id.is_none() {
-        prepared.trusted_session_id = trusted_session_id_override;
-    }
 
     // Add optional headers from prepared context
     apply_prepared_headers(&mut bridge_headers, &prepared);

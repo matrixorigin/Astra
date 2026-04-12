@@ -215,7 +215,7 @@ pub(super) async fn dispatch_chat_turn_bridge(
         bridge_headers.insert(HeaderName::from_static("authorization"), auth);
     }
 
-    let prepared = match prepare_chat_turn_bridge_body(state, user, body).await {
+    let prepared = match prepare_chat_turn_bridge_body(state, user, body, None).await {
         Ok(result) => result,
         Err((status, error)) => return sse_error_response(status, error.0.detail),
     };
