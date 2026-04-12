@@ -61,6 +61,7 @@ pub mod implicit_feedback;
 pub(crate) mod llm_client;
 pub mod llm_request_dump;
 pub mod loop_dispatcher;
+pub mod microcompact;
 pub mod observer;
 pub mod parallel_tool_exec;
 pub mod permission_gate;
