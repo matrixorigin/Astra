@@ -83,6 +83,7 @@
 - **GateValidation** (`services/src/evaluation/database.rs`): Quality gate validation now evaluates recent session-score windows against error-rate and score-regression thresholds and persists typed `eval_gate_results` history for later inspection.
 - **Calibration report** (`services/src/evaluation/database.rs`): `get_calibration()` now aggregates latest session-level quality scores against average `context_trace_signal` selection confidence per session, returning mean confidence/quality, calibration error, bias, and adjustment guidance without inventing a new confidence table.
 - **Training-data extraction** (`services/src/evaluation/database.rs`, `services/src/storage.rs`): `extract_training_data()` now snapshots session-level quality examples into persisted `eval_training_datasets` artifacts, so extraction is real even before the export route is implemented.
+- **Training-data export** (`services/src/evaluation/database.rs`): persisted training datasets can now be exported as inline JSONL or CSV payloads via the existing export route; only Parquet remains intentionally unsupported.
 - **FeedbackSignal system** (`auto_tuning.rs`): 16 signal types (Retry, Correction, Acceptance, StarRating, ToolChurn, FocusDrift, etc.).
 - **ScenarioDetector** (`user_profile.rs:520`): Confidence-threshold-based scenario detection.
 - **EvolutionRules** (`auto_tuning.rs`): Trigger → action rules with cooldown and rate limiting.
@@ -92,16 +93,17 @@
 - **Global mutation queue** (`services/src/session_audit.rs`, `runtime/src/server/audit_handlers.rs`): `/audit/mutations` now lists staged mutations across sessions with priority-first sorting plus state/session/tool/safety/retention filtering, and it can now further isolate `verifier_signal`, `verifier_source`, or `verifier_gap` cases so ops can directly review missing-verifier mutations instead of inferring them from raw payloads.
 
 ### Gaps
-- **Some evaluation routes still return 501**: `DatabaseEvaluationService` still leaves quality-trend model filtering and training-data export unimplemented.
+- **Some evaluation routes still return 501**: `DatabaseEvaluationService` still leaves quality-trend model filtering unimplemented.
 - **No multi-objective optimization**: Evaluation is single-dimensional (quality score). No Pareto frontier for efficiency × cost × accuracy.
 - **No noise filtering**: FeedbackSignals are consumed raw; no statistical filtering for outliers or noise.
 - **No fully universal verifier-complete scoreboard yet**: `MutationScoreboard` now persists verifier evidence for fork-skill mutations, generic verifier-shaped tool results, and conservative single-action same-turn journal verification events, and it now explicitly tags missing-signal cases with `verifier_gap`; however, tool paths with no structured or turn-scoped verification signal still lack a real positive verifier surface.
 - **Confidence intervals are not universal yet**: sampled evaluation/report surfaces now expose companion `ConfidenceInterval` fields (quality trend, drift, calibration means, session score, gate error rate, trust/SLO, skill success rate, memory confidence), but other unsampled or non-bounded aggregates still lack interval coverage.
+- **Parquet export parity is still missing**: `training-data export` now supports JSONL/CSV, but Parquet remains explicitly unsupported on the service side.
 - **No verifier diversity**: Gate validation is single-pass, not ensemble-based.
 
 ### Priority Actions
-1. Finish the remaining 501 evaluation routes (training-data export, quality-trend model filtering).
-2. Extend interval coverage beyond the current sample-backed companion fields.
+1. Finish quality-trend model filtering.
+2. Add Parquet export parity and extend interval coverage beyond the current sample-backed companion fields.
 
 ---
 
@@ -182,7 +184,7 @@
 | 1. State | ⬛⬛⬛⬜⬜ 60% | CompositeSnapshot 5D | No diff/merge/revert |
 | 2. Observation | ⬛⬛⬛⬜⬜ 55% | CausalChain + JournalEvents | Linear chains, no graph |
 | 3. Action | ⬛⬛⬜⬜⬜ 45% | Permission 3-tier model + compensation profiles | No automatic rollback executor |
-| 4. Evaluation | ⬛⬛⬛⬛⬜ 70% | EvaluationService + MutationScoreboard | Training export/model-filter 501s + non-universal CI coverage |
+| 4. Evaluation | ⬛⬛⬛⬛⬜ 75% | EvaluationService + MutationScoreboard | Model-filter 501 + non-universal CI/export parity |
 | 5. Credit | ⬛⬜⬜⬜⬜ 25% | causal_chain_id on events | No diff-based scoring |
 | 6. Search | ⬛⬛⬜⬜⬜ 35% | SchedulingContract + TeamOrch | No proposal diversity |
 | 7. Safety | ⬛⬛⬛⬜⬜ 55% | Drift detection + middleware | Causal guard is heuristic-only |

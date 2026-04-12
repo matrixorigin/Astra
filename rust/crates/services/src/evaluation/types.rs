@@ -491,4 +491,7 @@ pub struct TrainingDataExportResponse {
     pub format: String,
     pub status: String,
     pub message: String,
+    pub samples_exported: i64,
+    pub content_type: String,
+    pub content: String,
 }

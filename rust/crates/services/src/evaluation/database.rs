@@ -110,14 +110,14 @@ struct CalibrationSummary {
     adjustment_reason: String,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct ExtractedTrainingDataRequest {
     days: i32,
     min_quality: f64,
     max_samples: i32,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct ExtractedTrainingSample {
     session_id: String,
     quality_score: f64,
@@ -128,7 +128,7 @@ struct ExtractedTrainingSample {
     latest_context_trace_at: Option<String>,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct ExtractedTrainingDataset {
     schema_version: u32,
     extracted_at: String,
@@ -220,6 +220,66 @@ fn summarize_calibration(
 
 fn training_dataset_status(sample_count: usize) -> &'static str {
     if sample_count == 0 { "empty" } else { "ready" }
+}
+
+fn normalize_export_format(
+    format: &str,
+) -> Result<ExportFormat, (StatusCode, axum::Json<astra_core::ErrorResponse>)> {
+    match format.trim().to_ascii_lowercase().as_str() {
+        "jsonl" => Ok(ExportFormat::Jsonl),
+        "csv" => Ok(ExportFormat::Csv),
+        "parquet" => Ok(ExportFormat::Parquet),
+        other => Err(error_response(
+            StatusCode::BAD_REQUEST,
+            format!("Unsupported export format: {other}"),
+        )),
+    }
+}
+
+fn csv_escape(value: &str) -> String {
+    if value.contains([',', '"', '\n']) {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_string()
+    }
+}
+
+fn render_training_dataset_jsonl(
+    dataset: &ExtractedTrainingDataset,
+) -> Result<String, serde_json::Error> {
+    let lines = dataset
+        .samples
+        .iter()
+        .map(serde_json::to_string)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(lines.join("\n"))
+}
+
+fn render_training_dataset_csv(dataset: &ExtractedTrainingDataset) -> String {
+    let mut lines = vec![
+        "session_id,quality_score,step_count,avg_selector_confidence,selector_trace_count,quality_updated_at,latest_context_trace_at".to_string(),
+    ];
+    lines.extend(dataset.samples.iter().map(|sample| {
+        [
+            csv_escape(&sample.session_id),
+            sample.quality_score.to_string(),
+            sample.step_count.to_string(),
+            sample
+                .avg_selector_confidence
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+            sample.selector_trace_count.to_string(),
+            csv_escape(sample.quality_updated_at.as_deref().unwrap_or_default()),
+            csv_escape(
+                sample
+                    .latest_context_trace_at
+                    .as_deref()
+                    .unwrap_or_default(),
+            ),
+        ]
+        .join(",")
+    }));
+    lines.join("\n")
 }
 
 fn summarize_gate_validation(
@@ -1269,14 +1329,75 @@ impl EvaluationService for DatabaseEvaluationService {
 
     async fn export_training_data(
         &self,
-        _user_id: &str,
-        _dataset_id: &str,
-        _format: &str,
+        user_id: &str,
+        dataset_id: &str,
+        format: &str,
     ) -> ServiceResult<TrainingDataExportResponse> {
-        Err(error_response(
-            StatusCode::NOT_IMPLEMENTED,
-            "Training data export requires core pipeline module",
-        ))
+        let pool = self.get_pool().await.map_err(internal_error)?;
+        let export_format = normalize_export_format(format)?;
+        if matches!(export_format, ExportFormat::Parquet) {
+            return Err(error_response(
+                StatusCode::NOT_IMPLEMENTED,
+                "Parquet export is not implemented yet for evaluation training datasets",
+            ));
+        }
+
+        let row = query(
+            "SELECT dataset_json, sample_count \
+             FROM eval_training_datasets \
+             WHERE dataset_id = ? AND user_id = ?",
+        )
+        .bind(dataset_id)
+        .bind(user_id)
+        .fetch_optional(&pool)
+        .await
+        .map_err(internal_error)?;
+
+        let Some(row) = row else {
+            return Err(error_response(
+                StatusCode::NOT_FOUND,
+                format!("Training dataset {dataset_id} not found"),
+            ));
+        };
+
+        let dataset_json: String = row.try_get("dataset_json").unwrap_or_default();
+        let dataset: ExtractedTrainingDataset =
+            serde_json::from_str(&dataset_json).map_err(internal_error)?;
+        let samples_exported = row.try_get("sample_count").unwrap_or(0);
+        let (normalized_format, content_type, content) = match export_format {
+            ExportFormat::Jsonl => (
+                "jsonl".to_string(),
+                "application/x-ndjson".to_string(),
+                render_training_dataset_jsonl(&dataset).map_err(internal_error)?,
+            ),
+            ExportFormat::Csv => (
+                "csv".to_string(),
+                "text/csv".to_string(),
+                render_training_dataset_csv(&dataset),
+            ),
+            ExportFormat::Parquet => unreachable!(),
+        };
+        let status = if samples_exported == 0 {
+            "empty".to_string()
+        } else {
+            "exported".to_string()
+        };
+
+        Ok(TrainingDataExportResponse {
+            dataset_id: dataset_id.to_string(),
+            format: normalized_format.clone(),
+            status: status.clone(),
+            message: if samples_exported == 0 {
+                format!("Dataset {dataset_id} has no samples to export as {normalized_format}.")
+            } else {
+                format!(
+                    "Exported {samples_exported} samples from dataset {dataset_id} as {normalized_format}."
+                )
+            },
+            samples_exported,
+            content_type,
+            content,
+        })
     }
 }
 
@@ -1575,6 +1696,49 @@ mod tests {
     fn training_dataset_status_matches_sample_count() {
         assert_eq!(training_dataset_status(0), "empty");
         assert_eq!(training_dataset_status(3), "ready");
+    }
+
+    fn sample_training_dataset() -> ExtractedTrainingDataset {
+        ExtractedTrainingDataset {
+            schema_version: 1,
+            extracted_at: "2026-04-12T00:00:00".into(),
+            request: ExtractedTrainingDataRequest {
+                days: 30,
+                min_quality: 0.8,
+                max_samples: 10,
+            },
+            samples: vec![ExtractedTrainingSample {
+                session_id: "sess-1".into(),
+                quality_score: 0.9,
+                step_count: 4,
+                avg_selector_confidence: Some(0.85),
+                selector_trace_count: 2,
+                quality_updated_at: Some("2026-04-12T00:00:00".into()),
+                latest_context_trace_at: Some("2026-04-12T00:01:00".into()),
+            }],
+        }
+    }
+
+    #[test]
+    fn normalize_export_format_rejects_unknown() {
+        let err = normalize_export_format("xml").unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn render_training_dataset_jsonl_outputs_one_line_per_sample() {
+        let dataset = sample_training_dataset();
+        let jsonl = render_training_dataset_jsonl(&dataset).unwrap();
+        assert_eq!(jsonl.lines().count(), 1);
+        assert!(jsonl.contains("\"session_id\":\"sess-1\""));
+    }
+
+    #[test]
+    fn render_training_dataset_csv_outputs_header_and_rows() {
+        let dataset = sample_training_dataset();
+        let csv = render_training_dataset_csv(&dataset);
+        assert!(csv.starts_with("session_id,quality_score,step_count"));
+        assert!(csv.contains("sess-1,0.9,4,0.85,2"));
     }
 
     #[test]
