@@ -266,7 +266,11 @@ impl ChatTurnSseFramer {
         if self.first_token_recorded {
             return;
         }
-        if event_block.contains("\"text_delta\"") || event_block.contains("\"content_block_delta\"")
+        if event_block.contains("\"text_delta\"")
+            || event_block.contains("\"content_block_delta\"")
+            || event_block.contains("\"thinking_delta\"")
+            || event_block.contains("\"reasoning_delta\"")
+            || event_block.contains("\"reasoning_message_content\"")
         {
             self.ttft_ms = Some(self.stream_start.elapsed().as_millis() as u64);
             self.first_token_recorded = true;
@@ -590,6 +594,22 @@ mod tests {
     #[test]
     fn framer_ttft_on_text_delta_block() {
         let block = sse("text_delta", ",\"content\":\"x\"");
+        let mut f = ChatTurnSseFramer::new();
+        let _ = f.push_lossy_bytes(block.as_bytes());
+        assert!(f.ttft_ms.is_some());
+    }
+
+    #[test]
+    fn framer_ttft_on_reasoning_delta_block() {
+        let block = sse("reasoning_delta", ",\"content\":\"thinking...\"");
+        let mut f = ChatTurnSseFramer::new();
+        let _ = f.push_lossy_bytes(block.as_bytes());
+        assert!(f.ttft_ms.is_some());
+    }
+
+    #[test]
+    fn framer_ttft_on_reasoning_message_content_block() {
+        let block = sse("reasoning_message_content", ",\"content\":\"thinking...\"");
         let mut f = ChatTurnSseFramer::new();
         let _ = f.push_lossy_bytes(block.as_bytes());
         assert!(f.ttft_ms.is_some());
