@@ -79,7 +79,7 @@ fn apply_one_event(
                 accum.full_text = ft.to_string();
             }
         }
-        "thinking_delta" | "reasoning_delta" => {
+        "thinking_delta" | "reasoning_delta" | "reasoning_message_content" => {
             effects.push(SseRenderEffect::StartThinkingSpinner);
             if let Some(chunk) = event.get("content").and_then(|v| v.as_str()) {
                 accum.reasoning_content.push_str(chunk);
@@ -392,7 +392,10 @@ mod tests {
     fn session_info_captured() {
         let mut a = ChatTurnSseAccum::default();
         dispatch_chat_turn_sse_event_block(
-            &sse("session_info", ",\"session_id\":\"abc-123\",\"run_id\":\"run-123\""),
+            &sse(
+                "session_info",
+                ",\"session_id\":\"abc-123\",\"run_id\":\"run-123\"",
+            ),
             &mut a,
             &mut vec![],
         );
@@ -496,6 +499,26 @@ mod tests {
         );
         dispatch_chat_turn_sse_event_block(&block, &mut a, &mut vec![]);
         assert_eq!(a.reasoning_content, "step 1 step 2");
+    }
+
+    #[test]
+    fn reasoning_message_content_captures_reasoning() {
+        let mut a = ChatTurnSseAccum::default();
+        let block = format!(
+            "{}{}",
+            sse("reasoning_message_content", ",\"content\":\"step 1\""),
+            sse("reasoning_message_content", ",\"content\":\" step 2\""),
+        );
+        let efx = dispatch_chat_turn_sse_event_block(&block, &mut a, &mut vec![]);
+        assert_eq!(a.reasoning_content, "step 1 step 2");
+        let chunks: Vec<&str> = efx
+            .iter()
+            .filter_map(|e| match e {
+                SseRenderEffect::ThinkingPreviewChunk(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(chunks, vec!["step 1", " step 2"]);
     }
 
     #[test]

@@ -34,6 +34,16 @@ fn dispatch_reasoning_delta_captures_reasoning_content() {
 }
 
 #[test]
+fn dispatch_reasoning_message_content_captures_reasoning_content() {
+    let mut result = TurnResult::new();
+    let mut render = StreamRenderState::new();
+    let block =
+        "data: {\"type\":\"reasoning_message_content\",\"content\":\"Step 1: search PRs\"}\n\n";
+    dispatch_turn_event_block(block, &mut result, &mut render, false, &mut vec![]);
+    assert_eq!(result.reasoning_content, "Step 1: search PRs");
+}
+
+#[test]
 fn dispatch_thinking_delta_accumulates_across_events() {
     let mut result = TurnResult::new();
     let mut render = StreamRenderState::new();
