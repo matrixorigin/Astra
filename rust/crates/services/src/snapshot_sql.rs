@@ -24,7 +24,8 @@ pub fn validate_sql_identifier(value: &str, label: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn quote_identifier(value: &str) -> String {
+/// Backtick-quote a MySQL/MatrixOne identifier (`a`b` → ``a``b``).
+pub(crate) fn quote_mysql_identifier(value: &str) -> String {
     format!("`{}`", value.replace('`', "``"))
 }
 
@@ -52,8 +53,8 @@ pub async fn resolve_account_name(pool: &sqlx::Pool<sqlx::MySql>) -> Result<Stri
 pub fn create_snapshot_for_db_sql(name: &str, db: &str) -> String {
     format!(
         "CREATE SNAPSHOT {} FOR DATABASE {}",
-        quote_identifier(name),
-        quote_identifier(db)
+        quote_mysql_identifier(name),
+        quote_mysql_identifier(db)
     )
 }
 
@@ -63,9 +64,9 @@ pub fn create_snapshot_for_db_sql(name: &str, db: &str) -> String {
 pub fn restore_snapshot_db_sql(snapshot: &str, account: &str, db: &str) -> String {
     format!(
         "RESTORE ACCOUNT {} DATABASE {} FROM SNAPSHOT {}",
-        quote_identifier(account),
-        quote_identifier(db),
-        quote_identifier(snapshot)
+        quote_mysql_identifier(account),
+        quote_mysql_identifier(db),
+        quote_mysql_identifier(snapshot)
     )
 }
 

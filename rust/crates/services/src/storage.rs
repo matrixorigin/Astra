@@ -147,7 +147,46 @@ where
     Ok(result.rows_affected())
 }
 
+/// When `MATRIXONE_AUTO_CREATE_DATABASE=1`, connect to a bootstrap catalog (default `mysql`) and
+/// run `CREATE DATABASE IF NOT EXISTS` for [`MatrixOneSettings::database`] before normal DDL.
+async fn ensure_matrixone_database_exists(settings: &MatrixOneSettings) -> Result<(), sqlx::Error> {
+    use std::error::Error;
+
+    crate::snapshot_sql::validate_sql_identifier(&settings.database, "matrixone database")
+        .map_err(|e| {
+            sqlx::Error::Configuration(
+                Box::new(std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
+                    as Box<dyn Error + Send + Sync>,
+            )
+        })?;
+    let catalog =
+        std::env::var("MATRIXONE_BOOTSTRAP_CATALOG").unwrap_or_else(|_| "mysql".to_string());
+    crate::snapshot_sql::validate_sql_identifier(&catalog, "matrixone bootstrap catalog")
+        .map_err(|e| {
+            sqlx::Error::Configuration(
+                Box::new(std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
+                    as Box<dyn Error + Send + Sync>,
+            )
+        })?;
+    let mut admin_settings = settings.clone();
+    admin_settings.database = catalog;
+    let admin_pool = connect_matrixone(&admin_settings).await?;
+    let ddl = format!(
+        "CREATE DATABASE IF NOT EXISTS {}",
+        crate::snapshot_sql::quote_mysql_identifier(&settings.database)
+    );
+    query(&ddl).execute(&admin_pool).await?;
+    admin_pool.close().await;
+    Ok(())
+}
+
 pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx::Error> {
+    if std::env::var("MATRIXONE_AUTO_CREATE_DATABASE")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+    {
+        ensure_matrixone_database_exists(settings).await?;
+    }
     let pool = connect_matrixone(settings).await?;
 
     // Auth
