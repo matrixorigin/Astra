@@ -314,13 +314,13 @@ impl ChatTurnBridge for UnavailableChatTurnBridge {
         _turn_session_activity_writer: Arc<dyn TurnSessionActivityWriter>,
         _client_cancel: Option<Arc<CancellationToken>>,
     ) -> Result<Response, (StatusCode, String)> {
-        let (trusted_session_id, trusted_turn_chain_id) = trusted_bridge_identity(headers);
+        let (trusted_session_id, _trusted_turn_chain_id) = trusted_bridge_identity(headers);
         Ok(bridge_error_sse_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "chat turn bridge disabled. Configure CHAT_TURN_BRIDGE_URL to a reachable /internal/chat/turn endpoint (example: compatible chat-turn bridge service), then restart API."
                 .to_string(),
             trusted_session_id.as_deref(),
-            trusted_turn_chain_id.as_deref(),
+            None,
         ))
     }
 }
@@ -385,7 +385,7 @@ impl ChatTurnBridge for HttpChatTurnBridge {
                     StatusCode::BAD_GATEWAY,
                     error.to_string(),
                     trusted_session_id.as_deref(),
-                    trusted_turn_chain_id.as_deref(),
+                    None,
                 ));
             }
         };
@@ -418,7 +418,7 @@ impl ChatTurnBridge for HttpChatTurnBridge {
                 status,
                 bridge_error_sse_message(status, &error_body),
                 trusted_session_id.as_deref(),
-                trusted_turn_chain_id.as_deref(),
+                None,
             ));
         }
         let filtered_stream = filter_bridge_state_events(
@@ -590,7 +590,7 @@ where
         if let Some(session_id) = trusted_session_id.as_deref() {
             yield Ok(Bytes::from(render_sse_json(synthesized_session_info_event(
                 session_id,
-                trusted_turn_chain_id.as_deref(),
+                None,
             ))));
         }
         let mut buffer = Vec::new();
@@ -1424,7 +1424,7 @@ mod tests {
 
         assert!(text.contains("\"type\":\"session_info\""));
         assert!(text.contains("\"session_id\":\"sess-1\""));
-        assert!(text.contains("\"run_id\":\"run-1\""));
+        assert!(!text.contains("\"run_id\":"));
         assert!(text.contains("\"type\":\"error\""));
         assert!(text.contains("\"code\":\"UPSTREAM_ERROR\""));
     }
@@ -1458,7 +1458,7 @@ mod tests {
 
         assert!(text.contains("\"type\":\"session_info\""));
         assert!(text.contains("\"session_id\":\"sess-1\""));
-        assert!(text.contains("\"run_id\":\"run-1\""));
+        assert!(!text.contains("\"run_id\":"));
         assert!(text.contains("\"type\":\"error\""));
         assert!(text.contains("chat turn bridge disabled"));
     }
@@ -1754,6 +1754,7 @@ mod tests {
         assert_eq!(text.matches("\"type\":\"session_info\"").count(), 1);
         assert!(text.contains("\"session_id\":\"trusted-s1\""));
         assert!(!text.contains("\"session_id\":\"upstream-s1\""));
+        assert!(!text.contains("\"run_id\":"));
     }
 
     #[tokio::test]
