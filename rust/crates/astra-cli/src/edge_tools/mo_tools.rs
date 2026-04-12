@@ -100,7 +100,16 @@ fn mo_execute_sql(sql: &str, database: Option<&str>) -> String {
                 } else {
                     stderr.to_string()
                 };
-                format!("Error: {}", err.trim())
+                let trimmed = err.trim();
+                let mut msg = format!("Error: {trimmed}");
+                // Schema enrichment: on column/table not found, auto-append schema info
+                // so the agent can self-correct without an extra round-trip.
+                let lower = trimmed.to_lowercase();
+                if let Some(hint) = schema_hint_for_error(&lower, sql, database) {
+                    msg.push_str("\n--- auto-fetched schema ---\n");
+                    msg.push_str(&hint);
+                }
+                msg
             } else if stdout.is_empty() {
                 "OK (no results)".to_string()
             } else {
@@ -127,6 +136,51 @@ fn mo_execute_sql(sql: &str, database: Option<&str>) -> String {
             }
         }
     }
+}
+
+/// Extract a table name from SQL (best-effort, handles common patterns).
+fn extract_table_from_sql(sql: &str) -> Option<String> {
+    let upper = sql.to_uppercase();
+    // FROM table, FROM db.table, INTO table, UPDATE table, DESCRIBE table
+    for kw in &["FROM ", "INTO ", "UPDATE ", "DESCRIBE ", "TABLE "] {
+        if let Some(pos) = upper.find(kw) {
+            let rest = &sql[pos + kw.len()..];
+            let token: String = rest
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '.' || *c == '`')
+                .collect();
+            let clean = token.trim_matches('`');
+            if !clean.is_empty() {
+                return Some(clean.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// On column/table-not-found errors, auto-fetch schema so the agent can self-correct.
+fn schema_hint_for_error(lower_err: &str, sql: &str, database: Option<&str>) -> Option<String> {
+    if lower_err.contains("column") && lower_err.contains("does not exist") {
+        // Column not found → DESCRIBE the table
+        if let Some(table) = extract_table_from_sql(sql) {
+            let desc = mo_execute_sql(&format!("DESCRIBE {table}"), database);
+            if !desc.starts_with("Error:") {
+                return Some(desc);
+            }
+        }
+    } else if lower_err.contains("table") && lower_err.contains("does not exist") {
+        // Table not found → SHOW TABLES in the database
+        let db = database
+            .map(String::from)
+            .unwrap_or_else(|| std::env::var("MATRIXONE_DATABASE").unwrap_or_default());
+        if !db.is_empty() {
+            let tables = mo_execute_sql(&format!("SHOW TABLES IN `{db}`"), None);
+            if !tables.starts_with("Error:") {
+                return Some(tables);
+            }
+        }
+    }
+    None
 }
 
 // ─── SQL safety validation ──────────────────────────────────────────────────
@@ -667,5 +721,22 @@ mod tests {
             strip_sql_comments("SELECT 1 -- inline\nFROM t").trim(),
             "SELECT 1  FROM t"
         );
+    }
+
+    #[test]
+    fn extract_table_from_common_sql() {
+        assert_eq!(
+            extract_table_from_sql("SELECT * FROM astra_runtime.ctx_snapshots WHERE id = 1"),
+            Some("astra_runtime.ctx_snapshots".into())
+        );
+        assert_eq!(
+            extract_table_from_sql("SELECT col FROM `my_table` LIMIT 5"),
+            Some("my_table".into())
+        );
+        assert_eq!(
+            extract_table_from_sql("DESCRIBE agent_tasks"),
+            Some("agent_tasks".into())
+        );
+        assert_eq!(extract_table_from_sql("SHOW DATABASES"), None);
     }
 }
