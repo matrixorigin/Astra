@@ -238,16 +238,21 @@ export function useChatStream(config: ChatConfig): UseChatStreamReturn {
         }
 
         case 'turn_complete': {
+          const hadError = sawErrorEventRef.current;
           const id = assistantIdRef.current;
           const finalTools = Array.from(toolCallMapRef.current.values());
-          setFollowupSuggestion(
-            event.followup_suggestion ??
-              suggestFollowupPrompt({
-                userMessage: lastUserMessageRef.current,
-                assistantMessage: accumulatedTextRef.current,
-                toolCalls: finalTools,
-              }),
-          );
+          if (hadError) {
+            setFollowupSuggestion(null);
+          } else {
+            setFollowupSuggestion(
+              event.followup_suggestion ??
+                suggestFollowupPrompt({
+                  userMessage: lastUserMessageRef.current,
+                  assistantMessage: accumulatedTextRef.current,
+                  toolCalls: finalTools,
+                }),
+            );
+          }
           setMessages((prev) =>
             prev.map((m) =>
               m.id === id
@@ -261,7 +266,9 @@ export function useChatStream(config: ChatConfig): UseChatStreamReturn {
             ),
           );
           setIsStreaming(false);
-          setConnectionState('idle');
+          if (!hadError) {
+            setConnectionState('idle');
+          }
           break;
         }
 

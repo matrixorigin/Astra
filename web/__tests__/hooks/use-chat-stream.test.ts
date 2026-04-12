@@ -413,4 +413,26 @@ describe('useChatStream', () => {
     expect(result.current.connectionState).toBe('error');
     expect(result.current.isStreaming).toBe(false);
   });
+
+  it('keeps error state when turn_complete follows an error event', async () => {
+    fetchMock.mockResolvedValueOnce(
+      sseResponse([
+        { type: 'text_delta', content: 'Partial answer' },
+        { type: 'error', message: 'Guard tripped' },
+        { type: 'turn_complete' },
+      ]),
+    );
+
+    const { result } = renderHook(() => useChatStream(baseConfig));
+
+    await act(async () => {
+      result.current.sendMessage('Hi');
+      await new Promise((r) => setTimeout(r, 50));
+    });
+
+    expect(result.current.error).toBe('Guard tripped');
+    expect(result.current.connectionState).toBe('error');
+    expect(result.current.followupSuggestion).toBeNull();
+    expect(result.current.isStreaming).toBe(false);
+  });
 });
