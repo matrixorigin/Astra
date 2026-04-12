@@ -8,7 +8,10 @@ use axum::{Json, http::StatusCode};
 use serde::{Deserialize, Serialize};
 use sqlx::{Row, query};
 
-use crate::{MutationScoreboard, PersistedMutationDecision, StagedMutationState};
+use crate::{
+    MutationRetentionVerdict, MutationSafetyVerdict, MutationScoreboard, PersistedMutationDecision,
+    StagedMutation, StagedMutationState,
+};
 use astra_core::{
     ErrorResponse, MatrixOneSettings, SharedPool, connect_matrixone, error_response, internal_error,
 };
@@ -301,7 +304,14 @@ pub struct CrossSessionMutationListParams {
     pub per_page: u32,
     pub since: Option<String>,
     pub until: Option<String>,
+    pub session_id: Option<String>,
+    pub tool_name: Option<String>,
     pub state: Option<StagedMutationState>,
+    pub safety_verdict: Option<MutationSafetyVerdict>,
+    pub retention_verdict: Option<MutationRetentionVerdict>,
+    pub min_retention_score: Option<f64>,
+    #[serde(default = "default_cross_session_mutation_sort")]
+    pub sort: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -330,6 +340,9 @@ fn default_sort() -> String {
 }
 fn default_order() -> String {
     "desc".into()
+}
+fn default_cross_session_mutation_sort() -> String {
+    "priority".into()
 }
 
 // ── Trait ─────────────────────────────────────────────────────────────────────
@@ -1545,43 +1558,13 @@ impl SessionAuditService for DatabaseSessionAuditService {
                 params.until.as_deref(),
             )
             .await?;
-        let mut mutations =
+        let mutations =
             build_cross_session_mutation_scoreboards(mutation_decisions, mutation_overrides)
                 .into_iter()
                 .flat_map(|scoreboard| scoreboard.mutations.into_iter())
                 .collect::<Vec<_>>();
 
-        if let Some(state) = params.state {
-            mutations.retain(|mutation| mutation.state == state);
-        }
-
-        mutations.sort_by(|left, right| {
-            right
-                .state_updated_at
-                .cmp(&left.state_updated_at)
-                .then_with(|| right.session_id.cmp(&left.session_id))
-                .then_with(|| right.turn_index.cmp(&left.turn_index))
-                .then_with(|| right.mutation_id.cmp(&left.mutation_id))
-        });
-
-        let total = mutations.len() as u32;
-        let page = params.page.max(1);
-        let per_page = params
-            .per_page
-            .clamp(1, MAX_CROSS_SESSION_MUTATIONS_PER_PAGE);
-        let offset = (page.saturating_sub(1) * per_page) as usize;
-        let mutations = mutations
-            .into_iter()
-            .skip(offset)
-            .take(per_page as usize)
-            .collect();
-
-        Ok(CrossSessionMutationListResponse {
-            mutations,
-            total,
-            page,
-            per_page,
-        })
+        Ok(select_cross_session_mutations(mutations, params))
     }
 }
 
@@ -1735,6 +1718,136 @@ fn build_mutation_scoreboard(
     MutationScoreboard::new(scoreboard.scoreboard_id, scoreboard.session_id, mutations)
 }
 
+fn select_cross_session_mutations(
+    mut mutations: Vec<StagedMutation>,
+    params: &CrossSessionMutationListParams,
+) -> CrossSessionMutationListResponse {
+    apply_cross_session_mutation_filters(&mut mutations, params);
+    sort_cross_session_mutations(&mut mutations, &params.sort);
+
+    let total = mutations.len() as u32;
+    let page = params.page.max(1);
+    let per_page = params
+        .per_page
+        .clamp(1, MAX_CROSS_SESSION_MUTATIONS_PER_PAGE);
+    let offset = (page.saturating_sub(1) * per_page) as usize;
+    let mutations = mutations
+        .into_iter()
+        .skip(offset)
+        .take(per_page as usize)
+        .collect();
+
+    CrossSessionMutationListResponse {
+        mutations,
+        total,
+        page,
+        per_page,
+    }
+}
+
+fn apply_cross_session_mutation_filters(
+    mutations: &mut Vec<StagedMutation>,
+    params: &CrossSessionMutationListParams,
+) {
+    if let Some(state) = params.state {
+        mutations.retain(|mutation| mutation.state == state);
+    }
+    if let Some(session_id) = params
+        .session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        mutations.retain(|mutation| mutation.session_id == session_id);
+    }
+    if let Some(tool_name) = params
+        .tool_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| normalize_tool_name(value.to_string()))
+    {
+        mutations.retain(|mutation| normalize_tool_name(mutation.tool_name.clone()) == tool_name);
+    }
+    if let Some(safety_verdict) = params.safety_verdict {
+        mutations.retain(|mutation| mutation.judgment.safety_verdict == safety_verdict);
+    }
+    if let Some(retention_verdict) = params.retention_verdict {
+        mutations.retain(|mutation| mutation.judgment.retention_verdict == retention_verdict);
+    }
+    if let Some(min_retention_score) = params.min_retention_score {
+        let threshold = min_retention_score.clamp(0.0, 1.0);
+        mutations.retain(|mutation| mutation.judgment.retention_score.point >= threshold);
+    }
+}
+
+fn sort_cross_session_mutations(mutations: &mut [StagedMutation], sort: &str) {
+    match sort {
+        "updated" => {
+            mutations.sort_by(|left, right| mutation_updated_cmp(left, right));
+        }
+        "retention" => {
+            mutations.sort_by(|left, right| {
+                right
+                    .judgment
+                    .retention_score
+                    .point
+                    .total_cmp(&left.judgment.retention_score.point)
+                    .then_with(|| mutation_priority_cmp(left, right))
+                    .then_with(|| mutation_updated_cmp(left, right))
+            });
+        }
+        _ => {
+            mutations.sort_by(|left, right| {
+                mutation_priority_cmp(left, right)
+                    .then_with(|| {
+                        right
+                            .judgment
+                            .retention_score
+                            .point
+                            .total_cmp(&left.judgment.retention_score.point)
+                    })
+                    .then_with(|| mutation_updated_cmp(left, right))
+            });
+        }
+    }
+}
+
+fn mutation_priority_cmp(left: &StagedMutation, right: &StagedMutation) -> std::cmp::Ordering {
+    mutation_priority_tuple(right).cmp(&mutation_priority_tuple(left))
+}
+
+fn mutation_priority_tuple(mutation: &StagedMutation) -> (u8, u8, u8) {
+    (
+        match mutation.state {
+            StagedMutationState::Ready => 5,
+            StagedMutationState::Pending => 4,
+            StagedMutationState::Blocked => 3,
+            StagedMutationState::Reverted => 2,
+            StagedMutationState::Applied => 1,
+        },
+        match mutation.judgment.safety_verdict {
+            MutationSafetyVerdict::RequiresApproval => 3,
+            MutationSafetyVerdict::Safe => 2,
+            MutationSafetyVerdict::Blocked => 1,
+        },
+        match mutation.judgment.retention_verdict {
+            MutationRetentionVerdict::Retain => 3,
+            MutationRetentionVerdict::Review => 2,
+            MutationRetentionVerdict::Reject => 1,
+        },
+    )
+}
+
+fn mutation_updated_cmp(left: &StagedMutation, right: &StagedMutation) -> std::cmp::Ordering {
+    right
+        .state_updated_at
+        .cmp(&left.state_updated_at)
+        .then_with(|| right.turn_index.cmp(&left.turn_index))
+        .then_with(|| right.session_id.cmp(&left.session_id))
+        .then_with(|| right.mutation_id.cmp(&left.mutation_id))
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct MutationStatsAggregate {
     total_mutations: u32,
@@ -1839,6 +1952,49 @@ fn build_cross_session_mutation_scoreboards(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use astra_core::confidence::ConfidenceInterval;
+
+    fn sample_queue_mutation(
+        mutation_id: &str,
+        session_id: &str,
+        tool_name: &str,
+        state: StagedMutationState,
+        safety_verdict: MutationSafetyVerdict,
+        retention_verdict: MutationRetentionVerdict,
+        retention_score: f64,
+        state_updated_at: Option<&str>,
+    ) -> crate::StagedMutation {
+        let mut mutation = crate::StagedMutation::new(
+            mutation_id,
+            session_id,
+            1,
+            tool_name,
+            serde_json::json!({"path": format!("src/{mutation_id}.rs")}),
+            None,
+            crate::MutationObjectiveScore::from_learning_signal(
+                retention_score,
+                None,
+                0.05,
+                0.95,
+                false,
+            ),
+            None,
+            crate::MutationCompensationPolicy {
+                bounded: true,
+                reversible: true,
+                requires_pre_state: false,
+                action_category: crate::MutationActionCategory::Write,
+                compensation_kind: Some("restore_file".into()),
+                compensation_summary: Some("restore prior contents".into()),
+            },
+        );
+        mutation.state = state;
+        mutation.judgment.safety_verdict = safety_verdict;
+        mutation.judgment.retention_verdict = retention_verdict;
+        mutation.judgment.retention_score = ConfidenceInterval::exact(retention_score);
+        mutation.state_updated_at = state_updated_at.map(ToString::to_string);
+        mutation
+    }
 
     #[test]
     fn truncate_short_string_unchanged() {
@@ -2645,6 +2801,181 @@ mod tests {
         assert_eq!(params.per_page, 20);
         assert!(params.since.is_none());
         assert!(params.until.is_none());
+        assert!(params.session_id.is_none());
+        assert!(params.tool_name.is_none());
         assert!(params.state.is_none());
+        assert!(params.safety_verdict.is_none());
+        assert!(params.retention_verdict.is_none());
+        assert!(params.min_retention_score.is_none());
+        assert_eq!(params.sort, "priority");
+    }
+
+    #[test]
+    fn cross_session_mutation_list_params_with_filters() {
+        let params: CrossSessionMutationListParams = serde_json::from_str(
+            r#"{
+                "page": 2,
+                "per_page": 5,
+                "session_id": "session-b",
+                "tool_name": "\"write_file\"",
+                "state": "pending",
+                "safety_verdict": "requires_approval",
+                "retention_verdict": "retain",
+                "min_retention_score": 0.7,
+                "sort": "retention"
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(params.page, 2);
+        assert_eq!(params.per_page, 5);
+        assert_eq!(params.session_id.as_deref(), Some("session-b"));
+        assert_eq!(params.tool_name.as_deref(), Some("\"write_file\""));
+        assert_eq!(params.state, Some(StagedMutationState::Pending));
+        assert_eq!(
+            params.safety_verdict,
+            Some(MutationSafetyVerdict::RequiresApproval)
+        );
+        assert_eq!(
+            params.retention_verdict,
+            Some(MutationRetentionVerdict::Retain)
+        );
+        assert_eq!(params.min_retention_score, Some(0.7));
+        assert_eq!(params.sort, "retention");
+    }
+
+    #[test]
+    fn cross_session_mutation_queue_prioritizes_ready_then_actionable_pending() {
+        let response = select_cross_session_mutations(
+            vec![
+                sample_queue_mutation(
+                    "applied",
+                    "session-a",
+                    "write_file",
+                    StagedMutationState::Applied,
+                    MutationSafetyVerdict::Safe,
+                    MutationRetentionVerdict::Retain,
+                    0.95,
+                    Some("2026-04-10T09:00:00Z"),
+                ),
+                sample_queue_mutation(
+                    "pending-approval",
+                    "session-b",
+                    "write_file",
+                    StagedMutationState::Pending,
+                    MutationSafetyVerdict::RequiresApproval,
+                    MutationRetentionVerdict::Retain,
+                    0.82,
+                    Some("2026-04-10T10:00:00Z"),
+                ),
+                sample_queue_mutation(
+                    "ready",
+                    "session-c",
+                    "edit_file",
+                    StagedMutationState::Ready,
+                    MutationSafetyVerdict::Safe,
+                    MutationRetentionVerdict::Review,
+                    0.61,
+                    Some("2026-04-09T10:00:00Z"),
+                ),
+                sample_queue_mutation(
+                    "blocked",
+                    "session-d",
+                    "bash",
+                    StagedMutationState::Blocked,
+                    MutationSafetyVerdict::Blocked,
+                    MutationRetentionVerdict::Reject,
+                    0.12,
+                    Some("2026-04-11T10:00:00Z"),
+                ),
+            ],
+            &CrossSessionMutationListParams {
+                page: 1,
+                per_page: 20,
+                since: None,
+                until: None,
+                session_id: None,
+                tool_name: None,
+                state: None,
+                safety_verdict: None,
+                retention_verdict: None,
+                min_retention_score: None,
+                sort: "priority".into(),
+            },
+        );
+
+        let ordered_ids = response
+            .mutations
+            .iter()
+            .map(|mutation| mutation.mutation_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ordered_ids,
+            vec!["ready", "pending-approval", "blocked", "applied"]
+        );
+    }
+
+    #[test]
+    fn cross_session_mutation_queue_filters_by_tool_and_verdicts() {
+        let response = select_cross_session_mutations(
+            vec![
+                sample_queue_mutation(
+                    "match",
+                    "session-b",
+                    "write_file",
+                    StagedMutationState::Pending,
+                    MutationSafetyVerdict::RequiresApproval,
+                    MutationRetentionVerdict::Retain,
+                    0.83,
+                    Some("2026-04-10T10:00:00Z"),
+                ),
+                sample_queue_mutation(
+                    "wrong-tool",
+                    "session-b",
+                    "bash",
+                    StagedMutationState::Pending,
+                    MutationSafetyVerdict::RequiresApproval,
+                    MutationRetentionVerdict::Retain,
+                    0.99,
+                    Some("2026-04-10T11:00:00Z"),
+                ),
+                sample_queue_mutation(
+                    "wrong-retention",
+                    "session-b",
+                    "write_file",
+                    StagedMutationState::Pending,
+                    MutationSafetyVerdict::RequiresApproval,
+                    MutationRetentionVerdict::Review,
+                    0.83,
+                    Some("2026-04-10T12:00:00Z"),
+                ),
+                sample_queue_mutation(
+                    "wrong-score",
+                    "session-b",
+                    "write_file",
+                    StagedMutationState::Pending,
+                    MutationSafetyVerdict::RequiresApproval,
+                    MutationRetentionVerdict::Retain,
+                    0.42,
+                    Some("2026-04-10T13:00:00Z"),
+                ),
+            ],
+            &CrossSessionMutationListParams {
+                page: 1,
+                per_page: 20,
+                since: None,
+                until: None,
+                session_id: Some("session-b".into()),
+                tool_name: Some("\"write_file\"".into()),
+                state: Some(StagedMutationState::Pending),
+                safety_verdict: Some(MutationSafetyVerdict::RequiresApproval),
+                retention_verdict: Some(MutationRetentionVerdict::Retain),
+                min_retention_score: Some(0.7),
+                sort: "priority".into(),
+            },
+        );
+
+        assert_eq!(response.total, 1);
+        assert_eq!(response.mutations.len(), 1);
+        assert_eq!(response.mutations[0].mutation_id, "match");
     }
 }

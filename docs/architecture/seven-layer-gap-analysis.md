@@ -87,7 +87,7 @@
 - **MutationScoreboard contract** (`services/src/mutation_scoreboard.rs`): Canonical typed scoreboard now unifies verifier summaries, objective/reward signals, staged mutation state, and aggregated retention metrics.
 - **Decision-audit-backed mutation scoreboard exposure** (`runtime/src/bridge/side_effects.rs`, `services/src/session_audit.rs`, `runtime/src/server/audit_handlers.rs`): tool-selection decision audits now persist `mutation_objective_score`, tool arguments, and turn metadata, and `/sessions/{session_id}/audit/mutations` reconstructs a typed per-session scoreboard for report/ops inspection.
 - **Cross-session mutation stats** (`services/src/session_audit.rs`): `/audit/stats` now aggregates global mutation counts (ready, approval-required, applied, reverted, blocked) across the user’s sessions, turning the per-session scoreboard into an account-level ops signal.
-- **Global mutation queue** (`services/src/session_audit.rs`, `runtime/src/server/audit_handlers.rs`): `/audit/mutations` now lists staged mutations across sessions with state filtering and pagination, giving ops a concrete queue instead of only counters.
+- **Global mutation queue** (`services/src/session_audit.rs`, `runtime/src/server/audit_handlers.rs`): `/audit/mutations` now lists staged mutations across sessions with priority-first sorting plus state/session/tool/safety/retention filtering, giving ops a concrete work queue instead of only counters.
 
 ### Gaps
 - **Most evaluation routes return 501**: `DatabaseEvaluationService` has "not implemented yet" for drift detection, drift pipeline, closed-loop, training data, SLO.
