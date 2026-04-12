@@ -471,6 +471,9 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             max_identical_tool_calls: astra_runtime::runtime_config::RuntimeConfig::load()
                 .tool_selection
                 .effective_max_identical_calls(),
+            max_tools_per_turn: astra_runtime::runtime_config::RuntimeConfig::load()
+                .tool_selection
+                .effective_max_tools_per_turn(),
             stall: Default::default(),
             telemetry: Default::default(),
             skills: SkillState {

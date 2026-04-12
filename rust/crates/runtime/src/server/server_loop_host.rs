@@ -1361,6 +1361,7 @@ mod tests {
             max_identical_tool_calls: crate::runtime_config::RuntimeConfig::load()
                 .tool_selection
                 .effective_max_identical_calls(),
+            max_tools_per_turn: 15,
             stall: Default::default(),
             telemetry: Default::default(),
             skills: Default::default(),

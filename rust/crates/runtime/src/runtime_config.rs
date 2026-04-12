@@ -316,6 +316,12 @@ pub struct ToolSelectionConfig {
     /// 0 = use default (2). Prevents infinite loops from ignored dedup hints.
     #[serde(default)]
     pub max_identical_tool_calls: u32,
+
+    /// Max tool calls to execute in a single LLM turn (headless round).
+    /// 0 = use default (15). Excess calls are skipped with a budget stub.
+    /// Prevents pathological turns where the agent requests 50+ tool calls.
+    #[serde(default)]
+    pub max_tools_per_turn: u32,
 }
 
 impl ToolSelectionConfig {
@@ -325,6 +331,15 @@ impl ToolSelectionConfig {
             self.max_identical_tool_calls
         } else {
             2
+        }
+    }
+
+    /// Resolved max tools per turn (0 → default of 15).
+    pub fn effective_max_tools_per_turn(&self) -> u32 {
+        if self.max_tools_per_turn > 0 {
+            self.max_tools_per_turn
+        } else {
+            15
         }
     }
 }
@@ -354,6 +369,7 @@ impl Default for ToolSelectionConfig {
             tool_budget_tokens: 0,
             selector_model: None,
             max_identical_tool_calls: 0,
+            max_tools_per_turn: 0,
         }
     }
 }
@@ -869,6 +885,7 @@ impl RuntimeConfig {
             tool_budget_tokens,
             selector_model,
             max_identical_tool_calls,
+            max_tools_per_turn,
         } = tool_selection;
         merge_if_non_default(
             &mut self.tool_selection.max_tools,
@@ -911,6 +928,11 @@ impl RuntimeConfig {
         merge_if_non_default(
             &mut self.tool_selection.max_identical_tool_calls,
             max_identical_tool_calls,
+            0,
+        );
+        merge_if_non_default(
+            &mut self.tool_selection.max_tools_per_turn,
+            max_tools_per_turn,
             0,
         );
 
@@ -1197,6 +1219,18 @@ mod tests {
     }
 
     #[test]
+    fn test_effective_max_tools_per_turn() {
+        let mut config = ToolSelectionConfig::default();
+        assert_eq!(config.effective_max_tools_per_turn(), 15);
+
+        config.max_tools_per_turn = 10;
+        assert_eq!(config.effective_max_tools_per_turn(), 10);
+
+        config.max_tools_per_turn = 1;
+        assert_eq!(config.effective_max_tools_per_turn(), 1);
+    }
+
+    #[test]
     fn test_compression_strategy_presets() {
         let mut config = CompressionConfig::default();
 
@@ -1304,6 +1338,7 @@ mod tests {
                 tool_budget_tokens: 0,
                 selector_model: None,
                 max_identical_tool_calls: 0,
+                max_tools_per_turn: 0,
             },
             learning: LearningConfig {
                 enabled: false,

@@ -99,6 +99,7 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
     semantic_dedup: &mut SemanticDedup,
     call_counts: &mut HashMap<String, u32>,
     max_identical_calls: u32,
+    max_tools_per_turn: u32,
     tool_call_records: &mut Vec<ToolCallRecord>,
     tool_event_hooks: &crate::skills::hooks::ToolEventHookRegistry,
     term: &mut dyn HeadlessRoundTerminal,
@@ -179,6 +180,7 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
     /// stop processing — the model is stuck emitting malformed calls.
     const MAX_CONSECUTIVE_EMPTY_NAME: u32 = 3;
     let mut consecutive_empty_name: u32 = 0;
+    let mut executed_this_turn: u32 = 0;
 
     for item in &indices {
         if let Some((aborted_count, aborted_tools)) =
@@ -196,6 +198,26 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
             );
             turn_guard.record_step_abort(&aborted_tools);
             break;
+        }
+
+        // ── Per-turn tool budget check ──
+        // When the turn has executed max_tools_per_turn tools, skip the
+        // rest with a short budget-exhaustion stub so the LLM can
+        // re-prioritize on the next turn instead of flooding one turn.
+        if executed_this_turn >= max_tools_per_turn {
+            let slot = resolve_headless_tool_slot(*item, tool_calls, |i| {
+                let e = &edge_tool_round[i];
+                (e.tool_name().to_string(), e.tool_args().clone())
+            });
+            let body = format!(
+                "⛔ Per-turn tool budget exhausted ({max_tools_per_turn} tools). \
+                 Skipping this call. Prioritize the most important remaining \
+                 tools in your next response — do not repeat all skipped calls.",
+            );
+            let (tool_msg, tr) = headless_idempotency_hit_openai_pair(&slot.id, &slot.name, &body);
+            messages.push(tool_msg);
+            tool_results.push(tr);
+            continue;
         }
 
         let slot = resolve_headless_tool_slot(*item, tool_calls, |i| {
@@ -322,6 +344,39 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
                 cached.output.len() as u32,
                 make_args_preview(&name, &args),
             ));
+            continue;
+        }
+
+        // ── Semantic dedup hard block (Tier 2: parameter-aware) ──
+        // If the same tool was already called with semantically equivalent args,
+        // skip execution and return the cached output. Unlike the hint-only
+        // path (which fires post-execution), this prevents execution entirely.
+        if CACHEABLE_TOOLS.contains(&name.as_str())
+            && let Some((prev_turn, cached_output)) =
+                semantic_dedup.pre_check_block(&name, &args, turn_index)
+        {
+            let body = format!(
+                "{cached_output}\n\n⛔ BLOCKED DUPLICATE: This {name} call is semantically \
+                 identical to turn {} — same tool with equivalent arguments. \
+                 Execution was skipped. Use the result above instead of calling again.",
+                prev_turn + 1,
+            );
+            let (tool_msg, tr) = headless_idempotency_hit_openai_pair(&id, &name, &body);
+            messages.push(tool_msg);
+            tool_results.push(tr);
+            turn_guard.health.record_cache_hit(&name);
+            tool_call_records.push(journal_record_cross_turn_cache_hit(
+                name.clone(),
+                cached_output.len() as u32,
+                make_args_preview(&name, &args),
+            ));
+            agent_warn!(
+                "dedup",
+                "Semantic block: tool '{}' (id={}) matches turn {} via param-aware dedup",
+                name,
+                id,
+                prev_turn + 1,
+            );
             continue;
         }
 
@@ -554,6 +609,7 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
             args_preview,
         ));
         step_recorder.complete_tool_with_result(&name, is_err, executed_ms, false, &result_str);
+        executed_this_turn += 1;
 
         if let Some(sid) = current_session_id {
             try_write_light_headless_step_checkpoint(sid, step_recorder);

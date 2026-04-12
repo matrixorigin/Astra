@@ -31,10 +31,10 @@ const EXPLORATION_TOOLS: &[&str] = &[
 ];
 
 /// Maximum consecutive exploration-only rounds before triggering correction.
-/// Lowered from 8→5: with auto-expanding read_file (full-file on 2nd+ ranged
-/// read), agents need fewer exploration rounds. 8 was too permissive — allowed
-/// long sequences of fragmented reads before any correction.
-pub const MAX_EXPLORATION_ROUNDS: usize = 5;
+/// Lowered from 8→5→3: with auto-expanding read_file (full-file on 2nd+ ranged
+/// read) and EdgeToolCache dedup, agents need fewer exploration rounds.
+/// 5 was still too permissive — allowed long sequences of redundant reads.
+pub const MAX_EXPLORATION_ROUNDS: usize = 3;
 
 pub fn canonical_tool_args(raw: &str) -> String {
     match serde_json::from_str::<Value>(raw) {
@@ -790,16 +790,16 @@ mod tests {
 
     #[test]
     fn divergence_exploring_three() {
-        // 3 consecutive exploration rounds → still Exploring (threshold is 5)
+        // 3 consecutive exploration rounds → Diverging (hits threshold of 3)
         let sigs = make_sigs(&[&["bash"], &["list_dir"], &["read_file"]]);
-        assert_eq!(detect_divergence(&sigs), DivergenceStatus::Exploring(3));
+        assert_eq!(detect_divergence(&sigs), DivergenceStatus::Diverging(3));
     }
 
     #[test]
     fn divergence_exploring_four() {
-        // 4 consecutive exploration rounds → still Exploring (threshold is 5)
+        // 4 consecutive exploration rounds → Diverging (past threshold of 3)
         let sigs = make_sigs(&[&["bash"], &["list_dir"], &["grep"], &["read_file"]]);
-        assert_eq!(detect_divergence(&sigs), DivergenceStatus::Exploring(4));
+        assert_eq!(detect_divergence(&sigs), DivergenceStatus::Diverging(4));
     }
 
     #[test]
@@ -869,13 +869,13 @@ mod tests {
 
     #[test]
     fn divergence_multi_tool_exploration_only() {
-        // 3 rounds of multi-tool exploration → Exploring(3), below threshold of 5
+        // 3 rounds of multi-tool exploration → Diverging(3), hits threshold of 3
         let sigs = make_sigs(&[
             &["bash", "grep"],
             &["list_dir", "read_file"],
             &["bash", "glob"],
         ]);
-        assert_eq!(detect_divergence(&sigs), DivergenceStatus::Exploring(3));
+        assert_eq!(detect_divergence(&sigs), DivergenceStatus::Diverging(3));
     }
 
     #[test]
@@ -892,17 +892,18 @@ mod tests {
     }
 
     /// Regression test for session f9903b97: grep→read_file→grep→grep is
-    /// a normal code analysis pattern, NOT divergence.
+    /// a normal code analysis pattern, but 4 consecutive exploration-only
+    /// rounds now exceed the lowered threshold of 3.
     #[test]
-    fn normal_code_analysis_not_diverging() {
+    fn normal_code_analysis_diverges_after_four() {
         let sigs = make_sigs(&[
             &["grep", "grep"], // round 0: search
             &["read_file"],    // round 1: read result
             &["grep"],         // round 2: refine search
             &["grep", "grep"], // round 3: more search
         ]);
-        // 4 consecutive exploration rounds → Exploring(4), NOT Diverging
-        assert_eq!(detect_divergence(&sigs), DivergenceStatus::Exploring(4));
+        // 4 consecutive exploration rounds → Diverging(4) with threshold=3
+        assert_eq!(detect_divergence(&sigs), DivergenceStatus::Diverging(4));
     }
 
     #[test]

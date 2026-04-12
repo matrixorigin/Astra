@@ -256,6 +256,35 @@ impl SemanticDedup {
         }
     }
 
+    /// Pre-execution hard-block check for high-confidence semantic duplicates.
+    ///
+    /// Returns `Some((prev_turn, cached_output))` when a Tier 2 parameter-aware
+    /// match exists AND a prior output is available in the output log.
+    /// The caller should skip execution and return the cached output directly.
+    ///
+    /// Unlike `check_and_record`, this does NOT update internal state — call
+    /// `check_and_record` after execution (or after returning cached output)
+    /// to keep the param cache and output log in sync.
+    pub fn pre_check_block(
+        &self,
+        tool_name: &str,
+        args: &Value,
+        current_turn: usize,
+    ) -> Option<(usize, String)> {
+        let sem_key = semantic_call_key(tool_name, args)?;
+        let (prev_turn, _prev_tool) = self.param_cache.get(&sem_key)?;
+        if current_turn <= *prev_turn {
+            return None;
+        }
+        // Find the most recent output from the same tool in output_log
+        for (prev_tool, _out_turn, prev_output) in self.output_log.iter().rev() {
+            if prev_tool == tool_name {
+                return Some((*prev_turn, prev_output.clone()));
+            }
+        }
+        None
+    }
+
     /// Check if a tool call is a semantic near-duplicate of a previous call.
     ///
     /// Returns `Some((prev_turn, reason))` if a near-duplicate is found.
@@ -954,5 +983,51 @@ mod tests {
         let k1 = semantic_call_key("git_diff", &json!({"base_ref": "HEAD~5", "ref": "HEAD"}));
         let k2 = semantic_call_key("git_diff", &json!({"base_ref": "HEAD~5", "ref": "HEAD"}));
         assert_eq!(k1, k2);
+    }
+
+    #[test]
+    fn pre_check_block_returns_none_on_first_call() {
+        let dedup = SemanticDedup::new(0.75);
+        let result = dedup.pre_check_block("read_file", &json!({"path": "src/main.rs"}), 0);
+        assert!(result.is_none(), "first call should not block");
+    }
+
+    #[test]
+    fn pre_check_block_returns_cached_output_on_repeat() {
+        let mut dedup = SemanticDedup::new(0.75);
+        // First call — records param cache + output
+        let output = "fn main() { println!(\"hello\"); }";
+        let res = dedup.check_and_record("read_file", &json!({"path": "src/main.rs"}), output, 0);
+        assert!(res.is_none());
+
+        // Second call with same semantic key — should block
+        let block = dedup.pre_check_block("read_file", &json!({"path": "src/main.rs"}), 1);
+        assert!(block.is_some(), "should block semantic duplicate");
+        let (prev_turn, cached) = block.unwrap();
+        assert_eq!(prev_turn, 0);
+        assert!(cached.contains("main"), "should contain prior output");
+    }
+
+    #[test]
+    fn pre_check_block_ignores_different_tool() {
+        let mut dedup = SemanticDedup::new(0.75);
+        dedup.check_and_record("read_file", &json!({"path": "src/main.rs"}), "content", 0);
+        // Different tool, different semantic namespace
+        let block = dedup.pre_check_block("grep", &json!({"path": "src/main.rs"}), 1);
+        assert!(block.is_none(), "different tool should not block");
+    }
+
+    #[test]
+    fn pre_check_block_normalizes_trailing_slash() {
+        let mut dedup = SemanticDedup::new(0.75);
+        dedup.check_and_record(
+            "read_file",
+            &json!({"path": "src/main.rs"}),
+            "file content here for normalization test",
+            0,
+        );
+        // Trailing slash should normalize to the same semantic key
+        let block = dedup.pre_check_block("read_file", &json!({"path": "src/main.rs/"}), 1);
+        assert!(block.is_some(), "normalized path should match");
     }
 }

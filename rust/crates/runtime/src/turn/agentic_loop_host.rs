@@ -454,6 +454,8 @@ pub struct AgenticLoopState {
     pub call_counts: HashMap<String, u32>,
     /// Resolved max identical tool calls (from config, computed once at init).
     pub max_identical_tool_calls: u32,
+    /// Resolved max tool calls per turn (from config, computed once at init).
+    pub max_tools_per_turn: u32,
 
     // ── Sub-states ──
     pub skills: SkillState,
@@ -4822,6 +4824,7 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                 &mut state.semantic_dedup,
                 &mut state.call_counts,
                 state.max_identical_tool_calls,
+                state.max_tools_per_turn,
                 &mut state.stall.tool_call_records,
                 &state.skills.tool_event_hooks,
                 &mut term_adapter,
@@ -5542,6 +5545,9 @@ mod tests {
             max_identical_tool_calls: crate::runtime_config::RuntimeConfig::load()
                 .tool_selection
                 .effective_max_identical_calls(),
+            max_tools_per_turn: crate::runtime_config::RuntimeConfig::load()
+                .tool_selection
+                .effective_max_tools_per_turn(),
             stall: Default::default(),
             telemetry: Default::default(),
             skills: SkillState {

@@ -159,6 +159,7 @@ mod tests {
             max_identical_tool_calls: crate::runtime_config::RuntimeConfig::load()
                 .tool_selection
                 .effective_max_identical_calls(),
+            max_tools_per_turn: 15,
             stall: Default::default(),
             telemetry: Default::default(),
             skills: Default::default(),
@@ -626,6 +627,7 @@ mod tests {
             &mut semantic_dedup,
             &mut std::collections::HashMap::new(),
             2,
+            15, // max_tools_per_turn
             &mut tool_call_records,
             &tool_event_hooks,
             &mut term,
@@ -693,6 +695,7 @@ mod tests {
             &mut semantic_dedup,
             &mut std::collections::HashMap::new(),
             2,
+            15, // max_tools_per_turn
             &mut tool_call_records,
             &tool_event_hooks,
             &mut term,
@@ -789,6 +792,7 @@ mod tests {
             &mut semantic_dedup,
             &mut std::collections::HashMap::new(),
             2,
+            15, // max_tools_per_turn
             &mut tool_call_records,
             &tool_event_hooks,
             &mut term,
@@ -905,6 +909,7 @@ mod tests {
             &mut semantic_dedup,
             &mut std::collections::HashMap::new(),
             2,
+            15, // max_tools_per_turn
             &mut tool_call_records,
             &tool_event_hooks,
             &mut term,
@@ -1009,6 +1014,7 @@ mod tests {
             &mut semantic_dedup,
             &mut std::collections::HashMap::new(),
             2,
+            15, // max_tools_per_turn
             &mut tool_call_records,
             &tool_event_hooks,
             &mut term,
@@ -1099,6 +1105,7 @@ mod tests {
             &mut semantic_dedup,
             &mut std::collections::HashMap::new(),
             2,
+            15, // max_tools_per_turn
             &mut tool_call_records,
             &tool_event_hooks,
             &mut term,
@@ -1216,6 +1223,7 @@ mod tests {
             &mut semantic_dedup,
             &mut std::collections::HashMap::new(),
             2,
+            15, // max_tools_per_turn
             &mut tool_call_records,
             &tool_event_hooks,
             &mut term,
@@ -1333,6 +1341,7 @@ mod tests {
             &mut semantic_dedup,
             &mut std::collections::HashMap::new(),
             2,
+            15, // max_tools_per_turn
             &mut tool_call_records,
             &tool_event_hooks,
             &mut term,
@@ -1407,7 +1416,8 @@ mod tests {
             &mut idempotency_cache,
             &mut semantic_dedup,
             &mut HashMap::new(),
-            2, // max_identical = 2
+            2,  // max_identical = 2
+            15, // max_tools_per_turn
             &mut tool_call_records,
             &tool_event_hooks,
             &mut term,
