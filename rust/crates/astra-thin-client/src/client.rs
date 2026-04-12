@@ -1176,6 +1176,72 @@ impl ThinClient {
         Ok(out)
     }
 
+    /// `POST /chat/runs/{run_id}/delegate` — dispatch a delegated sub-run plan.
+    pub async fn delegate_run(
+        &self,
+        bearer_override: Option<&str>,
+        run_id: &str,
+        body: &Value,
+    ) -> Result<Value, ThinClientError> {
+        let url = self.url(&paths::chat_run_delegate(run_id))?;
+        let resp = self
+            .http
+            .post(url)
+            .headers(self.auth_headers_for(bearer_override))
+            .json(body)
+            .send()
+            .await?;
+        Self::json_or_error(resp).await
+    }
+
+    /// `GET /chat/runs/{run_id}/delegations` — list delegated child run IDs.
+    pub async fn list_run_delegations(
+        &self,
+        bearer_override: Option<&str>,
+        run_id: &str,
+    ) -> Result<Value, ThinClientError> {
+        let url = self.url(&paths::chat_run_delegations(run_id))?;
+        let resp = self
+            .http
+            .get(url)
+            .headers(self.auth_headers_for(bearer_override))
+            .send()
+            .await?;
+        Self::json_or_error(resp).await
+    }
+
+    /// `POST /chat/runs/{run_id}/delegations/pause` — pause delegated child runs.
+    pub async fn pause_run_delegations(
+        &self,
+        bearer_override: Option<&str>,
+        run_id: &str,
+    ) -> Result<Value, ThinClientError> {
+        let url = self.url(&paths::chat_run_delegations_pause(run_id))?;
+        let resp = self
+            .http
+            .post(url)
+            .headers(self.auth_headers_for(bearer_override))
+            .send()
+            .await?;
+        Self::json_or_error(resp).await
+    }
+
+    /// `POST /chat/runs/{run_id}/delegations/resume` — resume delegated child runs.
+    pub async fn resume_run_delegations(
+        &self,
+        bearer_override: Option<&str>,
+        run_id: &str,
+    ) -> Result<Value, ThinClientError> {
+        let url = self.url(&paths::chat_run_delegations_resume(run_id))?;
+        let resp = self
+            .http
+            .post(url)
+            .headers(self.auth_headers_for(bearer_override))
+            .send()
+            .await?;
+        Self::json_or_error(resp).await
+    }
+
     pub async fn post_tool_result(
         &self,
         bearer_override: Option<&str>,
@@ -1548,6 +1614,98 @@ mod tests {
                 && status.as_deref() == Some("completed")
                 && error.is_none()
         ));
+    }
+
+    #[tokio::test]
+    async fn wiremock_delegate_run() {
+        let srv = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/runs/run-1/delegate"))
+            .and(header("authorization", "Bearer tok"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "delegation_id": "deleg-1",
+                "status": "running"
+            })))
+            .mount(&srv)
+            .await;
+
+        let client = ThinClient::new(&srv.uri(), None).unwrap();
+        let v = client
+            .delegate_run(
+                Some("tok"),
+                "run-1",
+                &serde_json::json!({"pattern": "fan_out", "agent_ids": ["a1"]}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(v["delegation_id"], "deleg-1");
+        assert_eq!(v["status"], "running");
+    }
+
+    #[tokio::test]
+    async fn wiremock_list_run_delegations() {
+        let srv = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/chat/runs/run-1/delegations"))
+            .and(header("authorization", "Bearer tok"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "parent_run_id": "run-1",
+                "sub_run_ids": ["child-1", "child-2"]
+            })))
+            .mount(&srv)
+            .await;
+
+        let client = ThinClient::new(&srv.uri(), None).unwrap();
+        let v = client
+            .list_run_delegations(Some("tok"), "run-1")
+            .await
+            .unwrap();
+        assert_eq!(v["parent_run_id"], "run-1");
+        assert_eq!(v["sub_run_ids"][0], "child-1");
+    }
+
+    #[tokio::test]
+    async fn wiremock_pause_run_delegations() {
+        let srv = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/runs/run-1/delegations/pause"))
+            .and(header("authorization", "Bearer tok"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "parent_run_id": "run-1",
+                "affected": 2
+            })))
+            .mount(&srv)
+            .await;
+
+        let client = ThinClient::new(&srv.uri(), None).unwrap();
+        let v = client
+            .pause_run_delegations(Some("tok"), "run-1")
+            .await
+            .unwrap();
+        assert_eq!(v["parent_run_id"], "run-1");
+        assert_eq!(v["affected"], 2);
+    }
+
+    #[tokio::test]
+    async fn wiremock_resume_run_delegations() {
+        let srv = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/runs/run-1/delegations/resume"))
+            .and(header("authorization", "Bearer tok"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "parent_run_id": "run-1",
+                "affected": 2
+            })))
+            .mount(&srv)
+            .await;
+
+        let client = ThinClient::new(&srv.uri(), None).unwrap();
+        let v = client
+            .resume_run_delegations(Some("tok"), "run-1")
+            .await
+            .unwrap();
+        assert_eq!(v["parent_run_id"], "run-1");
+        assert_eq!(v["affected"], 2);
     }
 
     #[tokio::test]

@@ -74,6 +74,26 @@ pub fn chat_run_resume(run_id: &str) -> String {
     format!("/chat/runs/{run_id}/resume")
 }
 
+#[inline]
+pub fn chat_run_delegate(run_id: &str) -> String {
+    format!("/chat/runs/{run_id}/delegate")
+}
+
+#[inline]
+pub fn chat_run_delegations(run_id: &str) -> String {
+    format!("/chat/runs/{run_id}/delegations")
+}
+
+#[inline]
+pub fn chat_run_delegations_pause(run_id: &str) -> String {
+    format!("/chat/runs/{run_id}/delegations/pause")
+}
+
+#[inline]
+pub fn chat_run_delegations_resume(run_id: &str) -> String {
+    format!("/chat/runs/{run_id}/delegations/resume")
+}
+
 pub const AUTH_REGISTER: &str = "/auth/register";
 pub const AUTH_LOGIN: &str = "/auth/login";
 pub const AUTH_REFRESH: &str = "/auth/refresh";
@@ -324,6 +344,32 @@ mod tests {
     #[test]
     fn chat_run_resume_path() {
         assert_eq!(chat_run_resume("r1"), "/chat/runs/r1/resume");
+    }
+
+    #[test]
+    fn chat_run_delegate_path() {
+        assert_eq!(chat_run_delegate("r1"), "/chat/runs/r1/delegate");
+    }
+
+    #[test]
+    fn chat_run_delegations_path() {
+        assert_eq!(chat_run_delegations("r1"), "/chat/runs/r1/delegations");
+    }
+
+    #[test]
+    fn chat_run_delegations_pause_path() {
+        assert_eq!(
+            chat_run_delegations_pause("r1"),
+            "/chat/runs/r1/delegations/pause"
+        );
+    }
+
+    #[test]
+    fn chat_run_delegations_resume_path() {
+        assert_eq!(
+            chat_run_delegations_resume("r1"),
+            "/chat/runs/r1/delegations/resume"
+        );
     }
 
     // --- Model/Skill paths ---
