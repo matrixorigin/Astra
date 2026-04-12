@@ -3075,6 +3075,68 @@ mod tests {
     }
 
     #[test]
+    fn process_bridge_stream_event_emits_run_started_before_tail_session_info() {
+        let mut conn = WsConnection {
+            user: AuthUserRecord {
+                user_id: "u1".into(),
+                username: "alice".into(),
+                email: "alice@example.com".into(),
+                display_name: Some("Alice".into()),
+            },
+            authorization: "Bearer test-token".into(),
+            session_id: None,
+            pending_session_id: Some("pending-session".into()),
+            active_run_id: None,
+            bridge_prepared_run_id: None,
+        };
+        let mut suppress = false;
+        let mut saw_turn_complete = false;
+        let mut terminal_error = None;
+        let explain = bridge_run_started_explain(true);
+
+        let processed = process_bridge_stream_event(
+            &mut conn,
+            serde_json::json!({
+                "type": "session_info",
+                "session_id": "sess-42",
+                "run_id": "run-9"
+            }),
+            explain.as_ref(),
+            &mut suppress,
+            &mut saw_turn_complete,
+            &mut terminal_error,
+        );
+
+        let mut frames: Vec<serde_json::Value> = processed
+            .pre_messages
+            .iter()
+            .map(|message| serde_json::to_value(message).expect("server message should serialize"))
+            .collect();
+        if let Some(raw_event) = processed.raw_event {
+            frames.push(raw_event);
+        }
+
+        assert_eq!(
+            frames,
+            vec![
+                serde_json::json!({
+                    "type": "run_started",
+                    "run_id": "run-9",
+                    "session_id": "sess-42",
+                    "explain": {"mode": "background"}
+                }),
+                serde_json::json!({
+                    "type": "session_info",
+                    "session_id": "sess-42",
+                    "run_id": "run-9"
+                }),
+            ]
+        );
+        assert!(!saw_turn_complete);
+        assert_eq!(terminal_error, None);
+    }
+
+    #[test]
     fn session_info_stream_event_updates_connection_state() {
         let mut conn = WsConnection {
             user: AuthUserRecord {
