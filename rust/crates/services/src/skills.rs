@@ -108,6 +108,12 @@ pub struct SkillStatusRecord {
 const MAX_SKILL_LIST_ROWS: u32 = 200;
 const MAX_SKILL_STATUS_PER_GROUP: u32 = 100;
 
+/// `list_skills` row projection — excludes `skill_definition` (large JSON); use `get_skill` for body.
+const SKILL_REGISTRY_LIST_SELECT: &str = "\
+    skill_id, skill_name, version, description, \
+    status, source, category, \
+    DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at";
+
 // ── Trait ─────────────────────────────────────────────────────────────────────
 
 #[async_trait]
@@ -262,14 +268,11 @@ impl SkillService for DatabaseSkillService {
             .map_err(internal_error)?;
         let total: i64 = count_row.try_get("cnt").unwrap_or(0);
 
-        let rows = query(
-            "SELECT skill_id, skill_name, version, description, \
-             IFNULL(CAST(skill_definition AS CHAR), '{}') AS definition_json, \
-             status, source, category, \
-             DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at \
-             FROM skills_registry WHERE is_active = 1 \
+        let list_sql = format!(
+            "SELECT {SKILL_REGISTRY_LIST_SELECT} FROM skills_registry WHERE is_active = 1 \
              ORDER BY created_at DESC LIMIT ? OFFSET ?",
-        )
+        );
+        let rows = query(&list_sql)
         .bind(limit)
         .bind(offset)
         .fetch_all(&pool)
@@ -768,5 +771,13 @@ mod tests {
     fn skill_get_query_no_version() {
         let q: SkillGetQuery = serde_json::from_str("{}").unwrap();
         assert!(q.version.is_none());
+    }
+
+    #[test]
+    fn skill_registry_list_select_omits_definition_blob() {
+        assert!(
+            !SKILL_REGISTRY_LIST_SELECT.contains("skill_definition"),
+            "list_skills must not read skill_definition (use get_skill for full record)"
+        );
     }
 }
