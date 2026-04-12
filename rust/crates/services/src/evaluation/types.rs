@@ -346,6 +346,7 @@ pub struct CalibrationResponse {
     pub bias_interval: ValueInterval,
     pub sample_count: i64,
     pub adjustment_multiplier: f64,
+    pub adjustment_multiplier_interval: ValueInterval,
     pub adjustment_reason: String,
     pub noise_filtered_mean_confidence: f64,
     pub noise_filtered_mean_confidence_interval: ConfidenceInterval,
@@ -357,6 +358,7 @@ pub struct CalibrationResponse {
     pub noise_filtered_bias_interval: ValueInterval,
     pub noise_filtered_sample_count: i64,
     pub noise_filtered_adjustment_multiplier: f64,
+    pub noise_filtered_adjustment_multiplier_interval: ValueInterval,
     pub noise_filtered_adjustment_reason: String,
 }
 
@@ -400,6 +402,7 @@ pub struct DriftPipelineResponse {
 pub struct LoopDiagnosisItem {
     pub metric: String,
     pub value: f64,
+    pub value_interval: ValueInterval,
     pub threshold: f64,
     pub action: LoopAction,
 }

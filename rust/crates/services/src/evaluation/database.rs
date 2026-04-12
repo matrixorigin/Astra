@@ -153,6 +153,7 @@ struct CalibrationSummary {
     bias_interval: ValueInterval,
     sample_count: i64,
     adjustment_multiplier: f64,
+    adjustment_multiplier_interval: ValueInterval,
     adjustment_reason: String,
 }
 
@@ -210,6 +211,49 @@ fn sampled_value_interval(point: f64, sample_count: i64) -> ValueInterval {
     }
     let margin = (0.5 / (sample_count as f64).sqrt()).clamp(0.05, 0.25);
     ValueInterval::new(point, point - margin, point + margin)
+}
+
+fn confidence_to_value_interval(interval: ConfidenceInterval) -> ValueInterval {
+    ValueInterval::new(interval.point, interval.lower, interval.upper)
+}
+
+fn absolute_value_interval(interval: ValueInterval) -> ValueInterval {
+    let lower = if interval.lower <= 0.0 && interval.upper >= 0.0 {
+        0.0
+    } else {
+        interval.lower.abs().min(interval.upper.abs())
+    };
+    let upper = interval.lower.abs().max(interval.upper.abs());
+    ValueInterval::new(interval.point.abs(), lower, upper)
+}
+
+fn adjustment_multiplier_interval(
+    calibration_error_interval: ValueInterval,
+    bias_interval: ValueInterval,
+    point: f64,
+) -> ValueInterval {
+    let mut lower = f64::INFINITY;
+    let mut upper = f64::NEG_INFINITY;
+    for error in [
+        calibration_error_interval.lower,
+        calibration_error_interval.point,
+        calibration_error_interval.upper,
+    ] {
+        for bias in [
+            bias_interval.lower,
+            bias_interval.point,
+            bias_interval.upper,
+        ] {
+            let candidate = compute_adjustment(error.abs(), bias).0;
+            lower = lower.min(candidate);
+            upper = upper.max(candidate);
+        }
+    }
+    if !lower.is_finite() || !upper.is_finite() {
+        ValueInterval::exact(point)
+    } else {
+        ValueInterval::new(point, lower, upper)
+    }
 }
 
 fn numeric_mean_interval(samples: &[f64]) -> NumericInterval {
@@ -321,6 +365,7 @@ fn summarize_calibration(
             bias_interval: ValueInterval::ZERO,
             sample_count: 0,
             adjustment_multiplier: 1.0,
+            adjustment_multiplier_interval: ValueInterval::ZERO,
             adjustment_reason: "No session calibration samples available.".into(),
         };
     }
@@ -330,6 +375,8 @@ fn summarize_calibration(
     let calibration_error = compute_calibration_error(mean_confidence, mean_quality);
     let bias = mean_confidence - mean_quality;
     let (adjustment_multiplier, adjustment_reason) = compute_adjustment(calibration_error, bias);
+    let calibration_error_interval = sampled_value_interval(calibration_error, sample_count);
+    let bias_interval = sampled_value_interval(bias, sample_count);
 
     CalibrationSummary {
         mean_confidence,
@@ -337,11 +384,16 @@ fn summarize_calibration(
         mean_quality,
         mean_quality_interval: sampled_confidence_interval(mean_quality, sample_count),
         calibration_error,
-        calibration_error_interval: sampled_value_interval(calibration_error, sample_count),
+        calibration_error_interval,
         bias,
-        bias_interval: sampled_value_interval(bias, sample_count),
+        bias_interval,
         sample_count,
         adjustment_multiplier,
+        adjustment_multiplier_interval: adjustment_multiplier_interval(
+            calibration_error_interval,
+            bias_interval,
+            adjustment_multiplier,
+        ),
         adjustment_reason,
     }
 }
@@ -1176,6 +1228,7 @@ impl EvaluationService for DatabaseEvaluationService {
             bias_interval: summary.bias_interval,
             sample_count: summary.sample_count,
             adjustment_multiplier: summary.adjustment_multiplier,
+            adjustment_multiplier_interval: summary.adjustment_multiplier_interval,
             adjustment_reason: summary.adjustment_reason,
             noise_filtered_mean_confidence: noise_filtered_summary.mean_confidence,
             noise_filtered_mean_confidence_interval: noise_filtered_summary
@@ -1189,6 +1242,8 @@ impl EvaluationService for DatabaseEvaluationService {
             noise_filtered_bias_interval: noise_filtered_summary.bias_interval,
             noise_filtered_sample_count: noise_filtered_summary.sample_count,
             noise_filtered_adjustment_multiplier: noise_filtered_summary.adjustment_multiplier,
+            noise_filtered_adjustment_multiplier_interval: noise_filtered_summary
+                .adjustment_multiplier_interval,
             noise_filtered_adjustment_reason: noise_filtered_summary.adjustment_reason,
         })
     }
@@ -1321,16 +1376,31 @@ impl EvaluationService for DatabaseEvaluationService {
         let quality = self.get_quality_trend(user_id, days, None).await?;
         let drift = self.detect_drift(user_id).await?;
 
-        let max_drift_delta = drift
-            .signals
-            .iter()
-            .map(|signal| signal.noise_filtered_delta.abs())
-            .fold(0.0_f64, f64::max);
+        let (max_drift_delta, max_drift_delta_interval) =
+            drift
+                .signals
+                .iter()
+                .fold((0.0_f64, ValueInterval::ZERO), |best, signal| {
+                    let candidate = signal.noise_filtered_delta.abs();
+                    if candidate > best.0 {
+                        (
+                            candidate,
+                            absolute_value_interval(signal.noise_filtered_delta_interval),
+                        )
+                    } else {
+                        best
+                    }
+                });
 
         let quality_signal = if quality.noise_filtered_total_events > 0 {
             quality.noise_filtered_overall_avg
         } else {
             quality.overall_avg
+        };
+        let quality_signal_interval = if quality.noise_filtered_total_events > 0 {
+            confidence_to_value_interval(quality.noise_filtered_overall_avg_interval)
+        } else {
+            confidence_to_value_interval(quality.overall_avg_interval)
         };
 
         let quality_action =
@@ -1363,18 +1433,21 @@ impl EvaluationService for DatabaseEvaluationService {
             LoopDiagnosisItem {
                 metric: "quality_overall_avg".into(),
                 value: quality_signal,
+                value_interval: quality_signal_interval,
                 threshold: LOOP_QUALITY_THRESHOLD,
                 action: quality_action,
             },
             LoopDiagnosisItem {
                 metric: "drift_signal_count".into(),
                 value: drift.signals.len() as f64,
+                value_interval: ValueInterval::exact(drift.signals.len() as f64),
                 threshold: 0.0,
                 action: drift_count_action,
             },
             LoopDiagnosisItem {
                 metric: "drift_max_delta".into(),
                 value: max_drift_delta,
+                value_interval: max_drift_delta_interval,
                 threshold: LOOP_DRIFT_DELTA_THRESHOLD,
                 action: drift_delta_action,
             },
@@ -1998,18 +2071,21 @@ mod tests {
             LoopDiagnosisItem {
                 metric: "quality_overall_avg".into(),
                 value: 0.5,
+                value_interval: ValueInterval::exact(0.5),
                 threshold: 0.7,
                 action: LoopAction::Retune,
             },
             LoopDiagnosisItem {
                 metric: "drift_signal_count".into(),
                 value: 2.0,
+                value_interval: ValueInterval::exact(2.0),
                 threshold: 0.0,
                 action: LoopAction::Alert,
             },
             LoopDiagnosisItem {
                 metric: "noop_metric".into(),
                 value: 1.0,
+                value_interval: ValueInterval::exact(1.0),
                 threshold: 1.0,
                 action: LoopAction::NoOp,
             },
@@ -2222,6 +2298,26 @@ mod tests {
         assert!((interval.point + 0.2).abs() < 0.0001);
         assert!(interval.lower < 0.0);
         assert!(interval.upper > interval.point);
+    }
+
+    #[test]
+    fn absolute_value_interval_clamps_crossing_zero_lower_bound() {
+        let interval = absolute_value_interval(ValueInterval::new(-0.1, -0.3, 0.2));
+        assert!((interval.point - 0.1).abs() < 0.0001);
+        assert_eq!(interval.lower, 0.0);
+        assert!((interval.upper - 0.3).abs() < 0.0001);
+    }
+
+    #[test]
+    fn adjustment_multiplier_interval_spans_interval_corners() {
+        let interval = adjustment_multiplier_interval(
+            ValueInterval::new(0.2, 0.1, 0.3),
+            ValueInterval::new(0.2, 0.1, 0.3),
+            0.8,
+        );
+        assert!((interval.point - 0.8).abs() < 0.0001);
+        assert!(interval.lower <= interval.point);
+        assert!(interval.upper >= interval.point);
     }
 
     #[test]
@@ -2475,6 +2571,10 @@ mod tests {
         );
         assert!((summary.bias_interval.point - summary.bias).abs() < 0.001);
         assert!(summary.adjustment_multiplier < 1.0);
+        assert!(
+            (summary.adjustment_multiplier_interval.point - summary.adjustment_multiplier).abs()
+                < 0.001
+        );
         assert!(summary.adjustment_reason.contains("Overconfident"));
     }
 
