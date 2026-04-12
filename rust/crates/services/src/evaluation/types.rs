@@ -451,13 +451,20 @@ pub struct SloHistoryResponse {
 #[derive(Debug, Clone, Serialize)]
 pub struct DecisionMetrics {
     pub avg_quality: f64,
+    pub avg_quality_interval: ConfidenceInterval,
+    pub noise_filtered_avg_quality: f64,
+    pub noise_filtered_avg_quality_interval: ConfidenceInterval,
     pub total_decisions: i64,
+    pub total_quality_samples: i64,
+    pub noise_filtered_quality_samples: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SessionMetrics {
     pub unique_sessions: i64,
     pub avg_turns_per_session: f64,
+    pub noise_filtered_avg_turns_per_session: f64,
+    pub noise_filtered_session_count: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]

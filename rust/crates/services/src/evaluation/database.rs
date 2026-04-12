@@ -1,15 +1,15 @@
 use async_trait::async_trait;
 use axum::http::StatusCode;
-use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
+use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 use serde_json::Value;
-use sqlx::{query, Row};
+use sqlx::{Row, query};
 
 use super::service::EvaluationService;
 use super::types::*;
 use super::utils::*;
 use astra_core::{
-    confidence::ConfidenceInterval, connect_matrixone, error_response, internal_error,
-    MatrixOneSettings, SharedPool,
+    MatrixOneSettings, SharedPool, confidence::ConfidenceInterval, connect_matrixone,
+    error_response, internal_error,
 };
 
 const MAX_EVALUATION_ROWS: i32 = 200;
@@ -301,11 +301,7 @@ fn summarize_calibration(
 }
 
 fn training_dataset_status(sample_count: usize) -> &'static str {
-    if sample_count == 0 {
-        "empty"
-    } else {
-        "ready"
-    }
+    if sample_count == 0 { "empty" } else { "ready" }
 }
 
 fn normalize_export_format(
@@ -404,6 +400,34 @@ fn noise_filtered_average(scores: &[f64]) -> NoiseFilteredAverage {
     NoiseFilteredAverage {
         average: average_scores(&filtered),
         sample_count: filtered.len() as i64,
+    }
+}
+
+fn summarize_decision_metrics(total_decisions: i64, quality_scores: &[f64]) -> DecisionMetrics {
+    let total_quality_samples = quality_scores.len() as i64;
+    let avg_quality = average_scores(quality_scores);
+    let noise_filtered = noise_filtered_average(quality_scores);
+    DecisionMetrics {
+        avg_quality,
+        avg_quality_interval: sampled_confidence_interval(avg_quality, total_quality_samples),
+        noise_filtered_avg_quality: noise_filtered.average,
+        noise_filtered_avg_quality_interval: sampled_confidence_interval(
+            noise_filtered.average,
+            noise_filtered.sample_count,
+        ),
+        total_decisions,
+        total_quality_samples,
+        noise_filtered_quality_samples: noise_filtered.sample_count,
+    }
+}
+
+fn summarize_session_metrics(turn_counts: &[f64]) -> SessionMetrics {
+    let noise_filtered = noise_filtered_average(turn_counts);
+    SessionMetrics {
+        unique_sessions: turn_counts.len() as i64,
+        avg_turns_per_session: average_scores(turn_counts),
+        noise_filtered_avg_turns_per_session: noise_filtered.average,
+        noise_filtered_session_count: noise_filtered.sample_count,
     }
 }
 
@@ -1308,56 +1332,65 @@ impl EvaluationService for DatabaseEvaluationService {
         let pool = self.get_pool().await.map_err(internal_error)?;
         let days = clamp_eval_days(days);
 
-        let decision_row = query(
-            "SELECT COUNT(*) AS cnt \
+        let session_turn_rows = query(
+            "SELECT COUNT(*) AS turn_count \
              FROM agent_events \
              WHERE user_id = ? \
-               AND agent_id = ? AND event_type = 'llm_response' \
-                 AND created_at > DATE_SUB(NOW(), INTERVAL ? DAY)",
+               AND agent_id = ? \
+               AND event_type = 'llm_response' \
+               AND created_at > DATE_SUB(NOW(), INTERVAL ? DAY) \
+             GROUP BY session_id",
         )
         .bind(user_id)
         .bind(agent_id)
         .bind(days)
-        .fetch_one(&pool)
-        .await;
+        .fetch_all(&pool)
+        .await
+        .unwrap_or_default();
+        let turn_counts_raw: Vec<i64> = session_turn_rows
+            .into_iter()
+            .filter_map(|row| row.try_get("turn_count").ok())
+            .collect();
+        let total_decisions = turn_counts_raw.iter().sum();
+        let turn_counts: Vec<f64> = turn_counts_raw.iter().map(|count| *count as f64).collect();
+        let session = summarize_session_metrics(&turn_counts);
 
-        let decision = match decision_row {
-            Ok(r) => DecisionMetrics {
-                avg_quality: 0.0,
-                total_decisions: r.try_get::<i64, _>("cnt").unwrap_or(0),
-            },
-            Err(_) => DecisionMetrics {
-                avg_quality: 0.0,
-                total_decisions: 0,
-            },
-        };
-
-        let session_row = query(
-            "SELECT COUNT(DISTINCT session_id) AS sess_cnt, \
-             AVG(turn_count) AS avg_turns \
-             FROM (SELECT session_id, COUNT(*) AS turn_count \
-                    FROM agent_events \
-                    WHERE user_id = ? \
-                      AND agent_id = ? \
-                      AND created_at > DATE_SUB(NOW(), INTERVAL ? DAY) \
-                    GROUP BY session_id) sub",
+        let decision_quality_rows = query(
+            "SELECT MAX(CAST(qa.score AS DOUBLE)) AS session_quality \
+             FROM eval_quality_assessments qa \
+             WHERE qa.user_id = ? \
+               AND qa.level = 'session' \
+               AND qa.updated_at >= DATE_SUB(NOW(), INTERVAL ? DAY) \
+               AND qa.updated_at = ( \
+                   SELECT MAX(q2.updated_at) \
+                   FROM eval_quality_assessments q2 \
+                   WHERE q2.user_id = qa.user_id \
+                     AND q2.level = 'session' \
+                     AND q2.target_id = qa.target_id \
+               ) \
+               AND EXISTS ( \
+                   SELECT 1 \
+                   FROM agent_events ev \
+                   WHERE ev.user_id = qa.user_id \
+                     AND ev.session_id = qa.target_id \
+                     AND ev.agent_id = ? \
+                     AND ev.event_type = 'llm_response' \
+                     AND ev.created_at > DATE_SUB(NOW(), INTERVAL ? DAY) \
+               ) \
+             GROUP BY qa.target_id",
         )
         .bind(user_id)
+        .bind(days)
         .bind(agent_id)
         .bind(days)
-        .fetch_one(&pool)
-        .await;
-
-        let session = match session_row {
-            Ok(r) => SessionMetrics {
-                unique_sessions: r.try_get::<i64, _>("sess_cnt").unwrap_or(0),
-                avg_turns_per_session: r.try_get::<f64, _>("avg_turns").unwrap_or(0.0),
-            },
-            Err(_) => SessionMetrics {
-                unique_sessions: 0,
-                avg_turns_per_session: 0.0,
-            },
-        };
+        .fetch_all(&pool)
+        .await
+        .unwrap_or_default();
+        let decision_quality_scores: Vec<f64> = decision_quality_rows
+            .into_iter()
+            .filter_map(|row| row.try_get("session_quality").ok())
+            .collect();
+        let decision = summarize_decision_metrics(total_decisions, &decision_quality_scores);
 
         let skill_row = query(
             "SELECT COUNT(*) AS total, \
@@ -1715,13 +1748,15 @@ mod tests {
 
     #[test]
     fn build_drift_signal_ignores_small_delta() {
-        assert!(build_drift_signal(
-            "session".into(),
-            None,
-            &[0.78, 0.79, 0.77, 0.78, 0.78],
-            &[0.75, 0.76, 0.74, 0.75, 0.75],
-        )
-        .is_none());
+        assert!(
+            build_drift_signal(
+                "session".into(),
+                None,
+                &[0.78, 0.79, 0.77, 0.78, 0.78],
+                &[0.75, 0.76, 0.74, 0.75, 0.75],
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -1744,13 +1779,15 @@ mod tests {
 
     #[test]
     fn build_drift_signal_uses_noise_filtered_delta_for_severity() {
-        assert!(build_drift_signal(
-            "session".into(),
-            None,
-            &[0.20, 0.79, 0.80, 0.81, 0.82],
-            &[0.79, 0.80, 0.81, 0.82, 0.83],
-        )
-        .is_none());
+        assert!(
+            build_drift_signal(
+                "session".into(),
+                None,
+                &[0.20, 0.79, 0.80, 0.81, 0.82],
+                &[0.79, 0.80, 0.81, 0.82, 0.83],
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -2050,6 +2087,25 @@ mod tests {
     }
 
     #[test]
+    fn summarize_decision_metrics_uses_filtered_quality_companion() {
+        let metrics = summarize_decision_metrics(12, &[0.2, 0.79, 0.8, 0.81, 0.82]);
+        assert_eq!(metrics.total_decisions, 12);
+        assert_eq!(metrics.total_quality_samples, 5);
+        assert_eq!(metrics.noise_filtered_quality_samples, 4);
+        assert!(metrics.noise_filtered_avg_quality > metrics.avg_quality);
+        assert!((metrics.noise_filtered_avg_quality - 0.805).abs() < 0.0001);
+    }
+
+    #[test]
+    fn summarize_session_metrics_filters_outlier_session_turns() {
+        let metrics = summarize_session_metrics(&[6.0, 7.0, 8.0, 9.0, 60.0]);
+        assert_eq!(metrics.unique_sessions, 5);
+        assert_eq!(metrics.noise_filtered_session_count, 4);
+        assert!(metrics.noise_filtered_avg_turns_per_session < metrics.avg_turns_per_session);
+        assert!((metrics.noise_filtered_avg_turns_per_session - 7.5).abs() < 0.0001);
+    }
+
+    #[test]
     fn noise_filtered_calibration_samples_drop_gap_outlier() {
         let filtered = noise_filtered_calibration_samples(&[
             (0.80, 0.79),
@@ -2112,9 +2168,11 @@ mod tests {
         assert_eq!(summary.mean_confidence_interval, ConfidenceInterval::ZERO);
         assert_eq!(summary.mean_quality_interval, ConfidenceInterval::ZERO);
         assert_eq!(summary.adjustment_multiplier, 1.0);
-        assert!(summary
-            .adjustment_reason
-            .contains("No session calibration samples"));
+        assert!(
+            summary
+                .adjustment_reason
+                .contains("No session calibration samples")
+        );
     }
 
     #[test]

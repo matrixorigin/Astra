@@ -976,6 +976,12 @@ pub(crate) fn with_signal_attribution(
         "turn_number".to_string(),
         serde_json::json!(attribution.turn_number),
     );
+    if signal.turn_id.is_none() {
+        signal.turn_id = Some(format!(
+            "{}:turn-{}",
+            attribution.session_id, attribution.turn_number
+        ));
+    }
     if let Some(scenario) = attribution.scenario.as_ref() {
         signal
             .context
@@ -1221,10 +1227,12 @@ mod tests {
             matches!(signal.signal_type, SignalType::Correction)
                 && signal.context.get("session_id").and_then(|v| v.as_str()) == Some("session1")
                 && signal.context.get("user_id").and_then(|v| v.as_str()) == Some("user1")
+                && signal.turn_id.is_some()
         }));
         assert!(signals.iter().any(|signal| {
             matches!(signal.signal_type, SignalType::QuickFollowUp { delay_ms } if delay_ms <= QUICK_FOLLOW_UP_MAX_DELAY_MS)
                 && signal.context.get("query_delay_ms").and_then(|v| v.as_u64()).is_some()
+                && signal.turn_id.is_some()
         }));
     }
 
@@ -1244,6 +1252,7 @@ mod tests {
         assert!(signals.iter().any(|signal| {
             matches!(signal.signal_type, SignalType::LongPause { delay_ms } if delay_ms >= LONG_PAUSE_MIN_DELAY_MS)
                 && signal.context.get("session_id").and_then(|v| v.as_str()) == Some("session1")
+                && signal.turn_id.is_some()
         }));
     }
 

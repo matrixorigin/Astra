@@ -8,7 +8,7 @@
 //! - Config adjustment with rollback support
 //! - Cooldown and rate limiting
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::RwLock;
 use std::time::{Duration, SystemTime};
@@ -404,6 +404,20 @@ fn noise_filtered_indices(values: &[u64]) -> Vec<usize> {
     indices
 }
 
+fn signal_turn_key(signal: &FeedbackSignal) -> Option<String> {
+    signal.turn_id.clone().or_else(|| {
+        let session_id = signal
+            .context
+            .get("session_id")
+            .and_then(|value| value.as_str())?;
+        let turn_number = signal
+            .context
+            .get("turn_number")
+            .and_then(|value| value.as_u64())?;
+        Some(format!("{session_id}:{turn_number}"))
+    })
+}
+
 /// Tracks feedback signals for rule evaluation.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct FeedbackAggregator {
@@ -456,11 +470,21 @@ impl FeedbackAggregator {
 
     /// Count signals of a specific type within a window.
     pub fn count_signals(&self, signal_type: &str, window: Duration) -> u32 {
-        let signals = self.signals_in_window(window);
-        signals
-            .iter()
-            .filter(|s| signal_type_matches(&s.signal_type, signal_type))
-            .count() as u32
+        let mut seen_turns = HashSet::new();
+        let mut count = 0;
+        for signal in self.signals_in_window(window) {
+            if !signal_type_matches(&signal.signal_type, signal_type) {
+                continue;
+            }
+            if let Some(turn_key) = signal_turn_key(signal) {
+                if seen_turns.insert(turn_key) {
+                    count += 1;
+                }
+            } else {
+                count += 1;
+            }
+        }
+        count
     }
 
     /// Calculate success rate within a window.
@@ -544,12 +568,18 @@ impl FeedbackAggregator {
 
     fn negative_streak_since(&self, cutoff: Option<SystemTime>) -> u32 {
         let mut streak = 0;
+        let mut last_turn_key: Option<String> = None;
         for signal in self.signals.iter().rev() {
             if let Some(cutoff) = cutoff
                 && signal.timestamp < cutoff
             {
                 break;
             }
+            let turn_key = signal_turn_key(signal);
+            if turn_key.is_some() && turn_key == last_turn_key {
+                continue;
+            }
+            last_turn_key = turn_key;
             let is_negative = matches!(
                 signal.signal_type,
                 SignalType::ThumbsRating { positive: false }
@@ -1673,6 +1703,19 @@ mod tests {
     }
 
     #[test]
+    fn test_negative_streak_dedupes_same_turn_negatives() {
+        let mut agg = FeedbackAggregator::new();
+
+        agg.record(FeedbackSignal::new(SignalType::Correction).with_turn("turn-1"));
+        agg.record(FeedbackSignal::new(SignalType::Retry { count: 1 }).with_turn("turn-1"));
+        agg.record(
+            FeedbackSignal::new(SignalType::ThumbsRating { positive: false }).with_turn("turn-2"),
+        );
+
+        assert_eq!(agg.negative_streak(), 2);
+    }
+
+    #[test]
     fn test_negative_streak_in_window_ignores_older_negatives() {
         let mut agg = FeedbackAggregator::new();
 
@@ -2186,6 +2229,38 @@ mod tests {
         assert!(
             !engine2.evaluate(&config).is_empty(),
             "loaded 2 success signals should trigger"
+        );
+    }
+
+    #[test]
+    fn signal_accumulation_dedupes_same_turn_matching_signals() {
+        let engine = AutoTuningEngine::new();
+        engine.add_rule(EvolutionRule::new(
+            "correction-acc",
+            EvolutionTrigger::SignalAccumulation {
+                signal_type: SignalType::NAME_CORRECTION.to_string(),
+                count: 2,
+                window_secs: 3600,
+            },
+            EvolutionAction::Alert {
+                message: "dedupe".into(),
+                severity: AlertSeverity::Info,
+            },
+        ));
+
+        engine.record_feedback(FeedbackSignal::new(SignalType::Correction).with_turn("turn-1"));
+        engine.record_feedback(FeedbackSignal::new(SignalType::Correction).with_turn("turn-1"));
+
+        let config = RuntimeConfig::default();
+        assert!(
+            engine.evaluate(&config).is_empty(),
+            "duplicate same-turn corrections should count once"
+        );
+
+        engine.record_feedback(FeedbackSignal::new(SignalType::Correction).with_turn("turn-2"));
+        assert!(
+            !engine.evaluate(&config).is_empty(),
+            "distinct-turn corrections should still accumulate"
         );
     }
 
