@@ -36,7 +36,9 @@
 //! {"type": "pong"}
 //! ```
 
-use super::chat_handlers::resolve_or_create_chat_session_id;
+use super::chat_handlers::{
+    is_session_service_unconfigured_error, resolve_or_create_chat_session_id,
+};
 use super::*;
 use astra_core::{STATUS_CANCELLED, STATUS_COMPLETED, STATUS_FAILED};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -550,6 +552,7 @@ async fn handle_chat_message(
                 conn,
                 content,
                 resolved_session_id,
+                request_session_id_is_trusted,
                 fallback_model,
                 fallback_context,
             )
@@ -675,6 +678,29 @@ fn build_bridge_chat_payload(
             "content": content
         }]
     })
+}
+
+async fn resolve_bridge_payload_session_id(
+    state: &AppState,
+    user: &AuthUserRecord,
+    request_session_id: Option<String>,
+    request_session_id_is_trusted: bool,
+) -> (Option<String>, Option<String>) {
+    let Some(session_id) = request_session_id else {
+        return (None, None);
+    };
+    if !request_session_id_is_trusted {
+        return (Some(session_id), None);
+    }
+
+    match state
+        .session_service
+        .get_session(session_id.clone(), user.user_id.clone())
+        .await
+    {
+        Err(error) if is_session_service_unconfigured_error(&error) => (None, Some(session_id)),
+        _ => (Some(session_id), None),
+    }
 }
 
 fn chat_request_session_id(
@@ -1070,11 +1096,21 @@ async fn handle_chat_message_via_bridge(
     conn: &mut WsConnection,
     content: &str,
     request_session_id: Option<String>,
+    request_session_id_is_trusted: bool,
     model: Option<String>,
     context: Option<serde_json::Map<String, serde_json::Value>>,
 ) {
+    let (bridge_payload_session_id, trusted_session_id_override) =
+        resolve_bridge_payload_session_id(
+            state,
+            &conn.user,
+            request_session_id,
+            request_session_id_is_trusted,
+        )
+        .await;
+
     // Build the bridge request body (same format as /chat/turn)
-    let payload = build_bridge_chat_payload(request_session_id, content, model, context);
+    let payload = build_bridge_chat_payload(bridge_payload_session_id, content, model, context);
 
     let body = match serde_json::to_vec(&payload) {
         Ok(b) => Bytes::from(b),
@@ -1140,13 +1176,16 @@ async fn handle_chat_message_via_bridge(
     );
 
     // Prepare request through bridge_prep (session validation, etc.)
-    let prepared = match prepare_chat_turn_bridge_body(state, &conn.user, body).await {
+    let mut prepared = match prepare_chat_turn_bridge_body(state, &conn.user, body).await {
         Ok(r) => r,
         Err((status, error)) => {
             send_msg(socket, &ws_error_from_status(status, error.0.detail)).await;
             return;
         }
     };
+    if prepared.trusted_session_id.is_none() {
+        prepared.trusted_session_id = trusted_session_id_override;
+    }
 
     // Add optional headers from prepared context
     apply_prepared_headers(&mut bridge_headers, &prepared);
@@ -1670,6 +1709,134 @@ async fn send_msg(socket: &mut WebSocket, msg: &WsServerMessage) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use axum::{Json, http::StatusCode};
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    use crate::{
+        AppState, ErrorResponse, HealthChecker, ServiceInfo, SessionActivityRecord,
+        SessionCreateRequestData, SessionListFilter, SessionListRecord, SessionRecord,
+        SessionService, SessionUpdateRequestData,
+    };
+
+    #[derive(Clone)]
+    struct StubHealthChecker;
+
+    #[async_trait]
+    impl HealthChecker for StubHealthChecker {
+        async fn database_healthy(&self) -> bool {
+            true
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct RecordingSessionService {
+        get_calls: Arc<Mutex<Vec<(String, String)>>>,
+    }
+
+    impl RecordingSessionService {
+        async fn get_calls(&self) -> Vec<(String, String)> {
+            self.get_calls.lock().await.clone()
+        }
+    }
+
+    #[async_trait]
+    impl SessionService for RecordingSessionService {
+        async fn create_session(
+            &self,
+            user_id: String,
+            request: SessionCreateRequestData,
+        ) -> Result<SessionRecord, (StatusCode, Json<ErrorResponse>)> {
+            Ok(SessionRecord {
+                session_id: "created-session".to_string(),
+                user_id,
+                agent_id: request.agent_id,
+                title: None,
+                metadata: request.metadata.unwrap_or_default(),
+                status: "active".to_string(),
+                event_count: 0,
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                updated_at: Some("2026-01-01T00:00:00Z".to_string()),
+                ended_at: None,
+            })
+        }
+
+        async fn list_sessions(
+            &self,
+            _filter: SessionListFilter,
+        ) -> Result<SessionListRecord, (StatusCode, Json<ErrorResponse>)> {
+            Ok(SessionListRecord {
+                sessions: Vec::new(),
+                total: 0,
+                limit: 20,
+                offset: 0,
+            })
+        }
+
+        async fn get_session(
+            &self,
+            session_id: String,
+            user_id: String,
+        ) -> Result<SessionRecord, (StatusCode, Json<ErrorResponse>)> {
+            self.get_calls
+                .lock()
+                .await
+                .push((session_id.clone(), user_id.clone()));
+            Ok(SessionRecord {
+                session_id,
+                user_id,
+                agent_id: None,
+                title: Some("Existing".to_string()),
+                metadata: serde_json::Map::new(),
+                status: "active".to_string(),
+                event_count: 0,
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                updated_at: Some("2026-01-01T00:00:00Z".to_string()),
+                ended_at: None,
+            })
+        }
+
+        async fn update_session(
+            &self,
+            session_id: String,
+            user_id: String,
+            _request: SessionUpdateRequestData,
+        ) -> Result<SessionRecord, (StatusCode, Json<ErrorResponse>)> {
+            self.get_session(session_id, user_id).await
+        }
+
+        async fn delete_session(
+            &self,
+            _session_id: String,
+            _user_id: String,
+        ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+            Ok(())
+        }
+
+        async fn get_session_activity(
+            &self,
+            _session_id: String,
+            _user_id: String,
+            _limit: u32,
+            _offset: u32,
+        ) -> Result<SessionActivityRecord, (StatusCode, Json<ErrorResponse>)> {
+            Ok(SessionActivityRecord {
+                session_id: String::new(),
+                activities: Vec::new(),
+                total: 0,
+            })
+        }
+    }
+
+    fn test_user() -> AuthUserRecord {
+        AuthUserRecord {
+            user_id: "u1".into(),
+            username: "alice".into(),
+            email: "alice@example.com".into(),
+            display_name: Some("Alice".into()),
+        }
+    }
 
     #[test]
     fn parse_auth_message() {
@@ -1729,6 +1896,47 @@ mod tests {
         assert_eq!(payload["context"], serde_json::Value::Object(context));
         assert_eq!(payload["messages"][0]["role"], "user");
         assert_eq!(payload["messages"][0]["content"], "hello");
+    }
+
+    #[tokio::test]
+    async fn resolve_bridge_payload_session_id_omits_trusted_session_when_service_unconfigured() {
+        let state = AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker));
+
+        let (payload_session_id, trusted_session_id_override) = resolve_bridge_payload_session_id(
+            &state,
+            &test_user(),
+            Some("bound-session".into()),
+            true,
+        )
+        .await;
+
+        assert_eq!(payload_session_id, None);
+        assert_eq!(
+            trusted_session_id_override.as_deref(),
+            Some("bound-session")
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_bridge_payload_session_id_keeps_trusted_session_when_service_configured() {
+        let session_service = RecordingSessionService::default();
+        let state = AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
+            .with_session_service(Arc::new(session_service.clone()));
+
+        let (payload_session_id, trusted_session_id_override) = resolve_bridge_payload_session_id(
+            &state,
+            &test_user(),
+            Some("bound-session".into()),
+            true,
+        )
+        .await;
+
+        assert_eq!(payload_session_id.as_deref(), Some("bound-session"));
+        assert_eq!(trusted_session_id_override, None);
+        assert_eq!(
+            session_service.get_calls().await,
+            vec![("bound-session".to_string(), "u1".to_string())]
+        );
     }
 
     #[test]

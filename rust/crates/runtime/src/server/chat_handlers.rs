@@ -1,6 +1,6 @@
 use super::bridge_prep::normalize_chat_turn_session_error;
-use super::*;
 use super::run_handlers::transform_stream_run_events_for_client;
+use super::*;
 
 /// Safely convert a string to a HeaderValue, returning an SSE error response on failure.
 #[allow(clippy::result_large_err)]
@@ -69,7 +69,9 @@ pub(super) async fn resolve_or_create_chat_session_id(
     }
 }
 
-fn is_session_service_unconfigured_error(error: &(StatusCode, Json<ErrorResponse>)) -> bool {
+pub(super) fn is_session_service_unconfigured_error(
+    error: &(StatusCode, Json<ErrorResponse>),
+) -> bool {
     error.0 == StatusCode::NOT_IMPLEMENTED && error.1.0.detail == "Session service not configured"
 }
 
