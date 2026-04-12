@@ -160,6 +160,9 @@ pub enum StreamEvent {
     ReasoningMessageContent {
         content: Value,
     },
+    ReasoningDelta {
+        content: Value,
+    },
     ThinkingDelta {
         content: Value,
     },
@@ -293,6 +296,9 @@ pub fn classify_stream_event(value: Value) -> Result<StreamEvent, crate::error::
             full_text: obj.get("full_text").cloned().unwrap_or(Value::Null),
         },
         "reasoning_message_content" => StreamEvent::ReasoningMessageContent {
+            content: obj.get("content").cloned().unwrap_or(Value::Null),
+        },
+        "reasoning_delta" => StreamEvent::ReasoningDelta {
             content: obj.get("content").cloned().unwrap_or(Value::Null),
         },
         "thinking_delta" => StreamEvent::ThinkingDelta {
@@ -541,6 +547,19 @@ mod tests {
     fn classify_reasoning_done() {
         match classify_stream_event(serde_json::json!({"type":"reasoning_done"})).unwrap() {
             StreamEvent::ReasoningDone => {}
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_reasoning_delta() {
+        match classify_stream_event(serde_json::json!({
+            "type":"reasoning_delta",
+            "content":"thinking"
+        }))
+        .unwrap()
+        {
+            StreamEvent::ReasoningDelta { content } => assert_eq!(content, "thinking"),
             other => panic!("unexpected {other:?}"),
         }
     }
