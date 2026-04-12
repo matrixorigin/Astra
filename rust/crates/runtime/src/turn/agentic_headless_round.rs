@@ -140,6 +140,10 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
     // Normalize tool_calls: replace empty/missing ids with synthetic UUIDs
     // so the assistant message and tool result messages share the same id.
     // Without this, APIs reject tool results with "tool_call_id not found".
+    // NOTE: agentic_loop_host already calls ensure_tool_call_ids before
+    // interception layers, so this is a no-op (Cow::Borrowed) in that path.
+    // Kept for defense-in-depth: other callers (tests, cloud runtime) may
+    // invoke this function directly without prior normalization.
     let tool_calls = super::headless_tool_assembly::ensure_tool_call_ids(tool_calls);
     let tool_calls = &tool_calls;
 

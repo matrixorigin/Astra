@@ -824,6 +824,206 @@ mod tests {
         assert_eq!(messages[2]["tool_call_id"], "call_bash");
     }
 
+    /// Regression test for session ccbd3a48: when skill defer intercepts ALL
+    /// tool calls, effective_tool_calls becomes empty. If the headless round
+    /// only sees the empty list, it falls back to the edge-only path and
+    /// builds the assistant message with `edge-N` ids — but pre_resolved
+    /// results use the original server-assigned ids. The mismatch causes
+    /// kimi-k2.5 to reject with 400 "tool_call_id is not found".
+    ///
+    /// Fix: pass the full (pre-interception) tool_calls to the headless round
+    /// so the assistant message always uses server-assigned ids.
+    #[tokio::test]
+    async fn all_tools_pre_resolved_still_uses_server_ids_in_assistant_message() {
+        // Simulate: server returned 2 tool_calls, but ALL were intercepted
+        // (e.g. skill + deferred). Edge round has matching results.
+        let tool_calls = vec![
+            json!({
+                "id": "skill:0",
+                "type": "function",
+                "function": { "name": "skill", "arguments": r#"{"skill_name":"review"}"# }
+            }),
+            json!({
+                "id": "read_file:1",
+                "type": "function",
+                "function": { "name": "read_file", "arguments": r#"{"path":"src/main.rs"}"# }
+            }),
+        ];
+
+        let mut messages = Vec::new();
+        let mut tool_results = Vec::new();
+        let valid_tool_names = HashSet::from(["bash".to_string(), "skill".to_string(), "read_file".to_string()]);
+        let mut restricted_tools = HashSet::new();
+        let mut turn_guard = TurnGuard::new();
+        let mut step_recorder = StepRecorder::new("test-session", "all-pre-resolved");
+        let mut idempotency_cache = InMemoryIdempotencyCache::new();
+        let mut semantic_dedup = SemanticDedup::new(0.95);
+        let mut tool_call_records = Vec::new();
+        let tool_event_hooks = crate::skills::hooks::ToolEventHookRegistry::default();
+        let mut term = NoopHeadlessTerminal;
+        let edge_callback_outputs = std::collections::HashMap::new();
+        let edge_tool_round: Vec<EdgeToolExecResult> = Vec::new();
+
+        // ALL tool calls were pre-resolved by upstream (skill + defer)
+        let pre_resolved = vec![
+            ("skill:0".to_string(), "Skill instructions".to_string()),
+            ("read_file:1".to_string(), "file contents".to_string()),
+        ];
+
+        run_agentic_headless_tool_round(
+            0,
+            true,
+            &astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
+            "",
+            None,
+            &tool_calls,  // full tool_calls, not empty
+            &edge_tool_round,
+            "",
+            &edge_callback_outputs,
+            &mut messages,
+            &mut tool_results,
+            &valid_tool_names,
+            &mut restricted_tools,
+            &mut turn_guard,
+            &mut step_recorder,
+            &mut idempotency_cache,
+            &mut semantic_dedup,
+            &mut std::collections::HashMap::new(),
+            2,
+            &mut tool_call_records,
+            &tool_event_hooks,
+            &mut term,
+            None,
+            None,
+            None,
+            &pre_resolved,
+        )
+        .await;
+
+        // Assistant message must use server-assigned ids, not edge-N
+        assert_eq!(messages[0]["role"], "assistant");
+        let tc_ids: Vec<&str> = messages[0]["tool_calls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tc| tc["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(tc_ids, vec!["skill:0", "read_file:1"],
+            "assistant tool_calls must use server-assigned ids, not edge-N");
+
+        // Tool results must use matching ids
+        assert_eq!(messages[1]["tool_call_id"], "skill:0");
+        assert_eq!(messages[2]["tool_call_id"], "read_file:1");
+
+        // No edge-N ids anywhere in messages
+        for (i, m) in messages.iter().enumerate() {
+            if let Some(tcid) = m.get("tool_call_id").and_then(Value::as_str) {
+                assert!(
+                    !tcid.starts_with("edge-"),
+                    "message[{i}] has orphan edge id: {tcid}"
+                );
+            }
+        }
+    }
+
+    /// Test: pre_resolved skill result + edge tool execution in the same round.
+    /// Verifies that edge tools are correctly matched to server tool_calls
+    /// while pre-resolved results are injected without duplication.
+    #[tokio::test]
+    async fn pre_resolved_mixed_with_edge_tool_execution() {
+        let tool_calls = vec![
+            json!({
+                "id": "skill:0",
+                "type": "function",
+                "function": { "name": "skill", "arguments": r#"{"skill_name":"review"}"# }
+            }),
+            json!({
+                "id": "grep:1",
+                "type": "function",
+                "function": { "name": "grep", "arguments": r#"{"pattern":"TODO"}"# }
+            }),
+        ];
+
+        // Edge round has the grep result (executed at edge during SSE)
+        let edge_tool_round = vec![EdgeToolExecResult {
+            request_id: String::new(),
+            tool: "grep".to_string(),
+            args: json!({"pattern": "TODO"}),
+            output: "src/main.rs:10: // TODO fix".to_string(),
+            status: "ok".to_string(),
+            duration_ms: 50,
+        }];
+
+        let mut messages = Vec::new();
+        let mut tool_results = Vec::new();
+        let valid_tool_names = HashSet::from(["skill".to_string(), "grep".to_string()]);
+        let mut restricted_tools = HashSet::new();
+        let mut turn_guard = TurnGuard::new();
+        let mut step_recorder = StepRecorder::new("test-session", "mixed-edge");
+        let mut idempotency_cache = InMemoryIdempotencyCache::new();
+        let mut semantic_dedup = SemanticDedup::new(0.95);
+        let mut tool_call_records = Vec::new();
+        let tool_event_hooks = crate::skills::hooks::ToolEventHookRegistry::default();
+        let mut term = NoopHeadlessTerminal;
+        let edge_callback_outputs: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+
+        // Skill was pre-resolved; grep will be matched from edge_tool_round
+        let pre_resolved = vec![
+            ("skill:0".to_string(), "Skill instructions".to_string()),
+        ];
+
+        run_agentic_headless_tool_round(
+            0,
+            true,
+            &astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
+            "",
+            None,
+            &tool_calls,
+            &edge_tool_round,
+            "",
+            &edge_callback_outputs,
+            &mut messages,
+            &mut tool_results,
+            &valid_tool_names,
+            &mut restricted_tools,
+            &mut turn_guard,
+            &mut step_recorder,
+            &mut idempotency_cache,
+            &mut semantic_dedup,
+            &mut std::collections::HashMap::new(),
+            2,
+            &mut tool_call_records,
+            &tool_event_hooks,
+            &mut term,
+            None,
+            None,
+            None,
+            &pre_resolved,
+        )
+        .await;
+
+        // assistant(skill:0, grep:1) → tool(skill:0, pre-resolved) → tool(grep:1, edge-executed)
+        assert_eq!(messages[0]["role"], "assistant");
+        assert_eq!(
+            messages[0]["tool_calls"].as_array().unwrap().len(),
+            2,
+            "assistant must have both tool_calls"
+        );
+
+        assert_eq!(messages[1]["tool_call_id"], "skill:0");
+        assert_eq!(messages[1]["content"], "Skill instructions");
+
+        assert_eq!(messages[2]["tool_call_id"], "grep:1");
+        assert!(
+            messages[2]["content"].as_str().unwrap().contains("TODO"),
+            "grep result should contain edge output"
+        );
+
+        // Exactly 3 messages: assistant + 2 tool results
+        assert_eq!(messages.len(), 3, "no duplicate tool results");
+    }
+
     #[tokio::test]
     async fn child_tool_round_aborts_after_three_consecutive_empty_tool_names() {
         let tool_calls = vec![
