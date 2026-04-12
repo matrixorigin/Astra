@@ -910,9 +910,15 @@ fn lifecycle_poll_error_policy(status: StatusCode) -> LifecyclePollErrorPolicy {
             emit_failed_terminal: false,
             continue_polling: true,
         }
-    } else {
+    } else if matches!(status, StatusCode::FORBIDDEN | StatusCode::NOT_FOUND) {
         LifecyclePollErrorPolicy {
             cancel_run: false,
+            emit_failed_terminal: true,
+            continue_polling: false,
+        }
+    } else {
+        LifecyclePollErrorPolicy {
+            cancel_run: true,
             emit_failed_terminal: true,
             continue_polling: false,
         }
@@ -3902,15 +3908,20 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_poll_error_policy_fails_terminal_for_non_retryable_errors() {
-        for status in [
-            StatusCode::NOT_FOUND,
-            StatusCode::FORBIDDEN,
-            StatusCode::UNPROCESSABLE_ENTITY,
-            StatusCode::BAD_REQUEST,
-        ] {
+    fn lifecycle_poll_error_policy_fails_terminal_without_cancel_for_missing_or_forbidden_runs() {
+        for status in [StatusCode::NOT_FOUND, StatusCode::FORBIDDEN] {
             let policy = lifecycle_poll_error_policy(status);
             assert!(!policy.cancel_run);
+            assert!(policy.emit_failed_terminal);
+            assert!(!policy.continue_polling);
+        }
+    }
+
+    #[test]
+    fn lifecycle_poll_error_policy_cancels_run_for_other_non_retryable_errors() {
+        for status in [StatusCode::UNPROCESSABLE_ENTITY, StatusCode::BAD_REQUEST] {
+            let policy = lifecycle_poll_error_policy(status);
+            assert!(policy.cancel_run);
             assert!(policy.emit_failed_terminal);
             assert!(!policy.continue_polling);
         }
