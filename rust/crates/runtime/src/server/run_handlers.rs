@@ -1,4 +1,12 @@
 use super::*;
+use astra_services::runs::transform_run_event_for_client;
+
+fn transform_stream_run_events_for_client(events: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
+    events
+        .into_iter()
+        .map(transform_run_event_for_client)
+        .collect()
+}
 
 pub(super) async fn get_run_status_handler(
     State(state): State<AppState>,
@@ -29,7 +37,7 @@ pub(super) async fn stream_run_handler(
         .stream_run(run_id, user.user_id, query.last_index)
         .await
     {
-        Ok(events) => sse_json_response(events),
+        Ok(events) => sse_json_response(transform_stream_run_events_for_client(events)),
         Err((status, error)) => sse_error_response(status, error.0.detail),
     }
 }
@@ -84,4 +92,32 @@ pub(super) async fn resume_run_handler(
         .resume_run(run_id, user.user_id)
         .await?;
     Ok(Json(RunMutationResponse::from(result)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn transform_stream_run_events_for_client_uses_client_protocol_shape() {
+        let transformed = transform_stream_run_events_for_client(vec![
+            json!({
+                "event_type": "text_delta",
+                "data": {"chunk": "hello"},
+                "index": 7
+            }),
+            json!({
+                "event_type": "run_error",
+                "data": {"error": "boom"},
+                "index": 8
+            }),
+        ]);
+
+        assert_eq!(transformed[0], json!({"type": "text_delta", "content": "hello"}));
+        assert_eq!(
+            transformed[1],
+            json!({"type": "error", "message": "boom", "code": "RUN_ERROR"})
+        );
+    }
 }
