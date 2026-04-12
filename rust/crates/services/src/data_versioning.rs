@@ -2,15 +2,18 @@ use async_trait::async_trait;
 use axum::{Json, http::StatusCode};
 use serde::{Deserialize, Serialize};
 use sqlx::{Row, query};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use astra_core::{
-    ErrorResponse, MatrixOneSettings, SharedPool, connect_matrixone, error_response, internal_error,
+    ErrorResponse, MatrixOneSettings, SharedPool,
+    composite_snapshot::{CompositeSnapshot, CompositeSnapshotIndex, StateDiff},
+    connect_matrixone, error_response, internal_error,
 };
 
 const MAX_CHECKPOINT_LIST_ROWS: i32 = 200;
 const MAX_CHECKPOINT_EVENT_ROWS: i32 = 200;
 const MAX_CAUSAL_CHAIN_ROWS: i32 = 500;
+const SNAPSHOT_DIFF_DIMENSIONS: f64 = 5.0;
 
 // ── Data types ───────────────────────────────────────────────────────────────
 
@@ -45,6 +48,8 @@ pub struct LineageNode {
     pub parent_event_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub parent_event_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contribution_score: Option<f64>,
     pub causal_chain_id: Option<String>,
     pub created_at: String,
 }
@@ -86,6 +91,80 @@ pub fn truncate_content(s: &str, max: usize) -> String {
     } else {
         format!("{}...", &s[..max])
     }
+}
+
+#[derive(Clone, Debug)]
+struct LineageContributionContext {
+    event_id: String,
+    session_id: String,
+    created_at: String,
+    parent_event_ids: Vec<String>,
+}
+
+fn composite_snapshots_json_path(session_id: &str) -> std::path::PathBuf {
+    crate::session_journal::local_sessions_dir()
+        .join(session_id)
+        .join("step_checkpoints")
+        .join("composite_snapshots.json")
+}
+
+fn read_composite_snapshot_index_local(
+    session_id: &str,
+) -> Result<Option<CompositeSnapshotIndex>, (StatusCode, Json<ErrorResponse>)> {
+    let path = composite_snapshots_json_path(session_id);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let content = std::fs::read_to_string(path).map_err(internal_error)?;
+    let mut index: CompositeSnapshotIndex =
+        serde_json::from_str(&content).map_err(internal_error)?;
+    index.normalize_versions();
+    Ok(Some(index))
+}
+
+fn timestamp_key(timestamp: &str) -> &str {
+    &timestamp[..timestamp.len().min(19)]
+}
+
+fn snapshot_for_event<'a>(
+    index: &'a CompositeSnapshotIndex,
+    created_at: &str,
+) -> Option<&'a CompositeSnapshot> {
+    let key = timestamp_key(created_at);
+    index
+        .snapshots
+        .iter()
+        .rev()
+        .find(|snapshot| timestamp_key(&snapshot.created_at) <= key)
+        .or_else(|| index.snapshots.first())
+}
+
+fn snapshot_by_version(index: &CompositeSnapshotIndex, version: u64) -> Option<&CompositeSnapshot> {
+    index
+        .snapshots
+        .iter()
+        .find(|snapshot| snapshot.version == version)
+}
+
+fn previous_snapshot(index: &CompositeSnapshotIndex, version: u64) -> Option<&CompositeSnapshot> {
+    index
+        .snapshots
+        .iter()
+        .rev()
+        .find(|snapshot| snapshot.version < version)
+}
+
+fn contribution_score_from_snapshots(
+    baseline: Option<&CompositeSnapshot>,
+    current: Option<&CompositeSnapshot>,
+) -> Option<f64> {
+    let baseline = baseline?;
+    let current = current?;
+    if baseline.snapshot_id == current.snapshot_id {
+        return Some(0.0);
+    }
+    let diff = baseline.diff(current);
+    Some(diff.ref_changes.len() as f64 / SNAPSHOT_DIFF_DIMENSIONS)
 }
 
 // ── Trait ─────────────────────────────────────────────────────────────────────
@@ -177,6 +256,63 @@ impl DatabaseDataVersioningService {
                 parent_id_map.get(&node.event_id).map(Vec::as_slice),
             );
         }
+        Ok(())
+    }
+
+    fn hydrate_contribution_scores(
+        nodes: &mut [LineageNode],
+        contexts: &[LineageContributionContext],
+    ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+        if nodes.is_empty() || contexts.is_empty() {
+            return Ok(());
+        }
+
+        let mut index_cache: HashMap<String, Option<CompositeSnapshotIndex>> = HashMap::new();
+        for session_id in contexts.iter().map(|context| context.session_id.clone()) {
+            index_cache
+                .entry(session_id.clone())
+                .or_insert(read_composite_snapshot_index_local(&session_id)?);
+        }
+
+        let mut event_snapshot_versions: HashMap<String, Option<u64>> = HashMap::new();
+        for context in contexts {
+            let current_version = index_cache
+                .get(&context.session_id)
+                .and_then(Option::as_ref)
+                .and_then(|index| snapshot_for_event(index, &context.created_at))
+                .map(|snapshot| snapshot.version);
+            event_snapshot_versions.insert(context.event_id.clone(), current_version);
+        }
+
+        for (node, context) in nodes.iter_mut().zip(contexts.iter()) {
+            let Some(index) = index_cache
+                .get(&context.session_id)
+                .and_then(Option::as_ref)
+            else {
+                continue;
+            };
+            let current_snapshot = event_snapshot_versions
+                .get(&context.event_id)
+                .copied()
+                .flatten()
+                .and_then(|version| snapshot_by_version(index, version));
+            let baseline = context
+                .parent_event_ids
+                .iter()
+                .filter_map(|parent_event_id| {
+                    event_snapshot_versions
+                        .get(parent_event_id)
+                        .copied()
+                        .flatten()
+                        .and_then(|version| snapshot_by_version(index, version))
+                })
+                .next()
+                .or_else(|| {
+                    current_snapshot.and_then(|snapshot| previous_snapshot(index, snapshot.version))
+                });
+            node.contribution_score = contribution_score_from_snapshots(baseline, current_snapshot);
+        }
+
         Ok(())
     }
 }
@@ -330,7 +466,7 @@ impl DataVersioningService for DatabaseDataVersioningService {
             .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Event has no causal chain"))?;
 
         let rows = query(
-            "SELECT event_id, event_type, \
+            "SELECT event_id, session_id, event_type, \
              SUBSTRING(IFNULL(CAST(content AS CHAR), ''), 1, 500) AS content, \
              parent_event_id, causal_chain_id, \
              DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at \
@@ -346,19 +482,34 @@ impl DataVersioningService for DatabaseDataVersioningService {
         .map_err(internal_error)?;
 
         let mut nodes = Vec::with_capacity(rows.len());
+        let mut contexts = Vec::with_capacity(rows.len());
         for row in rows {
+            let event_id: String = row.try_get("event_id").map_err(internal_error)?;
+            let session_id: String = row.try_get("session_id").map_err(internal_error)?;
             let raw_content: String = row.try_get("content").unwrap_or_default();
+            let created_at: String = row.try_get("created_at").unwrap_or_default();
             nodes.push(LineageNode {
-                event_id: row.try_get("event_id").map_err(internal_error)?,
+                event_id: event_id.clone(),
                 event_type: row.try_get("event_type").map_err(internal_error)?,
                 content: truncate_content(&raw_content, 500),
                 parent_event_id: row.try_get("parent_event_id").ok(),
                 parent_event_ids: Vec::new(),
+                contribution_score: None,
                 causal_chain_id: row.try_get("causal_chain_id").ok(),
-                created_at: row.try_get("created_at").unwrap_or_default(),
+                created_at: created_at.clone(),
+            });
+            contexts.push(LineageContributionContext {
+                event_id,
+                session_id,
+                created_at,
+                parent_event_ids: Vec::new(),
             });
         }
         Self::hydrate_parent_event_ids(&pool, &mut nodes).await?;
+        for (context, node) in contexts.iter_mut().zip(nodes.iter()) {
+            context.parent_event_ids = node.parent_event_ids.clone();
+        }
+        Self::hydrate_contribution_scores(&mut nodes, &contexts)?;
         Ok(nodes)
     }
 
@@ -370,6 +521,7 @@ impl DataVersioningService for DatabaseDataVersioningService {
         let pool = self.get_pool().await.map_err(internal_error)?;
 
         let mut chain = Vec::new();
+        let mut contexts = Vec::new();
         let mut visited = HashSet::new();
         let mut stack = vec![event_id];
         let max_depth = 100;
@@ -384,7 +536,7 @@ impl DataVersioningService for DatabaseDataVersioningService {
             visited.insert(eid.clone());
 
             let row = query(
-                "SELECT event_id, event_type, \
+                "SELECT event_id, session_id, event_type, \
                  SUBSTRING(IFNULL(CAST(content AS CHAR), ''), 1, 500) AS content, \
                  parent_event_id, causal_chain_id, \
                  DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at \
@@ -398,6 +550,8 @@ impl DataVersioningService for DatabaseDataVersioningService {
 
             match row {
                 Some(row) => {
+                    let event_id: String = row.try_get("event_id").map_err(internal_error)?;
+                    let session_id: String = row.try_get("session_id").map_err(internal_error)?;
                     let raw_content: String = row.try_get("content").unwrap_or_default();
                     let parent: Option<String> = row.try_get("parent_event_id").ok();
                     let parent_id_map = crate::storage::load_agent_event_parent_ids(
@@ -415,20 +569,32 @@ impl DataVersioningService for DatabaseDataVersioningService {
                             stack.push(parent_event_id.clone());
                         }
                     }
+                    let created_at: String = row.try_get("created_at").unwrap_or_default();
                     chain.push(LineageNode {
-                        event_id: row.try_get("event_id").map_err(internal_error)?,
+                        event_id: event_id.clone(),
                         event_type: row.try_get("event_type").map_err(internal_error)?,
                         content: truncate_content(&raw_content, 500),
                         parent_event_id: parent,
                         parent_event_ids,
+                        contribution_score: None,
                         causal_chain_id: row.try_get("causal_chain_id").ok(),
-                        created_at: row.try_get("created_at").unwrap_or_default(),
+                        created_at: created_at.clone(),
+                    });
+                    contexts.push(LineageContributionContext {
+                        event_id,
+                        session_id,
+                        created_at,
+                        parent_event_ids: chain
+                            .last()
+                            .map(|node| node.parent_event_ids.clone())
+                            .unwrap_or_default(),
                     });
                 }
                 None => break,
             }
         }
 
+        Self::hydrate_contribution_scores(&mut chain, &contexts)?;
         Ok(chain)
     }
 
@@ -656,12 +822,14 @@ mod tests {
             content: "hello".into(),
             parent_event_id: Some("e0".into()),
             parent_event_ids: vec!["e0".into(), "e2".into()],
+            contribution_score: Some(0.4),
             causal_chain_id: None,
             created_at: "2024-01-01T00:00:00".into(),
         };
         let json = serde_json::to_string(&node).unwrap();
         assert!(json.contains("\"parent_event_id\":\"e0\""));
         assert!(json.contains("\"parent_event_ids\":[\"e0\",\"e2\"]"));
+        assert!(json.contains("\"contribution_score\":0.4"));
         assert!(json.contains("\"causal_chain_id\":null"));
     }
 
@@ -672,6 +840,47 @@ mod tests {
             Some(&["p0".to_string(), "p2".to_string(), "p1".to_string()]),
         );
         assert_eq!(normalized, vec!["p0", "p2", "p1"]);
+    }
+
+    #[test]
+    fn contribution_score_uses_snapshot_diff_magnitude() {
+        let mut baseline = astra_core::composite_snapshot::CompositeSnapshotBuilder::new("s1", 1)
+            .session_state("000001-heavy.json")
+            .build();
+        baseline.snapshot_id = "snap-a".into();
+        baseline.created_at = "2026-04-12T10:00:00+00:00".into();
+        baseline.version = 1;
+
+        let mut current = astra_core::composite_snapshot::CompositeSnapshotBuilder::new("s1", 2)
+            .session_state("000002-heavy.json")
+            .git_commit("deadbeef")
+            .build();
+        current.snapshot_id = "snap-b".into();
+        current.created_at = "2026-04-12T10:05:00+00:00".into();
+        current.version = 2;
+
+        let score = contribution_score_from_snapshots(Some(&baseline), Some(&current)).unwrap();
+        assert!((score - 0.4).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn snapshot_for_event_picks_latest_snapshot_before_timestamp() {
+        let mut index = CompositeSnapshotIndex {
+            snapshots: vec![
+                astra_core::composite_snapshot::CompositeSnapshotBuilder::new("s1", 1)
+                    .session_state("000001-heavy.json")
+                    .build(),
+                astra_core::composite_snapshot::CompositeSnapshotBuilder::new("s1", 2)
+                    .session_state("000002-heavy.json")
+                    .build(),
+            ],
+        };
+        index.snapshots[0].created_at = "2026-04-12T10:00:00+00:00".into();
+        index.snapshots[1].created_at = "2026-04-12T10:05:00+00:00".into();
+        index.normalize_versions();
+
+        let snapshot = snapshot_for_event(&index, "2026-04-12T10:04:30").expect("snapshot");
+        assert_eq!(snapshot.version, 1);
     }
 
     #[test]
