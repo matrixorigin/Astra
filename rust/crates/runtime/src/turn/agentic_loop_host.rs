@@ -4567,16 +4567,7 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
             let mut fresh_tool_calls: Vec<Value> = Vec::new();
             for tc in effective_tool_calls {
                 if crate::turn::skill_tool::is_skill_call(tc) {
-                    let skill_name = tc
-                        .get("function")
-                        .and_then(|f| f.get("arguments"))
-                        .and_then(Value::as_str)
-                        .and_then(|s| serde_json::from_str::<Value>(s).ok())
-                        .and_then(|a| {
-                            a.get("skill_name")
-                                .and_then(Value::as_str)
-                                .map(String::from)
-                        });
+                    let skill_name = crate::turn::skill_tool::extract_skill_name(tc);
                     if let Some(ref name) = skill_name {
                         if let Some(prev) = state.skills.invoked.get(name.as_str()) {
                             let call_id = tc
@@ -4622,16 +4613,7 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                 if let Some(tc) = fresh_tool_calls.iter().find(|t| {
                     t.get("id").and_then(Value::as_str) == Some(result.tool_call_id.as_str())
                 }) {
-                    let name = tc
-                        .get("function")
-                        .and_then(|f| f.get("arguments"))
-                        .and_then(Value::as_str)
-                        .and_then(|s| serde_json::from_str::<Value>(s).ok())
-                        .and_then(|a| {
-                            a.get("skill_name")
-                                .and_then(Value::as_str)
-                                .map(String::from)
-                        });
+                    let name = crate::turn::skill_tool::extract_skill_name(tc);
                     if let Some(name) = name {
                         if crate::turn::skill_tool::is_skill_call(tc) {
                             state.skills.invoked.insert(

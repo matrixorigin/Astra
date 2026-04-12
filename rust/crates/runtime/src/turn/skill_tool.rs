@@ -790,6 +790,27 @@ pub fn is_skill_call(tool_call: &Value) -> bool {
         == Some(SKILL_TOOL_NAME)
 }
 
+/// Extract the `skill_name` from a skill tool call's arguments.
+///
+/// Handles both stringified JSON (OpenAI: `"arguments": "{\"skill_name\":...}"`)
+/// and direct JSON object (Anthropic: `"arguments": {"skill_name":...}`) formats.
+pub fn extract_skill_name(tool_call: &Value) -> Option<String> {
+    let args = tool_call
+        .get("function")
+        .and_then(|f| f.get("arguments"))?;
+    let parsed = if let Some(s) = args.as_str() {
+        serde_json::from_str::<Value>(s).ok()?
+    } else if args.is_object() {
+        args.clone()
+    } else {
+        return None;
+    };
+    parsed
+        .get("skill_name")
+        .and_then(Value::as_str)
+        .map(String::from)
+}
+
 /// Execute a skill tool call from the SSE edge handler.
 ///
 /// This is the simplified entry point for the cloud/SSE path where
@@ -1826,6 +1847,55 @@ mod tests {
     fn is_skill_call_rejects_missing_function() {
         let malformed = serde_json::json!({"id": "x"});
         assert!(!is_skill_call(&malformed));
+    }
+
+    #[test]
+    fn extract_skill_name_from_stringified_args() {
+        let tc = serde_json::json!({
+            "id": "call_1",
+            "function": {
+                "name": "skill",
+                "arguments": "{\"skill_name\": \"review-changes\"}"
+            }
+        });
+        assert_eq!(
+            extract_skill_name(&tc),
+            Some("review-changes".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_skill_name_from_object_args() {
+        let tc = serde_json::json!({
+            "id": "call_1",
+            "function": {
+                "name": "skill",
+                "arguments": {"skill_name": "review-changes", "task": "review latest"}
+            }
+        });
+        assert_eq!(
+            extract_skill_name(&tc),
+            Some("review-changes".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_skill_name_returns_none_for_non_skill() {
+        let tc = serde_json::json!({
+            "id": "call_1",
+            "function": {
+                "name": "bash",
+                "arguments": "{\"command\": \"ls\"}"
+            }
+        });
+        // Still extracts from arguments even if not a skill call
+        assert_eq!(extract_skill_name(&tc), None);
+    }
+
+    #[test]
+    fn extract_skill_name_returns_none_for_missing_args() {
+        let tc = serde_json::json!({"id": "x"});
+        assert_eq!(extract_skill_name(&tc), None);
     }
 
     #[tokio::test]
