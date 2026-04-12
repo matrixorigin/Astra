@@ -57,7 +57,7 @@ Shared helpers: `tests/system_matrix_http_e2e/harness.rs` (`bootstrap`, `grant_a
 
 - **Shared database**: All tests use the same MatrixOne database from `AppSettings` (typically `astra_runtime`). There is **no separate schema per test**.
 - **Row isolation**: Each `bootstrap()` registers a **new user** (`prod_matrix_{uuid}`), obtains a new `user_id`, creates a **new** `session_id`, and uses an `edge_agent_id` / `suffix` unique to that run. API state and SQL assertions are scoped by those IDs.
-- **Parallel runs**: Tests are safe to run in parallel by default (`cargo` / `make test-integration` without `--test-threads=1`). The full journey uses a **suffix-scoped marketplace skill name** (`e2e_matrix_mkt_{suffix}`) so concurrent runs do not fight over the same global marketplace stats key.
+- **Parallel runs**: Tests are safe to run in parallel by default (`cargo` / `make test-live-db` without `ASTRA_SYSTEM_MATRIX_E2E_TEST_THREADS=1`). The full journey uses a **suffix-scoped marketplace skill name** (`e2e_matrix_mkt_{suffix}`) so concurrent runs do not fight over the same global marketplace stats key.
 - **Opt-in serial**: If you hit flakiness (shared Redis keys, connection limits, etc.), run with `ASTRA_SYSTEM_MATRIX_E2E_TEST_THREADS=1` (see `Makefile` `test-ignored-integration`) to force `--test-threads=1` for `system_matrix_http_e2e` only.
 
 ## API groups vs coverage (P0 / P1)
@@ -99,7 +99,7 @@ Legend: **DB** = SQL assertion on MatrixOne; **HTTP** = response-only; **—** =
 
 ## CI
 
-- **PR** (`.github/workflows/test.yml`): MatrixOne + Redis service containers; `make test` plus ignored **`system_matrix_http_e2e`** and **`multi_agent_integration`** with env vars set in the workflow. See also [`coverage-matrix.md`](./coverage-matrix.md).
+- **PR** (`.github/workflows/test.yml`): MatrixOne + Redis service containers; single `make test` step with `ASTRA_SYSTEM_MATRIX_E2E`, `ASTRA_SYSTEM_MATRIX_E2E_TEST_THREADS`, and `ASTRA_MULTI_AGENT_IT` set for ignored **`system_matrix_http_e2e`** and **`multi_agent_integration`**. See also [`coverage-matrix.md`](./coverage-matrix.md).
 - **Manual / nightly**: `.github/workflows/e2e-matrix-nightly.yml` — `workflow_dispatch` with optional **test name filter** (substring) to run a subset (e.g. `e2e_matrix_tasks`) or leave empty for all ignored tests in the binary.
 
 ## Router groups alignment

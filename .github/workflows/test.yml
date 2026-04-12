@@ -79,21 +79,9 @@ jobs:
           done
           mysql -h matrixone -P6001 -uroot -p111 -e "CREATE DATABASE IF NOT EXISTS astra_runtime;"
 
-      - name: Run test suite (workspace + bridge hooks)
-        run: make test
-
-      - name: System Matrix HTTP E2E (ignored)
-        working-directory: rust
+      - name: Run full test suite (offline + live DB)
         env:
           ASTRA_SYSTEM_MATRIX_E2E: "1"
           ASTRA_SYSTEM_MATRIX_E2E_TEST_THREADS: "1"
-        run: |
-          cargo test -p astra-runtime --test system_matrix_http_e2e \
-            --features bridge-e2e-hooks -- --ignored --test-threads=1 --nocapture
-
-      - name: astra-services multi_agent integration (ignored)
-        env:
           ASTRA_MULTI_AGENT_IT: "1"
-        run: |
-          cargo test --manifest-path rust/Cargo.toml -p astra-services \
-            --test multi_agent_integration -- --ignored --nocapture
+        run: make test

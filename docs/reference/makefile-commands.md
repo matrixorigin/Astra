@@ -15,7 +15,9 @@
 
 | Command | Description |
 | --- | --- |
-| `make test` | Run Rust workspace tests |
+| `make test` | Workspace tests + `bridge-e2e-hooks` + live `#[ignore]` Matrix E2E and multi-agent integration (MatrixOne + Redis required for the live portion) |
+| `make test-offline` | Workspace tests + `bridge-e2e-hooks` only (no live `#[ignore]` suites) |
+| `make test-live-db` | Live `#[ignore]` suites only (`system_matrix_http_e2e`, `multi_agent_integration`) |
 | `make test-contract` | Run `http_contract` / `admin_contract` (astra-runtime) + settings JSON contract (`astra-core` `settings_contract_tests`) |
 
 ## Static Checks

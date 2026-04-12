@@ -11,8 +11,9 @@ You are working on **mo-agent-runtime**, a Rust-first agent platform (workspace 
 
 ```bash
 make build              # Release workspace build
-make test               # Unit + contract tests (no live DB)
-make test-integration   # Full E2E with MatrixOne
+make test               # Workspace + bridge hooks + live Matrix ignored suites (DB required for live portion)
+make test-offline       # Workspace + bridge hooks only (no #[ignore] live-DB suites)
+make test-live-db       # Matrix HTTP E2E + multi_agent_integration (#[ignore]; requires MatrixOne + Redis)
 make check              # lint + format + type checks (run before commit)
 make lint               # cargo clippy --workspace -- -D warnings
 make dev-start          # Start deps + API server
@@ -93,10 +94,10 @@ All persisted state must form a coherent, navigable chain for debugging and anal
 ## Testing Workflow
 
 1. `make build` — verify compilation
-2. `make test` — run workspace tests
+2. `make test` — workspace + bridge hooks + live ignored suites (MatrixOne + Redis required for live portion; use `make test-offline` without DB)
 3. `make lint` — clippy clean
 4. `make format-check` — formatting
-5. For DB-dependent tests: `make dev-start` then `make test-integration`
+5. For DB-dependent tests: `make dev-start` then `make test` (or `make test-live-db` if the workspace is already built and you only need ignored suites)
 
 ## Built-in Skills (read `skills/<name>/SKILL.md` for full instructions)
 

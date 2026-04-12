@@ -77,5 +77,6 @@ Legend: **E2E** = `rust/crates/runtime/tests/system_matrix_http_e2e/` with `ASTR
 
 ## How to run
 
-- Default workspace: `make test` (no live DB for ignored E2E unless env set).
-- Full Matrix E2E + multi-agent: `make test-integration` or set `ASTRA_SYSTEM_MATRIX_E2E=1` / `ASTRA_MULTI_AGENT_IT=1` as in [`system-e2e-matrix.md`](./system-e2e-matrix.md).
+- Offline slice: `make test-offline` (workspace + bridge hooks; no live `#[ignore]` suites).
+- Full validation with live DB: `make test` (`test-offline` then `test-live-db`) or run `make test-live-db` alone when you only need ignored suites.
+- Advanced: set `ASTRA_SYSTEM_MATRIX_E2E=1` / `ASTRA_MULTI_AGENT_IT=1` manually as in [`system-e2e-matrix.md`](./system-e2e-matrix.md).
