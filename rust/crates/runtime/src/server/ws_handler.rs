@@ -161,6 +161,8 @@ struct WsConnection {
     session_id: Option<String>,
     /// Active run ID (if any). Used for cancel/approval routing.
     active_run_id: Option<String>,
+    /// Prepared bridge-local run ID used before the upstream stream reports a real one.
+    bridge_prepared_run_id: Option<String>,
 }
 
 // ─── Handler ─────────────────────────────────────────────────────────────────
@@ -319,6 +321,7 @@ async fn authenticate_with_token(
                 user,
                 session_id,
                 active_run_id: None,
+                bridge_prepared_run_id: None,
             })
         }
         Err((_status, error)) => {
@@ -1014,6 +1017,7 @@ async fn handle_chat_message_via_bridge(
                 conn.session_id = Some(session_id.clone());
                 if let Some(run_id) = prepared.turn_chain_id.clone() {
                     conn.active_run_id = Some(run_id.clone());
+                    conn.bridge_prepared_run_id = Some(run_id.clone());
                     send_msg(socket, &WsServerMessage::RunStarted { run_id, session_id }).await;
                 }
             }
@@ -1059,6 +1063,7 @@ async fn handle_chat_message_via_bridge(
                 }
             }
             conn.active_run_id = None;
+            conn.bridge_prepared_run_id = None;
         }
         Err((status, error)) => {
             send_msg(
@@ -1070,7 +1075,7 @@ async fn handle_chat_message_via_bridge(
     }
 }
 
-fn sync_conn_state_from_stream_event(conn: &mut WsConnection, event: &Value) {
+fn sync_conn_state_from_stream_event(conn: &mut WsConnection, event: &Value) -> Option<String> {
     let event_type = event
         .get("type")
         .or_else(|| event.get("event_type"))
@@ -1080,12 +1085,17 @@ fn sync_conn_state_from_stream_event(conn: &mut WsConnection, event: &Value) {
         if let Some(session_id) = event.get("session_id").and_then(Value::as_str) {
             conn.session_id = Some(session_id.to_string());
         }
-        if conn.active_run_id.is_none()
-            && let Some(run_id) = event.get("run_id").and_then(Value::as_str)
-        {
-            conn.active_run_id = Some(run_id.to_string());
+        if let Some(run_id) = event.get("run_id").and_then(Value::as_str) {
+            let should_adopt_stream_run_id = conn.active_run_id.is_none()
+                || (conn.bridge_prepared_run_id.as_deref() == conn.active_run_id.as_deref()
+                    && conn.active_run_id.as_deref() != Some(run_id));
+            if should_adopt_stream_run_id {
+                conn.active_run_id = Some(run_id.to_string());
+                return Some(run_id.to_string());
+            }
         }
     }
+    None
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1224,13 +1234,19 @@ async fn stream_sse_response_as_ws(
                     Some(Ok(Message::Text(text))) => {
                         match serde_json::from_str::<WsClientMessage>(&text) {
                             Ok(WsClientMessage::CancelRun { run_id }) => {
-                                if conn.active_run_id.as_deref() == Some(run_id.as_str()) {
+                                if conn.active_run_id.as_deref() == Some(run_id.as_str())
+                                    || conn.bridge_prepared_run_id.as_deref() == Some(run_id.as_str())
+                                {
+                                    let effective_run_id = conn
+                                        .active_run_id
+                                        .clone()
+                                        .unwrap_or_else(|| run_id.clone());
                                     if let Some(t) = cancel.as_ref() {
                                         t.cancel();
                                     }
                                     send_msg(
                                         socket,
-                                        &WsServerMessage::RunCancelled { run_id },
+                                        &WsServerMessage::RunCancelled { run_id: effective_run_id },
                                     )
                                     .await;
                                     return BridgeWsTerminalStatus::Cancelled;
@@ -1329,7 +1345,18 @@ async fn stream_sse_response_as_ws(
                                 }
                             };
                             for event in events {
-                                sync_conn_state_from_stream_event(conn, &event);
+                                let adopted_run_id = sync_conn_state_from_stream_event(conn, &event);
+                                if let Some(run_id) = adopted_run_id
+                                    && conn.bridge_prepared_run_id.is_some()
+                                    && conn.bridge_prepared_run_id.as_deref() != Some(run_id.as_str())
+                                    && let Some(session_id) = conn.session_id.clone()
+                                {
+                                    send_msg(
+                                        socket,
+                                        &WsServerMessage::RunStarted { run_id, session_id },
+                                    )
+                                    .await;
+                                }
                                 match event.get("type").and_then(Value::as_str) {
                                     Some("turn_complete") => saw_turn_complete = true,
                                     Some("error") => {
@@ -1681,9 +1708,10 @@ mod tests {
             },
             session_id: None,
             active_run_id: None,
+            bridge_prepared_run_id: None,
         };
 
-        sync_conn_state_from_stream_event(
+        let adopted = sync_conn_state_from_stream_event(
             &mut conn,
             &serde_json::json!({
                 "type": "session_info",
@@ -1692,12 +1720,13 @@ mod tests {
             }),
         );
 
+        assert_eq!(adopted.as_deref(), Some("run-9"));
         assert_eq!(conn.session_id.as_deref(), Some("sess-42"));
         assert_eq!(conn.active_run_id.as_deref(), Some("run-9"));
     }
 
     #[test]
-    fn session_info_stream_event_does_not_override_existing_active_run_id() {
+    fn session_info_stream_event_upgrades_prepared_bridge_run_id() {
         let mut conn = WsConnection {
             user: AuthUserRecord {
                 user_id: "u1".into(),
@@ -1707,9 +1736,10 @@ mod tests {
             },
             session_id: Some("sess-1".into()),
             active_run_id: Some("prepared-run".into()),
+            bridge_prepared_run_id: Some("prepared-run".into()),
         };
 
-        sync_conn_state_from_stream_event(
+        let adopted = sync_conn_state_from_stream_event(
             &mut conn,
             &serde_json::json!({
                 "type": "session_info",
@@ -1718,8 +1748,37 @@ mod tests {
             }),
         );
 
+        assert_eq!(adopted.as_deref(), Some("upstream-run"));
         assert_eq!(conn.session_id.as_deref(), Some("sess-2"));
-        assert_eq!(conn.active_run_id.as_deref(), Some("prepared-run"));
+        assert_eq!(conn.active_run_id.as_deref(), Some("upstream-run"));
+    }
+
+    #[test]
+    fn session_info_stream_event_does_not_override_real_active_run_id() {
+        let mut conn = WsConnection {
+            user: AuthUserRecord {
+                user_id: "u1".into(),
+                username: "alice".into(),
+                email: "alice@example.com".into(),
+                display_name: Some("Alice".into()),
+            },
+            session_id: Some("sess-1".into()),
+            active_run_id: Some("real-run".into()),
+            bridge_prepared_run_id: Some("prepared-run".into()),
+        };
+
+        let adopted = sync_conn_state_from_stream_event(
+            &mut conn,
+            &serde_json::json!({
+                "type": "session_info",
+                "session_id": "sess-2",
+                "run_id": "upstream-run"
+            }),
+        );
+
+        assert_eq!(adopted, None);
+        assert_eq!(conn.session_id.as_deref(), Some("sess-2"));
+        assert_eq!(conn.active_run_id.as_deref(), Some("real-run"));
     }
 
     #[test]
