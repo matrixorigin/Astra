@@ -8,6 +8,8 @@ describe('LiveRunPanel', () => {
   it('renders lifecycle terminal events with readable summaries', () => {
     const events: StreamEvent[] = [
       { type: 'run_started', run_id: 'run-1' },
+      { type: 'run_paused', run_id: 'run-1' },
+      { type: 'run_resumed', run_id: 'run-1' },
       { type: 'run_finished', status: 'failed', error: 'boom' },
       { type: 'run_cancelled', run_id: 'run-2' },
     ];
@@ -15,6 +17,8 @@ describe('LiveRunPanel', () => {
     render(<LiveRunPanel events={events} connectionState="disconnected" />);
 
     expect(screen.getByText('Run started (run-1)')).toBeInTheDocument();
+    expect(screen.getByText('Run paused (run-1)')).toBeInTheDocument();
+    expect(screen.getByText('Run resumed (run-1)')).toBeInTheDocument();
     expect(screen.getByText('Run failed: boom')).toBeInTheDocument();
     expect(screen.getByText('Run cancelled (run-2)')).toBeInTheDocument();
     expect(screen.getByText('run_finished')).toHaveClass('text-red-300');

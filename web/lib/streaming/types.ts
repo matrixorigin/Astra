@@ -3,6 +3,8 @@
 export type StreamEventType =
   | 'session_info'
   | 'run_started'
+  | 'run_paused'
+  | 'run_resumed'
   | 'run_finished'
   | 'run_cancelled'
   | 'text_delta'
@@ -34,6 +36,16 @@ export type RunStartedEvent = {
   type: 'run_started';
   run_id?: string;
   session_id?: string;
+};
+
+export type RunPausedEvent = {
+  type: 'run_paused';
+  run_id?: string;
+};
+
+export type RunResumedEvent = {
+  type: 'run_resumed';
+  run_id?: string;
 };
 
 export type RunFinishedEvent = {
@@ -187,6 +199,8 @@ export type AgentCompletedEvent = {
 export type StreamEvent = (
   | SessionInfoEvent
   | RunStartedEvent
+  | RunPausedEvent
+  | RunResumedEvent
   | RunFinishedEvent
   | RunCancelledEvent
   | TextDeltaEvent

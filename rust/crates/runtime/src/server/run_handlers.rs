@@ -67,7 +67,10 @@ fn transform_stream_run_events_for_client(
         }
 
         let mut transformed = transform_run_event_for_client(event);
-        if (event_type == "run_started" || event_type == "run_finished")
+        if matches!(
+            event_type.as_str(),
+            "run_started" | "run_paused" | "run_resumed" | "run_finished"
+        )
             && let Some(obj) = transformed.as_object_mut()
             && !obj.contains_key("run_id")
         {
@@ -294,6 +297,31 @@ mod tests {
         assert_eq!(
             transformed[0],
             json!({"type": "run_started", "run_id": "run-123", "index": 1})
+        );
+    }
+
+    #[test]
+    fn transform_stream_run_events_for_client_injects_run_id_into_pause_resume_events() {
+        let transformed = transform_stream_run_events_for_client("run-123", vec![
+            json!({
+                "event_type": "run_paused",
+                "data": {},
+                "index": 2
+            }),
+            json!({
+                "event_type": "run_resumed",
+                "data": {},
+                "index": 3
+            }),
+        ]);
+
+        assert_eq!(
+            transformed[0],
+            json!({"type": "run_paused", "run_id": "run-123", "index": 2})
+        );
+        assert_eq!(
+            transformed[1],
+            json!({"type": "run_resumed", "run_id": "run-123", "index": 3})
         );
     }
 }

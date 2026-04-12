@@ -19,6 +19,8 @@ function eventBadgeColor(event: StreamEvent): string {
   const colors: Record<string, string> = {
     text_delta: 'bg-sky-500/20 text-sky-300',
     run_started: 'bg-blue-500/20 text-blue-300',
+    run_paused: 'bg-amber-500/20 text-amber-300',
+    run_resumed: 'bg-blue-500/20 text-blue-300',
     run_finished: 'bg-emerald-500/20 text-emerald-300',
     run_cancelled: 'bg-amber-500/20 text-amber-300',
     tool_call_start: 'bg-violet-500/20 text-violet-300',
@@ -52,6 +54,10 @@ function eventSummary(event: StreamEvent): string {
   switch (event.type) {
     case 'run_started':
       return event.run_id ? `Run started (${event.run_id})` : 'Run started';
+    case 'run_paused':
+      return event.run_id ? `Run paused (${event.run_id})` : 'Run paused';
+    case 'run_resumed':
+      return event.run_id ? `Run resumed (${event.run_id})` : 'Run resumed';
     case 'run_finished':
       return event.error
         ? `Run ${event.status ?? 'finished'}: ${event.error}`
