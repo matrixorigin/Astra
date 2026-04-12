@@ -178,22 +178,13 @@ pub(super) fn build_tool_call_start_event_from_frame(
     if payload.get("type").and_then(serde_json::Value::as_str) != Some("tool_call_start") {
         return None;
     }
-    Some(serde_json::Map::from_iter([
-        (
-            "type".to_string(),
-            serde_json::Value::String("tool_call_start".to_string()),
-        ),
-        (
-            "name".to_string(),
-            serde_json::Value::String(
-                payload
-                    .get("name")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-            ),
-        ),
-    ]))
+    let payload = payload.as_object()?;
+    Some(serde_json::Map::from_iter(
+        payload
+            .iter()
+            .filter(|(key, _)| matches!(key.as_str(), "type" | "tool" | "call_id" | "arguments"))
+            .map(|(key, value)| (key.clone(), value.clone())),
+    ))
 }
 
 pub(super) fn build_tool_call_event_from_frame(
