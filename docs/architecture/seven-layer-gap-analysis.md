@@ -93,7 +93,7 @@
 - **Most evaluation routes return 501**: `DatabaseEvaluationService` has "not implemented yet" for drift detection, drift pipeline, closed-loop, training data, SLO.
 - **No multi-objective optimization**: Evaluation is single-dimensional (quality score). No Pareto frontier for efficiency × cost × accuracy.
 - **No noise filtering**: FeedbackSignals are consumed raw; no statistical filtering for outliers or noise.
-- **No universal verifier-complete scoreboard yet**: `MutationScoreboard` now persists per-action verifier summaries for fork-skill mutations, but generic tool-path verifier outcomes are still not stitched into the same persisted surface.
+- **No fully universal verifier-complete scoreboard yet**: `MutationScoreboard` now persists per-action verifier summaries for fork-skill mutations and for generic tool results that already return verifier-shaped JSON, but tool paths that only emit coarse or unstructured outcomes are still not stitched into the same persisted surface.
 - **Confidence intervals are not end-to-end**: `ConfidenceInterval` exists in core/runtime, but evaluation and report surfaces do not expose it consistently.
 - **No verifier diversity**: Gate validation is single-pass, not ensemble-based.
 
