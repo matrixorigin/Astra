@@ -177,13 +177,14 @@
 - **SQL safety** (`mo_tools.rs`): Blocks destructive SQL operations.
 - **Shared SafetyMiddleware preflight** (`turn/safety_middleware.rs`, `tool_safety_guard.rs`): Centralized request-time guard chain now screens destructive SQL and prompt-injection-style shell obfuscation before live edge tool execution.
 - **Learning-boundary causal support gate** (`pipeline/learning.rs`, `turn/contracts.rs`): Trusted-success reinforcement now requires corroborating tool-result/quality evidence, and suspicious high-quality turns are damped instead of blindly reinforcing entity/pattern learning.
+- **Runtime reward-hacking throttle** (`turn/stall.rs`, `turn/turn_guard.rs`, `turn/agentic_post_tool_policy.rs`): high-risk repetitive or exploration-only tool batches now trigger a live `TurnGuard` warning, retry the LLM with an explicit correction, and temporarily restrict the repeated tools instead of only damping downstream learning updates.
 - **Permission gating**: Three-tier permission model with inherited restrictions.
 - **Stall detection** (`stall.rs`): Detects repeated identical tool calls, empty-name bursts.
 - **Symlink safety, path validation**: Guards against path traversal attacks.
 - **Evaluation gate** (`evaluation/`): Quality gates that can block deployment.
 
 ### Gaps
-- **Reward-hacking guard is learning-boundary only**: Suspicious turns stop reinforcing learned success, but live execution still relies on stall/permission controls rather than an active runtime throttle.
+- **Reward-hacking throttle is still heuristic-only**: suspicious low-value turns are now throttled live, but the guard still reacts to repetitive tool-pattern heuristics rather than richer post-tool validation or causal evidence.
 - **No model parameter drift detection**: System detects behavioral drift but not weight/embedding drift in fine-tuned models.
 - **Anti-hallucinated causality is heuristic-only**: The learning boundary now requires corroborating tool evidence, but it still lacks lineage-backed causal inference and richer cross-turn validation against spurious correlations.
 - **No adversarial testing framework**: No red-team/fuzzing infrastructure for systematically probing safety boundaries.

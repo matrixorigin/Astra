@@ -16,6 +16,7 @@ use crate::turn::chat_turn_heuristics::TaskExecutionProfile;
 use crate::turn::error_recovery::{self, EscalationLevel, SessionErrorSummary};
 use crate::turn::result_quality::{self, ResultQuality};
 use crate::turn::stall::{self, DivergenceStatus, StallReflection};
+use crate::turn::tool_call_shape::tool_call_name;
 use crate::turn::tool_health::ToolHealthTracker;
 
 /// Actionable verdict for the current turn.
@@ -87,6 +88,8 @@ pub struct TurnGuard {
     task_profile: TaskExecutionProfile,
     /// Per-turn tool call signatures for stall/divergence detection.
     pub tool_sigs: Vec<BTreeSet<String>>,
+    /// Raw tool calls from the latest round for per-turn behavior checks.
+    latest_tool_calls: Vec<serde_json::Value>,
     /// How many stall nudges have been sent this session.
     pub nudge_count: usize,
     /// Per-tool health tracker.
@@ -123,6 +126,7 @@ impl TurnGuard {
         Self {
             task_profile,
             tool_sigs: Vec::new(),
+            latest_tool_calls: Vec::new(),
             nudge_count: 0,
             health: ToolHealthTracker::new(),
             errors: SessionErrorSummary::new(),
@@ -158,15 +162,12 @@ impl TurnGuard {
     /// Also resolves any `pending_correction` by checking whether the agent
     /// complied with the avoid-list and used suggested alternatives.
     pub fn record_tool_calls(&mut self, tool_calls: &[serde_json::Value]) {
+        self.latest_tool_calls = tool_calls.to_vec();
+
         if let Some(correction) = self.pending_correction.take() {
             let current_tools: HashSet<String> = tool_calls
                 .iter()
-                .filter_map(|tc| {
-                    tc.get("function")
-                        .and_then(|f| f.get("name"))
-                        .and_then(|n| n.as_str())
-                        .map(String::from)
-                })
+                .filter_map(|tc| tool_call_name(tc).map(String::from))
                 .collect();
 
             let followed = !correction
@@ -285,7 +286,8 @@ impl TurnGuard {
             &self.tool_sigs,
             self.task_profile.exploration_round_budget,
         );
-        if let DivergenceStatus::Diverging(_) = divergence {
+        let divergence_detected = matches!(divergence, DivergenceStatus::Diverging(_));
+        if divergence_detected {
             injections.push(stall::DIVERGENCE_CORRECTION.to_string());
             if !stall_detected {
                 self.nudge_count += 1;
@@ -293,7 +295,26 @@ impl TurnGuard {
             severity = severity.max(VerdictSeverity::Warning);
         }
 
-        // 3. Nudge-ignore detection
+        // 3. Reward-hacking detection for the current turn.
+        let reward_hacking = stall::assess_reward_hacking(&self.latest_tool_calls, 0.0, None);
+        if reward_hacking.risk >= stall::ACTIVE_REWARD_HACKING_RISK_THRESHOLD
+            && !reward_hacking.flags.is_empty()
+        {
+            let reward_hacking_avoid = stall::reward_hacking_avoid_tools(&self.latest_tool_calls);
+            injections.push(stall::build_reward_hacking_correction(
+                &reward_hacking,
+                &reward_hacking_avoid,
+            ));
+            for tool in reward_hacking_avoid {
+                avoid_tools.insert(tool);
+            }
+            if !stall_detected && !divergence_detected {
+                self.nudge_count += 1;
+            }
+            severity = severity.max(VerdictSeverity::Warning);
+        }
+
+        // 4. Nudge-ignore detection
         if let Some(ref reflection) = self.last_reflection
             && !stall_detected
         {
@@ -321,7 +342,7 @@ impl TurnGuard {
             }
         }
 
-        // 4. Tool health warnings
+        // 5. Tool health warnings
         if let Some(warning) = self.health.deprioritize_warning() {
             injections.push(warning);
             for tool in self.health.deprioritized_tools() {
@@ -330,7 +351,7 @@ impl TurnGuard {
             severity = severity.max(VerdictSeverity::Warning);
         }
 
-        // 4a. Timeout-dominant tool guidance
+        // 5a. Timeout-dominant tool guidance
         // When most failures are timeouts, give softer guidance (infrastructure issue).
         let timeout_dominant = self.health.timeout_dominant_tools();
         if !timeout_dominant.is_empty() {
@@ -344,7 +365,7 @@ impl TurnGuard {
             // Don't add to avoid_tools — timeouts are transient, tool might recover
         }
 
-        // 4b. Cache duplication warning
+        // 5b. Cache duplication warning
         // When the LLM keeps making identical tool calls, flag token waste.
         let cache_wasteful = self.health.cache_wasteful_tools(3);
         if !cache_wasteful.is_empty() {
@@ -437,7 +458,7 @@ impl TurnGuard {
             false
         };
 
-        let is_diverging = matches!(divergence, DivergenceStatus::Diverging(_));
+        let is_diverging = divergence_detected;
 
         let avoid_tools_vec: Vec<String> = avoid_tools.into_iter().collect();
 
@@ -1101,6 +1122,29 @@ mod tests {
                 "divergence detection must increment nudge_count when no stall"
             );
         }
+    }
+
+    #[test]
+    fn reward_hacking_turn_triggers_runtime_warning() {
+        let mut guard = TurnGuard::new();
+        guard.record_tool_calls(&[
+            make_tool_call("read_file", r#"{"path":"src/lib.rs"}"#),
+            make_tool_call("read_file", r#"{"path":"src/lib.rs"}"#),
+        ]);
+        guard.record_tool_result("read_file", r#"fn main() {}"#);
+        guard.record_tool_result("read_file", r#"fn main() {}"#);
+
+        let initial_nudges = guard.nudge_count;
+        let verdict = guard.evaluate();
+        assert_eq!(verdict.severity, VerdictSeverity::Warning);
+        assert!(
+            verdict
+                .injections
+                .iter()
+                .any(|message| message.contains("Reward-hacking guard"))
+        );
+        assert!(verdict.avoid_tools.contains(&"read_file".to_string()));
+        assert_eq!(guard.nudge_count, initial_nudges + 1);
     }
 
     // ── CorrectionRecord / CorrectionOutcome tests ──

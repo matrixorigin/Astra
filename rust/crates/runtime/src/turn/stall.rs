@@ -111,6 +111,8 @@ pub fn detect_server_stall(tool_sigs: &[BTreeSet<String>], window: usize) -> boo
 pub const CLI_AGENTIC_VERDICT_REMAINING_PENALTY_CRITICAL: usize = 5;
 /// Same for **warning** severity.
 pub const CLI_AGENTIC_VERDICT_REMAINING_PENALTY_WARNING: usize = 2;
+/// Minimum risk before the runtime guard actively throttles a repetitive turn.
+pub const ACTIVE_REWARD_HACKING_RISK_THRESHOLD: f64 = 0.5;
 
 /// Per-round signature set and tool-name set for astra flat `tool_calls` rows (`name` + `arguments` JSON).
 pub fn round_tool_call_sig_and_names(tool_calls: &[Value]) -> (BTreeSet<String>, HashSet<String>) {
@@ -260,6 +262,57 @@ pub fn dampen_quality_for_reward_hacking(
     assessment: &RewardHackingAssessment,
 ) -> f64 {
     (quality * (1.0 - assessment.risk)).clamp(0.0, 1.0)
+}
+
+pub fn reward_hacking_avoid_tools(tool_calls: &[Value]) -> Vec<String> {
+    let tool_names = ordered_tool_call_names(tool_calls);
+    if tool_names.is_empty() {
+        return Vec::new();
+    }
+
+    let all_exploration = tool_names.len() >= 2
+        && tool_names
+            .iter()
+            .all(|name| EXPLORATION_TOOLS.contains(&name.as_str()));
+
+    let mut counts = HashMap::new();
+    for name in tool_names {
+        *counts.entry(name).or_insert(0usize) += 1;
+    }
+
+    let mut avoid_tools: Vec<String> = counts
+        .into_iter()
+        .filter_map(|(name, count)| {
+            if count >= 2 || (all_exploration && !name.is_empty()) {
+                Some(name)
+            } else {
+                None
+            }
+        })
+        .collect();
+    avoid_tools.sort();
+    avoid_tools
+}
+
+pub fn build_reward_hacking_correction(
+    assessment: &RewardHackingAssessment,
+    avoid_tools: &[String],
+) -> String {
+    let mut message = format!(
+        "⚠ Reward-hacking guard: the last tool batch looked repetitive or low-value ({}). \
+Stop repeating cheap actions that do not advance the task.",
+        assessment.flags.join("; ")
+    );
+    if !avoid_tools.is_empty() {
+        message.push_str(&format!(
+            "\nAvoid these tools next: [{}].",
+            avoid_tools.join(", ")
+        ));
+    }
+    message.push_str(
+        "\nInstead, use a different tool that can make concrete progress, or summarize what you learned and answer the user.",
+    );
+    message
 }
 
 /// Detect if the agent is diverging: last N rounds used ONLY exploration tools
@@ -882,6 +935,40 @@ mod tests {
             flags: vec!["repeated identical tool call x3".into()],
         };
         assert!((dampen_quality_for_reward_hacking(0.9, &assessment) - 0.36).abs() < 0.01);
+    }
+
+    #[test]
+    fn reward_hacking_avoid_tools_prefers_repeated_or_exploration_tools() {
+        let tool_calls = vec![
+            serde_json::json!({"name": "read_file", "arguments": {"path": "src/lib.rs"}}),
+            serde_json::json!({"name": "read_file", "arguments": {"path": "src/lib.rs"}}),
+            serde_json::json!({"name": "grep", "arguments": {"pattern": "TurnGuard"}}),
+        ];
+
+        assert_eq!(
+            reward_hacking_avoid_tools(&tool_calls),
+            vec!["grep".to_string(), "read_file".to_string()]
+        );
+    }
+
+    #[test]
+    fn reward_hacking_correction_mentions_flags_and_avoid_list() {
+        let assessment = RewardHackingAssessment {
+            risk: 0.6,
+            flags: vec![
+                "repeated identical tool call x2".into(),
+                "exploration-only tool chain".into(),
+            ],
+        };
+
+        let message = build_reward_hacking_correction(
+            &assessment,
+            &["read_file".to_string(), "grep".to_string()],
+        );
+
+        assert!(message.contains("Reward-hacking guard"));
+        assert!(message.contains("repeated identical tool call x2"));
+        assert!(message.contains("Avoid these tools next: [read_file, grep]"));
     }
 
     // ── Universal stemming ──

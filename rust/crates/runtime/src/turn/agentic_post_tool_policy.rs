@@ -225,6 +225,7 @@ pub fn apply_agentic_post_tool_policy(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn healthy_guard_proceeds_end_turn() {
@@ -275,6 +276,61 @@ mod tests {
         assert_eq!(
             map_post_tool_policy_outcome(AgenticPostToolPolicyOutcome::Abort("x".into())),
             AgenticPostToolIterationControl::Abort("x".into())
+        );
+    }
+
+    #[test]
+    fn reward_hacking_warning_retries_and_restricts_tools() {
+        let mut intent_tool_turns = Vec::new();
+        let mut messages = Vec::new();
+        let mut stall_events = Vec::new();
+        let mut verdict_events = Vec::new();
+        let mut restricted_tools = HashSet::new();
+        let mut remaining_turns = 10usize;
+        let mut step_recorder = StepRecorder::with_persistence("sid", "tid");
+        let mut last_heavy_checkpoint: Option<StepCheckpoint> = None;
+        let mut turn_guard = TurnGuard::new();
+        let tool_calls = vec![
+            json!({"name": "read_file", "arguments": {"path": "src/lib.rs"}}),
+            json!({"name": "read_file", "arguments": {"path": "src/lib.rs"}}),
+        ];
+        turn_guard.record_tool_calls(&tool_calls);
+        turn_guard.record_tool_result("read_file", "fn main() {}");
+        turn_guard.record_tool_result("read_file", "fn main() {}");
+
+        let out = apply_agentic_post_tool_policy(AgenticPostToolPolicyRequest {
+            turn_index: 0,
+            message: "inspect the code",
+            tool_calls_for_guard: &tool_calls,
+            intent_tool_turns: &mut intent_tool_turns,
+            messages: &mut messages,
+            stall_events: &mut stall_events,
+            turn_guard: &mut turn_guard,
+            verdict_events: &mut verdict_events,
+            restricted_tools: &mut restricted_tools,
+            remaining_turns: &mut remaining_turns,
+            step_recorder: &mut step_recorder,
+            current_session_id: None,
+            max_turns: 8,
+            loop_turn: 0,
+            recent_tools: &[],
+            last_heavy_checkpoint: &mut last_heavy_checkpoint,
+        });
+
+        assert_eq!(out, AgenticPostToolPolicyOutcome::RetryLlmClearToolResults);
+        assert_eq!(remaining_turns, 8);
+        assert!(restricted_tools.contains("read_file"));
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.to_string().contains("Reward-hacking guard"))
+        );
+        assert_eq!(verdict_events.len(), 1);
+        assert_eq!(verdict_events[0].severity, "warning");
+        assert!(
+            verdict_events[0]
+                .avoid_tools
+                .contains(&"read_file".to_string())
         );
     }
 }
