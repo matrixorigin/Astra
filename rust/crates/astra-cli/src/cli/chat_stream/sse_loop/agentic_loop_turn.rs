@@ -676,6 +676,9 @@ pub(crate) struct ChatTurnSseFetchRequest<'a> {
     pub skill_agent_type: Option<String>,
     /// Scenario-driven override for the tool selection token budget.
     pub tool_budget_override: Option<u32>,
+    /// When true, this is a continuation turn after a skill has already produced output.
+    /// Propagated to `EdgeSseContext` to buffer text and suppress thinking previews.
+    pub skill_continuation: bool,
 }
 
 /// stderr prep line + timing toggles for [`fetch_chat_turn_sse`].
@@ -793,6 +796,7 @@ pub(crate) async fn fetch_chat_turn_sse(
         skill_effort,
         skill_agent_type,
         tool_budget_override,
+        skill_continuation,
     } = ctx;
 
     let ui = chat_turn_sse_fetch_ui(render_policy, plan_assemble_line_release.as_ref());
@@ -867,6 +871,7 @@ pub(crate) async fn fetch_chat_turn_sse(
         stream_event_tx,
         approval_request_tx,
         skill_resolver,
+        skill_continuation,
     };
 
     let sse_mark = Instant::now();

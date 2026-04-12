@@ -214,6 +214,7 @@ impl AgenticLoopHost for SubRunHost {
             stream_event_tx: None,
             approval_request_tx: None,
             skill_resolver: self.skill_resolver.clone(),
+            skill_continuation: false,
         };
 
         let prep_line = ChatTurnPrepLineGuard::maybe_start(false, None);

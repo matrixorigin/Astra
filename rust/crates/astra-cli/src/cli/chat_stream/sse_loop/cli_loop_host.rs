@@ -193,6 +193,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             skill_effort: state.skills.effort.as_ref().map(|e| e.to_string()),
             skill_agent_type: state.skills.agent_type.clone(),
             tool_budget_override: state.tool_budget_override,
+            skill_continuation: state.skill_produced_output,
         })
         .await?;
 
@@ -274,6 +275,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
                 stream_event_tx: None,
                 approval_request_tx: None,
                 skill_resolver: None,
+                skill_continuation: false,
             }),
             0,
             state.cancellation.token.as_deref(),

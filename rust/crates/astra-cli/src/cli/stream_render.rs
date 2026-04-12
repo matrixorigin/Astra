@@ -106,6 +106,10 @@ pub(super) struct EdgeSseContext<'a> {
     pub approval_request_tx: Option<super::chat_stream::ApprovalRequestTx>,
     /// Skill resolver for intercepting "skill" tool calls in the SSE stream.
     pub skill_resolver: Option<std::sync::Arc<dyn astra_runtime::turn::skill_tool::SkillResolver>>,
+    /// When true, this is a continuation turn after a skill has already produced output.
+    /// Text is buffered (not streamed) and thinking previews are suppressed to avoid
+    /// intermediate noise between skill iterations.
+    pub skill_continuation: bool,
 }
 
 // ─── CLI SSE stream host ─────────────────────────────────────────────────────
@@ -153,7 +157,8 @@ struct CliSseStreamHost<'a> {
 
 impl<'a> CliSseStreamHost<'a> {
     fn from_edge_ctx(ctx: EdgeSseContext<'a>, term_width: usize, render_md: bool) -> Self {
-        let suppress_reasoning = ctx.render_policy == RenderPolicy::Silent;
+        let suppress_reasoning =
+            ctx.render_policy == RenderPolicy::Silent || ctx.skill_continuation;
         Self {
             api: ctx.api,
             token: ctx.token,
@@ -162,7 +167,10 @@ impl<'a> CliSseStreamHost<'a> {
             render_policy: ctx.render_policy,
             perm_manager: ctx.perm_manager,
             render: StreamRenderState::with_term_width(term_width, render_md, suppress_reasoning),
-            tool_work_detected: false,
+            // Skill continuation: buffer text from the start so intermediate prose
+            // never reaches the terminal.  The finalization path renders the buffer
+            // one-shot if this turns out to be the final (no-tool) turn.
+            tool_work_detected: ctx.skill_continuation,
             edge_tool_round: Vec::new(),
             xml_tag_buffer: String::new(),
             cancel_token: ctx.cancel_token,
@@ -1425,7 +1433,7 @@ impl StreamRenderState {
         // ThinkingPreviewPane now uses stdout (via TerminalRegion), so it works
         // in both markdown and non-markdown modes without cursor conflicts.
         let use_pane = rows > 0 && io::stdout().is_terminal() && !self.suppress_reasoning_viewport;
-        if !use_pane && io::stderr().is_terminal() {
+        if !use_pane && !self.suppress_reasoning_viewport && io::stderr().is_terminal() {
             self.thinking_spinner = Some(ThinkingSpinnerKind::Classic(Spinner::start(
                 "Thinking".to_string(),
             )));
