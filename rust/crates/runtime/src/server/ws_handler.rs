@@ -1075,7 +1075,13 @@ async fn handle_chat_message_via_bridge(
     }
 }
 
-fn sync_conn_state_from_stream_event(conn: &mut WsConnection, event: &Value) -> Option<String> {
+fn should_adopt_stream_run_id(conn: &WsConnection, run_id: &str) -> bool {
+    conn.active_run_id.is_none()
+        || (conn.bridge_prepared_run_id.as_deref() == conn.active_run_id.as_deref()
+            && conn.active_run_id.as_deref() != Some(run_id))
+}
+
+fn sync_conn_state_from_stream_event(conn: &mut WsConnection, event: &Value) -> Option<(String, bool)> {
     let event_type = event
         .get("type")
         .or_else(|| event.get("event_type"))
@@ -1085,15 +1091,16 @@ fn sync_conn_state_from_stream_event(conn: &mut WsConnection, event: &Value) -> 
         if let Some(session_id) = event.get("session_id").and_then(Value::as_str) {
             conn.session_id = Some(session_id.to_string());
         }
-        if let Some(run_id) = event.get("run_id").and_then(Value::as_str) {
-            let should_adopt_stream_run_id = conn.active_run_id.is_none()
-                || (conn.bridge_prepared_run_id.as_deref() == conn.active_run_id.as_deref()
-                    && conn.active_run_id.as_deref() != Some(run_id));
-            if should_adopt_stream_run_id {
-                conn.active_run_id = Some(run_id.to_string());
-                return Some(run_id.to_string());
-            }
-        }
+    }
+
+    if matches!(
+        event_type,
+        Some("session_info" | "run_started" | "run_paused" | "run_resumed" | "run_cancelled" | "run_finished")
+    ) && let Some(run_id) = event.get("run_id").and_then(Value::as_str)
+        && should_adopt_stream_run_id(conn, run_id)
+    {
+        conn.active_run_id = Some(run_id.to_string());
+        return Some((run_id.to_string(), event_type == Some("session_info")));
     }
     None
 }
@@ -1346,9 +1353,10 @@ async fn stream_sse_response_as_ws(
                             };
                             for event in events {
                                 let adopted_run_id = sync_conn_state_from_stream_event(conn, &event);
-                                if let Some(run_id) = adopted_run_id
+                                if let Some((run_id, synthesize_run_started)) = adopted_run_id
                                     && conn.bridge_prepared_run_id.is_some()
                                     && conn.bridge_prepared_run_id.as_deref() != Some(run_id.as_str())
+                                    && synthesize_run_started
                                     && let Some(session_id) = conn.session_id.clone()
                                 {
                                     send_msg(
@@ -1720,7 +1728,7 @@ mod tests {
             }),
         );
 
-        assert_eq!(adopted.as_deref(), Some("run-9"));
+        assert_eq!(adopted, Some(("run-9".into(), true)));
         assert_eq!(conn.session_id.as_deref(), Some("sess-42"));
         assert_eq!(conn.active_run_id.as_deref(), Some("run-9"));
     }
@@ -1748,7 +1756,7 @@ mod tests {
             }),
         );
 
-        assert_eq!(adopted.as_deref(), Some("upstream-run"));
+        assert_eq!(adopted, Some(("upstream-run".into(), true)));
         assert_eq!(conn.session_id.as_deref(), Some("sess-2"));
         assert_eq!(conn.active_run_id.as_deref(), Some("upstream-run"));
     }
@@ -1779,6 +1787,32 @@ mod tests {
         assert_eq!(adopted, None);
         assert_eq!(conn.session_id.as_deref(), Some("sess-2"));
         assert_eq!(conn.active_run_id.as_deref(), Some("real-run"));
+    }
+
+    #[test]
+    fn run_started_stream_event_upgrades_prepared_bridge_run_id_without_synthetic_start() {
+        let mut conn = WsConnection {
+            user: AuthUserRecord {
+                user_id: "u1".into(),
+                username: "alice".into(),
+                email: "alice@example.com".into(),
+                display_name: Some("Alice".into()),
+            },
+            session_id: Some("sess-1".into()),
+            active_run_id: Some("prepared-run".into()),
+            bridge_prepared_run_id: Some("prepared-run".into()),
+        };
+
+        let adopted = sync_conn_state_from_stream_event(
+            &mut conn,
+            &serde_json::json!({
+                "type": "run_started",
+                "run_id": "upstream-run"
+            }),
+        );
+
+        assert_eq!(adopted, Some(("upstream-run".into(), false)));
+        assert_eq!(conn.active_run_id.as_deref(), Some("upstream-run"));
     }
 
     #[test]
