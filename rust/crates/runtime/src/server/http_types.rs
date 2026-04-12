@@ -578,23 +578,11 @@ impl From<AuthTokenRecord> for AuthTokenResponse {
 }
 
 pub(super) fn chat_request_into_data(mut request: ChatRequest) -> ChatRequestData {
-    let mut context = request.context.take();
-    if request.plan_subtask_id.is_some() || request.is_plan_subtask == Some(true) {
-        let ctx = context.get_or_insert_with(serde_json::Map::new);
-        if let Some(id) = request
-            .plan_subtask_id
-            .take()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-        {
-            ctx.entry("plan_subtask_id".to_string())
-                .or_insert(serde_json::Value::String(id));
-        }
-        if request.is_plan_subtask == Some(true) {
-            ctx.entry("is_plan_subtask".to_string())
-                .or_insert(serde_json::Value::Bool(true));
-        }
-    }
+    let context = merge_plan_subtask_context(
+        request.context.take(),
+        request.plan_subtask_id.take(),
+        request.is_plan_subtask,
+    );
     ChatRequestData {
         message: request.message,
         session_id: request.session_id,
@@ -605,6 +593,28 @@ pub(super) fn chat_request_into_data(mut request: ChatRequest) -> ChatRequestDat
         max_candidates: request.max_candidates,
         explain: request.explain,
     }
+}
+
+pub(super) fn merge_plan_subtask_context(
+    mut context: Option<serde_json::Map<String, serde_json::Value>>,
+    plan_subtask_id: Option<String>,
+    is_plan_subtask: Option<bool>,
+) -> Option<serde_json::Map<String, serde_json::Value>> {
+    if plan_subtask_id.is_some() || is_plan_subtask == Some(true) {
+        let ctx = context.get_or_insert_with(serde_json::Map::new);
+        if let Some(id) = plan_subtask_id
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+        {
+            ctx.entry("plan_subtask_id".to_string())
+                .or_insert(serde_json::Value::String(id));
+        }
+        if is_plan_subtask == Some(true) {
+            ctx.entry("is_plan_subtask".to_string())
+                .or_insert(serde_json::Value::Bool(true));
+        }
+    }
+    context
 }
 
 pub(super) fn default_days() -> i32 {

@@ -9,7 +9,7 @@
 //! **Client → Server** (JSON text frames):
 //! ```text
 //! {"type": "auth", "token": "Bearer ..."}
-//! {"type": "message", "content": "...", "session_id": "...", "agent_id": "...", "model": "...", "skill_search": {...}, "max_candidates": 25, "explain": false}
+//! {"type": "message", "content": "...", "session_id": "...", "agent_id": "...", "model": "...", "skill_search": {...}, "max_candidates": 25, "explain": false, "plan_subtask_id": "...", "is_plan_subtask": true}
 //! {"type": "cancel_run", "run_id": "..."}
 //! {"type": "pause_run", "run_id": "..."}
 //! {"type": "resume_run", "run_id": "..."}
@@ -39,6 +39,7 @@
 use super::chat_handlers::{
     is_session_service_unconfigured_error, resolve_or_create_chat_session_id,
 };
+use super::http_types::merge_plan_subtask_context;
 use super::*;
 use astra_core::{STATUS_CANCELLED, STATUS_COMPLETED, STATUS_FAILED};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -95,6 +96,10 @@ pub(super) enum WsClientMessage {
         max_candidates: u32,
         #[serde(default)]
         explain: bool,
+        #[serde(default)]
+        plan_subtask_id: Option<String>,
+        #[serde(default)]
+        is_plan_subtask: Option<bool>,
     },
 
     /// Cancel an active run.
@@ -400,6 +405,8 @@ async fn message_loop(socket: &mut WebSocket, state: &AppState, mut conn: WsConn
                                 context,
                                 max_candidates,
                                 explain,
+                                plan_subtask_id,
+                                is_plan_subtask,
                             }) => {
                                 handle_chat_message(
                                     socket,
@@ -413,6 +420,8 @@ async fn message_loop(socket: &mut WebSocket, state: &AppState, mut conn: WsConn
                                     context,
                                     max_candidates,
                                     explain,
+                                    plan_subtask_id,
+                                    is_plan_subtask,
                                 )
                                 .await;
                             }
@@ -502,6 +511,8 @@ async fn handle_chat_message(
     context: Option<serde_json::Map<String, serde_json::Value>>,
     max_candidates: u32,
     explain: bool,
+    plan_subtask_id: Option<String>,
+    is_plan_subtask: Option<bool>,
 ) {
     // Keep explicit per-message session routing local to this request until
     // session resolution succeeds. That avoids poisoning the bound WS
@@ -514,7 +525,6 @@ async fn handle_chat_message(
     let fallback_agent_id = agent_id.clone();
     let fallback_model = model.clone();
     let fallback_skill_search = skill_search.clone();
-    let fallback_context = context.clone();
     let fallback_max_candidates = max_candidates;
     let fallback_explain = explain;
     let mut request = build_ws_chat_request(
@@ -526,7 +536,10 @@ async fn handle_chat_message(
         context,
         max_candidates,
         explain,
+        plan_subtask_id,
+        is_plan_subtask,
     );
+    let fallback_context = request.context.clone();
     request.session_id = match resolve_or_create_chat_session_id(
         state,
         &conn.user,
@@ -737,6 +750,8 @@ fn build_ws_chat_request(
     context: Option<serde_json::Map<String, serde_json::Value>>,
     max_candidates: u32,
     explain: bool,
+    plan_subtask_id: Option<String>,
+    is_plan_subtask: Option<bool>,
 ) -> astra_services::runs::ChatRequestData {
     astra_services::runs::ChatRequestData {
         message: content.to_string(),
@@ -744,7 +759,7 @@ fn build_ws_chat_request(
         agent_id,
         model,
         skill_search,
-        context,
+        context: merge_plan_subtask_context(context, plan_subtask_id, is_plan_subtask),
         max_candidates,
         explain,
     }
@@ -1936,7 +1951,7 @@ mod tests {
 
     #[test]
     fn parse_chat_message() {
-        let json = r#"{"type": "message", "content": "hello", "session_id": "s1", "agent_id": "agent-1", "skill_search": {"dynamic_surface": false, "min_catalog_size": 12, "surface_cap": 20}, "max_candidates": 3, "explain": true}"#;
+        let json = r#"{"type": "message", "content": "hello", "session_id": "s1", "agent_id": "agent-1", "skill_search": {"dynamic_surface": false, "min_catalog_size": 12, "surface_cap": 20}, "max_candidates": 3, "explain": true, "plan_subtask_id": "sub-42", "is_plan_subtask": true}"#;
         let msg: WsClientMessage = serde_json::from_str(json).unwrap();
         match msg {
             WsClientMessage::ChatMessage {
@@ -1948,6 +1963,8 @@ mod tests {
                 context,
                 max_candidates,
                 explain,
+                plan_subtask_id,
+                is_plan_subtask,
             } => {
                 assert_eq!(content, "hello");
                 assert_eq!(session_id, Some("s1".into()));
@@ -1964,6 +1981,8 @@ mod tests {
                 assert!(context.is_none());
                 assert_eq!(max_candidates, 3);
                 assert!(explain);
+                assert_eq!(plan_subtask_id.as_deref(), Some("sub-42"));
+                assert_eq!(is_plan_subtask, Some(true));
             }
             _ => panic!("expected ChatMessage"),
         }
@@ -1980,6 +1999,8 @@ mod tests {
                 skill_search,
                 max_candidates,
                 explain,
+                plan_subtask_id,
+                is_plan_subtask,
                 ..
             } => {
                 assert_eq!(content, "你好");
@@ -1987,6 +2008,8 @@ mod tests {
                 assert!(skill_search.is_none());
                 assert_eq!(max_candidates, default_ws_max_candidates());
                 assert!(!explain);
+                assert!(plan_subtask_id.is_none());
+                assert!(is_plan_subtask.is_none());
             }
             _ => panic!("expected ChatMessage"),
         }
@@ -2044,6 +2067,8 @@ mod tests {
             )])),
             7,
             true,
+            Some("sub-42".into()),
+            Some(true),
         );
 
         assert_eq!(request.message, "hello");
@@ -2059,6 +2084,8 @@ mod tests {
             })
         );
         assert_eq!(request.context.as_ref().unwrap()["cwd"], "/tmp");
+        assert_eq!(request.context.as_ref().unwrap()["plan_subtask_id"], "sub-42");
+        assert_eq!(request.context.as_ref().unwrap()["is_plan_subtask"], true);
         assert_eq!(request.max_candidates, 7);
         assert!(request.explain);
     }
