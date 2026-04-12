@@ -9,7 +9,7 @@
 //! let collector = TurnTraceCollector::new("turn-1", "session-abc");
 //!
 //! // During context assembly:
-//! collector.record_tool_selection(&selection_result, tools_available, latency_ms);
+//! collector.record_tool_selection(&selected_tools, strategy, confidence, &per_tool_costs, tools_available, latency_ms);
 //! collector.record_memory_retrieval(&query, candidates, &ranked_results, latency_ms);
 //! collector.record_compression(&pipeline_outcome, initial_msgs, final_msgs, ...);
 //!
@@ -99,9 +99,7 @@ impl TurnTraceCollector {
         selected_tools: &[String],
         strategy: &str,
         confidence: f64,
-        budget_used: u32,
-        selector_tokens_in: u64,
-        selector_tokens_out: u64,
+        per_tool_costs: &[(String, u32)],
         tools_available: u32,
         latency_ms: u64,
     ) {
@@ -110,9 +108,7 @@ impl TurnTraceCollector {
             selected_tools,
             strategy,
             confidence,
-            budget_used,
-            selector_tokens_in,
-            selector_tokens_out,
+            per_tool_costs,
             latency_ms,
         );
         if let Ok(mut state) = self.inner.write() {
@@ -120,29 +116,23 @@ impl TurnTraceCollector {
         }
     }
 
-    /// Patch per-tool token costs on the existing tool selection trace.
-    pub fn patch_tool_tokens(&self, costs: &[(String, u32)]) {
-        if let Ok(mut state) = self.inner.write() {
-            if let Some(ref mut tools) = state.tools {
-                for ts in &mut tools.tools_selected {
-                    if let Some((_, cost)) = costs.iter().find(|(n, _)| n == &ts.tool_name) {
-                        ts.tokens = *cost;
-                    }
-                }
-            }
-        }
-    }
-
     /// Record memory retrieval results.
     /// Set per-turn history retention data.
     pub fn set_history_retained(&self, turns: &[super::context_assembly_trace::TurnRetention]) {
         if let Ok(mut state) = self.inner.write() {
+            let had_history = state.history.is_some();
             let hist = state
                 .history
                 .get_or_insert_with(HistorySelectionTrace::default);
             hist.turns_retained = turns.to_vec();
             hist.total_turns_available = turns.len() as u32;
-            hist.tokens_after = turns.iter().map(|t| t.tokens).sum();
+            let total: u32 = turns.iter().map(|t| t.tokens).sum();
+            hist.tokens_after = total;
+            // If record_compression was never called (no prior history trace),
+            // default tokens_before to tokens_after (no compression occurred).
+            if !had_history {
+                hist.tokens_before = total;
+            }
         }
     }
 
@@ -349,6 +339,11 @@ impl TurnTraceCollector {
             || state.token_budget.is_some()
     }
 
+    /// Check if tool selection trace has already been recorded.
+    pub fn has_tool_trace(&self) -> bool {
+        self.inner.read().expect("lock poisoned").tools.is_some()
+    }
+
     /// Get elapsed time since collector creation.
     pub fn elapsed_ms(&self) -> u64 {
         let state = self.inner.read().expect("lock poisoned");
@@ -384,9 +379,7 @@ mod tests {
             &["view".to_string(), "edit".to_string()],
             "tfidf",
             0.85,
-            1000,
-            0,
-            0,
+            &[("view".into(), 500), ("edit".into(), 500)],
             50,
             15,
         );
@@ -412,7 +405,7 @@ mod tests {
         let collector1 = TurnTraceCollector::new("turn-1", "session-abc");
         let collector2 = collector1.clone_arc();
 
-        collector1.record_tool_selection(&["view".to_string()], "tfidf", 0.8, 100, 0, 0, 10, 5);
+        collector1.record_tool_selection(&["view".to_string()], "tfidf", 0.8, &[("view".into(), 100)], 10, 5);
 
         // Both should see the same data
         assert!(collector2.has_data());
@@ -431,9 +424,7 @@ mod tests {
             &["bash".into(), "view".into()],
             "tfidf",
             0.85,
-            3000,
-            0,
-            0,
+            &[("bash".into(), 1500), ("view".into(), 1500)],
             40,
             12,
         );
@@ -526,19 +517,16 @@ mod tests {
     }
 
     #[test]
-    fn patch_tool_tokens_updates_per_tool_costs() {
+    fn record_tool_selection_applies_per_tool_costs() {
         let collector = TurnTraceCollector::new("turn-0", "s1");
         collector.record_tool_selection(
             &["bash".into(), "grep".into()],
             "tfidf",
             0.8,
-            0,
-            0,
-            0,
+            &[("bash".into(), 350), ("grep".into(), 280)],
             10,
             5,
         );
-        collector.patch_tool_tokens(&[("bash".into(), 350), ("grep".into(), 280)]);
         let trace = collector.finalize();
         assert_eq!(trace.tools.tools_selected[0].tool_name, "bash");
         assert_eq!(trace.tools.tools_selected[0].tokens, 350);
@@ -571,6 +559,8 @@ mod tests {
         assert!(trace.history.turns_retained[1].has_tool_calls);
         assert_eq!(trace.history.total_turns_available, 2);
         assert_eq!(trace.history.tokens_after, 850);
+        // When record_compression was not called, tokens_before defaults to tokens_after.
+        assert_eq!(trace.history.tokens_before, 850);
     }
 
     #[test]

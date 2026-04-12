@@ -501,6 +501,9 @@ impl ToolRegistry {
         // Add dynamic tools greedily from ranked list using measured costs
         for &(idx, _score) in ranked_dynamic {
             let tool = &TOOL_CATALOG[idx];
+            if included_names.contains(tool.name) {
+                continue;
+            }
             let cost = self.token_cost(tool.name);
             if used_tokens + cost > budget_tokens {
                 continue;

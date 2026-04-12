@@ -3943,26 +3943,31 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
         }
 
         // ─── Trace collector: record tool selection ──────────────────────
+        // Only record if the CLI path didn't already set tool selection
+        // (CLI has accurate per-tool costs from its ToolRegistry).
+        // The server path builds selected_tools from edge_tool_round which
+        // reflects tool USAGE (with duplicates), not tool SELECTION.
         if let Some(ref collector) = state.telemetry.turn_trace_collector {
-            let selected_tools: Vec<String> = turn_result
-                .edge_tool_round
-                .iter()
-                .map(|r| r.tool.clone())
-                .collect();
-            collector.record_tool_selection(
-                &selected_tools,
-                state
-                    .telemetry
-                    .first_selector_strategy
-                    .as_deref()
-                    .unwrap_or("unknown"),
-                state.telemetry.first_selector_confidence.unwrap_or(0.0),
-                state.total_prompt as u32, // budget approximation
-                state.telemetry.selector_tokens_in,
-                state.telemetry.selector_tokens_out,
-                state.telemetry.all_tools_used.len() as u32,
-                state.telemetry.first_selector_ms.unwrap_or(0),
-            );
+            let already_has_tools = collector.has_tool_trace();
+            if !already_has_tools {
+                let selected_tools: Vec<String> = turn_result
+                    .edge_tool_round
+                    .iter()
+                    .map(|r| r.tool.clone())
+                    .collect();
+                collector.record_tool_selection(
+                    &selected_tools,
+                    state
+                        .telemetry
+                        .first_selector_strategy
+                        .as_deref()
+                        .unwrap_or("unknown"),
+                    state.telemetry.first_selector_confidence.unwrap_or(0.0),
+                    &[],
+                    state.telemetry.all_tools_used.len() as u32,
+                    state.telemetry.first_selector_ms.unwrap_or(0),
+                );
+            }
         }
 
         // ─── Step 3: Stall preflight ────────────────────────────────────

@@ -331,8 +331,8 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
         selection_report,
         selection_confidence,
         selection_strategy,
-        selection_tokens_in,
-        selection_tokens_out,
+        _selection_tokens_in,
+        _selection_tokens_out,
         selection_latency_ms,
     ) = if ctx.tool_results.is_empty() {
         let sel_start = Instant::now();
@@ -455,13 +455,10 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
             &selection_report.tools_selected,
             &selection_strategy,
             selection_confidence,
-            selected_tool_tokens_total,
-            selection_tokens_in,
-            selection_tokens_out,
+            &selected_tool_costs,
             ctx.registry.total_tool_count() as u32,
             selection_latency_ms,
         );
-        collector.patch_tool_tokens(&selected_tool_costs);
     }
 
     capture_first_selection_report_if_empty(

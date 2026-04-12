@@ -551,7 +551,7 @@ mod tests {
     fn tool_trace_scores_are_clamped_non_negative() {
         let selected_tools: Vec<String> = (0..16).map(|i| format!("tool-{i}")).collect();
         let trace =
-            build_tool_trace_from_selection(16, &selected_tools, "tfidf", 0.4, 1600, 0, 0, 5);
+            build_tool_trace_from_selection(16, &selected_tools, "tfidf", 0.4, &[], 5);
         assert!(trace.tools_selected.iter().all(|tool| tool.score >= 0.0));
     }
 }
@@ -610,23 +610,28 @@ pub fn build_tool_trace_from_selection(
     selected_tools: &[String],
     strategy: &str,
     confidence: f64,
-    budget_used: u32,
-    _selector_tokens_in: u64,
-    _selector_tokens_out: u64,
+    per_tool_costs: &[(String, u32)],
     selection_latency_ms: u64,
 ) -> ToolSelectionTrace {
     let tools_selected: Vec<ToolSelected> = selected_tools
         .iter()
         .enumerate()
-        .map(|(idx, name)| ToolSelected {
-            tool_name: name.clone(),
-            score: (1.0 - (idx as f64 * 0.1)).max(0.0), // Approximate ranking score
-            tokens: budget_used / selected_tools.len().max(1) as u32, // Distribute evenly
-            selection_factors: vec![SelectionFactor {
-                factor_name: "selector".to_string(),
-                weight: 1.0,
-                contribution: confidence,
-            }],
+        .map(|(idx, name)| {
+            let tokens = per_tool_costs
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, c)| *c)
+                .unwrap_or(0);
+            ToolSelected {
+                tool_name: name.clone(),
+                score: (1.0 - (idx as f64 * 0.1)).max(0.0),
+                tokens,
+                selection_factors: vec![SelectionFactor {
+                    factor_name: "selector".to_string(),
+                    weight: 1.0,
+                    contribution: confidence,
+                }],
+            }
         })
         .collect();
 
