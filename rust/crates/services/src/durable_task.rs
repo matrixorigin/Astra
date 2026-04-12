@@ -34,6 +34,9 @@ fn build_client_for_url(url: &str) -> reqwest::Client {
     builder.build().unwrap_or_else(|_| reqwest::Client::new())
 }
 
+/// Maximum `task_verification_results` rows loaded per task (unbounded `fetch_all` guard).
+const MAX_VERIFICATION_HISTORY_ROWS: i64 = 10_000;
+
 // ─── LLM Judge Trait ────────────────────────────────────────────────────────
 
 /// Trait for LLM-based semantic verification.
@@ -2415,16 +2418,18 @@ impl MatrixOneDurableTaskLifecycle {
         &self,
         task_id: &str,
     ) -> Result<Vec<SubtaskVerificationReport>, String> {
-        let rows = sqlx::query(
+        let mut rows = sqlx::query(
             "SELECT subtask_id, criterion_id, passed, evidence, expected, \
              duration_ms, error_message, CAST(created_at AS CHAR) AS created_at \
              FROM task_verification_results \
-             WHERE task_id = ? ORDER BY created_at",
+             WHERE task_id = ? ORDER BY created_at DESC LIMIT ?",
         )
         .bind(task_id)
+        .bind(MAX_VERIFICATION_HISTORY_ROWS)
         .fetch_all(&self.pool)
         .await
         .map_err(|e| format!("load_verification_history: {e}"))?;
+        rows.reverse();
 
         use sqlx::Row;
         use std::collections::BTreeMap;
@@ -3917,6 +3922,11 @@ impl DurableTaskLifecycle for UnconfiguredDurableTaskLifecycle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn verification_history_row_cap_is_positive() {
+        assert!(MAX_VERIFICATION_HISTORY_ROWS >= 1000);
+    }
 
     #[test]
     fn subtask_stage_transitions() {

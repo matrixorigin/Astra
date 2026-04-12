@@ -409,6 +409,12 @@ const MAX_CROSS_SESSION_TOOLS: i64 = 100;
 const MAX_CROSS_SESSION_MUTATIONS_PER_PAGE: u32 = 100;
 const MAX_CROSS_SESSION_PROMOTIONS_PER_PAGE: u32 = 100;
 
+/// Cap rows read for cross-session mutation inputs (wide time window or missing bounds).
+const MAX_CROSS_SESSION_MUTATION_DECISION_ROWS: i64 = 20_000;
+const MAX_CROSS_SESSION_MUTATION_EVENT_ROWS: i64 = 20_000;
+/// Runtime promotion events are paged in memory; bound DB read before filtering.
+const MAX_CROSS_SESSION_RUNTIME_PROMOTION_ROWS: i64 = 5_000;
+
 // ── Request params ───────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize)]
@@ -690,13 +696,15 @@ impl DatabaseSessionAuditService {
              FROM ctx_decision_audits d \
              JOIN agent_sessions s ON s.session_id = d.session_id \
              WHERE {mutation_where_clause} AND d.decision_type = 'tool_selection' \
-             ORDER BY d.created_at ASC"
+             ORDER BY d.created_at DESC LIMIT ?"
         );
         let mut dq = sqlx::query(&decisions_sql);
         for v in &mutation_bind_values {
             dq = dq.bind(v);
         }
-        let decision_rows = dq.fetch_all(pool).await.map_err(internal_error)?;
+        dq = dq.bind(MAX_CROSS_SESSION_MUTATION_DECISION_ROWS);
+        let mut decision_rows = dq.fetch_all(pool).await.map_err(internal_error)?;
+        decision_rows.reverse();
         let mutation_decisions = decision_rows
             .into_iter()
             .map(|row| {
@@ -728,13 +736,15 @@ impl DatabaseSessionAuditService {
             "SELECT e.session_id, CAST(e.metadata AS CHAR) AS metadata, e.created_at \
              FROM agent_events e \
              WHERE {override_where_clause} AND e.event_type = 'mutation_state' \
-             ORDER BY e.created_at ASC"
+             ORDER BY e.created_at DESC LIMIT ?"
         );
         let mut oq = sqlx::query(&overrides_sql);
         for v in &override_bind_values {
             oq = oq.bind(v);
         }
-        let override_rows = oq.fetch_all(pool).await.map_err(internal_error)?;
+        oq = oq.bind(MAX_CROSS_SESSION_MUTATION_EVENT_ROWS);
+        let mut override_rows = oq.fetch_all(pool).await.map_err(internal_error)?;
+        override_rows.reverse();
         let mutation_overrides = override_rows
             .into_iter()
             .filter_map(|row| {
@@ -777,7 +787,7 @@ impl DatabaseSessionAuditService {
         if until.is_some() {
             sql.push_str(" AND created_at <= ?");
         }
-        sql.push_str(" ORDER BY created_at DESC");
+        sql.push_str(" ORDER BY created_at DESC LIMIT ?");
 
         let mut query = query(&sql).bind(user_id).bind(RUNTIME_PROMOTION_EVENT_TYPE);
         if let Some(since) = since {
@@ -786,6 +796,7 @@ impl DatabaseSessionAuditService {
         if let Some(until) = until {
             query = query.bind(until);
         }
+        query = query.bind(MAX_CROSS_SESSION_RUNTIME_PROMOTION_ROWS);
 
         let rows = query.fetch_all(pool).await.map_err(internal_error)?;
         Ok(rows
@@ -2552,6 +2563,13 @@ fn build_cross_session_mutation_scoreboards(
 mod tests {
     use super::*;
     use astra_core::confidence::ConfidenceInterval;
+
+    #[test]
+    fn cross_session_input_row_caps_are_positive() {
+        assert!(MAX_CROSS_SESSION_MUTATION_DECISION_ROWS > 0);
+        assert!(MAX_CROSS_SESSION_MUTATION_EVENT_ROWS > 0);
+        assert!(MAX_CROSS_SESSION_RUNTIME_PROMOTION_ROWS > 0);
+    }
 
     fn sample_queue_mutation(
         mutation_id: &str,
