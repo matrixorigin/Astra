@@ -36,6 +36,7 @@ pub fn generate_fast_proposals(signals: &[EvolutionSignal]) -> Vec<EvolutionProp
                         ),
                         created_at: now,
                         status: ApprovalStatus::Pending,
+                        promotion_verdict: None,
                     });
                 }
             }
@@ -61,6 +62,7 @@ pub fn generate_fast_proposals(signals: &[EvolutionSignal]) -> Vec<EvolutionProp
                         reasoning: format!("Tool chain stalled {stall_count} consecutive rounds"),
                         created_at: now,
                         status: ApprovalStatus::Pending,
+                        promotion_verdict: None,
                     });
                 }
             }

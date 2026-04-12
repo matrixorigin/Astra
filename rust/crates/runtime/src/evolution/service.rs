@@ -4,20 +4,20 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use super::evolver;
+use super::promotion_gate::{ProposalPromotionContext, evaluate_proposal_promotion};
 use super::signal_collector::SignalCollector;
 use super::store::EvolutionStore;
 use super::types::{
-    ApprovalStatus, EvolutionAxis, EvolutionProposal, EvolutionSignal, ToolResultContext,
-    TurnSummary,
+    ApprovalStatus, EvolutionAxis, EvolutionProposal, EvolutionSignal,
+    ProposalPromotionRecommendation, ToolResultContext, TurnSummary,
 };
 
 use crate::liquid::reflection::ReflectionEngine;
 use crate::pipeline::calibration::ProgressiveCalibrator;
 use crate::pipeline::pattern::PatternLibrary;
+use crate::promotion_context::PromotionEvaluationContext;
 
 const MAX_APPLIED_LOG: usize = 100;
-const AUTO_APPLY_CONFIDENCE_THRESHOLD: f64 = 0.85;
-const AUTO_APPLY_CALIBRATION_ABS_MAX: f64 = 0.20;
 
 /// Orchestrates the evolution lifecycle: collect → propose → apply.
 pub struct EvolutionService {
@@ -32,6 +32,8 @@ pub struct EvolutionService {
     calibrator: Option<Arc<std::sync::Mutex<ProgressiveCalibrator>>>,
     /// Optional durable store for skill evolution proposals and approved diffs.
     evolution_store: Option<Arc<EvolutionStore>>,
+    /// Optional preloaded evaluation context shared across runtime promotions.
+    promotion_evaluation_context: std::sync::RwLock<Option<PromotionEvaluationContext>>,
     /// Cached reflection engine (stateless — reusable across calls).
     reflection_engine: ReflectionEngine,
 }
@@ -68,6 +70,7 @@ impl EvolutionService {
             pattern_library: None,
             calibrator: None,
             evolution_store: None,
+            promotion_evaluation_context: std::sync::RwLock::new(None),
             reflection_engine: ReflectionEngine::new(),
         }
     }
@@ -91,6 +94,13 @@ impl EvolutionService {
     pub fn with_evolution_store(mut self, store: Arc<EvolutionStore>) -> Self {
         self.evolution_store = Some(store);
         self
+    }
+
+    pub fn set_promotion_evaluation_context(&self, context: Option<PromotionEvaluationContext>) {
+        *self
+            .promotion_evaluation_context
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = context;
     }
 
     /// Feed a tool result into the signal collector.
@@ -177,20 +187,107 @@ impl EvolutionService {
 
     /// Add a skill-axis proposal (from LLM path) for user approval.
     pub async fn propose(&self, proposal: EvolutionProposal) {
+        let fallback = proposal.clone();
+        let proposal = self
+            .annotate_promotion_verdict(proposal)
+            .unwrap_or(fallback);
         self.pending_proposals.lock().await.push(proposal);
     }
 
     /// Get all pending proposals awaiting user approval.
     pub async fn pending(&self) -> Vec<EvolutionProposal> {
         let mut v = self.pending_proposals.lock().await.clone();
-        // Higher confidence first.
         v.sort_by(|a, b| {
-            let score = |p: &EvolutionProposal| p.confidence;
-            score(b)
-                .partial_cmp(&score(a))
-                .unwrap_or(std::cmp::Ordering::Equal)
+            pending_priority(a)
+                .cmp(&pending_priority(b))
+                .then_with(|| {
+                    verdict_score(b)
+                        .partial_cmp(&verdict_score(a))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .then_with(|| {
+                    b.confidence
+                        .partial_cmp(&a.confidence)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .then_with(|| a.created_at.cmp(&b.created_at))
         });
         v
+    }
+
+    fn annotate_promotion_verdict(
+        &self,
+        mut proposal: EvolutionProposal,
+    ) -> Result<EvolutionProposal, String> {
+        let promotion_evaluation_context = self
+            .promotion_evaluation_context
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let verdict = match &proposal.axis {
+            EvolutionAxis::Pattern { .. } => {
+                if let Some(pattern_library) = self.pattern_library.as_ref() {
+                    let Ok(library) = pattern_library.lock() else {
+                        return Err("pattern library lock poisoned while scoring promotion".into());
+                    };
+                    evaluate_proposal_promotion(
+                        &proposal,
+                        ProposalPromotionContext {
+                            pattern_library: Some(&library),
+                            calibrator: None,
+                            promotion_evaluation_context: promotion_evaluation_context.as_ref(),
+                        },
+                    )?
+                } else {
+                    evaluate_proposal_promotion(
+                        &proposal,
+                        ProposalPromotionContext {
+                            pattern_library: None,
+                            calibrator: None,
+                            promotion_evaluation_context: promotion_evaluation_context.as_ref(),
+                        },
+                    )?
+                }
+            }
+            EvolutionAxis::Calibration { .. } => {
+                if let Some(calibrator) = self.calibrator.as_ref() {
+                    let Ok(calibrator) = calibrator.lock() else {
+                        return Err(
+                            "progressive calibrator lock poisoned while scoring promotion".into(),
+                        );
+                    };
+                    evaluate_proposal_promotion(
+                        &proposal,
+                        ProposalPromotionContext {
+                            pattern_library: None,
+                            calibrator: Some(&calibrator),
+                            promotion_evaluation_context: promotion_evaluation_context.as_ref(),
+                        },
+                    )?
+                } else {
+                    evaluate_proposal_promotion(
+                        &proposal,
+                        ProposalPromotionContext {
+                            pattern_library: None,
+                            calibrator: None,
+                            promotion_evaluation_context: promotion_evaluation_context.as_ref(),
+                        },
+                    )?
+                }
+            }
+            EvolutionAxis::Skill { .. } | EvolutionAxis::Entity { .. } => {
+                evaluate_proposal_promotion(
+                    &proposal,
+                    ProposalPromotionContext {
+                        pattern_library: None,
+                        calibrator: None,
+                        promotion_evaluation_context: promotion_evaluation_context.as_ref(),
+                    },
+                )?
+            }
+        };
+        proposal.promotion_verdict = Some(verdict);
+        Ok(proposal)
     }
 
     /// Approve a proposal by ID. Returns the proposal if found.
@@ -402,7 +499,8 @@ impl EvolutionService {
     ) -> Result<ProposalRoutingOutcome, String> {
         let mut routed = ProposalRoutingOutcome::default();
         for proposal in proposals {
-            if self.should_auto_apply(&proposal)? {
+            let proposal = self.annotate_promotion_verdict(proposal)?;
+            if self.should_auto_apply(&proposal) {
                 match self.apply_proposal(&proposal) {
                     Ok(()) => {
                         let mut applied = proposal.clone();
@@ -445,43 +543,27 @@ impl EvolutionService {
         }
     }
 
-    fn should_auto_apply(&self, proposal: &EvolutionProposal) -> Result<bool, String> {
-        if proposal.confidence < AUTO_APPLY_CONFIDENCE_THRESHOLD {
-            return Ok(false);
-        }
-
-        match &proposal.axis {
-            EvolutionAxis::Pattern { signature, .. } => {
-                let Some(pattern_library) = self.pattern_library.as_ref() else {
-                    return Ok(false);
-                };
-                let Ok(library) = pattern_library.lock() else {
-                    return Err("pattern library lock poisoned while validating auto-apply".into());
-                };
-                Ok(library
-                    .export()
-                    .iter()
-                    .any(|pattern| pattern.signature == *signature))
-            }
-            EvolutionAxis::Calibration { axis, adjustment } => {
-                if adjustment.abs() > AUTO_APPLY_CALIBRATION_ABS_MAX {
-                    return Ok(false);
-                }
-                let Some(calibrator) = self.calibrator.as_ref() else {
-                    return Ok(false);
-                };
-                let Ok(calibrator) = calibrator.lock() else {
-                    return Err(
-                        "progressive calibrator lock poisoned while validating auto-apply".into(),
-                    );
-                };
-                Ok(!calibrator
-                    .preview_evolution_adjustment(axis, *adjustment)?
-                    .would_clamp)
-            }
-            _ => Ok(false),
-        }
+    fn should_auto_apply(&self, proposal: &EvolutionProposal) -> bool {
+        proposal.promotion_verdict.as_ref().is_some_and(|verdict| {
+            verdict.recommendation == ProposalPromotionRecommendation::Promote
+        })
     }
+}
+
+fn pending_priority(proposal: &EvolutionProposal) -> u8 {
+    proposal
+        .promotion_verdict
+        .as_ref()
+        .map(|verdict| verdict.recommendation.priority())
+        .unwrap_or(ProposalPromotionRecommendation::Hold.priority())
+}
+
+fn verdict_score(proposal: &EvolutionProposal) -> f64 {
+    proposal
+        .promotion_verdict
+        .as_ref()
+        .map(|verdict| verdict.overall_score)
+        .unwrap_or(proposal.confidence)
 }
 
 /// Wrap in Arc for shared ownership across async tasks.
@@ -493,7 +575,10 @@ pub fn new_shared() -> Arc<EvolutionService> {
 mod tests {
     use super::*;
     use crate::evolution::store::StoredStatus;
-    use crate::evolution::types::{ApprovalStatus, CalibrationAxis, EvolutionAxis, PatternAction};
+    use crate::evolution::types::{
+        ApprovalStatus, CalibrationAxis, EvolutionAxis, PatternAction,
+        ProposalPromotionRecommendation,
+    };
     use crate::liquid::reflection::ReflectionContext;
     use crate::pipeline::calibration::ProgressiveCalibrator;
     use crate::pipeline::routing::{DomainHint, TaskType};
@@ -546,6 +631,10 @@ mod tests {
         let (auto, llm) = svc.flush().await;
         assert_eq!(auto.len(), 1);
         assert_eq!(auto[0].status, ApprovalStatus::AutoApplied);
+        assert_eq!(
+            auto[0].promotion_verdict.as_ref().map(|v| v.recommendation),
+            Some(ProposalPromotionRecommendation::Promote)
+        );
         assert!(llm.is_empty());
         // Should be in applied log
         assert_eq!(svc.applied().await.len(), 1);
@@ -598,6 +687,7 @@ mod tests {
             reasoning: "test".into(),
             created_at: 0,
             status: ApprovalStatus::Pending,
+            promotion_verdict: None,
         };
         svc.propose(proposal).await;
         assert_eq!(svc.pending().await.len(), 1);
@@ -623,6 +713,7 @@ mod tests {
             reasoning: "test".into(),
             created_at: 0,
             status: ApprovalStatus::Pending,
+            promotion_verdict: None,
         };
         svc.propose(proposal).await;
         let rejected = svc.reject("ev_reject").await.unwrap();
@@ -715,8 +806,17 @@ mod tests {
         .await;
 
         let (auto, llm) = svc.flush().await;
-        assert_eq!(auto.len(), 2, "drift + stall → 2 auto proposals");
+        assert_eq!(auto.len(), 1, "drift promotes, block falls back to canary");
         assert_eq!(llm.len(), 1, "tool failure with skill → 1 LLM signal");
+        let pending = svc.pending().await;
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending[0]
+                .promotion_verdict
+                .as_ref()
+                .map(|v| v.recommendation),
+            Some(ProposalPromotionRecommendation::Canary)
+        );
     }
 
     #[tokio::test]
@@ -782,6 +882,10 @@ mod tests {
             "drift proposal should be Demote"
         );
         assert_eq!(auto[0].status, ApprovalStatus::AutoApplied);
+        assert_eq!(
+            auto[0].promotion_verdict.as_ref().map(|v| v.recommendation),
+            Some(ProposalPromotionRecommendation::Promote)
+        );
     }
 
     #[tokio::test]
@@ -914,6 +1018,7 @@ mod tests {
         let pending = svc.pending().await;
         assert_eq!(pending.len(), 2);
         assert!(pending.iter().all(|p| p.id.starts_with("reflect-")));
+        assert!(pending.iter().all(|p| p.promotion_verdict.is_some()));
     }
 
     #[tokio::test]
@@ -961,6 +1066,13 @@ mod tests {
         let applied = svc.applied().await;
         assert_eq!(applied.len(), 1);
         assert_eq!(applied[0].status, ApprovalStatus::AutoApplied);
+        assert_eq!(
+            applied[0]
+                .promotion_verdict
+                .as_ref()
+                .map(|v| v.recommendation),
+            Some(ProposalPromotionRecommendation::Promote)
+        );
     }
 
     #[tokio::test]
@@ -984,6 +1096,14 @@ mod tests {
             }
         );
         assert!(svc.pending().await.is_empty());
+        let applied = svc.applied().await;
+        assert_eq!(
+            applied[0]
+                .promotion_verdict
+                .as_ref()
+                .map(|v| v.recommendation),
+            Some(ProposalPromotionRecommendation::Promote)
+        );
         let threshold =
             calibrator
                 .lock()
@@ -1014,6 +1134,13 @@ mod tests {
         );
         let pending = svc.pending().await;
         assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending[0]
+                .promotion_verdict
+                .as_ref()
+                .map(|v| v.recommendation),
+            Some(ProposalPromotionRecommendation::Canary)
+        );
         match &pending[0].axis {
             EvolutionAxis::Calibration {
                 axis: CalibrationAxis::Intent(intent),
@@ -1054,6 +1181,19 @@ mod tests {
         );
         let pending = svc.pending().await;
         assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending[0]
+                .promotion_verdict
+                .as_ref()
+                .map(|v| v.recommendation),
+            Some(ProposalPromotionRecommendation::Hold)
+        );
+        assert!(
+            pending[0]
+                .promotion_verdict
+                .as_ref()
+                .is_some_and(|v| !v.blockers.is_empty())
+        );
         match &pending[0].axis {
             EvolutionAxis::Calibration {
                 axis: CalibrationAxis::Task(TaskType::Fetch),
@@ -1104,6 +1244,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count, 1);
+        assert_eq!(
+            svc.pending().await[0]
+                .promotion_verdict
+                .as_ref()
+                .map(|v| v.recommendation),
+            Some(ProposalPromotionRecommendation::Hold)
+        );
         let stored = store.load("review_changes").unwrap();
         assert_eq!(stored.len(), 1);
         assert_eq!(stored[0].status, StoredStatus::Pending);

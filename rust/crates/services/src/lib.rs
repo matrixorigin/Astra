@@ -132,6 +132,7 @@ pub use multi_agent::{
 };
 pub use mutation_scoreboard::{
     MutationActionCategory, MutationCompensationPolicy, MutationJudgment, MutationObjectiveScore,
+    MutationPromotionEvaluationContext, MutationPromotionRecommendation, MutationPromotionVerdict,
     MutationRetentionVerdict, MutationSafetyVerdict, MutationScoreboard, MutationVerifierSummary,
     PersistedMutationDecision, StagedMutation, StagedMutationState,
 };

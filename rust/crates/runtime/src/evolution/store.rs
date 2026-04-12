@@ -387,6 +387,7 @@ mod tests {
             reasoning: "test".into(),
             created_at: now_epoch(),
             status: ApprovalStatus::Pending,
+            promotion_verdict: None,
         }
     }
 

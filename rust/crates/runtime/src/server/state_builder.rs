@@ -307,7 +307,7 @@ pub(super) struct PipelineLearningStack {
 
 /// Creates pipeline modules (EntityGraph, PatternLibrary, ProgressiveCalibrator)
 /// and wires them into a PipelineLearningWriter for turn-outcome-driven learning.
-fn build_pipeline_learning_stack() -> PipelineLearningStack {
+pub(super) fn build_pipeline_learning_stack() -> PipelineLearningStack {
     use crate::pipeline::{
         calibration::ProgressiveCalibrator,
         defaults::{default_calibration, default_entities, default_patterns},

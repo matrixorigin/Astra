@@ -58,6 +58,10 @@ use astra_services::self_surface::{
     PersistentSelfSnapshot, SelfSurfaceDimension, SelfSurfaceResponse, SelfSurfaceService,
     ToolFailureView, ToolHealthView, VerificationEventView, VerificationSurface,
 };
+use astra_services::session_audit::{
+    RuntimePromotionController, RuntimePromotionEventData, RuntimePromotionOutcome,
+    RuntimePromotionRecommendation,
+};
 use astra_services::session_journal::ToolCallRecord;
 use async_trait::async_trait;
 use serde_json::Value;
@@ -311,6 +315,10 @@ pub struct TelemetryState {
     /// Typically set at session init and shared across agents.
     pub observability_hub:
         Option<std::sync::Arc<crate::observability_integration::ObservabilityHub>>,
+    /// Optional preloaded evaluation summaries used to damp runtime promotions.
+    pub promotion_evaluation_context: Option<crate::promotion_context::PromotionEvaluationContext>,
+    /// Runtime promotion verdicts captured for later audit/report persistence.
+    pub promotion_events: Vec<RuntimePromotionEventData>,
     /// Optional turn trace collector for detailed context assembly observability.
     /// When set, records system prompt, history, memory, and tool selection traces.
     /// Created at turn start, finalized at turn end.
@@ -1007,7 +1015,7 @@ fn apply_adaptive_execution_profile(state: &mut AgenticLoopState) {
 /// - Memory retrieval expansion on tool churn or drift
 /// - Verification strictness increase on corrections
 fn apply_per_turn_adaptation(state: &mut AgenticLoopState, turn_tokens_used: u64) {
-    let session = match &state.telemetry.observability_session {
+    let session = match state.telemetry.observability_session.clone() {
         Some(s) => s,
         None => return,
     };
@@ -2062,6 +2070,128 @@ fn is_valid_model_string(model: &str) -> bool {
     })
 }
 
+fn runtime_promotion_recommendation(
+    recommendation: crate::evolution::types::ProposalPromotionRecommendation,
+) -> RuntimePromotionRecommendation {
+    match recommendation {
+        crate::evolution::types::ProposalPromotionRecommendation::Promote => {
+            RuntimePromotionRecommendation::Promote
+        }
+        crate::evolution::types::ProposalPromotionRecommendation::Canary => {
+            RuntimePromotionRecommendation::Canary
+        }
+        crate::evolution::types::ProposalPromotionRecommendation::Hold => {
+            RuntimePromotionRecommendation::Hold
+        }
+    }
+}
+
+fn record_runtime_promotion_event(state: &mut AgenticLoopState, event: RuntimePromotionEventData) {
+    let already_recorded = state.telemetry.promotion_events.iter().any(|existing| {
+        existing.controller == event.controller
+            && existing.outcome == event.outcome
+            && existing.subject_id == event.subject_id
+    });
+    if !already_recorded {
+        state.telemetry.promotion_events.push(event);
+    }
+}
+
+fn record_adaptive_baseline_event(
+    state: &mut AgenticLoopState,
+    outcome: RuntimePromotionOutcome,
+    experiment_id: &str,
+    variant_id: &str,
+    verdict: &crate::adaptive_baselines::AdaptiveBaselinePromotionVerdict,
+) {
+    record_runtime_promotion_event(
+        state,
+        RuntimePromotionEventData {
+            controller: RuntimePromotionController::AdaptiveBaseline,
+            outcome,
+            recommendation: runtime_promotion_recommendation(verdict.recommendation),
+            subject_id: experiment_id.to_string(),
+            summary: format!(
+                "adaptive baseline winner '{variant_id}' for experiment '{experiment_id}'"
+            ),
+            turn: None,
+            confidence_score: verdict.confidence_score,
+            support_score: verdict.support_score,
+            safety_score: verdict.safety_score,
+            overall_score: verdict.overall_score,
+            blockers: verdict.blockers.clone(),
+            evidence: verdict.evidence.clone(),
+            rollback_hint: verdict.rollback_hint.clone(),
+            run_id: state.current_run_id.clone(),
+        },
+    );
+}
+
+fn record_evolution_proposal_event(
+    state: &mut AgenticLoopState,
+    outcome: RuntimePromotionOutcome,
+    proposal: &crate::evolution::types::EvolutionProposal,
+) {
+    let Some(verdict) = proposal.promotion_verdict.as_ref() else {
+        return;
+    };
+    record_runtime_promotion_event(
+        state,
+        RuntimePromotionEventData {
+            controller: RuntimePromotionController::Evolution,
+            outcome,
+            recommendation: runtime_promotion_recommendation(verdict.recommendation),
+            subject_id: proposal.id.clone(),
+            summary: proposal.reasoning.clone(),
+            turn: None,
+            confidence_score: verdict.confidence_score,
+            support_score: verdict.support_score,
+            safety_score: verdict.safety_score,
+            overall_score: verdict.overall_score,
+            blockers: verdict.blockers.clone(),
+            evidence: verdict.evidence.clone(),
+            rollback_hint: verdict.rollback_hint.clone(),
+            run_id: state.current_run_id.clone(),
+        },
+    );
+}
+
+async fn snapshot_evolution_promotion_ids(
+    evo: &crate::evolution::service::EvolutionService,
+) -> (HashSet<String>, HashSet<String>) {
+    let pending = evo
+        .pending()
+        .await
+        .into_iter()
+        .map(|proposal| proposal.id)
+        .collect::<HashSet<_>>();
+    let applied = evo
+        .applied()
+        .await
+        .into_iter()
+        .map(|proposal| proposal.id)
+        .collect::<HashSet<_>>();
+    (pending, applied)
+}
+
+async fn record_new_evolution_promotion_events(
+    state: &mut AgenticLoopState,
+    evo: &crate::evolution::service::EvolutionService,
+    pending_before: &HashSet<String>,
+    applied_before: &HashSet<String>,
+) {
+    for proposal in evo.pending().await {
+        if !pending_before.contains(&proposal.id) {
+            record_evolution_proposal_event(state, RuntimePromotionOutcome::Queued, &proposal);
+        }
+    }
+    for proposal in evo.applied().await {
+        if !applied_before.contains(&proposal.id) {
+            record_evolution_proposal_event(state, RuntimePromotionOutcome::AutoApplied, &proposal);
+        }
+    }
+}
+
 /// Run the multi-turn agentic loop using the provided host.
 ///
 /// This is the runtime-portable entry point. The host handles all
@@ -2074,8 +2204,11 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
     let result = run_agentic_loop_impl(host, state).await;
 
     // ── Evolution: flush signals and auto-apply fast-path proposals ──
-    if let Some(ref evo) = state.evolution_service {
+    if let Some(evo) = state.evolution_service.clone() {
+        evo.set_promotion_evaluation_context(state.telemetry.promotion_evaluation_context.clone());
+        let (pending_before, applied_before) = snapshot_evolution_promotion_ids(&evo).await;
         let (auto_applied, _llm_signals) = evo.flush().await;
+        record_new_evolution_promotion_events(state, &evo, &pending_before, &applied_before).await;
         if !auto_applied.is_empty() {
             eprintln!(
                 "[evolution] auto-applied {} fast-path proposals",
@@ -2337,12 +2470,12 @@ fn maybe_run_tuning_cycle(state: &mut AgenticLoopState) {
     }
     state.telemetry.completed_turns_for_tuning = 0;
 
-    let hub = match &state.telemetry.observability_hub {
+    let hub = match state.telemetry.observability_hub.clone() {
         Some(h) => h,
         None => return,
     };
 
-    let session = match &state.telemetry.observability_session {
+    let session = match state.telemetry.observability_session.clone() {
         Some(s) => s,
         None => return,
     };
@@ -2421,6 +2554,7 @@ fn maybe_run_tuning_cycle(state: &mut AgenticLoopState) {
     if let Err(e) = crate::auto_tuning::save_feedback("default", hub.tuning()) {
         eprintln!("[auto-tuning] failed to persist feedback: {e}");
     }
+    drop(session_guard);
 
     let exploration = crate::exploration_engine::ExplorationEngine::default();
     let created = match hub.pattern_library() {
@@ -2459,13 +2593,45 @@ fn maybe_run_tuning_cycle(state: &mut AgenticLoopState) {
         );
     }
     let mut promoted = Vec::new();
+    let mut deferred = Vec::new();
     for conclusion in &concluded {
         let Some(winner_variant_id) = conclusion.winner_variant_id.as_deref() else {
             continue;
         };
-        match hub.promote_experiment_winner(&conclusion.experiment_id, winner_variant_id) {
-            Ok(Some(promotion)) => promoted.push(promotion),
-            Ok(None) => {}
+        match hub.promote_experiment_winner_with_context(
+            &conclusion.experiment_id,
+            winner_variant_id,
+            state.telemetry.promotion_evaluation_context.as_ref(),
+        ) {
+            Ok(crate::adaptive_baselines::AdaptiveBaselinePromotionDecision::Promoted {
+                promotion,
+                verdict,
+            }) => {
+                record_adaptive_baseline_event(
+                    state,
+                    RuntimePromotionOutcome::Promoted,
+                    &conclusion.experiment_id,
+                    winner_variant_id,
+                    &verdict,
+                );
+                promoted.push(promotion);
+            }
+            Ok(crate::adaptive_baselines::AdaptiveBaselinePromotionDecision::Deferred(verdict)) => {
+                record_adaptive_baseline_event(
+                    state,
+                    RuntimePromotionOutcome::Deferred,
+                    &conclusion.experiment_id,
+                    winner_variant_id,
+                    &verdict,
+                );
+                deferred.push((
+                    conclusion.experiment_id.clone(),
+                    winner_variant_id.to_string(),
+                    verdict.recommendation,
+                    verdict.blockers,
+                ));
+            }
+            Ok(crate::adaptive_baselines::AdaptiveBaselinePromotionDecision::Skipped) => {}
             Err(err) => eprintln!(
                 "[adaptive-exec] failed to promote winner for {}: {err}",
                 conclusion.experiment_id
@@ -2495,6 +2661,21 @@ fn maybe_run_tuning_cycle(state: &mut AgenticLoopState) {
                 ),
             );
         }
+    }
+    if !deferred.is_empty() {
+        eprintln!(
+            "[adaptive-exec] deferred {} adaptive baseline promotion(s): {:?}",
+            deferred.len(),
+            deferred
+                .iter()
+                .map(|(experiment_id, variant_id, recommendation, blockers)| (
+                    experiment_id,
+                    variant_id,
+                    recommendation,
+                    blockers
+                ))
+                .collect::<Vec<_>>()
+        );
     }
 }
 
@@ -2995,7 +3176,10 @@ async fn maybe_trigger_auto_reflection<H: AgenticLoopHost>(
         None => return,
     };
 
+    evo.set_promotion_evaluation_context(state.telemetry.promotion_evaluation_context.clone());
+    let (pending_before, applied_before) = snapshot_evolution_promotion_ids(&evo).await;
     let (fast, llm_signals) = evo.flush().await;
+    record_new_evolution_promotion_events(state, &evo, &pending_before, &applied_before).await;
 
     if !fast.is_empty() {
         for proposal in fast.iter().take(MAX_RECENT_TACTICAL_ACTIONS) {
@@ -3101,11 +3285,14 @@ async fn maybe_trigger_auto_reflection<H: AgenticLoopHost>(
 
     apply_auto_reflection_usage(state, &reflection_result);
 
+    let (pending_before, applied_before) = snapshot_evolution_promotion_ids(&evo).await;
     match evo
         .ingest_reflection_response_detailed(&reflection_result.full_text, &ctx)
         .await
     {
         Ok(outcome) => {
+            record_new_evolution_promotion_events(state, &evo, &pending_before, &applied_before)
+                .await;
             state.pending_reflection_signals.clear();
             state.recent_tactical_actions.clear();
             host.emit_headless_line(

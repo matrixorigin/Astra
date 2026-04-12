@@ -8,9 +8,11 @@ use axum::{Json, http::StatusCode};
 use serde::{Deserialize, Serialize};
 use sqlx::{Row, query};
 
+use crate::evaluation::{DatabaseEvaluationService, EvaluationService};
 use crate::{
-    MutationRetentionVerdict, MutationSafetyVerdict, MutationScoreboard, PersistedMutationDecision,
-    StagedMutation, StagedMutationState,
+    MutationPromotionEvaluationContext, MutationPromotionRecommendation, MutationRetentionVerdict,
+    MutationSafetyVerdict, MutationScoreboard, PersistedMutationDecision, StagedMutation,
+    StagedMutationState,
 };
 use astra_core::{
     ErrorResponse, MatrixOneSettings, SharedPool, connect_matrixone, error_response, internal_error,
@@ -23,6 +25,19 @@ fn normalize_tool_name(name: String) -> String {
     } else {
         trimmed.to_string()
     }
+}
+
+fn runtime_promotion_record_from_row(
+    row: &sqlx::mysql::MySqlRow,
+) -> Option<RuntimePromotionRecord> {
+    let metadata: String = row.try_get("metadata").ok()?;
+    let data: RuntimePromotionEventData = serde_json::from_str(&metadata).ok()?;
+    Some(RuntimePromotionRecord::from_event(
+        row.try_get("event_id").ok()?,
+        row.try_get("session_id").ok()?,
+        row.try_get("created_at").ok()?,
+        data,
+    ))
 }
 
 /// `SUBSTRING(..., 1, N)` caps for `agent_events.content` to avoid full LONGTEXT reads.
@@ -254,6 +269,124 @@ pub struct CrossSessionMutationListResponse {
     pub per_page: u32,
 }
 
+pub const RUNTIME_PROMOTION_EVENT_TYPE: &str = "runtime_promotion_verdict";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimePromotionController {
+    Evolution,
+    AdaptiveBaseline,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimePromotionOutcome {
+    AutoApplied,
+    Queued,
+    Promoted,
+    Deferred,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimePromotionRecommendation {
+    Promote,
+    Canary,
+    Hold,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimePromotionEventData {
+    pub controller: RuntimePromotionController,
+    pub outcome: RuntimePromotionOutcome,
+    pub recommendation: RuntimePromotionRecommendation,
+    pub subject_id: String,
+    pub summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn: Option<u32>,
+    pub confidence_score: f64,
+    pub support_score: f64,
+    pub safety_score: f64,
+    pub overall_score: f64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blockers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollback_hint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimePromotionRecord {
+    pub event_id: String,
+    pub session_id: String,
+    pub created_at: String,
+    pub controller: RuntimePromotionController,
+    pub outcome: RuntimePromotionOutcome,
+    pub recommendation: RuntimePromotionRecommendation,
+    pub subject_id: String,
+    pub summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn: Option<u32>,
+    pub confidence_score: f64,
+    pub support_score: f64,
+    pub safety_score: f64,
+    pub overall_score: f64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blockers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollback_hint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+}
+
+impl RuntimePromotionRecord {
+    fn from_event(
+        event_id: String,
+        session_id: String,
+        created_at: String,
+        data: RuntimePromotionEventData,
+    ) -> Self {
+        Self {
+            event_id,
+            session_id,
+            created_at,
+            controller: data.controller,
+            outcome: data.outcome,
+            recommendation: data.recommendation,
+            subject_id: data.subject_id,
+            summary: data.summary,
+            turn: data.turn,
+            confidence_score: data.confidence_score,
+            support_score: data.support_score,
+            safety_score: data.safety_score,
+            overall_score: data.overall_score,
+            blockers: data.blockers,
+            evidence: data.evidence,
+            rollback_hint: data.rollback_hint,
+            run_id: data.run_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionRuntimePromotionListResponse {
+    pub promotions: Vec<RuntimePromotionRecord>,
+    pub total: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CrossSessionRuntimePromotionListResponse {
+    pub promotions: Vec<RuntimePromotionRecord>,
+    pub total: u32,
+    pub page: u32,
+    pub per_page: u32,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MutationVerifierSignalFilter {
@@ -264,6 +397,7 @@ pub enum MutationVerifierSignalFilter {
 const MAX_AUDIT_SESSIONS_PER_PAGE: u32 = 100;
 const MAX_CROSS_SESSION_TOOLS: i64 = 100;
 const MAX_CROSS_SESSION_MUTATIONS_PER_PAGE: u32 = 100;
+const MAX_CROSS_SESSION_PROMOTIONS_PER_PAGE: u32 = 100;
 
 // ── Request params ───────────────────────────────────────────────────────────
 
@@ -320,6 +454,7 @@ pub struct CrossSessionMutationListParams {
     pub session_id: Option<String>,
     pub tool_name: Option<String>,
     pub state: Option<StagedMutationState>,
+    pub promotion_recommendation: Option<MutationPromotionRecommendation>,
     pub safety_verdict: Option<MutationSafetyVerdict>,
     pub retention_verdict: Option<MutationRetentionVerdict>,
     pub min_retention_score: Option<f64>,
@@ -328,6 +463,20 @@ pub struct CrossSessionMutationListParams {
     pub verifier_gap: Option<String>,
     #[serde(default = "default_cross_session_mutation_sort")]
     pub sort: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CrossSessionRuntimePromotionListParams {
+    #[serde(default = "default_page")]
+    pub page: u32,
+    #[serde(default = "default_per_page")]
+    pub per_page: u32,
+    pub since: Option<String>,
+    pub until: Option<String>,
+    pub session_id: Option<String>,
+    pub controller: Option<RuntimePromotionController>,
+    pub outcome: Option<RuntimePromotionOutcome>,
+    pub recommendation: Option<RuntimePromotionRecommendation>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -407,6 +556,13 @@ pub trait SessionAuditService: Send + Sync {
         session_id: &str,
     ) -> AuditResult<MutationScoreboard>;
 
+    /// List runtime promotion verdicts recorded for a single session.
+    async fn list_session_runtime_promotions(
+        &self,
+        user_id: &str,
+        session_id: &str,
+    ) -> AuditResult<SessionRuntimePromotionListResponse>;
+
     // ── Cross-session methods ────────────────────────────────────────────────
 
     /// List user's sessions with filtering and pagination.
@@ -436,6 +592,13 @@ pub trait SessionAuditService: Send + Sync {
         user_id: &str,
         params: &CrossSessionMutationListParams,
     ) -> AuditResult<CrossSessionMutationListResponse>;
+
+    /// List runtime promotion verdicts across the user's sessions.
+    async fn list_cross_session_runtime_promotions(
+        &self,
+        user_id: &str,
+        params: &CrossSessionRuntimePromotionListParams,
+    ) -> AuditResult<CrossSessionRuntimePromotionListResponse>;
 }
 
 // ── Database implementation ──────────────────────────────────────────────────
@@ -584,6 +747,43 @@ impl DatabaseSessionAuditService {
             .collect::<Vec<_>>();
 
         Ok((mutation_decisions, mutation_overrides))
+    }
+
+    fn evaluation_service(&self) -> DatabaseEvaluationService {
+        let service = DatabaseEvaluationService::new(self.matrixone.clone());
+        if let Some(ref pool) = self.pool {
+            service.with_pool(pool.clone())
+        } else {
+            service
+        }
+    }
+
+    async fn load_mutation_promotion_context(
+        &self,
+        user_id: &str,
+        missing_verifier_rate: Option<f64>,
+    ) -> AuditResult<MutationPromotionEvaluationContext> {
+        let evaluation = self.evaluation_service();
+        let quality = evaluation.get_quality_trend(user_id, 30, None).await?;
+        let latest_gate = evaluation
+            .get_gate_history(user_id, 1)
+            .await?
+            .gates
+            .into_iter()
+            .next();
+        let calibration = evaluation.get_calibration(user_id, None, 30).await?;
+
+        Ok(MutationPromotionEvaluationContext {
+            noise_filtered_quality: Some(quality.noise_filtered_overall_avg_interval),
+            latest_gate_passed: latest_gate.as_ref().map(|gate| gate.passed),
+            latest_gate_score_delta: latest_gate.as_ref().map(|gate| gate.score_delta),
+            calibration_error: Some(if calibration.noise_filtered_sample_count > 0 {
+                calibration.noise_filtered_calibration_error
+            } else {
+                calibration.calibration_error
+            }),
+            missing_verifier_rate,
+        })
     }
 }
 
@@ -1153,7 +1353,47 @@ impl SessionAuditService for DatabaseSessionAuditService {
             })
             .collect::<Vec<_>>();
 
-        Ok(build_mutation_scoreboard(session_id, decisions, overrides))
+        let scoreboard = build_mutation_scoreboard(session_id, decisions, overrides);
+        let context = self
+            .load_mutation_promotion_context(
+                user_id,
+                mutation_missing_verifier_rate(scoreboard.mutations.iter()),
+            )
+            .await?;
+
+        Ok(scoreboard.with_promotion_context(&context))
+    }
+
+    async fn list_session_runtime_promotions(
+        &self,
+        user_id: &str,
+        session_id: &str,
+    ) -> AuditResult<SessionRuntimePromotionListResponse> {
+        let pool = self.get_pool().await.map_err(internal_error)?;
+        self.verify_session_owner(&pool, session_id, user_id)
+            .await?;
+
+        let rows = query(
+            "SELECT event_id, session_id, metadata, created_at \
+             FROM agent_events \
+             WHERE user_id = ? AND session_id = ? AND event_type = ? \
+             ORDER BY created_at DESC",
+        )
+        .bind(user_id)
+        .bind(session_id)
+        .bind(RUNTIME_PROMOTION_EVENT_TYPE)
+        .fetch_all(&pool)
+        .await
+        .map_err(internal_error)?;
+
+        let promotions = rows
+            .iter()
+            .filter_map(runtime_promotion_record_from_row)
+            .collect::<Vec<_>>();
+        Ok(SessionRuntimePromotionListResponse {
+            total: promotions.len() as u32,
+            promotions,
+        })
     }
 
     // ── Cross-session implementations ────────────────────────────────────────
@@ -1419,8 +1659,24 @@ impl SessionAuditService for DatabaseSessionAuditService {
                 params.until.as_deref(),
             )
             .await?;
-        let mutation_stats =
-            aggregate_cross_session_mutation_stats(mutation_decisions, mutation_overrides);
+        let mutation_scoreboards =
+            build_cross_session_mutation_scoreboards(mutation_decisions, mutation_overrides);
+        let context = self
+            .load_mutation_promotion_context(
+                user_id,
+                mutation_missing_verifier_rate(
+                    mutation_scoreboards
+                        .iter()
+                        .flat_map(|scoreboard| scoreboard.mutations.iter()),
+                ),
+            )
+            .await?;
+        let mutation_stats = aggregate_cross_session_mutation_scoreboards(
+            mutation_scoreboards
+                .into_iter()
+                .map(|scoreboard| scoreboard.with_promotion_context(&context))
+                .collect(),
+        );
 
         let sc = session_count.max(1) as f64;
         Ok(CrossSessionStats {
@@ -1581,13 +1837,61 @@ impl SessionAuditService for DatabaseSessionAuditService {
                 params.until.as_deref(),
             )
             .await?;
-        let mutations =
-            build_cross_session_mutation_scoreboards(mutation_decisions, mutation_overrides)
-                .into_iter()
-                .flat_map(|scoreboard| scoreboard.mutations.into_iter())
-                .collect::<Vec<_>>();
+        let scoreboards =
+            build_cross_session_mutation_scoreboards(mutation_decisions, mutation_overrides);
+        let context = self
+            .load_mutation_promotion_context(
+                user_id,
+                mutation_missing_verifier_rate(
+                    scoreboards
+                        .iter()
+                        .flat_map(|scoreboard| scoreboard.mutations.iter()),
+                ),
+            )
+            .await?;
+        let mutations = scoreboards
+            .into_iter()
+            .map(|scoreboard| scoreboard.with_promotion_context(&context))
+            .flat_map(|scoreboard| scoreboard.mutations.into_iter())
+            .collect::<Vec<_>>();
 
         Ok(select_cross_session_mutations(mutations, params))
+    }
+
+    async fn list_cross_session_runtime_promotions(
+        &self,
+        user_id: &str,
+        params: &CrossSessionRuntimePromotionListParams,
+    ) -> AuditResult<CrossSessionRuntimePromotionListResponse> {
+        let pool = self.get_pool().await.map_err(internal_error)?;
+
+        let mut sql = String::from(
+            "SELECT event_id, session_id, metadata, created_at \
+             FROM agent_events \
+             WHERE user_id = ? AND event_type = ?",
+        );
+        if params.since.is_some() {
+            sql.push_str(" AND created_at >= ?");
+        }
+        if params.until.is_some() {
+            sql.push_str(" AND created_at <= ?");
+        }
+        sql.push_str(" ORDER BY created_at DESC");
+
+        let mut query = query(&sql).bind(user_id).bind(RUNTIME_PROMOTION_EVENT_TYPE);
+        if let Some(since) = &params.since {
+            query = query.bind(since);
+        }
+        if let Some(until) = &params.until {
+            query = query.bind(until);
+        }
+
+        let rows = query.fetch_all(&pool).await.map_err(internal_error)?;
+        let promotions = rows
+            .iter()
+            .filter_map(runtime_promotion_record_from_row)
+            .collect::<Vec<_>>();
+        Ok(select_cross_session_runtime_promotions(promotions, params))
     }
 }
 
@@ -1620,6 +1924,13 @@ impl SessionAuditService for UnconfiguredSessionAuditService {
     async fn get_mutation_scoreboard(&self, _: &str, _: &str) -> AuditResult<MutationScoreboard> {
         Err(internal_error("audit service not configured"))
     }
+    async fn list_session_runtime_promotions(
+        &self,
+        _: &str,
+        _: &str,
+    ) -> AuditResult<SessionRuntimePromotionListResponse> {
+        Err(internal_error("audit service not configured"))
+    }
     async fn list_sessions(
         &self,
         _: &str,
@@ -1646,6 +1957,13 @@ impl SessionAuditService for UnconfiguredSessionAuditService {
         _: &str,
         _: &CrossSessionMutationListParams,
     ) -> AuditResult<CrossSessionMutationListResponse> {
+        Err(internal_error("audit service not configured"))
+    }
+    async fn list_cross_session_runtime_promotions(
+        &self,
+        _: &str,
+        _: &CrossSessionRuntimePromotionListParams,
+    ) -> AuditResult<CrossSessionRuntimePromotionListResponse> {
         Err(internal_error("audit service not configured"))
     }
 }
@@ -1768,12 +2086,59 @@ fn select_cross_session_mutations(
     }
 }
 
+fn select_cross_session_runtime_promotions(
+    mut promotions: Vec<RuntimePromotionRecord>,
+    params: &CrossSessionRuntimePromotionListParams,
+) -> CrossSessionRuntimePromotionListResponse {
+    if let Some(session_id) = params
+        .session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        promotions.retain(|promotion| promotion.session_id == session_id);
+    }
+    if let Some(controller) = params.controller {
+        promotions.retain(|promotion| promotion.controller == controller);
+    }
+    if let Some(outcome) = params.outcome {
+        promotions.retain(|promotion| promotion.outcome == outcome);
+    }
+    if let Some(recommendation) = params.recommendation {
+        promotions.retain(|promotion| promotion.recommendation == recommendation);
+    }
+
+    let total = promotions.len() as u32;
+    let page = params.page.max(1);
+    let per_page = params
+        .per_page
+        .clamp(1, MAX_CROSS_SESSION_PROMOTIONS_PER_PAGE);
+    let offset = (page.saturating_sub(1) * per_page) as usize;
+    let promotions = promotions
+        .into_iter()
+        .skip(offset)
+        .take(per_page as usize)
+        .collect();
+
+    CrossSessionRuntimePromotionListResponse {
+        promotions,
+        total,
+        page,
+        per_page,
+    }
+}
+
 fn apply_cross_session_mutation_filters(
     mutations: &mut Vec<StagedMutation>,
     params: &CrossSessionMutationListParams,
 ) {
     if let Some(state) = params.state {
         mutations.retain(|mutation| mutation.state == state);
+    }
+    if let Some(recommendation) = params.promotion_recommendation {
+        mutations.retain(|mutation| {
+            mutation.judgment.promotion_verdict.recommendation == recommendation
+        });
     }
     if let Some(session_id) = params
         .session_id
@@ -1862,7 +2227,7 @@ fn mutation_priority_cmp(left: &StagedMutation, right: &StagedMutation) -> std::
     mutation_priority_tuple(right).cmp(&mutation_priority_tuple(left))
 }
 
-fn mutation_priority_tuple(mutation: &StagedMutation) -> (u8, u8, u8) {
+fn mutation_priority_tuple(mutation: &StagedMutation) -> (u8, u8, u8, u8) {
     (
         match mutation.state {
             StagedMutationState::Ready => 5,
@@ -1870,6 +2235,11 @@ fn mutation_priority_tuple(mutation: &StagedMutation) -> (u8, u8, u8) {
             StagedMutationState::Blocked => 3,
             StagedMutationState::Reverted => 2,
             StagedMutationState::Applied => 1,
+        },
+        match mutation.judgment.promotion_verdict.recommendation {
+            MutationPromotionRecommendation::Promote => 3,
+            MutationPromotionRecommendation::Canary => 2,
+            MutationPromotionRecommendation::Hold => 1,
         },
         match mutation.judgment.safety_verdict {
             MutationSafetyVerdict::RequiresApproval => 3,
@@ -1979,18 +2349,41 @@ fn parse_mutation_state_override(
     })
 }
 
+#[cfg(test)]
 fn aggregate_cross_session_mutation_stats(
     decisions: Vec<PersistedMutationDecision>,
     overrides: Vec<(String, MutationStateOverride)>,
 ) -> MutationStatsAggregate {
+    aggregate_cross_session_mutation_scoreboards(build_cross_session_mutation_scoreboards(
+        decisions, overrides,
+    ))
+}
+
+fn aggregate_cross_session_mutation_scoreboards(
+    scoreboards: Vec<MutationScoreboard>,
+) -> MutationStatsAggregate {
     let mut aggregate = MutationStatsAggregate::default();
-    for scoreboard in build_cross_session_mutation_scoreboards(decisions, overrides) {
+    for scoreboard in scoreboards {
         for mutation in &scoreboard.mutations {
             aggregate.observe_mutation(mutation);
         }
     }
 
     aggregate
+}
+
+fn mutation_missing_verifier_rate<'a>(
+    mutations: impl Iterator<Item = &'a StagedMutation>,
+) -> Option<f64> {
+    let mut total = 0_u32;
+    let mut missing = 0_u32;
+    for mutation in mutations {
+        total += 1;
+        if mutation.verifier.is_none() {
+            missing += 1;
+        }
+    }
+    (total > 0).then_some(missing as f64 / total as f64)
 }
 
 fn build_cross_session_mutation_scoreboards(
@@ -2080,6 +2473,39 @@ mod tests {
         mutation.judgment.safety_verdict = safety_verdict;
         mutation.judgment.retention_verdict = retention_verdict;
         mutation.judgment.retention_score = ConfidenceInterval::exact(retention_score);
+        mutation.judgment.promotion_verdict = crate::MutationPromotionVerdict {
+            recommendation: match state {
+                StagedMutationState::Ready | StagedMutationState::Applied => {
+                    crate::MutationPromotionRecommendation::Promote
+                }
+                StagedMutationState::Pending => crate::MutationPromotionRecommendation::Canary,
+                StagedMutationState::Blocked | StagedMutationState::Reverted => {
+                    crate::MutationPromotionRecommendation::Hold
+                }
+            },
+            confidence_score: retention_score,
+            support_score: if mutation.verifier.is_some() {
+                1.0
+            } else {
+                0.55
+            },
+            safety_score: match safety_verdict {
+                MutationSafetyVerdict::Safe => 0.90,
+                MutationSafetyVerdict::RequiresApproval => 0.65,
+                MutationSafetyVerdict::Blocked => 0.25,
+            },
+            overall_score: retention_score,
+            evidence: mutation.judgment.rationale.clone(),
+            blockers: if matches!(
+                state,
+                StagedMutationState::Blocked | StagedMutationState::Reverted
+            ) {
+                mutation.judgment.rationale.clone()
+            } else {
+                Vec::new()
+            },
+            rollback_hint: mutation.compensation.compensation_summary.clone(),
+        };
         mutation.state_updated_at = state_updated_at.map(ToString::to_string);
         mutation
     }
@@ -2686,7 +3112,14 @@ mod tests {
         );
 
         assert_eq!(scoreboard.total_mutations, 1);
-        assert_eq!(scoreboard.ready_mutations, 1);
+        assert_eq!(scoreboard.ready_mutations, 0);
+        assert_eq!(
+            scoreboard.mutations[0]
+                .judgment
+                .promotion_verdict
+                .recommendation,
+            crate::MutationPromotionRecommendation::Canary
+        );
         assert_eq!(scoreboard.mutations[0].tool_name, "edit_file");
         assert_eq!(scoreboard.mutations[0].turn_index, 4);
     }
@@ -3003,6 +3436,7 @@ mod tests {
         assert!(params.session_id.is_none());
         assert!(params.tool_name.is_none());
         assert!(params.state.is_none());
+        assert!(params.promotion_recommendation.is_none());
         assert!(params.safety_verdict.is_none());
         assert!(params.retention_verdict.is_none());
         assert!(params.min_retention_score.is_none());
@@ -3021,6 +3455,7 @@ mod tests {
                 "session_id": "session-b",
                 "tool_name": "\"write_file\"",
                 "state": "pending",
+                "promotion_recommendation": "canary",
                 "safety_verdict": "requires_approval",
                 "retention_verdict": "retain",
                 "min_retention_score": 0.7,
@@ -3036,6 +3471,10 @@ mod tests {
         assert_eq!(params.tool_name.as_deref(), Some("\"write_file\""));
         assert_eq!(params.state, Some(StagedMutationState::Pending));
         assert_eq!(
+            params.promotion_recommendation,
+            Some(MutationPromotionRecommendation::Canary)
+        );
+        assert_eq!(
             params.safety_verdict,
             Some(MutationSafetyVerdict::RequiresApproval)
         );
@@ -3050,6 +3489,109 @@ mod tests {
         );
         assert_eq!(params.verifier_gap.as_deref(), Some("no_verifier_signal"));
         assert_eq!(params.sort, "retention");
+    }
+
+    #[test]
+    fn cross_session_runtime_promotion_list_params_defaults() {
+        let params: CrossSessionRuntimePromotionListParams = serde_json::from_str("{}").unwrap();
+        assert_eq!(params.page, 1);
+        assert_eq!(params.per_page, 20);
+        assert!(params.since.is_none());
+        assert!(params.until.is_none());
+        assert!(params.session_id.is_none());
+        assert!(params.controller.is_none());
+        assert!(params.outcome.is_none());
+        assert!(params.recommendation.is_none());
+    }
+
+    #[test]
+    fn cross_session_runtime_promotions_filter_and_paginate() {
+        let promotions = vec![
+            RuntimePromotionRecord::from_event(
+                "evt-1".into(),
+                "session-a".into(),
+                "2026-04-12T12:00:00Z".into(),
+                RuntimePromotionEventData {
+                    controller: RuntimePromotionController::AdaptiveBaseline,
+                    outcome: RuntimePromotionOutcome::Deferred,
+                    recommendation: RuntimePromotionRecommendation::Hold,
+                    subject_id: "exp-a".into(),
+                    summary: "adaptive baseline deferred".into(),
+                    turn: None,
+                    confidence_score: 0.71,
+                    support_score: 0.48,
+                    safety_score: 0.82,
+                    overall_score: 0.63,
+                    blockers: vec![
+                        "global quality trend is materially below promotion threshold".into(),
+                    ],
+                    evidence: vec![],
+                    rollback_hint: Some("rollback_experiment(\"exp-a\")".into()),
+                    run_id: Some("run-a".into()),
+                },
+            ),
+            RuntimePromotionRecord::from_event(
+                "evt-2".into(),
+                "session-b".into(),
+                "2026-04-12T11:00:00Z".into(),
+                RuntimePromotionEventData {
+                    controller: RuntimePromotionController::Evolution,
+                    outcome: RuntimePromotionOutcome::Queued,
+                    recommendation: RuntimePromotionRecommendation::Canary,
+                    subject_id: "proposal-1".into(),
+                    summary: "queue for review".into(),
+                    turn: None,
+                    confidence_score: 0.76,
+                    support_score: 0.64,
+                    safety_score: 0.70,
+                    overall_score: 0.69,
+                    blockers: vec![],
+                    evidence: vec![],
+                    rollback_hint: None,
+                    run_id: Some("run-b".into()),
+                },
+            ),
+            RuntimePromotionRecord::from_event(
+                "evt-3".into(),
+                "session-b".into(),
+                "2026-04-12T10:00:00Z".into(),
+                RuntimePromotionEventData {
+                    controller: RuntimePromotionController::Evolution,
+                    outcome: RuntimePromotionOutcome::AutoApplied,
+                    recommendation: RuntimePromotionRecommendation::Promote,
+                    subject_id: "proposal-2".into(),
+                    summary: "auto applied".into(),
+                    turn: None,
+                    confidence_score: 0.92,
+                    support_score: 0.88,
+                    safety_score: 0.86,
+                    overall_score: 0.89,
+                    blockers: vec![],
+                    evidence: vec![],
+                    rollback_hint: None,
+                    run_id: Some("run-b".into()),
+                },
+            ),
+        ];
+
+        let response = select_cross_session_runtime_promotions(
+            promotions,
+            &CrossSessionRuntimePromotionListParams {
+                page: 1,
+                per_page: 10,
+                since: None,
+                until: None,
+                session_id: Some("session-b".into()),
+                controller: Some(RuntimePromotionController::Evolution),
+                outcome: Some(RuntimePromotionOutcome::Queued),
+                recommendation: Some(RuntimePromotionRecommendation::Canary),
+            },
+        );
+
+        assert_eq!(response.total, 1);
+        assert_eq!(response.promotions.len(), 1);
+        assert_eq!(response.promotions[0].event_id, "evt-2");
+        assert_eq!(response.promotions[0].summary, "queue for review");
     }
 
     #[test]
@@ -3105,6 +3647,7 @@ mod tests {
                 session_id: None,
                 tool_name: None,
                 state: None,
+                promotion_recommendation: None,
                 safety_verdict: None,
                 retention_verdict: None,
                 min_retention_score: None,
@@ -3179,6 +3722,7 @@ mod tests {
                 session_id: Some("session-b".into()),
                 tool_name: Some("\"write_file\"".into()),
                 state: Some(StagedMutationState::Pending),
+                promotion_recommendation: Some(MutationPromotionRecommendation::Canary),
                 safety_verdict: Some(MutationSafetyVerdict::RequiresApproval),
                 retention_verdict: Some(MutationRetentionVerdict::Retain),
                 min_retention_score: Some(0.7),
@@ -3253,6 +3797,7 @@ mod tests {
                 session_id: None,
                 tool_name: None,
                 state: None,
+                promotion_recommendation: None,
                 safety_verdict: None,
                 retention_verdict: None,
                 min_retention_score: None,
@@ -3275,6 +3820,7 @@ mod tests {
                 session_id: None,
                 tool_name: None,
                 state: None,
+                promotion_recommendation: None,
                 safety_verdict: None,
                 retention_verdict: None,
                 min_retention_score: None,

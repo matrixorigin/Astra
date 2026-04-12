@@ -26,13 +26,21 @@ use astra_services::runs::{
     CancelRunRecord, ChatRequestData, ChatRunRecord, ChatStreamRecord, DurableRunRecord,
     RunLifecycleService, RunListRecord, RunMutationRecord, RunStatusRecord,
 };
+use astra_services::session_audit::{RUNTIME_PROMOTION_EVENT_TYPE, RuntimePromotionEventData};
 
 use crate::FernetTokenEncryptor;
 use crate::MatrixOneSettings;
+use crate::evolution::service::EvolutionService;
+use crate::observability_integration::ObservabilityHub;
 use crate::pipeline::step_recorder::StepRecorder;
+use crate::promotion_context::PromotionEvaluationContext;
 use crate::turn::agentic_loop_host::{
     AgenticLoopOutcome, AgenticLoopState, CancellationState, MessagingState, SkillState,
     StopHookState, run_agentic_loop_with_host,
+};
+use crate::{
+    DatabaseEvaluationService, DatabaseEventService, EvaluationService, EventCreateRequestData,
+    EventService,
 };
 
 use astra_core::{
@@ -81,6 +89,151 @@ fn skill_search_from_context(
         .cloned()
         .and_then(|v| serde_json::from_value(v).ok())
         .unwrap_or_default()
+}
+
+fn build_runtime_evaluation_service(
+    matrixone: &MatrixOneSettings,
+    shared_pool: Option<&SharedPool>,
+) -> DatabaseEvaluationService {
+    let service = DatabaseEvaluationService::new(matrixone.clone());
+    match shared_pool {
+        Some(pool) => service.with_pool(pool.clone()),
+        None => service,
+    }
+}
+
+async fn load_runtime_promotion_context(
+    matrixone: &MatrixOneSettings,
+    shared_pool: Option<&SharedPool>,
+    user_id: &str,
+) -> Result<PromotionEvaluationContext, (StatusCode, Json<ErrorResponse>)> {
+    let service = build_runtime_evaluation_service(matrixone, shared_pool);
+    let quality = service.get_quality_trend(user_id, 30, None).await?;
+    let gate_history = service.get_gate_history(user_id, 1).await?;
+    let calibration = service.get_calibration(user_id, None, 30).await?;
+    let latest_gate = gate_history.gates.first();
+    let calibration_error = if calibration.noise_filtered_sample_count > 0 {
+        calibration.noise_filtered_calibration_error
+    } else {
+        calibration.calibration_error
+    };
+
+    Ok(PromotionEvaluationContext {
+        noise_filtered_quality: Some(quality.noise_filtered_overall_avg),
+        noise_filtered_quality_interval: Some(quality.noise_filtered_overall_avg_interval),
+        latest_gate_passed: latest_gate.map(|gate| gate.passed),
+        latest_gate_score_delta: latest_gate.map(|gate| gate.score_delta),
+        calibration_error: Some(calibration_error),
+    })
+}
+
+fn initialize_runtime_controllers(
+    loop_state: &mut AgenticLoopState,
+    user_id: &str,
+    session_id: &str,
+    promotion_context: Option<PromotionEvaluationContext>,
+) {
+    let learning_stack = super::state_builder::build_pipeline_learning_stack();
+    let hub = Arc::new(ObservabilityHub::new());
+    hub.attach_pattern_library(learning_stack.pattern_library.clone());
+    let session = hub.start_session(user_id, session_id);
+
+    let evolution_service = Arc::new(
+        EvolutionService::new()
+            .with_pattern_library(learning_stack.pattern_library)
+            .with_calibrator(learning_stack.calibrator),
+    );
+    evolution_service.set_promotion_evaluation_context(promotion_context.clone());
+
+    loop_state.telemetry.observability_hub = Some(hub);
+    loop_state.telemetry.observability_session = Some(session);
+    loop_state.telemetry.promotion_evaluation_context = promotion_context;
+    loop_state.evolution_service = Some(evolution_service);
+}
+
+async fn configure_runtime_controllers(
+    matrixone: &MatrixOneSettings,
+    shared_pool: Option<&SharedPool>,
+    loop_state: &mut AgenticLoopState,
+    user_id: &str,
+    session_id: &str,
+) {
+    let promotion_context = match load_runtime_promotion_context(matrixone, shared_pool, user_id)
+        .await
+    {
+        Ok(context) => Some(context),
+        Err((status, response)) => {
+            eprintln!(
+                "[promotion-context] failed to preload evaluation summaries for {user_id}: {status} {}",
+                response.0.detail
+            );
+            None
+        }
+    };
+    initialize_runtime_controllers(loop_state, user_id, session_id, promotion_context);
+}
+
+fn build_runtime_event_service(
+    matrixone: &MatrixOneSettings,
+    shared_pool: Option<&SharedPool>,
+) -> DatabaseEventService {
+    let service = DatabaseEventService::new(matrixone.clone());
+    match shared_pool {
+        Some(pool) => service.with_pool(pool.clone()),
+        None => service,
+    }
+}
+
+async fn persist_runtime_promotion_events(
+    matrixone: &MatrixOneSettings,
+    shared_pool: Option<&SharedPool>,
+    user_id: &str,
+    session_id: &str,
+    run_id: &str,
+    promotions: &[RuntimePromotionEventData],
+) {
+    if promotions.is_empty() {
+        return;
+    }
+
+    let service = build_runtime_event_service(matrixone, shared_pool);
+    for promotion in promotions {
+        let metadata = match serde_json::to_value(promotion) {
+            Ok(value) => Some(value),
+            Err(err) => {
+                eprintln!(
+                    "[runtime-promotion] failed to serialize promotion event {}: {err}",
+                    promotion.subject_id
+                );
+                continue;
+            }
+        };
+        if let Err((status, response)) = service
+            .create_event(
+                user_id.to_string(),
+                EventCreateRequestData {
+                    session_id: session_id.to_string(),
+                    event_type: RUNTIME_PROMOTION_EVENT_TYPE.to_string(),
+                    content: promotion.summary.clone(),
+                    agent_id: None,
+                    agent_version: None,
+                    parent_event_id: None,
+                    parent_event_ids: Some(Vec::new()),
+                    causal_chain_id: Some(format!(
+                        "{session_id}:runtime-promotion:{}:{run_id}",
+                        promotion.subject_id
+                    )),
+                    metadata,
+                },
+            )
+            .await
+        {
+            eprintln!(
+                "[runtime-promotion] failed to persist promotion event {}: {status} {}",
+                promotion.subject_id, response.0.detail
+            );
+        }
+    }
 }
 
 // ─── Run State ──────────────────────────────────────────────────────────────
@@ -708,11 +861,23 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             &pause_flag,
             &llm_cancel_token,
         );
+        configure_runtime_controllers(
+            &self.matrixone,
+            self.shared_pool.as_ref(),
+            &mut loop_state,
+            &user_id,
+            &session_id,
+        )
+        .await;
 
         // Clone handles we need inside the spawned task.
         let runs = self.runs_handle();
         let run_engine = self.run_engine.clone();
         let bg_run_id = run_id.clone();
+        let bg_user_id = user_id.clone();
+        let bg_session_id = session_id.clone();
+        let bg_matrixone = self.matrixone.clone();
+        let bg_shared_pool = self.shared_pool.clone();
 
         tokio::spawn(async move {
             let outcome = run_agentic_loop_with_host(&mut host, &mut loop_state).await;
@@ -721,6 +886,15 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             crate::skills::hooks::fire_session_end(
                 &loop_state.skills.session_event_hooks,
                 loop_state.current_session_id.as_deref().unwrap_or(""),
+            )
+            .await;
+            persist_runtime_promotion_events(
+                &bg_matrixone,
+                bg_shared_pool.as_ref(),
+                &bg_user_id,
+                &bg_session_id,
+                &bg_run_id,
+                &loop_state.telemetry.promotion_events,
             )
             .await;
 
@@ -822,6 +996,14 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             &pause_flag,
             &llm_cancel_token,
         );
+        configure_runtime_controllers(
+            &self.matrixone,
+            self.shared_pool.as_ref(),
+            &mut state,
+            &user_id,
+            &session_id,
+        )
+        .await;
 
         let loop_result = run_agentic_loop_with_host(&mut host, &mut state).await;
 
@@ -829,6 +1011,15 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         crate::skills::hooks::fire_session_end(
             &state.skills.session_event_hooks,
             state.current_session_id.as_deref().unwrap_or(""),
+        )
+        .await;
+        persist_runtime_promotion_events(
+            &self.matrixone,
+            self.shared_pool.as_ref(),
+            &user_id,
+            &session_id,
+            &run_id,
+            &state.telemetry.promotion_events,
         )
         .await;
 
@@ -1371,6 +1562,14 @@ impl SubRunExecutor for ServerSubRunExecutor {
             pending_reflection_signals: Vec::new(),
             recent_tactical_actions: Vec::new(),
         };
+        configure_runtime_controllers(
+            &self.matrixone,
+            self.shared_pool.as_ref(),
+            &mut loop_state,
+            &config.user_id,
+            &config.session_id,
+        )
+        .await;
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut loop_state).await;
 
@@ -1378,6 +1577,15 @@ impl SubRunExecutor for ServerSubRunExecutor {
         crate::skills::hooks::fire_session_end(
             &loop_state.skills.session_event_hooks,
             loop_state.current_session_id.as_deref().unwrap_or(""),
+        )
+        .await;
+        persist_runtime_promotion_events(
+            &self.matrixone,
+            self.shared_pool.as_ref(),
+            &config.user_id,
+            &config.session_id,
+            &config.run_id,
+            &loop_state.telemetry.promotion_events,
         )
         .await;
 

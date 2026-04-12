@@ -1098,6 +1098,7 @@ impl ReflectionEngine {
                 .unwrap_or_default()
                 .as_secs(),
             status: ApprovalStatus::Pending,
+            promotion_verdict: None,
         })
     }
 }

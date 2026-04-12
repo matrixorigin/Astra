@@ -169,12 +169,47 @@ pub enum MutationRetentionVerdict {
     Reject,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MutationPromotionRecommendation {
+    Promote,
+    Canary,
+    #[default]
+    Hold,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct MutationPromotionVerdict {
+    pub recommendation: MutationPromotionRecommendation,
+    pub confidence_score: f64,
+    pub support_score: f64,
+    pub safety_score: f64,
+    pub overall_score: f64,
+    #[serde(default)]
+    pub evidence: Vec<String>,
+    #[serde(default)]
+    pub blockers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollback_hint: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct MutationPromotionEvaluationContext {
+    pub noise_filtered_quality: Option<ConfidenceInterval>,
+    pub latest_gate_passed: Option<bool>,
+    pub latest_gate_score_delta: Option<f64>,
+    pub calibration_error: Option<f64>,
+    pub missing_verifier_rate: Option<f64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MutationJudgment {
     pub retention_score: ConfidenceInterval,
     pub verifier_pass_rate: ConfidenceInterval,
     pub safety_verdict: MutationSafetyVerdict,
     pub retention_verdict: MutationRetentionVerdict,
+    #[serde(default)]
+    pub promotion_verdict: MutationPromotionVerdict,
     pub rationale: Vec<String>,
 }
 
@@ -183,8 +218,9 @@ impl MutationJudgment {
         objective: &MutationObjectiveScore,
         verifier: Option<&MutationVerifierSummary>,
         compensation: &MutationCompensationPolicy,
-        has_pre_state_snapshot: bool,
+        pre_state_snapshot_id: Option<&str>,
     ) -> Self {
+        let has_pre_state_snapshot = pre_state_snapshot_id.is_some();
         let retention_score = objective.retention_score();
         let verifier_pass_rate = verifier
             .map(|summary| summary.pass_rate)
@@ -220,25 +256,123 @@ impl MutationJudgment {
 
         rationale.sort();
         rationale.dedup();
+        let promotion_verdict = build_mutation_promotion_verdict(
+            retention_score,
+            verifier,
+            safety_verdict,
+            retention_verdict,
+            compensation,
+            has_pre_state_snapshot,
+            pre_state_snapshot_id,
+            &rationale,
+        );
         Self {
             retention_score,
             verifier_pass_rate,
             safety_verdict,
             retention_verdict,
+            promotion_verdict,
             rationale,
         }
     }
 
     pub fn staged_state(&self) -> StagedMutationState {
-        match (self.retention_verdict, self.safety_verdict) {
-            (MutationRetentionVerdict::Reject, _) | (_, MutationSafetyVerdict::Blocked) => {
-                StagedMutationState::Blocked
+        match self.promotion_verdict.recommendation {
+            MutationPromotionRecommendation::Promote => StagedMutationState::Ready,
+            MutationPromotionRecommendation::Canary => StagedMutationState::Pending,
+            MutationPromotionRecommendation::Hold => {
+                if matches!(self.retention_verdict, MutationRetentionVerdict::Reject)
+                    || matches!(self.safety_verdict, MutationSafetyVerdict::Blocked)
+                {
+                    StagedMutationState::Blocked
+                } else {
+                    StagedMutationState::Pending
+                }
             }
-            (MutationRetentionVerdict::Retain, MutationSafetyVerdict::Safe) => {
-                StagedMutationState::Ready
-            }
-            _ => StagedMutationState::Pending,
         }
+    }
+
+    pub fn apply_promotion_context(
+        &mut self,
+        context: &MutationPromotionEvaluationContext,
+        verifier_present: bool,
+    ) {
+        if let Some(quality) = context.noise_filtered_quality {
+            self.promotion_verdict
+                .evidence
+                .push(format!("noise_filtered_quality={:.2}", quality.point));
+            self.promotion_verdict.confidence_score =
+                self.promotion_verdict.confidence_score.min(quality.point);
+            if quality.lower < 0.55 {
+                self.promotion_verdict
+                    .blockers
+                    .push("noise_filtered_quality_low".into());
+            }
+        }
+        if let Some(passed) = context.latest_gate_passed {
+            self.promotion_verdict
+                .evidence
+                .push(format!("latest_gate_passed={passed}"));
+            if !passed {
+                self.promotion_verdict.support_score =
+                    self.promotion_verdict.support_score.min(0.60);
+                self.promotion_verdict.safety_score = self.promotion_verdict.safety_score.min(0.60);
+            }
+        }
+        if let Some(score_delta) = context.latest_gate_score_delta {
+            self.promotion_verdict
+                .evidence
+                .push(format!("latest_gate_score_delta={score_delta:.2}"));
+            if score_delta < -0.15 {
+                self.promotion_verdict
+                    .blockers
+                    .push("latest_gate_regression".into());
+            } else if score_delta < -0.05 {
+                self.promotion_verdict.support_score =
+                    self.promotion_verdict.support_score.min(0.65);
+            }
+        }
+        if let Some(calibration_error) = context.calibration_error {
+            self.promotion_verdict
+                .evidence
+                .push(format!("calibration_error={calibration_error:.2}"));
+            if calibration_error > 0.35 {
+                self.promotion_verdict
+                    .blockers
+                    .push("calibration_error_high".into());
+            } else if calibration_error > 0.20 {
+                self.promotion_verdict.support_score =
+                    self.promotion_verdict.support_score.min(0.60);
+            }
+        }
+        if let Some(missing_verifier_rate) = context.missing_verifier_rate {
+            self.promotion_verdict
+                .evidence
+                .push(format!("missing_verifier_rate={missing_verifier_rate:.2}"));
+            if !verifier_present {
+                self.promotion_verdict.support_score = self
+                    .promotion_verdict
+                    .support_score
+                    .min((0.75 - missing_verifier_rate).clamp(0.35, 0.55));
+            }
+        }
+
+        self.promotion_verdict.evidence.sort();
+        self.promotion_verdict.evidence.dedup();
+        self.promotion_verdict.blockers.sort();
+        self.promotion_verdict.blockers.dedup();
+        self.promotion_verdict.overall_score = (self.promotion_verdict.confidence_score * 0.45
+            + self.promotion_verdict.support_score * 0.30
+            + self.promotion_verdict.safety_score * 0.25)
+            .clamp(0.0, 1.0);
+        self.promotion_verdict.recommendation = compute_mutation_promotion_recommendation(
+            &self.promotion_verdict.blockers,
+            verifier_present,
+            self.retention_verdict,
+            self.safety_verdict,
+            self.promotion_verdict.support_score,
+            self.promotion_verdict.overall_score,
+        );
     }
 }
 
@@ -293,7 +427,7 @@ impl StagedMutation {
             &objective,
             verifier.as_ref(),
             &compensation,
-            pre_state_snapshot_id.is_some(),
+            pre_state_snapshot_id.as_deref(),
         );
         let state = judgment.staged_state();
         Self {
@@ -313,6 +447,125 @@ impl StagedMutation {
             compensation,
             judgment,
         }
+    }
+
+    pub fn apply_promotion_context(&mut self, context: &MutationPromotionEvaluationContext) {
+        self.judgment
+            .apply_promotion_context(context, self.verifier.is_some());
+        if self.state_updated_at.is_none() {
+            self.state = self.judgment.staged_state();
+        }
+    }
+}
+
+fn build_mutation_promotion_verdict(
+    retention_score: ConfidenceInterval,
+    verifier: Option<&MutationVerifierSummary>,
+    safety_verdict: MutationSafetyVerdict,
+    retention_verdict: MutationRetentionVerdict,
+    compensation: &MutationCompensationPolicy,
+    has_pre_state_snapshot: bool,
+    pre_state_snapshot_id: Option<&str>,
+    rationale: &[String],
+) -> MutationPromotionVerdict {
+    let mut evidence = vec![format!("retention_score={:.2}", retention_score.point)];
+    let mut blockers = Vec::new();
+
+    let support_score = if let Some(summary) = verifier {
+        evidence.push(format!(
+            "verifier_pass_rate={:.2} ({}/{})",
+            summary.pass_rate.point, summary.criteria_passed, summary.criteria_total
+        ));
+        if !summary.all_required_passed {
+            blockers.push(format!(
+                "required_verifiers_failed:{}",
+                summary.failing_criteria.join(",")
+            ));
+        }
+        summary.pass_rate.point
+    } else {
+        evidence.push("no_structured_verifier_signal".into());
+        0.55
+    };
+
+    let mut safety_score: f64 = match safety_verdict {
+        MutationSafetyVerdict::Safe => 0.90,
+        MutationSafetyVerdict::RequiresApproval => 0.65,
+        MutationSafetyVerdict::Blocked => 0.25,
+    };
+    if compensation.bounded && compensation.reversible {
+        evidence.push("bounded_reversible_compensation".into());
+    } else {
+        evidence.push("manual_or_unbounded_rollback".into());
+    }
+    if compensation.requires_pre_state && !has_pre_state_snapshot {
+        evidence.push("missing_pre_state_snapshot".into());
+        safety_score = safety_score.min(0.60);
+    }
+
+    if matches!(retention_verdict, MutationRetentionVerdict::Reject) {
+        blockers.push("retention_score_below_threshold".into());
+    }
+    if matches!(safety_verdict, MutationSafetyVerdict::Blocked) {
+        blockers.push("mutation_safety_blocked".into());
+    }
+
+    let rollback_hint = compensation.compensation_summary.clone().or_else(|| {
+        pre_state_snapshot_id.map(|snapshot_id| format!("restore snapshot {snapshot_id}"))
+    });
+    let confidence_score = retention_score.point;
+    let overall_score =
+        (confidence_score * 0.45 + support_score * 0.30 + safety_score * 0.25).clamp(0.0, 1.0);
+
+    let recommendation = compute_mutation_promotion_recommendation(
+        &blockers,
+        verifier.is_some(),
+        retention_verdict,
+        safety_verdict,
+        support_score,
+        overall_score,
+    );
+
+    let mut all_evidence = rationale.to_vec();
+    all_evidence.extend(evidence);
+    all_evidence.sort();
+    all_evidence.dedup();
+
+    MutationPromotionVerdict {
+        recommendation,
+        confidence_score,
+        support_score,
+        safety_score,
+        overall_score,
+        evidence: all_evidence,
+        blockers,
+        rollback_hint,
+    }
+}
+
+fn compute_mutation_promotion_recommendation(
+    blockers: &[String],
+    verifier_present: bool,
+    retention_verdict: MutationRetentionVerdict,
+    safety_verdict: MutationSafetyVerdict,
+    support_score: f64,
+    overall_score: f64,
+) -> MutationPromotionRecommendation {
+    if blockers.is_empty()
+        && verifier_present
+        && matches!(retention_verdict, MutationRetentionVerdict::Retain)
+        && matches!(safety_verdict, MutationSafetyVerdict::Safe)
+        && support_score >= 0.70
+        && overall_score >= 0.78
+    {
+        MutationPromotionRecommendation::Promote
+    } else if !matches!(retention_verdict, MutationRetentionVerdict::Reject)
+        && !matches!(safety_verdict, MutationSafetyVerdict::Blocked)
+        && overall_score >= 0.55
+    {
+        MutationPromotionRecommendation::Canary
+    } else {
+        MutationPromotionRecommendation::Hold
     }
 }
 
@@ -418,6 +671,13 @@ impl MutationScoreboard {
             .flat_map(staged_mutations_from_persisted_decision)
             .collect::<Vec<_>>();
         Self::new(scoreboard_id, session_id, mutations)
+    }
+
+    pub fn with_promotion_context(mut self, context: &MutationPromotionEvaluationContext) -> Self {
+        for mutation in &mut self.mutations {
+            mutation.apply_promotion_context(context);
+        }
+        Self::new(self.scoreboard_id, self.session_id, self.mutations)
     }
 }
 
@@ -604,6 +864,10 @@ mod tests {
             mutation.judgment.retention_verdict,
             MutationRetentionVerdict::Retain
         );
+        assert_eq!(
+            mutation.judgment.promotion_verdict.recommendation,
+            MutationPromotionRecommendation::Promote
+        );
     }
 
     #[test]
@@ -632,6 +896,39 @@ mod tests {
                 .rationale
                 .iter()
                 .any(|reason| reason == "missing_pre_state_snapshot")
+        );
+        assert_eq!(
+            mutation.judgment.promotion_verdict.recommendation,
+            MutationPromotionRecommendation::Canary
+        );
+    }
+
+    #[test]
+    fn staged_mutation_without_verifier_stays_canary_pending() {
+        let mutation = StagedMutation::new(
+            "mut-3",
+            "session-1",
+            5,
+            "write_file",
+            serde_json::json!({"path": "src/lib.rs"}),
+            Some("snap-3".into()),
+            MutationObjectiveScore::from_learning_signal(0.94, Some(90), 0.05, 0.86, false),
+            None,
+            automated_policy(true),
+        );
+
+        assert_eq!(mutation.state, StagedMutationState::Pending);
+        assert_eq!(
+            mutation.judgment.promotion_verdict.recommendation,
+            MutationPromotionRecommendation::Canary
+        );
+        assert!(
+            mutation
+                .judgment
+                .promotion_verdict
+                .evidence
+                .iter()
+                .any(|evidence| evidence == "no_structured_verifier_signal")
         );
     }
 
@@ -739,6 +1036,13 @@ mod tests {
         );
         assert_eq!(
             scoreboard.mutations[0]
+                .judgment
+                .promotion_verdict
+                .recommendation,
+            MutationPromotionRecommendation::Canary
+        );
+        assert_eq!(
+            scoreboard.mutations[0]
                 .verifier
                 .as_ref()
                 .map(|summary| summary.criteria_passed),
@@ -750,5 +1054,52 @@ mod tests {
         );
         assert_eq!(scoreboard.mutations[0].verifier_gap.as_deref(), None);
         assert_eq!(scoreboard.approval_required_mutations, 1);
+    }
+
+    #[test]
+    fn promotion_context_downgrades_ready_mutation_on_gate_regression() {
+        let scoreboard = MutationScoreboard::new(
+            "board-ctx",
+            "session-1",
+            vec![StagedMutation::new(
+                "mut-ctx",
+                "session-1",
+                1,
+                "write_file",
+                serde_json::json!({"path": "src/lib.rs"}),
+                Some("snap-1".into()),
+                MutationObjectiveScore::from_learning_signal(0.93, Some(88), 0.08, 0.82, false),
+                Some(MutationVerifierSummary::from_report(&verification_report(
+                    true,
+                ))),
+                automated_policy(true),
+            )],
+        );
+
+        let scoreboard = scoreboard.with_promotion_context(&MutationPromotionEvaluationContext {
+            noise_filtered_quality: Some(ConfidenceInterval::new(0.72, 0.68, 0.76)),
+            latest_gate_passed: Some(false),
+            latest_gate_score_delta: Some(-0.08),
+            calibration_error: Some(0.24),
+            missing_verifier_rate: Some(0.4),
+        });
+
+        assert_eq!(scoreboard.ready_mutations, 0);
+        assert_eq!(scoreboard.mutations[0].state, StagedMutationState::Pending);
+        assert_eq!(
+            scoreboard.mutations[0]
+                .judgment
+                .promotion_verdict
+                .recommendation,
+            MutationPromotionRecommendation::Canary
+        );
+        assert!(
+            scoreboard.mutations[0]
+                .judgment
+                .promotion_verdict
+                .evidence
+                .iter()
+                .any(|evidence| evidence == "latest_gate_passed=false")
+        );
     }
 }

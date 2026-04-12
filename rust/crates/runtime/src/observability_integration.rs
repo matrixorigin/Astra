@@ -20,8 +20,11 @@ use astra_services::session_journal::{JournalEvent, JournalWriter};
 use astra_services::session_workspace::GoalProgressSnapshot;
 use serde::{Deserialize, Serialize};
 
-use crate::ab_testing::{ExperimentOutcome, ExperimentStatus, ExperimentStore};
-use crate::adaptive_baselines::{AdaptiveBaselinePromotion, AdaptiveBaselineStore};
+use crate::ab_testing::{ExperimentAnalyzer, ExperimentOutcome, ExperimentStatus, ExperimentStore};
+use crate::adaptive_baselines::{
+    AdaptiveBaselinePromotionDecision, AdaptiveBaselineScope, AdaptiveBaselineStore,
+    evaluate_promotion_verdict,
+};
 use crate::auto_tuning::{AutoTuningEngine, DelegationOutcomeTracker, FeedbackSignal, SignalType};
 use crate::pipeline::pattern::PatternLibrary;
 use crate::runtime_config::RuntimeConfig;
@@ -293,7 +296,11 @@ impl ObservabilitySession {
             .goal_tracker
             .as_ref()
             .map(|tracker| tracker.goal() == goal)
-            .or_else(|| self.original_query.as_deref().map(|existing| existing == goal))
+            .or_else(|| {
+                self.original_query
+                    .as_deref()
+                    .map(|existing| existing == goal)
+            })
             .unwrap_or(false);
         if already_tracking {
             return false;
@@ -815,15 +822,63 @@ impl ObservabilityHub {
         &self,
         experiment_id: &str,
         winner_variant_id: &str,
-    ) -> Result<Option<AdaptiveBaselinePromotion>, String> {
-        let experiment = self
+    ) -> Result<AdaptiveBaselinePromotionDecision, String> {
+        self.promote_experiment_winner_with_context(experiment_id, winner_variant_id, None)
+    }
+
+    pub fn promote_experiment_winner_with_context(
+        &self,
+        experiment_id: &str,
+        winner_variant_id: &str,
+        promotion_context: Option<&crate::promotion_context::PromotionEvaluationContext>,
+    ) -> Result<AdaptiveBaselinePromotionDecision, String> {
+        let experiment_store = self
             .experiment_store
             .read()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(|e| e.into_inner());
+        let experiment = experiment_store
             .get(experiment_id)
             .ok_or_else(|| format!("missing experiment {experiment_id}"))?;
-        self.adaptive_baselines
-            .promote_winner(&experiment, winner_variant_id)
+        let outcomes = experiment_store.get_outcomes(experiment_id);
+
+        let winner = experiment.variant(winner_variant_id).ok_or_else(|| {
+            format!(
+                "experiment {} missing winner variant {winner_variant_id}",
+                experiment.id
+            )
+        })?;
+        if winner.is_control || winner.config_diff.is_empty() {
+            return Ok(AdaptiveBaselinePromotionDecision::Skipped);
+        }
+
+        let analysis = ExperimentAnalyzer::analyze(&experiment, &outcomes);
+        let scope = AdaptiveBaselineScope::from_experiment(&experiment)
+            .ok_or_else(|| format!("experiment {} missing baseline scope tags", experiment.id))?;
+        let verdict = evaluate_promotion_verdict(
+            &experiment,
+            &analysis,
+            winner_variant_id,
+            self.adaptive_baselines.has_scope(&scope),
+            promotion_context,
+        )?;
+
+        match verdict.recommendation {
+            crate::evolution::types::ProposalPromotionRecommendation::Promote => {
+                match self
+                    .adaptive_baselines
+                    .promote_winner(&experiment, winner_variant_id)?
+                {
+                    Some(promotion) => {
+                        Ok(AdaptiveBaselinePromotionDecision::Promoted { promotion, verdict })
+                    }
+                    None => Ok(AdaptiveBaselinePromotionDecision::Skipped),
+                }
+            }
+            crate::evolution::types::ProposalPromotionRecommendation::Canary
+            | crate::evolution::types::ProposalPromotionRecommendation::Hold => {
+                Ok(AdaptiveBaselinePromotionDecision::Deferred(verdict))
+            }
+        }
     }
 
     /// Get the auto-tuning engine.
@@ -1063,6 +1118,7 @@ pub fn on_task_complete(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pipeline::routing::TaskType;
 
     #[test]
     fn test_observability_hub_creation() {
@@ -1136,7 +1192,10 @@ mod tests {
             session.goal_tracker.as_ref().map(|tracker| tracker.goal()),
             Some("ship billing flow")
         );
-        assert_eq!(session.recent_queries, vec!["ship billing flow".to_string()]);
+        assert_eq!(
+            session.recent_queries,
+            vec!["ship billing flow".to_string()]
+        );
         assert!(session.compressed_turns.is_empty());
         assert!(session.user_corrections.is_empty());
         assert!(session.context_traces.is_empty());
@@ -1365,5 +1424,88 @@ mod tests {
         // Oldest traces evicted, newest retained
         assert_eq!(guard.context_traces[0].turn_id, "turn-10");
         assert_eq!(guard.context_traces[49].turn_id, "turn-59");
+    }
+
+    #[test]
+    fn promote_experiment_winner_defers_on_significant_regression() {
+        let hub = ObservabilityHub::new();
+        let experiment = crate::ab_testing::Experiment::new("exp-mixed")
+            .with_variant(crate::ab_testing::Variant::control())
+            .with_variant(
+                crate::ab_testing::Variant::new("treatment")
+                    .with_traffic(0.5)
+                    .with_config_diff("memory.retrieval_top_k", serde_json::json!(8)),
+            )
+            .with_metric(crate::ab_testing::MetricDefinition::success_rate())
+            .with_metric(crate::ab_testing::MetricDefinition::token_usage())
+            .with_min_samples(5)
+            .with_tag("task_type:fetch")
+            .with_tag("domain:any")
+            .build();
+        let outcomes = vec![
+            crate::ab_testing::ExperimentOutcome::new("c1", "control")
+                .with_metric("success_rate", 0.35)
+                .with_metric("token_usage", 100.0),
+            crate::ab_testing::ExperimentOutcome::new("c2", "control")
+                .with_metric("success_rate", 0.40)
+                .with_metric("token_usage", 98.0),
+            crate::ab_testing::ExperimentOutcome::new("c3", "control")
+                .with_metric("success_rate", 0.45)
+                .with_metric("token_usage", 102.0),
+            crate::ab_testing::ExperimentOutcome::new("c4", "control")
+                .with_metric("success_rate", 0.38)
+                .with_metric("token_usage", 101.0),
+            crate::ab_testing::ExperimentOutcome::new("c5", "control")
+                .with_metric("success_rate", 0.42)
+                .with_metric("token_usage", 99.0),
+            crate::ab_testing::ExperimentOutcome::new("t1", "treatment")
+                .with_metric("success_rate", 0.80)
+                .with_metric("token_usage", 180.0),
+            crate::ab_testing::ExperimentOutcome::new("t2", "treatment")
+                .with_metric("success_rate", 0.85)
+                .with_metric("token_usage", 185.0),
+            crate::ab_testing::ExperimentOutcome::new("t3", "treatment")
+                .with_metric("success_rate", 0.88)
+                .with_metric("token_usage", 190.0),
+            crate::ab_testing::ExperimentOutcome::new("t4", "treatment")
+                .with_metric("success_rate", 0.90)
+                .with_metric("token_usage", 175.0),
+            crate::ab_testing::ExperimentOutcome::new("t5", "treatment")
+                .with_metric("success_rate", 0.86)
+                .with_metric("token_usage", 188.0),
+        ];
+
+        {
+            let store = hub.experiments_mut();
+            store.register(experiment.clone());
+            for outcome in outcomes {
+                store.record_outcome(&experiment.id, outcome);
+            }
+        }
+
+        let decision = hub
+            .promote_experiment_winner(&experiment.id, "treatment")
+            .expect("promotion decision");
+
+        match decision {
+            AdaptiveBaselinePromotionDecision::Deferred(verdict) => {
+                assert_eq!(
+                    verdict.recommendation,
+                    crate::evolution::types::ProposalPromotionRecommendation::Hold
+                );
+                assert!(
+                    verdict
+                        .blockers
+                        .iter()
+                        .any(|blocker| blocker.contains("token_usage"))
+                );
+            }
+            other => panic!("expected deferred decision, got {other:?}"),
+        }
+        assert!(
+            hub.adaptive_baselines()
+                .resolve(TaskType::Fetch, None)
+                .is_none()
+        );
     }
 }

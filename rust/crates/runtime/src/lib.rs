@@ -99,6 +99,7 @@ pub mod output_style;
 pub mod pipeline;
 pub mod plan;
 pub mod plan_decompose;
+pub mod promotion_context;
 pub mod prompts;
 pub mod runtime_config;
 pub mod scenario_router;

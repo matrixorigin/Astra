@@ -593,7 +593,10 @@ mod tests {
             } => {
                 assert_eq!(tool, "bash");
                 assert_eq!(call_id, "c1");
-                assert_eq!(arguments, Some(Value::String("{\"command\":\"ls\"}".to_string())));
+                assert_eq!(
+                    arguments,
+                    Some(Value::String("{\"command\":\"ls\"}".to_string()))
+                );
             }
             other => panic!("unexpected {other:?}"),
         }

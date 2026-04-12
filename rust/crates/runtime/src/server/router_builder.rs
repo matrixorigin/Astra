@@ -421,6 +421,10 @@ pub(super) fn build_router(state: AppState) -> Router {
             get(audit_handlers::audit_mutations_handler),
         )
         .route(
+            "/sessions/{session_id}/audit/promotions",
+            get(audit_handlers::audit_runtime_promotions_handler),
+        )
+        .route(
             "/sessions/{session_id}/audit/mutations/{mutation_id}/state",
             post(audit_handlers::audit_mutation_state_handler),
         )
@@ -440,6 +444,10 @@ pub(super) fn build_router(state: AppState) -> Router {
         .route(
             "/audit/mutations",
             get(audit_handlers::cross_session_mutations_handler),
+        )
+        .route(
+            "/audit/promotions",
+            get(audit_handlers::cross_session_runtime_promotions_handler),
         )
         // Marketplace
         .route(

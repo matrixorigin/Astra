@@ -1,7 +1,7 @@
 use super::*;
 use astra_services::session_audit::{
-    AuditSessionListParams, CrossSessionMutationListParams, CrossSessionStatsParams,
-    MutationStateUpdateRequest, TurnListParams,
+    AuditSessionListParams, CrossSessionMutationListParams, CrossSessionRuntimePromotionListParams,
+    CrossSessionStatsParams, MutationStateUpdateRequest, TurnListParams,
 };
 use astra_services::{EventCreateRequestData, StagedMutationState};
 
@@ -83,6 +83,21 @@ pub(super) async fn audit_mutations_handler(
         .await?;
     Ok(Json(
         serde_json::to_value(mutations).map_err(internal_error)?,
+    ))
+}
+
+pub(super) async fn audit_runtime_promotions_handler(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let user = state.auth_service.current_user(&headers).await?;
+    let promotions = state
+        .session_audit_service
+        .list_session_runtime_promotions(&user.user_id, &session_id)
+        .await?;
+    Ok(Json(
+        serde_json::to_value(promotions).map_err(internal_error)?,
     ))
 }
 
@@ -215,6 +230,19 @@ pub(super) async fn cross_session_mutations_handler(
     let result = state
         .session_audit_service
         .list_cross_session_mutations(&user.user_id, &params)
+        .await?;
+    Ok(Json(serde_json::to_value(result).map_err(internal_error)?))
+}
+
+pub(super) async fn cross_session_runtime_promotions_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<CrossSessionRuntimePromotionListParams>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let user = state.auth_service.current_user(&headers).await?;
+    let result = state
+        .session_audit_service
+        .list_cross_session_runtime_promotions(&user.user_id, &params)
         .await?;
     Ok(Json(serde_json::to_value(result).map_err(internal_error)?))
 }

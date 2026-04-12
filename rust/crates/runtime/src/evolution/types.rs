@@ -161,6 +161,35 @@ pub enum EntityAction {
     SetDomain(DomainHint),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProposalPromotionRecommendation {
+    Promote,
+    Canary,
+    Hold,
+}
+
+impl ProposalPromotionRecommendation {
+    pub fn priority(self) -> u8 {
+        match self {
+            Self::Promote => 0,
+            Self::Canary => 1,
+            Self::Hold => 2,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProposalPromotionVerdict {
+    pub recommendation: ProposalPromotionRecommendation,
+    pub confidence_score: f64,
+    pub support_score: f64,
+    pub safety_score: f64,
+    pub overall_score: f64,
+    pub evidence: Vec<String>,
+    pub blockers: Vec<String>,
+    pub rollback_hint: Option<String>,
+}
+
 /// A proposed evolution with metadata.
 #[derive(Debug, Clone)]
 pub struct EvolutionProposal {
@@ -171,6 +200,7 @@ pub struct EvolutionProposal {
     pub reasoning: String,
     pub created_at: u64,
     pub status: ApprovalStatus,
+    pub promotion_verdict: Option<ProposalPromotionVerdict>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -304,7 +334,20 @@ mod tests {
             reasoning: "test".into(),
             created_at: 0,
             status: ApprovalStatus::Pending,
+            promotion_verdict: None,
         };
         assert_eq!(p.status, ApprovalStatus::Pending);
+    }
+
+    #[test]
+    fn promotion_recommendation_priorities_sort_promote_first() {
+        assert!(
+            ProposalPromotionRecommendation::Promote.priority()
+                < ProposalPromotionRecommendation::Canary.priority()
+        );
+        assert!(
+            ProposalPromotionRecommendation::Canary.priority()
+                < ProposalPromotionRecommendation::Hold.priority()
+        );
     }
 }
