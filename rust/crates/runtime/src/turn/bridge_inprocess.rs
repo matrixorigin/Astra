@@ -30,7 +30,7 @@
 ///     x-mo-user-id, x-mo-session-id, x-mo-turn-chain-id, x-mo-user-query-event-id, ...
 ///   This bridge reads those headers, calls the LLM, streams SSE back, persists events, and
 ///   for each tool round blocks on [`super::edge_ledger`] until `POST /tools/result` (or timeout).
-use std::{collections::HashMap, sync::Arc, time::Instant};
+use std::{collections::HashMap, future::Future, sync::Arc, time::Instant};
 
 use async_stream::stream;
 use axum::body::Body;
@@ -168,6 +168,26 @@ fn apply_forward_llm_sse_event(
 
 fn reasoning_done_sse_bytes_if_needed(reasoning: &str) -> Option<Bytes> {
     (!reasoning.is_empty()).then(|| render_sse(&json!({"type": "reasoning_done"})))
+}
+
+async fn await_with_client_disconnect<T, F>(
+    cancel: Option<&CancellationToken>,
+    future: F,
+) -> Result<T, Map<String, Value>>
+where
+    F: Future<Output = T>,
+{
+    tokio::select! {
+        biased;
+        _ = crate::turn::llm_client::wait_until_cancelled_or_pending(cancel) => Err(
+            build_stream_error_event(
+                "Request cancelled (client disconnected)",
+                "CLIENT_DISCONNECT",
+                false,
+            ),
+        ),
+        out = future => Ok(out),
+    }
 }
 
 fn latest_user_message_text(messages: &[Value]) -> Option<&str> {
@@ -2012,9 +2032,24 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                         path.as_deref(),
                         detail.as_deref(),
                     ));
-                        match wait_approval_ledger_for_tool(
-                            &edge_callback_ledger, &user_id, tc, ledger_wait,
-                        ).await {
+                        let approval = match await_with_client_disconnect(
+                            cc.as_deref(),
+                            wait_approval_ledger_for_tool(
+                                &edge_callback_ledger,
+                                &user_id,
+                                tc,
+                                ledger_wait,
+                            ),
+                        )
+                        .await
+                        {
+                            Ok(approval) => approval,
+                            Err(event) => {
+                                yield render_sse_map(&event);
+                                return;
+                            }
+                        };
+                        match approval {
                             Ok(()) => {}
                             Err(part) => {
                                 for m in part.sse_maps {
@@ -2028,9 +2063,23 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                     for m in sse_maps_through_tool_request(tc) {
                         yield render_sse_map(&m);
                     }
-                    let tail = wait_tool_result_ledger_for_tool(
-                        &edge_callback_ledger, &user_id, tc, ledger_wait,
-                    ).await;
+                    let tail = match await_with_client_disconnect(
+                        cc.as_deref(),
+                        wait_tool_result_ledger_for_tool(
+                            &edge_callback_ledger,
+                            &user_id,
+                            tc,
+                            ledger_wait,
+                        ),
+                    )
+                    .await
+                    {
+                        Ok(tail) => tail,
+                        Err(event) => {
+                            yield render_sse_map(&event);
+                            return;
+                        }
+                    };
                     for m in tail.sse_maps {
                         yield render_sse_map(&m);
                     }
@@ -2057,7 +2106,20 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                         }
                     })).buffer_unordered(MAX_CONCURRENT_READ_ONLY_TOOLS);
                     tokio::pin!(tool_stream);
-                    while let Some(tail) = tool_stream.next().await {
+                    loop {
+                        let next_tail = match await_with_client_disconnect(
+                            cc.as_deref(),
+                            tool_stream.next(),
+                        )
+                        .await
+                        {
+                            Ok(next_tail) => next_tail,
+                            Err(event) => {
+                                yield render_sse_map(&event);
+                                return;
+                            }
+                        };
+                        let Some(tail) = next_tail else { break };
                         for m in tail.sse_maps {
                             yield render_sse_map(&m);
                         }
@@ -4462,6 +4524,35 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn await_with_client_disconnect_returns_future_output() {
+        let token = CancellationToken::new();
+        let result = await_with_client_disconnect(Some(&token), async { 42_u8 })
+            .await
+            .expect("future output");
+        assert_eq!(result, 42);
+    }
+
+    #[tokio::test]
+    async fn await_with_client_disconnect_returns_disconnect_error() {
+        let token = CancellationToken::new();
+        token.cancel();
+        let result = await_with_client_disconnect(Some(&token), async {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            42_u8
+        })
+        .await
+        .expect_err("disconnect error");
+        assert_eq!(
+            result.get("code").and_then(Value::as_str),
+            Some("CLIENT_DISCONNECT")
+        );
+        assert_eq!(
+            result.get("message").and_then(Value::as_str),
+            Some("Request cancelled (client disconnected)")
+        );
     }
 
     #[test]
