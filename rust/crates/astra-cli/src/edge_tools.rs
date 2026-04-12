@@ -1105,7 +1105,12 @@ impl ToolExecutor {
             "goals" => {
                 if let Some(ref model) = self_model {
                     serde_json::json!({
+                        "goal": model.goals.goal,
                         "session_goal": model.goals.session_goal,
+                        "plan_goal": model.goals.plan_goal,
+                        "tracked_goal": model.goals.tracked_goal,
+                        "goal_source": model.goals.goal_source,
+                        "tracking_status": model.goals.tracking_status,
                         "progress": model.goals.progress,
                         "recent_milestones": model.goals.recent_milestones,
                         "milestone_count": model.goals.milestone_count,
@@ -1199,6 +1204,8 @@ impl ToolExecutor {
             elapsed,
             session.user_corrections.len(),
             session.compressed_turns.len(),
+            goal_text,
+            None,
             goal_text,
             goal_progress.as_ref(),
             milestone_slice,

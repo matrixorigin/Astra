@@ -1,5 +1,4 @@
 use astra_runtime::self_model::ConstraintSet;
-use astra_runtime::turn::goal_tracker::GoalTracker;
 use serde_json::{Value, json};
 
 use super::ToolExecutor;
@@ -399,7 +398,6 @@ impl ToolExecutor {
                 return json!({"error": "Failed to acquire observability session"}).to_string();
             }
         };
-
         if let Some(session_id) = self.active_session_id.as_deref()
             && let Err(error) = crate::self_command::persist_goal_override(session_id, goal)
         {
@@ -411,8 +409,7 @@ impl ToolExecutor {
             .to_string();
         }
 
-        session.goal_tracker = Some(GoalTracker::new(goal));
-        session.original_query = Some(goal.to_string());
+        session.steer_goal(goal);
 
         json!({
             "status": "ok",

@@ -1079,6 +1079,43 @@ pub(super) fn handle_session_command(arg: &str, state: &mut ReplState) {
                                     .unwrap_or("lifecycle");
                                 eprintln!("  {} {} plan: {}", ts_short.dim(), "📋".cyan(), summary,);
                             }
+                            session_journal::JournalEventType::GoalSteered => {
+                                let source = evt
+                                    .metadata
+                                    .as_ref()
+                                    .and_then(|m| m.get("source"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("unknown");
+                                let new_goal = evt
+                                    .metadata
+                                    .as_ref()
+                                    .and_then(|m| m.get("new_goal"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("updated goal");
+                                if let Some(previous_goal) = evt
+                                    .metadata
+                                    .as_ref()
+                                    .and_then(|m| m.get("previous_goal"))
+                                    .and_then(|v| v.as_str())
+                                {
+                                    eprintln!(
+                                        "  {} {} goal steered ({}): {} -> {}",
+                                        ts_short.dim(),
+                                        "🎯".cyan(),
+                                        source,
+                                        previous_goal,
+                                        new_goal,
+                                    );
+                                } else {
+                                    eprintln!(
+                                        "  {} {} goal steered ({}): {}",
+                                        ts_short.dim(),
+                                        "🎯".cyan(),
+                                        source,
+                                        new_goal,
+                                    );
+                                }
+                            }
                             session_journal::JournalEventType::SessionFork => {
                                 let parent = evt
                                     .session_lineage
@@ -3949,6 +3986,7 @@ pub(super) async fn handle_resume_command(arg: &str, profile: Option<&str>, stat
             }
             if let Some(ref goal) = restored.plan_goal {
                 state.executing_plan_goal = Some(goal.clone());
+                repl_turn::steer_observability_goal(state, goal);
             }
             if let Some(ref json) = restored.plan_config_json {
                 state.plan_execution_config = serde_json::from_str(json).ok();

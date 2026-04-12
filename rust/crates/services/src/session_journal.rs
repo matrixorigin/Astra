@@ -671,6 +671,8 @@ pub enum JournalEventType {
     PlanEdit,
     /// Plan lifecycle event (created, completed, abandoned, replanned).
     PlanLifecycle,
+    /// Effective goal steering changed (manual goal set, active plan goal took over).
+    GoalSteered,
     /// Context assembly trace recorded (observability: prompt building details).
     ContextAssemblyRecorded,
     /// Focus drift detected during a turn (severity, cause, evidence).
@@ -1855,6 +1857,26 @@ impl JournalEvent {
         evt
     }
 
+    /// Goal steering event — manual goal set or plan-goal alignment took over.
+    pub fn goal_steered(
+        session_id: Option<&str>,
+        turn: u32,
+        source: &str,
+        previous_goal: Option<&str>,
+        new_goal: &str,
+        metadata: Option<serde_json::Value>,
+    ) -> Self {
+        let mut evt = Self::base(JournalEventType::GoalSteered, session_id);
+        evt.turn = Some(turn);
+        evt.metadata = Some(serde_json::json!({
+            "source": source,
+            "previous_goal": previous_goal,
+            "new_goal": new_goal,
+            "detail": metadata,
+        }));
+        evt
+    }
+
     /// Verification completed — emitted after subtask or global verification.
     pub fn verification_completed(
         session_id: Option<&str>,
@@ -2461,6 +2483,37 @@ mod tests {
         assert_eq!(
             m.get("summary").and_then(|v| v.as_str()),
             Some("Plan execution started")
+        );
+    }
+
+    #[test]
+    fn journal_event_goal_steered_serializes_and_round_trips() {
+        let evt = JournalEvent::goal_steered(
+            Some("sid-goal"),
+            4,
+            "edge_tool:set_goal",
+            Some("old goal"),
+            "new goal",
+            Some(serde_json::json!({"mode": "manual"})),
+        );
+        assert_eq!(evt.event_type, JournalEventType::GoalSteered);
+        let json = serde_json::to_string(&evt).unwrap();
+        assert!(json.contains("\"type\":\"goal_steered\""));
+        let parsed: JournalEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.event_type, JournalEventType::GoalSteered);
+        assert_eq!(parsed.turn, Some(4));
+        let metadata = parsed.metadata.expect("metadata");
+        assert_eq!(
+            metadata.get("source").and_then(|value| value.as_str()),
+            Some("edge_tool:set_goal")
+        );
+        assert_eq!(
+            metadata.get("previous_goal").and_then(|value| value.as_str()),
+            Some("old goal")
+        );
+        assert_eq!(
+            metadata.get("new_goal").and_then(|value| value.as_str()),
+            Some("new goal")
         );
     }
 

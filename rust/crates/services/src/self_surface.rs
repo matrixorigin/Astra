@@ -234,7 +234,11 @@ impl Default for SurfaceConstraints {
 pub struct GoalSurface {
     pub session_id: String,
     pub goal: Option<String>,
+    pub session_goal: Option<String>,
     pub plan_goal: Option<String>,
+    pub tracked_goal: Option<String>,
+    pub goal_source: String,
+    pub tracking_status: String,
     pub phase: String,
     pub plan_execution_rounds: usize,
     pub plan_corrections: Vec<String>,
@@ -664,6 +668,24 @@ fn build_run_surface(
     let budget = budget_state_from_artifacts(artifacts);
     let risk_flags = build_risk_flags(&budget, health, runtime_checks, evolution);
     let pending_blockers = build_pending_blockers(health, runtime_checks, &[]);
+    let session_goal = artifacts
+        .workspace
+        .as_ref()
+        .and_then(|ws| ws.session_goal.clone());
+    let plan_goal = artifacts
+        .workspace
+        .as_ref()
+        .and_then(|ws| ws.plan_goal.clone());
+    let tracked_goal = artifacts.workspace.as_ref().and_then(|ws| {
+        ws.goal_progress
+            .as_ref()
+            .map(|progress| progress.goal.clone())
+    });
+    let (effective_goal, _) = resolve_effective_goal(
+        session_goal.as_deref(),
+        plan_goal.as_deref(),
+        tracked_goal.as_deref(),
+    );
 
     RunSurface {
         session_id: artifacts.session_id.clone(),
@@ -694,10 +716,7 @@ fn build_run_surface(
                     .map(|restored| restored.turn_count)
             })
             .unwrap_or_default(),
-        goal: artifacts
-            .workspace
-            .as_ref()
-            .and_then(|ws| ws.session_goal.clone().or_else(|| ws.plan_goal.clone())),
+        goal: effective_goal,
         active_skill: latest_active_skill(&artifacts.journal_events),
         latest_user_request: latest_event_text(&artifacts.journal_events, true),
         latest_assistant_output: latest_event_text(&artifacts.journal_events, false),
@@ -818,18 +837,31 @@ fn build_goal_surface(
         .as_ref()
         .and_then(|ws| ws.goal_progress.as_ref())
         .map(goal_progress_view);
+    let session_goal = artifacts
+        .workspace
+        .as_ref()
+        .and_then(|ws| ws.session_goal.clone());
+    let plan_goal = artifacts
+        .workspace
+        .as_ref()
+        .and_then(|ws| ws.plan_goal.clone());
+    let tracked_goal = progress.as_ref().map(|view| view.tracked_goal.clone());
+    let (goal, goal_source) = resolve_effective_goal(
+        session_goal.as_deref(),
+        plan_goal.as_deref(),
+        tracked_goal.as_deref(),
+    );
+    let tracking_status =
+        goal_tracking_status(goal.as_deref(), tracked_goal.as_deref()).to_string();
 
     GoalSurface {
         session_id: artifacts.session_id.clone(),
-        goal: snapshot
-            .run
-            .goal
-            .clone()
-            .or_else(|| progress.as_ref().map(|view| view.tracked_goal.clone())),
-        plan_goal: artifacts
-            .workspace
-            .as_ref()
-            .and_then(|ws| ws.plan_goal.clone()),
+        goal,
+        session_goal,
+        plan_goal,
+        tracked_goal,
+        goal_source: goal_source.to_string(),
+        tracking_status,
         phase: snapshot.run.phase.clone(),
         plan_execution_rounds: artifacts
             .workspace
@@ -849,10 +881,38 @@ fn build_goal_surface(
                 JournalEventType::PlanProgress,
                 JournalEventType::PlanEdit,
                 JournalEventType::PlanLifecycle,
+                JournalEventType::GoalSteered,
                 JournalEventType::VerificationCompleted,
             ],
         ),
         pending_blockers: snapshot.run.pending_blockers.clone(),
+    }
+}
+
+fn resolve_effective_goal(
+    session_goal: Option<&str>,
+    plan_goal: Option<&str>,
+    tracked_goal: Option<&str>,
+) -> (Option<String>, &'static str) {
+    if let Some(goal) = plan_goal {
+        return (Some(goal.to_string()), "plan_goal");
+    }
+    if let Some(goal) = session_goal {
+        return (Some(goal.to_string()), "session_goal");
+    }
+    if let Some(goal) = tracked_goal {
+        return (Some(goal.to_string()), "tracked_goal");
+    }
+    (None, "none")
+}
+
+fn goal_tracking_status(effective_goal: Option<&str>, tracked_goal: Option<&str>) -> &'static str {
+    match (effective_goal, tracked_goal) {
+        (None, None) => "idle",
+        (Some(_), None) => "untracked",
+        (Some(goal), Some(tracked)) if goal == tracked => "aligned",
+        (Some(_), Some(_)) => "stale",
+        (None, Some(_)) => "tracked_only",
     }
 }
 
@@ -1805,7 +1865,7 @@ fn actor_for_event(event: &JournalEvent) -> &'static str {
         | JournalEventType::AdaptiveTuningRuleTriggered
         | JournalEventType::AdaptiveBaselinePromoted => "adaptive_engine",
         JournalEventType::VerificationCompleted => "verifier",
-        JournalEventType::ConfigChange => "self_mutation",
+        JournalEventType::ConfigChange | JournalEventType::GoalSteered => "self_mutation",
         JournalEventType::Turn | JournalEventType::TurnError if event.tool_calls.is_some() => {
             "agentic_loop"
         }
@@ -1815,7 +1875,10 @@ fn actor_for_event(event: &JournalEvent) -> &'static str {
 
 fn phase_for_event_type(event_type: &JournalEventType) -> &'static str {
     match event_type {
-        JournalEventType::Turn | JournalEventType::PlanProgress | JournalEventType::PlanEdit => {
+        JournalEventType::Turn
+        | JournalEventType::PlanProgress
+        | JournalEventType::PlanEdit
+        | JournalEventType::GoalSteered => {
             "execute"
         }
         JournalEventType::TurnError
@@ -1890,6 +1953,31 @@ fn summarize_event(event: &JournalEvent) -> String {
             "adaptive tuning rule triggered".to_string()
         }
         JournalEventType::AdaptiveBaselinePromoted => "adaptive baseline promoted".to_string(),
+        JournalEventType::GoalSteered => event
+            .metadata
+            .as_ref()
+            .map(|metadata| {
+                let source = metadata
+                    .get("source")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown");
+                let new_goal = metadata
+                    .get("new_goal")
+                    .and_then(serde_json::Value::as_str)
+                    .map(|goal| truncate(goal, 80))
+                    .unwrap_or_else(|| "updated goal".to_string());
+                match metadata
+                    .get("previous_goal")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    Some(previous) => format!(
+                        "goal steered via {source}: {} -> {new_goal}",
+                        truncate(previous, 40)
+                    ),
+                    None => format!("goal steered via {source}: {new_goal}"),
+                }
+            })
+            .unwrap_or_else(|| "goal steered".to_string()),
         JournalEventType::VerificationCompleted => event
             .error
             .as_deref()
@@ -1992,6 +2080,7 @@ fn event_type_name(event_type: &JournalEventType) -> String {
         JournalEventType::CompositeSnapshot => "composite_snapshot",
         JournalEventType::PlanEdit => "plan_edit",
         JournalEventType::PlanLifecycle => "plan_lifecycle",
+        JournalEventType::GoalSteered => "goal_steered",
         JournalEventType::ContextAssemblyRecorded => "context_assembly_recorded",
         JournalEventType::DriftDetected => "drift_detected",
         JournalEventType::AdaptiveScenarioApplied => "adaptive_scenario_applied",
@@ -2220,6 +2309,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn snapshot_run_goal_prefers_active_plan_goal() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(temp.path());
+        let session_id = "svc-self-snapshot-plan-goal";
+        let mut ws = WorkspaceMetadata::with_context(session_id, "gpt-5.4", "/repo", Some("main"));
+        ws.session_goal = Some("ship self surface".to_string());
+        ws.plan_goal = Some("execute migration plan".to_string());
+        session_workspace::write_workspace(&ws).unwrap();
+
+        let service =
+            LocalSelfSurfaceService::new().with_runtime_support(Arc::new(StubRuntimeSupport));
+        let snapshot = service.snapshot(session_id, 10).await.unwrap();
+
+        assert_eq!(snapshot.run.goal.as_deref(), Some("execute migration plan"));
+    }
+
+    #[tokio::test]
     async fn goal_surface_includes_persisted_goal_progress() {
         let temp = tempfile::tempdir().unwrap();
         let _guard = JournalDirGuard::new(temp.path());
@@ -2262,6 +2368,9 @@ mod tests {
         };
         let progress = goal.progress.expect("goal progress view");
         assert_eq!(goal.goal.as_deref(), Some("ship self surface"));
+        assert_eq!(goal.tracked_goal.as_deref(), Some("ship self surface"));
+        assert_eq!(goal.goal_source, "tracked_goal");
+        assert_eq!(goal.tracking_status, "aligned");
         assert_eq!(progress.tracked_goal, "ship self surface");
         assert_eq!(progress.milestone_count, 2);
         assert_eq!(progress.recent_milestones[0].signal, "build_success");
@@ -2269,6 +2378,60 @@ mod tests {
             progress.recent_milestones[0].detail.as_deref(),
             Some("build succeeded")
         );
+    }
+
+    #[tokio::test]
+    async fn goal_surface_exposes_plan_goal_alignment_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(temp.path());
+        let session_id = "svc-self-goal-alignment";
+        let mut ws = WorkspaceMetadata::with_context(session_id, "gpt-5.4", "/repo", Some("main"));
+        ws.session_goal = Some("ship self surface".to_string());
+        ws.plan_goal = Some("execute migration plan".to_string());
+        ws.goal_progress = Some(crate::session_workspace::GoalProgressSnapshot {
+            goal: "ship self surface".to_string(),
+            completion_score: 0.72,
+            momentum: 0.5,
+            milestone_count: 2,
+            summary: "Still tracking the old session goal".to_string(),
+            weighted_progress: 1.4,
+            negative_signals: 0.0,
+            milestones: vec![crate::session_workspace::GoalMilestoneSnapshot {
+                turn: 2,
+                signal: crate::session_workspace::GoalMilestoneSignalSnapshot::BuildSuccess,
+                relevance: 0.9,
+            }],
+        });
+        session_workspace::write_workspace(&ws).unwrap();
+        JournalWriter::new(session_id)
+            .unwrap()
+            .append(&JournalEvent::goal_steered(
+                Some(session_id),
+                2,
+                "plan_execution_start",
+                Some("ship self surface"),
+                "execute migration plan",
+                Some(serde_json::json!({"mode": "auto"})),
+            ))
+            .unwrap();
+
+        let service =
+            LocalSelfSurfaceService::new().with_runtime_support(Arc::new(StubRuntimeSupport));
+        let surface = service
+            .surface(session_id, SelfSurfaceDimension::Goal, 10)
+            .await
+            .unwrap();
+
+        let SelfSurfaceResponse::Goal(goal) = surface else {
+            panic!("expected goal surface");
+        };
+        assert_eq!(goal.goal.as_deref(), Some("execute migration plan"));
+        assert_eq!(goal.session_goal.as_deref(), Some("ship self surface"));
+        assert_eq!(goal.plan_goal.as_deref(), Some("execute migration plan"));
+        assert_eq!(goal.tracked_goal.as_deref(), Some("ship self surface"));
+        assert_eq!(goal.goal_source, "plan_goal");
+        assert_eq!(goal.tracking_status, "stale");
+        assert_eq!(goal.recent_goal_events[0].event_type, "goal_steered");
     }
 
     #[tokio::test]

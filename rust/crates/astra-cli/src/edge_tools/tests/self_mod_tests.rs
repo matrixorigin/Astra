@@ -133,6 +133,53 @@ async fn set_goal_and_compress_context_update_session_state() {
 }
 
 #[tokio::test]
+async fn legacy_goal_dimension_exposes_steering_state() {
+    let (exe, _session) = executor_with_session();
+
+    let set_goal_out = exe
+        .execute("set_goal", &json!({"goal": "Finish adaptive engine"}))
+        .await;
+    let parsed_goal: Value = serde_json::from_str(&set_goal_out).unwrap();
+    assert_eq!(parsed_goal["status"], "ok");
+
+    let goals_out = exe
+        .execute("get_agent_info", &json!({"dimension": "goals"}))
+        .await;
+    let parsed_goals: Value = serde_json::from_str(&goals_out).unwrap();
+    assert_eq!(parsed_goals["goal"], "Finish adaptive engine");
+    assert_eq!(parsed_goals["session_goal"], "Finish adaptive engine");
+    assert_eq!(parsed_goals["tracked_goal"], "Finish adaptive engine");
+    assert_eq!(parsed_goals["goal_source"], "session_goal");
+    assert_eq!(parsed_goals["tracking_status"], "aligned");
+}
+
+#[tokio::test]
+async fn persisted_set_goal_appends_goal_steered_journal_event() {
+    let (_tmp, _guard, exe, _session, session_id) = executor_with_persisted_session();
+
+    let out = exe
+        .execute("set_goal", &json!({"goal": "Persist steering event"}))
+        .await;
+    let parsed: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(parsed["status"], "ok");
+
+    let events = astra_services::session_journal::read_journal(&session_id).unwrap();
+    let goal_event = events
+        .iter()
+        .find(|event| event.event_type == astra_services::session_journal::JournalEventType::GoalSteered)
+        .expect("goal_steered event");
+    let metadata = goal_event.metadata.as_ref().expect("goal steering metadata");
+    assert_eq!(
+        metadata.get("source").and_then(|value| value.as_str()),
+        Some("edge_tool:set_goal")
+    );
+    assert_eq!(
+        metadata.get("new_goal").and_then(|value| value.as_str()),
+        Some("Persist steering event")
+    );
+}
+
+#[tokio::test]
 async fn self_mod_persists_goal_config_and_tool_preferences() {
     let (_tmp, _guard, exe, _session, session_id) = executor_with_persisted_session();
 

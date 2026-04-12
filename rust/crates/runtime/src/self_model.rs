@@ -109,8 +109,18 @@ pub struct TokenBudgetSnapshot {
 /// Goal tracking state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GoalState {
+    /// The effective goal currently steering the agent.
+    pub goal: Option<String>,
     /// The session goal (original user query).
     pub session_goal: Option<String>,
+    /// The active plan goal, if plan execution currently owns steering.
+    pub plan_goal: Option<String>,
+    /// The goal currently tracked by the live GoalTracker.
+    pub tracked_goal: Option<String>,
+    /// Which source currently provides the effective goal.
+    pub goal_source: String,
+    /// Whether tracked progress is aligned with the effective goal.
+    pub tracking_status: String,
     /// Goal progress analysis.
     pub progress: Option<GoalProgress>,
     /// Recent milestones (last 5).
@@ -174,7 +184,9 @@ impl SelfModel {
         session_elapsed_secs: u64,
         correction_count: usize,
         compression_count: usize,
-        goal_text: Option<&str>,
+        session_goal: Option<&str>,
+        plan_goal: Option<&str>,
+        tracked_goal: Option<&str>,
         goal_progress: Option<&GoalProgress>,
         milestones: Option<&[Milestone]>,
         recent_signals: &[FeedbackSignal],
@@ -248,9 +260,17 @@ impl SelfModel {
             })
             .unwrap_or_default();
         let milestone_count = milestones.map(|ms| ms.len()).unwrap_or(0);
+        let (goal, goal_source) =
+            resolve_effective_goal(session_goal, plan_goal, tracked_goal);
+        let tracking_status = goal_tracking_status(goal.as_deref(), tracked_goal).to_string();
 
         let goals = GoalState {
-            session_goal: goal_text.map(|s| s.to_string()),
+            goal,
+            session_goal: session_goal.map(|s| s.to_string()),
+            plan_goal: plan_goal.map(|s| s.to_string()),
+            tracked_goal: tracked_goal.map(|s| s.to_string()),
+            goal_source: goal_source.to_string(),
+            tracking_status,
             progress: goal_progress.cloned(),
             recent_milestones,
             milestone_count,
@@ -282,6 +302,33 @@ impl SelfModel {
             recent_signals: signal_summaries,
             constraints: ConstraintSet::default(),
         }
+    }
+}
+
+fn resolve_effective_goal(
+    session_goal: Option<&str>,
+    plan_goal: Option<&str>,
+    tracked_goal: Option<&str>,
+) -> (Option<String>, &'static str) {
+    if let Some(goal) = plan_goal {
+        return (Some(goal.to_string()), "plan_goal");
+    }
+    if let Some(goal) = session_goal {
+        return (Some(goal.to_string()), "session_goal");
+    }
+    if let Some(goal) = tracked_goal {
+        return (Some(goal.to_string()), "tracked_goal");
+    }
+    (None, "none")
+}
+
+fn goal_tracking_status(effective_goal: Option<&str>, tracked_goal: Option<&str>) -> &'static str {
+    match (effective_goal, tracked_goal) {
+        (None, None) => "idle",
+        (Some(_), None) => "untracked",
+        (Some(goal), Some(tracked)) if goal == tracked => "aligned",
+        (Some(_), Some(_)) => "stale",
+        (None, Some(_)) => "tracked_only",
     }
 }
 
@@ -325,13 +372,16 @@ impl SelfModel {
         }
 
         // ── Goal progress ──
-        if let Some(ref goal) = self.goals.session_goal {
+        if let Some(ref goal) = self.goals.goal {
             let truncated = if goal.len() > 100 {
                 format!("{}...", &goal[..97])
             } else {
                 goal.clone()
             };
             let _ = write!(s, "Goal: \"{}\"", truncated);
+            if self.goals.goal_source != "none" && self.goals.goal_source != "session_goal" {
+                let _ = write!(s, " [{}]", self.goals.goal_source);
+            }
             if let Some(ref progress) = self.goals.progress {
                 let _ = write!(
                     s,
@@ -345,6 +395,9 @@ impl SelfModel {
                         "→"
                     }
                 );
+            }
+            if self.goals.tracking_status == "stale" {
+                s.push_str(" (tracking stale)");
             }
             s.push('\n');
         }
@@ -442,11 +495,22 @@ impl SelfModel {
 
         // ── Goals ──
         s.push_str("\n## Goals\n");
-        if let Some(ref goal) = self.goals.session_goal {
-            let _ = writeln!(s, "- Session goal: \"{}\"", goal);
+        if let Some(ref goal) = self.goals.goal {
+            let _ = writeln!(s, "- Effective goal: \"{}\"", goal);
         } else {
             s.push_str("- No explicit goal set\n");
         }
+        if let Some(ref goal) = self.goals.session_goal {
+            let _ = writeln!(s, "- Session goal: \"{}\"", goal);
+        }
+        if let Some(ref goal) = self.goals.plan_goal {
+            let _ = writeln!(s, "- Plan goal: \"{}\"", goal);
+        }
+        if let Some(ref goal) = self.goals.tracked_goal {
+            let _ = writeln!(s, "- Tracked goal: \"{}\"", goal);
+        }
+        let _ = writeln!(s, "- Goal source: {}", self.goals.goal_source);
+        let _ = writeln!(s, "- Tracking status: {}", self.goals.tracking_status);
         if let Some(ref progress) = self.goals.progress {
             let _ = writeln!(s, "- Completion: {:.0}%", progress.completion_score * 100.0);
             let _ = writeln!(s, "- Momentum: {:.2}", progress.momentum);
@@ -613,12 +677,17 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
             &[],
             &config,
         );
         assert_eq!(model.capabilities.total_tools, 3);
         assert_eq!(model.state.turn_number, 3);
+        assert!(model.goals.goal.is_none());
         assert!(model.goals.session_goal.is_none());
+        assert_eq!(model.goals.goal_source, "none");
+        assert_eq!(model.goals.tracking_status, "idle");
         assert!(model.recent_signals.is_empty());
     }
 
@@ -645,20 +714,68 @@ mod tests {
             1,
             0,
             Some("Fix the auth bug"),
+            None,
+            Some("Fix the auth bug"),
             Some(&progress),
             None,
             &[],
             &config,
         );
+        assert_eq!(model.goals.goal.as_deref(), Some("Fix the auth bug"));
         assert_eq!(
             model.goals.session_goal.as_deref(),
             Some("Fix the auth bug")
         );
         assert_eq!(
+            model.goals.tracked_goal.as_deref(),
+            Some("Fix the auth bug")
+        );
+        assert_eq!(model.goals.goal_source, "session_goal");
+        assert_eq!(model.goals.tracking_status, "aligned");
+        assert_eq!(
             model.goals.progress.as_ref().unwrap().completion_score,
             0.45
         );
         assert_eq!(model.state.correction_count, 1);
+    }
+
+    #[test]
+    fn snapshot_with_plan_goal_reports_stale_tracking() {
+        let config = RuntimeConfig::default();
+        let model = SelfModel::snapshot(
+            &["bash"],
+            &[],
+            &[],
+            &[],
+            None,
+            8,
+            None,
+            None,
+            None,
+            300,
+            0,
+            0,
+            Some("Fix the auth bug"),
+            Some("Execute the migration plan"),
+            Some("Fix the auth bug"),
+            None,
+            None,
+            &[],
+            &config,
+        );
+
+        assert_eq!(model.goals.goal.as_deref(), Some("Execute the migration plan"));
+        assert_eq!(model.goals.session_goal.as_deref(), Some("Fix the auth bug"));
+        assert_eq!(
+            model.goals.plan_goal.as_deref(),
+            Some("Execute the migration plan")
+        );
+        assert_eq!(
+            model.goals.tracked_goal.as_deref(),
+            Some("Fix the auth bug")
+        );
+        assert_eq!(model.goals.goal_source, "plan_goal");
+        assert_eq!(model.goals.tracking_status, "stale");
     }
 
     #[test]
@@ -684,6 +801,8 @@ mod tests {
             10,
             0,
             0,
+            None,
+            None,
             None,
             None,
             None,
@@ -724,6 +843,8 @@ mod tests {
             Some("Fix the auth bug in user_service.rs"),
             None,
             None,
+            None,
+            None,
             &[],
             &config,
         );
@@ -754,6 +875,8 @@ mod tests {
             2,
             1,
             Some("Implement feature X"),
+            None,
+            None,
             None,
             None,
             &[],
@@ -787,6 +910,8 @@ mod tests {
             0,
             0,
             0,
+            None,
+            None,
             None,
             None,
             None,

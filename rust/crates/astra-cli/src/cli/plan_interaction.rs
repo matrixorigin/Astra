@@ -515,6 +515,27 @@ fn journal_plan_event(
     let _ = writer.append(&event);
 }
 
+pub(super) fn journal_goal_steering_event(
+    journal: &mut Option<session_journal::JournalWriter>,
+    turn: u32,
+    source: &str,
+    previous_goal: Option<&str>,
+    new_goal: &str,
+    metadata: Option<serde_json::Value>,
+) {
+    let Some(writer) = journal else {
+        return;
+    };
+    let _ = writer.append(&session_journal::JournalEvent::goal_steered(
+        None,
+        turn,
+        source,
+        previous_goal,
+        new_goal,
+        metadata,
+    ));
+}
+
 /// Cleanly shut down a running plan executor handle.
 ///
 /// Sends `Cancel`, drains remaining updates, and returns `true` if a handle was
@@ -1281,7 +1302,20 @@ async fn handle_plan_command(
                 step_by_step,
                 auto_execute: !step_by_step,
             });
-            state.executing_plan_goal = Some(goal);
+            state.executing_plan_goal = Some(goal.clone());
+            if let Some(change) = super::repl_turn::steer_observability_goal(state, &goal) {
+                journal_goal_steering_event(
+                    &mut state.journal,
+                    change.turn,
+                    "plan_execution_start",
+                    change.previous_goal.as_deref(),
+                    &goal,
+                    Some(serde_json::json!({
+                        "mode": if step_by_step { "step_by_step" } else { "auto" },
+                        "subtask_count": plan.subtasks.len(),
+                    })),
+                );
+            }
             state.plan_execution_rounds = 0;
             state.plan_execution_corrections.clear();
             state.executing_plan = Some(plan);

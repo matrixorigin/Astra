@@ -1733,6 +1733,30 @@ fn sync_session_state_to_workspace(
     }
 }
 
+pub(super) struct GoalSteeringChange {
+    pub previous_goal: Option<String>,
+    pub turn: u32,
+}
+
+pub(super) fn steer_observability_goal(state: &mut ReplState, goal: &str) -> Option<GoalSteeringChange> {
+    let Some(obs) = state.observability_session.as_ref() else {
+        return None;
+    };
+    let mut guard = obs.write().unwrap_or_else(|error| error.into_inner());
+    let previous_goal = guard
+        .goal_tracker
+        .as_ref()
+        .map(|tracker| tracker.goal().to_string())
+        .or_else(|| guard.original_query.clone());
+    if !guard.steer_goal(goal) {
+        return None;
+    }
+    Some(GoalSteeringChange {
+        previous_goal,
+        turn: guard.turn_number,
+    })
+}
+
 /// Apply persisted adaptive engine state to a newly created ObservabilitySession.
 /// Called when pending_adaptive_state was stashed during workspace restore and the
 /// ObservabilitySession is now available to receive it.
@@ -2515,6 +2539,32 @@ mod tests {
             .expect("adaptive state should remain pending");
         assert_eq!(adaptive.last_token_budget_direction, 1);
         assert_eq!(adaptive.active_experiment_id.as_deref(), Some("exp-1"));
+    }
+
+    #[test]
+    fn steer_observability_goal_updates_live_tracker() {
+        let mut state = ReplState::default();
+        let mut obs =
+            astra_runtime::observability_integration::ObservabilitySession::new_simple("sid-steer");
+        obs.record_query("finish auth flow");
+        obs.compressed_turns.push(2);
+        state.observability_session = Some(std::sync::Arc::new(std::sync::RwLock::new(obs)));
+
+        steer_observability_goal(&mut state, "ship billing flow");
+
+        let guard = state
+            .observability_session
+            .as_ref()
+            .unwrap()
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        assert_eq!(guard.original_query.as_deref(), Some("ship billing flow"));
+        assert_eq!(
+            guard.goal_tracker.as_ref().map(|tracker| tracker.goal()),
+            Some("ship billing flow")
+        );
+        assert_eq!(guard.recent_queries, vec!["ship billing flow".to_string()]);
+        assert!(guard.compressed_turns.is_empty());
     }
 
     #[test]

@@ -313,7 +313,7 @@ pub(crate) async fn execute_self_command(
         }
         SelfCmd::Mutate(SelfMutateCmd::Goal(SelfMutateGoalArgs { session_id, text })) => {
             let session_id = resolve_session_id(session_id.as_deref(), profile)?;
-            to_json(&persist_goal_mutation(&session_id, text)?)
+            to_json(&persist_goal_mutation(&session_id, text, "astra self mutate")?)
         }
     }
 }
@@ -529,9 +529,11 @@ fn build_self_model(artifacts: &SessionArtifacts) -> Result<SelfModel, String> {
     }
     let tracker = build_tool_health_tracker(&artifacts.journal_events, &blocked_tools);
     let skills = merged_skills(workspace);
-    let goal_text = workspace
-        .and_then(|ws| ws.session_goal.as_deref())
-        .or_else(|| workspace.and_then(|ws| ws.plan_goal.as_deref()));
+    let session_goal = workspace.and_then(|ws| ws.session_goal.as_deref());
+    let plan_goal = workspace.and_then(|ws| ws.plan_goal.as_deref());
+    let tracked_goal = workspace
+        .and_then(|ws| ws.goal_progress.as_ref())
+        .map(|progress| progress.goal.as_str());
     let scenario = latest_scenario(&artifacts.journal_events);
     let active_experiment = workspace.and_then(|ws| ws.active_experiment_id.as_deref());
     let session_elapsed_secs = workspace
@@ -578,7 +580,9 @@ fn build_self_model(artifacts: &SessionArtifacts) -> Result<SelfModel, String> {
         session_elapsed_secs,
         correction_count,
         compression_count,
-        goal_text,
+        session_goal,
+        plan_goal,
+        tracked_goal,
         None,
         None,
         &recent_signals,
@@ -605,6 +609,7 @@ fn build_goal_response(artifacts: &SessionArtifacts) -> GoalResponse {
                 JournalEventType::PlanProgress,
                 JournalEventType::PlanEdit,
                 JournalEventType::PlanLifecycle,
+                JournalEventType::GoalSteered,
                 JournalEventType::VerificationCompleted,
             ],
         ),
@@ -806,7 +811,11 @@ pub(crate) fn persist_config_override(
     serde_json::to_value(&preview).map_err(|e| e.to_string())
 }
 
-fn persist_goal_mutation(session_id: &str, text: &str) -> Result<GoalMutationResponse, String> {
+fn persist_goal_mutation(
+    session_id: &str,
+    text: &str,
+    source: &str,
+) -> Result<GoalMutationResponse, String> {
     let mut ws = session_workspace::read_workspace(session_id).map_err(|e| e.to_string())?;
     let old_goal = ws.session_goal.clone();
     ws.session_goal = Some(text.to_string());
@@ -820,6 +829,9 @@ fn persist_goal_mutation(session_id: &str, text: &str) -> Result<GoalMutationRes
         &serde_json::Value::String(text.to_string()),
         old_goal.clone().map(serde_json::Value::String),
     )?;
+    if old_goal.as_deref() != Some(text) {
+        append_goal_steering_event(session_id, ws.turn_count, source, old_goal.as_deref(), text, None)?;
+    }
     Ok(GoalMutationResponse {
         session_id: session_id.to_string(),
         old_goal,
@@ -832,7 +844,8 @@ pub(crate) fn persist_goal_override(
     session_id: &str,
     text: &str,
 ) -> Result<serde_json::Value, String> {
-    serde_json::to_value(persist_goal_mutation(session_id, text)?).map_err(|e| e.to_string())
+    serde_json::to_value(persist_goal_mutation(session_id, text, "edge_tool:set_goal")?)
+        .map_err(|e| e.to_string())
 }
 
 pub(crate) fn persist_tool_preferences(
@@ -994,6 +1007,27 @@ fn append_config_change_event(
             routing_domain_hint: None,
             entity_learn_skipped_no_domain: false,
         })
+        .map_err(|e| e.to_string())
+}
+
+pub(crate) fn append_goal_steering_event(
+    session_id: &str,
+    turn: u32,
+    source: &str,
+    previous_goal: Option<&str>,
+    new_goal: &str,
+    detail: Option<serde_json::Value>,
+) -> Result<(), String> {
+    let writer = session_journal::JournalWriter::new(session_id).map_err(|e| e.to_string())?;
+    writer
+        .append(&JournalEvent::goal_steered(
+            Some(session_id),
+            turn,
+            source,
+            previous_goal,
+            new_goal,
+            detail,
+        ))
         .map_err(|e| e.to_string())
 }
 
@@ -1826,6 +1860,7 @@ fn event_type_name(event_type: &JournalEventType) -> String {
         JournalEventType::CompositeSnapshot => "composite_snapshot",
         JournalEventType::PlanEdit => "plan_edit",
         JournalEventType::PlanLifecycle => "plan_lifecycle",
+        JournalEventType::GoalSteered => "goal_steered",
         JournalEventType::ContextAssemblyRecorded => "context_assembly_recorded",
         JournalEventType::DriftDetected => "drift_detected",
         JournalEventType::AdaptiveScenarioApplied => "adaptive_scenario_applied",

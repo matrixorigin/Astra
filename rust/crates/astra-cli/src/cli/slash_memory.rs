@@ -1457,7 +1457,23 @@ pub(super) async fn handle_memory_domain_command(
                                         auto_execute: true,
                                         ..Default::default()
                                     });
-                                    state.executing_plan_goal = Some(sub_arg.to_string());
+                                    let plan_goal = sub_arg.to_string();
+                                    state.executing_plan_goal = Some(plan_goal.clone());
+                                    if let Some(change) =
+                                        super::repl_turn::steer_observability_goal(state, &plan_goal)
+                                    {
+                                        super::plan_interaction::journal_goal_steering_event(
+                                            &mut state.journal,
+                                            change.turn,
+                                            "plan_execution_start",
+                                            change.previous_goal.as_deref(),
+                                            &plan_goal,
+                                            Some(serde_json::json!({
+                                                "mode": "auto",
+                                                "subtask_count": plan.subtasks.len(),
+                                            })),
+                                        );
+                                    }
                                     state.plan_execution_rounds = 0;
                                     state.plan_execution_corrections.clear();
                                     state.executing_plan = Some(plan);
@@ -1917,7 +1933,20 @@ async fn _old_handle_plan_mode_input(
             step_by_step: false,
             auto_execute: true,
         });
-        state.executing_plan_goal = Some(goal);
+        state.executing_plan_goal = Some(goal.clone());
+        if let Some(change) = super::repl_turn::steer_observability_goal(state, &goal) {
+            super::plan_interaction::journal_goal_steering_event(
+                &mut state.journal,
+                change.turn,
+                "plan_execution_start",
+                change.previous_goal.as_deref(),
+                &goal,
+                Some(serde_json::json!({
+                    "mode": "auto",
+                    "subtask_count": plan.subtasks.len(),
+                })),
+            );
+        }
         state.plan_execution_rounds = 0;
 
         // Store plan for auto-execution and exit plan mode
@@ -1950,7 +1979,20 @@ async fn _old_handle_plan_mode_input(
             step_by_step: true,
             auto_execute: false,
         });
-        state.executing_plan_goal = Some(goal);
+        state.executing_plan_goal = Some(goal.clone());
+        if let Some(change) = super::repl_turn::steer_observability_goal(state, &goal) {
+            super::plan_interaction::journal_goal_steering_event(
+                &mut state.journal,
+                change.turn,
+                "plan_execution_start",
+                change.previous_goal.as_deref(),
+                &goal,
+                Some(serde_json::json!({
+                    "mode": "step_by_step",
+                    "subtask_count": plan.subtasks.len(),
+                })),
+            );
+        }
         state.plan_execution_rounds = 0;
 
         state.plan_execution_corrections.clear();

@@ -283,6 +283,35 @@ impl ObservabilitySession {
         self.record_query_at(query, Instant::now());
     }
 
+    /// Explicitly steer the session onto a new goal and reset goal-specific drift state.
+    pub fn steer_goal(&mut self, goal: &str) -> bool {
+        let goal = goal.trim();
+        if goal.is_empty() {
+            return false;
+        }
+        let already_tracking = self
+            .goal_tracker
+            .as_ref()
+            .map(|tracker| tracker.goal() == goal)
+            .or_else(|| self.original_query.as_deref().map(|existing| existing == goal))
+            .unwrap_or(false);
+        if already_tracking {
+            return false;
+        }
+
+        self.original_query = Some(goal.to_string());
+        self.goal_tracker = Some(GoalTracker::new(goal));
+        self.recent_queries.clear();
+        self.recent_queries.push(goal.to_string());
+        self.compressed_turns.clear();
+        self.user_corrections.clear();
+        self.context_traces.clear();
+        self.drift_detector = DriftDetector::default();
+        self.last_reported_drift_turn = None;
+        self.last_query_at = None;
+        true
+    }
+
     fn record_query_at(&mut self, query: &str, query_time: Instant) {
         // Set original query on first turn
         if self.original_query.is_none() {
@@ -1087,6 +1116,32 @@ mod tests {
         let profile = hub.profiles().get_profile("user1");
         assert_eq!(profile.stats.total_queries, 1);
         assert_eq!(profile.stats.total_tool_calls, 1);
+    }
+
+    #[test]
+    fn steer_goal_resets_goal_specific_drift_state() {
+        let mut session = ObservabilitySession::new_simple("session-steer");
+        session.record_query("finish auth flow");
+        session.recent_queries.push("debug auth flow".to_string());
+        session.compressed_turns.push(3);
+        session.user_corrections.push(4);
+        session.context_traces.push(ContextAssemblyTrace::default());
+        session.last_reported_drift_turn = Some(7);
+        session.last_query_at = Some(Instant::now());
+
+        session.steer_goal("ship billing flow");
+
+        assert_eq!(session.original_query.as_deref(), Some("ship billing flow"));
+        assert_eq!(
+            session.goal_tracker.as_ref().map(|tracker| tracker.goal()),
+            Some("ship billing flow")
+        );
+        assert_eq!(session.recent_queries, vec!["ship billing flow".to_string()]);
+        assert!(session.compressed_turns.is_empty());
+        assert!(session.user_corrections.is_empty());
+        assert!(session.context_traces.is_empty());
+        assert_eq!(session.last_reported_drift_turn, None);
+        assert!(session.last_query_at.is_none());
     }
 
     #[test]
