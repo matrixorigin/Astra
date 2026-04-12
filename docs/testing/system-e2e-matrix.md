@@ -39,7 +39,9 @@ Evaluation **read** routes in the full journey use `x-user-id` without bearer (s
 
 ## Test binaries (ignored by default)
 
-Eight tests total — overlap with the full journey is avoided (e.g. no separate “basic session” test that repeats the same list/get/close/resume steps).
+Nine tests in `system_matrix_http_e2e` — overlap with the full journey is avoided (e.g. no separate “basic session” test that repeats the same list/get/close/resume steps).
+
+**Related (separate crate / gate):** `ASTRA_SERVICES_DB_IT=1` runs `cargo test -p astra-services --test services_db_integration -- --ignored` (MatrixOne): pagination clamps, `skills_registry` list/index, cross-session audit service paths, and `MatrixOneDurableTaskLifecycle::resume_task` verification history (see that test file’s module doc).
 
 | Test name | File / module | Scope |
 |-----------|---------------|-------|
@@ -51,6 +53,7 @@ Eight tests total — overlap with the full journey is avoided (e.g. no separate
 | `e2e_matrix_auth_session_negative_paths` | `journey_extended.rs` | `GET /sessions` without auth (401); duplicate `POST /auth/register`; bad `POST /auth/login`; successful login |
 | `e2e_matrix_memory_proxy_user_isolation` | `journey_extended.rs` | Unauthenticated `POST /memory/store` (401); spoofed `user_id`/`session_id` in body → forwarder receives JWT `user_id` for both fields |
 | `e2e_matrix_models_admin_crud` | `journey_extended.rs` | SQL `astra_admin` role grant; `POST/PUT/DELETE /models` with `provider: mock` + `infra_llm_models` row checks |
+| `e2e_matrix_audit_cross_session_analytics_http` | `journey_audit_cross_session.rs` | Seed `agent_sessions` / `agent_events` / `ctx_decision_audits`; `GET /audit/stats`, `GET /audit/mutations`, `GET /audit/promotions` JSON assertions |
 
 Shared helpers: `tests/system_matrix_http_e2e/harness.rs` (`bootstrap`, `grant_astra_admin_role`, HTTP helpers, `cleanup_*`, row getters, SSE helpers, `wait_for_agent_event_types` — polls `agent_events` after `chat/turn` instead of a fixed sleep).
 
@@ -70,7 +73,7 @@ Legend: **DB** = SQL assertion on MatrixOne; **HTTP** = response-only; **—** =
 | Meta | P0 | `GET /health`, `GET /` | — | `product_matrix_*` |
 | Auth | P0 | `/auth/register`, `/login`, `/refresh`, `/me`, `/logout` | `auth_users` | Every test uses `bootstrap` (register/login); `product_matrix_*` also hits `/auth/refresh` and `/logout` |
 | Sessions | P0 | `/sessions`, `.../close`, `.../resume`, `.../cancel`, `DELETE ...`, `.../activity` | `agent_sessions` | `product_matrix_*` + `e2e_matrix_session_cancel_delete` |
-| Session audit | P0 | `/sessions/{id}/audit/*`, `/audit/*` | mostly HTTP | `product_matrix_*` |
+| Session audit | P0 | `/sessions/{id}/audit/*`, `/audit/*` | mostly HTTP | `product_matrix_*`; `e2e_matrix_audit_cross_session_analytics_http` (`/audit/stats`, `/audit/mutations`, `/audit/promotions` + DB seed) |
 | Agents | P0 | `/agents` CRUD | `agent_agents` | `product_matrix_*` |
 | Models | P1 | `GET /models`, admin `POST/PUT/DELETE /models` | `infra_llm_models` | `product_matrix_*` (list); `e2e_matrix_models_admin_crud` (admin CRUD + DB) |
 | Events | P0 | `/events`, causal chain, session events | `agent_events` | `product_matrix_*` |

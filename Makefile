@@ -419,7 +419,8 @@ test-runtime-bridge-hooks:
 # Ignored tests: opt-in via env vars (see `make test-online`). Enable with:
 #   ASTRA_SYSTEM_MATRIX_E2E=1   -> system_matrix_http_e2e (--ignored)
 #   ASTRA_MULTI_AGENT_IT=1      -> astra-services multi_agent_integration + team_persistence (--ignored)
-#   ASTRA_SERVICES_DB_IT=1      -> astra-services services_db_integration (--ignored)
+#   ASTRA_SERVICES_DB_IT=1      -> astra-services services_db_integration (--ignored): list clamps,
+#                                 skills index, cross-session audit stats/lists, durable_task resume history
 # Optional serial Matrix E2E: ASTRA_SYSTEM_MATRIX_E2E_TEST_THREADS=1 -> --test-threads=1
 .PHONY: test-ignored-integration
 test-ignored-integration:

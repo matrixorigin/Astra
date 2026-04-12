@@ -733,7 +733,8 @@ impl DatabaseSessionAuditService {
         }
         let override_where_clause = override_where_parts.join(" AND ");
         let overrides_sql = format!(
-            "SELECT e.session_id, CAST(e.metadata AS CHAR) AS metadata, e.created_at \
+            "SELECT e.session_id, CAST(e.metadata AS CHAR) AS metadata, \
+             CAST(e.created_at AS CHAR) AS created_at \
              FROM agent_events e \
              WHERE {override_where_clause} AND e.event_type = 'mutation_state' \
              ORDER BY e.created_at DESC LIMIT ?"
@@ -755,7 +756,7 @@ impl DatabaseSessionAuditService {
                     .unwrap_or(serde_json::Value::Null);
                 parse_mutation_state_override(
                     &metadata,
-                    row.try_get("created_at").unwrap_or_default(),
+                    row.try_get::<String, _>("created_at").unwrap_or_default(),
                 )
                 .map(|override_entry| {
                     (
@@ -777,7 +778,8 @@ impl DatabaseSessionAuditService {
         until: Option<&str>,
     ) -> AuditResult<Vec<RuntimePromotionRecord>> {
         let mut sql = String::from(
-            "SELECT event_id, session_id, metadata, created_at \
+            "SELECT event_id, session_id, CAST(metadata AS CHAR) AS metadata, \
+             CAST(created_at AS CHAR) AS created_at \
              FROM agent_events \
              WHERE user_id = ? AND event_type = ?",
         );
@@ -1392,7 +1394,7 @@ impl SessionAuditService for DatabaseSessionAuditService {
             .collect::<Vec<_>>();
 
         let override_rows = query(
-            "SELECT CAST(metadata AS CHAR) AS metadata, created_at \
+            "SELECT CAST(metadata AS CHAR) AS metadata, CAST(created_at AS CHAR) AS created_at \
              FROM agent_events \
              WHERE session_id = ? AND user_id = ? AND event_type = 'mutation_state' \
              ORDER BY created_at ASC",
@@ -1413,7 +1415,7 @@ impl SessionAuditService for DatabaseSessionAuditService {
                     .unwrap_or(serde_json::Value::Null);
                 parse_mutation_state_override(
                     &metadata,
-                    row.try_get("created_at").unwrap_or_default(),
+                    row.try_get::<String, _>("created_at").unwrap_or_default(),
                 )
             })
             .collect::<Vec<_>>();
@@ -1439,7 +1441,8 @@ impl SessionAuditService for DatabaseSessionAuditService {
             .await?;
 
         let rows = query(
-            "SELECT event_id, session_id, metadata, created_at \
+            "SELECT event_id, session_id, CAST(metadata AS CHAR) AS metadata, \
+             CAST(created_at AS CHAR) AS created_at \
              FROM agent_events \
              WHERE user_id = ? AND session_id = ? AND event_type = ? \
              ORDER BY created_at DESC",
