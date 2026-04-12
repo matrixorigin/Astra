@@ -1186,6 +1186,7 @@ mod tests {
         let sse = concat!(
             "data: {\"type\":\"session_info\",\"session_id\":\"s-x\",\"run_id\":\"r-y\"}\n\n",
             "data: {\"type\":\"text_delta\",\"content\":\"hello\"}\n\n",
+            "data: {\"type\":\"run_finished\",\"run_id\":\"r-y\",\"status\":\"completed\"}\n\n",
         );
         Mock::given(method("POST"))
             .and(path("/chat/stream"))
@@ -1197,13 +1198,23 @@ mod tests {
         let client = ThinClient::new(&srv.uri(), None).unwrap();
         let req = ChatStreamRequest::new("ping");
         let evs = client.chat_stream_collect(&req, Some("tkn")).await.unwrap();
-        assert_eq!(evs.len(), 2);
+        assert_eq!(evs.len(), 3);
         assert!(matches!(
             evs[0],
             StreamEvent::SessionInfo {
                 ref session_id,
                 ref run_id,
             } if session_id == "s-x" && run_id.as_deref() == Some("r-y")
+        ));
+        assert!(matches!(
+            evs[2],
+            StreamEvent::RunFinished {
+                ref run_id,
+                ref status,
+                ref error,
+            } if run_id.as_deref() == Some("r-y")
+                && status.as_deref() == Some("completed")
+                && error.is_none()
         ));
     }
 

@@ -207,8 +207,24 @@ pub enum StreamEvent {
         agent_id: Value,
         result: Value,
     },
-    RunStarted,
-    RunFinished,
+    RunStarted {
+        run_id: Option<String>,
+        session_id: Option<String>,
+    },
+    RunPaused {
+        run_id: Option<String>,
+    },
+    RunResumed {
+        run_id: Option<String>,
+    },
+    RunCancelled {
+        run_id: Option<String>,
+    },
+    RunFinished {
+        run_id: Option<String>,
+        status: Option<String>,
+        error: Option<String>,
+    },
     Ping,
     Done {
         tokens_used: Option<u64>,
@@ -319,8 +335,24 @@ pub fn classify_stream_event(value: Value) -> Result<StreamEvent, crate::error::
             agent_id: obj.get("agent_id").cloned().unwrap_or(Value::Null),
             result: obj.get("result").cloned().unwrap_or(Value::Null),
         },
-        "run_started" => StreamEvent::RunStarted,
-        "run_finished" => StreamEvent::RunFinished,
+        "run_started" => StreamEvent::RunStarted {
+            run_id: optional_str(&obj, "run_id"),
+            session_id: optional_str(&obj, "session_id"),
+        },
+        "run_paused" => StreamEvent::RunPaused {
+            run_id: optional_str(&obj, "run_id"),
+        },
+        "run_resumed" => StreamEvent::RunResumed {
+            run_id: optional_str(&obj, "run_id"),
+        },
+        "run_cancelled" => StreamEvent::RunCancelled {
+            run_id: optional_str(&obj, "run_id"),
+        },
+        "run_finished" => StreamEvent::RunFinished {
+            run_id: optional_str(&obj, "run_id"),
+            status: optional_str(&obj, "status"),
+            error: optional_str(&obj, "error"),
+        },
         "ping" => StreamEvent::Ping,
         "done" => StreamEvent::Done {
             tokens_used: obj.get("tokens_used").and_then(|v| v.as_u64()).or_else(|| {
@@ -380,6 +412,12 @@ fn get_str(obj: &serde_json::Map<String, Value>, key: &str) -> String {
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string()
+}
+
+fn optional_str(obj: &serde_json::Map<String, Value>, key: &str) -> Option<String> {
+    obj.get(key)
+        .and_then(|v| v.as_str())
+        .map(std::string::ToString::to_string)
 }
 
 #[cfg(test)]
@@ -456,6 +494,41 @@ mod tests {
                 assert_eq!(args["command"], "ls");
             }
             e => panic!("unexpected {e:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_run_lifecycle_events() {
+        let started = serde_json::json!({
+            "type": "run_started",
+            "run_id": "run-1",
+            "session_id": "sess-1"
+        });
+        match classify_stream_event(started).unwrap() {
+            StreamEvent::RunStarted { run_id, session_id } => {
+                assert_eq!(run_id.as_deref(), Some("run-1"));
+                assert_eq!(session_id.as_deref(), Some("sess-1"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        let finished = serde_json::json!({
+            "type": "run_finished",
+            "run_id": "run-1",
+            "status": "failed",
+            "error": "boom"
+        });
+        match classify_stream_event(finished).unwrap() {
+            StreamEvent::RunFinished {
+                run_id,
+                status,
+                error,
+            } => {
+                assert_eq!(run_id.as_deref(), Some("run-1"));
+                assert_eq!(status.as_deref(), Some("failed"));
+                assert_eq!(error.as_deref(), Some("boom"));
+            }
+            other => panic!("unexpected {other:?}"),
         }
     }
 
