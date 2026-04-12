@@ -4,7 +4,6 @@ description: "Context-aware code review: git diffs + code intelligence (symbols,
 author: "astra"
 
 tools:
-  - bash
   - read_file
   - grep
   - glob

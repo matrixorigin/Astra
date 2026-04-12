@@ -4702,20 +4702,18 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                     });
                 }
                 post_skill_tool_calls = Vec::new(); // clear remaining
-                if !quiet {
-                    let verb = if skill_produced_output {
-                        "skipped"
-                    } else {
-                        "deferred"
-                    };
-                    host.emit_headless_line(
-                        HeadlessStderrStyle::Dim,
-                        format!(
-                            "  ⏸ {} non-skill tool call(s) {} — skill takes priority",
-                            dropped_count, verb
-                        ),
-                    );
-                }
+                let verb = if skill_produced_output {
+                    "skipped"
+                } else {
+                    "deferred"
+                };
+                tracing::debug!(
+                    dropped_count,
+                    verb,
+                    "skill exclusivity: {} non-skill tool call(s) {}",
+                    dropped_count,
+                    verb
+                );
             } else {
                 post_skill_tool_calls = remaining;
             }
@@ -8149,10 +8147,11 @@ mod tests {
                 .contains("# Skill: test-skill")
         );
 
-        // Host should have emitted a deferred notice
+        // Skill exclusivity drop is now a debug log, not a user-facing headless line.
+        // Verify the host did NOT receive any deferred notice (it goes to tracing now).
         assert!(
-            host.emitted_lines.iter().any(|l| l.contains("deferred")),
-            "Expected deferred notice in emitted lines: {:?}",
+            !host.emitted_lines.iter().any(|l| l.contains("deferred")),
+            "Should NOT emit deferred notice to user: {:?}",
             host.emitted_lines
         );
     }

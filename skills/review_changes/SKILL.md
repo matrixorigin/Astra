@@ -18,7 +18,6 @@ allowed_tools:
   - read_file
   - grep
   - glob
-  - bash
 ---
 # Review Changes
 
@@ -29,6 +28,13 @@ trait implementations, and call graph impact.
 **Signal-to-noise philosophy**: Only surface issues that genuinely matter — bugs, security
 vulnerabilities, logic errors, API breakage, missing tests. Never comment on style,
 formatting, or trivial matters.
+
+**Efficiency rules:**
+- Use `read_file` with line ranges instead of reading entire files
+- Make **parallel** tool calls when reading multiple independent files
+- Never read the same file twice — gather all needed ranges in one pass
+- Use `git_diff` with `stat_only: true` FIRST to plan which files to deep-dive
+- Use `git_diff` with `path: "file.rs"` for targeted per-file diffs instead of full repo diff
 
 ## Task
 
@@ -58,10 +64,16 @@ $ARGUMENTS
 
 ### 1.2 Assess Scope Before Deep Dive
 
-First call `git_diff` with `stat_only: true` to see the file list:
+**⚠ CRITICAL workflow — always follow this exact sequence:**
+
+1. **First call**: `git_diff` with `stat_only: true` to get the file list and line counts
+2. **Then**: For each interesting file, call `git_show` or `git_diff` with `path: "specific/file.rs"` to get per-file diffs
+3. **Never**: Request the full diff of all files at once — this wastes context
+
+Scope guidelines based on the stat output:
 - **Trivial** (<50 lines, 1-2 files): Quick inline review
 - **Medium** (50-300 lines, 3-10 files): Per-file review with cross-file analysis
-- **Large** (>300 lines, >10 files): Ask user to narrow scope, or review only the most critical files
+- **Large** (>300 lines, >10 files): Review only the most critical files (core logic, public API, largest hunks)
 
 For large diffs, **do not** read every file. Focus on:
 - Core logic changes (skip config, docs, generated files)
@@ -90,9 +102,9 @@ For each changed file, use astra's code intelligence to extract symbols:
 3. **Find callers of changed symbols** — grep for function names across codebase
 4. **Check if signature changed** — parameter types, return type, generics
 
-```bash
-# For each modified function, find callers
-grep -rn "function_name(" --include="*.rs" rust/crates/ | grep -v "test" | head -20
+Use the built-in `grep` tool for caller analysis:
+```json
+{"pattern": "function_name(", "path": "rust/crates/", "glob": "*.rs"}
 ```
 
 ### 2.2 Import/Dependency Changes
@@ -242,6 +254,10 @@ If cloud-synced data structures changed:
 ---
 
 ## Phase 6: Review Report
+
+**⚠ CRITICAL: Do NOT start writing the review report until ALL analysis in Phases 1-5 is
+complete. While you are still making tool calls to gather information, output NOTHING as text.
+The review box below must be your FINAL text output — no tool calls after it.**
 
 ```
 ╔══════════════════════════════════════════════════════════════╗

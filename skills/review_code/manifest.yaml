@@ -4,7 +4,6 @@ description: "Code review focused on test quality: unhappy paths, E2E with DB as
 author: "astra"
 
 tools:
-  - bash
   - read_file
   - grep
   - glob
