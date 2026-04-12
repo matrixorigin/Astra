@@ -75,6 +75,26 @@ pub(super) fn is_session_service_unconfigured_error(
     error.0 == StatusCode::NOT_IMPLEMENTED && error.1.0.detail == "Session service not configured"
 }
 
+fn chat_stream_bridge_fallback_payload(
+    chat_data: &astra_services::runs::ChatRequestData,
+) -> serde_json::Value {
+    serde_json::json!({
+        "session_id": chat_data.session_id.as_deref(),
+        "agent_id": chat_data.agent_id.as_deref(),
+        "model": chat_data.model.as_deref(),
+        "skill_search": chat_data.skill_search.as_ref(),
+        "context": chat_data.context.as_ref(),
+        "max_candidates": chat_data.max_candidates,
+        "explain": chat_data.explain,
+        "messages": [
+            {
+                "role": "user",
+                "content": chat_data.message.as_str(),
+            }
+        ],
+    })
+}
+
 pub(super) async fn chat_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -142,18 +162,7 @@ pub(super) async fn chat_stream_handler(
         {
             // Fallback path: route /chat/stream through chat-turn bridge when lifecycle
             // service isn't wired yet. This preserves CLI usability during cutover.
-            let payload = serde_json::json!({
-                "session_id": chat_data.session_id,
-                "agent_id": chat_data.agent_id,
-                "model": chat_data.model,
-                "context": chat_data.context,
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": chat_data.message
-                    }
-                ]
-            });
+            let payload = chat_stream_bridge_fallback_payload(&chat_data);
             let body = match serde_json::to_vec(&payload).map(Bytes::from) {
                 Ok(body) => body,
                 Err(e) => {
@@ -340,6 +349,9 @@ pub(super) async fn chat_route_handler(
 
 #[cfg(test)]
 mod tests {
+    use astra_core::SkillSearchSettings;
+    use astra_services::runs::ChatRequestData;
+
     use super::*;
 
     #[test]
@@ -401,19 +413,28 @@ mod tests {
 
     #[test]
     fn chat_stream_fallback_payload_shape() {
-        let payload = serde_json::json!({
-            "session_id": Some("s1"),
-            "agent_id": Some("a1"),
-            "model": Some("gpt-4"),
-            "context": null,
-            "messages": [{
-                "role": "user",
-                "content": "hello"
-            }]
+        let payload = chat_stream_bridge_fallback_payload(&ChatRequestData {
+            message: "hello".to_string(),
+            session_id: Some("s1".to_string()),
+            agent_id: Some("a1".to_string()),
+            model: Some("gpt-4".to_string()),
+            skill_search: Some(SkillSearchSettings {
+                dynamic_surface: false,
+                min_catalog_size: 12,
+                surface_cap: 20,
+            }),
+            context: None,
+            max_candidates: 3,
+            explain: true,
         });
         let obj = payload.as_object().unwrap();
         assert!(obj.contains_key("messages"));
         assert!(obj.contains_key("session_id"));
+        assert_eq!(obj["max_candidates"], 3);
+        assert_eq!(obj["explain"], true);
+        assert_eq!(obj["skill_search"]["dynamic_surface"], false);
+        assert_eq!(obj["skill_search"]["min_catalog_size"], 12);
+        assert_eq!(obj["skill_search"]["surface_cap"], 20);
         let messages = obj["messages"].as_array().unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0]["role"], "user");
@@ -1068,7 +1089,7 @@ mod chat_stream_bridge_fallback_tests {
                     .header("authorization", "Bearer good-token")
                     .header("content-type", "application/json")
                     .body(Body::from(
-                        r#"{"message":"hi","session_id":"s1","model":"demo-model"}"#,
+                        r#"{"message":"hi","session_id":"s1","model":"demo-model","context":{"topic":"runtime"},"skill_search":{"dynamic_surface":false,"min_catalog_size":12,"surface_cap":20},"max_candidates":3,"explain":true}"#,
                     ))
                     .expect("request should build"),
             )
@@ -1091,6 +1112,12 @@ mod chat_stream_bridge_fallback_tests {
             .expect("bridge should receive payload");
         assert_eq!(forwarded["session_id"], "s1");
         assert_eq!(forwarded["model"], "demo-model");
+        assert_eq!(forwarded["context"]["topic"], "runtime");
+        assert_eq!(forwarded["skill_search"]["dynamic_surface"], false);
+        assert_eq!(forwarded["skill_search"]["min_catalog_size"], 12);
+        assert_eq!(forwarded["skill_search"]["surface_cap"], 20);
+        assert_eq!(forwarded["max_candidates"], 3);
+        assert_eq!(forwarded["explain"], true);
         assert_eq!(forwarded["messages"][0]["role"], "user");
         assert_eq!(forwarded["messages"][0]["content"], "hi");
     }

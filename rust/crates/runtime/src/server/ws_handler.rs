@@ -181,6 +181,8 @@ pub(super) enum WsServerMessage {
 /// Per-connection state for an authenticated WebSocket session.
 struct WsConnection {
     user: AuthUserRecord,
+    /// Normalized bearer header captured during WS auth and replayed on bridge fallback.
+    authorization: String,
     /// Trusted session bound by the server after validation or creation.
     session_id: Option<String>,
     /// Untrusted session requested during the initial handshake. This is only
@@ -346,6 +348,7 @@ async fn authenticate_with_token(
             .await;
             Ok(WsConnection {
                 user,
+                authorization: bearer,
                 session_id: None,
                 pending_session_id: session_id,
                 active_run_id: None,
@@ -678,6 +681,36 @@ fn build_bridge_chat_payload(
             "content": content
         }]
     })
+}
+
+fn build_ws_bridge_headers(
+    state: &AppState,
+    conn: &WsConnection,
+) -> Result<HeaderMap, &'static str> {
+    let mut bridge_headers = HeaderMap::new();
+    let secret_hv = HeaderValue::from_str(&state.chat_turn_bridge_secret)
+        .map_err(|_| "Invalid bridge secret for headers")?;
+    bridge_headers.insert(HeaderName::from_static("x-mo-bridge-secret"), secret_hv);
+    let user_id_hv =
+        HeaderValue::from_str(&conn.user.user_id).map_err(|_| "Invalid user_id for headers")?;
+    bridge_headers.insert(HeaderName::from_static("x-mo-user-id"), user_id_hv);
+    let authorization_hv = HeaderValue::from_str(&conn.authorization)
+        .map_err(|_| "Invalid authorization header")?;
+    bridge_headers.insert(
+        HeaderName::from_static("authorization"),
+        authorization_hv,
+    );
+    let username_b64 = URL_SAFE.encode(conn.user.username.as_bytes());
+    bridge_headers.insert(
+        HeaderName::from_static("x-mo-username-b64"),
+        HeaderValue::from_str(&username_b64)
+            .unwrap_or_else(|_| HeaderValue::from_static("unknown")),
+    );
+    bridge_headers.insert(
+        HeaderName::from_static("x-mo-bridge-capabilities"),
+        HeaderValue::from_static("state-sync-v1"),
+    );
+    Ok(bridge_headers)
 }
 
 async fn resolve_bridge_payload_session_id(
@@ -1128,15 +1161,13 @@ async fn handle_chat_message_via_bridge(
         }
     };
 
-    // Build bridge headers
-    let mut bridge_headers = HeaderMap::new();
-    let secret_hv = match HeaderValue::from_str(&state.chat_turn_bridge_secret) {
-        Ok(v) => v,
-        Err(_) => {
+    let mut bridge_headers = match build_ws_bridge_headers(state, conn) {
+        Ok(headers) => headers,
+        Err(message) => {
             send_msg(
                 socket,
                 &WsServerMessage::Error {
-                    message: "Invalid bridge secret for headers".into(),
+                    message: message.into(),
                     code: "INTERNAL_ERROR".into(),
                     retryable: false,
                 },
@@ -1145,35 +1176,6 @@ async fn handle_chat_message_via_bridge(
             return;
         }
     };
-    bridge_headers.insert(HeaderName::from_static("x-mo-bridge-secret"), secret_hv);
-    let user_id_hv = match HeaderValue::from_str(&conn.user.user_id) {
-        Ok(v) => v,
-        Err(_) => {
-            send_msg(
-                socket,
-                &WsServerMessage::Error {
-                    message: "Invalid user_id for headers".into(),
-                    code: "INTERNAL_ERROR".into(),
-                    retryable: false,
-                },
-            )
-            .await;
-            return;
-        }
-    };
-    bridge_headers.insert(HeaderName::from_static("x-mo-user-id"), user_id_hv);
-    let username_b64 = URL_SAFE.encode(conn.user.username.as_bytes());
-    // base64 URL-safe encoding guarantees valid header chars
-    bridge_headers.insert(
-        HeaderName::from_static("x-mo-username-b64"),
-        // URL-safe base64 guarantees valid header chars; fallback is defensive only.
-        HeaderValue::from_str(&username_b64)
-            .unwrap_or_else(|_| HeaderValue::from_static("unknown")),
-    );
-    bridge_headers.insert(
-        HeaderName::from_static("x-mo-bridge-capabilities"),
-        HeaderValue::from_static("state-sync-v1"),
-    );
 
     // Prepare request through bridge_prep (session validation, etc.)
     let prepared = match prepare_chat_turn_bridge_body(
@@ -1902,6 +1904,26 @@ mod tests {
         assert_eq!(payload["messages"][0]["content"], "hello");
     }
 
+    #[test]
+    fn ws_bridge_headers_forward_authorization() {
+        let state = AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
+            .with_chat_turn_bridge_secret("bridge-secret");
+        let conn = WsConnection {
+            user: test_user(),
+            authorization: "Bearer good-token".into(),
+            session_id: None,
+            pending_session_id: None,
+            active_run_id: None,
+            bridge_prepared_run_id: None,
+        };
+
+        let headers = build_ws_bridge_headers(&state, &conn).expect("headers should build");
+
+        assert_eq!(headers.get("x-mo-bridge-secret").unwrap(), "bridge-secret");
+        assert_eq!(headers.get("x-mo-user-id").unwrap(), "u1");
+        assert_eq!(headers.get("authorization").unwrap(), "Bearer good-token");
+    }
+
     #[tokio::test]
     async fn resolve_bridge_payload_session_id_omits_trusted_session_when_service_unconfigured() {
         let state = AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker));
@@ -1952,6 +1974,7 @@ mod tests {
                 email: "alice@example.com".into(),
                 display_name: Some("Alice".into()),
             },
+            authorization: "Bearer test-token".into(),
             session_id: Some("bound-session".into()),
             pending_session_id: Some("handshake-session".into()),
             active_run_id: None,
@@ -1977,6 +2000,7 @@ mod tests {
                 email: "alice@example.com".into(),
                 display_name: Some("Alice".into()),
             },
+            authorization: "Bearer test-token".into(),
             session_id: Some("bound-session".into()),
             pending_session_id: None,
             active_run_id: None,
@@ -1997,6 +2021,7 @@ mod tests {
                 email: "alice@example.com".into(),
                 display_name: Some("Alice".into()),
             },
+            authorization: "Bearer test-token".into(),
             session_id: Some("bound-session".into()),
             pending_session_id: Some("handshake-session".into()),
             active_run_id: None,
@@ -2017,6 +2042,7 @@ mod tests {
                 email: "alice@example.com".into(),
                 display_name: Some("Alice".into()),
             },
+            authorization: "Bearer test-token".into(),
             session_id: Some("bound-session".into()),
             pending_session_id: None,
             active_run_id: None,
@@ -2029,6 +2055,7 @@ mod tests {
                 email: "alice@example.com".into(),
                 display_name: Some("Alice".into()),
             },
+            authorization: "Bearer test-token".into(),
             session_id: Some("bound-session".into()),
             pending_session_id: Some("handshake-session".into()),
             active_run_id: None,
@@ -2245,6 +2272,7 @@ mod tests {
                 email: "alice@example.com".into(),
                 display_name: Some("Alice".into()),
             },
+            authorization: "Bearer test-token".into(),
             session_id: None,
             pending_session_id: Some("pending-session".into()),
             active_run_id: None,
@@ -2275,6 +2303,7 @@ mod tests {
                 email: "alice@example.com".into(),
                 display_name: Some("Alice".into()),
             },
+            authorization: "Bearer test-token".into(),
             session_id: Some("sess-1".into()),
             pending_session_id: Some("pending-session".into()),
             active_run_id: Some("prepared-run".into()),
@@ -2305,6 +2334,7 @@ mod tests {
                 email: "alice@example.com".into(),
                 display_name: Some("Alice".into()),
             },
+            authorization: "Bearer test-token".into(),
             session_id: Some("sess-1".into()),
             pending_session_id: Some("pending-session".into()),
             active_run_id: Some("real-run".into()),
@@ -2335,6 +2365,7 @@ mod tests {
                 email: "alice@example.com".into(),
                 display_name: Some("Alice".into()),
             },
+            authorization: "Bearer test-token".into(),
             session_id: Some("sess-1".into()),
             pending_session_id: None,
             active_run_id: Some("prepared-run".into()),
