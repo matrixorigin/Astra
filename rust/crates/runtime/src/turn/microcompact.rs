@@ -24,7 +24,7 @@ const PERSISTED_TAG: &str = "<persisted-output>";
 
 /// Tool names whose results are safe to compact (read-only, reproducible).
 /// Excluded: bash (non-idempotent), write_file/str_replace (mutation records),
-/// skill (instructions needed for subsequent iterations).
+/// skill (instructions), delegate (delegation records).
 const COMPACTABLE_TOOLS: &[&str] = &[
     "read_file",
     "grep",
@@ -34,8 +34,30 @@ const COMPACTABLE_TOOLS: &[&str] = &[
     "git_diff",
     "git_log",
     "git_status",
+    "git_blame",
+    "git_file_history",
+    "git_contributors",
+    "git_log_search",
     "web_search",
     "web_fetch",
+    // Code intel tools (idempotent reads, can produce large output)
+    "symbols",
+    "find_definition",
+    "find_references",
+    "symbol_search",
+    "hover_info",
+    "call_graph",
+    "type_hierarchy",
+    "dead_code",
+    "extract_members",
+    // GitHub read-only tools
+    "github_list_prs",
+    "github_get_pr",
+    "github_ci_status",
+    "github_list_issues",
+    "github_get_issue",
+    "github_repo_stats",
+    "get_agent_info",
 ];
 
 /// How many recent compactable tool results to keep intact.
@@ -51,6 +73,8 @@ const TOKEN_BUDGET: usize = 12_000;
 const MIN_COMPACT_SIZE: usize = 500;
 
 /// Rough token estimate for a string. ~4 bytes per token for English/code.
+/// Underestimates for CJK (~2 bytes/token) — acceptable since the budget
+/// is a soft threshold, not a hard limit.
 fn estimate_tokens(s: &str) -> usize {
     s.len() / 4
 }
@@ -185,6 +209,16 @@ mod tests {
 
     fn tool_result(id: &str, content: &str) -> Value {
         json!({"role": "tool", "tool_call_id": id, "content": content})
+    }
+
+    #[test]
+    fn estimate_tokens_reasonable_for_code() {
+        // Typical code: ~4 bytes/token. 1000 bytes → ~250 tokens.
+        assert_eq!(estimate_tokens(&"x".repeat(1000)), 250);
+        assert_eq!(estimate_tokens(&"x".repeat(4)), 1);
+        assert_eq!(estimate_tokens(""), 0);
+        // Short content rounds down
+        assert_eq!(estimate_tokens("abc"), 0);
     }
 
     // ── Count-based compaction ───────────────────────────────────────────
@@ -672,5 +706,282 @@ mod tests {
 
         // 7. Total message count unchanged (no messages deleted)
         assert_eq!(messages.len(), 20, "no messages should be deleted, only content replaced");
+    }
+
+    // ── Complex / edge-case tests ────────────────────────────────────
+
+    #[test]
+    fn progressive_compaction_across_multiple_rounds() {
+        // Simulate: compact after round 2, add more tools, compact again after round 3.
+        // Verifies compaction compounds correctly and doesn't double-clear.
+        let big = "x".repeat(800);
+
+        let mut messages = vec![
+            json!({"role": "user", "content": "task"}),
+            // Round 1: 4 reads
+            assistant_with_tools(&[("c1","read_file"),("c2","read_file"),("c3","grep"),("c4","read_file")]),
+            tool_result("c1", &big), tool_result("c2", &big),
+            tool_result("c3", &big), tool_result("c4", &big),
+        ];
+
+        // Compact after round 1 — 4 compactable, under keep=6, no compaction
+        let s1 = compact_tool_results(&mut messages, None);
+        assert_eq!(s1.results_compacted, 0);
+
+        // Round 2: 4 more reads (total 8 compactable > keep=6)
+        messages.push(assistant_with_tools(&[("c5","read_file"),("c6","grep"),("c7","git_diff"),("c8","read_file")]));
+        messages.extend([tool_result("c5",&big), tool_result("c6",&big), tool_result("c7",&big), tool_result("c8",&big)]);
+
+        // Compact after round 2 — 8 compactable, clear oldest 2
+        let s2 = compact_tool_results(&mut messages, None);
+        assert_eq!(s2.results_compacted, 2);
+        assert_eq!(messages[2]["content"], CLEARED_PLACEHOLDER); // c1
+        assert_eq!(messages[3]["content"], CLEARED_PLACEHOLDER); // c2
+        assert_ne!(messages[4]["content"], CLEARED_PLACEHOLDER); // c3 kept
+
+        // Round 3: 3 more reads (total 9 non-cleared compactable > keep=6)
+        messages.push(assistant_with_tools(&[("c9","read_file"),("c10","grep"),("c11","read_file")]));
+        messages.extend([tool_result("c9",&big), tool_result("c10",&big), tool_result("c11",&big)]);
+
+        // Compact after round 3 — should clear more old ones, NOT re-clear c1/c2
+        let s3 = compact_tool_results(&mut messages, None);
+        assert!(s3.results_compacted > 0, "should compact more old results");
+        // c1, c2 already cleared — should still be placeholder (idempotent)
+        assert_eq!(messages[2]["content"], CLEARED_PLACEHOLDER);
+        assert_eq!(messages[3]["content"], CLEARED_PLACEHOLDER);
+        // Total non-cleared compactable should be <= KEEP_RECENT
+        let live = messages.iter().filter(|m| {
+            m.get("role").and_then(Value::as_str) == Some("tool")
+                && m.get("content").and_then(Value::as_str) != Some(CLEARED_PLACEHOLDER)
+                && m.get("content").and_then(Value::as_str).map_or(false, |c| c.len() >= MIN_COMPACT_SIZE)
+        }).count();
+        assert!(live <= KEEP_RECENT, "at most {} live compactable results, got {}", KEEP_RECENT, live);
+    }
+
+    #[test]
+    fn token_budget_boundary_exact() {
+        // Exactly at TOKEN_BUDGET — should NOT trigger token-based compaction.
+        // 4 results × 3000 tokens each = 12000 = TOKEN_BUDGET exactly.
+        // The trigger condition is `>` (strict), so exactly-at-budget is safe.
+        let content = "x".repeat(12_000); // ~3000 tokens
+        let mut messages = vec![
+            json!({"role": "user", "content": "task"}),
+            assistant_with_tools(&[("c1","read_file"),("c2","read_file"),("c3","grep"),("c4","git_diff")]),
+            tool_result("c1", &content), tool_result("c2", &content),
+            tool_result("c3", &content), tool_result("c4", &content),
+        ];
+
+        // 4 compactable < keep=6, so count-based won't trigger.
+        // Token-based: 4 × 3000 = 12000 = TOKEN_BUDGET. Condition is >, not >=.
+        let stats = compact_tool_results(&mut messages, None);
+        assert_eq!(stats.results_compacted, 0, "exactly at budget should not trigger (> not >=)");
+        for m in &messages[2..6] {
+            assert_ne!(m["content"], CLEARED_PLACEHOLDER);
+        }
+    }
+
+    #[test]
+    fn mixed_tool_calls_in_single_assistant_message() {
+        // One assistant message calls read_file + bash + write_file.
+        // Only read_file should be compactable.
+        let big = "x".repeat(800);
+        let mut messages = vec![
+            json!({"role": "user", "content": "task"}),
+            // 3 assistant messages, each with mixed tools, to exceed keep=6
+            assistant_with_tools(&[("c1","read_file"),("c2","bash"),("c3","write_file")]),
+            tool_result("c1", &big), tool_result("c2", &big), tool_result("c3", &big),
+            assistant_with_tools(&[("c4","read_file"),("c5","bash"),("c6","str_replace")]),
+            tool_result("c4", &big), tool_result("c5", &big), tool_result("c6", &big),
+            assistant_with_tools(&[("c7","read_file"),("c8","bash"),("c9","read_file")]),
+            tool_result("c7", &big), tool_result("c8", &big), tool_result("c9", &big),
+            // 4th round to push read_file count past keep
+            assistant_with_tools(&[("c10","read_file"),("c11","grep"),("c12","read_file"),("c13","read_file"),("c14","read_file")]),
+            tool_result("c10", &big), tool_result("c11", &big), tool_result("c12", &big),
+            tool_result("c13", &big), tool_result("c14", &big),
+        ];
+
+        let stats = compact_tool_results(&mut messages, None);
+
+        // bash results must NEVER be compacted
+        for id in ["c2", "c5", "c8"] {
+            let m = messages.iter().find(|m| m.get("tool_call_id").and_then(Value::as_str) == Some(id)).unwrap();
+            assert_eq!(m["content"].as_str().unwrap(), &big, "bash result {} must survive", id);
+        }
+        // write_file / str_replace must NEVER be compacted
+        for id in ["c3", "c6"] {
+            let m = messages.iter().find(|m| m.get("tool_call_id").and_then(Value::as_str) == Some(id)).unwrap();
+            assert_eq!(m["content"].as_str().unwrap(), &big, "mutation result {} must survive", id);
+        }
+        // Some read_file/grep should be compacted
+        assert!(stats.results_compacted > 0, "should compact some read-only results");
+    }
+
+    #[test]
+    fn cache_stub_not_re_compacted() {
+        // A cache stub (~90 bytes) is under MIN_COMPACT_SIZE.
+        // Verify it's not touched by microcompact.
+        let stub = "(cached — identical call already executed in this conversation. \
+                     Re-read the file only if you need the content again.)";
+        let big = "x".repeat(800);
+
+        let mut messages = vec![
+            json!({"role": "user", "content": "task"}),
+            // 8 results: 1 stub + 7 big reads (to exceed keep=6)
+            assistant_with_tools(&[
+                ("c1","read_file"),("c2","read_file"),("c3","read_file"),("c4","read_file"),
+                ("c5","read_file"),("c6","read_file"),("c7","read_file"),("c8","read_file"),
+            ]),
+            tool_result("c1", stub),  // cache stub — small, should be skipped
+            tool_result("c2", &big), tool_result("c3", &big), tool_result("c4", &big),
+            tool_result("c5", &big), tool_result("c6", &big), tool_result("c7", &big),
+            tool_result("c8", &big),
+        ];
+
+        compact_tool_results(&mut messages, None);
+
+        // Stub must survive untouched
+        assert_eq!(
+            messages[2]["content"].as_str().unwrap(), stub,
+            "cache stub must not be compacted (under MIN_COMPACT_SIZE)"
+        );
+    }
+
+    #[test]
+    fn persisted_output_mixed_with_compactable_in_same_turn() {
+        // One assistant turn produces both a persisted-output result and
+        // a normal compactable result. Only the normal one should compact.
+        let persisted = "<persisted-output>Preview of large file... (saved to /tmp/abc)</persisted-output>";
+        let big = "x".repeat(800);
+
+        // Need >6 compactable (non-persisted) to trigger count-based.
+        // 10 total: 2 persisted + 8 normal compactable → 8 > keep=6 → clear 2.
+        let mut messages = vec![
+            json!({"role": "user", "content": "task"}),
+            assistant_with_tools(&[
+                ("c1","read_file"),("c2","read_file"),("c3","read_file"),("c4","read_file"),
+                ("c5","read_file"),("c6","read_file"),("c7","read_file"),("c8","read_file"),
+                ("c9","read_file"),("c10","read_file"),
+            ]),
+            tool_result("c1", persisted),  // persisted — must survive
+            tool_result("c2", &big), tool_result("c3", &big), tool_result("c4", &big),
+            tool_result("c5", persisted),  // persisted — must survive
+            tool_result("c6", &big), tool_result("c7", &big), tool_result("c8", &big),
+            tool_result("c9", &big), tool_result("c10", &big),
+        ];
+
+        let stats = compact_tool_results(&mut messages, None);
+        assert!(stats.results_compacted > 0);
+
+        // Both persisted results must survive
+        assert_eq!(messages[2]["content"].as_str().unwrap(), persisted, "c1 persisted must survive");
+        assert_eq!(messages[6]["content"].as_str().unwrap(), persisted, "c5 persisted must survive");
+    }
+
+    #[test]
+    fn stress_50_tools_across_15_iterations() {
+        // Stress test: 50+ tool results across 15 iterations.
+        // Verifies no panic, correct bounds, and reasonable compaction.
+        let big = "x".repeat(1000);
+        let mut messages: Vec<Value> = vec![json!({"role": "user", "content": "big task"})];
+
+        let tools_per_iter = [4, 5, 3, 4, 3, 4, 3, 3, 4, 3, 3, 2, 3, 3, 2];
+        let mut call_id = 0u32;
+        let mut all_tool_names: Vec<(String, String)> = Vec::new(); // (id, name)
+
+        for (iter, &count) in tools_per_iter.iter().enumerate() {
+            let tool_calls: Vec<(&str, String)> = (0..count).map(|j| {
+                call_id += 1;
+                let name = match j % 4 {
+                    0 => "read_file",
+                    1 => "grep",
+                    2 => if iter % 3 == 0 { "bash" } else { "git_diff" },
+                    _ => "glob",
+                };
+                (name, format!("s{}", call_id))
+            }).collect();
+
+            let tc_pairs: Vec<(&str, &str)> = tool_calls.iter().map(|(n, id)| (id.as_str(), *n)).collect();
+            messages.push(assistant_with_tools(&tc_pairs));
+
+            for (name, id) in &tool_calls {
+                let content = if *name == "bash" { "ok" } else { &big };
+                messages.push(tool_result(id, content));
+                all_tool_names.push((id.clone(), name.to_string()));
+            }
+
+            // Run microcompact before each iteration (except first)
+            if iter > 0 {
+                compact_tool_results(&mut messages, None);
+            }
+        }
+
+        // Final compaction
+        compact_tool_results(&mut messages, None);
+
+        // Structural integrity: every tool result has tool_call_id and content
+        let tool_msgs: Vec<&Value> = messages.iter()
+            .filter(|m| m.get("role").and_then(Value::as_str) == Some("tool"))
+            .collect();
+        for m in &tool_msgs {
+            assert!(m.get("tool_call_id").is_some(), "every tool result must have tool_call_id");
+            assert!(m.get("content").is_some(), "every tool result must have content");
+        }
+
+        // bash results must all survive (non-compactable)
+        for (id, name) in &all_tool_names {
+            if name == "bash" {
+                let m = messages.iter()
+                    .find(|m| m.get("tool_call_id").and_then(Value::as_str) == Some(id.as_str()))
+                    .unwrap();
+                assert_ne!(m["content"], CLEARED_PLACEHOLDER, "bash {} must survive", id);
+            }
+        }
+
+        // Total tool results count unchanged (no deletions)
+        let total_tool_count: usize = tools_per_iter.iter().sum();
+        assert_eq!(tool_msgs.len(), total_tool_count,
+            "no tool messages deleted: expected {}, got {}", total_tool_count, tool_msgs.len());
+
+        // Some compaction must have happened
+        let cleared_count = tool_msgs.iter()
+            .filter(|m| m.get("content").and_then(Value::as_str) == Some(CLEARED_PLACEHOLDER))
+            .count();
+        assert!(cleared_count > 0, "stress test should trigger compaction");
+    }
+
+    #[test]
+    fn non_string_content_not_compacted() {
+        // OpenAI vision format: content can be an array. Must not crash or compact.
+        let mut messages = vec![
+            json!({"role": "user", "content": "task"}),
+            assistant_with_tools(&[("c1","read_file"),("c2","read_file")]),
+            json!({"role": "tool", "tool_call_id": "c1", "content": [
+                {"type": "text", "text": "file content here that is long enough to exceed min compact size threshold for testing purposes"}
+            ]}),
+            tool_result("c2", &"x".repeat(800)),
+        ];
+
+        // Should not panic on array content
+        let stats = compact_tool_results(&mut messages, None);
+        // Array content treated as size 0 → skipped
+        assert!(messages[2]["content"].is_array(), "array content must be preserved as-is");
+        assert_eq!(stats.results_compacted, 0, "nothing to compact (1 array + 1 under keep)");
+    }
+
+    #[test]
+    fn empty_and_null_content_handled() {
+        let mut messages = vec![
+            json!({"role": "user", "content": "task"}),
+            assistant_with_tools(&[("c1","read_file"),("c2","read_file"),("c3","read_file")]),
+            json!({"role": "tool", "tool_call_id": "c1", "content": ""}),
+            json!({"role": "tool", "tool_call_id": "c2", "content": null}),
+            tool_result("c3", &"x".repeat(800)),
+        ];
+
+        // Should not panic
+        let stats = compact_tool_results(&mut messages, None);
+        assert_eq!(stats.results_compacted, 0, "empty/null/single under keep");
+        assert_eq!(messages[2]["content"], "");
+        assert!(messages[3]["content"].is_null());
     }
 }

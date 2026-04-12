@@ -168,9 +168,15 @@ pub fn unknown_local_tool_error_message(name: &str, valid_tool_names: &HashSet<S
 }
 
 /// User-visible `tool` message body when replaying an idempotent cache hit.
+///
+/// Returns a short stub instead of the full cached output. The original
+/// content is already in an earlier tool_result message in the conversation,
+/// so re-sending it wastes tokens. The LLM can re-read the file if needed.
 #[must_use]
-pub fn idempotency_cache_hit_message(cached_output: &str) -> String {
-    format!("(cached from earlier turn — identical call)\n{cached_output}")
+pub fn idempotency_cache_hit_message(_cached_output: &str) -> String {
+    "(cached — identical call already executed in this conversation. \
+     Re-read the file only if you need the content again.)"
+        .to_string()
 }
 
 /// `tool` / `tool_results` body when the same signature was already executed this headless round.
@@ -645,9 +651,11 @@ mod tests {
     }
 
     #[test]
-    fn idempotency_cache_hit_message_shape() {
-        let m = idempotency_cache_hit_message("body");
-        assert_eq!(m, "(cached from earlier turn — identical call)\nbody");
+    fn idempotency_cache_hit_message_is_stub() {
+        let m = idempotency_cache_hit_message("huge output that should not appear");
+        assert!(!m.contains("huge output"), "cache hit should return stub, not full content");
+        assert!(m.contains("cached"), "stub should mention caching");
+        assert!(m.contains("Re-read"), "stub should tell LLM to re-read if needed");
     }
 
     #[test]

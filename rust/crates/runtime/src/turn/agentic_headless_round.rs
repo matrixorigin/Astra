@@ -269,11 +269,12 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
         if *count > max_identical {
             // Hard cap: return cached result if available, otherwise short stub.
             let idem_key = IdempotencyKey::semantic(&name, &args);
-            if let Some(cached) = idempotency_cache.check(&idem_key) {
+            if let Some(_cached) = idempotency_cache.check(&idem_key) {
                 let body = format!(
-                    "{}\n\n⛔ This is a cached repeat (call #{} for identical args, limit: {}). \
+                    "⛔ Cached repeat (call #{} for identical args, limit: {}). \
+                     The result is already in this conversation from an earlier call. \
                      Do NOT call this tool again with the same arguments.",
-                    cached.output, *count, max_identical
+                    *count, max_identical
                 );
                 let (tool_msg, tr) = headless_idempotency_hit_openai_pair(&id, &name, &body);
                 messages.push(tool_msg);
