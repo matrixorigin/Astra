@@ -159,11 +159,15 @@ fn apply_forward_llm_sse_event(
             }
             Ok(vec![])
         }
-        "text_delta" | "reasoning_delta" | "tool_call_start" | "usage" | "error"
+        "text_delta" | "reasoning_delta" | "reasoning_done" | "tool_call_start" | "usage" | "error"
         | "error_message" => Ok(vec![render_sse(event)]),
         "warning" => Ok(vec![render_sse(event)]),
         _ => Ok(vec![]),
     }
+}
+
+fn reasoning_done_sse_bytes_if_needed(reasoning: &str) -> Option<Bytes> {
+    (!reasoning.is_empty()).then(|| render_sse(&json!({"type": "reasoning_done"})))
 }
 
 fn extend_forward_from_validated_sse_block(
@@ -538,7 +542,7 @@ fn bridge_llm_cancel(cc: &Option<Arc<CancellationToken>>) -> LlmCancel<'_> {
 }
 
 /// Call LLM streaming API, yield SSE bytes.
-/// Emits: text_delta, reasoning_delta, tool_call_start, usage SSE events,
+/// Emits: text_delta, reasoning_delta, reasoning_done, tool_call_start, usage SSE events,
 /// then a final `_inprocess_summary` event with full_text/tool_calls/usage/model_used.
 ///
 /// **Stream resilience (Claude Code–style, same as [`super::llm_client::call_llm_and_collect`])**:
@@ -1854,6 +1858,9 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                 }
                 if !loop_reasoning.is_empty() {
                     reasoning.push_str(&loop_reasoning);
+                    if let Some(done) = reasoning_done_sse_bytes_if_needed(&loop_reasoning) {
+                        yield done;
+                    }
                 }
                 llm_steps.push(json!({
                     "step": "llm",
@@ -4278,6 +4285,38 @@ mod tests {
         assert_eq!(result.len(), 1);
         let s = std::str::from_utf8(&result[0]).unwrap();
         assert!(s.contains("text_delta"));
+    }
+
+    #[test]
+    fn forward_event_reasoning_done_forwarded_as_sse() {
+        let event = json!({"type": "reasoning_done"});
+        let mut saw = false;
+        let mut text = String::new();
+        let mut reasoning = String::new();
+        let mut tc = vec![];
+        let mut usage = Map::new();
+        let mut model = String::new();
+        let result = apply_forward_llm_sse_event(
+            &event,
+            &mut saw,
+            &mut text,
+            &mut reasoning,
+            &mut tc,
+            &mut usage,
+            &mut model,
+        )
+        .unwrap();
+        assert_eq!(result.len(), 1);
+        let s = std::str::from_utf8(&result[0]).unwrap();
+        assert!(s.contains("reasoning_done"));
+    }
+
+    #[test]
+    fn reasoning_done_sse_bytes_only_for_non_empty_reasoning() {
+        let bytes = reasoning_done_sse_bytes_if_needed("thinking...").unwrap();
+        let s = std::str::from_utf8(&bytes).unwrap();
+        assert!(s.contains("reasoning_done"));
+        assert!(reasoning_done_sse_bytes_if_needed("").is_none());
     }
 
     #[test]

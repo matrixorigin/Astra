@@ -202,6 +202,19 @@ impl ServerAgenticLoopHostBuilder {
 }
 
 impl ServerAgenticLoopHost {
+    fn push_reasoning_events(emitted_events: &mut Vec<Value>, reasoning: &str) {
+        if reasoning.is_empty() {
+            return;
+        }
+        emitted_events.push(json!({
+            "type": "reasoning_delta",
+            "content": reasoning,
+        }));
+        emitted_events.push(json!({
+            "type": "reasoning_done",
+        }));
+    }
+
     /// Access collected SSE events from the last turn.
     /// Also drains any pending agent progress events into the result.
     pub fn take_emitted_events(&mut self) -> Vec<Value> {
@@ -671,12 +684,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 "content": result.full_text,
             }));
         }
-        if !result.reasoning.is_empty() {
-            self.emitted_events.push(json!({
-                "type": "reasoning_delta",
-                "content": result.reasoning,
-            }));
-        }
+        Self::push_reasoning_events(&mut self.emitted_events, &result.reasoning);
         if !result.usage.is_empty() {
             self.emitted_events.push(json!({
                 "type": "usage",
@@ -1074,6 +1082,24 @@ mod tests {
         assert_eq!(host.emitted_events.len(), 1);
         assert_eq!(host.emitted_events[0]["type"], "headless_line");
         assert_eq!(host.emitted_events[0]["content"], "test line");
+    }
+
+    #[test]
+    fn push_reasoning_events_emits_done_marker() {
+        let mut emitted = Vec::new();
+        ServerAgenticLoopHost::push_reasoning_events(&mut emitted, "thinking...");
+
+        assert_eq!(emitted.len(), 2);
+        assert_eq!(emitted[0]["type"], "reasoning_delta");
+        assert_eq!(emitted[0]["content"], "thinking...");
+        assert_eq!(emitted[1]["type"], "reasoning_done");
+    }
+
+    #[test]
+    fn push_reasoning_events_skips_empty_reasoning() {
+        let mut emitted = Vec::new();
+        ServerAgenticLoopHost::push_reasoning_events(&mut emitted, "");
+        assert!(emitted.is_empty());
     }
 
     #[test]
