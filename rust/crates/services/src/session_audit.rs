@@ -206,6 +206,12 @@ pub struct CrossSessionStats {
     pub applied_mutations: u32,
     pub reverted_mutations: u32,
     pub blocked_mutations: u32,
+    pub verified_mutations: u32,
+    pub missing_verifier_mutations: u32,
+    pub tool_result_verified_mutations: u32,
+    pub journal_verified_mutations: u32,
+    pub no_verifier_signal_mutations: u32,
+    pub ambiguous_multi_action_verifier_mutations: u32,
     pub top_tools: Vec<ToolUsageBrief>,
     pub top_models: Vec<ModelUsageBrief>,
 }
@@ -1439,6 +1445,13 @@ impl SessionAuditService for DatabaseSessionAuditService {
             applied_mutations: mutation_stats.applied_mutations,
             reverted_mutations: mutation_stats.reverted_mutations,
             blocked_mutations: mutation_stats.blocked_mutations,
+            verified_mutations: mutation_stats.verified_mutations,
+            missing_verifier_mutations: mutation_stats.missing_verifier_mutations,
+            tool_result_verified_mutations: mutation_stats.tool_result_verified_mutations,
+            journal_verified_mutations: mutation_stats.journal_verified_mutations,
+            no_verifier_signal_mutations: mutation_stats.no_verifier_signal_mutations,
+            ambiguous_multi_action_verifier_mutations: mutation_stats
+                .ambiguous_multi_action_verifier_mutations,
             top_tools,
             top_models,
         })
@@ -1888,6 +1901,52 @@ struct MutationStatsAggregate {
     applied_mutations: u32,
     reverted_mutations: u32,
     blocked_mutations: u32,
+    verified_mutations: u32,
+    missing_verifier_mutations: u32,
+    tool_result_verified_mutations: u32,
+    journal_verified_mutations: u32,
+    no_verifier_signal_mutations: u32,
+    ambiguous_multi_action_verifier_mutations: u32,
+}
+
+impl MutationStatsAggregate {
+    fn observe_mutation(&mut self, mutation: &StagedMutation) {
+        self.total_mutations += 1;
+        if mutation.state == StagedMutationState::Ready {
+            self.ready_mutations += 1;
+        }
+        if mutation.state == StagedMutationState::Pending
+            && mutation.judgment.safety_verdict == MutationSafetyVerdict::RequiresApproval
+        {
+            self.approval_required_mutations += 1;
+        }
+        if mutation.state == StagedMutationState::Applied {
+            self.applied_mutations += 1;
+        }
+        if mutation.state == StagedMutationState::Reverted {
+            self.reverted_mutations += 1;
+        }
+        if mutation.state == StagedMutationState::Blocked {
+            self.blocked_mutations += 1;
+        }
+        if mutation.verifier.is_some() {
+            self.verified_mutations += 1;
+        } else {
+            self.missing_verifier_mutations += 1;
+        }
+        match mutation.verifier_source.as_deref() {
+            Some("tool_result") => self.tool_result_verified_mutations += 1,
+            Some("turn_journal") => self.journal_verified_mutations += 1,
+            _ => {}
+        }
+        match mutation.verifier_gap.as_deref() {
+            Some("no_verifier_signal") => self.no_verifier_signal_mutations += 1,
+            Some("ambiguous_multi_action_turn") => {
+                self.ambiguous_multi_action_verifier_mutations += 1;
+            }
+            _ => {}
+        }
+    }
 }
 
 fn parse_mutation_state_override(
@@ -1926,12 +1985,9 @@ fn aggregate_cross_session_mutation_stats(
 ) -> MutationStatsAggregate {
     let mut aggregate = MutationStatsAggregate::default();
     for scoreboard in build_cross_session_mutation_scoreboards(decisions, overrides) {
-        aggregate.total_mutations += scoreboard.total_mutations;
-        aggregate.ready_mutations += scoreboard.ready_mutations;
-        aggregate.approval_required_mutations += scoreboard.approval_required_mutations;
-        aggregate.applied_mutations += scoreboard.applied_mutations;
-        aggregate.reverted_mutations += scoreboard.reverted_mutations;
-        aggregate.blocked_mutations += scoreboard.blocked_mutations;
+        for mutation in &scoreboard.mutations {
+            aggregate.observe_mutation(mutation);
+        }
     }
 
     aggregate
@@ -2201,6 +2257,12 @@ mod tests {
             applied_mutations: 2,
             reverted_mutations: 1,
             blocked_mutations: 2,
+            verified_mutations: 7,
+            missing_verifier_mutations: 5,
+            tool_result_verified_mutations: 4,
+            journal_verified_mutations: 3,
+            no_verifier_signal_mutations: 4,
+            ambiguous_multi_action_verifier_mutations: 1,
             top_tools: vec![ToolUsageBrief {
                 name: "bash".into(),
                 call_count: 100,
@@ -2216,6 +2278,7 @@ mod tests {
         assert!(json.contains("\"session_count\":10"));
         assert!(json.contains("\"total_turns\":150"));
         assert!(json.contains("\"total_mutations\":12"));
+        assert!(json.contains("\"verified_mutations\":7"));
         assert!(json.contains("\"top_tools\":["));
         assert!(json.contains("\"top_models\":["));
     }
@@ -2240,6 +2303,12 @@ mod tests {
             applied_mutations: 0,
             reverted_mutations: 0,
             blocked_mutations: 0,
+            verified_mutations: 0,
+            missing_verifier_mutations: 0,
+            tool_result_verified_mutations: 0,
+            journal_verified_mutations: 0,
+            no_verifier_signal_mutations: 0,
+            ambiguous_multi_action_verifier_mutations: 0,
             top_tools: vec![],
             top_models: vec![],
         };
@@ -2512,6 +2581,12 @@ mod tests {
             applied_mutations: 2,
             reverted_mutations: 1,
             blocked_mutations: 1,
+            verified_mutations: 5,
+            missing_verifier_mutations: 4,
+            tool_result_verified_mutations: 3,
+            journal_verified_mutations: 2,
+            no_verifier_signal_mutations: 3,
+            ambiguous_multi_action_verifier_mutations: 1,
             top_tools: vec![],
             top_models: vec![],
         };
@@ -2519,6 +2594,7 @@ mod tests {
         let restored: CrossSessionStats = serde_json::from_str(&json).unwrap();
         assert_eq!(restored.session_count, 10);
         assert_eq!(restored.total_mutations, 9);
+        assert_eq!(restored.missing_verifier_mutations, 4);
         assert!((restored.tool_error_rate - 0.025).abs() < 0.001);
     }
 
@@ -2696,6 +2772,14 @@ mod tests {
                                 "tool_call_id": "call-1",
                                 "tool_name": "edit_file",
                                 "arguments": {"path": "src/lib.rs"},
+                                "verifier_source": "tool_result",
+                                "verifier": {
+                                    "all_required_passed": true,
+                                    "criteria_total": 1,
+                                    "criteria_passed": 1,
+                                    "pass_rate": {"point": 1.0, "lower": 1.0, "upper": 1.0},
+                                    "failing_criteria": []
+                                },
                                 "profile": {
                                     "bounded": true,
                                     "reversible": true,
@@ -2724,6 +2808,72 @@ mod tests {
                                 "tool_call_id": "call-2",
                                 "tool_name": "bash",
                                 "arguments": {"command": "git commit -m x"},
+                                "verifier_gap": "no_verifier_signal",
+                                "profile": {
+                                    "bounded": false,
+                                    "reversible": true,
+                                    "requires_pre_state": false,
+                                    "action_category": "execute",
+                                    "compensation_kind": "git_revert_commit",
+                                    "compensation_summary": "revert the commit"
+                                }
+                            }
+                        ]
+                    }),
+                },
+                PersistedMutationDecision {
+                    decision_id: "decision-3".into(),
+                    session_id: "session-3".into(),
+                    decision_output: serde_json::json!({
+                        "turn": 3,
+                        "mutation_objective_score": {
+                            "quality": {"point": 0.81, "lower": 0.81, "upper": 0.81},
+                            "reward_hacking_risk": {"point": 0.10, "lower": 0.10, "upper": 0.10},
+                            "causal_support": {"point": 0.82, "lower": 0.82, "upper": 0.82},
+                            "was_corrected": false
+                        },
+                        "action_profiles": [
+                            {
+                                "tool_call_id": "call-3",
+                                "tool_name": "bash",
+                                "arguments": {"command": "cargo test"},
+                                "verifier_source": "turn_journal",
+                                "verifier": {
+                                    "all_required_passed": true,
+                                    "criteria_total": 2,
+                                    "criteria_passed": 2,
+                                    "pass_rate": {"point": 1.0, "lower": 1.0, "upper": 1.0},
+                                    "failing_criteria": []
+                                },
+                                "profile": {
+                                    "bounded": false,
+                                    "reversible": true,
+                                    "requires_pre_state": false,
+                                    "action_category": "execute",
+                                    "compensation_kind": "git_revert_commit",
+                                    "compensation_summary": "revert the commit"
+                                }
+                            }
+                        ]
+                    }),
+                },
+                PersistedMutationDecision {
+                    decision_id: "decision-4".into(),
+                    session_id: "session-4".into(),
+                    decision_output: serde_json::json!({
+                        "turn": 4,
+                        "mutation_objective_score": {
+                            "quality": {"point": 0.72, "lower": 0.72, "upper": 0.72},
+                            "reward_hacking_risk": {"point": 0.18, "lower": 0.18, "upper": 0.18},
+                            "causal_support": {"point": 0.74, "lower": 0.74, "upper": 0.74},
+                            "was_corrected": false
+                        },
+                        "action_profiles": [
+                            {
+                                "tool_call_id": "call-4",
+                                "tool_name": "bash",
+                                "arguments": {"command": "git push"},
+                                "verifier_gap": "ambiguous_multi_action_turn",
                                 "profile": {
                                     "bounded": false,
                                     "reversible": true,
@@ -2737,22 +2887,39 @@ mod tests {
                     }),
                 },
             ],
-            vec![(
-                "session-2".into(),
-                MutationStateOverride {
-                    mutation_id: "decision-2:call-2".into(),
-                    state: StagedMutationState::Applied,
-                    note: Some("applied globally".into()),
-                    created_at: "2026-04-12T12:00:00Z".into(),
-                },
-            )],
+            vec![
+                (
+                    "session-2".into(),
+                    MutationStateOverride {
+                        mutation_id: "decision-2:call-2".into(),
+                        state: StagedMutationState::Applied,
+                        note: Some("applied globally".into()),
+                        created_at: "2026-04-12T12:00:00Z".into(),
+                    },
+                ),
+                (
+                    "session-4".into(),
+                    MutationStateOverride {
+                        mutation_id: "decision-4:call-4".into(),
+                        state: StagedMutationState::Blocked,
+                        note: Some("blocked after review".into()),
+                        created_at: "2026-04-12T12:01:00Z".into(),
+                    },
+                ),
+            ],
         );
 
-        assert_eq!(stats.total_mutations, 2);
+        assert_eq!(stats.total_mutations, 4);
         assert_eq!(stats.ready_mutations, 1);
         assert_eq!(stats.applied_mutations, 1);
-        assert_eq!(stats.approval_required_mutations, 0);
-        assert_eq!(stats.blocked_mutations, 0);
+        assert_eq!(stats.approval_required_mutations, 1);
+        assert_eq!(stats.blocked_mutations, 1);
+        assert_eq!(stats.verified_mutations, 2);
+        assert_eq!(stats.missing_verifier_mutations, 2);
+        assert_eq!(stats.tool_result_verified_mutations, 1);
+        assert_eq!(stats.journal_verified_mutations, 1);
+        assert_eq!(stats.no_verifier_signal_mutations, 1);
+        assert_eq!(stats.ambiguous_multi_action_verifier_mutations, 1);
     }
 
     #[test]
