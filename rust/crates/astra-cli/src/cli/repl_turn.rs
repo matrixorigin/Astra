@@ -1200,6 +1200,7 @@ fn apply_turn_success(
                 let obs_session = hub.start_session(&user_id, session_id);
                 state.observability_session = Some(obs_session);
                 apply_pending_adaptive_state(state);
+                apply_pending_goal_progress_state(state);
             }
         }
     }
@@ -1575,6 +1576,7 @@ fn initialize_journal(state: &mut ReplState, session_id: &str) {
             astra_runtime::observability_integration::ObservabilitySession::new_simple(session_id),
         )));
         apply_pending_adaptive_state(state);
+        apply_pending_goal_progress_state(state);
     }
 }
 
@@ -1701,12 +1703,26 @@ fn sync_session_state_to_workspace(
     ws: &mut astra_services::session_workspace::WorkspaceMetadata,
 ) {
     ws.session_goal = state.session_goal.clone();
+    ws.goal_progress = None;
     ws.pinned_skills = state.pinned_skills.iter().cloned().collect();
     ws.discovered_skills = state.discovered_skills.iter().cloned().collect();
 
     // Persist adaptive engine state (anti-flap, experiment, tuned config)
     if let Some(obs) = &state.observability_session {
         if let Ok(guard) = obs.read() {
+            ws.goal_progress = guard.goal_progress_snapshot().filter(|progress| {
+                state
+                    .session_goal
+                    .as_deref()
+                    .map(|goal| goal == progress.goal.as_str())
+                    .unwrap_or(true)
+            });
+            if ws.session_goal.is_none() {
+                ws.session_goal = ws
+                    .goal_progress
+                    .as_ref()
+                    .map(|progress| progress.goal.clone());
+            }
             ws.last_scenario_change_turn = guard.last_scenario_change_turn;
             ws.last_token_budget_direction = guard.last_token_budget_direction;
             ws.last_token_budget_change_turn = guard.last_token_budget_change_turn;
@@ -1727,24 +1743,62 @@ pub(super) fn apply_pending_adaptive_state(state: &mut ReplState) {
     };
     let obs = match &state.observability_session {
         Some(o) => o,
+        None => {
+            state.pending_adaptive_state = Some(adaptive);
+            return;
+        }
+    };
+    let mut guard = match obs.write() {
+        Ok(guard) => guard,
+        Err(_) => {
+            state.pending_adaptive_state = Some(adaptive);
+            return;
+        }
+    };
+    guard.last_scenario_change_turn = adaptive.last_scenario_change_turn;
+    guard.last_token_budget_direction = adaptive.last_token_budget_direction;
+    guard.last_token_budget_change_turn = adaptive.last_token_budget_change_turn;
+    if adaptive.active_experiment_id.is_some() {
+        guard.active_experiment_id = adaptive.active_experiment_id;
+        guard.active_variant = adaptive.active_variant;
+    }
+    // Restore tuned RuntimeConfig (merge on top of freshly loaded defaults)
+    if let Some(json) = &adaptive.tuned_config_json {
+        if let Ok(saved_config) =
+            serde_json::from_str::<astra_runtime::runtime_config::RuntimeConfig>(json)
+        {
+            let current = std::mem::take(&mut guard.config);
+            guard.config = current.merge(saved_config);
+        }
+    }
+}
+
+pub(super) fn apply_pending_goal_progress_state(state: &mut ReplState) {
+    let goal_progress = match state.pending_goal_progress.take() {
+        Some(progress) => progress,
         None => return,
     };
-    if let Ok(mut guard) = obs.write() {
-        guard.last_scenario_change_turn = adaptive.last_scenario_change_turn;
-        guard.last_token_budget_direction = adaptive.last_token_budget_direction;
-        guard.last_token_budget_change_turn = adaptive.last_token_budget_change_turn;
-        if adaptive.active_experiment_id.is_some() {
-            guard.active_experiment_id = adaptive.active_experiment_id;
-            guard.active_variant = adaptive.active_variant;
+    if state
+        .session_goal
+        .as_deref()
+        .map(|goal| goal != goal_progress.goal.as_str())
+        .unwrap_or(false)
+    {
+        // Deliberately drop stale progress snapshots when the tracked goal no longer
+        // matches the current session goal.
+        return;
+    }
+    let obs = match &state.observability_session {
+        Some(session) => session,
+        None => {
+            state.pending_goal_progress = Some(goal_progress);
+            return;
         }
-        // Restore tuned RuntimeConfig (merge on top of freshly loaded defaults)
-        if let Some(json) = &adaptive.tuned_config_json {
-            if let Ok(saved_config) =
-                serde_json::from_str::<astra_runtime::runtime_config::RuntimeConfig>(json)
-            {
-                let current = std::mem::take(&mut guard.config);
-                guard.config = current.merge(saved_config);
-            }
+    };
+    match obs.write() {
+        Ok(mut guard) => guard.restore_goal_progress(goal_progress),
+        Err(_) => {
+            state.pending_goal_progress = Some(goal_progress);
         }
     }
 }
@@ -2171,6 +2225,22 @@ mod tests {
         (tmp, guard)
     }
 
+    fn poisoned_observability_session(
+        session_id: &str,
+    ) -> std::sync::Arc<
+        std::sync::RwLock<astra_runtime::observability_integration::ObservabilitySession>,
+    > {
+        let session = std::sync::Arc::new(std::sync::RwLock::new(
+            astra_runtime::observability_integration::ObservabilitySession::new_simple(session_id),
+        ));
+        let poisoned = session.clone();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = poisoned.write().unwrap();
+            panic!("poison observability lock");
+        }));
+        session
+    }
+
     #[test]
     fn initialize_journal_attaches_without_duplicate_start_or_workspace_reset() {
         let (_tmp, _g) = isolated_sessions_dir();
@@ -2348,6 +2418,103 @@ mod tests {
         assert_eq!(ws.plan_goal.as_deref(), Some("goal-x"));
         assert_eq!(ws.plan_execution_rounds, 9);
         assert_eq!(ws.plan_corrections, vec!["note".to_string()]);
+    }
+
+    #[test]
+    fn sync_session_state_persists_goal_progress() {
+        let mut state = ReplState::default();
+        state.session_goal = Some("ship auth".to_string());
+        let mut obs =
+            astra_runtime::observability_integration::ObservabilitySession::new_simple("sid-goal");
+        obs.record_query("ship auth");
+        obs.record_tool_result(
+            "bash",
+            "test result: ok. 12 passed; 0 failed; 0 ignored",
+            Some(0),
+        );
+        state.observability_session = Some(std::sync::Arc::new(std::sync::RwLock::new(obs)));
+
+        let mut ws = astra_services::session_workspace::WorkspaceMetadata::new("sid-goal", "m");
+        sync_session_state_to_workspace(&state, &mut ws);
+
+        let progress = ws.goal_progress.expect("goal progress should persist");
+        assert_eq!(progress.goal, "ship auth");
+        assert_eq!(progress.milestone_count, 1);
+        assert!(progress.completion_score > 0.0);
+    }
+
+    #[test]
+    fn apply_pending_goal_progress_restores_observability_tracker() {
+        let mut source =
+            astra_runtime::observability_integration::ObservabilitySession::new_simple("sid-src");
+        source.record_query("ship auth");
+        source.record_tool_result("bash", "Finished `dev` profile", Some(0));
+        let snapshot = source
+            .goal_progress_snapshot()
+            .expect("goal progress snapshot");
+
+        let mut state = ReplState::default();
+        state.session_goal = Some(snapshot.goal.clone());
+        state.pending_goal_progress = Some(snapshot.clone());
+        state.observability_session = Some(std::sync::Arc::new(std::sync::RwLock::new(
+            astra_runtime::observability_integration::ObservabilitySession::new_simple("sid-dst"),
+        )));
+
+        apply_pending_goal_progress_state(&mut state);
+
+        let restored = state
+            .observability_session
+            .as_ref()
+            .unwrap()
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .goal_progress()
+            .expect("restored progress");
+        assert_eq!(restored.milestone_count, snapshot.milestone_count);
+        assert!(state.pending_goal_progress.is_none());
+    }
+
+    #[test]
+    fn apply_pending_goal_progress_requeues_when_lock_is_poisoned() {
+        let mut source =
+            astra_runtime::observability_integration::ObservabilitySession::new_simple("sid-src");
+        source.record_query("ship auth");
+        source.record_tool_result("bash", "Finished `dev` profile", Some(0));
+        let snapshot = source
+            .goal_progress_snapshot()
+            .expect("goal progress snapshot");
+
+        let mut state = ReplState::default();
+        state.session_goal = Some(snapshot.goal.clone());
+        state.pending_goal_progress = Some(snapshot.clone());
+        state.observability_session = Some(poisoned_observability_session("sid-poisoned"));
+
+        apply_pending_goal_progress_state(&mut state);
+
+        assert_eq!(state.pending_goal_progress, Some(snapshot));
+    }
+
+    #[test]
+    fn apply_pending_adaptive_state_requeues_when_lock_is_poisoned() {
+        let mut state = ReplState::default();
+        state.pending_adaptive_state = Some(super::repl_state::PersistedAdaptiveState {
+            last_scenario_change_turn: Some(3),
+            last_token_budget_direction: 1,
+            last_token_budget_change_turn: Some(2),
+            active_experiment_id: Some("exp-1".to_string()),
+            active_variant: Some("variant-a".to_string()),
+            tuned_config_json: None,
+        });
+        state.observability_session = Some(poisoned_observability_session("sid-adaptive"));
+
+        apply_pending_adaptive_state(&mut state);
+
+        let adaptive = state
+            .pending_adaptive_state
+            .as_ref()
+            .expect("adaptive state should remain pending");
+        assert_eq!(adaptive.last_token_budget_direction, 1);
+        assert_eq!(adaptive.active_experiment_id.as_deref(), Some("exp-1"));
     }
 
     #[test]

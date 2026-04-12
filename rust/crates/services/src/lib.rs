@@ -25,6 +25,7 @@ pub mod reflect;
 pub mod replay;
 pub mod runs;
 pub mod sandbox;
+pub mod self_surface;
 pub mod session_analytics;
 pub mod session_audit;
 pub mod session_checkpoint;
@@ -147,6 +148,15 @@ pub use runs::{
 };
 pub use sandbox::{
     DatabaseSandboxService, SandboxRecord, SandboxService, UnconfiguredSandboxService,
+};
+pub use self_surface::{
+    AcceptanceSurface, BudgetConfig, BudgetState, BudgetSurface, CapabilitySurface,
+    EnvironmentSurface, EventPreview, EvolutionRecord, EvolutionSurface, GoalSurface,
+    HealthSurface, JournalSurface, LocalSelfSurfaceService, NoopSelfSurfaceRuntimeSupport,
+    PersistentSelfSnapshot, ProfileSurface, RunSurface, RunTotals, ScoredAlternative,
+    SelfSurfaceCheck, SelfSurfaceDimension, SelfSurfaceResponse, SelfSurfaceRuntimeSupport,
+    SelfSurfaceService, SignalsSurface, StepRecord, SurfaceConstraints, ToolCallView,
+    ToolFailureView, ToolHealthView, TraceSurface, VerificationSurface,
 };
 pub use session_fork::{
     CrossBranchLearning, DataBranchOptions, ExploreError, ExploreOptions, ExploreResult,

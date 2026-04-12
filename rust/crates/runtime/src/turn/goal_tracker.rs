@@ -9,6 +9,10 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+use astra_services::session_workspace::{
+    GoalMilestoneSignalSnapshot, GoalMilestoneSnapshot, GoalProgressSnapshot,
+};
+
 use crate::text_tokenize;
 
 // ─── Data Types ─────────────────────────────────────────────────────────────
@@ -155,6 +159,50 @@ impl GoalTracker {
         &self.original_goal
     }
 
+    /// Export the tracker into a persisted snapshot for workspace resume.
+    pub fn snapshot(&self) -> GoalProgressSnapshot {
+        let progress = self.progress();
+        GoalProgressSnapshot {
+            goal: self.original_goal.clone(),
+            completion_score: progress.completion_score,
+            momentum: progress.momentum,
+            milestone_count: progress.milestone_count,
+            summary: progress.summary,
+            weighted_progress: self.weighted_progress,
+            negative_signals: self.negative_signals,
+            milestones: self
+                .milestones
+                .iter()
+                .map(GoalMilestoneSnapshot::from)
+                .collect(),
+        }
+    }
+
+    /// Restore a tracker from a persisted workspace snapshot.
+    pub fn from_snapshot(snapshot: &GoalProgressSnapshot) -> Self {
+        let tokens = text_tokenize::tokenize(&snapshot.goal);
+        let goal_tf = text_tokenize::build_tf(&tokens);
+        let milestones = snapshot
+            .milestones
+            .iter()
+            .cloned()
+            .map(Milestone::from)
+            .collect::<Vec<_>>();
+        let (weighted_progress, negative_signals) = if milestones.is_empty() {
+            (snapshot.weighted_progress, snapshot.negative_signals)
+        } else {
+            accumulated_progress(&milestones)
+        };
+
+        Self {
+            original_goal: snapshot.goal.clone(),
+            goal_tf,
+            milestones,
+            weighted_progress,
+            negative_signals,
+        }
+    }
+
     // ── Internal ────────────────────────────────────────────────────────────
 
     /// Compute relevance of a description to the goal using TF-IDF cosine.
@@ -251,6 +299,79 @@ fn signal_description(signal: &MilestoneSignal) -> String {
         MilestoneSignal::UserDisapproval => "user rejected".to_string(),
         MilestoneSignal::BuildSuccess => "build succeeded".to_string(),
         MilestoneSignal::BuildFail => "build failed".to_string(),
+    }
+}
+
+fn accumulated_progress(milestones: &[Milestone]) -> (f64, f64) {
+    let mut weighted_progress = 0.0;
+    let mut negative_signals = 0.0;
+    for milestone in milestones {
+        let weight = signal_weight(&milestone.signal);
+        if weight > 0.0 {
+            weighted_progress += weight * milestone.relevance.max(0.3);
+        } else {
+            negative_signals += weight.abs() * milestone.relevance.max(0.3);
+        }
+    }
+    (weighted_progress, negative_signals)
+}
+
+impl From<&MilestoneSignal> for GoalMilestoneSignalSnapshot {
+    fn from(signal: &MilestoneSignal) -> Self {
+        match signal {
+            MilestoneSignal::ToolSuccess(tool, detail) => Self::ToolSuccess {
+                tool: tool.clone(),
+                detail: detail.clone(),
+            },
+            MilestoneSignal::TestPass(count) => Self::TestPass { count: *count },
+            MilestoneSignal::TestFail(count) => Self::TestFail { count: *count },
+            MilestoneSignal::FileChanged(path) => Self::FileChanged { path: path.clone() },
+            MilestoneSignal::CommitMade(message) => Self::CommitMade {
+                message: message.clone(),
+            },
+            MilestoneSignal::UserApproval => Self::UserApproval,
+            MilestoneSignal::UserDisapproval => Self::UserDisapproval,
+            MilestoneSignal::BuildSuccess => Self::BuildSuccess,
+            MilestoneSignal::BuildFail => Self::BuildFail,
+        }
+    }
+}
+
+impl From<GoalMilestoneSignalSnapshot> for MilestoneSignal {
+    fn from(signal: GoalMilestoneSignalSnapshot) -> Self {
+        match signal {
+            GoalMilestoneSignalSnapshot::ToolSuccess { tool, detail } => {
+                Self::ToolSuccess(tool, detail)
+            }
+            GoalMilestoneSignalSnapshot::TestPass { count } => Self::TestPass(count),
+            GoalMilestoneSignalSnapshot::TestFail { count } => Self::TestFail(count),
+            GoalMilestoneSignalSnapshot::FileChanged { path } => Self::FileChanged(path),
+            GoalMilestoneSignalSnapshot::CommitMade { message } => Self::CommitMade(message),
+            GoalMilestoneSignalSnapshot::UserApproval => Self::UserApproval,
+            GoalMilestoneSignalSnapshot::UserDisapproval => Self::UserDisapproval,
+            GoalMilestoneSignalSnapshot::BuildSuccess => Self::BuildSuccess,
+            GoalMilestoneSignalSnapshot::BuildFail => Self::BuildFail,
+        }
+    }
+}
+
+impl From<&Milestone> for GoalMilestoneSnapshot {
+    fn from(milestone: &Milestone) -> Self {
+        Self {
+            turn: milestone.turn,
+            signal: GoalMilestoneSignalSnapshot::from(&milestone.signal),
+            relevance: milestone.relevance,
+        }
+    }
+}
+
+impl From<GoalMilestoneSnapshot> for Milestone {
+    fn from(milestone: GoalMilestoneSnapshot) -> Self {
+        Self {
+            turn: milestone.turn,
+            signal: milestone.signal.into(),
+            relevance: milestone.relevance,
+        }
     }
 }
 
@@ -540,6 +661,29 @@ mod tests {
         assert!(
             progress.momentum > 0.0,
             "momentum should be positive after recovery"
+        );
+    }
+
+    #[test]
+    fn test_goal_tracker_snapshot_round_trip() {
+        let mut tracker = GoalTracker::new("implement user authentication with JWT");
+        tracker.record(0, MilestoneSignal::FileChanged("src/auth.rs".to_string()));
+        tracker.record(1, MilestoneSignal::TestPass(12));
+        tracker.record(2, MilestoneSignal::BuildSuccess);
+
+        let snapshot = tracker.snapshot();
+        let restored = GoalTracker::from_snapshot(&snapshot);
+        let progress = restored.progress();
+
+        assert_eq!(restored.goal(), "implement user authentication with JWT");
+        assert_eq!(progress.milestone_count, 3);
+        assert!(
+            (progress.completion_score - snapshot.completion_score).abs() < 0.0001,
+            "completion score should survive round-trip"
+        );
+        assert!(
+            (progress.momentum - snapshot.momentum).abs() < 0.0001,
+            "momentum should survive round-trip"
         );
     }
 

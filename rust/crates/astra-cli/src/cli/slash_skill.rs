@@ -1720,15 +1720,21 @@ Follow these steps:
             .map_err(|e| e.to_string())?;
 
             let response = result.full_text.trim();
-            let queued = evo.ingest_reflection_response(response, &ctx).await;
-            match queued {
-                Ok(count) => {
+            let outcome = evo
+                .ingest_reflection_response_detailed(response, &ctx)
+                .await;
+            match outcome {
+                Ok(outcome) => {
                     eprintln!(
-                        "\n  {} Reflection executed live; queued {} proposal(s).",
+                        "\n  {} Reflection executed live; processed {} proposal(s): {} auto-applied, {} queued.",
                         "✓".green(),
-                        count.to_string().cyan()
+                        outcome.processed.to_string().cyan(),
+                        outcome.auto_applied.to_string().cyan(),
+                        outcome.queued.to_string().cyan()
                     );
-                    eprintln!("  💡 Review proposals in: {}", "/skill evolve".cyan());
+                    if outcome.queued > 0 {
+                        eprintln!("  💡 Review proposals in: {}", "/skill evolve".cyan());
+                    }
                 }
                 Err(err) => {
                     let preview = response.lines().take(12).collect::<Vec<_>>().join("\n");

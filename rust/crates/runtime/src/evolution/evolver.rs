@@ -35,7 +35,7 @@ pub fn generate_fast_proposals(signals: &[EvolutionSignal]) -> Vec<EvolutionProp
                             recent_rate * 100.0
                         ),
                         created_at: now,
-                        status: ApprovalStatus::AutoApplied,
+                        status: ApprovalStatus::Pending,
                     });
                 }
             }
@@ -60,7 +60,7 @@ pub fn generate_fast_proposals(signals: &[EvolutionSignal]) -> Vec<EvolutionProp
                         confidence: 0.9,
                         reasoning: format!("Tool chain stalled {stall_count} consecutive rounds"),
                         created_at: now,
-                        status: ApprovalStatus::AutoApplied,
+                        status: ApprovalStatus::Pending,
                     });
                 }
             }
@@ -127,7 +127,7 @@ mod tests {
             }
             _ => panic!("expected Pattern axis"),
         }
-        assert_eq!(proposals[0].status, ApprovalStatus::AutoApplied);
+        assert_eq!(proposals[0].status, ApprovalStatus::Pending);
     }
 
     #[test]

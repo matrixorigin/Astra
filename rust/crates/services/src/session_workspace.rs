@@ -186,6 +186,77 @@ impl ContextTraceSignal {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum GoalMilestoneSignalSnapshot {
+    ToolSuccess { tool: String, detail: String },
+    TestPass { count: u32 },
+    TestFail { count: u32 },
+    FileChanged { path: String },
+    CommitMade { message: String },
+    UserApproval,
+    UserDisapproval,
+    BuildSuccess,
+    BuildFail,
+}
+
+impl GoalMilestoneSignalSnapshot {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::ToolSuccess { .. } => "tool_success",
+            Self::TestPass { .. } => "test_pass",
+            Self::TestFail { .. } => "test_fail",
+            Self::FileChanged { .. } => "file_changed",
+            Self::CommitMade { .. } => "commit_made",
+            Self::UserApproval => "user_approval",
+            Self::UserDisapproval => "user_disapproval",
+            Self::BuildSuccess => "build_success",
+            Self::BuildFail => "build_fail",
+        }
+    }
+
+    pub fn detail(&self) -> Option<String> {
+        match self {
+            Self::ToolSuccess { tool, detail } => Some(format!("{tool}: {detail}")),
+            Self::TestPass { count } => Some(format!("{count} tests passed")),
+            Self::TestFail { count } => Some(format!("{count} tests failed")),
+            Self::FileChanged { path } => Some(path.clone()),
+            Self::CommitMade { message } => Some(message.clone()),
+            Self::UserApproval => Some("user approved".to_string()),
+            Self::UserDisapproval => Some("user rejected".to_string()),
+            Self::BuildSuccess => Some("build succeeded".to_string()),
+            Self::BuildFail => Some("build failed".to_string()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GoalMilestoneSnapshot {
+    pub turn: u32,
+    pub signal: GoalMilestoneSignalSnapshot,
+    #[serde(default)]
+    pub relevance: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GoalProgressSnapshot {
+    pub goal: String,
+    #[serde(default)]
+    pub completion_score: f64,
+    #[serde(default)]
+    pub momentum: f64,
+    #[serde(default)]
+    pub milestone_count: usize,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub summary: String,
+    #[serde(default)]
+    pub weighted_progress: f64,
+    #[serde(default)]
+    pub negative_signals: f64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub milestones: Vec<GoalMilestoneSnapshot>,
+}
+
 /// Session workspace metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkspaceMetadata {
@@ -261,6 +332,9 @@ pub struct WorkspaceMetadata {
     /// User-stated session goal (e.g. "implement auth module").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_goal: Option<String>,
+    /// Persisted live goal-tracker state for resume and self-surface reporting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal_progress: Option<GoalProgressSnapshot>,
     /// Skills explicitly pinned by the user.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pinned_skills: Vec<String>,
@@ -375,6 +449,7 @@ impl WorkspaceMetadata {
             agent_role: None,
             last_context_trace: None,
             session_goal: None,
+            goal_progress: None,
             pinned_skills: Vec::new(),
             discovered_skills: Vec::new(),
             pinned_tools: Vec::new(),
@@ -422,6 +497,7 @@ impl WorkspaceMetadata {
             agent_role: None,
             last_context_trace: None,
             session_goal: None,
+            goal_progress: None,
             pinned_skills: Vec::new(),
             discovered_skills: Vec::new(),
             pinned_tools: Vec::new(),
@@ -853,6 +929,7 @@ mod tests {
         assert!(ws.plan_config_json.is_none());
         assert_eq!(ws.plan_execution_rounds, 0);
         assert!(ws.last_context_trace.is_none());
+        assert!(ws.goal_progress.is_none());
     }
 
     #[test]
@@ -884,6 +961,41 @@ mod tests {
         assert!(!yaml.contains("plan_goal"));
         assert!(!yaml.contains("plan_config_json"));
         assert!(!yaml.contains("plan_execution_rounds"));
+    }
+
+    #[test]
+    fn workspace_goal_progress_round_trip() {
+        let mut ws = WorkspaceMetadata::with_context("goal-sess", "gpt-4", "/tmp", Some("main"));
+        ws.session_goal = Some("ship auth".to_string());
+        ws.goal_progress = Some(GoalProgressSnapshot {
+            goal: "ship auth".to_string(),
+            completion_score: 0.65,
+            momentum: 0.4,
+            milestone_count: 3,
+            summary: "Well underway — 65% estimated".to_string(),
+            weighted_progress: 1.2,
+            negative_signals: 0.1,
+            milestones: vec![
+                GoalMilestoneSnapshot {
+                    turn: 1,
+                    signal: GoalMilestoneSignalSnapshot::FileChanged {
+                        path: "src/auth.rs".to_string(),
+                    },
+                    relevance: 0.8,
+                },
+                GoalMilestoneSnapshot {
+                    turn: 2,
+                    signal: GoalMilestoneSignalSnapshot::TestPass { count: 12 },
+                    relevance: 0.9,
+                },
+            ],
+        });
+
+        let yaml = serde_yaml::to_string(&ws).unwrap();
+        let parsed: WorkspaceMetadata = serde_yaml::from_str(&yaml).unwrap();
+
+        assert_eq!(parsed.goal_progress, ws.goal_progress);
+        assert!(yaml.contains("goal_progress"));
     }
 
     #[test]

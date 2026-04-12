@@ -24,7 +24,9 @@ use tokio::sync::Mutex as TokioMutex;
 
 use crate::bridge::rate_limit_cooldown::{PerModelCooldown, RateLimitAction};
 use crate::turn::agentic_headless_round::HeadlessStderrStyle;
-use crate::turn::agentic_loop_host::{AgenticLoopHost, AgenticLoopState, HostTurnResult};
+use crate::turn::agentic_loop_host::{
+    AgenticLoopHost, AgenticLoopState, HostReflectionRequest, HostReflectionResult, HostTurnResult,
+};
 use crate::turn::chat_turn_sse_dispatch::ChatTurnSseAccum;
 use crate::turn::llm_client::{
     LlmCallResult, LlmCancel, cached_system_prompt, call_llm_and_collect, classify_llm_error,
@@ -704,6 +706,110 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             ttft_ms,
             edge_tool_round: Vec::new(),
         })
+    }
+
+    fn supports_auto_reflection(&self) -> bool {
+        true
+    }
+
+    async fn execute_reflection(
+        &mut self,
+        state: &mut AgenticLoopState,
+        request: HostReflectionRequest<'_>,
+    ) -> Result<Option<HostReflectionResult>, String> {
+        let effective_model_override = state
+            .skills
+            .model_override
+            .as_deref()
+            .or(self.model_override.as_deref());
+        let pool_ref = self.shared_pool.as_ref().map(|sp| sp.get());
+        let (mut model_name, mut api_key, mut base_url, mut provider, fallback_model_name) =
+            match astra_services::resolve_active_llm_model(
+                &self.matrixone,
+                self.encryptor.as_ref(),
+                effective_model_override,
+                pool_ref,
+            )
+            .await
+            {
+                Ok(m) => (
+                    m.model_name,
+                    m.api_key,
+                    m.base_url,
+                    m.provider,
+                    m.fallback_model,
+                ),
+                Err(e) => return Err(format!("Model resolution failed: {e}")),
+            };
+        let has_fallback = fallback_model_name.is_some();
+
+        match rate_limit_cooldown().with(&model_name, |c| c.check_request(has_fallback)) {
+            RateLimitAction::Proceed => {}
+            RateLimitAction::WaitAndRetry { delay_ms } => {
+                sleep_ms_or_llm_cancel(delay_ms, llm_cancel_for_state(state)).await?;
+            }
+            RateLimitAction::UseFallback { .. } => {
+                if let Some(ref fb_name) = fallback_model_name
+                    && let Ok(fb) = astra_services::resolve_active_llm_model(
+                        &self.matrixone,
+                        self.encryptor.as_ref(),
+                        Some(fb_name.as_str()),
+                        pool_ref,
+                    )
+                    .await
+                {
+                    model_name = fb.model_name;
+                    api_key = fb.api_key;
+                    base_url = fb.base_url;
+                    provider = fb.provider;
+                }
+            }
+            RateLimitAction::Reject {
+                reason,
+                reset_in_ms,
+            } => {
+                return Err(format!(
+                    "Rate limit cooldown active ({}). Resets in {}s.",
+                    reason.as_str(),
+                    reset_in_ms / 1000
+                ));
+            }
+        }
+
+        let reflection_messages = vec![
+            json!({"role": "system", "content": request.system_prompt}),
+            json!({"role": "user", "content": request.user_prompt}),
+        ];
+        let result = call_llm_and_collect(
+            &reflection_messages,
+            &[],
+            &model_name,
+            &api_key,
+            &base_url,
+            &provider,
+            request.max_output_tokens,
+            has_fallback,
+            llm_cancel_for_state(state),
+        )
+        .await
+        .map_err(|e| {
+            let kind = classify_llm_error(&e);
+            format!("[{kind}] {e}")
+        })?;
+        let accum = Self::result_to_accum(&result);
+
+        if accum.has_tool_calls {
+            return Err("auto-reflection unexpectedly returned tool calls".to_string());
+        }
+
+        Ok(Some(HostReflectionResult {
+            full_text: accum.full_text.trim().to_string(),
+            prompt_tokens: accum.prompt_tokens,
+            completion_tokens: accum.completion_tokens,
+            cache_read_tokens: accum.cache_read_tokens,
+            cache_creation_tokens: accum.cache_creation_tokens,
+            has_usage: accum.has_usage,
+        }))
     }
 
     fn emit_headless_line(&mut self, _style: HeadlessStderrStyle, line: String) {

@@ -99,6 +99,28 @@ pub struct HostTurnResult {
     pub edge_tool_round: Vec<EdgeToolExecResult>,
 }
 
+/// Request for a hidden host-executed reflection subcall.
+pub struct HostReflectionRequest<'a> {
+    /// Structured runtime context that motivated the reflection.
+    pub context: &'a crate::liquid::reflection::ReflectionContext,
+    /// System prompt for the reflection subcall.
+    pub system_prompt: &'a str,
+    /// User prompt for the reflection subcall.
+    pub user_prompt: &'a str,
+    /// Optional output cap for the reflection response.
+    pub max_output_tokens: Option<usize>,
+}
+
+/// Result from a hidden host-executed reflection subcall.
+pub struct HostReflectionResult {
+    pub full_text: String,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub has_usage: bool,
+}
+
 // ─── Host trait ──────────────────────────────────────────────────────────────
 
 /// Abstraction for host-specific agentic loop behavior.
@@ -127,6 +149,22 @@ pub trait AgenticLoopHost: Send {
         &mut self,
         state: &mut AgenticLoopState,
     ) -> Result<HostTurnResult, String>;
+
+    /// Whether the host can execute a hidden reflection-only LLM subcall.
+    fn supports_auto_reflection(&self) -> bool {
+        false
+    }
+
+    /// Execute a hidden reflection-only LLM subcall and return the raw text.
+    ///
+    /// Hosts that do not support this can keep the default implementation.
+    async fn execute_reflection(
+        &mut self,
+        _state: &mut AgenticLoopState,
+        _request: HostReflectionRequest<'_>,
+    ) -> Result<Option<HostReflectionResult>, String> {
+        Ok(None)
+    }
 
     /// Headless round terminal output.
     fn emit_headless_line(&mut self, style: HeadlessStderrStyle, line: String);
@@ -2438,6 +2476,7 @@ fn maybe_run_tuning_cycle(state: &mut AgenticLoopState) {
 
 /// Minimum accumulated LLM-routed signals before auto-reflection triggers.
 const AUTO_REFLECTION_SIGNAL_THRESHOLD: usize = 3;
+const AUTO_REFLECTION_MAX_OUTPUT_TOKENS: usize = 1200;
 const AUTO_REFLECTION_TOOL_WINDOW: usize = 24;
 const AUTO_REFLECTION_TOOL_STAT_LIMIT: usize = 8;
 const MAX_RECENT_TACTICAL_ACTIONS: usize = 8;
@@ -2478,11 +2517,24 @@ fn build_auto_reflection_experiment_summary(
         )
 }
 
+fn apply_auto_reflection_usage(state: &mut AgenticLoopState, result: &HostReflectionResult) {
+    state.total_prompt += result.prompt_tokens;
+    state.total_completion += result.completion_tokens;
+    state.total_cache_read += result.cache_read_tokens;
+    state.total_cache_creation += result.cache_creation_tokens;
+    if result.has_usage {
+        state.has_any_usage = true;
+    }
+}
+
 /// After a tuning cycle, flush evolution signals and accumulate LLM-routed
-/// ones on the state.  When the accumulated count reaches the threshold,
-/// build a compact reflection prompt and inject it as a system message so
-/// the LLM can self-reflect on the next turn.
-async fn maybe_trigger_auto_reflection(state: &mut AgenticLoopState) {
+/// ones on the state. When the accumulated count reaches the threshold,
+/// ask the host to run a hidden reflection-only LLM subcall, then ingest
+/// the structured response back into the evolution service.
+async fn maybe_trigger_auto_reflection<H: AgenticLoopHost>(
+    host: &mut H,
+    state: &mut AgenticLoopState,
+) {
     let evo = match &state.evolution_service {
         Some(e) => Arc::clone(e),
         None => return,
@@ -2510,8 +2562,11 @@ async fn maybe_trigger_auto_reflection(state: &mut AgenticLoopState) {
         return;
     }
 
-    // Drain pending signals and build reflection context.
-    let signals: Vec<_> = state.pending_reflection_signals.drain(..).collect();
+    if !host.supports_auto_reflection() {
+        return;
+    }
+
+    let signals = state.pending_reflection_signals.clone();
 
     let session_id = state.current_session_id.as_deref().unwrap_or("unknown");
     let turns_completed = (state.max_turns - state.remaining_turns) as u32;
@@ -2531,7 +2586,7 @@ async fn maybe_trigger_auto_reflection(state: &mut AgenticLoopState) {
         total as f64 / (budget * effective_turns)
     };
     let tool_stats = build_auto_reflection_tool_stats(state);
-    let recent_tactical_actions = std::mem::take(&mut state.recent_tactical_actions);
+    let recent_tactical_actions = state.recent_tactical_actions.clone();
     let active_experiment = build_auto_reflection_experiment_summary(state);
 
     let ctx = evo.build_reflection_context(
@@ -2545,25 +2600,57 @@ async fn maybe_trigger_auto_reflection(state: &mut AgenticLoopState) {
         active_experiment,
     );
 
-    let (_system_prompt, user_prompt) = evo.build_reflection_prompt(&ctx);
+    let (system_prompt, user_prompt) = evo.build_reflection_prompt(&ctx);
+    let reflection_result = match host
+        .execute_reflection(
+            state,
+            HostReflectionRequest {
+                context: &ctx,
+                system_prompt: &system_prompt,
+                user_prompt: &user_prompt,
+                max_output_tokens: Some(AUTO_REFLECTION_MAX_OUTPUT_TOKENS),
+            },
+        )
+        .await
+    {
+        Ok(Some(result)) => result,
+        Ok(None) => return,
+        Err(err) => {
+            host.emit_headless_line(
+                HeadlessStderrStyle::Yellow,
+                format!("Auto-reflection skipped: {err}"),
+            );
+            return;
+        }
+    };
 
-    // Inject a compact hint as a system message.
-    let hint = format!(
-        "[auto-reflection] {} signal(s) accumulated. Reflection summary:\n{}",
-        ctx.signals.len(),
-        ctx.render_prompt_section()
-    );
+    apply_auto_reflection_usage(state, &reflection_result);
 
-    state.messages.push(serde_json::json!({
-        "role": "system",
-        "content": hint,
-    }));
-
-    eprintln!(
-        "[liquid] auto-reflection triggered ({} signals, {} chars prompt)",
-        ctx.signals.len(),
-        user_prompt.len()
-    );
+    match evo
+        .ingest_reflection_response_detailed(&reflection_result.full_text, &ctx)
+        .await
+    {
+        Ok(outcome) => {
+            state.pending_reflection_signals.clear();
+            state.recent_tactical_actions.clear();
+            host.emit_headless_line(
+                HeadlessStderrStyle::Green,
+                format!(
+                    "Auto-reflection processed {} proposal(s): {} auto-applied, {} queued from {} signal(s).",
+                    outcome.processed,
+                    outcome.auto_applied,
+                    outcome.queued,
+                    ctx.signals.len(),
+                ),
+            );
+        }
+        Err(err) => {
+            host.emit_headless_line(
+                HeadlessStderrStyle::Yellow,
+                format!("Auto-reflection parse failed: {err}"),
+            );
+        }
+    }
 }
 
 fn write_session_journal_event(
@@ -4418,7 +4505,7 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                 // ── Auto-tuning: count completed turns & periodic cycle ──
                 state.telemetry.completed_turns_for_tuning += 1;
                 maybe_run_tuning_cycle(state);
-                maybe_trigger_auto_reflection(state).await;
+                maybe_trigger_auto_reflection(host, state).await;
 
                 // ── Per-turn micro-adaptation ──
                 let turn_tokens = state.last_measured_prompt_tokens.unwrap_or(0);
@@ -4501,6 +4588,9 @@ mod tests {
         emitted_lines: Vec<String>,
         quiet: bool,
         injected_schemas: Vec<Value>,
+        reflection_text: Option<String>,
+        reflection_error: Option<String>,
+        last_reflection_prompt: Option<String>,
     }
 
     impl MockHost {
@@ -4512,11 +4602,24 @@ mod tests {
                 emitted_lines: Vec::new(),
                 quiet: true,
                 injected_schemas: Vec::new(),
+                reflection_text: None,
+                reflection_error: None,
+                last_reflection_prompt: None,
             }
         }
 
         fn with_valid_tools(mut self, tools: &[&str]) -> Self {
             self.valid_tools = tools.iter().map(|s| s.to_string()).collect();
+            self
+        }
+
+        fn with_reflection_text(mut self, text: &str) -> Self {
+            self.reflection_text = Some(text.to_string());
+            self
+        }
+
+        fn with_reflection_error(mut self, error: &str) -> Self {
+            self.reflection_error = Some(error.to_string());
             self
         }
     }
@@ -4533,6 +4636,32 @@ mod tests {
             let result = self.turn_results.remove(0);
             self.current_turn += 1;
             Ok(result)
+        }
+
+        fn supports_auto_reflection(&self) -> bool {
+            self.reflection_text.is_some() || self.reflection_error.is_some()
+        }
+
+        async fn execute_reflection(
+            &mut self,
+            _state: &mut AgenticLoopState,
+            request: HostReflectionRequest<'_>,
+        ) -> Result<Option<HostReflectionResult>, String> {
+            self.last_reflection_prompt = Some(request.user_prompt.to_string());
+            if let Some(error) = self.reflection_error.take() {
+                return Err(error);
+            }
+            let Some(text) = self.reflection_text.take() else {
+                return Ok(None);
+            };
+            Ok(Some(HostReflectionResult {
+                full_text: text,
+                prompt_tokens: 91,
+                completion_tokens: 37,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
+                has_usage: true,
+            }))
         }
 
         fn emit_headless_line(&mut self, _style: HeadlessStderrStyle, line: String) {
@@ -10368,19 +10497,21 @@ print(json.dumps({'context': 'user said: ' + msg}))
 
     #[tokio::test]
     async fn auto_reflection_skips_without_evolution_service() {
+        let mut host = MockHost::new(vec![]);
         let mut state = make_state();
         assert!(state.evolution_service.is_none());
         assert!(state.pending_reflection_signals.is_empty());
 
         // Should be a no-op — no panic, no messages added.
         let msg_count = state.messages.len();
-        maybe_trigger_auto_reflection(&mut state).await;
+        maybe_trigger_auto_reflection(&mut host, &mut state).await;
         assert_eq!(state.messages.len(), msg_count);
         assert!(state.pending_reflection_signals.is_empty());
     }
 
     #[tokio::test]
     async fn auto_reflection_accumulates_below_threshold() {
+        let mut host = MockHost::new(vec![]);
         let mut state = make_state();
 
         // Add fewer signals than threshold.
@@ -10395,7 +10526,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
 
         // Without evolution service, signals stay.
         let msg_count = state.messages.len();
-        maybe_trigger_auto_reflection(&mut state).await;
+        maybe_trigger_auto_reflection(&mut host, &mut state).await;
         assert_eq!(state.messages.len(), msg_count);
         // Signals are NOT drained (no evo service to flush).
         assert_eq!(state.pending_reflection_signals.len(), 1);
@@ -10403,6 +10534,18 @@ print(json.dumps({'context': 'user said: ' + msg}))
 
     #[tokio::test]
     async fn auto_reflection_triggers_at_threshold() {
+        let reflection_response = r#"{
+            "proposals": [
+                {
+                    "axis": "pattern",
+                    "description": "Demote failing chain",
+                    "confidence": 0.8,
+                    "details": { "signature": "tool_0", "action": "demote" }
+                }
+            ],
+            "summary": "One issue found."
+        }"#;
+        let mut host = MockHost::new(vec![]).with_reflection_text(reflection_response);
         let mut state = make_state();
 
         // Create an evolution service.
@@ -10425,30 +10568,38 @@ print(json.dumps({'context': 'user said: ' + msg}))
         );
 
         let msg_count = state.messages.len();
-        maybe_trigger_auto_reflection(&mut state).await;
+        maybe_trigger_auto_reflection(&mut host, &mut state).await;
 
         // Signals should be drained.
         assert!(
             state.pending_reflection_signals.is_empty(),
             "Signals should be drained after reflection"
         );
-        // A system message should be injected.
-        assert_eq!(
-            state.messages.len(),
-            msg_count + 1,
-            "One system message should be added"
-        );
-        let last = state.messages.last().unwrap();
-        assert_eq!(last["role"], "system");
-        let content = last["content"].as_str().unwrap();
+        assert_eq!(state.messages.len(), msg_count);
+        assert_eq!(evo.pending().await.len(), 1);
+        assert_eq!(state.total_prompt, 91);
+        assert_eq!(state.total_completion, 37);
         assert!(
-            content.contains("auto-reflection"),
-            "Message should contain auto-reflection marker"
+            host.emitted_lines
+                .iter()
+                .any(|line| line.contains("processed 1 proposal(s): 0 auto-applied, 1 queued"))
         );
     }
 
     #[tokio::test]
     async fn auto_reflection_flushes_evo_signals() {
+        let reflection_response = r#"{
+            "proposals": [
+                {
+                    "axis": "skill",
+                    "description": "Add retry hint",
+                    "confidence": 0.6,
+                    "details": { "skill_name": "ops", "section": "troubleshooting", "content": "retry" }
+                }
+            ],
+            "summary": "Retry needed."
+        }"#;
+        let mut host = MockHost::new(vec![]).with_reflection_text(reflection_response);
         let mut state = make_state();
         let evo = std::sync::Arc::new(crate::evolution::service::EvolutionService::new());
         state.evolution_service = Some(evo.clone());
@@ -10475,21 +10626,93 @@ print(json.dumps({'context': 'user said: ' + msg}))
         }
 
         let msg_count = state.messages.len();
-        maybe_trigger_auto_reflection(&mut state).await;
+        maybe_trigger_auto_reflection(&mut host, &mut state).await;
 
         // Should have triggered: pre-loaded + flushed >= threshold.
         assert!(
             state.pending_reflection_signals.is_empty(),
             "All signals drained"
         );
+        assert_eq!(state.messages.len(), msg_count);
+        assert_eq!(evo.pending().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn auto_reflection_parse_failure_retains_signals() {
+        let mut host = MockHost::new(vec![]).with_reflection_text("not json");
+        let mut state = make_state();
+        state.evolution_service = Some(std::sync::Arc::new(
+            crate::evolution::service::EvolutionService::new(),
+        ));
+
+        for i in 0..AUTO_REFLECTION_SIGNAL_THRESHOLD {
+            state.pending_reflection_signals.push(
+                crate::evolution::types::EvolutionSignal::RepeatedStall {
+                    tool_chain: vec![format!("tool_{i}")],
+                    stall_count: 3,
+                    turn_id: format!("t{i}"),
+                },
+            );
+        }
+
+        maybe_trigger_auto_reflection(&mut host, &mut state).await;
+
+        assert_eq!(
+            state.pending_reflection_signals.len(),
+            AUTO_REFLECTION_SIGNAL_THRESHOLD
+        );
         assert!(
-            state.messages.len() > msg_count,
-            "System message should be injected"
+            host.emitted_lines
+                .iter()
+                .any(|line| line.contains("parse failed"))
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_reflection_host_error_retains_signals() {
+        let mut host = MockHost::new(vec![]).with_reflection_error("network unavailable");
+        let mut state = make_state();
+        state.evolution_service = Some(std::sync::Arc::new(
+            crate::evolution::service::EvolutionService::new(),
+        ));
+
+        for i in 0..AUTO_REFLECTION_SIGNAL_THRESHOLD {
+            state.pending_reflection_signals.push(
+                crate::evolution::types::EvolutionSignal::RepeatedStall {
+                    tool_chain: vec![format!("tool_{i}")],
+                    stall_count: 3,
+                    turn_id: format!("t{i}"),
+                },
+            );
+        }
+
+        maybe_trigger_auto_reflection(&mut host, &mut state).await;
+
+        assert_eq!(
+            state.pending_reflection_signals.len(),
+            AUTO_REFLECTION_SIGNAL_THRESHOLD
+        );
+        assert!(
+            host.emitted_lines
+                .iter()
+                .any(|line| line.contains("skipped: network unavailable"))
         );
     }
 
     #[tokio::test]
     async fn auto_reflection_summarizes_recent_tools_and_tactical_actions() {
+        let reflection_response = r#"{
+            "proposals": [
+                {
+                    "axis": "pattern",
+                    "description": "Demote bash chain",
+                    "confidence": 0.8,
+                    "details": { "signature": "bash", "action": "demote" }
+                }
+            ],
+            "summary": "Tool issues found."
+        }"#;
+        let mut host = MockHost::new(vec![]).with_reflection_text(reflection_response);
         let mut state = make_state();
         state.current_session_id = Some("sess-reflect".into());
         state.evolution_service = Some(std::sync::Arc::new(
@@ -10556,24 +10779,23 @@ print(json.dumps({'context': 'user said: ' + msg}))
             .evolution_service
             .as_ref()
             .unwrap()
-            .add_signal(crate::evolution::types::EvolutionSignal::PatternDrift {
-                pattern_signature: "bash".into(),
-                task_type: crate::pipeline::routing::TaskType::Code,
-                domain: Some(crate::pipeline::routing::DomainHint::Code),
-                historical_rate: 0.9,
-                recent_rate: 0.2,
+            .add_signal(crate::evolution::types::EvolutionSignal::ToolFailure {
+                tool_name: "bash".into(),
+                error_snippet: "Permission denied".into(),
+                skill_context: Some("ops".into()),
+                turn_id: "t-reflect".into(),
             })
             .await;
 
-        maybe_trigger_auto_reflection(&mut state).await;
+        maybe_trigger_auto_reflection(&mut host, &mut state).await;
 
-        let content = state.messages.last().unwrap()["content"].as_str().unwrap();
-        assert!(content.contains("Tool statistics:"));
-        assert!(content.contains("bash — calls=2, failures=1, avg_ms=150"));
-        assert!(content.contains("Active experiment: exp-123 (variant=variant-b, samples=4)"));
-        assert!(content.contains("Recent tactical actions:"));
-        assert!(content.contains("verify outputs more strictly"));
-        assert!(content.contains("auto-evolution: Pattern success rate dropped"));
+        let prompt = host.last_reflection_prompt.as_deref().unwrap();
+        assert!(prompt.contains("Tool statistics:"));
+        assert!(prompt.contains("bash — calls=2, failures=1, avg_ms=150"));
+        assert!(prompt.contains("Active experiment: exp-123 (variant=variant-b, samples=4)"));
+        assert!(prompt.contains("Recent tactical actions:"));
+        assert!(prompt.contains("verify outputs more strictly"));
+        assert!(prompt.contains("[ToolFailure] bash: Permission denied"));
         assert!(state.recent_tactical_actions.is_empty());
     }
 

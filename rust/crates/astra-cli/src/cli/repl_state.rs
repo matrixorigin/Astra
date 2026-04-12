@@ -245,6 +245,8 @@ pub(crate) struct ReplState {
     >,
     /// Adaptive state restored from workspace, applied when ObservabilitySession is created.
     pub pending_adaptive_state: Option<PersistedAdaptiveState>,
+    /// Persisted live goal-progress snapshot restored from workspace.
+    pub pending_goal_progress: Option<astra_services::session_workspace::GoalProgressSnapshot>,
 
     // ── A/B Testing (M4) ──
     /// Shared experiment store for A/B testing.
@@ -379,6 +381,7 @@ impl Default for ReplState {
             observability_hub: None,
             observability_session: None,
             pending_adaptive_state: None,
+            pending_goal_progress: None,
             experiment_store: std::sync::Arc::new(std::sync::RwLock::new(
                 astra_runtime::ab_testing::ExperimentStore::new(),
             )),

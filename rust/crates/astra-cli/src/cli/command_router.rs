@@ -261,7 +261,8 @@ async fn execute_repl_bridge_command(
     // Initialize evolution service with pattern library for drift detection.
     {
         let mut evo = astra_runtime::evolution::service::EvolutionService::new()
-            .with_pattern_library(pipeline_modules.pattern_library.clone());
+            .with_pattern_library(pipeline_modules.pattern_library.clone())
+            .with_calibrator(pipeline_modules.calibrator.clone());
         if let Some(skills_dir) = astra_runtime::skills::loader::skill_search_paths()
             .into_iter()
             .next()

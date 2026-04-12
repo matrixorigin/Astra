@@ -22,6 +22,9 @@ use astra_services::session_restore::{
 };
 use astra_services::session_workspace::{self, ContextTraceSignal, WorkspaceMetadata};
 
+#[path = "self_surface.rs"]
+mod self_surface;
+
 #[derive(Debug, Clone)]
 struct SessionArtifacts {
     session_id: String,
@@ -320,8 +323,7 @@ pub(crate) async fn render_surface_for_session(
     surface: &str,
     journal_limit: usize,
 ) -> Result<String, String> {
-    let artifacts = load_artifacts(session_id.to_string()).await?;
-    render_surface_from_artifacts(surface, &artifacts, journal_limit)
+    self_surface::render_surface_for_session(session_id, surface, journal_limit).await
 }
 
 pub(crate) async fn render_reflect_surface_for_session(
@@ -359,82 +361,6 @@ pub(crate) fn agent_info_surface_alias(dimension: &str) -> Option<&'static str> 
         "goals" => Some("goal"),
         "context_snapshot" | "context_trend" => Some("trace"),
         _ => None,
-    }
-}
-
-fn render_surface_from_artifacts(
-    surface: &str,
-    artifacts: &SessionArtifacts,
-    journal_limit: usize,
-) -> Result<String, String> {
-    match surface {
-        "snapshot" => to_json(&build_snapshot_response(artifacts)?),
-        "reflect" => to_json(&build_reflect_response(
-            artifacts,
-            journal_limit,
-            "auto",
-            None,
-        )),
-        "profile" => to_json(&ProfileResponse {
-            session_id: artifacts.session_id.clone(),
-            identity: identity_view(),
-            self_model: build_self_model(artifacts)?,
-        }),
-        "goal" => to_json(&build_goal_response(artifacts)),
-        "trace" => to_json(&build_trace_response(artifacts)),
-        "budget" => {
-            let model = build_self_model(artifacts)?;
-            let config = effective_runtime_config(artifacts.workspace.as_ref())?;
-            to_json(&BudgetResponse {
-                session_id: artifacts.session_id.clone(),
-                token_budget: model.state.token_budget,
-                tool_budget_tokens: config.tool_selection.tool_budget_tokens,
-                compression_threshold: config.compression.compression_threshold,
-                max_turn_input_tokens: config.token_budget.max_turn_input_tokens,
-                compression_threshold_min: config.context_window.compression_threshold_min,
-                compression_threshold_max: config.context_window.compression_threshold_max,
-            })
-        }
-        "signals" => {
-            let model = build_self_model(artifacts)?;
-            to_json(&SignalsResponse {
-                session_id: artifacts.session_id.clone(),
-                recent_signals: model.recent_signals,
-                recent_events: recent_event_previews(
-                    &artifacts.journal_events,
-                    12,
-                    &[
-                        JournalEventType::DriftDetected,
-                        JournalEventType::StallDetected,
-                        JournalEventType::AdaptiveScenarioApplied,
-                        JournalEventType::AdaptivePerTurnApplied,
-                        JournalEventType::AdaptiveExperimentEnrolled,
-                        JournalEventType::AdaptiveTuningRuleTriggered,
-                        JournalEventType::TurnError,
-                        JournalEventType::VerificationCompleted,
-                    ],
-                ),
-            })
-        }
-        "health" => to_json(&build_health_response(artifacts)),
-        "journal" => {
-            let events = artifacts
-                .journal_events
-                .iter()
-                .rev()
-                .take(journal_limit)
-                .map(event_preview)
-                .collect::<Vec<_>>();
-            to_json(&serde_json::json!({
-                "session_id": artifacts.session_id,
-                "total_events": artifacts.journal_events.len(),
-                "returned": events.len(),
-                "events": events,
-            }))
-        }
-        "verify" => to_json(&verify_artifacts(artifacts)),
-        "identity" => to_json(&identity_view()),
-        other => Err(format!("unsupported self surface '{other}'")),
     }
 }
 
@@ -884,6 +810,7 @@ fn persist_goal_mutation(session_id: &str, text: &str) -> Result<GoalMutationRes
     let mut ws = session_workspace::read_workspace(session_id).map_err(|e| e.to_string())?;
     let old_goal = ws.session_goal.clone();
     ws.session_goal = Some(text.to_string());
+    ws.goal_progress = None;
     ws.updated_at = Utc::now().to_rfc3339();
     session_workspace::write_workspace(&ws).map_err(|e| e.to_string())?;
     append_config_change_event(
@@ -2059,13 +1986,17 @@ mod tests {
         .unwrap();
 
         let value: serde_json::Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(value["session"]["session_id"], session_id);
+        assert_eq!(value["run"]["session_id"], session_id);
+        assert_eq!(value["run"]["goal"], "finish the engine");
+        assert_eq!(value["recent_steps"][0]["event_type"], "turn");
         assert_eq!(
-            value["self_model"]["goals"]["session_goal"],
-            "finish the engine"
+            value["environment"]["last_context_trace_preview"]
+                .as_str()
+                .unwrap()
+                .contains("turn-7"),
+            true
         );
-        assert_eq!(value["trace"]["compact_trace"]["turn_id"], "turn-7");
-        assert_eq!(value["journal"]["total_events"], 1);
+        assert_eq!(value["acceptance"]["ok"], true);
     }
 
     #[tokio::test]
@@ -2302,5 +2233,135 @@ mod tests {
                 .unwrap()
                 .contains("Question")
         );
+    }
+
+    #[tokio::test]
+    async fn health_surface_exposes_risk_flags_and_acceptance() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(temp.path());
+        let session_id = "self-health-session";
+        let mut ws = WorkspaceMetadata::with_context(session_id, "gpt-5.4", "/repo", Some("main"));
+        ws.deprioritized_tools = vec!["bash".to_string()];
+        ws.last_context_trace = Some(ContextTraceSignal {
+            turn_id: "turn-3".to_string(),
+            captured_at: Some(Utc::now().to_rfc3339()),
+            tool_selection: None,
+            memory: None,
+            history: None,
+            budget: Some(
+                astra_services::session_workspace::ContextTraceBudgetSignal {
+                    max_tokens: 10000,
+                    total_used: 9100,
+                    budget_pressure: 0.91,
+                    compression_triggered: true,
+                },
+            ),
+            timing: None,
+            explanations: vec!["pressure rising".to_string()],
+        });
+        session_workspace::write_workspace(&ws).unwrap();
+
+        let writer = session_journal::JournalWriter::new(session_id).unwrap();
+        writer
+            .append(&JournalEvent {
+                event_type: JournalEventType::TurnError,
+                ts: Utc::now().to_rfc3339(),
+                session_id: Some(session_id.to_string()),
+                turn: Some(3),
+                model: Some("gpt-5.4".to_string()),
+                user_input: Some("debug".to_string()),
+                assistant_output: None,
+                tool_count: Some(1),
+                tokens_in: Some(20),
+                tokens_out: Some(0),
+                duration_ms: Some(120),
+                error: Some("bash failed".to_string()),
+                config_key: None,
+                config_value: None,
+                turns_compacted: None,
+                facts_stored: None,
+                tools_selected: Some(vec!["bash".to_string()]),
+                selected_skills: Some(vec!["goal-driven-evolution".to_string()]),
+                tools_used: Some(vec!["bash".to_string()]),
+                tool_calls: Some(vec![ToolCallRecord {
+                    name: "bash".to_string(),
+                    ok: false,
+                    ms: 120,
+                    error: Some("command timed out".to_string()),
+                    input_bytes: None,
+                    output_bytes: None,
+                    args_preview: None,
+                    result_preview: None,
+                }]),
+                budget_used: Some(9100),
+                budget_pressure: Some(0.91),
+                stall_type: None,
+                metadata: None,
+                plan_subtask_id: None,
+                ttft_ms: None,
+                context_ms: None,
+                selector_strategy: Some("tfidf".to_string()),
+                selector_ms: None,
+                selector_tokens_in: None,
+                selector_tokens_out: None,
+                cache_read_tokens: None,
+                cache_creation_tokens: None,
+                memoria_ms: None,
+                session_lineage: None,
+                coordination: None,
+                edge_policy: None,
+                selection_trace: None,
+                context_assembly_trace: None,
+                selector_confidence: Some(0.6),
+                routing_domain_hint: Some("code".to_string()),
+                entity_learn_skipped_no_domain: false,
+            })
+            .unwrap();
+
+        let body = execute_self_command(
+            &SelfCmd::Health(SelfSessionArgs {
+                session_id: Some(session_id.to_string()),
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let risk_flags = value["risk_flags"].as_array().unwrap();
+        assert!(risk_flags.iter().any(|flag| flag == "high_token_pressure"));
+        assert!(risk_flags.iter().any(|flag| flag == "recent_tool_failures"));
+        assert_eq!(value["recent_failures"][0]["tool"], "bash");
+        assert_eq!(value["acceptance_ok"], true);
+    }
+
+    #[tokio::test]
+    async fn verify_surface_reports_acceptance_gaps() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(temp.path());
+        let session_id = "self-verify-session";
+        let ws = WorkspaceMetadata::with_context(session_id, "gpt-5.4", "/repo", Some("main"));
+        session_workspace::write_workspace(&ws).unwrap();
+
+        let body = execute_self_command(
+            &SelfCmd::Verify(SelfSessionArgs {
+                session_id: Some(session_id.to_string()),
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["ok"], false);
+        let checks = value["checks"].as_array().unwrap();
+        assert!(
+            checks
+                .iter()
+                .any(|check| { check["name"] == "journal_present" && check["ok"] == false })
+        );
+        assert!(checks.iter().any(|check| {
+            check["name"] == "steps_present_when_journal_present" && check["ok"] == true
+        }));
     }
 }

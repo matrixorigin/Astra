@@ -38,6 +38,7 @@
 //! ```
 
 use super::routing::{DomainHint, TaskType};
+use crate::evolution::types::CalibrationAxis;
 use std::collections::HashMap;
 
 /// Get current Unix timestamp in seconds.
@@ -96,6 +97,12 @@ pub struct ProgressiveCalibrator {
     per_domain: HashMap<DomainHint, CalibrationEntry>,
     /// Per-task-type calibration.
     per_task: HashMap<TaskType, CalibrationEntry>,
+    /// Manual intent-specific threshold nudges from accepted evolution proposals.
+    manual_intent_adjustments: HashMap<String, f64>,
+    /// Manual domain-specific threshold nudges from accepted evolution proposals.
+    manual_domain_adjustments: HashMap<DomainHint, f64>,
+    /// Manual task-specific threshold nudges from accepted evolution proposals.
+    manual_task_adjustments: HashMap<TaskType, f64>,
     /// Base confidence threshold (before calibration).
     base_threshold: f64,
     /// Floor — never go below this.
@@ -112,6 +119,14 @@ pub struct ProgressiveCalibrator {
 const INTENT_WEIGHT: f64 = 0.15;
 const DOMAIN_WEIGHT: f64 = 0.10;
 const TASK_WEIGHT: f64 = 0.10;
+const MAX_MANUAL_ADJUSTMENT: f64 = 0.35;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CalibrationAdjustmentPreview {
+    pub resulting_threshold: f64,
+    pub cumulative_adjustment: f64,
+    pub would_clamp: bool,
+}
 
 impl ProgressiveCalibrator {
     pub fn new(base_threshold: f64) -> Self {
@@ -119,6 +134,9 @@ impl ProgressiveCalibrator {
             per_intent: HashMap::new(),
             per_domain: HashMap::new(),
             per_task: HashMap::new(),
+            manual_intent_adjustments: HashMap::new(),
+            manual_domain_adjustments: HashMap::new(),
+            manual_task_adjustments: HashMap::new(),
             base_threshold,
             min_threshold: 0.25,
             max_threshold: 0.95,
@@ -180,28 +198,71 @@ impl ProgressiveCalibrator {
         domain: Option<DomainHint>,
         task_type: TaskType,
     ) -> f64 {
-        let intent_adj = self
-            .per_intent
-            .get(intent)
-            .filter(|e| e.has_enough_data())
-            .map(|e| e.correction_rate() * INTENT_WEIGHT)
-            .unwrap_or(0.0);
-
-        let domain_adj = domain
-            .and_then(|d| self.per_domain.get(&d))
-            .filter(|e| e.has_enough_data())
-            .map(|e: &CalibrationEntry| e.correction_rate() * DOMAIN_WEIGHT)
-            .unwrap_or(0.0);
-
-        let task_adj = self
-            .per_task
-            .get(&task_type)
-            .filter(|e| e.has_enough_data())
-            .map(|e| e.correction_rate() * TASK_WEIGHT)
-            .unwrap_or(0.0);
-
-        let adjusted = self.base_threshold - intent_adj - domain_adj - task_adj;
+        let adjusted = self.base_threshold
+            - self.learned_adjustment(intent, domain, task_type)
+            - self.manual_adjustment(intent, domain, task_type);
         adjusted.clamp(self.min_threshold, self.max_threshold)
+    }
+
+    pub fn preview_evolution_adjustment(
+        &self,
+        axis: &CalibrationAxis,
+        adjustment: f64,
+    ) -> Result<CalibrationAdjustmentPreview, String> {
+        if !adjustment.is_finite() {
+            return Err("calibration adjustment must be finite".to_string());
+        }
+        let current = self.current_manual_adjustment(axis);
+        let requested = current + adjustment;
+        let cumulative_adjustment = requested.clamp(-MAX_MANUAL_ADJUSTMENT, MAX_MANUAL_ADJUSTMENT);
+        let (intent, domain, task_type) = axis_probe(axis);
+        let raw_threshold = self.base_threshold
+            - self.learned_adjustment(intent, domain, task_type)
+            - self.manual_adjustment_with_override(
+                axis,
+                cumulative_adjustment,
+                intent,
+                domain,
+                task_type,
+            );
+        let resulting_threshold = raw_threshold.clamp(self.min_threshold, self.max_threshold);
+        Ok(CalibrationAdjustmentPreview {
+            resulting_threshold,
+            cumulative_adjustment,
+            would_clamp: (requested - cumulative_adjustment).abs() > f64::EPSILON
+                || (raw_threshold - resulting_threshold).abs() > f64::EPSILON,
+        })
+    }
+
+    pub fn apply_evolution_adjustment(
+        &mut self,
+        axis: &CalibrationAxis,
+        adjustment: f64,
+    ) -> Result<CalibrationAdjustmentPreview, String> {
+        let preview = self.preview_evolution_adjustment(axis, adjustment)?;
+        if preview.would_clamp {
+            return Err(format!(
+                "calibration adjustment would clamp threshold or exceed cumulative limit (threshold={:.3}, cumulative={:.3})",
+                preview.resulting_threshold, preview.cumulative_adjustment
+            ));
+        }
+
+        match axis {
+            CalibrationAxis::Intent(intent) => {
+                self.manual_intent_adjustments
+                    .insert(intent.clone(), preview.cumulative_adjustment);
+            }
+            CalibrationAxis::Domain(domain) => {
+                self.manual_domain_adjustments
+                    .insert(*domain, preview.cumulative_adjustment);
+            }
+            CalibrationAxis::Task(task_type) => {
+                self.manual_task_adjustments
+                    .insert(*task_type, preview.cumulative_adjustment);
+            }
+        }
+        self.dirty = true;
+        Ok(preview)
     }
 
     /// Get calibration stats for a specific intent.
@@ -240,6 +301,9 @@ impl ProgressiveCalibrator {
             per_intent: self.per_intent.clone(),
             per_domain: self.per_domain.clone(),
             per_task: self.per_task.clone(),
+            manual_intent_adjustments: self.manual_intent_adjustments.clone(),
+            manual_domain_adjustments: self.manual_domain_adjustments.clone(),
+            manual_task_adjustments: self.manual_task_adjustments.clone(),
             base_threshold: self.base_threshold,
         }
     }
@@ -282,6 +346,141 @@ impl ProgressiveCalibrator {
                 *existing = entry.clone();
             }
         }
+        for (intent, adjustment) in &data.manual_intent_adjustments {
+            let existing = self
+                .manual_intent_adjustments
+                .entry(intent.clone())
+                .or_insert(0.0);
+            *existing =
+                (*existing + *adjustment).clamp(-MAX_MANUAL_ADJUSTMENT, MAX_MANUAL_ADJUSTMENT);
+        }
+        for (domain, adjustment) in &data.manual_domain_adjustments {
+            let existing = self.manual_domain_adjustments.entry(*domain).or_insert(0.0);
+            *existing =
+                (*existing + *adjustment).clamp(-MAX_MANUAL_ADJUSTMENT, MAX_MANUAL_ADJUSTMENT);
+        }
+        for (task_type, adjustment) in &data.manual_task_adjustments {
+            let existing = self
+                .manual_task_adjustments
+                .entry(*task_type)
+                .or_insert(0.0);
+            *existing =
+                (*existing + *adjustment).clamp(-MAX_MANUAL_ADJUSTMENT, MAX_MANUAL_ADJUSTMENT);
+        }
+    }
+
+    fn learned_adjustment(
+        &self,
+        intent: &str,
+        domain: Option<DomainHint>,
+        task_type: TaskType,
+    ) -> f64 {
+        let intent_adj = self
+            .per_intent
+            .get(intent)
+            .filter(|e| e.has_enough_data())
+            .map(|e| e.correction_rate() * INTENT_WEIGHT)
+            .unwrap_or(0.0);
+
+        let domain_adj = domain
+            .and_then(|d| self.per_domain.get(&d))
+            .filter(|e| e.has_enough_data())
+            .map(|e: &CalibrationEntry| e.correction_rate() * DOMAIN_WEIGHT)
+            .unwrap_or(0.0);
+
+        let task_adj = self
+            .per_task
+            .get(&task_type)
+            .filter(|e| e.has_enough_data())
+            .map(|e| e.correction_rate() * TASK_WEIGHT)
+            .unwrap_or(0.0);
+
+        intent_adj + domain_adj + task_adj
+    }
+
+    fn manual_adjustment(
+        &self,
+        intent: &str,
+        domain: Option<DomainHint>,
+        task_type: TaskType,
+    ) -> f64 {
+        self.manual_intent_adjustments
+            .get(intent)
+            .copied()
+            .unwrap_or(0.0)
+            + domain
+                .and_then(|d| self.manual_domain_adjustments.get(&d).copied())
+                .unwrap_or(0.0)
+            + self
+                .manual_task_adjustments
+                .get(&task_type)
+                .copied()
+                .unwrap_or(0.0)
+    }
+
+    fn current_manual_adjustment(&self, axis: &CalibrationAxis) -> f64 {
+        match axis {
+            CalibrationAxis::Intent(intent) => self
+                .manual_intent_adjustments
+                .get(intent)
+                .copied()
+                .unwrap_or(0.0),
+            CalibrationAxis::Domain(domain) => self
+                .manual_domain_adjustments
+                .get(domain)
+                .copied()
+                .unwrap_or(0.0),
+            CalibrationAxis::Task(task_type) => self
+                .manual_task_adjustments
+                .get(task_type)
+                .copied()
+                .unwrap_or(0.0),
+        }
+    }
+
+    fn manual_adjustment_with_override(
+        &self,
+        axis: &CalibrationAxis,
+        override_value: f64,
+        intent: &str,
+        domain: Option<DomainHint>,
+        task_type: TaskType,
+    ) -> f64 {
+        match axis {
+            CalibrationAxis::Intent(_) => {
+                override_value
+                    + domain
+                        .and_then(|d| self.manual_domain_adjustments.get(&d).copied())
+                        .unwrap_or(0.0)
+                    + self
+                        .manual_task_adjustments
+                        .get(&task_type)
+                        .copied()
+                        .unwrap_or(0.0)
+            }
+            CalibrationAxis::Domain(_) => {
+                self.manual_intent_adjustments
+                    .get(intent)
+                    .copied()
+                    .unwrap_or(0.0)
+                    + override_value
+                    + self
+                        .manual_task_adjustments
+                        .get(&task_type)
+                        .copied()
+                        .unwrap_or(0.0)
+            }
+            CalibrationAxis::Task(_) => {
+                self.manual_intent_adjustments
+                    .get(intent)
+                    .copied()
+                    .unwrap_or(0.0)
+                    + domain
+                        .and_then(|d| self.manual_domain_adjustments.get(&d).copied())
+                        .unwrap_or(0.0)
+                    + override_value
+            }
+        }
     }
 }
 
@@ -299,7 +498,21 @@ pub struct CalibrationExport {
     pub per_intent: HashMap<String, CalibrationEntry>,
     pub per_domain: HashMap<DomainHint, CalibrationEntry>,
     pub per_task: HashMap<TaskType, CalibrationEntry>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub manual_intent_adjustments: HashMap<String, f64>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub manual_domain_adjustments: HashMap<DomainHint, f64>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub manual_task_adjustments: HashMap<TaskType, f64>,
     pub base_threshold: f64,
+}
+
+fn axis_probe(axis: &CalibrationAxis) -> (&str, Option<DomainHint>, TaskType) {
+    match axis {
+        CalibrationAxis::Intent(intent) => (intent.as_str(), None, TaskType::Unknown),
+        CalibrationAxis::Domain(domain) => ("__auto__", Some(*domain), TaskType::Unknown),
+        CalibrationAxis::Task(task_type) => ("__auto__", None, *task_type),
+    }
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -608,6 +821,48 @@ mod tests {
         let threshold2 =
             cal2.calibrated_threshold("fetch", Some(DomainHint::GitHub), TaskType::Fetch);
         assert!((threshold1 - threshold2).abs() < 0.001);
+    }
+
+    #[test]
+    fn manual_adjustment_lowers_threshold() {
+        let mut cal = ProgressiveCalibrator::default();
+        let preview = cal
+            .apply_evolution_adjustment(&CalibrationAxis::Intent("fetch".into()), 0.10)
+            .unwrap();
+
+        assert!((preview.resulting_threshold - 0.60).abs() < 0.01);
+        assert!((preview.cumulative_adjustment - 0.10).abs() < 0.001);
+        assert!(cal.has_dirty());
+
+        let threshold = cal.calibrated_threshold("fetch", None, TaskType::Unknown);
+        assert!((threshold - 0.60).abs() < 0.01, "got {threshold}");
+    }
+
+    #[test]
+    fn manual_adjustment_rejects_threshold_clamp() {
+        let mut cal = ProgressiveCalibrator::new(0.30);
+        let err = cal
+            .apply_evolution_adjustment(&CalibrationAxis::Intent("fetch".into()), 0.10)
+            .unwrap_err();
+
+        assert!(err.contains("would clamp"), "{err}");
+        let threshold = cal.calibrated_threshold("fetch", None, TaskType::Unknown);
+        assert!((threshold - 0.30).abs() < 0.01, "got {threshold}");
+    }
+
+    #[test]
+    fn manual_adjustment_round_trips_through_export_merge() {
+        let mut cal = ProgressiveCalibrator::default();
+        cal.apply_evolution_adjustment(&CalibrationAxis::Domain(DomainHint::GitHub), 0.12)
+            .unwrap();
+
+        let exported = cal.export();
+        let mut restored = ProgressiveCalibrator::default();
+        restored.merge(&exported);
+
+        let threshold =
+            restored.calibrated_threshold("__auto__", Some(DomainHint::GitHub), TaskType::Unknown);
+        assert!((threshold - 0.58).abs() < 0.01, "got {threshold}");
     }
 
     #[test]

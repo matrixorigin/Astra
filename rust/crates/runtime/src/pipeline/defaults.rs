@@ -250,6 +250,9 @@ pub fn default_calibration() -> CalibrationExport {
         per_intent: HashMap::new(), // Start with no intent-specific adjustments
         per_domain: HashMap::new(), // Start with no domain-specific adjustments
         per_task: HashMap::new(),   // Start with no task-type adjustments
+        manual_intent_adjustments: HashMap::new(),
+        manual_domain_adjustments: HashMap::new(),
+        manual_task_adjustments: HashMap::new(),
     }
 }
 

@@ -270,11 +270,8 @@ async fn get_agent_info_snapshot_uses_persistent_surface() {
         .execute("get_agent_info", &json!({"dimension": "snapshot"}))
         .await;
     let parsed: Value = serde_json::from_str(&out).unwrap();
-    assert_eq!(parsed["session"]["session_id"], session_id);
-    assert_eq!(
-        parsed["self_model"]["goals"]["session_goal"],
-        "Snapshot bridge"
-    );
+    assert_eq!(parsed["run"]["session_id"], session_id);
+    assert_eq!(parsed["run"]["goal"], "Snapshot bridge");
 }
 
 #[tokio::test]
@@ -298,7 +295,7 @@ async fn get_agent_info_legacy_dimensions_alias_persistent_surfaces() {
     let parsed_state: Value = serde_json::from_str(&state).unwrap();
     let parsed_all: Value = serde_json::from_str(&all).unwrap();
 
-    assert_eq!(parsed_goals["session_goal"], "Legacy alias");
-    assert_eq!(parsed_state["session"]["session_id"], session_id);
-    assert_eq!(parsed_all["session"]["session_id"], session_id);
+    assert_eq!(parsed_goals["goal"], "Legacy alias");
+    assert_eq!(parsed_state["run"]["session_id"], session_id);
+    assert_eq!(parsed_all["run"]["session_id"], session_id);
 }

@@ -12,7 +12,12 @@ use super::types::{
 };
 
 use crate::liquid::reflection::ReflectionEngine;
+use crate::pipeline::calibration::ProgressiveCalibrator;
 use crate::pipeline::pattern::PatternLibrary;
+
+const MAX_APPLIED_LOG: usize = 100;
+const AUTO_APPLY_CONFIDENCE_THRESHOLD: f64 = 0.85;
+const AUTO_APPLY_CALIBRATION_ABS_MAX: f64 = 0.20;
 
 /// Orchestrates the evolution lifecycle: collect → propose → apply.
 pub struct EvolutionService {
@@ -23,10 +28,35 @@ pub struct EvolutionService {
     applied_log: Mutex<Vec<EvolutionProposal>>,
     /// Optional pattern library for drift detection during flush.
     pattern_library: Option<Arc<std::sync::Mutex<PatternLibrary>>>,
+    /// Optional progressive calibrator for calibration proposal application.
+    calibrator: Option<Arc<std::sync::Mutex<ProgressiveCalibrator>>>,
     /// Optional durable store for skill evolution proposals and approved diffs.
     evolution_store: Option<Arc<EvolutionStore>>,
     /// Cached reflection engine (stateless — reusable across calls).
     reflection_engine: ReflectionEngine,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProposalIngestOutcome {
+    pub processed: usize,
+    pub auto_applied: usize,
+    pub queued: usize,
+}
+
+#[derive(Debug, Default)]
+struct ProposalRoutingOutcome {
+    auto_applied: Vec<EvolutionProposal>,
+    queued: Vec<EvolutionProposal>,
+}
+
+impl ProposalRoutingOutcome {
+    fn summary(&self) -> ProposalIngestOutcome {
+        ProposalIngestOutcome {
+            processed: self.auto_applied.len() + self.queued.len(),
+            auto_applied: self.auto_applied.len(),
+            queued: self.queued.len(),
+        }
+    }
 }
 
 impl EvolutionService {
@@ -36,6 +66,7 @@ impl EvolutionService {
             pending_proposals: Mutex::new(Vec::new()),
             applied_log: Mutex::new(Vec::new()),
             pattern_library: None,
+            calibrator: None,
             evolution_store: None,
             reflection_engine: ReflectionEngine::new(),
         }
@@ -44,6 +75,15 @@ impl EvolutionService {
     /// Create with a pattern library reference for drift detection.
     pub fn with_pattern_library(mut self, lib: Arc<std::sync::Mutex<PatternLibrary>>) -> Self {
         self.pattern_library = Some(lib);
+        self
+    }
+
+    /// Create with a progressive calibrator reference for calibration evolution.
+    pub fn with_calibrator(
+        mut self,
+        calibrator: Arc<std::sync::Mutex<ProgressiveCalibrator>>,
+    ) -> Self {
+        self.calibrator = Some(calibrator);
         self
     }
 
@@ -82,12 +122,12 @@ impl EvolutionService {
         self.collector.lock().await.add_signal(signal);
     }
 
-    /// Drain signals, generate fast-path proposals, auto-apply them,
-    /// and return any that need user approval (skill axis).
+    /// Drain signals, generate fast-path proposals, route them through auto-apply
+    /// guardrails, and return any LLM-routed signals for deeper reflection.
     ///
     /// Also checks pattern library for drift and injects drift signals.
     ///
-    /// Returns `(auto_applied, needs_approval)`.
+    /// Returns `(auto_applied, llm_routed_signals)`.
     pub async fn flush(&self) -> (Vec<EvolutionProposal>, Vec<EvolutionSignal>) {
         // Inject drift signals from pattern library before draining.
         if let Some(ref lib) = self.pattern_library {
@@ -120,39 +160,19 @@ impl EvolutionService {
             .filter(|s| evolver::needs_llm(s))
             .collect();
 
-        if !fast.is_empty() {
-            self.apply_auto_proposals(&fast).await;
-        }
-
-        // Auto-applied proposals go to the log.
-        {
-            let mut log = self.applied_log.lock().await;
-            for p in &fast {
-                log.push(p.clone());
+        let auto_applied = if fast.is_empty() {
+            Vec::new()
+        } else {
+            match self.route_proposals(fast.clone()).await {
+                Ok(outcome) => outcome.auto_applied,
+                Err(_) => {
+                    let _ = self.enqueue_pending_proposals(fast).await;
+                    Vec::new()
+                }
             }
-            // Bound the log to prevent unbounded growth.
-            const MAX_APPLIED_LOG: usize = 100;
-            if log.len() > MAX_APPLIED_LOG {
-                let excess = log.len() - MAX_APPLIED_LOG;
-                log.drain(..excess);
-            }
-        }
-
-        (fast, llm_signals)
-    }
-
-    async fn apply_auto_proposals(&self, proposals: &[EvolutionProposal]) {
-        let Some(pattern_library) = self.pattern_library.as_ref() else {
-            return;
         };
-        let Ok(mut library) = pattern_library.lock() else {
-            return;
-        };
-        for proposal in proposals {
-            if let EvolutionAxis::Pattern { signature, action } = &proposal.axis {
-                library.apply_evolution_action(signature, *action);
-            }
-        }
+
+        (auto_applied, llm_signals)
     }
 
     /// Add a skill-axis proposal (from LLM path) for user approval.
@@ -274,25 +294,30 @@ impl EvolutionService {
         self.reflection_engine.build_prompt(ctx)
     }
 
-    /// Parse an LLM response and queue the resulting proposals as pending.
-    ///
-    /// Returns the number of proposals queued.
+    /// Parse an LLM response, auto-apply eligible proposals, and queue the rest.
+    pub async fn ingest_reflection_response_detailed(
+        &self,
+        llm_response: &str,
+        ctx: &crate::liquid::reflection::ReflectionContext,
+    ) -> Result<ProposalIngestOutcome, String> {
+        let parsed = self.reflection_engine.parse_response(llm_response)?;
+        let proposals = self
+            .reflection_engine
+            .convert_proposals(&parsed.proposals, ctx);
+        let routed = self.route_proposals(proposals).await?;
+        Ok(routed.summary())
+    }
+
+    /// Parse an LLM response and return the number of proposals processed.
     pub async fn ingest_reflection_response(
         &self,
         llm_response: &str,
         ctx: &crate::liquid::reflection::ReflectionContext,
     ) -> Result<usize, String> {
-        let parsed = self.reflection_engine.parse_response(llm_response)?;
-        let proposals = self
-            .reflection_engine
-            .convert_proposals(&parsed.proposals, ctx);
-        self.persist_skill_proposals(&proposals)?;
-        let count = proposals.len();
-        let mut pending = self.pending_proposals.lock().await;
-        for p in proposals {
-            pending.push(p);
-        }
-        Ok(count)
+        Ok(self
+            .ingest_reflection_response_detailed(llm_response, ctx)
+            .await?
+            .processed)
     }
 
     fn persist_skill_proposals(&self, proposals: &[EvolutionProposal]) -> Result<(), String> {
@@ -339,8 +364,21 @@ impl EvolutionService {
                 }
                 Ok(())
             }
-            EvolutionAxis::Calibration { .. } => {
-                Err("calibration proposal approval is not wired yet".into())
+            EvolutionAxis::Calibration { axis, adjustment } => {
+                let Some(calibrator) = self.calibrator.as_ref() else {
+                    return Err(
+                        "progressive calibrator not configured for calibration proposal approval"
+                            .into(),
+                    );
+                };
+                let Ok(mut calibrator) = calibrator.lock() else {
+                    return Err(
+                        "progressive calibrator lock poisoned during proposal approval".into(),
+                    );
+                };
+                calibrator
+                    .apply_evolution_adjustment(axis, *adjustment)
+                    .map(|_| ())
             }
             EvolutionAxis::Entity { .. } => Err("entity proposal approval is not wired yet".into()),
         }
@@ -357,6 +395,93 @@ impl EvolutionService {
             _ => Ok(()),
         }
     }
+
+    async fn route_proposals(
+        &self,
+        proposals: Vec<EvolutionProposal>,
+    ) -> Result<ProposalRoutingOutcome, String> {
+        let mut routed = ProposalRoutingOutcome::default();
+        for proposal in proposals {
+            if self.should_auto_apply(&proposal)? {
+                match self.apply_proposal(&proposal) {
+                    Ok(()) => {
+                        let mut applied = proposal.clone();
+                        applied.status = ApprovalStatus::AutoApplied;
+                        routed.auto_applied.push(applied);
+                    }
+                    Err(_) => routed.queued.push(proposal),
+                }
+            } else {
+                routed.queued.push(proposal);
+            }
+        }
+
+        if !routed.queued.is_empty() {
+            self.enqueue_pending_proposals(routed.queued.clone())
+                .await?;
+        }
+        if !routed.auto_applied.is_empty() {
+            self.append_applied_log(&routed.auto_applied).await;
+        }
+        Ok(routed)
+    }
+
+    async fn enqueue_pending_proposals(
+        &self,
+        proposals: Vec<EvolutionProposal>,
+    ) -> Result<(), String> {
+        self.persist_skill_proposals(&proposals)?;
+        let mut pending = self.pending_proposals.lock().await;
+        pending.extend(proposals);
+        Ok(())
+    }
+
+    async fn append_applied_log(&self, proposals: &[EvolutionProposal]) {
+        let mut log = self.applied_log.lock().await;
+        log.extend(proposals.iter().cloned());
+        if log.len() > MAX_APPLIED_LOG {
+            let excess = log.len() - MAX_APPLIED_LOG;
+            log.drain(..excess);
+        }
+    }
+
+    fn should_auto_apply(&self, proposal: &EvolutionProposal) -> Result<bool, String> {
+        if proposal.confidence < AUTO_APPLY_CONFIDENCE_THRESHOLD {
+            return Ok(false);
+        }
+
+        match &proposal.axis {
+            EvolutionAxis::Pattern { signature, .. } => {
+                let Some(pattern_library) = self.pattern_library.as_ref() else {
+                    return Ok(false);
+                };
+                let Ok(library) = pattern_library.lock() else {
+                    return Err("pattern library lock poisoned while validating auto-apply".into());
+                };
+                Ok(library
+                    .export()
+                    .iter()
+                    .any(|pattern| pattern.signature == *signature))
+            }
+            EvolutionAxis::Calibration { axis, adjustment } => {
+                if adjustment.abs() > AUTO_APPLY_CALIBRATION_ABS_MAX {
+                    return Ok(false);
+                }
+                let Some(calibrator) = self.calibrator.as_ref() else {
+                    return Ok(false);
+                };
+                let Ok(calibrator) = calibrator.lock() else {
+                    return Err(
+                        "progressive calibrator lock poisoned while validating auto-apply".into(),
+                    );
+                };
+                Ok(!calibrator
+                    .preview_evolution_adjustment(axis, *adjustment)?
+                    .would_clamp)
+            }
+            _ => Ok(false),
+        }
+    }
 }
 
 /// Wrap in Arc for shared ownership across async tasks.
@@ -368,8 +493,9 @@ pub fn new_shared() -> Arc<EvolutionService> {
 mod tests {
     use super::*;
     use crate::evolution::store::StoredStatus;
-    use crate::evolution::types::{ApprovalStatus, EvolutionAxis, PatternAction};
+    use crate::evolution::types::{ApprovalStatus, CalibrationAxis, EvolutionAxis, PatternAction};
     use crate::liquid::reflection::ReflectionContext;
+    use crate::pipeline::calibration::ProgressiveCalibrator;
     use crate::pipeline::routing::{DomainHint, TaskType};
 
     fn tool_failure_signal(tool: &str, skill: Option<&str>) -> EvolutionSignal {
@@ -386,8 +512,8 @@ mod tests {
             pattern_signature: sig.into(),
             task_type: TaskType::Code,
             domain: Some(DomainHint::Code),
-            historical_rate: 0.9,
-            recent_rate: 0.2,
+            historical_rate: 0.95,
+            recent_rate: 0.05,
         }
     }
 
@@ -401,7 +527,21 @@ mod tests {
 
     #[tokio::test]
     async fn flush_drift_auto_applies() {
-        let svc = EvolutionService::new();
+        use crate::pipeline::pattern::PatternLibrary;
+
+        let lib = Arc::new(std::sync::Mutex::new(PatternLibrary::default()));
+        {
+            let mut l = lib.lock().unwrap();
+            l.record_outcome(
+                &["bash".to_string(), "read_file".to_string()],
+                TaskType::Code,
+                Some(DomainHint::Code),
+                true,
+                0.8,
+                None,
+            );
+        }
+        let svc = EvolutionService::new().with_pattern_library(lib);
         svc.add_signal(drift_signal("bash|read_file")).await;
         let (auto, llm) = svc.flush().await;
         assert_eq!(auto.len(), 1);
@@ -541,7 +681,29 @@ mod tests {
 
     #[tokio::test]
     async fn mixed_flush_separates_fast_and_llm() {
-        let svc = EvolutionService::new();
+        use crate::pipeline::pattern::PatternLibrary;
+
+        let lib = Arc::new(std::sync::Mutex::new(PatternLibrary::default()));
+        {
+            let mut l = lib.lock().unwrap();
+            l.record_outcome(
+                &["a".to_string()],
+                TaskType::Code,
+                Some(DomainHint::Code),
+                true,
+                0.8,
+                None,
+            );
+            l.record_outcome(
+                &["bash".to_string()],
+                TaskType::Code,
+                Some(DomainHint::Code),
+                true,
+                0.8,
+                None,
+            );
+        }
+        let svc = EvolutionService::new().with_pattern_library(lib);
         svc.add_signal(drift_signal("a")).await;
         svc.add_signal(tool_failure_signal("bash", Some("skill_a")))
             .await;
@@ -576,13 +738,14 @@ mod tests {
         use crate::pipeline::pattern::PatternLibrary;
 
         let lib = Arc::new(std::sync::Mutex::new(PatternLibrary::default()));
-        // Need historical rate >> recent rate to trigger drift.
-        // 20 successes pushes historical high, then 10 failures fills the
+        // Need historical rate >> recent rate to trigger drift and meet
+        // auto-apply confidence threshold.
+        // 100 successes pushes historical high, then 10 failures fills the
         // recent window (size 10) with all failures → recent_rate ≈ 0.0,
-        // historical_rate ≈ 0.67, drift_score = (0.67-0.0)/0.25 = 2.68 → clamped to 1.0.
+        // historical_rate ≈ 0.91, confidence ≈ 0.91.
         {
             let mut l = lib.lock().unwrap();
-            for _ in 0..20 {
+            for _ in 0..100 {
                 l.record_outcome(
                     &["bash".to_string()],
                     TaskType::Code,
@@ -762,7 +925,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ingest_then_approve_proposal() {
+    async fn ingest_high_confidence_pattern_auto_applies() {
         use crate::pipeline::pattern::PatternLibrary;
 
         let lib = Arc::new(std::sync::Mutex::new(PatternLibrary::default()));
@@ -781,20 +944,129 @@ mod tests {
         let ctx = svc.build_reflection_context("s", 1, None, 0.0, &[], vec![], vec![], None);
 
         let llm = r#"{"proposals": [{"axis": "pattern", "description": "Boost", "confidence": 0.9, "details": {"signature": "a", "action": "boost"}}], "summary": "ok"}"#;
-        svc.ingest_reflection_response(llm, &ctx).await.unwrap();
+        let outcome = svc
+            .ingest_reflection_response_detailed(llm, &ctx)
+            .await
+            .unwrap();
 
+        assert_eq!(
+            outcome,
+            ProposalIngestOutcome {
+                processed: 1,
+                auto_applied: 1,
+                queued: 0,
+            }
+        );
+        assert!(svc.pending().await.is_empty());
+        let applied = svc.applied().await;
+        assert_eq!(applied.len(), 1);
+        assert_eq!(applied[0].status, ApprovalStatus::AutoApplied);
+    }
+
+    #[tokio::test]
+    async fn ingest_high_confidence_calibration_auto_applies() {
+        let calibrator = Arc::new(std::sync::Mutex::new(ProgressiveCalibrator::default()));
+        let svc = EvolutionService::new().with_calibrator(calibrator.clone());
+        let ctx = svc.build_reflection_context("s", 1, None, 0.0, &[], vec![], vec![], None);
+
+        let llm = r#"{"proposals": [{"axis": "calibration", "description": "Nudge fetch intent threshold", "confidence": 0.91, "details": {"axis": "intent:fetch", "adjustment": 0.10}}], "summary": "ok"}"#;
+        let outcome = svc
+            .ingest_reflection_response_detailed(llm, &ctx)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            ProposalIngestOutcome {
+                processed: 1,
+                auto_applied: 1,
+                queued: 0,
+            }
+        );
+        assert!(svc.pending().await.is_empty());
+        let threshold =
+            calibrator
+                .lock()
+                .unwrap()
+                .calibrated_threshold("fetch", None, TaskType::Unknown);
+        assert!((threshold - 0.60).abs() < 0.01, "got {threshold}");
+    }
+
+    #[tokio::test]
+    async fn ingest_low_confidence_calibration_stays_pending() {
+        let calibrator = Arc::new(std::sync::Mutex::new(ProgressiveCalibrator::default()));
+        let svc = EvolutionService::new().with_calibrator(calibrator.clone());
+        let ctx = svc.build_reflection_context("s", 1, None, 0.0, &[], vec![], vec![], None);
+
+        let llm = r#"{"proposals": [{"axis": "calibration", "description": "Nudge fetch intent threshold", "confidence": 0.80, "details": {"axis": "intent:fetch", "adjustment": 0.10}}], "summary": "ok"}"#;
+        let outcome = svc
+            .ingest_reflection_response_detailed(llm, &ctx)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            ProposalIngestOutcome {
+                processed: 1,
+                auto_applied: 0,
+                queued: 1,
+            }
+        );
         let pending = svc.pending().await;
         assert_eq!(pending.len(), 1);
-        let id = pending[0].id.clone();
+        match &pending[0].axis {
+            EvolutionAxis::Calibration {
+                axis: CalibrationAxis::Intent(intent),
+                adjustment,
+            } => {
+                assert_eq!(intent, "fetch");
+                assert!((*adjustment - 0.10).abs() < 0.001);
+            }
+            other => panic!("expected intent calibration proposal, got {other:?}"),
+        }
+        let threshold =
+            calibrator
+                .lock()
+                .unwrap()
+                .calibrated_threshold("fetch", None, TaskType::Unknown);
+        assert!((threshold - 0.70).abs() < 0.01, "got {threshold}");
+    }
 
-        let approved = svc.approve(&id).await.unwrap();
-        assert!(approved.is_some());
-        assert_eq!(approved.unwrap().status, ApprovalStatus::Approved);
+    #[tokio::test]
+    async fn ingest_oversized_calibration_stays_pending() {
+        let calibrator = Arc::new(std::sync::Mutex::new(ProgressiveCalibrator::default()));
+        let svc = EvolutionService::new().with_calibrator(calibrator.clone());
+        let ctx = svc.build_reflection_context("s", 1, None, 0.0, &[], vec![], vec![], None);
 
-        // No longer pending.
-        assert!(svc.pending().await.is_empty());
-        // Shows in applied log.
-        assert_eq!(svc.applied().await.len(), 1);
+        let llm = r#"{"proposals": [{"axis": "calibration", "description": "Oversized nudge", "confidence": 0.95, "details": {"axis": "task:fetch", "adjustment": 0.25}}], "summary": "ok"}"#;
+        let outcome = svc
+            .ingest_reflection_response_detailed(llm, &ctx)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            ProposalIngestOutcome {
+                processed: 1,
+                auto_applied: 0,
+                queued: 1,
+            }
+        );
+        let pending = svc.pending().await;
+        assert_eq!(pending.len(), 1);
+        match &pending[0].axis {
+            EvolutionAxis::Calibration {
+                axis: CalibrationAxis::Task(TaskType::Fetch),
+                adjustment,
+            } => assert!((*adjustment - 0.25).abs() < 0.001),
+            other => panic!("expected task calibration proposal, got {other:?}"),
+        }
+        let threshold =
+            calibrator
+                .lock()
+                .unwrap()
+                .calibrated_threshold("__auto__", None, TaskType::Fetch);
+        assert!((threshold - 0.70).abs() < 0.01, "got {threshold}");
     }
 
     #[tokio::test]

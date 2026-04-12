@@ -17,6 +17,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use astra_services::session_journal::{JournalEvent, JournalWriter};
+use astra_services::session_workspace::GoalProgressSnapshot;
 use serde::{Deserialize, Serialize};
 
 use crate::ab_testing::{ExperimentOutcome, ExperimentStatus, ExperimentStore};
@@ -456,6 +457,17 @@ impl ObservabilitySession {
     /// Get current goal progress (None if no goal set yet).
     pub fn goal_progress(&self) -> Option<GoalProgress> {
         self.goal_tracker.as_ref().map(|t| t.progress())
+    }
+
+    /// Export persisted goal-tracker state for workspace resume and self surfaces.
+    pub fn goal_progress_snapshot(&self) -> Option<GoalProgressSnapshot> {
+        self.goal_tracker.as_ref().map(GoalTracker::snapshot)
+    }
+
+    /// Restore goal-tracker state from workspace persistence.
+    pub fn restore_goal_progress(&mut self, snapshot: GoalProgressSnapshot) {
+        self.original_query = Some(snapshot.goal.clone());
+        self.goal_tracker = Some(GoalTracker::from_snapshot(&snapshot));
     }
 }
 

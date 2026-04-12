@@ -569,6 +569,7 @@ pub(crate) fn initialize_repl_state(
         match astra_services::session_workspace::read_workspace(sid) {
             Ok(ws) => {
                 state.session_goal = ws.session_goal;
+                state.pending_goal_progress = ws.goal_progress;
                 state.pinned_skills = ws.pinned_skills.into_iter().collect();
                 state.discovered_skills = ws.discovered_skills.into_iter().collect();
 
@@ -628,6 +629,7 @@ pub(crate) fn initialize_repl_state(
         state.observability_session = Some(hub.start_session(&user_id, "pending"));
         // Apply any adaptive state stashed during workspace restore.
         super::repl_turn::apply_pending_adaptive_state(&mut state);
+        super::repl_turn::apply_pending_goal_progress_state(&mut state);
     }
 
     // Restore persisted feedback aggregator state (if any)
