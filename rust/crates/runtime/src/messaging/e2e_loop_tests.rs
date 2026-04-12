@@ -961,8 +961,8 @@ mod tests {
     /// so they don't inflate call_counts and flood the context with 50+ stubs.
     #[tokio::test]
     async fn empty_tool_name_rejected_before_dedup() {
-        // 5 tool calls with empty name — all should be recorded as unknown_tool,
-        // none should hit the dedup hard-cap path.
+        // 5 tool calls with empty name — the round should stop after the
+        // malformed-call abort threshold, and none should hit the dedup path.
         let tool_calls: Vec<Value> = (0..5)
             .map(|i| {
                 json!({
@@ -1016,8 +1016,10 @@ mod tests {
         )
         .await;
 
-        // All 5 should be recorded (not swallowed by dedup).
-        assert_eq!(tool_call_records.len(), 5);
+        // Only the malformed empty-name calls up to the abort threshold should
+        // be recorded, and each should still produce an immediate tool result.
+        assert_eq!(tool_call_records.len(), 3);
+        assert_eq!(tool_results.len(), 3);
         // Every record should be unknown_tool, not duplicate_within_turn.
         for rec in &tool_call_records {
             assert!(
