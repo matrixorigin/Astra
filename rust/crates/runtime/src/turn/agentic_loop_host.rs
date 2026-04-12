@@ -53,6 +53,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use astra_services::self_surface::{
+    GoalSurface, LocalSelfSurfaceService, SelfSurfaceDimension, SelfSurfaceResponse,
+    SelfSurfaceService, VerificationSurface,
+};
 use astra_services::session_journal::ToolCallRecord;
 use async_trait::async_trait;
 use serde_json::Value;
@@ -2484,6 +2488,7 @@ const AUTO_REFLECTION_MAX_OUTPUT_TOKENS: usize = 1200;
 const AUTO_REFLECTION_TOOL_WINDOW: usize = 24;
 const AUTO_REFLECTION_TOOL_STAT_LIMIT: usize = 8;
 const MAX_RECENT_TACTICAL_ACTIONS: usize = 8;
+const AUTO_REFLECTION_SELF_EVIDENCE_JOURNAL_LIMIT: usize = 12;
 
 fn build_auto_reflection_tool_stats(
     state: &AgenticLoopState,
@@ -2519,6 +2524,100 @@ fn build_auto_reflection_experiment_summary(
                 _ => None,
             },
         )
+}
+
+fn reflection_goal_summary_from_surface(
+    goal: GoalSurface,
+) -> Option<crate::liquid::reflection::GoalSummary> {
+    Some(crate::liquid::reflection::GoalSummary {
+        effective_goal: goal.goal?,
+        goal_source: goal.goal_source,
+        tracking_status: goal.tracking_status,
+        progress_summary: goal.progress.map(|progress| progress.summary),
+    })
+}
+
+fn reflection_verification_summary_from_surface(
+    verification: VerificationSurface,
+) -> crate::liquid::reflection::VerificationSummary {
+    crate::liquid::reflection::VerificationSummary {
+        ok: verification.ok,
+        acceptance_ok: verification.acceptance_ok,
+        objective_ok: verification.objective_ok,
+        summary: verification.summary,
+        pending_blockers: verification.objective.pending_blockers,
+        latest_verification: verification
+            .objective
+            .latest_verification
+            .map(|event| event.summary),
+    }
+}
+
+fn build_live_auto_reflection_goal_summary(
+    state: &AgenticLoopState,
+) -> Option<crate::liquid::reflection::GoalSummary> {
+    state
+        .telemetry
+        .observability_session
+        .as_ref()
+        .and_then(|session| session.read().ok())
+        .and_then(|session| {
+            let effective_goal = session
+                .goal_tracker
+                .as_ref()
+                .map(|tracker| tracker.goal().to_string())
+                .or_else(|| session.original_query.clone())?;
+            let progress_summary = session.goal_progress().map(|progress| progress.summary);
+            Some(crate::liquid::reflection::GoalSummary {
+                effective_goal,
+                goal_source: "tracked_goal".into(),
+                tracking_status: "tracked_only".into(),
+                progress_summary,
+            })
+        })
+}
+
+async fn build_auto_reflection_self_evidence(
+    state: &AgenticLoopState,
+) -> (
+    Option<crate::liquid::reflection::GoalSummary>,
+    Option<crate::liquid::reflection::VerificationSummary>,
+) {
+    let mut goal = None;
+    let mut verification = None;
+    if let Some(session_id) = state.current_session_id.as_deref() {
+        let service = LocalSelfSurfaceService::new();
+        goal = match service
+            .surface(
+                session_id,
+                SelfSurfaceDimension::Goal,
+                AUTO_REFLECTION_SELF_EVIDENCE_JOURNAL_LIMIT,
+            )
+            .await
+        {
+            Ok(SelfSurfaceResponse::Goal(goal_surface)) => {
+                reflection_goal_summary_from_surface(goal_surface)
+            }
+            _ => None,
+        };
+        verification = match service
+            .surface(
+                session_id,
+                SelfSurfaceDimension::Verify,
+                AUTO_REFLECTION_SELF_EVIDENCE_JOURNAL_LIMIT,
+            )
+            .await
+        {
+            Ok(SelfSurfaceResponse::Verify(verification_surface)) => Some(
+                reflection_verification_summary_from_surface(verification_surface),
+            ),
+            _ => None,
+        };
+    }
+    if goal.is_none() {
+        goal = build_live_auto_reflection_goal_summary(state);
+    }
+    (goal, verification)
 }
 
 fn apply_auto_reflection_usage(state: &mut AgenticLoopState, result: &HostReflectionResult) {
@@ -2593,7 +2692,8 @@ async fn maybe_trigger_auto_reflection<H: AgenticLoopHost>(
     let recent_tactical_actions = state.recent_tactical_actions.clone();
     let active_experiment = build_auto_reflection_experiment_summary(state);
 
-    let ctx = evo.build_reflection_context(
+    let (goal, verification) = build_auto_reflection_self_evidence(state).await;
+    let mut ctx = evo.build_reflection_context(
         session_id,
         turns_completed,
         scenario.as_deref(),
@@ -2603,6 +2703,8 @@ async fn maybe_trigger_auto_reflection<H: AgenticLoopHost>(
         recent_tactical_actions,
         active_experiment,
     );
+    ctx.goal = goal;
+    ctx.verification = verification;
 
     let (system_prompt, user_prompt) = evo.build_reflection_prompt(&ctx);
     let reflection_result = match host
@@ -10728,6 +10830,8 @@ print(json.dumps({'context': 'user said: ' + msg}))
 
     #[tokio::test]
     async fn auto_reflection_summarizes_recent_tools_and_tactical_actions() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
         let reflection_response = r#"{
             "proposals": [
                 {
@@ -10742,6 +10846,72 @@ print(json.dumps({'context': 'user said: ' + msg}))
         let mut host = MockHost::new(vec![]).with_reflection_text(reflection_response);
         let mut state = make_state();
         state.current_session_id = Some("sess-reflect".into());
+        let mut workspace = astra_services::session_workspace::WorkspaceMetadata::with_context(
+            "sess-reflect",
+            "gpt-5.4",
+            "/repo",
+            Some("main"),
+        );
+        workspace.session_goal = Some("ship self surface".into());
+        workspace.plan_goal = Some("stabilize reflection loop".into());
+        workspace.goal_progress = Some(astra_services::session_workspace::GoalProgressSnapshot {
+            goal: "ship self surface".into(),
+            completion_score: 0.5,
+            momentum: 0.2,
+            milestone_count: 2,
+            summary: "2/4 milestones complete".into(),
+            weighted_progress: 0.5,
+            negative_signals: 0.0,
+            milestones: Vec::new(),
+        });
+        workspace.contract_json = Some(
+            serde_json::to_string(&astra_services::TaskContract {
+                contract_id: "contract-1".into(),
+                task_id: "task-1".into(),
+                goal: "stabilize reflection loop".into(),
+                scope: astra_services::TaskScope::default(),
+                subtasks: vec![astra_services::DurableSubtask {
+                    id: "subtask-1".into(),
+                    title: "wire reflection evidence".into(),
+                    stage: astra_services::SubtaskStage::Pending,
+                    criteria: vec![astra_services::VerificationCriterion {
+                        id: "criterion-1".into(),
+                        description: "reflection prompt includes goal + verify".into(),
+                        verifier: astra_services::VerifierKind::BuildPass {
+                            cmd: "cargo test".into(),
+                        },
+                        required: true,
+                        timeout_sec: 120,
+                        global_only: false,
+                    }],
+                    ..Default::default()
+                }],
+                global_verification: Vec::new(),
+                version: 1,
+                status: astra_services::ContractStatus::Active,
+                created_at: chrono::Utc::now().to_rfc3339(),
+                updated_at: chrono::Utc::now().to_rfc3339(),
+                domain_hint: None,
+                task_type: None,
+                last_global_results: Vec::new(),
+            })
+            .unwrap(),
+        );
+        astra_services::session_workspace::write_workspace(&workspace).unwrap();
+        astra_services::session_journal::JournalWriter::new("sess-reflect")
+            .unwrap()
+            .append(&astra_services::session_journal::JournalEvent::turn(
+                Some("sess-reflect"),
+                1,
+                Some("gpt-5.4"),
+                "improve reflection",
+                "working on it",
+                0,
+                10,
+                20,
+                30,
+            ))
+            .unwrap();
         state.evolution_service = Some(std::sync::Arc::new(
             crate::evolution::service::EvolutionService::new(),
         ));
@@ -10817,6 +10987,9 @@ print(json.dumps({'context': 'user said: ' + msg}))
         maybe_trigger_auto_reflection(&mut host, &mut state).await;
 
         let prompt = host.last_reflection_prompt.as_deref().unwrap();
+        assert!(prompt.contains("Effective goal: stabilize reflection loop"));
+        assert!(prompt.contains("Goal progress: 2/4 milestones complete"));
+        assert!(prompt.contains("Verification summary: objective pending"));
         assert!(prompt.contains("Tool statistics:"));
         assert!(prompt.contains("bash — calls=2, failures=1, avg_ms=150"));
         assert!(prompt.contains("Active experiment: exp-123 (variant=variant-b, samples=4)"));

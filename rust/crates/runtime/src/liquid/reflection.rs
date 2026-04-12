@@ -43,6 +43,10 @@ pub struct ReflectionContext {
     pub token_utilisation: f64,
     /// Recent tactical actions taken by the step-level adapter.
     pub recent_tactical_actions: Vec<String>,
+    /// Distilled goal / steering state for this reflection window.
+    pub goal: Option<GoalSummary>,
+    /// Distilled verification / acceptance state for this reflection window.
+    pub verification: Option<VerificationSummary>,
 }
 
 /// Compressed representation of an EvolutionSignal for the LLM prompt.
@@ -60,6 +64,26 @@ pub struct ExperimentSummary {
     pub experiment_id: String,
     pub variant: String,
     pub samples: u32,
+}
+
+/// Goal / steering summary for the reflection window.
+#[derive(Debug, Clone, Serialize)]
+pub struct GoalSummary {
+    pub effective_goal: String,
+    pub goal_source: String,
+    pub tracking_status: String,
+    pub progress_summary: Option<String>,
+}
+
+/// Verification / acceptance summary for the reflection window.
+#[derive(Debug, Clone, Serialize)]
+pub struct VerificationSummary {
+    pub ok: bool,
+    pub acceptance_ok: bool,
+    pub objective_ok: bool,
+    pub summary: String,
+    pub pending_blockers: Vec<String>,
+    pub latest_verification: Option<String>,
 }
 
 /// Per-tool aggregate statistics for the reflection window.
@@ -126,6 +150,8 @@ impl ReflectionContext {
             tool_stats: Vec::new(),
             token_utilisation: 0.0,
             recent_tactical_actions: Vec::new(),
+            goal: None,
+            verification: None,
         }
     }
 
@@ -155,6 +181,33 @@ impl ReflectionContext {
                 "Active experiment: {} (variant={}, samples={})\n",
                 exp.experiment_id, exp.variant, exp.samples
             ));
+        }
+
+        if let Some(ref goal) = self.goal {
+            out.push_str(&format!(
+                "Effective goal: {} (source={}, tracking={})\n",
+                goal.effective_goal, goal.goal_source, goal.tracking_status
+            ));
+            if let Some(ref progress_summary) = goal.progress_summary {
+                out.push_str(&format!("Goal progress: {progress_summary}\n"));
+            }
+        }
+
+        if let Some(ref verification) = self.verification {
+            out.push_str(&format!(
+                "Verification: ok={} acceptance_ok={} objective_ok={}\n",
+                verification.ok, verification.acceptance_ok, verification.objective_ok
+            ));
+            out.push_str(&format!("Verification summary: {}\n", verification.summary));
+            if !verification.pending_blockers.is_empty() {
+                out.push_str(&format!(
+                    "Pending blockers: {}\n",
+                    verification.pending_blockers.join("; ")
+                ));
+            }
+            if let Some(ref latest) = verification.latest_verification {
+                out.push_str(&format!("Latest verification: {latest}\n"));
+            }
         }
 
         if !self.tool_stats.is_empty() {
@@ -630,11 +683,29 @@ mod tests {
     #[test]
     fn engine_build_prompt() {
         let engine = ReflectionEngine::new();
-        let ctx = ReflectionContext::new("sess-1");
+        let mut ctx = ReflectionContext::new("sess-1");
+        ctx.goal = Some(GoalSummary {
+            effective_goal: "stabilize the parser".into(),
+            goal_source: "plan_goal".into(),
+            tracking_status: "aligned".into(),
+            progress_summary: Some("2/3 milestones complete".into()),
+        });
+        ctx.verification = Some(VerificationSummary {
+            ok: false,
+            acceptance_ok: true,
+            objective_ok: false,
+            summary: "objective blocked: integration tests pending".into(),
+            pending_blockers: vec!["integration tests pending".into()],
+            latest_verification: Some("turn 8: parser unit suite passed".into()),
+        });
         let (system, user) = engine.build_prompt(&ctx);
         assert!(system.contains("execution improvement advisor"));
         assert!(user.contains("Analyze the following"));
         assert!(user.contains("sess-1"));
+        assert!(user.contains("Effective goal: stabilize the parser"));
+        assert!(
+            user.contains("Verification summary: objective blocked: integration tests pending")
+        );
     }
 
     #[test]

@@ -10,12 +10,19 @@ use crate::cli_args::{
 };
 use crate::cli_utils::resumable_last_session_id;
 use astra_runtime::auto_tuning::{FeedbackSignal, SignalType};
+use astra_runtime::liquid::reflection::{
+    GoalSummary as ReflectionGoalSummary, VerificationSummary as ReflectionVerificationSummary,
+};
 use astra_runtime::runtime_config::RuntimeConfig;
 use astra_runtime::self_model::{ConstraintSet, SelfModel};
 use astra_runtime::tool_registry::{TOOL_CATALOG, ToolRegistry};
 use astra_runtime::turn::context_assembly_trace::TokenBudgetTrace;
 use astra_runtime::turn::tool_health::ToolHealthTracker;
 use astra_runtime::user_profile::Scenario;
+use astra_services::self_surface::{
+    GoalSurface, LocalSelfSurfaceService, SelfSurfaceDimension, SelfSurfaceResponse,
+    SelfSurfaceService, VerificationSurface,
+};
 use astra_services::session_journal::{self, JournalEvent, JournalEventType};
 use astra_services::session_restore::{
     HybridRestoreService, RestoredSession, SessionRestoreService,
@@ -313,7 +320,11 @@ pub(crate) async fn execute_self_command(
         }
         SelfCmd::Mutate(SelfMutateCmd::Goal(SelfMutateGoalArgs { session_id, text })) => {
             let session_id = resolve_session_id(session_id.as_deref(), profile)?;
-            to_json(&persist_goal_mutation(&session_id, text, "astra self mutate")?)
+            to_json(&persist_goal_mutation(
+                &session_id,
+                text,
+                "astra self mutate",
+            )?)
         }
     }
 }
@@ -333,14 +344,17 @@ pub(crate) async fn render_reflect_surface_for_session(
     question: Option<&str>,
 ) -> Result<String, String> {
     let artifacts = load_artifacts(session_id.to_string()).await?;
-    to_json(&build_reflect_response(
-        &artifacts,
-        journal_limit.max(1),
-        normalize_reflect_focus(focus),
-        question
-            .map(str::trim)
-            .filter(|question| !question.is_empty()),
-    ))
+    to_json(
+        &build_reflect_response(
+            &artifacts,
+            journal_limit.max(1),
+            normalize_reflect_focus(focus),
+            question
+                .map(str::trim)
+                .filter(|question| !question.is_empty()),
+        )
+        .await,
+    )
 }
 
 pub(crate) fn agent_info_surface_alias(dimension: &str) -> Option<&'static str> {
@@ -490,14 +504,22 @@ fn build_snapshot_response(artifacts: &SessionArtifacts) -> Result<SnapshotRespo
     })
 }
 
-fn build_reflect_response(
+async fn build_reflect_response(
     artifacts: &SessionArtifacts,
     journal_limit: usize,
     focus: &str,
     question: Option<&str>,
 ) -> ReflectResponse {
-    let context =
-        build_persistent_reflection_context(artifacts, journal_limit.max(1), focus, question);
+    let (goal, verification) =
+        load_reflection_self_evidence(&artifacts.session_id, journal_limit.max(1)).await;
+    let context = build_persistent_reflection_context(
+        artifacts,
+        journal_limit.max(1),
+        focus,
+        question,
+        goal,
+        verification,
+    );
     let prompt_preview = context.render_prompt_section();
     ReflectResponse {
         session_id: artifacts.session_id.clone(),
@@ -510,6 +532,58 @@ fn build_reflect_response(
             journal_limit,
             focus,
         ),
+    }
+}
+
+async fn load_reflection_self_evidence(
+    session_id: &str,
+    journal_limit: usize,
+) -> (
+    Option<ReflectionGoalSummary>,
+    Option<ReflectionVerificationSummary>,
+) {
+    let service = LocalSelfSurfaceService::new();
+    let goal = match service
+        .surface(session_id, SelfSurfaceDimension::Goal, journal_limit)
+        .await
+    {
+        Ok(SelfSurfaceResponse::Goal(goal)) => reflection_goal_summary(goal),
+        _ => None,
+    };
+    let verification = match service
+        .surface(session_id, SelfSurfaceDimension::Verify, journal_limit)
+        .await
+    {
+        Ok(SelfSurfaceResponse::Verify(verification)) => {
+            Some(reflection_verification_summary(verification))
+        }
+        _ => None,
+    };
+    (goal, verification)
+}
+
+fn reflection_goal_summary(goal: GoalSurface) -> Option<ReflectionGoalSummary> {
+    Some(ReflectionGoalSummary {
+        effective_goal: goal.goal?,
+        goal_source: goal.goal_source,
+        tracking_status: goal.tracking_status,
+        progress_summary: goal.progress.map(|progress| progress.summary),
+    })
+}
+
+fn reflection_verification_summary(
+    verification: VerificationSurface,
+) -> ReflectionVerificationSummary {
+    ReflectionVerificationSummary {
+        ok: verification.ok,
+        acceptance_ok: verification.acceptance_ok,
+        objective_ok: verification.objective_ok,
+        summary: verification.summary,
+        pending_blockers: verification.objective.pending_blockers,
+        latest_verification: verification
+            .objective
+            .latest_verification
+            .map(|event| event.summary),
     }
 }
 
@@ -830,7 +904,14 @@ fn persist_goal_mutation(
         old_goal.clone().map(serde_json::Value::String),
     )?;
     if old_goal.as_deref() != Some(text) {
-        append_goal_steering_event(session_id, ws.turn_count, source, old_goal.as_deref(), text, None)?;
+        append_goal_steering_event(
+            session_id,
+            ws.turn_count,
+            source,
+            old_goal.as_deref(),
+            text,
+            None,
+        )?;
     }
     Ok(GoalMutationResponse {
         session_id: session_id.to_string(),
@@ -844,8 +925,12 @@ pub(crate) fn persist_goal_override(
     session_id: &str,
     text: &str,
 ) -> Result<serde_json::Value, String> {
-    serde_json::to_value(persist_goal_mutation(session_id, text, "edge_tool:set_goal")?)
-        .map_err(|e| e.to_string())
+    serde_json::to_value(persist_goal_mutation(
+        session_id,
+        text,
+        "edge_tool:set_goal",
+    )?)
+    .map_err(|e| e.to_string())
 }
 
 pub(crate) fn persist_tool_preferences(
@@ -1207,6 +1292,8 @@ fn build_persistent_reflection_context(
     signal_limit: usize,
     focus: &str,
     question: Option<&str>,
+    goal: Option<ReflectionGoalSummary>,
+    verification: Option<ReflectionVerificationSummary>,
 ) -> astra_runtime::liquid::reflection::ReflectionContext {
     const REFLECTION_TOOL_RECORD_LIMIT: usize = 24;
     const REFLECTION_TOOL_STAT_LIMIT: usize = 8;
@@ -1251,6 +1338,8 @@ fn build_persistent_reflection_context(
         focus,
     );
     context.active_experiment = active_reflection_experiment(artifacts, context.turns_completed);
+    context.goal = goal;
+    context.verification = verification;
     context
 }
 
@@ -2041,6 +2130,51 @@ mod tests {
         let session_id = "self-reflect-session";
         let mut ws = WorkspaceMetadata::with_context(session_id, "gpt-5.4", "/repo", Some("main"));
         ws.turn_count = 9;
+        ws.session_goal = Some("ship self surface".to_string());
+        ws.plan_goal = Some("stabilize reflection loop".to_string());
+        ws.goal_progress = Some(astra_services::session_workspace::GoalProgressSnapshot {
+            goal: "ship self surface".to_string(),
+            completion_score: 0.6,
+            momentum: 0.3,
+            milestone_count: 2,
+            summary: "2/3 milestones complete".to_string(),
+            weighted_progress: 0.6,
+            negative_signals: 0.0,
+            milestones: Vec::new(),
+        });
+        ws.contract_json = Some(
+            serde_json::to_string(&astra_services::TaskContract {
+                contract_id: "contract-reflect".to_string(),
+                task_id: "task-reflect".to_string(),
+                goal: "stabilize reflection loop".to_string(),
+                scope: astra_services::TaskScope::default(),
+                subtasks: vec![astra_services::DurableSubtask {
+                    id: "subtask-1".to_string(),
+                    title: "close reflection gap".to_string(),
+                    stage: astra_services::SubtaskStage::Pending,
+                    criteria: vec![astra_services::VerificationCriterion {
+                        id: "criterion-1".to_string(),
+                        description: "reflection evidence prompt wired".to_string(),
+                        verifier: astra_services::VerifierKind::BuildPass {
+                            cmd: "cargo test".to_string(),
+                        },
+                        required: true,
+                        timeout_sec: 120,
+                        global_only: false,
+                    }],
+                    ..Default::default()
+                }],
+                global_verification: Vec::new(),
+                version: 1,
+                status: astra_services::ContractStatus::Active,
+                created_at: Utc::now().to_rfc3339(),
+                updated_at: Utc::now().to_rfc3339(),
+                domain_hint: None,
+                task_type: None,
+                last_global_results: Vec::new(),
+            })
+            .unwrap(),
+        );
         ws.active_experiment_id = Some("exp-liquid".to_string());
         ws.active_variant = Some("treatment-a".to_string());
         ws.last_context_trace = Some(ContextTraceSignal {
@@ -2259,6 +2393,18 @@ mod tests {
             "Question"
         );
         assert_eq!(
+            value["reflection_context"]["goal"]["effective_goal"],
+            "stabilize reflection loop"
+        );
+        assert_eq!(
+            value["reflection_context"]["goal"]["goal_source"],
+            "plan_goal"
+        );
+        assert_eq!(
+            value["reflection_context"]["verification"]["objective_ok"],
+            false
+        );
+        assert_eq!(
             value["reflection_context"]["recent_tactical_actions"][0],
             "high token pressure"
         );
@@ -2267,6 +2413,18 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("Question")
+        );
+        assert!(
+            value["prompt_preview"]
+                .as_str()
+                .unwrap()
+                .contains("Effective goal: stabilize reflection loop")
+        );
+        assert!(
+            value["prompt_preview"]
+                .as_str()
+                .unwrap()
+                .contains("Verification summary:")
         );
     }
 
