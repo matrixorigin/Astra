@@ -200,13 +200,24 @@ pub enum StreamEvent {
         agent_id: Value,
         task: Value,
     },
+    AgentSpawned {
+        agent_id: String,
+        run_id: String,
+        parent_run_id: String,
+        agent_type: String,
+        description: String,
+        timestamp: Option<u64>,
+        raw: Value,
+    },
     AgentProgress {
-        agent_id: Value,
-        progress: Value,
+        agent_id: String,
+        status: Option<String>,
+        raw: Value,
     },
     AgentCompleted {
-        agent_id: Value,
-        result: Value,
+        agent_id: String,
+        status: Option<String>,
+        raw: Value,
     },
     RunStarted {
         run_id: Option<String>,
@@ -329,13 +340,24 @@ pub fn classify_stream_event(value: Value) -> Result<StreamEvent, crate::error::
             agent_id: obj.get("agent_id").cloned().unwrap_or(Value::Null),
             task: obj.get("task").cloned().unwrap_or(Value::Null),
         },
+        "agent_spawned" => StreamEvent::AgentSpawned {
+            agent_id: get_str(&obj, "agent_id"),
+            run_id: get_str(&obj, "run_id"),
+            parent_run_id: get_str(&obj, "parent_run_id"),
+            agent_type: get_str(&obj, "agent_type"),
+            description: get_str(&obj, "description"),
+            timestamp: obj.get("timestamp").and_then(|v| v.as_u64()),
+            raw,
+        },
         "agent_progress" => StreamEvent::AgentProgress {
-            agent_id: obj.get("agent_id").cloned().unwrap_or(Value::Null),
-            progress: obj.get("progress").cloned().unwrap_or(Value::Null),
+            agent_id: get_str(&obj, "agent_id"),
+            status: optional_str(&obj, "status"),
+            raw,
         },
         "agent_completed" => StreamEvent::AgentCompleted {
-            agent_id: obj.get("agent_id").cloned().unwrap_or(Value::Null),
-            result: obj.get("result").cloned().unwrap_or(Value::Null),
+            agent_id: get_str(&obj, "agent_id"),
+            status: optional_str(&obj, "status"),
+            raw,
         },
         "run_started" => StreamEvent::RunStarted {
             run_id: optional_str(&obj, "run_id"),
@@ -519,6 +541,81 @@ mod tests {
     fn classify_reasoning_done() {
         match classify_stream_event(serde_json::json!({"type":"reasoning_done"})).unwrap() {
             StreamEvent::ReasoningDone => {}
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_agent_events() {
+        let spawned = serde_json::json!({
+            "type": "agent_spawned",
+            "agent_id": "agent-1",
+            "run_id": "run-1",
+            "parent_run_id": "root-1",
+            "agent_type": "worker",
+            "description": "Investigate",
+            "timestamp": 123
+        });
+        match classify_stream_event(spawned).unwrap() {
+            StreamEvent::AgentSpawned {
+                agent_id,
+                run_id,
+                parent_run_id,
+                agent_type,
+                description,
+                timestamp,
+                raw,
+            } => {
+                assert_eq!(agent_id, "agent-1");
+                assert_eq!(run_id, "run-1");
+                assert_eq!(parent_run_id, "root-1");
+                assert_eq!(agent_type, "worker");
+                assert_eq!(description, "Investigate");
+                assert_eq!(timestamp, Some(123));
+                assert_eq!(raw["type"], "agent_spawned");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        let progress = serde_json::json!({
+            "type": "agent_progress",
+            "agent_id": "agent-1",
+            "status": "started",
+            "description": "Reading files",
+            "timestamp": 456
+        });
+        match classify_stream_event(progress).unwrap() {
+            StreamEvent::AgentProgress {
+                agent_id,
+                status,
+                raw,
+            } => {
+                assert_eq!(agent_id, "agent-1");
+                assert_eq!(status.as_deref(), Some("started"));
+                assert_eq!(raw["description"], "Reading files");
+                assert_eq!(raw["timestamp"], 456);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        let completed = serde_json::json!({
+            "type": "agent_completed",
+            "agent_id": "agent-1",
+            "status": "failed",
+            "error": "boom",
+            "timestamp": 789
+        });
+        match classify_stream_event(completed).unwrap() {
+            StreamEvent::AgentCompleted {
+                agent_id,
+                status,
+                raw,
+            } => {
+                assert_eq!(agent_id, "agent-1");
+                assert_eq!(status.as_deref(), Some("failed"));
+                assert_eq!(raw["error"], "boom");
+                assert_eq!(raw["timestamp"], 789);
+            }
             other => panic!("unexpected {other:?}"),
         }
     }
