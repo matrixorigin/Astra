@@ -880,4 +880,77 @@ mod tests {
             error
         );
     }
+
+    /// Empty tool names (model bug) must be rejected before dedup counting
+    /// so they don't inflate call_counts and flood the context with 50+ stubs.
+    #[tokio::test]
+    async fn empty_tool_name_rejected_before_dedup() {
+        // 5 tool calls with empty name — all should be recorded as unknown_tool,
+        // none should hit the dedup hard-cap path.
+        let tool_calls: Vec<Value> = (0..5)
+            .map(|i| {
+                json!({
+                    "id": format!("call-{i}"),
+                    "name": "",
+                    "arguments": "{}"
+                })
+            })
+            .collect();
+
+        let mut messages = Vec::new();
+        let mut tool_results = Vec::new();
+        let valid_tool_names = HashSet::from(["bash".to_string()]);
+        let mut restricted_tools = HashSet::new();
+        let mut turn_guard = TurnGuard::new();
+        let mut step_recorder = StepRecorder::new("test-session", "empty-name");
+        let mut idempotency_cache = InMemoryIdempotencyCache::new();
+        let mut semantic_dedup = SemanticDedup::new(0.95);
+        let mut tool_call_records = Vec::new();
+        let tool_event_hooks = crate::skills::hooks::ToolEventHookRegistry::default();
+        let mut term = NoopHeadlessTerminal;
+        let edge_callback_outputs = HashMap::new();
+        let edge_tool_round: Vec<EdgeToolExecResult> = Vec::new();
+
+        run_agentic_headless_tool_round(
+            0,
+            true,
+            &astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
+            "",
+            None,
+            &tool_calls,
+            &edge_tool_round,
+            "",
+            &edge_callback_outputs,
+            &mut messages,
+            &mut tool_results,
+            &valid_tool_names,
+            &mut restricted_tools,
+            &mut turn_guard,
+            &mut step_recorder,
+            &mut idempotency_cache,
+            &mut semantic_dedup,
+            &mut HashMap::new(),
+            2, // max_identical = 2
+            &mut tool_call_records,
+            &tool_event_hooks,
+            &mut term,
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        // All 5 should be recorded (not swallowed by dedup).
+        assert_eq!(tool_call_records.len(), 5);
+        // Every record should be unknown_tool, not duplicate_within_turn.
+        for rec in &tool_call_records {
+            assert!(
+                rec.error
+                    .as_deref()
+                    .is_some_and(|e| e.starts_with("unknown_tool")),
+                "expected unknown_tool error, got: {:?}",
+                rec.error
+            );
+        }
+    }
 }

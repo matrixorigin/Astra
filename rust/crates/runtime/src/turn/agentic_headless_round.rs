@@ -180,6 +180,30 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
             synthetic_edge_index: synthetic_idx,
         } = slot;
 
+        // Reject empty tool names immediately — some models emit tool_call
+        // objects with a missing/empty name field.  Treating these as
+        // unknown_tool *before* dedup counting prevents a single malformed
+        // burst from inflating call_counts and flooding the context.
+        if name.is_empty() {
+            let err_msg = unknown_local_tool_error_message(&name, valid_tool_names);
+            if !quiet {
+                term.emit_line(
+                    HeadlessStderrStyle::Red,
+                    headless_stderr_unknown_tool_header(&name),
+                );
+                term.emit_line(
+                    HeadlessStderrStyle::Dim,
+                    headless_stderr_unknown_tool_detail(&err_msg),
+                );
+            }
+            let (tool_msg, err_tr) =
+                headless_unknown_local_tool_openai_pair(&id, &name, valid_tool_names);
+            messages.push(tool_msg);
+            tool_results.push(err_tr);
+            tool_call_records.push(journal_record_unknown_tool(name.clone(), 0));
+            continue;
+        }
+
         let call_sig = tool_dedup_signature(&name, &args);
         let count = call_counts.entry(call_sig.clone()).or_insert(0);
         *count += 1;
