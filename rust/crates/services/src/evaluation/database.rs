@@ -282,6 +282,42 @@ fn render_training_dataset_csv(dataset: &ExtractedTrainingDataset) -> String {
     lines.join("\n")
 }
 
+fn normalize_model_filter(model: Option<&str>) -> Option<String> {
+    model.and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
+}
+
+fn quality_trend_query(model: Option<&str>) -> &'static str {
+    if model.is_some() {
+        "SELECT DATE_FORMAT(DATE(qa.created_at), '%Y-%m-%d') AS dt, \
+         AVG(qa.score) AS avg_score, COUNT(*) AS cnt \
+         FROM eval_quality_assessments qa \
+         WHERE qa.user_id = ? \
+           AND qa.level = 'session' \
+           AND qa.created_at >= DATE_SUB(NOW(), INTERVAL ? DAY) \
+           AND EXISTS ( \
+               SELECT 1 FROM agent_events e \
+               WHERE e.user_id = qa.user_id \
+                 AND e.session_id = qa.target_id \
+                 AND e.llm_model_used = ? \
+           ) \
+         GROUP BY dt ORDER BY dt"
+    } else {
+        "SELECT DATE_FORMAT(DATE(qa.created_at), '%Y-%m-%d') AS dt, \
+         AVG(qa.score) AS avg_score, COUNT(*) AS cnt \
+         FROM eval_quality_assessments qa \
+         WHERE qa.user_id = ? \
+           AND qa.created_at >= DATE_SUB(NOW(), INTERVAL ? DAY) \
+         GROUP BY dt ORDER BY dt"
+    }
+}
+
 fn summarize_gate_validation(
     scores_desc: &[f64],
     golden_session_count: i32,
@@ -474,28 +510,17 @@ impl EvaluationService for DatabaseEvaluationService {
         days: i32,
         model: Option<&str>,
     ) -> ServiceResult<QualityTrendResponse> {
-        if model.is_some() {
-            return Err(not_implemented(
-                "Evaluation quality trend model filtering is not implemented yet",
-            ));
-        }
-
         let pool = self.get_pool().await.map_err(internal_error)?;
         let days = clamp_eval_days(days);
+        let normalized_model = normalize_model_filter(model);
 
-        let rows = query(
-            "SELECT DATE_FORMAT(DATE(created_at), '%Y-%m-%d') AS dt, \
-             AVG(score) AS avg_score, COUNT(*) AS cnt \
-             FROM eval_quality_assessments \
-             WHERE user_id = ? \
-               AND created_at >= DATE_SUB(NOW(), INTERVAL ? DAY) \
-             GROUP BY dt ORDER BY dt",
-        )
-        .bind(user_id)
-        .bind(days)
-        .fetch_all(&pool)
-        .await
-        .unwrap_or_default();
+        let mut trend_query = query(quality_trend_query(normalized_model.as_deref()))
+            .bind(user_id)
+            .bind(days);
+        if let Some(ref model) = normalized_model {
+            trend_query = trend_query.bind(model);
+        }
+        let rows = trend_query.fetch_all(&pool).await.unwrap_or_default();
 
         let points: Vec<QualityTrendPoint> = rows
             .iter()
@@ -507,7 +532,7 @@ impl EvaluationService for DatabaseEvaluationService {
                     avg_score,
                     avg_score_interval: sampled_confidence_interval(avg_score, count),
                     count,
-                    model: None,
+                    model: normalized_model.clone(),
                 }
             })
             .collect();
@@ -1696,6 +1721,33 @@ mod tests {
     fn training_dataset_status_matches_sample_count() {
         assert_eq!(training_dataset_status(0), "empty");
         assert_eq!(training_dataset_status(3), "ready");
+    }
+
+    #[test]
+    fn normalize_model_filter_trims_and_drops_empty_values() {
+        assert_eq!(normalize_model_filter(None), None);
+        assert_eq!(normalize_model_filter(Some("   ")), None);
+        assert_eq!(
+            normalize_model_filter(Some(" gpt-4.1 ")),
+            Some("gpt-4.1".into())
+        );
+    }
+
+    #[test]
+    fn quality_trend_query_without_model_uses_unfiltered_assessments() {
+        let sql = quality_trend_query(None);
+        assert!(sql.contains("FROM eval_quality_assessments qa"));
+        assert!(!sql.contains("qa.level = 'session'"));
+        assert!(!sql.contains("agent_events e"));
+    }
+
+    #[test]
+    fn quality_trend_query_with_model_filters_session_assessments() {
+        let sql = quality_trend_query(Some("gpt-4"));
+        assert!(sql.contains("qa.level = 'session'"));
+        assert!(sql.contains("EXISTS ("));
+        assert!(sql.contains("e.session_id = qa.target_id"));
+        assert!(sql.contains("e.llm_model_used = ?"));
     }
 
     fn sample_training_dataset() -> ExtractedTrainingDataset {

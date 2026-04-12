@@ -282,7 +282,7 @@ async fn memoria_stubbed_evaluation_routes_surface_expected_errors() {
             "/evaluation/quality/trend?model=gpt-4",
             body::Body::empty(),
             false,
-            StatusCode::NOT_IMPLEMENTED,
+            StatusCode::INTERNAL_SERVER_ERROR,
         ),
         (
             "GET",
