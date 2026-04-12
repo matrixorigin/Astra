@@ -781,7 +781,9 @@ mod tests {
             noise_filtered_quality_interval: None,
             latest_gate_passed: Some(false),
             latest_gate_score_delta: Some(-0.11),
+            latest_gate_score_delta_interval: None,
             calibration_error: Some(0.24),
+            calibration_error_interval: None,
         };
 
         let verdict =

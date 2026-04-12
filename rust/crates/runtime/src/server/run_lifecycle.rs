@@ -117,13 +117,20 @@ async fn load_runtime_promotion_context(
     } else {
         calibration.calibration_error
     };
+    let calibration_error_interval = if calibration.noise_filtered_sample_count > 0 {
+        calibration.noise_filtered_calibration_error_interval
+    } else {
+        calibration.calibration_error_interval
+    };
 
     Ok(PromotionEvaluationContext {
         noise_filtered_quality: Some(quality.noise_filtered_overall_avg),
         noise_filtered_quality_interval: Some(quality.noise_filtered_overall_avg_interval),
         latest_gate_passed: latest_gate.map(|gate| gate.passed),
         latest_gate_score_delta: latest_gate.map(|gate| gate.score_delta),
+        latest_gate_score_delta_interval: latest_gate.map(|gate| gate.score_delta_interval),
         calibration_error: Some(calibration_error),
+        calibration_error_interval: Some(calibration_error_interval),
     })
 }
 

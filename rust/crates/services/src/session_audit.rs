@@ -4,9 +4,9 @@
 //! All queries run against MatrixOne `agent_events` + `agent_sessions` tables.
 
 use async_trait::async_trait;
-use axum::{http::StatusCode, Json};
+use axum::{Json, http::StatusCode};
 use serde::{Deserialize, Serialize};
-use sqlx::{query, Row};
+use sqlx::{Row, query};
 
 use crate::evaluation::{DatabaseEvaluationService, EvaluationService};
 use crate::{
@@ -15,7 +15,7 @@ use crate::{
     StagedMutationState,
 };
 use astra_core::{
-    connect_matrixone, error_response, internal_error, ErrorResponse, MatrixOneSettings, SharedPool,
+    ErrorResponse, MatrixOneSettings, SharedPool, connect_matrixone, error_response, internal_error,
 };
 
 fn normalize_tool_name(name: String) -> String {
@@ -817,16 +817,25 @@ impl DatabaseSessionAuditService {
             .into_iter()
             .next();
         let calibration = evaluation.get_calibration(user_id, None, 30).await?;
+        let calibration_error_interval = if calibration.noise_filtered_sample_count > 0 {
+            calibration.noise_filtered_calibration_error_interval
+        } else {
+            calibration.calibration_error_interval
+        };
 
         Ok(MutationPromotionEvaluationContext {
             noise_filtered_quality: Some(quality.noise_filtered_overall_avg_interval),
             latest_gate_passed: latest_gate.as_ref().map(|gate| gate.passed),
             latest_gate_score_delta: latest_gate.as_ref().map(|gate| gate.score_delta),
+            latest_gate_score_delta_interval: latest_gate
+                .as_ref()
+                .map(|gate| gate.score_delta_interval),
             calibration_error: Some(if calibration.noise_filtered_sample_count > 0 {
                 calibration.noise_filtered_calibration_error
             } else {
                 calibration.calibration_error
             }),
+            calibration_error_interval: Some(calibration_error_interval),
             missing_verifier_rate,
         })
     }

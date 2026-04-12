@@ -2,6 +2,7 @@ use astra_core::confidence::ConfidenceInterval;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::evaluation::types::ValueInterval;
 use crate::{SubtaskVerificationReport, VerificationResult};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -45,6 +46,29 @@ impl MutationCompensationPolicy {
 
 fn is_false(value: &bool) -> bool {
     !*value
+}
+
+fn format_value_interval_evidence(
+    label: &str,
+    value: f64,
+    interval: Option<&ValueInterval>,
+) -> String {
+    if let Some(interval) = interval {
+        format!(
+            "{label}={value:.2}[{:.2},{:.2}]",
+            interval.lower, interval.upper
+        )
+    } else {
+        format!("{label}={value:.2}")
+    }
+}
+
+fn interval_floor(value: f64, interval: Option<&ValueInterval>) -> f64 {
+    interval.map_or(value, |interval| interval.lower)
+}
+
+fn interval_ceiling(value: f64, interval: Option<&ValueInterval>) -> f64 {
+    interval.map_or(value, |interval| interval.upper)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -198,7 +222,9 @@ pub struct MutationPromotionEvaluationContext {
     pub noise_filtered_quality: Option<ConfidenceInterval>,
     pub latest_gate_passed: Option<bool>,
     pub latest_gate_score_delta: Option<f64>,
+    pub latest_gate_score_delta_interval: Option<ValueInterval>,
     pub calibration_error: Option<f64>,
+    pub calibration_error_interval: Option<ValueInterval>,
     pub missing_verifier_rate: Option<f64>,
 }
 
@@ -298,9 +324,10 @@ impl MutationJudgment {
         verifier_present: bool,
     ) {
         if let Some(quality) = context.noise_filtered_quality {
-            self.promotion_verdict
-                .evidence
-                .push(format!("noise_filtered_quality={:.2}", quality.point));
+            self.promotion_verdict.evidence.push(format!(
+                "noise_filtered_quality={:.2}[{:.2},{:.2}]",
+                quality.point, quality.lower, quality.upper
+            ));
             self.promotion_verdict.confidence_score =
                 self.promotion_verdict.confidence_score.min(quality.point);
             if quality.lower < 0.55 {
@@ -320,27 +347,39 @@ impl MutationJudgment {
             }
         }
         if let Some(score_delta) = context.latest_gate_score_delta {
+            let delta_interval = context.latest_gate_score_delta_interval.as_ref();
+            let delta_floor = interval_floor(score_delta, delta_interval);
             self.promotion_verdict
                 .evidence
-                .push(format!("latest_gate_score_delta={score_delta:.2}"));
-            if score_delta < -0.15 {
+                .push(format_value_interval_evidence(
+                    "latest_gate_score_delta",
+                    score_delta,
+                    delta_interval,
+                ));
+            if delta_floor < -0.15 {
                 self.promotion_verdict
                     .blockers
                     .push("latest_gate_regression".into());
-            } else if score_delta < -0.05 {
+            } else if delta_floor < -0.05 {
                 self.promotion_verdict.support_score =
                     self.promotion_verdict.support_score.min(0.65);
             }
         }
         if let Some(calibration_error) = context.calibration_error {
+            let calibration_interval = context.calibration_error_interval.as_ref();
+            let calibration_ceiling = interval_ceiling(calibration_error, calibration_interval);
             self.promotion_verdict
                 .evidence
-                .push(format!("calibration_error={calibration_error:.2}"));
-            if calibration_error > 0.35 {
+                .push(format_value_interval_evidence(
+                    "calibration_error",
+                    calibration_error,
+                    calibration_interval,
+                ));
+            if calibration_ceiling > 0.35 {
                 self.promotion_verdict
                     .blockers
                     .push("calibration_error_high".into());
-            } else if calibration_error > 0.20 {
+            } else if calibration_ceiling > 0.20 {
                 self.promotion_verdict.support_score =
                     self.promotion_verdict.support_score.min(0.60);
             }
@@ -1080,7 +1119,9 @@ mod tests {
             noise_filtered_quality: Some(ConfidenceInterval::new(0.72, 0.68, 0.76)),
             latest_gate_passed: Some(false),
             latest_gate_score_delta: Some(-0.08),
+            latest_gate_score_delta_interval: Some(ValueInterval::new(-0.08, -0.10, -0.04)),
             calibration_error: Some(0.24),
+            calibration_error_interval: Some(ValueInterval::new(0.24, 0.20, 0.28)),
             missing_verifier_rate: Some(0.4),
         });
 
@@ -1100,6 +1141,62 @@ mod tests {
                 .evidence
                 .iter()
                 .any(|evidence| evidence == "latest_gate_passed=false")
+        );
+    }
+
+    #[test]
+    fn promotion_context_uses_interval_bounds_for_mutation_penalties() {
+        let scoreboard = MutationScoreboard::new(
+            "board-intervals",
+            "session-1",
+            vec![StagedMutation::new(
+                "mut-intervals",
+                "session-1",
+                1,
+                "write_file",
+                serde_json::json!({"path": "src/lib.rs"}),
+                Some("snap-1".into()),
+                MutationObjectiveScore::from_learning_signal(0.93, Some(88), 0.08, 0.82, false),
+                Some(MutationVerifierSummary::from_report(&verification_report(
+                    true,
+                ))),
+                automated_policy(true),
+            )],
+        );
+
+        let scoreboard = scoreboard.with_promotion_context(&MutationPromotionEvaluationContext {
+            noise_filtered_quality: Some(ConfidenceInterval::new(0.72, 0.68, 0.76)),
+            latest_gate_passed: Some(false),
+            latest_gate_score_delta: Some(-0.04),
+            latest_gate_score_delta_interval: Some(ValueInterval::new(-0.04, -0.18, 0.02)),
+            calibration_error: Some(0.18),
+            calibration_error_interval: Some(ValueInterval::new(0.18, 0.12, 0.26)),
+            missing_verifier_rate: Some(0.1),
+        });
+
+        assert!(
+            scoreboard.mutations[0]
+                .judgment
+                .promotion_verdict
+                .blockers
+                .iter()
+                .any(|blocker| blocker == "latest_gate_regression")
+        );
+        assert!(
+            scoreboard.mutations[0]
+                .judgment
+                .promotion_verdict
+                .evidence
+                .iter()
+                .any(|evidence| evidence.contains("latest_gate_score_delta=-0.04[-0.18,0.02]"))
+        );
+        assert!(
+            scoreboard.mutations[0]
+                .judgment
+                .promotion_verdict
+                .evidence
+                .iter()
+                .any(|evidence| evidence.contains("calibration_error=0.18[0.12,0.26]"))
         );
     }
 }
