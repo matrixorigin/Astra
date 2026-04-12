@@ -170,6 +170,23 @@ fn reasoning_done_sse_bytes_if_needed(reasoning: &str) -> Option<Bytes> {
     (!reasoning.is_empty()).then(|| render_sse(&json!({"type": "reasoning_done"})))
 }
 
+fn latest_user_message_text(messages: &[Value]) -> Option<&str> {
+    messages
+        .iter()
+        .rev()
+        .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))
+        .and_then(|m| m.get("content").and_then(Value::as_str))
+}
+
+fn tool_names_from_tool_calls(tool_calls: &[Value]) -> Vec<String> {
+    tool_calls
+        .iter()
+        .filter_map(|tool_call| tool_call.get("function").and_then(Value::as_object))
+        .filter_map(|function| function.get("name").and_then(Value::as_str))
+        .map(std::string::ToString::to_string)
+        .collect()
+}
+
 fn tool_call_start_event(tool_call: &mut Map<String, Value>) -> Option<Value> {
     let function = tool_call.get("function").and_then(Value::as_object)?;
     let tool = function
@@ -204,6 +221,28 @@ fn tool_call_start_event(tool_call: &mut Map<String, Value>) -> Option<Value> {
         obj.insert("arguments".to_string(), Value::String(arguments));
     }
     Some(event)
+}
+
+fn turn_complete_event(messages: &[Value], assistant_text: &str, tool_calls: &[Value]) -> Value {
+    let mut event = crate::turn::complete::build_turn_complete_event(
+        !tool_calls.is_empty(),
+        false,
+        &crate::turn::stall::DivergenceStatus::Healthy,
+        None,
+    );
+    if let Some(user_message) = latest_user_message_text(messages)
+        && let Some(suggestion) = crate::turn::followup_suggestion::suggest_followup(
+            user_message,
+            assistant_text,
+            &tool_names_from_tool_calls(tool_calls),
+        )
+    {
+        event.insert(
+            "followup_suggestion".to_string(),
+            Value::String(suggestion.text),
+        );
+    }
+    Value::Object(event)
 }
 
 fn extend_forward_from_validated_sse_block(
@@ -2022,10 +2061,7 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
             let llm_duration_ms = llm_started.elapsed().as_millis() as i64;
 
             // Persist events (fire-and-forget)
-            let user_content = messages.iter()
-                .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))
-                .and_then(|m| m.get("content").and_then(Value::as_str))
-                .map(ToString::to_string);
+            let user_content = latest_user_message_text(&messages).map(ToString::to_string);
 
             let has_tool_calls = !all_round_tool_calls.is_empty();
             let llm_content = full_text.trim().to_string();
@@ -2337,10 +2373,7 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
             }
 
             // turn_complete
-            yield render_sse(&json!({
-                "type": "turn_complete",
-                "has_tool_calls": has_tool_calls,
-            }));
+            yield render_sse(&turn_complete_event(&messages, &llm_content, &all_round_tool_calls));
         };
 
         let body = Body::from_stream(stream.map(Ok::<_, std::io::Error>));
@@ -4456,5 +4489,28 @@ mod tests {
             .expect("call_id");
         assert!(!call_id.is_empty());
         assert_eq!(tool_call.get("id").and_then(Value::as_str), Some(call_id));
+    }
+
+    #[test]
+    fn latest_user_message_text_prefers_last_user() {
+        let messages = vec![
+            json!({"role": "user", "content": "first prompt"}),
+            json!({"role": "assistant", "content": "intermediate"}),
+            json!({"role": "user", "content": "继续处理"}),
+        ];
+        assert_eq!(latest_user_message_text(&messages), Some("继续处理"));
+    }
+
+    #[test]
+    fn turn_complete_event_includes_followup_suggestion_from_last_user() {
+        let messages = vec![
+            json!({"role": "user", "content": "first prompt"}),
+            json!({"role": "assistant", "content": "intermediate"}),
+            json!({"role": "user", "content": "继续处理"}),
+        ];
+        let event = turn_complete_event(&messages, "Should I continue?", &[]);
+        assert_eq!(event["type"], "turn_complete");
+        assert_eq!(event["has_tool_calls"], false);
+        assert_eq!(event["followup_suggestion"], "继续");
     }
 }
