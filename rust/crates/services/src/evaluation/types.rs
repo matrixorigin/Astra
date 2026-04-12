@@ -282,6 +282,9 @@ pub struct QualityTrendResponse {
     pub overall_avg: f64,
     pub overall_avg_interval: ConfidenceInterval,
     pub total_events: i64,
+    pub noise_filtered_overall_avg: f64,
+    pub noise_filtered_overall_avg_interval: ConfidenceInterval,
+    pub noise_filtered_total_events: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -136,6 +136,12 @@ struct ExtractedTrainingDataset {
     samples: Vec<ExtractedTrainingSample>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct NoiseFilteredAverage {
+    average: f64,
+    sample_count: i64,
+}
+
 fn average_scores(scores: &[f64]) -> f64 {
     if scores.is_empty() {
         0.0
@@ -282,6 +288,73 @@ fn render_training_dataset_csv(dataset: &ExtractedTrainingDataset) -> String {
     lines.join("\n")
 }
 
+fn percentile(sorted_scores: &[f64], fraction: f64) -> f64 {
+    if sorted_scores.is_empty() {
+        return 0.0;
+    }
+    if sorted_scores.len() == 1 {
+        return sorted_scores[0];
+    }
+
+    let position = fraction.clamp(0.0, 1.0) * (sorted_scores.len() - 1) as f64;
+    let lower_idx = position.floor() as usize;
+    let upper_idx = position.ceil() as usize;
+    if lower_idx == upper_idx {
+        sorted_scores[lower_idx]
+    } else {
+        let lower = sorted_scores[lower_idx];
+        let upper = sorted_scores[upper_idx];
+        lower + (upper - lower) * (position - lower_idx as f64)
+    }
+}
+
+fn noise_filtered_average(scores: &[f64]) -> NoiseFilteredAverage {
+    if scores.is_empty() {
+        return NoiseFilteredAverage {
+            average: 0.0,
+            sample_count: 0,
+        };
+    }
+
+    if scores.len() < 5 {
+        return NoiseFilteredAverage {
+            average: average_scores(scores),
+            sample_count: scores.len() as i64,
+        };
+    }
+
+    let mut sorted = scores.to_vec();
+    sorted.sort_by(f64::total_cmp);
+
+    let q1 = percentile(&sorted, 0.25);
+    let q3 = percentile(&sorted, 0.75);
+    let iqr = q3 - q1;
+    if iqr <= f64::EPSILON {
+        return NoiseFilteredAverage {
+            average: average_scores(&sorted),
+            sample_count: sorted.len() as i64,
+        };
+    }
+
+    let lower = q1 - 1.5 * iqr;
+    let upper = q3 + 1.5 * iqr;
+    let filtered: Vec<f64> = sorted
+        .into_iter()
+        .filter(|score| *score >= lower && *score <= upper)
+        .collect();
+    if filtered.len() < 3 {
+        return NoiseFilteredAverage {
+            average: average_scores(scores),
+            sample_count: scores.len() as i64,
+        };
+    }
+
+    NoiseFilteredAverage {
+        average: average_scores(&filtered),
+        sample_count: filtered.len() as i64,
+    }
+}
+
 fn normalize_model_filter(model: Option<&str>) -> Option<String> {
     model.and_then(|value| {
         let trimmed = value.trim();
@@ -315,6 +388,29 @@ fn quality_trend_query(model: Option<&str>) -> &'static str {
          WHERE qa.user_id = ? \
            AND qa.created_at >= DATE_SUB(NOW(), INTERVAL ? DAY) \
          GROUP BY dt ORDER BY dt"
+    }
+}
+
+fn quality_trend_scores_query(model: Option<&str>) -> &'static str {
+    if model.is_some() {
+        "SELECT qa.score AS score \
+         FROM eval_quality_assessments qa \
+         WHERE qa.user_id = ? \
+           AND qa.level = 'session' \
+           AND qa.created_at >= DATE_SUB(NOW(), INTERVAL ? DAY) \
+           AND EXISTS ( \
+               SELECT 1 FROM agent_events e \
+               WHERE e.user_id = qa.user_id \
+                 AND e.session_id = qa.target_id \
+                 AND e.llm_model_used = ? \
+           ) \
+         ORDER BY qa.created_at"
+    } else {
+        "SELECT qa.score AS score \
+         FROM eval_quality_assessments qa \
+         WHERE qa.user_id = ? \
+           AND qa.created_at >= DATE_SUB(NOW(), INTERVAL ? DAY) \
+         ORDER BY qa.created_at"
     }
 }
 
@@ -522,6 +618,21 @@ impl EvaluationService for DatabaseEvaluationService {
         }
         let rows = trend_query.fetch_all(&pool).await.unwrap_or_default();
 
+        let mut scores_query = query(quality_trend_scores_query(normalized_model.as_deref()))
+            .bind(user_id)
+            .bind(days);
+        if let Some(ref model) = normalized_model {
+            scores_query = scores_query.bind(model);
+        }
+        let raw_scores: Vec<f64> = scores_query
+            .fetch_all(&pool)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|row| row.try_get("score").ok())
+            .collect();
+        let noise_filtered = noise_filtered_average(&raw_scores);
+
         let points: Vec<QualityTrendPoint> = rows
             .iter()
             .map(|r| {
@@ -545,6 +656,12 @@ impl EvaluationService for DatabaseEvaluationService {
             overall_avg,
             overall_avg_interval: sampled_confidence_interval(overall_avg, total_events),
             total_events,
+            noise_filtered_overall_avg: noise_filtered.average,
+            noise_filtered_overall_avg_interval: sampled_confidence_interval(
+                noise_filtered.average,
+                noise_filtered.sample_count,
+            ),
+            noise_filtered_total_events: noise_filtered.sample_count,
         })
     }
 
@@ -858,8 +975,14 @@ impl EvaluationService for DatabaseEvaluationService {
             .map(|signal| signal.delta.abs())
             .fold(0.0_f64, f64::max);
 
+        let quality_signal = if quality.noise_filtered_total_events > 0 {
+            quality.noise_filtered_overall_avg
+        } else {
+            quality.overall_avg
+        };
+
         let quality_action =
-            if quality.total_events > 0 && quality.overall_avg < LOOP_QUALITY_THRESHOLD {
+            if quality.noise_filtered_total_events > 0 && quality_signal < LOOP_QUALITY_THRESHOLD {
                 LoopAction::Retune
             } else {
                 LoopAction::NoOp
@@ -887,7 +1010,7 @@ impl EvaluationService for DatabaseEvaluationService {
         let diagnoses = vec![
             LoopDiagnosisItem {
                 metric: "quality_overall_avg".into(),
-                value: quality.overall_avg,
+                value: quality_signal,
                 threshold: LOOP_QUALITY_THRESHOLD,
                 action: quality_action,
             },
@@ -1748,6 +1871,46 @@ mod tests {
         assert!(sql.contains("EXISTS ("));
         assert!(sql.contains("e.session_id = qa.target_id"));
         assert!(sql.contains("e.llm_model_used = ?"));
+    }
+
+    #[test]
+    fn quality_trend_scores_query_with_model_filters_session_assessments() {
+        let sql = quality_trend_scores_query(Some("gpt-4"));
+        assert!(sql.contains("SELECT qa.score AS score"));
+        assert!(sql.contains("qa.level = 'session'"));
+        assert!(sql.contains("e.session_id = qa.target_id"));
+    }
+
+    #[test]
+    fn noise_filtered_average_empty_scores_returns_zero() {
+        assert_eq!(
+            noise_filtered_average(&[]),
+            NoiseFilteredAverage {
+                average: 0.0,
+                sample_count: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn noise_filtered_average_small_sample_keeps_raw_scores() {
+        let filtered = noise_filtered_average(&[0.7, 0.8, 0.6, 0.9]);
+        assert_eq!(filtered.sample_count, 4);
+        assert!((filtered.average - 0.75).abs() < 1e-9);
+    }
+
+    #[test]
+    fn noise_filtered_average_drops_iqr_outlier() {
+        let filtered = noise_filtered_average(&[0.2, 0.79, 0.8, 0.81, 0.82]);
+        assert_eq!(filtered.sample_count, 4);
+        assert!((filtered.average - 0.805).abs() < 0.0001);
+    }
+
+    #[test]
+    fn noise_filtered_average_keeps_flat_distribution() {
+        let filtered = noise_filtered_average(&[0.7, 0.7, 0.7, 0.7, 0.7]);
+        assert_eq!(filtered.sample_count, 5);
+        assert!((filtered.average - 0.7).abs() < 1e-9);
     }
 
     fn sample_training_dataset() -> ExtractedTrainingDataset {
