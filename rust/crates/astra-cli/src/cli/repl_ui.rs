@@ -803,6 +803,10 @@ fn accepted_slash_edit(
     }
 }
 
+fn should_append_space_on_tab_completion(current: &str, selected: Option<&'static str>) -> bool {
+    selected.is_some_and(|cmd| current == cmd)
+}
+
 fn slash_completion_query(line: &str) -> Option<&str> {
     if !line.starts_with('/') {
         return None;
@@ -1612,13 +1616,23 @@ impl ConditionalEventHandler for SlashStartCompleteHandler {
                     return None;
                 }
                 RlKeyEvent(RlKeyCode::Enter, _) => {
-                    // Enter = execute the command immediately
+                    // Enter in subcmd picker: complete if prefix, execute if exact match.
                     if let Some(parent) = get_subcmd_parent() {
                         if let Some(subcmd) = subcmd_picker_selected_command() {
                             let full_cmd = format!("{} {}", parent, subcmd);
+                            let current = ctx.line().trim_end();
+                            if current == full_cmd {
+                                // Exact match — execute.
+                                clear_subcmd_overlay();
+                                set_subcmd_pending_execute(Some(full_cmd.clone()));
+                                return Some(RlCmd::Replace(RlMovement::WholeLine, Some(full_cmd)));
+                            }
+                            // Prefix — complete to the subcommand, don't execute.
                             clear_subcmd_overlay();
-                            set_subcmd_pending_execute(Some(full_cmd.clone()));
-                            return Some(RlCmd::Replace(RlMovement::WholeLine, Some(full_cmd)));
+                            return Some(RlCmd::Replace(
+                                RlMovement::WholeLine,
+                                Some(full_cmd),
+                            ));
                         }
                     }
                     clear_subcmd_overlay();
@@ -1820,8 +1834,9 @@ impl ConditionalEventHandler for SlashStartCompleteHandler {
                 let current = ctx.line();
                 let selected = get_slash_picker_selected();
                 let selected_cmd = rows.get(selected).map(|(cmd, _)| *cmd);
+                let append_space = should_append_space_on_tab_completion(current, selected_cmd);
 
-                if let Some(edit) = accepted_slash_edit(current, selected_cmd, true) {
+                if let Some(edit) = accepted_slash_edit(current, selected_cmd, append_space) {
                     match edit {
                         AcceptedSlashEdit::KeepLine => {
                             if rows.len() > 1 {
@@ -1955,17 +1970,38 @@ impl ConditionalEventHandler for SlashStartCompleteHandler {
                 let current = ctx.line();
                 let rows = picker_rows_for_filter();
                 let selected = get_slash_picker_selected();
-                clear_slash_overlay();
-                // Execute selected command if different from current input
+
                 if let Some((cmd, _)) = rows.get(selected) {
-                    if *cmd != current {
+                    if current == *cmd || current == format!("{cmd} ") {
+                        // Exact match — execute immediately.
+                        clear_slash_overlay();
                         set_slash_pending_execute(Some(cmd.to_string()));
+                        return None; // AcceptLine
                     }
-                } else if current == "/" {
-                    // No selection and just "/" typed → show help
-                    return None;
+                    // Prefix only — complete to the selected command (like Tab),
+                    // don't execute yet.  User must press Enter again to run.
+                    let replacement = format!("{cmd} ");
+                    // Trigger subcmd picker if the completed command has subcommands.
+                    if let Some((parent, filter)) = parse_subcmd_context(&replacement) {
+                        set_subcmd_picker_selected(0);
+                        render_subcmd_overlay(
+                            parent,
+                            if filter.is_empty() { None } else { Some(&filter) },
+                        );
+                    } else {
+                        clear_slash_overlay();
+                    }
+                    return Some(RlCmd::Replace(
+                        RlMovement::WholeLine,
+                        Some(replacement),
+                    ));
                 }
-                return None; // AcceptLine → immediate execution
+
+                if current == "/" {
+                    return None; // show help
+                }
+                clear_slash_overlay();
+                return None; // AcceptLine with typed text
             }
 
             // ── Dismiss ─────────────────────────────────────────────────
@@ -2562,6 +2598,22 @@ mod tests {
             accepted_slash_edit("/skill d", Some("/skill dev"), false),
             Some(AcceptedSlashEdit::InsertSuffix("ev".to_string()))
         );
+    }
+
+    #[test]
+    fn tab_completion_from_prefix_does_not_append_space() {
+        assert!(!should_append_space_on_tab_completion(
+            "/conte",
+            Some("/context")
+        ));
+    }
+
+    #[test]
+    fn tab_completion_from_exact_command_appends_space() {
+        assert!(should_append_space_on_tab_completion(
+            "/context",
+            Some("/context")
+        ));
     }
 
     #[test]
