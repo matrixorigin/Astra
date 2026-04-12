@@ -1339,6 +1339,7 @@ async fn handle_chat_message_via_bridge(
 
     match response {
         Ok(resp) => {
+            let run_started_explain = bridge_run_started_explain(explain);
             if let Some(session_id) = prepared.trusted_session_id.clone() {
                 conn.session_id = Some(session_id.clone());
                 conn.pending_session_id = None;
@@ -1350,15 +1351,22 @@ async fn handle_chat_message_via_bridge(
                         &WsServerMessage::RunStarted {
                             run_id,
                             session_id,
-                            explain: None,
+                            explain: run_started_explain.clone(),
                         },
                     )
                     .await;
                 }
             }
 
-            let terminal_status =
-                stream_sse_response_as_ws(socket, state, conn, resp, Some(client_cancel)).await;
+            let terminal_status = stream_sse_response_as_ws(
+                socket,
+                state,
+                conn,
+                resp,
+                Some(client_cancel),
+                run_started_explain,
+            )
+            .await;
             if let Some(run_id) = conn.active_run_id.clone() {
                 match terminal_status {
                     BridgeWsTerminalStatus::Completed => {
@@ -1449,6 +1457,30 @@ fn sync_conn_state_from_stream_event(
         return Some((run_id.to_string(), event_type == Some("session_info")));
     }
     None
+}
+
+fn synthetic_bridge_run_started(
+    conn: &WsConnection,
+    adopted_run_id: Option<(String, bool)>,
+    explain: Option<&Value>,
+) -> Option<WsServerMessage> {
+    // `sync_conn_state_from_stream_event` only returns an adopted session_info run_id
+    // for the first fresh bridge run or when an upstream run_id replaces the prepared
+    // placeholder, so emitting here preserves the one-shot run_started contract.
+    let (run_id, synthesize_run_started) = adopted_run_id?;
+    if !synthesize_run_started {
+        return None;
+    }
+    let session_id = conn.session_id.clone()?;
+    Some(WsServerMessage::RunStarted {
+        run_id,
+        session_id,
+        explain: explain.cloned(),
+    })
+}
+
+fn bridge_run_started_explain(explain: bool) -> Option<Value> {
+    explain.then(|| serde_json::json!({"mode": "background"}))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1562,6 +1594,7 @@ async fn stream_sse_response_as_ws(
     conn: &mut WsConnection,
     response: Response,
     cancel: Option<Arc<CancellationToken>>,
+    run_started_explain: Option<Value>,
 ) -> BridgeWsTerminalStatus {
     let (_parts, body) = response.into_parts();
     let mut stream = body.into_data_stream();
@@ -1711,21 +1744,12 @@ async fn stream_sse_response_as_ws(
                             };
                             for event in events {
                                 let adopted_run_id = sync_conn_state_from_stream_event(conn, &event);
-                                if let Some((run_id, synthesize_run_started)) = adopted_run_id
-                                    && conn.bridge_prepared_run_id.is_some()
-                                    && conn.bridge_prepared_run_id.as_deref() != Some(run_id.as_str())
-                                    && synthesize_run_started
-                                    && let Some(session_id) = conn.session_id.clone()
-                                {
-                                    send_msg(
-                                        socket,
-                                        &WsServerMessage::RunStarted {
-                                            run_id,
-                                            session_id,
-                                            explain: None,
-                                        },
-                                    )
-                                    .await;
+                                if let Some(run_started) = synthetic_bridge_run_started(
+                                    conn,
+                                    adopted_run_id,
+                                    run_started_explain.as_ref(),
+                                ) {
+                                    send_msg(socket, &run_started).await;
                                 }
                                 match event.get("type").and_then(Value::as_str) {
                                     Some("turn_complete") => saw_turn_complete = true,
@@ -2619,6 +2643,46 @@ mod tests {
     }
 
     #[test]
+    fn session_info_stream_event_without_prepared_run_id_synthesizes_run_started() {
+        let mut conn = WsConnection {
+            user: AuthUserRecord {
+                user_id: "u1".into(),
+                username: "alice".into(),
+                email: "alice@example.com".into(),
+                display_name: Some("Alice".into()),
+            },
+            authorization: "Bearer test-token".into(),
+            session_id: None,
+            pending_session_id: Some("pending-session".into()),
+            active_run_id: None,
+            bridge_prepared_run_id: None,
+        };
+
+        let adopted = sync_conn_state_from_stream_event(
+            &mut conn,
+            &serde_json::json!({
+                "type": "session_info",
+                "session_id": "sess-42",
+                "run_id": "run-9"
+            }),
+        );
+        let explain = bridge_run_started_explain(true);
+
+        match synthetic_bridge_run_started(&conn, adopted, explain.as_ref()) {
+            Some(WsServerMessage::RunStarted {
+                run_id,
+                session_id,
+                explain,
+            }) => {
+                assert_eq!(run_id, "run-9");
+                assert_eq!(session_id, "sess-42");
+                assert_eq!(explain, Some(serde_json::json!({"mode": "background"})));
+            }
+            other => panic!("expected synthesized RunStarted, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn session_info_stream_event_does_not_override_real_active_run_id() {
         let mut conn = WsConnection {
             user: AuthUserRecord {
@@ -2650,6 +2714,36 @@ mod tests {
     }
 
     #[test]
+    fn repeated_session_info_without_prepared_run_id_does_not_resynthesize_run_started() {
+        let mut conn = WsConnection {
+            user: AuthUserRecord {
+                user_id: "u1".into(),
+                username: "alice".into(),
+                email: "alice@example.com".into(),
+                display_name: Some("Alice".into()),
+            },
+            authorization: "Bearer test-token".into(),
+            session_id: Some("sess-42".into()),
+            pending_session_id: None,
+            active_run_id: Some("run-9".into()),
+            bridge_prepared_run_id: None,
+        };
+
+        let adopted = sync_conn_state_from_stream_event(
+            &mut conn,
+            &serde_json::json!({
+                "type": "session_info",
+                "session_id": "sess-42",
+                "run_id": "run-9"
+            }),
+        );
+        let explain = bridge_run_started_explain(true);
+
+        assert_eq!(adopted, None);
+        assert!(synthetic_bridge_run_started(&conn, adopted, explain.as_ref()).is_none());
+    }
+
+    #[test]
     fn run_started_stream_event_upgrades_prepared_bridge_run_id_without_synthetic_start() {
         let mut conn = WsConnection {
             user: AuthUserRecord {
@@ -2672,9 +2766,20 @@ mod tests {
                 "run_id": "upstream-run"
             }),
         );
+        let explain = bridge_run_started_explain(true);
 
         assert_eq!(adopted, Some(("upstream-run".into(), false)));
         assert_eq!(conn.active_run_id.as_deref(), Some("upstream-run"));
+        assert!(synthetic_bridge_run_started(&conn, adopted, explain.as_ref()).is_none());
+    }
+
+    #[test]
+    fn bridge_run_started_explain_matches_lifecycle_shape() {
+        assert_eq!(
+            bridge_run_started_explain(true),
+            Some(serde_json::json!({"mode": "background"}))
+        );
+        assert_eq!(bridge_run_started_explain(false), None);
     }
 
     #[test]
