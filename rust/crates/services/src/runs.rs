@@ -400,8 +400,33 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
             "call_id": data.get("call_id").cloned().unwrap_or(serde_json::Value::String(String::new())),
             "result": data.get("result").cloned().unwrap_or(serde_json::Value::String(String::new())),
         }),
-        "run_started" => serde_json::json!({ "type": "run_started" }),
-        "run_finished" => serde_json::json!({ "type": "run_finished" }),
+        "run_started" => {
+            let mut out = serde_json::json!({ "type": "run_started" });
+            if let Some(obj) = out.as_object_mut() {
+                if let Some(run_id) = data.get("run_id").cloned() {
+                    obj.insert("run_id".to_string(), run_id);
+                }
+                if let Some(session_id) = data.get("session_id").cloned() {
+                    obj.insert("session_id".to_string(), session_id);
+                }
+            }
+            out
+        }
+        "run_finished" => {
+            let mut out = serde_json::json!({ "type": "run_finished" });
+            if let Some(obj) = out.as_object_mut() {
+                if let Some(run_id) = data.get("run_id").cloned() {
+                    obj.insert("run_id".to_string(), run_id);
+                }
+                if let Some(status) = data.get("status").cloned() {
+                    obj.insert("status".to_string(), status);
+                }
+                if let Some(error) = data.get("error").cloned() {
+                    obj.insert("error".to_string(), error);
+                }
+            }
+            out
+        }
         "run_error" => serde_json::json!({
             "type": "error",
             "message": data.get("error").cloned().unwrap_or(serde_json::Value::String("Unknown error".to_string())),
@@ -632,10 +657,22 @@ mod tests {
 
     #[test]
     fn run_started_and_finished() {
-        let started = transform_run_event_for_client(make_event("run_started", json!({})));
+        let started = transform_run_event_for_client(make_event(
+            "run_started",
+            json!({"run_id": "run-1", "session_id": "sess-1"}),
+        ));
         assert_eq!(started["type"], "run_started");
-        let finished = transform_run_event_for_client(make_event("run_finished", json!({})));
+        assert_eq!(started["run_id"], "run-1");
+        assert_eq!(started["session_id"], "sess-1");
+
+        let finished = transform_run_event_for_client(make_event(
+            "run_finished",
+            json!({"run_id": "run-1", "status": "failed", "error": "boom"}),
+        ));
         assert_eq!(finished["type"], "run_finished");
+        assert_eq!(finished["run_id"], "run-1");
+        assert_eq!(finished["status"], "failed");
+        assert_eq!(finished["error"], "boom");
     }
 
     #[test]
