@@ -54,6 +54,13 @@ pub(crate) async fn insert_core_turn_event(
     .bind(event.token_usage.as_ref().and_then(|v| v.get("total")).and_then(|v| v.as_i64()))
     .execute(&mut **tx)
     .await?;
+    insert_agent_event_edges(
+        &mut **tx,
+        &event.event_id,
+        event.parent_event_id.as_deref(),
+        &event.parent_event_ids,
+    )
+    .await?;
     Ok(())
 }
 
@@ -85,6 +92,13 @@ pub(crate) async fn insert_tool_turn_event(
     .bind(metadata_tool_name(event.metadata.as_ref()))
     .bind(metadata_duration_ms(event.metadata.as_ref()))
     .execute(&mut **tx)
+    .await?;
+    insert_agent_event_edges(
+        &mut **tx,
+        &event.event_id,
+        event.parent_event_id.as_deref(),
+        &event.parent_event_ids,
+    )
     .await?;
     Ok(())
 }

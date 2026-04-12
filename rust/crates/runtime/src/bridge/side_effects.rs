@@ -347,6 +347,7 @@ fn build_core_event_persist_from_payload(
             event_type: "user_query".to_string(),
             content: user_content.to_string(),
             parent_event_id: None,
+            parent_event_ids: Vec::new(),
             causal_chain_id: turn_chain_id.clone(),
             llm_model_used: None,
             token_usage: None,
@@ -372,6 +373,7 @@ fn build_core_event_persist_from_payload(
             event_type: "llm_response".to_string(),
             content: llm_plan.content,
             parent_event_id: parent_event_id.clone(),
+            parent_event_ids: parent_event_id.iter().cloned().collect(),
             causal_chain_id: turn_chain_id.clone(),
             llm_model_used: optional_object_str(persist_payload, "model_used")
                 .map(ToString::to_string),
@@ -765,6 +767,7 @@ fn build_auxiliary_event_record(
     parent_event_id: Option<String>,
     causal_chain_id: &str,
 ) -> TurnAuxiliaryEventRecord {
+    let parent_event_ids = parent_event_id.iter().cloned().collect();
     TurnAuxiliaryEventRecord {
         event_id: Uuid::now_v7().to_string(),
         user_id: user_id.to_string(),
@@ -780,6 +783,7 @@ fn build_auxiliary_event_record(
             })
             .unwrap_or_else(|| "null".to_string()),
         parent_event_id,
+        parent_event_ids,
         causal_chain_id: causal_chain_id.to_string(),
         metadata: payload
             .get("metadata")
@@ -801,6 +805,7 @@ fn build_tool_event_record(
     parent_event_id: Option<String>,
     causal_chain_id: &str,
 ) -> TurnToolEventRecord {
+    let parent_event_ids = parent_event_id.iter().cloned().collect();
     TurnToolEventRecord {
         event_id: Uuid::now_v7().to_string(),
         user_id: user_id.to_string(),
@@ -812,6 +817,7 @@ fn build_tool_event_record(
             value => serde_json::to_string(&value).unwrap_or_else(|_| "null".to_string()),
         },
         parent_event_id,
+        parent_event_ids,
         causal_chain_id: causal_chain_id.to_string(),
         metadata: (!payload.metadata.is_empty())
             .then_some(serde_json::Value::Object(payload.metadata)),

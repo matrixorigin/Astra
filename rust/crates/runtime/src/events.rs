@@ -25,6 +25,7 @@ pub async fn create_event_handler(
                 agent_id: request.agent_id,
                 agent_version: request.agent_version,
                 parent_event_id: request.parent_event_id,
+                parent_event_ids: request.parent_event_ids,
                 causal_chain_id: request.causal_chain_id,
                 metadata: request.metadata,
             },

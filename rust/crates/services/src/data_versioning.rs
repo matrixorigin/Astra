@@ -43,6 +43,8 @@ pub struct LineageNode {
     pub event_type: String,
     pub content: String,
     pub parent_event_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parent_event_ids: Vec<String>,
     pub causal_chain_id: Option<String>,
     pub created_at: String,
 }
@@ -159,6 +161,23 @@ impl DatabaseDataVersioningService {
             return Ok(p.get().clone());
         }
         connect_matrixone(&self.matrixone).await
+    }
+
+    async fn hydrate_parent_event_ids(
+        pool: &sqlx::Pool<sqlx::MySql>,
+        nodes: &mut [LineageNode],
+    ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+        let event_ids: Vec<String> = nodes.iter().map(|node| node.event_id.clone()).collect();
+        let parent_id_map = crate::storage::load_agent_event_parent_ids(pool, &event_ids)
+            .await
+            .map_err(internal_error)?;
+        for node in nodes {
+            node.parent_event_ids = crate::storage::normalized_parent_event_ids(
+                node.parent_event_id.as_deref(),
+                parent_id_map.get(&node.event_id).map(Vec::as_slice),
+            );
+        }
+        Ok(())
     }
 }
 
@@ -334,10 +353,12 @@ impl DataVersioningService for DatabaseDataVersioningService {
                 event_type: row.try_get("event_type").map_err(internal_error)?,
                 content: truncate_content(&raw_content, 500),
                 parent_event_id: row.try_get("parent_event_id").ok(),
+                parent_event_ids: Vec::new(),
                 causal_chain_id: row.try_get("causal_chain_id").ok(),
                 created_at: row.try_get("created_at").unwrap_or_default(),
             });
         }
+        Self::hydrate_parent_event_ids(&pool, &mut nodes).await?;
         Ok(nodes)
     }
 
@@ -350,11 +371,14 @@ impl DataVersioningService for DatabaseDataVersioningService {
 
         let mut chain = Vec::new();
         let mut visited = HashSet::new();
-        let mut current_id = Some(event_id);
+        let mut stack = vec![event_id];
         let max_depth = 100;
 
-        while let Some(eid) = current_id.take() {
-            if visited.contains(&eid) || chain.len() >= max_depth {
+        while let Some(eid) = stack.pop() {
+            if visited.contains(&eid) {
+                continue;
+            }
+            if chain.len() >= max_depth {
                 break;
             }
             visited.insert(eid.clone());
@@ -376,12 +400,27 @@ impl DataVersioningService for DatabaseDataVersioningService {
                 Some(row) => {
                     let raw_content: String = row.try_get("content").unwrap_or_default();
                     let parent: Option<String> = row.try_get("parent_event_id").ok();
-                    current_id = parent.clone();
+                    let parent_id_map = crate::storage::load_agent_event_parent_ids(
+                        &pool,
+                        std::slice::from_ref(&eid),
+                    )
+                    .await
+                    .map_err(internal_error)?;
+                    let parent_event_ids = crate::storage::normalized_parent_event_ids(
+                        parent.as_deref(),
+                        parent_id_map.get(&eid).map(Vec::as_slice),
+                    );
+                    for parent_event_id in parent_event_ids.iter().rev() {
+                        if !visited.contains(parent_event_id) {
+                            stack.push(parent_event_id.clone());
+                        }
+                    }
                     chain.push(LineageNode {
                         event_id: row.try_get("event_id").map_err(internal_error)?,
                         event_type: row.try_get("event_type").map_err(internal_error)?,
                         content: truncate_content(&raw_content, 500),
                         parent_event_id: parent,
+                        parent_event_ids,
                         causal_chain_id: row.try_get("causal_chain_id").ok(),
                         created_at: row.try_get("created_at").unwrap_or_default(),
                     });
@@ -616,12 +655,23 @@ mod tests {
             event_type: "tool_call".into(),
             content: "hello".into(),
             parent_event_id: Some("e0".into()),
+            parent_event_ids: vec!["e0".into(), "e2".into()],
             causal_chain_id: None,
             created_at: "2024-01-01T00:00:00".into(),
         };
         let json = serde_json::to_string(&node).unwrap();
         assert!(json.contains("\"parent_event_id\":\"e0\""));
+        assert!(json.contains("\"parent_event_ids\":[\"e0\",\"e2\"]"));
         assert!(json.contains("\"causal_chain_id\":null"));
+    }
+
+    #[test]
+    fn normalized_parent_event_ids_keep_primary_first() {
+        let normalized = crate::storage::normalized_parent_event_ids(
+            Some("p0"),
+            Some(&["p0".to_string(), "p2".to_string(), "p1".to_string()]),
+        );
+        assert_eq!(normalized, vec!["p0", "p2", "p1"]);
     }
 
     #[test]

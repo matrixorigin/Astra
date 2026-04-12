@@ -3,8 +3,149 @@ use crate::auth::session::SessionRecord;
 use astra_core::{ErrorResponse, MatrixOneSettings, connect_matrixone, internal_error};
 use axum::{Json, http::StatusCode};
 use sqlx::{MySql, QueryBuilder, Row, query};
+use std::collections::HashSet;
 use std::collections::{BTreeSet, HashMap};
 use uuid::Uuid;
+
+const CAUSAL_EDGE_KIND: &str = "causal";
+
+fn unique_event_ids(event_ids: &[String]) -> Vec<&str> {
+    let mut seen = HashSet::new();
+    event_ids
+        .iter()
+        .map(String::as_str)
+        .filter(|event_id| !event_id.trim().is_empty() && seen.insert(*event_id))
+        .collect()
+}
+
+pub fn normalized_parent_event_ids(
+    primary_parent_event_id: Option<&str>,
+    parent_event_ids: Option<&[String]>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+
+    if let Some(primary_parent_event_id) = primary_parent_event_id.map(str::trim)
+        && !primary_parent_event_id.is_empty()
+        && seen.insert(primary_parent_event_id.to_string())
+    {
+        out.push(primary_parent_event_id.to_string());
+    }
+
+    if let Some(parent_event_ids) = parent_event_ids {
+        for parent_event_id in parent_event_ids {
+            let parent_event_id = parent_event_id.trim();
+            if parent_event_id.is_empty() {
+                continue;
+            }
+            if seen.insert(parent_event_id.to_string()) {
+                out.push(parent_event_id.to_string());
+            }
+        }
+    }
+
+    out
+}
+
+pub async fn insert_agent_event_edges<'e, E>(
+    executor: E,
+    child_event_id: &str,
+    primary_parent_event_id: Option<&str>,
+    parent_event_ids: &[String],
+) -> Result<(), sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = MySql>,
+{
+    let normalized = normalized_parent_event_ids(primary_parent_event_id, Some(parent_event_ids));
+    if normalized.is_empty() {
+        return Ok(());
+    }
+
+    let mut builder = QueryBuilder::<MySql>::new(
+        "INSERT IGNORE INTO agent_event_edges \
+         (child_event_id, parent_event_id, relation_kind, parent_order) ",
+    );
+    builder.push_values(
+        normalized.iter().enumerate(),
+        |mut row, (idx, parent_event_id)| {
+            row.push_bind(child_event_id)
+                .push_bind(parent_event_id)
+                .push_bind(CAUSAL_EDGE_KIND)
+                .push_bind(i32::try_from(idx).unwrap_or(i32::MAX));
+        },
+    );
+    builder.build().execute(executor).await?;
+    Ok(())
+}
+
+pub async fn load_agent_event_parent_ids<'e, E>(
+    executor: E,
+    event_ids: &[String],
+) -> Result<HashMap<String, Vec<String>>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = MySql>,
+{
+    let mut out = HashMap::new();
+    let event_ids = unique_event_ids(event_ids);
+    if event_ids.is_empty() {
+        return Ok(out);
+    }
+
+    let mut builder = QueryBuilder::<MySql>::new(
+        "SELECT child_event_id, parent_event_id \
+         FROM agent_event_edges WHERE relation_kind = ",
+    );
+    builder.push_bind(CAUSAL_EDGE_KIND);
+    builder.push(" AND child_event_id IN (");
+    let mut separated = builder.separated(", ");
+    for event_id in &event_ids {
+        separated.push_bind(*event_id);
+    }
+    separated.push_unseparated(")");
+    builder.push(" ORDER BY child_event_id ASC, parent_order ASC, parent_event_id ASC");
+
+    let rows = builder.build().fetch_all(executor).await?;
+    for row in rows {
+        let child_event_id: String = row.try_get("child_event_id")?;
+        let parent_event_id: String = row.try_get("parent_event_id")?;
+        out.entry(child_event_id).or_default().push(parent_event_id);
+    }
+    Ok(out)
+}
+
+pub async fn delete_agent_event_edges_for_event_ids<'e, E>(
+    executor: E,
+    event_ids: &[String],
+) -> Result<u64, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = MySql>,
+{
+    let event_ids = unique_event_ids(event_ids);
+    if event_ids.is_empty() {
+        return Ok(0);
+    }
+
+    let mut builder =
+        QueryBuilder::<MySql>::new("DELETE FROM agent_event_edges WHERE child_event_id IN (");
+    {
+        let mut child_ids = builder.separated(", ");
+        for event_id in &event_ids {
+            child_ids.push_bind(*event_id);
+        }
+        child_ids.push_unseparated(")");
+    }
+    builder.push(" OR parent_event_id IN (");
+    {
+        let mut parent_ids = builder.separated(", ");
+        for event_id in &event_ids {
+            parent_ids.push_bind(*event_id);
+        }
+        parent_ids.push_unseparated(")");
+    }
+
+    let result = builder.build().execute(executor).await?;
+    Ok(result.rows_affected())
+}
 
 pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx::Error> {
     let pool = connect_matrixone(settings).await?;
@@ -162,6 +303,21 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
             INDEX idx_agent_events_skill_created (skill_name, created_at),
             INDEX idx_agent_events_created_at (created_at),
             INDEX idx_agent_events_tool_name (meta_tool_name)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    query(
+        "CREATE TABLE IF NOT EXISTS agent_event_edges (
+            child_event_id VARCHAR(36) NOT NULL,
+            parent_event_id VARCHAR(36) NOT NULL,
+            relation_kind VARCHAR(32) NOT NULL DEFAULT 'causal',
+            parent_order INT NOT NULL DEFAULT 0,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (child_event_id, parent_event_id, relation_kind),
+            INDEX idx_agent_event_edges_child (child_event_id, parent_order),
+            INDEX idx_agent_event_edges_parent (parent_event_id, parent_order)
         )",
     )
     .execute(&pool)
@@ -1284,17 +1440,41 @@ pub async fn cleanup_expired_data(
     });
 
     // 7. Old agent events
-    let deleted = sqlx::query(
-        "DELETE FROM agent_events \
+    let expired_event_rows = sqlx::query(
+        "SELECT event_id FROM agent_events \
          WHERE created_at < DATE_SUB(NOW(6), INTERVAL ? DAY) \
+         ORDER BY created_at ASC \
          LIMIT ?",
     )
     .bind(policy.event_days)
     .bind(BATCH_LIMIT)
-    .execute(pool)
+    .fetch_all(pool)
     .await
-    .map(|r| r.rows_affected())
-    .unwrap_or(0);
+    .unwrap_or_default();
+    let expired_event_ids: Vec<String> = expired_event_rows
+        .into_iter()
+        .filter_map(|row| row.try_get("event_id").ok())
+        .collect();
+    if !expired_event_ids.is_empty() {
+        let _ = delete_agent_event_edges_for_event_ids(pool, &expired_event_ids).await;
+    }
+    let deleted = if expired_event_ids.is_empty() {
+        0
+    } else {
+        let mut builder =
+            QueryBuilder::<MySql>::new("DELETE FROM agent_events WHERE event_id IN (");
+        let mut event_ids = builder.separated(", ");
+        for event_id in &expired_event_ids {
+            event_ids.push_bind(event_id);
+        }
+        event_ids.push_unseparated(")");
+        builder
+            .build()
+            .execute(pool)
+            .await
+            .map(|r| r.rows_affected())
+            .unwrap_or(0)
+    };
     results.push(CleanupResult {
         table: "agent_events",
         rows_deleted: deleted,

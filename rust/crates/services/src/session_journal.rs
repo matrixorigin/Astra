@@ -424,6 +424,9 @@ pub struct CoordinationMeta {
     /// Shared id across forked sessions, sub-agents, or cloud-orchestrated steps.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub correlation_id: Option<String>,
+    /// Optional upstream event ids when this event is caused by multiple parents.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream_event_ids: Option<Vec<String>>,
 }
 
 /// Edge permission / cloud policy fingerprint at a point in time (for cloud–edge audit alignment).

@@ -82,6 +82,7 @@ impl LlmRequestDump {
             event_type: "llm_request_dump".to_string(),
             content: serde_json::to_string(&self.to_json()).unwrap_or_default(),
             parent_event_id: None,
+            parent_event_ids: Vec::new(),
             causal_chain_id: causal_chain_id.to_string(),
             metadata: Some(json!({
                 "model": self.model,

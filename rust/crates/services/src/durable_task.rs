@@ -2240,6 +2240,7 @@ impl MatrixOneDurableTaskLifecycle {
             metadata: Some(metadata),
             created_at: chrono::Utc::now().to_rfc3339(),
             parent_event_id: None,
+            parent_event_ids: Vec::new(),
             causal_chain_id: None,
         });
     }
@@ -3242,6 +3243,7 @@ impl LocalDurableTaskLifecycle {
             metadata: Some(metadata),
             created_at: chrono::Utc::now().to_rfc3339(),
             parent_event_id: None,
+            parent_event_ids: Vec::new(),
             causal_chain_id: None,
         });
     }
@@ -4024,9 +4026,7 @@ mod tests {
         // Test name generation
         let name = sanitize_snapshot_name(&format!(
             "task_{}_{}_v{}",
-            "358c9443-d3c1-42cc-b1c9-6b78054c9c48",
-            "create_login_html",
-            2
+            "358c9443-d3c1-42cc-b1c9-6b78054c9c48", "create_login_html", 2
         ));
         assert_eq!(
             name,

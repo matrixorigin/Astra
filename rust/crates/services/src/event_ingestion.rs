@@ -66,6 +66,9 @@ pub struct IngestionEvent {
     pub created_at: String,
     /// Parent event ID for causal chain linkage.
     pub parent_event_id: Option<String>,
+    /// Ordered parent event ids for DAG lineage.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parent_event_ids: Vec<String>,
     /// Causal chain root ID for grouping related events.
     pub causal_chain_id: Option<String>,
 }
@@ -168,6 +171,12 @@ impl IngestionEvent {
             .coordination
             .as_ref()
             .and_then(|c| c.correlation_id.clone());
+        let parent_event_ids = event
+            .coordination
+            .as_ref()
+            .and_then(|c| c.upstream_event_ids.clone())
+            .unwrap_or_default();
+        let parent_event_id = parent_event_ids.first().cloned();
 
         Self {
             event_id,
@@ -180,7 +189,8 @@ impl IngestionEvent {
             skill_name: None,
             metadata: merged_metadata_from_journal_event(event),
             created_at: event.ts.clone(),
-            parent_event_id: None,
+            parent_event_id,
+            parent_event_ids,
             causal_chain_id,
         }
     }
@@ -255,6 +265,7 @@ impl IngestionEvent {
                     metadata: Some(metadata),
                     created_at: event.ts.clone(),
                     parent_event_id: Some(main_event_id.clone()),
+                    parent_event_ids: vec![main_event_id.clone()],
                     causal_chain_id: Some(main_event_id.clone()),
                 });
             }
@@ -541,6 +552,17 @@ impl EventIngestionWorker {
             .await
             .map_err(|e| format!("batch insert ({} events): {e}", events.len()))?;
 
+        for event in events {
+            crate::storage::insert_agent_event_edges(
+                &mut *tx,
+                &event.event_id,
+                event.parent_event_id.as_deref(),
+                &event.parent_event_ids,
+            )
+            .await
+            .map_err(|e| format!("edge insert for {}: {e}", event.event_id))?;
+        }
+
         let rows_inserted = insert_result.rows_affected() as usize;
 
         // Update event_count on agent_sessions for each affected session.
@@ -621,6 +643,7 @@ mod tests {
             metadata: None,
             created_at: "2025-01-15T10:30:00Z".into(),
             parent_event_id: None,
+            parent_event_ids: Vec::new(),
             causal_chain_id: None,
         }
     }
@@ -852,6 +875,7 @@ mod tests {
             agent_id: Some("agent-a".into()),
             agent_role: Some("worker".into()),
             correlation_id: Some("corr-chain-1".into()),
+            upstream_event_ids: Some(vec!["evt-up-1".into(), "evt-up-2".into()]),
         });
         journal.session_lineage = Some(SessionLineage {
             parent_session_id: "parent-sid".into(),
@@ -860,6 +884,10 @@ mod tests {
         });
         let ingestion = IngestionEvent::from_journal_event(&journal, "user-1");
         assert_eq!(ingestion.causal_chain_id.as_deref(), Some("corr-chain-1"));
+        assert_eq!(
+            ingestion.parent_event_ids,
+            vec!["evt-up-1".to_string(), "evt-up-2".to_string()]
+        );
         let meta = ingestion.metadata.expect("metadata");
         assert!(meta.get("coordination").is_some());
         assert!(meta.get("session_lineage").is_some());

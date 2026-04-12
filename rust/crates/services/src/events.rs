@@ -20,6 +20,7 @@ pub struct EventCreateRequestData {
     pub agent_id: Option<String>,
     pub agent_version: Option<String>,
     pub parent_event_id: Option<String>,
+    pub parent_event_ids: Option<Vec<String>>,
     pub causal_chain_id: Option<String>,
     pub metadata: Option<serde_json::Value>,
 }
@@ -34,6 +35,7 @@ pub struct EventRecord {
     pub agent_id: Option<String>,
     pub agent_version: Option<String>,
     pub parent_event_id: Option<String>,
+    pub parent_event_ids: Vec<String>,
     pub causal_chain_id: String,
     pub metadata: serde_json::Value,
     pub created_at: String,
@@ -140,11 +142,35 @@ impl DatabaseEventService {
             agent_id: row.try_get("agent_id").ok(),
             agent_version: row.try_get("agent_version").ok(),
             parent_event_id: row.try_get("parent_event_id").ok(),
+            parent_event_ids: Vec::new(),
             causal_chain_id: row.try_get("causal_chain_id").map_err(internal_error)?,
             metadata: serde_json::from_str(&metadata_json)
                 .unwrap_or(serde_json::Value::Object(Default::default())),
             created_at: row.try_get("created_at").unwrap_or_default(),
         })
+    }
+
+    async fn hydrate_parent_event_ids<'e, E>(
+        executor: E,
+        records: &mut [EventRecord],
+    ) -> Result<(), (StatusCode, Json<ErrorResponse>)>
+    where
+        E: sqlx::Executor<'e, Database = sqlx::MySql>,
+    {
+        let event_ids: Vec<String> = records
+            .iter()
+            .map(|record| record.event_id.clone())
+            .collect();
+        let parent_id_map = crate::storage::load_agent_event_parent_ids(executor, &event_ids)
+            .await
+            .map_err(internal_error)?;
+        for record in records {
+            record.parent_event_ids = crate::storage::normalized_parent_event_ids(
+                record.parent_event_id.as_deref(),
+                parent_id_map.get(&record.event_id).map(Vec::as_slice),
+            );
+        }
+        Ok(())
     }
     pub fn with_pool(mut self, pool: SharedPool) -> Self {
         self.pool = Some(pool);
@@ -174,7 +200,7 @@ pub const EVENT_LIST_SELECT_COLS: &str = "\
     END AS content, \
     agent_id, \
     NULL AS agent_version, \
-    NULL AS parent_event_id, \
+    parent_event_id, \
     causal_chain_id, \
     '{}' AS metadata_json, \
     DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at";
@@ -186,6 +212,17 @@ impl EventService for DatabaseEventService {
         user_id: String,
         request: EventCreateRequestData,
     ) -> Result<EventRecord, (StatusCode, Json<ErrorResponse>)> {
+        let EventCreateRequestData {
+            session_id,
+            event_type,
+            content,
+            agent_id,
+            agent_version,
+            parent_event_id,
+            parent_event_ids,
+            causal_chain_id,
+            metadata,
+        } = request;
         let pool = self.get_pool().await.map_err(internal_error)?;
 
         // Start transaction for atomicity of INSERT event + UPDATE session
@@ -193,39 +230,44 @@ impl EventService for DatabaseEventService {
         let mut tx = conn.begin().await.map_err(internal_error)?;
 
         let session_row = query("SELECT user_id FROM agent_sessions WHERE session_id = ?")
-            .bind(&request.session_id)
+            .bind(&session_id)
             .fetch_optional(&mut *tx)
             .await
             .map_err(internal_error)?;
         let session_row = session_row.ok_or_else(|| {
             error_response(
                 StatusCode::NOT_FOUND,
-                format!("Session {} not found", request.session_id),
+                format!("Session {} not found", session_id),
             )
         })?;
         let session_owner: String = session_row.try_get("user_id").map_err(internal_error)?;
         if session_owner != user_id {
             return Err(error_response(
                 StatusCode::NOT_FOUND,
-                format!("Session {} not found", request.session_id),
+                format!("Session {} not found", session_id),
             ));
         }
 
         let event_id = Uuid::new_v4().to_string();
-        let causal_chain_id = request
-            .causal_chain_id
-            .unwrap_or_else(|| Uuid::new_v4().to_string());
-        let metadata_str = request
-            .metadata
+        let causal_chain_id = causal_chain_id.unwrap_or_else(|| Uuid::new_v4().to_string());
+        let primary_parent_event_id = parent_event_id.clone().or_else(|| {
+            parent_event_ids
+                .as_ref()
+                .and_then(|ids| ids.first().cloned())
+        });
+        let normalized_parent_event_ids = crate::storage::normalized_parent_event_ids(
+            primary_parent_event_id.as_deref(),
+            parent_event_ids.as_deref(),
+        );
+        let metadata_str = metadata
             .as_ref()
             .map(|v| v.to_string())
             .unwrap_or_else(|| "{}".to_string());
-        let agent_id = request.agent_id.unwrap_or_else(|| "system".to_string());
-        let agent_version = request.agent_version.unwrap_or_else(|| "1.0.0".to_string());
+        let agent_id = agent_id.unwrap_or_else(|| "system".to_string());
+        let agent_version = agent_version.unwrap_or_else(|| "1.0.0".to_string());
 
-        let meta_tool_name = metadata_tool_name(request.metadata.as_ref());
-        let meta_duration_ms = request
-            .metadata
+        let meta_tool_name = metadata_tool_name(metadata.as_ref());
+        let meta_duration_ms = metadata
             .as_ref()
             .and_then(|v| v.get("duration_ms"))
             .and_then(|v| v.as_i64())
@@ -238,13 +280,13 @@ impl EventService for DatabaseEventService {
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())",
         )
         .bind(&event_id)
-        .bind(&request.session_id)
+        .bind(&session_id)
         .bind(&user_id)
         .bind(&agent_id)
         .bind(&agent_version)
-        .bind(&request.event_type)
-        .bind(&request.content)
-        .bind(&request.parent_event_id)
+        .bind(&event_type)
+        .bind(&content)
+        .bind(&primary_parent_event_id)
         .bind(&causal_chain_id)
         .bind(&metadata_str)
         .bind(&meta_tool_name)
@@ -253,10 +295,19 @@ impl EventService for DatabaseEventService {
         .await
         .map_err(internal_error)?;
 
+        crate::storage::insert_agent_event_edges(
+            &mut *tx,
+            &event_id,
+            primary_parent_event_id.as_deref(),
+            &normalized_parent_event_ids,
+        )
+        .await
+        .map_err(internal_error)?;
+
         query(
             "UPDATE agent_sessions SET event_count = event_count + 1, updated_at = NOW() WHERE session_id = ?",
         )
-        .bind(&request.session_id)
+        .bind(&session_id)
         .execute(&mut *tx)
         .await
         .map_err(internal_error)?;
@@ -271,7 +322,8 @@ impl EventService for DatabaseEventService {
             .await
             .map_err(internal_error)?;
 
-        let result = Self::event_record_from_row(row)?;
+        let mut result = Self::event_record_from_row(row)?;
+        result.parent_event_ids = normalized_parent_event_ids;
 
         tx.commit().await.map_err(internal_error)?;
 
@@ -346,6 +398,7 @@ impl EventService for DatabaseEventService {
         for row in rows {
             events.push(Self::event_record_from_row(row)?);
         }
+        Self::hydrate_parent_event_ids(&pool, &mut events).await?;
 
         Ok(EventListRecord {
             events,
@@ -377,7 +430,9 @@ impl EventService for DatabaseEventService {
                 format!("Event {} not found", event_id),
             )
         })?;
-        let record = Self::event_record_from_row(row)?;
+        let mut records = vec![Self::event_record_from_row(row)?];
+        Self::hydrate_parent_event_ids(&pool, &mut records).await?;
+        let record = records.pop().expect("single event record");
         if record.user_id != user_id {
             return Err(error_response(StatusCode::FORBIDDEN, "Permission denied"));
         }
@@ -406,6 +461,7 @@ impl EventService for DatabaseEventService {
         for row in rows {
             events.push(Self::event_record_from_row(row)?);
         }
+        Self::hydrate_parent_event_ids(&pool, &mut events).await?;
         Ok(events)
     }
 
@@ -458,6 +514,7 @@ impl EventService for DatabaseEventService {
         for row in rows {
             events.push(Self::event_record_from_row(row)?);
         }
+        Self::hydrate_parent_event_ids(&pool, &mut events).await?;
         Ok(EventListRecord {
             events,
             total,
@@ -493,11 +550,19 @@ impl EventService for DatabaseEventService {
             return Err(error_response(StatusCode::FORBIDDEN, "Permission denied"));
         }
 
-        query("DELETE FROM agent_events WHERE event_id = ?")
+        let mut tx = pool.begin().await.map_err(internal_error)?;
+        query("DELETE FROM agent_event_edges WHERE child_event_id = ? OR parent_event_id = ?")
             .bind(&event_id)
-            .execute(&pool)
+            .bind(&event_id)
+            .execute(&mut *tx)
             .await
             .map_err(internal_error)?;
+        query("DELETE FROM agent_events WHERE event_id = ?")
+            .bind(&event_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(internal_error)?;
+        tx.commit().await.map_err(internal_error)?;
 
         Ok(())
     }
@@ -564,6 +629,8 @@ pub struct EventCreateRequest {
     pub agent_id: Option<String>,
     pub agent_version: Option<String>,
     pub parent_event_id: Option<String>,
+    #[serde(default)]
+    pub parent_event_ids: Option<Vec<String>>,
     pub causal_chain_id: Option<String>,
     pub metadata: Option<serde_json::Value>,
 }
@@ -606,6 +673,8 @@ pub struct EventResponse {
     pub agent_id: Option<String>,
     pub agent_version: Option<String>,
     pub parent_event_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parent_event_ids: Vec<String>,
     pub causal_chain_id: String,
     pub metadata: serde_json::Value,
     pub created_at: String,
@@ -630,6 +699,7 @@ impl From<EventRecord> for EventResponse {
             agent_id: r.agent_id,
             agent_version: r.agent_version,
             parent_event_id: r.parent_event_id,
+            parent_event_ids: r.parent_event_ids,
             causal_chain_id: r.causal_chain_id,
             metadata: r.metadata,
             created_at: r.created_at,
@@ -722,6 +792,7 @@ mod tests {
             agent_id: Some("a1".to_string()),
             agent_version: None,
             parent_event_id: None,
+            parent_event_ids: vec!["p1".to_string(), "p2".to_string()],
             causal_chain_id: "cc1".to_string(),
             metadata: serde_json::json!({"tool_name": "bash"}),
             created_at: "2025-01-01".to_string(),
@@ -730,6 +801,10 @@ mod tests {
         assert_eq!(resp.event_id, "e1");
         assert_eq!(resp.agent_id.as_deref(), Some("a1"));
         assert!(resp.agent_version.is_none());
+        assert_eq!(
+            resp.parent_event_ids,
+            vec!["p1".to_string(), "p2".to_string()]
+        );
     }
 
     #[test]
@@ -744,6 +819,7 @@ mod tests {
                 agent_id: None,
                 agent_version: None,
                 parent_event_id: None,
+                parent_event_ids: Vec::new(),
                 causal_chain_id: "cc".to_string(),
                 metadata: serde_json::json!(null),
                 created_at: "now".to_string(),
@@ -771,5 +847,24 @@ mod tests {
         let q: SessionEventQuery = serde_json::from_str("{}").unwrap();
         assert_eq!(q.limit, 100);
         assert_eq!(q.offset, 0);
+    }
+
+    #[test]
+    fn event_create_request_accepts_parent_event_ids() {
+        let request: EventCreateRequest = serde_json::from_str(
+            r#"{
+                "session_id":"s1",
+                "event_type":"tool_call",
+                "content":"x",
+                "parent_event_id":"p0",
+                "parent_event_ids":["p0","p1"]
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(request.parent_event_id.as_deref(), Some("p0"));
+        assert_eq!(
+            request.parent_event_ids.expect("parent_event_ids"),
+            vec!["p0".to_string(), "p1".to_string()]
+        );
     }
 }

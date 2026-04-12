@@ -393,28 +393,36 @@ impl TurnAuxiliaryEventWriter for DatabaseTurnAuxiliaryEventWriter {
                 .and_then(|v| v.get("duration_ms"))
                 .and_then(|v| v.as_i64())
                 .map(|v| v as i32);
-            let metadata_json = event.metadata.map(|metadata| metadata.to_string());
+            let metadata_json = event.metadata.as_ref().map(|metadata| metadata.to_string());
             query(
                 "INSERT INTO agent_events \
                  (event_id, session_id, user_id, agent_id, agent_version, event_type, content, \
                   parent_event_id, causal_chain_id, `metadata`, reasoning_content, \
                   meta_tool_name, meta_duration_ms, created_at) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())",
+                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())",
             )
-            .bind(event.event_id)
-            .bind(event.session_id)
-            .bind(event.user_id)
+            .bind(&event.event_id)
+            .bind(&event.session_id)
+            .bind(&event.user_id)
             .bind(event.agent_id.as_deref().unwrap_or("astra-cli"))
             .bind(env!("CARGO_PKG_VERSION"))
-            .bind(event.event_type)
-            .bind(event.content)
-            .bind(event.parent_event_id)
-            .bind(event.causal_chain_id)
+            .bind(&event.event_type)
+            .bind(&event.content)
+            .bind(&event.parent_event_id)
+            .bind(&event.causal_chain_id)
             .bind(metadata_json)
-            .bind(event.reasoning_content)
+            .bind(&event.reasoning_content)
             .bind(meta_tool_name)
             .bind(meta_duration_ms)
             .execute(&mut *tx)
+            .await
+            .map_err(|error| error.to_string())?;
+            crate::storage::insert_agent_event_edges(
+                &mut *tx,
+                &event.event_id,
+                event.parent_event_id.as_deref(),
+                &event.parent_event_ids,
+            )
             .await
             .map_err(|error| error.to_string())?;
         }

@@ -246,6 +246,14 @@ pub async fn cleanup_session_data(pool: &sqlx::MySqlPool, session_id: &str) {
         .bind(session_id)
         .execute(pool)
         .await;
+    let _ = sqlx::query(
+        "DELETE edge FROM agent_event_edges edge \
+         JOIN agent_events ev ON edge.child_event_id = ev.event_id \
+         WHERE ev.session_id = ?",
+    )
+    .bind(session_id)
+    .execute(pool)
+    .await;
     let _ = sqlx::query("DELETE FROM agent_events WHERE session_id = ?")
         .bind(session_id)
         .execute(pool)
