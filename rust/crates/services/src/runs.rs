@@ -362,6 +362,12 @@ impl RunStateStore for InMemoryRunStateStore {
 }
 
 pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::Value {
+    if event.get("event_type").and_then(serde_json::Value::as_str).is_none()
+        && event.get("type").and_then(serde_json::Value::as_str).is_some()
+    {
+        return event;
+    }
+
     let event_type = event
         .get("event_type")
         .and_then(serde_json::Value::as_str)
@@ -762,6 +768,13 @@ mod tests {
         let out = transform_run_event_for_client(json!({"event_type": "text_delta"}));
         assert_eq!(out["type"], "text_delta");
         assert_eq!(out["content"], "");
+    }
+
+    #[test]
+    fn already_shaped_client_event_passthrough() {
+        let event = json!({"type": "reasoning_delta", "content": "thinking", "index": 7});
+        let out = transform_run_event_for_client(event.clone());
+        assert_eq!(out, event);
     }
 
     #[tokio::test]
