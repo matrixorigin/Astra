@@ -143,6 +143,14 @@ pub(super) enum WsServerMessage {
     #[serde(rename = "auth_error")]
     AuthError { message: String },
 
+    /// Session/run identifiers for the active websocket chat stream.
+    #[serde(rename = "session_info")]
+    SessionInfo {
+        session_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        run_id: Option<String>,
+    },
+
     /// Agentic run started — client should track this run_id.
     #[serde(rename = "run_started")]
     RunStarted {
@@ -583,6 +591,15 @@ async fn handle_chat_message(
         Ok(run) => {
             conn.active_run_id = Some(run.run_id.clone());
             conn.session_id = Some(run.session_id.clone());
+
+            send_msg(
+                socket,
+                &WsServerMessage::SessionInfo {
+                    session_id: run.session_id.clone(),
+                    run_id: Some(run.run_id.clone()),
+                },
+            )
+            .await;
 
             // Send run_started
             send_msg(
@@ -3479,6 +3496,18 @@ mod tests {
     }
 
     #[test]
+    fn serialize_session_info_with_run_id() {
+        let msg = WsServerMessage::SessionInfo {
+            session_id: "s1".into(),
+            run_id: Some("r1".into()),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains(r#""type":"session_info""#));
+        assert!(json.contains(r#""session_id":"s1""#));
+        assert!(json.contains(r#""run_id":"r1""#));
+    }
+
+    #[test]
     fn serialize_run_finished_completed() {
         let msg = WsServerMessage::RunFinished {
             run_id: "r1".into(),
@@ -3601,6 +3630,10 @@ mod tests {
             },
             WsServerMessage::AuthError {
                 message: "bad".into(),
+            },
+            WsServerMessage::SessionInfo {
+                session_id: "s1".into(),
+                run_id: Some("r1".into()),
             },
             WsServerMessage::RunStarted {
                 run_id: "r1".into(),
