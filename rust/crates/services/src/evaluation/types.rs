@@ -296,6 +296,12 @@ pub struct DriftSignalResponse {
     pub previous_avg: f64,
     pub previous_avg_interval: ConfidenceInterval,
     pub delta: f64,
+    pub noise_filtered_current_avg: f64,
+    pub noise_filtered_current_avg_interval: ConfidenceInterval,
+    pub noise_filtered_previous_avg: f64,
+    pub noise_filtered_previous_avg_interval: ConfidenceInterval,
+    pub noise_filtered_delta: f64,
+    pub noise_filtered_sample_count: i64,
     pub severity: DriftSeverity,
     pub sample_count: i64,
 }

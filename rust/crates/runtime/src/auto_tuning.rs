@@ -299,6 +299,111 @@ pub enum RollbackCondition {
 
 // ─── Rule Evaluation ────────────────────────────────────────────────────────
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TokenUsageWindowStats {
+    raw_average: u64,
+    sample_count: usize,
+    noise_filtered_average: u64,
+    noise_filtered_sample_count: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OutcomeWindowStats {
+    success_count: usize,
+    failure_count: usize,
+    retry_count: usize,
+    sample_count: usize,
+}
+
+impl OutcomeWindowStats {
+    fn success_rate(self) -> f64 {
+        if self.sample_count == 0 {
+            0.0
+        } else {
+            self.success_count as f64 / self.sample_count as f64
+        }
+    }
+
+    fn retry_rate(self) -> f64 {
+        if self.sample_count == 0 {
+            0.0
+        } else {
+            self.retry_count as f64 / self.sample_count as f64
+        }
+    }
+}
+
+fn average_tokens(values: &[u64]) -> u64 {
+    if values.is_empty() {
+        0
+    } else {
+        values.iter().sum::<u64>() / values.len() as u64
+    }
+}
+
+fn percentile(values: &[f64], fraction: f64) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    if values.len() == 1 {
+        return values[0];
+    }
+
+    let position = fraction.clamp(0.0, 1.0) * (values.len() - 1) as f64;
+    let lower_idx = position.floor() as usize;
+    let upper_idx = position.ceil() as usize;
+    if lower_idx == upper_idx {
+        values[lower_idx]
+    } else {
+        let lower = values[lower_idx];
+        let upper = values[upper_idx];
+        lower + (upper - lower) * (position - lower_idx as f64)
+    }
+}
+
+fn noise_filtered_indices(values: &[u64]) -> Vec<usize> {
+    if values.is_empty() {
+        return Vec::new();
+    }
+    if values.len() < 5 {
+        return (0..values.len()).collect();
+    }
+
+    let mut sorted: Vec<(usize, f64)> = values
+        .iter()
+        .copied()
+        .map(|value| value as f64)
+        .enumerate()
+        .collect();
+    sorted.sort_by(|left, right| left.1.total_cmp(&right.1));
+    let sorted_values: Vec<f64> = sorted.iter().map(|(_, value)| *value).collect();
+    let q1 = percentile(&sorted_values, 0.25);
+    let q3 = percentile(&sorted_values, 0.75);
+    let iqr = q3 - q1;
+
+    let mut indices: Vec<usize> = if iqr <= f64::EPSILON {
+        let median = percentile(&sorted_values, 0.5);
+        sorted
+            .into_iter()
+            .filter(|(_, value)| (*value - median).abs() <= f64::EPSILON)
+            .map(|(index, _)| index)
+            .collect()
+    } else {
+        let lower = q1 - 1.5 * iqr;
+        let upper = q3 + 1.5 * iqr;
+        sorted
+            .into_iter()
+            .filter(|(_, value)| *value >= lower && *value <= upper)
+            .map(|(index, _)| index)
+            .collect()
+    };
+    if indices.len() < 3 {
+        return (0..values.len()).collect();
+    }
+    indices.sort_unstable();
+    indices
+}
+
 /// Tracks feedback signals for rule evaluation.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct FeedbackAggregator {
@@ -360,55 +465,14 @@ impl FeedbackAggregator {
 
     /// Calculate success rate within a window.
     pub fn success_rate(&self, window: Duration) -> Option<f64> {
-        let signals = self.signals_in_window(window);
-        let successes = signals
-            .iter()
-            .filter(|s| {
-                matches!(
-                    s.signal_type,
-                    SignalType::TaskSuccess | SignalType::Acceptance
-                )
-            })
-            .count();
-        let failures = signals
-            .iter()
-            .filter(|s| {
-                matches!(
-                    s.signal_type,
-                    SignalType::TaskFailure { .. }
-                        | SignalType::Retry { .. }
-                        | SignalType::Correction
-                )
-            })
-            .count();
-
-        let total = successes + failures;
-        if total == 0 {
-            None
-        } else {
-            Some(successes as f64 / total as f64)
-        }
+        self.outcome_window_stats(window)
+            .map(OutcomeWindowStats::success_rate)
     }
 
     /// Calculate average token usage within a window.
     pub fn avg_token_usage(&self, window: Duration) -> Option<u64> {
-        let signals = self.signals_in_window(window);
-        let token_signals: Vec<u64> = signals
-            .iter()
-            .filter_map(|s| {
-                if let SignalType::HighTokenUsage { tokens, .. } = &s.signal_type {
-                    Some(*tokens)
-                } else {
-                    s.context.get("tokens").and_then(|v| v.as_u64())
-                }
-            })
-            .collect();
-
-        if token_signals.is_empty() {
-            None
-        } else {
-            Some(token_signals.iter().sum::<u64>() / token_signals.len() as u64)
-        }
+        self.token_usage_stats(window)
+            .map(|stats| stats.noise_filtered_average)
     }
 
     /// Check for negative feedback streak.
@@ -419,6 +483,63 @@ impl FeedbackAggregator {
     /// Check for negative feedback streak within a time window.
     pub fn negative_streak_in_window(&self, window: Duration) -> u32 {
         self.negative_streak_since(Some(SystemTime::now() - window))
+    }
+
+    fn token_usage_stats(&self, window: Duration) -> Option<TokenUsageWindowStats> {
+        let token_signals: Vec<u64> = self
+            .signals_in_window(window)
+            .iter()
+            .filter_map(|signal| {
+                if let SignalType::HighTokenUsage { tokens, .. } = &signal.signal_type {
+                    Some(*tokens)
+                } else {
+                    signal
+                        .context
+                        .get("tokens")
+                        .and_then(|value| value.as_u64())
+                }
+            })
+            .collect();
+        if token_signals.is_empty() {
+            return None;
+        }
+        let filtered_indices = noise_filtered_indices(&token_signals);
+        let filtered_tokens: Vec<u64> = filtered_indices
+            .into_iter()
+            .map(|index| token_signals[index])
+            .collect();
+        Some(TokenUsageWindowStats {
+            raw_average: average_tokens(&token_signals),
+            sample_count: token_signals.len(),
+            noise_filtered_average: average_tokens(&filtered_tokens),
+            noise_filtered_sample_count: filtered_tokens.len(),
+        })
+    }
+
+    fn outcome_window_stats(&self, window: Duration) -> Option<OutcomeWindowStats> {
+        let mut success_count = 0;
+        let mut failure_count = 0;
+        let mut retry_count = 0;
+
+        for signal in self.signals_in_window(window) {
+            match signal.signal_type {
+                SignalType::TaskSuccess | SignalType::Acceptance => success_count += 1,
+                SignalType::Retry { .. } => {
+                    failure_count += 1;
+                    retry_count += 1;
+                }
+                SignalType::TaskFailure { .. } | SignalType::Correction => failure_count += 1,
+                _ => {}
+            }
+        }
+
+        let sample_count = success_count + failure_count;
+        (sample_count > 0).then_some(OutcomeWindowStats {
+            success_count,
+            failure_count,
+            retry_count,
+            sample_count,
+        })
     }
 
     fn negative_streak_since(&self, cutoff: Option<SystemTime>) -> u32 {
@@ -773,12 +894,11 @@ impl AutoTuningEngine {
                 min_samples,
             } => {
                 let window = Duration::from_secs(*window_secs);
-                let signals = aggregator.signals_in_window(window);
-                if signals.len() < *min_samples as usize {
-                    return false;
-                }
-                if let Some(rate) = aggregator.success_rate(window) {
-                    rate < *threshold
+                if let Some(stats) = aggregator.outcome_window_stats(window) {
+                    if stats.sample_count < *min_samples as usize {
+                        return false;
+                    }
+                    stats.success_rate() < *threshold
                 } else {
                     false
                 }
@@ -790,12 +910,11 @@ impl AutoTuningEngine {
                 min_samples,
             } => {
                 let window = Duration::from_secs(*window_secs);
-                let signals = aggregator.signals_in_window(window);
-                if signals.len() < *min_samples as usize {
-                    return false;
-                }
-                if let Some(avg) = aggregator.avg_token_usage(window) {
-                    avg > *threshold_tokens
+                if let Some(stats) = aggregator.token_usage_stats(window) {
+                    if stats.noise_filtered_sample_count < *min_samples as usize {
+                        return false;
+                    }
+                    stats.noise_filtered_average > *threshold_tokens
                 } else {
                     false
                 }
@@ -807,13 +926,14 @@ impl AutoTuningEngine {
                 min_samples,
             } => {
                 let window = Duration::from_secs(*window_secs);
-                let signals = aggregator.signals_in_window(window);
-                if signals.len() < *min_samples as usize {
-                    return false;
+                if let Some(stats) = aggregator.outcome_window_stats(window) {
+                    if stats.sample_count < *min_samples as usize {
+                        return false;
+                    }
+                    stats.retry_rate() > *threshold
+                } else {
+                    false
                 }
-                let retries = aggregator.count_signals(SignalType::NAME_RETRY, window);
-                let total = signals.len() as f64;
-                (retries as f64 / total) > *threshold
             }
 
             EvolutionTrigger::NegativeFeedbackStreak { count } => {
@@ -856,8 +976,8 @@ impl AutoTuningEngine {
             } => {
                 let window = Duration::from_secs(*window_secs);
                 // Only evaluate signals after the execution
-                if let Some(rate) = aggregator.success_rate(window) {
-                    rate < *threshold
+                if let Some(stats) = aggregator.outcome_window_stats(window) {
+                    stats.success_rate() < *threshold
                 } else {
                     false
                 }
@@ -1495,6 +1615,50 @@ mod tests {
     }
 
     #[test]
+    fn test_token_usage_stats_filters_outlier_spike() {
+        let mut agg = FeedbackAggregator::new();
+
+        for tokens in [8_000, 8_500, 9_000, 9_500, 120_000] {
+            agg.record(FeedbackSignal::new(SignalType::HighTokenUsage {
+                tokens,
+                threshold: 70_000,
+            }));
+        }
+
+        let stats = agg
+            .token_usage_stats(Duration::from_secs(60))
+            .expect("token stats should exist");
+
+        assert_eq!(stats.sample_count, 5);
+        assert_eq!(stats.noise_filtered_sample_count, 4);
+        assert!(stats.noise_filtered_average < stats.raw_average);
+        assert_eq!(agg.avg_token_usage(Duration::from_secs(60)), Some(8_750));
+    }
+
+    #[test]
+    fn test_outcome_window_stats_ignore_unrelated_feedback() {
+        let mut agg = FeedbackAggregator::new();
+
+        agg.record(FeedbackSignal::new(SignalType::TaskSuccess));
+        agg.record(FeedbackSignal::new(SignalType::Retry { count: 1 }));
+        agg.record(FeedbackSignal::new(SignalType::QuickFollowUp {
+            delay_ms: 500,
+        }));
+        agg.record(FeedbackSignal::new(SignalType::LongPause {
+            delay_ms: 120_000,
+        }));
+
+        let stats = agg
+            .outcome_window_stats(Duration::from_secs(60))
+            .expect("outcome stats should exist");
+
+        assert_eq!(stats.sample_count, 2);
+        assert_eq!(stats.retry_count, 1);
+        assert!((stats.success_rate() - 0.5).abs() < 0.001);
+        assert!((stats.retry_rate() - 0.5).abs() < 0.001);
+    }
+
+    #[test]
     fn test_negative_streak() {
         let mut agg = FeedbackAggregator::new();
 
@@ -1720,6 +1884,131 @@ mod tests {
                 .iter()
                 .any(|(r, _)| r.id == "long-pause-expand-memory"),
             "Long pause rule should trigger on 2+ signals"
+        );
+    }
+
+    #[test]
+    fn high_token_usage_trigger_counts_token_samples_not_all_signals() {
+        let engine = AutoTuningEngine::new();
+        engine.add_rule(EvolutionRule::new(
+            "high-token-window",
+            EvolutionTrigger::HighTokenUsage {
+                threshold_tokens: 4_000,
+                window_secs: 3_600,
+                min_samples: 2,
+            },
+            EvolutionAction::Alert {
+                message: "high token usage".into(),
+                severity: AlertSeverity::Warning,
+            },
+        ));
+
+        engine.record_feedback(FeedbackSignal::new(SignalType::TaskSuccess));
+        engine.record_feedback(FeedbackSignal::new(SignalType::Correction));
+        engine.record_feedback(FeedbackSignal::new(SignalType::HighTokenUsage {
+            tokens: 8_000,
+            threshold: 4_000,
+        }));
+
+        let result = engine.evaluate(&RuntimeConfig::default());
+        assert!(
+            result.is_empty(),
+            "one token sample plus unrelated feedback should not satisfy min_samples"
+        );
+    }
+
+    #[test]
+    fn high_token_usage_trigger_ignores_outlier_spike() {
+        let engine = AutoTuningEngine::new();
+        engine.add_rule(EvolutionRule::new(
+            "high-token-window",
+            EvolutionTrigger::HighTokenUsage {
+                threshold_tokens: 10_000,
+                window_secs: 3_600,
+                min_samples: 3,
+            },
+            EvolutionAction::Alert {
+                message: "high token usage".into(),
+                severity: AlertSeverity::Warning,
+            },
+        ));
+
+        for tokens in [8_000, 8_500, 9_000, 9_500, 120_000] {
+            engine.record_feedback(FeedbackSignal::new(SignalType::HighTokenUsage {
+                tokens,
+                threshold: 70_000,
+            }));
+        }
+
+        let result = engine.evaluate(&RuntimeConfig::default());
+        assert!(
+            result.is_empty(),
+            "filtered token average should ignore a single extreme spike"
+        );
+    }
+
+    #[test]
+    fn low_success_trigger_counts_only_outcome_samples() {
+        let engine = AutoTuningEngine::new();
+        engine.add_rule(EvolutionRule::new(
+            "low-success-window",
+            EvolutionTrigger::LowSuccessRate {
+                threshold: 0.8,
+                window_secs: 3_600,
+                min_samples: 2,
+            },
+            EvolutionAction::Alert {
+                message: "low success".into(),
+                severity: AlertSeverity::Warning,
+            },
+        ));
+
+        engine.record_feedback(FeedbackSignal::new(SignalType::TaskFailure {
+            reason: "oops".into(),
+        }));
+        for _ in 0..3 {
+            engine.record_feedback(FeedbackSignal::new(SignalType::QuickFollowUp {
+                delay_ms: 500,
+            }));
+        }
+
+        let result = engine.evaluate(&RuntimeConfig::default());
+        assert!(
+            result.is_empty(),
+            "one failure plus unrelated feedback should not satisfy low-success min_samples"
+        );
+    }
+
+    #[test]
+    fn high_retry_rate_trigger_ignores_unrelated_feedback_in_denominator() {
+        let engine = AutoTuningEngine::new();
+        engine.add_rule(EvolutionRule::new(
+            "high-retry-window",
+            EvolutionTrigger::HighRetryRate {
+                threshold: 0.4,
+                window_secs: 3_600,
+                min_samples: 2,
+            },
+            EvolutionAction::Alert {
+                message: "high retry".into(),
+                severity: AlertSeverity::Warning,
+            },
+        ));
+
+        engine.record_feedback(FeedbackSignal::new(SignalType::Retry { count: 1 }));
+        engine.record_feedback(FeedbackSignal::new(SignalType::TaskSuccess));
+        for _ in 0..3 {
+            engine.record_feedback(FeedbackSignal::new(SignalType::QuickFollowUp {
+                delay_ms: 500,
+            }));
+        }
+
+        let result = engine.evaluate(&RuntimeConfig::default());
+        assert!(
+            result
+                .iter()
+                .any(|(rule, _)| rule.id == "high-retry-window"),
+            "retry rate should be computed from outcome-bearing samples, not diluted by chatter"
         );
     }
 

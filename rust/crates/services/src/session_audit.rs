@@ -4,9 +4,9 @@
 //! All queries run against MatrixOne `agent_events` + `agent_sessions` tables.
 
 use async_trait::async_trait;
-use axum::{Json, http::StatusCode};
+use axum::{http::StatusCode, Json};
 use serde::{Deserialize, Serialize};
-use sqlx::{Row, query};
+use sqlx::{query, Row};
 
 use crate::evaluation::{DatabaseEvaluationService, EvaluationService};
 use crate::{
@@ -15,7 +15,7 @@ use crate::{
     StagedMutationState,
 };
 use astra_core::{
-    ErrorResponse, MatrixOneSettings, SharedPool, connect_matrixone, error_response, internal_error,
+    connect_matrixone, error_response, internal_error, ErrorResponse, MatrixOneSettings, SharedPool,
 };
 
 fn normalize_tool_name(name: String) -> String {
@@ -227,6 +227,16 @@ pub struct CrossSessionStats {
     pub journal_verified_mutations: u32,
     pub no_verifier_signal_mutations: u32,
     pub ambiguous_multi_action_verifier_mutations: u32,
+    pub total_runtime_promotions: u32,
+    pub adaptive_baseline_runtime_promotions: u32,
+    pub evolution_runtime_promotions: u32,
+    pub promoted_runtime_promotions: u32,
+    pub deferred_runtime_promotions: u32,
+    pub queued_runtime_promotions: u32,
+    pub auto_applied_runtime_promotions: u32,
+    pub runtime_promote_recommendations: u32,
+    pub runtime_canary_recommendations: u32,
+    pub runtime_hold_recommendations: u32,
     pub top_tools: Vec<ToolUsageBrief>,
     pub top_models: Vec<ModelUsageBrief>,
 }
@@ -747,6 +757,41 @@ impl DatabaseSessionAuditService {
             .collect::<Vec<_>>();
 
         Ok((mutation_decisions, mutation_overrides))
+    }
+
+    async fn load_cross_session_runtime_promotions(
+        &self,
+        pool: &sqlx::Pool<sqlx::MySql>,
+        user_id: &str,
+        since: Option<&str>,
+        until: Option<&str>,
+    ) -> AuditResult<Vec<RuntimePromotionRecord>> {
+        let mut sql = String::from(
+            "SELECT event_id, session_id, metadata, created_at \
+             FROM agent_events \
+             WHERE user_id = ? AND event_type = ?",
+        );
+        if since.is_some() {
+            sql.push_str(" AND created_at >= ?");
+        }
+        if until.is_some() {
+            sql.push_str(" AND created_at <= ?");
+        }
+        sql.push_str(" ORDER BY created_at DESC");
+
+        let mut query = query(&sql).bind(user_id).bind(RUNTIME_PROMOTION_EVENT_TYPE);
+        if let Some(since) = since {
+            query = query.bind(since);
+        }
+        if let Some(until) = until {
+            query = query.bind(until);
+        }
+
+        let rows = query.fetch_all(pool).await.map_err(internal_error)?;
+        Ok(rows
+            .iter()
+            .filter_map(runtime_promotion_record_from_row)
+            .collect())
     }
 
     fn evaluation_service(&self) -> DatabaseEvaluationService {
@@ -1677,6 +1722,16 @@ impl SessionAuditService for DatabaseSessionAuditService {
                 .map(|scoreboard| scoreboard.with_promotion_context(&context))
                 .collect(),
         );
+        let runtime_promotion_stats = aggregate_runtime_promotion_stats(
+            &self
+                .load_cross_session_runtime_promotions(
+                    &pool,
+                    user_id,
+                    params.since.as_deref(),
+                    params.until.as_deref(),
+                )
+                .await?,
+        );
 
         let sc = session_count.max(1) as f64;
         Ok(CrossSessionStats {
@@ -1708,6 +1763,19 @@ impl SessionAuditService for DatabaseSessionAuditService {
             no_verifier_signal_mutations: mutation_stats.no_verifier_signal_mutations,
             ambiguous_multi_action_verifier_mutations: mutation_stats
                 .ambiguous_multi_action_verifier_mutations,
+            total_runtime_promotions: runtime_promotion_stats.total_runtime_promotions,
+            adaptive_baseline_runtime_promotions: runtime_promotion_stats
+                .adaptive_baseline_runtime_promotions,
+            evolution_runtime_promotions: runtime_promotion_stats.evolution_runtime_promotions,
+            promoted_runtime_promotions: runtime_promotion_stats.promoted_runtime_promotions,
+            deferred_runtime_promotions: runtime_promotion_stats.deferred_runtime_promotions,
+            queued_runtime_promotions: runtime_promotion_stats.queued_runtime_promotions,
+            auto_applied_runtime_promotions: runtime_promotion_stats
+                .auto_applied_runtime_promotions,
+            runtime_promote_recommendations: runtime_promotion_stats
+                .runtime_promote_recommendations,
+            runtime_canary_recommendations: runtime_promotion_stats.runtime_canary_recommendations,
+            runtime_hold_recommendations: runtime_promotion_stats.runtime_hold_recommendations,
             top_tools,
             top_models,
         })
@@ -1864,33 +1932,14 @@ impl SessionAuditService for DatabaseSessionAuditService {
         params: &CrossSessionRuntimePromotionListParams,
     ) -> AuditResult<CrossSessionRuntimePromotionListResponse> {
         let pool = self.get_pool().await.map_err(internal_error)?;
-
-        let mut sql = String::from(
-            "SELECT event_id, session_id, metadata, created_at \
-             FROM agent_events \
-             WHERE user_id = ? AND event_type = ?",
-        );
-        if params.since.is_some() {
-            sql.push_str(" AND created_at >= ?");
-        }
-        if params.until.is_some() {
-            sql.push_str(" AND created_at <= ?");
-        }
-        sql.push_str(" ORDER BY created_at DESC");
-
-        let mut query = query(&sql).bind(user_id).bind(RUNTIME_PROMOTION_EVENT_TYPE);
-        if let Some(since) = &params.since {
-            query = query.bind(since);
-        }
-        if let Some(until) = &params.until {
-            query = query.bind(until);
-        }
-
-        let rows = query.fetch_all(&pool).await.map_err(internal_error)?;
-        let promotions = rows
-            .iter()
-            .filter_map(runtime_promotion_record_from_row)
-            .collect::<Vec<_>>();
+        let promotions = self
+            .load_cross_session_runtime_promotions(
+                &pool,
+                user_id,
+                params.since.as_deref(),
+                params.until.as_deref(),
+            )
+            .await?;
         Ok(select_cross_session_runtime_promotions(promotions, params))
     }
 }
@@ -2319,6 +2368,51 @@ impl MutationStatsAggregate {
     }
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct RuntimePromotionStatsAggregate {
+    total_runtime_promotions: u32,
+    adaptive_baseline_runtime_promotions: u32,
+    evolution_runtime_promotions: u32,
+    promoted_runtime_promotions: u32,
+    deferred_runtime_promotions: u32,
+    queued_runtime_promotions: u32,
+    auto_applied_runtime_promotions: u32,
+    runtime_promote_recommendations: u32,
+    runtime_canary_recommendations: u32,
+    runtime_hold_recommendations: u32,
+}
+
+impl RuntimePromotionStatsAggregate {
+    fn observe_promotion(&mut self, promotion: &RuntimePromotionRecord) {
+        self.total_runtime_promotions += 1;
+        match promotion.controller {
+            RuntimePromotionController::AdaptiveBaseline => {
+                self.adaptive_baseline_runtime_promotions += 1;
+            }
+            RuntimePromotionController::Evolution => {
+                self.evolution_runtime_promotions += 1;
+            }
+        }
+        match promotion.outcome {
+            RuntimePromotionOutcome::Promoted => self.promoted_runtime_promotions += 1,
+            RuntimePromotionOutcome::Deferred => self.deferred_runtime_promotions += 1,
+            RuntimePromotionOutcome::Queued => self.queued_runtime_promotions += 1,
+            RuntimePromotionOutcome::AutoApplied => self.auto_applied_runtime_promotions += 1,
+        }
+        match promotion.recommendation {
+            RuntimePromotionRecommendation::Promote => {
+                self.runtime_promote_recommendations += 1;
+            }
+            RuntimePromotionRecommendation::Canary => {
+                self.runtime_canary_recommendations += 1;
+            }
+            RuntimePromotionRecommendation::Hold => {
+                self.runtime_hold_recommendations += 1;
+            }
+        }
+    }
+}
+
 fn parse_mutation_state_override(
     metadata: &serde_json::Value,
     created_at: String,
@@ -2369,6 +2463,16 @@ fn aggregate_cross_session_mutation_scoreboards(
         }
     }
 
+    aggregate
+}
+
+fn aggregate_runtime_promotion_stats(
+    promotions: &[RuntimePromotionRecord],
+) -> RuntimePromotionStatsAggregate {
+    let mut aggregate = RuntimePromotionStatsAggregate::default();
+    for promotion in promotions {
+        aggregate.observe_promotion(promotion);
+    }
     aggregate
 }
 
@@ -2689,6 +2793,16 @@ mod tests {
             journal_verified_mutations: 3,
             no_verifier_signal_mutations: 4,
             ambiguous_multi_action_verifier_mutations: 1,
+            total_runtime_promotions: 6,
+            adaptive_baseline_runtime_promotions: 2,
+            evolution_runtime_promotions: 4,
+            promoted_runtime_promotions: 1,
+            deferred_runtime_promotions: 2,
+            queued_runtime_promotions: 2,
+            auto_applied_runtime_promotions: 1,
+            runtime_promote_recommendations: 2,
+            runtime_canary_recommendations: 2,
+            runtime_hold_recommendations: 2,
             top_tools: vec![ToolUsageBrief {
                 name: "bash".into(),
                 call_count: 100,
@@ -2705,6 +2819,8 @@ mod tests {
         assert!(json.contains("\"total_turns\":150"));
         assert!(json.contains("\"total_mutations\":12"));
         assert!(json.contains("\"verified_mutations\":7"));
+        assert!(json.contains("\"total_runtime_promotions\":6"));
+        assert!(json.contains("\"runtime_hold_recommendations\":2"));
         assert!(json.contains("\"top_tools\":["));
         assert!(json.contains("\"top_models\":["));
     }
@@ -2735,6 +2851,16 @@ mod tests {
             journal_verified_mutations: 0,
             no_verifier_signal_mutations: 0,
             ambiguous_multi_action_verifier_mutations: 0,
+            total_runtime_promotions: 0,
+            adaptive_baseline_runtime_promotions: 0,
+            evolution_runtime_promotions: 0,
+            promoted_runtime_promotions: 0,
+            deferred_runtime_promotions: 0,
+            queued_runtime_promotions: 0,
+            auto_applied_runtime_promotions: 0,
+            runtime_promote_recommendations: 0,
+            runtime_canary_recommendations: 0,
+            runtime_hold_recommendations: 0,
             top_tools: vec![],
             top_models: vec![],
         };
@@ -3013,6 +3139,16 @@ mod tests {
             journal_verified_mutations: 2,
             no_verifier_signal_mutations: 3,
             ambiguous_multi_action_verifier_mutations: 1,
+            total_runtime_promotions: 4,
+            adaptive_baseline_runtime_promotions: 1,
+            evolution_runtime_promotions: 3,
+            promoted_runtime_promotions: 1,
+            deferred_runtime_promotions: 1,
+            queued_runtime_promotions: 1,
+            auto_applied_runtime_promotions: 1,
+            runtime_promote_recommendations: 2,
+            runtime_canary_recommendations: 1,
+            runtime_hold_recommendations: 1,
             top_tools: vec![],
             top_models: vec![],
         };
@@ -3021,6 +3157,8 @@ mod tests {
         assert_eq!(restored.session_count, 10);
         assert_eq!(restored.total_mutations, 9);
         assert_eq!(restored.missing_verifier_mutations, 4);
+        assert_eq!(restored.total_runtime_promotions, 4);
+        assert_eq!(restored.runtime_promote_recommendations, 2);
         assert!((restored.tool_error_rate - 0.025).abs() < 0.001);
     }
 
@@ -3592,6 +3730,88 @@ mod tests {
         assert_eq!(response.promotions.len(), 1);
         assert_eq!(response.promotions[0].event_id, "evt-2");
         assert_eq!(response.promotions[0].summary, "queue for review");
+    }
+
+    #[test]
+    fn aggregate_runtime_promotion_stats_counts_controllers_outcomes_and_recommendations() {
+        let promotions = vec![
+            RuntimePromotionRecord::from_event(
+                "evt-1".into(),
+                "session-a".into(),
+                "2026-04-12T12:00:00Z".into(),
+                RuntimePromotionEventData {
+                    controller: RuntimePromotionController::AdaptiveBaseline,
+                    outcome: RuntimePromotionOutcome::Deferred,
+                    recommendation: RuntimePromotionRecommendation::Hold,
+                    subject_id: "exp-a".into(),
+                    summary: "adaptive baseline deferred".into(),
+                    turn: None,
+                    confidence_score: 0.71,
+                    support_score: 0.48,
+                    safety_score: 0.82,
+                    overall_score: 0.63,
+                    blockers: vec![],
+                    evidence: vec![],
+                    rollback_hint: Some("rollback_experiment(\"exp-a\")".into()),
+                    run_id: Some("run-a".into()),
+                },
+            ),
+            RuntimePromotionRecord::from_event(
+                "evt-2".into(),
+                "session-b".into(),
+                "2026-04-12T11:00:00Z".into(),
+                RuntimePromotionEventData {
+                    controller: RuntimePromotionController::Evolution,
+                    outcome: RuntimePromotionOutcome::Queued,
+                    recommendation: RuntimePromotionRecommendation::Canary,
+                    subject_id: "proposal-1".into(),
+                    summary: "queue for review".into(),
+                    turn: None,
+                    confidence_score: 0.76,
+                    support_score: 0.64,
+                    safety_score: 0.70,
+                    overall_score: 0.69,
+                    blockers: vec![],
+                    evidence: vec![],
+                    rollback_hint: None,
+                    run_id: Some("run-b".into()),
+                },
+            ),
+            RuntimePromotionRecord::from_event(
+                "evt-3".into(),
+                "session-b".into(),
+                "2026-04-12T10:00:00Z".into(),
+                RuntimePromotionEventData {
+                    controller: RuntimePromotionController::Evolution,
+                    outcome: RuntimePromotionOutcome::AutoApplied,
+                    recommendation: RuntimePromotionRecommendation::Promote,
+                    subject_id: "proposal-2".into(),
+                    summary: "auto applied".into(),
+                    turn: None,
+                    confidence_score: 0.92,
+                    support_score: 0.88,
+                    safety_score: 0.86,
+                    overall_score: 0.89,
+                    blockers: vec![],
+                    evidence: vec![],
+                    rollback_hint: None,
+                    run_id: Some("run-b".into()),
+                },
+            ),
+        ];
+
+        let stats = aggregate_runtime_promotion_stats(&promotions);
+
+        assert_eq!(stats.total_runtime_promotions, 3);
+        assert_eq!(stats.adaptive_baseline_runtime_promotions, 1);
+        assert_eq!(stats.evolution_runtime_promotions, 2);
+        assert_eq!(stats.promoted_runtime_promotions, 0);
+        assert_eq!(stats.deferred_runtime_promotions, 1);
+        assert_eq!(stats.queued_runtime_promotions, 1);
+        assert_eq!(stats.auto_applied_runtime_promotions, 1);
+        assert_eq!(stats.runtime_promote_recommendations, 1);
+        assert_eq!(stats.runtime_canary_recommendations, 1);
+        assert_eq!(stats.runtime_hold_recommendations, 1);
     }
 
     #[test]

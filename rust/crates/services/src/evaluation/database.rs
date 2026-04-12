@@ -1,15 +1,15 @@
 use async_trait::async_trait;
 use axum::http::StatusCode;
-use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
+use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
 use serde_json::Value;
-use sqlx::{Row, query};
+use sqlx::{query, Row};
 
 use super::service::EvaluationService;
 use super::types::*;
 use super::utils::*;
 use astra_core::{
-    MatrixOneSettings, SharedPool, confidence::ConfidenceInterval, connect_matrixone,
-    error_response, internal_error,
+    confidence::ConfidenceInterval, connect_matrixone, error_response, internal_error,
+    MatrixOneSettings, SharedPool,
 };
 
 const MAX_EVALUATION_ROWS: i32 = 200;
@@ -49,24 +49,56 @@ fn classify_drift_severity(delta: f64) -> Option<DriftSeverity> {
     }
 }
 
+fn average_score(scores: &[f64]) -> f64 {
+    if scores.is_empty() {
+        0.0
+    } else {
+        scores.iter().sum::<f64>() / scores.len() as f64
+    }
+}
+
 fn build_drift_signal(
     model: String,
     template_id: Option<String>,
-    current_avg: f64,
-    previous_avg: f64,
-    sample_count: i64,
+    current_scores: &[f64],
+    previous_scores: &[f64],
 ) -> Option<DriftSignalResponse> {
+    if current_scores.is_empty() || previous_scores.is_empty() {
+        return None;
+    }
+    let current_avg = average_score(current_scores);
+    let previous_avg = average_score(previous_scores);
     let delta = current_avg - previous_avg;
-    classify_drift_severity(delta).map(|severity| DriftSignalResponse {
+    let current_noise_filtered = noise_filtered_average(current_scores);
+    let previous_noise_filtered = noise_filtered_average(previous_scores);
+    let noise_filtered_delta = current_noise_filtered.average - previous_noise_filtered.average;
+    classify_drift_severity(noise_filtered_delta).map(|severity| DriftSignalResponse {
         model,
         template_id,
         current_avg,
-        current_avg_interval: sampled_confidence_interval(current_avg, sample_count),
+        current_avg_interval: sampled_confidence_interval(current_avg, current_scores.len() as i64),
         previous_avg,
-        previous_avg_interval: sampled_confidence_interval(previous_avg, sample_count),
+        previous_avg_interval: sampled_confidence_interval(
+            previous_avg,
+            previous_scores.len() as i64,
+        ),
         delta,
+        noise_filtered_current_avg: current_noise_filtered.average,
+        noise_filtered_current_avg_interval: sampled_confidence_interval(
+            current_noise_filtered.average,
+            current_noise_filtered.sample_count,
+        ),
+        noise_filtered_previous_avg: previous_noise_filtered.average,
+        noise_filtered_previous_avg_interval: sampled_confidence_interval(
+            previous_noise_filtered.average,
+            previous_noise_filtered.sample_count,
+        ),
+        noise_filtered_delta,
+        noise_filtered_sample_count: current_noise_filtered
+            .sample_count
+            .min(previous_noise_filtered.sample_count),
         severity,
-        sample_count,
+        sample_count: current_scores.len().min(previous_scores.len()) as i64,
     })
 }
 
@@ -269,7 +301,11 @@ fn summarize_calibration(
 }
 
 fn training_dataset_status(sample_count: usize) -> &'static str {
-    if sample_count == 0 { "empty" } else { "ready" }
+    if sample_count == 0 {
+        "empty"
+    } else {
+        "ready"
+    }
 }
 
 fn normalize_export_format(
@@ -743,52 +779,41 @@ impl EvaluationService for DatabaseEvaluationService {
 
         let rows = query(
             "SELECT level, \
-             AVG(CASE WHEN created_at >= DATE_SUB(NOW(), INTERVAL ? DAY) THEN score END) AS current_avg, \
-             AVG(CASE WHEN created_at < DATE_SUB(NOW(), INTERVAL ? DAY) \
-                      AND created_at >= DATE_SUB(NOW(), INTERVAL ? DAY) THEN score END) AS previous_avg, \
-             SUM(CASE WHEN created_at >= DATE_SUB(NOW(), INTERVAL ? DAY) THEN 1 ELSE 0 END) AS current_count, \
-             SUM(CASE WHEN created_at < DATE_SUB(NOW(), INTERVAL ? DAY) \
-                      AND created_at >= DATE_SUB(NOW(), INTERVAL ? DAY) THEN 1 ELSE 0 END) AS previous_count \
+             CASE WHEN created_at >= DATE_SUB(NOW(), INTERVAL ? DAY) THEN 'current' ELSE 'previous' END AS window_bucket, \
+             score \
              FROM eval_quality_assessments \
              WHERE user_id = ? \
                AND created_at >= DATE_SUB(NOW(), INTERVAL ? DAY) \
-             GROUP BY level \
-             ORDER BY level",
+             ORDER BY level, created_at DESC",
         )
         .bind(window_days)
-        .bind(window_days)
-        .bind(lookback_days)
-        .bind(window_days)
-        .bind(window_days)
-        .bind(lookback_days)
         .bind(user_id)
         .bind(lookback_days)
         .fetch_all(&pool)
         .await
         .unwrap_or_default();
 
-        let signals = rows
-            .iter()
-            .filter_map(|row| {
-                let current_count = row.try_get::<i64, _>("current_count").unwrap_or(0);
-                let previous_count = row.try_get::<i64, _>("previous_count").unwrap_or(0);
-                if current_count == 0 || previous_count == 0 {
-                    return None;
-                }
+        let mut scores_by_level = std::collections::BTreeMap::<String, (Vec<f64>, Vec<f64>)>::new();
+        for row in &rows {
+            let level = row
+                .try_get::<String, _>("level")
+                .unwrap_or_else(|_| "unknown".into());
+            let window_bucket = row
+                .try_get::<String, _>("window_bucket")
+                .unwrap_or_else(|_| "previous".into());
+            let score = row.try_get::<f64, _>("score").unwrap_or(0.0);
+            let entry = scores_by_level.entry(level).or_default();
+            if window_bucket == "current" {
+                entry.0.push(score);
+            } else {
+                entry.1.push(score);
+            }
+        }
 
-                let level = row
-                    .try_get::<String, _>("level")
-                    .unwrap_or_else(|_| "unknown".into());
-                let current_avg = row.try_get::<f64, _>("current_avg").unwrap_or(0.0);
-                let previous_avg = row.try_get::<f64, _>("previous_avg").unwrap_or(0.0);
-
-                build_drift_signal(
-                    level,
-                    None,
-                    current_avg,
-                    previous_avg,
-                    current_count.min(previous_count),
-                )
+        let signals = scores_by_level
+            .into_iter()
+            .filter_map(|(level, (current_scores, previous_scores))| {
+                build_drift_signal(level, None, &current_scores, &previous_scores)
             })
             .collect();
 
@@ -1058,7 +1083,7 @@ impl EvaluationService for DatabaseEvaluationService {
         let max_drift_delta = drift
             .signals
             .iter()
-            .map(|signal| signal.delta.abs())
+            .map(|signal| signal.noise_filtered_delta.abs())
             .fold(0.0_f64, f64::max);
 
         let quality_signal = if quality.noise_filtered_total_events > 0 {
@@ -1690,17 +1715,42 @@ mod tests {
 
     #[test]
     fn build_drift_signal_ignores_small_delta() {
-        assert!(build_drift_signal("session".into(), None, 0.78, 0.75, 8).is_none());
+        assert!(build_drift_signal(
+            "session".into(),
+            None,
+            &[0.78, 0.79, 0.77, 0.78, 0.78],
+            &[0.75, 0.76, 0.74, 0.75, 0.75],
+        )
+        .is_none());
     }
 
     #[test]
     fn build_drift_signal_sets_expected_fields() {
-        let signal = build_drift_signal("session".into(), None, 0.55, 0.78, 12).unwrap();
+        let signal = build_drift_signal(
+            "session".into(),
+            None,
+            &[0.55, 0.56, 0.54, 0.55, 0.55],
+            &[0.78, 0.79, 0.77, 0.78, 0.78],
+        )
+        .unwrap();
         assert_eq!(signal.model, "session");
         assert_eq!(signal.template_id, None);
         assert!((signal.delta + 0.23).abs() < 1e-9);
+        assert!((signal.noise_filtered_delta + 0.23).abs() < 1e-9);
         assert_eq!(signal.severity, DriftSeverity::Critical);
-        assert_eq!(signal.sample_count, 12);
+        assert_eq!(signal.sample_count, 5);
+        assert_eq!(signal.noise_filtered_sample_count, 5);
+    }
+
+    #[test]
+    fn build_drift_signal_uses_noise_filtered_delta_for_severity() {
+        assert!(build_drift_signal(
+            "session".into(),
+            None,
+            &[0.20, 0.79, 0.80, 0.81, 0.82],
+            &[0.79, 0.80, 0.81, 0.82, 0.83],
+        )
+        .is_none());
     }
 
     #[test]
@@ -2062,11 +2112,9 @@ mod tests {
         assert_eq!(summary.mean_confidence_interval, ConfidenceInterval::ZERO);
         assert_eq!(summary.mean_quality_interval, ConfidenceInterval::ZERO);
         assert_eq!(summary.adjustment_multiplier, 1.0);
-        assert!(
-            summary
-                .adjustment_reason
-                .contains("No session calibration samples")
-        );
+        assert!(summary
+            .adjustment_reason
+            .contains("No session calibration samples"));
     }
 
     #[test]
