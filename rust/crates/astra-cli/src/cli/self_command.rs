@@ -11,8 +11,8 @@ use crate::cli_args::{
 use crate::cli_utils::resumable_last_session_id;
 use astra_runtime::auto_tuning::{FeedbackSignal, SignalType};
 use astra_runtime::liquid::reflection::{
-    GoalSummary as ReflectionGoalSummary, ReflectionEventSummary,
-    VerificationSummary as ReflectionVerificationSummary,
+    GoalSummary as ReflectionGoalSummary, HealthSummary as ReflectionHealthSummary,
+    ReflectionEventSummary, VerificationSummary as ReflectionVerificationSummary,
 };
 use astra_runtime::runtime_config::RuntimeConfig;
 use astra_runtime::self_model::{ConstraintSet, SelfModel};
@@ -21,8 +21,10 @@ use astra_runtime::turn::context_assembly_trace::TokenBudgetTrace;
 use astra_runtime::turn::tool_health::ToolHealthTracker;
 use astra_runtime::user_profile::Scenario;
 use astra_services::self_surface::{
-    EventPreview as SurfaceEventPreview, EvolutionRecord, GoalSurface, LocalSelfSurfaceService,
-    PersistentSelfSnapshot, SelfSurfaceDimension, SelfSurfaceResponse, SelfSurfaceService,
+    EventPreview as SurfaceEventPreview, EvolutionRecord, GoalSurface,
+    HealthSurface as SurfaceHealthSurface, LocalSelfSurfaceService, PersistentSelfSnapshot,
+    SelfSurfaceDimension, SelfSurfaceResponse, SelfSurfaceService,
+    ToolFailureView as SurfaceToolFailureView, ToolHealthView as SurfaceToolHealthView,
     VerificationEventView, VerificationSurface,
 };
 use astra_services::session_journal::{self, JournalEvent, JournalEventType};
@@ -515,6 +517,7 @@ async fn build_reflect_response(
     let (
         goal,
         verification,
+        health,
         recent_evaluation_events,
         recent_adaptations,
         recent_adaptation_outcomes,
@@ -526,6 +529,7 @@ async fn build_reflect_response(
         question,
         goal,
         verification,
+        health,
         recent_evaluation_events,
         recent_adaptations,
         recent_adaptation_outcomes,
@@ -551,6 +555,7 @@ async fn load_reflection_self_evidence(
 ) -> (
     Option<ReflectionGoalSummary>,
     Option<ReflectionVerificationSummary>,
+    Option<ReflectionHealthSummary>,
     Vec<ReflectionEventSummary>,
     Vec<ReflectionEventSummary>,
     Vec<ReflectionEventSummary>,
@@ -571,6 +576,13 @@ async fn load_reflection_self_evidence(
         Ok(SelfSurfaceResponse::Verify(verification)) => Some(verification),
         _ => None,
     };
+    let health_surface = match service
+        .surface(session_id, SelfSurfaceDimension::Health, journal_limit)
+        .await
+    {
+        Ok(SelfSurfaceResponse::Health(health)) => Some(health),
+        _ => None,
+    };
     let recent_evaluation_events =
         reflection_recent_evaluation_events(goal_surface.as_ref(), verification_surface.as_ref());
     let recent_adaptations = reflection_recent_adaptations(snapshot.as_ref());
@@ -578,6 +590,7 @@ async fn load_reflection_self_evidence(
     (
         goal_surface.and_then(reflection_goal_summary),
         verification_surface.map(reflection_verification_summary),
+        health_surface.and_then(reflection_health_summary),
         recent_evaluation_events,
         recent_adaptations,
         recent_adaptation_outcomes,
@@ -607,6 +620,69 @@ fn reflection_verification_summary(
             .latest_verification
             .map(|event| event.summary),
     }
+}
+
+fn reflection_health_summary(health: SurfaceHealthSurface) -> Option<ReflectionHealthSummary> {
+    let risk_flags = health.risk_flags.into_iter().take(4).collect::<Vec<_>>();
+    let blocked_tools = health.blocked_tools.into_iter().take(4).collect::<Vec<_>>();
+    let hotspots = health
+        .tool_hotspots
+        .into_iter()
+        .take(3)
+        .map(reflection_tool_hotspot_summary)
+        .collect::<Vec<_>>();
+    let recent_failures = health
+        .recent_failures
+        .into_iter()
+        .take(3)
+        .map(reflection_tool_failure_summary)
+        .collect::<Vec<_>>();
+    if risk_flags.is_empty()
+        && blocked_tools.is_empty()
+        && hotspots.is_empty()
+        && recent_failures.is_empty()
+    {
+        return None;
+    }
+    Some(ReflectionHealthSummary {
+        risk_flags,
+        blocked_tools,
+        hotspots,
+        recent_failures,
+    })
+}
+
+fn reflection_tool_hotspot_summary(tool: SurfaceToolHealthView) -> String {
+    let mut parts = vec![format!(
+        "{} success={:.0}%",
+        tool.name,
+        tool.success_rate * 100.0
+    )];
+    if tool.deprioritized {
+        parts.push("deprioritized".into());
+    }
+    if tool.consecutive_failures > 0 {
+        parts.push(format!(
+            "consecutive_failures={}",
+            tool.consecutive_failures
+        ));
+    }
+    if tool.rehabilitation_count > 0 {
+        parts.push(format!("rehab={}", tool.rehabilitation_count));
+    }
+    parts.join(", ")
+}
+
+fn reflection_tool_failure_summary(failure: SurfaceToolFailureView) -> String {
+    let mut detail = match failure.turn {
+        Some(turn) => format!("turn {turn} {}", failure.tool),
+        None => failure.tool,
+    };
+    if let Some(error) = failure.error {
+        detail.push_str(" — ");
+        detail.push_str(&truncate(&error, 80));
+    }
+    detail
 }
 
 fn reflection_recent_evaluation_events(
@@ -1508,6 +1584,7 @@ fn build_persistent_reflection_context(
     question: Option<&str>,
     goal: Option<ReflectionGoalSummary>,
     verification: Option<ReflectionVerificationSummary>,
+    health: Option<ReflectionHealthSummary>,
     recent_evaluation_events: Vec<ReflectionEventSummary>,
     recent_adaptations: Vec<ReflectionEventSummary>,
     recent_adaptation_outcomes: Vec<ReflectionEventSummary>,
@@ -1557,6 +1634,7 @@ fn build_persistent_reflection_context(
     context.active_experiment = active_reflection_experiment(artifacts, context.turns_completed);
     context.goal = goal;
     context.verification = verification;
+    context.health = health;
     context.recent_evaluation_events = recent_evaluation_events;
     context.recent_adaptations = recent_adaptations;
     context.recent_adaptation_outcomes = recent_adaptation_outcomes;
@@ -2397,6 +2475,7 @@ mod tests {
         );
         ws.active_experiment_id = Some("exp-liquid".to_string());
         ws.active_variant = Some("treatment-a".to_string());
+        ws.deprioritized_tools = vec!["bash".to_string()];
         ws.last_context_trace = Some(ContextTraceSignal {
             turn_id: "turn-9".to_string(),
             captured_at: Some(Utc::now().to_rfc3339()),
@@ -2645,6 +2724,10 @@ mod tests {
             false
         );
         assert_eq!(
+            value["reflection_context"]["health"]["blocked_tools"][0],
+            "bash"
+        );
+        assert_eq!(
             value["reflection_context"]["recent_evaluation_events"][0]["kind"],
             "Verification"
         );
@@ -2681,6 +2764,18 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("Verification summary:")
+        );
+        assert!(
+            value["prompt_preview"]
+                .as_str()
+                .unwrap()
+                .contains("Tool health:")
+        );
+        assert!(
+            value["prompt_preview"]
+                .as_str()
+                .unwrap()
+                .contains("Blocked tools: bash")
         );
         assert!(
             value["prompt_preview"]

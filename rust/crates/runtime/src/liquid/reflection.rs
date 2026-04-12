@@ -47,6 +47,8 @@ pub struct ReflectionContext {
     pub goal: Option<GoalSummary>,
     /// Distilled verification / acceptance state for this reflection window.
     pub verification: Option<VerificationSummary>,
+    /// Distilled tool-health / risk state for this reflection window.
+    pub health: Option<HealthSummary>,
     /// Recent steering / verification events that explain what changed.
     pub recent_evaluation_events: Vec<ReflectionEventSummary>,
     /// Recent adaptive / mutation records that explain what the system changed.
@@ -90,6 +92,15 @@ pub struct VerificationSummary {
     pub summary: String,
     pub pending_blockers: Vec<String>,
     pub latest_verification: Option<String>,
+}
+
+/// Tool-health / risk summary for the reflection window.
+#[derive(Debug, Clone, Serialize)]
+pub struct HealthSummary {
+    pub risk_flags: Vec<String>,
+    pub blocked_tools: Vec<String>,
+    pub hotspots: Vec<String>,
+    pub recent_failures: Vec<String>,
 }
 
 /// Compact steering / verification timeline entry.
@@ -166,6 +177,7 @@ impl ReflectionContext {
             recent_tactical_actions: Vec::new(),
             goal: None,
             verification: None,
+            health: None,
             recent_evaluation_events: Vec::new(),
             recent_adaptations: Vec::new(),
             recent_adaptation_outcomes: Vec::new(),
@@ -224,6 +236,31 @@ impl ReflectionContext {
             }
             if let Some(ref latest) = verification.latest_verification {
                 out.push_str(&format!("Latest verification: {latest}\n"));
+            }
+        }
+
+        if let Some(ref health) = self.health {
+            out.push_str("\nTool health:\n");
+            if !health.risk_flags.is_empty() {
+                out.push_str(&format!("  Risk flags: {}\n", health.risk_flags.join(", ")));
+            }
+            if !health.blocked_tools.is_empty() {
+                out.push_str(&format!(
+                    "  Blocked tools: {}\n",
+                    health.blocked_tools.join(", ")
+                ));
+            }
+            if !health.hotspots.is_empty() {
+                out.push_str("  Hotspots:\n");
+                for hotspot in &health.hotspots {
+                    out.push_str(&format!("    - {hotspot}\n"));
+                }
+            }
+            if !health.recent_failures.is_empty() {
+                out.push_str("  Recent tool failures:\n");
+                for failure in &health.recent_failures {
+                    out.push_str(&format!("    - {failure}\n"));
+                }
             }
         }
 
@@ -659,6 +696,12 @@ mod tests {
             failures: 3,
             avg_latency_ms: 250,
         });
+        ctx.health = Some(HealthSummary {
+            risk_flags: vec!["recent_tool_failures".into()],
+            blocked_tools: vec!["bash".into()],
+            hotspots: vec!["bash success=80%, deprioritized".into()],
+            recent_failures: vec!["turn 9 bash — permission denied".into()],
+        });
         ctx.recent_tactical_actions
             .push("IncreaseVerification".into());
 
@@ -671,6 +714,8 @@ mod tests {
         assert!(rendered.contains("ToolFailure"));
         assert!(rendered.contains("UserCorrection"));
         assert!(rendered.contains("PatternDrift"));
+        assert!(rendered.contains("Tool health:"));
+        assert!(rendered.contains("Blocked tools: bash"));
         assert!(rendered.contains("IncreaseVerification"));
     }
 
@@ -754,6 +799,12 @@ mod tests {
             pending_blockers: vec!["integration tests pending".into()],
             latest_verification: Some("turn 8: parser unit suite passed".into()),
         });
+        ctx.health = Some(HealthSummary {
+            risk_flags: vec!["recent_tool_failures".into(), "deprioritized_tools".into()],
+            blocked_tools: vec!["bash".into()],
+            hotspots: vec!["bash success=50%, deprioritized, consecutive_failures=1".into()],
+            recent_failures: vec!["turn 9 bash — command timed out".into()],
+        });
         ctx.recent_evaluation_events = vec![
             ReflectionEventSummary {
                 kind: "GoalSteered".into(),
@@ -784,6 +835,8 @@ mod tests {
         assert!(
             user.contains("Verification summary: objective blocked: integration tests pending")
         );
+        assert!(user.contains("Tool health:"));
+        assert!(user.contains("Blocked tools: bash"));
         assert!(user.contains("Recent evaluation events:"));
         assert!(user.contains("[GoalSteered]"));
         assert!(user.contains("Recent adaptations:"));

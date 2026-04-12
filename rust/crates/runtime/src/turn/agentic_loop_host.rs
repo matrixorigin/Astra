@@ -54,9 +54,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use astra_services::self_surface::{
-    EventPreview, EvolutionRecord, GoalSurface, LocalSelfSurfaceService, PersistentSelfSnapshot,
-    SelfSurfaceDimension, SelfSurfaceResponse, SelfSurfaceService, VerificationEventView,
-    VerificationSurface,
+    EventPreview, EvolutionRecord, GoalSurface, HealthSurface, LocalSelfSurfaceService,
+    PersistentSelfSnapshot, SelfSurfaceDimension, SelfSurfaceResponse, SelfSurfaceService,
+    ToolFailureView, ToolHealthView, VerificationEventView, VerificationSurface,
 };
 use astra_services::session_journal::ToolCallRecord;
 use async_trait::async_trait;
@@ -2554,6 +2554,71 @@ fn reflection_verification_summary_from_surface(
     }
 }
 
+fn reflection_health_summary_from_surface(
+    health: HealthSurface,
+) -> Option<crate::liquid::reflection::HealthSummary> {
+    let risk_flags = health.risk_flags.into_iter().take(4).collect::<Vec<_>>();
+    let blocked_tools = health.blocked_tools.into_iter().take(4).collect::<Vec<_>>();
+    let hotspots = health
+        .tool_hotspots
+        .into_iter()
+        .take(3)
+        .map(reflection_tool_hotspot_summary)
+        .collect::<Vec<_>>();
+    let recent_failures = health
+        .recent_failures
+        .into_iter()
+        .take(3)
+        .map(reflection_tool_failure_summary)
+        .collect::<Vec<_>>();
+    if risk_flags.is_empty()
+        && blocked_tools.is_empty()
+        && hotspots.is_empty()
+        && recent_failures.is_empty()
+    {
+        return None;
+    }
+    Some(crate::liquid::reflection::HealthSummary {
+        risk_flags,
+        blocked_tools,
+        hotspots,
+        recent_failures,
+    })
+}
+
+fn reflection_tool_hotspot_summary(tool: ToolHealthView) -> String {
+    let mut parts = vec![format!(
+        "{} success={:.0}%",
+        tool.name,
+        tool.success_rate * 100.0
+    )];
+    if tool.deprioritized {
+        parts.push("deprioritized".into());
+    }
+    if tool.consecutive_failures > 0 {
+        parts.push(format!(
+            "consecutive_failures={}",
+            tool.consecutive_failures
+        ));
+    }
+    if tool.rehabilitation_count > 0 {
+        parts.push(format!("rehab={}", tool.rehabilitation_count));
+    }
+    parts.join(", ")
+}
+
+fn reflection_tool_failure_summary(failure: ToolFailureView) -> String {
+    let mut detail = match failure.turn {
+        Some(turn) => format!("turn {turn} {}", failure.tool),
+        None => failure.tool,
+    };
+    if let Some(error) = failure.error {
+        detail.push_str(" — ");
+        detail.push_str(&truncate_str(&error, 80));
+    }
+    detail
+}
+
 fn compact_json_value(value: &serde_json::Value) -> String {
     match value {
         serde_json::Value::Null => "null".to_string(),
@@ -2789,12 +2854,14 @@ async fn build_auto_reflection_self_evidence(
 ) -> (
     Option<crate::liquid::reflection::GoalSummary>,
     Option<crate::liquid::reflection::VerificationSummary>,
+    Option<crate::liquid::reflection::HealthSummary>,
     Vec<crate::liquid::reflection::ReflectionEventSummary>,
     Vec<crate::liquid::reflection::ReflectionEventSummary>,
     Vec<crate::liquid::reflection::ReflectionEventSummary>,
 ) {
     let mut goal = None;
     let mut verification = None;
+    let mut health = None;
     let mut recent_evaluation_events = Vec::new();
     let mut recent_adaptations = Vec::new();
     let mut recent_adaptation_outcomes = Vec::new();
@@ -2826,6 +2893,17 @@ async fn build_auto_reflection_self_evidence(
             Ok(SelfSurfaceResponse::Verify(verification_surface)) => Some(verification_surface),
             _ => None,
         };
+        let health_surface = match service
+            .surface(
+                session_id,
+                SelfSurfaceDimension::Health,
+                AUTO_REFLECTION_SELF_EVIDENCE_JOURNAL_LIMIT,
+            )
+            .await
+        {
+            Ok(SelfSurfaceResponse::Health(health_surface)) => Some(health_surface),
+            _ => None,
+        };
         recent_evaluation_events = reflection_recent_evaluation_events(
             goal_surface.as_ref(),
             verification_surface.as_ref(),
@@ -2834,6 +2912,7 @@ async fn build_auto_reflection_self_evidence(
         recent_adaptation_outcomes = reflection_recent_adaptation_outcomes(snapshot.as_ref());
         goal = goal_surface.and_then(reflection_goal_summary_from_surface);
         verification = verification_surface.map(reflection_verification_summary_from_surface);
+        health = health_surface.and_then(reflection_health_summary_from_surface);
     }
     if goal.is_none() {
         goal = build_live_auto_reflection_goal_summary(state);
@@ -2841,6 +2920,7 @@ async fn build_auto_reflection_self_evidence(
     (
         goal,
         verification,
+        health,
         recent_evaluation_events,
         recent_adaptations,
         recent_adaptation_outcomes,
@@ -2922,6 +3002,7 @@ async fn maybe_trigger_auto_reflection<H: AgenticLoopHost>(
     let (
         goal,
         verification,
+        health,
         recent_evaluation_events,
         recent_adaptations,
         recent_adaptation_outcomes,
@@ -2938,6 +3019,7 @@ async fn maybe_trigger_auto_reflection<H: AgenticLoopHost>(
     );
     ctx.goal = goal;
     ctx.verification = verification;
+    ctx.health = health;
     ctx.recent_evaluation_events = recent_evaluation_events;
     ctx.recent_adaptations = recent_adaptations;
     ctx.recent_adaptation_outcomes = recent_adaptation_outcomes;
@@ -11090,6 +11172,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
         );
         workspace.session_goal = Some("ship self surface".into());
         workspace.plan_goal = Some("stabilize reflection loop".into());
+        workspace.deprioritized_tools = vec!["bash".into()];
         workspace.goal_progress = Some(astra_services::session_workspace::GoalProgressSnapshot {
             goal: "ship self surface".into(),
             completion_score: 0.5,
@@ -11160,6 +11243,62 @@ print(json.dumps({'context': 'user said: ' + msg}))
                     None,
                 ),
             )
+            .unwrap();
+        astra_services::session_journal::JournalWriter::new("sess-reflect")
+            .unwrap()
+            .append(&astra_services::session_journal::JournalEvent {
+                event_type: astra_services::session_journal::JournalEventType::TurnError,
+                ts: chrono::Utc::now().to_rfc3339(),
+                session_id: Some("sess-reflect".to_string()),
+                turn: Some(3),
+                model: Some("gpt-5.4".to_string()),
+                user_input: Some("debug bash timeout".to_string()),
+                assistant_output: None,
+                tool_count: Some(1),
+                tokens_in: Some(10),
+                tokens_out: Some(0),
+                duration_ms: Some(120),
+                error: Some("timed out waiting for test".to_string()),
+                config_key: None,
+                config_value: None,
+                turns_compacted: None,
+                facts_stored: None,
+                tools_selected: Some(vec!["bash".to_string()]),
+                selected_skills: None,
+                tools_used: Some(vec!["bash".to_string()]),
+                tool_calls: Some(vec![ToolCallRecord {
+                    name: "bash".to_string(),
+                    ok: false,
+                    ms: 120,
+                    error: Some("timed out waiting for test".to_string()),
+                    input_bytes: None,
+                    output_bytes: None,
+                    args_preview: None,
+                    result_preview: None,
+                }]),
+                budget_used: None,
+                budget_pressure: None,
+                stall_type: None,
+                metadata: None,
+                plan_subtask_id: None,
+                ttft_ms: None,
+                context_ms: None,
+                selector_strategy: None,
+                selector_ms: None,
+                selector_tokens_in: None,
+                selector_tokens_out: None,
+                cache_read_tokens: None,
+                cache_creation_tokens: None,
+                memoria_ms: None,
+                session_lineage: None,
+                coordination: None,
+                edge_policy: None,
+                selection_trace: None,
+                context_assembly_trace: None,
+                selector_confidence: None,
+                routing_domain_hint: None,
+                entity_learn_skipped_no_domain: false,
+            })
             .unwrap();
         astra_services::session_journal::JournalWriter::new("sess-reflect")
             .unwrap()
@@ -11262,7 +11401,9 @@ print(json.dumps({'context': 'user said: ' + msg}))
         let prompt = host.last_reflection_prompt.as_deref().unwrap();
         assert!(prompt.contains("Effective goal: stabilize reflection loop"));
         assert!(prompt.contains("Goal progress: 2/4 milestones complete"));
-        assert!(prompt.contains("Verification summary: objective pending"));
+        assert!(prompt.contains("Verification summary:"));
+        assert!(prompt.contains("Tool health:"));
+        assert!(prompt.contains("Blocked tools: bash"));
         assert!(prompt.contains("Recent evaluation events:"));
         assert!(prompt.contains("[GoalSteered]"));
         assert!(prompt.contains("[Verification]"));
