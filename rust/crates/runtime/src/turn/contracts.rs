@@ -212,6 +212,11 @@ pub struct TurnLearningOutcome {
     /// Used to close the feedback loop: low scores indicate user dissatisfaction
     /// even if the turn technically succeeded.
     pub user_feedback_score: Option<i64>,
+    /// Risk that the turn's apparent success came from repetitive cheap actions
+    /// rather than genuine progress.
+    pub reward_hacking_risk: f64,
+    /// Human-readable reasons for the reward-hacking risk score.
+    pub reward_hacking_flags: Vec<String>,
 }
 
 /// Trait for recording turn outcomes into pipeline learning modules.

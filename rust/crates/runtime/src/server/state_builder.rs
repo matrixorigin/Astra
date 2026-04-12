@@ -364,6 +364,8 @@ mod tests {
             task_type_label: Some("code".to_string()),
             domain_hint_label: Some("github".to_string()),
             user_feedback_score: None,
+            reward_hacking_risk: 0.0,
+            reward_hacking_flags: Vec::new(),
         };
         let _ = writer.record_outcome(outcome).await;
     }
@@ -383,6 +385,8 @@ mod tests {
                 task_type_label: Some("code".to_string()),
                 domain_hint_label: None,
                 user_feedback_score: None,
+                reward_hacking_risk: 0.0,
+                reward_hacking_flags: Vec::new(),
             };
             let _ = writer.record_outcome(outcome).await;
         }

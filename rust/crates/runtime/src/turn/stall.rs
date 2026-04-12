@@ -154,10 +154,112 @@ pub enum DivergenceStatus {
     Diverging(usize),
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct RewardHackingAssessment {
+    pub risk: f64,
+    pub flags: Vec<String>,
+}
+
 fn tool_names_from_sigs(sigs: &BTreeSet<String>) -> Vec<String> {
     sigs.iter()
         .filter_map(|sig| sig.split(':').next().map(String::from))
         .collect()
+}
+
+fn max_duplicate_count(values: &[String]) -> usize {
+    let mut counts = HashMap::new();
+    for value in values {
+        *counts.entry(value).or_insert(0usize) += 1;
+    }
+    counts.into_values().max().unwrap_or(0)
+}
+
+fn tool_call_signatures(tool_calls: &[Value]) -> Vec<String> {
+    tool_calls
+        .iter()
+        .map(|tool_call| {
+            let name = tool_call_name(tool_call).unwrap_or("");
+            let args = tool_call_arguments_value(tool_call);
+            format!(
+                "{}:{}",
+                name,
+                serde_json::to_string(&args).unwrap_or_default()
+            )
+        })
+        .collect()
+}
+
+fn ordered_tool_call_names(tool_calls: &[Value]) -> Vec<String> {
+    tool_calls
+        .iter()
+        .map(|tool_call| tool_call_name(tool_call).unwrap_or("").to_string())
+        .filter(|name| !name.is_empty())
+        .collect()
+}
+
+pub fn assess_reward_hacking(
+    tool_calls: &[Value],
+    quality: f64,
+    user_feedback_score: Option<i64>,
+) -> RewardHackingAssessment {
+    let tool_names = ordered_tool_call_names(tool_calls);
+    if tool_names.is_empty() {
+        return RewardHackingAssessment {
+            risk: 0.0,
+            flags: Vec::new(),
+        };
+    }
+
+    let mut risk = 0.0_f64;
+    let mut flags = Vec::new();
+    let identical_signature_count = max_duplicate_count(&tool_call_signatures(tool_calls));
+    if identical_signature_count >= 2 {
+        flags.push(format!(
+            "repeated identical tool call x{identical_signature_count}"
+        ));
+        risk += if identical_signature_count >= 3 {
+            0.55
+        } else {
+            0.35
+        };
+    }
+
+    let repeated_tool_name_count = max_duplicate_count(&tool_names);
+    if repeated_tool_name_count >= 3 {
+        flags.push(format!("repeated tool name x{repeated_tool_name_count}"));
+        risk += 0.20;
+    }
+
+    if tool_names.len() >= 2
+        && tool_names
+            .iter()
+            .all(|name| EXPLORATION_TOOLS.contains(&name.as_str()))
+    {
+        flags.push("exploration-only tool chain".to_string());
+        risk += 0.25;
+    }
+
+    if !flags.is_empty() && quality >= 0.7 {
+        flags.push("high quality attached to repetitive actions".to_string());
+        risk += 0.15;
+    }
+
+    if !flags.is_empty() && user_feedback_score.is_some_and(|score| score < 50) {
+        flags.push("low user feedback despite positive-looking outcome".to_string());
+        risk += 0.20;
+    }
+
+    RewardHackingAssessment {
+        risk: risk.clamp(0.0, 0.95),
+        flags,
+    }
+}
+
+pub fn dampen_quality_for_reward_hacking(
+    quality: f64,
+    assessment: &RewardHackingAssessment,
+) -> f64 {
+    (quality * (1.0 - assessment.risk)).clamp(0.0, 1.0)
 }
 
 /// Detect if the agent is diverging: last N rounds used ONLY exploration tools
@@ -748,6 +850,38 @@ mod tests {
         ]);
         // 4 consecutive exploration rounds → Exploring(4), NOT Diverging
         assert_eq!(detect_divergence(&sigs), DivergenceStatus::Exploring(4));
+    }
+
+    #[test]
+    fn reward_hacking_flags_repeated_identical_exploration() {
+        let tool_calls = vec![
+            serde_json::json!({"function": {"name": "read_file", "arguments": {"path": "src/lib.rs"}}}),
+            serde_json::json!({"function": {"name": "read_file", "arguments": {"path": "src/lib.rs"}}}),
+            serde_json::json!({"function": {"name": "read_file", "arguments": {"path": "src/lib.rs"}}}),
+        ];
+        let assessment = assess_reward_hacking(&tool_calls, 0.9, None);
+        assert!(assessment.risk >= 0.8, "{assessment:?}");
+        assert!(
+            assessment
+                .flags
+                .iter()
+                .any(|flag| flag.contains("repeated identical tool call"))
+        );
+        assert!(
+            assessment
+                .flags
+                .iter()
+                .any(|flag| flag.contains("exploration-only"))
+        );
+    }
+
+    #[test]
+    fn reward_hacking_dampens_quality() {
+        let assessment = RewardHackingAssessment {
+            risk: 0.6,
+            flags: vec!["repeated identical tool call x3".into()],
+        };
+        assert!((dampen_quality_for_reward_hacking(0.9, &assessment) - 0.36).abs() < 0.01);
     }
 
     // ── Universal stemming ──

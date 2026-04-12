@@ -14,6 +14,7 @@ use crate::pipeline::entity::{EntityGraph, extract_entities};
 use crate::pipeline::pattern::PatternLibrary;
 use crate::pipeline::routing::{DomainHint, TaskType};
 use crate::turn::contracts::{TurnLearningOutcome, TurnLearningWriter};
+use crate::turn::stall::{assess_reward_hacking, dampen_quality_for_reward_hacking};
 
 /// Concrete implementation of [`TurnLearningWriter`] that updates pipeline modules.
 ///
@@ -133,12 +134,11 @@ impl TurnLearningWriter for PipelineLearningWriter {
         let task_type = parse_task_type(outcome.task_type_label.as_deref());
         let domain = parse_domain_hint(outcome.domain_hint_label.as_deref());
         let feedback = outcome.user_feedback_score;
+        let trusted_success = outcome.success && outcome.reward_hacking_risk < 0.5;
 
         // 1. Entity graph: learn entity → domain → tools (only on success)
         // Pass feedback to modulate confidence growth
-        if outcome.success
-            && let Some(eg) = &self.entity_graph
-        {
+        if trusted_success && let Some(eg) = &self.entity_graph {
             let mut graph = eg.lock().unwrap_or_else(|e| e.into_inner());
             let entities = extract_entities(&outcome.query);
             if let Some(d) = domain {
@@ -156,7 +156,7 @@ impl TurnLearningWriter for PipelineLearningWriter {
                 &outcome.tools_used,
                 task_type,
                 domain,
-                outcome.success,
+                trusted_success,
                 outcome.quality,
                 feedback,
             );
@@ -202,9 +202,20 @@ pub fn build_learning_outcome_from_payload(
         })
         .unwrap_or_default();
     let tools_used = tools_used.unwrap_or_default();
+    let tool_calls = obj
+        .get("tool_calls")
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    // User feedback score: extracted from payload if available (will be populated
+    // later when feedback is submitted via /api/v1/learning/feedback)
+    let user_feedback_score = obj.get("user_feedback_score").and_then(|v| v.as_i64());
 
     // Extract quality from tool_quality_assessments
-    let quality = extract_aggregate_quality(obj);
+    let raw_quality = extract_aggregate_quality(obj);
+    let reward_hacking = assess_reward_hacking(&tool_calls, raw_quality, user_feedback_score);
+    let quality = dampen_quality_for_reward_hacking(raw_quality, &reward_hacking);
 
     // Extract routing metadata
     let (task_type_label, domain_hint_label) = extract_routing_labels(obj);
@@ -214,10 +225,6 @@ pub fn build_learning_outcome_from_payload(
 
     // Correction detection: check if this payload indicates a correction turn
     let was_corrected = detect_correction(obj);
-
-    // User feedback score: extracted from payload if available (will be populated
-    // later when feedback is submitted via /api/v1/learning/feedback)
-    let user_feedback_score = obj.get("user_feedback_score").and_then(|v| v.as_i64());
 
     Some(TurnLearningOutcome {
         query,
@@ -229,6 +236,8 @@ pub fn build_learning_outcome_from_payload(
         task_type_label,
         domain_hint_label,
         user_feedback_score,
+        reward_hacking_risk: reward_hacking.risk,
+        reward_hacking_flags: reward_hacking.flags,
     })
 }
 
@@ -406,6 +415,8 @@ mod tests {
         assert!(!outcome.was_corrected);
         assert_eq!(outcome.task_type_label.as_deref(), Some("fetch"));
         assert_eq!(outcome.domain_hint_label.as_deref(), Some("github"));
+        assert_eq!(outcome.reward_hacking_risk, 0.0);
+        assert!(outcome.reward_hacking_flags.is_empty());
     }
 
     #[test]
@@ -475,6 +486,34 @@ mod tests {
         assert!(!detect_correction(&obj));
     }
 
+    #[test]
+    fn extract_outcome_dampens_repetitive_exploration_score() {
+        let payload = json!({
+            "messages": [
+                {"role": "user", "content": "find the struct"}
+            ],
+            "tool_calls": [
+                {"function": {"name": "read_file", "arguments": {"path": "src/lib.rs"}}},
+                {"function": {"name": "read_file", "arguments": {"path": "src/lib.rs"}}},
+                {"function": {"name": "read_file", "arguments": {"path": "src/lib.rs"}}}
+            ],
+            "tool_quality_assessments": [
+                {"quality_score": 0.9}
+            ]
+        });
+
+        let outcome = build_learning_outcome_from_payload(&payload).unwrap();
+        assert!(outcome.reward_hacking_risk >= 0.8, "{outcome:?}");
+        assert!(outcome.quality < 0.3, "{outcome:?}");
+        assert!(!outcome.success, "{outcome:?}");
+        assert!(
+            outcome
+                .reward_hacking_flags
+                .iter()
+                .any(|flag| flag.contains("repeated identical tool call"))
+        );
+    }
+
     // ── PipelineLearningWriter tests ──
 
     #[tokio::test]
@@ -492,6 +531,8 @@ mod tests {
             task_type_label: Some("fetch".into()),
             domain_hint_label: Some("github".into()),
             user_feedback_score: None,
+            reward_hacking_risk: 0.0,
+            reward_hacking_flags: Vec::new(),
         };
 
         writer.record_outcome(outcome).await.unwrap();
@@ -519,6 +560,8 @@ mod tests {
             task_type_label: Some("code".into()),
             domain_hint_label: Some("system".into()),
             user_feedback_score: None,
+            reward_hacking_risk: 0.0,
+            reward_hacking_flags: Vec::new(),
         };
 
         writer.record_outcome(outcome).await.unwrap();
@@ -548,6 +591,8 @@ mod tests {
                 task_type_label: Some("fetch".into()),
                 domain_hint_label: Some("github".into()),
                 user_feedback_score: None,
+                reward_hacking_risk: 0.0,
+                reward_hacking_flags: Vec::new(),
             };
             writer.record_outcome(outcome).await.unwrap();
         }
@@ -577,6 +622,8 @@ mod tests {
                 task_type_label: Some("code".into()),
                 domain_hint_label: Some("code".into()),
                 user_feedback_score: None,
+                reward_hacking_risk: 0.0,
+                reward_hacking_flags: Vec::new(),
             };
             writer.record_outcome(outcome).await.unwrap();
         }
@@ -613,6 +660,8 @@ mod tests {
             task_type_label: Some("fetch".into()),
             domain_hint_label: Some("github".into()),
             user_feedback_score: None,
+            reward_hacking_risk: 0.0,
+            reward_hacking_flags: Vec::new(),
         };
 
         let result = writer.record_outcome(outcome).await;
@@ -636,9 +685,36 @@ mod tests {
             task_type_label: None,
             domain_hint_label: None,
             user_feedback_score: None,
+            reward_hacking_risk: 0.0,
+            reward_hacking_flags: Vec::new(),
         };
         // Should not panic
         let result = writer.record_outcome(outcome).await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn pipeline_writer_skips_entity_learning_on_reward_hacking_risk() {
+        let graph = Arc::new(Mutex::new(EntityGraph::new()));
+        let writer = PipelineLearningWriter::new().with_entity_graph(graph.clone());
+
+        let outcome = TurnLearningOutcome {
+            query: "inspect matrixorigin code".into(),
+            tools_selected: vec!["read_file".into()],
+            tools_used: vec!["read_file".into(), "read_file".into(), "read_file".into()],
+            success: true,
+            quality: 0.35,
+            was_corrected: false,
+            task_type_label: Some("code".into()),
+            domain_hint_label: Some("code".into()),
+            user_feedback_score: None,
+            reward_hacking_risk: 0.8,
+            reward_hacking_flags: vec!["repeated identical tool call x3".into()],
+        };
+
+        writer.record_outcome(outcome).await.unwrap();
+
+        let g = graph.lock().unwrap();
+        assert!(g.boost_for("matrixorigin").is_empty());
     }
 }
