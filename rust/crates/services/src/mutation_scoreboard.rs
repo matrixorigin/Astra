@@ -63,6 +63,13 @@ fn format_value_interval_evidence(
     }
 }
 
+fn format_confidence_interval_evidence(label: &str, interval: ConfidenceInterval) -> String {
+    format!(
+        "{label}={:.2}[{:.2},{:.2}]",
+        interval.point, interval.lower, interval.upper
+    )
+}
+
 fn interval_floor(value: f64, interval: Option<&ValueInterval>) -> f64 {
     interval.map_or(value, |interval| interval.lower)
 }
@@ -270,7 +277,7 @@ impl MutationJudgment {
             MutationSafetyVerdict::Safe
         };
 
-        let retention_verdict = if !all_required_passed || retention_score.point < 0.4 {
+        let retention_verdict = if !all_required_passed || retention_score.upper < 0.4 {
             rationale.push("retain_score_below_threshold".to_string());
             MutationRetentionVerdict::Reject
         } else if retention_score.lower >= 0.6 && verifier_pass_rate.lower >= 0.7 {
@@ -329,7 +336,7 @@ impl MutationJudgment {
                 quality.point, quality.lower, quality.upper
             ));
             self.promotion_verdict.confidence_score =
-                self.promotion_verdict.confidence_score.min(quality.point);
+                self.promotion_verdict.confidence_score.min(quality.lower);
             if quality.lower < 0.55 {
                 self.promotion_verdict
                     .blockers
@@ -507,13 +514,18 @@ fn build_mutation_promotion_verdict(
     pre_state_snapshot_id: Option<&str>,
     rationale: &[String],
 ) -> MutationPromotionVerdict {
-    let mut evidence = vec![format!("retention_score={:.2}", retention_score.point)];
+    let mut evidence = vec![format_confidence_interval_evidence(
+        "retention_score",
+        retention_score,
+    )];
     let mut blockers = Vec::new();
 
     let support_score = if let Some(summary) = verifier {
         evidence.push(format!(
-            "verifier_pass_rate={:.2} ({}/{})",
-            summary.pass_rate.point, summary.criteria_passed, summary.criteria_total
+            "{} ({}/{})",
+            format_confidence_interval_evidence("verifier_pass_rate", summary.pass_rate),
+            summary.criteria_passed,
+            summary.criteria_total
         ));
         if !summary.all_required_passed {
             blockers.push(format!(
@@ -521,7 +533,7 @@ fn build_mutation_promotion_verdict(
                 summary.failing_criteria.join(",")
             ));
         }
-        summary.pass_rate.point
+        summary.pass_rate.lower
     } else {
         evidence.push("no_structured_verifier_signal".into());
         0.55
@@ -552,7 +564,7 @@ fn build_mutation_promotion_verdict(
     let rollback_hint = compensation.compensation_summary.clone().or_else(|| {
         pre_state_snapshot_id.map(|snapshot_id| format!("restore snapshot {snapshot_id}"))
     });
-    let confidence_score = retention_score.point;
+    let confidence_score = retention_score.lower;
     let overall_score =
         (confidence_score * 0.45 + support_score * 0.30 + safety_score * 0.25).clamp(0.0, 1.0);
 
@@ -968,6 +980,79 @@ mod tests {
                 .evidence
                 .iter()
                 .any(|evidence| evidence == "no_structured_verifier_signal")
+        );
+    }
+
+    #[test]
+    fn uncertain_retention_score_stays_review_instead_of_reject() {
+        let mutation = StagedMutation::new(
+            "mut-uncertain",
+            "session-1",
+            6,
+            "write_file",
+            serde_json::json!({"path": "src/lib.rs"}),
+            Some("snap-6".into()),
+            MutationObjectiveScore::new(
+                ConfidenceInterval::new(0.38, 0.28, 0.48),
+                None,
+                ConfidenceInterval::exact(0.05),
+                ConfidenceInterval::exact(0.90),
+                false,
+            ),
+            Some(MutationVerifierSummary::from_report(&verification_report(
+                true,
+            ))),
+            automated_policy(true),
+        );
+
+        assert_eq!(
+            mutation.judgment.retention_verdict,
+            MutationRetentionVerdict::Review
+        );
+        assert!(
+            mutation
+                .judgment
+                .rationale
+                .iter()
+                .any(|reason| reason == "retain_score_requires_review")
+        );
+    }
+
+    #[test]
+    fn promotion_verdict_uses_lower_bounds_for_scalar_scores() {
+        let mutation = StagedMutation::new(
+            "mut-lower-bounds",
+            "session-1",
+            7,
+            "write_file",
+            serde_json::json!({"path": "src/lib.rs"}),
+            Some("snap-7".into()),
+            MutationObjectiveScore::new(
+                ConfidenceInterval::new(0.78, 0.64, 0.88),
+                None,
+                ConfidenceInterval::exact(0.05),
+                ConfidenceInterval::exact(0.90),
+                false,
+            ),
+            Some(MutationVerifierSummary {
+                all_required_passed: true,
+                criteria_total: 3,
+                criteria_passed: 3,
+                pass_rate: ConfidenceInterval::new(0.90, 0.72, 0.98),
+                failing_criteria: Vec::new(),
+            }),
+            automated_policy(true),
+        );
+
+        assert!((mutation.judgment.promotion_verdict.confidence_score - 0.64).abs() < 0.0001);
+        assert!((mutation.judgment.promotion_verdict.support_score - 0.72).abs() < 0.0001);
+        assert!(
+            mutation
+                .judgment
+                .promotion_verdict
+                .evidence
+                .iter()
+                .any(|evidence| evidence.contains("retention_score=0.78[0.64,0.88]"))
         );
     }
 

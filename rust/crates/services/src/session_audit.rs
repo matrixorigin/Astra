@@ -2223,7 +2223,7 @@ fn apply_cross_session_mutation_filters(
     }
     if let Some(min_retention_score) = params.min_retention_score {
         let threshold = min_retention_score.clamp(0.0, 1.0);
-        mutations.retain(|mutation| mutation.judgment.retention_score.point >= threshold);
+        mutations.retain(|mutation| mutation.judgment.retention_score.lower >= threshold);
     }
     if let Some(verifier_signal) = params.verifier_signal {
         mutations.retain(|mutation| match verifier_signal {
@@ -2256,11 +2256,7 @@ fn sort_cross_session_mutations(mutations: &mut [StagedMutation], sort: &str) {
         }
         "retention" => {
             mutations.sort_by(|left, right| {
-                right
-                    .judgment
-                    .retention_score
-                    .point
-                    .total_cmp(&left.judgment.retention_score.point)
+                mutation_retention_cmp(left, right)
                     .then_with(|| mutation_priority_cmp(left, right))
                     .then_with(|| mutation_updated_cmp(left, right))
             });
@@ -2268,13 +2264,7 @@ fn sort_cross_session_mutations(mutations: &mut [StagedMutation], sort: &str) {
         _ => {
             mutations.sort_by(|left, right| {
                 mutation_priority_cmp(left, right)
-                    .then_with(|| {
-                        right
-                            .judgment
-                            .retention_score
-                            .point
-                            .total_cmp(&left.judgment.retention_score.point)
-                    })
+                    .then_with(|| mutation_retention_cmp(left, right))
                     .then_with(|| mutation_updated_cmp(left, right))
             });
         }
@@ -2283,6 +2273,21 @@ fn sort_cross_session_mutations(mutations: &mut [StagedMutation], sort: &str) {
 
 fn mutation_priority_cmp(left: &StagedMutation, right: &StagedMutation) -> std::cmp::Ordering {
     mutation_priority_tuple(right).cmp(&mutation_priority_tuple(left))
+}
+
+fn mutation_retention_cmp(left: &StagedMutation, right: &StagedMutation) -> std::cmp::Ordering {
+    right
+        .judgment
+        .retention_score
+        .lower
+        .total_cmp(&left.judgment.retention_score.lower)
+        .then_with(|| {
+            right
+                .judgment
+                .retention_score
+                .point
+                .total_cmp(&left.judgment.retention_score.point)
+        })
 }
 
 fn mutation_priority_tuple(mutation: &StagedMutation) -> (u8, u8, u8, u8) {
@@ -3900,6 +3905,18 @@ mod tests {
 
     #[test]
     fn cross_session_mutation_queue_filters_by_tool_and_verdicts() {
+        let mut wrong_score = sample_queue_mutation(
+            "wrong-score",
+            "session-b",
+            "write_file",
+            StagedMutationState::Pending,
+            MutationSafetyVerdict::RequiresApproval,
+            MutationRetentionVerdict::Retain,
+            0.82,
+            Some("2026-04-10T13:00:00Z"),
+        );
+        wrong_score.judgment.retention_score = ConfidenceInterval::new(0.82, 0.42, 0.91);
+
         let response = select_cross_session_mutations(
             vec![
                 sample_queue_mutation(
@@ -3932,16 +3949,7 @@ mod tests {
                     0.83,
                     Some("2026-04-10T12:00:00Z"),
                 ),
-                sample_queue_mutation(
-                    "wrong-score",
-                    "session-b",
-                    "write_file",
-                    StagedMutationState::Pending,
-                    MutationSafetyVerdict::RequiresApproval,
-                    MutationRetentionVerdict::Retain,
-                    0.42,
-                    Some("2026-04-10T13:00:00Z"),
-                ),
+                wrong_score,
             ],
             &CrossSessionMutationListParams {
                 page: 1,
@@ -3965,6 +3973,64 @@ mod tests {
         assert_eq!(response.total, 1);
         assert_eq!(response.mutations.len(), 1);
         assert_eq!(response.mutations[0].mutation_id, "match");
+    }
+
+    #[test]
+    fn cross_session_mutation_queue_sorts_retention_by_lower_bound_first() {
+        let mut uncertain_high_point = sample_queue_mutation(
+            "uncertain-high-point",
+            "session-a",
+            "write_file",
+            StagedMutationState::Pending,
+            MutationSafetyVerdict::RequiresApproval,
+            MutationRetentionVerdict::Retain,
+            0.92,
+            Some("2026-04-10T10:00:00Z"),
+        );
+        uncertain_high_point.judgment.retention_score = ConfidenceInterval::new(0.92, 0.41, 0.99);
+
+        let mut steady_lower_bound = sample_queue_mutation(
+            "steady-lower-bound",
+            "session-b",
+            "write_file",
+            StagedMutationState::Pending,
+            MutationSafetyVerdict::RequiresApproval,
+            MutationRetentionVerdict::Retain,
+            0.83,
+            Some("2026-04-10T10:00:00Z"),
+        );
+        steady_lower_bound.judgment.retention_score = ConfidenceInterval::new(0.83, 0.79, 0.87);
+
+        let response = select_cross_session_mutations(
+            vec![uncertain_high_point, steady_lower_bound],
+            &CrossSessionMutationListParams {
+                page: 1,
+                per_page: 20,
+                since: None,
+                until: None,
+                session_id: None,
+                tool_name: None,
+                state: Some(StagedMutationState::Pending),
+                promotion_recommendation: Some(MutationPromotionRecommendation::Canary),
+                safety_verdict: Some(MutationSafetyVerdict::RequiresApproval),
+                retention_verdict: Some(MutationRetentionVerdict::Retain),
+                min_retention_score: None,
+                verifier_signal: None,
+                verifier_source: None,
+                verifier_gap: None,
+                sort: "retention".into(),
+            },
+        );
+
+        let ordered_ids = response
+            .mutations
+            .iter()
+            .map(|mutation| mutation.mutation_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ordered_ids,
+            vec!["steady-lower-bound", "uncertain-high-point"]
+        );
     }
 
     #[test]
