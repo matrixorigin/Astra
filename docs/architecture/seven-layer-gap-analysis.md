@@ -84,12 +84,13 @@
 - **ScenarioDetector** (`user_profile.rs:520`): Confidence-threshold-based scenario detection.
 - **EvolutionRules** (`auto_tuning.rs`): Trigger → action rules with cooldown and rate limiting.
 - **MutationScoreboard contract** (`services/src/mutation_scoreboard.rs`): Canonical typed scoreboard now unifies verifier summaries, objective/reward signals, staged mutation state, and aggregated retention metrics.
+- **Decision-audit-backed mutation scoreboard exposure** (`runtime/src/bridge/side_effects.rs`, `services/src/session_audit.rs`, `runtime/src/server/audit_handlers.rs`): tool-selection decision audits now persist `mutation_objective_score`, tool arguments, and turn metadata, and `/sessions/{session_id}/audit/mutations` reconstructs a typed per-session scoreboard for report/ops inspection.
 
 ### Gaps
 - **Most evaluation routes return 501**: `DatabaseEvaluationService` has "not implemented yet" for drift detection, drift pipeline, closed-loop, training data, SLO.
 - **No multi-objective optimization**: Evaluation is single-dimensional (quality score). No Pareto frontier for efficiency × cost × accuracy.
 - **No noise filtering**: FeedbackSignals are consumed raw; no statistical filtering for outliers or noise.
-- **No persisted unified scoreboard**: `MutationScoreboard` is currently a typed contract only; it is not yet written, queried, or surfaced through report/ops APIs.
+- **No cross-session / verifier-complete scoreboard yet**: `MutationScoreboard` is now reconstructed from persisted decision audits for per-session ops/report views, but verifier outcomes and cross-session mutation analytics are not yet stitched into one persisted surface.
 - **Confidence intervals are not end-to-end**: `ConfidenceInterval` exists in core/runtime, but evaluation and report surfaces do not expose it consistently.
 - **No verifier diversity**: Gate validation is single-pass, not ensemble-based.
 
@@ -176,7 +177,7 @@
 | 1. State | ⬛⬛⬛⬜⬜ 60% | CompositeSnapshot 5D | No diff/merge/revert |
 | 2. Observation | ⬛⬛⬛⬜⬜ 55% | CausalChain + JournalEvents | Linear chains, no graph |
 | 3. Action | ⬛⬛⬜⬜⬜ 45% | Permission 3-tier model + compensation profiles | No automatic rollback executor |
-| 4. Evaluation | ⬛⬛⬜⬜⬜ 40% | EvaluationService + MutationScoreboard | Scoreboard not persisted/exposed |
+| 4. Evaluation | ⬛⬛⬜⬜⬜ 45% | EvaluationService + MutationScoreboard | No cross-session / verifier-complete scoreboard |
 | 5. Credit | ⬛⬜⬜⬜⬜ 25% | causal_chain_id on events | No diff-based scoring |
 | 6. Search | ⬛⬛⬜⬜⬜ 35% | SchedulingContract + TeamOrch | No proposal diversity |
 | 7. Safety | ⬛⬛⬛⬜⬜ 55% | Drift detection + middleware | Causal guard is heuristic-only |

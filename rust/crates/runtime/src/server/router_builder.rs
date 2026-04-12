@@ -416,6 +416,10 @@ pub(super) fn build_router(state: AppState) -> Router {
             "/sessions/{session_id}/audit/errors",
             get(audit_handlers::audit_errors_handler),
         )
+        .route(
+            "/sessions/{session_id}/audit/mutations",
+            get(audit_handlers::audit_mutations_handler),
+        )
         // Cross-session Analytics
         .route(
             "/audit/sessions",

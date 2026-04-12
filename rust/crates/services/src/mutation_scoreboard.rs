@@ -37,6 +37,10 @@ impl MutationCompensationPolicy {
             compensation_summary: None,
         }
     }
+
+    pub fn from_value(value: &Value) -> Option<Self> {
+        serde_json::from_value(value.clone()).ok()
+    }
 }
 
 fn is_false(value: &bool) -> bool {
@@ -101,6 +105,10 @@ impl MutationObjectiveScore {
             score = score.min(ConfidenceInterval::exact(0.25));
         }
         score
+    }
+
+    pub fn from_value(value: &Value) -> Option<Self> {
+        serde_json::from_value(value.clone()).ok()
     }
 }
 
@@ -289,6 +297,13 @@ impl StagedMutation {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct PersistedMutationDecision {
+    pub decision_id: String,
+    pub session_id: String,
+    pub decision_output: Value,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MutationScoreboard {
     pub scoreboard_id: String,
@@ -371,10 +386,84 @@ impl MutationScoreboard {
             mutations,
         }
     }
+
+    pub fn from_persisted_decisions(
+        scoreboard_id: impl Into<String>,
+        session_id: impl Into<String>,
+        decisions: impl IntoIterator<Item = PersistedMutationDecision>,
+    ) -> Self {
+        let session_id = session_id.into();
+        let mutations = decisions
+            .into_iter()
+            .flat_map(staged_mutations_from_persisted_decision)
+            .collect::<Vec<_>>();
+        Self::new(scoreboard_id, session_id, mutations)
+    }
 }
 
 fn normalized_feedback_interval(score: i64) -> ConfidenceInterval {
     ConfidenceInterval::exact((score as f64 / 100.0).clamp(0.0, 1.0))
+}
+
+fn staged_mutations_from_persisted_decision(
+    decision: PersistedMutationDecision,
+) -> Vec<StagedMutation> {
+    let Some(objective) = decision
+        .decision_output
+        .get("mutation_objective_score")
+        .and_then(MutationObjectiveScore::from_value)
+    else {
+        return Vec::new();
+    };
+    let turn_index = decision
+        .decision_output
+        .get("turn")
+        .and_then(Value::as_u64)
+        .unwrap_or_default() as u32;
+    let Some(action_profiles) = decision
+        .decision_output
+        .get("action_profiles")
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+
+    action_profiles
+        .iter()
+        .enumerate()
+        .filter_map(|(index, action_profile)| {
+            let tool_name = action_profile.get("tool_name").and_then(Value::as_str)?;
+            let compensation = action_profile
+                .get("profile")
+                .and_then(MutationCompensationPolicy::from_value)?;
+            let tool_call_id = action_profile
+                .get("tool_call_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let mutation_id = if tool_call_id.is_empty() {
+                format!("{}:{index}", decision.decision_id)
+            } else {
+                format!("{}:{tool_call_id}", decision.decision_id)
+            };
+            Some(StagedMutation::new(
+                mutation_id,
+                decision.session_id.clone(),
+                turn_index,
+                tool_name,
+                action_profile
+                    .get("arguments")
+                    .cloned()
+                    .unwrap_or_else(|| Value::Object(Default::default())),
+                action_profile
+                    .get("pre_state_snapshot_id")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string),
+                objective.clone(),
+                None,
+                compensation,
+            ))
+        })
+        .collect()
 }
 
 fn average_confidence(values: impl Iterator<Item = ConfidenceInterval>) -> ConfidenceInterval {
@@ -560,5 +649,55 @@ mod tests {
         assert_eq!(scoreboard.blocked_mutations, 0);
         assert!(scoreboard.avg_retention_score.point > 0.5);
         assert!(scoreboard.avg_reward_hacking_risk.point < 0.2);
+    }
+
+    #[test]
+    fn scoreboard_rehydrates_persisted_decisions() {
+        let scoreboard = MutationScoreboard::from_persisted_decisions(
+            "board-1",
+            "session-1",
+            vec![PersistedMutationDecision {
+                decision_id: "decision-1".into(),
+                session_id: "session-1".into(),
+                decision_output: serde_json::json!({
+                    "turn": 7,
+                    "mutation_objective_score": {
+                        "quality": {"point": 0.82, "lower": 0.82, "upper": 0.82},
+                        "user_feedback": {"point": 0.91, "lower": 0.91, "upper": 0.91},
+                        "reward_hacking_risk": {"point": 0.10, "lower": 0.10, "upper": 0.10},
+                        "causal_support": {"point": 0.78, "lower": 0.78, "upper": 0.78},
+                        "was_corrected": false
+                    },
+                    "action_profiles": [
+                        {
+                            "tool_call_id": "call-1",
+                            "tool_name": "write_file",
+                            "arguments": {"path": "src/lib.rs"},
+                            "profile": {
+                                "bounded": true,
+                                "reversible": true,
+                                "requires_pre_state": true,
+                                "action_category": "write",
+                                "compensation_kind": "restore_or_delete_file",
+                                "compensation_summary": "restore prior contents"
+                            }
+                        }
+                    ]
+                }),
+            }],
+        );
+
+        assert_eq!(scoreboard.total_mutations, 1);
+        assert_eq!(scoreboard.mutations[0].turn_index, 7);
+        assert_eq!(scoreboard.mutations[0].tool_name, "write_file");
+        assert_eq!(
+            scoreboard.mutations[0].tool_args["path"].as_str(),
+            Some("src/lib.rs")
+        );
+        assert_eq!(
+            scoreboard.mutations[0].judgment.safety_verdict,
+            MutationSafetyVerdict::RequiresApproval
+        );
+        assert_eq!(scoreboard.approval_required_mutations, 1);
     }
 }

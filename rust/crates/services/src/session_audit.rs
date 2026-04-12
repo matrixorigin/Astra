@@ -8,6 +8,7 @@ use axum::{Json, http::StatusCode};
 use serde::{Deserialize, Serialize};
 use sqlx::{Row, query};
 
+use crate::{MutationScoreboard, PersistedMutationDecision};
 use astra_core::{
     ErrorResponse, MatrixOneSettings, SharedPool, connect_matrixone, error_response, internal_error,
 };
@@ -328,6 +329,13 @@ pub trait SessionAuditService: Send + Sync {
 
     /// List error/anomaly events in a session.
     async fn list_errors(&self, user_id: &str, session_id: &str) -> AuditResult<ErrorListResponse>;
+
+    /// Get the per-session mutation scoreboard reconstructed from decision audits.
+    async fn get_mutation_scoreboard(
+        &self,
+        user_id: &str,
+        session_id: &str,
+    ) -> AuditResult<MutationScoreboard>;
 
     // ── Cross-session methods ────────────────────────────────────────────────
 
@@ -910,6 +918,45 @@ impl SessionAuditService for DatabaseSessionAuditService {
         Ok(ErrorListResponse { errors, total })
     }
 
+    async fn get_mutation_scoreboard(
+        &self,
+        user_id: &str,
+        session_id: &str,
+    ) -> AuditResult<MutationScoreboard> {
+        let pool = self.get_pool().await.map_err(internal_error)?;
+        self.verify_session_owner(&pool, session_id, user_id)
+            .await?;
+
+        let rows = query(
+            "SELECT decision_id, session_id, CAST(decision_output AS CHAR) AS decision_output \
+             FROM ctx_decision_audits \
+             WHERE session_id = ? AND decision_type = 'tool_selection' \
+             ORDER BY created_at ASC",
+        )
+        .bind(session_id)
+        .fetch_all(&pool)
+        .await
+        .map_err(internal_error)?;
+
+        let decisions = rows
+            .into_iter()
+            .map(|row| {
+                let decision_output = row
+                    .try_get::<String, _>("decision_output")
+                    .ok()
+                    .and_then(|value| serde_json::from_str(&value).ok())
+                    .unwrap_or(serde_json::Value::Null);
+                PersistedMutationDecision {
+                    decision_id: row.try_get("decision_id").unwrap_or_default(),
+                    session_id: row.try_get("session_id").unwrap_or_default(),
+                    decision_output,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        Ok(build_mutation_scoreboard(session_id, decisions))
+    }
+
     // ── Cross-session implementations ────────────────────────────────────────
 
     async fn list_sessions(
@@ -1324,6 +1371,9 @@ impl SessionAuditService for UnconfiguredSessionAuditService {
     async fn list_errors(&self, _: &str, _: &str) -> AuditResult<ErrorListResponse> {
         Err(internal_error("audit service not configured"))
     }
+    async fn get_mutation_scoreboard(&self, _: &str, _: &str) -> AuditResult<MutationScoreboard> {
+        Err(internal_error("audit service not configured"))
+    }
     async fn list_sessions(
         &self,
         _: &str,
@@ -1401,6 +1451,17 @@ fn compute_duration_secs(first: Option<&str>, last: Option<&str>) -> f64 {
         }
         _ => 0.0,
     }
+}
+
+fn build_mutation_scoreboard(
+    session_id: &str,
+    decisions: Vec<PersistedMutationDecision>,
+) -> MutationScoreboard {
+    MutationScoreboard::from_persisted_decisions(
+        format!("audit:mutation-scoreboard:{session_id}"),
+        session_id.to_string(),
+        decisions,
+    )
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -1911,5 +1972,67 @@ mod tests {
         let json = serde_json::to_string(&t).unwrap();
         let restored: CrossSessionToolAnalytics = serde_json::from_str(&json).unwrap();
         assert_eq!(restored.last_error.as_deref(), Some("timeout"));
+    }
+
+    #[test]
+    fn build_mutation_scoreboard_skips_decisions_without_objective_score() {
+        let scoreboard = build_mutation_scoreboard(
+            "session-1",
+            vec![
+                PersistedMutationDecision {
+                    decision_id: "decision-1".into(),
+                    session_id: "session-1".into(),
+                    decision_output: serde_json::json!({
+                        "turn": 4,
+                        "mutation_objective_score": {
+                            "quality": {"point": 0.84, "lower": 0.84, "upper": 0.84},
+                            "reward_hacking_risk": {"point": 0.10, "lower": 0.10, "upper": 0.10},
+                            "causal_support": {"point": 0.75, "lower": 0.75, "upper": 0.75},
+                            "was_corrected": false
+                        },
+                        "action_profiles": [
+                            {
+                                "tool_call_id": "call-1",
+                                "tool_name": "edit_file",
+                                "arguments": {"path": "src/lib.rs"},
+                                "profile": {
+                                    "bounded": true,
+                                    "reversible": true,
+                                    "requires_pre_state": false,
+                                    "action_category": "write",
+                                    "compensation_kind": "restore_file",
+                                    "compensation_summary": "restore prior contents"
+                                }
+                            }
+                        ]
+                    }),
+                },
+                PersistedMutationDecision {
+                    decision_id: "decision-2".into(),
+                    session_id: "session-1".into(),
+                    decision_output: serde_json::json!({
+                        "turn": 5,
+                        "action_profiles": [
+                            {
+                                "tool_call_id": "call-2",
+                                "tool_name": "bash",
+                                "arguments": {"command": "ls"},
+                                "profile": {
+                                    "bounded": true,
+                                    "reversible": true,
+                                    "requires_pre_state": false,
+                                    "action_category": "read"
+                                }
+                            }
+                        ]
+                    }),
+                },
+            ],
+        );
+
+        assert_eq!(scoreboard.total_mutations, 1);
+        assert_eq!(scoreboard.ready_mutations, 1);
+        assert_eq!(scoreboard.mutations[0].tool_name, "edit_file");
+        assert_eq!(scoreboard.mutations[0].turn_index, 4);
     }
 }

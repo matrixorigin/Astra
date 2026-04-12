@@ -528,13 +528,18 @@ fn build_hook_db_persist_from_payload(
                 .get("arguments")
                 .cloned()
                 .unwrap_or_else(|| serde_json::Value::Object(Default::default()));
+            let profile = crate::tool_action_profile_value(tool_name, &arguments);
             serde_json::json!({
                 "tool_call_id": tool_call.get("id").cloned().unwrap_or(serde_json::Value::String(String::new())),
                 "tool_name": tool_name,
-                "profile": crate::tool_action_profile_value(tool_name, &arguments),
+                "arguments": arguments,
+                "profile": profile,
             })
         })
         .collect::<Vec<_>>();
+    let mutation_objective_score =
+        crate::pipeline::learning::build_learning_outcome_from_payload(payload)
+            .and_then(|outcome| serde_json::to_value(outcome.mutation_objective_score()).ok());
     let decision_audit = Some(TurnDecisionAuditRecord {
         decision_id: Uuid::now_v7().to_string(),
         session_id: session_id.clone(),
@@ -546,8 +551,10 @@ fn build_hook_db_persist_from_payload(
         },
         decision_output: serde_json::json!({
             "text": truncate_text(optional_object_str(hook_payload, "full_text").unwrap_or_default(), 500),
+            "turn": hook_payload.get("turn_count").cloned(),
             "tool_calls": tool_call_names,
             "action_profiles": tool_action_profiles,
+            "mutation_objective_score": mutation_objective_score,
             "model_used": optional_object_str(hook_payload, "model_used"),
         }),
         model_used: optional_object_str(hook_payload, "model_used").map(ToString::to_string),
@@ -2158,6 +2165,11 @@ mod inprocess_hook_contract_tests {
             audit.decision_output["action_profiles"][0]["tool_name"],
             "bash"
         );
+        assert_eq!(audit.decision_output["turn"], 1);
+        assert_eq!(
+            audit.decision_output["action_profiles"][0]["arguments"],
+            json!("{\"command\": \"ls src/\"}")
+        );
         assert_eq!(
             audit.decision_output["action_profiles"][0]["profile"]["category"],
             "read"
@@ -2166,6 +2178,7 @@ mod inprocess_hook_contract_tests {
             audit.decision_output["action_profiles"][0]["profile"]["bounded"],
             false
         );
+        assert!(audit.decision_output["mutation_objective_score"].is_object());
 
         let selection = plan
             .skill_selection

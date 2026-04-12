@@ -133,7 +133,7 @@ pub use multi_agent::{
 pub use mutation_scoreboard::{
     MutationActionCategory, MutationCompensationPolicy, MutationJudgment, MutationObjectiveScore,
     MutationRetentionVerdict, MutationSafetyVerdict, MutationScoreboard, MutationVerifierSummary,
-    StagedMutation, StagedMutationState,
+    PersistedMutationDecision, StagedMutation, StagedMutationState,
 };
 pub use protocol::{
     ApplyDeltaRequest, ApplyDeltaResponse, ApplyOptions, Checkpoint, CheckpointOptions,
