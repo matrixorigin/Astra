@@ -74,6 +74,18 @@ impl std::fmt::Display for GitSafetyViolation {
     }
 }
 
+/// Whether a violation is "soft" — respects auto-run mode and session overrides.
+///
+/// Soft violations are common legitimate operations (e.g. `cd repo && git status`)
+/// that should not repeatedly prompt the user after they chose auto-run.
+/// Hard violations (injection, config manipulation) always require explicit approval.
+pub fn is_soft_violation(v: &GitSafetyViolation) -> bool {
+    matches!(
+        v,
+        GitSafetyViolation::CdGitCompound | GitSafetyViolation::CommitAmend
+    )
+}
+
 /// Validate a shell command for git safety violations.
 ///
 /// Returns all detected violations (may be multiple per command).

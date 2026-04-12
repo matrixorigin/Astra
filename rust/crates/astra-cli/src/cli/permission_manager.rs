@@ -836,11 +836,17 @@ impl PermissionManager {
             return true;
         }
 
-        // Step 2: Git safety checks (bypass-immune — even auto mode can't skip these).
-        // MUST run before session overrides so "always approve" can't skip them.
+        // Step 2: Git safety checks.
+        // Hard violations always require explicit approval.
+        // Soft violations (cd+git, commit --amend) respect auto mode and session overrides.
         if side_effect == SideEffect::Execute {
             let git_violations = Self::check_git_safety(args);
             if !git_violations.is_empty() {
+                use astra_runtime::tool_sandbox::is_soft_violation;
+
+                let has_hard = git_violations.iter().any(|v| !is_soft_violation(v));
+                let all_soft = !has_hard;
+
                 for v in &git_violations {
                     eprintln!("  {}", format!("⚠  Git safety: {v}").yellow());
                 }
@@ -849,8 +855,17 @@ impl PermissionManager {
                     eprintln!("  {}", "  Git safety violation — blocked".red());
                     return false;
                 }
-                // Git safety violations require explicit approval (not auto-approved).
-                if self.mode == PermissionMode::Auto {
+                // Soft-only violations: respect auto mode and session overrides.
+                if all_soft {
+                    if self.mode == PermissionMode::Auto {
+                        return true;
+                    }
+                    if let Some(&allowed) = self.session_overrides.get(name) {
+                        return allowed;
+                    }
+                }
+                // Hard violations: always require explicit approval.
+                if self.mode == PermissionMode::Auto && has_hard {
                     eprintln!(
                         "  {}",
                         "  Git safety violation — requires your approval".yellow()
@@ -1010,13 +1025,36 @@ impl PermissionManager {
             return PermissionDecision::Allow;
         }
 
-        // Step 3: Git safety checks (bypass-immune — MUST run before session overrides).
+        // Step 3: Git safety checks.
+        // Hard violations (injection, config manipulation) are bypass-immune.
+        // Soft violations (cd+git compound, commit --amend) respect auto mode
+        // and session overrides so users aren't repeatedly prompted.
         if side_effect == SideEffect::Execute {
             let git_violations = Self::check_git_safety(args);
             if !git_violations.is_empty() {
+                use astra_runtime::tool_sandbox::is_soft_violation;
+
+                let has_hard = git_violations.iter().any(|v| !is_soft_violation(v));
+                let all_soft = !has_hard;
+
                 if self.mode == PermissionMode::Deny {
                     return PermissionDecision::Deny("Git safety violation (deny mode)".into());
                 }
+
+                // Soft-only violations: respect auto mode and session overrides.
+                if all_soft {
+                    if self.mode == PermissionMode::Auto {
+                        return PermissionDecision::Allow;
+                    }
+                    if let Some(&allowed) = self.session_overrides.get(name) {
+                        return if allowed {
+                            PermissionDecision::Allow
+                        } else {
+                            PermissionDecision::Deny("Skipped for session".into())
+                        };
+                    }
+                }
+
                 let reasons: Vec<String> = git_violations.iter().map(|v| format!("{v}")).collect();
                 let (header, detail) = Self::format_tool_display(name, args);
                 return PermissionDecision::NeedApproval {
