@@ -558,11 +558,7 @@ impl ScenarioDetector {
         scores
             .into_iter()
             .filter(|(_, score)| score.conservatively_exceeds(self.confidence_threshold))
-            .max_by(|a, b| {
-                a.1.point
-                    .partial_cmp(&b.1.point)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
+            .max_by(|a, b| scenario_confidence_cmp(&a.1, &b.1))
     }
 
     /// Score all scenarios based on current evidence.
@@ -640,6 +636,20 @@ impl ScenarioDetector {
         self.recent_queries.clear();
         self.recent_tools.clear();
     }
+}
+
+fn scenario_confidence_cmp(
+    left: &ConfidenceInterval,
+    right: &ConfidenceInterval,
+) -> std::cmp::Ordering {
+    left.lower
+        .partial_cmp(&right.lower)
+        .unwrap_or(std::cmp::Ordering::Equal)
+        .then_with(|| {
+            left.point
+                .partial_cmp(&right.point)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
 }
 
 fn scenario_keywords(scenario: Scenario) -> Vec<&'static str> {
@@ -1086,6 +1096,17 @@ mod tests {
         let mut detector = ScenarioDetector::new();
         detector.observe_query("fix");
         assert!(detector.detect().is_none());
+    }
+
+    #[test]
+    fn scenario_confidence_cmp_prefers_stronger_lower_bound() {
+        let wide_high_point = ConfidenceInterval::new(0.82, 0.61, 1.0);
+        let steadier_lower_bound = ConfidenceInterval::new(0.79, 0.74, 0.84);
+
+        assert_eq!(
+            scenario_confidence_cmp(&wide_high_point, &steadier_lower_bound),
+            std::cmp::Ordering::Less
+        );
     }
 
     #[test]

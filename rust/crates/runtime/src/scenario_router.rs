@@ -56,7 +56,7 @@ impl ScenarioRouter {
         // 1. Scenario detection
         if let Some((scenario, confidence)) = detector.detect() {
             profile.apply_scenario(scenario);
-            profile.confidence = profile.confidence.min(confidence.point);
+            profile.confidence = profile.confidence.min(confidence.lower);
         } else if let Some(scenario) = scenario_from_task_type(routing.task_type) {
             profile.apply_scenario(scenario);
         }
@@ -217,6 +217,25 @@ mod tests {
                 strategy.max_tools_per_turn as u32
             );
         }
+    }
+
+    #[test]
+    fn select_uses_conservative_scenario_confidence() {
+        let config = RuntimeConfig::default();
+        let router = ScenarioRouter::new();
+        let mut detector = ScenarioDetector::new();
+        for _ in 0..5 {
+            detector.observe_query("fix the bug in the code");
+            detector.observe_tool("bash");
+            detector.observe_tool("view");
+        }
+        let mut routing = dummy_routing(TaskType::Code);
+        routing.confidence = 1.0;
+        let detected_confidence = detector.detect().expect("scenario detection").1;
+
+        let profile = router.select(&config, &routing, &detector, None, None, None, "user-1");
+
+        assert!((profile.confidence - detected_confidence.lower).abs() < f64::EPSILON);
     }
 
     #[test]

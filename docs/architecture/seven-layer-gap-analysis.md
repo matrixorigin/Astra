@@ -97,7 +97,7 @@
 - **Guidance-level uncertainty guards** (`services/src/evaluation/database.rs`, `services/src/evaluation/types.rs`): calibration adjustment guidance and `ClosedLoopResponse.diagnoses[]` now carry explicit value intervals, so higher-level recommendations inherit uncertainty from the underlying quality/drift/calibration signals instead of discarding it at the last hop.
 - **Promotion-context uncertainty guards** (`runtime/src/promotion_context.rs`, `runtime/src/server/run_lifecycle.rs`, `services/src/mutation_scoreboard.rs`, `services/src/session_audit.rs`): the runtime promotion gate and mutation promotion scoreboard now carry gate-score and calibration-error intervals all the way into their downstream scoring context, so those ops-facing promotion decisions no longer collapse guarded evaluation signals back to naked point values.
 - **Mutation retention bound-aware scoring** (`services/src/mutation_scoreboard.rs`, `services/src/session_audit.rs`): mutation rejection, promotion scalar scoring, queue filtering, and retention sorting now use interval bounds instead of `.point` only, so uncertain retention evidence no longer gets over-promoted or over-filtered by the ops queue.
-- **ScenarioDetector** (`user_profile.rs:520`): Confidence-threshold-based scenario detection.
+- **ScenarioDetector** (`user_profile.rs:520`): Confidence-threshold-based scenario detection now prefers the strongest lower-bound confidence among qualifying scenarios instead of ranking them by point estimate alone.
 - **EvolutionRules** (`auto_tuning.rs`): Trigger → action rules with cooldown and rate limiting.
 - **Evolution proposal promotion gate** (`runtime/src/evolution/promotion_gate.rs`, `runtime/src/evolution/service.rs`): skill/pattern/calibration proposals now carry typed `ProposalPromotionVerdict` values (`promote`, `canary`, `hold`) with evidence, blockers, and rollback hints. `EvolutionService` only auto-applies `promote`; hard `PatternAction::Block` proposals now fall back to canary/pending instead of silently mutating live behavior on confidence alone.
 - **Adaptive-baseline promotion gate** (`runtime/src/adaptive_baselines.rs`, `runtime/src/observability_integration.rs`, `runtime/src/turn/agentic_loop_host.rs`): experiment winners are now scored with the same typed `promote` / `canary` / `hold` discipline before overwriting a live baseline. `ObservabilityHub::promote_experiment_winner()` returns explicit `Promoted` / `Deferred` / `Skipped` outcomes, mixed winners with significant regressions defer instead of silently promoting, and the agentic loop now logs deferred winners instead of making them look like silent `None` no-ops.
@@ -152,7 +152,7 @@
 
 ### Existing Capabilities
 - **SchedulingContract** (`pipeline/step_protocol.rs`): Priority (0-10), timeout, per-tool timeout, retry with exponential backoff.
-- **ScenarioRouter** (`scenario_router.rs`): Route queries to specialized profiles with config diffs and metric definitions.
+- **ScenarioRouter** (`scenario_router.rs`): Route queries to specialized profiles with config diffs and metric definitions, now folding detected scenario confidence into the execution profile via the conservative lower bound instead of the point estimate.
 - **Team orchestration** (`server/team_orchestrator.rs`): Budget-based execution, cancellation tokens, fan-out/sequential/adversarial delegation patterns.
 - **PatternLibrary diversity**: Records multiple tool chains for similar intents.
 - **IntentDisambiguation** (`turn/routing_metrics.rs`): Widens tool selection when ambiguity detected.
@@ -161,7 +161,7 @@
 - **No proposal diversity constraint**: Planning generates a single execution path; no mechanism to force N diverse candidates.
 - **No offline/online decoupling**: All computation is online (request-path). No queue or scheduler for expensive background tasks (training, pattern consolidation, sleep integration).
 - **No resource quota system**: Budget is per-execution (token count); no cross-session resource accounting.
-- **No exploration/exploitation policy**: Selection is greedy (highest confidence); no UCB/Thompson-sampling for trying new approaches.
+- **No exploration/exploitation policy**: Selection is still mostly greedy overall, even though scenario ranking now prefers higher lower-bound confidence instead of raw point estimates; there is still no UCB/Thompson-sampling or other deliberate exploration policy.
 
 ### Priority Actions
 1. Design `ProposalGenerator` trait that produces N diverse candidate plans with diversity metric.
