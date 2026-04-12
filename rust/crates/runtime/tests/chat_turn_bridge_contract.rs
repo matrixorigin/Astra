@@ -711,6 +711,16 @@ fn build_request(path: &str, auth_header: Option<&str>, body: serde_json::Value)
     builder.body(Body::from(body.to_string())).unwrap()
 }
 
+fn assert_trusted_session_info_frame(frame: &serde_json::Value, session_id: &str) {
+    assert_eq!(frame["type"], "session_info");
+    assert_eq!(frame["session_id"], session_id);
+    let run_id = frame
+        .get("run_id")
+        .and_then(serde_json::Value::as_str)
+        .expect("trusted session_info should include run_id");
+    assert!(Uuid::parse_str(run_id).is_ok());
+}
+
 /// Shared harness for HTTP bridge tests that hit a local `/internal/chat/turn` stub.
 macro_rules! internal_rebuild_case {
     ($contract:expr, $label:literal, $handler:expr, $check:expr) => {{
@@ -1760,10 +1770,7 @@ async fn http_chat_turn_bridge_filters_bridge_state_events() {
         .map(|json| serde_json::from_str::<serde_json::Value>(json).unwrap())
         .collect::<Vec<_>>();
     assert_eq!(frames.len(), 2);
-    assert_eq!(
-        frames[0],
-        serde_json::json!({"type": "session_info", "session_id": "s1"})
-    );
+    assert_trusted_session_info_frame(&frames[0], "s1");
     assert_eq!(frames[1]["type"], "turn_complete");
     assert!(frames[1]["stall_detected"].is_null());
     assert_eq!(frames[1]["has_tool_calls"], true);
@@ -2597,14 +2604,12 @@ async fn http_chat_turn_bridge_blocks_prompt_leak_from_bridge_state() {
         .map(|frame| frame.strip_prefix("data: ").unwrap())
         .map(|json| serde_json::from_str::<serde_json::Value>(json).unwrap())
         .collect::<Vec<_>>();
-    assert_eq!(frames.len(), 2);
-    assert_eq!(
-        frames[0],
-        serde_json::json!({"type": "session_info", "session_id": "s1"})
-    );
+    assert_eq!(frames.len(), 3);
+    assert_trusted_session_info_frame(&frames[0], "s1");
     assert_eq!(frames[1]["type"], "error");
     assert_eq!(frames[1]["code"], "PROMPT_LEAK");
     assert_eq!(frames[1]["retryable"], true);
+    assert_eq!(frames[2]["type"], "turn_complete");
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -2664,10 +2669,7 @@ async fn http_chat_turn_bridge_synthesizes_warning_before_turn_complete() {
         .map(|json| serde_json::from_str::<serde_json::Value>(json).unwrap())
         .collect::<Vec<_>>();
     assert_eq!(frames.len(), 3);
-    assert_eq!(
-        frames[0],
-        serde_json::json!({"type": "session_info", "session_id": "s1"})
-    );
+    assert_trusted_session_info_frame(&frames[0], "s1");
     assert_eq!(
         frames[1],
         serde_json::json!({
@@ -2732,13 +2734,7 @@ async fn http_chat_turn_bridge_synthesizes_explain_before_turn_complete() {
         .map(|json| serde_json::from_str::<serde_json::Value>(json).unwrap())
         .collect::<Vec<_>>();
     assert_eq!(frames.len(), 3);
-    assert_eq!(
-        frames[0],
-        serde_json::json!({
-            "type": "session_info",
-            "session_id": "s1"
-        })
-    );
+    assert_trusted_session_info_frame(&frames[0], "s1");
     assert_eq!(
         frames[1],
         serde_json::json!({
@@ -2768,7 +2764,7 @@ async fn http_chat_turn_bridge_synthesizes_explain_before_turn_complete() {
 }
 
 #[tokio::test]
-async fn http_chat_turn_bridge_drops_upstream_warning_without_bridge_state() {
+async fn http_chat_turn_bridge_preserves_upstream_warning_without_bridge_state() {
     let contract = load_contract();
     let (addr, server) = spawn_internal_bridge!(Router::new().route(
         "/internal/chat/turn",
@@ -2808,26 +2804,23 @@ async fn http_chat_turn_bridge_drops_upstream_warning_without_bridge_state() {
         .map(|frame| frame.strip_prefix("data: ").unwrap())
         .map(|json| serde_json::from_str::<serde_json::Value>(json).unwrap())
         .collect::<Vec<_>>();
-    assert_eq!(frames.len(), 2);
-    assert_eq!(
-        frames[0],
-        serde_json::json!({
-            "type": "session_info",
-            "session_id": "s1"
-        })
-    );
-    assert_eq!(frames[1]["type"], "turn_complete");
+    assert_eq!(frames.len(), 3);
+    assert_trusted_session_info_frame(&frames[0], "s1");
     assert!(
-        !frames
-            .iter()
-            .any(|frame| frame.get("type") == Some(&serde_json::json!("warning")))
+        frames[1]
+            == serde_json::json!({
+                "type": "warning",
+                "message": "upstream warning",
+                "claims_failed": 9
+            })
     );
+    assert_eq!(frames[2]["type"], "turn_complete");
 
     server.abort();
 }
 
 #[tokio::test]
-async fn http_chat_turn_bridge_drops_upstream_explain_without_bridge_state() {
+async fn http_chat_turn_bridge_preserves_upstream_explain_without_bridge_state() {
     let contract = load_contract();
     let (addr, server) = spawn_internal_bridge!(Router::new().route(
         "/internal/chat/turn",
@@ -2867,20 +2860,21 @@ async fn http_chat_turn_bridge_drops_upstream_explain_without_bridge_state() {
         .map(|frame| frame.strip_prefix("data: ").unwrap())
         .map(|json| serde_json::from_str::<serde_json::Value>(json).unwrap())
         .collect::<Vec<_>>();
-    assert_eq!(frames.len(), 2);
+    assert_eq!(frames.len(), 3);
+    assert_trusted_session_info_frame(&frames[0], "s1");
     assert_eq!(
-        frames[0],
+        frames[1],
         serde_json::json!({
-            "type": "session_info",
-            "session_id": "s1"
+            "type": "explain",
+            "total_ms": 1,
+            "tools_selected": 0,
+            "tools_available": 0,
+            "tool_selection": null,
+            "tool_selection_fallback": null,
+            "steps": []
         })
     );
-    assert_eq!(frames[1]["type"], "turn_complete");
-    assert!(
-        !frames
-            .iter()
-            .any(|frame| frame.get("type") == Some(&serde_json::json!("explain")))
-    );
+    assert_eq!(frames[2]["type"], "turn_complete");
 
     server.abort();
 }
@@ -2928,13 +2922,7 @@ async fn http_chat_turn_bridge_synthesizes_trusted_session_info() {
         .map(|json| serde_json::from_str::<serde_json::Value>(json).unwrap())
         .collect::<Vec<_>>();
     assert_eq!(frames.len(), 2);
-    assert_eq!(
-        frames[0],
-        serde_json::json!({
-            "type": "session_info",
-            "session_id": "generated-session"
-        })
-    );
+    assert_trusted_session_info_frame(&frames[0], "generated-session");
     assert_eq!(frames[1]["type"], "turn_complete");
     assert_eq!(
         *session_capture.create_user_id.lock().await,
@@ -2986,10 +2974,7 @@ async fn http_chat_turn_bridge_derives_has_tool_calls_from_tool_sigs() {
         .map(|json| serde_json::from_str::<serde_json::Value>(json).unwrap())
         .collect::<Vec<_>>();
     assert_eq!(frames.len(), 2);
-    assert_eq!(
-        frames[0],
-        serde_json::json!({"type": "session_info", "session_id": "s1"})
-    );
+    assert_trusted_session_info_frame(&frames[0], "s1");
     assert_eq!(
         frames[1],
         serde_json::json!({"type": "turn_complete", "has_tool_calls": true})
@@ -3008,11 +2993,7 @@ async fn http_chat_turn_bridge_rebuilds_sanitized_upstream_events() {
         usage_internal_turn,
         |frames: &[serde_json::Value], l: &str| {
             assert_eq!(frames.len(), 3, "{l}");
-            assert_eq!(
-                frames[0],
-                serde_json::json!({"type": "session_info", "session_id": "s1"}),
-                "{l}"
-            );
+            assert_trusted_session_info_frame(&frames[0], "s1");
             assert_eq!(
                 frames[1],
                 serde_json::json!({
@@ -3033,11 +3014,7 @@ async fn http_chat_turn_bridge_rebuilds_sanitized_upstream_events() {
         tool_call_start_internal_turn,
         |frames: &[serde_json::Value], l: &str| {
             assert_eq!(frames.len(), 3, "{l}");
-            assert_eq!(
-                frames[0],
-                serde_json::json!({"type": "session_info", "session_id": "s1"}),
-                "{l}"
-            );
+            assert_trusted_session_info_frame(&frames[0], "s1");
             assert_eq!(
                 frames[1],
                 serde_json::json!({
@@ -3058,11 +3035,7 @@ async fn http_chat_turn_bridge_rebuilds_sanitized_upstream_events() {
         tool_call_internal_turn,
         |frames: &[serde_json::Value], l: &str| {
             assert_eq!(frames.len(), 3, "{l}");
-            assert_eq!(
-                frames[0],
-                serde_json::json!({"type": "session_info", "session_id": "s1"}),
-                "{l}"
-            );
+            assert_trusted_session_info_frame(&frames[0], "s1");
             assert_eq!(frames[1]["type"], "tool_call", "{l}");
             assert_eq!(frames[1]["id"], "tc1", "{l}");
             assert_eq!(frames[1]["name"], "bash", "{l}");
@@ -3081,11 +3054,7 @@ async fn http_chat_turn_bridge_rebuilds_sanitized_upstream_events() {
         error_internal_turn,
         |frames: &[serde_json::Value], l: &str| {
             assert_eq!(frames.len(), 2, "{l}");
-            assert_eq!(
-                frames[0],
-                serde_json::json!({"type": "session_info", "session_id": "s1"}),
-                "{l}"
-            );
+            assert_trusted_session_info_frame(&frames[0], "s1");
             assert_eq!(
                 frames[1],
                 serde_json::json!({
