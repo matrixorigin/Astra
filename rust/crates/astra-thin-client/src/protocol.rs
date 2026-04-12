@@ -250,6 +250,19 @@ pub enum StreamEvent {
         cache_read_input_tokens: Option<u64>,
         raw: Value,
     },
+    TurnComplete {
+        followup_suggestion: Option<String>,
+        raw: Value,
+    },
+    Warning {
+        message: String,
+        claims_failed: Option<u64>,
+        raw: Value,
+    },
+    Explain {
+        content: String,
+        raw: Value,
+    },
     Ping,
     Done {
         tokens_used: Option<u64>,
@@ -403,6 +416,19 @@ pub fn classify_stream_event(value: Value) -> Result<StreamEvent, crate::error::
                 .get("cache_creation_input_tokens")
                 .and_then(|v| v.as_u64()),
             cache_read_input_tokens: obj.get("cache_read_input_tokens").and_then(|v| v.as_u64()),
+            raw,
+        },
+        "turn_complete" => StreamEvent::TurnComplete {
+            followup_suggestion: optional_str(&obj, "followup_suggestion"),
+            raw,
+        },
+        "warning" => StreamEvent::Warning {
+            message: get_str(&obj, "message"),
+            claims_failed: obj.get("claims_failed").and_then(|v| v.as_u64()),
+            raw,
+        },
+        "explain" => StreamEvent::Explain {
+            content: get_str(&obj, "content"),
             raw,
         },
         "ping" => StreamEvent::Ping,
@@ -687,6 +713,57 @@ mod tests {
                 assert_eq!(cache_creation_tokens, Some(3));
                 assert_eq!(cache_read_tokens, Some(1));
                 assert_eq!(raw["type"], "usage");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_turn_complete_warning_and_explain() {
+        match classify_stream_event(serde_json::json!({
+            "type": "turn_complete",
+            "followup_suggestion": "Try /plan"
+        }))
+        .unwrap()
+        {
+            StreamEvent::TurnComplete {
+                followup_suggestion,
+                raw,
+            } => {
+                assert_eq!(followup_suggestion.as_deref(), Some("Try /plan"));
+                assert_eq!(raw["type"], "turn_complete");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        match classify_stream_event(serde_json::json!({
+            "type": "warning",
+            "message": "approaching limit",
+            "claims_failed": 2
+        }))
+        .unwrap()
+        {
+            StreamEvent::Warning {
+                message,
+                claims_failed,
+                raw,
+            } => {
+                assert_eq!(message, "approaching limit");
+                assert_eq!(claims_failed, Some(2));
+                assert_eq!(raw["type"], "warning");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        match classify_stream_event(serde_json::json!({
+            "type": "explain",
+            "content": "why this happened"
+        }))
+        .unwrap()
+        {
+            StreamEvent::Explain { content, raw } => {
+                assert_eq!(content, "why this happened");
+                assert_eq!(raw["type"], "explain");
             }
             other => panic!("unexpected {other:?}"),
         }
