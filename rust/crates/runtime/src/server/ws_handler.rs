@@ -2332,6 +2332,7 @@ mod tests {
                 display_name: Some("Alice".into()),
             },
             session_id: Some("sess-1".into()),
+            pending_session_id: None,
             active_run_id: Some("prepared-run".into()),
             bridge_prepared_run_id: Some("prepared-run".into()),
         };
