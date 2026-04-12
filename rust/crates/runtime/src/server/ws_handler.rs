@@ -1743,6 +1743,7 @@ mod tests {
             session_id: Some("bound-session".into()),
             pending_session_id: Some("handshake-session".into()),
             active_run_id: None,
+            bridge_prepared_run_id: None,
         };
 
         let session_id = chat_request_session_id(&conn, Some("requested-session".into()));
@@ -1767,6 +1768,7 @@ mod tests {
             session_id: Some("bound-session".into()),
             pending_session_id: None,
             active_run_id: None,
+            bridge_prepared_run_id: None,
         };
 
         let session_id = chat_request_session_id(&conn, None);
@@ -1786,6 +1788,7 @@ mod tests {
             session_id: Some("bound-session".into()),
             pending_session_id: Some("handshake-session".into()),
             active_run_id: None,
+            bridge_prepared_run_id: None,
         };
 
         let session_id = chat_request_session_id(&conn, None);
@@ -1805,6 +1808,7 @@ mod tests {
             session_id: Some("bound-session".into()),
             pending_session_id: None,
             active_run_id: None,
+            bridge_prepared_run_id: None,
         };
         let pending_conn = WsConnection {
             user: AuthUserRecord {
@@ -1816,6 +1820,7 @@ mod tests {
             session_id: Some("bound-session".into()),
             pending_session_id: Some("handshake-session".into()),
             active_run_id: None,
+            bridge_prepared_run_id: None,
         };
 
         assert!(chat_request_session_id_is_trusted(&trusted_conn, &None));

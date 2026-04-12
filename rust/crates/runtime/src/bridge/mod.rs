@@ -621,7 +621,7 @@ where
         if let Some(session_id) = trusted_session_id.as_deref() {
             yield Ok(Bytes::from(render_sse_json(synthesized_session_info_event(
                 session_id,
-                None,
+                trusted_turn_chain_id.as_deref(),
             ))));
         }
         let mut buffer = Vec::new();
@@ -1455,7 +1455,7 @@ mod tests {
 
         assert!(text.contains("\"type\":\"session_info\""));
         assert!(text.contains("\"session_id\":\"sess-1\""));
-        assert!(!text.contains("\"run_id\":"));
+        assert!(text.contains("\"run_id\":\"run-1\""));
         assert!(text.contains("\"type\":\"error\""));
         assert!(text.contains("\"code\":\"UPSTREAM_ERROR\""));
     }
@@ -1798,7 +1798,7 @@ mod tests {
         assert_eq!(text.matches("\"type\":\"session_info\"").count(), 1);
         assert!(text.contains("\"session_id\":\"trusted-s1\""));
         assert!(!text.contains("\"session_id\":\"upstream-s1\""));
-        assert!(!text.contains("\"run_id\":"));
+        assert!(text.contains("\"run_id\":\"run-1\""));
     }
 
     #[tokio::test]
