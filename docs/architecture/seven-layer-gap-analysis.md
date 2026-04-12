@@ -85,7 +85,7 @@
 - **ScenarioDetector** (`user_profile.rs:520`): Confidence-threshold-based scenario detection.
 - **EvolutionRules** (`auto_tuning.rs`): Trigger → action rules with cooldown and rate limiting.
 - **MutationScoreboard contract** (`services/src/mutation_scoreboard.rs`): Canonical typed scoreboard now unifies verifier summaries, objective/reward signals, staged mutation state, and aggregated retention metrics.
-- **Decision-audit-backed mutation scoreboard exposure** (`runtime/src/bridge/side_effects.rs`, `services/src/session_audit.rs`, `runtime/src/server/audit_handlers.rs`): tool-selection decision audits now persist `mutation_objective_score`, tool arguments, turn metadata, and available per-action verifier summaries, and `/sessions/{session_id}/audit/mutations` reconstructs a typed per-session scoreboard for report/ops inspection.
+- **Decision-audit-backed mutation scoreboard exposure** (`runtime/src/bridge/side_effects.rs`, `services/src/session_audit.rs`, `runtime/src/server/audit_handlers.rs`): tool-selection decision audits now persist `mutation_objective_score`, tool arguments, turn metadata, and available verifier evidence from per-action summaries, verifier-shaped tool results, or conservative same-turn single-action journal fallbacks, and `/sessions/{session_id}/audit/mutations` reconstructs a typed per-session scoreboard for report/ops inspection.
 - **Cross-session mutation stats** (`services/src/session_audit.rs`): `/audit/stats` now aggregates global mutation counts (ready, approval-required, applied, reverted, blocked) across the user’s sessions, turning the per-session scoreboard into an account-level ops signal.
 - **Global mutation queue** (`services/src/session_audit.rs`, `runtime/src/server/audit_handlers.rs`): `/audit/mutations` now lists staged mutations across sessions with priority-first sorting plus state/session/tool/safety/retention filtering, giving ops a concrete work queue instead of only counters.
 
@@ -93,7 +93,7 @@
 - **Most evaluation routes return 501**: `DatabaseEvaluationService` has "not implemented yet" for drift detection, drift pipeline, closed-loop, training data, SLO.
 - **No multi-objective optimization**: Evaluation is single-dimensional (quality score). No Pareto frontier for efficiency × cost × accuracy.
 - **No noise filtering**: FeedbackSignals are consumed raw; no statistical filtering for outliers or noise.
-- **No fully universal verifier-complete scoreboard yet**: `MutationScoreboard` now persists per-action verifier summaries for fork-skill mutations and for generic tool results that already return verifier-shaped JSON, but tool paths that only emit coarse or unstructured outcomes are still not stitched into the same persisted surface.
+- **No fully universal verifier-complete scoreboard yet**: `MutationScoreboard` now persists verifier evidence for fork-skill mutations, generic verifier-shaped tool results, and conservative single-action same-turn journal verification events, but tool paths with no structured or turn-scoped verification signal are still not stitched into the same persisted surface.
 - **Confidence intervals are not end-to-end**: `ConfidenceInterval` exists in core/runtime, but evaluation and report surfaces do not expose it consistently.
 - **No verifier diversity**: Gate validation is single-pass, not ensemble-based.
 
