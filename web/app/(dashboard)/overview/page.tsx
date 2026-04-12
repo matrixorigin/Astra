@@ -9,6 +9,7 @@ import { StatusBar } from '@/components/dashboard/status-bar';
 import { EventBreakdownChart } from '@/components/dashboard/event-breakdown-chart';
 import { LiveActivityCard } from '@/components/dashboard/live-activity-card';
 import { getRuntimeConfig } from '@/lib/runtime-config';
+import type { EventSummary } from '@/lib/models/platform';
 
 export const dynamic = 'force-dynamic';
 
@@ -35,11 +36,27 @@ const eventTypeColors: Record<string, string> = {
 };
 
 function getEventColor(type: string): string {
+  if (type === 'agent_completed (failed)') return '#ef4444';
+  if (type === 'agent_completed (cancelled)') return '#a78bfa';
+
   const lower = type.toLowerCase();
   for (const [key, color] of Object.entries(eventTypeColors)) {
     if (lower.includes(key)) return color;
   }
   return '#475569';
+}
+
+function getEventBreakdownLabel(event: EventSummary): string {
+  if (
+    event.type === 'agent_completed' &&
+    (event.status === 'completed' ||
+      event.status === 'failed' ||
+      event.status === 'cancelled')
+  ) {
+    return `agent_completed (${event.status})`;
+  }
+
+  return event.type;
 }
 
 export default async function OverviewPage() {
@@ -78,7 +95,10 @@ export default async function OverviewPage() {
 
   // Event type breakdown (top 8)
   const eventTypeCounts = new Map<string, number>();
-  events.forEach((e) => eventTypeCounts.set(e.type, (eventTypeCounts.get(e.type) ?? 0) + 1));
+  events.forEach((event) => {
+    const label = getEventBreakdownLabel(event);
+    eventTypeCounts.set(label, (eventTypeCounts.get(label) ?? 0) + 1);
+  });
   const eventBreakdown = Array.from(eventTypeCounts.entries())
     .sort((a, b) => b[1] - a[1])
     .slice(0, 8)

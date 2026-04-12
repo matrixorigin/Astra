@@ -36,8 +36,16 @@ const eventTypeColors: Record<string, { bg: string; border: string }> = {
   agent_completed: { bg: '#052e16', border: '#22c55e' },
 };
 const defaultEventColor = { bg: '#0f172a', border: '#334155' };
+const failedEventColor = { bg: '#450a0a', border: '#ef4444' };
+const cancelledEventColor = { bg: '#2e1065', border: '#a78bfa' };
 
-function getEventColor(eventType: string) {
+function getEventColor(event: EventSummary) {
+  if (event.type === 'agent_completed') {
+    if (event.status === 'failed') return failedEventColor;
+    if (event.status === 'cancelled') return cancelledEventColor;
+  }
+
+  const eventType = event.type;
   const lower = eventType.toLowerCase();
   for (const [key, val] of Object.entries(eventTypeColors)) {
     if (lower.includes(key)) return val;
@@ -114,7 +122,7 @@ function buildSessionGraph(
 
   displayEvents.forEach((event, i) => {
     const nodeId = `event-${event.id}`;
-    const color = getEventColor(event.type);
+    const color = getEventColor(event);
 
     nodes.push({
       id: nodeId,

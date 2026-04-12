@@ -156,6 +156,40 @@ export function normalizeSession(session: ApiSession): SessionSummary {
   };
 }
 
+function parseEventStatus(content: string): string | undefined {
+  try {
+    const parsed = JSON.parse(content) as unknown;
+    if (!parsed || typeof parsed !== 'object') {
+      return undefined;
+    }
+
+    const record = parsed as Record<string, unknown>;
+    if (typeof record.status === 'string' && record.status.length > 0) {
+      return record.status;
+    }
+    if (record.cancelled === true) {
+      return 'cancelled';
+    }
+
+    const data = record.data;
+    if (!data || typeof data !== 'object') {
+      return undefined;
+    }
+
+    const dataRecord = data as Record<string, unknown>;
+    if (typeof dataRecord.status === 'string' && dataRecord.status.length > 0) {
+      return dataRecord.status;
+    }
+    if (dataRecord.cancelled === true) {
+      return 'cancelled';
+    }
+  } catch {
+    return undefined;
+  }
+
+  return undefined;
+}
+
 export function normalizeEvent(event: ApiEvent): EventSummary {
   return {
     id: event.event_id,
@@ -163,6 +197,7 @@ export function normalizeEvent(event: ApiEvent): EventSummary {
     type: event.event_type,
     summary: event.content,
     agentId: event.agent_id,
+    status: parseEventStatus(event.content),
     createdAt: event.created_at,
   };
 }

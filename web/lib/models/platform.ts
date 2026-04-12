@@ -26,6 +26,7 @@ export type EventSummary = {
   type: string;
   summary: string;
   agentId?: string;
+  status?: string;
   createdAt: string;
 };
 

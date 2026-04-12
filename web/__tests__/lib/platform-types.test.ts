@@ -203,6 +203,31 @@ describe('normalizeEvent', () => {
     };
     expect(normalizeEvent(event).agentId).toBeUndefined();
   });
+
+  it('extracts status from json event content', () => {
+    const event: ApiEvent = {
+      event_id: 'evt-3',
+      session_id: 'sess-3',
+      event_type: 'agent_completed',
+      content: '{"status":"failed","error":"boom"}',
+      agent_id: 'agent-3',
+      created_at: '2024-01-01T14:00:00Z',
+    };
+
+    expect(normalizeEvent(event).status).toBe('failed');
+  });
+
+  it('maps cancelled event content to cancelled status', () => {
+    const event: ApiEvent = {
+      event_id: 'evt-4',
+      session_id: 'sess-4',
+      event_type: 'run_finished',
+      content: '{"data":{"cancelled":true}}',
+      created_at: '2024-01-01T15:00:00Z',
+    };
+
+    expect(normalizeEvent(event).status).toBe('cancelled');
+  });
 });
 
 // ---------------------------------------------------------------------------
