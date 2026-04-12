@@ -1443,7 +1443,7 @@ mod tests {
 
         assert!(text.contains("\"type\":\"session_info\""));
         assert!(text.contains("\"session_id\":\"sess-1\""));
-        assert!(text.contains("\"run_id\":\"run-1\""));
+        assert!(!text.contains("\"run_id\":"));
         assert!(text.contains("\"type\":\"error\""));
         assert!(text.contains("\"code\":\"UPSTREAM_ERROR\""));
     }
