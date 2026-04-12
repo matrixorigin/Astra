@@ -248,6 +248,13 @@ pub struct CrossSessionMutationListResponse {
     pub per_page: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MutationVerifierSignalFilter {
+    Present,
+    Missing,
+}
+
 const MAX_AUDIT_SESSIONS_PER_PAGE: u32 = 100;
 const MAX_CROSS_SESSION_TOOLS: i64 = 100;
 const MAX_CROSS_SESSION_MUTATIONS_PER_PAGE: u32 = 100;
@@ -310,6 +317,9 @@ pub struct CrossSessionMutationListParams {
     pub safety_verdict: Option<MutationSafetyVerdict>,
     pub retention_verdict: Option<MutationRetentionVerdict>,
     pub min_retention_score: Option<f64>,
+    pub verifier_signal: Option<MutationVerifierSignalFilter>,
+    pub verifier_source: Option<String>,
+    pub verifier_gap: Option<String>,
     #[serde(default = "default_cross_session_mutation_sort")]
     pub sort: String,
 }
@@ -1779,6 +1789,28 @@ fn apply_cross_session_mutation_filters(
         let threshold = min_retention_score.clamp(0.0, 1.0);
         mutations.retain(|mutation| mutation.judgment.retention_score.point >= threshold);
     }
+    if let Some(verifier_signal) = params.verifier_signal {
+        mutations.retain(|mutation| match verifier_signal {
+            MutationVerifierSignalFilter::Present => mutation.verifier.is_some(),
+            MutationVerifierSignalFilter::Missing => mutation.verifier.is_none(),
+        });
+    }
+    if let Some(verifier_source) = params
+        .verifier_source
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        mutations.retain(|mutation| mutation.verifier_source.as_deref() == Some(verifier_source));
+    }
+    if let Some(verifier_gap) = params
+        .verifier_gap
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        mutations.retain(|mutation| mutation.verifier_gap.as_deref() == Some(verifier_gap));
+    }
 }
 
 fn sort_cross_session_mutations(mutations: &mut [StagedMutation], sort: &str) {
@@ -2807,6 +2839,9 @@ mod tests {
         assert!(params.safety_verdict.is_none());
         assert!(params.retention_verdict.is_none());
         assert!(params.min_retention_score.is_none());
+        assert!(params.verifier_signal.is_none());
+        assert!(params.verifier_source.is_none());
+        assert!(params.verifier_gap.is_none());
         assert_eq!(params.sort, "priority");
     }
 
@@ -2822,6 +2857,8 @@ mod tests {
                 "safety_verdict": "requires_approval",
                 "retention_verdict": "retain",
                 "min_retention_score": 0.7,
+                "verifier_signal": "missing",
+                "verifier_gap": "no_verifier_signal",
                 "sort": "retention"
             }"#,
         )
@@ -2840,6 +2877,11 @@ mod tests {
             Some(MutationRetentionVerdict::Retain)
         );
         assert_eq!(params.min_retention_score, Some(0.7));
+        assert_eq!(
+            params.verifier_signal,
+            Some(MutationVerifierSignalFilter::Missing)
+        );
+        assert_eq!(params.verifier_gap.as_deref(), Some("no_verifier_signal"));
         assert_eq!(params.sort, "retention");
     }
 
@@ -2899,6 +2941,9 @@ mod tests {
                 safety_verdict: None,
                 retention_verdict: None,
                 min_retention_score: None,
+                verifier_signal: None,
+                verifier_source: None,
+                verifier_gap: None,
                 sort: "priority".into(),
             },
         );
@@ -2970,6 +3015,9 @@ mod tests {
                 safety_verdict: Some(MutationSafetyVerdict::RequiresApproval),
                 retention_verdict: Some(MutationRetentionVerdict::Retain),
                 min_retention_score: Some(0.7),
+                verifier_signal: None,
+                verifier_source: None,
+                verifier_gap: None,
                 sort: "priority".into(),
             },
         );
@@ -2977,5 +3025,99 @@ mod tests {
         assert_eq!(response.total, 1);
         assert_eq!(response.mutations.len(), 1);
         assert_eq!(response.mutations[0].mutation_id, "match");
+    }
+
+    #[test]
+    fn cross_session_mutation_queue_filters_by_verifier_signal_and_gap() {
+        let mut missing = sample_queue_mutation(
+            "missing",
+            "session-a",
+            "write_file",
+            StagedMutationState::Pending,
+            MutationSafetyVerdict::RequiresApproval,
+            MutationRetentionVerdict::Retain,
+            0.81,
+            Some("2026-04-10T10:00:00Z"),
+        );
+        missing.verifier_gap = Some("no_verifier_signal".into());
+
+        let mut ambiguous = sample_queue_mutation(
+            "ambiguous",
+            "session-b",
+            "bash",
+            StagedMutationState::Pending,
+            MutationSafetyVerdict::RequiresApproval,
+            MutationRetentionVerdict::Review,
+            0.65,
+            Some("2026-04-10T11:00:00Z"),
+        );
+        ambiguous.verifier_gap = Some("ambiguous_multi_action_turn".into());
+
+        let mut present = sample_queue_mutation(
+            "present",
+            "session-c",
+            "edit_file",
+            StagedMutationState::Ready,
+            MutationSafetyVerdict::Safe,
+            MutationRetentionVerdict::Retain,
+            0.93,
+            Some("2026-04-10T12:00:00Z"),
+        );
+        present.verifier = Some(crate::MutationVerifierSummary::from_results(
+            true,
+            &[crate::VerificationResult {
+                criterion_id: "tests".into(),
+                passed: true,
+                evidence: "all checks passed".into(),
+                expected: "tests green".into(),
+                duration_ms: 120,
+                error: None,
+            }],
+        ));
+        present.verifier_source = Some("tool_result".into());
+
+        let missing_response = select_cross_session_mutations(
+            vec![missing.clone(), ambiguous.clone(), present.clone()],
+            &CrossSessionMutationListParams {
+                page: 1,
+                per_page: 20,
+                since: None,
+                until: None,
+                session_id: None,
+                tool_name: None,
+                state: None,
+                safety_verdict: None,
+                retention_verdict: None,
+                min_retention_score: None,
+                verifier_signal: Some(MutationVerifierSignalFilter::Missing),
+                verifier_source: None,
+                verifier_gap: Some("no_verifier_signal".into()),
+                sort: "priority".into(),
+            },
+        );
+        assert_eq!(missing_response.total, 1);
+        assert_eq!(missing_response.mutations[0].mutation_id, "missing");
+
+        let present_response = select_cross_session_mutations(
+            vec![missing, ambiguous, present],
+            &CrossSessionMutationListParams {
+                page: 1,
+                per_page: 20,
+                since: None,
+                until: None,
+                session_id: None,
+                tool_name: None,
+                state: None,
+                safety_verdict: None,
+                retention_verdict: None,
+                min_retention_score: None,
+                verifier_signal: Some(MutationVerifierSignalFilter::Present),
+                verifier_source: Some("tool_result".into()),
+                verifier_gap: None,
+                sort: "priority".into(),
+            },
+        );
+        assert_eq!(present_response.total, 1);
+        assert_eq!(present_response.mutations[0].mutation_id, "present");
     }
 }
