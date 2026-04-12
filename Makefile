@@ -27,9 +27,9 @@ help:
 	@echo "  make dev-api-status     - Show API server status"
 	@echo ""
 	@echo "Testing:"
-	@echo "  make test               - test-offline + test-live-db (MatrixOne + Redis required for live portion)"
-	@echo "  make test-offline       - Workspace tests + astra-runtime bridge-e2e-hooks only (no #[ignore] live-DB suites)"
-	@echo "  make test-live-db       - Ignored Matrix HTTP E2E + astra-services multi_agent_integration (exports opt-in env vars)"
+	@echo "  make test               - test-offline + test-online (MatrixOne + Redis required for online portion)"
+	@echo "  make test-offline       - Workspace tests + astra-runtime bridge-e2e-hooks only (no #[ignore] online/Matrix suites)"
+	@echo "  make test-online        - Ignored Matrix HTTP E2E + astra-services multi_agent_integration (exports opt-in env vars)"
 	@echo "  make test-contract      - Run contract tests (http/admin/config)"
 	@echo ""
 	@echo "Code Quality:"
@@ -398,8 +398,8 @@ clean-incremental:
 # Testing
 # ============================================================================
 
-.PHONY: test test-offline test-live-db
-test: test-offline test-live-db
+.PHONY: test test-offline test-online
+test: test-offline test-online
 
 .PHONY: test-offline
 test-offline: test-workspace test-runtime-bridge-hooks
@@ -416,14 +416,14 @@ test-runtime-bridge-hooks:
 	@echo "Running astra-runtime tests with feature bridge-e2e-hooks..."
 	@$(CARGO) test $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) --features bridge-e2e-hooks
 
-# Ignored tests: opt-in via env vars (see `make test-live-db`). Enable with:
+# Ignored tests: opt-in via env vars (see `make test-online`). Enable with:
 #   ASTRA_SYSTEM_MATRIX_E2E=1   -> system_matrix_http_e2e (--ignored)
 #   ASTRA_MULTI_AGENT_IT=1      -> astra-services multi_agent_integration (--ignored)
 # Optional serial Matrix E2E: ASTRA_SYSTEM_MATRIX_E2E_TEST_THREADS=1 -> --test-threads=1
 .PHONY: test-ignored-integration
 test-ignored-integration:
 	@if [ "$${ASTRA_SYSTEM_MATRIX_E2E:-}" != "1" ] && [ "$${ASTRA_MULTI_AGENT_IT:-}" != "1" ]; then \
-		echo "Note: no live-DB ignored suites selected (neither ASTRA_SYSTEM_MATRIX_E2E=1 nor ASTRA_MULTI_AGENT_IT=1). Use \`make test-live-db\` or set those variables."; \
+		echo "Note: no online/Matrix ignored suites selected (neither ASTRA_SYSTEM_MATRIX_E2E=1 nor ASTRA_MULTI_AGENT_IT=1). Use \`make test-online\` or set those variables."; \
 	fi
 	@if [ "$${ASTRA_SYSTEM_MATRIX_E2E:-}" = "1" ]; then \
 		EXTRA_THREADS=""; \
@@ -441,9 +441,9 @@ test-ignored-integration:
 		$(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-services --test multi_agent_integration -- --ignored; \
 	fi
 
-# Live MatrixOne + Redis: runs opt-in #[ignore] integration binaries (see test-ignored-integration).
-.PHONY: test-live-db
-test-live-db:
+# Online (MatrixOne + Redis): opt-in #[ignore] integration binaries (see test-ignored-integration).
+.PHONY: test-online
+test-online:
 	@ASTRA_SYSTEM_MATRIX_E2E=1 ASTRA_MULTI_AGENT_IT=1 $(MAKE) test-ignored-integration
 
 .PHONY: test-contract

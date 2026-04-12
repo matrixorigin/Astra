@@ -77,6 +77,6 @@ Legend: **E2E** = `rust/crates/runtime/tests/system_matrix_http_e2e/` with `ASTR
 
 ## How to run
 
-- Offline slice: `make test-offline` (workspace + bridge hooks; no live `#[ignore]` suites).
-- Full validation with live DB: `make test` (`test-offline` then `test-live-db`) or run `make test-live-db` alone when you only need ignored suites.
+- Offline slice: `make test-offline` (workspace + bridge hooks; no online `#[ignore]` suites).
+- Full validation with MatrixOne: `make test` (`test-offline` then `test-online`) or run `make test-online` alone when you only need ignored suites.
 - Advanced: set `ASTRA_SYSTEM_MATRIX_E2E=1` / `ASTRA_MULTI_AGENT_IT=1` manually as in [`system-e2e-matrix.md`](./system-e2e-matrix.md).

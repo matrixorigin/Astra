@@ -6,9 +6,9 @@ You are working on astra-engine, a Rust-first agent platform. Your primary tasks
 
 ```bash
 make build              # Release workspace build
-make test               # Workspace + bridge hooks + live ignored suites (DB required for live portion)
+make test               # Workspace + bridge hooks + online ignored suites (DB required for online portion)
 make test-offline       # Workspace + bridge hooks only
-make test-live-db       # Matrix HTTP E2E + multi_agent_integration (#[ignore])
+make test-online        # Matrix HTTP E2E + multi_agent_integration (#[ignore])
 make check              # lint + format + type checks (run before commit)
 make lint               # cargo clippy --workspace -- -D warnings
 make dev-start          # Start deps + API server

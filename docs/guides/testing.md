@@ -5,14 +5,14 @@ This repository is validated through Rust-first checks, contract tests (fast, ma
 ## Primary Commands
 
 ```bash
-# Full suite: workspace + bridge-e2e-hooks + live #[ignore] Matrix E2E + multi-agent integration (requires MatrixOne + Redis for the live portion)
+# Full suite: workspace + bridge-e2e-hooks + online #[ignore] Matrix E2E + multi-agent integration (requires MatrixOne + Redis for the online portion)
 make test
 
-# Workspace + bridge hooks only (no live #[ignore] suites)
+# Workspace + bridge hooks only (no online #[ignore] suites)
 make test-offline
 
-# Live #[ignore] suites only (exports ASTRA_SYSTEM_MATRIX_E2E=1 and ASTRA_MULTI_AGENT_IT=1)
-make test-live-db
+# Online #[ignore] suites only (exports ASTRA_SYSTEM_MATRIX_E2E=1 and ASTRA_MULTI_AGENT_IT=1)
+make test-online
 
 # Narrow contract smoke (HTTP + admin integration binaries; settings JSON via astra-core lib tests)
 make test-contract
@@ -60,11 +60,11 @@ cargo test --manifest-path rust/Cargo.toml -p astra-runtime --test http_contract
 # 2. Core HTTP contract smoke
 make test-contract
 
-# 3. Full workspace + bridge hooks (no live #[ignore] suites)
+# 3. Full workspace + bridge hooks (no online #[ignore] suites)
 make test-offline
 
-# 4. With MatrixOne + Redis up: add live #[ignore] suites (also what `make test` runs after offline)
-make test-live-db
+# 4. With MatrixOne + Redis up: add online #[ignore] suites (same as the second half of `make test`)
+make test-online
 ```
 
 ## What "done" Means

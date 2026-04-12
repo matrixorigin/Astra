@@ -79,7 +79,7 @@ jobs:
           done
           mysql -h matrixone -P6001 -uroot -p111 -e "CREATE DATABASE IF NOT EXISTS astra_runtime;"
 
-      - name: Run full test suite (offline + live DB)
+      - name: Run full test suite (test-offline + test-online)
         env:
           ASTRA_SYSTEM_MATRIX_E2E: "1"
           ASTRA_SYSTEM_MATRIX_E2E_TEST_THREADS: "1"
