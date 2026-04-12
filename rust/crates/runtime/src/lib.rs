@@ -263,6 +263,10 @@ pub use turn::services::{
 };
 
 pub use turn::{
+    action_compensation::{
+        ActionCategory, ActionCompensationProfile, CompensationKind, compensation_prompt_note,
+        tool_action_profile, tool_action_profile_value,
+    },
     activity::{SessionActivityUpdatePlan, build_session_activity_update_plan},
     cache::SessionCache,
     cloud::{

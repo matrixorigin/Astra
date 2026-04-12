@@ -1,3 +1,4 @@
+pub mod action_compensation;
 pub mod activity;
 pub mod agent_progress_ui;
 pub mod agentic_headless_round;

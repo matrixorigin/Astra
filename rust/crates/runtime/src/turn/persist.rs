@@ -1,5 +1,7 @@
 use serde_json::{Map, Value, json};
 
+use super::action_compensation::tool_action_profile_value;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct PersistEventPayload {
     pub content: Value,
@@ -74,19 +76,17 @@ pub fn build_tool_call_event_payload(
         .get("_source")
         .and_then(Value::as_str)
         .unwrap_or("edge");
+    let raw_arguments = function
+        .get("arguments")
+        .cloned()
+        .unwrap_or(Value::from("{}"));
     let mut content = Map::from_iter([
         (
             "tool_call_id".to_string(),
             tool_call.get("id").cloned().unwrap_or(Value::from("")),
         ),
         ("name".to_string(), Value::from(skill_name.clone())),
-        (
-            "arguments".to_string(),
-            function
-                .get("arguments")
-                .cloned()
-                .unwrap_or(Value::from("{}")),
-        ),
+        ("arguments".to_string(), raw_arguments.clone()),
     ]);
     if source == "cloud" {
         content.insert("source".to_string(), Value::from("cloud"));
@@ -101,6 +101,10 @@ pub fn build_tool_call_event_payload(
             ("name".to_string(), Value::from(skill_name.clone())),
             ("tool_name".to_string(), Value::from(skill_name.clone())),
             ("source".to_string(), Value::from(source)),
+            (
+                "action_profile".to_string(),
+                tool_action_profile_value(&skill_name, &raw_arguments),
+            ),
         ]),
         skill_name,
         reasoning_content: if !reasoning_content.is_empty() && index == 0 {
@@ -304,5 +308,26 @@ mod tests {
         let p = build_tool_call_event_payload(&tc, 0, "");
         assert_eq!(p.content["tool_call_id"].as_str().unwrap(), "");
         assert_eq!(p.metadata["tool_call_id"].as_str().unwrap(), "");
+    }
+
+    #[test]
+    fn tool_call_metadata_carries_action_profile() {
+        let tc = Map::from_iter([(
+            "function".to_string(),
+            json!({"name": "write_file", "arguments": {"path": "src/main.rs"}}),
+        )]);
+        let p = build_tool_call_event_payload(&tc, 0, "");
+        assert_eq!(
+            p.metadata["action_profile"]["category"].as_str(),
+            Some("write")
+        );
+        assert_eq!(
+            p.metadata["action_profile"]["compensation_kind"].as_str(),
+            Some("restore_or_delete_file")
+        );
+        assert_eq!(
+            p.metadata["action_profile"]["requires_pre_state"].as_bool(),
+            Some(true)
+        );
     }
 }

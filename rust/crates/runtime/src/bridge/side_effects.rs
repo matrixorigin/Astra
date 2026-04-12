@@ -512,6 +512,29 @@ fn build_hook_db_persist_from_payload(
                 .map(ToString::to_string)
         })
         .collect::<Vec<_>>();
+    let tool_action_profiles = tool_calls
+        .iter()
+        .map(|tool_call| {
+            let function = tool_call
+                .get("function")
+                .and_then(serde_json::Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+            let tool_name = function
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            let arguments = function
+                .get("arguments")
+                .cloned()
+                .unwrap_or_else(|| serde_json::Value::Object(Default::default()));
+            serde_json::json!({
+                "tool_call_id": tool_call.get("id").cloned().unwrap_or(serde_json::Value::String(String::new())),
+                "tool_name": tool_name,
+                "profile": crate::tool_action_profile_value(tool_name, &arguments),
+            })
+        })
+        .collect::<Vec<_>>();
     let decision_audit = Some(TurnDecisionAuditRecord {
         decision_id: Uuid::now_v7().to_string(),
         session_id: session_id.clone(),
@@ -524,6 +547,7 @@ fn build_hook_db_persist_from_payload(
         decision_output: serde_json::json!({
             "text": truncate_text(optional_object_str(hook_payload, "full_text").unwrap_or_default(), 500),
             "tool_calls": tool_call_names,
+            "action_profiles": tool_action_profiles,
             "model_used": optional_object_str(hook_payload, "model_used"),
         }),
         model_used: optional_object_str(hook_payload, "model_used").map(ToString::to_string),
@@ -2130,6 +2154,18 @@ mod inprocess_hook_contract_tests {
         assert_eq!(audit.event_id, "evt-query-1");
         assert_eq!(audit.decision_type, "tool_selection");
         assert_eq!(audit.model_used.as_deref(), Some("gpt-4"));
+        assert_eq!(
+            audit.decision_output["action_profiles"][0]["tool_name"],
+            "bash"
+        );
+        assert_eq!(
+            audit.decision_output["action_profiles"][0]["profile"]["category"],
+            "read"
+        );
+        assert_eq!(
+            audit.decision_output["action_profiles"][0]["profile"]["bounded"],
+            false
+        );
 
         let selection = plan
             .skill_selection

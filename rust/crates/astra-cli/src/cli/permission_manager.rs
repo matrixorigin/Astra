@@ -1,5 +1,6 @@
 use super::*;
 
+use astra_runtime::compensation_prompt_note;
 use astra_runtime::tool_sandbox::{
     CommandRisk, GitSafetyViolation, analyze_command_risks, is_dangerous_file_path,
     validate_git_command,
@@ -665,7 +666,11 @@ impl PermissionManager {
         };
         let brief = permission_prompt_primary_detail(name, args).unwrap_or_else(|| "…".into());
         let header = format!("{icon} {name}");
-        let detail = Some(Self::format_prompt_detail(&brief));
+        let mut detail_lines = vec![Self::format_prompt_detail(&brief)];
+        if let Some(compensation) = compensation_prompt_note(name, args) {
+            detail_lines.push(Self::format_prompt_detail(&compensation));
+        }
+        let detail = Some(detail_lines.join("\n"));
         (header, detail)
     }
 
@@ -1750,6 +1755,25 @@ mod tests {
         let decision = pm.check_nonblocking("read_file", &args);
         // read_file is classified as Read → always allowed
         assert!(matches!(decision, PermissionDecision::Allow));
+    }
+
+    #[test]
+    fn write_file_prompt_includes_compensation_hint() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
+        let args = serde_json::json!({"path": "src/main.rs", "content": "fn main() {}"});
+        let decision = pm.check_nonblocking("write_file", &args);
+        match decision {
+            PermissionDecision::NeedApproval {
+                detail: Some(detail),
+                ..
+            } => {
+                assert!(detail.contains("src/main.rs"));
+                assert!(detail.contains("Compensation:"));
+                assert!(detail.contains("restore prior contents"));
+            }
+            other => panic!("expected NeedApproval with detail, got: {other:?}"),
+        }
     }
 
     // ── Security: session overrides cannot bypass safety checks ──────────────
