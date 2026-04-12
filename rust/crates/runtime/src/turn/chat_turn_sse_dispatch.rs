@@ -62,7 +62,9 @@ fn normalize_tool_call_for_accum(event: &Value) -> Option<Value> {
         .get("id")
         .or_else(|| event.get("call_id"))
         .and_then(Value::as_str)
-        .unwrap_or("");
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
 
     if let Some(function) = event.get("function").and_then(Value::as_object) {
         let name = function.get("name").and_then(Value::as_str).unwrap_or("");
@@ -1224,5 +1226,39 @@ mod tests {
             &mut vec![],
         );
         assert_eq!(a.explain_turns.len(), 1);
+    }
+
+    #[test]
+    fn tool_call_with_empty_id_gets_synthetic_uuid() {
+        let mut a = ChatTurnSseAccum::default();
+        // Simulate a model returning a tool_call with empty id
+        dispatch_chat_turn_sse_event_block(
+            &sse(
+                "tool_call_start",
+                ",\"id\":\"\",\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"ls\\\"}\"",
+            ),
+            &mut a,
+            &mut vec![],
+        );
+        assert_eq!(a.tool_calls.len(), 1);
+        let id = a.tool_calls[0]["id"].as_str().unwrap();
+        assert!(!id.is_empty(), "empty tool_call id must be replaced with a synthetic UUID");
+    }
+
+    #[test]
+    fn tool_call_with_missing_id_gets_synthetic_uuid() {
+        let mut a = ChatTurnSseAccum::default();
+        // No id field at all
+        dispatch_chat_turn_sse_event_block(
+            &sse(
+                "tool_call_start",
+                ",\"name\":\"grep\",\"arguments\":\"{}\"",
+            ),
+            &mut a,
+            &mut vec![],
+        );
+        assert_eq!(a.tool_calls.len(), 1);
+        let id = a.tool_calls[0]["id"].as_str().unwrap();
+        assert!(!id.is_empty(), "missing tool_call id must be replaced with a synthetic UUID");
     }
 }

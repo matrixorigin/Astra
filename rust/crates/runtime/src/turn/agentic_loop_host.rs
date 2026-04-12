@@ -4052,7 +4052,10 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                 let tc_entries: Vec<Value> = delegate_tool_calls
                     .iter()
                     .map(|tc| {
-                        let id = tc.get("id").and_then(Value::as_str).unwrap_or("");
+                        let id = tc.get("id").and_then(Value::as_str)
+                            .filter(|s| !s.is_empty())
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
                         let name = tool_call_name(tc).unwrap_or("delegate");
                         let args = tool_call_arguments_value(tc);
                         serde_json::json!({

@@ -262,9 +262,10 @@ pub async fn deliver_tool_calls_through_edge_ledger(
     tool_calls: &[Value],
     ledger_wait: Duration,
 ) -> EdgeToolRoundDelivery {
+    let tool_calls = super::headless_tool_assembly::ensure_tool_call_ids(tool_calls);
     let mut out = EdgeToolRoundDelivery::default();
 
-    for tc in tool_calls {
+    for tc in tool_calls.iter() {
         let Some(tc_map) = tc.as_object() else {
             continue;
         };
@@ -320,11 +321,12 @@ pub async fn deliver_tool_calls_concurrent(
     tool_calls: &[Value],
     ledger_wait: Duration,
 ) -> EdgeToolRoundDelivery {
+    let tool_calls = super::headless_tool_assembly::ensure_tool_call_ids(tool_calls);
     let mut out = EdgeToolRoundDelivery::default();
     let mut read_only: Vec<&Value> = Vec::new();
 
     // Phase 1: approval-required tools sequentially, collect read-only for later.
-    for tc in tool_calls {
+    for tc in tool_calls.iter() {
         let Some(tc_map) = tc.as_object() else {
             continue;
         };

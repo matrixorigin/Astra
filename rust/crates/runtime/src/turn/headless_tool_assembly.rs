@@ -72,6 +72,36 @@ pub fn headless_round_tool_indices(
     }
 }
 
+/// Ensure every tool_call in the slice has a non-empty `"id"` field.
+/// Returns a `Cow::Borrowed` when all ids are present, avoiding allocation.
+/// When any id is empty/missing, clones those entries and patches them
+/// with a synthetic UUID v7.
+pub fn ensure_tool_call_ids(tool_calls: &[Value]) -> std::borrow::Cow<'_, [Value]> {
+    let needs_patch = tool_calls.iter().any(|tc| {
+        tc.get("id")
+            .and_then(|v| v.as_str())
+            .map_or(true, |s| s.is_empty())
+    });
+    if !needs_patch {
+        return std::borrow::Cow::Borrowed(tool_calls);
+    }
+    std::borrow::Cow::Owned(
+        tool_calls
+            .iter()
+            .map(|tc| {
+                let id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                if id.is_empty() {
+                    let mut patched = tc.clone();
+                    patched["id"] = Value::String(uuid::Uuid::now_v7().to_string());
+                    patched
+                } else {
+                    tc.clone()
+                }
+            })
+            .collect(),
+    )
+}
+
 /// Parse flat `/chat/turn` tool-call JSON: top-level `id`, `name`, `arguments` (object or JSON string).
 pub fn parse_flat_tool_call_event(tc: &Value) -> (String, String, Value) {
     let id = tc
@@ -834,5 +864,70 @@ mod tests {
         let (id2, _, _) = parse_flat_tool_call_event(&tc2);
         assert!(!id2.is_empty());
         assert_ne!(id, id2, "each call should get a unique id");
+    }
+
+    // ── ensure_tool_call_ids regression tests ───────────────────────────
+
+    #[test]
+    fn ensure_ids_borrows_when_all_present() {
+        let tcs = vec![
+            json!({"id": "a", "name": "bash"}),
+            json!({"id": "b", "name": "grep"}),
+        ];
+        let result = ensure_tool_call_ids(&tcs);
+        assert!(matches!(result, std::borrow::Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn ensure_ids_patches_empty_id() {
+        let tcs = vec![
+            json!({"id": "", "name": "bash"}),
+            json!({"id": "ok", "name": "grep"}),
+        ];
+        let result = ensure_tool_call_ids(&tcs);
+        assert!(matches!(result, std::borrow::Cow::Owned(_)));
+        let id0 = result[0]["id"].as_str().unwrap();
+        assert!(!id0.is_empty(), "empty id must be patched");
+        assert_eq!(result[1]["id"].as_str().unwrap(), "ok", "valid id untouched");
+    }
+
+    #[test]
+    fn ensure_ids_patches_missing_id() {
+        let tcs = vec![json!({"name": "bash"})];
+        let result = ensure_tool_call_ids(&tcs);
+        let id = result[0]["id"].as_str().unwrap();
+        assert!(!id.is_empty());
+    }
+
+    #[test]
+    fn ensure_ids_unique_per_call() {
+        let tcs = vec![
+            json!({"id": "", "name": "a"}),
+            json!({"id": "", "name": "b"}),
+        ];
+        let result = ensure_tool_call_ids(&tcs);
+        let id0 = result[0]["id"].as_str().unwrap();
+        let id1 = result[1]["id"].as_str().unwrap();
+        assert_ne!(id0, id1, "each empty id must get a distinct UUID");
+    }
+
+    /// The critical invariant: after ensure_tool_call_ids, building an
+    /// assistant message and parsing tool result ids must produce matching ids.
+    #[test]
+    fn ensure_ids_makes_assistant_and_result_ids_match() {
+        let tcs = vec![json!({"id": "", "name": "bash", "arguments": "{}"})];
+        let patched = ensure_tool_call_ids(&tcs);
+
+        // Assistant message path
+        let assistant_msg = openai_assistant_with_tool_calls_message::<Row>(
+            &patched, &[], "",
+        );
+        let assistant_id = assistant_msg["tool_calls"][0]["id"].as_str().unwrap();
+
+        // Tool result path
+        let (result_id, _, _) = parse_flat_tool_call_event(&patched[0]);
+
+        assert_eq!(assistant_id, result_id,
+            "assistant tool_call id and tool result id must match after ensure_tool_call_ids");
     }
 }

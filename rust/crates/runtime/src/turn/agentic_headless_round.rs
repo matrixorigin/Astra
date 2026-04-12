@@ -133,6 +133,12 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
     let force_reasoning =
         !reasoning_content.is_empty() || super::edge_ledger::history_has_reasoning(messages);
 
+    // Normalize tool_calls: replace empty/missing ids with synthetic UUIDs
+    // so the assistant message and tool result messages share the same id.
+    // Without this, APIs reject tool results with "tool_call_id not found".
+    let tool_calls = super::headless_tool_assembly::ensure_tool_call_ids(tool_calls);
+    let tool_calls = &tool_calls;
+
     let opening = begin_headless_tool_round_opening_ext(
         tool_calls,
         edge_tool_round,
