@@ -77,7 +77,8 @@ where
     fn new(stream: S, client_cancel: Option<Arc<CancellationToken>>) -> Self {
         Self {
             stream: Box::pin(stream),
-            _disconnect_guard: client_cancel.map(crate::turn::llm_client::CancelOnClientDisconnect::new),
+            _disconnect_guard: client_cancel
+                .map(crate::turn::llm_client::CancelOnClientDisconnect::new),
         }
     }
 }
@@ -634,6 +635,7 @@ where
         let mut tool_rounds: i64 = 0;
         let mut received_turn_complete = false;
         let mut force_max_rounds_completion = false;
+        let mut saw_error_event = false;
         while let Some(chunk) = stream.next().await {
             match chunk {
                 Ok(chunk) => {
@@ -849,6 +851,7 @@ where
                                     serde_json::Value::Object(cloud_tool_result_event),
                                 )));
                             } else if let Some(error_event) = build_error_event_from_frame(&frame) {
+                                saw_error_event = true;
                                 yield Ok(Bytes::from(render_sse_json(
                                     serde_json::Value::Object(error_event),
                                 )));
@@ -938,6 +941,7 @@ where
                                 serde_json::Value::Object(cloud_tool_result_event),
                             )));
                         } else if let Some(error_event) = build_error_event_from_frame(&frame) {
+                            saw_error_event = true;
                             yield Ok(Bytes::from(render_sse_json(
                                 serde_json::Value::Object(error_event),
                             )));
@@ -951,6 +955,10 @@ where
                             yield Ok(Bytes::from(render_sse_json(
                                 serde_json::Value::Object(tool_call_start_event),
                             )));
+                        } else if is_turn_complete_frame(&frame) {
+                            yield Ok(Bytes::from(frame));
+                            received_turn_complete = true;
+                            continue;
                         } else if is_warning_frame(&frame) || is_explain_frame(&frame) {
                             yield Ok(Bytes::from(frame));
                             continue;
@@ -1172,6 +1180,7 @@ where
                             serde_json::Value::Object(cloud_tool_result_event),
                         )));
                     } else if let Some(error_event) = build_error_event_from_frame(&buffer) {
+                        saw_error_event = true;
                         yield Ok(Bytes::from(render_sse_json(
                             serde_json::Value::Object(error_event),
                         )));
@@ -1257,6 +1266,7 @@ where
                         serde_json::Value::Object(cloud_tool_result_event),
                     )));
                 } else if let Some(error_event) = build_error_event_from_frame(&buffer) {
+                    saw_error_event = true;
                     yield Ok(Bytes::from(render_sse_json(
                         serde_json::Value::Object(error_event),
                     )));
@@ -1270,6 +1280,9 @@ where
                     yield Ok(Bytes::from(render_sse_json(
                         serde_json::Value::Object(tool_call_start_event),
                     )));
+                } else if is_turn_complete_frame(&buffer) {
+                    yield Ok(Bytes::from(buffer));
+                    received_turn_complete = true;
                 } else if is_warning_frame(&buffer) || is_explain_frame(&buffer) {
                     yield Ok(Bytes::from(buffer));
                 } else {
@@ -1307,6 +1320,15 @@ where
         }
 
         if !received_turn_complete {
+            if !saw_error_event {
+                yield Ok(Bytes::from(render_sse_json(serde_json::Value::Object(
+                    build_stream_error_event(
+                        "Bridge stream ended before turn_complete",
+                        "UPSTREAM_ERROR",
+                        true,
+                    ),
+                ))));
+            }
             astra_core::agent_warn!("bridge", "SSE stream ended without turn_complete frame — possible interruption");
         }
     }

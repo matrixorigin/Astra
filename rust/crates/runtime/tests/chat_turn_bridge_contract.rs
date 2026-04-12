@@ -344,6 +344,10 @@ data: {\"type\":\"turn_complete\",\"has_tool_calls\":false}\n\n",
     )
 }
 
+async fn interrupted_text_delta_internal_turn() -> Response {
+    sse_ok("data: {\"type\":\"text_delta\",\"content\":\"partial\"}\n\n")
+}
+
 async fn conflicting_has_tool_calls_internal_turn() -> Response {
     sse_ok(
         "data: {\"type\":\"bridge_state\",\"tail_update_args\":{\"full_text\":\"\",\"tool_calls\":[{\"id\":\"call-1\",\"type\":\"function\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"cmd\\\":\\\"pwd\\\"}\"}}],\"reasoning_content\":\"\",\"cloud_loop_history\":[]}}\n\n\
@@ -2556,6 +2560,62 @@ async fn http_chat_turn_bridge_runs_observer_when_hook_flag_uses_inprocess_bridg
         Some(serde_json::Value::String(
             "2026-03-20T00:00:00Z".to_string()
         ))
+    );
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn http_chat_turn_bridge_signals_error_on_truncated_stream() {
+    let contract = load_contract();
+    let (addr, server) = spawn_internal_bridge!(Router::new().route(
+        "/internal/chat/turn",
+        post(interrupted_text_delta_internal_turn),
+    ));
+
+    let app = build_app(
+        AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
+            .with_auth_service(Arc::new(StubAuthService))
+            .with_session_service(Arc::new(StubSessionService {
+                capture: SessionCaptureState::default(),
+            }))
+            .with_chat_turn_bridge_secret(contract.bridge_secret)
+            .with_chat_turn_bridge_url(internal_chat_turn_url(addr)),
+    );
+
+    let response = app
+        .oneshot(build_request(
+            "/chat/turn",
+            Some("Bearer good-token"),
+            serde_json::json!({
+                "messages": [{"role": "user", "content": "hi"}],
+                "session_id": "s1",
+                "explain": false
+            }),
+        ))
+        .await
+        .unwrap();
+
+    let body = body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let payload = String::from_utf8(body.to_vec()).unwrap();
+    let frames = payload
+        .trim()
+        .split("\n\n")
+        .map(|frame| frame.strip_prefix("data: ").unwrap())
+        .map(|json| serde_json::from_str::<serde_json::Value>(json).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(frames.len(), 3);
+    assert_trusted_session_info_frame(&frames[0], "s1");
+    assert_eq!(frames[1]["type"], "text_delta");
+    assert_eq!(frames[1]["content"], "partial");
+    assert_eq!(frames[2]["type"], "error");
+    assert_eq!(frames[2]["code"], "UPSTREAM_ERROR");
+    assert_eq!(frames[2]["retryable"], true);
+    assert_eq!(
+        frames[2]["message"],
+        "Bridge stream ended before turn_complete"
     );
 
     server.abort();
