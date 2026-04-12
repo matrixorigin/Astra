@@ -17,5 +17,6 @@ describe('LiveRunPanel', () => {
     expect(screen.getByText('Run started (run-1)')).toBeInTheDocument();
     expect(screen.getByText('Run failed: boom')).toBeInTheDocument();
     expect(screen.getByText('Run cancelled (run-2)')).toBeInTheDocument();
+    expect(screen.getByText('run_finished')).toHaveClass('text-red-300');
   });
 });

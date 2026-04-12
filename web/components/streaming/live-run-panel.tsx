@@ -5,7 +5,17 @@ import type { StreamEvent } from '@/lib/streaming/types';
 import type { ConnectionState } from '@/lib/streaming/types';
 import { ConnectionStatus } from './connection-status';
 
-function EventBadge({ type }: { type: string }) {
+function eventBadgeColor(event: StreamEvent): string {
+  if (event.type === 'run_finished') {
+    if (event.status === 'failed') return 'bg-red-500/20 text-red-300';
+    if (event.status === 'cancelled') return 'bg-amber-500/20 text-amber-300';
+  }
+
+  if (event.type === 'agent_completed') {
+    if (event.status === 'failed') return 'bg-red-500/20 text-red-300';
+    if (event.status === 'cancelled') return 'bg-amber-500/20 text-amber-300';
+  }
+
   const colors: Record<string, string> = {
     text_delta: 'bg-sky-500/20 text-sky-300',
     run_started: 'bg-blue-500/20 text-blue-300',
@@ -25,11 +35,15 @@ function EventBadge({ type }: { type: string }) {
     agent_completed: 'bg-emerald-500/20 text-emerald-300',
   };
 
+  return colors[event.type] ?? 'bg-slate-700/30 text-slate-400';
+}
+
+function EventBadge({ event }: { event: StreamEvent }) {
   return (
     <span
-      className={`inline-block rounded-full px-2 py-0.5 text-xs font-medium ${colors[type] ?? 'bg-slate-700/30 text-slate-400'}`}
+      className={`inline-block rounded-full px-2 py-0.5 text-xs font-medium ${eventBadgeColor(event)}`}
     >
-      {type}
+      {event.type}
     </span>
   );
 }
@@ -147,7 +161,7 @@ export function LiveRunPanel({
                 key={index}
                 className="flex items-start gap-2 text-sm"
               >
-                <EventBadge type={event.type} />
+                <EventBadge event={event} />
                 <span className="min-w-0 flex-1 break-words text-slate-300">
                   {eventSummary(event)}
                 </span>
