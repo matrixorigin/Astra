@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::SystemTime;
 
-use astra_core::{DriftCause, DriftEvidence, EvidenceType};
+use astra_core::{ConfidenceInterval, DriftCause, DriftEvidence, EvidenceType};
 
 use super::context_assembly_trace::{MemoryRetrievalTrace, TokenBudgetTrace};
 
@@ -303,7 +303,7 @@ impl FocusDriftAnalysis {
             turn,
             evidence_type,
             description: description.into(),
-            confidence: confidence.clamp(0.0, 1.0),
+            confidence: ConfidenceInterval::exact(confidence),
         });
         self
     }
@@ -352,7 +352,7 @@ impl FocusDriftAnalysis {
                     ev.turn,
                     ev.evidence_type,
                     ev.description,
-                    ev.confidence * 100.0
+                    ev.confidence.point * 100.0
                 ));
             }
             lines.push(String::new());
@@ -487,7 +487,7 @@ impl DriftDetector {
                 turn: last_correction,
                 evidence_type: EvidenceType::UserCorrection,
                 description: "User provided correction/redirection".to_string(),
-                confidence: 0.8,
+                confidence: ConfidenceInterval::exact(0.8),
             });
             severity += 0.4;
         }
@@ -507,7 +507,7 @@ impl DriftDetector {
                         sim * 100.0,
                         overlap * 100.0
                     ),
-                    confidence: 0.7,
+                    confidence: ConfidenceInterval::exact(0.7),
                 });
                 severity += 0.2;
             }
@@ -519,7 +519,7 @@ impl DriftDetector {
                 turn: compressed_turns[0],
                 evidence_type: EvidenceType::CompressionLoss,
                 description: format!("{} turns were compressed", compressed_turns.len()),
-                confidence: 0.5,
+                confidence: ConfidenceInterval::exact(0.5),
             });
             severity += 0.15;
         }
@@ -628,7 +628,7 @@ impl DriftDetector {
                     turn: i as u32,
                     evidence_type: EvidenceType::MemoryMismatch,
                     description: desc,
-                    confidence: 0.6,
+                    confidence: ConfidenceInterval::exact(0.6),
                 });
                 if !memory_miss_detected {
                     extra_severity += 0.2;
@@ -652,7 +652,7 @@ impl DriftDetector {
                         "Token budget pressure {:.0}% — {sacrificed}",
                         trace.budget_pressure * 100.0
                     ),
-                    confidence: 0.7,
+                    confidence: ConfidenceInterval::exact(0.7),
                 });
                 if !budget_pressure_detected {
                     extra_severity += 0.25;
@@ -684,7 +684,7 @@ impl DriftDetector {
                                     "Repeated corrections on similar queries (similarity {:.0}%)",
                                     sim * 100.0
                                 ),
-                                confidence: 0.75,
+                                confidence: ConfidenceInterval::exact(0.75),
                             });
                             extra_severity += 0.3;
                             break; // One ambiguity signal is enough

@@ -411,117 +411,115 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         } else {
             None
         };
-        let allowed = match &mut self.perm_manager {
-            Some(pm) => {
-                // Always use non-blocking check to avoid freezing the async SSE consumer.
-                match pm.check_nonblocking(tool, args) {
-                    crate::permission_manager::PermissionDecision::Allow => true,
-                    crate::permission_manager::PermissionDecision::Deny(_reason) => false,
-                    crate::permission_manager::PermissionDecision::NeedApproval {
-                        tool: t,
+        let decision = match self.perm_manager.as_mut() {
+            Some(pm) => crate::tool_safety_guard::ToolSafetyGuard::check_request(
+                Some(&mut **pm),
+                tool,
+                args,
+            ),
+            None => crate::tool_safety_guard::ToolSafetyGuard::check_request(None, tool, args),
+        };
+        let mut denied_output = None;
+        let allowed = match decision {
+            crate::permission_manager::PermissionDecision::Allow => true,
+            crate::permission_manager::PermissionDecision::Deny(reason) => {
+                denied_output = Some(format!("Error: {reason}"));
+                false
+            }
+            crate::permission_manager::PermissionDecision::NeedApproval {
+                tool: t,
+                header,
+                detail,
+                reason,
+            } => {
+                if let Some(tx) = &self.approval_request_tx {
+                    let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+                    let _ = tx.send(super::chat_stream::ApprovalRequest {
+                        tool: t.clone(),
                         header,
                         detail,
                         reason,
-                    } => {
-                        if let Some(tx) = &self.approval_request_tx {
-                            // Plan execution: route approval through channel to REPL
-                            let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-                            let _ = tx.send(super::chat_stream::ApprovalRequest {
-                                tool: t.clone(),
-                                header,
-                                detail,
-                                reason,
-                                response_tx: resp_tx,
-                            });
-                            let result = if let Some(token) = self.cancel_token {
-                                tokio::select! {
-                                    biased;
-                                    _ = token.cancelled() => false,
-                                    r = resp_rx => r.unwrap_or(false),
-                                }
-                            } else {
-                                resp_rx.await.unwrap_or(false)
-                            };
-                            if result {
-                                pm.record_approval(&t, true);
-                            }
-                            result
-                        } else if self.quiet {
-                            // Sub-run mode (no terminal): auto-deny permission requests.
-                            // This prevents silent hangs where a background agent waits
-                            // forever for user input that can never come.
-                            //
-                            // The tool will get a denial result and the agent can either:
-                            // - Use an alternative approach
-                            // - Report the permission issue in its output
-                            astra_core::agent_warn!(
-                                "permission",
-                                "Auto-denied {t} in sub-run mode (no interactive terminal): {reason}"
-                            );
-                            pm.record_approval(&t, false);
-                            false
-                        } else {
-                            // Normal interactive mode: prompt on a blocking thread so we
-                            // don't freeze the async SSE consumer.  Rustyline is inactive
-                            // during turn execution, so the terminal is available.
-                            //
-                            // Stop the running-tool spinner so the approval prompt is
-                            // visible (the spinner continuously overwrites the line).
-                            self.render.stop_tool_stderr_running();
-                            self.render.stop_tool_stdout_anim();
-                            use crossterm::style::Stylize;
-                            eprintln!("  {}", format!("⚠  {header}").yellow());
-                            if let Some(d) = &detail {
-                                eprintln!("{}", d.as_str().dim());
-                            }
-                            if !reason.is_empty() {
-                                eprintln!("  {}", reason.dim());
-                            }
-                            let ch = tokio::task::spawn_blocking(|| {
-                                crate::permission_manager::PermissionManager::prompt_approval(
-                                    crate::permission_manager::ApprovalPromptKind::LocalStandard,
-                                )
-                            })
-                            .await
-                            .unwrap_or('n');
-                            let approved = matches!(ch, 'y' | 'a' | '!');
-                            if approved {
-                                pm.record_approval(&t, true);
-                            }
-                            if ch == '!' {
-                                pm.set_mode(crate::permission_manager::PermissionMode::Auto);
-                                eprintln!(
-                                    "  {}",
-                                    "  ⚡ Auto-run enabled for this session. Use /allow prompt to restore."
+                        response_tx: resp_tx,
+                    });
+                    let result = if let Some(token) = self.cancel_token {
+                        tokio::select! {
+                            biased;
+                            _ = token.cancelled() => false,
+                            r = resp_rx => r.unwrap_or(false),
+                        }
+                    } else {
+                        resp_rx.await.unwrap_or(false)
+                    };
+                    if let Some(pm) = self.perm_manager.as_mut()
+                        && result
+                    {
+                        pm.record_approval(&t, true);
+                    }
+                    result
+                } else if self.quiet {
+                    astra_core::agent_warn!(
+                        "permission",
+                        "Auto-denied {t} in sub-run mode (no interactive terminal): {reason}"
+                    );
+                    if let Some(pm) = self.perm_manager.as_mut() {
+                        pm.record_approval(&t, false);
+                    }
+                    false
+                } else {
+                    self.render.stop_tool_stderr_running();
+                    self.render.stop_tool_stdout_anim();
+                    use crossterm::style::Stylize;
+                    eprintln!("  {}", format!("⚠  {header}").yellow());
+                    if let Some(d) = &detail {
+                        eprintln!("{}", d.as_str().dim());
+                    }
+                    if !reason.is_empty() {
+                        eprintln!("  {}", reason.dim());
+                    }
+                    let ch = tokio::task::spawn_blocking(|| {
+                        crate::permission_manager::PermissionManager::prompt_approval(
+                            crate::permission_manager::ApprovalPromptKind::LocalStandard,
+                        )
+                    })
+                    .await
+                    .unwrap_or('n');
+                    let approved = matches!(ch, 'y' | 'a' | '!');
+                    if let Some(pm) = self.perm_manager.as_mut() {
+                        if approved {
+                            pm.record_approval(&t, true);
+                        }
+                        if ch == '!' {
+                            pm.set_mode(crate::permission_manager::PermissionMode::Auto);
+                            eprintln!(
+                                "  {}",
+                                "  ⚡ Auto-run enabled for this session. Use /allow prompt to restore."
                                     .yellow()
+                            );
+                        }
+                        if ch == 'a' {
+                            let rule =
+                                crate::permission_manager::PermissionManager::make_allow_rule(
+                                    &t, args,
                                 );
-                            }
-                            if ch == 'a' {
-                                let rule =
-                                    crate::permission_manager::PermissionManager::make_allow_rule(
-                                        &t, args,
-                                    );
-                                pm.add_allow_rule(&rule);
-                                let scope = if pm.has_project_root() {
-                                    "project"
-                                } else {
-                                    "session"
-                                };
-                                eprintln!(
-                                    "  {}",
-                                    format!("  ✓ {rule}: always allowed ({scope})").dim()
-                                );
-                            }
-                            if ch == 's' {
-                                pm.record_approval(&t, false);
-                                eprintln!("  {}", format!("  ✗ {t}: skipped for session").dim());
-                            }
-                            approved
+                            pm.add_allow_rule(&rule);
+                            let scope = if pm.has_project_root() {
+                                "project"
+                            } else {
+                                "session"
+                            };
+                            eprintln!(
+                                "  {}",
+                                format!("  ✓ {rule}: always allowed ({scope})").dim()
+                            );
+                        }
+                        if ch == 's' {
+                            pm.record_approval(&t, false);
+                            eprintln!("  {}", format!("  ✗ {t}: skipped for session").dim());
                         }
                     }
+                    approved
                 }
             }
-            None => true,
         };
         let start = std::time::Instant::now();
         let output = if allowed {
@@ -569,9 +567,11 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     if let Some(pm) = &mut self.perm_manager {
                         let sandbox_msg = &result[crate::edge_tools::SANDBOX_DENIED_PREFIX.len()..];
                         let sandbox_tool_key = format!("sandbox_expand:{tool}");
-                        let decision = pm.check_nonblocking(
+                        let guard_args = serde_json::json!({"reason": sandbox_msg});
+                        let decision = crate::tool_safety_guard::ToolSafetyGuard::check_request(
+                            Some(&mut **pm),
                             &sandbox_tool_key,
-                            &serde_json::json!({"reason": sandbox_msg}),
+                            &guard_args,
                         );
                         let approved = match decision {
                             crate::permission_manager::PermissionDecision::Allow => true,
@@ -692,7 +692,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                             }
                             self.executor.execute(tool, args).await
                         } else {
-                            result
+                            format!("Error: {sandbox_msg}")
                         }
                     } else {
                         result
@@ -702,7 +702,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 }
             }
         } else {
-            "Permission denied".to_string()
+            denied_output.unwrap_or_else(|| "Permission denied".to_string())
         };
         let status = if !allowed {
             "error"
@@ -933,13 +933,20 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         // Read-only tools hit the fast-path in check_nonblocking (SideEffect::Read → Allow).
         let mut all_allowed = true;
         for (_, req) in &conc_reqs {
-            let ok = match &mut self.perm_manager {
-                Some(pm) => matches!(
-                    pm.check_nonblocking(&req.tool, &req.args),
-                    crate::permission_manager::PermissionDecision::Allow
+            let decision = match self.perm_manager.as_mut() {
+                Some(pm) => crate::tool_safety_guard::ToolSafetyGuard::check_request(
+                    Some(&mut **pm),
+                    &req.tool,
+                    &req.args,
                 ),
-                None => true,
+                None => crate::tool_safety_guard::ToolSafetyGuard::check_request(
+                    None, &req.tool, &req.args,
+                ),
             };
+            let ok = matches!(
+                decision,
+                crate::permission_manager::PermissionDecision::Allow
+            );
             if !ok {
                 all_allowed = false;
                 break;

@@ -1629,10 +1629,7 @@ impl ConditionalEventHandler for SlashStartCompleteHandler {
                             }
                             // Prefix — complete to the subcommand, don't execute.
                             clear_subcmd_overlay();
-                            return Some(RlCmd::Replace(
-                                RlMovement::WholeLine,
-                                Some(full_cmd),
-                            ));
+                            return Some(RlCmd::Replace(RlMovement::WholeLine, Some(full_cmd)));
                         }
                     }
                     clear_subcmd_overlay();
@@ -1713,7 +1710,11 @@ impl ConditionalEventHandler for SlashStartCompleteHandler {
                     set_subcmd_picker_selected(0);
                     render_subcmd_overlay(
                         parent,
-                        if filter.is_empty() { None } else { Some(&filter) },
+                        if filter.is_empty() {
+                            None
+                        } else {
+                            Some(&filter)
+                        },
                     );
                     return None; // let space be inserted
                 } else if in_slash && active {
@@ -1939,15 +1940,16 @@ impl ConditionalEventHandler for SlashStartCompleteHandler {
                         set_subcmd_picker_selected(0);
                         render_subcmd_overlay(
                             parent,
-                            if filter.is_empty() { None } else { Some(&filter) },
+                            if filter.is_empty() {
+                                None
+                            } else {
+                                Some(&filter)
+                            },
                         );
                     } else {
                         clear_slash_overlay();
                     }
-                    return Some(RlCmd::Replace(
-                        RlMovement::WholeLine,
-                        Some(replacement),
-                    ));
+                    return Some(RlCmd::Replace(RlMovement::WholeLine, Some(replacement)));
                 }
 
                 if current == "/" {

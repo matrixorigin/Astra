@@ -13,6 +13,13 @@ use astra_core::{
 
 const MAX_EVALUATION_ROWS: i32 = 200;
 const MAX_EVALUATION_DAYS: i32 = 365;
+const DEFAULT_DRIFT_WINDOW_DAYS: i32 = 30;
+const DRIFT_INFO_DELTA: f64 = 0.05;
+const DRIFT_WARNING_DELTA: f64 = 0.10;
+const DRIFT_CRITICAL_DELTA: f64 = 0.20;
+const LOOP_QUALITY_THRESHOLD: f64 = 0.70;
+const LOOP_DRIFT_DELTA_THRESHOLD: f64 = 0.10;
+const TRUST_SLO_TARGET: f64 = 0.95;
 
 fn clamp_eval_limit(limit: i32) -> i32 {
     limit.clamp(1, MAX_EVALUATION_ROWS)
@@ -20,6 +27,57 @@ fn clamp_eval_limit(limit: i32) -> i32 {
 
 fn clamp_eval_days(days: i32) -> i32 {
     days.clamp(1, MAX_EVALUATION_DAYS)
+}
+
+fn classify_drift_severity(delta: f64) -> Option<DriftSeverity> {
+    let magnitude = delta.abs();
+    if magnitude >= DRIFT_CRITICAL_DELTA {
+        Some(DriftSeverity::Critical)
+    } else if magnitude >= DRIFT_WARNING_DELTA {
+        Some(DriftSeverity::Warning)
+    } else if magnitude >= DRIFT_INFO_DELTA {
+        Some(DriftSeverity::Info)
+    } else {
+        None
+    }
+}
+
+fn build_drift_signal(
+    model: String,
+    template_id: Option<String>,
+    current_avg: f64,
+    previous_avg: f64,
+    sample_count: i64,
+) -> Option<DriftSignalResponse> {
+    let delta = current_avg - previous_avg;
+    classify_drift_severity(delta).map(|severity| DriftSignalResponse {
+        model,
+        template_id,
+        current_avg,
+        previous_avg,
+        delta,
+        severity,
+        sample_count,
+    })
+}
+
+fn build_loop_actions(diagnoses: &[LoopDiagnosisItem], dry_run: bool) -> Vec<String> {
+    diagnoses
+        .iter()
+        .filter_map(|diagnosis| match diagnosis.action {
+            LoopAction::NoOp => None,
+            LoopAction::Retune => Some(format!(
+                "{}retune:{}",
+                if dry_run { "dry_run:" } else { "" },
+                diagnosis.metric
+            )),
+            LoopAction::Alert => Some(format!(
+                "{}alert:{}",
+                if dry_run { "dry_run:" } else { "" },
+                diagnosis.metric
+            )),
+        })
+        .collect()
 }
 
 #[derive(Clone, Debug)]
@@ -157,10 +215,66 @@ impl EvaluationService for DatabaseEvaluationService {
         })
     }
 
-    async fn detect_drift(&self, _user_id: &str) -> ServiceResult<DriftDetectResponse> {
-        Err(not_implemented(
-            "Evaluation drift detection is not implemented yet",
-        ))
+    async fn detect_drift(&self, user_id: &str) -> ServiceResult<DriftDetectResponse> {
+        let pool = self.get_pool().await.map_err(internal_error)?;
+        let window_days = clamp_eval_days(DEFAULT_DRIFT_WINDOW_DAYS);
+        let lookback_days = window_days * 2;
+
+        let rows = query(
+            "SELECT level, \
+             AVG(CASE WHEN created_at >= DATE_SUB(NOW(), INTERVAL ? DAY) THEN score END) AS current_avg, \
+             AVG(CASE WHEN created_at < DATE_SUB(NOW(), INTERVAL ? DAY) \
+                      AND created_at >= DATE_SUB(NOW(), INTERVAL ? DAY) THEN score END) AS previous_avg, \
+             SUM(CASE WHEN created_at >= DATE_SUB(NOW(), INTERVAL ? DAY) THEN 1 ELSE 0 END) AS current_count, \
+             SUM(CASE WHEN created_at < DATE_SUB(NOW(), INTERVAL ? DAY) \
+                      AND created_at >= DATE_SUB(NOW(), INTERVAL ? DAY) THEN 1 ELSE 0 END) AS previous_count \
+             FROM eval_quality_assessments \
+             WHERE user_id = ? \
+               AND created_at >= DATE_SUB(NOW(), INTERVAL ? DAY) \
+             GROUP BY level \
+             ORDER BY level",
+        )
+        .bind(window_days)
+        .bind(window_days)
+        .bind(lookback_days)
+        .bind(window_days)
+        .bind(window_days)
+        .bind(lookback_days)
+        .bind(user_id)
+        .bind(lookback_days)
+        .fetch_all(&pool)
+        .await
+        .unwrap_or_default();
+
+        let signals = rows
+            .iter()
+            .filter_map(|row| {
+                let current_count = row.try_get::<i64, _>("current_count").unwrap_or(0);
+                let previous_count = row.try_get::<i64, _>("previous_count").unwrap_or(0);
+                if current_count == 0 || previous_count == 0 {
+                    return None;
+                }
+
+                let level = row
+                    .try_get::<String, _>("level")
+                    .unwrap_or_else(|_| "unknown".into());
+                let current_avg = row.try_get::<f64, _>("current_avg").unwrap_or(0.0);
+                let previous_avg = row.try_get::<f64, _>("previous_avg").unwrap_or(0.0);
+
+                build_drift_signal(
+                    level,
+                    None,
+                    current_avg,
+                    previous_avg,
+                    current_count.min(previous_count),
+                )
+            })
+            .collect();
+
+        Ok(DriftDetectResponse {
+            signals,
+            checked_at: now_iso(),
+        })
     }
 
     async fn get_gate_history(
@@ -258,21 +372,90 @@ impl EvaluationService for DatabaseEvaluationService {
         ))
     }
 
-    async fn run_drift_pipeline(&self, _user_id: &str) -> ServiceResult<DriftPipelineResponse> {
-        Err(not_implemented(
-            "Evaluation drift pipeline execution is not implemented yet",
-        ))
+    async fn run_drift_pipeline(&self, user_id: &str) -> ServiceResult<DriftPipelineResponse> {
+        let drift = self.detect_drift(user_id).await?;
+        let started_at = drift.checked_at.clone();
+        let run_id = format!("drift-{}", started_at.replace(['-', 'T', ':'], ""));
+        Ok(DriftPipelineResponse {
+            run_id,
+            signals_detected: drift.signals.len(),
+            signals: drift.signals,
+            started_at,
+        })
     }
 
     async fn run_closed_loop(
         &self,
-        _user_id: &str,
-        _days: i32,
-        _dry_run: bool,
+        user_id: &str,
+        days: i32,
+        dry_run: bool,
     ) -> ServiceResult<ClosedLoopResponse> {
-        Err(not_implemented(
-            "Evaluation closed-loop execution is not implemented yet",
-        ))
+        let days = clamp_eval_days(days);
+        let quality = self.get_quality_trend(user_id, days, None).await?;
+        let drift = self.detect_drift(user_id).await?;
+
+        let max_drift_delta = drift
+            .signals
+            .iter()
+            .map(|signal| signal.delta.abs())
+            .fold(0.0_f64, f64::max);
+
+        let quality_action =
+            if quality.total_events > 0 && quality.overall_avg < LOOP_QUALITY_THRESHOLD {
+                LoopAction::Retune
+            } else {
+                LoopAction::NoOp
+            };
+        let drift_count_action = if drift.signals.iter().any(|signal| {
+            matches!(
+                signal.severity,
+                DriftSeverity::Critical | DriftSeverity::Warning
+            )
+        }) {
+            LoopAction::Alert
+        } else if !drift.signals.is_empty() {
+            LoopAction::Retune
+        } else {
+            LoopAction::NoOp
+        };
+        let drift_delta_action = if max_drift_delta >= DRIFT_CRITICAL_DELTA {
+            LoopAction::Alert
+        } else if max_drift_delta >= LOOP_DRIFT_DELTA_THRESHOLD {
+            LoopAction::Retune
+        } else {
+            LoopAction::NoOp
+        };
+
+        let diagnoses = vec![
+            LoopDiagnosisItem {
+                metric: "quality_overall_avg".into(),
+                value: quality.overall_avg,
+                threshold: LOOP_QUALITY_THRESHOLD,
+                action: quality_action,
+            },
+            LoopDiagnosisItem {
+                metric: "drift_signal_count".into(),
+                value: drift.signals.len() as f64,
+                threshold: 0.0,
+                action: drift_count_action,
+            },
+            LoopDiagnosisItem {
+                metric: "drift_max_delta".into(),
+                value: max_drift_delta,
+                threshold: LOOP_DRIFT_DELTA_THRESHOLD,
+                action: drift_delta_action,
+            },
+        ];
+
+        let loop_id = format!("loop-{}", now_iso().replace(['-', 'T', ':'], ""));
+        let actions_taken = build_loop_actions(&diagnoses, dry_run);
+
+        Ok(ClosedLoopResponse {
+            loop_id,
+            dry_run,
+            diagnoses,
+            actions_taken,
+        })
     }
 
     async fn trust_report(
@@ -321,23 +504,102 @@ impl EvaluationService for DatabaseEvaluationService {
 
     async fn slo_dashboard(
         &self,
-        _user_id: &str,
-        _period_days: i32,
+        user_id: &str,
+        period_days: i32,
     ) -> ServiceResult<SloDashboardResponse> {
-        Err(not_implemented(
-            "Evaluation SLO dashboard is not implemented yet",
-        ))
+        let pool = self.get_pool().await.map_err(internal_error)?;
+        let period_days = clamp_eval_days(period_days);
+
+        let rows = query(
+            "SELECT agent_id, COUNT(*) AS total, \
+             SUM(CASE WHEN JSON_UNQUOTE(JSON_EXTRACT(content, '$.safe_to_deliver')) = 'true' \
+                  THEN 1 ELSE 0 END) AS safe_cnt \
+             FROM agent_events \
+             WHERE user_id = ? \
+               AND event_type = 'hallucination_check' \
+               AND agent_id IS NOT NULL \
+               AND created_at > DATE_SUB(NOW(), INTERVAL ? DAY) \
+             GROUP BY agent_id \
+             ORDER BY agent_id",
+        )
+        .bind(user_id)
+        .bind(period_days)
+        .fetch_all(&pool)
+        .await
+        .unwrap_or_default();
+
+        let agents = rows
+            .iter()
+            .map(|row| {
+                let agent_id = row.try_get::<String, _>("agent_id").unwrap_or_default();
+                let total = row.try_get::<i64, _>("total").unwrap_or(0);
+                let safe = row.try_get::<i64, _>("safe_cnt").unwrap_or(0);
+                let actual = trust_ratio(total, safe);
+                SloEntry {
+                    agent_id,
+                    slo_name: "trust_ratio".into(),
+                    target: TRUST_SLO_TARGET,
+                    actual,
+                    met: actual >= TRUST_SLO_TARGET,
+                }
+            })
+            .collect();
+
+        Ok(SloDashboardResponse {
+            period_days,
+            agents,
+        })
     }
 
     async fn slo_history(
         &self,
-        _user_id: &str,
-        _agent_id: &str,
-        _days: i32,
+        user_id: &str,
+        agent_id: &str,
+        days: i32,
     ) -> ServiceResult<SloHistoryResponse> {
-        Err(not_implemented(
-            "Evaluation SLO history is not implemented yet",
-        ))
+        let pool = self.get_pool().await.map_err(internal_error)?;
+        let days = clamp_eval_days(days);
+
+        let rows = query(
+            "SELECT DATE_FORMAT(DATE(created_at), '%Y-%m-%d') AS dt, \
+             COUNT(*) AS total, \
+             SUM(CASE WHEN JSON_UNQUOTE(JSON_EXTRACT(content, '$.safe_to_deliver')) = 'true' \
+                  THEN 1 ELSE 0 END) AS safe_cnt \
+             FROM agent_events \
+             WHERE user_id = ? \
+               AND agent_id = ? \
+               AND event_type = 'hallucination_check' \
+               AND created_at > DATE_SUB(NOW(), INTERVAL ? DAY) \
+             GROUP BY dt \
+             ORDER BY dt",
+        )
+        .bind(user_id)
+        .bind(agent_id)
+        .bind(days)
+        .fetch_all(&pool)
+        .await
+        .unwrap_or_default();
+
+        let history = rows
+            .iter()
+            .map(|row| {
+                let total = row.try_get::<i64, _>("total").unwrap_or(0);
+                let safe = row.try_get::<i64, _>("safe_cnt").unwrap_or(0);
+                let value = trust_ratio(total, safe);
+                SloHistoryPoint {
+                    date: row.try_get::<String, _>("dt").unwrap_or_default(),
+                    value,
+                    target: TRUST_SLO_TARGET,
+                    met: value >= TRUST_SLO_TARGET,
+                }
+            })
+            .collect();
+
+        Ok(SloHistoryResponse {
+            agent_id: agent_id.to_string(),
+            days,
+            history,
+        })
     }
 
     async fn observability_metrics(
@@ -581,6 +843,68 @@ mod tests {
         assert_eq!(clamp_eval_days(999), MAX_EVALUATION_DAYS);
         assert_eq!(clamp_eval_days(1), 1);
         assert_eq!(clamp_eval_days(365), 365);
+    }
+
+    #[test]
+    fn classify_drift_severity_thresholds() {
+        assert_eq!(classify_drift_severity(0.03), None);
+        assert_eq!(classify_drift_severity(0.06), Some(DriftSeverity::Info));
+        assert_eq!(classify_drift_severity(-0.12), Some(DriftSeverity::Warning));
+        assert_eq!(classify_drift_severity(0.25), Some(DriftSeverity::Critical));
+    }
+
+    #[test]
+    fn build_drift_signal_ignores_small_delta() {
+        assert!(build_drift_signal("session".into(), None, 0.78, 0.75, 8).is_none());
+    }
+
+    #[test]
+    fn build_drift_signal_sets_expected_fields() {
+        let signal = build_drift_signal("session".into(), None, 0.55, 0.78, 12).unwrap();
+        assert_eq!(signal.model, "session");
+        assert_eq!(signal.template_id, None);
+        assert!((signal.delta + 0.23).abs() < 1e-9);
+        assert_eq!(signal.severity, DriftSeverity::Critical);
+        assert_eq!(signal.sample_count, 12);
+    }
+
+    #[test]
+    fn build_loop_actions_honors_dry_run_prefix() {
+        let diagnoses = vec![
+            LoopDiagnosisItem {
+                metric: "quality_overall_avg".into(),
+                value: 0.5,
+                threshold: 0.7,
+                action: LoopAction::Retune,
+            },
+            LoopDiagnosisItem {
+                metric: "drift_signal_count".into(),
+                value: 2.0,
+                threshold: 0.0,
+                action: LoopAction::Alert,
+            },
+            LoopDiagnosisItem {
+                metric: "noop_metric".into(),
+                value: 1.0,
+                threshold: 1.0,
+                action: LoopAction::NoOp,
+            },
+        ];
+
+        assert_eq!(
+            build_loop_actions(&diagnoses, true),
+            vec![
+                "dry_run:retune:quality_overall_avg".to_string(),
+                "dry_run:alert:drift_signal_count".to_string(),
+            ]
+        );
+        assert_eq!(
+            build_loop_actions(&diagnoses, false),
+            vec![
+                "retune:quality_overall_avg".to_string(),
+                "alert:drift_signal_count".to_string(),
+            ]
+        );
     }
 
     // ── DatabaseEvaluationService builder ───────────────────────────────

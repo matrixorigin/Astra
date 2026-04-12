@@ -1,10 +1,11 @@
+use astra_core::ConfidenceInterval;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Mutex;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RoutingMetricsPlan {
-    pub confidence: f64,
+    pub confidence: ConfidenceInterval,
     pub threshold: f64,
     pub record_fallback: bool,
     pub record_cache_hit: bool,
@@ -14,7 +15,7 @@ pub struct RoutingMetricsPlan {
 
 #[allow(clippy::too_many_arguments)]
 pub fn build_routing_metrics_plan(
-    confidence: f64,
+    confidence: ConfidenceInterval,
     threshold: f64,
     matched_by: &str,
     tier: i64,
@@ -37,6 +38,15 @@ pub fn build_routing_metrics_plan(
             None
         },
     }
+}
+
+fn correction_rate_interval(total: u64, corrections: u64) -> ConfidenceInterval {
+    if total == 0 {
+        return ConfidenceInterval::ZERO;
+    }
+    let rate = corrections as f64 / total as f64;
+    let margin = (0.5 / (total as f64).sqrt()).clamp(0.05, 0.25);
+    ConfidenceInterval::symmetric(rate, margin)
 }
 
 // ─── Confidence Calibration ─────────────────────────────────────────────────
@@ -92,29 +102,21 @@ impl ConfidenceCalibrator {
     }
 
     /// Get accuracy stats for an intent.
-    pub fn intent_stats(&self, intent: &str) -> Option<(u64, u64, f64)> {
+    pub fn intent_stats(&self, intent: &str) -> Option<(u64, u64, ConfidenceInterval)> {
         let history = self.history.lock().unwrap_or_else(|e| e.into_inner());
         history.get(intent).map(|&(total, corrections)| {
-            let rate = if total > 0 {
-                corrections as f64 / total as f64
-            } else {
-                0.0
-            };
+            let rate = correction_rate_interval(total, corrections);
             (total, corrections, rate)
         })
     }
 
     /// Get all tracked intents and their stats.
-    pub fn all_stats(&self) -> HashMap<String, (u64, u64, f64)> {
+    pub fn all_stats(&self) -> HashMap<String, (u64, u64, ConfidenceInterval)> {
         let history = self.history.lock().unwrap_or_else(|e| e.into_inner());
         history
             .iter()
             .map(|(intent, &(total, corrections))| {
-                let rate = if total > 0 {
-                    corrections as f64 / total as f64
-                } else {
-                    0.0
-                };
+                let rate = correction_rate_interval(total, corrections);
                 (intent.clone(), (total, corrections, rate))
             })
             .collect()
@@ -235,9 +237,18 @@ mod tests {
 
     #[test]
     fn metrics_plan_basic() {
-        let plan =
-            build_routing_metrics_plan(0.85, 0.70, "both", 0, false, None, "command", 5000, 10000);
-        assert_eq!(plan.confidence, 0.85);
+        let plan = build_routing_metrics_plan(
+            0.85.into(),
+            0.70,
+            "both",
+            0,
+            false,
+            None,
+            "command",
+            5000,
+            10000,
+        );
+        assert_eq!(plan.confidence.point, 0.85);
         assert!(!plan.record_fallback);
         assert!(plan.record_cache_hit);
         assert!(!plan.record_correction);
@@ -247,7 +258,15 @@ mod tests {
     #[test]
     fn metrics_plan_fallback() {
         let plan = build_routing_metrics_plan(
-            0.5, 0.70, "fallback", 1, false, None, "question", 5000, 10000,
+            0.5.into(),
+            0.70,
+            "fallback",
+            1,
+            false,
+            None,
+            "question",
+            5000,
+            10000,
         );
         assert!(plan.record_fallback);
         assert!(!plan.record_cache_hit);
@@ -258,7 +277,7 @@ mod tests {
     #[test]
     fn metrics_plan_correction() {
         let plan = build_routing_metrics_plan(
-            0.8,
+            0.8.into(),
             0.70,
             "regex",
             0,
@@ -337,8 +356,17 @@ mod tests {
         cal.record("mutate", true);
         let stats = cal.all_stats();
         assert_eq!(stats.len(), 2);
-        assert_eq!(stats["fetch"], (1, 0, 0.0));
-        assert_eq!(stats["mutate"], (1, 1, 1.0));
+        let fetch = stats.get("fetch").unwrap();
+        assert_eq!(fetch.0, 1);
+        assert_eq!(fetch.1, 0);
+        assert_eq!(fetch.2.point, 0.0);
+        assert!(fetch.2.upper > fetch.2.point);
+
+        let mutate = stats.get("mutate").unwrap();
+        assert_eq!(mutate.0, 1);
+        assert_eq!(mutate.1, 1);
+        assert_eq!(mutate.2.point, 1.0);
+        assert!(mutate.2.lower < mutate.2.point);
     }
 
     // ── Multi-Intent Disambiguation ──

@@ -1,0 +1,186 @@
+# Seven-Layer Resilient Agent Architecture — Gap Analysis
+
+> Produced: 2026-04-12 | Base: `migrate_to_rust` @ `f4fd5d67`
+
+---
+
+## Layer 1: State Layer — Typed & Versioned State Management
+
+### Existing Capabilities
+- **CompositeSnapshot** (`core/composite_snapshot.rs`): 5-dimensional snapshot system (Session, DataSnapshot, Memory, GitCommit, Workspace). Each variant carries typed `SnapshotRef` with `serde` tag-based dispatch.
+- **SessionStateAccumulator** (`services/session_journal.rs:119`): Tracks session state deltas — tool usage, token consumption, goal events. Strongly typed fields, not raw KV.
+- **DataVersioningService** (`services/data_versioning.rs`): Checkpoint CRUD, causal chain queries, trace-upstream lineage. Backed by MatrixOne.
+- **DataSnapshotRef**: Carries `snapshot_name`, `databases`, `branch_name` — aligns with Git4Data concept.
+- **PatternLibrary** (`pipeline/pattern.rs`): Versioned tool-chain patterns with confidence scores, drift detection.
+
+### Gaps
+- **No State Diff**: Cannot compute a typed diff between two snapshots. CompositeSnapshot stores refs, but there's no `diff(snap_a, snap_b) → StateDelta` operation.
+- **No State Merge**: No merge semantics for combining divergent state branches (e.g., after parallel agent exploration).
+- **No Revert primitive**: Restore-from-snapshot exists at the MatrixOne level, but no unified `revert(snap) → Result` across all 5 dimensions.
+- **Schema Enforcement partial**: SessionStateAccumulator is typed, but `edge_profile` uses `HashMap<String, Value>` — raw KV leak.
+- **No version counter**: State changes are timestamped but not numbered; no monotonic version for conflict detection.
+
+### Priority Actions
+1. Define `StateDiff` trait with `diff()`, `apply()`, `merge()` for each snapshot dimension.
+2. Add monotonic `version: u64` to CompositeSnapshot and enforce CAS (compare-and-swap) on writes.
+
+---
+
+## Layer 2: Observation Layer — Evidence Graphs & Structured Metrics
+
+### Existing Capabilities
+- **DriftEvidence** (`core/drift.rs`): Typed evidence with `turn`, `evidence_type`, `confidence`. Six evidence types (ToolCallTopicChange, UserCorrection, etc.).
+- **CausalChain** (`services/events.rs`, `data_versioning.rs`): `causal_chain_id` on every agent event; `get_causal_chain()` and `trace_upstream()` queries.
+- **JournalEvent system** (`services/session_journal.rs`): ~20 event types (tool_call, goal_steered, drift_detected, etc.) with structured payloads.
+- **DecisionTrace** (`astra-thin-client/paths.rs:53`): `/chat/session/{id}/decision-trace` API endpoint.
+- **StartupTracer** (`astra-cli/startup_trace.rs`): Phase-based startup timing.
+- **BridgeHealthMetrics** (`runtime/improvement_proofs`): p99 latency, degradation detection.
+- **RoutingMetrics** (`turn/routing_metrics.rs`): ConfidenceCalibrator, DisambiguationAction, precision/recall metrics.
+
+### Gaps
+- **No Evidence Graph**: CausalChain is a linear sequence (parent → child). No graph structure for multi-cause or fan-out relationships. Cannot answer "which 3 decisions contributed to this outcome?"
+- **No entity-relation evidence links**: DriftEvidence exists for drift only; no general-purpose evidence attachment to arbitrary decisions.
+- **Metrics not schema-aligned**: BridgeHealthMetrics are ad-hoc structs; no schema registry linking metrics to State Layer types.
+- **No structured metric aggregation pipeline**: Metrics are computed locally; no streaming aggregation or windowed rollups.
+
+### Priority Actions
+1. Design `EvidenceGraph` with typed nodes (Decision, Observation, Outcome) and edges (causes, supports, contradicts).
+2. Extend `causal_chain_id` to support DAG topology (multiple parents per event).
+
+---
+
+## Layer 3: Action Space — Bounded & Reversible
+
+### Existing Capabilities
+- **PermissionManager** (`astra-cli/permission_manager.rs`): Three modes (Prompt/Auto/Deny). Tool-level allow/deny policies.
+- **Permission sync** (`runtime/permission_sync_e2e.rs`): Parent-child permission inheritance, mailbox-based request/response.
+- **SQL safety validation** (`edge_tools/mo_tools.rs:232`): `check_sql_safety()` blocks DROP/DELETE/TRUNCATE/ALTER/GRANT.
+- **Tool allowlist**: Inherited permissions can restrict child agents to specific tool sets.
+- **Sandbox checkpointing** (`data_versioning.rs:SandboxCheckpointData`): Checkpoint before risky operations.
+- **Symlink safety** (`session_checkpoint.rs:97`): Path traversal protection.
+
+### Gaps
+- **No Compensation Actions**: No action has a registered inverse. File writes can't be atomically undone; tool calls have no `undo()` method.
+- **Bash is unbounded**: `bash` tool allows arbitrary code execution — directly violates "finite action space" requirement.
+- **No action registry**: Tools are discovered dynamically; there's no compile-time exhaustive enumeration of all possible actions.
+- **No transactional tool execution**: Multi-tool turns are not atomic — partial failures leave inconsistent state.
+- **Rollback is manual**: CompositeSnapshot supports restore, but no automatic "compensation on failure" mechanism.
+
+### Priority Actions
+1. Define `CompensationAction` trait: every `ToolImpl` optionally provides `compensate(context) → Result`.
+2. Implement transaction boundaries for multi-tool turns with automatic rollback on failure.
+
+---
+
+## Layer 4: Evaluation Layer — Multi-Objective, Noise-Robust
+
+### Existing Capabilities
+- **EvaluationService** (`services/evaluation/service.rs`): 16-method trait covering quality trends, drift detection, calibration, session scores, SLO dashboards, trust reports, training data export.
+- **ConfidenceCalibrator** (`turn/routing_metrics.rs`): Calibrates selection confidence scores.
+- **GateValidation** (`evaluation/`): Quality gate validation with pass/fail decisions.
+- **FeedbackSignal system** (`auto_tuning.rs`): 16 signal types (Retry, Correction, Acceptance, StarRating, ToolChurn, FocusDrift, etc.).
+- **ScenarioDetector** (`user_profile.rs:520`): Confidence-threshold-based scenario detection.
+- **EvolutionRules** (`auto_tuning.rs`): Trigger → action rules with cooldown and rate limiting.
+
+### Gaps
+- **Most evaluation routes return 501**: `DatabaseEvaluationService` has "not implemented yet" for drift detection, drift pipeline, closed-loop, training data, SLO.
+- **No multi-objective optimization**: Evaluation is single-dimensional (quality score). No Pareto frontier for efficiency × cost × accuracy.
+- **No noise filtering**: FeedbackSignals are consumed raw; no statistical filtering for outliers or noise.
+- **No uncertainty intervals**: Confidence is a single `f64`; no credible interval or distribution output.
+- **No verifier diversity**: Gate validation is single-pass, not ensemble-based.
+
+### Priority Actions
+1. Implement `detect_drift()` and `run_closed_loop()` in DatabaseEvaluationService.
+2. Add `ConfidenceInterval { point: f64, lower: f64, upper: f64 }` to replace bare `f64` confidence.
+
+---
+
+## Layer 5: Credit Assignment — Diff-Based & Causal
+
+### Existing Capabilities
+- **CausalChainId** (`services/events.rs`): Every event carries `causal_chain_id` + `parent_event_id` for lineage.
+- **get_causal_chain() / trace_upstream()**: Query lineage forward and backward.
+- **goal_steered event** (`session_journal.rs:1861`): Records when agent behavior was steered toward a goal.
+- **SessionStateAccumulator**: Tracks per-turn deltas (tokens, tools, goals) — basis for diff computation.
+- **PatternLibrary**: Records success/failure counts per tool chain — primitive credit signal.
+- **Attribution fields**: `session_id` for attribution on edge tools, durable tasks.
+
+### Gaps
+- **No State Diff comparison**: Cannot compute "what changed between turn N and turn N+K" programmatically.
+- **No contribution scoring**: No algorithm assigns credit to individual decisions within a causal chain.
+- **No causal inference**: Lineage is correlation-based (parent→child); no counterfactual or interventional analysis.
+- **No reward signal**: System has no explicit reward/utility function to decompose across decisions.
+- **Causal chain is linear**: `parent_event_id` implies single parent — cannot model decision fan-in.
+
+### Priority Actions
+1. Implement `StateDiffComputer`: given two snapshots, produce a typed delta with per-field attribution.
+2. Add `contribution_score: f64` to `LineageNode` computed from state diff magnitude.
+
+---
+
+## Layer 6: Search Control — Controlled Exploration & Scheduling
+
+### Existing Capabilities
+- **SchedulingContract** (`pipeline/step_protocol.rs`): Priority (0-10), timeout, per-tool timeout, retry with exponential backoff.
+- **ScenarioRouter** (`scenario_router.rs`): Route queries to specialized profiles with config diffs and metric definitions.
+- **Team orchestration** (`server/team_orchestrator.rs`): Budget-based execution, cancellation tokens, fan-out/sequential/adversarial delegation patterns.
+- **PatternLibrary diversity**: Records multiple tool chains for similar intents.
+- **IntentDisambiguation** (`turn/routing_metrics.rs`): Widens tool selection when ambiguity detected.
+
+### Gaps
+- **No proposal diversity constraint**: Planning generates a single execution path; no mechanism to force N diverse candidates.
+- **No offline/online decoupling**: All computation is online (request-path). No queue or scheduler for expensive background tasks (training, pattern consolidation, sleep integration).
+- **No resource quota system**: Budget is per-execution (token count); no cross-session resource accounting.
+- **No exploration/exploitation policy**: Selection is greedy (highest confidence); no UCB/Thompson-sampling for trying new approaches.
+
+### Priority Actions
+1. Design `ProposalGenerator` trait that produces N diverse candidate plans with diversity metric.
+2. Add background task scheduler for offline pattern consolidation and training data extraction.
+
+---
+
+## Layer 7: Safety Layer — Adversarial Defense
+
+### Existing Capabilities
+- **Drift detection** (`core/drift.rs`, `auto_tuning.rs`): DriftCause (5 types), DriftEvidence (6 types), auto-tuning rules for drift-triggered history trimming.
+- **Pattern drift alert** (`auto_tuning.rs:1302`): Alert when pattern confidence drops >0.3.
+- **SQL safety** (`mo_tools.rs`): Blocks destructive SQL operations.
+- **Permission gating**: Three-tier permission model with inherited restrictions.
+- **Stall detection** (`stall.rs`): Detects repeated identical tool calls, empty-name bursts.
+- **Symlink safety, path validation**: Guards against path traversal attacks.
+- **Evaluation gate** (`evaluation/`): Quality gates that can block deployment.
+
+### Gaps
+- **No anti-reward hacking**: No mechanism to detect or prevent agents gaming the evaluation system (e.g., repeating cheap successful actions to inflate scores).
+- **No model parameter drift detection**: System detects behavioral drift but not weight/embedding drift in fine-tuned models.
+- **No anti-hallucinated causality**: No validation that learned patterns reflect true causal relationships vs. spurious correlations.
+- **No adversarial testing framework**: No red-team/fuzzing infrastructure for systematically probing safety boundaries.
+- **Safety checks are scattered**: No centralized safety middleware; checks are ad-hoc in individual tools.
+
+### Priority Actions
+1. Implement centralized `SafetyMiddleware` that intercepts all tool calls with pluggable guard chain.
+2. Add reward-hacking detector: flag when score increases correlate with action repetition rather than genuine progress.
+
+---
+
+## Summary Matrix
+
+| Layer | Maturity | Key Existing Asset | Biggest Gap |
+|-------|----------|--------------------|-------------|
+| 1. State | ⬛⬛⬛⬜⬜ 60% | CompositeSnapshot 5D | No diff/merge/revert |
+| 2. Observation | ⬛⬛⬛⬜⬜ 55% | CausalChain + JournalEvents | Linear chains, no graph |
+| 3. Action | ⬛⬛⬜⬜⬜ 40% | Permission 3-tier model | No compensation actions |
+| 4. Evaluation | ⬛⬛⬜⬜⬜ 35% | EvaluationService 16 methods | Most routes unimplemented |
+| 5. Credit | ⬛⬜⬜⬜⬜ 25% | causal_chain_id on events | No diff-based scoring |
+| 6. Search | ⬛⬛⬜⬜⬜ 35% | SchedulingContract + TeamOrch | No proposal diversity |
+| 7. Safety | ⬛⬛⬜⬜⬜ 40% | Drift detection + permission | No centralized middleware |
+
+## Recommended Build Order
+
+1. **State Layer** (foundation for all others) — StateDiff trait, version counter
+2. **Observation Layer** (depends on State) — EvidenceGraph with DAG topology
+3. **Evaluation Layer** (depends on Observation) — Implement 501 routes, confidence intervals
+4. **Action Space** (depends on State) — CompensationAction, transaction boundaries
+5. **Credit Assignment** (depends on State + Evaluation) — StateDiffComputer, contribution scoring
+6. **Safety Layer** (depends on Action + Evaluation) — Centralized middleware
+7. **Search Control** (depends on all above) — Proposal diversity, offline scheduler

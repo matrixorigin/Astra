@@ -2,6 +2,7 @@
 
 use std::collections::HashSet;
 
+use astra_core::ConfidenceInterval;
 use serde_json::Value;
 
 use crate::tool_registry::{self, SelectionReport};
@@ -21,7 +22,7 @@ pub fn apply_selector_hints_then_attach_filtered_edge_tools(
     tool_registry::apply_selector_hints_to_edge_profile(
         &mut payload["edge_profile"],
         first_selection_report,
-        selection_confidence,
+        ConfidenceInterval::exact(selection_confidence),
         learned_context_hint,
         learned_task_type,
     );

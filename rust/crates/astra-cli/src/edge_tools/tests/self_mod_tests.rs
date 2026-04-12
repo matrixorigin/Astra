@@ -166,9 +166,14 @@ async fn persisted_set_goal_appends_goal_steered_journal_event() {
     let events = astra_services::session_journal::read_journal(&session_id).unwrap();
     let goal_event = events
         .iter()
-        .find(|event| event.event_type == astra_services::session_journal::JournalEventType::GoalSteered)
+        .find(|event| {
+            event.event_type == astra_services::session_journal::JournalEventType::GoalSteered
+        })
         .expect("goal_steered event");
-    let metadata = goal_event.metadata.as_ref().expect("goal steering metadata");
+    let metadata = goal_event
+        .metadata
+        .as_ref()
+        .expect("goal steering metadata");
     assert_eq!(
         metadata.get("source").and_then(|value| value.as_str()),
         Some("edge_tool:set_goal")

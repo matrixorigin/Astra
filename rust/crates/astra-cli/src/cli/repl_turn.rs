@@ -1738,7 +1738,10 @@ pub(super) struct GoalSteeringChange {
     pub turn: u32,
 }
 
-pub(super) fn steer_observability_goal(state: &mut ReplState, goal: &str) -> Option<GoalSteeringChange> {
+pub(super) fn steer_observability_goal(
+    state: &mut ReplState,
+    goal: &str,
+) -> Option<GoalSteeringChange> {
     let Some(obs) = state.observability_session.as_ref() else {
         return None;
     };

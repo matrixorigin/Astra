@@ -2966,7 +2966,7 @@ fn handle_session_drift(arg: &str, state: &ReplState) {
                     ev.turn,
                     type_str,
                     ellipsize(&ev.description, 50),
-                    ev.confidence * 100.0
+                    ev.confidence.point * 100.0
                 );
             }
         }

@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::confidence::ConfidenceInterval;
+
 /// Possible causes of focus drift.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type")]
@@ -52,8 +54,8 @@ pub struct DriftEvidence {
     /// Description of the evidence.
     pub description: String,
 
-    /// Confidence in this evidence (0.0-1.0).
-    pub confidence: f64,
+    /// Confidence in this evidence with explicit uncertainty bounds.
+    pub confidence: ConfidenceInterval,
 }
 
 /// Types of evidence for drift detection.
@@ -71,4 +73,27 @@ pub enum EvidenceType {
     CompressionLoss,
     /// Memory query returned irrelevant results.
     MemoryMismatch,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn drift_evidence_serializes_confidence_interval() {
+        let evidence = DriftEvidence {
+            turn: 3,
+            evidence_type: EvidenceType::MemoryMismatch,
+            description: "wrong memory cluster".into(),
+            confidence: ConfidenceInterval::symmetric(0.8, 0.1),
+        };
+
+        let json = serde_json::to_value(&evidence).unwrap();
+        let point = json["confidence"]["point"].as_f64().unwrap();
+        let lower = json["confidence"]["lower"].as_f64().unwrap();
+        let upper = json["confidence"]["upper"].as_f64().unwrap();
+        assert!((point - 0.8).abs() < f64::EPSILON);
+        assert!((lower - 0.7).abs() < 1e-9);
+        assert!((upper - 0.9).abs() < f64::EPSILON);
+    }
 }

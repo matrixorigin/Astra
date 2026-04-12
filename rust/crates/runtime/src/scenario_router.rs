@@ -56,7 +56,7 @@ impl ScenarioRouter {
         // 1. Scenario detection
         if let Some((scenario, confidence)) = detector.detect() {
             profile.apply_scenario(scenario);
-            profile.confidence = profile.confidence.min(confidence);
+            profile.confidence = profile.confidence.min(confidence.point);
         } else if let Some(scenario) = scenario_from_task_type(routing.task_type) {
             profile.apply_scenario(scenario);
         }

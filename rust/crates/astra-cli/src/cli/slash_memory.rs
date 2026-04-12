@@ -1459,9 +1459,9 @@ pub(super) async fn handle_memory_domain_command(
                                     });
                                     let plan_goal = sub_arg.to_string();
                                     state.executing_plan_goal = Some(plan_goal.clone());
-                                    if let Some(change) =
-                                        super::repl_turn::steer_observability_goal(state, &plan_goal)
-                                    {
+                                    if let Some(change) = super::repl_turn::steer_observability_goal(
+                                        state, &plan_goal,
+                                    ) {
                                         super::plan_interaction::journal_goal_steering_event(
                                             &mut state.journal,
                                             change.turn,

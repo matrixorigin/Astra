@@ -13,6 +13,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::SystemTime;
 
+use astra_core::ConfidenceInterval;
 use serde::{Deserialize, Serialize};
 
 use crate::lock_ext::RwLockExt;
@@ -550,18 +551,22 @@ impl ScenarioDetector {
     }
 
     /// Detect the most likely scenario.
-    pub fn detect(&self) -> Option<(Scenario, f64)> {
+    pub fn detect(&self) -> Option<(Scenario, ConfidenceInterval)> {
         let scores = self.score_scenarios();
 
         // Find the highest scoring scenario above threshold
         scores
             .into_iter()
-            .filter(|(_, score)| *score >= self.confidence_threshold)
-            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .filter(|(_, score)| score.conservatively_exceeds(self.confidence_threshold))
+            .max_by(|a, b| {
+                a.1.point
+                    .partial_cmp(&b.1.point)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
     }
 
     /// Score all scenarios based on current evidence.
-    fn score_scenarios(&self) -> Vec<(Scenario, f64)> {
+    fn score_scenarios(&self) -> Vec<(Scenario, ConfidenceInterval)> {
         let scenarios = [
             Scenario::CodeReview,
             Scenario::Debugging,
@@ -582,7 +587,7 @@ impl ScenarioDetector {
                 let tool_score = self.score_tools(s);
                 // Weight queries slightly more than tools
                 let combined = query_score * 0.6 + tool_score * 0.4;
-                (s, combined)
+                (s, self.score_interval(combined))
             })
             .collect()
     }
@@ -622,6 +627,12 @@ impl ScenarioDetector {
         }
 
         matches as f64 / self.recent_tools.len() as f64
+    }
+
+    fn score_interval(&self, point: f64) -> ConfidenceInterval {
+        let observation_count = (self.recent_queries.len() + self.recent_tools.len()).max(1) as f64;
+        let margin = (0.35 / observation_count.sqrt()).clamp(0.08, 0.25);
+        ConfidenceInterval::symmetric(point, margin)
     }
 
     /// Clear detection history.
@@ -1065,7 +1076,16 @@ mod tests {
         assert!(result.is_some());
         let (scenario, confidence) = result.unwrap();
         assert_eq!(scenario, Scenario::Debugging);
-        assert!(confidence >= 0.6);
+        assert!(confidence.conservatively_exceeds(0.6));
+        assert!(confidence.point >= confidence.lower);
+        assert!(confidence.point <= confidence.upper);
+    }
+
+    #[test]
+    fn test_scenario_detection_rejects_thin_evidence() {
+        let mut detector = ScenarioDetector::new();
+        detector.observe_query("fix");
+        assert!(detector.detect().is_none());
     }
 
     #[test]

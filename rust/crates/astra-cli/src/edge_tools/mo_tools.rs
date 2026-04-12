@@ -16,6 +16,9 @@
 use std::process::Command;
 
 use super::*;
+use crate::tool_safety_guard::check_sql_safety;
+#[cfg(test)]
+use crate::tool_safety_guard::strip_sql_comments;
 
 // ─── MatrixOne connection helper ────────────────────────────────────────────
 
@@ -177,66 +180,6 @@ fn schema_hint_for_error(lower_err: &str, sql: &str, database: Option<&str>) -> 
             let tables = mo_execute_sql(&format!("SHOW TABLES IN `{db}`"), None);
             if !tables.starts_with("Error:") {
                 return Some(tables);
-            }
-        }
-    }
-    None
-}
-
-// ─── SQL safety validation ──────────────────────────────────────────────────
-
-/// Strip SQL comments (both `--` line comments and `/* ... */` block comments).
-fn strip_sql_comments(sql: &str) -> String {
-    let mut out = String::with_capacity(sql.len());
-    let mut chars = sql.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '-' && chars.peek() == Some(&'-') {
-            // Line comment: skip to end of line
-            for ch in chars.by_ref() {
-                if ch == '\n' {
-                    out.push(' ');
-                    break;
-                }
-            }
-        } else if c == '/' && chars.peek() == Some(&'*') {
-            // Block comment: skip to */
-            chars.next(); // consume '*'
-            let mut depth = 1u32;
-            while depth > 0 {
-                match chars.next() {
-                    Some('/') if chars.peek() == Some(&'*') => {
-                        chars.next();
-                        depth += 1;
-                    }
-                    Some('*') if chars.peek() == Some(&'/') => {
-                        chars.next();
-                        depth -= 1;
-                    }
-                    None => break,
-                    _ => {}
-                }
-            }
-            out.push(' ');
-        } else {
-            out.push(c);
-        }
-    }
-    out
-}
-
-const DESTRUCTIVE_KEYWORDS: &[&str] = &["DROP", "DELETE", "TRUNCATE", "ALTER", "GRANT", "REVOKE"];
-
-/// Check if a SQL string contains destructive operations.
-/// Handles block comments, line comments, and multi-statement (semicolons).
-/// Returns Some(kind) if blocked, None if safe.
-fn check_sql_safety(sql: &str) -> Option<&'static str> {
-    let stripped = strip_sql_comments(sql).to_uppercase();
-    // Check each statement (split on ';')
-    for stmt in stripped.split(';') {
-        let first_word = stmt.split_whitespace().next().unwrap_or("");
-        for &kw in DESTRUCTIVE_KEYWORDS {
-            if first_word == kw {
-                return Some(kw);
             }
         }
     }

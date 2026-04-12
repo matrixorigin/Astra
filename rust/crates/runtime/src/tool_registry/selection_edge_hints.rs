@@ -1,5 +1,6 @@
 //! Edge `edge_profile` fields derived from tool selection (recommended dynamic tools, confidence).
 
+use astra_core::ConfidenceInterval;
 use serde_json::{Value, json};
 
 use super::SelectionReport;
@@ -24,14 +25,14 @@ pub fn top_unpinned_tool_names_from_report(report: &SelectionReport, max: usize)
 pub fn apply_selector_hints_to_edge_profile(
     edge_profile: &mut Value,
     first_selection_report: Option<&SelectionReport>,
-    selection_confidence: f64,
+    selection_confidence: ConfidenceInterval,
     learned_context_hint: &str,
     learned_task_type: Option<&str>,
 ) {
     let dynamic_tools = first_selection_report
         .map(|r| top_unpinned_tool_names_from_report(r, 3))
         .unwrap_or_default();
-    if selection_confidence >= 0.4
+    if selection_confidence.conservatively_exceeds(0.4)
         && !dynamic_tools.is_empty()
         && let Some(obj) = edge_profile.as_object_mut()
     {
@@ -75,6 +76,50 @@ mod tests {
 
     #[test]
     fn apply_hints_respects_confidence_threshold() {
+        let report = SelectionReport {
+            tools_selected: vec!["github_list_prs".into()],
+            selected_count: 1,
+            budget_used: 0,
+            budget_total: 0,
+        };
+        let mut ep = json!({});
+        apply_selector_hints_to_edge_profile(
+            &mut ep,
+            Some(&report),
+            ConfidenceInterval::exact(0.39),
+            "",
+            None,
+        );
+        assert!(ep.get("recommended_tools").is_none());
+
+        let mut ep = json!({});
+        apply_selector_hints_to_edge_profile(
+            &mut ep,
+            Some(&report),
+            ConfidenceInterval::exact(0.4),
+            "",
+            None,
+        );
+        assert!(ep.get("recommended_tools").is_some());
+        assert_eq!(ep["selection_confidence"]["point"], 0.4);
+    }
+
+    #[test]
+    fn apply_learned_hint_and_task_type() {
+        let mut ep = json!({});
+        apply_selector_hints_to_edge_profile(
+            &mut ep,
+            None,
+            ConfidenceInterval::exact(1.0),
+            "hint",
+            Some("fetch"),
+        );
+        assert_eq!(ep["learned_context_hint"], "hint");
+        assert_eq!(ep["selection_task_type"], "fetch");
+    }
+
+    #[test]
+    fn apply_hints_requires_confident_lower_bound() {
         let mut ep = json!({});
         let report = SelectionReport {
             tools_selected: vec!["github_list_prs".into()],
@@ -82,18 +127,14 @@ mod tests {
             budget_used: 0,
             budget_total: 0,
         };
-        apply_selector_hints_to_edge_profile(&mut ep, Some(&report), 0.39, "", None);
+
+        apply_selector_hints_to_edge_profile(
+            &mut ep,
+            Some(&report),
+            ConfidenceInterval::new(0.6, 0.39, 0.9),
+            "",
+            None,
+        );
         assert!(ep.get("recommended_tools").is_none());
-
-        apply_selector_hints_to_edge_profile(&mut ep, Some(&report), 0.4, "", None);
-        assert!(ep.get("recommended_tools").is_some());
-    }
-
-    #[test]
-    fn apply_learned_hint_and_task_type() {
-        let mut ep = json!({});
-        apply_selector_hints_to_edge_profile(&mut ep, None, 1.0, "hint", Some("fetch"));
-        assert_eq!(ep["learned_context_hint"], "hint");
-        assert_eq!(ep["selection_task_type"], "fetch");
     }
 }

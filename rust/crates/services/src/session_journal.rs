@@ -2508,7 +2508,9 @@ mod tests {
             Some("edge_tool:set_goal")
         );
         assert_eq!(
-            metadata.get("previous_goal").and_then(|value| value.as_str()),
+            metadata
+                .get("previous_goal")
+                .and_then(|value| value.as_str()),
             Some("old goal")
         );
         assert_eq!(
@@ -2531,7 +2533,7 @@ mod tests {
                 turn: 6,
                 evidence_type: EvidenceType::MemoryMismatch,
                 description: "Retrieved unrelated CI memories instead of resume context".into(),
-                confidence: 0.9,
+                confidence: 0.9.into(),
             }],
             "Re-query with explicit session-resume terms",
         );

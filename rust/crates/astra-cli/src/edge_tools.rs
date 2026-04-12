@@ -703,169 +703,177 @@ impl ToolExecutor {
     }
 
     pub async fn execute(&self, name: &str, args: &Value) -> String {
-        let output = match name {
-            "bash" => self.bash(args),
-            "powershell" => self.powershell(args),
-            "read_file" => self.read_file(args),
-            "write_file" => self.write_file(args),
-            "str_replace" => self.str_replace(args),
-            "delete_file" => self.delete_file(args),
-            "multi_edit" => self.multi_edit(args),
-            "list_dir" => self.list_dir(args),
-            "grep" => self.grep(args),
-            "glob" => self.glob(args),
-            "git_status" => git_gix::git_status(&self.project_root),
-            "git_diff" => git_gix::git_diff(
-                &self.project_root,
-                args,
-                self.get_budget_pressure(),
-                self.aggregate_output_bytes
-                    .load(std::sync::atomic::Ordering::Relaxed),
-            ),
-            "git_log" => git_gix::git_log(&self.project_root, args),
-            "git_show" => git_gix::git_show(
-                &self.project_root,
-                args,
-                self.get_budget_pressure(),
-                self.aggregate_output_bytes
-                    .load(std::sync::atomic::Ordering::Relaxed),
-            ),
-            "git_blame" => git_gix::git_blame(&self.project_root, args),
-            "git_file_history" => git_gix::git_file_history(&self.project_root, args),
-            "git_contributors" => git_gix::git_contributors(&self.project_root, args),
-            "git_log_search" => git_gix::git_log_search(&self.project_root, args),
-            "git_commit" => git_gix::git_commit(&self.project_root, args),
-            "git_stash" => git_gix::git_stash(&self.project_root, args),
-            "git_checkout_file" => git_gix::git_checkout_file(&self.project_root, args),
-            "git_worktree" => self.git_worktree(args),
-            "find_definition" => self.find_definition(args),
-            "find_references" => self.find_references(args),
-            "call_graph" => self.call_graph(args),
-            "rename_symbol" => self.rename_symbol(args),
-            "dead_code" => self.dead_code(args),
-            "extract_members" => self.extract_members(args),
-            "type_hierarchy" => self.type_hierarchy(args),
-            "hover_info" => self.hover_info(args),
-            "symbol_search" => self.symbol_search(args),
-            "run_build_test" => self.run_build_test(args),
-            "symbols" => self.symbols(args),
-            "mo_query" => self.mo_query(args),
-            "mo_snapshot" => self.mo_snapshot(args),
-            "mo_branch" => self.mo_branch(args),
-            "github_list_prs" => self.github_list_prs(args).await,
-            "github_get_pr" => self.github_get_pr(args).await,
-            "github_ci_status" => self.github_ci_status(args).await,
-            "github_list_issues" => self.github_list_issues(args).await,
-            "github_get_issue" => self.github_get_issue(args).await,
-            "github_repo_stats" => self.github_repo_stats(args).await,
-            "github_create_issue" => self.github_create_issue(args).await,
-            "web_fetch" => self.web_fetch(args),
-            "memory_retrieve" => self.memoria_call("retrieve", args).await,
-            "memory_store" => self.memoria_call("store", args).await,
-            "memory_search" => self.memoria_call("search", args).await,
-            "memory_purge" => self.memoria_call("purge", args).await,
-            "memory_correct" => self.memoria_call("correct", args).await,
-            "memory_profile" => self.memoria_call("profile", args).await,
-            "adjust_config" => self.adjust_config(args),
-            "prioritize_tool" => self.prioritize_tool(args),
-            "deprioritize_tool" => self.deprioritize_tool(args),
-            "set_goal" => self.set_goal(args),
-            "compress_context" => self.compress_context(args),
-            "get_agent_info" => self.get_agent_info(args).await,
-            "reflect" => {
-                let focus = args.get("focus").and_then(|v| v.as_str()).unwrap_or("auto");
-                let question = args.get("question").and_then(|v| v.as_str()).unwrap_or("");
-                let last_n = args.get("last_n").and_then(|v| v.as_i64()).unwrap_or(20);
-                if let Some(session_id) = self
-                    .active_session_id
-                    .as_deref()
-                    .filter(|id| !id.is_empty())
-                {
-                    let limit = usize::try_from(last_n.max(1)).unwrap_or(20);
-                    match crate::self_command::render_reflect_surface_for_session(
-                        session_id,
-                        limit,
-                        Some(focus),
-                        Some(question),
-                    )
-                    .await
+        let output = if let Err(error) =
+            crate::tool_safety_guard::ToolSafetyGuard::check_dispatch(name, args)
+        {
+            error
+        } else {
+            match name {
+                "bash" => self.bash(args),
+                "powershell" => self.powershell(args),
+                "read_file" => self.read_file(args),
+                "write_file" => self.write_file(args),
+                "str_replace" => self.str_replace(args),
+                "delete_file" => self.delete_file(args),
+                "multi_edit" => self.multi_edit(args),
+                "list_dir" => self.list_dir(args),
+                "grep" => self.grep(args),
+                "glob" => self.glob(args),
+                "git_status" => git_gix::git_status(&self.project_root),
+                "git_diff" => git_gix::git_diff(
+                    &self.project_root,
+                    args,
+                    self.get_budget_pressure(),
+                    self.aggregate_output_bytes
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                ),
+                "git_log" => git_gix::git_log(&self.project_root, args),
+                "git_show" => git_gix::git_show(
+                    &self.project_root,
+                    args,
+                    self.get_budget_pressure(),
+                    self.aggregate_output_bytes
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                ),
+                "git_blame" => git_gix::git_blame(&self.project_root, args),
+                "git_file_history" => git_gix::git_file_history(&self.project_root, args),
+                "git_contributors" => git_gix::git_contributors(&self.project_root, args),
+                "git_log_search" => git_gix::git_log_search(&self.project_root, args),
+                "git_commit" => git_gix::git_commit(&self.project_root, args),
+                "git_stash" => git_gix::git_stash(&self.project_root, args),
+                "git_checkout_file" => git_gix::git_checkout_file(&self.project_root, args),
+                "git_worktree" => self.git_worktree(args),
+                "find_definition" => self.find_definition(args),
+                "find_references" => self.find_references(args),
+                "call_graph" => self.call_graph(args),
+                "rename_symbol" => self.rename_symbol(args),
+                "dead_code" => self.dead_code(args),
+                "extract_members" => self.extract_members(args),
+                "type_hierarchy" => self.type_hierarchy(args),
+                "hover_info" => self.hover_info(args),
+                "symbol_search" => self.symbol_search(args),
+                "run_build_test" => self.run_build_test(args),
+                "symbols" => self.symbols(args),
+                "mo_query" => self.mo_query(args),
+                "mo_snapshot" => self.mo_snapshot(args),
+                "mo_branch" => self.mo_branch(args),
+                "github_list_prs" => self.github_list_prs(args).await,
+                "github_get_pr" => self.github_get_pr(args).await,
+                "github_ci_status" => self.github_ci_status(args).await,
+                "github_list_issues" => self.github_list_issues(args).await,
+                "github_get_issue" => self.github_get_issue(args).await,
+                "github_repo_stats" => self.github_repo_stats(args).await,
+                "github_create_issue" => self.github_create_issue(args).await,
+                "web_fetch" => self.web_fetch(args),
+                "memory_retrieve" => self.memoria_call("retrieve", args).await,
+                "memory_store" => self.memoria_call("store", args).await,
+                "memory_search" => self.memoria_call("search", args).await,
+                "memory_purge" => self.memoria_call("purge", args).await,
+                "memory_correct" => self.memoria_call("correct", args).await,
+                "memory_profile" => self.memoria_call("profile", args).await,
+                "adjust_config" => self.adjust_config(args),
+                "prioritize_tool" => self.prioritize_tool(args),
+                "deprioritize_tool" => self.deprioritize_tool(args),
+                "set_goal" => self.set_goal(args),
+                "compress_context" => self.compress_context(args),
+                "get_agent_info" => self.get_agent_info(args).await,
+                "reflect" => {
+                    let focus = args.get("focus").and_then(|v| v.as_str()).unwrap_or("auto");
+                    let question = args.get("question").and_then(|v| v.as_str()).unwrap_or("");
+                    let last_n = args.get("last_n").and_then(|v| v.as_i64()).unwrap_or(20);
+                    if let Some(session_id) = self
+                        .active_session_id
+                        .as_deref()
+                        .filter(|id| !id.is_empty())
                     {
-                        Ok(surface) => surface,
-                        Err(error) => serde_json::json!({
-                            "status": "reflect_unavailable",
-                            "focus": focus,
-                            "question": question,
-                            "last_n": last_n,
-                            "error": error,
-                        })
-                        .to_string(),
-                    }
-                } else {
-                    serde_json::json!({
+                        let limit = usize::try_from(last_n.max(1)).unwrap_or(20);
+                        match crate::self_command::render_reflect_surface_for_session(
+                            session_id,
+                            limit,
+                            Some(focus),
+                            Some(question),
+                        )
+                        .await
+                        {
+                            Ok(surface) => surface,
+                            Err(error) => serde_json::json!({
+                                "status": "reflect_unavailable",
+                                "focus": focus,
+                                "question": question,
+                                "last_n": last_n,
+                                "error": error,
+                            })
+                            .to_string(),
+                        }
+                    } else {
+                        serde_json::json!({
                         "status": "reflect_requires_session",
                         "focus": focus,
                         "question": question,
                         "last_n": last_n,
                         "note": "Reflect data comes from the server API. Use /reflect command for direct access."
                     }).to_string()
-                }
-            }
-            "run_chain" => {
-                match serde_json::from_value::<astra_runtime::tool_registry::ToolChain>(
-                    args.clone(),
-                ) {
-                    Ok(chain) => {
-                        // Validate chain steps reference known tools
-                        let known: Vec<&str> = astra_runtime::tool_registry::TOOL_CATALOG
-                            .iter()
-                            .map(|t| t.name)
-                            .collect();
-                        if let Err(errors) = chain.validate(&known) {
-                            return format!("Error: Invalid chain: {}", errors.join("; "));
-                        }
-                        let input = args
-                            .get("input")
-                            .cloned()
-                            .unwrap_or_else(|| serde_json::json!({}));
-                        self.execute_chain(&chain, input).await
                     }
-                    Err(e) => format!("Error: Invalid chain format: {e}"),
                 }
-            }
-            "ask_user" => self.ask_user(args),
-            // Task management tools
-            "task_create" => self.task_create(args).await,
-            "task_list" => self.task_list(args).await,
-            "task_get" => self.task_get(args).await,
-            "task_update" => self.task_update(args).await,
-            "task_stop" => self.task_stop(args).await,
-            "sleep" => self.sleep_tool(args).await,
-            "tool_search" => self.tool_search(args),
-            "web_search" => self.web_search(args),
-            "send_message" => {
-                agent_messaging::handle_send_message_tool(args, self.send_message_context.as_ref())
+                "run_chain" => {
+                    match serde_json::from_value::<astra_runtime::tool_registry::ToolChain>(
+                        args.clone(),
+                    ) {
+                        Ok(chain) => {
+                            // Validate chain steps reference known tools
+                            let known: Vec<&str> = astra_runtime::tool_registry::TOOL_CATALOG
+                                .iter()
+                                .map(|t| t.name)
+                                .collect();
+                            if let Err(errors) = chain.validate(&known) {
+                                return format!("Error: Invalid chain: {}", errors.join("; "));
+                            }
+                            let input = args
+                                .get("input")
+                                .cloned()
+                                .unwrap_or_else(|| serde_json::json!({}));
+                            self.execute_chain(&chain, input).await
+                        }
+                        Err(e) => format!("Error: Invalid chain format: {e}"),
+                    }
+                }
+                "ask_user" => self.ask_user(args),
+                // Task management tools
+                "task_create" => self.task_create(args).await,
+                "task_list" => self.task_list(args).await,
+                "task_get" => self.task_get(args).await,
+                "task_update" => self.task_update(args).await,
+                "task_stop" => self.task_stop(args).await,
+                "sleep" => self.sleep_tool(args).await,
+                "tool_search" => self.tool_search(args),
+                "web_search" => self.web_search(args),
+                "send_message" => {
+                    agent_messaging::handle_send_message_tool(
+                        args,
+                        self.send_message_context.as_ref(),
+                    )
                     .await
-            }
-            "spawn_agent" => {
-                agent_spawning::handle_spawn_agent_tool(args, self.spawn_context.as_ref()).await
-            }
-            "share_context" => self.share_context(args),
-            "query_context" => self.query_context(args),
-            astra_runtime::turn::agentic_loop_host::DELEGATE_TOOL_NAME => {
-                "Delegation request acknowledged. The delegation engine will execute \
+                }
+                "spawn_agent" => {
+                    agent_spawning::handle_spawn_agent_tool(args, self.spawn_context.as_ref()).await
+                }
+                "share_context" => self.share_context(args),
+                "query_context" => self.query_context(args),
+                astra_runtime::turn::agentic_loop_host::DELEGATE_TOOL_NAME => {
+                    "Delegation request acknowledged. The delegation engine will execute \
                 this request and provide results in the next round."
-                    .to_string()
-            }
-            "diagnose" => self.diagnose(args).await,
-            "lsp" => self.lsp(args),
-            "env" => self.env_tool(args),
-            "notebook_edit" => self.notebook_edit(args),
-            "config" => self.config_tool(args),
-            "brief" => self.brief(args),
-            "context_analysis" => self.context_analysis(args),
-            _ if name.starts_with("mcp_") => self.execute_mcp_tool(name, args).await,
-            _ => format!(
-                "Unknown tool: {name}. Available tools: bash, read_file, write_file, str_replace, \
+                        .to_string()
+                }
+                "diagnose" => self.diagnose(args).await,
+                "lsp" => self.lsp(args),
+                "env" => self.env_tool(args),
+                "notebook_edit" => self.notebook_edit(args),
+                "config" => self.config_tool(args),
+                "brief" => self.brief(args),
+                "context_analysis" => self.context_analysis(args),
+                _ if name.starts_with("mcp_") => self.execute_mcp_tool(name, args).await,
+                _ => format!(
+                    "Unknown tool: {name}. Available tools: bash, read_file, write_file, str_replace, \
                  list_dir, grep, glob, symbols, find_definition, find_references, git_status, \
                  git_diff, git_log, git_show, git_blame, call_graph, run_build_test, web_fetch, \
                  mo_query, memory_search, memory_profile, adjust_config, prioritize_tool, \
@@ -873,7 +881,8 @@ impl ToolExecutor {
                  task_get, task_update, task_stop, sleep, tool_search, web_search, send_message, \
                  spawn_agent, share_context, query_context, context_analysis, \
                  diagnose, lsp, env, notebook_edit, config, powershell, brief"
-            ),
+                ),
+            }
         };
         // Normalize empty output, then apply global safety net
         let output = normalize_empty_output(output, name);
@@ -968,6 +977,21 @@ impl ToolExecutor {
         input: Value,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = String> + Send + '_>> {
         use astra_runtime::tool_registry::chain::{ChainContext, resolve_args};
+
+        if let Err(error) = crate::tool_safety_guard::ToolSafetyGuard::check_chain(chain) {
+            let chain_name = chain.name.clone();
+            let steps_total = chain.steps.len();
+            return Box::pin(async move {
+                serde_json::json!({
+                    "chain": chain_name,
+                    "steps_executed": 0,
+                    "steps_total": steps_total,
+                    "final_output": error,
+                    "steps": [],
+                })
+                .to_string()
+            });
+        }
 
         let chain_name = chain.name.clone();
         let steps = chain.steps.clone();

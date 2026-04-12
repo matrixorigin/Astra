@@ -200,3 +200,87 @@ async fn run_chain_invalid_format_returns_error() {
         "should return error for invalid chain: {result}"
     );
 }
+
+#[tokio::test]
+async fn run_chain_blocks_recursive_child_chain() {
+    let executor = test_executor();
+    let result = executor
+        .execute(
+            "run_chain",
+            &json!({
+                "name": "outer",
+                "description": "outer",
+                "steps": [
+                    {
+                        "tool": "run_chain",
+                        "args": {"name": "inner", "description": "inner", "steps": []}
+                    }
+                ],
+                "input": {}
+            }),
+        )
+        .await;
+    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+    assert_eq!(parsed["steps_executed"], 0);
+    assert!(
+        parsed["final_output"]
+            .as_str()
+            .unwrap()
+            .contains("recursive run_chain"),
+        "unexpected result: {result}"
+    );
+}
+
+#[tokio::test]
+async fn run_chain_blocks_repeated_identical_steps() {
+    let executor = test_executor();
+    let result = executor
+        .execute(
+            "run_chain",
+            &json!({
+                "name": "stall",
+                "description": "stall",
+                "steps": [
+                    {"tool": "read_file", "args": {"path": "same.txt"}},
+                    {"tool": "read_file", "args": {"path": "same.txt"}},
+                    {"tool": "read_file", "args": {"path": "same.txt"}}
+                ],
+                "input": {}
+            }),
+        )
+        .await;
+    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+    assert_eq!(parsed["steps_executed"], 0);
+    assert!(
+        parsed["final_output"]
+            .as_str()
+            .unwrap()
+            .contains("likely stall"),
+        "unexpected result: {result}"
+    );
+}
+
+#[tokio::test]
+async fn execute_chain_blocks_mutating_burst() {
+    use astra_runtime::tool_registry::ToolChain;
+
+    let executor = test_executor();
+    let mut chain = ToolChain::new("writes", "writes");
+    for idx in 0..=crate::tool_safety_guard::MAX_RUN_CHAIN_MUTATING_STEPS {
+        chain = chain.step(
+            "write_file",
+            json!({"path": format!("file-{idx}.txt"), "content": "x"}),
+        );
+    }
+
+    let result = executor.execute_chain(&chain, json!({})).await;
+    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+    assert_eq!(parsed["steps_executed"], 0);
+    assert!(
+        parsed["final_output"]
+            .as_str()
+            .unwrap()
+            .contains("write/execute steps"),
+        "unexpected result: {result}"
+    );
+}
