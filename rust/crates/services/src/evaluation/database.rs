@@ -80,6 +80,134 @@ fn build_loop_actions(diagnoses: &[LoopDiagnosisItem], dry_run: bool) -> Vec<Str
         .collect()
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct GateValidationSummary {
+    sessions_tested: i64,
+    error_rate: f64,
+    score_delta: f64,
+    passed: bool,
+    details: String,
+}
+
+fn average_scores(scores: &[f64]) -> f64 {
+    if scores.is_empty() {
+        0.0
+    } else {
+        scores.iter().sum::<f64>() / scores.len() as f64
+    }
+}
+
+fn change_type_label(change_type: &ChangeType) -> &'static str {
+    match change_type {
+        ChangeType::Prompt => "prompt",
+        ChangeType::Skill => "skill",
+        ChangeType::Config => "config",
+        ChangeType::Selector => "selector",
+        ChangeType::ContextBudget => "context_budget",
+        ChangeType::Knowledge => "knowledge",
+    }
+}
+
+fn summarize_gate_validation(
+    scores_desc: &[f64],
+    golden_session_count: i32,
+    error_rate_threshold: f64,
+    score_regression_threshold: f64,
+) -> GateValidationSummary {
+    let window = clamp_eval_limit(golden_session_count) as usize;
+    let error_rate_threshold = error_rate_threshold.clamp(0.0, 1.0);
+    let recent_end = scores_desc.len().min(window);
+    let recent = &scores_desc[..recent_end];
+    if recent.is_empty() {
+        return GateValidationSummary {
+            sessions_tested: 0,
+            error_rate: 0.0,
+            score_delta: 0.0,
+            passed: false,
+            details: "No session quality scores available for gate validation.".into(),
+        };
+    }
+
+    let baseline_end = scores_desc.len().min(window * 2);
+    let baseline = &scores_desc[recent_end..baseline_end];
+    let recent_avg = average_scores(recent);
+    let baseline_avg = average_scores(baseline);
+    let error_count = recent
+        .iter()
+        .filter(|score| **score < LOOP_QUALITY_THRESHOLD)
+        .count();
+    let error_rate = error_count as f64 / recent.len() as f64;
+    let score_delta = if baseline.is_empty() {
+        0.0
+    } else {
+        recent_avg - baseline_avg
+    };
+
+    let error_ok = error_rate <= error_rate_threshold;
+    let score_ok = baseline.is_empty() || score_delta >= score_regression_threshold;
+    let passed = error_ok && score_ok;
+
+    let mut reasons = Vec::new();
+    if !error_ok {
+        reasons.push(format!(
+            "error rate {:.1}% exceeded {:.1}%",
+            error_rate * 100.0,
+            error_rate_threshold * 100.0
+        ));
+    }
+    if !score_ok {
+        reasons.push(format!(
+            "score delta {:.3} below {:.3}",
+            score_delta, score_regression_threshold
+        ));
+    }
+
+    let details = if baseline.is_empty() {
+        format!(
+            "{} Validated {} recent session scores with no baseline window; recent avg {:.3}, error rate {:.1}% (threshold {:.1}%).",
+            if passed {
+                "Gate passed."
+            } else {
+                "Gate failed."
+            },
+            recent.len(),
+            recent_avg,
+            error_rate * 100.0,
+            error_rate_threshold * 100.0
+        )
+    } else {
+        format!(
+            "{} Validated {} recent vs {} baseline session scores; recent avg {:.3}, baseline avg {:.3}, delta {:.3} (threshold {:.3}), error rate {:.1}% (threshold {:.1}%).{}",
+            if passed {
+                "Gate passed."
+            } else {
+                "Gate failed."
+            },
+            recent.len(),
+            baseline.len(),
+            recent_avg,
+            baseline_avg,
+            score_delta,
+            score_regression_threshold,
+            error_rate * 100.0,
+            error_rate_threshold * 100.0,
+            if reasons.is_empty() {
+                String::new()
+            } else {
+                format!(" Reasons: {}.", reasons.join("; "))
+            }
+        )
+    };
+
+    GateValidationSummary {
+        sessions_tested: recent.len() as i64,
+        error_rate,
+        score_delta,
+        passed,
+        details,
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct DatabaseEvaluationService {
     matrixone: MatrixOneSettings,
@@ -364,12 +492,64 @@ impl EvaluationService for DatabaseEvaluationService {
 
     async fn validate_gate(
         &self,
-        _user_id: &str,
-        _request: GateValidateRequest,
+        user_id: &str,
+        request: GateValidateRequest,
     ) -> ServiceResult<GateValidateResponse> {
-        Err(not_implemented(
-            "Evaluation gate validation is not implemented yet",
-        ))
+        let pool = self.get_pool().await.map_err(internal_error)?;
+        let sample_limit = clamp_eval_limit(request.golden_session_count) * 2;
+        let rows = query(
+            "SELECT score \
+             FROM eval_quality_assessments \
+             WHERE user_id = ? \
+               AND level = 'session' \
+             ORDER BY updated_at DESC LIMIT ?",
+        )
+        .bind(user_id)
+        .bind(sample_limit)
+        .fetch_all(&pool)
+        .await
+        .map_err(internal_error)?;
+
+        let scores = rows
+            .iter()
+            .map(|row| row.try_get::<f64, _>("score").unwrap_or(0.0))
+            .collect::<Vec<_>>();
+        let summary = summarize_gate_validation(
+            &scores,
+            request.golden_session_count,
+            request.error_rate_threshold,
+            request.score_regression_threshold,
+        );
+        let gate_id = uuid::Uuid::now_v7().to_string();
+        let change_type = request.change_type.clone();
+
+        query(
+            "INSERT INTO eval_gate_results \
+             (gate_id, user_id, change_type, change_id, sessions_tested, error_rate, score_delta, passed) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&gate_id)
+        .bind(user_id)
+        .bind(change_type_label(&change_type))
+        .bind(&request.change_id)
+        .bind(summary.sessions_tested)
+        .bind(summary.error_rate)
+        .bind(summary.score_delta)
+        .bind(if summary.passed { 1_i8 } else { 0_i8 })
+        .execute(&pool)
+        .await
+        .map_err(internal_error)?;
+
+        Ok(GateValidateResponse {
+            gate_id,
+            change_type,
+            change_id: request.change_id,
+            sessions_tested: summary.sessions_tested,
+            error_rate: summary.error_rate,
+            score_delta: summary.score_delta,
+            passed: summary.passed,
+            details: summary.details,
+        })
     }
 
     async fn run_drift_pipeline(&self, user_id: &str) -> ServiceResult<DriftPipelineResponse> {
@@ -1181,6 +1361,41 @@ mod tests {
         assert_eq!(req.golden_session_count, 50);
         assert!((req.error_rate_threshold - 0.05).abs() < 0.001);
         assert!((req.score_regression_threshold - (-0.1)).abs() < 0.001);
+    }
+
+    #[test]
+    fn summarize_gate_validation_rejects_missing_scores() {
+        let summary = summarize_gate_validation(&[], 50, 0.05, -0.1);
+        assert_eq!(summary.sessions_tested, 0);
+        assert!(!summary.passed);
+        assert!(summary.details.contains("No session quality scores"));
+    }
+
+    #[test]
+    fn summarize_gate_validation_passes_stable_recent_window() {
+        let summary = summarize_gate_validation(&[0.91, 0.88, 0.85, 0.84], 2, 0.2, -0.1);
+        assert_eq!(summary.sessions_tested, 2);
+        assert!(summary.passed);
+        assert!((summary.error_rate - 0.0).abs() < 1e-9);
+        assert!((summary.score_delta - 0.05).abs() < 1e-9);
+    }
+
+    #[test]
+    fn summarize_gate_validation_fails_on_error_rate() {
+        let summary = summarize_gate_validation(&[0.65, 0.60, 0.91, 0.90], 2, 0.25, -0.5);
+        assert_eq!(summary.sessions_tested, 2);
+        assert!(!summary.passed);
+        assert!((summary.error_rate - 1.0).abs() < 1e-9);
+        assert!(summary.details.contains("error rate"));
+    }
+
+    #[test]
+    fn summarize_gate_validation_fails_on_score_regression() {
+        let summary = summarize_gate_validation(&[0.72, 0.70, 0.95, 0.92], 2, 1.0, -0.1);
+        assert_eq!(summary.sessions_tested, 2);
+        assert!(!summary.passed);
+        assert!(summary.score_delta < -0.2);
+        assert!(summary.details.contains("score delta"));
     }
 
     #[test]

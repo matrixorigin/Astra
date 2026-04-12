@@ -80,7 +80,7 @@
 ### Existing Capabilities
 - **EvaluationService** (`services/evaluation/service.rs`): 16-method trait covering quality trends, drift detection, calibration, session scores, SLO dashboards, trust reports, training data export.
 - **ConfidenceCalibrator** (`turn/routing_metrics.rs`): Calibrates selection confidence scores.
-- **GateValidation** (`evaluation/`): Quality gate validation with pass/fail decisions.
+- **GateValidation** (`services/src/evaluation/database.rs`): Quality gate validation now evaluates recent session-score windows against error-rate and score-regression thresholds and persists typed `eval_gate_results` history for later inspection.
 - **FeedbackSignal system** (`auto_tuning.rs`): 16 signal types (Retry, Correction, Acceptance, StarRating, ToolChurn, FocusDrift, etc.).
 - **ScenarioDetector** (`user_profile.rs:520`): Confidence-threshold-based scenario detection.
 - **EvolutionRules** (`auto_tuning.rs`): Trigger → action rules with cooldown and rate limiting.
@@ -90,7 +90,7 @@
 - **Global mutation queue** (`services/src/session_audit.rs`, `runtime/src/server/audit_handlers.rs`): `/audit/mutations` now lists staged mutations across sessions with priority-first sorting plus state/session/tool/safety/retention filtering, and it can now further isolate `verifier_signal`, `verifier_source`, or `verifier_gap` cases so ops can directly review missing-verifier mutations instead of inferring them from raw payloads.
 
 ### Gaps
-- **Most evaluation routes return 501**: `DatabaseEvaluationService` has "not implemented yet" for drift detection, drift pipeline, closed-loop, training data, SLO.
+- **Some evaluation routes still return 501**: `DatabaseEvaluationService` still leaves quality-trend model filtering, calibration reporting, training-data extraction, and training-data export unimplemented.
 - **No multi-objective optimization**: Evaluation is single-dimensional (quality score). No Pareto frontier for efficiency × cost × accuracy.
 - **No noise filtering**: FeedbackSignals are consumed raw; no statistical filtering for outliers or noise.
 - **No fully universal verifier-complete scoreboard yet**: `MutationScoreboard` now persists verifier evidence for fork-skill mutations, generic verifier-shaped tool results, and conservative single-action same-turn journal verification events, and it now explicitly tags missing-signal cases with `verifier_gap`; however, tool paths with no structured or turn-scoped verification signal still lack a real positive verifier surface.
@@ -98,7 +98,7 @@
 - **No verifier diversity**: Gate validation is single-pass, not ensemble-based.
 
 ### Priority Actions
-1. Implement `detect_drift()` and `run_closed_loop()` in DatabaseEvaluationService.
+1. Implement `get_calibration()` on real confidence evidence instead of returning 501.
 2. Add `ConfidenceInterval { point: f64, lower: f64, upper: f64 }` to replace bare `f64` confidence.
 
 ---
