@@ -889,13 +889,42 @@ fn ws_error_from_status(status: StatusCode, message: impl Into<String>) -> WsSer
 struct LifecyclePollErrorPolicy {
     cancel_run: bool,
     emit_failed_terminal: bool,
+    continue_polling: bool,
 }
 
-fn lifecycle_poll_error_policy(_status: StatusCode) -> LifecyclePollErrorPolicy {
-    LifecyclePollErrorPolicy {
-        cancel_run: false,
-        emit_failed_terminal: false,
+fn lifecycle_poll_error_policy(status: StatusCode) -> LifecyclePollErrorPolicy {
+    match status {
+        StatusCode::FORBIDDEN | StatusCode::NOT_FOUND => LifecyclePollErrorPolicy {
+            cancel_run: false,
+            emit_failed_terminal: true,
+            continue_polling: false,
+        },
+        status if super::http_helpers::status_to_sse_retryable(status) => LifecyclePollErrorPolicy {
+            cancel_run: false,
+            emit_failed_terminal: false,
+            continue_polling: true,
+        },
+        _ => LifecyclePollErrorPolicy {
+            cancel_run: false,
+            emit_failed_terminal: false,
+            continue_polling: false,
+        },
     }
+}
+
+fn should_emit_transient_poll_error(
+    last_error: &mut Option<(StatusCode, String)>,
+    status: StatusCode,
+    message: &str,
+) -> bool {
+    if last_error
+        .as_ref()
+        .is_some_and(|(prev_status, prev_message)| *prev_status == status && prev_message == message)
+    {
+        return false;
+    }
+    *last_error = Some((status, message.to_string()));
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -981,6 +1010,8 @@ async fn stream_run_over_websocket(
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut last_index = 0u32;
     let mut terminal_error: Option<String> = None;
+    let mut stream_poll_error: Option<(StatusCode, String)> = None;
+    let mut status_poll_error: Option<(StatusCode, String)> = None;
 
     loop {
         tokio::select! {
@@ -1063,15 +1094,26 @@ async fn stream_run_over_websocket(
                     .stream_run(run_id.to_string(), conn.user.user_id.clone(), last_index)
                     .await
                 {
-                    Ok(events) => events,
+                    Ok(events) => {
+                        stream_poll_error = None;
+                        events
+                    }
                     Err((status, err)) => {
                         let message = err.0.detail;
                         let policy = lifecycle_poll_error_policy(status);
-                        send_msg(
-                            socket,
-                            &ws_error_from_status(status, message.clone()),
-                        )
-                        .await;
+                        if !policy.continue_polling
+                            || should_emit_transient_poll_error(
+                                &mut stream_poll_error,
+                                status,
+                                &message,
+                            )
+                        {
+                            send_msg(
+                                socket,
+                                &ws_error_from_status(status, message.clone()),
+                            )
+                            .await;
+                        }
                         if policy.cancel_run {
                             best_effort_cancel_run(state, conn, run_id).await;
                         }
@@ -1081,10 +1123,13 @@ async fn stream_run_over_websocket(
                                 &WsServerMessage::RunFinished {
                                     run_id: run_id.to_string(),
                                     status: STATUS_FAILED.to_string(),
-                                    error: Some(message),
+                                    error: Some(message.clone()),
                                 },
                             )
                             .await;
+                        }
+                        if policy.continue_polling {
+                            continue;
                         }
                         return;
                     }
@@ -1110,7 +1155,7 @@ async fn stream_run_over_websocket(
                                 &WsServerMessage::RunFinished {
                                     run_id: run_id.to_string(),
                                     status: STATUS_FAILED.to_string(),
-                                    error: Some(message),
+                                    error: Some(message.clone()),
                                 },
                             )
                             .await;
@@ -1127,15 +1172,26 @@ async fn stream_run_over_websocket(
                     .get_run_status(run_id.to_string(), conn.user.user_id.clone())
                     .await
                 {
-                    Ok(status) => status,
+                    Ok(status) => {
+                        status_poll_error = None;
+                        status
+                    }
                     Err((status, err)) => {
                         let message = err.0.detail;
                         let policy = lifecycle_poll_error_policy(status);
-                        send_msg(
-                            socket,
-                            &ws_error_from_status(status, message.clone()),
-                        )
-                        .await;
+                        if !policy.continue_polling
+                            || should_emit_transient_poll_error(
+                                &mut status_poll_error,
+                                status,
+                                &message,
+                            )
+                        {
+                            send_msg(
+                                socket,
+                                &ws_error_from_status(status, message.clone()),
+                            )
+                            .await;
+                        }
                         if policy.cancel_run {
                             best_effort_cancel_run(state, conn, run_id).await;
                         }
@@ -1145,10 +1201,13 @@ async fn stream_run_over_websocket(
                                 &WsServerMessage::RunFinished {
                                     run_id: run_id.to_string(),
                                     status: STATUS_FAILED.to_string(),
-                                    error: Some(message),
+                                    error: Some(message.clone()),
                                 },
                             )
                             .await;
+                        }
+                        if policy.continue_polling {
+                            continue;
                         }
                         return;
                     }
@@ -3162,16 +3221,68 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_poll_error_policy_is_nonterminal_for_transient_errors() {
+    fn lifecycle_poll_error_policy_retries_transient_errors() {
         for status in [
-            StatusCode::NOT_FOUND,
             StatusCode::SERVICE_UNAVAILABLE,
             StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::TOO_MANY_REQUESTS,
         ] {
             let policy = lifecycle_poll_error_policy(status);
             assert!(!policy.cancel_run);
             assert!(!policy.emit_failed_terminal);
+            assert!(policy.continue_polling);
         }
+    }
+
+    #[test]
+    fn lifecycle_poll_error_policy_fails_terminal_for_missing_or_forbidden_runs() {
+        for status in [StatusCode::NOT_FOUND, StatusCode::FORBIDDEN] {
+            let policy = lifecycle_poll_error_policy(status);
+            assert!(!policy.cancel_run);
+            assert!(policy.emit_failed_terminal);
+            assert!(!policy.continue_polling);
+        }
+    }
+
+    #[test]
+    fn transient_poll_error_suppression_is_scoped_per_poll_path() {
+        let mut stream_error = None;
+        let mut status_error = None;
+
+        assert!(should_emit_transient_poll_error(
+            &mut status_error,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "service down",
+        ));
+        assert!(should_emit_transient_poll_error(
+            &mut stream_error,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "service down",
+        ));
+        assert!(!should_emit_transient_poll_error(
+            &mut status_error,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "service down",
+        ));
+
+        stream_error = None;
+        assert!(should_emit_transient_poll_error(
+            &mut stream_error,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "service down",
+        ));
+
+        assert!(!should_emit_transient_poll_error(
+            &mut status_error,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "service down",
+        ));
+        status_error = None;
+        assert!(should_emit_transient_poll_error(
+            &mut status_error,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "service down",
+        ));
     }
 
     #[test]
