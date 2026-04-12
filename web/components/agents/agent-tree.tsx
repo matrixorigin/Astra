@@ -150,7 +150,7 @@ export function AgentTree({ events }: { events: StreamEvent[] }) {
 
   const totalAgents = events.filter((e) => e.type === 'agent_spawned').length;
   const completedAgents = events.filter(
-    (e) => e.type === 'agent_completed',
+    (e) => e.type === 'agent_completed' && e.status === 'completed',
   ).length;
 
   return (
