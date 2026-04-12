@@ -284,6 +284,11 @@ pub(crate) async fn stream_chat_sse(
         approval_request_tx: p.approval_request_tx,
         root_send_message_context,
         repl_turn_index: p.turn_index,
+        tool_cache: crate::stream_render::EdgeToolCache::new(
+            astra_runtime::runtime_config::RuntimeConfig::load()
+                .tool_selection
+                .effective_max_identical_calls(),
+        ),
     };
 
     let bare_mode = std::env::var("ASTRA_BARE")

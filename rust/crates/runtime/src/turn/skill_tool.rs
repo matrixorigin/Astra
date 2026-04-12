@@ -793,9 +793,7 @@ pub fn is_skill_call(tool_call: &Value) -> bool {
 /// Parse tool call arguments from either stringified JSON (OpenAI) or direct
 /// object (Anthropic) format into a `Value`.
 pub fn extract_tool_args(tool_call: &Value) -> Option<Value> {
-    let args = tool_call
-        .get("function")
-        .and_then(|f| f.get("arguments"))?;
+    let args = tool_call.get("function").and_then(|f| f.get("arguments"))?;
     if let Some(s) = args.as_str() {
         serde_json::from_str::<Value>(s).ok()
     } else if args.is_object() {
@@ -1855,10 +1853,7 @@ mod tests {
                 "arguments": "{\"skill_name\": \"review-changes\"}"
             }
         });
-        assert_eq!(
-            extract_skill_name(&tc),
-            Some("review-changes".to_string())
-        );
+        assert_eq!(extract_skill_name(&tc), Some("review-changes".to_string()));
     }
 
     #[test]
@@ -1870,10 +1865,7 @@ mod tests {
                 "arguments": {"skill_name": "review-changes", "task": "review latest"}
             }
         });
-        assert_eq!(
-            extract_skill_name(&tc),
-            Some("review-changes".to_string())
-        );
+        assert_eq!(extract_skill_name(&tc), Some("review-changes".to_string()));
     }
 
     #[test]

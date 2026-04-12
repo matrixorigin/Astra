@@ -362,8 +362,14 @@ impl RunStateStore for InMemoryRunStateStore {
 }
 
 pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::Value {
-    if event.get("event_type").and_then(serde_json::Value::as_str).is_none()
-        && event.get("type").and_then(serde_json::Value::as_str).is_some()
+    if event
+        .get("event_type")
+        .and_then(serde_json::Value::as_str)
+        .is_none()
+        && event
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .is_some()
     {
         return event;
     }

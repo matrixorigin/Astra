@@ -31,8 +31,6 @@ use crate::prompts;
 pub(crate) const LLM_MAX_RETRIES: u32 = 3;
 /// Base delay between retries (doubles each attempt: 1s, 2s, 4s).
 pub(crate) const LLM_RETRY_BASE_MS: u64 = 1000;
-/// Stream idle watchdog: abort streaming if no chunk arrives within this time.
-pub(crate) const STREAM_IDLE_TIMEOUT_MS: u64 = 90_000;
 /// TCP connect timeout for LLM API requests (seconds). Override: `MO_LLM_CONNECT_TIMEOUT_S`.
 const LLM_CONNECT_TIMEOUT_S: u64 = 30;
 /// Non-stream fallback hard timeout (seconds). Override: `MO_LLM_FALLBACK_TIMEOUT_S`.
@@ -221,12 +219,8 @@ pub(crate) async fn sleep_ms_or_llm_cancel(
 
 /// Per-chunk idle watchdog (Claude Code–style): no SSE JSON for this long → treat as stalled.
 pub(crate) fn stream_idle_timeout() -> std::time::Duration {
-    // Allow tests and deployments to override the idle watchdog.
-    let ms = std::env::var("MO_STREAM_IDLE_TIMEOUT_MS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(STREAM_IDLE_TIMEOUT_MS);
-    std::time::Duration::from_millis(ms)
+    // Delegate to the canonical public function in sse_stream_host.
+    crate::turn::sse_stream_host::stream_idle_timeout()
 }
 
 /// TCP connect timeout for LLM API requests.

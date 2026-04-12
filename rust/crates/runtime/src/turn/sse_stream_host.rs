@@ -22,8 +22,18 @@ use crate::turn::chat_turn_sse_dispatch::{
 use async_trait::async_trait;
 use serde_json::Value;
 
-/// Stream idle watchdog: abort SSE consumption if no chunk arrives within this time.
+/// Stream idle watchdog default: abort SSE consumption if no chunk arrives within this time.
 pub const STREAM_IDLE_TIMEOUT_MS: u64 = 90_000;
+
+/// Configurable stream idle timeout. Reads `MO_STREAM_IDLE_TIMEOUT_MS` env var,
+/// falling back to [`STREAM_IDLE_TIMEOUT_MS`] (90 s).
+pub fn stream_idle_timeout() -> std::time::Duration {
+    let ms = std::env::var("MO_STREAM_IDLE_TIMEOUT_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(STREAM_IDLE_TIMEOUT_MS);
+    std::time::Duration::from_millis(ms)
+}
 
 // ─── Data types ──────────────────────────────────────────────────────────────
 

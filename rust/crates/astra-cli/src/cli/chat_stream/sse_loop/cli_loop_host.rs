@@ -75,6 +75,8 @@ pub(crate) struct CliAgenticLoopHost<'a> {
         Option<crate::edge_tools::agent_messaging::SendMessageRuntimeContext>,
     /// REPL turn counter (0-based) for correct turn_id in trace collector.
     pub repl_turn_index: u32,
+    /// Cross-turn tool output cache for edge-path dedup.
+    pub tool_cache: crate::stream_render::EdgeToolCache,
 }
 
 #[async_trait]
@@ -194,6 +196,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             skill_agent_type: state.skills.agent_type.clone(),
             tool_budget_override: state.tool_budget_override,
             skill_continuation: state.skill_produced_output,
+            tool_cache: &mut self.tool_cache,
         })
         .await?;
 
@@ -276,6 +279,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
                 approval_request_tx: None,
                 skill_resolver: None,
                 skill_continuation: false,
+                tool_cache: &mut self.tool_cache,
             }),
             0,
             state.cancellation.token.as_deref(),

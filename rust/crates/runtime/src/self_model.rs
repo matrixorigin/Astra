@@ -260,8 +260,7 @@ impl SelfModel {
             })
             .unwrap_or_default();
         let milestone_count = milestones.map(|ms| ms.len()).unwrap_or(0);
-        let (goal, goal_source) =
-            resolve_effective_goal(session_goal, plan_goal, tracked_goal);
+        let (goal, goal_source) = resolve_effective_goal(session_goal, plan_goal, tracked_goal);
         let tracking_status = goal_tracking_status(goal.as_deref(), tracked_goal).to_string();
 
         let goals = GoalState {
@@ -764,8 +763,14 @@ mod tests {
             &config,
         );
 
-        assert_eq!(model.goals.goal.as_deref(), Some("Execute the migration plan"));
-        assert_eq!(model.goals.session_goal.as_deref(), Some("Fix the auth bug"));
+        assert_eq!(
+            model.goals.goal.as_deref(),
+            Some("Execute the migration plan")
+        );
+        assert_eq!(
+            model.goals.session_goal.as_deref(),
+            Some("Fix the auth bug")
+        );
         assert_eq!(
             model.goals.plan_goal.as_deref(),
             Some("Execute the migration plan")

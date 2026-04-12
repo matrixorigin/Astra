@@ -5628,7 +5628,12 @@ mod tests {
         // final text completion.
         let mut host = MockHost::new(vec![
             edge_tool_result(vec![make_edge_tool("grep", "results...")], 20, 10, Some(50)),
-            edge_tool_result(vec![make_edge_tool("grep", "more results")], 20, 10, Some(50)),
+            edge_tool_result(
+                vec![make_edge_tool("grep", "more results")],
+                20,
+                10,
+                Some(50),
+            ),
             text_result("Done!", 15, 8, Some(30)),
         ])
         .with_valid_tools(&["grep"]);
@@ -12140,7 +12145,9 @@ print(json.dumps({'context': 'user said: ' + msg}))
                     make_edge_tool("read_file", &big_output),
                     make_edge_tool("read_file", &big_output),
                 ],
-                100, 50, Some(30),
+                100,
+                50,
+                Some(30),
             ),
             // Iteration 2: 3 more edge tool calls
             edge_tool_result(
@@ -12149,13 +12156,17 @@ print(json.dumps({'context': 'user said: ' + msg}))
                     make_edge_tool("read_file", &big_output),
                     make_edge_tool("read_file", &big_output),
                 ],
-                100, 50, Some(30),
+                100,
+                50,
+                Some(30),
             ),
             // Iteration 3: final text
             text_result("Done.", 50, 20, None),
         ]);
         let mut state = make_state();
-        state.messages.push(json!({"role": "user", "content": "review"}));
+        state
+            .messages
+            .push(json!({"role": "user", "content": "review"}));
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(outcome.is_ok());
@@ -12165,11 +12176,17 @@ print(json.dumps({'context': 'user said: ' + msg}))
         // Microcompact keeps the last 6, so with 6 total tool results,
         // iteration 1's results (first 3) should be compacted if there are
         // more than 6 total tool-role messages.
-        let tool_msgs: Vec<&Value> = state.messages.iter()
+        let tool_msgs: Vec<&Value> = state
+            .messages
+            .iter()
             .filter(|m| m.get("role").and_then(Value::as_str) == Some("tool"))
             .collect();
         // Verify at least some tool messages exist
-        assert!(tool_msgs.len() >= 3, "expected tool messages, got {}", tool_msgs.len());
+        assert!(
+            tool_msgs.len() >= 3,
+            "expected tool messages, got {}",
+            tool_msgs.len()
+        );
 
         // With KEEP_RECENT=6 and 6 tool results, none get compacted.
         // But the test verifies the microcompact code path runs without
@@ -12181,11 +12198,11 @@ print(json.dumps({'context': 'user said: ' + msg}))
     #[tokio::test]
     async fn microcompact_skips_first_iteration() {
         // Single iteration: microcompact should NOT run (turn_index == 0).
-        let mut host = MockHost::new(vec![
-            text_result("Hello.", 50, 20, None),
-        ]);
+        let mut host = MockHost::new(vec![text_result("Hello.", 50, 20, None)]);
         let mut state = make_state();
-        state.messages.push(json!({"role": "user", "content": "hi"}));
+        state
+            .messages
+            .push(json!({"role": "user", "content": "hi"}));
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(outcome.is_ok());
@@ -12210,17 +12227,18 @@ print(json.dumps({'context': 'user said: ' + msg}))
                     make_edge_tool("git_log", &big_output),
                     make_edge_tool("git_status", &big_output),
                 ],
-                100, 50, Some(30),
+                100,
+                50,
+                Some(30),
             ),
             // Iteration 2: 1 more tool (total 8, triggers compaction of oldest)
-            edge_tool_result(
-                vec![make_edge_tool("bash", &big_output)],
-                100, 50, Some(30),
-            ),
+            edge_tool_result(vec![make_edge_tool("bash", &big_output)], 100, 50, Some(30)),
             text_result("Done.", 50, 20, None),
         ]);
         let mut state = make_state();
-        state.messages.push(json!({"role": "user", "content": "analyze"}));
+        state
+            .messages
+            .push(json!({"role": "user", "content": "analyze"}));
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(outcome.is_ok());
@@ -12254,20 +12272,26 @@ print(json.dumps({'context': 'user said: ' + msg}))
                     make_edge_tool("git_log", &big),
                     make_edge_tool("git_status", &big),
                 ],
-                100, 50, Some(30),
+                100,
+                50,
+                Some(30),
             ),
             text_result("Done.", 50, 20, None),
         ]);
         host.quiet = false; // Enable status line output
         let mut state = make_state();
-        state.messages.push(json!({"role": "user", "content": "review"}));
+        state
+            .messages
+            .push(json!({"role": "user", "content": "review"}));
 
         let _ = run_agentic_loop_with_host(&mut host, &mut state).await;
 
         // Check if any emitted line contains the compaction marker.
         // Compaction only fires on turn_index > 0, and with 7 tool results
         // (keep=6), at most 1 gets compacted — IF the content is >= 500 bytes.
-        let compact_lines: Vec<&String> = host.emitted_lines.iter()
+        let compact_lines: Vec<&String> = host
+            .emitted_lines
+            .iter()
             .filter(|l| l.contains("Compacted"))
             .collect();
         // With 7 tool results and keep=6, iteration 2 should compact 1.
@@ -12275,8 +12299,14 @@ print(json.dumps({'context': 'user said: ' + msg}))
         // Edge tool results go through the headless round which may format them.
         // This test verifies the status line mechanism works when compaction fires.
         if !compact_lines.is_empty() {
-            assert!(compact_lines[0].contains("♻"), "status line should contain ♻ marker");
-            assert!(compact_lines[0].contains("tokens saved"), "status line should mention tokens saved");
+            assert!(
+                compact_lines[0].contains("♻"),
+                "status line should contain ♻ marker"
+            );
+            assert!(
+                compact_lines[0].contains("tokens saved"),
+                "status line should mention tokens saved"
+            );
         }
     }
 
@@ -12292,20 +12322,26 @@ print(json.dumps({'context': 'user said: ' + msg}))
             text_result("Done.", 50, 20, None),
         ]);
         let mut state = make_state();
-        state.messages.push(json!({"role": "user", "content": "go"}));
+        state
+            .messages
+            .push(json!({"role": "user", "content": "go"}));
 
         // Pre-populate messages with old tool results (simulating prior iterations).
         // These are already in the history before the loop starts.
         for i in 0..10 {
             state.messages.push(json!({"role": "assistant", "content": "", "tool_calls": [{"id": format!("old-{i}"), "type": "function", "function": {"name": "read_file", "arguments": "{}"}}]}));
-            state.messages.push(json!({"role": "tool", "tool_call_id": format!("old-{i}"), "content": &big}));
+            state
+                .messages
+                .push(json!({"role": "tool", "tool_call_id": format!("old-{i}"), "content": &big}));
         }
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(outcome.is_ok());
 
         // Count how many old tool results were compacted
-        let compacted = state.messages.iter()
+        let compacted = state
+            .messages
+            .iter()
             .filter(|m| {
                 m.get("role").and_then(Value::as_str) == Some("tool")
                     && m.get("content").and_then(Value::as_str)
@@ -12322,7 +12358,9 @@ print(json.dumps({'context': 'user said: ' + msg}))
         );
 
         // Verify total content size decreased
-        let total_content_bytes: usize = state.messages.iter()
+        let total_content_bytes: usize = state
+            .messages
+            .iter()
             .filter(|m| m.get("role").and_then(Value::as_str) == Some("tool"))
             .map(|m| m.get("content").and_then(Value::as_str).unwrap_or("").len())
             .sum();

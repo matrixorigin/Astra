@@ -679,6 +679,8 @@ pub(crate) struct ChatTurnSseFetchRequest<'a> {
     /// When true, this is a continuation turn after a skill has already produced output.
     /// Propagated to `EdgeSseContext` to buffer text and suppress thinking previews.
     pub skill_continuation: bool,
+    /// Cross-turn tool output cache (persists across turns via `CliAgenticLoopHost`).
+    pub tool_cache: &'a mut crate::stream_render::EdgeToolCache,
 }
 
 /// stderr prep line + timing toggles for [`fetch_chat_turn_sse`].
@@ -797,6 +799,7 @@ pub(crate) async fn fetch_chat_turn_sse(
         skill_agent_type,
         tool_budget_override,
         skill_continuation,
+        tool_cache,
     } = ctx;
 
     let ui = chat_turn_sse_fetch_ui(render_policy, plan_assemble_line_release.as_ref());
@@ -872,6 +875,7 @@ pub(crate) async fn fetch_chat_turn_sse(
         approval_request_tx,
         skill_resolver,
         skill_continuation,
+        tool_cache,
     };
 
     let sse_mark = Instant::now();

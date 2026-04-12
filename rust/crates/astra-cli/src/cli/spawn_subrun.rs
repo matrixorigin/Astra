@@ -127,6 +127,11 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             skill_resolver: self.skill_resolver.clone(),
             progress_tx: None,
             agent_id: config.agent_id.clone(),
+            tool_cache: super::stream_render::EdgeToolCache::new(
+                astra_runtime::runtime_config::RuntimeConfig::load()
+                    .tool_selection
+                    .effective_max_identical_calls(),
+            ),
         };
 
         // Build system message from agent type definition

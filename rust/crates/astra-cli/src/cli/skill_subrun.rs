@@ -75,6 +75,8 @@ pub(crate) struct SubRunHost {
     pub(crate) progress_tx: Option<tokio::sync::mpsc::UnboundedSender<SubRunProgressEvent>>,
     /// Agent identifier used to tag progress events.
     pub(crate) agent_id: String,
+    /// Cross-turn tool output cache for edge-path dedup within this sub-run.
+    pub(crate) tool_cache: super::stream_render::EdgeToolCache,
 }
 
 /// A progress event emitted by a sub-run agent.
@@ -215,6 +217,7 @@ impl AgenticLoopHost for SubRunHost {
             approval_request_tx: None,
             skill_resolver: self.skill_resolver.clone(),
             skill_continuation: false,
+            tool_cache: &mut self.tool_cache,
         };
 
         let prep_line = ChatTurnPrepLineGuard::maybe_start(false, None);
@@ -390,6 +393,11 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             skill_resolver: self.skill_resolver.clone(),
             progress_tx: None,
             agent_id: String::new(),
+            tool_cache: super::stream_render::EdgeToolCache::new(
+                astra_runtime::runtime_config::RuntimeConfig::load()
+                    .tool_selection
+                    .effective_max_identical_calls(),
+            ),
         };
 
         let messages = vec![
@@ -557,6 +565,7 @@ mod tests {
             skill_resolver: None,
             progress_tx: None,
             agent_id: String::new(),
+            tool_cache: crate::stream_render::EdgeToolCache::new(3),
         };
         assert!(host.is_quiet());
     }
@@ -581,6 +590,7 @@ mod tests {
             skill_resolver: None,
             progress_tx: Some(tx),
             agent_id: "test-agent".to_string(),
+            tool_cache: crate::stream_render::EdgeToolCache::new(3),
         };
         assert!(!host.is_quiet());
     }
@@ -604,6 +614,7 @@ mod tests {
             skill_resolver: None,
             progress_tx: None,
             agent_id: String::new(),
+            tool_cache: crate::stream_render::EdgeToolCache::new(3),
         };
         let schema = json!({
             "type": "function",

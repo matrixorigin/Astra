@@ -653,9 +653,15 @@ mod tests {
     #[test]
     fn idempotency_cache_hit_message_is_stub() {
         let m = idempotency_cache_hit_message("huge output that should not appear");
-        assert!(!m.contains("huge output"), "cache hit should return stub, not full content");
+        assert!(
+            !m.contains("huge output"),
+            "cache hit should return stub, not full content"
+        );
         assert!(m.contains("cached"), "stub should mention caching");
-        assert!(m.contains("Re-read"), "stub should tell LLM to re-read if needed");
+        assert!(
+            m.contains("Re-read"),
+            "stub should tell LLM to re-read if needed"
+        );
     }
 
     #[test]
@@ -908,7 +914,11 @@ mod tests {
         assert!(matches!(result, std::borrow::Cow::Owned(_)));
         let id0 = result[0]["id"].as_str().unwrap();
         assert!(!id0.is_empty(), "empty id must be patched");
-        assert_eq!(result[1]["id"].as_str().unwrap(), "ok", "valid id untouched");
+        assert_eq!(
+            result[1]["id"].as_str().unwrap(),
+            "ok",
+            "valid id untouched"
+        );
     }
 
     #[test]
@@ -939,16 +949,16 @@ mod tests {
         let patched = ensure_tool_call_ids(&tcs);
 
         // Assistant message path
-        let assistant_msg = openai_assistant_with_tool_calls_message::<Row>(
-            &patched, &[], "",
-        );
+        let assistant_msg = openai_assistant_with_tool_calls_message::<Row>(&patched, &[], "");
         let assistant_id = assistant_msg["tool_calls"][0]["id"].as_str().unwrap();
 
         // Tool result path
         let (result_id, _, _) = parse_flat_tool_call_event(&patched[0]);
 
-        assert_eq!(assistant_id, result_id,
-            "assistant tool_call id and tool result id must match after ensure_tool_call_ids");
+        assert_eq!(
+            assistant_id, result_id,
+            "assistant tool_call id and tool result id must match after ensure_tool_call_ids"
+        );
     }
 
     /// parse_flat_tool_call_event must handle OpenAI format (function.name/arguments)
@@ -998,11 +1008,10 @@ mod tests {
                 "arguments": "{\"commit\":\"abc\"}"
             }
         })];
-        let slot = resolve_headless_tool_slot(
-            HeadlessRoundToolIdx::ServerToolCall(0),
-            &server,
-            |_| panic!("edge lookup not used"),
-        );
+        let slot =
+            resolve_headless_tool_slot(HeadlessRoundToolIdx::ServerToolCall(0), &server, |_| {
+                panic!("edge lookup not used")
+            });
         assert_eq!(slot.name, "git_show");
         assert_eq!(slot.args, json!({"commit": "abc"}));
     }

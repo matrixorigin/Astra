@@ -2,14 +2,16 @@ use super::*;
 use astra_runtime::turn::chat_turn_sse_dispatch::{
     ChatTurnSseAccum, SseRenderEffect, dispatch_chat_turn_sse_event_block,
 };
+use astra_runtime::turn::headless_tool_assembly::CACHEABLE_TOOLS;
 use astra_runtime::turn::sse_edge_stderr_lines::{
     edge_sse_post_approval_fail_line, edge_sse_post_tool_result_fail_line,
 };
 use astra_runtime::turn::sse_stream_host::{
-    EdgeApprovalResult, EdgeToolExecResult, NoopSseStreamHost, STREAM_IDLE_TIMEOUT_MS,
-    SseStreamHost, ToolBatchRequest, consume_sse_stream_cancellable, is_tool_concurrency_safe,
+    EdgeApprovalResult, EdgeToolExecResult, NoopSseStreamHost, SseStreamHost, ToolBatchRequest,
+    consume_sse_stream_cancellable, is_tool_concurrency_safe, stream_idle_timeout,
 };
 use astra_runtime::turn::tool_result_semantics::cloud_tool_result_status_label;
+use astra_runtime::turn::tool_result_semantics::tool_dedup_signature;
 use crossterm::style::Stylize;
 use futures_util::StreamExt;
 use serde_json::Value;
@@ -90,6 +92,31 @@ impl RenderPolicy {
     }
 }
 
+/// Cross-turn tool output cache for the CLI edge tool execution path.
+///
+/// Mirrors the headless round's `InMemoryIdempotencyCache` + `call_counts`, but
+/// scoped to edge-path tool calls (`tool_request` SSE events).  Cacheable tools
+/// (read_file, grep, git_log, …) get their output stored and replayed on repeat.
+/// All tools get a hard call-count limit to prevent runaway repetition.
+pub(super) struct EdgeToolCache {
+    /// `dedup_signature → (output, status)` for read-only tools.
+    output_cache: std::collections::HashMap<String, (String, String)>,
+    /// `dedup_signature → count` across all turns.
+    call_counts: std::collections::HashMap<String, u32>,
+    /// Hard cap on identical calls (same tool + same args).
+    max_identical_calls: u32,
+}
+
+impl EdgeToolCache {
+    pub fn new(max_identical_calls: u32) -> Self {
+        Self {
+            output_cache: std::collections::HashMap::new(),
+            call_counts: std::collections::HashMap::new(),
+            max_identical_calls,
+        }
+    }
+}
+
 /// When set, SSE `tool_request` / `approval_required` are handled and posted to the cloud API.
 pub(super) struct EdgeSseContext<'a> {
     pub api: &'a astra_thin_client::ThinClient,
@@ -110,6 +137,8 @@ pub(super) struct EdgeSseContext<'a> {
     /// Text is buffered (not streamed) and thinking previews are suppressed to avoid
     /// intermediate noise between skill iterations.
     pub skill_continuation: bool,
+    /// Cross-turn tool output cache (persists across turns via `CliAgenticLoopHost`).
+    pub tool_cache: &'a mut EdgeToolCache,
 }
 
 // ─── CLI SSE stream host ─────────────────────────────────────────────────────
@@ -152,6 +181,8 @@ struct CliSseStreamHost<'a> {
     skill_resolver: Option<std::sync::Arc<dyn astra_runtime::turn::skill_tool::SkillResolver>>,
     /// Skills already invoked during this SSE stream (for edge-path dedup).
     skills_invoked: std::collections::HashSet<String>,
+    /// Cross-turn tool output cache (shared with `CliAgenticLoopHost`).
+    tool_cache: &'a mut EdgeToolCache,
 }
 
 impl<'a> CliSseStreamHost<'a> {
@@ -188,6 +219,7 @@ impl<'a> CliSseStreamHost<'a> {
             approval_request_tx: ctx.approval_request_tx,
             skill_resolver: ctx.skill_resolver,
             skills_invoked: std::collections::HashSet::new(),
+            tool_cache: ctx.tool_cache,
         }
     }
 
@@ -253,6 +285,39 @@ impl<'a> CliSseStreamHost<'a> {
         if !buf.is_empty() {
             self.render_text(&buf);
         }
+    }
+
+    /// Build an `EdgeToolExecResult` and post it to the cloud API.
+    /// Used for cache-hit and dedup-limit early returns inside `execute_tool`.
+    async fn finish_edge_tool(
+        &mut self,
+        request_id: &str,
+        tool: &str,
+        args: &serde_json::Value,
+        output: String,
+        status: String,
+        duration_ms: u64,
+    ) -> EdgeToolExecResult {
+        let result = EdgeToolExecResult {
+            request_id: request_id.to_string(),
+            tool: tool.to_string(),
+            args: args.clone(),
+            output: output.clone(),
+            status: status.clone(),
+            duration_ms,
+        };
+        self.edge_tool_round.push(result.clone());
+        let body = astra_thin_client::ToolResultRequest {
+            request_id: request_id.to_string(),
+            status,
+            output: Some(output),
+            duration_ms: Some(duration_ms),
+        };
+        let _ = self
+            .api
+            .post_tool_result(Some(self.token), Some(self.executor_id), &body)
+            .await;
+        result
     }
 }
 
@@ -489,6 +554,58 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         } else {
             None
         };
+
+        // ── Edge-path dedup: call-count limit + output cache ───────────
+        let dedup_sig = tool_dedup_signature(tool, args);
+        let call_count = self
+            .tool_cache
+            .call_counts
+            .entry(dedup_sig.clone())
+            .or_insert(0);
+        *call_count += 1;
+        let max_calls = self.tool_cache.max_identical_calls;
+
+        if *call_count > max_calls {
+            // Hard cap exceeded — return a stub telling the LLM to stop.
+            let body = if let Some((cached_out, _)) = self.tool_cache.output_cache.get(&dedup_sig) {
+                format!(
+                    "⛔ Cached repeat (call #{} for identical args, limit: {}). \
+                     The result is already in this conversation from an earlier call. \
+                     Do NOT call this tool again with the same arguments.\n\n{}",
+                    *call_count,
+                    max_calls,
+                    &cached_out[..cached_out.len().min(200)],
+                )
+            } else {
+                format!(
+                    "⛔ Duplicate call #{} (limit: {}). This tool has been called too many times \
+                     with the same arguments. Use the results from earlier calls instead.",
+                    *call_count, max_calls,
+                )
+            };
+            let status = "error";
+            if let Some(idx) = tool_idx {
+                self.render.tool_done(idx, tool, args, status, 0, &body);
+            }
+            return self
+                .finish_edge_tool(request_id, tool, args, body, status.to_string(), 0)
+                .await;
+        }
+
+        // Cache hit for read-only (cacheable) tools
+        if CACHEABLE_TOOLS.contains(&tool)
+            && let Some((cached_output, cached_status)) =
+                self.tool_cache.output_cache.get(&dedup_sig).cloned()
+        {
+            if let Some(idx) = tool_idx {
+                self.render
+                    .tool_done(idx, tool, args, &cached_status, 0, &cached_output);
+            }
+            return self
+                .finish_edge_tool(request_id, tool, args, cached_output, cached_status, 0)
+                .await;
+        }
+
         let decision = match self.perm_manager.as_mut() {
             Some(pm) => crate::tool_safety_guard::ToolSafetyGuard::check_request(
                 Some(&mut **pm),
@@ -799,6 +916,13 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             cloud_tool_result_status_label(&output)
         };
         let duration_ms = start.elapsed().as_millis() as u64;
+
+        // Store successful cacheable tool results for cross-turn dedup.
+        if allowed && status != "error" && CACHEABLE_TOOLS.contains(&tool) {
+            self.tool_cache
+                .output_cache
+                .insert(dedup_sig.clone(), (output.clone(), status.to_string()));
+        }
 
         // Forward tool-completed event to observer channel
         if let Some(tx) = &self.stream_event_tx {
@@ -2657,7 +2781,7 @@ pub(super) async fn consume_turn_sse(
     );
 
     // Delegate to runtime's generic SSE consumer with the appropriate host
-    let idle = std::time::Duration::from_millis(STREAM_IDLE_TIMEOUT_MS);
+    let idle = stream_idle_timeout();
     let (sse_result, edge_tool_round, mut md_renderer, lines_written, _pending_xml_buffer) =
         if let Some(ctx) = edge {
             let mut host = CliSseStreamHost::from_edge_ctx(
@@ -3284,5 +3408,76 @@ diff --git a/src/a.rs b/src/a.rs\n\
         );
         assert!(msg.contains("code-review"));
         assert!(msg.contains("already loaded"));
+    }
+
+    // ── EdgeToolCache unit tests ─────────────────────────────────────────
+
+    #[test]
+    fn edge_tool_cache_new_has_correct_limit() {
+        let cache = EdgeToolCache::new(5);
+        assert_eq!(cache.max_identical_calls, 5);
+        assert!(cache.output_cache.is_empty());
+        assert!(cache.call_counts.is_empty());
+    }
+
+    #[test]
+    fn edge_tool_cache_stores_and_retrieves() {
+        let mut cache = EdgeToolCache::new(3);
+        let sig = "read_file:{\"path\":\"/tmp/foo\"}".to_string();
+        cache.output_cache.insert(
+            sig.clone(),
+            ("file content".to_string(), "success".to_string()),
+        );
+        let hit = cache.output_cache.get(&sig);
+        assert!(hit.is_some());
+        let (output, status) = hit.unwrap();
+        assert_eq!(output, "file content");
+        assert_eq!(status, "success");
+    }
+
+    #[test]
+    fn edge_tool_cache_call_count_increments() {
+        let mut cache = EdgeToolCache::new(3);
+        let sig = "grep:{\"pattern\":\"foo\"}".to_string();
+        let count = cache.call_counts.entry(sig.clone()).or_insert(0);
+        *count += 1;
+        assert_eq!(cache.call_counts[&sig], 1);
+        *cache.call_counts.get_mut(&sig).unwrap() += 1;
+        assert_eq!(cache.call_counts[&sig], 2);
+    }
+
+    #[test]
+    fn edge_tool_cache_call_count_exceeds_limit() {
+        let mut cache = EdgeToolCache::new(2);
+        let sig = "bash:{\"command\":\"ls\"}".to_string();
+        let count = cache.call_counts.entry(sig.clone()).or_insert(0);
+        *count += 1;
+        assert!(*count <= cache.max_identical_calls);
+        *cache.call_counts.get_mut(&sig).unwrap() += 1;
+        assert!(*cache.call_counts.get(&sig).unwrap() <= cache.max_identical_calls);
+        *cache.call_counts.get_mut(&sig).unwrap() += 1;
+        assert!(*cache.call_counts.get(&sig).unwrap() > cache.max_identical_calls);
+    }
+
+    #[test]
+    fn edge_tool_cache_cacheable_tools_lookup() {
+        // Verify that well-known cacheable tools are in the set
+        assert!(CACHEABLE_TOOLS.contains(&"read_file"));
+        assert!(CACHEABLE_TOOLS.contains(&"grep"));
+        assert!(CACHEABLE_TOOLS.contains(&"glob"));
+        assert!(CACHEABLE_TOOLS.contains(&"git_log"));
+        // bash is NOT cacheable (side effects)
+        assert!(!CACHEABLE_TOOLS.contains(&"bash"));
+    }
+
+    #[test]
+    fn edge_tool_cache_dedup_signature_deterministic() {
+        let args = serde_json::json!({"path": "/tmp/foo", "pattern": "bar"});
+        let sig1 = tool_dedup_signature("grep", &args);
+        let sig2 = tool_dedup_signature("grep", &args);
+        assert_eq!(sig1, sig2);
+        // Different tool name → different signature
+        let sig3 = tool_dedup_signature("read_file", &args);
+        assert_ne!(sig1, sig3);
     }
 }

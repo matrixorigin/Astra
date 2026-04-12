@@ -161,8 +161,7 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
     let mut pre_resolved_ids: HashSet<&str> = HashSet::new();
     for (call_id, result_text) in pre_resolved_results {
         pre_resolved_ids.insert(call_id.as_str());
-        let (tool_msg, tr) =
-            openai_tool_roundtrip_values(call_id, "pre_resolved", result_text);
+        let (tool_msg, tr) = openai_tool_roundtrip_values(call_id, "pre_resolved", result_text);
         messages.push(tool_msg);
         tool_results.push(tr);
     }

@@ -78,8 +78,7 @@ pub(super) fn transform_stream_run_events_for_client_with_pending(
         if matches!(
             event_type.as_str(),
             "run_started" | "run_paused" | "run_resumed" | "run_finished"
-        )
-            && let Some(obj) = transformed.as_object_mut()
+        ) && let Some(obj) = transformed.as_object_mut()
             && !obj.contains_key("run_id")
         {
             obj.insert(
@@ -215,18 +214,21 @@ mod tests {
 
     #[test]
     fn transform_stream_run_events_for_client_uses_client_protocol_shape() {
-        let transformed = transform_stream_run_events_for_client("run-123", vec![
-            json!({
-                "event_type": "text_delta",
-                "data": {"chunk": "hello"},
-                "index": 7
-            }),
-            json!({
-                "event_type": "run_error",
-                "data": {"error": "boom"},
-                "index": 8
-            }),
-        ]);
+        let transformed = transform_stream_run_events_for_client(
+            "run-123",
+            vec![
+                json!({
+                    "event_type": "text_delta",
+                    "data": {"chunk": "hello"},
+                    "index": 7
+                }),
+                json!({
+                    "event_type": "run_error",
+                    "data": {"error": "boom"},
+                    "index": 8
+                }),
+            ],
+        );
 
         assert_eq!(
             transformed[0],
@@ -240,11 +242,14 @@ mod tests {
 
     #[test]
     fn transform_stream_run_events_for_client_maps_tool_result_to_tool_call_end() {
-        let transformed = transform_stream_run_events_for_client("run-123", vec![json!({
-            "event_type": "tool_result",
-            "data": {"call_id": "call-1", "result": "ok"},
-            "index": 9
-        })]);
+        let transformed = transform_stream_run_events_for_client(
+            "run-123",
+            vec![json!({
+                "event_type": "tool_result",
+                "data": {"call_id": "call-1", "result": "ok"},
+                "index": 9
+            })],
+        );
 
         assert_eq!(
             transformed[0],
@@ -254,23 +259,26 @@ mod tests {
 
     #[test]
     fn transform_stream_run_events_for_client_emits_usage_and_terminal_status() {
-        let transformed = transform_stream_run_events_for_client("run-123", vec![
-            json!({
-                "event_type": "run_error",
-                "data": {"error": "boom"},
-                "index": 10
-            }),
-            json!({
-                "event_type": "run_finished",
-                "data": {"prompt_tokens": 7, "completion_tokens": 3, "tool_call_count": 2},
-                "index": 11
-            }),
-            json!({
-                "event_type": "run_finished",
-                "data": {"cancelled": true, "prompt_tokens": 1, "completion_tokens": 0},
-                "index": 12
-            }),
-        ]);
+        let transformed = transform_stream_run_events_for_client(
+            "run-123",
+            vec![
+                json!({
+                    "event_type": "run_error",
+                    "data": {"error": "boom"},
+                    "index": 10
+                }),
+                json!({
+                    "event_type": "run_finished",
+                    "data": {"prompt_tokens": 7, "completion_tokens": 3, "tool_call_count": 2},
+                    "index": 11
+                }),
+                json!({
+                    "event_type": "run_finished",
+                    "data": {"cancelled": true, "prompt_tokens": 1, "completion_tokens": 0},
+                    "index": 12
+                }),
+            ],
+        );
 
         assert_eq!(
             transformed[0],
@@ -296,11 +304,14 @@ mod tests {
 
     #[test]
     fn transform_stream_run_events_for_client_injects_run_id_into_run_started() {
-        let transformed = transform_stream_run_events_for_client("run-123", vec![json!({
-            "event_type": "run_started",
-            "data": {},
-            "index": 1
-        })]);
+        let transformed = transform_stream_run_events_for_client(
+            "run-123",
+            vec![json!({
+                "event_type": "run_started",
+                "data": {},
+                "index": 1
+            })],
+        );
 
         assert_eq!(
             transformed[0],
@@ -310,18 +321,21 @@ mod tests {
 
     #[test]
     fn transform_stream_run_events_for_client_injects_run_id_into_pause_resume_events() {
-        let transformed = transform_stream_run_events_for_client("run-123", vec![
-            json!({
-                "event_type": "run_paused",
-                "data": {},
-                "index": 2
-            }),
-            json!({
-                "event_type": "run_resumed",
-                "data": {},
-                "index": 3
-            }),
-        ]);
+        let transformed = transform_stream_run_events_for_client(
+            "run-123",
+            vec![
+                json!({
+                    "event_type": "run_paused",
+                    "data": {},
+                    "index": 2
+                }),
+                json!({
+                    "event_type": "run_resumed",
+                    "data": {},
+                    "index": 3
+                }),
+            ],
+        );
 
         assert_eq!(
             transformed[0],

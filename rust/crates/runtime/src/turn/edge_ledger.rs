@@ -98,7 +98,9 @@ pub fn persist_value_for_ledger_tool_result(
     ledger_entry: Option<&Value>,
     timed_out: bool,
 ) -> Value {
-    let id = tc.get("id").and_then(Value::as_str)
+    let id = tc
+        .get("id")
+        .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
         .unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
