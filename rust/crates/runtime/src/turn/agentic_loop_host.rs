@@ -195,6 +195,16 @@ pub trait AgenticLoopHost: Send {
     ///
     /// Default: no-op (used by MockHost and hosts that don't support injection).
     fn inject_tool_schema(&mut self, _schema: Value) {}
+
+    /// Render the final answer text to the user.
+    ///
+    /// Called only when the agentic loop is certain the text is the final
+    /// answer (no more iterations, stop-hooks satisfied). Text was deferred
+    /// during SSE consumption to avoid premature rendering that leaks into
+    /// tool-turn output when the loop continues.
+    ///
+    /// Default: no-op (tests, headless, sub-run hosts).
+    fn render_final_text(&mut self, _text: &str) {}
 }
 
 // ─── Loop state sub-structs ──────────────────────────────────────────────────
@@ -3533,6 +3543,7 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                         reason.as_str(),
                         state.total_tool_calls,
                     );
+                    host.render_final_text(&state.final_text);
                     return Ok(AgenticLoopOutcome::Completed);
                 }
                 return Err(format!(
@@ -3945,6 +3956,7 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                     }
                     finalize_turn_trace(state);
                     try_write_heavy_checkpoint(state);
+                    host.render_final_text(&state.final_text);
                     return Ok(AgenticLoopOutcome::Completed);
                 }
 
@@ -3994,6 +4006,10 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                 }
                 finalize_turn_trace(state);
                 try_write_heavy_checkpoint(state);
+                // Render deferred final text now that we're certain the loop is done.
+                if !state.final_text.is_empty() {
+                    host.render_final_text(&state.final_text);
+                }
                 return Ok(AgenticLoopOutcome::Completed);
             }
             AgenticIngestIterationControl::ContinueIterating => {
@@ -4057,6 +4073,9 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                         }
                         finalize_turn_trace(state);
                         try_write_heavy_checkpoint(state);
+                        if !state.final_text.is_empty() {
+                            host.render_final_text(&state.final_text);
+                        }
                         return Ok(AgenticLoopOutcome::Completed);
                     }
                     // First breach — inject wrap-up instruction, skip tool execution.
@@ -5230,6 +5249,9 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
     }
     // Loop exhausted max_turns without explicit break — write final state.
     try_write_heavy_checkpoint(state);
+    if !state.final_text.is_empty() {
+        host.render_final_text(&state.final_text);
+    }
     Ok(AgenticLoopOutcome::Completed)
 }
 
@@ -5306,6 +5328,7 @@ mod tests {
         reflection_text: Option<String>,
         reflection_error: Option<String>,
         last_reflection_prompt: Option<String>,
+        rendered_final_text: Vec<String>,
     }
 
     impl MockHost {
@@ -5320,6 +5343,7 @@ mod tests {
                 reflection_text: None,
                 reflection_error: None,
                 last_reflection_prompt: None,
+                rendered_final_text: Vec::new(),
             }
         }
 
@@ -5400,6 +5424,10 @@ mod tests {
                 self.valid_tools.insert(name.to_string());
             }
             self.injected_schemas.push(schema);
+        }
+
+        fn render_final_text(&mut self, text: &str) {
+            self.rendered_final_text.push(text.to_string());
         }
     }
 
@@ -5572,6 +5600,45 @@ mod tests {
         assert_eq!(state.total_prompt, 10);
         assert_eq!(state.total_completion, 5);
         assert!(state.has_any_usage);
+        // Deferred rendering: host.render_final_text() is called with the final text.
+        assert_eq!(host.rendered_final_text.len(), 1);
+        assert_eq!(host.rendered_final_text[0], "Hello, world!");
+    }
+
+    #[tokio::test]
+    async fn render_final_text_called_once_at_completion() {
+        // Two turns: tool turn (no render) → text turn (render).
+        let mut host = MockHost::new(vec![
+            edge_tool_result(vec![make_edge_tool("grep", "results...")], 20, 10, Some(50)),
+            text_result("Final answer", 15, 8, Some(30)),
+        ])
+        .with_valid_tools(&["grep"]);
+        let mut state = make_state();
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+        assert!(outcome.is_ok());
+        assert_eq!(state.final_text, "Final answer");
+        // render_final_text should be called exactly once with the final text.
+        assert_eq!(host.rendered_final_text.len(), 1);
+        assert_eq!(host.rendered_final_text[0], "Final answer");
+    }
+
+    #[tokio::test]
+    async fn render_final_text_not_duplicated_across_tool_then_text() {
+        // Verify render_final_text isn't called after tool turns, only at
+        // final text completion.
+        let mut host = MockHost::new(vec![
+            edge_tool_result(vec![make_edge_tool("grep", "results...")], 20, 10, Some(50)),
+            edge_tool_result(vec![make_edge_tool("grep", "more results")], 20, 10, Some(50)),
+            text_result("Done!", 15, 8, Some(30)),
+        ])
+        .with_valid_tools(&["grep"]);
+        let mut state = make_state();
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+        assert!(outcome.is_ok());
+        assert_eq!(state.final_text, "Done!");
+        // Key contract: render_final_text called exactly once, not once per turn.
+        assert_eq!(host.rendered_final_text.len(), 1);
+        assert_eq!(host.rendered_final_text[0], "Done!");
     }
 
     #[test]

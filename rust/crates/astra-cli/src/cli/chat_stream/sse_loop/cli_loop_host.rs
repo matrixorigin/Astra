@@ -364,4 +364,25 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             }
         }
     }
+
+    fn render_final_text(&mut self, text: &str) {
+        use std::io::Write;
+        if self.render_policy.is_silent() || self.render_policy == RenderPolicy::PlanDecompose {
+            return;
+        }
+        if text.is_empty() {
+            return;
+        }
+        if self.render_md {
+            let mut md = crate::streaming_md::StreamingMarkdown::new(self.term_width);
+            md.push(text);
+            md.finish();
+        } else {
+            print!("{text}");
+            if !text.ends_with('\n') {
+                println!();
+            }
+            let _ = std::io::stdout().flush();
+        }
+    }
 }
