@@ -49,7 +49,7 @@ export interface DelegationEvent {
   fromAgentId: string;
   toAgentId: string;
   taskDescription: string;
-  status: 'delegated' | 'in_progress' | 'completed' | 'failed';
+  status: 'delegated' | 'in_progress' | 'completed' | 'failed' | 'cancelled';
   timestamp: string;
 }
 

@@ -107,7 +107,12 @@ function extractDelegations(
   for (const e of events) {
     const type = (e.event_type ?? e.eventType ?? e.type) as string;
     const meta = (e.metadata ?? e.meta ?? e.data ?? {}) as Record<string, unknown>;
-    const agentId = (meta.agent_id as string) ?? (meta.agentId as string) ?? '';
+    const agentId =
+      (meta.agent_id as string) ??
+      (meta.agentId as string) ??
+      (e.agent_id as string) ??
+      (e.agentId as string) ??
+      '';
     const fromAgent =
       (meta.from_agent_id as string) ??
       (meta.fromAgentId as string) ??
@@ -128,7 +133,15 @@ function extractDelegations(
     } else if (type === 'agent_progress' && delegationMap.has(agentId)) {
       delegationMap.get(agentId)!.status = 'in_progress';
     } else if (type === 'agent_completed' && delegationMap.has(agentId)) {
-      delegationMap.get(agentId)!.status = 'completed';
+      const completionStatus = normalizeStatus(
+        ((e.status as string | undefined) ?? (meta.status as string | undefined)) as
+          | string
+          | undefined,
+      );
+      delegationMap.get(agentId)!.status =
+        completionStatus === 'failed' || completionStatus === 'cancelled'
+          ? completionStatus
+          : 'completed';
     }
   }
 

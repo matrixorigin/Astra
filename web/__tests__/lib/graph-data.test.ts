@@ -179,6 +179,45 @@ describe('graph/data — extractDelegations', () => {
     expect(result.delegations[0].toAgentId).toBe('code-agent');
     expect(result.delegations[0].status).toBe('completed');
   });
+
+  it('preserves failed and cancelled agent completion states', () => {
+    const taskRaw = {
+      task_id: 't1',
+      title: 'Test',
+      status: 'in_progress',
+      created_at: '',
+      updated_at: '',
+    };
+    const eventsRaw = [
+      {
+        event_type: 'agent_delegated',
+        ts: '2026-01-01T00:00:00Z',
+        metadata: { agent_id: 'failed-agent', task: 'Do risky thing' },
+      },
+      {
+        type: 'agent_completed',
+        timestamp: '2026-01-01T00:01:00Z',
+        agent_id: 'failed-agent',
+        status: 'failed',
+      },
+      {
+        event_type: 'agent_delegated',
+        ts: '2026-01-01T00:02:00Z',
+        metadata: { agent_id: 'cancelled-agent', task: 'Do other thing' },
+      },
+      {
+        type: 'agent_completed',
+        timestamp: '2026-01-01T00:03:00Z',
+        agent_id: 'cancelled-agent',
+        status: 'cancelled',
+      },
+    ];
+
+    const result = buildPlanGraphData(taskRaw, eventsRaw);
+    expect(result.delegations).toHaveLength(2);
+    expect(result.delegations[0].status).toBe('failed');
+    expect(result.delegations[1].status).toBe('cancelled');
+  });
 });
 
 describe('graph/data — demoPlanGraphData', () => {
