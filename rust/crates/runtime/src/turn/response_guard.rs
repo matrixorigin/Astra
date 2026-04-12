@@ -1,3 +1,5 @@
+use super::tool_call_shape::tool_call_name;
+
 // ── Fallback messages when guards fire ──────────────────────────────
 /// Replacement text when the LLM leaks the system prompt.
 pub const PROMPT_LEAK_FALLBACK: &str =
@@ -136,7 +138,7 @@ pub fn find_hallucinated_tools(
 ) -> Vec<String> {
     let mut hallucinated = Vec::new();
     for tc in tool_calls {
-        let name = tc.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        let name = tool_call_name(tc).unwrap_or("");
         if !name.is_empty() && !allowed_tools.contains(&name) {
             hallucinated.push(name.to_string());
         }
@@ -350,6 +352,27 @@ mod tests {
         ];
         let allowed = &["bash", "read_file", "grep"];
         assert!(find_hallucinated_tools(&calls, allowed).is_empty());
+    }
+
+    #[test]
+    fn hallucinated_tools_detected_for_canonical_shape() {
+        let calls = vec![
+            serde_json::json!({
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "imaginary_tool", "arguments": "{}"}
+            }),
+            serde_json::json!({
+                "id": "call_2",
+                "type": "function",
+                "function": {"name": "bash", "arguments": "{}"}
+            }),
+        ];
+        let allowed = &["bash", "read_file", "grep"];
+        assert_eq!(
+            find_hallucinated_tools(&calls, allowed),
+            vec!["imaginary_tool"]
+        );
     }
 
     #[test]

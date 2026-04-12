@@ -3,6 +3,8 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use super::tool_call_shape::{tool_call_arguments_value, tool_call_name};
+
 /// Require 3 consecutive identical tool call turns (not 2) to detect stall.
 /// Window=2 was too aggressive: legitimate retries and exploration patterns
 /// (e.g. read_file with different args each turn) triggered false stalls.
@@ -115,8 +117,8 @@ pub fn round_tool_call_sig_and_names(tool_calls: &[Value]) -> (BTreeSet<String>,
     let sig_set: BTreeSet<String> = tool_calls
         .iter()
         .map(|tc| {
-            let name = tc.get("name").and_then(|v| v.as_str()).unwrap_or("");
-            let args = tc.get("arguments").cloned().unwrap_or_default();
+            let name = tool_call_name(tc).unwrap_or("");
+            let args = tool_call_arguments_value(tc);
             format!(
                 "{}:{}",
                 name,
@@ -126,12 +128,7 @@ pub fn round_tool_call_sig_and_names(tool_calls: &[Value]) -> (BTreeSet<String>,
         .collect();
     let name_set: HashSet<String> = tool_calls
         .iter()
-        .map(|tc| {
-            tc.get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string()
-        })
+        .map(|tc| tool_call_name(tc).unwrap_or("").to_string())
         .collect();
     (sig_set, name_set)
 }
@@ -568,6 +565,24 @@ mod tests {
         let calls = vec![serde_json::json!({
             "name": "read_file",
             "arguments": {"path": "a.rs"}
+        })];
+        let (sigs, names) = round_tool_call_sig_and_names(&calls);
+        assert!(
+            sigs.iter()
+                .any(|s| s.contains("read_file") && s.contains("a.rs"))
+        );
+        assert!(names.contains("read_file"));
+    }
+
+    #[test]
+    fn round_tool_call_sig_and_names_canonical_shape() {
+        let calls = vec![serde_json::json!({
+            "id": "call_1",
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "arguments": "{\"path\":\"a.rs\"}"
+            }
         })];
         let (sigs, names) = round_tool_call_sig_and_names(&calls);
         assert!(

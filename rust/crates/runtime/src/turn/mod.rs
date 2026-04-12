@@ -93,6 +93,7 @@ pub mod tail_persist;
 pub mod task;
 pub mod tool_args_repair;
 pub mod tool_argument_hints;
+pub(crate) mod tool_call_shape;
 pub mod tool_health;
 pub mod tool_result_sanitize;
 pub mod tool_result_semantics;

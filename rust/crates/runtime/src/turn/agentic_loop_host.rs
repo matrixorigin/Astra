@@ -1178,27 +1178,11 @@ pub enum AgenticLoopOutcome {
 pub const DELEGATE_TOOL_NAME: &str = "delegate";
 
 fn tool_call_name(tool_call: &Value) -> Option<&str> {
-    tool_call.get("name").and_then(Value::as_str).or_else(|| {
-        tool_call
-            .get("function")
-            .and_then(|f| f.get("name"))
-            .and_then(Value::as_str)
-    })
+    super::tool_call_shape::tool_call_name(tool_call)
 }
 
 fn tool_call_arguments_value(tool_call: &Value) -> Value {
-    tool_call
-        .get("arguments")
-        .or_else(|| tool_call.get("args"))
-        .cloned()
-        .or_else(|| {
-            tool_call
-                .get("function")
-                .and_then(|f| f.get("arguments"))
-                .and_then(Value::as_str)
-                .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
-        })
-        .unwrap_or_else(|| serde_json::json!({}))
+    super::tool_call_shape::tool_call_arguments_value(tool_call)
 }
 
 /// Check if a tool call is a delegation call.

@@ -14,6 +14,7 @@ use super::chat_turn_heuristics::{
 };
 use super::chat_turn_sse_dispatch::ChatTurnSseAccum;
 use super::response_guard::apply_response_guards;
+use super::tool_call_shape::tool_call_name;
 use crate::pipeline::step_recorder::StepRecorder;
 
 /// Read-only slice of [`super::chat_turn_sse_dispatch::ChatTurnSseAccum`] fields needed for ingest.
@@ -172,7 +173,7 @@ pub fn ingest_agentic_turn_stream(
         .record_tokens(snap.prompt_tokens, snap.completion_tokens);
 
     for tc in snap.tool_calls {
-        if let Some(name) = tc.get("name").and_then(|v| v.as_str()) {
+        if let Some(name) = tool_call_name(tc) {
             st.all_tools_used.insert(name.to_string());
         }
     }
@@ -510,6 +511,43 @@ mod tests {
     #[test]
     fn has_tool_calls_from_server_tool_calls() {
         let tcs = vec![json!({"name": "read_file", "arguments": {}})];
+        let snap = AgenticTurnStreamSnapshot {
+            ttft_ms: None,
+            session_id: &None,
+            run_id: &None,
+            full_text: "",
+            tool_calls: &tcs,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            has_usage: false,
+            error_message: &None,
+        };
+        let mut pack = Pack::new();
+        let out = ingest_agentic_turn_stream(
+            &snap,
+            0,
+            |_| String::new(),
+            "hi",
+            &[],
+            true,
+            pack.ingest_mut(),
+        );
+        assert_eq!(out, AgenticTurnIngestOutcome::HasToolCalls);
+        assert!(pack.all_tools_used.contains("read_file"));
+    }
+
+    #[test]
+    fn has_tool_calls_from_canonical_server_tool_calls() {
+        let tcs = vec![json!({
+            "id": "call_1",
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "arguments": "{\"path\":\"a.rs\"}"
+            }
+        })];
         let snap = AgenticTurnStreamSnapshot {
             ttft_ms: None,
             session_id: &None,
