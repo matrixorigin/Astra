@@ -54,8 +54,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use astra_services::self_surface::{
-    EventPreview, GoalSurface, LocalSelfSurfaceService, SelfSurfaceDimension, SelfSurfaceResponse,
-    SelfSurfaceService, VerificationEventView, VerificationSurface,
+    EventPreview, EvolutionRecord, GoalSurface, LocalSelfSurfaceService, PersistentSelfSnapshot,
+    SelfSurfaceDimension, SelfSurfaceResponse, SelfSurfaceService, VerificationEventView,
+    VerificationSurface,
 };
 use astra_services::session_journal::ToolCallRecord;
 use async_trait::async_trait;
@@ -2654,6 +2655,55 @@ fn reflection_recent_evaluation_events(
     events
 }
 
+fn reflection_recent_adaptations(
+    snapshot: Option<&PersistentSelfSnapshot>,
+) -> Vec<crate::liquid::reflection::ReflectionEventSummary> {
+    let Some(snapshot) = snapshot else {
+        return Vec::new();
+    };
+    let mut records = snapshot
+        .evolution
+        .records
+        .iter()
+        .filter_map(reflection_adaptation_summary)
+        .collect::<Vec<_>>();
+    records.sort_by(|a, b| {
+        b.turn
+            .unwrap_or_default()
+            .cmp(&a.turn.unwrap_or_default())
+            .then_with(|| a.kind.cmp(&b.kind))
+    });
+    records.truncate(4);
+    records
+}
+
+fn reflection_adaptation_summary(
+    record: &EvolutionRecord,
+) -> Option<crate::liquid::reflection::ReflectionEventSummary> {
+    if !matches!(record.status.as_str(), "applied" | "enrolled" | "promoted") {
+        return None;
+    }
+    if matches!(
+        record.kind.as_str(),
+        "failure" | "stall" | "drift" | "verification"
+    ) {
+        return None;
+    }
+    Some(crate::liquid::reflection::ReflectionEventSummary {
+        kind: reflection_kind_label(&record.kind),
+        turn: record.turn,
+        detail: format!("{} — {}", record.status, truncate_str(&record.summary, 120)),
+    })
+}
+
+fn reflection_kind_label(kind: &str) -> String {
+    let mut chars = kind.chars();
+    match chars.next() {
+        Some(first) => format!("{}{}", first.to_ascii_uppercase(), chars.as_str()),
+        None => "Event".to_string(),
+    }
+}
+
 fn build_live_auto_reflection_goal_summary(
     state: &AgenticLoopState,
 ) -> Option<crate::liquid::reflection::GoalSummary> {
@@ -2684,12 +2734,18 @@ async fn build_auto_reflection_self_evidence(
     Option<crate::liquid::reflection::GoalSummary>,
     Option<crate::liquid::reflection::VerificationSummary>,
     Vec<crate::liquid::reflection::ReflectionEventSummary>,
+    Vec<crate::liquid::reflection::ReflectionEventSummary>,
 ) {
     let mut goal = None;
     let mut verification = None;
     let mut recent_evaluation_events = Vec::new();
+    let mut recent_adaptations = Vec::new();
     if let Some(session_id) = state.current_session_id.as_deref() {
         let service = LocalSelfSurfaceService::new();
+        let snapshot = service
+            .snapshot(session_id, AUTO_REFLECTION_SELF_EVIDENCE_JOURNAL_LIMIT)
+            .await
+            .ok();
         let goal_surface = match service
             .surface(
                 session_id,
@@ -2716,13 +2772,19 @@ async fn build_auto_reflection_self_evidence(
             goal_surface.as_ref(),
             verification_surface.as_ref(),
         );
+        recent_adaptations = reflection_recent_adaptations(snapshot.as_ref());
         goal = goal_surface.and_then(reflection_goal_summary_from_surface);
         verification = verification_surface.map(reflection_verification_summary_from_surface);
     }
     if goal.is_none() {
         goal = build_live_auto_reflection_goal_summary(state);
     }
-    (goal, verification, recent_evaluation_events)
+    (
+        goal,
+        verification,
+        recent_evaluation_events,
+        recent_adaptations,
+    )
 }
 
 fn apply_auto_reflection_usage(state: &mut AgenticLoopState, result: &HostReflectionResult) {
@@ -2797,7 +2859,7 @@ async fn maybe_trigger_auto_reflection<H: AgenticLoopHost>(
     let recent_tactical_actions = state.recent_tactical_actions.clone();
     let active_experiment = build_auto_reflection_experiment_summary(state);
 
-    let (goal, verification, recent_evaluation_events) =
+    let (goal, verification, recent_evaluation_events, recent_adaptations) =
         build_auto_reflection_self_evidence(state).await;
     let mut ctx = evo.build_reflection_context(
         session_id,
@@ -2812,6 +2874,7 @@ async fn maybe_trigger_auto_reflection<H: AgenticLoopHost>(
     ctx.goal = goal;
     ctx.verification = verification;
     ctx.recent_evaluation_events = recent_evaluation_events;
+    ctx.recent_adaptations = recent_adaptations;
 
     let (system_prompt, user_prompt) = evo.build_reflection_prompt(&ctx);
     let reflection_result = match host
@@ -11045,6 +11108,17 @@ print(json.dumps({'context': 'user said: ' + msg}))
                 ),
             )
             .unwrap();
+        astra_services::session_journal::JournalWriter::new("sess-reflect")
+            .unwrap()
+            .append(
+                &astra_services::session_journal::JournalEvent::adaptive_per_turn_applied(
+                    Some("sess-reflect"),
+                    4,
+                    vec![("verification.strictness".into(), "0.6".into(), "0.7".into())],
+                    vec!["high token pressure".into()],
+                ),
+            )
+            .unwrap();
         state.evolution_service = Some(std::sync::Arc::new(
             crate::evolution::service::EvolutionService::new(),
         ));
@@ -11126,6 +11200,8 @@ print(json.dumps({'context': 'user said: ' + msg}))
         assert!(prompt.contains("Recent evaluation events:"));
         assert!(prompt.contains("[GoalSteered]"));
         assert!(prompt.contains("[Verification]"));
+        assert!(prompt.contains("Recent adaptations:"));
+        assert!(prompt.contains("[Adaptation]"));
         assert!(prompt.contains("Tool statistics:"));
         assert!(prompt.contains("bash — calls=2, failures=1, avg_ms=150"));
         assert!(prompt.contains("Active experiment: exp-123 (variant=variant-b, samples=4)"));

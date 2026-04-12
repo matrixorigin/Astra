@@ -21,9 +21,9 @@ use astra_runtime::turn::context_assembly_trace::TokenBudgetTrace;
 use astra_runtime::turn::tool_health::ToolHealthTracker;
 use astra_runtime::user_profile::Scenario;
 use astra_services::self_surface::{
-    EventPreview as SurfaceEventPreview, GoalSurface, LocalSelfSurfaceService,
-    SelfSurfaceDimension, SelfSurfaceResponse, SelfSurfaceService, VerificationEventView,
-    VerificationSurface,
+    EventPreview as SurfaceEventPreview, EvolutionRecord, GoalSurface, LocalSelfSurfaceService,
+    PersistentSelfSnapshot, SelfSurfaceDimension, SelfSurfaceResponse, SelfSurfaceService,
+    VerificationEventView, VerificationSurface,
 };
 use astra_services::session_journal::{self, JournalEvent, JournalEventType};
 use astra_services::session_restore::{
@@ -512,7 +512,7 @@ async fn build_reflect_response(
     focus: &str,
     question: Option<&str>,
 ) -> ReflectResponse {
-    let (goal, verification, recent_evaluation_events) =
+    let (goal, verification, recent_evaluation_events, recent_adaptations) =
         load_reflection_self_evidence(&artifacts.session_id, journal_limit.max(1)).await;
     let context = build_persistent_reflection_context(
         artifacts,
@@ -522,6 +522,7 @@ async fn build_reflect_response(
         goal,
         verification,
         recent_evaluation_events,
+        recent_adaptations,
     );
     let prompt_preview = context.render_prompt_section();
     ReflectResponse {
@@ -545,8 +546,10 @@ async fn load_reflection_self_evidence(
     Option<ReflectionGoalSummary>,
     Option<ReflectionVerificationSummary>,
     Vec<ReflectionEventSummary>,
+    Vec<ReflectionEventSummary>,
 ) {
     let service = LocalSelfSurfaceService::new();
+    let snapshot = service.snapshot(session_id, journal_limit).await.ok();
     let goal_surface = match service
         .surface(session_id, SelfSurfaceDimension::Goal, journal_limit)
         .await
@@ -563,10 +566,12 @@ async fn load_reflection_self_evidence(
     };
     let recent_evaluation_events =
         reflection_recent_evaluation_events(goal_surface.as_ref(), verification_surface.as_ref());
+    let recent_adaptations = reflection_recent_adaptations(snapshot.as_ref());
     (
         goal_surface.and_then(reflection_goal_summary),
         verification_surface.map(reflection_verification_summary),
         recent_evaluation_events,
+        recent_adaptations,
     )
 }
 
@@ -626,6 +631,45 @@ fn reflection_recent_evaluation_events(
     events
 }
 
+fn reflection_recent_adaptations(
+    snapshot: Option<&PersistentSelfSnapshot>,
+) -> Vec<ReflectionEventSummary> {
+    let Some(snapshot) = snapshot else {
+        return Vec::new();
+    };
+    let mut records = snapshot
+        .evolution
+        .records
+        .iter()
+        .filter_map(reflection_adaptation_summary)
+        .collect::<Vec<_>>();
+    records.sort_by(|a, b| {
+        b.turn
+            .unwrap_or_default()
+            .cmp(&a.turn.unwrap_or_default())
+            .then_with(|| a.kind.cmp(&b.kind))
+    });
+    records.truncate(4);
+    records
+}
+
+fn reflection_adaptation_summary(record: &EvolutionRecord) -> Option<ReflectionEventSummary> {
+    if !matches!(record.status.as_str(), "applied" | "enrolled" | "promoted") {
+        return None;
+    }
+    if matches!(
+        record.kind.as_str(),
+        "failure" | "stall" | "drift" | "verification"
+    ) {
+        return None;
+    }
+    Some(ReflectionEventSummary {
+        kind: reflection_kind_label(&record.kind),
+        turn: record.turn,
+        detail: format!("{} — {}", record.status, truncate(&record.summary, 120)),
+    })
+}
+
 fn reflection_goal_event_summary(event: &SurfaceEventPreview) -> Option<ReflectionEventSummary> {
     if event.event_type != "goal_steered" {
         return None;
@@ -681,6 +725,14 @@ fn reflection_verification_event_summary(event: &VerificationEventView) -> Refle
         kind: "Verification".into(),
         turn: event.turn,
         detail,
+    }
+}
+
+fn reflection_kind_label(kind: &str) -> String {
+    let mut chars = kind.chars();
+    match chars.next() {
+        Some(first) => format!("{}{}", first.to_ascii_uppercase(), chars.as_str()),
+        None => "Event".to_string(),
     }
 }
 
@@ -1392,6 +1444,7 @@ fn build_persistent_reflection_context(
     goal: Option<ReflectionGoalSummary>,
     verification: Option<ReflectionVerificationSummary>,
     recent_evaluation_events: Vec<ReflectionEventSummary>,
+    recent_adaptations: Vec<ReflectionEventSummary>,
 ) -> astra_runtime::liquid::reflection::ReflectionContext {
     const REFLECTION_TOOL_RECORD_LIMIT: usize = 24;
     const REFLECTION_TOOL_STAT_LIMIT: usize = 8;
@@ -1439,6 +1492,7 @@ fn build_persistent_reflection_context(
     context.goal = goal;
     context.verification = verification;
     context.recent_evaluation_events = recent_evaluation_events;
+    context.recent_adaptations = recent_adaptations;
     context
 }
 
@@ -2532,6 +2586,10 @@ mod tests {
             "GoalSteered"
         );
         assert_eq!(
+            value["reflection_context"]["recent_adaptations"][0]["kind"],
+            "Adaptation"
+        );
+        assert_eq!(
             value["reflection_context"]["recent_tactical_actions"][0],
             "high token pressure"
         );
@@ -2564,6 +2622,18 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("[GoalSteered]")
+        );
+        assert!(
+            value["prompt_preview"]
+                .as_str()
+                .unwrap()
+                .contains("Recent adaptations:")
+        );
+        assert!(
+            value["prompt_preview"]
+                .as_str()
+                .unwrap()
+                .contains("[Adaptation]")
         );
     }
 

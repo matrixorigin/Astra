@@ -49,6 +49,8 @@ pub struct ReflectionContext {
     pub verification: Option<VerificationSummary>,
     /// Recent steering / verification events that explain what changed.
     pub recent_evaluation_events: Vec<ReflectionEventSummary>,
+    /// Recent adaptive / mutation records that explain what the system changed.
+    pub recent_adaptations: Vec<ReflectionEventSummary>,
 }
 
 /// Compressed representation of an EvolutionSignal for the LLM prompt.
@@ -163,6 +165,7 @@ impl ReflectionContext {
             goal: None,
             verification: None,
             recent_evaluation_events: Vec::new(),
+            recent_adaptations: Vec::new(),
         }
     }
 
@@ -224,6 +227,19 @@ impl ReflectionContext {
         if !self.recent_evaluation_events.is_empty() {
             out.push_str("\nRecent evaluation events:\n");
             for event in &self.recent_evaluation_events {
+                match event.turn {
+                    Some(turn) => out.push_str(&format!(
+                        "  - turn {} [{}] {}\n",
+                        turn, event.kind, event.detail
+                    )),
+                    None => out.push_str(&format!("  - [{}] {}\n", event.kind, event.detail)),
+                }
+            }
+        }
+
+        if !self.recent_adaptations.is_empty() {
+            out.push_str("\nRecent adaptations:\n");
+            for event in &self.recent_adaptations {
                 match event.turn {
                     Some(turn) => out.push_str(&format!(
                         "  - turn {} [{}] {}\n",
@@ -734,6 +750,11 @@ mod tests {
                 detail: "failed global subtask-1 — parser integration timed out".into(),
             },
         ];
+        ctx.recent_adaptations = vec![ReflectionEventSummary {
+            kind: "Adaptation".into(),
+            turn: Some(6),
+            detail: "applied — adaptive per-turn changes applied".into(),
+        }];
         let (system, user) = engine.build_prompt(&ctx);
         assert!(system.contains("execution improvement advisor"));
         assert!(user.contains("Analyze the following"));
@@ -744,6 +765,8 @@ mod tests {
         );
         assert!(user.contains("Recent evaluation events:"));
         assert!(user.contains("[GoalSteered]"));
+        assert!(user.contains("Recent adaptations:"));
+        assert!(user.contains("[Adaptation]"));
     }
 
     #[test]
