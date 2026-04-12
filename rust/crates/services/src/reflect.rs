@@ -23,6 +23,8 @@ pub struct ReflectReport {
     pub reflection_context: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_preview: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_graph: Option<EvidenceGraph>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -88,6 +90,52 @@ pub struct Insight {
     pub evidence: String,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceGraphNodeKind {
+    Decision,
+    Observation,
+    Outcome,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceGraphEdgeKind {
+    Causes,
+    Supports,
+    Contradicts,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EvidenceGraphNode {
+    pub id: String,
+    pub kind: EvidenceGraphNodeKind,
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EvidenceGraphEdge {
+    pub from: String,
+    pub to: String,
+    pub kind: EvidenceGraphEdgeKind,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct EvidenceGraph {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub nodes: Vec<EvidenceGraphNode>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub edges: Vec<EvidenceGraphEdge>,
+}
+
 /// Raw error record fetched from DB for content analysis.
 #[derive(Debug, Clone)]
 pub struct RawError {
@@ -112,6 +160,26 @@ pub struct DecisionAgg {
     pub decision_type: String,
     pub cnt: i64,
     pub models_used: i64,
+}
+
+#[derive(Debug, Clone)]
+struct EvidenceDecision {
+    decision_id: String,
+    event_id: String,
+    decision_type: String,
+    decision_output: serde_json::Value,
+    created_at: String,
+}
+
+#[derive(Debug, Clone)]
+struct EvidenceEvent {
+    event_id: String,
+    event_type: String,
+    content: String,
+    skill_name: Option<String>,
+    parent_event_id: Option<String>,
+    causal_chain_id: Option<String>,
+    created_at: String,
 }
 
 /// Data completeness assessment for a reflection report.
@@ -161,6 +229,132 @@ pub fn assess_data_completeness(
         confidence,
         warnings,
     }
+}
+
+fn truncate_graph_summary(value: &str, max_chars: usize) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let snippet: String = trimmed.chars().take(max_chars).collect();
+    Some(snippet)
+}
+
+fn classify_evidence_event_kind(event_type: &str) -> EvidenceGraphNodeKind {
+    if matches!(
+        event_type,
+        "tool_result" | "tool_error" | "error" | "stall_detected"
+    ) || event_type.contains("error")
+        || event_type.contains("fail")
+    {
+        EvidenceGraphNodeKind::Outcome
+    } else {
+        EvidenceGraphNodeKind::Observation
+    }
+}
+
+fn build_evidence_graph(
+    decisions: &[EvidenceDecision],
+    events: &[EvidenceEvent],
+    parent_id_map: &std::collections::HashMap<String, Vec<String>>,
+) -> Option<EvidenceGraph> {
+    if decisions.is_empty() && events.is_empty() {
+        return None;
+    }
+
+    let mut nodes = Vec::new();
+    let mut edges = Vec::new();
+    let mut event_node_ids = std::collections::HashSet::new();
+    let mut edge_keys = std::collections::HashSet::new();
+    let event_ids: std::collections::HashSet<&str> =
+        events.iter().map(|event| event.event_id.as_str()).collect();
+
+    for decision in decisions {
+        nodes.push(EvidenceGraphNode {
+            id: format!("decision:{}", decision.decision_id),
+            kind: EvidenceGraphNodeKind::Decision,
+            label: decision.decision_type.clone(),
+            summary: truncate_graph_summary(&decision.decision_output.to_string(), 140),
+            anchor: Some(decision.event_id.clone()),
+            created_at: Some(decision.created_at.clone()),
+            metadata: Some(serde_json::json!({
+                "decision_id": decision.decision_id,
+                "event_id": decision.event_id,
+                "decision_output": decision.decision_output,
+            })),
+        });
+    }
+
+    for event in events {
+        let node_id = format!("event:{}", event.event_id);
+        event_node_ids.insert(event.event_id.clone());
+        nodes.push(EvidenceGraphNode {
+            id: node_id,
+            kind: classify_evidence_event_kind(&event.event_type),
+            label: event.event_type.clone(),
+            summary: truncate_graph_summary(&event.content, 140),
+            anchor: Some(event.event_id.clone()),
+            created_at: Some(event.created_at.clone()),
+            metadata: Some(serde_json::json!({
+                "skill_name": event.skill_name,
+                "causal_chain_id": event.causal_chain_id,
+            })),
+        });
+    }
+
+    for decision in decisions {
+        if event_node_ids.contains(&decision.event_id) {
+            let from = format!("event:{}", decision.event_id);
+            let to = format!("decision:{}", decision.decision_id);
+            let key = format!("{from}->{to}:supports");
+            if edge_keys.insert(key) {
+                edges.push(EvidenceGraphEdge {
+                    from,
+                    to,
+                    kind: EvidenceGraphEdgeKind::Supports,
+                });
+            }
+        }
+    }
+
+    for event in events {
+        let full_parent_ids = crate::storage::normalized_parent_event_ids(
+            event.parent_event_id.as_deref(),
+            parent_id_map.get(&event.event_id).map(Vec::as_slice),
+        );
+
+        for parent_event_id in full_parent_ids {
+            if event_ids.contains(parent_event_id.as_str()) {
+                let from = format!("event:{parent_event_id}");
+                let to = format!("event:{}", event.event_id);
+                let key = format!("{from}->{to}:causes");
+                if edge_keys.insert(key) {
+                    edges.push(EvidenceGraphEdge {
+                        from,
+                        to,
+                        kind: EvidenceGraphEdgeKind::Causes,
+                    });
+                }
+            }
+
+            for decision in decisions {
+                if decision.event_id == parent_event_id {
+                    let from = format!("decision:{}", decision.decision_id);
+                    let to = format!("event:{}", event.event_id);
+                    let key = format!("{from}->{to}:causes");
+                    if edge_keys.insert(key) {
+                        edges.push(EvidenceGraphEdge {
+                            from,
+                            to,
+                            kind: EvidenceGraphEdgeKind::Causes,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    Some(EvidenceGraph { nodes, edges })
 }
 
 /// Build analysis context for a specific turn from local data.
@@ -849,6 +1043,133 @@ impl DatabaseReflectService {
         }
         connect_matrixone(&self.matrixone).await
     }
+
+    async fn build_recent_evidence_graph(
+        &self,
+        pool: &sqlx::Pool<sqlx::MySql>,
+        session_id: &str,
+        focus: &str,
+        last_n: i32,
+    ) -> ServiceResult<Option<EvidenceGraph>> {
+        if !matches!(focus, "auto" | "tool_selection") {
+            return Ok(None);
+        }
+
+        let decision_limit = i64::from(last_n.clamp(1, 50));
+        let decision_rows = query(
+            "SELECT decision_id, event_id, decision_type, \
+               IFNULL(CAST(decision_output AS CHAR), '{}') AS decision_output_json, \
+               DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at \
+             FROM ctx_decision_audits \
+             WHERE session_id = ? \
+             ORDER BY created_at DESC LIMIT ?",
+        )
+        .bind(session_id)
+        .bind(decision_limit)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| internal_error(format!("evidence graph decisions query: {e}")))?;
+
+        let decisions: Vec<EvidenceDecision> = decision_rows
+            .iter()
+            .map(|row| {
+                let decision_output_json: String = row
+                    .try_get("decision_output_json")
+                    .unwrap_or_else(|_| "{}".to_string());
+                EvidenceDecision {
+                    decision_id: row.try_get("decision_id").unwrap_or_default(),
+                    event_id: row.try_get("event_id").unwrap_or_default(),
+                    decision_type: row.try_get("decision_type").unwrap_or_default(),
+                    decision_output: serde_json::from_str(&decision_output_json)
+                        .unwrap_or(serde_json::Value::Object(Default::default())),
+                    created_at: row.try_get("created_at").unwrap_or_default(),
+                }
+            })
+            .collect();
+
+        if decisions.is_empty() {
+            return Ok(None);
+        }
+
+        let event_limit = std::cmp::max(decision_limit * 10, 50);
+        let event_rows = query(
+            "SELECT event_id, event_type, \
+               SUBSTRING(COALESCE(CAST(content AS CHAR), ''), 1, 180) AS content, \
+               skill_name, parent_event_id, causal_chain_id, \
+               DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at \
+             FROM agent_events \
+             WHERE session_id = ? \
+             ORDER BY created_at DESC LIMIT ?",
+        )
+        .bind(session_id)
+        .bind(event_limit)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| internal_error(format!("evidence graph events query: {e}")))?;
+
+        let recent_events: Vec<EvidenceEvent> = event_rows
+            .iter()
+            .map(|row| EvidenceEvent {
+                event_id: row.try_get("event_id").unwrap_or_default(),
+                event_type: row.try_get("event_type").unwrap_or_default(),
+                content: row.try_get("content").unwrap_or_default(),
+                skill_name: row.try_get("skill_name").ok(),
+                parent_event_id: row.try_get("parent_event_id").ok(),
+                causal_chain_id: row.try_get("causal_chain_id").ok(),
+                created_at: row.try_get("created_at").unwrap_or_default(),
+            })
+            .collect();
+
+        let decision_event_ids: std::collections::HashSet<String> = decisions
+            .iter()
+            .map(|decision| decision.event_id.clone())
+            .collect();
+        let relevant_chain_ids: std::collections::HashSet<String> = recent_events
+            .iter()
+            .filter(|event| decision_event_ids.contains(&event.event_id))
+            .filter_map(|event| event.causal_chain_id.clone())
+            .collect();
+        let parent_id_map = crate::storage::load_agent_event_parent_ids(
+            pool,
+            &recent_events
+                .iter()
+                .map(|event| event.event_id.clone())
+                .collect::<Vec<_>>(),
+        )
+        .await
+        .map_err(|e| internal_error(format!("evidence graph parent query: {e}")))?;
+
+        let filtered_events: Vec<EvidenceEvent> = recent_events
+            .into_iter()
+            .filter(|event| {
+                decision_event_ids.contains(&event.event_id)
+                    || event
+                        .parent_event_id
+                        .as_ref()
+                        .map(|parent_event_id| decision_event_ids.contains(parent_event_id))
+                        .unwrap_or(false)
+                    || event
+                        .causal_chain_id
+                        .as_ref()
+                        .map(|causal_chain_id| relevant_chain_ids.contains(causal_chain_id))
+                        .unwrap_or(false)
+                    || parent_id_map
+                        .get(&event.event_id)
+                        .map(|parent_ids| {
+                            parent_ids
+                                .iter()
+                                .any(|parent_event_id| decision_event_ids.contains(parent_event_id))
+                        })
+                        .unwrap_or(false)
+            })
+            .collect();
+
+        Ok(build_evidence_graph(
+            &decisions,
+            &filtered_events,
+            &parent_id_map,
+        ))
+    }
 }
 
 #[async_trait]
@@ -858,7 +1179,7 @@ impl ReflectService for DatabaseReflectService {
         user_id: &str,
         session_id: &str,
         focus: &str,
-        _last_n: i32,
+        last_n: i32,
         question: &str,
     ) -> ServiceResult<ReflectReport> {
         let pool = self
@@ -1063,6 +1384,9 @@ impl ReflectService for DatabaseReflectService {
         );
         let prompt_preview =
             render_reflection_prompt_preview(session_id, focus, question, &reflection_context);
+        let evidence_graph = self
+            .build_recent_evidence_graph(&pool, session_id, focus, last_n)
+            .await?;
 
         Ok(ReflectReport {
             session_id: session_id.to_string(),
@@ -1073,6 +1397,7 @@ impl ReflectService for DatabaseReflectService {
             recommendations,
             reflection_context: Some(reflection_context),
             prompt_preview: Some(prompt_preview),
+            evidence_graph,
         })
     }
 }
@@ -1366,10 +1691,70 @@ mod tests {
             recommendations: vec!["do something".into()],
             reflection_context: Some(reflection_context),
             prompt_preview: Some("Session: test-sess".into()),
+            evidence_graph: Some(EvidenceGraph {
+                nodes: vec![EvidenceGraphNode {
+                    id: "decision:d1".into(),
+                    kind: EvidenceGraphNodeKind::Decision,
+                    label: "tool_selection".into(),
+                    summary: Some("picked bash".into()),
+                    anchor: Some("evt-1".into()),
+                    created_at: Some("2026-04-12T10:00:00".into()),
+                    metadata: None,
+                }],
+                edges: vec![],
+            }),
         };
         let json = serde_json::to_string(&report).unwrap();
         let parsed: ReflectReport = serde_json::from_str(&json).unwrap();
         assert_eq!(report, parsed);
+    }
+
+    #[test]
+    fn build_evidence_graph_attaches_decisions_to_related_events() {
+        let decisions = vec![EvidenceDecision {
+            decision_id: "d1".into(),
+            event_id: "evt-user".into(),
+            decision_type: "tool_selection".into(),
+            decision_output: serde_json::json!({"tool_calls":["bash"]}),
+            created_at: "2026-04-12T10:00:01".into(),
+        }];
+        let events = vec![
+            EvidenceEvent {
+                event_id: "evt-user".into(),
+                event_type: "user_query".into(),
+                content: "list files".into(),
+                skill_name: None,
+                parent_event_id: None,
+                causal_chain_id: Some("chain-1".into()),
+                created_at: "2026-04-12T10:00:00".into(),
+            },
+            EvidenceEvent {
+                event_id: "evt-tool".into(),
+                event_type: "tool_result".into(),
+                content: "listed files".into(),
+                skill_name: Some("bash".into()),
+                parent_event_id: Some("evt-user".into()),
+                causal_chain_id: Some("chain-1".into()),
+                created_at: "2026-04-12T10:00:02".into(),
+            },
+        ];
+        let parent_id_map = std::collections::HashMap::from([(
+            "evt-tool".to_string(),
+            vec!["evt-user".to_string()],
+        )]);
+
+        let graph = build_evidence_graph(&decisions, &events, &parent_id_map).expect("graph");
+        assert_eq!(graph.nodes.len(), 3);
+        assert!(graph.edges.iter().any(|edge| {
+            edge.from == "event:evt-user"
+                && edge.to == "decision:d1"
+                && edge.kind == EvidenceGraphEdgeKind::Supports
+        }));
+        assert!(graph.edges.iter().any(|edge| {
+            edge.from == "decision:d1"
+                && edge.to == "event:evt-tool"
+                && edge.kind == EvidenceGraphEdgeKind::Causes
+        }));
     }
 
     #[test]
