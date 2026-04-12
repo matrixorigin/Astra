@@ -94,12 +94,12 @@
 - **No multi-objective optimization**: Evaluation is single-dimensional (quality score). No Pareto frontier for efficiency × cost × accuracy.
 - **No noise filtering**: FeedbackSignals are consumed raw; no statistical filtering for outliers or noise.
 - **No fully universal verifier-complete scoreboard yet**: `MutationScoreboard` now persists verifier evidence for fork-skill mutations, generic verifier-shaped tool results, and conservative single-action same-turn journal verification events, and it now explicitly tags missing-signal cases with `verifier_gap`; however, tool paths with no structured or turn-scoped verification signal still lack a real positive verifier surface.
-- **Confidence intervals are not end-to-end**: `ConfidenceInterval` exists in core/runtime, but evaluation and report surfaces do not expose it consistently.
+- **Confidence intervals are not universal yet**: sampled 0..1 evaluation/report surfaces now expose companion `ConfidenceInterval` fields (quality trend, drift, session score, gate error rate, trust/SLO, skill success rate, memory confidence), but calibration and other unsampled or non-bounded aggregates still lack interval coverage.
 - **No verifier diversity**: Gate validation is single-pass, not ensemble-based.
 
 ### Priority Actions
 1. Implement `get_calibration()` on real confidence evidence instead of returning 501.
-2. Add `ConfidenceInterval { point: f64, lower: f64, upper: f64 }` to replace bare `f64` confidence.
+2. Finish the remaining 501 evaluation routes (training-data extract/export, quality-trend model filtering) and then extend interval coverage beyond the current sample-backed companion fields.
 
 ---
 
@@ -180,7 +180,7 @@
 | 1. State | ⬛⬛⬛⬜⬜ 60% | CompositeSnapshot 5D | No diff/merge/revert |
 | 2. Observation | ⬛⬛⬛⬜⬜ 55% | CausalChain + JournalEvents | Linear chains, no graph |
 | 3. Action | ⬛⬛⬜⬜⬜ 45% | Permission 3-tier model + compensation profiles | No automatic rollback executor |
-| 4. Evaluation | ⬛⬛⬛⬜⬜ 55% | EvaluationService + MutationScoreboard | Missing universal positive verifier surface |
+| 4. Evaluation | ⬛⬛⬛⬜⬜ 60% | EvaluationService + MutationScoreboard | Calibration/training 501s + non-universal CI coverage |
 | 5. Credit | ⬛⬜⬜⬜⬜ 25% | causal_chain_id on events | No diff-based scoring |
 | 6. Search | ⬛⬛⬜⬜⬜ 35% | SchedulingContract + TeamOrch | No proposal diversity |
 | 7. Safety | ⬛⬛⬛⬜⬜ 55% | Drift detection + middleware | Causal guard is heuristic-only |
@@ -189,7 +189,7 @@
 
 1. **State Layer** (foundation for all others) — StateDiff trait, version counter
 2. **Observation Layer** (depends on State) — EvidenceGraph with DAG topology
-3. **Evaluation Layer** (depends on Observation) — Implement 501 routes, confidence intervals
+3. **Evaluation Layer** (depends on Observation) — Implement remaining 501 routes, extend CI coverage
 4. **Action Space** (depends on State) — CompensationAction, transaction boundaries
 5. **Credit Assignment** (depends on State + Evaluation) — StateDiffComputer, contribution scoring
 6. **Safety Layer** (depends on Action + Evaluation) — Expand middleware + deepen causal safeguards

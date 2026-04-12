@@ -1,3 +1,4 @@
+use astra_core::confidence::ConfidenceInterval;
 use serde::{Deserialize, Serialize};
 
 // ── Enums ────────────────────────────────────────────────────────────────────
@@ -270,6 +271,7 @@ mod tests {
 pub struct QualityTrendPoint {
     pub date: String,
     pub avg_score: f64,
+    pub avg_score_interval: ConfidenceInterval,
     pub count: i64,
     pub model: Option<String>,
 }
@@ -278,6 +280,7 @@ pub struct QualityTrendPoint {
 pub struct QualityTrendResponse {
     pub points: Vec<QualityTrendPoint>,
     pub overall_avg: f64,
+    pub overall_avg_interval: ConfidenceInterval,
     pub total_events: i64,
 }
 
@@ -286,7 +289,9 @@ pub struct DriftSignalResponse {
     pub model: String,
     pub template_id: Option<String>,
     pub current_avg: f64,
+    pub current_avg_interval: ConfidenceInterval,
     pub previous_avg: f64,
+    pub previous_avg_interval: ConfidenceInterval,
     pub delta: f64,
     pub severity: DriftSeverity,
     pub sample_count: i64,
@@ -305,6 +310,7 @@ pub struct GateResultResponse {
     pub change_id: String,
     pub sessions_tested: i64,
     pub error_rate: f64,
+    pub error_rate_interval: ConfidenceInterval,
     pub score_delta: f64,
     pub passed: bool,
     pub created_at: Option<String>,
@@ -331,6 +337,7 @@ pub struct CalibrationResponse {
 pub struct SessionScoreResponse {
     pub session_id: String,
     pub score: f64,
+    pub score_interval: ConfidenceInterval,
     pub chain_count: i64,
 }
 
@@ -347,6 +354,7 @@ pub struct GateValidateResponse {
     pub change_id: String,
     pub sessions_tested: i64,
     pub error_rate: f64,
+    pub error_rate_interval: ConfidenceInterval,
     pub score_delta: f64,
     pub passed: bool,
     pub details: String,
@@ -383,7 +391,9 @@ pub struct TrustReportResponse {
     pub total_checks: i64,
     pub safe_count: i64,
     pub trust_ratio: f64,
+    pub trust_ratio_interval: ConfidenceInterval,
     pub hallucination_rate: f64,
+    pub hallucination_rate_interval: ConfidenceInterval,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -392,6 +402,7 @@ pub struct SloEntry {
     pub slo_name: String,
     pub target: f64,
     pub actual: f64,
+    pub actual_interval: ConfidenceInterval,
     pub met: bool,
 }
 
@@ -405,6 +416,7 @@ pub struct SloDashboardResponse {
 pub struct SloHistoryPoint {
     pub date: String,
     pub value: f64,
+    pub value_interval: ConfidenceInterval,
     pub target: f64,
     pub met: bool,
 }
@@ -433,6 +445,7 @@ pub struct SkillMetrics {
     pub total_invocations: i64,
     pub success_count: i64,
     pub success_rate: f64,
+    pub success_rate_interval: ConfidenceInterval,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -458,6 +471,7 @@ pub struct MemoryHealthResponse {
 pub struct MemoryMetricsResponse {
     pub total_memories: i64,
     pub avg_confidence: f64,
+    pub avg_confidence_interval: ConfidenceInterval,
     pub stale_count: i64,
 }
 

@@ -8,7 +8,8 @@ use super::service::EvaluationService;
 use super::types::*;
 use super::utils::*;
 use astra_core::{
-    MatrixOneSettings, SharedPool, connect_matrixone, error_response, internal_error,
+    MatrixOneSettings, SharedPool, confidence::ConfidenceInterval, connect_matrixone,
+    error_response, internal_error,
 };
 
 const MAX_EVALUATION_ROWS: i32 = 200;
@@ -54,7 +55,9 @@ fn build_drift_signal(
         model,
         template_id,
         current_avg,
+        current_avg_interval: sampled_confidence_interval(current_avg, sample_count),
         previous_avg,
+        previous_avg_interval: sampled_confidence_interval(previous_avg, sample_count),
         delta,
         severity,
         sample_count,
@@ -95,6 +98,22 @@ fn average_scores(scores: &[f64]) -> f64 {
     } else {
         scores.iter().sum::<f64>() / scores.len() as f64
     }
+}
+
+fn sampled_confidence_interval(point: f64, sample_count: i64) -> ConfidenceInterval {
+    if sample_count <= 0 {
+        return ConfidenceInterval::ZERO;
+    }
+    let margin = (0.5 / (sample_count as f64).sqrt()).clamp(0.05, 0.25);
+    ConfidenceInterval::symmetric(point.clamp(0.0, 1.0), margin)
+}
+
+fn complement_interval(interval: ConfidenceInterval) -> ConfidenceInterval {
+    ConfidenceInterval::new(
+        1.0 - interval.point,
+        1.0 - interval.upper,
+        1.0 - interval.lower,
+    )
 }
 
 fn change_type_label(change_type: &ChangeType) -> &'static str {
@@ -325,11 +344,16 @@ impl EvaluationService for DatabaseEvaluationService {
 
         let points: Vec<QualityTrendPoint> = rows
             .iter()
-            .map(|r| QualityTrendPoint {
-                date: r.try_get("dt").unwrap_or_default(),
-                avg_score: r.try_get("avg_score").unwrap_or(0.0),
-                count: r.try_get("cnt").unwrap_or(0),
-                model: None,
+            .map(|r| {
+                let avg_score = r.try_get("avg_score").unwrap_or(0.0);
+                let count = r.try_get("cnt").unwrap_or(0);
+                QualityTrendPoint {
+                    date: r.try_get("dt").unwrap_or_default(),
+                    avg_score,
+                    avg_score_interval: sampled_confidence_interval(avg_score, count),
+                    count,
+                    model: None,
+                }
             })
             .collect();
 
@@ -339,6 +363,7 @@ impl EvaluationService for DatabaseEvaluationService {
         Ok(QualityTrendResponse {
             points,
             overall_avg,
+            overall_avg_interval: sampled_confidence_interval(overall_avg, total_events),
             total_events,
         })
     }
@@ -429,15 +454,20 @@ impl EvaluationService for DatabaseEvaluationService {
 
         let gates: Vec<GateResultResponse> = rows
             .iter()
-            .map(|r| GateResultResponse {
-                gate_id: r.try_get("gate_id").unwrap_or_default(),
-                change_type: r.try_get("change_type").unwrap_or_default(),
-                change_id: r.try_get("change_id").unwrap_or_default(),
-                sessions_tested: r.try_get("sessions_tested").unwrap_or(0),
-                error_rate: r.try_get("error_rate").unwrap_or(0.0),
-                score_delta: r.try_get("score_delta").unwrap_or(0.0),
-                passed: r.try_get::<i8, _>("passed").unwrap_or(0) != 0,
-                created_at: r.try_get("created_at").ok(),
+            .map(|r| {
+                let sessions_tested = r.try_get("sessions_tested").unwrap_or(0);
+                let error_rate = r.try_get("error_rate").unwrap_or(0.0);
+                GateResultResponse {
+                    gate_id: r.try_get("gate_id").unwrap_or_default(),
+                    change_type: r.try_get("change_type").unwrap_or_default(),
+                    change_id: r.try_get("change_id").unwrap_or_default(),
+                    sessions_tested,
+                    error_rate,
+                    error_rate_interval: sampled_confidence_interval(error_rate, sessions_tested),
+                    score_delta: r.try_get("score_delta").unwrap_or(0.0),
+                    passed: r.try_get::<i8, _>("passed").unwrap_or(0) != 0,
+                    created_at: r.try_get("created_at").ok(),
+                }
             })
             .collect();
         let total = gates.len();
@@ -480,10 +510,14 @@ impl EvaluationService for DatabaseEvaluationService {
 
         let sessions: Vec<SessionScoreResponse> = rows
             .iter()
-            .map(|r| SessionScoreResponse {
-                session_id: r.try_get("target_id").unwrap_or_default(),
-                score: r.try_get("score").unwrap_or(0.0),
-                chain_count: r.try_get("chain_count").unwrap_or(0),
+            .map(|r| {
+                let score = r.try_get("score").unwrap_or(0.0);
+                SessionScoreResponse {
+                    session_id: r.try_get("target_id").unwrap_or_default(),
+                    score,
+                    score_interval: ConfidenceInterval::exact(score.clamp(0.0, 1.0)),
+                    chain_count: r.try_get("chain_count").unwrap_or(0),
+                }
             })
             .collect();
         let total = sessions.len();
@@ -546,6 +580,10 @@ impl EvaluationService for DatabaseEvaluationService {
             change_id: request.change_id,
             sessions_tested: summary.sessions_tested,
             error_rate: summary.error_rate,
+            error_rate_interval: sampled_confidence_interval(
+                summary.error_rate,
+                summary.sessions_tested,
+            ),
             score_delta: summary.score_delta,
             passed: summary.passed,
             details: summary.details,
@@ -672,13 +710,16 @@ impl EvaluationService for DatabaseEvaluationService {
         };
 
         let ratio = trust_ratio(total, safe);
+        let trust_ratio_interval = sampled_confidence_interval(ratio, total);
         Ok(TrustReportResponse {
             agent_id: agent_id.to_string(),
             period_days: days,
             total_checks: total,
             safe_count: safe,
             trust_ratio: ratio,
+            trust_ratio_interval,
             hallucination_rate: 1.0 - ratio,
+            hallucination_rate_interval: complement_interval(trust_ratio_interval),
         })
     }
 
@@ -720,6 +761,7 @@ impl EvaluationService for DatabaseEvaluationService {
                     slo_name: "trust_ratio".into(),
                     target: TRUST_SLO_TARGET,
                     actual,
+                    actual_interval: sampled_confidence_interval(actual, total),
                     met: actual >= TRUST_SLO_TARGET,
                 }
             })
@@ -769,6 +811,7 @@ impl EvaluationService for DatabaseEvaluationService {
                 SloHistoryPoint {
                     date: row.try_get::<String, _>("dt").unwrap_or_default(),
                     value,
+                    value_interval: sampled_confidence_interval(value, total),
                     target: TRUST_SLO_TARGET,
                     met: value >= TRUST_SLO_TARGET,
                 }
@@ -858,16 +901,19 @@ impl EvaluationService for DatabaseEvaluationService {
             Ok(r) => {
                 let total: i64 = r.try_get("total").unwrap_or(0);
                 let success: i64 = r.try_get("ok_cnt").unwrap_or(0);
+                let success_rate = skill_success_rate(total, success);
                 SkillMetrics {
                     total_invocations: total,
                     success_count: success,
-                    success_rate: skill_success_rate(total, success),
+                    success_rate,
+                    success_rate_interval: sampled_confidence_interval(success_rate, total),
                 }
             }
             Err(_) => SkillMetrics {
                 total_invocations: 0,
                 success_count: 0,
                 success_rate: 0.0,
+                success_rate_interval: ConfidenceInterval::ZERO,
             },
         };
 
@@ -960,6 +1006,7 @@ impl EvaluationService for DatabaseEvaluationService {
         Ok(MemoryMetricsResponse {
             total_memories,
             avg_confidence,
+            avg_confidence_interval: sampled_confidence_interval(avg_confidence, weighted_count),
             stale_count,
         })
     }
@@ -1220,12 +1267,14 @@ mod tests {
             QualityTrendPoint {
                 date: "2024-01-01".into(),
                 avg_score: 0.8,
+                avg_score_interval: ConfidenceInterval::exact(0.8),
                 count: 10,
                 model: None,
             },
             QualityTrendPoint {
                 date: "2024-01-02".into(),
                 avg_score: 0.6,
+                avg_score_interval: ConfidenceInterval::exact(0.6),
                 count: 10,
                 model: None,
             },
@@ -1241,10 +1290,32 @@ mod tests {
         let points = vec![QualityTrendPoint {
             date: "2024-01-01".into(),
             avg_score: 0.9,
+            avg_score_interval: ConfidenceInterval::exact(0.9),
             count: 0,
             model: None,
         }];
         assert_eq!(compute_overall_avg(&points), 0.0);
+    }
+
+    #[test]
+    fn sampled_confidence_interval_zero_samples_is_zero() {
+        let interval = sampled_confidence_interval(0.8, 0);
+        assert_eq!(interval, ConfidenceInterval::ZERO);
+    }
+
+    #[test]
+    fn sampled_confidence_interval_clamps_bounds() {
+        let interval = sampled_confidence_interval(0.9, 4);
+        assert_eq!(interval.point, 0.9);
+        assert!(interval.lower >= 0.0);
+        assert!(interval.upper <= 1.0);
+    }
+
+    #[test]
+    fn complement_interval_flips_bounds() {
+        let interval = ConfidenceInterval::new(0.8, 0.7, 0.9);
+        let complement = complement_interval(interval);
+        assert_eq!(complement, ConfidenceInterval::new(0.2, 0.1, 0.3));
     }
 
     #[test]

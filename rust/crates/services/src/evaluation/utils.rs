@@ -69,6 +69,7 @@ mod tests {
         QualityTrendPoint {
             date: date.into(),
             avg_score,
+            avg_score_interval: astra_core::confidence::ConfidenceInterval::exact(avg_score),
             count,
             model: None,
         }
