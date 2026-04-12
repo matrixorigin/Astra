@@ -37,6 +37,8 @@ use self::sse_events::{
 };
 
 use crate::turn::routing::max_tool_rounds;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use tokio_util::sync::CancellationToken;
 
 const TOOL_RESULT_AUDIT_CHARS: usize = 4000;
@@ -61,6 +63,34 @@ fn synthesized_session_info_event(session_id: &str, run_id: Option<&str>) -> ser
         );
     }
     event
+}
+
+struct BridgeResponseStream<S> {
+    stream: Pin<Box<S>>,
+    _disconnect_guard: Option<crate::turn::llm_client::CancelOnClientDisconnect>,
+}
+
+impl<S> BridgeResponseStream<S>
+where
+    S: futures_util::stream::Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
+{
+    fn new(stream: S, client_cancel: Option<Arc<CancellationToken>>) -> Self {
+        Self {
+            stream: Box::pin(stream),
+            _disconnect_guard: client_cancel.map(crate::turn::llm_client::CancelOnClientDisconnect::new),
+        }
+    }
+}
+
+impl<S> futures_util::stream::Stream for BridgeResponseStream<S>
+where
+    S: futures_util::stream::Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
+{
+    type Item = Result<Bytes, std::io::Error>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.stream.as_mut().poll_next(cx)
+    }
 }
 
 fn is_bridge_sse_content_type(content_type: Option<&str>) -> bool {
@@ -339,7 +369,7 @@ impl ChatTurnBridge for HttpChatTurnBridge {
         turn_observer_worker: Arc<dyn TurnObserverWorker>,
         turn_auxiliary_event_writer: Arc<dyn TurnAuxiliaryEventWriter>,
         turn_session_activity_writer: Arc<dyn TurnSessionActivityWriter>,
-        _client_cancel: Option<Arc<CancellationToken>>,
+        client_cancel: Option<Arc<CancellationToken>>,
     ) -> Result<Response, (StatusCode, String)> {
         let mut bridge_headers = HeaderMap::new();
         let side_effect_request_context = parse_bridge_side_effect_request_context(&body);
@@ -511,9 +541,10 @@ impl ChatTurnBridge for HttpChatTurnBridge {
             turn_session_activity_writer,
             self.turn_learning_writer.clone(),
         );
+        let response_stream = BridgeResponseStream::new(filtered_stream, client_cancel);
         Ok(sse_stream_response(
             StatusCode::OK,
-            Body::from_stream(filtered_stream),
+            Body::from_stream(response_stream),
         ))
     }
 }
@@ -1497,6 +1528,19 @@ mod tests {
         assert!(text.contains("\"type\":\"error\""));
         assert!(text.contains("\"code\":\"UPSTREAM_ERROR\""));
         assert!(text.contains("upstream exploded"));
+    }
+
+    #[tokio::test]
+    async fn bridge_response_stream_cancels_token_when_body_drops() {
+        let token = Arc::new(CancellationToken::new());
+        let body = Body::from_stream(BridgeResponseStream::new(
+            futures_util::stream::pending::<Result<Bytes, std::io::Error>>(),
+            Some(token.clone()),
+        ));
+
+        assert!(!token.is_cancelled());
+        drop(body);
+        assert!(token.is_cancelled());
     }
 
     #[tokio::test]
