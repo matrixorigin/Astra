@@ -4,7 +4,16 @@ use astra_services::runs::transform_run_event_for_client;
 fn transform_stream_run_events_for_client(events: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
     events
         .into_iter()
-        .map(transform_run_event_for_client)
+        .map(|event| {
+            let index = event.get("index").cloned();
+            let mut transformed = transform_run_event_for_client(event);
+            if let Some(index) = index
+                && let Some(obj) = transformed.as_object_mut()
+            {
+                obj.insert("index".to_string(), index);
+            }
+            transformed
+        })
         .collect()
 }
 
@@ -114,10 +123,13 @@ mod tests {
             }),
         ]);
 
-        assert_eq!(transformed[0], json!({"type": "text_delta", "content": "hello"}));
+        assert_eq!(
+            transformed[0],
+            json!({"type": "text_delta", "content": "hello", "index": 7})
+        );
         assert_eq!(
             transformed[1],
-            json!({"type": "error", "message": "boom", "code": "RUN_ERROR"})
+            json!({"type": "error", "message": "boom", "code": "RUN_ERROR", "index": 8})
         );
     }
 }

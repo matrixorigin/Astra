@@ -184,7 +184,7 @@ export type AgentCompletedEvent = {
   timestamp?: number;
 };
 
-export type StreamEvent =
+export type StreamEvent = (
   | SessionInfoEvent
   | RunStartedEvent
   | RunFinishedEvent
@@ -206,6 +206,6 @@ export type StreamEvent =
   | AgentDelegatedEvent
   | AgentSpawnedEvent
   | AgentProgressEvent
-  | AgentCompletedEvent;
+  | AgentCompletedEvent) & { index?: number };
 
 export type ConnectionState = 'disconnected' | 'connecting' | 'connected' | 'error';
