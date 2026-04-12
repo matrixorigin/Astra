@@ -63,6 +63,8 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Poll cadence for background lifecycle runs streamed over WebSocket.
 const RUN_STREAM_POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// Safety valve for retryable lifecycle poll failures to avoid indefinite hung streams.
+const MAX_CONSECUTIVE_RETRYABLE_POLL_ERRORS: u32 = 300;
 
 /// Preserve the historical websocket candidate budget unless callers opt in explicitly.
 fn default_ws_max_candidates() -> u32 {
@@ -942,6 +944,11 @@ fn should_emit_transient_poll_error(
     true
 }
 
+fn retryable_poll_failure_limit_reached(consecutive_failures: &mut u32) -> bool {
+    *consecutive_failures = consecutive_failures.saturating_add(1);
+    *consecutive_failures >= MAX_CONSECUTIVE_RETRYABLE_POLL_ERRORS
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum WsSendFailure {
     Failed(String),
@@ -1028,6 +1035,8 @@ async fn stream_run_over_websocket(
     let mut terminal_error: Option<String> = None;
     let mut stream_poll_error: Option<(StatusCode, String)> = None;
     let mut status_poll_error: Option<(StatusCode, String)> = None;
+    let mut consecutive_stream_retryable_errors = 0u32;
+    let mut consecutive_status_retryable_errors = 0u32;
 
     loop {
         tokio::select! {
@@ -1112,11 +1121,41 @@ async fn stream_run_over_websocket(
                 {
                     Ok(events) => {
                         stream_poll_error = None;
+                        consecutive_stream_retryable_errors = 0;
                         events
                     }
                     Err((status, err)) => {
                         let message = err.0.detail;
                         let policy = lifecycle_poll_error_policy(status);
+                        if policy.continue_polling
+                            && retryable_poll_failure_limit_reached(
+                                &mut consecutive_stream_retryable_errors,
+                            )
+                        {
+                            let terminal_message = format!(
+                                "stream_run polling failed {MAX_CONSECUTIVE_RETRYABLE_POLL_ERRORS} consecutive times: {message}"
+                            );
+                            send_msg(
+                                socket,
+                                &WsServerMessage::Error {
+                                    message: terminal_message.clone(),
+                                    code: "UPSTREAM_ERROR".into(),
+                                    retryable: false,
+                                },
+                            )
+                            .await;
+                            best_effort_cancel_run(state, conn, run_id).await;
+                            send_msg(
+                                socket,
+                                &WsServerMessage::RunFinished {
+                                    run_id: run_id.to_string(),
+                                    status: STATUS_FAILED.to_string(),
+                                    error: Some(terminal_message),
+                                },
+                            )
+                            .await;
+                            return;
+                        }
                         if !policy.continue_polling
                             || should_emit_transient_poll_error(
                                 &mut stream_poll_error,
@@ -1190,11 +1229,41 @@ async fn stream_run_over_websocket(
                 {
                     Ok(status) => {
                         status_poll_error = None;
+                        consecutive_status_retryable_errors = 0;
                         status
                     }
                     Err((status, err)) => {
                         let message = err.0.detail;
                         let policy = lifecycle_poll_error_policy(status);
+                        if policy.continue_polling
+                            && retryable_poll_failure_limit_reached(
+                                &mut consecutive_status_retryable_errors,
+                            )
+                        {
+                            let terminal_message = format!(
+                                "get_run_status polling failed {MAX_CONSECUTIVE_RETRYABLE_POLL_ERRORS} consecutive times: {message}"
+                            );
+                            send_msg(
+                                socket,
+                                &WsServerMessage::Error {
+                                    message: terminal_message.clone(),
+                                    code: "UPSTREAM_ERROR".into(),
+                                    retryable: false,
+                                },
+                            )
+                            .await;
+                            best_effort_cancel_run(state, conn, run_id).await;
+                            send_msg(
+                                socket,
+                                &WsServerMessage::RunFinished {
+                                    run_id: run_id.to_string(),
+                                    status: STATUS_FAILED.to_string(),
+                                    error: Some(terminal_message),
+                                },
+                            )
+                            .await;
+                            return;
+                        }
                         if !policy.continue_polling
                             || should_emit_transient_poll_error(
                                 &mut status_poll_error,
@@ -3980,6 +4049,16 @@ mod tests {
             StatusCode::SERVICE_UNAVAILABLE,
             "service down",
         ));
+    }
+
+    #[test]
+    fn retryable_poll_failure_limit_reached_at_threshold() {
+        let mut failures = 0u32;
+        for _ in 0..MAX_CONSECUTIVE_RETRYABLE_POLL_ERRORS.saturating_sub(1) {
+            assert!(!retryable_poll_failure_limit_reached(&mut failures));
+        }
+        assert!(retryable_poll_failure_limit_reached(&mut failures));
+        assert!(retryable_poll_failure_limit_reached(&mut failures));
     }
 
     #[test]
