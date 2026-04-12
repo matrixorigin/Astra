@@ -75,7 +75,7 @@ impl AppSettings {
                     "MATRIXONE_PASSWORD",
                     super::runtime_limits::DEV_MATRIXONE_PASSWORD,
                 ),
-                database: value_or_default(&lookup, "MATRIXONE_DATABASE", "astra_runtime"),
+                database: resolve_matrixone_database_name(&lookup),
             },
             redis: RedisSettings {
                 host: value_or_default(&lookup, "REDIS_HOST", "localhost"),
@@ -233,6 +233,33 @@ impl fmt::Display for ConfigError {
 
 impl Error for ConfigError {}
 
+/// Resolves the logical MatrixOne database name used in URLs and DDL.
+///
+/// When `MATRIXONE_DATABASE_PREFIX` is set and non-empty, the effective name is
+/// `{prefix}{MATRIXONE_DATABASE}` (base name from `MATRIXONE_DATABASE`, default
+/// `database_default`). This lets you keep a shared base name (e.g. `astra_runtime`) and isolate
+/// dev/CI/test from production with a prefix (`test_` → `test_astra_runtime`).
+pub fn resolve_matrixone_database_name_or<F>(lookup: &F, database_default: &str) -> String
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let base = value_or_default(lookup, "MATRIXONE_DATABASE", database_default);
+    let prefix = optional_value(lookup, "MATRIXONE_DATABASE_PREFIX").unwrap_or_default();
+    if prefix.is_empty() {
+        base
+    } else {
+        format!("{prefix}{base}")
+    }
+}
+
+/// Same as [`resolve_matrixone_database_name_or`] with default base name `astra_runtime`.
+pub fn resolve_matrixone_database_name<F>(lookup: &F) -> String
+where
+    F: Fn(&str) -> Option<String>,
+{
+    resolve_matrixone_database_name_or(lookup, "astra_runtime")
+}
+
 fn value_or_default<F>(lookup: &F, key: &'static str, default: &str) -> String
 where
     F: Fn(&str) -> Option<String>,
@@ -305,6 +332,8 @@ fn known_embedding_dimension(model: &str) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
 
     #[test]
@@ -343,6 +372,28 @@ mod tests {
     }
 
     #[test]
+    fn resolve_matrixone_database_prefix_concat() {
+        let mut m: HashMap<String, String> = HashMap::new();
+        m.insert("MATRIXONE_DATABASE".into(), "prod".into());
+        m.insert("MATRIXONE_DATABASE_PREFIX".into(), "ci_".into());
+        assert_eq!(
+            resolve_matrixone_database_name(&|k| m.get(k).cloned()),
+            "ci_prod"
+        );
+    }
+
+    #[test]
+    fn resolve_matrixone_database_empty_prefix_uses_base_only() {
+        let mut m: HashMap<String, String> = HashMap::new();
+        m.insert("MATRIXONE_DATABASE".into(), "astra_runtime".into());
+        m.insert("MATRIXONE_DATABASE_PREFIX".into(), "".into());
+        assert_eq!(
+            resolve_matrixone_database_name(&|k| m.get(k).cloned()),
+            "astra_runtime"
+        );
+    }
+
+    #[test]
     fn jwt_settings_match_runtime_defaults_and_padding() {
         let settings = AppSettings::from_map(&HashMap::new()).expect("defaults should parse");
 
@@ -356,6 +407,15 @@ mod tests {
                 .secret_key
                 .starts_with("change-me-in-production")
         );
+    }
+
+    #[test]
+    fn app_settings_matrixone_database_includes_prefix() {
+        let mut m = HashMap::new();
+        m.insert("MATRIXONE_DATABASE".into(), "agent_db".into());
+        m.insert("MATRIXONE_DATABASE_PREFIX".into(), "ci_".into());
+        let settings = AppSettings::from_map(&m).expect("parse");
+        assert_eq!(settings.matrixone.database, "ci_agent_db");
     }
 }
 

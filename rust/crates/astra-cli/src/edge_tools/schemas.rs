@@ -567,7 +567,7 @@ pub fn all_tool_schemas() -> Vec<Value> {
                     "type": "object",
                     "properties": {
                         "sql": {"type": "string", "description": "SQL query to execute"},
-                        "database": {"type": "string", "description": "Database name (default: from MATRIXONE_DATABASE env)"}
+                        "database": {"type": "string", "description": "Database name (default: MATRIXONE_DATABASE_PREFIX + MATRIXONE_DATABASE from env)"}
                     },
                     "required": ["sql"]
                 }

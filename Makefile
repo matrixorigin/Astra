@@ -529,7 +529,7 @@ db-reset:
 	if [ "$$REPLY" = "y" ] || [ "$$REPLY" = "Y" ]; then \
 		if [ -f .env ]; then \
 			export $$(cat .env | grep -v '^#' | xargs); \
-			DB_NAME=$${MATRIXONE_DATABASE:-dev_agent}; \
+			DB_NAME=$${MATRIXONE_DATABASE_PREFIX:-}$${MATRIXONE_DATABASE:-dev_agent}; \
 		else \
 			DB_NAME=dev_agent; \
 		fi; \

@@ -338,6 +338,8 @@ pub async fn wait_for_agent_event_types(
 pub struct MatrixE2eCtx {
     pub app: Router,
     pub pool: sqlx::MySqlPool,
+    /// Logical MatrixOne database (includes `MATRIXONE_DATABASE_PREFIX` + `MATRIXONE_DATABASE`).
+    pub matrixone_database: String,
     pub memoria: Arc<E2eMemoriaStub>,
     pub user_id: String,
     /// Registered username (for duplicate-register negative tests).
@@ -386,6 +388,7 @@ pub async fn bootstrap() -> BootstrapResult {
     dotenvy::dotenv().ok();
 
     let settings = AppSettings::from_env().expect("AppSettings::from_env (see astra-server env)");
+    let matrixone_database = settings.matrixone.database.clone();
     let url = settings.matrixone.database_url();
     let pool = sqlx::mysql::MySqlPoolOptions::new()
         .max_connections(4)
@@ -493,6 +496,7 @@ pub async fn bootstrap() -> BootstrapResult {
         ctx: MatrixE2eCtx {
             app,
             pool,
+            matrixone_database,
             memoria,
             user_id,
             username,

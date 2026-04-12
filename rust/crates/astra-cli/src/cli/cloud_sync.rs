@@ -10,6 +10,7 @@
 //! - **Preferences**: `try_cloud_pull_preferences` and `try_cloud_push_preferences` for user settings
 //! - **Conflict resolution**: Optimistic locking with version numbers; conflicts trigger re-pull
 
+use astra_core::resolve_matrixone_database_name_or;
 use astra_runtime::pipeline::persistence::{
     DeltaSnapshot, LearningSnapshot, ToolHealthEntry, clear_dirty_learning_in_modules,
     export_dirty_learning_from_modules, export_from_modules_with_health, export_tool_health_delta,
@@ -41,7 +42,7 @@ pub(super) async fn try_connect_matrixone() -> Option<sqlx::Pool<sqlx::MySql>> {
         .unwrap_or(6001);
     let user = std::env::var("MATRIXONE_USER").unwrap_or_else(|_| "root".to_string());
     let password = std::env::var("MATRIXONE_PASSWORD").unwrap_or_default();
-    let database = std::env::var("MATRIXONE_DATABASE").unwrap_or_else(|_| "astra".to_string());
+    let database = resolve_matrixone_database_name_or(&|k| std::env::var(k).ok(), "astra");
     let url = format!("mysql://{user}:{password}@{host}:{port}/{database}");
     sqlx::mysql::MySqlPoolOptions::new()
         .max_connections(2)

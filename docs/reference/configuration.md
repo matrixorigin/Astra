@@ -26,6 +26,10 @@ Use these files as the canonical configuration references:
 - `MATRIXONE_USER`
 - `MATRIXONE_PASSWORD`
 - `MATRIXONE_DATABASE`
+- `MATRIXONE_DATABASE_PREFIX` (optional): when set and non-empty, the runtime uses
+  `{MATRIXONE_DATABASE_PREFIX}{MATRIXONE_DATABASE}` as the logical database name (same rule as
+  `astra_core::resolve_matrixone_database_name` in `rust/crates/core/src/config.rs`). Use this to
+  isolate dev/CI from production on one MatrixOne server.
 
 ### Redis
 

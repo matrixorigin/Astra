@@ -284,7 +284,7 @@ pub async fn run_product_matrix_full_journey(
         json!({
             "name": "matrix-crud-agent",
             "agent_config": { "suite": "matrix" },
-            "data_source": { "type": "matrixone", "database": "astra_runtime" }
+            "data_source": { "type": "matrixone", "database": ctx.matrixone_database.clone() }
         }),
     )
     .await;

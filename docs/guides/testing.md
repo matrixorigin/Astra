@@ -49,7 +49,7 @@ cargo test -p astra-runtime --test system_matrix_http_e2e --features bridge-e2e-
   --ignored --nocapture
 ```
 
-Requires the same environment as `astra-server`: `MATRIXONE_*`, `JWT_SECRET_KEY` / `SECRET_KEY`, `TOKEN_ENCRYPTION_KEY`, Redis, embedding settings per `astra_core::AppSettings::from_env`. Use a local `.env` if you use one for development.
+Requires the same environment as `astra-server`: `MATRIXONE_*`, `JWT_SECRET_KEY` / `SECRET_KEY`, `TOKEN_ENCRYPTION_KEY`, Redis, embedding settings per `astra_core::AppSettings::from_env`. Use a local `.env` if you use one for development. To isolate from production on one MatrixOne host, set **`MATRIXONE_DATABASE_PREFIX`** (effective DB = prefix + `MATRIXONE_DATABASE`) and create that database before running online tests.
 
 ## Recommended Workflow
 

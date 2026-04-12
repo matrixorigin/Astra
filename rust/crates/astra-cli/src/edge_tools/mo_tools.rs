@@ -9,6 +9,7 @@
 //!   MATRIXONE_USER (default: root)
 //!   MATRIXONE_PASSWORD (default: dev-only; set for production!)
 //!   MATRIXONE_DATABASE (default: astra_runtime)
+//!   MATRIXONE_DATABASE_PREFIX (optional; effective DB = prefix + MATRIXONE_DATABASE)
 //!
 //! Uses the `mysql` CLI client (MySQL protocol compatible), same pattern as
 //! git tools — shell out to native CLI for zero Rust-side connection overhead.
@@ -49,7 +50,7 @@ fn mo_database() -> &'static str {
     use std::sync::OnceLock;
     static DB: OnceLock<String> = OnceLock::new();
     DB.get_or_init(|| {
-        std::env::var("MATRIXONE_DATABASE").unwrap_or_else(|_| "astra_runtime".into())
+        astra_core::resolve_matrixone_database_name(&|k| std::env::var(k).ok())
     })
 }
 
@@ -74,7 +75,7 @@ fn mo_mysql_cmd(database: Option<&str>) -> Command {
     let password = std::env::var("MATRIXONE_PASSWORD")
         .unwrap_or_else(|_| astra_core::DEV_MATRIXONE_PASSWORD.to_string());
     let db = database.map(String::from).unwrap_or_else(|| {
-        std::env::var("MATRIXONE_DATABASE").unwrap_or_else(|_| "astra_runtime".to_string())
+        astra_core::resolve_matrixone_database_name(&|k| std::env::var(k).ok())
     });
 
     let mut cmd = Command::new("mysql");
@@ -175,7 +176,7 @@ fn schema_hint_for_error(lower_err: &str, sql: &str, database: Option<&str>) -> 
         // Table not found → SHOW TABLES in the database
         let db = database
             .map(String::from)
-            .unwrap_or_else(|| std::env::var("MATRIXONE_DATABASE").unwrap_or_default());
+            .unwrap_or_else(|| astra_core::resolve_matrixone_database_name(&|k| std::env::var(k).ok()));
         if !db.is_empty() {
             let tables = mo_execute_sql(&format!("SHOW TABLES IN `{db}`"), None);
             if !tables.starts_with("Error:") {
@@ -531,6 +532,7 @@ mod tests {
         let _guard = env_guard();
         unsafe {
             std::env::remove_var("MATRIXONE_DATABASE");
+            std::env::remove_var("MATRIXONE_DATABASE_PREFIX");
         }
         let cmd = mo_mysql_cmd(None);
         let args: Vec<_> = cmd
@@ -542,6 +544,30 @@ mod tests {
             "should default to astra_runtime: {:?}",
             args
         );
+    }
+
+    #[test]
+    fn mo_mysql_cmd_default_database_applies_prefix() {
+        let _guard = env_guard();
+        unsafe {
+            std::env::remove_var("MATRIXONE_DATABASE_PREFIX");
+            std::env::set_var("MATRIXONE_DATABASE_PREFIX", "it_");
+            std::env::set_var("MATRIXONE_DATABASE", "astra_runtime");
+        }
+        let cmd = mo_mysql_cmd(None);
+        let args: Vec<_> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert!(
+            args.iter().any(|a| a == "it_astra_runtime"),
+            "should concatenate prefix + base: {:?}",
+            args
+        );
+        unsafe {
+            std::env::remove_var("MATRIXONE_DATABASE_PREFIX");
+            std::env::remove_var("MATRIXONE_DATABASE");
+        }
     }
 
     // ── SQL safety validation ──
