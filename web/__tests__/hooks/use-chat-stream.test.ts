@@ -410,7 +410,7 @@ describe('useChatStream', () => {
 
     // The error message is captured even though the stream finishes afterward
     expect(result.current.error).toBe('Something went wrong');
-    // After stream completes naturally, isStreaming is false
+    expect(result.current.connectionState).toBe('error');
     expect(result.current.isStreaming).toBe(false);
   });
 });

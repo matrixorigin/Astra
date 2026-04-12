@@ -39,13 +39,13 @@ const defaultEventColor = { bg: '#0f172a', border: '#334155' };
 const failedEventColor = { bg: '#450a0a', border: '#ef4444' };
 const cancelledEventColor = { bg: '#2e1065', border: '#a78bfa' };
 
-function getEventColor(event: EventSummary) {
-  if (event.type === 'agent_completed') {
+function getEventColor(event: EventSummary | string) {
+  if (typeof event !== 'string' && event.type === 'agent_completed') {
     if (event.status === 'failed') return failedEventColor;
     if (event.status === 'cancelled') return cancelledEventColor;
   }
 
-  const eventType = event.type;
+  const eventType = typeof event === 'string' ? event : event.type;
   const lower = eventType.toLowerCase();
   for (const [key, val] of Object.entries(eventTypeColors)) {
     if (lower.includes(key)) return val;

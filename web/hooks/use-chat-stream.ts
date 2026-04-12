@@ -59,6 +59,7 @@ export function useChatStream(config: ChatConfig): UseChatStreamReturn {
   const accumulatedThinkingRef = useRef('');
   const toolCallMapRef = useRef<Map<string, ToolCall>>(new Map());
   const lastUserMessageRef = useRef('');
+  const sawErrorEventRef = useRef(false);
   // Track config.sessionId to detect external changes
   const configSessionIdRef = useRef(config.sessionId);
 
@@ -84,6 +85,7 @@ export function useChatStream(config: ChatConfig): UseChatStreamReturn {
       accumulatedTextRef.current = '';
       accumulatedThinkingRef.current = '';
       lastUserMessageRef.current = '';
+      sawErrorEventRef.current = false;
       toolCallMapRef.current.clear();
     }
   }, [config.sessionId]);
@@ -264,6 +266,7 @@ export function useChatStream(config: ChatConfig): UseChatStreamReturn {
         }
 
         case 'error': {
+          sawErrorEventRef.current = true;
           setError(event.message);
           setIsStreaming(false);
           setConnectionState('error');
@@ -312,6 +315,7 @@ export function useChatStream(config: ChatConfig): UseChatStreamReturn {
       setConnectionState('streaming');
       setFollowupSuggestion(null);
       lastUserMessageRef.current = content;
+      sawErrorEventRef.current = false;
 
       const userMsg: ChatMessage = {
         id: uid(),
@@ -403,7 +407,9 @@ export function useChatStream(config: ChatConfig): UseChatStreamReturn {
           }
 
           setIsStreaming(false);
-          setConnectionState('idle');
+          if (!sawErrorEventRef.current) {
+            setConnectionState('idle');
+          }
         })
         .catch((err) => {
           if (err instanceof DOMException && err.name === 'AbortError') {
