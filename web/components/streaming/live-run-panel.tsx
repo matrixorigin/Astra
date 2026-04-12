@@ -8,6 +8,9 @@ import { ConnectionStatus } from './connection-status';
 function EventBadge({ type }: { type: string }) {
   const colors: Record<string, string> = {
     text_delta: 'bg-sky-500/20 text-sky-300',
+    run_started: 'bg-blue-500/20 text-blue-300',
+    run_finished: 'bg-emerald-500/20 text-emerald-300',
+    run_cancelled: 'bg-amber-500/20 text-amber-300',
     tool_call_start: 'bg-violet-500/20 text-violet-300',
     tool_call_end: 'bg-violet-500/20 text-violet-300',
     usage: 'bg-slate-500/20 text-slate-300',
@@ -33,6 +36,14 @@ function EventBadge({ type }: { type: string }) {
 
 function eventSummary(event: StreamEvent): string {
   switch (event.type) {
+    case 'run_started':
+      return event.run_id ? `Run started (${event.run_id})` : 'Run started';
+    case 'run_finished':
+      return event.error
+        ? `Run ${event.status ?? 'finished'}: ${event.error}`
+        : `Run ${event.status ?? 'finished'}`;
+    case 'run_cancelled':
+      return `Run cancelled (${event.run_id})`;
     case 'text_delta':
       return event.content.length > 120
         ? event.content.slice(0, 120) + '…'
