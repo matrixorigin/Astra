@@ -92,6 +92,19 @@ struct GateValidationSummary {
     details: String,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct CalibrationSummary {
+    mean_confidence: f64,
+    mean_confidence_interval: ConfidenceInterval,
+    mean_quality: f64,
+    mean_quality_interval: ConfidenceInterval,
+    calibration_error: f64,
+    bias: f64,
+    sample_count: i64,
+    adjustment_multiplier: f64,
+    adjustment_reason: String,
+}
+
 fn average_scores(scores: &[f64]) -> f64 {
     if scores.is_empty() {
         0.0
@@ -124,6 +137,44 @@ fn change_type_label(change_type: &ChangeType) -> &'static str {
         ChangeType::Selector => "selector",
         ChangeType::ContextBudget => "context_budget",
         ChangeType::Knowledge => "knowledge",
+    }
+}
+
+fn summarize_calibration(
+    mean_confidence: f64,
+    mean_quality: f64,
+    sample_count: i64,
+) -> CalibrationSummary {
+    if sample_count <= 0 {
+        return CalibrationSummary {
+            mean_confidence: 0.0,
+            mean_confidence_interval: ConfidenceInterval::ZERO,
+            mean_quality: 0.0,
+            mean_quality_interval: ConfidenceInterval::ZERO,
+            calibration_error: 0.0,
+            bias: 0.0,
+            sample_count: 0,
+            adjustment_multiplier: 1.0,
+            adjustment_reason: "No session calibration samples available.".into(),
+        };
+    }
+
+    let mean_confidence = mean_confidence.clamp(0.0, 1.0);
+    let mean_quality = mean_quality.clamp(0.0, 1.0);
+    let calibration_error = compute_calibration_error(mean_confidence, mean_quality);
+    let bias = mean_confidence - mean_quality;
+    let (adjustment_multiplier, adjustment_reason) = compute_adjustment(calibration_error, bias);
+
+    CalibrationSummary {
+        mean_confidence,
+        mean_confidence_interval: sampled_confidence_interval(mean_confidence, sample_count),
+        mean_quality,
+        mean_quality_interval: sampled_confidence_interval(mean_quality, sample_count),
+        calibration_error,
+        bias,
+        sample_count,
+        adjustment_multiplier,
+        adjustment_reason,
     }
 }
 
@@ -476,13 +527,76 @@ impl EvaluationService for DatabaseEvaluationService {
 
     async fn get_calibration(
         &self,
-        _user_id: &str,
-        _agent_id: Option<&str>,
-        _days: i32,
+        user_id: &str,
+        agent_id: Option<&str>,
+        days: i32,
     ) -> ServiceResult<CalibrationResponse> {
-        Err(not_implemented(
-            "Evaluation calibration reporting is not implemented yet",
-        ))
+        let pool = self.get_pool().await.map_err(internal_error)?;
+        let days = clamp_eval_days(days);
+        let confidence_expr = "COALESCE(\
+                CAST(JSON_UNQUOTE(JSON_EXTRACT(ev.metadata, '$.tool_selection.selection_confidence')) AS DOUBLE), \
+                CAST(JSON_UNQUOTE(JSON_EXTRACT(ev.metadata, '$.selection_confidence')) AS DOUBLE)\
+            )";
+        let agent_filter = if agent_id.is_some() {
+            "AND ev.agent_id = ?"
+        } else {
+            ""
+        };
+        let sql = format!(
+            "SELECT AVG(samples.session_confidence) AS mean_confidence, \
+                    AVG(samples.session_quality) AS mean_quality, \
+                    COUNT(*) AS sample_count \
+             FROM ( \
+                 SELECT qa.target_id AS session_id, \
+                        MAX(CAST(qa.score AS DOUBLE)) AS session_quality, \
+                        AVG({confidence_expr}) AS session_confidence \
+                 FROM eval_quality_assessments qa \
+                 JOIN agent_events ev \
+                   ON ev.session_id = qa.target_id \
+                  AND ev.user_id = qa.user_id \
+                  AND ev.event_type = 'context_trace_signal' \
+                 WHERE qa.user_id = ? \
+                   AND qa.level = 'session' \
+                   AND qa.updated_at >= DATE_SUB(NOW(), INTERVAL ? DAY) \
+                   AND qa.updated_at = ( \
+                       SELECT MAX(q2.updated_at) \
+                       FROM eval_quality_assessments q2 \
+                       WHERE q2.user_id = qa.user_id \
+                         AND q2.level = 'session' \
+                         AND q2.target_id = qa.target_id \
+                   ) \
+                   AND ev.created_at >= DATE_SUB(NOW(), INTERVAL ? DAY) \
+                   {agent_filter} \
+                 GROUP BY qa.target_id \
+             ) samples \
+             WHERE samples.session_confidence IS NOT NULL"
+        );
+
+        let mut calibration_query = query(&sql).bind(user_id).bind(days).bind(days);
+        if let Some(agent_id) = agent_id {
+            calibration_query = calibration_query.bind(agent_id);
+        }
+        let row = calibration_query
+            .fetch_one(&pool)
+            .await
+            .map_err(internal_error)?;
+        let summary = summarize_calibration(
+            row.try_get("mean_confidence").unwrap_or(0.0),
+            row.try_get("mean_quality").unwrap_or(0.0),
+            row.try_get("sample_count").unwrap_or(0),
+        );
+
+        Ok(CalibrationResponse {
+            mean_confidence: summary.mean_confidence,
+            mean_confidence_interval: summary.mean_confidence_interval,
+            mean_quality: summary.mean_quality,
+            mean_quality_interval: summary.mean_quality_interval,
+            calibration_error: summary.calibration_error,
+            bias: summary.bias,
+            sample_count: summary.sample_count,
+            adjustment_multiplier: summary.adjustment_multiplier,
+            adjustment_reason: summary.adjustment_reason,
+        })
     }
 
     async fn get_session_scores(
@@ -1316,6 +1430,32 @@ mod tests {
         let interval = ConfidenceInterval::new(0.8, 0.7, 0.9);
         let complement = complement_interval(interval);
         assert_eq!(complement, ConfidenceInterval::new(0.2, 0.1, 0.3));
+    }
+
+    #[test]
+    fn summarize_calibration_empty_samples_returns_default() {
+        let summary = summarize_calibration(0.9, 0.7, 0);
+        assert_eq!(summary.sample_count, 0);
+        assert_eq!(summary.mean_confidence_interval, ConfidenceInterval::ZERO);
+        assert_eq!(summary.mean_quality_interval, ConfidenceInterval::ZERO);
+        assert_eq!(summary.adjustment_multiplier, 1.0);
+        assert!(
+            summary
+                .adjustment_reason
+                .contains("No session calibration samples")
+        );
+    }
+
+    #[test]
+    fn summarize_calibration_derives_bias_and_intervals() {
+        let summary = summarize_calibration(0.9, 0.7, 16);
+        assert_eq!(summary.sample_count, 16);
+        assert!((summary.calibration_error - 0.2).abs() < 0.001);
+        assert!((summary.bias - 0.2).abs() < 0.001);
+        assert!(summary.mean_confidence_interval.lower <= summary.mean_confidence);
+        assert!(summary.mean_quality_interval.upper >= summary.mean_quality);
+        assert!(summary.adjustment_multiplier < 1.0);
+        assert!(summary.adjustment_reason.contains("Overconfident"));
     }
 
     #[test]

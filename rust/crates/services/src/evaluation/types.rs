@@ -325,7 +325,9 @@ pub struct GateHistoryResponse {
 #[derive(Debug, Clone, Serialize)]
 pub struct CalibrationResponse {
     pub mean_confidence: f64,
+    pub mean_confidence_interval: ConfidenceInterval,
     pub mean_quality: f64,
+    pub mean_quality_interval: ConfidenceInterval,
     pub calibration_error: f64,
     pub bias: f64,
     pub sample_count: i64,
