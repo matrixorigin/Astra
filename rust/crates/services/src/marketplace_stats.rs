@@ -421,6 +421,7 @@ impl MarketplaceStatsService for NoopMarketplaceStatsService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pagination::{MAX_MARKETPLACE_SEARCH_OFFSET, clamp_marketplace_search_offset};
 
     #[test]
     fn skill_search_query_default_all_none() {
@@ -465,7 +466,15 @@ mod tests {
     fn skill_search_limit_clamps_to_max_results() {
         let lim = Some(u32::MAX)
             .unwrap_or(DEFAULT_SEARCH_LIMIT)
-            .min(MAX_SEARCH_RESULTS);
-        assert_eq!(lim, MAX_SEARCH_RESULTS);
+            .min(super::MAX_SEARCH_RESULTS);
+        assert_eq!(lim, super::MAX_SEARCH_RESULTS);
+    }
+
+    #[test]
+    fn skill_search_offset_uses_shared_clamp() {
+        assert_eq!(
+            clamp_marketplace_search_offset(u32::MAX),
+            MAX_MARKETPLACE_SEARCH_OFFSET
+        );
     }
 }

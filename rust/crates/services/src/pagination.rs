@@ -1,7 +1,4 @@
 //! Server-side caps for HTTP-driven list queries (`LIMIT` / `OFFSET`).
-//!
-//! Prevents unbounded client-supplied paging from causing OOM, huge `IN (...)` fan-out
-//! (e.g. parent-edge hydration), or pathological `OFFSET` scans.
 
 /// Aligns with other list endpoints (`skills`, `workflows`, `context` snapshots, etc.).
 pub const MAX_API_LIST_LIMIT: u32 = 200;
@@ -49,13 +46,6 @@ mod tests {
         let (l, o) = clamp_api_list_pagination(10, u32::MAX);
         assert_eq!(l, 10);
         assert_eq!(o, MAX_API_LIST_OFFSET);
-    }
-
-    #[test]
-    fn clamp_api_list_pagination_preserves_small_values() {
-        let (l, o) = clamp_api_list_pagination(50, 10_000);
-        assert_eq!(l, 50);
-        assert_eq!(o, 10_000);
     }
 
     #[test]

@@ -593,6 +593,7 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
             updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             UNIQUE KEY uq_skill_name_version (skill_name, version),
             INDEX idx_skill_active_name (is_active, status, skill_name),
+            INDEX idx_skill_active_created_at (is_active, created_at),
             INDEX idx_skill_source_name (source, skill_name),
             INDEX idx_skill_active_name_ver (is_active, skill_name, version)
         )",

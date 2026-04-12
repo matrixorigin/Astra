@@ -121,6 +121,16 @@ pub use learning::{
 pub use marketplace::{
     DatabaseMarketplaceService, MarketplaceService, UnconfiguredMarketplaceService,
 };
+pub use marketplace_stats::{
+    DatabaseMarketplaceStatsService, MarketplaceStatsService, NoopMarketplaceStatsService,
+    QualityReportData, SkillMarketplaceStats, SkillSearchQuery, SkillSearchResponse,
+    SkillSearchResult,
+};
+pub use pagination::{
+    clamp_admin_audit_limit, clamp_api_list_pagination, clamp_marketplace_search_offset,
+    MAX_ADMIN_AUDIT_LOG_LIMIT, MAX_API_LIST_LIMIT, MAX_API_LIST_OFFSET,
+    MAX_MARKETPLACE_SEARCH_OFFSET,
+};
 pub use models::{
     DatabaseModelService, ModelCreateRequestData, ModelListItem, ModelRecord, ModelService,
     ModelUpdateRequestData, PricingData, QuirksData, ResolvedActiveLlmModel,

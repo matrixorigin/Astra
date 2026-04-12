@@ -418,12 +418,13 @@ test-runtime-bridge-hooks:
 
 # Ignored tests: opt-in via env vars (see `make test-online`). Enable with:
 #   ASTRA_SYSTEM_MATRIX_E2E=1   -> system_matrix_http_e2e (--ignored)
-#   ASTRA_MULTI_AGENT_IT=1      -> astra-services multi_agent_integration (--ignored)
+#   ASTRA_MULTI_AGENT_IT=1      -> astra-services multi_agent_integration + team_persistence (--ignored)
+#   ASTRA_SERVICES_DB_IT=1      -> astra-services services_db_integration (--ignored)
 # Optional serial Matrix E2E: ASTRA_SYSTEM_MATRIX_E2E_TEST_THREADS=1 -> --test-threads=1
 .PHONY: test-ignored-integration
 test-ignored-integration:
-	@if [ "$${ASTRA_SYSTEM_MATRIX_E2E:-}" != "1" ] && [ "$${ASTRA_MULTI_AGENT_IT:-}" != "1" ]; then \
-		echo "Note: no online/Matrix ignored suites selected (neither ASTRA_SYSTEM_MATRIX_E2E=1 nor ASTRA_MULTI_AGENT_IT=1). Use \`make test-online\` or set those variables."; \
+	@if [ "$${ASTRA_SYSTEM_MATRIX_E2E:-}" != "1" ] && [ "$${ASTRA_MULTI_AGENT_IT:-}" != "1" ] && [ "$${ASTRA_SERVICES_DB_IT:-}" != "1" ]; then \
+		echo "Note: no online/Matrix ignored suites selected. Use \`make test-online\` or set ASTRA_SYSTEM_MATRIX_E2E=1 / ASTRA_MULTI_AGENT_IT=1 / ASTRA_SERVICES_DB_IT=1."; \
 	fi
 	@if [ "$${ASTRA_SYSTEM_MATRIX_E2E:-}" = "1" ]; then \
 		EXTRA_THREADS=""; \
@@ -439,12 +440,18 @@ test-ignored-integration:
 	@if [ "$${ASTRA_MULTI_AGENT_IT:-}" = "1" ]; then \
 		echo "Running multi_agent_integration (ignored; live MatrixOne)..."; \
 		$(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-services --test multi_agent_integration -- --ignored; \
+		echo "Running team_persistence_integration (ignored; live MatrixOne)..."; \
+		$(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-services --test team_persistence_integration -- --ignored; \
+	fi
+	@if [ "$${ASTRA_SERVICES_DB_IT:-}" = "1" ]; then \
+		echo "Running services_db_integration (ignored; live MatrixOne)..."; \
+		$(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-services --test services_db_integration -- --ignored; \
 	fi
 
 # Online (MatrixOne + Redis): opt-in #[ignore] integration binaries (see test-ignored-integration).
 .PHONY: test-online
 test-online:
-	@ASTRA_SYSTEM_MATRIX_E2E=1 ASTRA_MULTI_AGENT_IT=1 $(MAKE) test-ignored-integration
+	@ASTRA_SYSTEM_MATRIX_E2E=1 ASTRA_MULTI_AGENT_IT=1 ASTRA_SERVICES_DB_IT=1 $(MAKE) test-ignored-integration
 
 .PHONY: test-contract
 test-contract:

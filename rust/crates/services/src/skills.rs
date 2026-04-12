@@ -6,6 +6,8 @@ use sqlx::{Row, query};
 use astra_core::{
     ErrorResponse, MatrixOneSettings, SharedPool, connect_matrixone, error_response, internal_error,
 };
+
+use crate::pagination::clamp_api_list_pagination;
 use sha2::Digest;
 
 fn is_duplicate_key_error(err: &sqlx::Error) -> bool {
@@ -105,7 +107,6 @@ pub struct SkillStatusRecord {
     pub user_total: i64,
 }
 
-const MAX_SKILL_LIST_ROWS: u32 = 200;
 const MAX_SKILL_STATUS_PER_GROUP: u32 = 100;
 
 /// `list_skills` row projection — excludes `skill_definition` (large JSON); use `get_skill` for body.
@@ -260,7 +261,7 @@ impl SkillService for DatabaseSkillService {
         offset: u32,
     ) -> Result<SkillListRecord, (StatusCode, Json<ErrorResponse>)> {
         let pool = self.get_pool().await.map_err(internal_error)?;
-        let limit = limit.min(MAX_SKILL_LIST_ROWS);
+        let (limit, offset) = clamp_api_list_pagination(limit, offset);
 
         let count_row = query("SELECT COUNT(*) AS cnt FROM skills_registry WHERE is_active = 1")
             .fetch_one(&pool)
@@ -273,11 +274,11 @@ impl SkillService for DatabaseSkillService {
              ORDER BY created_at DESC LIMIT ? OFFSET ?",
         );
         let rows = query(&list_sql)
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(&pool)
-        .await
-        .map_err(internal_error)?;
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&pool)
+            .await
+            .map_err(internal_error)?;
 
         let skills: Vec<SkillListItem> = rows
             .iter()
