@@ -797,12 +797,9 @@ fn build_ws_bridge_headers(
     let user_id_hv =
         HeaderValue::from_str(&conn.user.user_id).map_err(|_| "Invalid user_id for headers")?;
     bridge_headers.insert(HeaderName::from_static("x-mo-user-id"), user_id_hv);
-    let authorization_hv = HeaderValue::from_str(&conn.authorization)
-        .map_err(|_| "Invalid authorization header")?;
-    bridge_headers.insert(
-        HeaderName::from_static("authorization"),
-        authorization_hv,
-    );
+    let authorization_hv =
+        HeaderValue::from_str(&conn.authorization).map_err(|_| "Invalid authorization header")?;
+    bridge_headers.insert(HeaderName::from_static("authorization"), authorization_hv);
     let username_b64 = URL_SAFE.encode(conn.user.username.as_bytes());
     bridge_headers.insert(
         HeaderName::from_static("x-mo-username-b64"),
@@ -913,11 +910,13 @@ fn lifecycle_poll_error_policy(status: StatusCode) -> LifecyclePollErrorPolicy {
             emit_failed_terminal: true,
             continue_polling: false,
         },
-        status if super::http_helpers::status_to_sse_retryable(status) => LifecyclePollErrorPolicy {
-            cancel_run: false,
-            emit_failed_terminal: false,
-            continue_polling: true,
-        },
+        status if super::http_helpers::status_to_sse_retryable(status) => {
+            LifecyclePollErrorPolicy {
+                cancel_run: false,
+                emit_failed_terminal: false,
+                continue_polling: true,
+            }
+        }
         _ => LifecyclePollErrorPolicy {
             cancel_run: false,
             emit_failed_terminal: false,
@@ -933,7 +932,9 @@ fn should_emit_transient_poll_error(
 ) -> bool {
     if last_error
         .as_ref()
-        .is_some_and(|(prev_status, prev_message)| *prev_status == status && prev_message == message)
+        .is_some_and(|(prev_status, prev_message)| {
+            *prev_status == status && prev_message == message
+        })
     {
         return false;
     }
@@ -1614,6 +1615,104 @@ fn bridge_ws_terminal_status(
     }
 }
 
+#[derive(Debug)]
+struct ProcessedBridgeStreamEvent {
+    pre_messages: Vec<WsServerMessage>,
+    raw_event: Option<Value>,
+}
+
+fn process_bridge_stream_event(
+    conn: &mut WsConnection,
+    event: Value,
+    run_started_explain: Option<&Value>,
+    suppress_initial_session_info: &mut bool,
+    saw_turn_complete: &mut bool,
+    terminal_error: &mut Option<String>,
+) -> ProcessedBridgeStreamEvent {
+    if should_suppress_initial_bridge_session_info(suppress_initial_session_info, &event) {
+        return ProcessedBridgeStreamEvent {
+            pre_messages: Vec::new(),
+            raw_event: None,
+        };
+    }
+
+    let adopted_run_id = sync_conn_state_from_stream_event(conn, &event);
+    let mut pre_messages = Vec::new();
+    if let Some(run_started) =
+        synthetic_bridge_run_started(conn, adopted_run_id, run_started_explain)
+    {
+        pre_messages.push(run_started);
+    }
+
+    match event.get("type").and_then(Value::as_str) {
+        Some("turn_complete") => *saw_turn_complete = true,
+        Some("error") => {
+            *terminal_error = event
+                .get("message")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .or_else(|| Some("Bridge returned error event".to_string()));
+        }
+        _ => {}
+    }
+
+    ProcessedBridgeStreamEvent {
+        pre_messages,
+        raw_event: Some(event),
+    }
+}
+
+async fn forward_bridge_stream_event(
+    socket: &mut WebSocket,
+    conn: &mut WsConnection,
+    event: Value,
+    cancel: Option<&Arc<CancellationToken>>,
+    run_started_explain: Option<&Value>,
+    suppress_initial_session_info: &mut bool,
+    saw_turn_complete: &mut bool,
+    terminal_error: &mut Option<String>,
+) -> Result<(), BridgeWsTerminalStatus> {
+    let processed = process_bridge_stream_event(
+        conn,
+        event,
+        run_started_explain,
+        suppress_initial_session_info,
+        saw_turn_complete,
+        terminal_error,
+    );
+
+    for message in processed.pre_messages {
+        send_msg(socket, &message).await;
+    }
+
+    let Some(raw_event) = processed.raw_event else {
+        return Ok(());
+    };
+
+    let text = match serde_json::to_string(&raw_event) {
+        Ok(s) => s,
+        Err(e) => {
+            let message = format!("Failed to serialize event: {e}");
+            send_msg(
+                socket,
+                &WsServerMessage::Error {
+                    message: message.clone(),
+                    code: "INTERNAL_ERROR".into(),
+                    retryable: false,
+                },
+            )
+            .await;
+            *terminal_error = Some(message.clone());
+            if let Some(t) = cancel {
+                t.cancel();
+            }
+            return Err(BridgeWsTerminalStatus::Failed(Some(message)));
+        }
+    };
+
+    send_bridge_frame_or_cancel(socket, text, cancel).await
+}
+
 async fn send_bridge_frame_or_cancel(
     socket: &mut WebSocket,
     text: String,
@@ -1855,53 +1954,18 @@ async fn stream_sse_response_as_ws(
                                 }
                             };
                             for event in events {
-                                if should_suppress_initial_bridge_session_info(
-                                    &mut suppress_initial_session_info,
-                                    &event,
-                                ) {
-                                    continue;
-                                }
-                                let adopted_run_id = sync_conn_state_from_stream_event(conn, &event);
-                                if let Some(run_started) = synthetic_bridge_run_started(
-                                    conn,
-                                    adopted_run_id,
-                                    run_started_explain.as_ref(),
-                                ) {
-                                    send_msg(socket, &run_started).await;
-                                }
-                                match event.get("type").and_then(Value::as_str) {
-                                    Some("turn_complete") => saw_turn_complete = true,
-                                    Some("error") => {
-                                        terminal_error = event
-                                            .get("message")
-                                            .and_then(Value::as_str)
-                                            .map(str::to_string)
-                                            .or_else(|| Some("Bridge returned error event".to_string()));
-                                    }
-                                    _ => {}
-                                }
-                                let text = match serde_json::to_string(&event) {
-                                    Ok(s) => s,
-                                    Err(e) => {
-                                        let message = format!("Failed to serialize event: {e}");
-                                        send_msg(
-                                            socket,
-                                            &WsServerMessage::Error {
-                                                message: message.clone(),
-                                                code: "INTERNAL_ERROR".into(),
-                                                retryable: false,
-                                            },
-                                        )
-                                        .await;
-                                        terminal_error = Some(message);
-                                        if let Some(t) = cancel.as_ref() {
-                                            t.cancel();
-                                        }
-                                        return BridgeWsTerminalStatus::Failed(terminal_error);
-                                    }
-                                };
                                 if let Err(status) =
-                                    send_bridge_frame_or_cancel(socket, text, cancel.as_ref()).await
+                                    forward_bridge_stream_event(
+                                        socket,
+                                        conn,
+                                        event,
+                                        cancel.as_ref(),
+                                        run_started_explain.as_ref(),
+                                        &mut suppress_initial_session_info,
+                                        &mut saw_turn_complete,
+                                        &mut terminal_error,
+                                    )
+                                    .await
                                 {
                                     return status;
                                 }
@@ -1935,23 +1999,17 @@ async fn stream_sse_response_as_ws(
         match ws_json_events_from_sse_block(&tail) {
             Ok(events) => {
                 for event in events {
-                    sync_conn_state_from_stream_event(conn, &event);
-                    match event.get("type").and_then(Value::as_str) {
-                        Some("turn_complete") => saw_turn_complete = true,
-                        Some("error") => {
-                            terminal_error = event
-                                .get("message")
-                                .and_then(Value::as_str)
-                                .map(str::to_string)
-                                .or_else(|| Some("Bridge returned error event".to_string()));
-                        }
-                        _ => {}
-                    }
-                    let Ok(text) = serde_json::to_string(&event) else {
-                        continue;
-                    };
-                    if let Err(status) =
-                        send_bridge_frame_or_cancel(socket, text, cancel.as_ref()).await
+                    if let Err(status) = forward_bridge_stream_event(
+                        socket,
+                        conn,
+                        event,
+                        cancel.as_ref(),
+                        run_started_explain.as_ref(),
+                        &mut suppress_initial_session_info,
+                        &mut saw_turn_complete,
+                        &mut terminal_error,
+                    )
+                    .await
                     {
                         return status;
                     }
@@ -2264,7 +2322,10 @@ mod tests {
             })
         );
         assert_eq!(request.context.as_ref().unwrap()["cwd"], "/tmp");
-        assert_eq!(request.context.as_ref().unwrap()["plan_subtask_id"], "sub-42");
+        assert_eq!(
+            request.context.as_ref().unwrap()["plan_subtask_id"],
+            "sub-42"
+        );
         assert_eq!(request.context.as_ref().unwrap()["is_plan_subtask"], true);
         assert_eq!(request.max_candidates, 7);
         assert!(request.explain);
@@ -2618,11 +2679,8 @@ mod tests {
         );
         assert_eq!(pending_run_error.as_deref(), Some("boom"));
 
-        let terminal_payloads = lifecycle_events_to_ws_payloads(
-            "run-123",
-            vec![run_finished],
-            &mut pending_run_error,
-        );
+        let terminal_payloads =
+            lifecycle_events_to_ws_payloads("run-123", vec![run_finished], &mut pending_run_error);
         assert_eq!(
             terminal_payloads,
             vec![
@@ -2912,6 +2970,108 @@ mod tests {
             &mut suppress,
             &text_delta,
         ));
+    }
+
+    #[test]
+    fn process_bridge_stream_event_suppresses_initial_tail_session_info() {
+        let mut conn = WsConnection {
+            user: AuthUserRecord {
+                user_id: "u1".into(),
+                username: "alice".into(),
+                email: "alice@example.com".into(),
+                display_name: Some("Alice".into()),
+            },
+            authorization: "Bearer test-token".into(),
+            session_id: Some("sess-1".into()),
+            pending_session_id: None,
+            active_run_id: Some("run-1".into()),
+            bridge_prepared_run_id: Some("run-1".into()),
+        };
+        let mut suppress = true;
+        let mut saw_turn_complete = false;
+        let mut terminal_error = None;
+
+        let processed = process_bridge_stream_event(
+            &mut conn,
+            serde_json::json!({
+                "type": "session_info",
+                "session_id": "upstream-sess",
+                "run_id": "run-1"
+            }),
+            None,
+            &mut suppress,
+            &mut saw_turn_complete,
+            &mut terminal_error,
+        );
+
+        assert!(processed.pre_messages.is_empty());
+        assert!(processed.raw_event.is_none());
+        assert!(!suppress);
+        assert!(!saw_turn_complete);
+        assert_eq!(terminal_error, None);
+        assert_eq!(conn.session_id.as_deref(), Some("sess-1"));
+        assert_eq!(conn.active_run_id.as_deref(), Some("run-1"));
+    }
+
+    #[test]
+    fn process_bridge_stream_event_synthesizes_run_started_for_tail_session_info() {
+        let mut conn = WsConnection {
+            user: AuthUserRecord {
+                user_id: "u1".into(),
+                username: "alice".into(),
+                email: "alice@example.com".into(),
+                display_name: Some("Alice".into()),
+            },
+            authorization: "Bearer test-token".into(),
+            session_id: None,
+            pending_session_id: Some("pending-session".into()),
+            active_run_id: None,
+            bridge_prepared_run_id: None,
+        };
+        let mut suppress = false;
+        let mut saw_turn_complete = false;
+        let mut terminal_error = None;
+        let explain = bridge_run_started_explain(true);
+
+        let processed = process_bridge_stream_event(
+            &mut conn,
+            serde_json::json!({
+                "type": "session_info",
+                "session_id": "sess-42",
+                "run_id": "run-9"
+            }),
+            explain.as_ref(),
+            &mut suppress,
+            &mut saw_turn_complete,
+            &mut terminal_error,
+        );
+
+        match processed.pre_messages.as_slice() {
+            [
+                WsServerMessage::RunStarted {
+                    run_id,
+                    session_id,
+                    explain,
+                },
+            ] => {
+                assert_eq!(run_id, "run-9");
+                assert_eq!(session_id, "sess-42");
+                assert_eq!(explain, &Some(serde_json::json!({"mode": "background"})));
+            }
+            other => panic!("expected synthesized RunStarted, got {other:?}"),
+        }
+        assert_eq!(
+            processed.raw_event,
+            Some(serde_json::json!({
+                "type": "session_info",
+                "session_id": "sess-42",
+                "run_id": "run-9"
+            }))
+        );
+        assert!(!saw_turn_complete);
+        assert_eq!(terminal_error, None);
+        assert_eq!(conn.session_id.as_deref(), Some("sess-42"));
+        assert_eq!(conn.active_run_id.as_deref(), Some("run-9"));
     }
 
     #[test]
