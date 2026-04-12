@@ -9,13 +9,17 @@ use std::time::Duration;
 use astra_thin_client::ApprovalRespondRequest;
 use serde_json::{Map, Value, json};
 
+#[cfg(test)]
+use futures_util::stream::StreamExt;
+
 use super::cloud_approval_policy::{bash_command_is_read_only, edge_tool_requires_cloud_approval};
 use super::edge_ledger::{
     MSG_TOOL_LEDGER_TIMEOUT, approval_callback_key, persist_value_for_ledger_tool_result,
     take_ledger_entry, tool_callback_key, tool_content_from_ledger_entry,
 };
 use super::stream_events::{
-    build_approval_required_event, build_edge_tool_call_event, build_tool_request_event,
+    build_approval_required_event, build_edge_tool_call_event, build_tool_call_end_event,
+    build_tool_request_event,
 };
 use super::tool_argument_hints::{
     normalize_llm_function_arguments, path_hint_from_args, permission_prompt_primary_detail,
@@ -145,7 +149,10 @@ pub(crate) async fn wait_approval_ledger_for_tool(
     let ap_entry = take_ledger_entry(ledger, &ap_key, ledger_wait).await;
     match parse_cloud_approval_outcome(ap_entry.as_ref()) {
         CloudApprovalResult::Denied { reason } => Err(EdgeToolRoundDelivery {
-            sse_maps: vec![],
+            sse_maps: vec![build_tool_call_end_event(
+                id,
+                Value::String(denied_tool_content(reason.as_deref())),
+            )],
             tool_messages: vec![json!({
                 "role": "tool",
                 "tool_call_id": id,
@@ -154,7 +161,10 @@ pub(crate) async fn wait_approval_ledger_for_tool(
             persist_tool_results: vec![persist_denied_tool_result(tc, reason.as_deref())],
         }),
         CloudApprovalResult::Timeout => Err(EdgeToolRoundDelivery {
-            sse_maps: vec![],
+            sse_maps: vec![build_tool_call_end_event(
+                id,
+                Value::String(MSG_APPROVAL_LEDGER_TIMEOUT.to_string()),
+            )],
             tool_messages: vec![json!({
                 "role": "tool",
                 "tool_call_id": id,
@@ -167,7 +177,10 @@ pub(crate) async fn wait_approval_ledger_for_tool(
             })],
         }),
         CloudApprovalResult::Malformed => Err(EdgeToolRoundDelivery {
-            sse_maps: vec![],
+            sse_maps: vec![build_tool_call_end_event(
+                id,
+                Value::String("malformed approval response (§5.5 ledger)".to_string()),
+            )],
             tool_messages: vec![json!({
                 "role": "tool",
                 "tool_call_id": id,
@@ -218,6 +231,10 @@ pub(crate) async fn wait_tool_result_ledger_for_tool(
         "tool_call_id": id,
         "content": content,
     }));
+    out.sse_maps.push(build_tool_call_end_event(
+        id,
+        Value::String(content.clone()),
+    ));
     out.persist_tool_results
         .push(persist_value_for_ledger_tool_result(
             tc,
@@ -270,6 +287,7 @@ pub async fn deliver_tool_calls_through_edge_ledger(
             match wait_approval_ledger_for_tool(ledger, user_id, tc, ledger_wait).await {
                 Ok(()) => {}
                 Err(part) => {
+                    out.sse_maps.extend(part.sse_maps);
                     out.tool_messages.extend(part.tool_messages);
                     out.persist_tool_results.extend(part.persist_tool_results);
                     continue;
@@ -279,6 +297,7 @@ pub async fn deliver_tool_calls_through_edge_ledger(
 
         out.sse_maps.extend(sse_maps_through_tool_request(tc));
         let tail = wait_tool_result_ledger_for_tool(ledger, user_id, tc, ledger_wait).await;
+        out.sse_maps.extend(tail.sse_maps);
         out.tool_messages.extend(tail.tool_messages);
         out.persist_tool_results.extend(tail.persist_tool_results);
     }
@@ -330,6 +349,7 @@ pub async fn deliver_tool_calls_concurrent(
         match wait_approval_ledger_for_tool(ledger, user_id, tc, ledger_wait).await {
             Ok(()) => {}
             Err(part) => {
+                out.sse_maps.extend(part.sse_maps);
                 out.tool_messages.extend(part.tool_messages);
                 out.persist_tool_results.extend(part.persist_tool_results);
                 continue;
@@ -337,6 +357,7 @@ pub async fn deliver_tool_calls_concurrent(
         }
         out.sse_maps.extend(sse_maps_through_tool_request(tc));
         let tail = wait_tool_result_ledger_for_tool(ledger, user_id, tc, ledger_wait).await;
+        out.sse_maps.extend(tail.sse_maps);
         out.tool_messages.extend(tail.tool_messages);
         out.persist_tool_results.extend(tail.persist_tool_results);
     }
@@ -358,7 +379,12 @@ pub async fn deliver_tool_calls_concurrent(
                     }
                 })
                 .collect();
-        for tail in futures_util::future::join_all(futs).await {
+        for tail in futures_util::stream::iter(futs)
+            .buffer_unordered(read_only.len())
+            .collect::<Vec<_>>()
+            .await
+        {
+            out.sse_maps.extend(tail.sse_maps);
             out.tool_messages.extend(tail.tool_messages);
             out.persist_tool_results.extend(tail.persist_tool_results);
         }
@@ -429,7 +455,7 @@ mod tests {
         });
         let d = deliver_tool_calls_through_edge_ledger(&ledger, uid, &[tc], Duration::from_secs(2))
             .await;
-        assert_eq!(d.sse_maps.len(), 2);
+        assert_eq!(d.sse_maps.len(), 3);
         assert_eq!(
             d.sse_maps[0].get("type").and_then(Value::as_str),
             Some("tool_call")
@@ -437,6 +463,10 @@ mod tests {
         assert_eq!(
             d.sse_maps[1].get("type").and_then(Value::as_str),
             Some("tool_request")
+        );
+        assert_eq!(
+            d.sse_maps[2].get("type").and_then(Value::as_str),
+            Some("tool_call_end")
         );
         assert_eq!(d.tool_messages.len(), 1);
         assert!(
@@ -482,7 +512,11 @@ mod tests {
             d.sse_maps[0].get("path").and_then(Value::as_str),
             Some("b.rs")
         );
-        assert_eq!(d.sse_maps.len(), 3);
+        assert_eq!(d.sse_maps.len(), 4);
+        assert_eq!(
+            d.sse_maps[3].get("type").and_then(Value::as_str),
+            Some("tool_call_end")
+        );
         assert!(
             d.tool_messages[0]["content"]
                 .as_str()
@@ -513,7 +547,11 @@ mod tests {
         });
         let d = deliver_tool_calls_through_edge_ledger(&ledger, uid, &[tc], Duration::from_secs(2))
             .await;
-        assert_eq!(d.sse_maps.len(), 1);
+        assert_eq!(d.sse_maps.len(), 2);
+        assert_eq!(
+            d.sse_maps[1].get("type").and_then(Value::as_str),
+            Some("tool_call_end")
+        );
         let body = d.tool_messages[0]["content"].as_str().unwrap();
         assert!(body.contains("user_denied"));
         assert!(body.contains("policy"));
@@ -567,10 +605,9 @@ mod tests {
 
         let d = deliver_tool_calls_concurrent(&ledger, uid, &tcs, Duration::from_secs(2)).await;
 
-        // SSE events: approval_required + tool_call + tool_request (write) + 2×(tool_call + tool_request) (reads)
-        // write: approval_required, tool_call, tool_request = 3
-        // read×2: tool_call, tool_request each = 4
-        assert_eq!(d.sse_maps.len(), 7, "sse_maps: {:#?}", d.sse_maps);
+        // SSE events: approval_required + tool_call + tool_request + tool_call_end (write)
+        // + 2×(tool_call + tool_request + tool_call_end) (reads)
+        assert_eq!(d.sse_maps.len(), 10, "sse_maps: {:#?}", d.sse_maps);
         assert_eq!(
             d.sse_maps[0].get("type").and_then(Value::as_str),
             Some("approval_required"),
@@ -630,25 +667,14 @@ mod tests {
         let elapsed = started.elapsed();
 
         assert_eq!(d.tool_messages.len(), 3);
-        // Results are in original tool_call order (r1, r2, r3) regardless of arrival order
-        assert!(
-            d.tool_messages[0]["content"]
-                .as_str()
-                .unwrap()
-                .contains("c1")
-        );
-        assert!(
-            d.tool_messages[1]["content"]
-                .as_str()
-                .unwrap()
-                .contains("c2")
-        );
-        assert!(
-            d.tool_messages[2]["content"]
-                .as_str()
-                .unwrap()
-                .contains("c3")
-        );
+        let contents: Vec<&str> = d
+            .tool_messages
+            .iter()
+            .map(|m| m["content"].as_str().unwrap())
+            .collect();
+        assert!(contents.iter().any(|c| c.contains("c1")));
+        assert!(contents.iter().any(|c| c.contains("c2")));
+        assert!(contents.iter().any(|c| c.contains("c3")));
 
         // If sequential, would take ~30ms (10+10+10). Concurrent should be ~30ms too
         // since they're staggered, but the key point is all 3 complete.

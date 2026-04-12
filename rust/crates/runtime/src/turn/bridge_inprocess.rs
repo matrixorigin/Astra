@@ -159,8 +159,8 @@ fn apply_forward_llm_sse_event(
             }
             Ok(vec![])
         }
-        "text_delta" | "reasoning_delta" | "reasoning_done" | "tool_call_start" | "usage" | "error"
-        | "error_message" => Ok(vec![render_sse(event)]),
+        "text_delta" | "reasoning_delta" | "reasoning_done" | "tool_call_start" | "usage"
+        | "error" | "error_message" => Ok(vec![render_sse(event)]),
         "warning" => Ok(vec![render_sse(event)]),
         _ => Ok(vec![]),
     }
@@ -2012,22 +2012,28 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                         path.as_deref(),
                         detail.as_deref(),
                     ));
-                    match wait_approval_ledger_for_tool(
-                        &edge_callback_ledger, &user_id, tc, ledger_wait,
-                    ).await {
-                        Ok(()) => {}
-                        Err(part) => {
-                            merged_tool_results.extend(part.persist_tool_results);
-                            llm_messages.extend(part.tool_messages);
-                            continue;
+                        match wait_approval_ledger_for_tool(
+                            &edge_callback_ledger, &user_id, tc, ledger_wait,
+                        ).await {
+                            Ok(()) => {}
+                            Err(part) => {
+                                for m in part.sse_maps {
+                                    yield render_sse_map(&m);
+                                }
+                                merged_tool_results.extend(part.persist_tool_results);
+                                llm_messages.extend(part.tool_messages);
+                                continue;
+                            }
                         }
-                    }
                     for m in sse_maps_through_tool_request(tc) {
                         yield render_sse_map(&m);
                     }
                     let tail = wait_tool_result_ledger_for_tool(
                         &edge_callback_ledger, &user_id, tc, ledger_wait,
                     ).await;
+                    for m in tail.sse_maps {
+                        yield render_sse_map(&m);
+                    }
                     merged_tool_results.extend(tail.persist_tool_results);
                     llm_messages.extend(tail.tool_messages);
                 }
@@ -2052,6 +2058,9 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                     })).buffer_unordered(MAX_CONCURRENT_READ_ONLY_TOOLS);
                     tokio::pin!(tool_stream);
                     while let Some(tail) = tool_stream.next().await {
+                        for m in tail.sse_maps {
+                            yield render_sse_map(&m);
+                        }
                         merged_tool_results.extend(tail.persist_tool_results);
                         llm_messages.extend(tail.tool_messages);
                     }

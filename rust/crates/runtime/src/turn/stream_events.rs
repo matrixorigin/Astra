@@ -204,6 +204,17 @@ pub fn build_tool_request_event(tool_call: &Map<String, Value>) -> Map<String, V
     ])
 }
 
+pub fn build_tool_call_end_event(call_id: &str, result: Value) -> Map<String, Value> {
+    Map::from_iter([
+        (
+            "type".to_string(),
+            Value::String("tool_call_end".to_string()),
+        ),
+        ("call_id".to_string(), Value::String(call_id.to_string())),
+        ("result".to_string(), result),
+    ])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -243,6 +254,17 @@ mod tests {
             Some("call_abc")
         );
         assert_eq!(ev.get("tool").and_then(Value::as_str), Some("bash"));
+    }
+
+    #[test]
+    fn tool_call_end_event_preserves_call_id_and_result() {
+        let ev = build_tool_call_end_event("call_abc", Value::String("ok".to_string()));
+        assert_eq!(
+            ev.get("type").and_then(Value::as_str),
+            Some("tool_call_end")
+        );
+        assert_eq!(ev.get("call_id").and_then(Value::as_str), Some("call_abc"));
+        assert_eq!(ev.get("result").and_then(Value::as_str), Some("ok"));
     }
 
     // --- edge cases ---
