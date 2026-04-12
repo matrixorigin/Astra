@@ -272,8 +272,11 @@ pub fn read_composite_snapshot_index(
         return Ok(astra_core::composite_snapshot::CompositeSnapshotIndex::default());
     }
     let content = std::fs::read_to_string(&path)?;
-    serde_json::from_str(&content)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    let mut index: astra_core::composite_snapshot::CompositeSnapshotIndex =
+        serde_json::from_str(&content)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    index.normalize_versions();
+    Ok(index)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

@@ -510,7 +510,11 @@ fn read_composite_snapshot_index_local(
     }
     let content = std::fs::read_to_string(&path)
         .map_err(|e| format!("read composite_snapshots.json: {e}"))?;
-    serde_json::from_str(&content).map_err(|e| format!("parse composite_snapshots.json: {e}"))
+    let mut index: astra_core::composite_snapshot::CompositeSnapshotIndex =
+        serde_json::from_str(&content)
+            .map_err(|e| format!("parse composite_snapshots.json: {e}"))?;
+    index.normalize_versions();
+    Ok(index)
 }
 
 fn composite_snapshots_json_path(session_id: &str) -> PathBuf {

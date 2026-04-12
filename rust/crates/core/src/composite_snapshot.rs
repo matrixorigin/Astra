@@ -35,7 +35,7 @@ use std::pin::Pin;
 /// Each variant carries just enough information to **locate** the state —
 /// never the state itself. This keeps the snapshot index lightweight while
 /// enabling full rollback/fork/tuning across all dimensions.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "ref")]
 pub enum SnapshotRef {
     /// Session execution state (heavy checkpoint on local disk).
@@ -62,7 +62,7 @@ pub enum SnapshotRef {
 /// The business layer decides *which* databases/tables to snapshot and fills this
 /// in. The runtime treats it as an opaque locator — only the data layer
 /// (MatrixOne adapter) knows how to `RESTORE ... FROM SNAPSHOT`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DataSnapshotRef {
     /// Snapshot name (for `RESTORE ... FROM SNAPSHOT 'name'`).
     pub snapshot_name: String,
@@ -78,7 +78,7 @@ pub struct DataSnapshotRef {
 }
 
 /// Reference to a persisted learning/memory snapshot.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemorySnapshotRef {
     /// Profile name owning this snapshot.
     pub profile: String,
@@ -97,7 +97,130 @@ pub struct MemorySnapshotRef {
 /// - A tuning experiment anchor adds `DataSnapshot + GitCommit`.
 ///
 /// Rollback/fork/resume can select which components to restore.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotDimension {
+    SessionState,
+    Data,
+    Memory,
+    Git,
+    Workspace,
+}
+
+fn ordered_dimensions() -> [SnapshotDimension; 5] {
+    [
+        SnapshotDimension::SessionState,
+        SnapshotDimension::Data,
+        SnapshotDimension::Memory,
+        SnapshotDimension::Git,
+        SnapshotDimension::Workspace,
+    ]
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompositeSnapshotIdentity {
+    pub snapshot_id: String,
+    pub session_id: String,
+    pub turn: u32,
+    pub created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub version: u64,
+}
+
+impl From<&CompositeSnapshot> for CompositeSnapshotIdentity {
+    fn from(snapshot: &CompositeSnapshot) -> Self {
+        Self {
+            snapshot_id: snapshot.snapshot_id.clone(),
+            session_id: snapshot.session_id.clone(),
+            turn: snapshot.turn,
+            created_at: snapshot.created_at.clone(),
+            label: snapshot.label.clone(),
+            version: snapshot.version,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotRefChange {
+    pub dimension: SnapshotDimension,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before: Option<SnapshotRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<SnapshotRef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompositeSnapshotDiff {
+    pub from: CompositeSnapshotIdentity,
+    pub to: CompositeSnapshotIdentity,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ref_changes: Vec<SnapshotRefChange>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompositeSnapshotError {
+    SessionMismatch {
+        expected: String,
+        found: String,
+    },
+    VersionConflict {
+        expected: u64,
+        found: u64,
+    },
+    ApplySourceMismatch {
+        expected_snapshot_id: String,
+        found_snapshot_id: String,
+    },
+    MergeConflict {
+        dimension: SnapshotDimension,
+        left: SnapshotRef,
+        right: SnapshotRef,
+    },
+}
+
+impl std::fmt::Display for CompositeSnapshotError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SessionMismatch { expected, found } => {
+                write!(
+                    f,
+                    "snapshot session mismatch: expected {expected}, found {found}"
+                )
+            }
+            Self::VersionConflict { expected, found } => {
+                write!(
+                    f,
+                    "snapshot version conflict: expected next version {expected}, found {found}"
+                )
+            }
+            Self::ApplySourceMismatch {
+                expected_snapshot_id,
+                found_snapshot_id,
+            } => write!(
+                f,
+                "snapshot diff source mismatch: expected {expected_snapshot_id}, found {found_snapshot_id}"
+            ),
+            Self::MergeConflict { dimension, .. } => {
+                write!(f, "snapshot merge conflict on {dimension:?}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for CompositeSnapshotError {}
+
+pub trait StateDiff: Sized {
+    type Diff;
+    type Error;
+
+    fn diff(&self, target: &Self) -> Self::Diff;
+    fn apply(&self, diff: &Self::Diff) -> Result<Self, Self::Error>;
+    fn merge(&self, other: &Self) -> Result<Self, Self::Error>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompositeSnapshot {
     /// Unique identifier.
     pub snapshot_id: String,
@@ -107,6 +230,9 @@ pub struct CompositeSnapshot {
     pub turn: u32,
     /// ISO 8601 creation timestamp.
     pub created_at: String,
+    /// Monotonic per-session version assigned when written to a snapshot index.
+    #[serde(default)]
+    pub version: u64,
     /// Human-readable label.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
@@ -140,6 +266,32 @@ impl CompositeSnapshot {
         self.refs.iter().find_map(|r| match r {
             SnapshotRef::GitCommit(sha) => Some(sha.as_str()),
             _ => None,
+        })
+    }
+
+    pub fn workspace_state(&self) -> Option<&str> {
+        self.refs.iter().find_map(|r| match r {
+            SnapshotRef::WorkspaceState(session_id) => Some(session_id.as_str()),
+            _ => None,
+        })
+    }
+
+    pub fn identity(&self) -> CompositeSnapshotIdentity {
+        CompositeSnapshotIdentity::from(self)
+    }
+
+    pub fn ref_for_dimension(&self, dimension: SnapshotDimension) -> Option<&SnapshotRef> {
+        self.refs.iter().find(|reference| {
+            matches!(
+                (dimension, reference),
+                (
+                    SnapshotDimension::SessionState,
+                    SnapshotRef::SessionState(_)
+                ) | (SnapshotDimension::Data, SnapshotRef::DataSnapshot(_))
+                    | (SnapshotDimension::Memory, SnapshotRef::MemorySnapshot(_))
+                    | (SnapshotDimension::Git, SnapshotRef::GitCommit(_))
+                    | (SnapshotDimension::Workspace, SnapshotRef::WorkspaceState(_))
+            )
         })
     }
 
@@ -183,10 +335,177 @@ impl CompositeSnapshot {
     }
 }
 
+impl StateDiff for CompositeSnapshot {
+    type Diff = CompositeSnapshotDiff;
+    type Error = CompositeSnapshotError;
+
+    fn diff(&self, target: &Self) -> Self::Diff {
+        let ref_changes = ordered_dimensions()
+            .into_iter()
+            .filter_map(|dimension| {
+                let before = self.ref_for_dimension(dimension).cloned();
+                let after = target.ref_for_dimension(dimension).cloned();
+                (before != after).then_some(SnapshotRefChange {
+                    dimension,
+                    before,
+                    after,
+                })
+            })
+            .collect();
+        CompositeSnapshotDiff {
+            from: self.identity(),
+            to: target.identity(),
+            ref_changes,
+        }
+    }
+
+    fn apply(&self, diff: &Self::Diff) -> Result<Self, Self::Error> {
+        if self.snapshot_id != diff.from.snapshot_id {
+            return Err(CompositeSnapshotError::ApplySourceMismatch {
+                expected_snapshot_id: diff.from.snapshot_id.clone(),
+                found_snapshot_id: self.snapshot_id.clone(),
+            });
+        }
+        if self.session_id != diff.from.session_id || self.session_id != diff.to.session_id {
+            return Err(CompositeSnapshotError::SessionMismatch {
+                expected: diff.from.session_id.clone(),
+                found: self.session_id.clone(),
+            });
+        }
+
+        let refs = ordered_dimensions()
+            .into_iter()
+            .filter_map(|dimension| {
+                diff.ref_changes
+                    .iter()
+                    .find(|change| change.dimension == dimension)
+                    .map(|change| change.after.clone())
+                    .unwrap_or_else(|| self.ref_for_dimension(dimension).cloned())
+            })
+            .collect();
+
+        Ok(CompositeSnapshot {
+            snapshot_id: diff.to.snapshot_id.clone(),
+            session_id: diff.to.session_id.clone(),
+            turn: diff.to.turn,
+            created_at: diff.to.created_at.clone(),
+            version: diff.to.version,
+            label: diff.to.label.clone(),
+            refs,
+        })
+    }
+
+    fn merge(&self, other: &Self) -> Result<Self, Self::Error> {
+        if self.session_id != other.session_id {
+            return Err(CompositeSnapshotError::SessionMismatch {
+                expected: self.session_id.clone(),
+                found: other.session_id.clone(),
+            });
+        }
+
+        let mut refs = Vec::new();
+        for dimension in ordered_dimensions() {
+            match (
+                self.ref_for_dimension(dimension).cloned(),
+                other.ref_for_dimension(dimension).cloned(),
+            ) {
+                (Some(left), Some(right)) if left != right => {
+                    return Err(CompositeSnapshotError::MergeConflict {
+                        dimension,
+                        left,
+                        right,
+                    });
+                }
+                (Some(reference), _) | (_, Some(reference)) => refs.push(reference),
+                (None, None) => {}
+            }
+        }
+
+        let label = match (&self.label, &other.label) {
+            (Some(left), Some(right)) if left == right => Some(left.clone()),
+            (Some(left), Some(right)) => Some(format!("merge:{left}|{right}")),
+            (Some(label), None) | (None, Some(label)) => Some(label.clone()),
+            (None, None) => None,
+        };
+
+        Ok(CompositeSnapshot {
+            snapshot_id: format!(
+                "merge-{}-{}",
+                &self.snapshot_id[..8.min(self.snapshot_id.len())],
+                &other.snapshot_id[..8.min(other.snapshot_id.len())]
+            ),
+            session_id: self.session_id.clone(),
+            turn: self.turn.max(other.turn),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            version: self.version.max(other.version).saturating_add(1),
+            label,
+            refs,
+        })
+    }
+}
+
 /// Index of composite snapshots for a session.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompositeSnapshotIndex {
     pub snapshots: Vec<CompositeSnapshot>,
+}
+
+impl CompositeSnapshotIndex {
+    pub fn normalize_versions(&mut self) {
+        let mut next_version = 1;
+        for snapshot in &mut self.snapshots {
+            if snapshot.version == 0 {
+                snapshot.version = next_version;
+            }
+            next_version = snapshot.version.saturating_add(1);
+        }
+    }
+
+    pub fn current_version(&self) -> u64 {
+        self.snapshots
+            .iter()
+            .enumerate()
+            .map(|(index, snapshot)| {
+                if snapshot.version == 0 {
+                    index as u64 + 1
+                } else {
+                    snapshot.version
+                }
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    pub fn append(
+        &mut self,
+        snapshot: &mut CompositeSnapshot,
+    ) -> Result<(), CompositeSnapshotError> {
+        self.normalize_versions();
+        if let Some(existing_session_id) =
+            self.snapshots.first().map(|existing| &existing.session_id)
+            && existing_session_id != &snapshot.session_id
+        {
+            return Err(CompositeSnapshotError::SessionMismatch {
+                expected: existing_session_id.clone(),
+                found: snapshot.session_id.clone(),
+            });
+        }
+
+        let expected_version = self.current_version().saturating_add(1);
+        match snapshot.version {
+            0 => snapshot.version = expected_version,
+            found if found == expected_version => {}
+            found => {
+                return Err(CompositeSnapshotError::VersionConflict {
+                    expected: expected_version,
+                    found,
+                });
+            }
+        }
+
+        self.snapshots.push(snapshot.clone());
+        Ok(())
+    }
 }
 
 /// Specification of which state dimensions to include when creating a composite snapshot.
@@ -240,6 +559,7 @@ impl SnapshotSpec {
             session_id,
             turn,
             created_at,
+            version: 0,
             label,
             refs,
         }
@@ -451,6 +771,7 @@ impl CompositeSnapshotBuilder {
             session_id: self.session_id,
             turn: self.turn,
             created_at,
+            version: 0,
             label: self.label,
             refs: self.refs,
         }
@@ -538,6 +859,7 @@ mod tests {
 
         assert_eq!(snap.session_id, "session-123");
         assert_eq!(snap.turn, 5);
+        assert_eq!(snap.version, 0);
         assert_eq!(snap.label.as_deref(), Some("test-snapshot"));
         assert_eq!(snap.refs.len(), 5);
 
@@ -594,6 +916,7 @@ mod tests {
         assert_eq!(snap.snapshot_id, "id1");
         assert_eq!(snap.session_id, "sess1");
         assert_eq!(snap.turn, 3);
+        assert_eq!(snap.version, 0);
         assert_eq!(snap.refs.len(), 3); // session + data + git
         assert!(snap.has_session_state());
         assert_eq!(snap.session_state(), Some("000003-heavy.json"));
@@ -658,6 +981,7 @@ mod tests {
         assert_eq!(deser.snapshot_id, snap.snapshot_id);
         assert_eq!(deser.session_id, "s1");
         assert_eq!(deser.turn, 2);
+        assert_eq!(deser.version, 0);
         assert_eq!(deser.refs.len(), 4);
         assert!(deser.has_session_state());
         assert!(deser.has_data_snapshot());
@@ -687,6 +1011,100 @@ mod tests {
         let deser: CompositeSnapshotIndex = serde_json::from_str(&json).unwrap();
         assert_eq!(deser.snapshots.len(), 2);
         assert_eq!(deser.snapshots[1].refs.len(), 2);
+    }
+
+    #[test]
+    fn index_append_assigns_monotonic_versions() {
+        let mut index = CompositeSnapshotIndex {
+            snapshots: vec![
+                CompositeSnapshotBuilder::new("s1", 1)
+                    .session_state("a")
+                    .build(),
+                CompositeSnapshotBuilder::new("s1", 2)
+                    .session_state("b")
+                    .build(),
+            ],
+        };
+        let mut next = CompositeSnapshotBuilder::new("s1", 3)
+            .session_state("c")
+            .build();
+
+        index.append(&mut next).unwrap();
+
+        assert_eq!(index.snapshots[0].version, 1);
+        assert_eq!(index.snapshots[1].version, 2);
+        assert_eq!(next.version, 3);
+        assert_eq!(index.snapshots[2].version, 3);
+    }
+
+    #[test]
+    fn diff_and_apply_recreate_target_snapshot() {
+        let mut base = CompositeSnapshotBuilder::new("s1", 1)
+            .session_state("000001-heavy.json")
+            .workspace_state("s1")
+            .build();
+        base.snapshot_id = "snap-a".into();
+        base.created_at = "2026-04-12T00:00:00Z".into();
+        base.version = 1;
+
+        let mut target = CompositeSnapshotBuilder::new("s1", 2)
+            .session_state("000002-heavy.json")
+            .git_commit("deadbeef")
+            .workspace_state("s1")
+            .build();
+        target.snapshot_id = "snap-b".into();
+        target.created_at = "2026-04-12T00:01:00Z".into();
+        target.label = Some("next".into());
+        target.version = 2;
+
+        let diff = base.diff(&target);
+        assert_eq!(diff.ref_changes.len(), 2);
+
+        let applied = base.apply(&diff).unwrap();
+        assert_eq!(applied, target);
+    }
+
+    #[test]
+    fn merge_combines_non_conflicting_dimensions() {
+        let mut left = CompositeSnapshotBuilder::new("s1", 1)
+            .session_state("000001-heavy.json")
+            .build();
+        left.snapshot_id = "left".into();
+        left.version = 2;
+
+        let mut right = CompositeSnapshotBuilder::new("s1", 3)
+            .git_commit("deadbeef")
+            .workspace_state("s1")
+            .build();
+        right.snapshot_id = "right".into();
+        right.version = 4;
+
+        let merged = left.merge(&right).unwrap();
+        assert_eq!(merged.session_state(), Some("000001-heavy.json"));
+        assert_eq!(merged.git_commit(), Some("deadbeef"));
+        assert_eq!(merged.workspace_state(), Some("s1"));
+        assert_eq!(merged.version, 5);
+    }
+
+    #[test]
+    fn merge_rejects_conflicting_dimensions() {
+        let mut left = CompositeSnapshotBuilder::new("s1", 1)
+            .git_commit("abc")
+            .build();
+        left.snapshot_id = "left".into();
+        let mut right = CompositeSnapshotBuilder::new("s1", 1)
+            .git_commit("def")
+            .build();
+        right.snapshot_id = "right".into();
+
+        let err = left.merge(&right).unwrap_err();
+        assert!(matches!(
+            err,
+            CompositeSnapshotError::MergeConflict {
+                dimension: SnapshotDimension::Git,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]

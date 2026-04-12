@@ -2008,14 +2008,16 @@ fn persist_manual_heavy_and_composite(
     let heavy_path = write_step_checkpoint(sid, next_step, step_cp)
         .map_err(|e| format!("write heavy step checkpoint: {e}"))?;
 
-    let snapshot =
+    let mut snapshot =
         astra_core::composite_snapshot::CompositeSnapshotBuilder::new(sid.to_string(), turn)
             .label(format!("manual:{title}"))
             .session_state(format!("{next_step:06}-heavy.json"))
             .workspace_state(sid.to_string())
             .build();
     let mut index = read_composite_snapshot_index(sid).unwrap_or_default();
-    index.snapshots.push(snapshot);
+    index
+        .append(&mut snapshot)
+        .map_err(|e| format!("append snapshot version: {e}"))?;
     if let Err(e) = write_composite_snapshot_index(sid, &index) {
         return Err(format!(
             "write composite snapshot index: {e} (heavy file already at {})",

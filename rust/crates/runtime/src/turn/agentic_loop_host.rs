@@ -1910,14 +1910,18 @@ fn try_write_heavy_checkpoint(state: &mut AgenticLoopState) {
     }
 
     let turn = (state.max_turns - state.remaining_turns) as u32;
-    let snapshot = astra_core::composite_snapshot::CompositeSnapshotBuilder::new(sid.clone(), turn)
-        .label(format!("checkpoint-t{turn}"))
-        .session_state(format!("{:06}-heavy.json", ckpt_num))
-        .workspace_state(sid.clone())
-        .build();
+    let mut snapshot =
+        astra_core::composite_snapshot::CompositeSnapshotBuilder::new(sid.clone(), turn)
+            .label(format!("checkpoint-t{turn}"))
+            .session_state(format!("{:06}-heavy.json", ckpt_num))
+            .workspace_state(sid.clone())
+            .build();
 
     let mut index = step_checkpoint::read_composite_snapshot_index(sid).unwrap_or_default();
-    index.snapshots.push(snapshot.clone());
+    if let Err(e) = index.append(&mut snapshot) {
+        astra_core::agent_warn!("checkpoint", "Failed to append snapshot version: {e}");
+        return;
+    }
     if let Err(e) = step_checkpoint::write_composite_snapshot_index(sid, &index) {
         astra_core::agent_warn!("checkpoint", "Failed to write snapshot index: {e}");
     }
@@ -1989,10 +1993,16 @@ async fn build_full_composite_snapshot(
         }
     }
 
-    let snapshot = builder.build();
+    let mut snapshot = builder.build();
 
     let mut index = step_checkpoint::read_composite_snapshot_index(sid).unwrap_or_default();
-    index.snapshots.push(snapshot.clone());
+    if let Err(e) = index.append(&mut snapshot) {
+        astra_core::agent_warn!(
+            "checkpoint",
+            "Failed to append composite snapshot version: {e}"
+        );
+        return Some(snapshot);
+    }
     if let Err(e) = step_checkpoint::write_composite_snapshot_index(sid, &index) {
         astra_core::agent_warn!(
             "checkpoint",
@@ -4052,7 +4062,9 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                 let tc_entries: Vec<Value> = delegate_tool_calls
                     .iter()
                     .map(|tc| {
-                        let id = tc.get("id").and_then(Value::as_str)
+                        let id = tc
+                            .get("id")
+                            .and_then(Value::as_str)
                             .filter(|s| !s.is_empty())
                             .map(|s| s.to_string())
                             .unwrap_or_else(|| uuid::Uuid::now_v7().to_string());

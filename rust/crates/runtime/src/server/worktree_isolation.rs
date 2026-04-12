@@ -241,6 +241,7 @@ impl WorktreeManager {
                 session_id: delegation_id.to_string(),
                 turn: 0,
                 created_at: chrono::Utc::now().to_rfc3339(),
+                version: 0,
                 label: Some(format!("worktree fork for {agent_id}")),
                 refs: vec![SnapshotRef::GitCommit(base_commit.clone())],
             };
@@ -420,6 +421,7 @@ impl WorktreeManager {
                         session_id: delegation_id.to_string(),
                         turn: 0,
                         created_at: chrono::Utc::now().to_rfc3339(),
+                        version: 0,
                         label: Some(format!("merge conflict for {agent_id}")),
                         refs: vec![SnapshotRef::GitCommit(pre_merge_head_ref)],
                     };
