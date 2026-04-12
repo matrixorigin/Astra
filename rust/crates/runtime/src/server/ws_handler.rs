@@ -949,12 +949,13 @@ enum WsSendFailure {
 }
 
 fn next_run_stream_index(event: &Value, current: u32) -> u32 {
-    event
+    let next = event
         .get("index")
         .and_then(Value::as_u64)
         .and_then(|index| u32::try_from(index).ok())
         .map(|index| index.saturating_add(1))
-        .unwrap_or_else(|| current.saturating_add(1))
+        .unwrap_or_else(|| current.saturating_add(1));
+    current.max(next)
 }
 
 fn lifecycle_events_to_ws_payloads(
@@ -3714,6 +3715,19 @@ mod tests {
 
         assert!(!ws_text_frame_exceeds_limit(&within_limit));
         assert!(ws_text_frame_exceeds_limit(&over_limit));
+    }
+
+    #[test]
+    fn next_run_stream_index_never_regresses_on_out_of_order_indices() {
+        let mut current = 0;
+        current = next_run_stream_index(&serde_json::json!({ "index": 10 }), current);
+        assert_eq!(current, 11);
+
+        // Out-of-order or duplicated events should not move the cursor backwards.
+        current = next_run_stream_index(&serde_json::json!({ "index": 5 }), current);
+        assert_eq!(current, 11);
+        current = next_run_stream_index(&serde_json::json!({ "index": 10 }), current);
+        assert_eq!(current, 11);
     }
 
     #[test]
