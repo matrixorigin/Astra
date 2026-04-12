@@ -1,3 +1,4 @@
+use super::bridge_prep::normalize_chat_turn_session_error;
 use super::*;
 use super::run_handlers::transform_stream_run_events_for_client;
 
@@ -12,15 +13,84 @@ fn safe_header_value(value: &str) -> Result<HeaderValue, Response> {
     })
 }
 
+pub(super) async fn resolve_or_create_chat_session_id(
+    state: &AppState,
+    user: &AuthUserRecord,
+    requested_session_id: Option<String>,
+    agent_id: Option<String>,
+    session_id_is_trusted: bool,
+) -> Result<Option<String>, (StatusCode, Json<ErrorResponse>)> {
+    match requested_session_id {
+        Some(session_id) => {
+            if session_id.trim().is_empty() {
+                return Err(error_response(
+                    StatusCode::BAD_REQUEST,
+                    "session_id must not be empty",
+                ));
+            }
+
+            match state
+                .session_service
+                .get_session(session_id.clone(), user.user_id.clone())
+                .await
+            {
+                Ok(_) => Ok(Some(session_id)),
+                Err(error) if is_session_service_unconfigured_error(&error) => {
+                    Ok(session_id_is_trusted.then_some(session_id))
+                }
+                Err(error) => Err(normalize_chat_turn_session_error(error)),
+            }
+        }
+        None => {
+            let metadata = agent_id.as_ref().map(|agent_id| {
+                serde_json::Map::from_iter([(
+                    "agent_id".to_string(),
+                    serde_json::Value::String(agent_id.clone()),
+                )])
+            });
+
+            match state
+                .session_service
+                .create_session(
+                    user.user_id.clone(),
+                    SessionCreateRequestData {
+                        agent_id,
+                        title: None,
+                        metadata,
+                    },
+                )
+                .await
+            {
+                Ok(session) => Ok(Some(session.session_id)),
+                Err(error) if is_session_service_unconfigured_error(&error) => Ok(None),
+                Err(error) => Err(error),
+            }
+        }
+    }
+}
+
+fn is_session_service_unconfigured_error(error: &(StatusCode, Json<ErrorResponse>)) -> bool {
+    error.0 == StatusCode::NOT_IMPLEMENTED && error.1.0.detail == "Session service not configured"
+}
+
 pub(super) async fn chat_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(request): Json<ChatRequest>,
 ) -> Result<Json<ChatResponse>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
+    let mut chat_data = chat_request_into_data(request);
+    chat_data.session_id = resolve_or_create_chat_session_id(
+        &state,
+        &user,
+        chat_data.session_id.take(),
+        chat_data.agent_id.clone(),
+        false,
+    )
+    .await?;
     let run = state
         .run_lifecycle_service
-        .create_run(user.user_id, chat_request_into_data(request))
+        .create_run(user.user_id, chat_data)
         .await?;
     Ok(Json(ChatResponse::from(run)))
 }
@@ -35,7 +105,19 @@ pub(super) async fn chat_stream_handler(
         Err((status, error)) => return sse_error_response(status, error.0.detail),
     };
 
-    let chat_data = chat_request_into_data(request);
+    let mut chat_data = chat_request_into_data(request);
+    chat_data.session_id = match resolve_or_create_chat_session_id(
+        &state,
+        &user,
+        chat_data.session_id.take(),
+        chat_data.agent_id.clone(),
+        false,
+    )
+    .await
+    {
+        Ok(session_id) => session_id,
+        Err((status, error)) => return sse_error_response(status, error.0.detail),
+    };
     match state
         .run_lifecycle_service
         .stream_chat(user.user_id.clone(), chat_data.clone())
@@ -354,6 +436,253 @@ mod tests {
         //   execution-state-b64)
         // Total possible: 14
         assert_eq!(4 + 1 + 9, 14);
+    }
+}
+
+#[cfg(test)]
+mod session_resolution_tests {
+    use std::sync::Arc;
+
+    use astra_core::error_response;
+    use async_trait::async_trait;
+    use tokio::sync::Mutex;
+
+    use crate::{
+        AppState, AuthUserRecord, ErrorResponse, HealthChecker, ServiceInfo, SessionActivityRecord,
+        SessionCreateRequestData, SessionListFilter, SessionListRecord, SessionRecord,
+        SessionService, SessionUpdateRequestData,
+    };
+
+    use super::*;
+
+    #[derive(Clone)]
+    struct StubHealthChecker;
+
+    #[async_trait]
+    impl HealthChecker for StubHealthChecker {
+        async fn database_healthy(&self) -> bool {
+            true
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct RecordingSessionService {
+        created: Arc<Mutex<Vec<(String, SessionCreateRequestData)>>>,
+        missing_sessions: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl RecordingSessionService {
+        async fn mark_missing(&self, session_id: &str) {
+            self.missing_sessions
+                .lock()
+                .await
+                .push(session_id.to_string());
+        }
+
+        async fn created_requests(&self) -> Vec<(String, SessionCreateRequestData)> {
+            self.created.lock().await.clone()
+        }
+    }
+
+    #[async_trait]
+    impl SessionService for RecordingSessionService {
+        async fn create_session(
+            &self,
+            user_id: String,
+            request: SessionCreateRequestData,
+        ) -> Result<SessionRecord, (StatusCode, Json<ErrorResponse>)> {
+            self.created
+                .lock()
+                .await
+                .push((user_id.clone(), request.clone()));
+            Ok(SessionRecord {
+                session_id: "s-created".to_string(),
+                user_id,
+                agent_id: request.agent_id,
+                title: Some("Created".to_string()),
+                metadata: request.metadata.unwrap_or_default(),
+                status: "active".to_string(),
+                event_count: 0,
+                created_at: "2026-01-01T00:00:00".to_string(),
+                updated_at: Some("2026-01-01T00:00:00".to_string()),
+                ended_at: None,
+            })
+        }
+
+        async fn list_sessions(
+            &self,
+            _filter: SessionListFilter,
+        ) -> Result<SessionListRecord, (StatusCode, Json<ErrorResponse>)> {
+            Ok(SessionListRecord {
+                sessions: Vec::new(),
+                total: 0,
+                limit: 20,
+                offset: 0,
+            })
+        }
+
+        async fn get_session(
+            &self,
+            session_id: String,
+            user_id: String,
+        ) -> Result<SessionRecord, (StatusCode, Json<ErrorResponse>)> {
+            if self
+                .missing_sessions
+                .lock()
+                .await
+                .iter()
+                .any(|missing| missing == &session_id)
+            {
+                return Err(error_response(
+                    StatusCode::NOT_FOUND,
+                    "session lookup missed backing record",
+                ));
+            }
+
+            Ok(SessionRecord {
+                session_id,
+                user_id,
+                agent_id: None,
+                title: Some("Existing".to_string()),
+                metadata: serde_json::Map::new(),
+                status: "active".to_string(),
+                event_count: 0,
+                created_at: "2026-01-01T00:00:00".to_string(),
+                updated_at: Some("2026-01-01T00:00:00".to_string()),
+                ended_at: None,
+            })
+        }
+
+        async fn update_session(
+            &self,
+            session_id: String,
+            user_id: String,
+            _request: SessionUpdateRequestData,
+        ) -> Result<SessionRecord, (StatusCode, Json<ErrorResponse>)> {
+            self.get_session(session_id, user_id).await
+        }
+
+        async fn delete_session(
+            &self,
+            _session_id: String,
+            _user_id: String,
+        ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+            Ok(())
+        }
+
+        async fn get_session_activity(
+            &self,
+            _session_id: String,
+            _user_id: String,
+            _limit: u32,
+            _offset: u32,
+        ) -> Result<SessionActivityRecord, (StatusCode, Json<ErrorResponse>)> {
+            Ok(SessionActivityRecord {
+                session_id: String::new(),
+                activities: vec![],
+                total: 0,
+            })
+        }
+    }
+
+    fn test_user() -> AuthUserRecord {
+        AuthUserRecord {
+            user_id: "u1".to_string(),
+            username: "test-user".to_string(),
+            email: "u1@example.test".to_string(),
+            display_name: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_or_create_chat_session_id_creates_session_for_new_lifecycle_turn() {
+        let session_service = RecordingSessionService::default();
+        let state = AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
+            .with_session_service(Arc::new(session_service.clone()));
+
+        let session_id = resolve_or_create_chat_session_id(
+            &state,
+            &test_user(),
+            None,
+            Some("agent-1".to_string()),
+            false,
+        )
+        .await
+        .expect("session resolution should succeed");
+
+        assert_eq!(session_id.as_deref(), Some("s-created"));
+
+        let created = session_service.created_requests().await;
+        assert_eq!(created.len(), 1);
+        assert_eq!(created[0].0, "u1");
+        assert_eq!(created[0].1.agent_id.as_deref(), Some("agent-1"));
+        assert_eq!(
+            created[0]
+                .1
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("agent_id"))
+                .and_then(serde_json::Value::as_str),
+            Some("agent-1")
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_or_create_chat_session_id_rejects_unknown_requested_session() {
+        let session_service = RecordingSessionService::default();
+        session_service.mark_missing("missing-session").await;
+
+        let state = AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
+            .with_session_service(Arc::new(session_service));
+
+        let error = resolve_or_create_chat_session_id(
+            &state,
+            &test_user(),
+            Some("missing-session".to_string()),
+            None,
+            false,
+        )
+        .await
+        .expect_err("missing session should be rejected");
+
+        assert_eq!(error.0, StatusCode::NOT_FOUND);
+        assert_eq!(error.1.0.detail, "Session not found");
+    }
+
+    #[tokio::test]
+    async fn resolve_or_create_chat_session_id_strips_untrusted_session_when_service_unconfigured()
+    {
+        let state = AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker));
+
+        let session_id = resolve_or_create_chat_session_id(
+            &state,
+            &test_user(),
+            Some("client-supplied".to_string()),
+            None,
+            false,
+        )
+        .await
+        .expect("unconfigured service should fall back to server session creation");
+
+        assert_eq!(session_id, None);
+    }
+
+    #[tokio::test]
+    async fn resolve_or_create_chat_session_id_keeps_trusted_bound_session_when_service_unconfigured()
+     {
+        let state = AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker));
+
+        let session_id = resolve_or_create_chat_session_id(
+            &state,
+            &test_user(),
+            Some("bound-session".to_string()),
+            None,
+            true,
+        )
+        .await
+        .expect("trusted server-bound session should survive unconfigured lookup");
+
+        assert_eq!(session_id.as_deref(), Some("bound-session"));
     }
 }
 

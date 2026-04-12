@@ -36,6 +36,7 @@
 //! {"type": "pong"}
 //! ```
 
+use super::chat_handlers::resolve_or_create_chat_session_id;
 use super::*;
 use astra_core::{STATUS_CANCELLED, STATUS_COMPLETED, STATUS_FAILED};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -178,7 +179,11 @@ pub(super) enum WsServerMessage {
 /// Per-connection state for an authenticated WebSocket session.
 struct WsConnection {
     user: AuthUserRecord,
+    /// Trusted session bound by the server after validation or creation.
     session_id: Option<String>,
+    /// Untrusted session requested during the initial handshake. This is only
+    /// used as the next message's requested session until validation happens.
+    pending_session_id: Option<String>,
     /// Active run ID (if any). Used for cancel/approval routing.
     active_run_id: Option<String>,
     /// Prepared bridge-local run ID used before the upstream stream reports a real one.
@@ -192,7 +197,7 @@ struct WsConnection {
 pub(super) struct WsUpgradeQuery {
     /// Optional Bearer token (alternative to sending auth message).
     pub token: Option<String>,
-    /// Optional session ID to bind to immediately.
+    /// Optional session ID to request on the first chat turn.
     pub session_id: Option<String>,
 }
 
@@ -339,7 +344,8 @@ async fn authenticate_with_token(
             .await;
             Ok(WsConnection {
                 user,
-                session_id,
+                session_id: None,
+                pending_session_id: session_id,
                 active_run_id: None,
                 bridge_prepared_run_id: None,
             })
@@ -373,11 +379,8 @@ async fn message_loop(socket: &mut WebSocket, state: &AppState, mut conn: WsConn
                                 model,
                                 context,
                             }) => {
-                                if session_id.is_some() {
-                                    conn.session_id = session_id;
-                                }
                                 handle_chat_message(
-                                    socket, state, &mut conn, &content, model, context,
+                                    socket, state, &mut conn, &content, session_id, model, context,
                                 )
                                 .await;
                             }
@@ -460,16 +463,25 @@ async fn handle_chat_message(
     state: &AppState,
     conn: &mut WsConnection,
     content: &str,
+    requested_session_id: Option<String>,
     model: Option<String>,
     context: Option<serde_json::Map<String, serde_json::Value>>,
 ) {
     use astra_services::runs::ChatRequestData;
 
+    // Keep explicit per-message session routing local to this request until
+    // session resolution succeeds. That avoids poisoning the bound WS
+    // connection state with an empty or unknown session_id on failed requests.
+    let request_session_id_is_trusted =
+        chat_request_session_id_is_trusted(conn, &requested_session_id);
+    let should_clear_pending_session_id =
+        requested_session_id.is_some() || conn.pending_session_id.is_some();
+    let request_session_id = chat_request_session_id(conn, requested_session_id);
     let fallback_model = model.clone();
     let fallback_context = context.clone();
-    let request = ChatRequestData {
+    let mut request = ChatRequestData {
         message: content.to_string(),
-        session_id: conn.session_id.clone(),
+        session_id: request_session_id,
         agent_id: None,
         model,
         skill_search: None,
@@ -477,6 +489,33 @@ async fn handle_chat_message(
         max_candidates: 25,
         explain: false,
     };
+    request.session_id = match resolve_or_create_chat_session_id(
+        state,
+        &conn.user,
+        request.session_id.take(),
+        request.agent_id.clone(),
+        request_session_id_is_trusted,
+    )
+    .await
+    {
+        Ok(session_id) => {
+            if let Some(session_id) = session_id.as_ref() {
+                conn.session_id = Some(session_id.clone());
+            }
+            if should_clear_pending_session_id {
+                conn.pending_session_id = None;
+            }
+            session_id
+        }
+        Err((status, err)) => {
+            if should_clear_pending_session_id {
+                conn.pending_session_id = None;
+            }
+            send_msg(socket, &ws_error_from_status(status, err.0.detail)).await;
+            return;
+        }
+    };
+    let resolved_session_id = request.session_id.clone();
 
     // Try RunLifecycleService first (server-side agentic loop)
     match state
@@ -510,6 +549,7 @@ async fn handle_chat_message(
                 state,
                 conn,
                 content,
+                resolved_session_id,
                 fallback_model,
                 fallback_context,
             )
@@ -635,6 +675,29 @@ fn build_bridge_chat_payload(
             "content": content
         }]
     })
+}
+
+fn chat_request_session_id(
+    conn: &WsConnection,
+    requested_session_id: Option<String>,
+) -> Option<String> {
+    requested_session_id
+        .or_else(|| conn.pending_session_id.clone())
+        .or_else(|| conn.session_id.clone())
+}
+
+fn chat_request_session_id_is_trusted(
+    conn: &WsConnection,
+    requested_session_id: &Option<String>,
+) -> bool {
+    if conn.pending_session_id.is_some() {
+        return false;
+    }
+
+    match requested_session_id.as_deref() {
+        Some(requested_session_id) => conn.session_id.as_deref() == Some(requested_session_id),
+        None => conn.session_id.is_some(),
+    }
 }
 
 fn ws_text_frame_exceeds_limit(text: &str) -> bool {
@@ -1006,11 +1069,12 @@ async fn handle_chat_message_via_bridge(
     state: &AppState,
     conn: &mut WsConnection,
     content: &str,
+    request_session_id: Option<String>,
     model: Option<String>,
     context: Option<serde_json::Map<String, serde_json::Value>>,
 ) {
     // Build the bridge request body (same format as /chat/turn)
-    let payload = build_bridge_chat_payload(conn.session_id.clone(), content, model, context);
+    let payload = build_bridge_chat_payload(request_session_id, content, model, context);
 
     let body = match serde_json::to_vec(&payload) {
         Ok(b) => Bytes::from(b),
@@ -1111,6 +1175,7 @@ async fn handle_chat_message_via_bridge(
         Ok(resp) => {
             if let Some(session_id) = prepared.trusted_session_id.clone() {
                 conn.session_id = Some(session_id.clone());
+                conn.pending_session_id = None;
                 if let Some(run_id) = prepared.turn_chain_id.clone() {
                     conn.active_run_id = Some(run_id.clone());
                     conn.bridge_prepared_run_id = Some(run_id.clone());
@@ -1189,6 +1254,7 @@ fn sync_conn_state_from_stream_event(
     if event_type == Some("session_info") {
         if let Some(session_id) = event.get("session_id").and_then(Value::as_str) {
             conn.session_id = Some(session_id.to_string());
+            conn.pending_session_id = None;
         }
     }
 
@@ -1666,6 +1732,105 @@ mod tests {
     }
 
     #[test]
+    fn chat_request_session_id_prefers_requested_value_without_mutating_connection() {
+        let conn = WsConnection {
+            user: AuthUserRecord {
+                user_id: "u1".into(),
+                username: "alice".into(),
+                email: "alice@example.com".into(),
+                display_name: Some("Alice".into()),
+            },
+            session_id: Some("bound-session".into()),
+            pending_session_id: Some("handshake-session".into()),
+            active_run_id: None,
+        };
+
+        let session_id = chat_request_session_id(&conn, Some("requested-session".into()));
+
+        assert_eq!(session_id.as_deref(), Some("requested-session"));
+        assert_eq!(conn.session_id.as_deref(), Some("bound-session"));
+        assert_eq!(
+            conn.pending_session_id.as_deref(),
+            Some("handshake-session")
+        );
+    }
+
+    #[test]
+    fn chat_request_session_id_falls_back_to_bound_connection_session() {
+        let conn = WsConnection {
+            user: AuthUserRecord {
+                user_id: "u1".into(),
+                username: "alice".into(),
+                email: "alice@example.com".into(),
+                display_name: Some("Alice".into()),
+            },
+            session_id: Some("bound-session".into()),
+            pending_session_id: None,
+            active_run_id: None,
+        };
+
+        let session_id = chat_request_session_id(&conn, None);
+
+        assert_eq!(session_id.as_deref(), Some("bound-session"));
+    }
+
+    #[test]
+    fn chat_request_session_id_prefers_pending_handshake_session_before_bound_session() {
+        let conn = WsConnection {
+            user: AuthUserRecord {
+                user_id: "u1".into(),
+                username: "alice".into(),
+                email: "alice@example.com".into(),
+                display_name: Some("Alice".into()),
+            },
+            session_id: Some("bound-session".into()),
+            pending_session_id: Some("handshake-session".into()),
+            active_run_id: None,
+        };
+
+        let session_id = chat_request_session_id(&conn, None);
+
+        assert_eq!(session_id.as_deref(), Some("handshake-session"));
+    }
+
+    #[test]
+    fn chat_request_session_id_is_trusted_only_for_bound_session() {
+        let trusted_conn = WsConnection {
+            user: AuthUserRecord {
+                user_id: "u1".into(),
+                username: "alice".into(),
+                email: "alice@example.com".into(),
+                display_name: Some("Alice".into()),
+            },
+            session_id: Some("bound-session".into()),
+            pending_session_id: None,
+            active_run_id: None,
+        };
+        let pending_conn = WsConnection {
+            user: AuthUserRecord {
+                user_id: "u1".into(),
+                username: "alice".into(),
+                email: "alice@example.com".into(),
+                display_name: Some("Alice".into()),
+            },
+            session_id: Some("bound-session".into()),
+            pending_session_id: Some("handshake-session".into()),
+            active_run_id: None,
+        };
+
+        assert!(chat_request_session_id_is_trusted(&trusted_conn, &None));
+        assert!(!chat_request_session_id_is_trusted(&pending_conn, &None));
+        assert!(chat_request_session_id_is_trusted(
+            &trusted_conn,
+            &Some("bound-session".into())
+        ));
+        assert!(!chat_request_session_id_is_trusted(
+            &trusted_conn,
+            &Some("client-session".into())
+        ));
+    }
+
+    #[test]
     fn run_status_is_terminal_detects_expected_statuses() {
         assert!(run_status_is_terminal(STATUS_COMPLETED));
         assert!(run_status_is_terminal(STATUS_FAILED));
@@ -1864,6 +2029,7 @@ mod tests {
                 display_name: Some("Alice".into()),
             },
             session_id: None,
+            pending_session_id: Some("pending-session".into()),
             active_run_id: None,
             bridge_prepared_run_id: None,
         };
@@ -1879,6 +2045,7 @@ mod tests {
 
         assert_eq!(adopted, Some(("run-9".into(), true)));
         assert_eq!(conn.session_id.as_deref(), Some("sess-42"));
+        assert_eq!(conn.pending_session_id, None);
         assert_eq!(conn.active_run_id.as_deref(), Some("run-9"));
     }
 
@@ -1892,6 +2059,7 @@ mod tests {
                 display_name: Some("Alice".into()),
             },
             session_id: Some("sess-1".into()),
+            pending_session_id: Some("pending-session".into()),
             active_run_id: Some("prepared-run".into()),
             bridge_prepared_run_id: Some("prepared-run".into()),
         };
@@ -1907,6 +2075,7 @@ mod tests {
 
         assert_eq!(adopted, Some(("upstream-run".into(), true)));
         assert_eq!(conn.session_id.as_deref(), Some("sess-2"));
+        assert_eq!(conn.pending_session_id, None);
         assert_eq!(conn.active_run_id.as_deref(), Some("upstream-run"));
     }
 
@@ -1920,6 +2089,7 @@ mod tests {
                 display_name: Some("Alice".into()),
             },
             session_id: Some("sess-1".into()),
+            pending_session_id: Some("pending-session".into()),
             active_run_id: Some("real-run".into()),
             bridge_prepared_run_id: Some("prepared-run".into()),
         };
@@ -1935,6 +2105,7 @@ mod tests {
 
         assert_eq!(adopted, None);
         assert_eq!(conn.session_id.as_deref(), Some("sess-2"));
+        assert_eq!(conn.pending_session_id, None);
         assert_eq!(conn.active_run_id.as_deref(), Some("real-run"));
     }
 

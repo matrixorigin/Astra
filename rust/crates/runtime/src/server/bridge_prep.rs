@@ -314,7 +314,7 @@ fn normalize_session_created_at_for_bridge(created_at: &str) -> Option<String> {
         .or_else(|| Some(trimmed.to_string()))
 }
 
-fn normalize_chat_turn_session_error(
+pub(super) fn normalize_chat_turn_session_error(
     error: (StatusCode, Json<ErrorResponse>),
 ) -> (StatusCode, Json<ErrorResponse>) {
     let (status, detail) = error;
