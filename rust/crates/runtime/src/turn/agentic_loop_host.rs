@@ -4613,9 +4613,14 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
         {
             let valid_tool_names = host.valid_tool_names().clone();
             let mut term_adapter = HostTerminalAdapter(host);
+            // Suppress headless-round terminal output when a skill already
+            // produced visible output — avoids leaking internal tool progress
+            // lines (blocked-tool warnings, git diffs, etc.) into the user's
+            // terminal after the skill's result was shown.
+            let headless_quiet = quiet || state.skill_produced_output;
             run_agentic_headless_tool_round(
                 turn_index,
-                quiet,
+                headless_quiet,
                 &state.api,
                 &state.api_token,
                 state.current_session_id.as_ref(),
