@@ -22,6 +22,7 @@ const DRIFT_CRITICAL_DELTA: f64 = 0.20;
 const LOOP_QUALITY_THRESHOLD: f64 = 0.70;
 const LOOP_DRIFT_DELTA_THRESHOLD: f64 = 0.10;
 const TRUST_SLO_TARGET: f64 = 0.95;
+const ZERO_IQR_NOISE_BAND: f64 = 0.05;
 
 fn clamp_eval_limit(limit: i32) -> i32 {
     limit.clamp(1, MAX_EVALUATION_ROWS)
@@ -156,6 +157,49 @@ fn sampled_confidence_interval(point: f64, sample_count: i64) -> ConfidenceInter
     }
     let margin = (0.5 / (sample_count as f64).sqrt()).clamp(0.05, 0.25);
     ConfidenceInterval::symmetric(point.clamp(0.0, 1.0), margin)
+}
+
+fn noise_filtered_indices(values: &[f64]) -> Vec<usize> {
+    if values.is_empty() {
+        return Vec::new();
+    }
+    if values.len() < 5 {
+        return (0..values.len()).collect();
+    }
+
+    let mut sorted: Vec<(usize, f64)> = values.iter().copied().enumerate().collect();
+    sorted.sort_by(|left, right| left.1.total_cmp(&right.1));
+    let sorted_values: Vec<f64> = sorted.iter().map(|(_, value)| *value).collect();
+    let q1 = percentile(&sorted_values, 0.25);
+    let q3 = percentile(&sorted_values, 0.75);
+    let iqr = q3 - q1;
+    if iqr <= f64::EPSILON {
+        let median = percentile(&sorted_values, 0.5);
+        let mut indices: Vec<usize> = sorted
+            .iter()
+            .filter(|(_, value)| (*value - median).abs() <= ZERO_IQR_NOISE_BAND)
+            .map(|(index, _)| *index)
+            .collect();
+        if indices.len() >= 3 && indices.len() < values.len() {
+            indices.sort_unstable();
+            return indices;
+        }
+        return (0..values.len()).collect();
+    }
+
+    let lower = q1 - 1.5 * iqr;
+    let upper = q3 + 1.5 * iqr;
+    let mut indices: Vec<usize> = sorted
+        .into_iter()
+        .filter(|(_, value)| *value >= lower && *value <= upper)
+        .map(|(index, _)| index)
+        .collect();
+    if indices.len() < 3 {
+        return (0..values.len()).collect();
+    }
+
+    indices.sort_unstable();
+    indices
 }
 
 fn complement_interval(interval: ConfidenceInterval) -> ConfidenceInterval {
@@ -315,44 +359,43 @@ fn noise_filtered_average(scores: &[f64]) -> NoiseFilteredAverage {
             sample_count: 0,
         };
     }
-
-    if scores.len() < 5 {
-        return NoiseFilteredAverage {
-            average: average_scores(scores),
-            sample_count: scores.len() as i64,
-        };
-    }
-
-    let mut sorted = scores.to_vec();
-    sorted.sort_by(f64::total_cmp);
-
-    let q1 = percentile(&sorted, 0.25);
-    let q3 = percentile(&sorted, 0.75);
-    let iqr = q3 - q1;
-    if iqr <= f64::EPSILON {
-        return NoiseFilteredAverage {
-            average: average_scores(&sorted),
-            sample_count: sorted.len() as i64,
-        };
-    }
-
-    let lower = q1 - 1.5 * iqr;
-    let upper = q3 + 1.5 * iqr;
-    let filtered: Vec<f64> = sorted
-        .into_iter()
-        .filter(|score| *score >= lower && *score <= upper)
+    let filtered_indices = noise_filtered_indices(scores);
+    let filtered: Vec<f64> = filtered_indices
+        .iter()
+        .map(|index| scores[*index])
         .collect();
-    if filtered.len() < 3 {
-        return NoiseFilteredAverage {
-            average: average_scores(scores),
-            sample_count: scores.len() as i64,
-        };
-    }
 
     NoiseFilteredAverage {
         average: average_scores(&filtered),
         sample_count: filtered.len() as i64,
     }
+}
+
+fn summarize_calibration_samples(samples: &[(f64, f64)]) -> CalibrationSummary {
+    let mean_confidence = average_scores(
+        &samples
+            .iter()
+            .map(|(confidence, _)| *confidence)
+            .collect::<Vec<_>>(),
+    );
+    let mean_quality = average_scores(
+        &samples
+            .iter()
+            .map(|(_, quality)| *quality)
+            .collect::<Vec<_>>(),
+    );
+    summarize_calibration(mean_confidence, mean_quality, samples.len() as i64)
+}
+
+fn noise_filtered_calibration_samples(samples: &[(f64, f64)]) -> Vec<(f64, f64)> {
+    let gaps: Vec<f64> = samples
+        .iter()
+        .map(|(confidence, quality)| (confidence - quality).abs())
+        .collect();
+    noise_filtered_indices(&gaps)
+        .into_iter()
+        .map(|index| samples[index])
+        .collect()
 }
 
 fn normalize_model_filter(model: Option<&str>) -> Option<String> {
@@ -814,9 +857,7 @@ impl EvaluationService for DatabaseEvaluationService {
             ""
         };
         let sql = format!(
-            "SELECT AVG(samples.session_confidence) AS mean_confidence, \
-                    AVG(samples.session_quality) AS mean_quality, \
-                    COUNT(*) AS sample_count \
+            "SELECT samples.session_confidence, samples.session_quality \
              FROM ( \
                  SELECT qa.target_id AS session_id, \
                         MAX(CAST(qa.score AS DOUBLE)) AS session_quality, \
@@ -847,15 +888,22 @@ impl EvaluationService for DatabaseEvaluationService {
         if let Some(agent_id) = agent_id {
             calibration_query = calibration_query.bind(agent_id);
         }
-        let row = calibration_query
-            .fetch_one(&pool)
+        let rows = calibration_query
+            .fetch_all(&pool)
             .await
             .map_err(internal_error)?;
-        let summary = summarize_calibration(
-            row.try_get("mean_confidence").unwrap_or(0.0),
-            row.try_get("mean_quality").unwrap_or(0.0),
-            row.try_get("sample_count").unwrap_or(0),
-        );
+        let samples: Vec<(f64, f64)> = rows
+            .into_iter()
+            .filter_map(|row| {
+                Some((
+                    row.try_get("session_confidence").ok()?,
+                    row.try_get("session_quality").ok()?,
+                ))
+            })
+            .collect();
+        let summary = summarize_calibration_samples(&samples);
+        let noise_filtered_summary =
+            summarize_calibration_samples(&noise_filtered_calibration_samples(&samples));
 
         Ok(CalibrationResponse {
             mean_confidence: summary.mean_confidence,
@@ -867,6 +915,16 @@ impl EvaluationService for DatabaseEvaluationService {
             sample_count: summary.sample_count,
             adjustment_multiplier: summary.adjustment_multiplier,
             adjustment_reason: summary.adjustment_reason,
+            noise_filtered_mean_confidence: noise_filtered_summary.mean_confidence,
+            noise_filtered_mean_confidence_interval: noise_filtered_summary
+                .mean_confidence_interval,
+            noise_filtered_mean_quality: noise_filtered_summary.mean_quality,
+            noise_filtered_mean_quality_interval: noise_filtered_summary.mean_quality_interval,
+            noise_filtered_calibration_error: noise_filtered_summary.calibration_error,
+            noise_filtered_bias: noise_filtered_summary.bias,
+            noise_filtered_sample_count: noise_filtered_summary.sample_count,
+            noise_filtered_adjustment_multiplier: noise_filtered_summary.adjustment_multiplier,
+            noise_filtered_adjustment_reason: noise_filtered_summary.adjustment_reason,
         })
     }
 
@@ -1939,6 +1997,19 @@ mod tests {
         let filtered = noise_filtered_average(&[0.7, 0.7, 0.7, 0.7, 0.7]);
         assert_eq!(filtered.sample_count, 5);
         assert!((filtered.average - 0.7).abs() < 1e-9);
+    }
+
+    #[test]
+    fn noise_filtered_calibration_samples_drop_gap_outlier() {
+        let filtered = noise_filtered_calibration_samples(&[
+            (0.80, 0.79),
+            (0.81, 0.80),
+            (0.82, 0.81),
+            (0.83, 0.82),
+            (0.20, 0.90),
+        ]);
+        assert_eq!(filtered.len(), 4);
+        assert!(!filtered.contains(&(0.20, 0.90)));
     }
 
     fn sample_training_dataset() -> ExtractedTrainingDataset {

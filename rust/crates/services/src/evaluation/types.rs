@@ -336,6 +336,15 @@ pub struct CalibrationResponse {
     pub sample_count: i64,
     pub adjustment_multiplier: f64,
     pub adjustment_reason: String,
+    pub noise_filtered_mean_confidence: f64,
+    pub noise_filtered_mean_confidence_interval: ConfidenceInterval,
+    pub noise_filtered_mean_quality: f64,
+    pub noise_filtered_mean_quality_interval: ConfidenceInterval,
+    pub noise_filtered_calibration_error: f64,
+    pub noise_filtered_bias: f64,
+    pub noise_filtered_sample_count: i64,
+    pub noise_filtered_adjustment_multiplier: f64,
+    pub noise_filtered_adjustment_reason: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
