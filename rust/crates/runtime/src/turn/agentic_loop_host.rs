@@ -54,8 +54,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use astra_services::self_surface::{
-    GoalSurface, LocalSelfSurfaceService, SelfSurfaceDimension, SelfSurfaceResponse,
-    SelfSurfaceService, VerificationSurface,
+    EventPreview, GoalSurface, LocalSelfSurfaceService, SelfSurfaceDimension, SelfSurfaceResponse,
+    SelfSurfaceService, VerificationEventView, VerificationSurface,
 };
 use astra_services::session_journal::ToolCallRecord;
 use async_trait::async_trait;
@@ -2553,6 +2553,107 @@ fn reflection_verification_summary_from_surface(
     }
 }
 
+fn compact_json_value(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Null => "null".to_string(),
+        serde_json::Value::String(inner) => truncate_str(inner, 80),
+        _ => truncate_str(&value.to_string(), 80),
+    }
+}
+
+fn reflection_goal_event_summary(
+    event: &EventPreview,
+) -> Option<crate::liquid::reflection::ReflectionEventSummary> {
+    if event.event_type != "goal_steered" {
+        return None;
+    }
+    let metadata = event.metadata.as_ref();
+    let source = metadata
+        .and_then(|meta| meta.get("source"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("goal_steered");
+    let previous_goal = metadata
+        .and_then(|meta| meta.get("previous_goal"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|goal| !goal.is_empty());
+    let new_goal = metadata
+        .and_then(|meta| meta.get("new_goal"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("goal updated");
+    let mut detail = match previous_goal {
+        Some(previous_goal) => format!("{source}: {previous_goal} -> {new_goal}"),
+        None => format!("{source}: {new_goal}"),
+    };
+    if let Some(extra) = metadata
+        .and_then(|meta| meta.get("detail"))
+        .filter(|value| !value.is_null())
+    {
+        detail.push_str(&format!(" ({})", compact_json_value(extra)));
+    }
+    Some(crate::liquid::reflection::ReflectionEventSummary {
+        kind: "GoalSteered".into(),
+        turn: event.turn,
+        detail,
+    })
+}
+
+fn reflection_verification_event_summary(
+    event: &VerificationEventView,
+) -> crate::liquid::reflection::ReflectionEventSummary {
+    let outcome = match event.passed {
+        Some(true) => "passed",
+        Some(false) => "failed",
+        None => "recorded",
+    };
+    let mut detail = outcome.to_string();
+    if let Some(scope) = event.scope.as_deref() {
+        detail.push(' ');
+        detail.push_str(scope);
+    }
+    if let Some(target) = event.target.as_deref() {
+        detail.push(' ');
+        detail.push_str(target);
+    }
+    detail.push_str(" — ");
+    detail.push_str(&truncate_str(&event.summary, 120));
+    crate::liquid::reflection::ReflectionEventSummary {
+        kind: "Verification".into(),
+        turn: event.turn,
+        detail,
+    }
+}
+
+fn reflection_recent_evaluation_events(
+    goal: Option<&GoalSurface>,
+    verification: Option<&VerificationSurface>,
+) -> Vec<crate::liquid::reflection::ReflectionEventSummary> {
+    let mut events = Vec::new();
+    if let Some(goal) = goal {
+        events.extend(
+            goal.recent_goal_events
+                .iter()
+                .filter_map(reflection_goal_event_summary),
+        );
+    }
+    if let Some(verification) = verification {
+        events.extend(
+            verification
+                .objective
+                .recent_verifications
+                .iter()
+                .map(reflection_verification_event_summary),
+        );
+    }
+    events.sort_by(|a, b| {
+        b.turn
+            .unwrap_or_default()
+            .cmp(&a.turn.unwrap_or_default())
+            .then_with(|| a.kind.cmp(&b.kind))
+    });
+    events.truncate(4);
+    events
+}
+
 fn build_live_auto_reflection_goal_summary(
     state: &AgenticLoopState,
 ) -> Option<crate::liquid::reflection::GoalSummary> {
@@ -2582,12 +2683,14 @@ async fn build_auto_reflection_self_evidence(
 ) -> (
     Option<crate::liquid::reflection::GoalSummary>,
     Option<crate::liquid::reflection::VerificationSummary>,
+    Vec<crate::liquid::reflection::ReflectionEventSummary>,
 ) {
     let mut goal = None;
     let mut verification = None;
+    let mut recent_evaluation_events = Vec::new();
     if let Some(session_id) = state.current_session_id.as_deref() {
         let service = LocalSelfSurfaceService::new();
-        goal = match service
+        let goal_surface = match service
             .surface(
                 session_id,
                 SelfSurfaceDimension::Goal,
@@ -2595,12 +2698,10 @@ async fn build_auto_reflection_self_evidence(
             )
             .await
         {
-            Ok(SelfSurfaceResponse::Goal(goal_surface)) => {
-                reflection_goal_summary_from_surface(goal_surface)
-            }
+            Ok(SelfSurfaceResponse::Goal(goal_surface)) => Some(goal_surface),
             _ => None,
         };
-        verification = match service
+        let verification_surface = match service
             .surface(
                 session_id,
                 SelfSurfaceDimension::Verify,
@@ -2608,16 +2709,20 @@ async fn build_auto_reflection_self_evidence(
             )
             .await
         {
-            Ok(SelfSurfaceResponse::Verify(verification_surface)) => Some(
-                reflection_verification_summary_from_surface(verification_surface),
-            ),
+            Ok(SelfSurfaceResponse::Verify(verification_surface)) => Some(verification_surface),
             _ => None,
         };
+        recent_evaluation_events = reflection_recent_evaluation_events(
+            goal_surface.as_ref(),
+            verification_surface.as_ref(),
+        );
+        goal = goal_surface.and_then(reflection_goal_summary_from_surface);
+        verification = verification_surface.map(reflection_verification_summary_from_surface);
     }
     if goal.is_none() {
         goal = build_live_auto_reflection_goal_summary(state);
     }
-    (goal, verification)
+    (goal, verification, recent_evaluation_events)
 }
 
 fn apply_auto_reflection_usage(state: &mut AgenticLoopState, result: &HostReflectionResult) {
@@ -2692,7 +2797,8 @@ async fn maybe_trigger_auto_reflection<H: AgenticLoopHost>(
     let recent_tactical_actions = state.recent_tactical_actions.clone();
     let active_experiment = build_auto_reflection_experiment_summary(state);
 
-    let (goal, verification) = build_auto_reflection_self_evidence(state).await;
+    let (goal, verification, recent_evaluation_events) =
+        build_auto_reflection_self_evidence(state).await;
     let mut ctx = evo.build_reflection_context(
         session_id,
         turns_completed,
@@ -2705,6 +2811,7 @@ async fn maybe_trigger_auto_reflection<H: AgenticLoopHost>(
     );
     ctx.goal = goal;
     ctx.verification = verification;
+    ctx.recent_evaluation_events = recent_evaluation_events;
 
     let (system_prompt, user_prompt) = evo.build_reflection_prompt(&ctx);
     let reflection_result = match host
@@ -10912,6 +11019,32 @@ print(json.dumps({'context': 'user said: ' + msg}))
                 30,
             ))
             .unwrap();
+        astra_services::session_journal::JournalWriter::new("sess-reflect")
+            .unwrap()
+            .append(
+                &astra_services::session_journal::JournalEvent::goal_steered(
+                    Some("sess-reflect"),
+                    2,
+                    "plan_execution_start",
+                    Some("ship self surface"),
+                    "stabilize reflection loop",
+                    None,
+                ),
+            )
+            .unwrap();
+        astra_services::session_journal::JournalWriter::new("sess-reflect")
+            .unwrap()
+            .append(
+                &astra_services::session_journal::JournalEvent::verification_completed(
+                    Some("sess-reflect"),
+                    3,
+                    "subtask-1",
+                    "global",
+                    false,
+                    &serde_json::json!([{"check":"integration-tests","passed":false}]),
+                ),
+            )
+            .unwrap();
         state.evolution_service = Some(std::sync::Arc::new(
             crate::evolution::service::EvolutionService::new(),
         ));
@@ -10990,6 +11123,9 @@ print(json.dumps({'context': 'user said: ' + msg}))
         assert!(prompt.contains("Effective goal: stabilize reflection loop"));
         assert!(prompt.contains("Goal progress: 2/4 milestones complete"));
         assert!(prompt.contains("Verification summary: objective pending"));
+        assert!(prompt.contains("Recent evaluation events:"));
+        assert!(prompt.contains("[GoalSteered]"));
+        assert!(prompt.contains("[Verification]"));
         assert!(prompt.contains("Tool statistics:"));
         assert!(prompt.contains("bash — calls=2, failures=1, avg_ms=150"));
         assert!(prompt.contains("Active experiment: exp-123 (variant=variant-b, samples=4)"));

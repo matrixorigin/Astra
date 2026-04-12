@@ -11,7 +11,8 @@ use crate::cli_args::{
 use crate::cli_utils::resumable_last_session_id;
 use astra_runtime::auto_tuning::{FeedbackSignal, SignalType};
 use astra_runtime::liquid::reflection::{
-    GoalSummary as ReflectionGoalSummary, VerificationSummary as ReflectionVerificationSummary,
+    GoalSummary as ReflectionGoalSummary, ReflectionEventSummary,
+    VerificationSummary as ReflectionVerificationSummary,
 };
 use astra_runtime::runtime_config::RuntimeConfig;
 use astra_runtime::self_model::{ConstraintSet, SelfModel};
@@ -20,8 +21,9 @@ use astra_runtime::turn::context_assembly_trace::TokenBudgetTrace;
 use astra_runtime::turn::tool_health::ToolHealthTracker;
 use astra_runtime::user_profile::Scenario;
 use astra_services::self_surface::{
-    GoalSurface, LocalSelfSurfaceService, SelfSurfaceDimension, SelfSurfaceResponse,
-    SelfSurfaceService, VerificationSurface,
+    EventPreview as SurfaceEventPreview, GoalSurface, LocalSelfSurfaceService,
+    SelfSurfaceDimension, SelfSurfaceResponse, SelfSurfaceService, VerificationEventView,
+    VerificationSurface,
 };
 use astra_services::session_journal::{self, JournalEvent, JournalEventType};
 use astra_services::session_restore::{
@@ -510,7 +512,7 @@ async fn build_reflect_response(
     focus: &str,
     question: Option<&str>,
 ) -> ReflectResponse {
-    let (goal, verification) =
+    let (goal, verification, recent_evaluation_events) =
         load_reflection_self_evidence(&artifacts.session_id, journal_limit.max(1)).await;
     let context = build_persistent_reflection_context(
         artifacts,
@@ -519,6 +521,7 @@ async fn build_reflect_response(
         question,
         goal,
         verification,
+        recent_evaluation_events,
     );
     let prompt_preview = context.render_prompt_section();
     ReflectResponse {
@@ -541,25 +544,30 @@ async fn load_reflection_self_evidence(
 ) -> (
     Option<ReflectionGoalSummary>,
     Option<ReflectionVerificationSummary>,
+    Vec<ReflectionEventSummary>,
 ) {
     let service = LocalSelfSurfaceService::new();
-    let goal = match service
+    let goal_surface = match service
         .surface(session_id, SelfSurfaceDimension::Goal, journal_limit)
         .await
     {
-        Ok(SelfSurfaceResponse::Goal(goal)) => reflection_goal_summary(goal),
+        Ok(SelfSurfaceResponse::Goal(goal)) => Some(goal),
         _ => None,
     };
-    let verification = match service
+    let verification_surface = match service
         .surface(session_id, SelfSurfaceDimension::Verify, journal_limit)
         .await
     {
-        Ok(SelfSurfaceResponse::Verify(verification)) => {
-            Some(reflection_verification_summary(verification))
-        }
+        Ok(SelfSurfaceResponse::Verify(verification)) => Some(verification),
         _ => None,
     };
-    (goal, verification)
+    let recent_evaluation_events =
+        reflection_recent_evaluation_events(goal_surface.as_ref(), verification_surface.as_ref());
+    (
+        goal_surface.and_then(reflection_goal_summary),
+        verification_surface.map(reflection_verification_summary),
+        recent_evaluation_events,
+    )
 }
 
 fn reflection_goal_summary(goal: GoalSurface) -> Option<ReflectionGoalSummary> {
@@ -584,6 +592,95 @@ fn reflection_verification_summary(
             .objective
             .latest_verification
             .map(|event| event.summary),
+    }
+}
+
+fn reflection_recent_evaluation_events(
+    goal: Option<&GoalSurface>,
+    verification: Option<&VerificationSurface>,
+) -> Vec<ReflectionEventSummary> {
+    let mut events = Vec::new();
+    if let Some(goal) = goal {
+        events.extend(
+            goal.recent_goal_events
+                .iter()
+                .filter_map(reflection_goal_event_summary),
+        );
+    }
+    if let Some(verification) = verification {
+        events.extend(
+            verification
+                .objective
+                .recent_verifications
+                .iter()
+                .map(reflection_verification_event_summary),
+        );
+    }
+    events.sort_by(|a, b| {
+        b.turn
+            .unwrap_or_default()
+            .cmp(&a.turn.unwrap_or_default())
+            .then_with(|| a.kind.cmp(&b.kind))
+    });
+    events.truncate(4);
+    events
+}
+
+fn reflection_goal_event_summary(event: &SurfaceEventPreview) -> Option<ReflectionEventSummary> {
+    if event.event_type != "goal_steered" {
+        return None;
+    }
+    let metadata = event.metadata.as_ref();
+    let source = metadata
+        .and_then(|meta| meta.get("source"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("goal_steered");
+    let previous_goal = metadata
+        .and_then(|meta| meta.get("previous_goal"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|goal| !goal.is_empty());
+    let new_goal = metadata
+        .and_then(|meta| meta.get("new_goal"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("goal updated");
+    let mut detail = match previous_goal {
+        Some(previous_goal) => format!("{source}: {previous_goal} -> {new_goal}"),
+        None => format!("{source}: {new_goal}"),
+    };
+    if let Some(extra) = metadata
+        .and_then(|meta| meta.get("detail"))
+        .filter(|value| !value.is_null())
+    {
+        detail.push_str(&format!(" ({})", compact_json_value(extra)));
+    }
+    Some(ReflectionEventSummary {
+        kind: "GoalSteered".into(),
+        turn: event.turn,
+        detail,
+    })
+}
+
+fn reflection_verification_event_summary(event: &VerificationEventView) -> ReflectionEventSummary {
+    let outcome = match event.passed {
+        Some(true) => "passed",
+        Some(false) => "failed",
+        None => "recorded",
+    };
+    let mut detail = outcome.to_string();
+    if let Some(scope) = event.scope.as_deref() {
+        detail.push(' ');
+        detail.push_str(scope);
+    }
+    if let Some(target) = event.target.as_deref() {
+        detail.push(' ');
+        detail.push_str(target);
+    }
+    detail.push_str(" — ");
+    detail.push_str(&truncate(&event.summary, 120));
+    ReflectionEventSummary {
+        kind: "Verification".into(),
+        turn: event.turn,
+        detail,
     }
 }
 
@@ -1294,6 +1391,7 @@ fn build_persistent_reflection_context(
     question: Option<&str>,
     goal: Option<ReflectionGoalSummary>,
     verification: Option<ReflectionVerificationSummary>,
+    recent_evaluation_events: Vec<ReflectionEventSummary>,
 ) -> astra_runtime::liquid::reflection::ReflectionContext {
     const REFLECTION_TOOL_RECORD_LIMIT: usize = 24;
     const REFLECTION_TOOL_STAT_LIMIT: usize = 8;
@@ -1340,6 +1438,7 @@ fn build_persistent_reflection_context(
     context.active_experiment = active_reflection_experiment(artifacts, context.turns_completed);
     context.goal = goal;
     context.verification = verification;
+    context.recent_evaluation_events = recent_evaluation_events;
     context
 }
 
@@ -2363,6 +2462,26 @@ mod tests {
                 entity_learn_skipped_no_domain: false,
             })
             .unwrap();
+        writer
+            .append(&JournalEvent::goal_steered(
+                Some(session_id),
+                8,
+                "plan_execution_start",
+                Some("ship self surface"),
+                "stabilize reflection loop",
+                None,
+            ))
+            .unwrap();
+        writer
+            .append(&JournalEvent::verification_completed(
+                Some(session_id),
+                9,
+                "subtask-1",
+                "global",
+                false,
+                &serde_json::json!([{"check":"integration-tests","passed":false}]),
+            ))
+            .unwrap();
 
         let body = execute_self_command(
             &SelfCmd::Reflect(SelfReflectArgs {
@@ -2405,6 +2524,14 @@ mod tests {
             false
         );
         assert_eq!(
+            value["reflection_context"]["recent_evaluation_events"][0]["kind"],
+            "Verification"
+        );
+        assert_eq!(
+            value["reflection_context"]["recent_evaluation_events"][1]["kind"],
+            "GoalSteered"
+        );
+        assert_eq!(
             value["reflection_context"]["recent_tactical_actions"][0],
             "high token pressure"
         );
@@ -2425,6 +2552,18 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("Verification summary:")
+        );
+        assert!(
+            value["prompt_preview"]
+                .as_str()
+                .unwrap()
+                .contains("Recent evaluation events:")
+        );
+        assert!(
+            value["prompt_preview"]
+                .as_str()
+                .unwrap()
+                .contains("[GoalSteered]")
         );
     }
 

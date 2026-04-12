@@ -47,6 +47,8 @@ pub struct ReflectionContext {
     pub goal: Option<GoalSummary>,
     /// Distilled verification / acceptance state for this reflection window.
     pub verification: Option<VerificationSummary>,
+    /// Recent steering / verification events that explain what changed.
+    pub recent_evaluation_events: Vec<ReflectionEventSummary>,
 }
 
 /// Compressed representation of an EvolutionSignal for the LLM prompt.
@@ -84,6 +86,14 @@ pub struct VerificationSummary {
     pub summary: String,
     pub pending_blockers: Vec<String>,
     pub latest_verification: Option<String>,
+}
+
+/// Compact steering / verification timeline entry.
+#[derive(Debug, Clone, Serialize)]
+pub struct ReflectionEventSummary {
+    pub kind: String,
+    pub turn: Option<u32>,
+    pub detail: String,
 }
 
 /// Per-tool aggregate statistics for the reflection window.
@@ -152,6 +162,7 @@ impl ReflectionContext {
             recent_tactical_actions: Vec::new(),
             goal: None,
             verification: None,
+            recent_evaluation_events: Vec::new(),
         }
     }
 
@@ -207,6 +218,19 @@ impl ReflectionContext {
             }
             if let Some(ref latest) = verification.latest_verification {
                 out.push_str(&format!("Latest verification: {latest}\n"));
+            }
+        }
+
+        if !self.recent_evaluation_events.is_empty() {
+            out.push_str("\nRecent evaluation events:\n");
+            for event in &self.recent_evaluation_events {
+                match event.turn {
+                    Some(turn) => out.push_str(&format!(
+                        "  - turn {} [{}] {}\n",
+                        turn, event.kind, event.detail
+                    )),
+                    None => out.push_str(&format!("  - [{}] {}\n", event.kind, event.detail)),
+                }
             }
         }
 
@@ -698,6 +722,18 @@ mod tests {
             pending_blockers: vec!["integration tests pending".into()],
             latest_verification: Some("turn 8: parser unit suite passed".into()),
         });
+        ctx.recent_evaluation_events = vec![
+            ReflectionEventSummary {
+                kind: "GoalSteered".into(),
+                turn: Some(7),
+                detail: "plan_execution_start: fix auth -> stabilize the parser".into(),
+            },
+            ReflectionEventSummary {
+                kind: "Verification".into(),
+                turn: Some(8),
+                detail: "failed global subtask-1 — parser integration timed out".into(),
+            },
+        ];
         let (system, user) = engine.build_prompt(&ctx);
         assert!(system.contains("execution improvement advisor"));
         assert!(user.contains("Analyze the following"));
@@ -706,6 +742,8 @@ mod tests {
         assert!(
             user.contains("Verification summary: objective blocked: integration tests pending")
         );
+        assert!(user.contains("Recent evaluation events:"));
+        assert!(user.contains("[GoalSteered]"));
     }
 
     #[test]
