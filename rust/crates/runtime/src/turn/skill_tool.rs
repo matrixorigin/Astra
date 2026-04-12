@@ -837,6 +837,20 @@ pub struct SkillActivation {
     pub sandbox_policy: Option<crate::tool_sandbox::SandboxPolicy>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct SkillVerificationOutcome {
+    pub all_required_passed: bool,
+    pub summary: Option<astra_services::MutationVerifierSummary>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct InterceptedToolResult {
+    pub tool_call_id: String,
+    pub tool_name: String,
+    pub result: String,
+    pub verification_summary: Option<astra_services::MutationVerifierSummary>,
+}
+
 /// Handle `discover_skills` then `skill` tool calls in one batch (discover runs first).
 ///
 /// When dynamic surfacing is off, callers typically see no `discover_skills` calls; this still
@@ -851,7 +865,11 @@ pub async fn partition_discover_and_execute_skills(
     quality_tracker: Option<&mut crate::skills::quality::SkillQualityTracker>,
     composition_ctx: Option<&crate::skills::composition::CompositionContext>,
     skill_ctx: &SkillContext,
-) -> (Vec<(String, String)>, Vec<Value>, Option<SkillActivation>) {
+) -> (
+    Vec<InterceptedToolResult>,
+    Vec<Value>,
+    Option<SkillActivation>,
+) {
     let mut discover_calls = Vec::new();
     let mut skill_calls = Vec::new();
     let mut other = Vec::new();
@@ -911,7 +929,17 @@ pub async fn partition_discover_and_execute_skills(
             Err(e) => format!("Invalid discover_skills arguments: {e}"),
         };
 
-        combined_results.push((call_id, result));
+        combined_results.push(InterceptedToolResult {
+            tool_call_id: call_id,
+            tool_name: tc
+                .get("function")
+                .and_then(|function| function.get("name"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            result,
+            verification_summary: None,
+        });
     }
 
     let (skill_results, _remaining_skills_only, act) = partition_and_execute_skills(
@@ -941,7 +969,7 @@ pub async fn partition_discover_and_execute_skills(
 /// (which may run them in a sub-agent loop). Otherwise all skills are inlined.
 ///
 /// Returns `(skill_results, remaining_tool_calls, activation)` where:
-/// - `skill_results`: `(tool_call_id, output_text)` pairs
+/// - `skill_results`: intercepted tool results with optional verifier summaries
 /// - `remaining_tool_calls`: non-skill tool calls passed through
 /// - `activation`: optional model/tool overrides from the last skill invoked
 pub async fn partition_and_execute_skills(
@@ -951,7 +979,11 @@ pub async fn partition_and_execute_skills(
     mut quality_tracker: Option<&mut crate::skills::quality::SkillQualityTracker>,
     composition_ctx: Option<&crate::skills::composition::CompositionContext>,
     skill_ctx: &SkillContext,
-) -> (Vec<(String, String)>, Vec<Value>, Option<SkillActivation>) {
+) -> (
+    Vec<InterceptedToolResult>,
+    Vec<Value>,
+    Option<SkillActivation>,
+) {
     let mut skill_results = Vec::new();
     let mut remaining = Vec::new();
     let mut activation: Option<SkillActivation> = None;
@@ -967,6 +999,12 @@ pub async fn partition_and_execute_skills(
             .and_then(Value::as_str)
             .unwrap_or("unknown")
             .to_string();
+        let tool_name = tc
+            .get("function")
+            .and_then(|function| function.get("name"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
 
         let args_str = tc
             .get("function")
@@ -981,7 +1019,7 @@ pub async fn partition_and_execute_skills(
                 let task_hint = args.get("task").and_then(Value::as_str).unwrap_or("");
 
                 let start = std::time::Instant::now();
-                let (text, act, verification_passed) = execute_skill(
+                let (text, act, verification) = execute_skill(
                     resolver,
                     executor,
                     skill_name,
@@ -994,12 +1032,15 @@ pub async fn partition_and_execute_skills(
 
                 // Record outcome in quality tracker
                 if let Some(ref mut tracker) = quality_tracker {
-                    let success = verification_passed.unwrap_or_else(|| {
-                        // Heuristic fallback when no verification ran
-                        !(text.contains("blocked:")
-                            || text.contains("failed:")
-                            || text.starts_with("Unknown skill"))
-                    });
+                    let success = verification
+                        .as_ref()
+                        .map(|outcome| outcome.all_required_passed)
+                        .unwrap_or_else(|| {
+                            // Heuristic fallback when no verification ran
+                            !(text.contains("blocked:")
+                                || text.contains("failed:")
+                                || text.starts_with("Unknown skill"))
+                        });
                     tracker.record_outcome(&crate::skills::quality::SkillOutcome {
                         skill_name: skill_name.to_string(),
                         tokens_used: (text.len() as u32) / 4, // rough estimate
@@ -1012,12 +1053,22 @@ pub async fn partition_and_execute_skills(
                 if let Some(a) = act {
                     activation = Some(merge_activations(activation, a));
                 }
-                text
+                InterceptedToolResult {
+                    tool_call_id: call_id,
+                    tool_name,
+                    result: text,
+                    verification_summary: verification.and_then(|outcome| outcome.summary),
+                }
             }
-            Err(e) => format!("Invalid skill arguments: {e}"),
+            Err(e) => InterceptedToolResult {
+                tool_call_id: call_id,
+                tool_name,
+                result: format!("Invalid skill arguments: {e}"),
+                verification_summary: None,
+            },
         };
 
-        skill_results.push((call_id, result));
+        skill_results.push(result);
     }
 
     (skill_results, remaining, activation)
@@ -1101,7 +1152,11 @@ async fn execute_pipeline(
     task_hint: &str,
     composition_ctx: Option<&crate::skills::composition::CompositionContext>,
     skill_ctx: &SkillContext,
-) -> (String, Option<SkillActivation>, Option<bool>) {
+) -> (
+    String,
+    Option<SkillActivation>,
+    Option<SkillVerificationOutcome>,
+) {
     let total = steps.len();
     let mut results: Vec<(String, String, Option<bool>)> = Vec::new();
     let mut previous_output: Option<String> = None;
@@ -1135,7 +1190,7 @@ async fn execute_pipeline(
             None
         };
 
-        let (output, act, verified) = execute_skill(
+        let (output, act, verification) = execute_skill(
             resolver,
             executor,
             &step.skill,
@@ -1144,6 +1199,9 @@ async fn execute_pipeline(
             skill_ctx,
         )
         .await;
+        let verified = verification
+            .as_ref()
+            .map(|outcome| outcome.all_required_passed);
 
         // Determine step success: explicit verification > activation presence > assume pass
         let step_passed = match verified {
@@ -1178,7 +1236,14 @@ async fn execute_pipeline(
                 };
                 summary.push_str(&format!("## {icon} Step: {lbl}\n\n{out}\n\n---\n\n"));
             }
-            return (summary, last_activation, Some(false));
+            return (
+                summary,
+                last_activation,
+                Some(SkillVerificationOutcome {
+                    all_required_passed: false,
+                    summary: None,
+                }),
+            );
         }
     }
 
@@ -1196,7 +1261,14 @@ async fn execute_pipeline(
         summary.push_str(&format!("## {icon} Step: {lbl}\n\n{out}\n\n---\n\n"));
     }
 
-    (summary, last_activation, Some(all_passed))
+    (
+        summary,
+        last_activation,
+        Some(SkillVerificationOutcome {
+            all_required_passed: all_passed,
+            summary: None,
+        }),
+    )
 }
 
 /// Execute a single skill call and return the output text + activation metadata.
@@ -1214,8 +1286,13 @@ fn execute_skill<'a>(
     skill_ctx: &'a SkillContext,
 ) -> std::pin::Pin<
     Box<
-        dyn std::future::Future<Output = (String, Option<SkillActivation>, Option<bool>)>
-            + Send
+        dyn std::future::Future<
+                Output = (
+                    String,
+                    Option<SkillActivation>,
+                    Option<SkillVerificationOutcome>,
+                ),
+            > + Send
             + 'a,
     >,
 > {
@@ -1368,7 +1445,7 @@ fn execute_skill<'a>(
                                 run_hooks(&skill.hooks.post_invoke, is_mcp);
 
                                 // Post-execution verification (fork skills only)
-                                let (output, verified) = if !skill.success_criteria.is_empty() {
+                                let (output, verification) = if !skill.success_criteria.is_empty() {
                                     let work_dir = skill
                                         .skill_dir
                                         .as_ref()
@@ -1405,12 +1482,23 @@ fn execute_skill<'a>(
                                         );
                                         }
                                     }
-                                    (output, Some(all_passed))
+                                    (
+                                        output,
+                                        Some(SkillVerificationOutcome {
+                                            all_required_passed: all_passed,
+                                            summary: Some(
+                                                astra_services::MutationVerifierSummary::from_results(
+                                                    all_passed,
+                                                    &results,
+                                                ),
+                                            ),
+                                        }),
+                                    )
                                 } else {
                                     (result.output, None)
                                 };
 
-                                return (output, Some(build_activation(&skill)), verified);
+                                return (output, Some(build_activation(&skill)), verification);
                             }
                             Err(e) => {
                                 eprintln!(
@@ -1699,7 +1787,10 @@ mod tests {
         )
         .await;
         assert_eq!(results.len(), 1);
-        assert!(results[0].1.contains("test-writer") || results[0].1.contains("Additional skills"));
+        assert!(
+            results[0].result.contains("test-writer")
+                || results[0].result.contains("Additional skills")
+        );
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0]["function"]["name"], "bash");
     }
@@ -1786,6 +1877,104 @@ mod tests {
         .await;
         assert!(output.contains("Failed to load skill 'nonexistent'"));
         assert!(activation.is_none());
+    }
+
+    #[tokio::test]
+    async fn execute_skill_fork_returns_verification_summary() {
+        use async_trait::async_trait;
+
+        struct ForkResolver {
+            skill_dir: String,
+        }
+
+        impl SkillResolver for ForkResolver {
+            fn resolve(&self, name: &str) -> Result<ResolvedSkill, String> {
+                Ok(ResolvedSkill {
+                    name: name.into(),
+                    instructions: "Run forked task.".into(),
+                    model: None,
+                    max_tokens: None,
+                    allowed_tools: vec![],
+                    execution_context: ExecutionContext::Fork,
+                    hooks: crate::skills::hooks::SkillHooks::default(),
+                    skill_dir: Some(self.skill_dir.clone()),
+                    source: SkillSourceKind::Local,
+                    success_criteria: vec![astra_services::VerificationCriterion {
+                        id: "output-exists".into(),
+                        description: "Output file exists".into(),
+                        verifier: astra_services::VerifierKind::FileExists {
+                            paths: vec!["output.txt".into()],
+                        },
+                        required: true,
+                        timeout_sec: 5,
+                        global_only: false,
+                    }],
+                    composition: None,
+                    input_schema: None,
+                    aliases: vec![],
+                    effort: None,
+                    agent_type: None,
+                    trust_tier: crate::skills::manifest::TrustTier::Bundled,
+                })
+            }
+            fn available_skills(&self) -> Vec<SkillToolInfo> {
+                vec![]
+            }
+        }
+
+        struct StubExecutor;
+
+        #[async_trait]
+        impl SkillExecutor for StubExecutor {
+            async fn execute(
+                &self,
+                _skill: &LoadedSkill,
+                _context: &SkillExecutionContext,
+            ) -> Result<
+                crate::skills::traits::SkillExecutionResult,
+                crate::skills::traits::SkillError,
+            > {
+                Ok(crate::skills::traits::SkillExecutionResult {
+                    output: "fork completed".into(),
+                    tokens_used: 0,
+                    turns: 1,
+                    duration_ms: 1,
+                    success: true,
+                    verification_results: Vec::new(),
+                    error_category: None,
+                })
+            }
+
+            fn supports(&self, _context: &ExecutionContext) -> bool {
+                true
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("output.txt"), "ok").unwrap();
+        let resolver = ForkResolver {
+            skill_dir: dir.path().to_string_lossy().into_owned(),
+        };
+        let executor: Arc<dyn SkillExecutor> = Arc::new(StubExecutor);
+
+        let (output, activation, verification) = execute_skill(
+            &resolver,
+            Some(&executor),
+            "fork-verify",
+            "",
+            None,
+            &SkillContext::default(),
+        )
+        .await;
+
+        assert!(output.contains("Verification Results:"));
+        assert!(activation.is_some());
+        let verification = verification.expect("expected verification outcome");
+        assert!(verification.all_required_passed);
+        let summary = verification.summary.expect("expected verifier summary");
+        assert_eq!(summary.criteria_total, 1);
+        assert_eq!(summary.criteria_passed, 1);
+        assert!(summary.failing_criteria.is_empty());
     }
 
     #[test]
@@ -1903,11 +2092,15 @@ mod tests {
         assert_eq!(skill_results.len(), 2);
         assert_eq!(remaining.len(), 1);
 
-        assert_eq!(skill_results[0].0, "call_1");
-        assert!(skill_results[0].1.contains("code-review"));
+        assert_eq!(skill_results[0].tool_call_id, "call_1");
+        assert_eq!(skill_results[0].tool_name, "skill");
+        assert!(skill_results[0].result.contains("code-review"));
+        assert!(skill_results[0].verification_summary.is_none());
 
-        assert_eq!(skill_results[1].0, "call_3");
-        assert!(skill_results[1].1.contains("test-writer"));
+        assert_eq!(skill_results[1].tool_call_id, "call_3");
+        assert_eq!(skill_results[1].tool_name, "skill");
+        assert!(skill_results[1].result.contains("test-writer"));
+        assert!(skill_results[1].verification_summary.is_none());
 
         assert_eq!(remaining[0]["function"]["name"], "bash");
     }
@@ -1933,7 +2126,7 @@ mod tests {
         )
         .await;
         assert_eq!(results.len(), 1);
-        assert!(results[0].1.contains("Invalid skill arguments"));
+        assert!(results[0].result.contains("Invalid skill arguments"));
         assert_eq!(remaining.len(), 0);
     }
 
@@ -2778,8 +2971,8 @@ mod tests {
         .await;
 
         assert_eq!(results.len(), 2);
-        assert!(results[0].1.contains("# Skill: good"));
-        assert!(results[1].1.contains("Failed to load skill"));
+        assert!(results[0].result.contains("# Skill: good"));
+        assert!(results[1].result.contains("Failed to load skill"));
 
         // Good skill's activation preserved (failure returns None, doesn't overwrite)
         let act = activation.unwrap();
@@ -3217,7 +3410,10 @@ mod tests {
             "Should contain step-b output"
         );
         assert!(activation.is_some());
-        assert_eq!(verified, Some(true));
+        assert_eq!(
+            verified.as_ref().map(|outcome| outcome.all_required_passed),
+            Some(true)
+        );
     }
 
     #[tokio::test]

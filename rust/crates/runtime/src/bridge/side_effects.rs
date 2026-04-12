@@ -512,6 +512,17 @@ fn build_hook_db_persist_from_payload(
                 .map(ToString::to_string)
         })
         .collect::<Vec<_>>();
+    let tool_verification_summaries = object_array_maps(hook_payload, "tool_results")
+        .into_iter()
+        .filter_map(|tool_result| {
+            let tool_call_id = tool_result
+                .get("tool_call_id")
+                .and_then(serde_json::Value::as_str)
+                .filter(|id| !id.is_empty())?;
+            let summary = tool_result.get("verification_summary")?.clone();
+            Some((tool_call_id.to_string(), summary))
+        })
+        .collect::<std::collections::HashMap<_, _>>();
     let tool_action_profiles = tool_calls
         .iter()
         .map(|tool_call| {
@@ -529,12 +540,25 @@ fn build_hook_db_persist_from_payload(
                 .cloned()
                 .unwrap_or_else(|| serde_json::Value::Object(Default::default()));
             let profile = crate::tool_action_profile_value(tool_name, &arguments);
-            serde_json::json!({
-                "tool_call_id": tool_call.get("id").cloned().unwrap_or(serde_json::Value::String(String::new())),
-                "tool_name": tool_name,
-                "arguments": arguments,
-                "profile": profile,
-            })
+            let tool_call_id = tool_call
+                .get("id")
+                .cloned()
+                .unwrap_or(serde_json::Value::String(String::new()));
+            let mut action_profile = serde_json::Map::from_iter([
+                ("tool_call_id".to_string(), tool_call_id.clone()),
+                (
+                    "tool_name".to_string(),
+                    serde_json::Value::String(tool_name.to_string()),
+                ),
+                ("arguments".to_string(), arguments),
+                ("profile".to_string(), profile),
+            ]);
+            if let Some(tool_call_id) = tool_call_id.as_str()
+                && let Some(summary) = tool_verification_summaries.get(tool_call_id)
+            {
+                action_profile.insert("verifier".to_string(), summary.clone());
+            }
+            serde_json::Value::Object(action_profile)
         })
         .collect::<Vec<_>>();
     let mutation_objective_score =
@@ -2085,8 +2109,20 @@ mod inprocess_hook_contract_tests {
 
     fn build_hook_payload_with_tool_call() -> Value {
         let messages = vec![json!({"role": "user", "content": "list files in src/"})];
-        let tool_results: Vec<Value> = vec![];
+        let tool_results: Vec<Value> = vec![json!({
+            "tool_call_id": "call-1",
+            "name": "bash",
+            "result": "src/lib.rs",
+            "verification_summary": {
+                "all_required_passed": true,
+                "criteria_total": 1,
+                "criteria_passed": 1,
+                "pass_rate": {"point": 1.0, "lower": 1.0, "upper": 1.0},
+                "failing_criteria": []
+            }
+        })];
         let tool_calls = vec![json!({
+            "id": "call-1",
             "function": {"name": "bash", "arguments": "{\"command\": \"ls src/\"}"}
         })];
         Value::Object(build_turn_hook_args(
@@ -2165,10 +2201,18 @@ mod inprocess_hook_contract_tests {
             audit.decision_output["action_profiles"][0]["tool_name"],
             "bash"
         );
+        assert_eq!(
+            audit.decision_output["action_profiles"][0]["tool_call_id"],
+            "call-1"
+        );
         assert_eq!(audit.decision_output["turn"], 1);
         assert_eq!(
             audit.decision_output["action_profiles"][0]["arguments"],
             json!("{\"command\": \"ls src/\"}")
+        );
+        assert_eq!(
+            audit.decision_output["action_profiles"][0]["verifier"]["criteria_total"],
+            1
         );
         assert_eq!(
             audit.decision_output["action_profiles"][0]["profile"]["category"],

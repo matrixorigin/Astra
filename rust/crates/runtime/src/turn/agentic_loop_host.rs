@@ -4340,7 +4340,7 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                 crate::turn::skill_tool::skill_mask_names_lowercase(&visible_for_mask);
 
             // ── Same-session skill dedup: return stub for already-invoked skills ──
-            let mut dedup_results: Vec<(String, String)> = Vec::new();
+            let mut dedup_results: Vec<crate::turn::skill_tool::InterceptedToolResult> = Vec::new();
             let mut fresh_tool_calls: Vec<Value> = Vec::new();
             for tc in effective_tool_calls {
                 if crate::turn::skill_tool::is_skill_call(tc) {
@@ -4357,14 +4357,16 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                     if let Some(ref name) = skill_name {
                         if let Some(prev) = state.skills.invoked.get(name.as_str()) {
                             let call_id = tc.get("id").and_then(Value::as_str).unwrap_or("unknown");
-                            dedup_results.push((
-                                call_id.to_string(),
-                                format!(
+                            dedup_results.push(crate::turn::skill_tool::InterceptedToolResult {
+                                tool_call_id: call_id.to_string(),
+                                tool_name: crate::turn::skill_tool::SKILL_TOOL_NAME.to_string(),
+                                result: format!(
                                     "Skill '{}' was already loaded (turn {}). \
                                      Follow those instructions directly — do not re-invoke.",
                                     name, prev.invoked_at_turn
                                 ),
-                            ));
+                                verification_summary: None,
+                            });
                             continue;
                         }
                     }
@@ -4388,12 +4390,11 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
 
             // Record newly invoked skills + merge dedup stubs
             let current_turn = (state.max_turns - state.remaining_turns) as u32;
-            for (call_id, result_text) in &sr {
+            for result in &sr {
                 // Extract skill name from the matching fresh_tool_calls
-                if let Some(tc) = fresh_tool_calls
-                    .iter()
-                    .find(|t| t.get("id").and_then(Value::as_str) == Some(call_id.as_str()))
-                {
+                if let Some(tc) = fresh_tool_calls.iter().find(|t| {
+                    t.get("id").and_then(Value::as_str) == Some(result.tool_call_id.as_str())
+                }) {
                     let name = tc
                         .get("function")
                         .and_then(|f| f.get("arguments"))
@@ -4410,7 +4411,7 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                                 name.clone(),
                                 crate::turn::skill_tool::InvokedSkill {
                                     name,
-                                    content: result_text.clone(),
+                                    content: result.result.clone(),
                                     invoked_at_turn: current_turn,
                                 },
                             );
@@ -4444,14 +4445,16 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                         .and_then(|f| f.get("name"))
                         .and_then(Value::as_str)
                         .unwrap_or("unknown");
-                    skill_results.push((
-                        call_id.to_string(),
-                        format!(
+                    skill_results.push(crate::turn::skill_tool::InterceptedToolResult {
+                        tool_call_id: call_id.to_string(),
+                        tool_name: tool_name.to_string(),
+                        result: format!(
                             "Deferred: skill was invoked in this turn. Read the skill \
                              instructions above, then decide whether to call `{}` again.",
                             tool_name
                         ),
-                    ));
+                        verification_summary: None,
+                    });
                 }
                 post_skill_tool_calls = Vec::new(); // clear remaining
                 if !quiet {
@@ -4493,14 +4496,27 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
         };
 
         // Inject skill results into messages + tool_results
-        for (call_id, result_text) in &skill_results {
+        for result in &skill_results {
             let tool_msg = serde_json::json!({
                 "role": "tool",
-                "tool_call_id": call_id,
-                "content": result_text,
+                "tool_call_id": result.tool_call_id,
+                "content": result.result,
             });
             state.messages.push(tool_msg.clone());
-            state.tool_results.push(tool_msg);
+            let mut tool_result = serde_json::json!({
+                "tool_call_id": result.tool_call_id,
+                "name": result.tool_name,
+                "result": result.result,
+            });
+            if let Some(summary) = &result.verification_summary
+                && let Some(obj) = tool_result.as_object_mut()
+            {
+                obj.insert(
+                    "verification_summary".to_string(),
+                    serde_json::to_value(summary).unwrap_or(serde_json::Value::Null),
+                );
+            }
+            state.tool_results.push(tool_result);
         }
 
         // ─── Step 4: Headless tool round ────────────────────────────────

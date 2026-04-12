@@ -2,7 +2,7 @@ use astra_core::confidence::ConfidenceInterval;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::SubtaskVerificationReport;
+use crate::{SubtaskVerificationReport, VerificationResult};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -123,26 +123,33 @@ pub struct MutationVerifierSummary {
 
 impl MutationVerifierSummary {
     pub fn from_report(report: &SubtaskVerificationReport) -> Self {
-        let criteria_total = report.results.len() as u32;
-        let criteria_passed = report.results.iter().filter(|result| result.passed).count() as u32;
+        Self::from_results(report.all_required_passed, &report.results)
+    }
+
+    pub fn from_results(all_required_passed: bool, results: &[VerificationResult]) -> Self {
+        let criteria_total = results.len() as u32;
+        let criteria_passed = results.iter().filter(|result| result.passed).count() as u32;
         let pass_rate = if criteria_total == 0 {
             ConfidenceInterval::FULL
         } else {
             ConfidenceInterval::exact(criteria_passed as f64 / criteria_total as f64)
         };
-        let failing_criteria = report
-            .results
+        let failing_criteria = results
             .iter()
             .filter(|result| !result.passed)
             .map(|result| result.criterion_id.clone())
             .collect();
         Self {
-            all_required_passed: report.all_required_passed,
+            all_required_passed,
             criteria_total,
             criteria_passed,
             pass_rate,
             failing_criteria,
         }
+    }
+
+    pub fn from_value(value: &Value) -> Option<Self> {
+        serde_json::from_value(value.clone()).ok()
     }
 }
 
@@ -466,7 +473,9 @@ fn staged_mutations_from_persisted_decision(
                     .and_then(Value::as_str)
                     .map(ToString::to_string),
                 objective.clone(),
-                None,
+                action_profile
+                    .get("verifier")
+                    .and_then(MutationVerifierSummary::from_value),
                 compensation,
             ))
         })
@@ -680,6 +689,13 @@ mod tests {
                             "tool_call_id": "call-1",
                             "tool_name": "write_file",
                             "arguments": {"path": "src/lib.rs"},
+                            "verifier": {
+                                "all_required_passed": true,
+                                "criteria_total": 2,
+                                "criteria_passed": 2,
+                                "pass_rate": {"point": 1.0, "lower": 1.0, "upper": 1.0},
+                                "failing_criteria": []
+                            },
                             "profile": {
                                 "bounded": true,
                                 "reversible": true,
@@ -704,6 +720,13 @@ mod tests {
         assert_eq!(
             scoreboard.mutations[0].judgment.safety_verdict,
             MutationSafetyVerdict::RequiresApproval
+        );
+        assert_eq!(
+            scoreboard.mutations[0]
+                .verifier
+                .as_ref()
+                .map(|summary| summary.criteria_passed),
+            Some(2)
         );
         assert_eq!(scoreboard.approval_required_mutations, 1);
     }
