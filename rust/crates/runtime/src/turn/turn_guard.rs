@@ -203,8 +203,17 @@ impl TurnGuard {
         match quality {
             ResultQuality::Success => self.health.record_success(tool_name),
             ResultQuality::Error => {
-                self.health.record_failure(tool_name);
                 let category = error_recovery::classify_error(result_str);
+                match category {
+                    // Permanent failures: deprioritize immediately, no retry
+                    error_recovery::ErrorCategory::Unavailable
+                    | error_recovery::ErrorCategory::ResourceLimit => {
+                        self.health.record_resource_limit_failure(tool_name);
+                    }
+                    _ => {
+                        self.health.record_failure(tool_name);
+                    }
+                }
                 self.errors.record_error(category);
             }
             ResultQuality::Empty => self.health.record_empty(tool_name),
@@ -622,6 +631,14 @@ mod tests {
         let verdict = guard.evaluate();
         assert!(verdict.severity >= VerdictSeverity::Warning);
         assert!(verdict.avoid_tools.contains(&"bash".to_string()));
+    }
+
+    #[test]
+    fn unavailable_tool_deprioritized_immediately() {
+        let mut guard = TurnGuard::new();
+        // Single "command not found" → immediate deprioritize (no consecutive threshold)
+        guard.record_tool_result("mo_query", "Error: command not found");
+        assert!(guard.health.is_deprioritized("mo_query"));
     }
 
     #[test]
