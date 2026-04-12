@@ -1006,6 +1006,176 @@ impl ThinClient {
         Self::json_or_error(resp).await
     }
 
+    /// `GET /chat/runs/{run_id}` — durable run status/metadata.
+    pub async fn get_run(
+        &self,
+        bearer_override: Option<&str>,
+        run_id: &str,
+    ) -> Result<Value, ThinClientError> {
+        let url = self.url(&paths::chat_run(run_id))?;
+        let resp = self
+            .http
+            .get(url)
+            .headers(self.auth_headers_for(bearer_override))
+            .send()
+            .await?;
+        Self::json_or_error(resp).await
+    }
+
+    /// `DELETE /chat/runs/{run_id}` — cancel a durable run.
+    pub async fn cancel_run(
+        &self,
+        bearer_override: Option<&str>,
+        run_id: &str,
+    ) -> Result<Value, ThinClientError> {
+        let url = self.url(&paths::chat_run(run_id))?;
+        let resp = self
+            .http
+            .delete(url)
+            .headers(self.auth_headers_for(bearer_override))
+            .send()
+            .await?;
+        Self::json_or_error(resp).await
+    }
+
+    /// `POST /chat/runs/{run_id}/pause` — pause a durable run.
+    pub async fn pause_run(
+        &self,
+        bearer_override: Option<&str>,
+        run_id: &str,
+    ) -> Result<Value, ThinClientError> {
+        let url = self.url(&paths::chat_run_pause(run_id))?;
+        let resp = self
+            .http
+            .post(url)
+            .headers(self.auth_headers_for(bearer_override))
+            .send()
+            .await?;
+        Self::json_or_error(resp).await
+    }
+
+    /// `POST /chat/runs/{run_id}/resume` — resume a paused durable run.
+    pub async fn resume_run(
+        &self,
+        bearer_override: Option<&str>,
+        run_id: &str,
+    ) -> Result<Value, ThinClientError> {
+        let url = self.url(&paths::chat_run_resume(run_id))?;
+        let resp = self
+            .http
+            .post(url)
+            .headers(self.auth_headers_for(bearer_override))
+            .send()
+            .await?;
+        Self::json_or_error(resp).await
+    }
+
+    /// `GET /runs` — list durable runs for the current user.
+    pub async fn list_runs(
+        &self,
+        bearer_override: Option<&str>,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Value, ThinClientError> {
+        let url = self.url(paths::RUNS)?;
+        let resp = self
+            .http
+            .get(url)
+            .headers(self.auth_headers_for(bearer_override))
+            .query(&[("limit", limit), ("offset", offset)])
+            .send()
+            .await?;
+        Self::json_or_error(resp).await
+    }
+
+    /// `GET /chat/runs/{run_id}/stream` — yields classified lifecycle SSE events.
+    pub fn stream_run(
+        &self,
+        run_id: &str,
+        last_index: u32,
+        bearer_override: Option<&str>,
+    ) -> impl Stream<Item = Result<StreamEvent, ThinClientError>> + Send + '_ {
+        let url = match self.url(&paths::chat_run_stream(run_id)) {
+            Ok(u) => u,
+            Err(e) => {
+                return stream! {
+                    yield Err(e);
+                }
+                .boxed();
+            }
+        };
+        let req = self
+            .http
+            .get(url)
+            .headers(self.auth_headers_for(bearer_override))
+            .query(&[("last_index", last_index)]);
+        let fut = async move {
+            let resp = req.send().await?;
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let text = resp.text().await.unwrap_or_default();
+                return Err(ThinClientError::SseParse(format!("HTTP {status}: {text}")));
+            }
+            Ok(resp)
+        };
+
+        stream! {
+            let resp = match fut.await {
+                Ok(r) => r,
+                Err(e) => {
+                    yield Err(e);
+                    return;
+                }
+            };
+            let mut parser = SseParser::new();
+            let mut byte_stream = resp.bytes_stream();
+            while let Some(chunk) = byte_stream.next().await {
+                let chunk = match chunk {
+                    Ok(c) => c,
+                    Err(e) => {
+                        yield Err(e.into());
+                        return;
+                    }
+                };
+                match parser.push_bytes(&chunk) {
+                    Ok(evs) => {
+                        for ev in evs {
+                            yield Ok(ev);
+                        }
+                    }
+                    Err(e) => {
+                        yield Err(e);
+                        return;
+                    }
+                }
+            }
+            match parser.finish() {
+                Ok(evs) => {
+                    for ev in evs {
+                        yield Ok(ev);
+                    }
+                }
+                Err(e) => yield Err(e),
+            }
+        }
+        .boxed()
+    }
+
+    pub async fn stream_run_collect(
+        &self,
+        run_id: &str,
+        last_index: u32,
+        bearer_override: Option<&str>,
+    ) -> Result<Vec<StreamEvent>, ThinClientError> {
+        let mut out = Vec::new();
+        let mut stream = self.stream_run(run_id, last_index, bearer_override);
+        let mut s = Pin::new(&mut stream);
+        while let Some(item) = s.next().await {
+            out.push(item?);
+        }
+        Ok(out)
+    }
+
     pub async fn post_tool_result(
         &self,
         bearer_override: Option<&str>,
@@ -1177,7 +1347,7 @@ impl ThinClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wiremock::matchers::{header, method, path};
+    use wiremock::matchers::{header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[tokio::test]
@@ -1269,6 +1439,115 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(v["session_id"], "new");
+    }
+
+    #[tokio::test]
+    async fn wiremock_get_run_status() {
+        let srv = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/chat/runs/run-1"))
+            .and(header("authorization", "Bearer tok"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "run_id": "run-1",
+                "status": "running"
+            })))
+            .mount(&srv)
+            .await;
+
+        let client = ThinClient::new(&srv.uri(), None).unwrap();
+        let v = client.get_run(Some("tok"), "run-1").await.unwrap();
+        assert_eq!(v["run_id"], "run-1");
+        assert_eq!(v["status"], "running");
+    }
+
+    #[tokio::test]
+    async fn wiremock_pause_run() {
+        let srv = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/runs/run-1/pause"))
+            .and(header("authorization", "Bearer tok"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "run_id": "run-1",
+                "status": "paused",
+                "previous_status": "running"
+            })))
+            .mount(&srv)
+            .await;
+
+        let client = ThinClient::new(&srv.uri(), None).unwrap();
+        let v = client.pause_run(Some("tok"), "run-1").await.unwrap();
+        assert_eq!(v["status"], "paused");
+        assert_eq!(v["previous_status"], "running");
+    }
+
+    #[tokio::test]
+    async fn wiremock_list_runs() {
+        let srv = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/runs"))
+            .and(query_param("limit", "25"))
+            .and(query_param("offset", "5"))
+            .and(header("authorization", "Bearer tok"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "runs": [{"run_id": "run-1", "status": "running"}],
+                "total": 1,
+                "limit": 25,
+                "offset": 5
+            })))
+            .mount(&srv)
+            .await;
+
+        let client = ThinClient::new(&srv.uri(), None).unwrap();
+        let v = client.list_runs(Some("tok"), 25, 5).await.unwrap();
+        assert_eq!(v["total"], 1);
+        assert_eq!(v["runs"][0]["run_id"], "run-1");
+    }
+
+    #[tokio::test]
+    async fn wiremock_stream_run_parses_events() {
+        let srv = MockServer::start().await;
+        let sse = concat!(
+            "data: {\"type\":\"run_started\",\"run_id\":\"run-1\",\"session_id\":\"sess-1\"}\n\n",
+            "data: {\"type\":\"run_paused\",\"run_id\":\"run-1\"}\n\n",
+            "data: {\"type\":\"run_finished\",\"run_id\":\"run-1\",\"status\":\"completed\"}\n\n",
+        );
+        Mock::given(method("GET"))
+            .and(path("/chat/runs/run-1/stream"))
+            .and(query_param("last_index", "0"))
+            .and(header("authorization", "Bearer tok"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(sse))
+            .mount(&srv)
+            .await;
+
+        let client = ThinClient::new(&srv.uri(), None).unwrap();
+        let evs = client
+            .stream_run_collect("run-1", 0, Some("tok"))
+            .await
+            .unwrap();
+        assert_eq!(evs.len(), 3);
+        assert!(matches!(
+            evs[0],
+            StreamEvent::RunStarted {
+                ref run_id,
+                ref session_id,
+            } if run_id.as_deref() == Some("run-1") && session_id.as_deref() == Some("sess-1")
+        ));
+        assert!(matches!(
+            evs[1],
+            StreamEvent::RunPaused {
+                ref run_id,
+            } if run_id.as_deref() == Some("run-1")
+        ));
+        assert!(matches!(
+            evs[2],
+            StreamEvent::RunFinished {
+                ref run_id,
+                ref status,
+                ref error,
+            } if run_id.as_deref() == Some("run-1")
+                && status.as_deref() == Some("completed")
+                && error.is_none()
+        ));
     }
 
     #[tokio::test]

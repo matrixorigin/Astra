@@ -12,6 +12,9 @@ pub const TOOLS_RESULT: &str = "/tools/result";
 /// `POST` — design doc: user approval for gated tools.
 pub const APPROVAL_RESPOND: &str = "/approval/respond";
 
+/// `GET` — list durable runs.
+pub const RUNS: &str = "/runs";
+
 /// `POST` — edge registry (`edge_agent_registry` + JWT); body: [`crate::protocol::EdgeRegisterRequest`].
 pub const AGENTS_EDGE: &str = "/agents/edge";
 
@@ -49,6 +52,26 @@ pub fn chat_session_reflect(session_id: &str) -> String {
 #[inline]
 pub fn chat_session_decision_trace(session_id: &str) -> String {
     format!("/chat/session/{session_id}/decision-trace")
+}
+
+#[inline]
+pub fn chat_run(run_id: &str) -> String {
+    format!("/chat/runs/{run_id}")
+}
+
+#[inline]
+pub fn chat_run_stream(run_id: &str) -> String {
+    format!("/chat/runs/{run_id}/stream")
+}
+
+#[inline]
+pub fn chat_run_pause(run_id: &str) -> String {
+    format!("/chat/runs/{run_id}/pause")
+}
+
+#[inline]
+pub fn chat_run_resume(run_id: &str) -> String {
+    format!("/chat/runs/{run_id}/resume")
 }
 
 pub const AUTH_REGISTER: &str = "/auth/register";
@@ -210,6 +233,7 @@ mod tests {
             CHAT_TURN,
             TOOLS_RESULT,
             APPROVAL_RESPOND,
+            RUNS,
             AGENTS_EDGE,
             AGENTS_EDGE_HEARTBEAT,
             SESSIONS,
@@ -280,6 +304,26 @@ mod tests {
             chat_session_decision_trace("s1"),
             "/chat/session/s1/decision-trace"
         );
+    }
+
+    #[test]
+    fn chat_run_path() {
+        assert_eq!(chat_run("r1"), "/chat/runs/r1");
+    }
+
+    #[test]
+    fn chat_run_stream_path() {
+        assert_eq!(chat_run_stream("r1"), "/chat/runs/r1/stream");
+    }
+
+    #[test]
+    fn chat_run_pause_path() {
+        assert_eq!(chat_run_pause("r1"), "/chat/runs/r1/pause");
+    }
+
+    #[test]
+    fn chat_run_resume_path() {
+        assert_eq!(chat_run_resume("r1"), "/chat/runs/r1/resume");
     }
 
     // --- Model/Skill paths ---
