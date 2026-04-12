@@ -198,6 +198,13 @@ fn latest_user_message_text(messages: &[Value]) -> Option<&str> {
         .and_then(|m| m.get("content").and_then(Value::as_str))
 }
 
+fn turn_count_from_messages(messages: &[Value]) -> i64 {
+    messages
+        .iter()
+        .filter(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+        .count() as i64
+}
+
 fn tool_names_from_tool_calls(tool_calls: &[Value]) -> Vec<String> {
     tool_calls
         .iter()
@@ -2318,7 +2325,7 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                     Some(&resolved_model),
                     _agent_id.as_deref(),
                     Some(&user_query_event_id),
-                    0, // turn_count not tracked in inprocess bridge
+                    turn_count_from_messages(&messages),
                     None, // session_start
                     false, // run_hook_db_writes = false → triggers persist
                     false, // run_observer = false → triggers observer
@@ -4604,6 +4611,27 @@ mod tests {
             json!({"role": "user", "content": "继续处理"}),
         ];
         assert_eq!(latest_user_message_text(&messages), Some("继续处理"));
+    }
+
+    #[test]
+    fn turn_count_from_messages_counts_user_turns() {
+        let messages = vec![
+            json!({"role": "system", "content": "sys"}),
+            json!({"role": "user", "content": "first prompt"}),
+            json!({"role": "assistant", "content": "intermediate"}),
+            json!({"role": "tool", "content": "tool output"}),
+            json!({"role": "user", "content": "继续处理"}),
+        ];
+        assert_eq!(turn_count_from_messages(&messages), 2);
+    }
+
+    #[test]
+    fn turn_count_from_messages_zero_without_user_messages() {
+        let messages = vec![
+            json!({"role": "system", "content": "sys"}),
+            json!({"role": "assistant", "content": "intermediate"}),
+        ];
+        assert_eq!(turn_count_from_messages(&messages), 0);
     }
 
     #[test]
