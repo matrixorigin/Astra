@@ -22,7 +22,7 @@
 //! {"type": "auth_ok", "user_id": "...", "username": "..."}
 //! {"type": "auth_error", "message": "..."}
 //! {"type": "session_info", "session_id": "..."}
-//! {"type": "run_started", "run_id": "...", "session_id": "..."}
+//! {"type": "run_started", "run_id": "...", "session_id": "...", "explain": {...}}
 //! {"type": "run_paused", "run_id": "..."}
 //! {"type": "run_resumed", "run_id": "..."}
 //! {"type": "text_delta", "content": "..."}
@@ -40,6 +40,7 @@ use super::chat_handlers::{
     is_session_service_unconfigured_error, resolve_or_create_chat_session_id,
 };
 use super::http_types::merge_plan_subtask_context;
+use super::run_handlers::transform_stream_run_events_for_client_with_pending;
 use super::*;
 use astra_core::{STATUS_CANCELLED, STATUS_COMPLETED, STATUS_FAILED};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -144,7 +145,12 @@ pub(super) enum WsServerMessage {
 
     /// Agentic run started — client should track this run_id.
     #[serde(rename = "run_started")]
-    RunStarted { run_id: String, session_id: String },
+    RunStarted {
+        run_id: String,
+        session_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        explain: Option<serde_json::Value>,
+    },
 
     /// Agentic run finished (completed or failed).
     #[serde(rename = "run_finished")]
@@ -584,6 +590,7 @@ async fn handle_chat_message(
                 &WsServerMessage::RunStarted {
                     run_id: run.run_id.clone(),
                     session_id: run.session_id.clone(),
+                    explain: run.explain.clone(),
                 },
             )
             .await;
@@ -906,53 +913,15 @@ fn next_run_stream_index(event: &Value, current: u32) -> u32 {
         .unwrap_or_else(|| current.saturating_add(1))
 }
 
-fn lifecycle_event_to_ws_payload(event: &Value, run_id: &str) -> Option<Value> {
-    match event.get("event_type").and_then(Value::as_str) {
-        Some("run_started") => None,
-        Some("run_finished") => usage_payload_from_run_finished(event),
-        Some(event_type) => {
-            let mut payload = astra_services::runs::transform_run_event_for_client(event.clone());
-            if matches!(event_type, "run_paused" | "run_resumed" | "run_cancelled")
-                && let Some(obj) = payload.as_object_mut()
-                && !obj.contains_key("run_id")
-            {
-                obj.insert("run_id".to_string(), Value::String(run_id.to_string()));
-            }
-            if let Some(index) = event.get("index").cloned()
-                && let Some(obj) = payload.as_object_mut()
-            {
-                obj.insert("index".to_string(), index);
-            }
-            Some(payload)
-        }
-        None => Some(event.clone()),
-    }
-}
-
-fn usage_payload_from_run_finished(event: &Value) -> Option<Value> {
-    let data = event.get("data")?.as_object()?;
-    let mut payload =
-        serde_json::Map::from_iter([("type".to_string(), Value::String("usage".to_string()))]);
-    let mut has_usage = false;
-
-    for key in [
-        "prompt_tokens",
-        "completion_tokens",
-        "cache_read_tokens",
-        "cache_creation_tokens",
-        "tool_call_count",
-    ] {
-        if let Some(value) = data.get(key).cloned() {
-            payload.insert(key.to_string(), value);
-            has_usage = true;
-        }
-    }
-
-    if let Some(index) = event.get("index").cloned() {
-        payload.insert("index".to_string(), index);
-    }
-
-    has_usage.then(|| Value::Object(payload))
+fn lifecycle_events_to_ws_payloads(
+    run_id: &str,
+    events: Vec<Value>,
+    pending_run_error: &mut Option<String>,
+) -> Vec<Value> {
+    transform_stream_run_events_for_client_with_pending(run_id, events, pending_run_error)
+        .into_iter()
+        .filter(|payload| payload.get("type").and_then(Value::as_str) != Some("run_started"))
+        .collect()
 }
 
 async fn best_effort_cancel_run(state: &AppState, conn: &WsConnection, run_id: &str) {
@@ -1121,38 +1090,36 @@ async fn stream_run_over_websocket(
                     }
                 };
 
-                for event in events {
-                    last_index = next_run_stream_index(&event, last_index);
-                    if event.get("event_type").and_then(Value::as_str) == Some("run_error") {
-                        terminal_error = event
-                            .get("data")
-                            .and_then(|data| data.get("error"))
-                            .and_then(Value::as_str)
-                            .map(str::to_string);
-                    }
-                    if let Some(payload) = lifecycle_event_to_ws_payload(&event, run_id)
-                    {
-                        match send_json_value(socket, &payload).await {
-                            Ok(()) => {}
-                            Err(WsSendFailure::Disconnected) => {
-                                best_effort_cancel_run(state, conn, run_id).await;
-                                return;
-                            }
-                            Err(WsSendFailure::Failed(message)) => {
-                                best_effort_cancel_run(state, conn, run_id).await;
-                                send_msg(
-                                    socket,
-                                    &WsServerMessage::RunFinished {
-                                        run_id: run_id.to_string(),
-                                        status: STATUS_FAILED.to_string(),
-                                        error: Some(message),
-                                    },
-                                )
-                                .await;
-                                return;
-                            }
+                let saw_stream_terminal = events
+                    .iter()
+                    .any(|event| event.get("event_type").and_then(Value::as_str) == Some("run_finished"));
+                for event in &events {
+                    last_index = next_run_stream_index(event, last_index);
+                }
+                for payload in lifecycle_events_to_ws_payloads(run_id, events, &mut terminal_error) {
+                    match send_json_value(socket, &payload).await {
+                        Ok(()) => {}
+                        Err(WsSendFailure::Disconnected) => {
+                            best_effort_cancel_run(state, conn, run_id).await;
+                            return;
+                        }
+                        Err(WsSendFailure::Failed(message)) => {
+                            best_effort_cancel_run(state, conn, run_id).await;
+                            send_msg(
+                                socket,
+                                &WsServerMessage::RunFinished {
+                                    run_id: run_id.to_string(),
+                                    status: STATUS_FAILED.to_string(),
+                                    error: Some(message),
+                                },
+                            )
+                            .await;
+                            return;
                         }
                     }
+                }
+                if saw_stream_terminal {
+                    return;
                 }
 
                 let status = match state
@@ -1319,7 +1286,15 @@ async fn handle_chat_message_via_bridge(
                 if let Some(run_id) = prepared.turn_chain_id.clone() {
                     conn.active_run_id = Some(run_id.clone());
                     conn.bridge_prepared_run_id = Some(run_id.clone());
-                    send_msg(socket, &WsServerMessage::RunStarted { run_id, session_id }).await;
+                    send_msg(
+                        socket,
+                        &WsServerMessage::RunStarted {
+                            run_id,
+                            session_id,
+                            explain: None,
+                        },
+                    )
+                    .await;
                 }
             }
 
@@ -1685,7 +1660,11 @@ async fn stream_sse_response_as_ws(
                                 {
                                     send_msg(
                                         socket,
-                                        &WsServerMessage::RunStarted { run_id, session_id },
+                                        &WsServerMessage::RunStarted {
+                                            run_id,
+                                            session_id,
+                                            explain: None,
+                                        },
                                     )
                                     .await;
                                 }
@@ -2358,7 +2337,8 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_event_to_ws_payload_skips_run_started_and_preserves_terminal_usage() {
+    fn lifecycle_events_to_ws_payloads_skip_run_started_and_preserve_terminal_status() {
+        let mut pending_run_error = None;
         let run_started = serde_json::json!({"event_type": "run_started", "data": {}});
         let run_finished = serde_json::json!({
             "event_type": "run_finished",
@@ -2373,9 +2353,15 @@ mod tests {
         let text_delta = serde_json::json!({"type": "text_delta", "content": "hi", "index": 2});
         let agent_progress = serde_json::json!({"event_type": "agent_progress", "data": {"agent_id": "a1"}, "index": 4});
 
-        assert!(lifecycle_event_to_ws_payload(&run_started, "run-123").is_none());
+        let payloads = lifecycle_events_to_ws_payloads(
+            "run-123",
+            vec![run_started, run_finished, text_delta, agent_progress],
+            &mut pending_run_error,
+        );
+
+        assert_eq!(payloads.len(), 4);
         assert_eq!(
-            lifecycle_event_to_ws_payload(&run_finished, "run-123").unwrap(),
+            payloads[0],
             serde_json::json!({
                 "type": "usage",
                 "prompt_tokens": 7,
@@ -2385,25 +2371,82 @@ mod tests {
             })
         );
         assert_eq!(
-            lifecycle_event_to_ws_payload(&text_delta, "run-123").unwrap()["type"],
-            "text_delta"
+            payloads[1],
+            serde_json::json!({
+                "type": "run_finished",
+                "run_id": "run-123",
+                "status": "cancelled",
+                "index": 5
+            })
         );
-        assert_eq!(
-            lifecycle_event_to_ws_payload(&agent_progress, "run-123").unwrap()["type"],
-            "agent_progress"
-        );
-        assert_eq!(
-            lifecycle_event_to_ws_payload(&agent_progress, "run-123").unwrap()["agent_id"],
-            "a1"
-        );
-        assert_eq!(
-            lifecycle_event_to_ws_payload(&agent_progress, "run-123").unwrap()["index"],
-            4
-        );
+        assert_eq!(payloads[2]["type"], "text_delta");
+        assert_eq!(payloads[3]["type"], "agent_progress");
+        assert_eq!(payloads[3]["agent_id"], "a1");
+        assert_eq!(payloads[3]["index"], 4);
+        assert!(pending_run_error.is_none());
     }
 
     #[test]
-    fn lifecycle_event_to_ws_payload_injects_run_id_into_pause_resume_events() {
+    fn lifecycle_events_to_ws_payloads_preserve_run_error_across_batches() {
+        let mut pending_run_error = None;
+        let run_error = serde_json::json!({
+            "event_type": "run_error",
+            "data": {"error": "boom"},
+            "index": 2
+        });
+        let run_finished = serde_json::json!({
+            "event_type": "run_finished",
+            "data": {
+                "prompt_tokens": 7,
+                "completion_tokens": 3,
+                "tool_call_count": 2
+            },
+            "index": 3
+        });
+
+        let error_payloads =
+            lifecycle_events_to_ws_payloads("run-123", vec![run_error], &mut pending_run_error);
+        assert_eq!(
+            error_payloads,
+            vec![serde_json::json!({
+                "type": "error",
+                "message": "boom",
+                "code": "RUN_ERROR",
+                "index": 2
+            })]
+        );
+        assert_eq!(pending_run_error.as_deref(), Some("boom"));
+
+        let terminal_payloads = lifecycle_events_to_ws_payloads(
+            "run-123",
+            vec![run_finished],
+            &mut pending_run_error,
+        );
+        assert_eq!(
+            terminal_payloads,
+            vec![
+                serde_json::json!({
+                    "type": "usage",
+                    "prompt_tokens": 7,
+                    "completion_tokens": 3,
+                    "tool_call_count": 2,
+                    "index": 3
+                }),
+                serde_json::json!({
+                    "type": "run_finished",
+                    "run_id": "run-123",
+                    "status": "failed",
+                    "error": "boom",
+                    "index": 3
+                })
+            ]
+        );
+        assert!(pending_run_error.is_none());
+    }
+
+    #[test]
+    fn lifecycle_events_to_ws_payloads_inject_run_id_into_pause_resume_events() {
+        let mut pending_run_error = None;
         let run_paused = serde_json::json!({
             "event_type": "run_paused",
             "data": {},
@@ -2415,21 +2458,26 @@ mod tests {
             "index": 3
         });
 
-        assert_eq!(
-            lifecycle_event_to_ws_payload(&run_paused, "run-123").unwrap(),
-            serde_json::json!({
-                "type": "run_paused",
-                "run_id": "run-123",
-                "index": 2
-            })
+        let payloads = lifecycle_events_to_ws_payloads(
+            "run-123",
+            vec![run_paused, run_resumed],
+            &mut pending_run_error,
         );
+
         assert_eq!(
-            lifecycle_event_to_ws_payload(&run_resumed, "run-123").unwrap(),
-            serde_json::json!({
-                "type": "run_resumed",
-                "run_id": "run-123",
-                "index": 3
-            })
+            payloads,
+            vec![
+                serde_json::json!({
+                    "type": "run_paused",
+                    "run_id": "run-123",
+                    "index": 2
+                }),
+                serde_json::json!({
+                    "type": "run_resumed",
+                    "run_id": "run-123",
+                    "index": 3
+                })
+            ]
         );
     }
 
@@ -3069,11 +3117,13 @@ mod tests {
         let msg = WsServerMessage::RunStarted {
             run_id: "r1".into(),
             session_id: "s1".into(),
+            explain: Some(serde_json::json!({"mode": "background"})),
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains(r#""type":"run_started""#));
         assert!(json.contains(r#""run_id":"r1""#));
         assert!(json.contains(r#""session_id":"s1""#));
+        assert!(json.contains(r#""explain":{"mode":"background"}"#));
     }
 
     #[test]
@@ -3151,6 +3201,7 @@ mod tests {
             WsServerMessage::RunStarted {
                 run_id: "r1".into(),
                 session_id: "s1".into(),
+                explain: None,
             },
             WsServerMessage::RunFinished {
                 run_id: "r1".into(),

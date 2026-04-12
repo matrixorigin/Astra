@@ -5,8 +5,16 @@ pub(super) fn transform_stream_run_events_for_client(
     run_id: &str,
     events: Vec<serde_json::Value>,
 ) -> Vec<serde_json::Value> {
-    let mut transformed_events = Vec::with_capacity(events.len());
     let mut pending_run_error: Option<String> = None;
+    transform_stream_run_events_for_client_with_pending(run_id, events, &mut pending_run_error)
+}
+
+pub(super) fn transform_stream_run_events_for_client_with_pending(
+    run_id: &str,
+    events: Vec<serde_json::Value>,
+    pending_run_error: &mut Option<String>,
+) -> Vec<serde_json::Value> {
+    let mut transformed_events = Vec::with_capacity(events.len());
 
     for event in events {
         let index = event.get("index").cloned();
@@ -23,7 +31,7 @@ pub(super) fn transform_stream_run_events_for_client(
             .unwrap_or(false);
 
         if event_type == "run_error" {
-            pending_run_error = event
+            *pending_run_error = event
                 .get("data")
                 .and_then(serde_json::Value::as_object)
                 .and_then(|data| data.get("error"))
