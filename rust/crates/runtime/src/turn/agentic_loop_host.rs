@@ -3337,6 +3337,15 @@ fn write_session_journal_event(
     }
 }
 
+/// Render deferred final text if any is buffered, then write heavy checkpoint.
+fn finalize_and_render<H: AgenticLoopHost>(host: &mut H, state: &mut AgenticLoopState) {
+    finalize_turn_trace(state);
+    try_write_heavy_checkpoint(state);
+    if !state.final_text.is_empty() {
+        host.render_final_text(&state.final_text);
+    }
+}
+
 async fn run_agentic_loop_impl<H: AgenticLoopHost>(
     host: &mut H,
     state: &mut AgenticLoopState,
@@ -3543,7 +3552,7 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                         reason.as_str(),
                         state.total_tool_calls,
                     );
-                    host.render_final_text(&state.final_text);
+                    finalize_and_render(host, state);
                     return Ok(AgenticLoopOutcome::Completed);
                 }
                 return Err(format!(
@@ -3954,9 +3963,7 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                             timing,
                         );
                     }
-                    finalize_turn_trace(state);
-                    try_write_heavy_checkpoint(state);
-                    host.render_final_text(&state.final_text);
+                    finalize_and_render(host, state);
                     return Ok(AgenticLoopOutcome::Completed);
                 }
 
@@ -4004,12 +4011,7 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                     let mut session_guard = session.write().unwrap_or_else(|e| e.into_inner());
                     crate::observability_integration::on_turn_end(hub, &mut session_guard, timing);
                 }
-                finalize_turn_trace(state);
-                try_write_heavy_checkpoint(state);
-                // Render deferred final text now that we're certain the loop is done.
-                if !state.final_text.is_empty() {
-                    host.render_final_text(&state.final_text);
-                }
+                finalize_and_render(host, state);
                 return Ok(AgenticLoopOutcome::Completed);
             }
             AgenticIngestIterationControl::ContinueIterating => {
@@ -4071,11 +4073,7 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                                 timing,
                             );
                         }
-                        finalize_turn_trace(state);
-                        try_write_heavy_checkpoint(state);
-                        if !state.final_text.is_empty() {
-                            host.render_final_text(&state.final_text);
-                        }
+                        finalize_and_render(host, state);
                         return Ok(AgenticLoopOutcome::Completed);
                     }
                     // First breach — inject wrap-up instruction, skip tool execution.
@@ -5248,10 +5246,7 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
         }
     }
     // Loop exhausted max_turns without explicit break — write final state.
-    try_write_heavy_checkpoint(state);
-    if !state.final_text.is_empty() {
-        host.render_final_text(&state.final_text);
-    }
+    finalize_and_render(host, state);
     Ok(AgenticLoopOutcome::Completed)
 }
 
