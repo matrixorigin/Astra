@@ -51,6 +51,8 @@ pub struct ReflectionContext {
     pub recent_evaluation_events: Vec<ReflectionEventSummary>,
     /// Recent adaptive / mutation records that explain what the system changed.
     pub recent_adaptations: Vec<ReflectionEventSummary>,
+    /// Recent outcome signals observed after those adaptations landed.
+    pub recent_adaptation_outcomes: Vec<ReflectionEventSummary>,
 }
 
 /// Compressed representation of an EvolutionSignal for the LLM prompt.
@@ -166,6 +168,7 @@ impl ReflectionContext {
             verification: None,
             recent_evaluation_events: Vec::new(),
             recent_adaptations: Vec::new(),
+            recent_adaptation_outcomes: Vec::new(),
         }
     }
 
@@ -240,6 +243,19 @@ impl ReflectionContext {
         if !self.recent_adaptations.is_empty() {
             out.push_str("\nRecent adaptations:\n");
             for event in &self.recent_adaptations {
+                match event.turn {
+                    Some(turn) => out.push_str(&format!(
+                        "  - turn {} [{}] {}\n",
+                        turn, event.kind, event.detail
+                    )),
+                    None => out.push_str(&format!("  - [{}] {}\n", event.kind, event.detail)),
+                }
+            }
+        }
+
+        if !self.recent_adaptation_outcomes.is_empty() {
+            out.push_str("\nRecent adaptation outcomes:\n");
+            for event in &self.recent_adaptation_outcomes {
                 match event.turn {
                     Some(turn) => out.push_str(&format!(
                         "  - turn {} [{}] {}\n",
@@ -755,6 +771,11 @@ mod tests {
             turn: Some(6),
             detail: "applied — adaptive per-turn changes applied".into(),
         }];
+        ctx.recent_adaptation_outcomes = vec![ReflectionEventSummary {
+            kind: "Verification".into(),
+            turn: Some(7),
+            detail: "after Adaptation turn 6 — verification failed global subtask-1 — parser integration timed out".into(),
+        }];
         let (system, user) = engine.build_prompt(&ctx);
         assert!(system.contains("execution improvement advisor"));
         assert!(user.contains("Analyze the following"));
@@ -767,6 +788,8 @@ mod tests {
         assert!(user.contains("[GoalSteered]"));
         assert!(user.contains("Recent adaptations:"));
         assert!(user.contains("[Adaptation]"));
+        assert!(user.contains("Recent adaptation outcomes:"));
+        assert!(user.contains("[Verification]"));
     }
 
     #[test]

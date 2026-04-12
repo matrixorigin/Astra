@@ -512,8 +512,13 @@ async fn build_reflect_response(
     focus: &str,
     question: Option<&str>,
 ) -> ReflectResponse {
-    let (goal, verification, recent_evaluation_events, recent_adaptations) =
-        load_reflection_self_evidence(&artifacts.session_id, journal_limit.max(1)).await;
+    let (
+        goal,
+        verification,
+        recent_evaluation_events,
+        recent_adaptations,
+        recent_adaptation_outcomes,
+    ) = load_reflection_self_evidence(&artifacts.session_id, journal_limit.max(1)).await;
     let context = build_persistent_reflection_context(
         artifacts,
         journal_limit.max(1),
@@ -523,6 +528,7 @@ async fn build_reflect_response(
         verification,
         recent_evaluation_events,
         recent_adaptations,
+        recent_adaptation_outcomes,
     );
     let prompt_preview = context.render_prompt_section();
     ReflectResponse {
@@ -547,6 +553,7 @@ async fn load_reflection_self_evidence(
     Option<ReflectionVerificationSummary>,
     Vec<ReflectionEventSummary>,
     Vec<ReflectionEventSummary>,
+    Vec<ReflectionEventSummary>,
 ) {
     let service = LocalSelfSurfaceService::new();
     let snapshot = service.snapshot(session_id, journal_limit).await.ok();
@@ -567,11 +574,13 @@ async fn load_reflection_self_evidence(
     let recent_evaluation_events =
         reflection_recent_evaluation_events(goal_surface.as_ref(), verification_surface.as_ref());
     let recent_adaptations = reflection_recent_adaptations(snapshot.as_ref());
+    let recent_adaptation_outcomes = reflection_recent_adaptation_outcomes(snapshot.as_ref());
     (
         goal_surface.and_then(reflection_goal_summary),
         verification_surface.map(reflection_verification_summary),
         recent_evaluation_events,
         recent_adaptations,
+        recent_adaptation_outcomes,
     )
 }
 
@@ -604,6 +613,8 @@ fn reflection_recent_evaluation_events(
     goal: Option<&GoalSurface>,
     verification: Option<&VerificationSurface>,
 ) -> Vec<ReflectionEventSummary> {
+    const REFLECTION_EVENT_LIMIT: usize = 4;
+
     let mut events = Vec::new();
     if let Some(goal) = goal {
         events.extend(
@@ -627,40 +638,29 @@ fn reflection_recent_evaluation_events(
             .cmp(&a.turn.unwrap_or_default())
             .then_with(|| a.kind.cmp(&b.kind))
     });
-    events.truncate(4);
+    events.truncate(REFLECTION_EVENT_LIMIT);
     events
 }
 
 fn reflection_recent_adaptations(
     snapshot: Option<&PersistentSelfSnapshot>,
 ) -> Vec<ReflectionEventSummary> {
+    const REFLECTION_EVENT_LIMIT: usize = 4;
+
     let Some(snapshot) = snapshot else {
         return Vec::new();
     };
-    let mut records = snapshot
+    snapshot
         .evolution
         .records
         .iter()
         .filter_map(reflection_adaptation_summary)
-        .collect::<Vec<_>>();
-    records.sort_by(|a, b| {
-        b.turn
-            .unwrap_or_default()
-            .cmp(&a.turn.unwrap_or_default())
-            .then_with(|| a.kind.cmp(&b.kind))
-    });
-    records.truncate(4);
-    records
+        .take(REFLECTION_EVENT_LIMIT)
+        .collect()
 }
 
 fn reflection_adaptation_summary(record: &EvolutionRecord) -> Option<ReflectionEventSummary> {
-    if !matches!(record.status.as_str(), "applied" | "enrolled" | "promoted") {
-        return None;
-    }
-    if matches!(
-        record.kind.as_str(),
-        "failure" | "stall" | "drift" | "verification"
-    ) {
+    if !is_reflection_adaptation_record(record) {
         return None;
     }
     Some(ReflectionEventSummary {
@@ -668,6 +668,71 @@ fn reflection_adaptation_summary(record: &EvolutionRecord) -> Option<ReflectionE
         turn: record.turn,
         detail: format!("{} — {}", record.status, truncate(&record.summary, 120)),
     })
+}
+
+fn reflection_recent_adaptation_outcomes(
+    snapshot: Option<&PersistentSelfSnapshot>,
+) -> Vec<ReflectionEventSummary> {
+    const REFLECTION_EVENT_LIMIT: usize = 4;
+
+    let Some(snapshot) = snapshot else {
+        return Vec::new();
+    };
+    let mut outcomes = Vec::new();
+    let mut previous_adaptation_index = None;
+    for (index, record) in snapshot.evolution.records.iter().enumerate() {
+        if !is_reflection_adaptation_record(record) {
+            continue;
+        }
+        let start = previous_adaptation_index.map_or(0, |previous| previous + 1);
+        if let Some(outcome) = snapshot.evolution.records[start..index]
+            .iter()
+            .find(|candidate| is_reflection_adaptation_outcome_record(candidate))
+        {
+            outcomes.push(reflection_adaptation_outcome_summary(record, outcome));
+        }
+        previous_adaptation_index = Some(index);
+        if outcomes.len() >= REFLECTION_EVENT_LIMIT {
+            break;
+        }
+    }
+    outcomes
+}
+
+fn reflection_adaptation_outcome_summary(
+    adaptation: &EvolutionRecord,
+    outcome: &EvolutionRecord,
+) -> ReflectionEventSummary {
+    let detail = match adaptation.turn {
+        Some(turn) => format!(
+            "after {} turn {} — {}",
+            reflection_kind_label(&adaptation.kind),
+            turn,
+            truncate(&outcome.summary, 120)
+        ),
+        None => format!(
+            "after {} — {}",
+            reflection_kind_label(&adaptation.kind),
+            truncate(&outcome.summary, 120)
+        ),
+    };
+    ReflectionEventSummary {
+        kind: reflection_kind_label(&outcome.kind),
+        turn: outcome.turn.or(adaptation.turn),
+        detail,
+    }
+}
+
+fn is_reflection_adaptation_record(record: &EvolutionRecord) -> bool {
+    matches!(record.status.as_str(), "applied" | "enrolled" | "promoted")
+        && !is_reflection_adaptation_outcome_record(record)
+}
+
+fn is_reflection_adaptation_outcome_record(record: &EvolutionRecord) -> bool {
+    matches!(
+        record.kind.as_str(),
+        "verification" | "failure" | "stall" | "drift"
+    )
 }
 
 fn reflection_goal_event_summary(event: &SurfaceEventPreview) -> Option<ReflectionEventSummary> {
@@ -1445,6 +1510,7 @@ fn build_persistent_reflection_context(
     verification: Option<ReflectionVerificationSummary>,
     recent_evaluation_events: Vec<ReflectionEventSummary>,
     recent_adaptations: Vec<ReflectionEventSummary>,
+    recent_adaptation_outcomes: Vec<ReflectionEventSummary>,
 ) -> astra_runtime::liquid::reflection::ReflectionContext {
     const REFLECTION_TOOL_RECORD_LIMIT: usize = 24;
     const REFLECTION_TOOL_STAT_LIMIT: usize = 8;
@@ -1493,6 +1559,7 @@ fn build_persistent_reflection_context(
     context.verification = verification;
     context.recent_evaluation_events = recent_evaluation_events;
     context.recent_adaptations = recent_adaptations;
+    context.recent_adaptation_outcomes = recent_adaptation_outcomes;
     context
 }
 
@@ -2590,6 +2657,10 @@ mod tests {
             "Adaptation"
         );
         assert_eq!(
+            value["reflection_context"]["recent_adaptation_outcomes"][0]["kind"],
+            "Verification"
+        );
+        assert_eq!(
             value["reflection_context"]["recent_tactical_actions"][0],
             "high token pressure"
         );
@@ -2634,6 +2705,18 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("[Adaptation]")
+        );
+        assert!(
+            value["prompt_preview"]
+                .as_str()
+                .unwrap()
+                .contains("Recent adaptation outcomes:")
+        );
+        assert!(
+            value["prompt_preview"]
+                .as_str()
+                .unwrap()
+                .contains("[Verification] after Adaptation turn 9")
         );
     }
 

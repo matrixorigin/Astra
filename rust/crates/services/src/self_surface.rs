@@ -1878,9 +1878,7 @@ fn phase_for_event_type(event_type: &JournalEventType) -> &'static str {
         JournalEventType::Turn
         | JournalEventType::PlanProgress
         | JournalEventType::PlanEdit
-        | JournalEventType::GoalSteered => {
-            "execute"
-        }
+        | JournalEventType::GoalSteered => "execute",
         JournalEventType::TurnError
         | JournalEventType::Error
         | JournalEventType::StallDetected
@@ -1982,7 +1980,29 @@ fn summarize_event(event: &JournalEvent) -> String {
             .error
             .as_deref()
             .map(|error| format!("verification completed with error: {}", truncate(error, 80)))
-            .unwrap_or_else(|| "verification completed".to_string()),
+            .unwrap_or_else(|| {
+                verification_event_view_from_event(event)
+                    .map(|view| {
+                        let outcome = match view.passed {
+                            Some(true) => "verification passed",
+                            Some(false) => "verification failed",
+                            None => "verification recorded",
+                        };
+                        let mut detail = outcome.to_string();
+                        if let Some(scope) = view.scope.as_deref() {
+                            detail.push(' ');
+                            detail.push_str(scope);
+                        }
+                        if let Some(target) = view.target.as_deref() {
+                            detail.push(' ');
+                            detail.push_str(target);
+                        }
+                        detail.push_str(" — ");
+                        detail.push_str(&truncate(&view.summary, 80));
+                        detail
+                    })
+                    .unwrap_or_else(|| "verification completed".to_string())
+            }),
         JournalEventType::StallDetected => format!(
             "stall detected{}",
             event
@@ -2555,5 +2575,44 @@ mod tests {
             verify.objective.summary,
             "objective satisfied: 1/1 subtasks complete, 1/1 global checks passed"
         );
+    }
+
+    #[tokio::test]
+    async fn evolution_surface_verification_records_include_pass_fail_detail() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(temp.path());
+        let session_id = "svc-self-evolution-verification";
+        let ws = WorkspaceMetadata::with_context(session_id, "gpt-5.4", "/repo", Some("main"));
+        session_workspace::write_workspace(&ws).unwrap();
+        append_turn_event(session_id, 2);
+        JournalWriter::new(session_id)
+            .unwrap()
+            .append(&JournalEvent::verification_completed(
+                Some(session_id),
+                3,
+                "subtask-1",
+                "global",
+                false,
+                &serde_json::json!([sample_verification_result("integration-tests", false)]),
+            ))
+            .unwrap();
+
+        let service =
+            LocalSelfSurfaceService::new().with_runtime_support(Arc::new(StubRuntimeSupport));
+        let snapshot = service.snapshot(session_id, 10).await.unwrap();
+        let verification = snapshot
+            .evolution
+            .records
+            .iter()
+            .find(|record| record.kind == "verification")
+            .expect("verification evolution record");
+
+        assert_eq!(verification.status, "recorded");
+        assert!(
+            verification
+                .summary
+                .contains("verification failed global subtask-1")
+        );
+        assert!(verification.summary.contains("integration-tests"));
     }
 }

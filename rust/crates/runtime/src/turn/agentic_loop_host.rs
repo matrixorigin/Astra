@@ -2628,6 +2628,8 @@ fn reflection_recent_evaluation_events(
     goal: Option<&GoalSurface>,
     verification: Option<&VerificationSurface>,
 ) -> Vec<crate::liquid::reflection::ReflectionEventSummary> {
+    const REFLECTION_EVENT_LIMIT: usize = 4;
+
     let mut events = Vec::new();
     if let Some(goal) = goal {
         events.extend(
@@ -2651,42 +2653,31 @@ fn reflection_recent_evaluation_events(
             .cmp(&a.turn.unwrap_or_default())
             .then_with(|| a.kind.cmp(&b.kind))
     });
-    events.truncate(4);
+    events.truncate(REFLECTION_EVENT_LIMIT);
     events
 }
 
 fn reflection_recent_adaptations(
     snapshot: Option<&PersistentSelfSnapshot>,
 ) -> Vec<crate::liquid::reflection::ReflectionEventSummary> {
+    const REFLECTION_EVENT_LIMIT: usize = 4;
+
     let Some(snapshot) = snapshot else {
         return Vec::new();
     };
-    let mut records = snapshot
+    snapshot
         .evolution
         .records
         .iter()
         .filter_map(reflection_adaptation_summary)
-        .collect::<Vec<_>>();
-    records.sort_by(|a, b| {
-        b.turn
-            .unwrap_or_default()
-            .cmp(&a.turn.unwrap_or_default())
-            .then_with(|| a.kind.cmp(&b.kind))
-    });
-    records.truncate(4);
-    records
+        .take(REFLECTION_EVENT_LIMIT)
+        .collect()
 }
 
 fn reflection_adaptation_summary(
     record: &EvolutionRecord,
 ) -> Option<crate::liquid::reflection::ReflectionEventSummary> {
-    if !matches!(record.status.as_str(), "applied" | "enrolled" | "promoted") {
-        return None;
-    }
-    if matches!(
-        record.kind.as_str(),
-        "failure" | "stall" | "drift" | "verification"
-    ) {
+    if !is_reflection_adaptation_record(record) {
         return None;
     }
     Some(crate::liquid::reflection::ReflectionEventSummary {
@@ -2694,6 +2685,71 @@ fn reflection_adaptation_summary(
         turn: record.turn,
         detail: format!("{} — {}", record.status, truncate_str(&record.summary, 120)),
     })
+}
+
+fn reflection_recent_adaptation_outcomes(
+    snapshot: Option<&PersistentSelfSnapshot>,
+) -> Vec<crate::liquid::reflection::ReflectionEventSummary> {
+    const REFLECTION_EVENT_LIMIT: usize = 4;
+
+    let Some(snapshot) = snapshot else {
+        return Vec::new();
+    };
+    let mut outcomes = Vec::new();
+    let mut previous_adaptation_index = None;
+    for (index, record) in snapshot.evolution.records.iter().enumerate() {
+        if !is_reflection_adaptation_record(record) {
+            continue;
+        }
+        let start = previous_adaptation_index.map_or(0, |previous| previous + 1);
+        if let Some(outcome) = snapshot.evolution.records[start..index]
+            .iter()
+            .find(|candidate| is_reflection_adaptation_outcome_record(candidate))
+        {
+            outcomes.push(reflection_adaptation_outcome_summary(record, outcome));
+        }
+        previous_adaptation_index = Some(index);
+        if outcomes.len() >= REFLECTION_EVENT_LIMIT {
+            break;
+        }
+    }
+    outcomes
+}
+
+fn reflection_adaptation_outcome_summary(
+    adaptation: &EvolutionRecord,
+    outcome: &EvolutionRecord,
+) -> crate::liquid::reflection::ReflectionEventSummary {
+    let detail = match adaptation.turn {
+        Some(turn) => format!(
+            "after {} turn {} — {}",
+            reflection_kind_label(&adaptation.kind),
+            turn,
+            truncate_str(&outcome.summary, 120)
+        ),
+        None => format!(
+            "after {} — {}",
+            reflection_kind_label(&adaptation.kind),
+            truncate_str(&outcome.summary, 120)
+        ),
+    };
+    crate::liquid::reflection::ReflectionEventSummary {
+        kind: reflection_kind_label(&outcome.kind),
+        turn: outcome.turn.or(adaptation.turn),
+        detail,
+    }
+}
+
+fn is_reflection_adaptation_record(record: &EvolutionRecord) -> bool {
+    matches!(record.status.as_str(), "applied" | "enrolled" | "promoted")
+        && !is_reflection_adaptation_outcome_record(record)
+}
+
+fn is_reflection_adaptation_outcome_record(record: &EvolutionRecord) -> bool {
+    matches!(
+        record.kind.as_str(),
+        "verification" | "failure" | "stall" | "drift"
+    )
 }
 
 fn reflection_kind_label(kind: &str) -> String {
@@ -2735,11 +2791,13 @@ async fn build_auto_reflection_self_evidence(
     Option<crate::liquid::reflection::VerificationSummary>,
     Vec<crate::liquid::reflection::ReflectionEventSummary>,
     Vec<crate::liquid::reflection::ReflectionEventSummary>,
+    Vec<crate::liquid::reflection::ReflectionEventSummary>,
 ) {
     let mut goal = None;
     let mut verification = None;
     let mut recent_evaluation_events = Vec::new();
     let mut recent_adaptations = Vec::new();
+    let mut recent_adaptation_outcomes = Vec::new();
     if let Some(session_id) = state.current_session_id.as_deref() {
         let service = LocalSelfSurfaceService::new();
         let snapshot = service
@@ -2773,6 +2831,7 @@ async fn build_auto_reflection_self_evidence(
             verification_surface.as_ref(),
         );
         recent_adaptations = reflection_recent_adaptations(snapshot.as_ref());
+        recent_adaptation_outcomes = reflection_recent_adaptation_outcomes(snapshot.as_ref());
         goal = goal_surface.and_then(reflection_goal_summary_from_surface);
         verification = verification_surface.map(reflection_verification_summary_from_surface);
     }
@@ -2784,6 +2843,7 @@ async fn build_auto_reflection_self_evidence(
         verification,
         recent_evaluation_events,
         recent_adaptations,
+        recent_adaptation_outcomes,
     )
 }
 
@@ -2859,8 +2919,13 @@ async fn maybe_trigger_auto_reflection<H: AgenticLoopHost>(
     let recent_tactical_actions = state.recent_tactical_actions.clone();
     let active_experiment = build_auto_reflection_experiment_summary(state);
 
-    let (goal, verification, recent_evaluation_events, recent_adaptations) =
-        build_auto_reflection_self_evidence(state).await;
+    let (
+        goal,
+        verification,
+        recent_evaluation_events,
+        recent_adaptations,
+        recent_adaptation_outcomes,
+    ) = build_auto_reflection_self_evidence(state).await;
     let mut ctx = evo.build_reflection_context(
         session_id,
         turns_completed,
@@ -2875,6 +2940,7 @@ async fn maybe_trigger_auto_reflection<H: AgenticLoopHost>(
     ctx.verification = verification;
     ctx.recent_evaluation_events = recent_evaluation_events;
     ctx.recent_adaptations = recent_adaptations;
+    ctx.recent_adaptation_outcomes = recent_adaptation_outcomes;
 
     let (system_prompt, user_prompt) = evo.build_reflection_prompt(&ctx);
     let reflection_result = match host
@@ -11098,24 +11164,24 @@ print(json.dumps({'context': 'user said: ' + msg}))
         astra_services::session_journal::JournalWriter::new("sess-reflect")
             .unwrap()
             .append(
-                &astra_services::session_journal::JournalEvent::verification_completed(
+                &astra_services::session_journal::JournalEvent::adaptive_per_turn_applied(
                     Some("sess-reflect"),
-                    3,
-                    "subtask-1",
-                    "global",
-                    false,
-                    &serde_json::json!([{"check":"integration-tests","passed":false}]),
+                    4,
+                    vec![("verification.strictness".into(), "0.6".into(), "0.7".into())],
+                    vec!["high token pressure".into()],
                 ),
             )
             .unwrap();
         astra_services::session_journal::JournalWriter::new("sess-reflect")
             .unwrap()
             .append(
-                &astra_services::session_journal::JournalEvent::adaptive_per_turn_applied(
+                &astra_services::session_journal::JournalEvent::verification_completed(
                     Some("sess-reflect"),
-                    4,
-                    vec![("verification.strictness".into(), "0.6".into(), "0.7".into())],
-                    vec!["high token pressure".into()],
+                    5,
+                    "subtask-1",
+                    "global",
+                    false,
+                    &serde_json::json!([{"check":"integration-tests","passed":false}]),
                 ),
             )
             .unwrap();
@@ -11202,6 +11268,8 @@ print(json.dumps({'context': 'user said: ' + msg}))
         assert!(prompt.contains("[Verification]"));
         assert!(prompt.contains("Recent adaptations:"));
         assert!(prompt.contains("[Adaptation]"));
+        assert!(prompt.contains("Recent adaptation outcomes:"));
+        assert!(prompt.contains("[Verification] after Adaptation turn 4"));
         assert!(prompt.contains("Tool statistics:"));
         assert!(prompt.contains("bash — calls=2, failures=1, avg_ms=150"));
         assert!(prompt.contains("Active experiment: exp-123 (variant=variant-b, samples=4)"));
