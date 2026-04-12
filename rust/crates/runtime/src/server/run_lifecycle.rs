@@ -936,10 +936,12 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 if run.user_id != user_id {
                     return Err(error_response(StatusCode::FORBIDDEN, "Access denied"));
                 }
-                if run.status == RunStatus::Running {
+                if matches!(run.status, RunStatus::Running | RunStatus::Paused) {
                     run.cancel_flag.store(true, Ordering::SeqCst);
+                    run.pause_flag.store(false, Ordering::SeqCst);
                     run.llm_cancel_token.cancel();
                     run.status = RunStatus::Cancelled;
+                    run.waiting_for = None;
                     run.events.push(json!({
                         "event_type": "run_finished",
                         "data": {"cancelled": true}
@@ -975,7 +977,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         }
 
         if let Some(run) = self.load_durable_run_for_user(&run_id, &user_id).await? {
-            return if run.status == STATUS_RUNNING {
+            return if matches!(run.status.as_str(), STATUS_RUNNING | STATUS_PAUSED) {
                 Err(Self::run_control_state_unavailable("cancellation"))
             } else {
                 Ok(CancelRunRecord {
@@ -1698,6 +1700,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancel_run_from_paused_sets_cancelled_status_and_clears_pause_flag() {
+        let svc = test_service();
+        let run = ok(svc.create_run("user-1".into(), test_request("task")).await);
+        ok(svc.pause_run(run.run_id.clone(), "user-1".into()).await);
+        assert_eq!(svc.test_pause_flag_is_set(&run.run_id).await, Some(true));
+
+        let result = ok(svc.cancel_run(run.run_id.clone(), "user-1".into()).await);
+        assert_eq!(result.status, "cancelled");
+        assert_eq!(svc.test_pause_flag_is_set(&run.run_id).await, Some(false));
+        assert_eq!(
+            svc.test_llm_cancel_token_is_cancelled(&run.run_id).await,
+            Some(true)
+        );
+    }
+
+    #[tokio::test]
     async fn pause_run_sets_live_pause_flag_and_resume_clears_it() {
         let svc = test_service();
         let run = ok(svc.create_run("user-1".into(), test_request("task")).await);
@@ -2168,6 +2186,24 @@ mod tests {
         let e = err(svc.resume_run("run-1".into(), "user-1".into()).await);
         assert_eq!(e.0, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(e.1.0.detail, "Run control state unavailable for resume");
+    }
+
+    #[tokio::test]
+    async fn cancel_run_paused_cache_miss_returns_service_unavailable() {
+        let svc = test_service_with_engine();
+        let engine = svc.run_engine.as_ref().unwrap();
+        engine.start_run("run-1", "user-1", "sess-1").await.unwrap();
+        engine
+            .persist_status("run-1", STATUS_PAUSED, Some("user_resume"), None)
+            .await
+            .unwrap();
+
+        let e = err(svc.cancel_run("run-1".into(), "user-1".into()).await);
+        assert_eq!(e.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            e.1.0.detail,
+            "Run control state unavailable for cancellation"
+        );
     }
 
     #[tokio::test]
