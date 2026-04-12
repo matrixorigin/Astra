@@ -150,6 +150,10 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
     let by_sig: &HashMap<String, String> = edge_callback_outputs;
 
     let max_identical = max_identical_calls;
+    /// After this many consecutive empty-name tool calls in one headless round,
+    /// stop processing — the model is stuck emitting malformed calls.
+    const MAX_CONSECUTIVE_EMPTY_NAME: u32 = 3;
+    let mut consecutive_empty_name: u32 = 0;
 
     for item in &indices {
         if let Some((aborted_count, aborted_tools)) =
@@ -185,6 +189,7 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
         // unknown_tool *before* dedup counting prevents a single malformed
         // burst from inflating call_counts and flooding the context.
         if name.is_empty() {
+            consecutive_empty_name = consecutive_empty_name.saturating_add(1);
             let err_msg = unknown_local_tool_error_message(&name, valid_tool_names);
             if !quiet {
                 term.emit_line(
@@ -201,8 +206,17 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
             messages.push(tool_msg);
             tool_results.push(err_tr);
             tool_call_records.push(journal_record_unknown_tool(name.clone(), 0));
+            if consecutive_empty_name >= MAX_CONSECUTIVE_EMPTY_NAME {
+                agent_warn!(
+                    "step",
+                    "Aborting headless tool round after {} consecutive empty-name tool calls",
+                    consecutive_empty_name
+                );
+                break;
+            }
             continue;
         }
+        consecutive_empty_name = 0;
 
         let call_sig = tool_dedup_signature(&name, &args);
         let count = call_counts.entry(call_sig.clone()).or_insert(0);
