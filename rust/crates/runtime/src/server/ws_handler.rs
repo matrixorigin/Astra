@@ -11,6 +11,8 @@
 //! {"type": "auth", "token": "Bearer ..."}
 //! {"type": "message", "content": "...", "session_id": "...", "model": "..."}
 //! {"type": "cancel_run", "run_id": "..."}
+//! {"type": "pause_run", "run_id": "..."}
+//! {"type": "resume_run", "run_id": "..."}
 //! {"type": "tool_approval", "request_id": "...", "approved": true, "reason": "..."}
 //! {"type": "ping"}
 //! ```
@@ -21,6 +23,8 @@
 //! {"type": "auth_error", "message": "..."}
 //! {"type": "session_info", "session_id": "..."}
 //! {"type": "run_started", "run_id": "...", "session_id": "..."}
+//! {"type": "run_paused", "run_id": "..."}
+//! {"type": "run_resumed", "run_id": "..."}
 //! {"type": "text_delta", "content": "..."}
 //! {"type": "tool_call_start", "tool": "...", "call_id": "..."}
 //! {"type": "tool_approval_request", "request_id": "...", "tool": "...", "args": {...}}
@@ -81,6 +85,14 @@ pub(super) enum WsClientMessage {
     #[serde(rename = "cancel_run")]
     CancelRun { run_id: String },
 
+    /// Pause an active run.
+    #[serde(rename = "pause_run")]
+    PauseRun { run_id: String },
+
+    /// Resume a paused run.
+    #[serde(rename = "resume_run")]
+    ResumeRun { run_id: String },
+
     /// Respond to a tool approval request.
     #[serde(rename = "tool_approval")]
     ToolApproval {
@@ -125,6 +137,14 @@ pub(super) enum WsServerMessage {
     /// Run was cancelled by client request.
     #[serde(rename = "run_cancelled")]
     RunCancelled { run_id: String },
+
+    /// Run was paused.
+    #[serde(rename = "run_paused")]
+    RunPaused { run_id: String },
+
+    /// Run was resumed.
+    #[serde(rename = "run_resumed")]
+    RunResumed { run_id: String },
 
     /// Tool requires user approval before execution.
     #[serde(rename = "tool_approval_request")]
@@ -364,6 +384,12 @@ async fn message_loop(socket: &mut WebSocket, state: &AppState, mut conn: WsConn
                             Ok(WsClientMessage::CancelRun { run_id }) => {
                                 handle_cancel_run(socket, state, &conn, &run_id).await;
                             }
+                            Ok(WsClientMessage::PauseRun { run_id }) => {
+                                handle_pause_run(socket, state, &conn, &run_id, true).await;
+                            }
+                            Ok(WsClientMessage::ResumeRun { run_id }) => {
+                                handle_resume_run(socket, state, &conn, &run_id, true).await;
+                            }
                             Ok(WsClientMessage::ToolApproval {
                                 request_id,
                                 approved,
@@ -509,6 +535,64 @@ async fn handle_cancel_run(
     {
         Ok(record) => {
             send_msg(socket, &cancel_run_outcome_message(&record)).await;
+        }
+        Err((status, err)) => {
+            send_msg(socket, &ws_error_from_status(status, err.0.detail)).await;
+        }
+    }
+}
+
+async fn handle_pause_run(
+    socket: &mut WebSocket,
+    state: &AppState,
+    conn: &WsConnection,
+    run_id: &str,
+    emit_ack: bool,
+) {
+    match state
+        .run_lifecycle_service
+        .pause_run(run_id.to_string(), conn.user.user_id.clone())
+        .await
+    {
+        Ok(record) => {
+            if emit_ack {
+                send_msg(
+                    socket,
+                    &WsServerMessage::RunPaused {
+                        run_id: record.run_id,
+                    },
+                )
+                .await;
+            }
+        }
+        Err((status, err)) => {
+            send_msg(socket, &ws_error_from_status(status, err.0.detail)).await;
+        }
+    }
+}
+
+async fn handle_resume_run(
+    socket: &mut WebSocket,
+    state: &AppState,
+    conn: &WsConnection,
+    run_id: &str,
+    emit_ack: bool,
+) {
+    match state
+        .run_lifecycle_service
+        .resume_run(run_id.to_string(), conn.user.user_id.clone())
+        .await
+    {
+        Ok(record) => {
+            if emit_ack {
+                send_msg(
+                    socket,
+                    &WsServerMessage::RunResumed {
+                        run_id: record.run_id,
+                    },
+                )
+                .await;
+            }
         }
         Err((status, err)) => {
             send_msg(socket, &ws_error_from_status(status, err.0.detail)).await;
@@ -727,6 +811,12 @@ async fn stream_run_over_websocket(
                         match serde_json::from_str::<WsClientMessage>(&text) {
                             Ok(WsClientMessage::CancelRun { run_id: cancel_run_id }) => {
                                 handle_cancel_run(socket, state, conn, &cancel_run_id).await;
+                            }
+                            Ok(WsClientMessage::PauseRun { run_id }) => {
+                                handle_pause_run(socket, state, conn, &run_id, false).await;
+                            }
+                            Ok(WsClientMessage::ResumeRun { run_id }) => {
+                                handle_resume_run(socket, state, conn, &run_id, false).await;
                             }
                             Ok(WsClientMessage::ToolApproval { request_id, approved, reason }) => {
                                 handle_tool_approval(state, conn, &request_id, approved, reason).await;
@@ -1260,6 +1350,18 @@ async fn stream_sse_response_as_ws(
                                 } else {
                                     handle_cancel_run(socket, state, conn, &run_id).await;
                                 }
+                            }
+                            Ok(WsClientMessage::PauseRun { .. })
+                            | Ok(WsClientMessage::ResumeRun { .. }) => {
+                                send_msg(
+                                    socket,
+                                    &WsServerMessage::Error {
+                                        message: "Pause and resume are not supported for bridge fallback runs".into(),
+                                        code: "NOT_SUPPORTED".into(),
+                                        retryable: false,
+                                    },
+                                )
+                                .await;
                             }
                             Ok(WsClientMessage::ToolApproval { request_id, approved, reason }) => {
                                 handle_tool_approval(state, conn, &request_id, approved, reason).await;
@@ -1823,6 +1925,20 @@ mod tests {
     }
 
     #[test]
+    fn parse_pause_run_message() {
+        let json = r#"{"type": "pause_run", "run_id": "run-1"}"#;
+        let msg: WsClientMessage = serde_json::from_str(json).unwrap();
+        assert!(matches!(msg, WsClientMessage::PauseRun { run_id } if run_id == "run-1"));
+    }
+
+    #[test]
+    fn parse_resume_run_message() {
+        let json = r#"{"type": "resume_run", "run_id": "run-1"}"#;
+        let msg: WsClientMessage = serde_json::from_str(json).unwrap();
+        assert!(matches!(msg, WsClientMessage::ResumeRun { run_id } if run_id == "run-1"));
+    }
+
+    #[test]
     fn invalid_message_type_rejected() {
         let json = r#"{"type": "unknown"}"#;
         assert!(serde_json::from_str::<WsClientMessage>(json).is_err());
@@ -1873,6 +1989,26 @@ mod tests {
         let msg = WsServerMessage::Pong;
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains(r#""type":"pong""#));
+    }
+
+    #[test]
+    fn serialize_run_paused() {
+        let msg = WsServerMessage::RunPaused {
+            run_id: "run-123".into(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains(r#""type":"run_paused""#));
+        assert!(json.contains(r#""run_id":"run-123""#));
+    }
+
+    #[test]
+    fn serialize_run_resumed() {
+        let msg = WsServerMessage::RunResumed {
+            run_id: "run-123".into(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains(r#""type":"run_resumed""#));
+        assert!(json.contains(r#""run_id":"run-123""#));
     }
 
     #[test]
@@ -2126,6 +2262,12 @@ mod tests {
                 message: "err".into(),
                 code: "E".into(),
                 retryable: false,
+            },
+            WsServerMessage::RunPaused {
+                run_id: "run-1".into(),
+            },
+            WsServerMessage::RunResumed {
+                run_id: "run-1".into(),
             },
             WsServerMessage::Pong,
             WsServerMessage::Closing {
