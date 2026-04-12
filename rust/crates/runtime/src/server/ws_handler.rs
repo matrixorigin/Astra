@@ -1316,6 +1316,8 @@ async fn handle_chat_message_via_bridge(
 
     // Add optional headers from prepared context
     apply_prepared_headers(&mut bridge_headers, &prepared);
+    let prepared_trusted_session_id = prepared.trusted_session_id.clone();
+    let prepared_turn_chain_id = prepared.turn_chain_id.clone();
 
     let client_cancel = Arc::new(CancellationToken::new());
 
@@ -1340,22 +1342,20 @@ async fn handle_chat_message_via_bridge(
     match response {
         Ok(resp) => {
             let run_started_explain = bridge_run_started_explain(explain);
-            if let Some(session_id) = prepared.trusted_session_id.clone() {
-                conn.session_id = Some(session_id.clone());
-                conn.pending_session_id = None;
-                if let Some(run_id) = prepared.turn_chain_id.clone() {
-                    conn.active_run_id = Some(run_id.clone());
-                    conn.bridge_prepared_run_id = Some(run_id.clone());
-                    send_msg(
-                        socket,
-                        &WsServerMessage::RunStarted {
-                            run_id,
-                            session_id,
-                            explain: run_started_explain.clone(),
-                        },
-                    )
-                    .await;
-                }
+            if let Some((session_id, run_id)) = bind_prepared_bridge_identity(
+                conn,
+                prepared_trusted_session_id.as_deref(),
+                prepared_turn_chain_id.as_deref(),
+            ) {
+                send_msg(
+                    socket,
+                    &bridge_run_started_message(
+                        session_id,
+                        run_id,
+                        run_started_explain.as_ref(),
+                    ),
+                )
+                .await;
             }
 
             let terminal_status = stream_sse_response_as_ws(
@@ -1409,11 +1409,21 @@ async fn handle_chat_message_via_bridge(
             conn.bridge_prepared_run_id = None;
         }
         Err((status, error)) => {
-            send_msg(
-                socket,
-                &ws_error_from_status(status, format!("Bridge error: {error}")),
-            )
-            .await;
+            let run_started_explain = bridge_run_started_explain(explain);
+            let error_message = format!("Bridge error: {error}");
+            let messages = bridge_forward_error_messages(
+                conn,
+                prepared_trusted_session_id.as_deref(),
+                prepared_turn_chain_id.as_deref(),
+                run_started_explain.as_ref(),
+                status,
+                error_message,
+            );
+            for message in &messages {
+                send_msg(socket, message).await;
+            }
+            conn.active_run_id = None;
+            conn.bridge_prepared_run_id = None;
         }
     }
 }
@@ -1481,6 +1491,58 @@ fn synthetic_bridge_run_started(
 
 fn bridge_run_started_explain(explain: bool) -> Option<Value> {
     explain.then(|| serde_json::json!({"mode": "background"}))
+}
+
+fn bind_prepared_bridge_identity(
+    conn: &mut WsConnection,
+    trusted_session_id: Option<&str>,
+    turn_chain_id: Option<&str>,
+) -> Option<(String, String)> {
+    let session_id = trusted_session_id?.to_string();
+    conn.session_id = Some(session_id.clone());
+    conn.pending_session_id = None;
+
+    let run_id = turn_chain_id?.to_string();
+    conn.active_run_id = Some(run_id.clone());
+    conn.bridge_prepared_run_id = Some(run_id.clone());
+    Some((session_id, run_id))
+}
+
+fn bridge_run_started_message(
+    session_id: String,
+    run_id: String,
+    explain: Option<&Value>,
+) -> WsServerMessage {
+    WsServerMessage::RunStarted {
+        run_id,
+        session_id,
+        explain: explain.cloned(),
+    }
+}
+
+fn bridge_forward_error_messages(
+    conn: &mut WsConnection,
+    trusted_session_id: Option<&str>,
+    turn_chain_id: Option<&str>,
+    explain: Option<&Value>,
+    status: StatusCode,
+    error_message: String,
+) -> Vec<WsServerMessage> {
+    if let Some((session_id, run_id)) =
+        bind_prepared_bridge_identity(conn, trusted_session_id, turn_chain_id)
+    {
+        vec![
+            bridge_run_started_message(session_id, run_id.clone(), explain),
+            ws_error_from_status(status, error_message.clone()),
+            WsServerMessage::RunFinished {
+                run_id,
+                status: STATUS_FAILED.to_string(),
+                error: Some(error_message),
+            },
+        ]
+    } else {
+        vec![ws_error_from_status(status, error_message)]
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2578,6 +2640,132 @@ mod tests {
             bridge_ws_terminal_status(false, None),
             BridgeWsTerminalStatus::Failed(Some("Bridge stream ended before turn_complete".into()))
         );
+    }
+
+    #[test]
+    fn bridge_forward_error_messages_preserve_trusted_run_identity() {
+        let mut conn = WsConnection {
+            user: AuthUserRecord {
+                user_id: "u1".into(),
+                username: "alice".into(),
+                email: "alice@example.com".into(),
+                display_name: Some("Alice".into()),
+            },
+            authorization: "Bearer test-token".into(),
+            session_id: None,
+            pending_session_id: Some("pending-session".into()),
+            active_run_id: None,
+            bridge_prepared_run_id: None,
+        };
+        let prepared = PreparedChatTurnBridgeRequest {
+            body: Bytes::new(),
+            trusted_session_id: Some("sess-1".into()),
+            turn_chain_id: Some("run-1".into()),
+            user_query_event_id: None,
+            tools_changed: None,
+            task_hint: None,
+            user_query_b64: None,
+            routing_meta_b64: None,
+            force_intent: None,
+            execution_state_b64: None,
+        };
+        let explain = bridge_run_started_explain(true);
+
+        let messages = bridge_forward_error_messages(
+            &mut conn,
+            prepared.trusted_session_id.as_deref(),
+            prepared.turn_chain_id.as_deref(),
+            explain.as_ref(),
+            StatusCode::BAD_GATEWAY,
+            "Bridge error: boom".into(),
+        );
+
+        assert_eq!(conn.session_id.as_deref(), Some("sess-1"));
+        assert_eq!(conn.pending_session_id, None);
+        assert_eq!(conn.active_run_id.as_deref(), Some("run-1"));
+        assert_eq!(conn.bridge_prepared_run_id.as_deref(), Some("run-1"));
+        assert_eq!(messages.len(), 3);
+        match &messages[0] {
+            WsServerMessage::RunStarted {
+                run_id,
+                session_id,
+                explain,
+            } => {
+                assert_eq!(run_id, "run-1");
+                assert_eq!(session_id, "sess-1");
+                assert_eq!(explain, &Some(serde_json::json!({"mode": "background"})));
+            }
+            other => panic!("expected RunStarted, got {other:?}"),
+        }
+        match &messages[1] {
+            WsServerMessage::Error {
+                message,
+                code,
+                retryable,
+            } => {
+                assert_eq!(message, "Bridge error: boom");
+                assert_eq!(code, "INTERNAL_ERROR");
+                assert!(*retryable);
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+        match &messages[2] {
+            WsServerMessage::RunFinished {
+                run_id,
+                status,
+                error,
+            } => {
+                assert_eq!(run_id, "run-1");
+                assert_eq!(status, STATUS_FAILED);
+                assert_eq!(error.as_deref(), Some("Bridge error: boom"));
+            }
+            other => panic!("expected RunFinished, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bridge_forward_error_messages_without_run_id_only_emit_error() {
+        let mut conn = WsConnection {
+            user: AuthUserRecord {
+                user_id: "u1".into(),
+                username: "alice".into(),
+                email: "alice@example.com".into(),
+                display_name: Some("Alice".into()),
+            },
+            authorization: "Bearer test-token".into(),
+            session_id: None,
+            pending_session_id: Some("pending-session".into()),
+            active_run_id: None,
+            bridge_prepared_run_id: None,
+        };
+        let prepared = PreparedChatTurnBridgeRequest {
+            body: Bytes::new(),
+            trusted_session_id: Some("sess-1".into()),
+            turn_chain_id: None,
+            user_query_event_id: None,
+            tools_changed: None,
+            task_hint: None,
+            user_query_b64: None,
+            routing_meta_b64: None,
+            force_intent: None,
+            execution_state_b64: None,
+        };
+
+        let messages = bridge_forward_error_messages(
+            &mut conn,
+            prepared.trusted_session_id.as_deref(),
+            prepared.turn_chain_id.as_deref(),
+            None,
+            StatusCode::BAD_GATEWAY,
+            "Bridge error: boom".into(),
+        );
+
+        assert_eq!(conn.session_id.as_deref(), Some("sess-1"));
+        assert_eq!(conn.pending_session_id, None);
+        assert_eq!(conn.active_run_id, None);
+        assert_eq!(conn.bridge_prepared_run_id, None);
+        assert_eq!(messages.len(), 1);
+        assert!(matches!(messages[0], WsServerMessage::Error { .. }));
     }
 
     #[test]
