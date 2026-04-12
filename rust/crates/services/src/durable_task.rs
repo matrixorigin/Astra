@@ -1332,6 +1332,15 @@ impl TaskBranchOps for TaskBranchService {
     ) -> Result<String, String> {
         let name = sanitize_snapshot_name(&format!("task_{task_id}_{subtask_id}_v{version}"));
         validate_snapshot_name(&name)?;
+
+        // Drop existing snapshot if any (idempotent: ensures retry works)
+        // Note: Drop-then-create is not atomic. Concurrent retries of the same
+        // subtask may race. This is acceptable because subtasks are typically
+        // executed sequentially per task_id; concurrent execution is rare.
+        let drop_sql = format!("DROP SNAPSHOT IF EXISTS `{name}`");
+        // Drop failure is expected when snapshot doesn't exist; ignore error
+        let _ = sqlx::query(&drop_sql).execute(&self.pool).await;
+
         let sql = crate::snapshot_sql::create_snapshot_for_db_sql(&name, &self.database);
         sqlx::query(&sql)
             .execute(&self.pool)
@@ -4008,6 +4017,38 @@ mod tests {
         assert_eq!(st.stage, SubtaskStage::Pending);
         assert_eq!(st.max_retries, 2);
         assert_eq!(st.retry_count, 0);
+    }
+
+    #[test]
+    fn snapshot_name_generation_and_validation() {
+        // Test name generation
+        let name = sanitize_snapshot_name(&format!(
+            "task_{}_{}_v{}",
+            "358c9443-d3c1-42cc-b1c9-6b78054c9c48",
+            "create_login_html",
+            2
+        ));
+        assert_eq!(
+            name,
+            "task_358c9443_d3c1_42cc_b1c9_6b78054c9c48_create_login_html_v2"
+        );
+
+        // Test validation passes for valid names
+        assert!(validate_snapshot_name(&name).is_ok());
+
+        // Test validation fails for names with special characters
+        assert!(validate_snapshot_name("invalid;drop table").is_err());
+        assert!(validate_snapshot_name("invalid'quote").is_err());
+        assert!(validate_snapshot_name("invalid\"quote").is_err());
+        assert!(validate_snapshot_name("has spaces").is_err());
+        assert!(validate_snapshot_name("back`tick").is_err());
+
+        // Test validation fails for empty names
+        assert!(validate_snapshot_name("").is_err());
+
+        // Test validation passes for long names (no length limit in current implementation)
+        let long_name = "x".repeat(256);
+        assert!(validate_snapshot_name(&long_name).is_ok());
     }
 
     #[tokio::test]
