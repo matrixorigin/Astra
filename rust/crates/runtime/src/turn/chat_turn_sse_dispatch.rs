@@ -18,7 +18,7 @@ pub struct ChatTurnSseAccum {
     /// Thinking / reasoning chunks (for models that stream reasoning separately).
     pub reasoning_content: String,
     pub tool_calls: Vec<Value>,
-    /// Index from tool_call id → position in `tool_calls` for O(1) merge on `tool_call` events.
+    /// Index from tool_call id -> position in `tool_calls` for O(1) merges.
     pub(crate) tool_call_id_index: std::collections::HashMap<String, usize>,
     pub explain_turns: Vec<Value>,
     pub has_tool_calls: bool,
@@ -152,7 +152,11 @@ fn apply_one_event(
         "tool_call_start" => {
             effects.push(SseRenderEffect::StopThinkingSpinner);
             if let Some(tool_call) = normalize_tool_call_for_accum(event) {
-                let id = tool_call.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let id = tool_call
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 let idx = accum.tool_calls.len();
                 accum.tool_calls.push(tool_call);
                 if !id.is_empty() {
@@ -1260,7 +1264,10 @@ mod tests {
         );
         assert_eq!(a.tool_calls.len(), 1);
         let id = a.tool_calls[0]["id"].as_str().unwrap();
-        assert!(!id.is_empty(), "empty tool_call id must be replaced with a synthetic UUID");
+        assert!(
+            !id.is_empty(),
+            "empty tool_call id must be replaced with a synthetic UUID"
+        );
     }
 
     #[test]
@@ -1268,16 +1275,16 @@ mod tests {
         let mut a = ChatTurnSseAccum::default();
         // No id field at all
         dispatch_chat_turn_sse_event_block(
-            &sse(
-                "tool_call_start",
-                ",\"name\":\"grep\",\"arguments\":\"{}\"",
-            ),
+            &sse("tool_call_start", ",\"name\":\"grep\",\"arguments\":\"{}\""),
             &mut a,
             &mut vec![],
         );
         assert_eq!(a.tool_calls.len(), 1);
         let id = a.tool_calls[0]["id"].as_str().unwrap();
-        assert!(!id.is_empty(), "missing tool_call id must be replaced with a synthetic UUID");
+        assert!(
+            !id.is_empty(),
+            "missing tool_call id must be replaced with a synthetic UUID"
+        );
     }
 
     /// tool_call event with same id as prior tool_call_start must merge (update),
@@ -1297,6 +1304,7 @@ mod tests {
             &mut p,
         );
         assert_eq!(a.tool_calls.len(), 1);
+        assert_eq!(a.tool_call_id_index.get("tc-1"), Some(&0));
         // tool_call arrives with complete arguments — same id
         dispatch_chat_turn_sse_event_block(
             &sse(
@@ -1307,12 +1315,17 @@ mod tests {
             &mut p,
         );
         // Must still be 1 entry, not 2
-        assert_eq!(a.tool_calls.len(), 1, "tool_call should merge, not duplicate");
+        assert_eq!(
+            a.tool_calls.len(),
+            1,
+            "tool_call should merge, not duplicate"
+        );
         assert_eq!(a.tool_calls[0]["id"].as_str(), Some("tc-1"));
         assert_eq!(
             a.tool_calls[0]["function"]["arguments"].as_str(),
             Some("{\"n\":5}")
         );
+        assert_eq!(a.tool_call_id_index.get("tc-1"), Some(&0));
     }
 
     /// tool_call with a new id (no prior tool_call_start) appends normally.
@@ -1321,11 +1334,15 @@ mod tests {
         let mut a = ChatTurnSseAccum::default();
         let mut p = vec![];
         dispatch_chat_turn_sse_event_block(
-            &sse("tool_call", ",\"id\":\"tc-new\",\"name\":\"bash\",\"arguments\":{}"),
+            &sse(
+                "tool_call",
+                ",\"id\":\"tc-new\",\"name\":\"bash\",\"arguments\":{}",
+            ),
             &mut a,
             &mut p,
         );
         assert_eq!(a.tool_calls.len(), 1);
         assert_eq!(a.tool_calls[0]["id"].as_str(), Some("tc-new"));
+        assert_eq!(a.tool_call_id_index.get("tc-new"), Some(&0));
     }
 }
