@@ -87,12 +87,13 @@
 - **MutationScoreboard contract** (`services/src/mutation_scoreboard.rs`): Canonical typed scoreboard now unifies verifier summaries, objective/reward signals, staged mutation state, and aggregated retention metrics.
 - **Decision-audit-backed mutation scoreboard exposure** (`runtime/src/bridge/side_effects.rs`, `services/src/session_audit.rs`, `runtime/src/server/audit_handlers.rs`): tool-selection decision audits now persist `mutation_objective_score`, tool arguments, and turn metadata, and `/sessions/{session_id}/audit/mutations` reconstructs a typed per-session scoreboard for report/ops inspection.
 - **Cross-session mutation stats** (`services/src/session_audit.rs`): `/audit/stats` now aggregates global mutation counts (ready, approval-required, applied, reverted, blocked) across the user’s sessions, turning the per-session scoreboard into an account-level ops signal.
+- **Global mutation queue** (`services/src/session_audit.rs`, `runtime/src/server/audit_handlers.rs`): `/audit/mutations` now lists staged mutations across sessions with state filtering and pagination, giving ops a concrete queue instead of only counters.
 
 ### Gaps
 - **Most evaluation routes return 501**: `DatabaseEvaluationService` has "not implemented yet" for drift detection, drift pipeline, closed-loop, training data, SLO.
 - **No multi-objective optimization**: Evaluation is single-dimensional (quality score). No Pareto frontier for efficiency × cost × accuracy.
 - **No noise filtering**: FeedbackSignals are consumed raw; no statistical filtering for outliers or noise.
-- **No verifier-complete scoreboard yet**: `MutationScoreboard` now has per-session ops/report views, lifecycle writeback, and cross-session mutation counts, but verifier outcomes are still not stitched into that persisted surface and there is no richer global mutation queue/report yet.
+- **No verifier-complete scoreboard yet**: `MutationScoreboard` now has per-session ops/report views, lifecycle writeback, cross-session mutation counts, and a global mutation queue, but verifier outcomes are still not stitched into that persisted surface.
 - **Confidence intervals are not end-to-end**: `ConfidenceInterval` exists in core/runtime, but evaluation and report surfaces do not expose it consistently.
 - **No verifier diversity**: Gate validation is single-pass, not ensemble-based.
 
@@ -179,7 +180,7 @@
 | 1. State | ⬛⬛⬛⬜⬜ 60% | CompositeSnapshot 5D | No diff/merge/revert |
 | 2. Observation | ⬛⬛⬛⬜⬜ 55% | CausalChain + JournalEvents | Linear chains, no graph |
 | 3. Action | ⬛⬛⬜⬜⬜ 45% | Permission 3-tier model + compensation profiles | No automatic rollback executor |
-| 4. Evaluation | ⬛⬛⬛⬜⬜ 50% | EvaluationService + MutationScoreboard | No verifier-complete scoreboard / global mutation queue |
+| 4. Evaluation | ⬛⬛⬛⬜⬜ 55% | EvaluationService + MutationScoreboard | No verifier-complete scoreboard |
 | 5. Credit | ⬛⬜⬜⬜⬜ 25% | causal_chain_id on events | No diff-based scoring |
 | 6. Search | ⬛⬛⬜⬜⬜ 35% | SchedulingContract + TeamOrch | No proposal diversity |
 | 7. Safety | ⬛⬛⬛⬜⬜ 55% | Drift detection + middleware | Causal guard is heuristic-only |

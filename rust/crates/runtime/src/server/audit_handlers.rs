@@ -1,6 +1,7 @@
 use super::*;
 use astra_services::session_audit::{
-    AuditSessionListParams, CrossSessionStatsParams, MutationStateUpdateRequest, TurnListParams,
+    AuditSessionListParams, CrossSessionMutationListParams, CrossSessionStatsParams,
+    MutationStateUpdateRequest, TurnListParams,
 };
 use astra_services::{EventCreateRequestData, StagedMutationState};
 
@@ -201,6 +202,19 @@ pub(super) async fn cross_session_tools_handler(
     let result = state
         .session_audit_service
         .get_cross_session_tools(&user.user_id, &params)
+        .await?;
+    Ok(Json(serde_json::to_value(result).map_err(internal_error)?))
+}
+
+pub(super) async fn cross_session_mutations_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<CrossSessionMutationListParams>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let user = state.auth_service.current_user(&headers).await?;
+    let result = state
+        .session_audit_service
+        .list_cross_session_mutations(&user.user_id, &params)
         .await?;
     Ok(Json(serde_json::to_value(result).map_err(internal_error)?))
 }

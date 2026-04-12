@@ -437,6 +437,10 @@ pub(super) fn build_router(state: AppState) -> Router {
             "/audit/tools",
             get(audit_handlers::cross_session_tools_handler),
         )
+        .route(
+            "/audit/mutations",
+            get(audit_handlers::cross_session_mutations_handler),
+        )
         // Marketplace
         .route(
             "/marketplace/install",
