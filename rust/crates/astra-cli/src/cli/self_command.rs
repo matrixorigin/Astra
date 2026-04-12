@@ -13,6 +13,7 @@ use astra_runtime::auto_tuning::{FeedbackSignal, SignalType};
 use astra_runtime::liquid::reflection::{
     GoalSummary as ReflectionGoalSummary, HealthSummary as ReflectionHealthSummary,
     ReflectionEventSummary, VerificationSummary as ReflectionVerificationSummary,
+    summarize_recent_performance_deltas,
 };
 use astra_runtime::runtime_config::RuntimeConfig;
 use astra_runtime::self_model::{ConstraintSet, SelfModel};
@@ -518,6 +519,7 @@ async fn build_reflect_response(
         goal,
         verification,
         health,
+        recent_performance_deltas,
         recent_evaluation_events,
         recent_adaptations,
         recent_adaptation_outcomes,
@@ -530,6 +532,7 @@ async fn build_reflect_response(
         goal,
         verification,
         health,
+        recent_performance_deltas,
         recent_evaluation_events,
         recent_adaptations,
         recent_adaptation_outcomes,
@@ -559,6 +562,7 @@ async fn load_reflection_self_evidence(
     Vec<ReflectionEventSummary>,
     Vec<ReflectionEventSummary>,
     Vec<ReflectionEventSummary>,
+    Vec<ReflectionEventSummary>,
 ) {
     let service = LocalSelfSurfaceService::new();
     let snapshot = service.snapshot(session_id, journal_limit).await.ok();
@@ -583,6 +587,10 @@ async fn load_reflection_self_evidence(
         Ok(SelfSurfaceResponse::Health(health)) => Some(health),
         _ => None,
     };
+    let recent_performance_deltas = snapshot
+        .as_ref()
+        .map(|snapshot| summarize_recent_performance_deltas(&snapshot.recent_steps, 4))
+        .unwrap_or_default();
     let recent_evaluation_events =
         reflection_recent_evaluation_events(goal_surface.as_ref(), verification_surface.as_ref());
     let recent_adaptations = reflection_recent_adaptations(snapshot.as_ref());
@@ -591,6 +599,7 @@ async fn load_reflection_self_evidence(
         goal_surface.and_then(reflection_goal_summary),
         verification_surface.map(reflection_verification_summary),
         health_surface.and_then(reflection_health_summary),
+        recent_performance_deltas,
         recent_evaluation_events,
         recent_adaptations,
         recent_adaptation_outcomes,
@@ -1585,6 +1594,7 @@ fn build_persistent_reflection_context(
     goal: Option<ReflectionGoalSummary>,
     verification: Option<ReflectionVerificationSummary>,
     health: Option<ReflectionHealthSummary>,
+    recent_performance_deltas: Vec<ReflectionEventSummary>,
     recent_evaluation_events: Vec<ReflectionEventSummary>,
     recent_adaptations: Vec<ReflectionEventSummary>,
     recent_adaptation_outcomes: Vec<ReflectionEventSummary>,
@@ -1635,6 +1645,7 @@ fn build_persistent_reflection_context(
     context.goal = goal;
     context.verification = verification;
     context.health = health;
+    context.recent_performance_deltas = recent_performance_deltas;
     context.recent_evaluation_events = recent_evaluation_events;
     context.recent_adaptations = recent_adaptations;
     context.recent_adaptation_outcomes = recent_adaptation_outcomes;
@@ -2496,6 +2507,51 @@ mod tests {
         session_workspace::write_workspace(&ws).unwrap();
 
         let writer = session_journal::JournalWriter::new(session_id).unwrap();
+        for (turn, bash_ok, bash_ms, rg_ms) in [
+            (6, true, 60_u64, 25_u64),
+            (7, true, 70, 30),
+            (8, false, 220, 300),
+        ] {
+            let mut event = JournalEvent::turn(
+                Some(session_id),
+                turn,
+                Some("gpt-5.4"),
+                "inspect tool health",
+                "record tool outcome",
+                2,
+                12,
+                24,
+                bash_ms.max(rg_ms),
+            );
+            event.tools_selected = Some(vec!["bash".to_string(), "rg".to_string()]);
+            event.tools_used = Some(vec!["bash".to_string(), "rg".to_string()]);
+            event.tool_calls = Some(vec![
+                ToolCallRecord {
+                    name: "bash".to_string(),
+                    ok: bash_ok,
+                    ms: bash_ms,
+                    error: (!bash_ok).then(|| "bash regression".to_string()),
+                    input_bytes: None,
+                    output_bytes: None,
+                    args_preview: None,
+                    result_preview: None,
+                },
+                ToolCallRecord {
+                    name: "rg".to_string(),
+                    ok: true,
+                    ms: rg_ms,
+                    error: None,
+                    input_bytes: None,
+                    output_bytes: None,
+                    args_preview: None,
+                    result_preview: None,
+                },
+            ]);
+            if !bash_ok {
+                event.error = Some("bash regression".to_string());
+            }
+            writer.append(&event).unwrap();
+        }
         writer
             .append(&JournalEvent {
                 event_type: JournalEventType::AdaptiveScenarioApplied,
@@ -2728,6 +2784,10 @@ mod tests {
             "bash"
         );
         assert_eq!(
+            value["reflection_context"]["recent_performance_deltas"][0]["kind"],
+            "Regressed"
+        );
+        assert_eq!(
             value["reflection_context"]["recent_evaluation_events"][0]["kind"],
             "Verification"
         );
@@ -2770,6 +2830,12 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("Tool health:")
+        );
+        assert!(
+            value["prompt_preview"]
+                .as_str()
+                .unwrap()
+                .contains("Recent performance deltas:")
         );
         assert!(
             value["prompt_preview"]

@@ -2858,10 +2858,12 @@ async fn build_auto_reflection_self_evidence(
     Vec<crate::liquid::reflection::ReflectionEventSummary>,
     Vec<crate::liquid::reflection::ReflectionEventSummary>,
     Vec<crate::liquid::reflection::ReflectionEventSummary>,
+    Vec<crate::liquid::reflection::ReflectionEventSummary>,
 ) {
     let mut goal = None;
     let mut verification = None;
     let mut health = None;
+    let mut recent_performance_deltas = Vec::new();
     let mut recent_evaluation_events = Vec::new();
     let mut recent_adaptations = Vec::new();
     let mut recent_adaptation_outcomes = Vec::new();
@@ -2904,6 +2906,13 @@ async fn build_auto_reflection_self_evidence(
             Ok(SelfSurfaceResponse::Health(health_surface)) => Some(health_surface),
             _ => None,
         };
+        if let Some(snapshot) = snapshot.as_ref() {
+            recent_performance_deltas =
+                crate::liquid::reflection::summarize_recent_performance_deltas(
+                    &snapshot.recent_steps,
+                    4,
+                );
+        }
         recent_evaluation_events = reflection_recent_evaluation_events(
             goal_surface.as_ref(),
             verification_surface.as_ref(),
@@ -2921,6 +2930,7 @@ async fn build_auto_reflection_self_evidence(
         goal,
         verification,
         health,
+        recent_performance_deltas,
         recent_evaluation_events,
         recent_adaptations,
         recent_adaptation_outcomes,
@@ -3003,6 +3013,7 @@ async fn maybe_trigger_auto_reflection<H: AgenticLoopHost>(
         goal,
         verification,
         health,
+        recent_performance_deltas,
         recent_evaluation_events,
         recent_adaptations,
         recent_adaptation_outcomes,
@@ -3020,6 +3031,7 @@ async fn maybe_trigger_auto_reflection<H: AgenticLoopHost>(
     ctx.goal = goal;
     ctx.verification = verification;
     ctx.health = health;
+    ctx.recent_performance_deltas = recent_performance_deltas;
     ctx.recent_evaluation_events = recent_evaluation_events;
     ctx.recent_adaptations = recent_adaptations;
     ctx.recent_adaptation_outcomes = recent_adaptation_outcomes;
@@ -11231,6 +11243,54 @@ print(json.dumps({'context': 'user said: ' + msg}))
                 30,
             ))
             .unwrap();
+        for (turn, bash_ok, bash_ms, rg_ms) in [
+            (6, true, 60_u64, 25_u64),
+            (7, true, 70, 30),
+            (8, false, 220, 300),
+        ] {
+            let mut event = astra_services::session_journal::JournalEvent::turn(
+                Some("sess-reflect"),
+                turn,
+                Some("gpt-5.4"),
+                "inspect tool health",
+                "record tool outcome",
+                2,
+                12,
+                24,
+                bash_ms.max(rg_ms),
+            );
+            event.tools_selected = Some(vec!["bash".to_string(), "rg".to_string()]);
+            event.tools_used = Some(vec!["bash".to_string(), "rg".to_string()]);
+            event.tool_calls = Some(vec![
+                ToolCallRecord {
+                    name: "bash".to_string(),
+                    ok: bash_ok,
+                    ms: bash_ms,
+                    error: (!bash_ok).then(|| "bash regression".to_string()),
+                    input_bytes: None,
+                    output_bytes: None,
+                    args_preview: None,
+                    result_preview: None,
+                },
+                ToolCallRecord {
+                    name: "rg".to_string(),
+                    ok: true,
+                    ms: rg_ms,
+                    error: None,
+                    input_bytes: None,
+                    output_bytes: None,
+                    args_preview: None,
+                    result_preview: None,
+                },
+            ]);
+            if !bash_ok {
+                event.error = Some("bash regression".to_string());
+            }
+            astra_services::session_journal::JournalWriter::new("sess-reflect")
+                .unwrap()
+                .append(&event)
+                .unwrap();
+        }
         astra_services::session_journal::JournalWriter::new("sess-reflect")
             .unwrap()
             .append(
@@ -11404,6 +11464,8 @@ print(json.dumps({'context': 'user said: ' + msg}))
         assert!(prompt.contains("Verification summary:"));
         assert!(prompt.contains("Tool health:"));
         assert!(prompt.contains("Blocked tools: bash"));
+        assert!(prompt.contains("Recent performance deltas:"));
+        assert!(prompt.contains("[Regressed]"));
         assert!(prompt.contains("Recent evaluation events:"));
         assert!(prompt.contains("[GoalSteered]"));
         assert!(prompt.contains("[Verification]"));

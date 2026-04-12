@@ -11,6 +11,7 @@
 //!   real-time triggers.
 //! - All reflection is async and non-blocking — it never stalls the main loop.
 
+use astra_services::self_surface::StepRecord;
 use astra_services::session_journal::ToolCallRecord;
 use serde::{Deserialize, Serialize};
 
@@ -49,6 +50,8 @@ pub struct ReflectionContext {
     pub verification: Option<VerificationSummary>,
     /// Distilled tool-health / risk state for this reflection window.
     pub health: Option<HealthSummary>,
+    /// Recent tool-performance deltas comparing newer vs older recent-step windows.
+    pub recent_performance_deltas: Vec<ReflectionEventSummary>,
     /// Recent steering / verification events that explain what changed.
     pub recent_evaluation_events: Vec<ReflectionEventSummary>,
     /// Recent adaptive / mutation records that explain what the system changed.
@@ -163,6 +166,185 @@ impl ToolStat {
     }
 }
 
+#[derive(Default)]
+struct PerformanceDeltaWindow {
+    calls: u32,
+    failures: u32,
+    total_latency_ms: u64,
+    latest_turn: Option<u32>,
+}
+
+impl PerformanceDeltaWindow {
+    fn record(&mut self, turn: Option<u32>, ok: bool, latency_ms: u64) {
+        self.calls += 1;
+        if !ok {
+            self.failures += 1;
+        }
+        self.total_latency_ms += latency_ms;
+        if self.latest_turn.is_none() {
+            self.latest_turn = turn;
+        }
+    }
+
+    fn success_rate(&self) -> f64 {
+        if self.calls == 0 {
+            1.0
+        } else {
+            (self.calls.saturating_sub(self.failures)) as f64 / self.calls as f64
+        }
+    }
+
+    fn avg_latency_ms(&self) -> u64 {
+        if self.calls == 0 {
+            0
+        } else {
+            self.total_latency_ms / self.calls as u64
+        }
+    }
+}
+
+struct PerformanceDeltaCandidate {
+    kind: &'static str,
+    turn: Option<u32>,
+    detail: String,
+    score: u64,
+}
+
+pub fn summarize_recent_performance_deltas(
+    steps: &[StepRecord],
+    max_events: usize,
+) -> Vec<ReflectionEventSummary> {
+    const MIN_TOOL_STEPS: usize = 4;
+    const MIN_COMBINED_CALLS: u32 = 3;
+    const MIN_SUCCESS_RATE_DELTA: f64 = 0.34;
+    const MIN_LATENCY_DELTA_MS: u64 = 100;
+    const MIN_LATENCY_DELTA_RATIO: f64 = 0.25;
+
+    if max_events == 0 {
+        return Vec::new();
+    }
+
+    let tool_steps = steps
+        .iter()
+        .filter(|step| !step.tool_calls.is_empty())
+        .collect::<Vec<_>>();
+    if tool_steps.len() < MIN_TOOL_STEPS {
+        return Vec::new();
+    }
+
+    let split = tool_steps.len() / 2;
+    if split == 0 || split >= tool_steps.len() {
+        return Vec::new();
+    }
+
+    let newer = summarize_performance_window(&tool_steps[..split]);
+    let older = summarize_performance_window(&tool_steps[split..]);
+    let mut candidates = Vec::new();
+
+    for (tool, newer_window) in &newer {
+        let Some(older_window) = older.get(tool) else {
+            continue;
+        };
+        if newer_window.calls + older_window.calls < MIN_COMBINED_CALLS {
+            continue;
+        }
+
+        let older_success = older_window.success_rate();
+        let newer_success = newer_window.success_rate();
+        let success_delta = newer_success - older_success;
+        if success_delta.abs() >= MIN_SUCCESS_RATE_DELTA {
+            let kind = if success_delta.is_sign_positive() {
+                "Improved"
+            } else {
+                "Regressed"
+            };
+            let score =
+                (success_delta.abs() * 1000.0).round() as u64 + u64::from(newer_window.calls);
+            candidates.push(PerformanceDeltaCandidate {
+                kind,
+                turn: newer_window.latest_turn.or(older_window.latest_turn),
+                detail: format!(
+                    "{} success {:.0}% -> {:.0}% (recent={} calls, prior={})",
+                    tool,
+                    older_success * 100.0,
+                    newer_success * 100.0,
+                    newer_window.calls,
+                    older_window.calls
+                ),
+                score,
+            });
+        }
+
+        let older_latency = older_window.avg_latency_ms();
+        let newer_latency = newer_window.avg_latency_ms();
+        let latency_delta_ms = newer_latency.abs_diff(older_latency);
+        let latency_delta_ratio = latency_delta_ms as f64 / older_latency.max(1) as f64;
+        if older_latency > 0
+            && newer_latency > 0
+            && latency_delta_ms >= MIN_LATENCY_DELTA_MS
+            && latency_delta_ratio >= MIN_LATENCY_DELTA_RATIO
+        {
+            let kind = if newer_latency < older_latency {
+                "Improved"
+            } else {
+                "Regressed"
+            };
+            let score = latency_delta_ms + (latency_delta_ratio * 100.0).round() as u64;
+            candidates.push(PerformanceDeltaCandidate {
+                kind,
+                turn: newer_window.latest_turn.or(older_window.latest_turn),
+                detail: format!(
+                    "{} latency {}ms -> {}ms (recent={} calls, prior={})",
+                    tool, older_latency, newer_latency, newer_window.calls, older_window.calls
+                ),
+                score,
+            });
+        }
+    }
+
+    candidates.sort_by(|a, b| {
+        b.score
+            .cmp(&a.score)
+            .then_with(|| {
+                performance_delta_kind_priority(b.kind)
+                    .cmp(&performance_delta_kind_priority(a.kind))
+            })
+            .then_with(|| a.detail.cmp(&b.detail))
+    });
+    candidates.truncate(max_events);
+    candidates
+        .into_iter()
+        .map(|candidate| ReflectionEventSummary {
+            kind: candidate.kind.into(),
+            turn: candidate.turn,
+            detail: candidate.detail,
+        })
+        .collect()
+}
+
+fn summarize_performance_window(
+    steps: &[&StepRecord],
+) -> std::collections::HashMap<String, PerformanceDeltaWindow> {
+    let mut by_tool = std::collections::HashMap::new();
+    for step in steps {
+        for call in &step.tool_calls {
+            by_tool
+                .entry(call.name.clone())
+                .or_insert_with(PerformanceDeltaWindow::default)
+                .record(step.turn, call.ok, call.latency_ms);
+        }
+    }
+    by_tool
+}
+
+fn performance_delta_kind_priority(kind: &str) -> u8 {
+    match kind {
+        "Regressed" => 2,
+        "Improved" => 1,
+        _ => 0,
+    }
+}
+
 impl ReflectionContext {
     /// Create an empty context for a given session.
     pub fn new(session_id: impl Into<String>) -> Self {
@@ -178,6 +360,7 @@ impl ReflectionContext {
             goal: None,
             verification: None,
             health: None,
+            recent_performance_deltas: Vec::new(),
             recent_evaluation_events: Vec::new(),
             recent_adaptations: Vec::new(),
             recent_adaptation_outcomes: Vec::new(),
@@ -260,6 +443,19 @@ impl ReflectionContext {
                 out.push_str("  Recent tool failures:\n");
                 for failure in &health.recent_failures {
                     out.push_str(&format!("    - {failure}\n"));
+                }
+            }
+        }
+
+        if !self.recent_performance_deltas.is_empty() {
+            out.push_str("\nRecent performance deltas:\n");
+            for event in &self.recent_performance_deltas {
+                match event.turn {
+                    Some(turn) => out.push_str(&format!(
+                        "  - turn {} [{}] {}\n",
+                        turn, event.kind, event.detail
+                    )),
+                    None => out.push_str(&format!("  - [{}] {}\n", event.kind, event.detail)),
                 }
             }
         }
@@ -683,6 +879,45 @@ mod tests {
         ]
     }
 
+    fn step_with_calls(turn: u32, calls: &[(&str, bool, u64)]) -> StepRecord {
+        StepRecord {
+            id: format!("step-{turn}"),
+            turn: Some(turn),
+            ts: format!("2026-01-01T00:00:{turn:02}Z"),
+            event_type: "turn".into(),
+            actor: "assistant".into(),
+            phase: "execute".into(),
+            summary: format!("turn {turn}"),
+            selected_tools: calls
+                .iter()
+                .map(|(name, _, _)| (*name).to_string())
+                .collect(),
+            used_tools: calls
+                .iter()
+                .map(|(name, _, _)| (*name).to_string())
+                .collect(),
+            selected_skills: Vec::new(),
+            tool_calls: calls
+                .iter()
+                .map(
+                    |(name, ok, latency_ms)| astra_services::self_surface::ToolCallView {
+                        name: (*name).to_string(),
+                        ok: *ok,
+                        latency_ms: *latency_ms,
+                        error: (!ok).then(|| "tool error".to_string()),
+                        args_preview: None,
+                        result_preview: None,
+                    },
+                )
+                .collect(),
+            duration_ms: None,
+            tokens_in: None,
+            tokens_out: None,
+            budget_pressure: None,
+            error: None,
+        }
+    }
+
     #[test]
     fn context_render_includes_all_sections() {
         let mut ctx = ReflectionContext::new("test-session");
@@ -702,6 +937,11 @@ mod tests {
             hotspots: vec!["bash success=80%, deprioritized".into()],
             recent_failures: vec!["turn 9 bash — permission denied".into()],
         });
+        ctx.recent_performance_deltas = vec![ReflectionEventSummary {
+            kind: "Improved".into(),
+            turn: Some(9),
+            detail: "bash success 0% -> 100% (recent=2 calls, prior=2)".into(),
+        }];
         ctx.recent_tactical_actions
             .push("IncreaseVerification".into());
 
@@ -716,6 +956,8 @@ mod tests {
         assert!(rendered.contains("PatternDrift"));
         assert!(rendered.contains("Tool health:"));
         assert!(rendered.contains("Blocked tools: bash"));
+        assert!(rendered.contains("Recent performance deltas:"));
+        assert!(rendered.contains("[Improved]"));
         assert!(rendered.contains("IncreaseVerification"));
     }
 
@@ -763,6 +1005,27 @@ mod tests {
     }
 
     #[test]
+    fn summarize_recent_performance_deltas_detects_improvements_and_regressions() {
+        let steps = vec![
+            step_with_calls(8, &[("bash", true, 100), ("rg", true, 500)]),
+            step_with_calls(7, &[("bash", true, 120), ("rg", true, 450)]),
+            step_with_calls(6, &[("bash", false, 400), ("rg", true, 180)]),
+            step_with_calls(5, &[("bash", false, 300), ("rg", true, 160)]),
+        ];
+
+        let deltas = summarize_recent_performance_deltas(&steps, 4);
+        assert_eq!(deltas.len(), 3);
+        assert_eq!(deltas[0].kind, "Improved");
+        assert!(deltas[0].detail.contains("bash success 0% -> 100%"));
+        assert!(deltas.iter().any(|delta| {
+            delta.kind == "Improved" && delta.detail.contains("bash latency 350ms -> 110ms")
+        }));
+        assert!(deltas.iter().any(|delta| {
+            delta.kind == "Regressed" && delta.detail.contains("rg latency 170ms -> 475ms")
+        }));
+    }
+
+    #[test]
     fn signal_summary_from_all_variants() {
         let signals = sample_signals();
         for sig in &signals {
@@ -805,6 +1068,11 @@ mod tests {
             hotspots: vec!["bash success=50%, deprioritized, consecutive_failures=1".into()],
             recent_failures: vec!["turn 9 bash — command timed out".into()],
         });
+        ctx.recent_performance_deltas = vec![ReflectionEventSummary {
+            kind: "Regressed".into(),
+            turn: Some(9),
+            detail: "bash success 100% -> 0% (recent=2 calls, prior=2)".into(),
+        }];
         ctx.recent_evaluation_events = vec![
             ReflectionEventSummary {
                 kind: "GoalSteered".into(),
@@ -837,6 +1105,8 @@ mod tests {
         );
         assert!(user.contains("Tool health:"));
         assert!(user.contains("Blocked tools: bash"));
+        assert!(user.contains("Recent performance deltas:"));
+        assert!(user.contains("[Regressed]"));
         assert!(user.contains("Recent evaluation events:"));
         assert!(user.contains("[GoalSteered]"));
         assert!(user.contains("Recent adaptations:"));
