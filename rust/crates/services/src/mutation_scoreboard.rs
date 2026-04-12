@@ -255,6 +255,10 @@ pub struct StagedMutation {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pre_state_snapshot_id: Option<String>,
     pub state: StagedMutationState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_note: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_updated_at: Option<String>,
     pub objective: MutationObjectiveScore,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verifier: Option<MutationVerifierSummary>,
@@ -289,6 +293,8 @@ impl StagedMutation {
             tool_args,
             pre_state_snapshot_id,
             state,
+            state_note: None,
+            state_updated_at: None,
             objective,
             verifier,
             compensation,
@@ -335,7 +341,8 @@ impl MutationScoreboard {
         let approval_required_mutations = mutations
             .iter()
             .filter(|mutation| {
-                mutation.judgment.safety_verdict == MutationSafetyVerdict::RequiresApproval
+                mutation.state == StagedMutationState::Pending
+                    && mutation.judgment.safety_verdict == MutationSafetyVerdict::RequiresApproval
             })
             .count() as u32;
         let applied_mutations = mutations
@@ -644,7 +651,7 @@ mod tests {
         let scoreboard = MutationScoreboard::new("board-1", "session-1", vec![ready, reverted]);
         assert_eq!(scoreboard.total_mutations, 2);
         assert_eq!(scoreboard.ready_mutations, 1);
-        assert_eq!(scoreboard.approval_required_mutations, 1);
+        assert_eq!(scoreboard.approval_required_mutations, 0);
         assert_eq!(scoreboard.reverted_mutations, 1);
         assert_eq!(scoreboard.blocked_mutations, 0);
         assert!(scoreboard.avg_retention_score.point > 0.5);

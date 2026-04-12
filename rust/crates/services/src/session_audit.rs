@@ -8,7 +8,7 @@ use axum::{Json, http::StatusCode};
 use serde::{Deserialize, Serialize};
 use sqlx::{Row, query};
 
-use crate::{MutationScoreboard, PersistedMutationDecision};
+use crate::{MutationScoreboard, PersistedMutationDecision, StagedMutationState};
 use astra_core::{
     ErrorResponse, MatrixOneSettings, SharedPool, connect_matrixone, error_response, internal_error,
 };
@@ -276,6 +276,21 @@ pub struct CrossSessionStatsParams {
     pub since: Option<String>,
     /// Stats until this ISO 8601 timestamp.
     pub until: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MutationStateUpdateRequest {
+    pub state: StagedMutationState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct MutationStateOverride {
+    mutation_id: String,
+    state: StagedMutationState,
+    note: Option<String>,
+    created_at: String,
 }
 
 fn default_page() -> u32 {
@@ -954,7 +969,56 @@ impl SessionAuditService for DatabaseSessionAuditService {
             })
             .collect::<Vec<_>>();
 
-        Ok(build_mutation_scoreboard(session_id, decisions))
+        let override_rows = query(
+            "SELECT CAST(metadata AS CHAR) AS metadata, created_at \
+             FROM agent_events \
+             WHERE session_id = ? AND user_id = ? AND event_type = 'mutation_state' \
+             ORDER BY created_at ASC",
+        )
+        .bind(session_id)
+        .bind(user_id)
+        .fetch_all(&pool)
+        .await
+        .map_err(internal_error)?;
+
+        let overrides = override_rows
+            .into_iter()
+            .filter_map(|row| {
+                let metadata = row
+                    .try_get::<String, _>("metadata")
+                    .ok()
+                    .and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok())
+                    .unwrap_or(serde_json::Value::Null);
+                let mutation_id = metadata
+                    .get("mutation_id")
+                    .and_then(serde_json::Value::as_str)?;
+                let state = metadata
+                    .get("state")
+                    .cloned()
+                    .and_then(|value| serde_json::from_value::<StagedMutationState>(value).ok())?;
+                if !matches!(
+                    state,
+                    StagedMutationState::Applied
+                        | StagedMutationState::Reverted
+                        | StagedMutationState::Blocked
+                ) {
+                    return None;
+                }
+                Some(MutationStateOverride {
+                    mutation_id: mutation_id.to_string(),
+                    state,
+                    note: metadata
+                        .get("note")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::trim)
+                        .filter(|note| !note.is_empty())
+                        .map(ToString::to_string),
+                    created_at: row.try_get("created_at").unwrap_or_default(),
+                })
+            })
+            .collect::<Vec<_>>();
+
+        Ok(build_mutation_scoreboard(session_id, decisions, overrides))
     }
 
     // ── Cross-session implementations ────────────────────────────────────────
@@ -1456,12 +1520,36 @@ fn compute_duration_secs(first: Option<&str>, last: Option<&str>) -> f64 {
 fn build_mutation_scoreboard(
     session_id: &str,
     decisions: Vec<PersistedMutationDecision>,
+    overrides: Vec<MutationStateOverride>,
 ) -> MutationScoreboard {
-    MutationScoreboard::from_persisted_decisions(
+    let scoreboard = MutationScoreboard::from_persisted_decisions(
         format!("audit:mutation-scoreboard:{session_id}"),
         session_id.to_string(),
         decisions,
-    )
+    );
+    if overrides.is_empty() {
+        return scoreboard;
+    }
+
+    let mut latest_overrides = std::collections::HashMap::<String, MutationStateOverride>::new();
+    for override_entry in overrides {
+        latest_overrides.insert(override_entry.mutation_id.clone(), override_entry);
+    }
+
+    let mutations = scoreboard
+        .mutations
+        .into_iter()
+        .map(|mut mutation| {
+            if let Some(override_entry) = latest_overrides.get(&mutation.mutation_id) {
+                mutation.state = override_entry.state;
+                mutation.state_note = override_entry.note.clone();
+                mutation.state_updated_at = Some(override_entry.created_at.clone());
+            }
+            mutation
+        })
+        .collect::<Vec<_>>();
+
+    MutationScoreboard::new(scoreboard.scoreboard_id, scoreboard.session_id, mutations)
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -2028,11 +2116,73 @@ mod tests {
                     }),
                 },
             ],
+            vec![],
         );
 
         assert_eq!(scoreboard.total_mutations, 1);
         assert_eq!(scoreboard.ready_mutations, 1);
         assert_eq!(scoreboard.mutations[0].tool_name, "edit_file");
         assert_eq!(scoreboard.mutations[0].turn_index, 4);
+    }
+
+    #[test]
+    fn build_mutation_scoreboard_applies_latest_state_override() {
+        let scoreboard = build_mutation_scoreboard(
+            "session-1",
+            vec![PersistedMutationDecision {
+                decision_id: "decision-1".into(),
+                session_id: "session-1".into(),
+                decision_output: serde_json::json!({
+                    "turn": 4,
+                    "mutation_objective_score": {
+                        "quality": {"point": 0.84, "lower": 0.84, "upper": 0.84},
+                        "reward_hacking_risk": {"point": 0.10, "lower": 0.10, "upper": 0.10},
+                        "causal_support": {"point": 0.75, "lower": 0.75, "upper": 0.75},
+                        "was_corrected": false
+                    },
+                    "action_profiles": [
+                        {
+                            "tool_call_id": "call-1",
+                            "tool_name": "edit_file",
+                            "arguments": {"path": "src/lib.rs"},
+                            "profile": {
+                                "bounded": true,
+                                "reversible": true,
+                                "requires_pre_state": false,
+                                "action_category": "write",
+                                "compensation_kind": "restore_file",
+                                "compensation_summary": "restore prior contents"
+                            }
+                        }
+                    ]
+                }),
+            }],
+            vec![
+                MutationStateOverride {
+                    mutation_id: "decision-1:call-1".into(),
+                    state: StagedMutationState::Applied,
+                    note: Some("promoted after review".into()),
+                    created_at: "2026-04-12T12:00:00Z".into(),
+                },
+                MutationStateOverride {
+                    mutation_id: "decision-1:call-1".into(),
+                    state: StagedMutationState::Reverted,
+                    note: Some("rolled back after regression".into()),
+                    created_at: "2026-04-12T12:05:00Z".into(),
+                },
+            ],
+        );
+
+        assert_eq!(scoreboard.applied_mutations, 0);
+        assert_eq!(scoreboard.reverted_mutations, 1);
+        assert_eq!(scoreboard.mutations[0].state, StagedMutationState::Reverted);
+        assert_eq!(
+            scoreboard.mutations[0].state_note.as_deref(),
+            Some("rolled back after regression")
+        );
+        assert_eq!(
+            scoreboard.mutations[0].state_updated_at.as_deref(),
+            Some("2026-04-12T12:05:00Z")
+        );
     }
 }

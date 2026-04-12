@@ -1,7 +1,8 @@
 use super::*;
 use astra_services::session_audit::{
-    AuditSessionListParams, CrossSessionStatsParams, TurnListParams,
+    AuditSessionListParams, CrossSessionStatsParams, MutationStateUpdateRequest, TurnListParams,
 };
+use astra_services::{EventCreateRequestData, StagedMutationState};
 
 pub(super) async fn audit_summary_handler(
     State(state): State<AppState>,
@@ -81,6 +82,85 @@ pub(super) async fn audit_mutations_handler(
         .await?;
     Ok(Json(
         serde_json::to_value(mutations).map_err(internal_error)?,
+    ))
+}
+
+pub(super) async fn audit_mutation_state_handler(
+    State(state): State<AppState>,
+    Path((session_id, mutation_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(body): Json<MutationStateUpdateRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let user = state.auth_service.current_user(&headers).await?;
+    if !matches!(
+        body.state,
+        StagedMutationState::Applied | StagedMutationState::Reverted | StagedMutationState::Blocked
+    ) {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "mutation state updates only allow applied, reverted, or blocked",
+        ));
+    }
+
+    let existing = state
+        .session_audit_service
+        .get_mutation_scoreboard(&user.user_id, &session_id)
+        .await?;
+    let mutation = existing
+        .mutations
+        .iter()
+        .find(|mutation| mutation.mutation_id == mutation_id)
+        .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Mutation not found"))?;
+    let note = body
+        .note
+        .as_deref()
+        .map(str::trim)
+        .filter(|note| !note.is_empty())
+        .map(ToString::to_string);
+    let state_label = match body.state {
+        StagedMutationState::Applied => "applied",
+        StagedMutationState::Reverted => "reverted",
+        StagedMutationState::Blocked => "blocked",
+        StagedMutationState::Pending | StagedMutationState::Ready => unreachable!(),
+    };
+
+    state
+        .event_service
+        .create_event(
+            user.user_id.clone(),
+            EventCreateRequestData {
+                session_id: session_id.clone(),
+                event_type: "mutation_state".to_string(),
+                content: note
+                    .clone()
+                    .unwrap_or_else(|| format!("mutation `{mutation_id}` marked {state_label}")),
+                agent_id: None,
+                agent_version: None,
+                parent_event_id: None,
+                parent_event_ids: Some(Vec::new()),
+                causal_chain_id: Some(format!("{session_id}:mutation:{mutation_id}")),
+                metadata: Some(serde_json::json!({
+                    "mutation_id": mutation_id,
+                    "state": body.state,
+                    "note": note,
+                    "tool_name": mutation.tool_name,
+                    "turn": mutation.turn_index,
+                })),
+            },
+        )
+        .await?;
+
+    let updated = state
+        .session_audit_service
+        .get_mutation_scoreboard(&user.user_id, &session_id)
+        .await?;
+    let updated_mutation = updated
+        .mutations
+        .into_iter()
+        .find(|mutation| mutation.mutation_id == mutation_id)
+        .ok_or_else(|| internal_error("mutation state update did not materialize"))?;
+    Ok(Json(
+        serde_json::to_value(updated_mutation).map_err(internal_error)?,
     ))
 }
 

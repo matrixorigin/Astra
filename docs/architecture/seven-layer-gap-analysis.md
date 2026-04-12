@@ -59,6 +59,7 @@
 - **Sandbox checkpointing** (`data_versioning.rs:SandboxCheckpointData`): Checkpoint before risky operations.
 - **Action compensation profiles** (`runtime/src/turn/action_compensation.rs`): Typed bounded/reversible/manual rollback metadata now captures action category, pre-state requirements, and compensation kind per tool.
 - **Staged mutation contract** (`services/src/mutation_scoreboard.rs`): `MutationCompensationPolicy`, `StagedMutation`, and staged states (`pending/ready/applied/reverted/blocked`) now provide one canonical apply/rollback coordination contract.
+- **Mutation lifecycle writeback** (`services/src/session_audit.rs`, `runtime/src/server/audit_handlers.rs`): per-session mutation audits can now record `applied` / `reverted` / `blocked` lifecycle transitions via `mutation_state` events, so staged mutation status is operationally writable instead of read-only.
 - **Symlink safety** (`session_checkpoint.rs:97`): Path traversal protection.
 
 ### Gaps
@@ -90,7 +91,7 @@
 - **Most evaluation routes return 501**: `DatabaseEvaluationService` has "not implemented yet" for drift detection, drift pipeline, closed-loop, training data, SLO.
 - **No multi-objective optimization**: Evaluation is single-dimensional (quality score). No Pareto frontier for efficiency × cost × accuracy.
 - **No noise filtering**: FeedbackSignals are consumed raw; no statistical filtering for outliers or noise.
-- **No cross-session / verifier-complete scoreboard yet**: `MutationScoreboard` is now reconstructed from persisted decision audits for per-session ops/report views, but verifier outcomes and cross-session mutation analytics are not yet stitched into one persisted surface.
+- **No cross-session / verifier-complete scoreboard yet**: `MutationScoreboard` is now reconstructed from persisted decision audits for per-session ops/report views and supports per-mutation lifecycle writeback, but verifier outcomes and cross-session mutation analytics are not yet stitched into one persisted surface.
 - **Confidence intervals are not end-to-end**: `ConfidenceInterval` exists in core/runtime, but evaluation and report surfaces do not expose it consistently.
 - **No verifier diversity**: Gate validation is single-pass, not ensemble-based.
 
