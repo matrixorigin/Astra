@@ -1,3 +1,5 @@
+use astra_services::MutationObjectiveScore;
+
 use crate::*;
 
 #[async_trait]
@@ -224,6 +226,18 @@ pub struct TurnLearningOutcome {
     pub causal_support_flags: Vec<String>,
 }
 
+impl TurnLearningOutcome {
+    pub fn mutation_objective_score(&self) -> MutationObjectiveScore {
+        MutationObjectiveScore::from_learning_signal(
+            self.quality,
+            self.user_feedback_score,
+            self.reward_hacking_risk,
+            self.causal_support_score,
+            self.was_corrected,
+        )
+    }
+}
+
 /// Trait for recording turn outcomes into pipeline learning modules.
 /// Implementations update EntityGraph, PatternLibrary, and ProgressiveCalibrator.
 #[async_trait]
@@ -333,5 +347,31 @@ mod tests {
             reasoning_content: None,
         };
         assert_eq!(record.agent_id.as_deref(), Some("astra-cli"));
+    }
+
+    #[test]
+    fn turn_learning_outcome_exposes_mutation_objective_score() {
+        let outcome = TurnLearningOutcome {
+            query: "update the migration note".into(),
+            tools_selected: vec!["write_file".into()],
+            tools_used: vec!["write_file".into()],
+            success: true,
+            quality: 0.82,
+            was_corrected: false,
+            task_type_label: Some("mutate".into()),
+            domain_hint_label: Some("code".into()),
+            user_feedback_score: Some(90),
+            reward_hacking_risk: 0.15,
+            reward_hacking_flags: Vec::new(),
+            causal_support_score: 0.78,
+            causal_support_flags: Vec::new(),
+        };
+
+        let scoreboard = outcome.mutation_objective_score();
+        assert_eq!(scoreboard.quality.point, 0.82);
+        assert_eq!(scoreboard.user_feedback.map(|value| value.point), Some(0.9));
+        assert_eq!(scoreboard.reward_hacking_risk.point, 0.15);
+        assert_eq!(scoreboard.causal_support.point, 0.78);
+        assert!(!scoreboard.was_corrected);
     }
 }

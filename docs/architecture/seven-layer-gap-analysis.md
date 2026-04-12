@@ -57,14 +57,16 @@
 - **SQL safety validation** (`edge_tools/mo_tools.rs:232`): `check_sql_safety()` blocks DROP/DELETE/TRUNCATE/ALTER/GRANT.
 - **Tool allowlist**: Inherited permissions can restrict child agents to specific tool sets.
 - **Sandbox checkpointing** (`data_versioning.rs:SandboxCheckpointData`): Checkpoint before risky operations.
+- **Action compensation profiles** (`runtime/src/turn/action_compensation.rs`): Typed bounded/reversible/manual rollback metadata now captures action category, pre-state requirements, and compensation kind per tool.
+- **Staged mutation contract** (`services/src/mutation_scoreboard.rs`): `MutationCompensationPolicy`, `StagedMutation`, and staged states (`pending/ready/applied/reverted/blocked`) now provide one canonical apply/rollback coordination contract.
 - **Symlink safety** (`session_checkpoint.rs:97`): Path traversal protection.
 
 ### Gaps
-- **No Compensation Actions**: No action has a registered inverse. File writes can't be atomically undone; tool calls have no `undo()` method.
+- **No automatic compensation executor**: Compensation metadata exists, but no live runner automatically captures pre-state, applies canaries, or executes rollback on failure.
 - **Bash is unbounded**: `bash` tool allows arbitrary code execution — directly violates "finite action space" requirement.
 - **No action registry**: Tools are discovered dynamically; there's no compile-time exhaustive enumeration of all possible actions.
 - **No transactional tool execution**: Multi-tool turns are not atomic — partial failures leave inconsistent state.
-- **Rollback is manual**: CompositeSnapshot supports restore, but no automatic "compensation on failure" mechanism.
+- **Rollback execution is still manual**: CompositeSnapshot and staged mutation metadata exist, but there is no automatic "compensation on failure" mechanism yet.
 
 ### Priority Actions
 1. Define `CompensationAction` trait: every `ToolImpl` optionally provides `compensate(context) → Result`.
@@ -81,12 +83,14 @@
 - **FeedbackSignal system** (`auto_tuning.rs`): 16 signal types (Retry, Correction, Acceptance, StarRating, ToolChurn, FocusDrift, etc.).
 - **ScenarioDetector** (`user_profile.rs:520`): Confidence-threshold-based scenario detection.
 - **EvolutionRules** (`auto_tuning.rs`): Trigger → action rules with cooldown and rate limiting.
+- **MutationScoreboard contract** (`services/src/mutation_scoreboard.rs`): Canonical typed scoreboard now unifies verifier summaries, objective/reward signals, staged mutation state, and aggregated retention metrics.
 
 ### Gaps
 - **Most evaluation routes return 501**: `DatabaseEvaluationService` has "not implemented yet" for drift detection, drift pipeline, closed-loop, training data, SLO.
 - **No multi-objective optimization**: Evaluation is single-dimensional (quality score). No Pareto frontier for efficiency × cost × accuracy.
 - **No noise filtering**: FeedbackSignals are consumed raw; no statistical filtering for outliers or noise.
-- **No uncertainty intervals**: Confidence is a single `f64`; no credible interval or distribution output.
+- **No persisted unified scoreboard**: `MutationScoreboard` is currently a typed contract only; it is not yet written, queried, or surfaced through report/ops APIs.
+- **Confidence intervals are not end-to-end**: `ConfidenceInterval` exists in core/runtime, but evaluation and report surfaces do not expose it consistently.
 - **No verifier diversity**: Gate validation is single-pass, not ensemble-based.
 
 ### Priority Actions
@@ -171,8 +175,8 @@
 |-------|----------|--------------------|-------------|
 | 1. State | ⬛⬛⬛⬜⬜ 60% | CompositeSnapshot 5D | No diff/merge/revert |
 | 2. Observation | ⬛⬛⬛⬜⬜ 55% | CausalChain + JournalEvents | Linear chains, no graph |
-| 3. Action | ⬛⬛⬜⬜⬜ 40% | Permission 3-tier model | No compensation actions |
-| 4. Evaluation | ⬛⬛⬜⬜⬜ 35% | EvaluationService 16 methods | Most routes unimplemented |
+| 3. Action | ⬛⬛⬜⬜⬜ 45% | Permission 3-tier model + compensation profiles | No automatic rollback executor |
+| 4. Evaluation | ⬛⬛⬜⬜⬜ 40% | EvaluationService + MutationScoreboard | Scoreboard not persisted/exposed |
 | 5. Credit | ⬛⬜⬜⬜⬜ 25% | causal_chain_id on events | No diff-based scoring |
 | 6. Search | ⬛⬛⬜⬜⬜ 35% | SchedulingContract + TeamOrch | No proposal diversity |
 | 7. Safety | ⬛⬛⬛⬜⬜ 55% | Drift detection + middleware | Causal guard is heuristic-only |

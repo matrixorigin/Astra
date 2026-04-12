@@ -20,6 +20,7 @@ pub mod marketplace;
 pub mod marketplace_stats;
 pub mod models;
 pub mod multi_agent;
+pub mod mutation_scoreboard;
 pub mod protocol;
 pub mod reflect;
 pub mod replay;
@@ -128,6 +129,11 @@ pub use multi_agent::{
     DatabaseEdgeRegistryService, DatabaseTaskLeaseService, EdgeAgentRecord, EdgeRegistryService,
     LeaseClaimResult, TaskLeaseHoldCache, TaskLeaseService, TaskLeaseView, TasksPackPushResult,
     UnconfiguredEdgeRegistryService, UnconfiguredTaskLeaseService,
+};
+pub use mutation_scoreboard::{
+    MutationActionCategory, MutationCompensationPolicy, MutationJudgment, MutationObjectiveScore,
+    MutationRetentionVerdict, MutationSafetyVerdict, MutationScoreboard, MutationVerifierSummary,
+    StagedMutation, StagedMutationState,
 };
 pub use protocol::{
     ApplyDeltaRequest, ApplyDeltaResponse, ApplyOptions, Checkpoint, CheckpointOptions,
