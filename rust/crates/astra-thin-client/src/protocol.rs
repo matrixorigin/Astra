@@ -149,7 +149,7 @@ pub struct TaskLeaseMutationRequest {
 pub enum StreamEvent {
     SessionInfo {
         session_id: String,
-        run_id: String,
+        run_id: Option<String>,
     },
     TextDelta {
         content: Value,
@@ -253,7 +253,10 @@ pub fn classify_stream_event(value: Value) -> Result<StreamEvent, crate::error::
     Ok(match ty.as_str() {
         "session_info" => StreamEvent::SessionInfo {
             session_id: get_str(&obj, "session_id"),
-            run_id: get_str(&obj, "run_id"),
+            run_id: obj
+                .get("run_id")
+                .and_then(|v| v.as_str())
+                .map(std::string::ToString::to_string),
         },
         "text_delta" => StreamEvent::TextDelta {
             content: obj.get("content").cloned().unwrap_or(Value::Null),
@@ -416,7 +419,19 @@ mod tests {
         match classify_stream_event(v).unwrap() {
             StreamEvent::SessionInfo { session_id, run_id } => {
                 assert_eq!(session_id, "a");
-                assert_eq!(run_id, "b");
+                assert_eq!(run_id.as_deref(), Some("b"));
+            }
+            e => panic!("unexpected {e:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_session_info_without_run_id() {
+        let v = serde_json::json!({"type":"session_info","session_id":"a"});
+        match classify_stream_event(v).unwrap() {
+            StreamEvent::SessionInfo { session_id, run_id } => {
+                assert_eq!(session_id, "a");
+                assert_eq!(run_id, None);
             }
             e => panic!("unexpected {e:?}"),
         }

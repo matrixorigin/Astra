@@ -121,7 +121,21 @@ mod tests {
             StreamEvent::SessionInfo {
                 ref session_id,
                 ref run_id,
-            } if session_id == "s1" && run_id == "r1"
+            } if session_id == "s1" && run_id.as_deref() == Some("r1")
+        ));
+    }
+
+    #[test]
+    fn session_info_without_run_id() {
+        let body = "data: {\"type\":\"session_info\",\"session_id\":\"s1\"}\n\n";
+        let evs = parse_sse_body(body).unwrap();
+        assert_eq!(evs.len(), 1);
+        assert!(matches!(
+            evs[0],
+            StreamEvent::SessionInfo {
+                ref session_id,
+                ref run_id,
+            } if session_id == "s1" && run_id.is_none()
         ));
     }
 

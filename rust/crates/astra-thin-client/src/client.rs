@@ -1203,7 +1203,34 @@ mod tests {
             StreamEvent::SessionInfo {
                 ref session_id,
                 ref run_id,
-            } if session_id == "s-x" && run_id == "r-y"
+            } if session_id == "s-x" && run_id.as_deref() == Some("r-y")
+        ));
+    }
+
+    #[tokio::test]
+    async fn wiremock_chat_stream_allows_session_info_without_run_id() {
+        let srv = MockServer::start().await;
+        let sse = concat!(
+            "data: {\"type\":\"session_info\",\"session_id\":\"s-x\"}\n\n",
+            "data: {\"type\":\"text_delta\",\"content\":\"hello\"}\n\n",
+        );
+        Mock::given(method("POST"))
+            .and(path("/chat/stream"))
+            .and(header("authorization", "Bearer tkn"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(sse))
+            .mount(&srv)
+            .await;
+
+        let client = ThinClient::new(&srv.uri(), None).unwrap();
+        let req = ChatStreamRequest::new("ping");
+        let evs = client.chat_stream_collect(&req, Some("tkn")).await.unwrap();
+        assert_eq!(evs.len(), 2);
+        assert!(matches!(
+            evs[0],
+            StreamEvent::SessionInfo {
+                ref session_id,
+                ref run_id,
+            } if session_id == "s-x" && run_id.is_none()
         ));
     }
 
