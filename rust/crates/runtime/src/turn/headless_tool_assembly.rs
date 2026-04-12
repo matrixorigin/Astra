@@ -77,8 +77,9 @@ pub fn parse_flat_tool_call_event(tc: &Value) -> (String, String, Value) {
     let id = tc
         .get("id")
         .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
     let name = tc
         .get("name")
         .and_then(|v| v.as_str())
@@ -819,5 +820,19 @@ mod tests {
             CACHEABLE_TOOLS.contains(&"git_show"),
             "git_show should be cacheable (idempotent read of committed content)"
         );
+    }
+
+    #[test]
+    fn parse_flat_tool_call_generates_id_when_missing() {
+        let tc = json!({"name": "bash", "arguments": "{}"});
+        let (id, name, _) = parse_flat_tool_call_event(&tc);
+        assert!(!id.is_empty(), "empty id should be replaced with UUID");
+        assert_eq!(name, "bash");
+
+        // Empty string id should also be replaced
+        let tc2 = json!({"id": "", "name": "bash", "arguments": "{}"});
+        let (id2, _, _) = parse_flat_tool_call_event(&tc2);
+        assert!(!id2.is_empty());
+        assert_ne!(id, id2, "each call should get a unique id");
     }
 }
