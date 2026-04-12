@@ -2860,12 +2860,14 @@ async fn build_auto_reflection_self_evidence(
     Vec<crate::liquid::reflection::ReflectionEventSummary>,
     Vec<crate::liquid::reflection::ReflectionEventSummary>,
     Vec<crate::liquid::reflection::ReflectionEventSummary>,
+    Vec<crate::liquid::reflection::ReflectionEventSummary>,
 ) {
     let mut goal = None;
     let mut verification = None;
     let mut health = None;
     let mut recent_performance_deltas = Vec::new();
     let mut recent_adaptation_impacts = Vec::new();
+    let mut recent_adaptation_verification_impacts = Vec::new();
     let mut recent_evaluation_events = Vec::new();
     let mut recent_adaptations = Vec::new();
     let mut recent_adaptation_outcomes = Vec::new();
@@ -2920,6 +2922,14 @@ async fn build_auto_reflection_self_evidence(
                     &snapshot.evolution.records,
                     3,
                 );
+            if let Some(verification_surface) = verification_surface.as_ref() {
+                recent_adaptation_verification_impacts =
+                    crate::liquid::reflection::summarize_recent_adaptation_verification_impacts(
+                        &verification_surface.objective.recent_verifications,
+                        &snapshot.evolution.records,
+                        3,
+                    );
+            }
         }
         recent_evaluation_events = reflection_recent_evaluation_events(
             goal_surface.as_ref(),
@@ -2940,6 +2950,7 @@ async fn build_auto_reflection_self_evidence(
         health,
         recent_performance_deltas,
         recent_adaptation_impacts,
+        recent_adaptation_verification_impacts,
         recent_evaluation_events,
         recent_adaptations,
         recent_adaptation_outcomes,
@@ -3024,6 +3035,7 @@ async fn maybe_trigger_auto_reflection<H: AgenticLoopHost>(
         health,
         recent_performance_deltas,
         recent_adaptation_impacts,
+        recent_adaptation_verification_impacts,
         recent_evaluation_events,
         recent_adaptations,
         recent_adaptation_outcomes,
@@ -3043,6 +3055,7 @@ async fn maybe_trigger_auto_reflection<H: AgenticLoopHost>(
     ctx.health = health;
     ctx.recent_performance_deltas = recent_performance_deltas;
     ctx.recent_adaptation_impacts = recent_adaptation_impacts;
+    ctx.recent_adaptation_verification_impacts = recent_adaptation_verification_impacts;
     ctx.recent_evaluation_events = recent_evaluation_events;
     ctx.recent_adaptations = recent_adaptations;
     ctx.recent_adaptation_outcomes = recent_adaptation_outcomes;
@@ -11374,6 +11387,19 @@ print(json.dumps({'context': 'user said: ' + msg}))
         astra_services::session_journal::JournalWriter::new("sess-reflect")
             .unwrap()
             .append(
+                &astra_services::session_journal::JournalEvent::verification_completed(
+                    Some("sess-reflect"),
+                    3,
+                    "subtask-1",
+                    "global",
+                    true,
+                    &serde_json::json!([{"check":"unit-tests","passed":true}]),
+                ),
+            )
+            .unwrap();
+        astra_services::session_journal::JournalWriter::new("sess-reflect")
+            .unwrap()
+            .append(
                 &astra_services::session_journal::JournalEvent::adaptive_per_turn_applied(
                     Some("sess-reflect"),
                     4,
@@ -11485,6 +11511,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
         assert!(prompt.contains("Recent adaptation outcomes:"));
         assert!(prompt.contains("[Verification] after Adaptation turn 4"));
         assert!(prompt.contains("Recent adaptation impacts:"));
+        assert!(prompt.contains("Recent adaptation verification impacts:"));
         assert!(prompt.contains("Tool statistics:"));
         assert!(prompt.contains("bash — calls=2, failures=1, avg_ms=150"));
         assert!(prompt.contains("Active experiment: exp-123 (variant=variant-b, samples=4)"));

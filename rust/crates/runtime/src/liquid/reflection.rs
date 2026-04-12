@@ -11,7 +11,7 @@
 //!   real-time triggers.
 //! - All reflection is async and non-blocking — it never stalls the main loop.
 
-use astra_services::self_surface::{EvolutionRecord, StepRecord};
+use astra_services::self_surface::{EvolutionRecord, StepRecord, VerificationEventView};
 use astra_services::session_journal::ToolCallRecord;
 use serde::{Deserialize, Serialize};
 
@@ -54,6 +54,8 @@ pub struct ReflectionContext {
     pub recent_performance_deltas: Vec<ReflectionEventSummary>,
     /// Recent tool-performance changes attributed to nearby adaptation windows.
     pub recent_adaptation_impacts: Vec<ReflectionEventSummary>,
+    /// Recent verification-pressure changes attributed to nearby adaptation windows.
+    pub recent_adaptation_verification_impacts: Vec<ReflectionEventSummary>,
     /// Recent steering / verification events that explain what changed.
     pub recent_evaluation_events: Vec<ReflectionEventSummary>,
     /// Recent adaptive / mutation records that explain what the system changed.
@@ -212,6 +214,33 @@ struct PerformanceDeltaCandidate {
     score: u64,
 }
 
+#[derive(Default)]
+struct VerificationDeltaWindow {
+    events: u32,
+    passed: u32,
+    latest_turn: Option<u32>,
+}
+
+impl VerificationDeltaWindow {
+    fn record(&mut self, turn: Option<u32>, passed: bool) {
+        self.events += 1;
+        if passed {
+            self.passed += 1;
+        }
+        if self.latest_turn.is_none() {
+            self.latest_turn = turn;
+        }
+    }
+
+    fn pass_rate(&self) -> f64 {
+        if self.events == 0 {
+            1.0
+        } else {
+            self.passed as f64 / self.events as f64
+        }
+    }
+}
+
 pub fn summarize_recent_performance_deltas(
     steps: &[StepRecord],
     max_events: usize,
@@ -252,10 +281,7 @@ pub fn summarize_recent_adaptation_impacts(
         return Vec::new();
     }
 
-    let adaptations = records
-        .iter()
-        .filter(|record| record.turn.is_some() && is_reflection_adaptation_record(record))
-        .collect::<Vec<_>>();
+    let adaptations = reflection_adaptations_with_turn(records);
     let mut impacts = Vec::new();
 
     for (index, adaptation) in adaptations.iter().enumerate() {
@@ -288,6 +314,73 @@ pub fn summarize_recent_adaptation_impacts(
             .collect::<Vec<_>>();
 
         if let Some(delta) = summarize_performance_delta_windows(&newer_steps, &older_steps, 1)
+            .into_iter()
+            .next()
+        {
+            impacts.push(ReflectionEventSummary {
+                kind: delta.kind,
+                turn: adaptation.turn.or(delta.turn),
+                detail: reflection_adaptation_impact_detail(adaptation, &delta.detail),
+            });
+        }
+        if impacts.len() >= max_events {
+            break;
+        }
+    }
+
+    impacts
+}
+
+pub fn summarize_recent_adaptation_verification_impacts(
+    verification_events: &[VerificationEventView],
+    records: &[EvolutionRecord],
+    max_events: usize,
+) -> Vec<ReflectionEventSummary> {
+    const MIN_VERIFICATION_EVENTS: usize = 2;
+    const ADAPTATION_WINDOW_VERIFICATION_LIMIT: usize = 2;
+
+    if max_events == 0 {
+        return Vec::new();
+    }
+
+    let verification_events = verification_events_with_outcomes(verification_events);
+    if verification_events.len() < MIN_VERIFICATION_EVENTS {
+        return Vec::new();
+    }
+
+    let adaptations = reflection_adaptations_with_turn(records);
+    let mut impacts = Vec::new();
+
+    for (index, adaptation) in adaptations.iter().enumerate() {
+        let current_turn = adaptation.turn.expect("turn checked above");
+        let newer_bound = index
+            .checked_sub(1)
+            .and_then(|previous| adaptations.get(previous))
+            .and_then(|record| record.turn);
+        let older_bound = adaptations.get(index + 1).and_then(|record| record.turn);
+
+        let newer_events = verification_events
+            .iter()
+            .copied()
+            .filter(|event| {
+                event.turn.is_some_and(|turn| {
+                    turn >= current_turn && newer_bound.map_or(true, |upper| turn < upper)
+                })
+            })
+            .take(ADAPTATION_WINDOW_VERIFICATION_LIMIT)
+            .collect::<Vec<_>>();
+        let older_events = verification_events
+            .iter()
+            .copied()
+            .filter(|event| {
+                event.turn.is_some_and(|turn| {
+                    turn < current_turn && older_bound.map_or(true, |lower| turn >= lower)
+                })
+            })
+            .take(ADAPTATION_WINDOW_VERIFICATION_LIMIT)
+            .collect::<Vec<_>>();
+
+        if let Some(delta) = summarize_verification_delta_windows(&newer_events, &older_events)
             .into_iter()
             .next()
         {
@@ -404,10 +497,67 @@ fn summarize_performance_delta_windows(
         .collect()
 }
 
+fn summarize_verification_delta_windows(
+    newer_events: &[&VerificationEventView],
+    older_events: &[&VerificationEventView],
+) -> Vec<ReflectionEventSummary> {
+    const MIN_COMBINED_EVENTS: u32 = 2;
+    const MIN_PASS_RATE_DELTA: f64 = 0.5;
+
+    if newer_events.is_empty() || older_events.is_empty() {
+        return Vec::new();
+    }
+
+    let newer = summarize_verification_window(newer_events);
+    let older = summarize_verification_window(older_events);
+    if newer.events + older.events < MIN_COMBINED_EVENTS {
+        return Vec::new();
+    }
+
+    let older_pass_rate = older.pass_rate();
+    let newer_pass_rate = newer.pass_rate();
+    let pass_rate_delta = newer_pass_rate - older_pass_rate;
+    if pass_rate_delta.abs() < MIN_PASS_RATE_DELTA {
+        return Vec::new();
+    }
+
+    vec![ReflectionEventSummary {
+        kind: if pass_rate_delta.is_sign_positive() {
+            "Improved".into()
+        } else {
+            "Regressed".into()
+        },
+        turn: newer.latest_turn.or(older.latest_turn),
+        detail: format!(
+            "verification pass rate {:.0}% -> {:.0}% (recent={} checks, prior={})",
+            older_pass_rate * 100.0,
+            newer_pass_rate * 100.0,
+            newer.events,
+            older.events
+        ),
+    }]
+}
+
 fn tool_steps_with_calls(steps: &[StepRecord]) -> Vec<&StepRecord> {
     steps
         .iter()
         .filter(|step| !step.tool_calls.is_empty())
+        .collect::<Vec<_>>()
+}
+
+fn verification_events_with_outcomes(
+    events: &[VerificationEventView],
+) -> Vec<&VerificationEventView> {
+    events
+        .iter()
+        .filter(|event| event.turn.is_some() && event.passed.is_some())
+        .collect::<Vec<_>>()
+}
+
+fn reflection_adaptations_with_turn(records: &[EvolutionRecord]) -> Vec<&EvolutionRecord> {
+    records
+        .iter()
+        .filter(|record| record.turn.is_some() && is_reflection_adaptation_record(record))
         .collect::<Vec<_>>()
 }
 
@@ -458,6 +608,19 @@ fn summarize_performance_window(
     by_tool
 }
 
+fn summarize_verification_window(events: &[&VerificationEventView]) -> VerificationDeltaWindow {
+    let mut window = VerificationDeltaWindow::default();
+    for event in events {
+        window.record(
+            event.turn,
+            event
+                .passed
+                .expect("verification event filtered to have outcome"),
+        );
+    }
+    window
+}
+
 fn performance_delta_kind_priority(kind: &str) -> u8 {
     match kind {
         "Regressed" => 2,
@@ -483,6 +646,7 @@ impl ReflectionContext {
             health: None,
             recent_performance_deltas: Vec::new(),
             recent_adaptation_impacts: Vec::new(),
+            recent_adaptation_verification_impacts: Vec::new(),
             recent_evaluation_events: Vec::new(),
             recent_adaptations: Vec::new(),
             recent_adaptation_outcomes: Vec::new(),
@@ -624,6 +788,19 @@ impl ReflectionContext {
         if !self.recent_adaptation_impacts.is_empty() {
             out.push_str("\nRecent adaptation impacts:\n");
             for event in &self.recent_adaptation_impacts {
+                match event.turn {
+                    Some(turn) => out.push_str(&format!(
+                        "  - turn {} [{}] {}\n",
+                        turn, event.kind, event.detail
+                    )),
+                    None => out.push_str(&format!("  - [{}] {}\n", event.kind, event.detail)),
+                }
+            }
+        }
+
+        if !self.recent_adaptation_verification_impacts.is_empty() {
+            out.push_str("\nRecent adaptation verification impacts:\n");
+            for event in &self.recent_adaptation_verification_impacts {
                 match event.turn {
                     Some(turn) => out.push_str(&format!(
                         "  - turn {} [{}] {}\n",
@@ -1065,6 +1242,23 @@ mod tests {
         }
     }
 
+    fn verification_event(
+        turn: u32,
+        passed: bool,
+        scope: &str,
+        target: &str,
+        summary: &str,
+    ) -> VerificationEventView {
+        VerificationEventView {
+            ts: format!("2026-01-01T00:02:{turn:02}Z"),
+            turn: Some(turn),
+            scope: Some(scope.into()),
+            target: Some(target.into()),
+            passed: Some(passed),
+            summary: summary.into(),
+        }
+    }
+
     #[test]
     fn context_render_includes_all_sections() {
         let mut ctx = ReflectionContext::new("test-session");
@@ -1096,6 +1290,11 @@ mod tests {
                 "after Adaptation turn 8 — bash latency 350ms -> 110ms (recent=2 calls, prior=2)"
                     .into(),
         }];
+        ctx.recent_adaptation_verification_impacts = vec![ReflectionEventSummary {
+            kind: "Regressed".into(),
+            turn: Some(9),
+            detail: "after Adaptation turn 8 — verification pass rate 100% -> 0% (recent=1 checks, prior=1)".into(),
+        }];
         ctx.recent_tactical_actions
             .push("IncreaseVerification".into());
 
@@ -1113,6 +1312,7 @@ mod tests {
         assert!(rendered.contains("Recent performance deltas:"));
         assert!(rendered.contains("[Improved]"));
         assert!(rendered.contains("Recent adaptation impacts:"));
+        assert!(rendered.contains("Recent adaptation verification impacts:"));
         assert!(rendered.contains("IncreaseVerification"));
     }
 
@@ -1201,6 +1401,33 @@ mod tests {
     }
 
     #[test]
+    fn summarize_recent_adaptation_verification_impacts_attributes_regression_to_adaptation_window()
+    {
+        let verification_events = vec![
+            verification_event(
+                8,
+                false,
+                "global",
+                "subtask-1",
+                "integration tests timed out",
+            ),
+            verification_event(7, true, "global", "subtask-1", "unit checks passed"),
+        ];
+        let records = vec![adaptation_record(8, "adaptation")];
+
+        let impacts =
+            summarize_recent_adaptation_verification_impacts(&verification_events, &records, 2);
+        assert_eq!(impacts.len(), 1);
+        assert_eq!(impacts[0].kind, "Regressed");
+        assert!(impacts[0].detail.contains("after Adaptation turn 8"));
+        assert!(
+            impacts[0]
+                .detail
+                .contains("verification pass rate 100% -> 0%")
+        );
+    }
+
+    #[test]
     fn signal_summary_from_all_variants() {
         let signals = sample_signals();
         for sig in &signals {
@@ -1254,6 +1481,13 @@ mod tests {
             detail: "after Adaptation turn 6 — bash success 100% -> 0% (recent=2 calls, prior=2)"
                 .into(),
         }];
+        ctx.recent_adaptation_verification_impacts = vec![ReflectionEventSummary {
+            kind: "Regressed".into(),
+            turn: Some(9),
+            detail:
+                "after Adaptation turn 6 — verification pass rate 100% -> 0% (recent=1 checks, prior=1)"
+                    .into(),
+        }];
         ctx.recent_evaluation_events = vec![
             ReflectionEventSummary {
                 kind: "GoalSteered".into(),
@@ -1295,6 +1529,7 @@ mod tests {
         assert!(user.contains("Recent adaptation outcomes:"));
         assert!(user.contains("[Verification]"));
         assert!(user.contains("Recent adaptation impacts:"));
+        assert!(user.contains("Recent adaptation verification impacts:"));
     }
 
     #[test]

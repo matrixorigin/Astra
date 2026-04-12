@@ -13,7 +13,8 @@ use astra_runtime::auto_tuning::{FeedbackSignal, SignalType};
 use astra_runtime::liquid::reflection::{
     GoalSummary as ReflectionGoalSummary, HealthSummary as ReflectionHealthSummary,
     ReflectionEventSummary, VerificationSummary as ReflectionVerificationSummary,
-    summarize_recent_adaptation_impacts, summarize_recent_performance_deltas,
+    summarize_recent_adaptation_impacts, summarize_recent_adaptation_verification_impacts,
+    summarize_recent_performance_deltas,
 };
 use astra_runtime::runtime_config::RuntimeConfig;
 use astra_runtime::self_model::{ConstraintSet, SelfModel};
@@ -521,6 +522,7 @@ async fn build_reflect_response(
         health,
         recent_performance_deltas,
         recent_adaptation_impacts,
+        recent_adaptation_verification_impacts,
         recent_evaluation_events,
         recent_adaptations,
         recent_adaptation_outcomes,
@@ -535,6 +537,7 @@ async fn build_reflect_response(
         health,
         recent_performance_deltas,
         recent_adaptation_impacts,
+        recent_adaptation_verification_impacts,
         recent_evaluation_events,
         recent_adaptations,
         recent_adaptation_outcomes,
@@ -561,6 +564,7 @@ async fn load_reflection_self_evidence(
     Option<ReflectionGoalSummary>,
     Option<ReflectionVerificationSummary>,
     Option<ReflectionHealthSummary>,
+    Vec<ReflectionEventSummary>,
     Vec<ReflectionEventSummary>,
     Vec<ReflectionEventSummary>,
     Vec<ReflectionEventSummary>,
@@ -604,6 +608,17 @@ async fn load_reflection_self_evidence(
             )
         })
         .unwrap_or_default();
+    let recent_adaptation_verification_impacts = snapshot
+        .as_ref()
+        .zip(verification_surface.as_ref())
+        .map(|(snapshot, verification_surface)| {
+            summarize_recent_adaptation_verification_impacts(
+                &verification_surface.objective.recent_verifications,
+                &snapshot.evolution.records,
+                3,
+            )
+        })
+        .unwrap_or_default();
     let recent_evaluation_events =
         reflection_recent_evaluation_events(goal_surface.as_ref(), verification_surface.as_ref());
     let recent_adaptations = reflection_recent_adaptations(snapshot.as_ref());
@@ -614,6 +629,7 @@ async fn load_reflection_self_evidence(
         health_surface.and_then(reflection_health_summary),
         recent_performance_deltas,
         recent_adaptation_impacts,
+        recent_adaptation_verification_impacts,
         recent_evaluation_events,
         recent_adaptations,
         recent_adaptation_outcomes,
@@ -1610,6 +1626,7 @@ fn build_persistent_reflection_context(
     health: Option<ReflectionHealthSummary>,
     recent_performance_deltas: Vec<ReflectionEventSummary>,
     recent_adaptation_impacts: Vec<ReflectionEventSummary>,
+    recent_adaptation_verification_impacts: Vec<ReflectionEventSummary>,
     recent_evaluation_events: Vec<ReflectionEventSummary>,
     recent_adaptations: Vec<ReflectionEventSummary>,
     recent_adaptation_outcomes: Vec<ReflectionEventSummary>,
@@ -1662,6 +1679,7 @@ fn build_persistent_reflection_context(
     context.health = health;
     context.recent_performance_deltas = recent_performance_deltas;
     context.recent_adaptation_impacts = recent_adaptation_impacts;
+    context.recent_adaptation_verification_impacts = recent_adaptation_verification_impacts;
     context.recent_evaluation_events = recent_evaluation_events;
     context.recent_adaptations = recent_adaptations;
     context.recent_adaptation_outcomes = recent_adaptation_outcomes;
@@ -2747,6 +2765,16 @@ mod tests {
         writer
             .append(&JournalEvent::verification_completed(
                 Some(session_id),
+                8,
+                "subtask-1",
+                "global",
+                true,
+                &serde_json::json!([{"check":"unit-tests","passed":true}]),
+            ))
+            .unwrap();
+        writer
+            .append(&JournalEvent::verification_completed(
+                Some(session_id),
                 9,
                 "subtask-1",
                 "global",
@@ -2808,6 +2836,10 @@ mod tests {
             "Regressed"
         );
         assert_eq!(
+            value["reflection_context"]["recent_adaptation_verification_impacts"][0]["kind"],
+            "Regressed"
+        );
+        assert_eq!(
             value["reflection_context"]["recent_evaluation_events"][0]["kind"],
             "Verification"
         );
@@ -2862,6 +2894,12 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("Recent adaptation impacts:")
+        );
+        assert!(
+            value["prompt_preview"]
+                .as_str()
+                .unwrap()
+                .contains("Recent adaptation verification impacts:")
         );
         assert!(
             value["prompt_preview"]
