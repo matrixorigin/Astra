@@ -550,8 +550,7 @@ mod tests {
     #[test]
     fn tool_trace_scores_are_clamped_non_negative() {
         let selected_tools: Vec<String> = (0..16).map(|i| format!("tool-{i}")).collect();
-        let trace =
-            build_tool_trace_from_selection(16, &selected_tools, "tfidf", 0.4, &[], 5);
+        let trace = build_tool_trace_from_selection(16, &selected_tools, "tfidf", 0.4, &[], 5);
         assert!(trace.tools_selected.iter().all(|tool| tool.score >= 0.0));
     }
 }

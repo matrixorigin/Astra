@@ -182,6 +182,7 @@ mod tests {
             consecutive_context_window_errors: 0,
             max_turn_input_tokens: 0,
             budget_wrapup_injected: false,
+            skill_produced_output: false,
             max_cumulative_tokens: 0,
             thinking_budget_tokens: None,
             recent_file_reads: Vec::new(),
@@ -704,7 +705,10 @@ mod tests {
 
         // messages[0] = assistant message with tool_calls
         // messages[1] = tool result message with tool_call_id
-        assert!(messages.len() >= 2, "expected assistant + tool result messages");
+        assert!(
+            messages.len() >= 2,
+            "expected assistant + tool result messages"
+        );
 
         let assistant_tc_id = messages[0]["tool_calls"][0]["id"]
             .as_str()
@@ -760,9 +764,10 @@ mod tests {
         let edge_tool_round: Vec<EdgeToolExecResult> = Vec::new();
 
         // Simulate: skill interception resolved call_skill before headless round
-        let pre_resolved = vec![
-            ("call_skill".to_string(), "Skill instructions here".to_string()),
-        ];
+        let pre_resolved = vec![(
+            "call_skill".to_string(),
+            "Skill instructions here".to_string(),
+        )];
 
         run_agentic_headless_tool_round(
             0,
@@ -801,13 +806,19 @@ mod tests {
             messages.len() >= 3,
             "expected assistant + tool results, got {}: {:#?}",
             messages.len(),
-            messages.iter().map(|m| {
-                let role = m["role"].as_str().unwrap_or("?");
-                let tcid = m.get("tool_call_id").and_then(|v| v.as_str()).unwrap_or("");
-                format!("{}({})", role, tcid)
-            }).collect::<Vec<_>>()
+            messages
+                .iter()
+                .map(|m| {
+                    let role = m["role"].as_str().unwrap_or("?");
+                    let tcid = m.get("tool_call_id").and_then(|v| v.as_str()).unwrap_or("");
+                    format!("{}({})", role, tcid)
+                })
+                .collect::<Vec<_>>()
         );
-        assert_eq!(messages[0]["role"], "assistant", "first message must be assistant");
+        assert_eq!(
+            messages[0]["role"], "assistant",
+            "first message must be assistant"
+        );
         assert_eq!(
             messages[0]["tool_calls"].as_array().map(|a| a.len()),
             Some(2),
@@ -852,7 +863,11 @@ mod tests {
 
         let mut messages = Vec::new();
         let mut tool_results = Vec::new();
-        let valid_tool_names = HashSet::from(["bash".to_string(), "skill".to_string(), "read_file".to_string()]);
+        let valid_tool_names = HashSet::from([
+            "bash".to_string(),
+            "skill".to_string(),
+            "read_file".to_string(),
+        ]);
         let mut restricted_tools = HashSet::new();
         let mut turn_guard = TurnGuard::new();
         let mut step_recorder = StepRecorder::new("test-session", "all-pre-resolved");
@@ -876,7 +891,7 @@ mod tests {
             &astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
             "",
             None,
-            &tool_calls,  // full tool_calls, not empty
+            &tool_calls, // full tool_calls, not empty
             &edge_tool_round,
             "",
             &edge_callback_outputs,
@@ -908,8 +923,11 @@ mod tests {
             .iter()
             .map(|tc| tc["id"].as_str().unwrap())
             .collect();
-        assert_eq!(tc_ids, vec!["skill:0", "read_file:1"],
-            "assistant tool_calls must use server-assigned ids, not edge-N");
+        assert_eq!(
+            tc_ids,
+            vec!["skill:0", "read_file:1"],
+            "assistant tool_calls must use server-assigned ids, not edge-N"
+        );
 
         // Tool results must use matching ids
         assert_eq!(messages[1]["tool_call_id"], "skill:0");
@@ -969,9 +987,7 @@ mod tests {
             std::collections::HashMap::new();
 
         // Skill was pre-resolved; grep will be matched from edge_tool_round
-        let pre_resolved = vec![
-            ("skill:0".to_string(), "Skill instructions".to_string()),
-        ];
+        let pre_resolved = vec![("skill:0".to_string(), "Skill instructions".to_string())];
 
         run_agentic_headless_tool_round(
             0,

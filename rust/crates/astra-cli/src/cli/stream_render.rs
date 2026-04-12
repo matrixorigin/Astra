@@ -268,7 +268,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         if let Some(tx) = &self.stream_event_tx {
             let _ = tx.send(super::chat_stream::StreamEvent::WaitingForModel);
         }
-        if self.quiet || self.suppress_intermediate_output {
+        if self.quiet {
             return;
         }
         self.render.start_waiting_for_model();
@@ -285,7 +285,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
     }
 
     fn on_idle_tick(&mut self) {
-        if self.quiet || self.suppress_intermediate_output {
+        if self.quiet {
             return;
         }
         self.render.tick_thinking_pane();
@@ -314,6 +314,22 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         }
 
         if self.quiet || self.suppress_intermediate_output {
+            // In suppress mode, still render thinking preview (spinner +
+            // reasoning chunks) so the user sees progress.  Only suppress
+            // StreamText which is intermediate draft prose.
+            if self.quiet {
+                return;
+            }
+            for effect in &effects {
+                match effect {
+                    SseRenderEffect::StartThinkingSpinner => self.render.start_thinking(),
+                    SseRenderEffect::StopThinkingSpinner => self.render.stop_thinking(),
+                    SseRenderEffect::ThinkingPreviewChunk(s) => {
+                        self.render.push_thinking_preview_chunk(s);
+                    }
+                    SseRenderEffect::StreamText(_) => {} // suppressed
+                }
+            }
             return;
         }
         let mut i = 0usize;
@@ -2612,6 +2628,31 @@ pub(super) async fn consume_turn_sse(
     super::streaming_md::strip_leading_narration(&mut result.full_text);
 
     if quiet || suppress_intermediate_output {
+        // quiet: never render anything.
+        // suppress_intermediate_output: streaming text was suppressed, but if
+        // this is the final turn (no tool calls) we still need to render the
+        // assistant's answer.  Tool turns are discarded either way.
+        if quiet {
+            return result;
+        }
+        let has_any_tool_work = result.has_tool_calls || !result.edge_tool_round.is_empty();
+        if has_any_tool_work {
+            return result;
+        }
+        // Final turn with suppressed streaming — one-shot render.
+        if !result.full_text.is_empty() {
+            if render_md {
+                let mut md = super::streaming_md::StreamingMarkdown::new(term_width);
+                md.push(&result.full_text);
+                md.finish();
+            } else {
+                print!("{}", result.full_text);
+                if !result.full_text.ends_with('\n') {
+                    println!();
+                }
+                let _ = io::stdout().flush();
+            }
+        }
         return result;
     }
 

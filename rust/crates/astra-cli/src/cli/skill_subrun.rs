@@ -508,6 +508,7 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             consecutive_context_window_errors: 0,
             max_turn_input_tokens: astra_core::RuntimeLimits::global().max_turn_input_tokens,
             budget_wrapup_injected: false,
+            skill_produced_output: false,
             max_cumulative_tokens: SUBRUN_MAX_CUMULATIVE_TOKENS,
             thinking_budget_tokens: None,
             recent_file_reads: Vec::new(),

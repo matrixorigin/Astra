@@ -152,7 +152,8 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             render_md: self.render_md,
             term_width: self.term_width,
             quiet: self.quiet,
-            suppress_intermediate_output: self.suppress_intermediate_output,
+            suppress_intermediate_output: self.suppress_intermediate_output
+                || state.skill_produced_output,
             hide_streaming_assistant_text: self.hide_streaming_assistant_text,
             message: self.message,
             history: self.history,

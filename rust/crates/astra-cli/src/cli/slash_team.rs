@@ -1920,15 +1920,6 @@ mod tests {
     use super::*;
     use crate::cli_utils::{CredentialsFile, Profile};
     use axum::{Router, routing::get, routing::post};
-    use std::sync::{Mutex, MutexGuard, OnceLock};
-
-    /// Serialize tests that mutate ASTRA_CREDENTIALS_DIR.
-    fn creds_lock() -> MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-    }
 
     async fn spawn_mock(app: Router) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2207,6 +2198,16 @@ mod tests {
         assert!(hint.contains("help"));
     }
 
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    /// Serialize tests that mutate ASTRA_CREDENTIALS_DIR.
+    fn creds_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
     #[tokio::test]
     async fn ensure_team_run_session_creates_remote_session_when_missing() {
         let _lock = creds_lock();
@@ -2246,10 +2247,6 @@ mod tests {
             creds.profiles["default"].last_session_id.as_deref(),
             Some("team-sess-1")
         );
-
-        unsafe {
-            std::env::remove_var("ASTRA_CREDENTIALS_DIR");
-        }
     }
 
     #[tokio::test]
@@ -2306,10 +2303,6 @@ mod tests {
             creds.profiles["default"].last_session_id.as_deref(),
             Some("team-sess-2")
         );
-
-        unsafe {
-            std::env::remove_var("ASTRA_CREDENTIALS_DIR");
-        }
     }
 
     // ── Formatting helper tests ─────────────────────────────────

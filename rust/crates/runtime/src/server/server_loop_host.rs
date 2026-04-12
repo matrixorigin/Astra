@@ -1384,6 +1384,7 @@ mod tests {
             consecutive_context_window_errors: 0,
             max_turn_input_tokens: 0,
             budget_wrapup_injected: false,
+            skill_produced_output: false,
             max_cumulative_tokens: 0,
             thinking_budget_tokens: None,
             recent_file_reads: Vec::new(),

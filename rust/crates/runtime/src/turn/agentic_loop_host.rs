@@ -483,6 +483,11 @@ pub struct AgenticLoopState {
     /// The loop allows exactly one more LLM iteration after injection.
     pub budget_wrapup_injected: bool,
 
+    /// Set to `true` when a skill produced substantial output in the current
+    /// turn. The CLI host reads this to suppress intermediate text rendering
+    /// on subsequent iterations (prevents markdown leak from draft text).
+    pub skill_produced_output: bool,
+
     // ── Cumulative token budget ──
     /// Maximum cumulative (prompt + completion) tokens across all rounds.
     /// 0 = unlimited (default for interactive sessions).
@@ -4370,7 +4375,9 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                         });
                     if let Some(ref name) = skill_name {
                         if let Some(prev) = state.skills.invoked.get(name.as_str()) {
-                            let call_id = tc.get("id").and_then(Value::as_str)
+                            let call_id = tc
+                                .get("id")
+                                .and_then(Value::as_str)
                                 .filter(|s| !s.is_empty())
                                 .unwrap_or("unknown");
                             dedup_results.push(crate::turn::skill_tool::InterceptedToolResult {
@@ -4453,6 +4460,11 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                 .any(|tc| crate::turn::skill_tool::is_skill_call(tc));
             skill_results.extend(sr);
             if new_skills_fired && !remaining.is_empty() {
+                // Check if any skill produced substantial output — if so, the
+                // skill likely already performed the work these deferred calls
+                // would do (e.g. reading files for a code review). Tell the LLM
+                // the work is done rather than inviting re-evaluation.
+                let skill_produced_output = skill_results.iter().any(|r| r.result.len() > 500);
                 let dropped_count = remaining.len();
                 for tc in &remaining {
                     let call_id = tc.get("id").and_then(Value::as_str).unwrap_or("unknown");
@@ -4461,24 +4473,42 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                         .and_then(|f| f.get("name"))
                         .and_then(Value::as_str)
                         .unwrap_or("unknown");
-                    skill_results.push(crate::turn::skill_tool::InterceptedToolResult {
-                        tool_call_id: call_id.to_string(),
-                        tool_name: tool_name.to_string(),
-                        result: format!(
+                    let msg = if skill_produced_output {
+                        // Hard constraint: restrict these tools so the selector
+                        // won't offer them and the loop won't execute them even
+                        // if the LLM ignores the soft prompt.
+                        state.restricted_tools.insert(tool_name.to_string());
+                        format!(
+                            "Skipped: the skill already completed this work. \
+                             Do NOT call `{}` again — use the skill output above as your answer.",
+                            tool_name
+                        )
+                    } else {
+                        format!(
                             "Deferred: skill was invoked in this turn. Read the skill \
                              instructions above, then decide whether to call `{}` again.",
                             tool_name
-                        ),
+                        )
+                    };
+                    skill_results.push(crate::turn::skill_tool::InterceptedToolResult {
+                        tool_call_id: call_id.to_string(),
+                        tool_name: tool_name.to_string(),
+                        result: msg,
                         verification_summary: None,
                     });
                 }
                 post_skill_tool_calls = Vec::new(); // clear remaining
                 if !quiet {
+                    let verb = if skill_produced_output {
+                        "skipped"
+                    } else {
+                        "deferred"
+                    };
                     host.emit_headless_line(
                         HeadlessStderrStyle::Dim,
                         format!(
-                            "  ⏸ {} non-skill tool call(s) deferred — skill takes priority",
-                            dropped_count
+                            "  ⏸ {} non-skill tool call(s) {} — skill takes priority",
+                            dropped_count, verb
                         ),
                     );
                 }
@@ -4516,6 +4546,14 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
         // into both messages and tool_results in correct ordering.
         for result in &skill_results {
             pre_resolved_results.push((result.tool_call_id.clone(), result.result.clone()));
+        }
+
+        // Set skill_produced_output whenever a skill produces substantial
+        // output, regardless of whether deferral triggered. This suppresses
+        // intermediate text rendering on subsequent iterations (prevents
+        // markdown leak from draft review text).
+        if !state.skill_produced_output && skill_results.iter().any(|r| r.result.len() > 500) {
+            state.skill_produced_output = true;
         }
 
         // ─── Step 4: Headless tool round ────────────────────────────────
@@ -5319,6 +5357,7 @@ mod tests {
             consecutive_context_window_errors: 0,
             max_turn_input_tokens: 0,
             budget_wrapup_injected: false,
+            skill_produced_output: false,
             max_cumulative_tokens: 0,
             thinking_budget_tokens: None,
             recent_file_reads: Vec::new(),
@@ -11629,5 +11668,202 @@ print(json.dumps({'context': 'user said: ' + msg}))
         assert_eq!(guard.context_traces[0].token_budget.total_used, 20_000);
         assert_eq!(guard.context_traces[1].turn_id, "turn-1");
         assert_eq!(guard.context_traces[1].token_budget.total_used, 30_000);
+    }
+
+    // ── Skill deferral behavior tests ─────────────────────────────────────
+
+    /// Helper: build a HostTurnResult with a skill call + non-skill tool calls.
+    fn skill_plus_tools_result(
+        skill_call_id: &str,
+        skill_args: &str,
+        extra_calls: &[(&str, &str)], // (call_id, tool_name)
+        prompt: u64,
+        completion: u64,
+    ) -> HostTurnResult {
+        let mut tool_calls = vec![json!({
+            "id": skill_call_id,
+            "type": "function",
+            "function": {
+                "name": "skill",
+                "arguments": skill_args,
+            }
+        })];
+        for (id, name) in extra_calls {
+            tool_calls.push(json!({
+                "id": *id,
+                "type": "function",
+                "function": {
+                    "name": *name,
+                    "arguments": "{}",
+                }
+            }));
+        }
+        HostTurnResult {
+            accum: ChatTurnSseAccum {
+                has_tool_calls: true,
+                has_usage: true,
+                prompt_tokens: prompt,
+                completion_tokens: completion,
+                tool_calls,
+                ..ChatTurnSseAccum::default()
+            },
+            ttft_ms: Some(30),
+            edge_tool_round: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn skill_with_substantial_output_skips_deferred_calls() {
+        // Regression: session 746b6423 — skill produced a full code review
+        // but 18 deferred tool calls were re-executed in the next iteration,
+        // causing 3x token waste.
+        let mut resolver = StubSkillResolver::new();
+        // Simulate a skill that produces substantial output (like a code review).
+        // The formatted result includes "# Skill: ..." header (~120 chars) + instructions.
+        resolver.skills[0].2 = "x".repeat(500);
+        let turns = vec![
+            // Iteration 1: skill + 2 read_file calls
+            skill_plus_tools_result(
+                "call_skill",
+                r#"{"skill_name": "test-skill"}"#,
+                &[("call_rf1", "read_file"), ("call_rf2", "read_file")],
+                100,
+                50,
+            ),
+            // Iteration 2: LLM sees "Skipped" messages, produces final text
+            text_result("Final answer from skill output.", 200, 100, None),
+        ];
+
+        let mut host = MockHost::new(turns);
+        let mut state = make_state();
+        state
+            .messages
+            .push(json!({"role": "user", "content": "review code"}));
+        state.skills.resolver = Some(Arc::new(resolver));
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+        assert!(outcome.is_ok());
+
+        // The deferred calls should have "Skipped" messages (not "Deferred")
+        // because the skill produced substantial output (>200 chars).
+        let rf1_msgs: Vec<&Value> = state
+            .messages
+            .iter()
+            .filter(|m| m.get("tool_call_id").and_then(Value::as_str) == Some("call_rf1"))
+            .collect();
+        assert_eq!(
+            rf1_msgs.len(),
+            1,
+            "expected exactly one tool result for call_rf1"
+        );
+        let content = rf1_msgs[0]["content"].as_str().unwrap();
+        assert!(
+            content.contains("Skipped"),
+            "expected 'Skipped' message for deferred call when skill produced output, got: {content}"
+        );
+        assert!(
+            content.contains("Do NOT call"),
+            "should tell LLM not to re-invoke, got: {content}"
+        );
+
+        // skill_produced_output flag should be set
+        assert!(
+            state.skill_produced_output,
+            "skill_produced_output flag should be set when skill produces substantial output"
+        );
+
+        // Hard constraint: deferred tool names should be in restricted_tools
+        assert!(
+            state.restricted_tools.contains("read_file"),
+            "read_file should be restricted after skill produced output"
+        );
+    }
+
+    #[tokio::test]
+    async fn skill_with_short_output_defers_calls() {
+        // When skill output is short (<= 500 bytes), deferred calls should
+        // use the original "Deferred" message that invites re-evaluation.
+        let mut resolver = StubSkillResolver::new();
+        // Override with a short instruction (< 200 chars)
+        resolver.skills[0].2 = "Short.".into();
+        let turns = vec![
+            skill_plus_tools_result(
+                "call_skill",
+                r#"{"skill_name": "test-skill"}"#,
+                &[("call_rf1", "read_file")],
+                100,
+                50,
+            ),
+            text_result("Done.", 200, 100, None),
+        ];
+
+        let mut host = MockHost::new(turns);
+        let mut state = make_state();
+        state
+            .messages
+            .push(json!({"role": "user", "content": "do something"}));
+        state.skills.resolver = Some(Arc::new(resolver));
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+        assert!(outcome.is_ok());
+
+        let rf1_msgs: Vec<&Value> = state
+            .messages
+            .iter()
+            .filter(|m| m.get("tool_call_id").and_then(Value::as_str) == Some("call_rf1"))
+            .collect();
+        assert_eq!(rf1_msgs.len(), 1);
+        let content = rf1_msgs[0]["content"].as_str().unwrap();
+        assert!(
+            content.contains("Deferred"),
+            "expected 'Deferred' message for short skill output, got: {content}"
+        );
+        assert!(
+            !content.contains("Skipped"),
+            "should NOT say 'Skipped' for short skill output, got: {content}"
+        );
+
+        // skill_produced_output flag should NOT be set
+        assert!(
+            !state.skill_produced_output,
+            "skill_produced_output should not be set for short skill output"
+        );
+
+        // restricted_tools should NOT contain the deferred tool
+        assert!(
+            !state.restricted_tools.contains("read_file"),
+            "read_file should not be restricted for short skill output"
+        );
+    }
+
+    #[tokio::test]
+    async fn skill_only_call_with_substantial_output_sets_flag() {
+        // Regression: session 699a0f6c — skill sub-agent produced 212 lines
+        // but skill_produced_output was not set because there were no parallel
+        // tool calls (remaining was empty, deferral block never ran).
+        let mut resolver = StubSkillResolver::new();
+        resolver.skills[0].2 = "x".repeat(500);
+        let turns = vec![
+            // Iteration 1: skill-only call (no parallel tools)
+            skill_tool_call_result("call_skill", r#"{"skill_name": "test-skill"}"#, 100, 50),
+            // Iteration 2: LLM produces final text
+            text_result("Here is the review.", 200, 100, None),
+        ];
+
+        let mut host = MockHost::new(turns);
+        let mut state = make_state();
+        state
+            .messages
+            .push(json!({"role": "user", "content": "review code"}));
+        state.skills.resolver = Some(Arc::new(resolver));
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+        assert!(outcome.is_ok());
+
+        // Flag should be set even without deferral (skill-only call)
+        assert!(
+            state.skill_produced_output,
+            "skill_produced_output should be set for skill-only call with substantial output"
+        );
     }
 }

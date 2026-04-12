@@ -75,7 +75,6 @@ pub(crate) async fn stream_chat_sse(
     // Paint an immediate spinner so the user sees feedback during init (executor, schemas,
     // skill discovery, etc.) before the per-turn prep spinner takes over.
     let show_early_hint = !p.quiet
-        && !p.suppress_intermediate_output
         && std::io::IsTerminal::is_terminal(&std::io::stderr())
         && p.plan_assemble_line_release.is_none();
     let early_spinner: Option<crate::effects::Spinner> = if show_early_hint {
@@ -495,6 +494,7 @@ pub(crate) async fn stream_chat_sse(
         consecutive_context_window_errors: 0,
         max_turn_input_tokens: RuntimeLimits::global().max_turn_input_tokens,
         budget_wrapup_injected: false,
+        skill_produced_output: false,
         max_cumulative_tokens: 0,
         thinking_budget_tokens: None,
         recent_file_reads: Vec::new(),
@@ -545,7 +545,7 @@ pub(crate) async fn stream_chat_sse(
 
     eprint_stream_loop_sidecars(StreamLoopSidecarEprint {
         explain: p.explain,
-        quiet: p.quiet || p.suppress_intermediate_output,
+        quiet: p.quiet,
         verbose_mode: p.verbose_mode,
         start,
         model: p.model,

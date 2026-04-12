@@ -405,7 +405,14 @@ mod tests {
         let collector1 = TurnTraceCollector::new("turn-1", "session-abc");
         let collector2 = collector1.clone_arc();
 
-        collector1.record_tool_selection(&["view".to_string()], "tfidf", 0.8, &[("view".into(), 100)], 10, 5);
+        collector1.record_tool_selection(
+            &["view".to_string()],
+            "tfidf",
+            0.8,
+            &[("view".into(), 100)],
+            10,
+            5,
+        );
 
         // Both should see the same data
         assert!(collector2.has_data());
