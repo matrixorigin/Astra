@@ -1337,6 +1337,192 @@ fn sed_inline_non_path_flag_value(flag: &str) -> bool {
         || flag.starts_with("--expression=")
 }
 
+fn validate_command_path_operand(
+    policy: &astra_runtime::tool_sandbox::SandboxPolicy,
+    arg: &str,
+    oldpwd: Option<&std::path::Path>,
+) -> Option<String> {
+    (arg != "-")
+        .then(|| validate_command_path_arg(policy, arg, oldpwd))
+        .flatten()
+}
+
+fn check_tar_path_boundary(
+    policy: &astra_runtime::tool_sandbox::SandboxPolicy,
+    parts: &[String],
+    oldpwd: Option<&std::path::Path>,
+) -> Option<String> {
+    let mut idx = 1usize;
+
+    if let Some(cluster) = parts.get(1)
+        && !cluster.starts_with('-')
+        && cluster.chars().all(|ch| ch.is_ascii_alphabetic())
+    {
+        idx = 2;
+        for flag in cluster.chars() {
+            if tar_old_style_flag_has_path_value(flag) {
+                if let Some(value) = parts.get(idx)
+                    && let Some(msg) = validate_command_path_operand(policy, value, oldpwd)
+                {
+                    return Some(msg);
+                }
+                idx += 1;
+            }
+        }
+    } else {
+        while idx < parts.len() {
+            let arg = parts[idx].as_str();
+            if arg == "--" {
+                idx += 1;
+                break;
+            }
+
+            if let Some(path) = tar_inline_path_flag_value(arg) {
+                if let Some(msg) = validate_command_path_operand(policy, path, oldpwd) {
+                    return Some(msg);
+                }
+                idx += 1;
+                continue;
+            }
+            if let Some(kind) = tar_flag_value_kind(arg) {
+                if let Some(value) = parts.get(idx + 1) {
+                    if matches!(kind, ShellFlagValueKind::Path)
+                        && let Some(msg) = validate_command_path_operand(policy, value, oldpwd)
+                    {
+                        return Some(msg);
+                    }
+                    idx += 2;
+                    continue;
+                }
+                idx += 1;
+                continue;
+            }
+            if arg.starts_with('-') && arg != "-" {
+                idx += 1;
+                continue;
+            }
+            break;
+        }
+    }
+
+    while idx < parts.len() {
+        if let Some(msg) = validate_command_path_operand(policy, &parts[idx], oldpwd) {
+            return Some(msg);
+        }
+        idx += 1;
+    }
+
+    None
+}
+
+fn tar_old_style_flag_has_path_value(flag: char) -> bool {
+    matches!(flag, 'f' | 'C' | 'T' | 'X' | 'g')
+}
+
+fn tar_flag_value_kind(flag: &str) -> Option<ShellFlagValueKind> {
+    match flag {
+        "-f"
+        | "--file"
+        | "-C"
+        | "--directory"
+        | "-T"
+        | "--files-from"
+        | "-X"
+        | "--exclude-from"
+        | "-g"
+        | "--listed-incremental" => Some(ShellFlagValueKind::Path),
+        _ => None,
+    }
+}
+
+fn tar_inline_path_flag_value(flag: &str) -> Option<&str> {
+    flag.strip_prefix("-f")
+        .filter(|value| !value.is_empty())
+        .or_else(|| flag.strip_prefix("-C").filter(|value| !value.is_empty()))
+        .or_else(|| flag.strip_prefix("-T").filter(|value| !value.is_empty()))
+        .or_else(|| flag.strip_prefix("-X").filter(|value| !value.is_empty()))
+        .or_else(|| flag.strip_prefix("-g").filter(|value| !value.is_empty()))
+        .or_else(|| flag.strip_prefix("--file="))
+        .or_else(|| flag.strip_prefix("--directory="))
+        .or_else(|| flag.strip_prefix("--files-from="))
+        .or_else(|| flag.strip_prefix("--exclude-from="))
+        .or_else(|| flag.strip_prefix("--listed-incremental="))
+}
+
+fn check_patch_path_boundary(
+    policy: &astra_runtime::tool_sandbox::SandboxPolicy,
+    parts: &[String],
+    oldpwd: Option<&std::path::Path>,
+) -> Option<String> {
+    let mut idx = 1usize;
+    while idx < parts.len() {
+        let arg = parts[idx].as_str();
+        if arg == "--" {
+            idx += 1;
+            break;
+        }
+
+        if let Some(path) = patch_inline_path_flag_value(arg) {
+            if let Some(msg) = validate_command_path_operand(policy, path, oldpwd) {
+                return Some(msg);
+            }
+            idx += 1;
+            continue;
+        }
+        if let Some(kind) = patch_flag_value_kind(arg) {
+            if let Some(value) = parts.get(idx + 1) {
+                if matches!(kind, ShellFlagValueKind::Path)
+                    && let Some(msg) = validate_command_path_operand(policy, value, oldpwd)
+                {
+                    return Some(msg);
+                }
+                idx += 2;
+                continue;
+            }
+            idx += 1;
+            continue;
+        }
+        if arg.starts_with('-') && arg != "-" {
+            idx += 1;
+            continue;
+        }
+        if let Some(msg) = validate_command_path_operand(policy, arg, oldpwd) {
+            return Some(msg);
+        }
+        idx += 1;
+    }
+
+    while idx < parts.len() {
+        if let Some(msg) = validate_command_path_operand(policy, &parts[idx], oldpwd) {
+            return Some(msg);
+        }
+        idx += 1;
+    }
+
+    None
+}
+
+fn patch_flag_value_kind(flag: &str) -> Option<ShellFlagValueKind> {
+    match flag {
+        "-i" | "--input" | "-o" | "--output" | "-d" | "--directory" | "-r" | "--reject-file" => {
+            Some(ShellFlagValueKind::Path)
+        }
+        _ => None,
+    }
+}
+
+fn patch_inline_path_flag_value(flag: &str) -> Option<&str> {
+    flag.strip_prefix("-i")
+        .filter(|value| !value.is_empty())
+        .or_else(|| flag.strip_prefix("-o").filter(|value| !value.is_empty()))
+        .or_else(|| flag.strip_prefix("-d").filter(|value| !value.is_empty()))
+        .or_else(|| flag.strip_prefix("-r").filter(|value| !value.is_empty()))
+        .or_else(|| flag.strip_prefix("--input="))
+        .or_else(|| flag.strip_prefix("--output="))
+        .or_else(|| flag.strip_prefix("--directory="))
+        .or_else(|| flag.strip_prefix("--reject-file="))
+}
+
 /// Check a single (non-compound) command for path boundary violations.
 fn check_single_command_path_boundary(
     policy: &astra_runtime::tool_sandbox::SandboxPolicy,
@@ -1367,6 +1553,12 @@ fn check_single_command_path_boundary(
     }
     if base == "sed" {
         return check_sed_path_boundary(policy, &parts, oldpwd);
+    }
+    if base == "tar" {
+        return check_tar_path_boundary(policy, &parts, oldpwd);
+    }
+    if base == "patch" {
+        return check_patch_path_boundary(policy, &parts, oldpwd);
     }
 
     if base == "xargs" {
@@ -4411,6 +4603,105 @@ mod tests {
         assert!(
             result.is_none(),
             "fd fan-out should stay allowed for non-file-access subcommands"
+        );
+    }
+
+    #[test]
+    fn tar_file_flag_outside_project_is_blocked() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(&policy, "tar -xf /etc/archive.tar");
+        assert!(
+            result.is_some(),
+            "tar archive path should be boundary-checked"
+        );
+    }
+
+    #[test]
+    fn tar_directory_flag_outside_project_is_blocked() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(&policy, "tar -xf archive.tar -C /etc");
+        assert!(
+            result.is_some(),
+            "tar extraction directory should be boundary-checked"
+        );
+    }
+
+    #[test]
+    fn tar_create_source_outside_project_is_blocked() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(&policy, "tar -cf backup.tar /etc/passwd");
+        assert!(
+            result.is_some(),
+            "tar create source operands should be boundary-checked"
+        );
+    }
+
+    #[test]
+    fn tar_old_style_file_flag_outside_project_is_blocked() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(&policy, "tar xf /etc/archive.tar");
+        assert!(
+            result.is_some(),
+            "old-style tar option clusters should still validate archive paths"
+        );
+    }
+
+    #[test]
+    fn tar_in_project_paths_are_allowed() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(&policy, "tar -cf backup.tar src");
+        assert!(
+            result.is_none(),
+            "in-project tar paths should remain allowed"
+        );
+    }
+
+    #[test]
+    fn patch_input_file_outside_project_is_blocked() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(&policy, "patch -i /etc/fix.patch");
+        assert!(
+            result.is_some(),
+            "patch input files should be boundary-checked"
+        );
+    }
+
+    #[test]
+    fn patch_directory_outside_project_is_blocked() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(&policy, "patch -d /etc -i fix.patch");
+        assert!(
+            result.is_some(),
+            "patch working directories should be boundary-checked"
+        );
+    }
+
+    #[test]
+    fn patch_output_file_outside_project_is_blocked() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(&policy, "patch -o /etc/patched.txt -i fix.patch");
+        assert!(
+            result.is_some(),
+            "patch output files should be boundary-checked"
+        );
+    }
+
+    #[test]
+    fn patch_in_project_paths_are_allowed() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(&policy, "patch -d src -i fixes.patch");
+        assert!(
+            result.is_none(),
+            "in-project patch paths should remain allowed"
         );
     }
 
