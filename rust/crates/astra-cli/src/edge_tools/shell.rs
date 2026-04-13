@@ -374,6 +374,16 @@ fn validate_command_path_arg(
     arg: &str,
     oldpwd: Option<&std::path::Path>,
 ) -> Option<String> {
+    if let Some(kind) = unresolved_static_dir_reference_kind(arg) {
+        return Some(format!(
+            "{}The command references '{}' using {} which cannot be statically validated against the project directory '{}'. Ask the user for permission before accessing files outside the project.",
+            super::SANDBOX_DENIED_PREFIX,
+            arg,
+            kind,
+            policy.project_root.display(),
+        ));
+    }
+
     let resolved = if arg.starts_with('/') {
         std::path::PathBuf::from(arg)
     } else if let Some(expanded) = expand_static_dir_reference(policy, arg, oldpwd) {
@@ -450,8 +460,7 @@ fn check_shell_interpreter_path_boundary(
             }
             Some(ShellFlagValueKind::InitCommand) => {
                 if let Some(inner) = parts.get(idx + 1)
-                    && let Some(msg) =
-                        check_bash_path_boundary_with_oldpwd(policy, inner, oldpwd)
+                    && let Some(msg) = check_bash_path_boundary_with_oldpwd(policy, inner, oldpwd)
                 {
                     return Some(msg);
                 }
@@ -534,6 +543,51 @@ fn expand_oldpwd_dir_reference(
         .or_else(|| arg.strip_prefix("${OLDPWD}/"))
         .or_else(|| arg.strip_prefix("~-/"))?;
     Some(oldpwd.join(suffix))
+}
+
+fn unresolved_static_dir_reference_kind(arg: &str) -> Option<&'static str> {
+    if is_named_tilde_user_reference(arg) {
+        return Some("~user home-directory expansion");
+    }
+
+    (is_complex_dir_parameter_reference(arg, "HOME")
+        || is_complex_dir_parameter_reference(arg, "PWD")
+        || is_complex_dir_parameter_reference(arg, "OLDPWD"))
+    .then_some("shell parameter expansion from a directory anchor")
+}
+
+fn is_named_tilde_user_reference(arg: &str) -> bool {
+    let Some(rest) = arg.strip_prefix('~') else {
+        return false;
+    };
+    if rest.is_empty() || rest.starts_with('/') || rest.starts_with('+') || rest.starts_with('-') {
+        return false;
+    }
+
+    let login = rest.split('/').next().unwrap_or_default();
+    !login.is_empty()
+        && login
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
+}
+
+fn is_complex_dir_parameter_reference(arg: &str, name: &str) -> bool {
+    let exact = format!("${{{name}}}");
+    if arg == exact || arg.starts_with(&format!("{exact}/")) {
+        return false;
+    }
+    if let Some(rest) = arg.strip_prefix(&exact) {
+        return !rest.is_empty();
+    }
+
+    let Some(rest) = arg.strip_prefix(&format!("${{{name}")) else {
+        return false;
+    };
+
+    matches!(
+        rest.as_bytes().first().copied(),
+        Some(b':' | b'-' | b'=' | b'?' | b'+' | b'%' | b'#' | b'/' | b'^' | b',')
+    )
 }
 
 fn is_shell_interpreter_command(base: &str) -> bool {
@@ -3228,6 +3282,77 @@ mod tests {
         assert!(
             result.is_none(),
             "non-HOME env vars remain unresolved at static analysis time"
+        );
+    }
+
+    #[test]
+    fn named_tilde_user_expansion_requires_boundary_review() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(&policy, "cat ~root/.ssh/id_rsa");
+        assert!(
+            result
+                .as_deref()
+                .is_some_and(|msg| msg.starts_with(super::SANDBOX_DENIED_PREFIX)
+                    && msg.contains("~root/.ssh/id_rsa")
+                    && msg.contains("~user home-directory expansion")),
+            "~user references should require boundary review"
+        );
+    }
+
+    #[test]
+    fn complex_home_parameter_expansion_requires_boundary_review() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(&policy, "cat ${HOME:-/tmp}/.bashrc");
+        assert!(
+            result
+                .as_deref()
+                .is_some_and(|msg| msg.starts_with(super::SANDBOX_DENIED_PREFIX)
+                    && msg.contains("${HOME:-/tmp}/.bashrc")
+                    && msg.contains("directory anchor")),
+            "complex HOME parameter-expansion forms should require boundary review"
+        );
+    }
+
+    #[test]
+    fn complex_pwd_parameter_expansion_requires_boundary_review() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(&policy, "cat ${PWD%/project}/secret.txt");
+        assert!(
+            result
+                .as_deref()
+                .is_some_and(|msg| msg.starts_with(super::SANDBOX_DENIED_PREFIX)
+                    && msg.contains("${PWD%/project}/secret.txt")
+                    && msg.contains("directory anchor")),
+            "complex PWD parameter-expansion forms should require boundary review"
+        );
+    }
+
+    #[test]
+    fn complex_oldpwd_parameter_expansion_requires_boundary_review() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(&policy, "cat ${OLDPWD:?missing}/secret.txt");
+        assert!(
+            result
+                .as_deref()
+                .is_some_and(|msg| msg.starts_with(super::SANDBOX_DENIED_PREFIX)
+                    && msg.contains("${OLDPWD:?missing}/secret.txt")
+                    && msg.contains("directory anchor")),
+            "complex OLDPWD parameter-expansion forms should require boundary review"
+        );
+    }
+
+    #[test]
+    fn home_like_variable_name_remains_unresolved() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(&policy, "cat ${HOME_DIR}/notes.txt");
+        assert!(
+            result.is_none(),
+            "exact HOME/PWD/OLDPWD anchors should be matched without catching unrelated vars"
         );
     }
 
