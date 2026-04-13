@@ -452,7 +452,7 @@ pub(crate) async fn stream_chat_sse(
             observability_hub: p.observability_hub.clone(),
             turn_trace_collector: None,
             completed_turns_for_tuning: 0,
-            promotion_evaluation_context: None,
+            runtime_promotion_signals: None,
             promotion_events: Vec::new(),
         },
         skills: SkillState {
