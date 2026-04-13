@@ -47,10 +47,11 @@ pub fn semantic_call_key(tool_name: &str, args: &Value) -> Option<String> {
             let path = arg_str(args, "path").unwrap_or(".");
             Some(format!("glob:{}:{}", normalize_path(path), pattern))
         }
-        // Grep: key on path only — pattern is the query dimension (varies legitimately)
+        // Grep: key on path + pattern — both dimensions matter for dedup
         "grep" => {
             let path = arg_str(args, "path").unwrap_or(".");
-            Some(format!("grep:{}", normalize_path(path)))
+            let pattern = arg_str(args, "pattern").unwrap_or(".*");
+            Some(format!("grep:{}:{}", normalize_path(path), pattern))
         }
         // GitHub repo tools: case-insensitive repo
         "github_list_prs" | "github_list_issues" | "github_ci_status" | "github_repo_stats" => {
@@ -508,10 +509,14 @@ impl SemanticDedup {
         self.param_cache.contains_key(&key)
     }
 
-    /// Check if we've already done a grep in a specific directory.
+    /// Check if we've already done a grep scoped to this path (any pattern).
+    ///
+    /// Keys are `grep:{normalized_path}:{pattern}`; any cache entry whose path prefix matches
+    /// counts (e.g. `src/` matches `grep:src:foo` after normalizing `src/` → `src`).
     pub fn has_grep_in(&self, path: &str) -> bool {
-        let key = format!("grep:{}", normalize_path(path));
-        self.param_cache.contains_key(&key)
+        let needle = normalize_path(path);
+        let prefix = format!("grep:{needle}:");
+        self.param_cache.keys().any(|k| k.starts_with(&prefix))
     }
 }
 
@@ -539,12 +544,12 @@ mod tests {
     }
 
     #[test]
-    fn grep_same_file_different_pattern() {
+    fn grep_same_file_different_pattern_differs() {
         let k1 = semantic_call_key("grep", &json!({"pattern": "foo", "path": "src/main.rs"}));
         let k2 = semantic_call_key("grep", &json!({"pattern": "bar", "path": "src/main.rs"}));
-        assert_eq!(
+        assert_ne!(
             k1, k2,
-            "grep on same file should match regardless of pattern"
+            "grep dedup keys include pattern — different searches are distinct"
         );
     }
 

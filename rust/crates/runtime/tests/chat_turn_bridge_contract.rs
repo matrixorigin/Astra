@@ -6,7 +6,7 @@ use astra_runtime::{
     SessionActivityRecord, SessionActivityUpdatePlan, SessionCache, SessionCreateRequestData,
     SessionListFilter, SessionListRecord, SessionRecord, SessionService, SessionUpdateRequestData,
     TurnAuxiliaryEventRecord, TurnAuxiliaryEventWriter, TurnCoreEventWriter,
-    TurnCorePersistOutcome, TurnCorePersistPlan, TurnDecisionAuditRecord, TurnHookDbPersistPlan,
+    TurnCorePersistOutcome, TurnCorePersistPlan, TurnHookDbPersistPlan,
     TurnHookDbWriter, TurnObserverRequest, TurnObserverWorker, TurnReflectionLessonRecord,
     TurnReflectionLessonWriter, TurnReflectionMark, TurnReflectionStateStore,
     TurnSessionActivityWriter, TurnToolEventPersistPlan, TurnToolEventWriter, build_app,
@@ -1909,32 +1909,27 @@ async fn http_chat_turn_bridge_dispatches_hidden_side_effect_args() {
     assert!(tool_event_capture.plans.lock().await.is_empty());
     let hook_plans = hook_db_capture.plans.lock().await.clone();
     assert_eq!(hook_plans.len(), 1);
-    assert_eq!(
-        hook_plans[0].decision_audit,
-        Some(TurnDecisionAuditRecord {
-            decision_id: hook_plans[0]
-                .decision_audit
-                .as_ref()
-                .expect("decision audit should be present")
-                .decision_id
-                .clone(),
-            session_id: "s1".to_string(),
-            event_id: user_query_event.event_id.clone(),
-            decision_type: "response_generation".to_string(),
-            decision_output: serde_json::json!({"text":"Hello!","tool_calls":[],"model_used":"gpt-5.4"}),
-            model_used: Some("gpt-5.4".to_string()),
-            context_capture_id: None,
-        })
+    let audit = hook_plans[0]
+        .decision_audit
+        .as_ref()
+        .expect("decision audit should be present");
+    assert_eq!(audit.session_id, "s1");
+    assert_eq!(audit.event_id, user_query_event.event_id);
+    assert_eq!(audit.decision_type, "response_generation");
+    assert_eq!(audit.model_used.as_deref(), Some("gpt-5.4"));
+    assert_eq!(audit.context_capture_id, None);
+    assert!(Uuid::parse_str(&audit.decision_id).is_ok());
+    let out = &audit.decision_output;
+    assert_eq!(out["text"], serde_json::json!("Hello!"));
+    assert_eq!(out["tool_calls"], serde_json::json!([]));
+    assert_eq!(out["model_used"], serde_json::json!("gpt-5.4"));
+    assert!(
+        out.get("mutation_objective_score").is_some(),
+        "decision_output should include mutation_objective_score: {out}"
     );
     assert!(
-        Uuid::parse_str(
-            &hook_plans[0]
-                .decision_audit
-                .as_ref()
-                .expect("decision audit should be present")
-                .decision_id
-        )
-        .is_ok()
+        out.get("action_profiles").is_some(),
+        "decision_output should include action_profiles: {out}"
     );
     assert_eq!(hook_plans[0].skill_selection, None);
     assert_eq!(
@@ -2202,11 +2197,14 @@ async fn http_chat_turn_bridge_persists_tool_events_after_persist_success() {
         plan.events[1].reasoning_content.as_deref(),
         Some("need filesystem data")
     );
-    assert_eq!(
-        plan.events[1].metadata,
-        Some(
-            serde_json::json!({"tool_call_id":"tc-edge","name":"bash","source":"edge","tool_name":"bash"})
-        )
+    let meta = plan.events[1].metadata.as_ref().expect("tool_call metadata");
+    assert_eq!(meta["tool_call_id"], serde_json::json!("tc-edge"));
+    assert_eq!(meta["name"], serde_json::json!("bash"));
+    assert_eq!(meta["source"], serde_json::json!("edge"));
+    assert_eq!(meta["tool_name"], serde_json::json!("bash"));
+    assert!(
+        meta.get("action_profile").is_some(),
+        "metadata should include action_profile: {meta}"
     );
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&plan.events[2].content).unwrap(),
@@ -2273,9 +2271,17 @@ async fn http_chat_turn_bridge_persists_hook_db_writes_after_hook_success() {
     assert_eq!(decision_audit.session_id, "s1");
     assert!(Uuid::parse_str(&decision_audit.event_id).is_ok());
     assert_eq!(decision_audit.decision_type, "tool_selection");
-    assert_eq!(
-        decision_audit.decision_output,
-        serde_json::json!({"text":"Thinking...","tool_calls":["bash"],"model_used":"gpt-5.4"})
+    let out = &decision_audit.decision_output;
+    assert_eq!(out["text"], serde_json::json!("Thinking..."));
+    assert_eq!(out["tool_calls"], serde_json::json!(["bash"]));
+    assert_eq!(out["model_used"], serde_json::json!("gpt-5.4"));
+    assert!(
+        out.get("action_profiles").is_some_and(|v| v.is_array()),
+        "decision_output should include action_profiles: {out}"
+    );
+    assert!(
+        out.get("mutation_objective_score").is_some(),
+        "decision_output should include mutation_objective_score: {out}"
     );
     assert_eq!(decision_audit.model_used.as_deref(), Some("gpt-5.4"));
     assert!(Uuid::parse_str(&decision_audit.decision_id).is_ok());

@@ -416,7 +416,7 @@ mod divergence_detection {
 
     #[test]
     fn exploring_two_rounds() {
-        // With MAX_EXPLORATION_ROUNDS=5, two consecutive exploration rounds → Exploring(2)
+        // With MAX_EXPLORATION_ROUNDS=3, two consecutive exploration-only tail rounds → Exploring(2)
         let sigs = make_sigs(&[&["write_file"], &["bash"], &["read_file"]]);
         assert_eq!(detect_divergence(&sigs), DivergenceStatus::Exploring(2));
     }
@@ -425,9 +425,9 @@ mod divergence_detection {
 
     #[test]
     fn diverging_three_rounds() {
-        // 3 consecutive exploration rounds → Exploring(3), below threshold of 5
+        // 3 consecutive exploration rounds → Diverging(3) at default MAX_EXPLORATION_ROUNDS
         let sigs = make_sigs(&[&["bash"], &["list_dir"], &["read_file"]]);
-        assert_eq!(detect_divergence(&sigs), DivergenceStatus::Exploring(3));
+        assert_eq!(detect_divergence(&sigs), DivergenceStatus::Diverging(3));
     }
 
     #[test]
@@ -461,13 +461,13 @@ mod divergence_detection {
 
     #[test]
     fn diverging_multi_exploration_per_round() {
-        // 3 multi-tool exploration rounds → Exploring(3), below threshold of 5
+        // 3 consecutive exploration-only rounds (multi-tool counts as one round) → Diverging(3)
         let sigs = make_sigs(&[
             &["bash", "grep"],
             &["list_dir", "glob"],
             &["read_file", "bash"],
         ]);
-        assert_eq!(detect_divergence(&sigs), DivergenceStatus::Exploring(3));
+        assert_eq!(detect_divergence(&sigs), DivergenceStatus::Diverging(3));
     }
 
     // ── Reset behavior ──
@@ -475,7 +475,7 @@ mod divergence_detection {
     #[test]
     fn reset_by_productive_tool() {
         // Deep divergence resets when a productive tool is used;
-        // 2 exploration rounds after reset → Exploring(2) (below MAX_EXPLORATION_ROUNDS=5)
+        // 2 exploration rounds after reset → Exploring(2) (below MAX_EXPLORATION_ROUNDS=3)
         let sigs = make_sigs(&[
             &["bash"],
             &["bash"],

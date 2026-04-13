@@ -3229,7 +3229,8 @@ mod stall_enforcement_proofs {
             },
         ];
         assert!(!detect_server_stall(&div_sigs, 2)); // different tools each turn
-        assert_eq!(detect_divergence(&div_sigs), DivergenceStatus::Exploring(4));
+        // `MAX_EXPLORATION_ROUNDS` is 3: four consecutive exploration-only rounds are Diverging.
+        assert_eq!(detect_divergence(&div_sigs), DivergenceStatus::Diverging(4));
     }
 }
 
