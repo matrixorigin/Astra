@@ -40,6 +40,38 @@ fn reject_shell_meta(ref_str: &str) -> Result<(), String> {
     }
 }
 
+fn reject_stash_selector(selector: &str) -> Result<(), String> {
+    let trimmed = selector.trim();
+    if trimmed.is_empty() {
+        return Err("Error: stash_ref must not be empty".to_string());
+    }
+    if trimmed.chars().any(|c| {
+        matches!(
+            c,
+            ';' | '|' | '&' | '$' | '`' | '(' | ')' | '<' | '>' | '\n'
+        )
+    }) {
+        Err(format!(
+            "Error: stash selector contains disallowed characters: {selector}"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn apply_stash_selector(args: &Value) -> Result<String, String> {
+    if let Some(selector) = args.get("stash_ref").and_then(Value::as_str) {
+        reject_stash_selector(selector)?;
+        return Ok(selector.trim().to_string());
+    }
+    Ok(stash_index_selector(args))
+}
+
+fn stash_index_selector(args: &Value) -> String {
+    let idx = args.get("index").and_then(Value::as_u64).unwrap_or(0);
+    format!("stash@{{{idx}}}")
+}
+
 fn tool_output_limit() -> usize {
     super::tool_output_limit()
 }
@@ -1698,17 +1730,40 @@ pub fn git_commit(project_root: &Path, args: &Value) -> String {
 /// Stash working tree changes.
 ///
 /// Parameters:
-/// - `action` (required): "push" (save), "pop" (restore), "list", "drop"
+/// - `action` (required): "push" (save), "apply", "pop" (restore + drop), "list", "drop"
 /// - `message` (optional): description for push
-/// - `index` (optional): stash index for pop/drop (default 0)
+/// - `index` (optional): stash index for apply/pop/drop (default 0)
+/// - `stash_ref` (optional): exact stash selector or OID for apply
 pub fn git_stash(project_root: &Path, args: &Value) -> String {
+    git_stash_with_metadata(project_root, args).output
+}
+
+pub(crate) fn git_stash_with_metadata(
+    project_root: &Path,
+    args: &Value,
+) -> super::ToolExecutionOutcome {
     let action = match args.get("action").and_then(Value::as_str) {
         Some(a) => a,
-        None => return "Error: 'action' is required (push, pop, list, drop)".to_string(),
+        None => {
+            return super::ToolExecutionOutcome::text(
+                "Error: 'action' is required (push, apply, pop, list, drop)".to_string(),
+            );
+        }
     };
 
     let mut cmd = std::process::Command::new("git");
     cmd.current_dir(project_root);
+    let before_stash_oid = matches!(action, "push" | "save")
+        .then(|| {
+            std::process::Command::new("git")
+                .args(["rev-parse", "--verify", "refs/stash"])
+                .current_dir(project_root)
+                .output()
+                .ok()
+                .filter(|out| out.status.success())
+                .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        })
+        .flatten();
 
     match action {
         "push" | "save" => {
@@ -1717,18 +1772,29 @@ pub fn git_stash(project_root: &Path, args: &Value) -> String {
                 cmd.arg("-m").arg(msg);
             }
         }
+        "apply" => {
+            let selector = match apply_stash_selector(args) {
+                Ok(selector) => selector,
+                Err(error) => return super::ToolExecutionOutcome::text(error),
+            };
+            cmd.arg("stash").arg("apply").arg(selector);
+        }
         "pop" => {
-            let idx = args.get("index").and_then(Value::as_u64).unwrap_or(0);
-            cmd.arg("stash").arg("pop").arg(format!("stash@{{{idx}}}"));
+            let selector = stash_index_selector(args);
+            cmd.arg("stash").arg("pop").arg(selector);
         }
         "list" => {
             cmd.arg("stash").arg("list");
         }
         "drop" => {
-            let idx = args.get("index").and_then(Value::as_u64).unwrap_or(0);
-            cmd.arg("stash").arg("drop").arg(format!("stash@{{{idx}}}"));
+            let selector = stash_index_selector(args);
+            cmd.arg("stash").arg("drop").arg(selector);
         }
-        _ => return format!("Error: unknown stash action '{action}'. Use: push, pop, list, drop"),
+        _ => {
+            return super::ToolExecutionOutcome::text(format!(
+                "Error: unknown stash action '{action}'. Use: push, apply, pop, list, drop"
+            ));
+        }
     }
 
     match cmd.output() {
@@ -1737,7 +1803,7 @@ pub fn git_stash(project_root: &Path, args: &Value) -> String {
             let stderr = String::from_utf8_lossy(&out.stderr);
             if out.status.success() {
                 let result = stdout.trim();
-                if result.is_empty() {
+                let output = if result.is_empty() {
                     match action {
                         "push" | "save" => "✓ Changes stashed".to_string(),
                         "list" => "No stashes found".to_string(),
@@ -1745,17 +1811,41 @@ pub fn git_stash(project_root: &Path, args: &Value) -> String {
                     }
                 } else {
                     result.to_string()
+                };
+                let mut tool_result_fields = None;
+                if matches!(action, "push" | "save") {
+                    let after_stash_oid = std::process::Command::new("git")
+                        .args(["rev-parse", "--verify", "refs/stash"])
+                        .current_dir(project_root)
+                        .output()
+                        .ok()
+                        .filter(|out| out.status.success())
+                        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string());
+                    if let Some(stash_ref) = after_stash_oid
+                        && before_stash_oid.as_deref() != Some(stash_ref.as_str())
+                    {
+                        tool_result_fields = Some(serde_json::Map::from_iter([(
+                            "stash_ref".to_string(),
+                            Value::String(stash_ref),
+                        )]));
+                    }
+                }
+                super::ToolExecutionOutcome {
+                    output,
+                    tool_result_fields,
                 }
             } else {
                 let err = stderr.trim();
                 if err.contains("No local changes") || err.contains("No stash entries") {
-                    err.to_string()
+                    super::ToolExecutionOutcome::text(err.to_string())
                 } else {
-                    format!("Error: git stash {action} failed: {err}")
+                    super::ToolExecutionOutcome::text(format!(
+                        "Error: git stash {action} failed: {err}"
+                    ))
                 }
             }
         }
-        Err(e) => format!("Error: git stash failed: {e}"),
+        Err(e) => super::ToolExecutionOutcome::text(format!("Error: git stash failed: {e}")),
     }
 }
 
@@ -2105,12 +2195,44 @@ mod tests {
     use super::*;
     use astra_runtime::str_preview::prefix_chars;
     use serde_json::json;
+    use tempfile::TempDir;
 
     fn repo_root() -> std::path::PathBuf {
         let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         path.pop(); // crates/
         path.pop(); // rust/
         path
+    }
+
+    fn init_temp_repo() -> TempDir {
+        let dir = TempDir::new().expect("temp repo");
+        std::process::Command::new("git")
+            .arg("init")
+            .current_dir(dir.path())
+            .output()
+            .expect("git init");
+        std::process::Command::new("git")
+            .args(["config", "user.name", "Test User"])
+            .current_dir(dir.path())
+            .output()
+            .expect("git config user.name");
+        std::process::Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(dir.path())
+            .output()
+            .expect("git config user.email");
+        std::fs::write(dir.path().join("tracked.txt"), "one\n").expect("seed tracked file");
+        std::process::Command::new("git")
+            .args(["add", "tracked.txt"])
+            .current_dir(dir.path())
+            .output()
+            .expect("git add");
+        std::process::Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(dir.path())
+            .output()
+            .expect("git commit");
+        dir
     }
 
     #[test]
@@ -3064,6 +3186,43 @@ mod tests {
         assert!(
             result.contains("stash@") || result.contains("No stashes") || result.is_empty(),
             "unexpected stash list output: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_with_metadata_returns_stash_ref_for_push_and_apply_accepts_it() {
+        let repo = init_temp_repo();
+        let tracked = repo.path().join("tracked.txt");
+        std::fs::write(&tracked, "two\n").expect("modify tracked file");
+        let executor = ToolExecutor::new(repo.path());
+
+        let outcome = executor
+            .execute_with_metadata("git_stash", &json!({"action": "push", "message": "demo"}))
+            .await;
+        assert!(
+            !outcome.output.starts_with("Error:"),
+            "stash push failed: {}",
+            outcome.output
+        );
+        let stash_ref = outcome
+            .tool_result_fields
+            .as_ref()
+            .and_then(|fields| fields.get("stash_ref"))
+            .and_then(Value::as_str)
+            .expect("stash_ref");
+        assert_eq!(
+            std::fs::read_to_string(&tracked).expect("clean worktree after stash"),
+            "one\n"
+        );
+
+        let apply = git_stash(
+            repo.path(),
+            &json!({"action": "apply", "stash_ref": stash_ref}),
+        );
+        assert!(!apply.starts_with("Error:"), "stash apply failed: {apply}");
+        assert_eq!(
+            std::fs::read_to_string(&tracked).expect("restored working tree"),
+            "two\n"
         );
     }
 

@@ -775,6 +775,13 @@ impl ToolExecutor {
             outcome.output = output;
             return outcome;
         }
+        if name == "git_stash" {
+            let mut outcome = git_gix::git_stash_with_metadata(&self.project_root, args);
+            let output = self.finalize_tool_output(outcome.output, name);
+            self.record_output_size(output.len());
+            outcome.output = output;
+            return outcome;
+        }
 
         ToolExecutionOutcome::text(self.execute(name, args).await)
     }

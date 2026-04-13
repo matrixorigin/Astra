@@ -163,3 +163,29 @@ fn bounded_batch_transaction_fields_are_discoverable() {
         );
     }
 }
+
+#[test]
+fn git_stash_schema_exposes_apply_and_stash_ref() {
+    let schemas = all_tool_schemas();
+    let properties = schemas
+        .iter()
+        .find(|schema| schema["function"]["name"].as_str() == Some("git_stash"))
+        .and_then(|schema| schema["function"]["parameters"]["properties"].as_object())
+        .expect("missing git_stash properties");
+    let actions = schemas
+        .iter()
+        .find(|schema| schema["function"]["name"].as_str() == Some("git_stash"))
+        .and_then(|schema| {
+            schema["function"]["parameters"]["properties"]["action"]["enum"].as_array()
+        })
+        .expect("missing git_stash action enum");
+
+    assert!(
+        actions.iter().any(|value| value.as_str() == Some("apply")),
+        "git_stash schema should expose apply"
+    );
+    assert!(
+        properties.contains_key("stash_ref"),
+        "git_stash schema should expose stash_ref"
+    );
+}

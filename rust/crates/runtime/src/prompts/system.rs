@@ -292,7 +292,7 @@ fn tool_conditional_section(tool_names: &[&str], selection_confidence: f64) -> S
         s.push_str(
             "\n## Git Workflow\n\
              - Use **git_commit** to commit changes (stages automatically). Write clear, concise commit messages.\n\
-             - Use **git_stash** push/pop to save and restore work-in-progress.\n\
+             - Use **git_stash** push/apply/pop to save and restore work-in-progress.\n\
              - Use **git_checkout_file** to revert a file to its last committed state if an edit goes wrong.\n\
              - Commit after each logical milestone — don't accumulate too many uncommitted changes.\n",
         );

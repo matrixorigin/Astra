@@ -23,6 +23,7 @@ pub enum CompensationKind {
     DeleteFile,
     RestoreFileContents,
     RestoreOrDeleteFile,
+    GitApplyStash,
     GitRestoreIndex,
     GitRestoreWorktree,
     GitRevertCommit,
@@ -113,6 +114,7 @@ fn compensation_kind_label(kind: CompensationKind) -> String {
         CompensationKind::DeleteFile => "delete_file",
         CompensationKind::RestoreFileContents => "restore_file_contents",
         CompensationKind::RestoreOrDeleteFile => "restore_or_delete_file",
+        CompensationKind::GitApplyStash => "git_apply_stash",
         CompensationKind::GitRestoreIndex => "git_restore_index",
         CompensationKind::GitRestoreWorktree => "git_restore_worktree",
         CompensationKind::GitRevertCommit => "git_revert_commit",
@@ -339,6 +341,13 @@ pub fn tool_action_profile(tool_name: &str, args: &Value) -> ActionCompensationP
             CompensationKind::RestoreOrDeleteFile,
             restore_file_compensation_summary(string_arg(&normalized_args, "path"), true),
         ),
+        "git_commit" => ActionCompensationProfile::compensated(
+            false,
+            ActionCategory::Execute,
+            false,
+            CompensationKind::GitRevertCommit,
+            "create a compensating revert commit with `git revert <commit>`".to_string(),
+        ),
         "git_checkout_file" => ActionCompensationProfile::compensated(
             true,
             ActionCategory::Destructive,
@@ -346,6 +355,35 @@ pub fn tool_action_profile(tool_name: &str, args: &Value) -> ActionCompensationP
             CompensationKind::RestoreOrDeleteFile,
             restore_file_compensation_summary(string_arg(&normalized_args, "path"), true),
         ),
+        "git_stash" => match string_arg(&normalized_args, "action")
+            .map(|action| action.to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("list") => ActionCompensationProfile::read(true),
+            Some("push" | "save") => ActionCompensationProfile::compensated(
+                true,
+                ActionCategory::Execute,
+                false,
+                CompensationKind::GitApplyStash,
+                "re-apply the captured stash with `git_stash` using action=`apply` and the returned stash_ref"
+                    .to_string(),
+            ),
+            Some("apply") => ActionCompensationProfile::manual(
+                false,
+                ActionCategory::Destructive,
+                "git stash apply mutates the working tree; capture a fresh stash or commit first if you may need to undo it",
+            ),
+            Some("pop" | "drop") => ActionCompensationProfile::manual(
+                false,
+                ActionCategory::Destructive,
+                "git stash pop/drop mutates the stash stack and working tree; no automatic rollback is registered",
+            ),
+            _ => ActionCompensationProfile::manual(
+                false,
+                ActionCategory::Execute,
+                "git stash action is unknown or not yet modeled for automatic rollback",
+            ),
+        },
         "notebook_edit" => ActionCompensationProfile::compensated(
             true,
             ActionCategory::Write,
@@ -534,6 +572,37 @@ mod tests {
         assert_eq!(
             profile.compensation_kind,
             Some(CompensationKind::GitRevertCommit)
+        );
+    }
+
+    #[test]
+    fn git_commit_tool_has_compensation_summary() {
+        let profile = tool_action_profile("git_commit", &json!({"message": "x"}));
+        assert!(!profile.bounded);
+        assert_eq!(profile.category, ActionCategory::Execute);
+        assert!(profile.reversible);
+        assert_eq!(
+            profile.compensation_kind,
+            Some(CompensationKind::GitRevertCommit)
+        );
+    }
+
+    #[test]
+    fn git_stash_push_has_compensation_summary() {
+        let profile = tool_action_profile("git_stash", &json!({"action": "push"}));
+        assert!(profile.bounded);
+        assert_eq!(profile.category, ActionCategory::Execute);
+        assert!(profile.reversible);
+        assert_eq!(
+            profile.compensation_kind,
+            Some(CompensationKind::GitApplyStash)
+        );
+        assert!(
+            profile
+                .compensation_summary
+                .as_deref()
+                .unwrap_or_default()
+                .contains("stash_ref")
         );
     }
 

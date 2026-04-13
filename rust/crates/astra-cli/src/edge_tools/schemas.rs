@@ -431,9 +431,10 @@ pub fn all_tool_schemas() -> Vec<Value> {
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "action": {"type": "string", "enum": ["push", "pop", "list", "drop"], "description": "Stash operation"},
+                        "action": {"type": "string", "enum": ["push", "apply", "pop", "list", "drop"], "description": "Stash operation"},
                         "message": {"type": "string", "description": "Description for push (optional)"},
-                        "index": {"type": "integer", "description": "Stash index for pop/drop (default 0)"}
+                        "index": {"type": "integer", "description": "Stash index for apply/pop/drop (default 0)"},
+                        "stash_ref": {"type": "string", "description": "Exact stash selector or OID for apply. Prefer the stash_ref returned by a previous successful git_stash push."}
                     },
                     "required": ["action"]
                 }
