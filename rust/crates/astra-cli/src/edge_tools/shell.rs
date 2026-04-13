@@ -345,37 +345,12 @@ fn expand_home_dir_reference(arg: &str) -> Option<std::path::PathBuf> {
     Some(home.join(suffix))
 }
 
-/// Check a single (non-compound) command for path boundary violations.
-fn check_single_command_path_boundary(
-    policy: &astra_runtime::tool_sandbox::SandboxPolicy,
-    command: &str,
-) -> Option<String> {
-    let parts = shell_tokenize_like_bash(command);
-    if parts.is_empty() {
-        return None;
-    }
+fn is_shell_interpreter_command(base: &str) -> bool {
+    matches!(base, "bash" | "sh" | "zsh" | "dash" | "ksh" | "fish")
+}
 
-    let base = parts[0].rsplit('/').next().unwrap_or(parts[0].as_str());
-
-    if matches!(base, "bash" | "sh" | "zsh" | "dash" | "ksh" | "fish") {
-        for idx in 1..parts.len() {
-            let arg = parts[idx].as_str();
-            if is_nested_shell_c_flag(arg) {
-                if let Some(inner) = parts.get(idx + 1)
-                    && let Some(msg) = check_bash_path_boundary(policy, inner)
-                {
-                    return Some(msg);
-                }
-                break;
-            }
-            if !arg.starts_with('-') {
-                break;
-            }
-        }
-    }
-
-    // Only check commands known to access files by path argument.
-    let is_file_access_cmd = matches!(
+fn is_boundary_sensitive_file_access_command(base: &str) -> bool {
+    matches!(
         base,
         "cat"
             | "head"
@@ -399,8 +374,109 @@ fn check_single_command_path_boundary(
             | "realpath"
             | "source"
             | "."
-    );
-    if !is_file_access_cmd {
+    )
+}
+
+fn xargs_subcommand_requires_boundary_review(parts: &[String]) -> Option<String> {
+    let mut idx = 1usize;
+    while idx < parts.len() {
+        let token = parts[idx].as_str();
+        if token == "--" {
+            idx += 1;
+            break;
+        }
+        if !token.starts_with('-') || token == "-" {
+            break;
+        }
+        if xargs_flag_requires_value(token) {
+            idx = (idx + 2).min(parts.len());
+            continue;
+        }
+        idx += 1;
+    }
+
+    let subcommand = parts.get(idx)?;
+    let base = subcommand.rsplit('/').next().unwrap_or(subcommand.as_str());
+    (is_boundary_sensitive_file_access_command(base) || is_shell_interpreter_command(base))
+        .then(|| base.to_string())
+}
+
+fn xargs_flag_requires_value(flag: &str) -> bool {
+    matches!(
+        flag,
+        "-a" | "--arg-file"
+            | "-d"
+            | "--delimiter"
+            | "-E"
+            | "--eof"
+            | "-I"
+            | "--replace"
+            | "-L"
+            | "--max-lines"
+            | "-n"
+            | "--max-args"
+            | "-P"
+            | "--max-procs"
+            | "-s"
+            | "--max-chars"
+            | "--process-slot-var"
+    ) || flag.starts_with("--arg-file=")
+        || flag.starts_with("--delimiter=")
+        || flag.starts_with("--eof=")
+        || flag.starts_with("--replace=")
+        || flag.starts_with("--max-lines=")
+        || flag.starts_with("--max-args=")
+        || flag.starts_with("--max-procs=")
+        || flag.starts_with("--max-chars=")
+        || flag.starts_with("--process-slot-var=")
+        || matches!(
+            flag.as_bytes().get(1).copied(),
+            Some(b'a' | b'd' | b'E' | b'I' | b'L' | b'n' | b'P' | b's')
+        ) && flag.len() > 2
+            && !flag.starts_with("--")
+}
+
+/// Check a single (non-compound) command for path boundary violations.
+fn check_single_command_path_boundary(
+    policy: &astra_runtime::tool_sandbox::SandboxPolicy,
+    command: &str,
+) -> Option<String> {
+    let parts = shell_tokenize_like_bash(command);
+    if parts.is_empty() {
+        return None;
+    }
+
+    let base = parts[0].rsplit('/').next().unwrap_or(parts[0].as_str());
+
+    if is_shell_interpreter_command(base) {
+        for idx in 1..parts.len() {
+            let arg = parts[idx].as_str();
+            if is_nested_shell_c_flag(arg) {
+                if let Some(inner) = parts.get(idx + 1)
+                    && let Some(msg) = check_bash_path_boundary(policy, inner)
+                {
+                    return Some(msg);
+                }
+                break;
+            }
+            if !arg.starts_with('-') {
+                break;
+            }
+        }
+    }
+
+    if base == "xargs" {
+        if let Some(subcommand) = xargs_subcommand_requires_boundary_review(&parts) {
+            return Some(format!(
+                "{}The command uses `xargs {subcommand}` so file paths may be supplied from stdin and cannot be statically validated against the project directory '{}'. Ask the user for permission before using xargs to fan out file-access or shell commands.",
+                super::SANDBOX_DENIED_PREFIX,
+                policy.project_root.display(),
+            ));
+        }
+        return None;
+    }
+
+    if !is_boundary_sensitive_file_access_command(base) {
         return None;
     }
 
@@ -2840,14 +2916,58 @@ mod tests {
     }
 
     #[test]
-    fn bypass_xargs_not_caught() {
-        // find / -name passwd | xargs cat — xargs is not in the allowlist.
-        // KNOWN LIMITATION but low risk: find itself doesn't exfiltrate data,
-        // and xargs+cat is an unusual pattern the model rarely generates.
+    fn xargs_file_access_now_requires_boundary_review() {
         use astra_runtime::tool_sandbox::SandboxPolicy;
         let policy = SandboxPolicy::for_project("/home/user/project");
         let result = check_bash_path_boundary(&policy, "find / -name passwd | xargs cat");
-        assert!(result.is_none(), "xargs not in file-access command list");
+        assert!(
+            result
+                .as_deref()
+                .is_some_and(|msg| msg.starts_with(super::SANDBOX_DENIED_PREFIX)
+                    && msg.contains("xargs cat")),
+            "xargs file fan-out should require boundary review"
+        );
+    }
+
+    #[test]
+    fn xargs_flagged_file_access_still_requires_boundary_review() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result =
+            check_bash_path_boundary(&policy, "find / -name passwd -print0 | xargs -0 cat");
+        assert!(
+            result
+                .as_deref()
+                .is_some_and(|msg| msg.starts_with(super::SANDBOX_DENIED_PREFIX)
+                    && msg.contains("xargs cat")),
+            "xargs flags should not hide file fan-out execution"
+        );
+    }
+
+    #[test]
+    fn xargs_default_echo_is_allowed() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(&policy, "printf 'src/main.rs\n' | xargs echo");
+        assert!(
+            result.is_none(),
+            "default echo fan-out does not need boundary review"
+        );
+    }
+
+    #[test]
+    fn xargs_shell_now_requires_boundary_review() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let command = r#"printf 'src/main.rs\n' | xargs bash -c 'cat "$1"' _"#;
+        let result = check_bash_path_boundary(&policy, command);
+        assert!(
+            result
+                .as_deref()
+                .is_some_and(|msg| msg.starts_with(super::SANDBOX_DENIED_PREFIX)
+                    && msg.contains("xargs bash")),
+            "xargs shell fan-out should require boundary review"
+        );
     }
 
     #[test]
