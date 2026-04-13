@@ -66,7 +66,7 @@ fn planning_section() -> &'static str {
      Plan: [numbered steps — what to read/check/change/verify]\n\
      </think>\n\
      After each tool result, reflect: <reflect>[what I learned] [adjust plan or proceed]</reflect>\n\
-     This keeps you on track and prevents exploration spirals.\n\n\
+     This prevents exploration spirals.\n\n\
      ## Context Strategy\n\
      Before acting, identify WHAT context you need:\n\
      1. **Plan context needs**: What files/functions/tests must I understand first?\n\

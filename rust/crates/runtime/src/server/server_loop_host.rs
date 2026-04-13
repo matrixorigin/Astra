@@ -32,7 +32,8 @@ use crate::turn::llm_client::{
     LlmCallResult, LlmCancel, cached_system_prompt, call_llm_and_collect, classify_llm_error,
     sleep_ms_or_llm_cancel,
 };
-use crate::turn::tool_schema_prune::prune_tool_schemas;
+use crate::turn::tool_schema_prune::{filter_tool_schemas_by_excluded_names, prune_tool_schemas};
+use crate::turn::turn_guard::merge_deprioritized_tools_into_restricted;
 use crate::{FernetTokenEncryptor, MatrixOneSettings};
 use astra_core::SharedPool;
 
@@ -231,10 +232,10 @@ impl ServerAgenticLoopHost {
         std::mem::take(&mut self.emitted_events)
     }
 
-    /// Build the system prompt from edge context.
-    fn build_system_prompt(&self, user_content: &str) -> String {
-        let tool_names: Vec<&str> = self
-            .edge_tools
+    /// Build the system prompt from edge context and the tool schemas visible
+    /// to the current turn.
+    fn build_system_prompt(&self, user_content: &str, tools: &[Value]) -> String {
+        let tool_names: Vec<&str> = tools
             .iter()
             .filter_map(|t| {
                 t.get("function")
@@ -322,11 +323,27 @@ impl ServerAgenticLoopHost {
         format!("{base}{memory_signal_hint}{system_override}")
     }
 
+    /// Compute the tool schemas visible for the current turn after applying
+    /// health-based restrictions. This is the server-path equivalent of the
+    /// CLI's deny-at-assembly behavior.
+    fn filtered_turn_tools(&self, restricted_tools: &HashSet<String>) -> Vec<Value> {
+        filter_tool_schemas_by_excluded_names(self.edge_tools.clone(), restricted_tools)
+    }
+
+    /// Compute the tool schemas visible for the current turn after applying
+    /// health-based restrictions. This is the server-path equivalent of the
+    /// CLI's deny-at-assembly behavior.
+    fn visible_turn_tools(&self, state: &mut AgenticLoopState) -> Vec<Value> {
+        merge_deprioritized_tools_into_restricted(&state.turn_guard, &mut state.restricted_tools);
+        self.filtered_turn_tools(&state.restricted_tools)
+    }
+
     /// Build the LLM message array from loop state.
     async fn build_llm_messages(
         &self,
         system_prompt: &str,
         state: &AgenticLoopState,
+        visible_tools: &[Value],
         model_name: &str,
         api_key: &str,
         base_url: &str,
@@ -339,8 +356,7 @@ impl ServerAgenticLoopHost {
 
         // Compute compaction tier
         let budget = crate::prompts::budget_for_model(Some(model_name));
-        let tool_schema_tokens: usize = self
-            .edge_tools
+        let tool_schema_tokens: usize = visible_tools
             .iter()
             .map(|t| {
                 serde_json::to_string(t)
@@ -588,9 +604,11 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             .rev()
             .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))
             .and_then(|m| m.get("content").and_then(Value::as_str))
-            .unwrap_or("");
+            .unwrap_or("")
+            .to_string();
 
-        let system_prompt = self.build_system_prompt(user_content);
+        let visible_tools = self.visible_turn_tools(state);
+        let system_prompt = self.build_system_prompt(&user_content, &visible_tools);
 
         // Append skill-level hints (effort, agent_type) when active.
         let mut system_prompt = system_prompt;
@@ -610,6 +628,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             .build_llm_messages(
                 &system_prompt,
                 state,
+                &visible_tools,
                 &model_name,
                 &api_key,
                 &base_url,
@@ -621,8 +640,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         let budget = crate::prompts::budget_for_model(Some(&model_name));
         let max_output_tokens = crate::prompts::capped_output_tokens(&budget);
 
-        let tool_schema_tokens: usize = self
-            .edge_tools
+        let tool_schema_tokens: usize = visible_tools
             .iter()
             .map(|t| {
                 serde_json::to_string(t)
@@ -639,7 +657,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             state.last_measured_prompt_tokens,
             state.consecutive_context_window_errors,
         );
-        let pruned_tools = prune_tool_schemas(&self.edge_tools, tier);
+        let final_tools = prune_tool_schemas(&visible_tools, tier);
 
         let llm_cancel = llm_cancel_for_state(state);
 
@@ -649,7 +667,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         let result = loop {
             let r = call_llm_and_collect(
                 &llm_messages,
-                &pruned_tools,
+                &final_tools,
                 &model_name,
                 &api_key,
                 &base_url,
@@ -1046,7 +1064,7 @@ mod tests {
         .with_edge_profile(profile)
         .build();
 
-        let prompt = host.build_system_prompt("test query");
+        let prompt = host.build_system_prompt("test query", &host.edge_tools);
         assert!(
             prompt.contains("/home/user/project"),
             "prompt should contain cwd"
@@ -1072,7 +1090,7 @@ mod tests {
         .with_edge_profile(profile)
         .build();
 
-        let prompt = host.build_system_prompt("test");
+        let prompt = host.build_system_prompt("test", &host.edge_tools);
         assert!(
             prompt.contains("code_review"),
             "prompt should include skill names"
@@ -1097,7 +1115,7 @@ mod tests {
         .with_edge_profile(profile)
         .build();
 
-        let prompt = host.build_system_prompt("test");
+        let prompt = host.build_system_prompt("test", &host.edge_tools);
         assert!(
             prompt.contains("Learned Runtime Context"),
             "prompt should include learned context section"
@@ -1115,7 +1133,7 @@ mod tests {
         .with_edge_tools(sample_edge_tools())
         .build();
 
-        let prompt = host.build_system_prompt("remember that I prefer dark mode");
+        let prompt = host.build_system_prompt("remember that I prefer dark mode", &host.edge_tools);
         assert!(
             prompt.contains("MEMORY SIGNAL DETECTED"),
             "should detect memory store signal"
@@ -1243,6 +1261,7 @@ mod tests {
             .build_llm_messages(
                 "system prompt text",
                 &state,
+                &host.edge_tools,
                 "gpt-4",
                 "sk-test",
                 "https://api.test.com",
@@ -1397,6 +1416,31 @@ mod tests {
             pending_reflection_signals: Vec::new(),
             recent_tactical_actions: Vec::new(),
         }
+    }
+
+    #[test]
+    fn visible_turn_tools_excludes_restricted_and_deprioritized_tools() {
+        let host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u".to_string(),
+            "s".to_string(),
+        )
+        .with_edge_tools(sample_edge_tools())
+        .build();
+
+        let mut state = create_test_state();
+        state.restricted_tools.insert("read_file".to_string());
+        state
+            .turn_guard
+            .health
+            .record_resource_limit_failure("bash");
+
+        let visible = host.visible_turn_tools(&mut state);
+
+        assert!(visible.is_empty(), "both tools should be filtered out");
+        assert!(state.restricted_tools.contains("bash"));
+        assert!(state.restricted_tools.contains("read_file"));
     }
     #[tokio::test]
     async fn server_host_mock_text_response() {

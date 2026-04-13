@@ -234,6 +234,15 @@ pub(crate) async fn stream_chat_sse(
         }
     }
 
+    // Seed persisted hard-blocks from cross-session learning so blocked tools
+    // never appear in the visible schema set for a new CLI turn.
+    if let Some(ref hub) = p.observability_hub
+        && let Some(pattern_library) = hub.pattern_library()
+        && let Ok(lib) = pattern_library.lock()
+    {
+        initial_restricted.extend(lib.blocked_tool_names());
+    }
+
     let current_session_id = p.session_id.map(|s| s.to_string());
     let existing_root_mailbox = if let Some(slot) = p.root_mailbox_slot.as_deref_mut() {
         slot.take()

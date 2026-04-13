@@ -178,7 +178,10 @@ fn build_restricted_tools(
         return HashSet::new();
     }
     let allowed: HashSet<&str> = skill_filter.iter().map(|s| s.as_str()).collect();
-    if valid_tool_names.iter().any(|n| allowed.contains(n.as_str())) {
+    if valid_tool_names
+        .iter()
+        .any(|n| allowed.contains(n.as_str()))
+    {
         valid_tool_names
             .iter()
             .filter(|name| !allowed.contains(name.as_str()))

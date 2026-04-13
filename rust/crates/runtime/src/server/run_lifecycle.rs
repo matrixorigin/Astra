@@ -128,6 +128,15 @@ async fn load_runtime_promotion_signals(
     })
 }
 
+fn seed_restricted_tools_from_blocked_patterns(
+    loop_state: &mut AgenticLoopState,
+    pattern_library: &crate::pipeline::pattern::PatternLibrary,
+) {
+    for name in pattern_library.blocked_tool_names() {
+        loop_state.restricted_tools.insert(name);
+    }
+}
+
 fn initialize_runtime_controllers(
     loop_state: &mut AgenticLoopState,
     user_id: &str,
@@ -138,6 +147,13 @@ fn initialize_runtime_controllers(
     let hub = Arc::new(ObservabilityHub::new());
     hub.attach_pattern_library(learning_stack.pattern_library.clone());
     let session = hub.start_session(user_id, session_id);
+
+    // Seed restricted_tools from evolution-blocked patterns so the LLM never
+    // sees schemas for tools that cross-session learning has identified as
+    // persistently failing (deny-at-assembly).
+    if let Ok(lib) = learning_stack.pattern_library.lock() {
+        seed_restricted_tools_from_blocked_patterns(loop_state, &lib);
+    }
 
     let evolution_service = Arc::new(
         EvolutionService::new()
@@ -1725,6 +1741,31 @@ mod tests {
             max_candidates: 5,
             explain: false,
         }
+    }
+
+    #[test]
+    fn seed_restricted_tools_from_blocked_patterns_adds_blocked_tools() {
+        let svc = test_service();
+        let request = test_request("inspect blocked tools");
+        let mut state = svc.build_initial_state(&request, "session-1", "run-1");
+        let mut pattern_library = crate::pipeline::pattern::PatternLibrary::new();
+
+        for _ in 0..3 {
+            pattern_library.record_outcome(
+                &["bash".to_string()],
+                crate::pipeline::routing::TaskType::Code,
+                None,
+                true,
+                0.8,
+                None,
+            );
+        }
+        pattern_library
+            .apply_evolution_action("bash", crate::evolution::types::PatternAction::Block);
+
+        seed_restricted_tools_from_blocked_patterns(&mut state, &pattern_library);
+
+        assert!(state.restricted_tools.contains("bash"));
     }
 
     #[test]

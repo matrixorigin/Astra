@@ -685,6 +685,29 @@ impl PatternLibrary {
         self.patterns.values().filter(|p| p.is_drifting()).collect()
     }
 
+    /// Return individual tool names from patterns that are effectively blocked.
+    /// A pattern is treated as blocked when its latest three outcomes are all
+    /// failures and it has accumulated at least five failures overall. That
+    /// matches the explicit `PatternAction::Block` mutation while avoiding
+    /// turning a short-lived 3-failure streak into a persisted hard block.
+    /// These tools should be added to `restricted_tools` for deny-at-assembly.
+    pub fn blocked_tool_names(&self) -> Vec<String> {
+        let mut names: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for pattern in self.patterns.values() {
+            if pattern.recent_outcomes.len() >= 3
+                && pattern.failure_count >= 5
+                && pattern.recent_outcomes.iter().rev().take(3).all(|ok| !ok)
+            {
+                for tool in &pattern.tools {
+                    names.insert(tool.clone());
+                }
+            }
+        }
+        let mut names: Vec<String> = names.into_iter().collect();
+        names.sort();
+        names
+    }
+
     /// Export all patterns for persistence.
     pub fn export(&self) -> Vec<ToolChainPattern> {
         self.patterns.values().cloned().collect()
@@ -2263,6 +2286,19 @@ mod tests {
         assert_eq!(updated, 1);
         let after = lib.patterns.get(&key).unwrap().failure_count;
         assert!(after >= before + 5);
+    }
+
+    #[test]
+    fn blocked_tool_names_returns_tools_from_blocked_patterns() {
+        let mut lib = PatternLibrary::new();
+        for _ in 0..3 {
+            lib.record_outcome(&tools(&["bash"]), TaskType::Code, None, true, 0.8, None);
+        }
+
+        lib.apply_evolution_action("bash", crate::evolution::types::PatternAction::Block);
+
+        let blocked = lib.blocked_tool_names();
+        assert!(blocked.iter().any(|tool| tool == "bash"));
     }
 
     // ── Active Exploration Tests ──
