@@ -10,6 +10,7 @@ pub mod agentic_loop_finalization;
 pub mod agentic_loop_host;
 pub mod agentic_loop_lifecycle;
 pub mod agentic_loop_tool_phase;
+pub mod agentic_loop_tool_support;
 pub mod agentic_post_tool_policy;
 pub mod agentic_prepare_payload;
 pub mod agentic_recursion_guard;
