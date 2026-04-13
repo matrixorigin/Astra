@@ -209,6 +209,7 @@ const MEMORY_SUBCOMMANDS: &[(&str, &str)] = &[
 ];
 
 const SESSION_SUBCOMMANDS: &[(&str, &str)] = &[
+    ("analyze", "Deep session diagnostics"),
     ("cleanup", "Clean stale sessions"),
     ("errors", "Session errors"),
     ("export", "Export session"),

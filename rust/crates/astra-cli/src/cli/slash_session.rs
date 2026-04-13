@@ -1803,11 +1803,14 @@ pub(super) fn handle_session_command(arg: &str, state: &mut ReplState) {
         "adaptive" | "profile" | "tuning" => {
             handle_session_adaptive(sub_arg, state);
         }
+        "analyze" | "diag" => {
+            handle_session_analyze(sub_arg, state);
+        }
         other => {
             eprintln!("{}", format!("  Unknown subcommand: {other}").red());
             eprintln!(
                 "  {}",
-                "Usage: /session [list|switch|history|context|errors|export|fork|cleanup|verify|drift|adaptive] …"
+                "Usage: /session [list|switch|history|context|errors|export|fork|cleanup|verify|drift|adaptive|analyze] …"
                     .dim()
             );
         }
@@ -2996,6 +2999,489 @@ fn handle_session_drift(arg: &str, state: &ReplState) {
                 eprintln!("  {}", progress.summary.dim());
             }
         }
+    }
+
+    eprintln!();
+}
+
+// ── Session Analyze ─────────────────────────────────────────────────────────
+
+/// `/session analyze [session_id]` — deep diagnostics for a session.
+///
+/// Reads the full journal + workspace and produces:
+/// - Overview: model, duration, turns, total tokens
+/// - Turn timeline with efficiency metrics
+/// - Tool usage stats: frequency, success rate, blocked tools
+/// - Token budget analysis: per-turn, cumulative, cache rate
+/// - Issue detection: blocked tools, stalls, errors, latency spikes,
+///   recording gaps, duplicate checkpoints
+fn handle_session_analyze(arg: &str, state: &ReplState) {
+    let (target_sid, resolved_prefix) = match resolve_journal_target_session(
+        arg,
+        state,
+        "  No active session. Use /session analyze <session_id>.",
+    ) {
+        Ok(value) => value,
+        Err(msg) => {
+            eprintln!("{msg}");
+            return;
+        }
+    };
+    if resolved_prefix && !arg.is_empty() {
+        eprintln!(
+            "  {} Resolved {} → {}",
+            theme::icon_ok(),
+            arg.cyan(),
+            target_sid.as_str().cyan()
+        );
+    }
+
+    let events = match session_journal::read_journal(&target_sid) {
+        Ok(e) if e.is_empty() => {
+            eprintln!("{}", "  No journal entries.".dim());
+            return;
+        }
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("{}", format!("  ✗ Failed to read journal: {e}").red());
+            return;
+        }
+    };
+    let ws = session_workspace::read_workspace(&target_sid).ok();
+
+    // ── Collect turn events ─────────────────────────────────────────────────
+    let turns: Vec<&session_journal::JournalEvent> = events
+        .iter()
+        .filter(|e| e.event_type == session_journal::JournalEventType::Turn)
+        .collect();
+    let errors: Vec<&session_journal::JournalEvent> = events
+        .iter()
+        .filter(|e| {
+            matches!(
+                e.event_type,
+                session_journal::JournalEventType::TurnError
+                    | session_journal::JournalEventType::Error
+            )
+        })
+        .collect();
+    let stalls: Vec<&session_journal::JournalEvent> = events
+        .iter()
+        .filter(|e| e.event_type == session_journal::JournalEventType::StallDetected)
+        .collect();
+    let checkpoints: Vec<&session_journal::JournalEvent> = events
+        .iter()
+        .filter(|e| e.event_type == session_journal::JournalEventType::Checkpoint)
+        .collect();
+
+    // ── Overview ────────────────────────────────────────────────────────────
+    let sid_short = &target_sid[..8.min(target_sid.len())];
+    eprintln!(
+        "\n{}",
+        format!("─── Session Analysis ({sid_short}) ──────────────────────────")
+            .bold()
+            .cyan()
+    );
+
+    let model = ws
+        .as_ref()
+        .map(|w| w.model.as_str())
+        .or_else(|| events.first().and_then(|e| e.model.as_deref()))
+        .unwrap_or("unknown");
+    let total_tok_in: u64 = turns.iter().filter_map(|t| t.tokens_in).sum();
+    let total_tok_out: u64 = turns.iter().filter_map(|t| t.tokens_out).sum();
+    let total_ms: u64 = turns.iter().filter_map(|t| t.duration_ms).sum();
+    let total_tools: u32 = turns.iter().filter_map(|t| t.tool_count).sum();
+    let total_cache_read: u64 = turns.iter().filter_map(|t| t.cache_read_tokens).sum();
+    let total_cache_create: u64 = turns.iter().filter_map(|t| t.cache_creation_tokens).sum();
+
+    eprintln!("  {:<16} {}", "model:".dim(), model.cyan());
+    eprintln!(
+        "  {:<16} {} ({} prompt + {} completion)",
+        "tokens:".dim(),
+        format_u64_grouped(total_tok_in + total_tok_out).cyan(),
+        format_u64_grouped(total_tok_in),
+        format_u64_grouped(total_tok_out),
+    );
+    if total_cache_read > 0 || total_cache_create > 0 {
+        let cache_pct = if total_tok_in > 0 {
+            (total_cache_read as f64 / total_tok_in as f64 * 100.0) as u64
+        } else {
+            0
+        };
+        eprintln!(
+            "  {:<16} {} read, {} created ({}% hit rate)",
+            "cache:".dim(),
+            format_u64_grouped(total_cache_read).green(),
+            format_u64_grouped(total_cache_create),
+            cache_pct,
+        );
+    }
+    eprintln!(
+        "  {:<16} {} turns, {} tool calls, {:.1}s total",
+        "activity:".dim(),
+        turns.len().to_string().cyan(),
+        total_tools.to_string().cyan(),
+        total_ms as f64 / 1000.0,
+    );
+    if let Some(ref w) = ws {
+        if let Some(ref goal) = w.session_goal {
+            let g: String = goal.chars().take(60).collect();
+            eprintln!("  {:<16} {}", "goal:".dim(), g);
+        }
+    }
+
+    // ── Turn Timeline ───────────────────────────────────────────────────────
+    eprintln!(
+        "\n{}",
+        "  ── Turn Timeline ──────────────────────────────────────────".bold()
+    );
+    eprintln!(
+        "  {:>4} {:>7} {:>8} {:>8} {:>5} {:>5}  {}",
+        "Turn".dim(),
+        "Time".dim(),
+        "Tok-in".dim(),
+        "Tok-out".dim(),
+        "Tools".dim(),
+        "Errs".dim(),
+        "Input".dim(),
+    );
+
+    for evt in &turns {
+        let turn_n = evt.turn.unwrap_or(0);
+        let dur_s = evt.duration_ms.unwrap_or(0) as f64 / 1000.0;
+        let tok_in = evt.tokens_in.unwrap_or(0);
+        let tok_out = evt.tokens_out.unwrap_or(0);
+        let tool_cnt = evt.tool_count.unwrap_or(0);
+
+        // Count failed tool calls
+        let err_cnt = evt
+            .tool_calls
+            .as_ref()
+            .map(|calls| calls.iter().filter(|c| !c.ok).count())
+            .unwrap_or(0);
+
+        let input: String = evt
+            .user_input
+            .as_deref()
+            .unwrap_or("")
+            .chars()
+            .take(40)
+            .collect();
+
+        // Color-code by severity
+        let dur_str = format!("{dur_s:>6.1}s");
+        let dur_colored = if dur_s > 120.0 {
+            dur_str.red().to_string()
+        } else if dur_s > 60.0 {
+            dur_str.yellow().to_string()
+        } else {
+            dur_str.to_string()
+        };
+        let tok_str = format!("{tok_in:>8}");
+        let tok_colored = if tok_in > 80_000 {
+            tok_str.red().to_string()
+        } else if tok_in > 40_000 {
+            tok_str.yellow().to_string()
+        } else {
+            tok_str.to_string()
+        };
+        let err_str = if err_cnt > 0 {
+            format!("{err_cnt:>5}").red().to_string()
+        } else {
+            format!("{err_cnt:>5}")
+        };
+
+        eprintln!(
+            "  {:>4} {} {} {:>8} {:>5} {}  {}",
+            format!("T{turn_n}"),
+            dur_colored,
+            tok_colored,
+            tok_out,
+            tool_cnt,
+            err_str,
+            input.dim(),
+        );
+    }
+
+    // ── Tool Usage ──────────────────────────────────────────────────────────
+    let mut tool_stats: std::collections::HashMap<String, (u32, u32, u64, u64)> =
+        std::collections::HashMap::new(); // name -> (total, fails, total_ms, total_output_bytes)
+    let mut blocked_calls: Vec<(u32, String, String)> = Vec::new(); // (turn, tool, reason)
+    let mut recording_gaps: Vec<(u32, u32, usize)> = Vec::new(); // (turn, reported_count, recorded_count)
+
+    for evt in &turns {
+        let turn_n = evt.turn.unwrap_or(0);
+        let reported = evt.tool_count.unwrap_or(0);
+        let recorded = evt.tool_calls.as_ref().map(|c| c.len()).unwrap_or(0);
+        if reported > 0 && recorded > 0 && (reported as usize) > recorded + 2 {
+            recording_gaps.push((turn_n, reported, recorded));
+        }
+
+        if let Some(calls) = evt.tool_calls.as_ref() {
+            for call in calls {
+                let entry = tool_stats.entry(call.name.clone()).or_insert((0, 0, 0, 0));
+                entry.0 += 1;
+                if !call.ok {
+                    entry.1 += 1;
+                }
+                entry.2 += call.ms;
+                entry.3 += call.output_bytes.unwrap_or(0) as u64;
+
+                if let Some(ref err) = call.error {
+                    if err.starts_with("blocked_tool:") {
+                        let reason: String = err
+                            .strip_prefix("blocked_tool: ")
+                            .unwrap_or(err)
+                            .chars()
+                            .take(80)
+                            .collect();
+                        blocked_calls.push((turn_n, call.name.clone(), reason));
+                    }
+                }
+            }
+        }
+    }
+
+    if !tool_stats.is_empty() {
+        eprintln!(
+            "\n{}",
+            "  ── Tool Usage ─────────────────────────────────────────────".bold()
+        );
+        eprintln!(
+            "  {:>20} {:>5} {:>5} {:>7} {:>8}  {}",
+            "Tool".dim(),
+            "Total".dim(),
+            "Fail".dim(),
+            "Avg ms".dim(),
+            "Output".dim(),
+            "Rate".dim(),
+        );
+
+        let mut sorted_tools: Vec<_> = tool_stats.iter().collect();
+        sorted_tools.sort_by(|a, b| b.1.0.cmp(&a.1.0));
+
+        for (name, (total, fails, total_ms, total_bytes)) in &sorted_tools {
+            let avg_ms = if *total > 0 {
+                total_ms / *total as u64
+            } else {
+                0
+            };
+            let rate = if *total > 0 {
+                ((*total - fails) as f64 / *total as f64 * 100.0) as u32
+            } else {
+                0
+            };
+            let rate_str = format!("{rate}%");
+            let rate_colored = if rate < 50 {
+                rate_str.red().to_string()
+            } else if rate < 80 {
+                rate_str.yellow().to_string()
+            } else {
+                rate_str.green().to_string()
+            };
+            let bytes_str = if *total_bytes > 1_000_000 {
+                format!("{:.1}MB", *total_bytes as f64 / 1_000_000.0)
+            } else if *total_bytes > 1_000 {
+                format!("{:.1}KB", *total_bytes as f64 / 1_000.0)
+            } else {
+                format!("{}B", total_bytes)
+            };
+            let fail_str = if *fails > 0 {
+                format!("{:>5}", fails).red().to_string()
+            } else {
+                format!("{:>5}", fails)
+            };
+            let name_short: String = name.chars().take(20).collect();
+            eprintln!(
+                "  {:>20} {:>5} {} {:>6}ms {:>8}  {}",
+                name_short, total, fail_str, avg_ms, bytes_str, rate_colored,
+            );
+        }
+    }
+
+    // ── Issue Detection ─────────────────────────────────────────────────────
+    let mut issues: Vec<String> = Vec::new();
+
+    // Blocked tool calls
+    if !blocked_calls.is_empty() {
+        let mut by_tool: std::collections::HashMap<String, Vec<u32>> =
+            std::collections::HashMap::new();
+        for (turn, tool, _reason) in &blocked_calls {
+            by_tool.entry(tool.clone()).or_default().push(*turn);
+        }
+        for (tool, turns_list) in &by_tool {
+            let turns_str: Vec<String> = turns_list.iter().map(|t| format!("T{t}")).collect();
+            issues.push(format!(
+                "🚫 {} blocked {} time(s) in {}",
+                tool.as_str().red(),
+                turns_list.len(),
+                turns_str.join(", "),
+            ));
+        }
+    }
+
+    // Recording gaps (skill opacity)
+    for &(turn, reported, recorded) in &recording_gaps {
+        issues.push(format!(
+            "👁 T{turn}: {} tool calls reported but only {} recorded (skill opacity: {} invisible)",
+            reported,
+            recorded,
+            reported as usize - recorded,
+        ));
+    }
+
+    // Stalls
+    for evt in &stalls {
+        let turn = evt.turn.unwrap_or(0);
+        let stype = evt.stall_type.as_deref().unwrap_or("unknown");
+        issues.push(format!("⚠ T{turn}: stall detected ({stype})"));
+    }
+
+    // Errors
+    for evt in &errors {
+        let turn = evt.turn.unwrap_or(0);
+        let err: String = evt
+            .error
+            .as_deref()
+            .unwrap_or("?")
+            .chars()
+            .take(80)
+            .collect();
+        issues.push(format!("❌ T{turn}: {err}"));
+    }
+
+    // High latency turns (>120s)
+    for evt in &turns {
+        let turn = evt.turn.unwrap_or(0);
+        let dur_s = evt.duration_ms.unwrap_or(0) as f64 / 1000.0;
+        if dur_s > 120.0 {
+            let tok = evt.tokens_in.unwrap_or(0);
+            let tools = evt.tool_count.unwrap_or(0);
+            issues.push(format!(
+                "🐌 T{turn}: {dur_s:.0}s latency ({} prompt tokens, {tools} tool calls)",
+                format_u64_grouped(tok),
+            ));
+        }
+    }
+
+    // Duplicate checkpoints (same turn, multiple checkpoints)
+    let mut ckpt_by_turn: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+    for evt in &checkpoints {
+        *ckpt_by_turn.entry(evt.turn.unwrap_or(0)).or_insert(0) += 1;
+    }
+    for (turn, count) in &ckpt_by_turn {
+        if *count > 1 {
+            issues.push(format!(
+                "📌 T{turn}: {count} checkpoints (likely duplicated step_recorder + interval)"
+            ));
+        }
+    }
+
+    // High prompt token growth (>50K per turn after T1)
+    let mut prev_tok_in: u64 = 0;
+    for evt in &turns {
+        let turn = evt.turn.unwrap_or(0);
+        let tok_in = evt.tokens_in.unwrap_or(0);
+        if turn > 1 && tok_in > prev_tok_in + 20_000 && tok_in > 60_000 {
+            issues.push(format!(
+                "📈 T{turn}: prompt tokens jumped to {} (+{})",
+                format_u64_grouped(tok_in),
+                format_u64_grouped(tok_in.saturating_sub(prev_tok_in)),
+            ));
+        }
+        prev_tok_in = tok_in;
+    }
+
+    if !issues.is_empty() {
+        eprintln!(
+            "\n{}",
+            format!(
+                "  ── Issues ({}) ────────────────────────────────────────────",
+                issues.len()
+            )
+            .bold()
+            .yellow()
+        );
+        for issue in &issues {
+            eprintln!("  {issue}");
+        }
+    } else {
+        eprintln!("\n  {} {}", theme::icon_ok(), "No issues detected.".green());
+    }
+
+    // ── Efficiency Summary ──────────────────────────────────────────────────
+    eprintln!(
+        "\n{}",
+        "  ── Efficiency ─────────────────────────────────────────────".bold()
+    );
+
+    let tok_per_tool = if total_tools > 0 {
+        total_tok_in / total_tools as u64
+    } else {
+        0
+    };
+    eprintln!(
+        "  {:<24} {} tokens/tool-call",
+        "prompt efficiency:".dim(),
+        format_u64_grouped(tok_per_tool),
+    );
+
+    let tok_per_turn = if !turns.is_empty() {
+        total_tok_in / turns.len() as u64
+    } else {
+        0
+    };
+    eprintln!(
+        "  {:<24} {} tokens/turn",
+        "avg prompt per turn:".dim(),
+        format_u64_grouped(tok_per_turn),
+    );
+
+    let avg_turn_ms = if !turns.is_empty() {
+        total_ms / turns.len() as u64
+    } else {
+        0
+    };
+    eprintln!(
+        "  {:<24} {:.1}s",
+        "avg turn latency:".dim(),
+        avg_turn_ms as f64 / 1000.0,
+    );
+
+    // Tool selection strategy distribution
+    let mut strategy_counts: std::collections::HashMap<String, u32> =
+        std::collections::HashMap::new();
+    for evt in &turns {
+        if let Some(ref strat) = evt.selector_strategy {
+            *strategy_counts.entry(strat.clone()).or_insert(0) += 1;
+        }
+    }
+    if !strategy_counts.is_empty() {
+        let strat_parts: Vec<String> = strategy_counts
+            .iter()
+            .map(|(s, c)| format!("{s}×{c}"))
+            .collect();
+        eprintln!(
+            "  {:<24} {}",
+            "tool selection:".dim(),
+            strat_parts.join(", "),
+        );
+    }
+
+    // Budget pressure distribution
+    let pressures: Vec<f64> = turns.iter().filter_map(|e| e.budget_pressure).collect();
+    if !pressures.is_empty() {
+        let max_p = pressures.iter().cloned().fold(0.0_f64, f64::max);
+        let avg_p = pressures.iter().sum::<f64>() / pressures.len() as f64;
+        let pressure_str = format!("avg {avg_p:.2}, max {max_p:.2}");
+        let pressure_colored = if max_p > 0.7 {
+            pressure_str.red().to_string()
+        } else if max_p > 0.4 {
+            pressure_str.yellow().to_string()
+        } else {
+            pressure_str.green().to_string()
+        };
+        eprintln!("  {:<24} {}", "budget pressure:".dim(), pressure_colored,);
     }
 
     eprintln!();
