@@ -40,6 +40,7 @@ use crate::{StreamResult, cli_utils::terminal_width_usize, edge_tools};
 use super::ChatTurnParams;
 use agentic_sse_loop::{
     StreamLoopSidecarEprint, StreamResultBuild, build_stream_result, eprint_stream_loop_sidecars,
+    resolved_tool_metrics,
 };
 use cli_loop_host::CliAgenticLoopHost;
 use serde_json::json;
@@ -573,16 +574,21 @@ pub(crate) async fn stream_chat_sse(
         if let Some(shared) = p.discovered_skills {
             *shared = state.skills.discovered;
         }
+        let (tool_calls_count, tools_used) = resolved_tool_metrics(
+            state.total_tool_calls,
+            state.telemetry.all_tools_used.iter().cloned(),
+            &state.stall.tool_call_records,
+        );
         return Err(crate::TurnFailure {
             error: e,
             partial: crate::PartialTurnData {
                 tool_call_records: std::mem::take(&mut state.stall.tool_call_records),
-                tools_used: state.telemetry.all_tools_used.iter().cloned().collect(),
+                tools_used,
                 stall_events: std::mem::take(&mut state.stall.events),
                 verdict_events: std::mem::take(&mut state.stall.verdict_events),
                 prompt_tokens: state.total_prompt,
                 completion_tokens: state.total_completion,
-                tool_calls_count: state.total_tool_calls,
+                tool_calls_count,
                 tool_health_export: state.turn_guard.health.export_merged(p.tool_health_entries),
                 session_id: state.current_session_id.clone(),
                 last_heavy_checkpoint: state.stall.last_heavy_checkpoint.take(),

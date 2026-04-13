@@ -115,6 +115,34 @@ pub(crate) struct StreamResultBuild<'a> {
     pub(crate) entity_learn_skipped_no_domain: bool,
 }
 
+pub(crate) fn resolved_tool_metrics<I>(
+    fallback_count: u32,
+    fallback_tools: I,
+    tool_call_records: &[ToolCallRecord],
+) -> (u32, Vec<String>)
+where
+    I: IntoIterator<Item = String>,
+{
+    if tool_call_records.is_empty() {
+        return (fallback_count, fallback_tools.into_iter().collect());
+    }
+
+    let mut seen = HashSet::new();
+    let mut tools_used = Vec::new();
+    let mut tool_calls_count = 0u32;
+    for record in tool_call_records {
+        if record.is_synthetic_placeholder() {
+            continue;
+        }
+        tool_calls_count += 1;
+        if seen.insert(record.name.clone()) {
+            tools_used.push(record.name.clone());
+        }
+    }
+
+    (tool_calls_count, tools_used)
+}
+
 pub(crate) fn build_stream_result(ctx: StreamResultBuild<'_>) -> StreamResult {
     let StreamResultBuild {
         tool_health_entries,
@@ -147,6 +175,8 @@ pub(crate) fn build_stream_result(ctx: StreamResultBuild<'_>) -> StreamResult {
         routing_domain_hint,
         entity_learn_skipped_no_domain,
     } = ctx;
+    let (tool_calls_count, tools_used) =
+        resolved_tool_metrics(tool_calls_count, tools_used, &tool_call_records);
 
     let report = first_selection_report.unwrap_or_else(|| tool_registry::SelectionReport {
         tools_selected: Vec::new(),
@@ -187,7 +217,7 @@ pub(crate) fn build_stream_result(ctx: StreamResultBuild<'_>) -> StreamResult {
         tool_calls_count,
         tools_selected: report.tools_selected,
         selected_skills,
-        tools_used: tools_used.into_iter().collect(),
+        tools_used,
         tool_call_records,
         budget_used: report.budget_used,
         budget_pressure,
@@ -283,6 +313,52 @@ mod tests {
         assert_eq!(result.ttft_ms, Some(42));
         assert_eq!(result.context_ms, Some(100));
         assert_eq!(result.selector_strategy.as_deref(), Some("tfidf"));
+    }
+
+    fn tool_record(name: &str, ok: bool, result_preview: Option<&str>) -> ToolCallRecord {
+        ToolCallRecord {
+            name: name.into(),
+            ok,
+            ms: 0,
+            error: None,
+            input_bytes: None,
+            output_bytes: None,
+            args_preview: None,
+            result_preview: result_preview.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn build_stream_result_ignores_synthetic_tool_metrics() {
+        let sr = make_step_recorder();
+        let tg = make_turn_guard();
+        let mut ctx = make_build_ctx(&sr, &tg);
+        ctx.tool_calls_count = 5;
+        ctx.tools_used = HashSet::from([
+            "skill".to_string(),
+            "bash".to_string(),
+            "read_file".to_string(),
+        ]);
+        ctx.tool_call_records = vec![
+            tool_record(
+                "skill",
+                false,
+                Some(
+                    "Skill 'debug' was already loaded (turn 2). Follow those instructions directly.",
+                ),
+            ),
+            tool_record(
+                "bash",
+                false,
+                Some("Skipped: the skill already completed this work. Do NOT call `bash` again."),
+            ),
+            tool_record("read_file", true, Some("contents")),
+        ];
+
+        let result = build_stream_result(ctx);
+
+        assert_eq!(result.tool_calls_count, 1);
+        assert_eq!(result.tools_used, vec!["read_file".to_string()]);
     }
 
     #[test]

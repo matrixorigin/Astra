@@ -486,6 +486,22 @@ pub struct ToolCallRecord {
     pub result_preview: Option<String>,
 }
 
+impl ToolCallRecord {
+    /// Synthetic placeholders are audit-only records emitted when skill routing
+    /// suppresses a tool call without actually executing it.
+    pub fn is_synthetic_placeholder(&self) -> bool {
+        let Some(result_preview) = self.result_preview.as_deref() else {
+            return false;
+        };
+
+        result_preview.starts_with("Skipped:")
+            || result_preview.starts_with("Deferred:")
+            || (self.name == "skill"
+                && result_preview.starts_with("Skill '")
+                && result_preview.contains(" was already loaded (turn "))
+    }
+}
+
 #[inline]
 fn is_false(b: &bool) -> bool {
     !*b
@@ -514,7 +530,7 @@ pub struct JournalEvent {
     /// Assistant response text (for turn events).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub assistant_output: Option<String>,
-    /// Number of tool calls in this turn.
+    /// Number of material tool executions in this turn.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_count: Option<u32>,
     /// Prompt tokens used.
@@ -2996,6 +3012,64 @@ mod tests {
         let parsed: ToolCallRecord = serde_json::from_str(&json).unwrap();
         assert!(!parsed.ok);
         assert_eq!(parsed.error.as_deref(), Some("missing repo parameter"));
+    }
+
+    #[test]
+    fn tool_call_record_detects_synthetic_placeholders() {
+        let skipped = ToolCallRecord {
+            name: "read_file".into(),
+            ok: false,
+            ms: 0,
+            error: None,
+            input_bytes: None,
+            output_bytes: None,
+            args_preview: None,
+            result_preview: Some(
+                "Skipped: the skill already completed this work. Do NOT call `read_file` again."
+                    .into(),
+            ),
+        };
+        let deferred = ToolCallRecord {
+            name: "bash".into(),
+            ok: false,
+            ms: 0,
+            error: None,
+            input_bytes: None,
+            output_bytes: None,
+            args_preview: None,
+            result_preview: Some(
+                "Deferred: skill was invoked in this turn. Read the skill instructions above."
+                    .into(),
+            ),
+        };
+        let dedup = ToolCallRecord {
+            name: "skill".into(),
+            ok: false,
+            ms: 0,
+            error: None,
+            input_bytes: None,
+            output_bytes: None,
+            args_preview: None,
+            result_preview: Some(
+                "Skill 'debug' was already loaded (turn 2). Follow those instructions directly."
+                    .into(),
+            ),
+        };
+        let actual_failure = ToolCallRecord {
+            name: "skill".into(),
+            ok: false,
+            ms: 0,
+            error: Some("Unknown skill".into()),
+            input_bytes: None,
+            output_bytes: None,
+            args_preview: None,
+            result_preview: Some("Unknown skill 'debug'.".into()),
+        };
+
+        assert!(skipped.is_synthetic_placeholder());
+        assert!(deferred.is_synthetic_placeholder());
+        assert!(dedup.is_synthetic_placeholder());
+        assert!(!actual_failure.is_synthetic_placeholder());
     }
 
     #[test]

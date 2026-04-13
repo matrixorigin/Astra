@@ -1643,6 +1643,27 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
 /// Falls back to this constant when session config is unavailable.
 const DEFAULT_TUNING_CYCLE_INTERVAL: u32 = 5;
 
+fn effective_tool_metrics(state: &AgenticLoopState) -> (u32, u32) {
+    if state.stall.tool_call_records.is_empty() {
+        return (
+            state.total_tool_calls,
+            state.telemetry.all_tools_used.len() as u32,
+        );
+    }
+
+    let mut unique_tools = HashSet::new();
+    let mut tool_calls = 0u32;
+    for record in &state.stall.tool_call_records {
+        if record.is_synthetic_placeholder() {
+            continue;
+        }
+        tool_calls += 1;
+        unique_tools.insert(record.name.clone());
+    }
+
+    (tool_calls, unique_tools.len() as u32)
+}
+
 /// Record feedback signals based on the loop's outcome and accumulated state.
 ///
 /// Called once after the loop finishes (or errors) to feed the auto-tuning engine.
@@ -1727,8 +1748,7 @@ fn record_loop_completion_feedback(
     }
 
     // ── 3. Tool churn signal ──
-    let tool_calls = state.total_tool_calls;
-    let unique_tools = state.telemetry.all_tools_used.len() as u32;
+    let (tool_calls, unique_tools) = effective_tool_metrics(state);
     // High tool calls with low unique tools suggests repetitive/failing usage.
     if tool_calls > 10 && unique_tools > 0 && (tool_calls / unique_tools) > 5 {
         hub.record_feedback(enrich_signal(
@@ -3082,6 +3102,9 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                 .map(|(name, _)| name.clone());
             let active_skill_ref = active_skill.as_deref();
             for rec in &state.stall.tool_call_records[evo_records_before..] {
+                if rec.is_synthetic_placeholder() {
+                    continue;
+                }
                 let is_error = !rec.ok;
                 let ctx = crate::evolution::types::ToolResultContext {
                     tool_name: &rec.name,
@@ -7395,6 +7418,19 @@ print(json.dumps({'context': 'user said: ' + msg}))
         std::sync::Arc::new(crate::observability_integration::ObservabilityHub::new())
     }
 
+    fn tool_record(name: &str, ok: bool, result_preview: Option<&str>) -> ToolCallRecord {
+        ToolCallRecord {
+            name: name.into(),
+            ok,
+            ms: 0,
+            error: None,
+            input_bytes: None,
+            output_bytes: None,
+            args_preview: None,
+            result_preview: result_preview.map(str::to_string),
+        }
+    }
+
     fn make_session()
     -> std::sync::Arc<std::sync::RwLock<crate::observability_integration::ObservabilitySession>>
     {
@@ -7580,6 +7616,61 @@ print(json.dumps({'context': 'user said: ' + msg}))
         assert!(
             !triggered.is_empty(),
             "tool churn signal should fire accumulation rule"
+        );
+    }
+
+    #[test]
+    fn feedback_ignores_synthetic_tool_churn_records() {
+        let hub = make_hub();
+        let mut state = make_state();
+        state.telemetry.observability_hub = Some(hub.clone());
+        state.total_tool_calls = 15;
+        state.telemetry.all_tools_used = ["bash"].iter().map(|s| s.to_string()).collect();
+        state.stall.tool_call_records = vec![
+            tool_record(
+                "skill",
+                false,
+                Some(
+                    "Skill 'debug' was already loaded (turn 2). Follow those instructions directly.",
+                ),
+            ),
+            tool_record(
+                "bash",
+                false,
+                Some("Skipped: the skill already completed this work. Do NOT call `bash` again."),
+            ),
+            tool_record(
+                "read_file",
+                false,
+                Some(
+                    "Deferred: skill was invoked in this turn. Read the skill instructions above.",
+                ),
+            ),
+            tool_record("git_show", true, Some("diff")),
+            tool_record("read_file", true, Some("contents")),
+        ];
+
+        let result = Ok(AgenticLoopOutcome::Completed);
+        record_loop_completion_feedback(&mut state, &result);
+
+        hub.tuning()
+            .add_rule(crate::auto_tuning::EvolutionRule::new(
+                "churn-detect",
+                crate::auto_tuning::EvolutionTrigger::SignalAccumulation {
+                    signal_type: "tool_churn".into(),
+                    count: 1,
+                    window_secs: 3600,
+                },
+                crate::auto_tuning::EvolutionAction::Alert {
+                    message: "churn".into(),
+                    severity: crate::auto_tuning::AlertSeverity::Info,
+                },
+            ));
+        let config = crate::runtime_config::RuntimeConfig::default();
+        let triggered = hub.tuning().evaluate(&config);
+        assert!(
+            triggered.is_empty(),
+            "synthetic placeholders should not trigger churn feedback"
         );
     }
 

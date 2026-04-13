@@ -54,7 +54,7 @@ pub(crate) struct StreamResult {
     pub(crate) tools_selected: Vec<String>,
     /// Skill names selected by the LLM during tool selection.
     pub(crate) selected_skills: Vec<String>,
-    /// Tool names actually invoked by LLM across all turns.
+    /// Tool names with material execution across all turns.
     pub(crate) tools_used: Vec<String>,
     /// Per-tool-call audit records: name, ok, ms, error.
     pub(crate) tool_call_records: Vec<astra_services::session_journal::ToolCallRecord>,
