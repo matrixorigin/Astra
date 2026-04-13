@@ -775,6 +775,7 @@ fn should_replay_incomplete_suffix_for_pre_stream_failure(
     !is_sse
         && (status.is_server_error()
             || status == StatusCode::TOO_MANY_REQUESTS
+            || status == StatusCode::REQUEST_TIMEOUT
             || status.is_success())
 }
 
@@ -801,9 +802,10 @@ fn bridge_status_to_sse_error_code(status: StatusCode) -> &'static str {
         StatusCode::NOT_FOUND => "NOT_FOUND",
         StatusCode::UNPROCESSABLE_ENTITY => "VALIDATION_ERROR",
         StatusCode::TOO_MANY_REQUESTS => "RATE_LIMIT",
-        StatusCode::BAD_GATEWAY | StatusCode::SERVICE_UNAVAILABLE | StatusCode::GATEWAY_TIMEOUT => {
-            "UPSTREAM_ERROR"
-        }
+        StatusCode::REQUEST_TIMEOUT
+        | StatusCode::BAD_GATEWAY
+        | StatusCode::SERVICE_UNAVAILABLE
+        | StatusCode::GATEWAY_TIMEOUT => "UPSTREAM_ERROR",
         _ => "INTERNAL_ERROR",
     }
 }
@@ -822,6 +824,7 @@ fn bridge_error_sse_response(
             || matches!(
                 status,
                 StatusCode::TOO_MANY_REQUESTS
+                    | StatusCode::REQUEST_TIMEOUT
                     | StatusCode::BAD_GATEWAY
                     | StatusCode::SERVICE_UNAVAILABLE
                     | StatusCode::GATEWAY_TIMEOUT
@@ -2634,6 +2637,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn request_timeout_non_sse_replays_persisted_incomplete_suffix() {
+        use axum::Router;
+        use axum::http::header;
+        use axum::routing::post;
+        use tokio::net::TcpListener;
+        use tokio::sync::Mutex;
+
+        let app = Router::new().route(
+            "/",
+            post(|| async {
+                (
+                    StatusCode::REQUEST_TIMEOUT,
+                    [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                    "upstream timed out",
+                )
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener should have address");
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test server should run");
+        });
+
+        let persisted_replay_window_store = Arc::new(InMemoryBridgeReplayWindowStore::default());
+        let bridge = HttpChatTurnBridge::new(
+            format!("http://{addr}/"),
+            Arc::new(Mutex::new(SessionCache::new(1000, 86400.0))),
+        )
+        .with_persisted_replay_window_store(persisted_replay_window_store.clone());
+
+        let mut sequence = 0u64;
+        let session_info = render_stream_event_bytes(
+            serde_json::json!({"type": "session_info", "session_id": "sess-1", "run_id": "run-1"}),
+            &mut sequence,
+            Some("sess-1"),
+            Some("run-1"),
+            None,
+        );
+        let text_delta = render_stream_event_bytes(
+            serde_json::json!({"type": "text_delta", "content": "cached-incomplete"}),
+            &mut sequence,
+            Some("sess-1"),
+            Some("run-1"),
+            None,
+        );
+        let mut window = BridgeReplayWindow::default();
+        assert!(window.append_frame(&session_info));
+        assert!(window.append_frame(&text_delta));
+        persisted_replay_window_store
+            .persist_latest_window(
+                "sess-1",
+                &bridge_replay_window_key("sess-1", Some("run-1"), None),
+                &window,
+            )
+            .await
+            .expect("persisted replay window should store");
+        let last_event_id = parse_sse_json_frame(&session_info)
+            .and_then(|event| {
+                event
+                    .get("event_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(ToString::to_string)
+            })
+            .expect("session info should have event id");
+
+        let response = forward_with_noop_writers(&bridge, &trusted_resume_headers(&last_event_id))
+            .await
+            .expect("request-timeout failure should replay durable suffix");
+        let text = response_text(response).await;
+
+        assert!(!text.contains("\"type\":\"error\""));
+        assert!(text.contains("\"content\":\"cached-incomplete\""));
+        assert!(!text.contains("\"type\":\"turn_complete\""));
+    }
+
+    #[tokio::test]
     async fn non_sse_client_error_keeps_error_sse_even_with_persisted_incomplete_suffix() {
         use axum::Router;
         use axum::http::header;
@@ -3120,6 +3203,26 @@ mod tests {
         assert!(text.contains("\"run_id\":\"run-1\""));
         assert!(text.contains("\"type\":\"error\""));
         assert!(text.contains("\"code\":\"UPSTREAM_ERROR\""));
+    }
+
+    #[tokio::test]
+    async fn request_timeout_error_sse_is_retryable_upstream_error() {
+        let response = bridge_error_sse_response(
+            StatusCode::REQUEST_TIMEOUT,
+            bridge_error_sse_message(StatusCode::REQUEST_TIMEOUT, "upstream timed out"),
+            Some("sess-1"),
+            Some("run-1"),
+        );
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("body should read");
+        let text = String::from_utf8(body.to_vec()).expect("utf8");
+        assert!(text.contains("\"type\":\"session_info\""));
+        assert!(text.contains("\"type\":\"error\""));
+        assert!(text.contains("\"code\":\"UPSTREAM_ERROR\""));
+        assert!(text.contains("\"retryable\":true"));
+        assert!(text.contains("upstream timed out"));
     }
 
     #[tokio::test]
