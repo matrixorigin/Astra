@@ -205,7 +205,8 @@ fn adjust_config_compensation_summary(path: Option<&str>) -> String {
         .map(|path| format!("config path `{path}`"))
         .unwrap_or_else(|| "the changed config path".to_string());
     format!(
-        "rerun `adjust_config` with the previous `old` value from the tool result to restore {}; if a session workspace override was persisted, restore or remove that override manually",
+        "prefer `rollback_session_state` with scope=`current_turn` (or {}) to restore {}; alternatively rerun `adjust_config` with the previous `old` value from the tool result",
+        rollback_turn_tool_scope_hint(),
         target
     )
 }
@@ -216,29 +217,30 @@ fn tool_priority_compensation_summary(tool: Option<&str>) -> String {
         .map(|tool| format!("tool `{tool}`"))
         .unwrap_or_else(|| "the affected tool".to_string());
     format!(
-        "use the `previous_pinned_tools` and `previous_deprioritized_tools` fields from the tool result to restore {}'s prior preference state manually, or rewrite the session workspace tool preferences directly",
+        "prefer `rollback_session_state` with scope=`current_turn` (or {}) to restore {}'s prior preference state; the `previous_pinned_tools` and `previous_deprioritized_tools` fields remain the manual fallback",
+        rollback_turn_tool_scope_hint(),
         target
     )
 }
 
 fn set_goal_compensation_summary() -> &'static str {
-    "rerun `set_goal` with the `previous_goal` from the tool result if you need to steer back, but note that `set_goal` also clears goal-specific drift, compression, correction, and context-trace state with no automatic rollback"
+    "prefer `rollback_session_state` with scope=`current_turn` (or `rollback_turn_actions`) to restore the previous_goal and goal-tracking snapshot; rerun `set_goal` with the `previous_goal` from the tool result only as the manual fallback"
 }
 
 fn compress_context_compensation_summary() -> &'static str {
-    "manual compression markers are session-local and append-only; use the previous compression counters from the tool result plus session workspace/journal state if you need to undo the marker manually"
+    "prefer `rollback_session_state` with scope=`current_turn` (or `rollback_turn_actions`) to restore session-local compression state; manual compression journal markers remain append-only if you inspect the persisted journal later"
 }
 
 fn task_create_compensation_summary() -> &'static str {
-    "use `task_stop` with the returned `task_id` to cancel the created session-local task if needed; there is no dedicated task deletion rollback tool"
+    "prefer `rollback_session_state` with scope=`current_turn` (or `rollback_turn_actions`) to restore the pre-task snapshot; `task_stop` with the returned `task_id` remains the manual fallback if you only want to cancel the created task"
 }
 
 fn task_update_compensation_summary() -> &'static str {
-    "use `task_get` plus the `previous_status` from the tool result, then rerun `task_update` to restore the earlier task or subtask status manually; appended error text is not automatically removed"
+    "prefer `rollback_session_state` with scope=`current_turn` (or `rollback_turn_actions`) to restore the pre-update task snapshot; otherwise use `task_get` plus the `previous_status` from the tool result and rerun `task_update` manually"
 }
 
 fn task_stop_compensation_summary() -> &'static str {
-    "use `task_update` with the `previous_status` from the tool result if you need to re-open the cancelled session-local task manually; appended cancellation notes are not automatically removed"
+    "prefer `rollback_session_state` with scope=`current_turn` (or `rollback_turn_actions`) to restore the pre-stop task snapshot; otherwise use `task_update` with the `previous_status` from the tool result to reopen the task manually"
 }
 
 fn shell_action_profile(command: Option<&str>) -> ActionCompensationProfile {

@@ -199,8 +199,31 @@ pub fn all_tool_schemas() -> Vec<Value> {
         json!({
             "type": "function",
             "function": {
+                "name": "rollback_session_state",
+                "description": "Restore bounded session-local self-mod and task mutations recorded during this session. Use to roll back recent adjust_config, prioritize_tool, deprioritize_tool, set_goal, compress_context, task_create, task_update, or task_stop changes for the current turn, a specific turn, or to list recorded rollback handles.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "scope": {
+                            "type": "string",
+                            "enum": ["current_turn", "turn", "list"],
+                            "description": "Rollback scope. Defaults to current_turn. Use turn to restore one prior turn's recorded session-state mutations, or list to inspect recorded rollback entries."
+                        },
+                        "turn_index": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "description": "Specific turn index to roll back. Required when scope=turn."
+                        }
+                    },
+                    "required": []
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
                 "name": "rollback_turn_actions",
-                "description": "Orchestrate bounded rollback across the shared file edit journal, MatrixOne snapshot journal, and recorded git stash rollback handles for one turn. Use to revert mixed file/database/repo-state side effects from the current turn or a specific turn, or to list recorded rollback handles across all three journals.",
+                "description": "Orchestrate bounded rollback across the shared file edit journal, MatrixOne snapshot journal, recorded git stash/git commit/git worktree rollback handles, and bounded session-state mutations for one turn. Use to revert mixed file/database/repo/session side effects from the current turn or a specific turn, or to list recorded rollback handles across all journals.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -915,7 +938,7 @@ pub fn all_tool_schemas() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "adjust_config",
-                "description": "Adjust a bounded runtime config value during this session. Uses a governor with per-turn mutation and drift limits.",
+                "description": "Adjust a bounded runtime config value during this session. Uses a governor with per-turn mutation and drift limits, and records the previous value so rollback_session_state or rollback_turn_actions can restore it within the same session.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -948,7 +971,7 @@ pub fn all_tool_schemas() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "prioritize_tool",
-                "description": "Pin a tool as preferred for this session. Removes it from the deprioritized set.",
+                "description": "Pin a tool as preferred for this session. Removes it from the deprioritized set and records prior tool preferences for bounded session-state rollback.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -962,7 +985,7 @@ pub fn all_tool_schemas() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "deprioritize_tool",
-                "description": "Mark a tool as deprioritized for this session. Removes it from the pinned set.",
+                "description": "Mark a tool as deprioritized for this session. Removes it from the pinned set and records prior tool preferences for bounded session-state rollback.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -976,7 +999,7 @@ pub fn all_tool_schemas() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "set_goal",
-                "description": "Set or replace the session goal used by goal tracking and self-awareness.",
+                "description": "Set or replace the session goal used by goal tracking and self-awareness. Records the prior goal-tracking snapshot so rollback_session_state can restore it within the same session.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -990,7 +1013,7 @@ pub fn all_tool_schemas() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "compress_context",
-                "description": "Record a manual context compression request for this session.",
+                "description": "Record a manual context compression request for this session. Records the previous in-memory compression state so rollback_session_state can restore that session-local state.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -1156,7 +1179,7 @@ pub fn all_tool_schemas() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "task_create",
-                "description": "Create a structured task for tracking complex multi-step work. Use proactively when: (1) task requires 3+ distinct steps, (2) plan mode is active, (3) user provides multiple tasks. Skip for single trivial tasks.",
+                "description": "Create a structured task for tracking complex multi-step work. Use proactively when: (1) task requires 3+ distinct steps, (2) plan mode is active, (3) user provides multiple tasks. Skip for single trivial tasks. Successful mutations record a bounded task-state rollback handle.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -1229,7 +1252,7 @@ pub fn all_tool_schemas() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "task_update",
-                "description": "Update a task's status or progress. Always mark task as 'in_progress' BEFORE starting work, then 'completed' when done.",
+                "description": "Update a task's status or progress. Always mark task as 'in_progress' BEFORE starting work, then 'completed' when done. Successful mutations record a bounded task-state rollback handle.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -1259,7 +1282,7 @@ pub fn all_tool_schemas() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "task_stop",
-                "description": "Stop/cancel a running task. Use when a task needs to be aborted before completion.",
+                "description": "Stop/cancel a running task. Use when a task needs to be aborted before completion. Successful mutations record a bounded task-state rollback handle.",
                 "parameters": {
                     "type": "object",
                     "properties": {

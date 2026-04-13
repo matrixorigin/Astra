@@ -1024,6 +1024,8 @@ async fn plan_executor_task(
                     git_stash_journal: None,
                     git_commit_journal: None,
                     git_worktree_journal: None,
+                    session_state_journal: None,
+                    task_manager: None,
                     turn_index: 0,
                     evolution_service: None,
                 })

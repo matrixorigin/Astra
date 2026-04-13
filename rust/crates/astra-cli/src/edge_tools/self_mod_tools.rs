@@ -46,6 +46,7 @@ impl ToolExecutor {
         }
 
         let ceiling = constraints.config_drift_ceiling;
+        let session_snapshot = session.rollback_snapshot();
         let old_value: Option<Value>;
         let new_value: Option<Value>;
         let mut drift: Option<f64> = None;
@@ -265,6 +266,7 @@ impl ToolExecutor {
                 persisted_value.clone(),
             )
         {
+            session.restore_rollback_snapshot(&session_snapshot);
             return json!({
                 "error": "failed_to_persist_config_override",
                 "path": path,
@@ -274,6 +276,10 @@ impl ToolExecutor {
         }
 
         counter.1 += 1;
+        let path_owned = path.to_string();
+        if let Some(old_value) = old_value.clone() {
+            self.record_adjust_config_rollback(path_owned, old_value, session_snapshot);
+        }
         json!({
             "status": "ok",
             "path": path,
@@ -327,6 +333,14 @@ impl ToolExecutor {
             .to_string();
         }
 
+        let changed = original_pinned != *pinned || original_deprioritized != *deprioritized;
+        if changed {
+            self.record_tool_preferences_rollback(
+                original_pinned.clone(),
+                original_deprioritized.clone(),
+                format!("prioritize_tool:{tool}"),
+            );
+        }
         json!({
             "status": "ok",
             "prioritized_tool": tool,
@@ -377,6 +391,14 @@ impl ToolExecutor {
             .to_string();
         }
 
+        let changed = original_pinned != *pinned || original_deprioritized != *deprioritized;
+        if changed {
+            self.record_tool_preferences_rollback(
+                original_pinned.clone(),
+                original_deprioritized.clone(),
+                format!("deprioritize_tool:{tool}"),
+            );
+        }
         json!({
             "status": "ok",
             "deprioritized_tool": tool,
@@ -402,6 +424,7 @@ impl ToolExecutor {
                 return json!({"error": "Failed to acquire observability session"}).to_string();
             }
         };
+        let session_snapshot = session.rollback_snapshot();
         let previous_goal = session
             .goal_tracker
             .as_ref()
@@ -419,6 +442,9 @@ impl ToolExecutor {
         }
 
         let goal_changed = session.steer_goal(goal);
+        if goal_changed {
+            self.record_goal_rollback(previous_goal.clone(), session_snapshot);
+        }
 
         json!({
             "status": "ok",
@@ -444,6 +470,7 @@ impl ToolExecutor {
                 return json!({"error": "Failed to acquire observability session"}).to_string();
             }
         };
+        let session_snapshot = session.rollback_snapshot();
 
         let turn = if session.turn_number == 0 {
             1
@@ -467,6 +494,7 @@ impl ToolExecutor {
         }
 
         session.record_compression(turn);
+        self.record_compression_rollback(turn, session_snapshot);
 
         json!({
             "status": "ok",

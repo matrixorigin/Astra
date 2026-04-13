@@ -563,6 +563,8 @@ async fn maybe_auto_compact(
         git_stash_journal: Some(state.git_stash_journal.clone()),
         git_commit_journal: Some(state.git_commit_journal.clone()),
         git_worktree_journal: Some(state.git_worktree_journal.clone()),
+        session_state_journal: Some(state.session_state_journal.clone()),
+        task_manager: Some(state.task_manager.clone()),
         turn_index: state.turn,
         evolution_service: state.evolution_service.clone(),
     })
@@ -831,6 +833,8 @@ async fn run_chat_turn(
             git_stash_journal: Some(state.git_stash_journal.clone()),
             git_commit_journal: Some(state.git_commit_journal.clone()),
             git_worktree_journal: Some(state.git_worktree_journal.clone()),
+            session_state_journal: Some(state.session_state_journal.clone()),
+            task_manager: Some(state.task_manager.clone()),
             turn_index: state.turn,
             evolution_service: state.evolution_service.clone(),
         }) => TurnAttempt::Completed(Box::new(result)),

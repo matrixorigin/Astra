@@ -197,6 +197,7 @@ fn tool_conditional_section(tool_names: &[&str], selection_confidence: f64) -> S
     let has_git_mutations = tool_names.contains(&"git_commit");
     let has_git_revert = tool_names.contains(&"git_revert_commit");
     let has_git_worktree = tool_names.contains(&"git_worktree");
+    let has_session_state_rollback = tool_names.contains(&"rollback_session_state");
 
     let mut s = String::new();
 
@@ -309,6 +310,13 @@ fn tool_conditional_section(tool_names: &[&str], selection_confidence: f64) -> S
                 "             - Use **git_worktree** for isolated parallel branch work; clean worktrees created by `enter`/`add` can participate in `rollback_turn_actions`, but explicit `remove` or `exit_action=remove` is still the destructive manual boundary once that worktree has diverged.\n",
             );
         }
+    }
+    if has_session_state_rollback {
+        s.push_str(
+            "\n## Session-State Rollback\n\
+             - Use **rollback_session_state** to restore bounded self-mod or task mutations from the current turn (or inspect recorded handles with `scope=list`).\n\
+             - `rollback_turn_actions` now also includes recorded session-state mutations alongside file/database/git rollback journals for mixed-turn recovery.\n",
+        );
     }
     if has_memory {
         s.push_str(

@@ -1715,6 +1715,8 @@ Follow these steps:
                 git_stash_journal: Some(state.git_stash_journal.clone()),
                 git_commit_journal: Some(state.git_commit_journal.clone()),
                 git_worktree_journal: Some(state.git_worktree_journal.clone()),
+                session_state_journal: Some(state.session_state_journal.clone()),
+                task_manager: Some(state.task_manager.clone()),
                 turn_index: state.turn,
                 evolution_service: None,
             })

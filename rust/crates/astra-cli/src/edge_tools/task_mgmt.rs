@@ -37,6 +37,12 @@ pub(crate) struct TaskManager {
     id_counter: AtomicU32,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct TaskManagerSnapshot {
+    pub tasks: Vec<SessionTask>,
+    pub next_task_id: u32,
+}
+
 impl TaskManager {
     pub fn new() -> Self {
         Self {
@@ -48,6 +54,24 @@ impl TaskManager {
     /// Get a snapshot of all tasks (for brief/diagnostics).
     pub fn snapshot(&self) -> Vec<SessionTask> {
         self.tasks.lock().map(|g| g.clone()).unwrap_or_default()
+    }
+
+    pub fn snapshot_state(&self) -> TaskManagerSnapshot {
+        TaskManagerSnapshot {
+            tasks: self.snapshot(),
+            next_task_id: self.id_counter.load(Ordering::SeqCst),
+        }
+    }
+
+    pub fn restore_snapshot(&self, snapshot: &TaskManagerSnapshot) -> Result<(), String> {
+        let mut tasks = self
+            .tasks
+            .lock()
+            .map_err(|_| "failed to access task list".to_string())?;
+        *tasks = snapshot.tasks.clone();
+        self.id_counter
+            .store(snapshot.next_task_id, Ordering::SeqCst);
+        Ok(())
     }
 
     /// Create a new task in the session-local task list.

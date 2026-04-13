@@ -111,6 +111,21 @@ pub struct ObservabilitySession {
     pub last_token_budget_change_turn: Option<u32>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ObservabilitySessionRollbackSnapshot {
+    pub config: RuntimeConfig,
+    pub original_query: Option<String>,
+    pub goal_progress: Option<GoalProgressSnapshot>,
+    pub recent_queries: Vec<String>,
+    pub compressed_turns: Vec<u32>,
+    pub user_corrections: Vec<u32>,
+    pub context_traces: Vec<ContextAssemblyTrace>,
+    pub drift_min_severity_threshold: f64,
+    pub drift_analysis_window: u32,
+    pub last_reported_drift_turn: Option<u32>,
+    pub last_query_at: Option<Instant>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QueryBehavior {
     pub delay_since_last_query_ms: Option<u64>,
@@ -498,6 +513,41 @@ impl ObservabilitySession {
     /// Export persisted goal-tracker state for workspace resume and self surfaces.
     pub fn goal_progress_snapshot(&self) -> Option<GoalProgressSnapshot> {
         self.goal_tracker.as_ref().map(GoalTracker::snapshot)
+    }
+
+    pub fn rollback_snapshot(&self) -> ObservabilitySessionRollbackSnapshot {
+        ObservabilitySessionRollbackSnapshot {
+            config: self.config.clone(),
+            original_query: self.original_query.clone(),
+            goal_progress: self.goal_progress_snapshot(),
+            recent_queries: self.recent_queries.clone(),
+            compressed_turns: self.compressed_turns.clone(),
+            user_corrections: self.user_corrections.clone(),
+            context_traces: self.context_traces.clone(),
+            drift_min_severity_threshold: self.drift_detector.min_severity_threshold,
+            drift_analysis_window: self.drift_detector.analysis_window,
+            last_reported_drift_turn: self.last_reported_drift_turn,
+            last_query_at: self.last_query_at,
+        }
+    }
+
+    pub fn restore_rollback_snapshot(&mut self, snapshot: &ObservabilitySessionRollbackSnapshot) {
+        self.config = snapshot.config.clone();
+        self.original_query = snapshot.original_query.clone();
+        self.goal_tracker = snapshot
+            .goal_progress
+            .as_ref()
+            .map(GoalTracker::from_snapshot);
+        self.recent_queries = snapshot.recent_queries.clone();
+        self.compressed_turns = snapshot.compressed_turns.clone();
+        self.user_corrections = snapshot.user_corrections.clone();
+        self.context_traces = snapshot.context_traces.clone();
+        self.drift_detector = DriftDetector {
+            min_severity_threshold: snapshot.drift_min_severity_threshold,
+            analysis_window: snapshot.drift_analysis_window,
+        };
+        self.last_reported_drift_turn = snapshot.last_reported_drift_turn;
+        self.last_query_at = snapshot.last_query_at;
     }
 
     /// Restore goal-tracker state from workspace persistence.

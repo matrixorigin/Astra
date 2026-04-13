@@ -56,6 +56,7 @@ mod mo_tools;
 pub(crate) use git_gix::GitCommitRollbackJournal;
 pub(crate) use git_gix::GitStashRollbackJournal;
 pub(crate) use mo_tools::DatabaseSnapshotRollbackJournal;
+pub(crate) use session_state::SessionStateRollbackJournal;
 #[path = "edge_tools/passive_cargo_check.rs"]
 mod passive_cargo_check;
 #[path = "edge_tools/passive_lsp.rs"]
@@ -86,8 +87,11 @@ mod lsp_tools;
 mod notebook_edit;
 #[path = "edge_tools/self_mod_tools.rs"]
 mod self_mod_tools;
+#[path = "edge_tools/session_state.rs"]
+mod session_state;
 #[path = "edge_tools/task_mgmt.rs"]
 mod task_mgmt;
+pub(crate) use task_mgmt::TaskManager;
 #[path = "edge_tools/web_search.rs"]
 mod web_search;
 use file_state::FileState;
@@ -399,13 +403,17 @@ pub struct ToolExecutor {
     /// turn/batch rollback can remove them again while they are still clean.
     pub git_worktree_journal:
         std::sync::Arc<std::sync::Mutex<worktree::GitWorktreeRollbackJournal>>,
+    /// Session-state rollback journal — records bounded self-mod/task mutations so
+    /// same-turn rollback can restore prior in-memory session state.
+    session_state_journal:
+        std::sync::Arc<std::sync::Mutex<session_state::SessionStateRollbackJournal>>,
     /// Current turn index for file journal entries. Set externally per-turn.
     pub journal_turn_index: std::sync::atomic::AtomicU32,
     /// Active worktree session state. When set, `effective_project_root()` returns
     /// the worktree path instead of the original `project_root`.
     worktree_session: std::sync::Mutex<Option<WorktreeSession>>,
     /// In-memory task manager for the current session.
-    task_manager: task_mgmt::TaskManager,
+    task_manager: std::sync::Arc<task_mgmt::TaskManager>,
     /// Optional agent spawning context for the `spawn_agent` tool.
     pub spawn_context: Option<agent_spawning::SpawnAgentContext>,
     /// Optional shared context cache for cross-agent knowledge sharing.
@@ -482,9 +490,12 @@ impl ToolExecutor {
             git_worktree_journal: std::sync::Arc::new(std::sync::Mutex::new(
                 worktree::GitWorktreeRollbackJournal::default(),
             )),
+            session_state_journal: std::sync::Arc::new(std::sync::Mutex::new(
+                session_state::SessionStateRollbackJournal::default(),
+            )),
             journal_turn_index: std::sync::atomic::AtomicU32::new(0),
             worktree_session: std::sync::Mutex::new(None),
-            task_manager: task_mgmt::TaskManager::new(),
+            task_manager: std::sync::Arc::new(task_mgmt::TaskManager::new()),
             spawn_context: None,
             context_cache: None,
             agent_id: None,
@@ -594,6 +605,24 @@ impl ToolExecutor {
         self
     }
 
+    /// Use a shared session-state rollback journal (session-scoped) instead of the default.
+    pub fn with_shared_session_state_journal(
+        mut self,
+        journal: std::sync::Arc<std::sync::Mutex<session_state::SessionStateRollbackJournal>>,
+    ) -> Self {
+        self.session_state_journal = journal;
+        self
+    }
+
+    /// Use a shared task manager (session-scoped) instead of the default.
+    pub fn with_shared_task_manager(
+        mut self,
+        task_manager: std::sync::Arc<task_mgmt::TaskManager>,
+    ) -> Self {
+        self.task_manager = task_manager;
+        self
+    }
+
     /// Configure cloud proxy for memory tool calls.
     pub fn with_cloud(mut self, base: impl Into<String>, token: impl Into<String>) -> Self {
         self.cloud_base = Some(base.into());
@@ -604,7 +633,18 @@ impl ToolExecutor {
     // ─── Task management methods (delegated to task_mgmt module) ────────────
 
     async fn task_create(&self, args: &Value) -> String {
-        self.task_manager.create(args).await
+        let snapshot = self.task_manager.snapshot_state();
+        let output = self.task_manager.create(args).await;
+        if !output.starts_with("Error:") {
+            self.record_task_state_rollback(
+                snapshot,
+                format!(
+                    "task_create:{}",
+                    args.get("title").and_then(Value::as_str).unwrap_or("task")
+                ),
+            );
+        }
+        output
     }
     async fn task_list(&self, args: &Value) -> String {
         self.task_manager.list(args).await
@@ -613,10 +653,46 @@ impl ToolExecutor {
         self.task_manager.get(args).await
     }
     async fn task_update(&self, args: &Value) -> String {
-        self.task_manager.update(args).await
+        let snapshot = self.task_manager.snapshot_state();
+        let output = self.task_manager.update(args).await;
+        if !output.starts_with("Error:")
+            && serde_json::from_str::<Value>(&output)
+                .ok()
+                .and_then(|value| value.get("success").and_then(Value::as_bool))
+                .unwrap_or(false)
+        {
+            self.record_task_state_rollback(
+                snapshot,
+                format!(
+                    "task_update:{}",
+                    args.get("task_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("task")
+                ),
+            );
+        }
+        output
     }
     async fn task_stop(&self, args: &Value) -> String {
-        self.task_manager.stop(args).await
+        let snapshot = self.task_manager.snapshot_state();
+        let output = self.task_manager.stop(args).await;
+        if !output.starts_with("Error:")
+            && serde_json::from_str::<Value>(&output)
+                .ok()
+                .and_then(|value| value.get("success").and_then(Value::as_bool))
+                .unwrap_or(false)
+        {
+            self.record_task_state_rollback(
+                snapshot,
+                format!(
+                    "task_stop:{}",
+                    args.get("task_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("task")
+                ),
+            );
+        }
+        output
     }
 
     /// Sleep for a specified duration without holding a shell process.
@@ -869,6 +945,7 @@ impl ToolExecutor {
                 "write_file" => self.write_file(args),
                 "rollback_file_edits" => self.rollback_file_edits(args),
                 "rollback_database_snapshots" => self.rollback_database_snapshots(args),
+                "rollback_session_state" => self.rollback_session_state(args),
                 "rollback_turn_actions" => self.rollback_turn_actions(args),
                 "str_replace" => self.str_replace(args),
                 "delete_file" => self.delete_file(args),
@@ -1161,6 +1238,8 @@ impl ToolExecutor {
         let commit_checkpoint = rollback_on_failure.then(|| self.git_commit_journal_checkpoint());
         let worktree_checkpoint =
             rollback_on_failure.then(|| self.git_worktree_journal_checkpoint());
+        let session_state_checkpoint =
+            rollback_on_failure.then(|| self.session_state_journal_checkpoint());
         let steps = chain.steps.clone();
 
         Box::pin(async move {
@@ -1208,12 +1287,14 @@ impl ToolExecutor {
                             Some(stash_checkpoint),
                             Some(commit_checkpoint),
                             Some(worktree_checkpoint),
+                            Some(session_state_checkpoint),
                         ) = (
                             file_checkpoint,
                             database_checkpoint,
                             stash_checkpoint,
                             commit_checkpoint,
                             worktree_checkpoint,
+                            session_state_checkpoint,
                         ) {
                             let file_entries_added = self
                                 .file_journal_checkpoint()
@@ -1230,11 +1311,15 @@ impl ToolExecutor {
                             let worktree_entries_added = self
                                 .git_worktree_journal_checkpoint()
                                 .saturating_sub(worktree_checkpoint);
+                            let session_state_entries_added = self
+                                .session_state_journal_checkpoint()
+                                .saturating_sub(session_state_checkpoint);
                             if file_entries_added > 0
                                 || database_entries_added > 0
                                 || stash_entries_added > 0
                                 || commit_entries_added > 0
                                 || worktree_entries_added > 0
+                                || session_state_entries_added > 0
                             {
                                 let rollback_output =
                                     self.rollback_turn_actions(&serde_json::json!({
@@ -1245,6 +1330,7 @@ impl ToolExecutor {
                                         "stash_after_sequence": stash_checkpoint,
                                         "commit_after_sequence": commit_checkpoint,
                                         "worktree_after_sequence": worktree_checkpoint,
+                                        "session_state_after_sequence": session_state_checkpoint,
                                     }));
                                 rollback = Some(
                                     serde_json::from_str(&rollback_output).unwrap_or_else(

@@ -70,6 +70,8 @@ async fn stream_chat_sse_simple_text_response() {
         git_stash_journal: None,
         git_commit_journal: None,
         git_worktree_journal: None,
+        session_state_journal: None,
+        task_manager: None,
         turn_index: 0,
         evolution_service: None,
     })
@@ -158,6 +160,8 @@ async fn stream_chat_sse_reuses_persistent_root_mailbox_across_turns() {
             git_stash_journal: None,
             git_commit_journal: None,
             git_worktree_journal: None,
+            session_state_journal: None,
+            task_manager: None,
             turn_index: 0,
             evolution_service: None,
         })
@@ -240,6 +244,8 @@ async fn stream_chat_sse_unregisters_ephemeral_root_mailbox() {
         git_stash_journal: None,
         git_commit_journal: None,
         git_worktree_journal: None,
+        session_state_journal: None,
+        task_manager: None,
         turn_index: 0,
         evolution_service: None,
     })
@@ -350,6 +356,8 @@ async fn stream_chat_sse_api_error_propagated() {
         git_stash_journal: None,
         git_commit_journal: None,
         git_worktree_journal: None,
+        session_state_journal: None,
+        task_manager: None,
         turn_index: 0,
         evolution_service: None,
     })
@@ -434,6 +442,8 @@ async fn stream_chat_sse_with_tool_call_loop() {
         git_stash_journal: None,
         git_commit_journal: None,
         git_worktree_journal: None,
+        session_state_journal: None,
+        task_manager: None,
         turn_index: 0,
         evolution_service: None,
     })

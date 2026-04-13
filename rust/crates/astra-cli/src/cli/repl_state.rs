@@ -83,6 +83,12 @@ pub(crate) struct ReplState {
     /// bounded clean worktree cleanup across turns.
     pub git_worktree_journal:
         std::sync::Arc<std::sync::Mutex<crate::edge_tools::GitWorktreeRollbackJournal>>,
+    /// Session-scoped session-state rollback journal — shared with ToolExecutors for
+    /// bounded self-mod/task rollback across turns.
+    pub session_state_journal:
+        std::sync::Arc<std::sync::Mutex<crate::edge_tools::SessionStateRollbackJournal>>,
+    /// Session-scoped task manager so task mutations survive across turns.
+    pub task_manager: std::sync::Arc<crate::edge_tools::TaskManager>,
     /// Sticky task/thread summary used to anchor ultra-short follow-ups like
     /// "继续" even after history compaction prunes earlier turns.
     pub continuation_anchor: Option<String>,
@@ -312,6 +318,10 @@ impl Default for ReplState {
             git_worktree_journal: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::edge_tools::GitWorktreeRollbackJournal::default(),
             )),
+            session_state_journal: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::edge_tools::SessionStateRollbackJournal::default(),
+            )),
+            task_manager: std::sync::Arc::new(crate::edge_tools::TaskManager::new()),
             continuation_anchor: None,
             session_goal: None,
             pending_followup_suggestion: None,

@@ -142,6 +142,12 @@ pub(crate) struct ChatTurnParams<'a> {
     /// bounded clean worktree cleanup across turns.
     pub(crate) git_worktree_journal:
         Option<std::sync::Arc<std::sync::Mutex<crate::edge_tools::GitWorktreeRollbackJournal>>>,
+    /// Session-scoped session-state rollback journal — shared with ToolExecutors for
+    /// bounded self-mod/task rollback across turns.
+    pub(crate) session_state_journal:
+        Option<std::sync::Arc<std::sync::Mutex<crate::edge_tools::SessionStateRollbackJournal>>>,
+    /// Session-scoped task manager so task mutations survive across turns.
+    pub(crate) task_manager: Option<std::sync::Arc<crate::edge_tools::TaskManager>>,
     /// Current REPL turn number — used to tag journal entries for undo.
     pub(crate) turn_index: u32,
     /// Shared evolution service for multi-axis self-evolution.

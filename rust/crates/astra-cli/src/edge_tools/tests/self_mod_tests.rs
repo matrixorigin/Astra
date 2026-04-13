@@ -378,3 +378,120 @@ async fn get_agent_info_legacy_dimensions_alias_persistent_surfaces() {
     assert_eq!(parsed_state["run"]["session_id"], session_id);
     assert_eq!(parsed_all["run"]["session_id"], session_id);
 }
+
+#[tokio::test]
+async fn rollback_session_state_restores_self_mod_and_task_state() {
+    let (_tmp, _guard, exe, session, session_id) = executor_with_persisted_session();
+    exe.journal_turn_index
+        .store(7, std::sync::atomic::Ordering::Relaxed);
+
+    let original_top_k = session.read().unwrap().config.memory.retrieval_top_k;
+
+    let prioritize_out = exe
+        .execute("prioritize_tool", &json!({"tool": "bash"}))
+        .await;
+    let prioritize_json: Value = serde_json::from_str(&prioritize_out).unwrap();
+    assert_eq!(prioritize_json["status"], "ok");
+
+    let adjust_out = exe
+        .execute(
+            "adjust_config",
+            &json!({
+                "path": "memory.retrieval_top_k",
+                "value": original_top_k + 1
+            }),
+        )
+        .await;
+    let adjust_json: Value = serde_json::from_str(&adjust_out).unwrap();
+    assert_eq!(adjust_json["status"], "ok");
+
+    let goal_out = exe
+        .execute("set_goal", &json!({"goal": "Rollback this"}))
+        .await;
+    let goal_json: Value = serde_json::from_str(&goal_out).unwrap();
+    assert_eq!(goal_json["status"], "ok");
+
+    let task_out = exe
+        .execute("task_create", &json!({"title": "rollback task"}))
+        .await;
+    let task_json: Value = serde_json::from_str(&task_out).unwrap();
+    assert_eq!(task_json["success"], true);
+
+    let listed_before = exe.execute("task_list", &json!({})).await;
+    let listed_before_json: Value = serde_json::from_str(&listed_before).unwrap();
+    assert_eq!(listed_before_json["count"], 1);
+
+    let rollback_json: Value =
+        serde_json::from_str(&exe.rollback_session_state(&json!({"scope": "current_turn"})))
+            .unwrap();
+    assert_eq!(rollback_json["success"], true);
+    assert_eq!(
+        rollback_json["restored"]
+            .as_array()
+            .map(|entries| entries.len()),
+        Some(4)
+    );
+
+    let session_guard = session.read().unwrap();
+    assert_eq!(session_guard.config.memory.retrieval_top_k, original_top_k);
+    assert!(session_guard.goal_tracker.is_none());
+    drop(session_guard);
+
+    let self_model = exe.build_self_model_snapshot().unwrap();
+    assert!(self_model.capabilities.pinned_tools.is_empty());
+    assert!(self_model.capabilities.deprioritized_tools.is_empty());
+
+    let listed_after = exe.execute("task_list", &json!({})).await;
+    assert_eq!(listed_after, "No tasks found with status 'all'");
+
+    let ws = session_workspace::read_workspace(&session_id).unwrap();
+    assert!(ws.pinned_tools.is_empty());
+    assert!(ws.deprioritized_tools.is_empty());
+    assert!(ws.session_goal.is_none());
+}
+
+#[tokio::test]
+async fn shared_task_manager_and_session_state_journal_survive_across_executors() {
+    let shared_tasks = std::sync::Arc::new(TaskManager::new());
+    let shared_journal =
+        std::sync::Arc::new(std::sync::Mutex::new(SessionStateRollbackJournal::default()));
+
+    let exe_a = ToolExecutor::new(std::env::temp_dir())
+        .with_shared_task_manager(shared_tasks.clone())
+        .with_shared_session_state_journal(shared_journal.clone());
+    let exe_b = ToolExecutor::new(std::env::temp_dir())
+        .with_shared_task_manager(shared_tasks)
+        .with_shared_session_state_journal(shared_journal);
+
+    exe_a
+        .journal_turn_index
+        .store(11, std::sync::atomic::Ordering::Relaxed);
+    exe_b
+        .journal_turn_index
+        .store(11, std::sync::atomic::Ordering::Relaxed);
+
+    let create_out = exe_a
+        .execute("task_create", &json!({"title": "shared task"}))
+        .await;
+    let create_json: Value = serde_json::from_str(&create_out).unwrap();
+    assert_eq!(create_json["success"], true);
+
+    let listed_via_b = exe_b.execute("task_list", &json!({})).await;
+    let listed_via_b_json: Value = serde_json::from_str(&listed_via_b).unwrap();
+    assert_eq!(listed_via_b_json["count"], 1);
+
+    let rollback_json: Value = serde_json::from_str(
+        &exe_b.rollback_session_state(&json!({"scope": "turn", "turn_index": 11})),
+    )
+    .unwrap();
+    assert_eq!(rollback_json["success"], true);
+    assert_eq!(
+        rollback_json["restored"]
+            .as_array()
+            .map(|entries| entries.len()),
+        Some(1)
+    );
+
+    let listed_after = exe_a.execute("task_list", &json!({})).await;
+    assert_eq!(listed_after, "No tasks found with status 'all'");
+}
