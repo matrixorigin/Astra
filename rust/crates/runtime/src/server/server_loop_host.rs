@@ -1420,6 +1420,7 @@ mod tests {
             tool: "bash".to_string(),
             args: json!({"command": "echo hello"}),
             output: "hello\n".to_string(),
+            tool_result_fields: None,
             status: "ok".to_string(),
             duration_ms: 10,
         }];

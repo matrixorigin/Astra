@@ -4,6 +4,9 @@
 fn friendly_tool_name(tool_name: &str) -> &str {
     match tool_name {
         "read_file" | "view_file" => "Reading",
+        "rollback_database_snapshots" | "rollback_file_edits" | "rollback_turn_actions" => {
+            "Reverting"
+        }
         "write_file" | "create_file" => "Writing",
         "str_replace" | "multi_edit" => "Editing",
         "delete_file" => "Deleting",
@@ -214,6 +217,12 @@ mod tests {
     fn friendly_names_match_sse_rendering() {
         assert_eq!(friendly_tool_name("read_file"), "Reading");
         assert_eq!(friendly_tool_name("view_file"), "Reading");
+        assert_eq!(
+            friendly_tool_name("rollback_database_snapshots"),
+            "Reverting"
+        );
+        assert_eq!(friendly_tool_name("rollback_file_edits"), "Reverting");
+        assert_eq!(friendly_tool_name("rollback_turn_actions"), "Reverting");
         assert_eq!(friendly_tool_name("write_file"), "Writing");
         assert_eq!(friendly_tool_name("create_file"), "Writing");
         assert_eq!(friendly_tool_name("str_replace"), "Editing");

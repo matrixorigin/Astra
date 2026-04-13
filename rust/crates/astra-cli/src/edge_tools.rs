@@ -53,6 +53,7 @@ mod github;
 mod lsp_stdio_session;
 #[path = "edge_tools/mo_tools.rs"]
 mod mo_tools;
+pub(crate) use mo_tools::DatabaseSnapshotRollbackJournal;
 #[path = "edge_tools/passive_cargo_check.rs"]
 mod passive_cargo_check;
 #[path = "edge_tools/passive_lsp.rs"]
@@ -233,6 +234,21 @@ fn normalize_empty_output(output: String, tool_name: &str) -> String {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ToolExecutionOutcome {
+    pub output: String,
+    pub tool_result_fields: Option<serde_json::Map<String, Value>>,
+}
+
+impl ToolExecutionOutcome {
+    fn text(output: String) -> Self {
+        Self {
+            output,
+            tool_result_fields: None,
+        }
+    }
+}
+
 /// Parse a grep output line to extract the file path and line number.
 /// Handles format: `file:line:content` or `file:line:col:content`.
 fn parse_grep_file_line(line: &str) -> Option<(&str, usize)> {
@@ -366,6 +382,10 @@ pub struct ToolExecutor {
     /// Wrapped in Arc so the REPL session can share the journal across turns.
     pub file_journal:
         std::sync::Arc<std::sync::Mutex<astra_runtime::turn::file_edit_journal::FileEditJournal>>,
+    /// MatrixOne snapshot journal — records captured pre-state snapshots so the
+    /// executor can perform a bounded restore without reconstructing tool history.
+    pub database_snapshot_journal:
+        std::sync::Arc<std::sync::Mutex<mo_tools::DatabaseSnapshotRollbackJournal>>,
     /// Current turn index for file journal entries. Set externally per-turn.
     pub journal_turn_index: std::sync::atomic::AtomicU32,
     /// Active worktree session state. When set, `effective_project_root()` returns
@@ -436,6 +456,9 @@ impl ToolExecutor {
             mcp_manager: None,
             file_journal: std::sync::Arc::new(std::sync::Mutex::new(
                 astra_runtime::turn::file_edit_journal::FileEditJournal::default(),
+            )),
+            database_snapshot_journal: std::sync::Arc::new(std::sync::Mutex::new(
+                mo_tools::DatabaseSnapshotRollbackJournal::default(),
             )),
             journal_turn_index: std::sync::atomic::AtomicU32::new(0),
             worktree_session: std::sync::Mutex::new(None),
@@ -510,6 +533,15 @@ impl ToolExecutor {
         >,
     ) -> Self {
         self.file_journal = journal;
+        self
+    }
+
+    /// Use a shared MatrixOne snapshot journal (session-scoped) instead of the default.
+    pub fn with_shared_database_snapshot_journal(
+        mut self,
+        journal: std::sync::Arc<std::sync::Mutex<mo_tools::DatabaseSnapshotRollbackJournal>>,
+    ) -> Self {
+        self.database_snapshot_journal = journal;
         self
     }
 
@@ -729,6 +761,24 @@ impl ToolExecutor {
         self
     }
 
+    fn finalize_tool_output(&self, output: String, name: &str) -> String {
+        let output = normalize_empty_output(output, name);
+        let output = truncate_output(output, global_output_limit());
+        self.maybe_persist_large_output(output, name)
+    }
+
+    pub async fn execute_with_metadata(&self, name: &str, args: &Value) -> ToolExecutionOutcome {
+        if name == "mo_query" {
+            let mut outcome = self.mo_query_with_metadata(args);
+            let output = self.finalize_tool_output(outcome.output, name);
+            self.record_output_size(output.len());
+            outcome.output = output;
+            return outcome;
+        }
+
+        ToolExecutionOutcome::text(self.execute(name, args).await)
+    }
+
     pub async fn execute(&self, name: &str, args: &Value) -> String {
         let output = if let Err(error) =
             crate::tool_safety_guard::ToolSafetyGuard::check_dispatch(name, args)
@@ -740,6 +790,9 @@ impl ToolExecutor {
                 "powershell" => self.powershell(args),
                 "read_file" => self.read_file(args),
                 "write_file" => self.write_file(args),
+                "rollback_file_edits" => self.rollback_file_edits(args),
+                "rollback_database_snapshots" => self.rollback_database_snapshots(args),
+                "rollback_turn_actions" => self.rollback_turn_actions(args),
                 "str_replace" => self.str_replace(args),
                 "delete_file" => self.delete_file(args),
                 "multi_edit" => self.multi_edit(args),
@@ -912,9 +965,7 @@ impl ToolExecutor {
             }
         };
         // Normalize empty output, then apply global safety net
-        let output = normalize_empty_output(output, name);
-        let output = truncate_output(output, global_output_limit());
-        let output = self.maybe_persist_large_output(output, name);
+        let output = self.finalize_tool_output(output, name);
         self.record_output_size(output.len());
         output
     }
@@ -1021,11 +1072,19 @@ impl ToolExecutor {
         }
 
         let chain_name = chain.name.clone();
+        let rollback_on_failure = chain.rollback_on_failure;
+        let rollback_turn_index = self
+            .journal_turn_index
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let file_checkpoint = rollback_on_failure.then(|| self.file_journal_checkpoint());
+        let database_checkpoint =
+            rollback_on_failure.then(|| self.database_snapshot_journal_checkpoint());
         let steps = chain.steps.clone();
 
         Box::pin(async move {
             let mut ctx = ChainContext::new(input);
             let mut step_results = Vec::new();
+            let mut rollback = None;
 
             for (idx, step) in steps.iter().enumerate() {
                 if ctx.should_skip(step) {
@@ -1060,18 +1119,59 @@ impl ToolExecutor {
                 }));
 
                 if is_err {
+                    if rollback_on_failure {
+                        if let (Some(file_checkpoint), Some(database_checkpoint)) =
+                            (file_checkpoint, database_checkpoint)
+                        {
+                            let file_entries_added = self
+                                .file_journal_checkpoint()
+                                .saturating_sub(file_checkpoint);
+                            let database_entries_added = self
+                                .database_snapshot_journal_checkpoint()
+                                .saturating_sub(database_checkpoint);
+                            if file_entries_added > 0 || database_entries_added > 0 {
+                                let rollback_output =
+                                    self.rollback_turn_actions(&serde_json::json!({
+                                        "scope": "turn",
+                                        "turn_index": rollback_turn_index,
+                                        "file_after_sequence": file_checkpoint,
+                                        "database_after_sequence": database_checkpoint,
+                                    }));
+                                rollback = Some(
+                                    serde_json::from_str(&rollback_output).unwrap_or_else(
+                                        |error| {
+                                            serde_json::json!({
+                                                "success": false,
+                                                "error": format!("invalid rollback_turn_actions output: {error}"),
+                                                "raw_output": rollback_output,
+                                            })
+                                        },
+                                    ),
+                                );
+                            }
+                        }
+                    }
                     break;
                 }
             }
 
-            serde_json::json!({
-                "chain": chain_name,
-                "steps_executed": step_results.len(),
-                "steps_total": steps.len(),
-                "final_output": truncate_output(ctx.prev_output, 8192),
-                "steps": step_results,
-            })
-            .to_string()
+            let mut result = serde_json::Map::from_iter([
+                ("chain".to_string(), serde_json::json!(chain_name)),
+                (
+                    "steps_executed".to_string(),
+                    serde_json::json!(step_results.len()),
+                ),
+                ("steps_total".to_string(), serde_json::json!(steps.len())),
+                (
+                    "final_output".to_string(),
+                    serde_json::json!(truncate_output(ctx.prev_output, 8192)),
+                ),
+                ("steps".to_string(), serde_json::json!(step_results)),
+            ]);
+            if let Some(rollback) = rollback {
+                result.insert("rollback".to_string(), rollback);
+            }
+            Value::Object(result).to_string()
         })
     }
 

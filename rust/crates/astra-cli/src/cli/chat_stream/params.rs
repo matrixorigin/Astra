@@ -125,6 +125,11 @@ pub(crate) struct ChatTurnParams<'a> {
     pub(crate) file_journal: Option<
         std::sync::Arc<std::sync::Mutex<astra_runtime::turn::file_edit_journal::FileEditJournal>>,
     >,
+    /// Session-scoped MatrixOne snapshot journal — shared with ToolExecutors for
+    /// bounded database rollback support across turns.
+    pub(crate) database_snapshot_journal: Option<
+        std::sync::Arc<std::sync::Mutex<crate::edge_tools::DatabaseSnapshotRollbackJournal>>,
+    >,
     /// Current REPL turn number — used to tag journal entries for undo.
     pub(crate) turn_index: u32,
     /// Shared evolution service for multi-axis self-evolution.

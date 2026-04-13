@@ -66,6 +66,7 @@ async fn stream_chat_sse_simple_text_response() {
         observability_hub: None,
         observability_session: None,
         file_journal: None,
+        database_snapshot_journal: None,
         turn_index: 0,
         evolution_service: None,
     })
@@ -150,6 +151,7 @@ async fn stream_chat_sse_reuses_persistent_root_mailbox_across_turns() {
             observability_hub: None,
             observability_session: None,
             file_journal: None,
+            database_snapshot_journal: None,
             turn_index: 0,
             evolution_service: None,
         })
@@ -228,6 +230,7 @@ async fn stream_chat_sse_unregisters_ephemeral_root_mailbox() {
         observability_hub: None,
         observability_session: None,
         file_journal: None,
+        database_snapshot_journal: None,
         turn_index: 0,
         evolution_service: None,
     })
@@ -334,6 +337,7 @@ async fn stream_chat_sse_api_error_propagated() {
         observability_hub: None,
         observability_session: None,
         file_journal: None,
+        database_snapshot_journal: None,
         turn_index: 0,
         evolution_service: None,
     })
@@ -414,6 +418,7 @@ async fn stream_chat_sse_with_tool_call_loop() {
         observability_hub: None,
         observability_session: None,
         file_journal: None,
+        database_snapshot_journal: None,
         turn_index: 0,
         evolution_service: None,
     })

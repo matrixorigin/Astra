@@ -38,11 +38,15 @@ pub enum EditType {
     Overwrite,
     /// Existing file was patched in-place (str_replace).
     Patch,
+    /// Existing file was deleted.
+    Delete,
 }
 
 /// A single file edit recorded by the journal.
 #[derive(Debug, Clone)]
 pub struct FileEditEntry {
+    /// Monotonic sequence number assigned when the entry is recorded.
+    sequence: u64,
     /// Absolute path of the edited file.
     pub path: PathBuf,
     /// Agentic loop turn index when the edit occurred.
@@ -51,7 +55,7 @@ pub struct FileEditEntry {
     pub timestamp: SystemTime,
     /// Content before the edit. `None` if the file didn't exist (Create).
     pub before_content: Option<Vec<u8>>,
-    /// Content after the edit.
+    /// Content after the edit. Empty for deletions.
     pub after_content: Vec<u8>,
     /// Tool call ID that triggered this edit.
     pub tool_call_id: String,
@@ -78,6 +82,7 @@ pub struct UndoResult {
 pub struct FileEditJournal {
     entries: VecDeque<FileEditEntry>,
     max_entries: usize,
+    next_sequence: u64,
 }
 
 impl FileEditJournal {
@@ -86,6 +91,7 @@ impl FileEditJournal {
         Self {
             entries: VecDeque::with_capacity(max_entries.min(1024)),
             max_entries,
+            next_sequence: 0,
         }
     }
 
@@ -102,6 +108,7 @@ impl FileEditJournal {
         };
 
         self.push(FileEditEntry {
+            sequence: 0,
             path: path.to_owned(),
             turn_index,
             timestamp: SystemTime::now(),
@@ -134,6 +141,7 @@ impl FileEditJournal {
     pub fn record_before_patch(&mut self, path: &Path, tool_call_id: &str, turn_index: u32) {
         let before_content = std::fs::read(path).ok();
         self.push(FileEditEntry {
+            sequence: 0,
             path: path.to_owned(),
             turn_index,
             timestamp: SystemTime::now(),
@@ -141,6 +149,26 @@ impl FileEditJournal {
             after_content: Vec::new(),
             tool_call_id: tool_call_id.to_string(),
             edit_type: EditType::Patch,
+        });
+    }
+
+    /// Record a successful file deletion with the deleted file's prior content.
+    pub fn record_delete(
+        &mut self,
+        path: &Path,
+        tool_call_id: &str,
+        turn_index: u32,
+        before_content: Vec<u8>,
+    ) {
+        self.push(FileEditEntry {
+            sequence: 0,
+            path: path.to_owned(),
+            turn_index,
+            timestamp: SystemTime::now(),
+            before_content: Some(before_content),
+            after_content: Vec::new(),
+            tool_call_id: tool_call_id.to_string(),
+            edit_type: EditType::Delete,
         });
     }
 
@@ -159,6 +187,11 @@ impl FileEditJournal {
 
     /// Revert ALL file edits from a specific turn (in reverse chronological order).
     pub fn undo_turn(&self, turn_index: u32) -> UndoResult {
+        self.undo_turn_since(turn_index, 0)
+    }
+
+    /// Revert file edits from a specific turn recorded at or after a checkpoint.
+    pub fn undo_turn_since(&self, turn_index: u32, checkpoint: u64) -> UndoResult {
         let mut result = UndoResult {
             reverted: Vec::new(),
             failed: Vec::new(),
@@ -168,7 +201,7 @@ impl FileEditJournal {
             .entries
             .iter()
             .rev()
-            .filter(|e| e.turn_index == turn_index)
+            .filter(|e| e.turn_index == turn_index && e.sequence >= checkpoint)
             .collect();
 
         for entry in turn_entries {
@@ -178,6 +211,11 @@ impl FileEditJournal {
             }
         }
         result
+    }
+
+    /// Return a checkpoint token for future turn-scoped rollback filtering.
+    pub fn checkpoint(&self) -> u64 {
+        self.next_sequence
     }
 
     /// Number of entries currently in the journal.
@@ -209,7 +247,9 @@ impl FileEditJournal {
 
     // ── Internals ────────────────────────────────────────────────────────────
 
-    fn push(&mut self, entry: FileEditEntry) {
+    fn push(&mut self, mut entry: FileEditEntry) {
+        entry.sequence = self.next_sequence;
+        self.next_sequence = self.next_sequence.saturating_add(1);
         if self.entries.len() >= self.max_entries {
             self.entries.pop_front(); // evict oldest
         }
@@ -326,6 +366,7 @@ mod tests {
         for i in 0..5 {
             let path = PathBuf::from(format!("/tmp/test_{i}.txt"));
             journal.push(FileEditEntry {
+                sequence: 0,
                 path,
                 turn_index: i,
                 timestamp: SystemTime::now(),
@@ -345,6 +386,7 @@ mod tests {
         let mut journal = FileEditJournal::new(100);
         let push = |j: &mut FileEditJournal, path: &str, turn: u32| {
             j.push(FileEditEntry {
+                sequence: 0,
                 path: PathBuf::from(path),
                 turn_index: turn,
                 timestamp: SystemTime::now(),
@@ -372,5 +414,46 @@ mod tests {
         journal.record_before_patch(&file, "call-p", 0);
 
         assert_eq!(journal.entries.back().unwrap().edit_type, EditType::Patch);
+    }
+
+    #[test]
+    fn record_and_undo_delete() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("gone.txt");
+        std::fs::write(&file, "restore me").unwrap();
+
+        let mut journal = FileEditJournal::new(100);
+        let before = std::fs::read(&file).unwrap();
+        std::fs::remove_file(&file).unwrap();
+        journal.record_delete(&file, "call-d", 2, before);
+
+        assert!(!file.exists());
+
+        let result = journal.undo_file(&file).unwrap();
+        assert_eq!(result, Some(EditType::Delete));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "restore me");
+    }
+
+    #[test]
+    fn undo_turn_since_only_reverts_entries_after_checkpoint() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("test.txt");
+        std::fs::write(&file, "original").unwrap();
+
+        let mut journal = FileEditJournal::new(100);
+        journal.record_before(&file, "call-1", 4);
+        std::fs::write(&file, "first").unwrap();
+        journal.record_after(&file, "call-1", b"first");
+
+        let checkpoint = journal.checkpoint();
+
+        journal.record_before(&file, "call-2", 4);
+        std::fs::write(&file, "second").unwrap();
+        journal.record_after(&file, "call-2", b"second");
+
+        let result = journal.undo_turn_since(4, checkpoint);
+        assert_eq!(result.reverted.len(), 1);
+        assert!(result.failed.is_empty());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "first");
     }
 }

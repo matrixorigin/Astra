@@ -101,6 +101,11 @@ pub(crate) async fn stream_chat_sse(
         } else {
             ex
         };
+        let ex = if let Some(ref journal) = p.database_snapshot_journal {
+            ex.with_shared_database_snapshot_journal(journal.clone())
+        } else {
+            ex
+        };
         // Set turn index so journal entries are tagged for undo
         ex.journal_turn_index
             .store(p.turn_index, std::sync::atomic::Ordering::Relaxed);

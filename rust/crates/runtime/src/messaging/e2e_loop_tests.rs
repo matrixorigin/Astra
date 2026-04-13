@@ -422,6 +422,7 @@ mod tests {
             tool: "bash".into(),
             args: json!({"command": "echo hello"}),
             output: "hello".into(),
+            tool_result_fields: None,
             status: "ok".into(),
             duration_ms: 5,
         }];
@@ -477,6 +478,7 @@ mod tests {
             tool: "read_file".into(),
             args: json!({"path": "/tmp/x.txt"}),
             output: "content".into(),
+            tool_result_fields: None,
             status: "ok".into(),
             duration_ms: 5,
         }];
@@ -973,6 +975,7 @@ mod tests {
             tool: "grep".to_string(),
             args: json!({"pattern": "TODO"}),
             output: "src/main.rs:10: // TODO fix".to_string(),
+            tool_result_fields: None,
             status: "ok".to_string(),
             duration_ms: 50,
         }];

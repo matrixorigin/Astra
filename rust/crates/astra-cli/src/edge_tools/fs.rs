@@ -6,6 +6,15 @@ fn is_unc_path(path: &str) -> bool {
     path.starts_with("\\\\") || path.starts_with("//")
 }
 
+fn edit_type_label(edit_type: astra_runtime::turn::file_edit_journal::EditType) -> &'static str {
+    match edit_type {
+        astra_runtime::turn::file_edit_journal::EditType::Create => "create",
+        astra_runtime::turn::file_edit_journal::EditType::Overwrite => "overwrite",
+        astra_runtime::turn::file_edit_journal::EditType::Patch => "patch",
+        astra_runtime::turn::file_edit_journal::EditType::Delete => "delete",
+    }
+}
+
 /// Check if a path is a dangerous/sensitive file that should warn the user.
 pub(crate) fn is_dangerous_write_target(rel_path: &str) -> Option<&'static str> {
     const DANGEROUS_FILES: &[(&str, &str)] = &[
@@ -1001,12 +1010,417 @@ impl ToolExecutor {
             return format!("Error: file not found: {}", rel_str);
         }
 
+        let before_content = match fs::read(&path) {
+            Ok(content) => content,
+            Err(error) => return format!("Error reading file before delete: {error}"),
+        };
+        let turn_idx = self
+            .journal_turn_index
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let journal_call_id = format!("delete_file:{}", path.display());
+
         match fs::remove_file(&path) {
             Ok(_) => {
                 self.remove_file_state(&path);
+                match self.file_journal.lock() {
+                    Ok(mut journal) => {
+                        journal.record_delete(&path, &journal_call_id, turn_idx, before_content)
+                    }
+                    Err(poisoned) => poisoned.into_inner().record_delete(
+                        &path,
+                        &journal_call_id,
+                        turn_idx,
+                        before_content,
+                    ),
+                }
                 format!("Deleted: {}", rel_str)
             }
             Err(e) => format!("Error deleting file: {e}"),
+        }
+    }
+
+    fn rollback_display_path(&self, path: &Path) -> String {
+        path.strip_prefix(&self.project_root)
+            .unwrap_or(path)
+            .display()
+            .to_string()
+    }
+
+    fn parse_rollback_tool_output(tool_name: &str, output: String) -> Value {
+        serde_json::from_str(&output).unwrap_or_else(|error| {
+            json!({
+                "success": false,
+                "error": format!("invalid {tool_name} output: {error}"),
+                "raw_output": output,
+            })
+        })
+    }
+
+    fn refresh_rolled_back_file_state(&self, path: &Path) {
+        if path.exists() {
+            match read_to_string_lossy(path) {
+                Ok(content) => self.record_write_with_content(path, &content),
+                Err(_) => self.record_write(path),
+            }
+        } else {
+            self.remove_file_state(path);
+        }
+    }
+
+    pub(crate) fn file_journal_checkpoint(&self) -> u64 {
+        match self.file_journal.lock() {
+            Ok(journal) => journal.checkpoint(),
+            Err(poisoned) => poisoned.into_inner().checkpoint(),
+        }
+    }
+
+    pub(crate) fn rollback_turn_actions(&self, args: &Value) -> String {
+        let scope = args
+            .get("scope")
+            .and_then(Value::as_str)
+            .unwrap_or("current_turn");
+        let explicit_turn_index = if scope == "turn" {
+            match args.get("turn_index").and_then(Value::as_u64) {
+                Some(turn_index) => Some(turn_index),
+                None => {
+                    return json!({
+                        "success": false,
+                        "error": "missing 'turn_index' for scope=turn",
+                    })
+                    .to_string();
+                }
+            }
+        } else {
+            None
+        };
+
+        match scope {
+            "list" => {
+                let file_result = Self::parse_rollback_tool_output(
+                    "rollback_file_edits",
+                    self.rollback_file_edits(args),
+                );
+                let database_result = Self::parse_rollback_tool_output(
+                    "rollback_database_snapshots",
+                    self.rollback_database_snapshots(args),
+                );
+                let file_entries = file_result
+                    .get("entries")
+                    .cloned()
+                    .unwrap_or_else(|| Value::Array(Vec::new()));
+                let database_entries = database_result
+                    .get("entries")
+                    .cloned()
+                    .unwrap_or_else(|| Value::Array(Vec::new()));
+                let total_file_entries = file_result
+                    .get("total_entries")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_else(|| {
+                        file_entries
+                            .as_array()
+                            .map(|entries| entries.len() as u64)
+                            .unwrap_or(0)
+                    });
+                let total_database_entries = database_result
+                    .get("total_entries")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_else(|| {
+                        database_entries
+                            .as_array()
+                            .map(|entries| entries.len() as u64)
+                            .unwrap_or(0)
+                    });
+                json!({
+                    "success": file_result.get("success").and_then(Value::as_bool).unwrap_or(false)
+                        && database_result.get("success").and_then(Value::as_bool).unwrap_or(false),
+                    "scope": "list",
+                    "total_file_entries": total_file_entries,
+                    "total_database_entries": total_database_entries,
+                    "file_entries": file_entries,
+                    "database_entries": database_entries,
+                    "files": file_result,
+                    "database_snapshots": database_result,
+                    "summary": format!(
+                        "Listed {total_file_entries} file rollback entr{} and {total_database_entries} database snapshot entr{}",
+                        if total_file_entries == 1 { "y" } else { "ies" },
+                        if total_database_entries == 1 { "y" } else { "ies" }
+                    ),
+                })
+                .to_string()
+            }
+            "turn" | "current_turn" => {
+                let database_result = Self::parse_rollback_tool_output(
+                    "rollback_database_snapshots",
+                    self.rollback_database_snapshots(args),
+                );
+                let file_result = Self::parse_rollback_tool_output(
+                    "rollback_file_edits",
+                    self.rollback_file_edits(args),
+                );
+                let turn_index = database_result
+                    .get("turn_index")
+                    .and_then(Value::as_u64)
+                    .or_else(|| file_result.get("turn_index").and_then(Value::as_u64))
+                    .or(explicit_turn_index)
+                    .unwrap_or_else(|| {
+                        self.journal_turn_index
+                            .load(std::sync::atomic::Ordering::Relaxed)
+                            as u64
+                    });
+                let reverted_files = file_result
+                    .get("reverted")
+                    .cloned()
+                    .unwrap_or_else(|| Value::Array(Vec::new()));
+                let restored_snapshots = database_result
+                    .get("restored")
+                    .cloned()
+                    .unwrap_or_else(|| Value::Array(Vec::new()));
+                let failed_file_rollbacks = file_result
+                    .get("failed")
+                    .cloned()
+                    .unwrap_or_else(|| Value::Array(Vec::new()));
+                let failed_database_rollbacks = database_result
+                    .get("failed")
+                    .cloned()
+                    .unwrap_or_else(|| Value::Array(Vec::new()));
+                let reverted_file_count = reverted_files
+                    .as_array()
+                    .map(|entries| entries.len())
+                    .unwrap_or(0);
+                let restored_snapshot_count = restored_snapshots
+                    .as_array()
+                    .map(|entries| entries.len())
+                    .unwrap_or(0);
+                let failed_file_count = failed_file_rollbacks
+                    .as_array()
+                    .map(|entries| entries.len())
+                    .unwrap_or(0);
+                let failed_database_count = failed_database_rollbacks
+                    .as_array()
+                    .map(|entries| entries.len())
+                    .unwrap_or(0);
+                let success = reverted_file_count + restored_snapshot_count > 0
+                    && failed_file_count + failed_database_count == 0;
+                let summary = if reverted_file_count + restored_snapshot_count == 0 {
+                    format!("No recorded rollback actions found for turn {turn_index}")
+                } else if failed_file_count + failed_database_count == 0 {
+                    format!(
+                        "Rolled back {reverted_file_count} file edit{} and {restored_snapshot_count} database snapshot{} from turn {turn_index}",
+                        if reverted_file_count == 1 { "" } else { "s" },
+                        if restored_snapshot_count == 1 {
+                            ""
+                        } else {
+                            "s"
+                        }
+                    )
+                } else {
+                    format!(
+                        "Rolled back {reverted_file_count} file edit{} and {restored_snapshot_count} database snapshot{} from turn {turn_index} with {} failure{}",
+                        if reverted_file_count == 1 { "" } else { "s" },
+                        if restored_snapshot_count == 1 {
+                            ""
+                        } else {
+                            "s"
+                        },
+                        failed_file_count + failed_database_count,
+                        if failed_file_count + failed_database_count == 1 {
+                            ""
+                        } else {
+                            "s"
+                        }
+                    )
+                };
+                json!({
+                    "success": success,
+                    "scope": scope,
+                    "turn_index": turn_index,
+                    "reverted_files": reverted_files,
+                    "restored_database_snapshots": restored_snapshots,
+                    "failed_file_rollbacks": failed_file_rollbacks,
+                    "failed_database_rollbacks": failed_database_rollbacks,
+                    "files": file_result,
+                    "database_snapshots": database_result,
+                    "summary": summary,
+                })
+                .to_string()
+            }
+            other => json!({
+                "success": false,
+                "error": format!(
+                    "invalid 'scope': {other} (expected one of current_turn, turn, list)"
+                ),
+            })
+            .to_string(),
+        }
+    }
+
+    pub(crate) fn rollback_file_edits(&self, args: &Value) -> String {
+        let scope = args
+            .get("scope")
+            .and_then(Value::as_str)
+            .or_else(|| {
+                if args.get("path").is_some() {
+                    Some("file")
+                } else {
+                    None
+                }
+            })
+            .unwrap_or("current_turn");
+
+        match scope {
+            "list" => {
+                let summary = match self.file_journal.lock() {
+                    Ok(journal) => journal.summary(),
+                    Err(poisoned) => poisoned.into_inner().summary(),
+                };
+                let entries: Vec<Value> = summary
+                    .into_iter()
+                    .map(|(path, turn_index, edit_type)| {
+                        json!({
+                            "path": self.rollback_display_path(&path),
+                            "turn_index": turn_index,
+                            "edit_type": edit_type_label(edit_type),
+                        })
+                    })
+                    .collect();
+                json!({
+                    "success": true,
+                    "scope": "list",
+                    "total_entries": entries.len(),
+                    "entries": entries,
+                })
+                .to_string()
+            }
+            "file" => {
+                let raw_path = match args.get("path").and_then(Value::as_str) {
+                    Some(path) => path,
+                    None => {
+                        return json!({
+                            "success": false,
+                            "error": "missing 'path' for scope=file",
+                        })
+                        .to_string();
+                    }
+                };
+                let path = match self.resolve_checked(raw_path) {
+                    Ok(path) => path,
+                    Err(error) => return error,
+                };
+                let undo_result = match self.file_journal.lock() {
+                    Ok(journal) => journal.undo_file(&path),
+                    Err(poisoned) => poisoned.into_inner().undo_file(&path),
+                };
+                match undo_result {
+                    Ok(Some(edit_type)) => {
+                        self.refresh_rolled_back_file_state(&path);
+                        json!({
+                            "success": true,
+                            "scope": "file",
+                            "path": self.rollback_display_path(&path),
+                            "edit_type": edit_type_label(edit_type),
+                            "summary": format!(
+                                "Rolled back the latest recorded edit for {}",
+                                self.rollback_display_path(&path)
+                            ),
+                        })
+                        .to_string()
+                    }
+                    Ok(None) => json!({
+                        "success": false,
+                        "scope": "file",
+                        "path": self.rollback_display_path(&path),
+                        "error": "no recorded file edit found for that path",
+                    })
+                    .to_string(),
+                    Err(error) => json!({
+                        "success": false,
+                        "scope": "file",
+                        "path": self.rollback_display_path(&path),
+                        "error": error.to_string(),
+                    })
+                    .to_string(),
+                }
+            }
+            "turn" | "current_turn" => {
+                let turn_index = if scope == "turn" {
+                    match args.get("turn_index").and_then(Value::as_u64) {
+                        Some(turn_index) => turn_index as u32,
+                        None => {
+                            return json!({
+                                "success": false,
+                                "error": "missing 'turn_index' for scope=turn",
+                            })
+                            .to_string();
+                        }
+                    }
+                } else {
+                    self.journal_turn_index
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                };
+                let checkpoint = args
+                    .get("file_after_sequence")
+                    .or_else(|| args.get("after_sequence"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let result = match self.file_journal.lock() {
+                    Ok(journal) => journal.undo_turn_since(turn_index, checkpoint),
+                    Err(poisoned) => poisoned
+                        .into_inner()
+                        .undo_turn_since(turn_index, checkpoint),
+                };
+                for path in &result.reverted {
+                    self.refresh_rolled_back_file_state(path);
+                }
+                let reverted: Vec<String> = result
+                    .reverted
+                    .iter()
+                    .map(|path| self.rollback_display_path(path))
+                    .collect();
+                let failed: Vec<Value> = result
+                    .failed
+                    .iter()
+                    .map(|(path, error)| {
+                        json!({
+                            "path": self.rollback_display_path(path),
+                            "error": error,
+                        })
+                    })
+                    .collect();
+                let success = !reverted.is_empty() && failed.is_empty();
+                let summary = if reverted.is_empty() {
+                    format!("No recorded file edits found for turn {turn_index}")
+                } else if failed.is_empty() {
+                    format!(
+                        "Rolled back {} file edit{} from turn {turn_index}",
+                        reverted.len(),
+                        if reverted.len() == 1 { "" } else { "s" }
+                    )
+                } else {
+                    format!(
+                        "Rolled back {} file edit{} from turn {turn_index} with {} failure{}",
+                        reverted.len(),
+                        if reverted.len() == 1 { "" } else { "s" },
+                        failed.len(),
+                        if failed.len() == 1 { "" } else { "s" }
+                    )
+                };
+                json!({
+                    "success": success,
+                    "scope": scope,
+                    "turn_index": turn_index,
+                    "reverted": reverted,
+                    "failed": failed,
+                    "summary": summary,
+                })
+                .to_string()
+            }
+            other => json!({
+                "success": false,
+                "error": format!(
+                    "invalid 'scope': {other} (expected one of current_turn, turn, file, list)"
+                ),
+            })
+            .to_string(),
         }
     }
 
@@ -3162,6 +3576,29 @@ type Handler interface {
         let result = exe.delete_file(&json!({"path": "victim.txt"}));
         assert!(result.starts_with("Deleted:"), "result: {result}");
         assert!(!file.exists());
+    }
+
+    #[test]
+    fn delete_file_rollback_restores_file() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let file = tmpdir.path().join("victim.txt");
+        std::fs::write(&file, "restore me").unwrap();
+        let exe = ToolExecutor::new(tmpdir.path().to_path_buf());
+        exe.journal_turn_index
+            .store(7, std::sync::atomic::Ordering::Relaxed);
+
+        let result = exe.delete_file(&json!({"path": "victim.txt"}));
+        assert!(result.starts_with("Deleted:"), "result: {result}");
+        assert!(!file.exists());
+
+        let rollback = exe.rollback_file_edits(&json!({
+            "scope": "file",
+            "path": "victim.txt"
+        }));
+        let parsed: Value = serde_json::from_str(&rollback).unwrap();
+        assert_eq!(parsed["success"], true, "rollback: {rollback}");
+        assert_eq!(parsed["edit_type"], "delete", "rollback: {rollback}");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "restore me");
     }
 
     #[test]

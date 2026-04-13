@@ -512,17 +512,39 @@ fn build_hook_db_persist_from_payload(
                 .map(ToString::to_string)
         })
         .collect::<Vec<_>>();
-    let tool_verification_summaries = object_array_maps(hook_payload, "tool_results")
-        .into_iter()
-        .filter_map(|tool_result| {
-            let tool_call_id = tool_result
-                .get("tool_call_id")
-                .and_then(serde_json::Value::as_str)
-                .filter(|id| !id.is_empty())?;
-            let summary = tool_verification_summary_from_tool_result(&tool_result)?;
-            Some((tool_call_id.to_string(), summary))
-        })
-        .collect::<std::collections::HashMap<_, _>>();
+    let tool_results = object_array_maps(hook_payload, "tool_results");
+    let mut tool_verification_summaries = std::collections::HashMap::new();
+    let mut tool_pre_state_snapshots = std::collections::HashMap::new();
+    let mut tool_pre_state_snapshot_databases = std::collections::HashMap::new();
+    for tool_result in tool_results {
+        let Some(tool_call_id) = tool_result
+            .get("tool_call_id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|id| !id.is_empty())
+            .map(ToString::to_string)
+        else {
+            continue;
+        };
+
+        if let Some(summary) = tool_verification_summary_from_tool_result(&tool_result) {
+            tool_verification_summaries.insert(tool_call_id.clone(), summary);
+        }
+        if let Some(snapshot_id) = tool_result
+            .get("pre_state_snapshot_id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|snapshot_id| !snapshot_id.is_empty())
+        {
+            tool_pre_state_snapshots.insert(tool_call_id.clone(), snapshot_id.to_string());
+        }
+        if let Some(database) = tool_result
+            .get("pre_state_snapshot_database")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|database| !database.is_empty())
+        {
+            tool_pre_state_snapshot_databases.insert(tool_call_id, database.to_string());
+        }
+    }
     let turn_verification_summary = hook_payload
         .get("turn_count")
         .and_then(serde_json::Value::as_i64)
@@ -559,14 +581,42 @@ fn build_hook_db_persist_from_payload(
                 ("arguments".to_string(), arguments),
                 ("profile".to_string(), profile),
             ]);
-            if let Some(tool_call_id) = tool_call_id.as_str()
-                && let Some(summary) = tool_verification_summaries.get(tool_call_id)
-            {
-                action_profile.insert("verifier".to_string(), summary.clone());
-                action_profile.insert(
-                    "verifier_source".to_string(),
-                    serde_json::Value::String("tool_result".to_string()),
-                );
+            if let Some(tool_call_id) = tool_call_id.as_str() {
+                if let Some(snapshot_id) = tool_pre_state_snapshots.get(tool_call_id) {
+                    action_profile.insert(
+                        "pre_state_snapshot_id".to_string(),
+                        serde_json::Value::String(snapshot_id.clone()),
+                    );
+                    if let Some(database) = tool_pre_state_snapshot_databases.get(tool_call_id) {
+                        action_profile.insert(
+                            "pre_state_snapshot_database".to_string(),
+                            serde_json::Value::String(database.clone()),
+                        );
+                    }
+                }
+                if let Some(summary) = tool_verification_summaries.get(tool_call_id) {
+                    action_profile.insert("verifier".to_string(), summary.clone());
+                    action_profile.insert(
+                        "verifier_source".to_string(),
+                        serde_json::Value::String("tool_result".to_string()),
+                    );
+                } else if let Some(summary) = turn_verification_summary.as_ref() {
+                    action_profile.insert("verifier".to_string(), summary.clone());
+                    action_profile.insert(
+                        "verifier_source".to_string(),
+                        serde_json::Value::String("turn_journal".to_string()),
+                    );
+                } else {
+                    let verifier_gap = if tool_calls.len() > 1 {
+                        "ambiguous_multi_action_turn"
+                    } else {
+                        "no_verifier_signal"
+                    };
+                    action_profile.insert(
+                        "verifier_gap".to_string(),
+                        serde_json::Value::String(verifier_gap.to_string()),
+                    );
+                }
             } else if let Some(summary) = turn_verification_summary.as_ref() {
                 action_profile.insert("verifier".to_string(), summary.clone());
                 action_profile.insert(
@@ -2522,6 +2572,42 @@ mod inprocess_hook_contract_tests {
         ))
     }
 
+    fn build_hook_payload_with_mo_query_snapshot() -> Value {
+        let messages = vec![json!({"role": "user", "content": "update the database"})];
+        let tool_results: Vec<Value> = vec![json!({
+            "tool_call_id": "call-1",
+            "name": "mo_query",
+            "result": "OK (no results)",
+            "pre_state_snapshot_id": "moq_snap_123",
+            "pre_state_snapshot_database": "analytics"
+        })];
+        let tool_calls = vec![json!({
+            "id": "call-1",
+            "function": {
+                "name": "mo_query",
+                "arguments": "{\"sql\": \"UPDATE metrics SET value = 1\", \"database\": \"analytics\"}"
+            }
+        })];
+        Value::Object(build_turn_hook_args(
+            "user-1",
+            "session-1",
+            &messages,
+            &tool_results,
+            "Updated the database row.",
+            &tool_calls,
+            None,
+            Some("gpt-4"),
+            Some("agent-1"),
+            Some("evt-query-snapshot"),
+            4,
+            None,
+            false,
+            true,
+            true,
+            true,
+        ))
+    }
+
     fn build_hook_payload_with_single_tool_and_no_verifier(turn: i64) -> Value {
         let messages = vec![json!({"role": "user", "content": "run the command"})];
         let tool_results: Vec<Value> = vec![json!({
@@ -2735,6 +2821,47 @@ mod inprocess_hook_contract_tests {
         assert_eq!(
             audit.decision_output["action_profiles"][0]["verifier_source"],
             json!("tool_result")
+        );
+    }
+
+    #[tokio::test]
+    async fn hook_persists_pre_state_snapshot_id_on_action_profile() {
+        let hook_writer = RecordingHookDbWriter::default();
+        let reflection_store = RecordingReflectionStateStore::default();
+        let lesson_writer = RecordingReflectionLessonWriter::default();
+        let observer = RecordingObserverWorker::default();
+
+        run_bridge_hook_side_effects(
+            Some(build_hook_payload_with_mo_query_snapshot()),
+            Arc::new(hook_writer.clone()),
+            Arc::new(reflection_store),
+            Arc::new(lesson_writer),
+            Arc::new(observer),
+            None,
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let plans = hook_writer.plans.lock().await;
+        let audit = plans[0]
+            .decision_audit
+            .as_ref()
+            .expect("decision_audit missing");
+        assert_eq!(
+            audit.decision_output["action_profiles"][0]["tool_name"],
+            "mo_query"
+        );
+        assert_eq!(
+            audit.decision_output["action_profiles"][0]["pre_state_snapshot_id"],
+            "moq_snap_123"
+        );
+        assert_eq!(
+            audit.decision_output["action_profiles"][0]["pre_state_snapshot_database"],
+            "analytics"
+        );
+        assert_eq!(
+            audit.decision_output["action_profiles"][0]["profile"]["requires_pre_state"],
+            true
         );
     }
 

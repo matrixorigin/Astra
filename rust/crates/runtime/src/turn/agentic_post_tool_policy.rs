@@ -12,6 +12,7 @@ use super::stall::{
     CLI_AGENTIC_VERDICT_REMAINING_PENALTY_CRITICAL, CLI_AGENTIC_VERDICT_REMAINING_PENALTY_WARNING,
     IntentDrift, detect_intent_drift,
 };
+use super::tool_call_shape::{tool_call_arguments_value, tool_call_name};
 use super::turn_guard::{TurnGuard, VerdictSeverity};
 use crate::pipeline::step_checkpoint;
 use crate::pipeline::step_protocol::StepCheckpoint;
@@ -91,14 +92,11 @@ pub fn apply_agentic_post_tool_policy(
     {
         let turn_names: Vec<String> = tool_calls_for_guard
             .iter()
-            .filter_map(|tc| tc.get("name").and_then(|v| v.as_str()).map(String::from))
+            .filter_map(|tc| tool_call_name(tc).map(String::from))
             .collect();
         let turn_args_text: String = tool_calls_for_guard
             .iter()
-            .filter_map(|tc| {
-                tc.get("arguments")
-                    .map(|v| serde_json::to_string(v).unwrap_or_default())
-            })
+            .map(|tc| serde_json::to_string(&tool_call_arguments_value(tc)).unwrap_or_default())
             .collect::<Vec<_>>()
             .join(" ");
         intent_tool_turns.push((turn_names, turn_args_text));
@@ -332,5 +330,50 @@ mod tests {
                 .avoid_tools
                 .contains(&"read_file".to_string())
         );
+    }
+
+    #[test]
+    fn canonical_tool_call_shape_feeds_intent_tracking() {
+        let mut intent_tool_turns = Vec::new();
+        let mut messages = Vec::new();
+        let mut stall_events = Vec::new();
+        let mut verdict_events = Vec::new();
+        let mut restricted_tools = HashSet::new();
+        let mut remaining_turns = 10usize;
+        let mut step_recorder = StepRecorder::with_persistence("sid", "tid");
+        let mut last_heavy_checkpoint: Option<StepCheckpoint> = None;
+        let mut turn_guard = TurnGuard::new();
+        let tool_calls = vec![json!({
+            "id": "call_1",
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "arguments": "{\"command\":\"ls\"}"
+            }
+        })];
+
+        let out = apply_agentic_post_tool_policy(AgenticPostToolPolicyRequest {
+            turn_index: 0,
+            message: "list the files",
+            tool_calls_for_guard: &tool_calls,
+            intent_tool_turns: &mut intent_tool_turns,
+            messages: &mut messages,
+            stall_events: &mut stall_events,
+            turn_guard: &mut turn_guard,
+            verdict_events: &mut verdict_events,
+            restricted_tools: &mut restricted_tools,
+            remaining_turns: &mut remaining_turns,
+            step_recorder: &mut step_recorder,
+            current_session_id: None,
+            max_turns: 8,
+            loop_turn: 0,
+            recent_tools: &[],
+            last_heavy_checkpoint: &mut last_heavy_checkpoint,
+        });
+
+        assert_eq!(out, AgenticPostToolPolicyOutcome::ProceedEndTurn);
+        assert_eq!(intent_tool_turns.len(), 1);
+        assert_eq!(intent_tool_turns[0].0, vec!["bash".to_string()]);
+        assert!(intent_tool_turns[0].1.contains("\"command\":\"ls\""));
     }
 }

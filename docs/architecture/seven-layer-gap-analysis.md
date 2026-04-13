@@ -33,6 +33,7 @@
 - **CausalChain** (`services/events.rs`, `data_versioning.rs`): `causal_chain_id` on every agent event; `get_causal_chain()` and `trace_upstream()` queries.
 - **JournalEvent system** (`services/session_journal.rs`): ~20 event types (tool_call, goal_steered, drift_detected, etc.) with structured payloads.
 - **DecisionTrace** (`astra-thin-client/paths.rs:53`): `/chat/session/{id}/decision-trace` API endpoint.
+- **Versioned, buffered stream-event envelope** (`runtime/src/bridge/sse_events.rs`, `runtime/src/bridge/mod.rs`): bridge/SSE events now pick up a shared `protocol_version` envelope plus monotonic per-stream `sequence` values, durable `event_id`s, and turn/query correlation metadata (`turn_chain_id`, `user_query_event_id`) at the shared render choke point. The runtime also maintains a bounded in-memory replay window per trusted session/turn/query scope, persists a bounded set of complete and incomplete trusted replay windows per session+scope as a cross-process fallback, and can splice a persisted incomplete suffix ahead of a successfully resumed live stream while locally suppressing duplicate upstream frames.
 - **StartupTracer** (`astra-cli/startup_trace.rs`): Phase-based startup timing.
 - **BridgeHealthMetrics** (`runtime/improvement_proofs`): p99 latency, degradation detection.
 - **RoutingMetrics** (`turn/routing_metrics.rs`): ConfidenceCalibrator, DisambiguationAction, precision/recall metrics.
@@ -42,6 +43,7 @@
 - **No entity-relation evidence links**: DriftEvidence exists for drift only; no general-purpose evidence attachment to arbitrary decisions.
 - **Metrics not schema-aligned**: BridgeHealthMetrics are ad-hoc structs; no schema registry linking metrics to State Layer types.
 - **No structured metric aggregation pipeline**: Metrics are computed locally; no streaming aggregation or windowed rollups.
+- **Persisted replay coverage is still bounded**: recent complete and incomplete trusted stream suffixes can now survive a process restart, incomplete suffixes can be reused across request-send failures, circuit-breaker failures, retryable non-SSE pre-stream failures, and successful live splices, and the bridge now advances the forwarded upstream `Last-Event-ID` header to the persisted splice cursor when that suffix is reused. The remaining bound is that only a limited suffix window is retained, while explicit client/protocol failures still surface as errors instead of replay.
 
 ### Priority Actions
 1. Design `EvidenceGraph` with typed nodes (Decision, Observation, Outcome) and edges (causes, supports, contradicts).
@@ -58,20 +60,27 @@
 - **Tool allowlist**: Inherited permissions can restrict child agents to specific tool sets.
 - **Sandbox checkpointing** (`data_versioning.rs:SandboxCheckpointData`): Checkpoint before risky operations.
 - **Action compensation profiles** (`runtime/src/turn/action_compensation.rs`): Typed bounded/reversible/manual rollback metadata now captures action category, pre-state requirements, and compensation kind per tool.
+- **File-edit compensation executor** (`astra-cli/src/edge_tools/fs.rs`, `runtime/src/turn/file_edit_journal.rs`): `rollback_file_edits` now exposes a bounded compensation action over the shared file-edit journal, so current-turn or file-scoped `write_file` / `str_replace` / `multi_edit` changes can be actively reverted instead of only described in metadata, and `delete_file` now records bounded pre-state in that same journal so deleted files can be restored through the same rollback surface.
 - **Staged mutation contract** (`services/src/mutation_scoreboard.rs`): `MutationCompensationPolicy`, `StagedMutation`, and staged states (`pending/ready/applied/reverted/blocked`) now provide one canonical apply/rollback coordination contract.
+- **MatrixOne bounded rollback executor** (`astra-cli/src/edge_tools/mo_tools.rs`, `runtime/src/bridge/side_effects.rs`, `services/src/mutation_scoreboard.rs`): mutating `mo_query` calls now auto-capture a pre-state snapshot, record it in a shared session snapshot journal, persist `pre_state_snapshot_id` plus database metadata onto action profiles, and surface a concrete `rollback_database_snapshots` executor hint instead of a purely generic database compensation summary.
+- **Turn-scoped rollback orchestration** (`astra-cli/src/edge_tools/fs.rs`, `runtime/src/turn/action_compensation.rs`): `rollback_turn_actions` now composes the shared file-edit journal and MatrixOne snapshot journal under one bounded turn-scoped executor, so mixed file/database turns can be reverted through a single tool call and compensation hints can point at a unified rollback surface.
+- **Opt-in chain failure rollback** (`astra-cli/src/edge_tools.rs`, `runtime/src/tool_registry/chain.rs`, `runtime/src/turn/file_edit_journal.rs`): `run_chain` now accepts `rollback_on_failure`, captures file/database journal checkpoints at chain start, and automatically invokes bounded rollback for side effects recorded inside that chain when a later step fails.
+- **Explicit batched transaction rollback** (`astra-cli/src/cli/stream_render.rs`, `astra-cli/src/edge_tools/schemas.rs`): contiguous batched tool calls can now opt into shared `transaction_id` + `rollback_on_failure` boundaries, forcing deterministic in-order execution and reusing `rollback_turn_actions` plus journal checkpoints to unwind bounded file/database mutations when a later transaction-marked call fails. That boundary now includes `delete_file` alongside the earlier journaled file-edit tools.
+- **Durable replay checkpoints and live splicing** (`runtime/src/bridge/mod.rs`): bridge replay windows now persist bounded incomplete scopes as checkpointed suffixes, request-send failures / circuit-breaker failures / retryable non-SSE pre-stream failures can replay the latest durable mid-turn suffix after a matching `Last-Event-ID`, and successful reconnects can splice that persisted incomplete suffix ahead of new upstream events while both forwarding an upgraded upstream `Last-Event-ID` cursor and filtering duplicates from the live tail.
 - **Mutation lifecycle writeback** (`services/src/session_audit.rs`, `runtime/src/server/audit_handlers.rs`): per-session mutation audits can now record `applied` / `reverted` / `blocked` lifecycle transitions via `mutation_state` events, so staged mutation status is operationally writable instead of read-only.
 - **Symlink safety** (`session_checkpoint.rs:97`): Path traversal protection.
 
 ### Gaps
-- **No automatic compensation executor**: Compensation metadata exists, but no live runner automatically captures pre-state, applies canaries, or executes rollback on failure.
+- **No generalized automatic compensation executor**: bounded file writes/patches now have a live `rollback_file_edits` runner backed by the shared undo journal, MatrixOne writes now have a live `rollback_database_snapshots` runner backed by a shared session snapshot journal, mixed file/database turns now have a live `rollback_turn_actions` runner, and both `run_chain` plus explicit batched transactions can opt into bounded rollback on failure, but broader turn-level compensation is still not automatic by default.
 - **Bash is unbounded**: `bash` tool allows arbitrary code execution — directly violates "finite action space" requirement.
 - **No action registry**: Tools are discovered dynamically; there's no compile-time exhaustive enumeration of all possible actions.
-- **No transactional tool execution**: Multi-tool turns are not atomic — partial failures leave inconsistent state.
-- **Rollback execution is still manual**: CompositeSnapshot and staged mutation metadata exist, but there is no automatic "compensation on failure" mechanism yet.
+- **Transactional tool execution is still narrow and opt-in**: explicit batched transaction boundaries now exist, but only when calls share transaction metadata and only bounded file/database journals can be unwound automatically.
+- **Durable replay remains intentionally selective**: retryable non-SSE pre-stream failures now reuse durable incomplete suffixes, but explicit client/protocol failures still normalize to bridge error SSE and the replay window remains a bounded suffix rather than a full turn reconstruction log.
+- **Rollback orchestration is still narrow**: staged mutation metadata plus `rollback_turn_actions` can now coordinate bounded file/database rollback for one recorded turn, `run_chain` can opt into chain-local automatic recovery, and batched tool calls can opt into explicit transaction rollback, but there is still no default rollback-on-failure policy or coverage for non-file/non-database action classes.
 
 ### Priority Actions
-1. Define `CompensationAction` trait: every `ToolImpl` optionally provides `compensate(context) → Result`.
-2. Implement transaction boundaries for multi-tool turns with automatic rollback on failure.
+1. Extend bounded rollback coverage beyond the current journaled file/database action classes only where additional actions can prove safe recovery semantics.
+2. Decide whether any remaining explicit bridge client/protocol failure modes should stay as surfaced errors or consume durable replay as well.
 
 ---
 
@@ -178,6 +187,8 @@
 - **Shared SafetyMiddleware preflight** (`turn/safety_middleware.rs`, `tool_safety_guard.rs`): Centralized request-time guard chain now screens destructive SQL and prompt-injection-style shell obfuscation before live edge tool execution.
 - **Learning-boundary causal support gate** (`pipeline/learning.rs`, `turn/contracts.rs`): Trusted-success reinforcement now requires corroborating tool-result/quality evidence, and suspicious high-quality turns are damped instead of blindly reinforcing entity/pattern learning.
 - **Runtime reward-hacking throttle** (`turn/stall.rs`, `turn/turn_guard.rs`, `turn/agentic_post_tool_policy.rs`): high-risk repetitive or exploration-only tool batches now trigger a live `TurnGuard` warning, retry the LLM with an explicit correction, and temporarily restrict the repeated tools instead of only damping downstream learning updates.
+- **Legacy bridge guard reuse** (`turn/bridge_inprocess.rs`): the backward-compatible `/chat/turn` and `/chat/stream` in-process loop now thinly reuses the shared stall preflight plus post-tool policy, so old bridge traffic also inherits live reward-hacking/stall nudges and next-round tool-schema restriction instead of bypassing the shell entirely.
+- **Tool-output prompt-injection sanitization** (`turn/safety_middleware.rs`, `turn/tool_result_sanitize.rs`, `turn/cloud_tool_delivery.rs`, `turn/agentic_headless_round.rs`, `turn/agentic_loop_host.rs`): suspicious prompt-like lines are now stripped before tool outputs re-enter model context across edge-ledger delivery, standard headless tool rounds, pre-resolved tool results, and delegated-result summaries. Raw edge-ledger SSE/persisted payloads stay intact for user visibility and forensics.
 - **Permission gating**: Three-tier permission model with inherited restrictions.
 - **Stall detection** (`stall.rs`): Detects repeated identical tool calls, empty-name bursts.
 - **Symlink safety, path validation**: Guards against path traversal attacks.
@@ -188,7 +199,7 @@
 - **No model parameter drift detection**: System detects behavioral drift but not weight/embedding drift in fine-tuned models.
 - **Anti-hallucinated causality is heuristic-only**: The learning boundary now requires corroborating tool evidence, but it still lacks lineage-backed causal inference and richer cross-turn validation against spurious correlations.
 - **No adversarial testing framework**: No red-team/fuzzing infrastructure for systematically probing safety boundaries.
-- **Middleware is still thin**: Centralized guards currently cover request-time SQL/shell preflight, but post-tool validation and broader adversarial guard expansion are still scattered.
+- **Middleware is still thin**: Centralized guards now cover request-time SQL/shell preflight, legacy-bridge reuse of the shared post-tool guard, and prompt-injection stripping across the main tool-result-to-model paths, but richer post-tool validation (beyond prompt-like line stripping) plus broader adversarial guard expansion are still scattered.
 
 ### Priority Actions
 1. Expand centralized `SafetyMiddleware` beyond request-time preflight into broader post-tool/output validation.
@@ -202,7 +213,7 @@
 |-------|----------|--------------------|-------------|
 | 1. State | ⬛⬛⬛⬜⬜ 60% | CompositeSnapshot 5D | No diff/merge/revert |
 | 2. Observation | ⬛⬛⬛⬜⬜ 55% | CausalChain + JournalEvents | Linear chains, no graph |
-| 3. Action | ⬛⬛⬜⬜⬜ 45% | Permission 3-tier model + compensation profiles | No automatic rollback executor |
+| 3. Action | ⬛⬛⬛⬜⬜ 55% | Permission 3-tier model + partial compensation executors | No generalized automatic rollback |
 | 4. Evaluation | ⬛⬛⬛⬛⬜ 86% | EvaluationService + MutationScoreboard | Export parity + partial CI/noise coverage |
 | 5. Credit | ⬛⬜⬜⬜⬜ 25% | causal_chain_id on events | No diff-based scoring |
 | 6. Search | ⬛⬛⬜⬜⬜ 35% | SchedulingContract + TeamOrch | No proposal diversity |

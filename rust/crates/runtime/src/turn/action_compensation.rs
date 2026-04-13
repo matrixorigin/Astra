@@ -149,6 +149,54 @@ fn file_target_summary(path: Option<&str>) -> String {
         .unwrap_or_else(|| "the target file".to_string())
 }
 
+fn rollback_file_tool_scope_hint(path: Option<&str>) -> String {
+    path.filter(|path| !path.is_empty())
+        .map(|path| format!("call `rollback_file_edits` with scope=`file` and path=`{path}`"))
+        .unwrap_or_else(|| {
+            "call `rollback_file_edits` with scope=`file` and the target path".to_string()
+        })
+}
+
+fn rollback_turn_tool_scope_hint() -> &'static str {
+    "use `rollback_turn_actions` with scope=`current_turn` to revert mixed file/database changes from the same turn"
+}
+
+fn restore_file_compensation_summary(path: Option<&str>, delete_if_created: bool) -> String {
+    let target = file_target_summary(path);
+    if delete_if_created {
+        format!(
+            "{} to restore prior contents for {} or delete it if this write created the file; alternatively, {}",
+            rollback_file_tool_scope_hint(path),
+            target,
+            rollback_turn_tool_scope_hint()
+        )
+    } else {
+        format!(
+            "{} to restore prior contents for {}; alternatively, {}",
+            rollback_file_tool_scope_hint(path),
+            target,
+            rollback_turn_tool_scope_hint()
+        )
+    }
+}
+
+fn delete_created_file_compensation_summary(path: Option<&str>) -> String {
+    format!(
+        "{} to delete {}",
+        rollback_file_tool_scope_hint(path),
+        file_target_summary(path)
+    )
+}
+
+fn restore_deleted_file_compensation_summary(path: Option<&str>) -> String {
+    format!(
+        "{} to restore deleted contents for {}; alternatively, {}",
+        rollback_file_tool_scope_hint(path),
+        file_target_summary(path),
+        rollback_turn_tool_scope_hint()
+    )
+}
+
 fn shell_action_profile(command: Option<&str>) -> ActionCompensationProfile {
     let Some(command) = command.filter(|command| !command.trim().is_empty()) else {
         return ActionCompensationProfile::manual(
@@ -230,7 +278,10 @@ fn sql_action_profile(args: &Value) -> ActionCompensationProfile {
             ActionCategory::Write,
             true,
             CompensationKind::RestoreDatabaseSnapshot,
-            "restore affected data from a MatrixOne snapshot captured before execution".to_string(),
+            format!(
+                "call `rollback_database_snapshots` with scope=`current_turn` during the turn, or scope=`snapshot` with the captured snapshot_id, to restore affected data; alternatively, {}",
+                rollback_turn_tool_scope_hint()
+            ),
         ),
         Some("DROP" | "DELETE" | "TRUNCATE" | "ALTER" | "GRANT" | "REVOKE") => {
             ActionCompensationProfile::compensated(
@@ -238,8 +289,10 @@ fn sql_action_profile(args: &Value) -> ActionCompensationProfile {
                 ActionCategory::Destructive,
                 true,
                 CompensationKind::RestoreDatabaseSnapshot,
-                "restore affected objects from a MatrixOne snapshot captured before execution"
-                    .to_string(),
+                format!(
+                    "call `rollback_database_snapshots` with scope=`current_turn` during the turn, or scope=`snapshot` with the captured snapshot_id, to restore affected objects; alternatively, {}",
+                    rollback_turn_tool_scope_hint()
+                ),
             )
         }
         _ if args
@@ -252,8 +305,10 @@ fn sql_action_profile(args: &Value) -> ActionCompensationProfile {
                 ActionCategory::Destructive,
                 true,
                 CompensationKind::RestoreDatabaseSnapshot,
-                "restore affected objects from a MatrixOne snapshot captured before execution"
-                    .to_string(),
+                format!(
+                    "call `rollback_database_snapshots` with scope=`current_turn` during the turn, or scope=`snapshot` with the captured snapshot_id, to restore affected objects; alternatively, {}",
+                    rollback_turn_tool_scope_hint()
+                ),
             )
         }
         _ => ActionCompensationProfile::read(true),
@@ -268,30 +323,38 @@ pub fn tool_action_profile(tool_name: &str, args: &Value) -> ActionCompensationP
             ActionCategory::Write,
             false,
             CompensationKind::DeleteFile,
-            format!(
-                "delete {}",
-                file_target_summary(string_arg(&normalized_args, "path"))
-            ),
+            delete_created_file_compensation_summary(string_arg(&normalized_args, "path")),
+        ),
+        "delete_file" => ActionCompensationProfile::compensated(
+            true,
+            ActionCategory::Destructive,
+            true,
+            CompensationKind::RestoreFileContents,
+            restore_deleted_file_compensation_summary(string_arg(&normalized_args, "path")),
         ),
         "write_file" => ActionCompensationProfile::compensated(
             true,
             ActionCategory::Write,
             true,
             CompensationKind::RestoreOrDeleteFile,
-            format!(
-                "restore prior contents for {} or delete it if this write created the file",
-                file_target_summary(string_arg(&normalized_args, "path"))
-            ),
+            restore_file_compensation_summary(string_arg(&normalized_args, "path"), true),
         ),
-        "edit_file" | "str_replace" => ActionCompensationProfile::compensated(
+        "edit_file" | "multi_edit" | "str_replace" => ActionCompensationProfile::compensated(
             true,
             ActionCategory::Write,
             true,
             CompensationKind::RestoreFileContents,
-            format!(
-                "restore prior contents for {}",
-                file_target_summary(string_arg(&normalized_args, "path"))
-            ),
+            restore_file_compensation_summary(string_arg(&normalized_args, "path"), false),
+        ),
+        "rollback_database_snapshots" => ActionCompensationProfile::manual(
+            true,
+            ActionCategory::Destructive,
+            "database snapshot restore mutates state; capture a fresh snapshot first if you may need to undo the rollback",
+        ),
+        "rollback_turn_actions" => ActionCompensationProfile::manual(
+            true,
+            ActionCategory::Destructive,
+            "turn rollback can mutate both workspace files and database state; capture fresh recovery points first if you may need to undo the rollback",
         ),
         "bash" | "exec" | "run_command" | "shell" => {
             shell_action_profile(string_arg(&normalized_args, "command"))
@@ -360,7 +423,7 @@ mod tests {
                 .compensation_summary
                 .as_deref()
                 .unwrap_or_default()
-                .contains("src/lib.rs")
+                .contains("rollback_file_edits")
         );
     }
 
@@ -373,6 +436,69 @@ mod tests {
             profile.compensation_kind,
             Some(CompensationKind::DeleteFile)
         );
+        assert!(
+            profile
+                .compensation_summary
+                .as_deref()
+                .unwrap_or_default()
+                .contains("rollback_file_edits")
+        );
+    }
+
+    #[test]
+    fn multi_edit_uses_file_restore_compensation() {
+        let profile = tool_action_profile("multi_edit", &json!({"path": "src/lib.rs"}));
+        assert_eq!(profile.category, ActionCategory::Write);
+        assert!(profile.requires_pre_state);
+        assert_eq!(
+            profile.compensation_kind,
+            Some(CompensationKind::RestoreFileContents)
+        );
+        assert!(
+            profile
+                .compensation_summary
+                .as_deref()
+                .unwrap_or_default()
+                .contains("rollback_file_edits")
+        );
+    }
+
+    #[test]
+    fn delete_file_uses_file_restore_compensation() {
+        let profile = tool_action_profile("delete_file", &json!({"path": "src/lib.rs"}));
+        assert!(profile.bounded);
+        assert_eq!(profile.category, ActionCategory::Destructive);
+        assert!(profile.reversible);
+        assert!(profile.requires_pre_state);
+        assert_eq!(
+            profile.compensation_kind,
+            Some(CompensationKind::RestoreFileContents)
+        );
+        assert!(
+            profile
+                .compensation_summary
+                .as_deref()
+                .unwrap_or_default()
+                .contains("rollback_file_edits")
+        );
+    }
+
+    #[test]
+    fn rollback_database_snapshots_is_destructive_manual() {
+        let profile = tool_action_profile("rollback_database_snapshots", &json!({}));
+        assert_eq!(profile.category, ActionCategory::Destructive);
+        assert!(!profile.requires_pre_state);
+        assert!(!profile.reversible);
+        assert_eq!(profile.compensation_kind, Some(CompensationKind::Manual));
+    }
+
+    #[test]
+    fn rollback_turn_actions_is_destructive_manual() {
+        let profile = tool_action_profile("rollback_turn_actions", &json!({}));
+        assert_eq!(profile.category, ActionCategory::Destructive);
+        assert!(!profile.requires_pre_state);
+        assert!(!profile.reversible);
+        assert_eq!(profile.compensation_kind, Some(CompensationKind::Manual));
     }
 
     #[test]

@@ -1020,6 +1020,7 @@ async fn plan_executor_task(
                     observability_hub: None,
                     observability_session: None,
                     file_journal: None,
+                    database_snapshot_journal: None,
                     turn_index: 0,
                     evolution_service: None,
                 })

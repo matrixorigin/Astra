@@ -312,6 +312,34 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
     .await?;
 
     query(
+        "CREATE TABLE IF NOT EXISTS agent_session_replay_windows (
+            session_id VARCHAR(36) PRIMARY KEY,
+            scope_key VARCHAR(255) NOT NULL,
+            replay_window_json LONGTEXT NOT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            INDEX idx_agent_session_replay_windows_scope (scope_key),
+            INDEX idx_agent_session_replay_windows_updated (updated_at)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    query(
+        "CREATE TABLE IF NOT EXISTS agent_session_replay_scope_windows (
+            session_id VARCHAR(36) NOT NULL,
+            scope_key VARCHAR(255) NOT NULL,
+            replay_window_json LONGTEXT NOT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (session_id, scope_key),
+            INDEX idx_agent_session_replay_scope_windows_updated (updated_at)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    query(
         "CREATE TABLE IF NOT EXISTS agent_events (
             event_id VARCHAR(36) PRIMARY KEY,
             session_id VARCHAR(36) NOT NULL,

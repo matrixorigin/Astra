@@ -44,6 +44,7 @@ pub struct EdgeToolExecResult {
     pub tool: String,
     pub args: Value,
     pub output: String,
+    pub tool_result_fields: Option<serde_json::Map<String, Value>>,
     /// Semantic label: `"ok"`, `"error"`, etc.
     pub status: String,
     pub duration_ms: u64,
@@ -58,6 +59,9 @@ impl crate::turn::headless_tool_assembly::EdgeToolRoundRow for EdgeToolExecResul
     }
     fn tool_output(&self) -> &str {
         &self.output
+    }
+    fn tool_result_fields(&self) -> Option<&serde_json::Map<String, Value>> {
+        self.tool_result_fields.as_ref()
     }
     fn tool_duration_ms(&self) -> u64 {
         self.duration_ms
@@ -127,7 +131,6 @@ pub fn is_tool_concurrency_safe(tool: &str) -> bool {
             | "reflect"
             | "web_fetch"
             | "web_search"
-            | "mo_query"
             | "share_context"
             | "query_context"
             // ── GitHub read-only (async — benefits from join_all) ─────
@@ -500,6 +503,7 @@ impl SseStreamHost for NoopSseStreamHost {
             tool: tool.to_string(),
             args: args.clone(),
             output: "headless: tool execution not supported".to_string(),
+            tool_result_fields: None,
             status: "error".to_string(),
             duration_ms: 0,
         }
@@ -573,6 +577,7 @@ impl SseStreamHost for RecordingSseStreamHost {
             tool: tool.to_string(),
             args: args.clone(),
             output,
+            tool_result_fields: None,
             status: "ok".to_string(),
             duration_ms: 1,
         }
@@ -1255,6 +1260,7 @@ mod tests {
                     tool: tool.to_string(),
                     args: args.clone(),
                     output: format!("ok-{tool}"),
+                    tool_result_fields: None,
                     status: "ok".to_string(),
                     duration_ms: 1,
                 }

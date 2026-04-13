@@ -13,9 +13,10 @@
 /// # Legacy Status
 ///
 /// This module implements the **old-style cloud tool loop** (its own `for round_ix..`
-/// loop inside `stream!`). It does NOT use [`run_agentic_loop_with_host`], meaning
-/// stall detection, post-tool policy, semantic dedup, and step recording are **absent**
-/// from this path.
+/// loop inside `stream!`). It does NOT use [`run_agentic_loop_with_host`], so semantic
+/// dedup and full step recording are still absent here. Legacy `/chat/turn` and
+/// `/chat/stream` now thinly reuse the shared TurnGuard / post-tool-policy shell so
+/// they no longer bypass runtime stall and tool-restriction controls entirely.
 ///
 /// **Preferred replacement**: Use [`super::loop_dispatcher::LoopDispatcher`] with
 /// [`ServerAgenticLoopHost`](crate::server::server_loop_host::ServerAgenticLoopHost)
@@ -30,7 +31,12 @@
 ///     x-mo-user-id, x-mo-session-id, x-mo-turn-chain-id, x-mo-user-query-event-id, ...
 ///   This bridge reads those headers, calls the LLM, streams SSE back, persists events, and
 ///   for each tool round blocks on [`super::edge_ledger`] until `POST /tools/result` (or timeout).
-use std::{collections::HashMap, future::Future, sync::Arc, time::Instant};
+use std::{
+    collections::{HashMap, HashSet},
+    future::Future,
+    sync::Arc,
+    time::Instant,
+};
 
 use async_stream::stream;
 use axum::body::Body;
@@ -52,7 +58,15 @@ use crate::{
     TurnAuxiliaryEventWriter, TurnCoreEventRecord, TurnCoreEventWriter, TurnCorePersistPlan,
     TurnHookDbWriter, TurnObserverWorker, TurnReflectionLessonWriter, TurnReflectionStateStore,
     TurnSessionActivityWriter, TurnToolEventPersistPlan, TurnToolEventRecord, TurnToolEventWriter,
-    build_explain_event, build_stream_error_event, prompts,
+    build_explain_event, build_stream_error_event,
+    pipeline::{step_protocol::StepCheckpoint, step_recorder::StepRecorder},
+    prompts,
+    turn::agentic_post_tool_policy::{
+        AgenticPostToolPolicyOutcome, AgenticPostToolPolicyRequest, apply_agentic_post_tool_policy,
+    },
+    turn::agentic_stall_preflight::{
+        CliAgenticStallPreflightRequest, apply_cli_agentic_stall_preflight,
+    },
     turn::cloud_tool_delivery::{
         cloud_tool_requires_approval_for_delivery, sse_maps_through_tool_request,
         tool_approval_detail_for_delivery, tool_path_hint_for_delivery,
@@ -69,8 +83,11 @@ use crate::{
         drain_sse_data_lines, finish_sse_data_buffer, validate_sse_event_block_json,
         validated_json_events_from_sse_block,
     },
+    turn::stall::CLI_AGENTIC_TURN_BUDGET_STALL_ABORT_MSG,
     turn::stream_events::build_approval_required_event,
+    turn::tool_call_shape::tool_call_name,
     turn::tool_schema_prune::prune_tool_schemas,
+    turn::turn_guard::TurnGuard,
 };
 
 const TOOL_RESULT_AUDIT_CHARS: usize = 4000;
@@ -212,6 +229,38 @@ fn tool_names_from_tool_calls(tool_calls: &[Value]) -> Vec<String> {
         .filter_map(|function| function.get("name").and_then(Value::as_str))
         .map(std::string::ToString::to_string)
         .collect()
+}
+
+fn filter_round_edge_tools(edge_tools: &[Value], restricted_tools: &HashSet<String>) -> Vec<Value> {
+    if restricted_tools.is_empty() {
+        return edge_tools.to_vec();
+    }
+
+    edge_tools
+        .iter()
+        .filter(|tool| {
+            tool_call_name(tool)
+                .map(|name| !restricted_tools.contains(name))
+                .unwrap_or(true)
+        })
+        .cloned()
+        .collect()
+}
+
+fn record_turn_guard_tool_results(turn_guard: &mut TurnGuard, persist_tool_results: &[Value]) {
+    for tool_result in persist_tool_results {
+        let Some(tool_result) = tool_result.as_object() else {
+            continue;
+        };
+        let Some(tool_name) = tool_result.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        let result = tool_result
+            .get("result")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        turn_guard.record_tool_result(tool_name, result);
+    }
 }
 
 fn tool_call_start_event(tool_call: &mut Map<String, Value>) -> Option<Value> {
@@ -1608,13 +1657,42 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
             let mut last_measured_prompt: Option<u64> = None;
             let mut bridge_ptl_streak: u32 = 0;
             let mut cache_detector = crate::turn::cloud::cache_diagnostics::CacheBreakDetector::new();
-            // Pre-serialize tool schemas for cache fingerprinting (stable across rounds)
-            let tools_fingerprint_str = serde_json::to_string(&edge_tools).unwrap_or_default();
+            let mut bridge_turn_sigs = Vec::new();
+            let mut bridge_turn_tool_names = Vec::new();
+            let mut bridge_stall_events = Vec::new();
+            let mut bridge_intent_tool_turns = Vec::new();
+            let mut bridge_verdict_events = Vec::new();
+            let mut bridge_turn_guard = TurnGuard::new();
+            let mut bridge_restricted_tools = HashSet::new();
+            let mut bridge_remaining_turns = round_limit as usize;
+            let mut bridge_step_recorder = StepRecorder::new(&session_id, "legacy-bridge-loop");
+            let mut bridge_last_heavy_checkpoint: Option<StepCheckpoint> = None;
+            let user_message_for_guard = latest_user_message_text(&messages)
+                .unwrap_or("")
+                .to_string();
 
             for round_ix in 0i64..round_limit {
                 cloud_loop_turns += 1;
 
-                let tool_schema_tokens_round: usize = edge_tools
+                if bridge_remaining_turns == 0 {
+                    yield render_sse_map(&build_stream_error_event(
+                        &format!(
+                            "{} ({} turns used)",
+                            CLI_AGENTIC_TURN_BUDGET_STALL_ABORT_MSG, round_limit
+                        ),
+                        "TURN_BUDGET_EXHAUSTED",
+                        false,
+                    ));
+                    return;
+                }
+                bridge_remaining_turns = bridge_remaining_turns.saturating_sub(1);
+
+                let round_edge_tools =
+                    filter_round_edge_tools(&edge_tools, &bridge_restricted_tools);
+                let round_tools_fingerprint_str =
+                    serde_json::to_string(&round_edge_tools).unwrap_or_default();
+
+                let tool_schema_tokens_round: usize = round_edge_tools
                     .iter()
                     .map(|t| {
                         serde_json::to_string(t)
@@ -1632,7 +1710,7 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                     last_measured_prompt,
                     bridge_ptl_streak,
                 );
-                let mut pruned_tools = prune_tool_schemas(&edge_tools, round_tier);
+                let mut pruned_tools = prune_tool_schemas(&round_edge_tools, round_tier);
                 annotate_tool_schemas_for_caching(&mut pruned_tools, &cache_cfg);
 
                 let loop_started = Instant::now();
@@ -1797,7 +1875,10 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                             llm_messages.extend(compact_result.messages);
 
                             // Also prune tool schemas more aggressively
-                            pruned_tools = prune_tool_schemas(&edge_tools, crate::prompts::CompactionTier::AggressivePrune);
+                            pruned_tools = prune_tool_schemas(
+                                &round_edge_tools,
+                                crate::prompts::CompactionTier::AggressivePrune,
+                            );
                             annotate_tool_schemas_for_caching(&mut pruned_tools, &cache_cfg);
 
                             // Retry LLM call
@@ -1991,7 +2072,10 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                         None => String::new(),
                     };
                     let fp = crate::turn::cloud::cache_diagnostics::CacheFingerprint::new(
-                        &sys_prompt_str, &tools_fingerprint_str, &model_name, &provider,
+                        &sys_prompt_str,
+                        &round_tools_fingerprint_str,
+                        &model_name,
+                        &provider,
                     );
                     let cache_read = usage.get("cache_read")
                         .and_then(|v| v.as_u64().or_else(|| v.as_i64().map(|i| i.max(0) as u64)))
@@ -2008,6 +2092,14 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                 }
 
                 ensure_tool_call_ids(&mut loop_tool_calls);
+                apply_cli_agentic_stall_preflight(CliAgenticStallPreflightRequest {
+                    turn_index: round_ix as u32,
+                    tool_calls_for_guard: &loop_tool_calls,
+                    turn_sigs: &mut bridge_turn_sigs,
+                    turn_tool_names: &mut bridge_turn_tool_names,
+                    stall_events: &mut bridge_stall_events,
+                    turn_guard: &mut bridge_turn_guard,
+                });
 
                 all_round_tool_calls.extend(loop_tool_calls.iter().cloned());
 
@@ -2059,6 +2151,10 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                         match approval {
                             Ok(()) => {}
                             Err(part) => {
+                                record_turn_guard_tool_results(
+                                    &mut bridge_turn_guard,
+                                    &part.persist_tool_results,
+                                );
                                 for m in part.sse_maps {
                                     yield render_sse_map(&m);
                                 }
@@ -2090,6 +2186,7 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                     for m in tail.sse_maps {
                         yield render_sse_map(&m);
                     }
+                    record_turn_guard_tool_results(&mut bridge_turn_guard, &tail.persist_tool_results);
                     merged_tool_results.extend(tail.persist_tool_results);
                     llm_messages.extend(tail.tool_messages);
                 }
@@ -2130,8 +2227,43 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                         for m in tail.sse_maps {
                             yield render_sse_map(&m);
                         }
+                        record_turn_guard_tool_results(
+                            &mut bridge_turn_guard,
+                            &tail.persist_tool_results,
+                        );
                         merged_tool_results.extend(tail.persist_tool_results);
                         llm_messages.extend(tail.tool_messages);
+                    }
+                }
+
+                let recent_tools_for_policy = tool_names_from_tool_calls(&all_round_tool_calls);
+                match apply_agentic_post_tool_policy(AgenticPostToolPolicyRequest {
+                    turn_index: round_ix as u32,
+                    message: &user_message_for_guard,
+                    tool_calls_for_guard: &loop_tool_calls,
+                    intent_tool_turns: &mut bridge_intent_tool_turns,
+                    messages: &mut llm_messages,
+                    stall_events: &mut bridge_stall_events,
+                    turn_guard: &mut bridge_turn_guard,
+                    verdict_events: &mut bridge_verdict_events,
+                    restricted_tools: &mut bridge_restricted_tools,
+                    remaining_turns: &mut bridge_remaining_turns,
+                    step_recorder: &mut bridge_step_recorder,
+                    current_session_id: None,
+                    max_turns: round_limit as usize,
+                    loop_turn: round_ix as usize,
+                    recent_tools: &recent_tools_for_policy,
+                    last_heavy_checkpoint: &mut bridge_last_heavy_checkpoint,
+                }) {
+                    AgenticPostToolPolicyOutcome::ProceedEndTurn
+                    | AgenticPostToolPolicyOutcome::RetryLlmClearToolResults => {}
+                    AgenticPostToolPolicyOutcome::Abort(message) => {
+                        yield render_sse_map(&build_stream_error_event(
+                            &message,
+                            "TURN_GUARD_ABORT",
+                            false,
+                        ));
+                        return;
                     }
                 }
             }
@@ -4632,6 +4764,35 @@ mod tests {
             json!({"role": "assistant", "content": "intermediate"}),
         ];
         assert_eq!(turn_count_from_messages(&messages), 0);
+    }
+
+    #[test]
+    fn filter_round_edge_tools_excludes_restricted_tools() {
+        let edge_tools = vec![
+            json!({"type": "function", "function": {"name": "bash", "arguments": {}}}),
+            json!({"type": "function", "function": {"name": "view", "arguments": {}}}),
+        ];
+        let restricted = std::collections::HashSet::from(["bash".to_string()]);
+
+        let filtered = filter_round_edge_tools(&edge_tools, &restricted);
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(tool_call_name(&filtered[0]), Some("view"));
+    }
+
+    #[test]
+    fn record_turn_guard_tool_results_updates_error_summary() {
+        let mut turn_guard = TurnGuard::new();
+
+        record_turn_guard_tool_results(
+            &mut turn_guard,
+            &[json!({
+                "name": "bash",
+                "result": "{\"error\":\"permission denied\"}"
+            })],
+        );
+
+        assert_eq!(turn_guard.errors.total_errors, 1);
     }
 
     #[test]

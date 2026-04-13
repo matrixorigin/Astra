@@ -72,6 +72,63 @@ async fn chain_stops_on_error() {
 }
 
 #[tokio::test]
+async fn chain_rollback_on_failure_reverts_bounded_file_edits() {
+    use astra_runtime::tool_registry::ToolChain;
+
+    let dir = tempfile::tempdir().unwrap();
+    let executor = ToolExecutor::new(dir.path());
+
+    let chain = ToolChain::new("rollback_chain", "Write then fail")
+        .with_rollback_on_failure(true)
+        .step(
+            "write_file",
+            json!({"path": "rolled_back.txt", "content": "temporary"}),
+        )
+        .step("read_file", json!({"path": "missing.txt"}));
+
+    let result = executor.execute_chain(&chain, json!({})).await;
+    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+
+    assert_eq!(parsed["steps_executed"], 2);
+    let steps = parsed["steps"].as_array().unwrap();
+    assert!(steps[0]["success"].as_bool().unwrap());
+    assert!(!steps[1]["success"].as_bool().unwrap());
+    assert_eq!(parsed["rollback"]["success"].as_bool(), Some(true));
+    assert_eq!(
+        parsed["rollback"]["reverted_files"]
+            .as_array()
+            .map(Vec::len),
+        Some(1)
+    );
+    assert!(!dir.path().join("rolled_back.txt").exists());
+}
+
+#[tokio::test]
+async fn chain_without_rollback_on_failure_keeps_prior_edits() {
+    use astra_runtime::tool_registry::ToolChain;
+
+    let dir = tempfile::tempdir().unwrap();
+    let executor = ToolExecutor::new(dir.path());
+
+    let chain = ToolChain::new("no_rollback_chain", "Write then fail")
+        .step(
+            "write_file",
+            json!({"path": "kept.txt", "content": "temporary"}),
+        )
+        .step("read_file", json!({"path": "missing.txt"}));
+
+    let result = executor.execute_chain(&chain, json!({})).await;
+    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+
+    assert_eq!(parsed["steps_executed"], 2);
+    assert!(
+        parsed.get("rollback").is_none(),
+        "unexpected result: {result}"
+    );
+    assert!(dir.path().join("kept.txt").exists());
+}
+
+#[tokio::test]
 async fn chain_variable_substitution_end_to_end() {
     use astra_runtime::tool_registry::ToolChain;
 

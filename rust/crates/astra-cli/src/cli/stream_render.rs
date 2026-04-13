@@ -14,7 +14,7 @@ use astra_runtime::turn::tool_result_semantics::cloud_tool_result_status_label;
 use astra_runtime::turn::tool_result_semantics::tool_dedup_signature;
 use crossterm::style::Stylize;
 use futures_util::StreamExt;
-use serde_json::Value;
+use serde_json::{Map, Value};
 use std::io::{IsTerminal, Write};
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex};
@@ -185,6 +185,25 @@ struct CliSseStreamHost<'a> {
     tool_cache: &'a mut EdgeToolCache,
 }
 
+#[derive(Clone, Debug)]
+struct BatchTransactionMetadata {
+    id: String,
+}
+
+#[derive(Clone, Debug)]
+struct ActiveBatchTransaction {
+    id: String,
+    turn_index: u32,
+    file_checkpoint: u64,
+    database_checkpoint: u64,
+}
+
+#[derive(Clone, Debug)]
+struct AbortedBatchTransaction {
+    id: String,
+    rollback: Option<Value>,
+}
+
 impl<'a> CliSseStreamHost<'a> {
     fn from_edge_ctx(ctx: EdgeSseContext<'a>, term_width: usize, render_md: bool) -> Self {
         let suppress_reasoning =
@@ -318,6 +337,409 @@ impl<'a> CliSseStreamHost<'a> {
             .post_tool_result(Some(self.token), Some(self.executor_id), &body)
             .await;
         result
+    }
+}
+
+impl<'a> CliSseStreamHost<'a> {
+    fn has_batch_transaction_metadata(args: &Value) -> bool {
+        args.as_object().is_some_and(|obj| {
+            obj.contains_key("transaction_id") || obj.contains_key("rollback_on_failure")
+        })
+    }
+
+    fn parse_batch_transaction_metadata(
+        args: &Value,
+    ) -> Result<Option<BatchTransactionMetadata>, String> {
+        let Some(obj) = args.as_object() else {
+            return Ok(None);
+        };
+
+        let transaction_id = match obj.get("transaction_id") {
+            Some(Value::String(id)) if !id.trim().is_empty() => Some(id.trim().to_string()),
+            Some(Value::String(_)) => {
+                return Err("transaction_id must be a non-empty string.".to_string());
+            }
+            Some(_) => {
+                return Err("transaction_id must be a string.".to_string());
+            }
+            None => None,
+        };
+
+        let rollback_on_failure = match obj.get("rollback_on_failure") {
+            Some(Value::Bool(value)) => Some(*value),
+            Some(_) => {
+                return Err("rollback_on_failure must be a boolean.".to_string());
+            }
+            None => None,
+        };
+
+        match (transaction_id, rollback_on_failure) {
+            (None, None | Some(false)) => Ok(None),
+            (None, Some(true)) => {
+                Err("transaction_id is required when rollback_on_failure=true.".to_string())
+            }
+            (Some(id), Some(true)) => Ok(Some(BatchTransactionMetadata { id })),
+            (Some(id), None | Some(false)) => Err(format!(
+                "transaction `{id}` requires rollback_on_failure=true."
+            )),
+        }
+    }
+
+    fn batch_transaction_boundary_supported(tool: &str) -> bool {
+        is_tool_concurrency_safe(tool)
+            || matches!(
+                tool,
+                "write_file" | "delete_file" | "str_replace" | "multi_edit" | "mo_query"
+            )
+    }
+
+    fn merge_transaction_fields(
+        mut existing: Option<Map<String, Value>>,
+        transaction_id: &str,
+        state: &str,
+        rollback: Option<Value>,
+    ) -> Option<Map<String, Value>> {
+        let mut fields = existing.take().unwrap_or_default();
+        fields.insert(
+            "transaction_id".to_string(),
+            Value::String(transaction_id.to_string()),
+        );
+        fields.insert(
+            "transaction_boundary".to_string(),
+            Value::String("tool_batch".to_string()),
+        );
+        fields.insert(
+            "transaction_state".to_string(),
+            Value::String(state.to_string()),
+        );
+        if let Some(rollback) = rollback {
+            fields.insert("transaction_rollback".to_string(), rollback);
+        }
+        Some(fields)
+    }
+
+    fn append_transaction_note(
+        output: &str,
+        transaction_id: &str,
+        note: &str,
+        rollback: Option<&Value>,
+    ) -> String {
+        let mut rendered = output.trim_end().to_string();
+        if !rendered.is_empty() {
+            rendered.push_str("\n\n");
+        }
+        rendered.push_str(&format!("Transaction `{transaction_id}` {note}."));
+        if let Some(summary) = rollback
+            .and_then(|value| value.get("summary"))
+            .and_then(Value::as_str)
+        {
+            rendered.push(' ');
+            rendered.push_str(summary);
+        } else if rollback.is_some() {
+            rendered
+                .push_str(" Bounded rollback was attempted for earlier transaction side effects.");
+        }
+        rendered
+    }
+
+    fn rollback_active_batch_transaction(&self, active: &ActiveBatchTransaction) -> Option<Value> {
+        let file_entries_added = self
+            .executor
+            .file_journal_checkpoint()
+            .saturating_sub(active.file_checkpoint);
+        let database_entries_added = self
+            .executor
+            .database_snapshot_journal_checkpoint()
+            .saturating_sub(active.database_checkpoint);
+        if file_entries_added == 0 && database_entries_added == 0 {
+            return None;
+        }
+
+        let rollback_output = self.executor.rollback_turn_actions(&serde_json::json!({
+            "scope": "turn",
+            "turn_index": active.turn_index,
+            "file_after_sequence": active.file_checkpoint,
+            "database_after_sequence": active.database_checkpoint,
+        }));
+        Some(
+            serde_json::from_str(&rollback_output).unwrap_or_else(|error| {
+                serde_json::json!({
+                    "ok": false,
+                    "error": format!(
+                        "Failed to parse rollback_turn_actions output: {error}"
+                    ),
+                    "raw_output": rollback_output,
+                })
+            }),
+        )
+    }
+
+    async fn record_synthetic_batch_result(
+        &mut self,
+        req: &ToolBatchRequest,
+        output: String,
+        status: &str,
+        tool_result_fields: Option<Map<String, Value>>,
+    ) -> EdgeToolExecResult {
+        let duration_ms = 0;
+
+        if let Some(tx) = &self.stream_event_tx {
+            let output_summary = self
+                .render
+                .format_output_summary(&req.tool, &output, status)
+                .map(|summary| summary.text)
+                .unwrap_or_default();
+            let tool_description = self.render.format_tool_description(&req.tool, &req.args);
+            let _ = tx.send(super::chat_stream::StreamEvent::ToolCompleted {
+                name: req.tool.clone(),
+                description: tool_description,
+                status: status.to_string(),
+                duration_ms,
+                output_summary: if output_summary.is_empty() {
+                    None
+                } else {
+                    Some(output_summary)
+                },
+            });
+        }
+
+        let result = EdgeToolExecResult {
+            request_id: req.request_id.clone(),
+            tool: req.tool.clone(),
+            args: req.args.clone(),
+            output: output.clone(),
+            tool_result_fields,
+            status: status.to_string(),
+            duration_ms,
+        };
+        self.edge_tool_round.push(result.clone());
+
+        let body = astra_thin_client::ToolResultRequest {
+            request_id: req.request_id.clone(),
+            status: status.to_string(),
+            output: Some(output),
+            duration_ms: Some(duration_ms),
+        };
+        let post_result = self
+            .api
+            .post_tool_result(Some(self.token), Some(self.executor_id), &body)
+            .await;
+
+        if let Err(ref e) = post_result {
+            let is_auth_failure = matches!(
+                e,
+                astra_thin_client::ThinClientError::Api { status, .. }
+                    if status.as_u16() == 401
+            );
+
+            if is_auth_failure {
+                if let Some(token) = self.cancel_token {
+                    token.cancel();
+                }
+                if !self.render_policy.is_silent() {
+                    eprintln!(
+                        "{}",
+                        "Session expired. Please re-authenticate with `astra auth login`.".red()
+                    );
+                }
+            } else if !self.render_policy.suppress_tool_ui() {
+                eprintln!("{}", edge_sse_post_tool_result_fail_line(e).yellow());
+            }
+        }
+
+        result
+    }
+
+    async fn execute_transactional_batch(
+        &mut self,
+        requests: &[ToolBatchRequest],
+    ) -> Vec<EdgeToolExecResult> {
+        let total = requests.len();
+        let mut results = Vec::with_capacity(total);
+        let mut active_tx: Option<ActiveBatchTransaction> = None;
+        let mut aborted_tx: Option<AbortedBatchTransaction> = None;
+
+        for (idx, req) in requests.iter().enumerate() {
+            self.render.tool_batch_progress = Some((idx + 1, total));
+
+            let metadata = match Self::parse_batch_transaction_metadata(&req.args) {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    let rollback = active_tx
+                        .as_ref()
+                        .and_then(|active| self.rollback_active_batch_transaction(active));
+                    let result = self
+                        .record_synthetic_batch_result(
+                            req,
+                            if let Some(active) = &active_tx {
+                                Self::append_transaction_note(
+                                    &format!("Error: {error}"),
+                                    &active.id,
+                                    "failed before execution",
+                                    rollback.as_ref(),
+                                )
+                            } else {
+                                format!("Error: {error}")
+                            },
+                            "error",
+                            active_tx.as_ref().and_then(|active| {
+                                Self::merge_transaction_fields(
+                                    None,
+                                    &active.id,
+                                    if rollback.is_some() {
+                                        "rolled_back"
+                                    } else {
+                                        "failed"
+                                    },
+                                    rollback.clone(),
+                                )
+                            }),
+                        )
+                        .await;
+                    if let Some(active) = active_tx.take() {
+                        aborted_tx = Some(AbortedBatchTransaction {
+                            id: active.id,
+                            rollback,
+                        });
+                    }
+                    results.push(result);
+                    continue;
+                }
+            };
+
+            if let Some(aborted) = aborted_tx.as_ref() {
+                match metadata.as_ref() {
+                    Some(meta) if meta.id == aborted.id => {
+                        let result = self
+                            .record_synthetic_batch_result(
+                                req,
+                                Self::append_transaction_note(
+                                    &format!(
+                                        "Error: skipped because transaction `{}` already failed earlier in this batch",
+                                        aborted.id
+                                    ),
+                                    &aborted.id,
+                                    "was already aborted",
+                                    aborted.rollback.as_ref(),
+                                ),
+                                "error",
+                                Self::merge_transaction_fields(
+                                    None,
+                                    &aborted.id,
+                                    "aborted",
+                                    aborted.rollback.clone(),
+                                ),
+                            )
+                            .await;
+                        results.push(result);
+                        continue;
+                    }
+                    _ => aborted_tx = None,
+                }
+            }
+
+            let continuing_active_transaction = active_tx
+                .as_ref()
+                .zip(metadata.as_ref())
+                .is_some_and(|(active, meta)| active.id == meta.id);
+            if !continuing_active_transaction {
+                active_tx = None;
+            }
+
+            if let Some(meta) = metadata.as_ref() {
+                if !Self::batch_transaction_boundary_supported(&req.tool) {
+                    let rollback = active_tx
+                        .as_ref()
+                        .and_then(|active| self.rollback_active_batch_transaction(active));
+                    let result = self
+                        .record_synthetic_batch_result(
+                            req,
+                            Self::append_transaction_note(
+                                &format!(
+                                    "Error: tool `{}` does not support rollback-on-failure batch transactions",
+                                    req.tool
+                                ),
+                                &meta.id,
+                                "failed before execution",
+                                rollback.as_ref(),
+                            ),
+                            "error",
+                            Self::merge_transaction_fields(
+                                None,
+                                &meta.id,
+                                if rollback.is_some() {
+                                    "rolled_back"
+                                } else {
+                                    "failed"
+                                },
+                                rollback.clone(),
+                            ),
+                        )
+                        .await;
+                    aborted_tx = Some(AbortedBatchTransaction {
+                        id: meta.id.clone(),
+                        rollback,
+                    });
+                    active_tx = None;
+                    results.push(result);
+                    continue;
+                }
+
+                if active_tx.is_none() {
+                    active_tx = Some(ActiveBatchTransaction {
+                        id: meta.id.clone(),
+                        turn_index: self
+                            .executor
+                            .journal_turn_index
+                            .load(std::sync::atomic::Ordering::Relaxed),
+                        file_checkpoint: self.executor.file_journal_checkpoint(),
+                        database_checkpoint: self.executor.database_snapshot_journal_checkpoint(),
+                    });
+                }
+            }
+
+            let mut result = self
+                .execute_tool(&req.request_id, &req.tool, &req.args)
+                .await;
+
+            if let Some(active) = active_tx.as_ref() {
+                if metadata.as_ref().is_some_and(|meta| meta.id == active.id)
+                    && result.status == "error"
+                {
+                    let rollback = self.rollback_active_batch_transaction(active);
+                    result.output = Self::append_transaction_note(
+                        &result.output,
+                        &active.id,
+                        "failed",
+                        rollback.as_ref(),
+                    );
+                    result.tool_result_fields = Self::merge_transaction_fields(
+                        result.tool_result_fields.take(),
+                        &active.id,
+                        if rollback.is_some() {
+                            "rolled_back"
+                        } else {
+                            "failed"
+                        },
+                        rollback.clone(),
+                    );
+                    if let Some(last) = self.edge_tool_round.last_mut() {
+                        if last.request_id == result.request_id {
+                            *last = result.clone();
+                        }
+                    }
+                    aborted_tx = Some(AbortedBatchTransaction {
+                        id: active.id.clone(),
+                        rollback,
+                    });
+                    active_tx = None;
+                }
+            }
+
+            results.push(result);
+        }
+
+        results
     }
 }
 
@@ -717,6 +1139,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             }
         };
         let start = std::time::Instant::now();
+        let mut tool_result_fields = None;
         let output = if allowed {
             if tool == astra_runtime::turn::skill_tool::SKILL_TOOL_NAME {
                 // Edge-path skill dedup: if the same skill was already invoked
@@ -765,13 +1188,17 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                  before the parent agent finishes."
                     .to_string()
             } else {
-                let result = self.executor.execute(tool, args).await;
+                let mut outcome = self.executor.execute_with_metadata(tool, args).await;
                 // If the sandbox denied the operation, prompt the user for
                 // authorization. On approval, temporarily expand the sandbox
                 // boundary and retry the tool.
-                if result.starts_with(crate::edge_tools::SANDBOX_DENIED_PREFIX) {
+                if outcome
+                    .output
+                    .starts_with(crate::edge_tools::SANDBOX_DENIED_PREFIX)
+                {
                     if let Some(pm) = &mut self.perm_manager {
-                        let sandbox_msg = &result[crate::edge_tools::SANDBOX_DENIED_PREFIX.len()..];
+                        let sandbox_msg =
+                            &outcome.output[crate::edge_tools::SANDBOX_DENIED_PREFIX.len()..];
                         let sandbox_tool_key = format!("sandbox_expand:{tool}");
                         let guard_args = serde_json::json!({"reason": sandbox_msg});
                         let decision = crate::tool_safety_guard::ToolSafetyGuard::check_request(
@@ -896,15 +1323,18 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                             if let Some(dir) = expand_dir {
                                 self.executor.expand_sandbox_path(dir);
                             }
-                            self.executor.execute(tool, args).await
+                            outcome = self.executor.execute_with_metadata(tool, args).await;
+                            tool_result_fields = outcome.tool_result_fields;
+                            outcome.output
                         } else {
                             format!("Error: {sandbox_msg}")
                         }
                     } else {
-                        result
+                        outcome.output
                     }
                 } else {
-                    result
+                    tool_result_fields = outcome.tool_result_fields;
+                    outcome.output
                 }
             }
         } else {
@@ -955,6 +1385,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             tool: tool.to_string(),
             args: args.clone(),
             output: output.clone(),
+            tool_result_fields: tool_result_fields.clone(),
             status: status.to_string(),
             duration_ms,
         });
@@ -1000,6 +1431,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 tool: String::new(),
                 args: serde_json::Value::Null,
                 output: "Error: no tool result recorded".to_string(),
+                tool_result_fields: None,
                 status: "error".to_string(),
                 duration_ms: 0,
             })
@@ -1072,7 +1504,9 @@ impl SseStreamHost for CliSseStreamHost<'_> {
     ///
     /// Sequential (side-effect) tools run first via [`execute_tool`](Self::execute_tool).
     /// Then all concurrent-safe tools execute in parallel via `join_all`, overlapping
-    /// network I/O for async tools (GitHub, Memoria, MCP).
+    /// network I/O for async tools (GitHub, Memoria, MCP). If any request in the
+    /// batch carries explicit transaction metadata, the whole batch falls back to
+    /// deterministic original-order execution so rollback boundaries remain crisp.
     async fn execute_tools_batch(
         &mut self,
         requests: Vec<ToolBatchRequest>,
@@ -1093,6 +1527,15 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                         .await,
                 );
             }
+            self.render.tool_batch_progress = None;
+            return out;
+        }
+
+        if requests
+            .iter()
+            .any(|req| Self::has_batch_transaction_metadata(&req.args))
+        {
+            let out = self.execute_transactional_batch(&requests).await;
             self.render.tool_batch_progress = None;
             return out;
         }
@@ -1261,7 +1704,9 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             }
         }
 
-        struct ScopedJoinHandles(Vec<tokio::task::JoinHandle<(String, u64)>>);
+        struct ScopedJoinHandles(
+            Vec<tokio::task::JoinHandle<(crate::edge_tools::ToolExecutionOutcome, u64)>>,
+        );
         impl Drop for ScopedJoinHandles {
             fn drop(&mut self) {
                 for h in &self.0 {
@@ -1280,15 +1725,22 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 // SAFETY: ScopedJoinHandles aborts on drop — pointee is alive.
                 let exec = unsafe { h.as_ref() };
                 let t0 = Instant::now();
-                let output = exec.execute(&tool, &args).await;
+                let output = exec.execute_with_metadata(&tool, &args).await;
                 (output, t0.elapsed().as_millis() as u64)
             }));
         }
-        let mut outputs: Vec<(String, u64)> = Vec::with_capacity(scope.0.len());
+        let mut outputs: Vec<(crate::edge_tools::ToolExecutionOutcome, u64)> =
+            Vec::with_capacity(scope.0.len());
         for jh in std::mem::take(&mut scope.0) {
             match jh.await {
                 Ok(result) => outputs.push(result),
-                Err(e) => outputs.push((format!("Tool execution panicked: {e}"), 0)),
+                Err(e) => outputs.push((
+                    crate::edge_tools::ToolExecutionOutcome {
+                        output: format!("Tool execution panicked: {e}"),
+                        tool_result_fields: None,
+                    },
+                    0,
+                )),
             }
         }
 
@@ -1298,8 +1750,9 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             self.render.stop_tool_stderr_running();
         }
 
-        for (pos, (output, duration_ms)) in outputs.into_iter().enumerate() {
+        for (pos, (outcome, duration_ms)) in outputs.into_iter().enumerate() {
             let (orig_idx, req) = conc_reqs[pos];
+            let output = outcome.output;
             let status = cloud_tool_result_status_label(&output);
 
             // Forward tool-completed event.
@@ -1345,6 +1798,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 tool: req.tool.clone(),
                 args: req.args.clone(),
                 output: output.clone(),
+                tool_result_fields: outcome.tool_result_fields,
                 status: status.to_string(),
                 duration_ms,
             };
@@ -2889,6 +3343,9 @@ pub(super) fn dispatch_turn_event_block(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn sse(event_type: &str, extra: &str) -> String {
         format!("data: {{\"type\":\"{event_type}\"{extra}}}\n\n")
@@ -3479,5 +3936,256 @@ diff --git a/src/a.rs b/src/a.rs\n\
         // Different tool name → different signature
         let sig3 = tool_dedup_signature("read_file", &args);
         assert_ne!(sig1, sig3);
+    #[tokio::test]
+    async fn transactional_batch_rolls_back_earlier_file_write_on_later_failure() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/tools/result"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .mount(&server)
+            .await;
+
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
+        let temp = tempdir().expect("tempdir");
+        let mut executor = crate::edge_tools::ToolExecutor::new(temp.path());
+        executor
+            .journal_turn_index
+            .store(3, std::sync::atomic::Ordering::Relaxed);
+
+        let mut host = CliSseStreamHost::from_edge_ctx(
+            EdgeSseContext {
+                api: &api,
+                token: "tok",
+                executor_id: "edge-test",
+                executor: &mut executor,
+                render_policy: RenderPolicy::Silent,
+                perm_manager: None,
+                cancel_token: None,
+                stream_event_tx: None,
+                approval_request_tx: None,
+                skill_resolver: None,
+                skill_continuation: false,
+            },
+            80,
+            false,
+        );
+
+        let results = host
+            .execute_tools_batch(vec![
+                ToolBatchRequest {
+                    request_id: "tr-1".to_string(),
+                    tool: "write_file".to_string(),
+                    args: serde_json::json!({
+                        "path": "txn.txt",
+                        "content": "hello\n",
+                        "transaction_id": "tx-1",
+                        "rollback_on_failure": true,
+                    }),
+                },
+                ToolBatchRequest {
+                    request_id: "tr-2".to_string(),
+                    tool: "read_file".to_string(),
+                    args: serde_json::json!({
+                        "path": "missing.txt",
+                        "transaction_id": "tx-1",
+                        "rollback_on_failure": true,
+                    }),
+                },
+            ])
+            .await;
+
+        assert_eq!(results.len(), 2);
+        assert_ne!(results[0].status, "error");
+        let rollback_fields = results[1]
+            .tool_result_fields
+            .as_ref()
+            .expect("rollback fields");
+        assert_eq!(
+            rollback_fields["transaction_state"].as_str(),
+            Some("rolled_back")
+        );
+        assert_eq!(rollback_fields["transaction_id"].as_str(), Some("tx-1"));
+        assert!(
+            results[1].output.contains("Transaction `tx-1` failed."),
+            "{}",
+            results[1].output
+        );
+        assert!(
+            !temp.path().join("txn.txt").exists(),
+            "rollback should remove the written file"
+        );
+        assert_eq!(
+            rollback_fields["transaction_rollback"]["files"]["reverted"]
+                .as_array()
+                .map(|entries| entries.len()),
+            Some(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn transactional_batch_restores_deleted_file_on_failure() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/tools/result"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .mount(&server)
+            .await;
+
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
+        let temp = tempdir().expect("tempdir");
+        let victim = temp.path().join("txn.txt");
+        std::fs::write(&victim, "hello\n").expect("seed file");
+        let mut executor = crate::edge_tools::ToolExecutor::new(temp.path());
+        executor
+            .journal_turn_index
+            .store(4, std::sync::atomic::Ordering::Relaxed);
+
+        let mut host = CliSseStreamHost::from_edge_ctx(
+            EdgeSseContext {
+                api: &api,
+                token: "tok",
+                executor_id: "edge-test",
+                executor: &mut executor,
+                render_policy: RenderPolicy::Silent,
+                perm_manager: None,
+                cancel_token: None,
+                stream_event_tx: None,
+                approval_request_tx: None,
+                skill_resolver: None,
+                skill_continuation: false,
+            },
+            80,
+            false,
+        );
+
+        let results = host
+            .execute_tools_batch(vec![
+                ToolBatchRequest {
+                    request_id: "tr-1".to_string(),
+                    tool: "delete_file".to_string(),
+                    args: serde_json::json!({
+                        "path": "txn.txt",
+                        "transaction_id": "tx-del",
+                        "rollback_on_failure": true,
+                    }),
+                },
+                ToolBatchRequest {
+                    request_id: "tr-2".to_string(),
+                    tool: "read_file".to_string(),
+                    args: serde_json::json!({
+                        "path": "missing.txt",
+                        "transaction_id": "tx-del",
+                        "rollback_on_failure": true,
+                    }),
+                },
+            ])
+            .await;
+
+        assert_eq!(results.len(), 2);
+        let rollback_fields = results[1]
+            .tool_result_fields
+            .as_ref()
+            .expect("rollback fields");
+        assert_eq!(
+            rollback_fields["transaction_state"].as_str(),
+            Some("rolled_back")
+        );
+        assert_eq!(
+            std::fs::read_to_string(&victim).expect("restored file"),
+            "hello\n"
+        );
+        assert_eq!(
+            rollback_fields["transaction_rollback"]["files"]["reverted"]
+                .as_array()
+                .map(|entries| entries.len()),
+            Some(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn transactional_batch_skips_later_requests_after_rollback() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/tools/result"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .mount(&server)
+            .await;
+
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
+        let temp = tempdir().expect("tempdir");
+        std::fs::write(temp.path().join("other.txt"), "existing\n").expect("seed file");
+        let mut executor = crate::edge_tools::ToolExecutor::new(temp.path());
+        executor
+            .journal_turn_index
+            .store(5, std::sync::atomic::Ordering::Relaxed);
+
+        let mut host = CliSseStreamHost::from_edge_ctx(
+            EdgeSseContext {
+                api: &api,
+                token: "tok",
+                executor_id: "edge-test",
+                executor: &mut executor,
+                render_policy: RenderPolicy::Silent,
+                perm_manager: None,
+                cancel_token: None,
+                stream_event_tx: None,
+                approval_request_tx: None,
+                skill_resolver: None,
+                skill_continuation: false,
+            },
+            80,
+            false,
+        );
+
+        let results = host
+            .execute_tools_batch(vec![
+                ToolBatchRequest {
+                    request_id: "tr-1".to_string(),
+                    tool: "write_file".to_string(),
+                    args: serde_json::json!({
+                        "path": "txn.txt",
+                        "content": "hello\n",
+                        "transaction_id": "tx-2",
+                        "rollback_on_failure": true,
+                    }),
+                },
+                ToolBatchRequest {
+                    request_id: "tr-2".to_string(),
+                    tool: "read_file".to_string(),
+                    args: serde_json::json!({
+                        "path": "missing.txt",
+                        "transaction_id": "tx-2",
+                        "rollback_on_failure": true,
+                    }),
+                },
+                ToolBatchRequest {
+                    request_id: "tr-3".to_string(),
+                    tool: "read_file".to_string(),
+                    args: serde_json::json!({
+                        "path": "other.txt",
+                        "transaction_id": "tx-2",
+                        "rollback_on_failure": true,
+                    }),
+                },
+            ])
+            .await;
+
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[2].status, "error");
+        assert!(
+            results[2].output.contains("already aborted"),
+            "{}",
+            results[2].output
+        );
+        let fields = results[2]
+            .tool_result_fields
+            .as_ref()
+            .expect("transaction fields");
+        assert_eq!(fields["transaction_state"].as_str(), Some("aborted"));
+        assert_eq!(fields["transaction_id"].as_str(), Some("tx-2"));
+        assert!(
+            !results[2].output.contains("existing"),
+            "aborted transaction request should not execute normally"
+        );
     }
 }

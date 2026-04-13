@@ -517,6 +517,11 @@ impl AppState {
             chat_turn_bridge_url.into(),
             self.chat_turn_bridge_cache.clone(),
         );
+        if let Some(ref pool) = self.shared_pool {
+            bridge = bridge.with_persisted_replay_window_store(Arc::new(
+                crate::bridge::DatabaseBridgeReplayWindowStore::new(pool.clone()),
+            ));
+        }
         if let Some(ref writer) = self.turn_learning_writer {
             bridge = bridge.with_learning_writer(writer.clone());
         }
@@ -530,6 +535,11 @@ impl AppState {
     ) -> Self {
         if let Some(url) = chat_turn_bridge_url {
             let mut bridge = HttpChatTurnBridge::new(url, self.chat_turn_bridge_cache.clone());
+            if let Some(ref pool) = self.shared_pool {
+                bridge = bridge.with_persisted_replay_window_store(Arc::new(
+                    crate::bridge::DatabaseBridgeReplayWindowStore::new(pool.clone()),
+                ));
+            }
             if let Some(ref writer) = self.turn_learning_writer {
                 bridge = bridge.with_learning_writer(writer.clone());
             }

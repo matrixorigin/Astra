@@ -249,6 +249,9 @@ pub trait EdgeToolRoundRow {
     fn tool_name(&self) -> &str;
     fn tool_args(&self) -> &Value;
     fn tool_output(&self) -> &str;
+    fn tool_result_fields(&self) -> Option<&serde_json::Map<String, Value>> {
+        None
+    }
     fn tool_duration_ms(&self) -> u64 {
         0
     }
@@ -264,6 +267,7 @@ pub trait EdgeToolRoundRow {
 pub struct MatchedEdgeToolOutput {
     pub output: String,
     pub duration_ms: u64,
+    pub tool_result_fields: Option<serde_json::Map<String, Value>>,
 }
 
 /// Take output for a server-emitted `tool_call` by matching dedup signature against the edge round.
@@ -294,6 +298,7 @@ pub fn take_edge_output_for_tool_call_with_duration<T: EdgeToolRoundRow>(
             return MatchedEdgeToolOutput {
                 output: e.tool_output().to_string(),
                 duration_ms: e.tool_duration_ms(),
+                tool_result_fields: e.tool_result_fields().cloned(),
             };
         }
     }
@@ -304,6 +309,7 @@ pub fn take_edge_output_for_tool_call_with_duration<T: EdgeToolRoundRow>(
             )
         }),
         duration_ms: 0,
+        tool_result_fields: None,
     }
 }
 
@@ -428,16 +434,33 @@ pub fn openai_tool_roundtrip_values(
     tool_name: &str,
     content: &str,
 ) -> (Value, Value) {
+    openai_tool_roundtrip_values_with_result_fields(tool_call_id, tool_name, content, None)
+}
+
+#[must_use]
+pub fn openai_tool_roundtrip_values_with_result_fields(
+    tool_call_id: &str,
+    tool_name: &str,
+    content: &str,
+    tool_result_fields: Option<&serde_json::Map<String, Value>>,
+) -> (Value, Value) {
     let msg = json!({
         "role": "tool",
         "tool_call_id": tool_call_id,
         "content": content,
     });
-    let tr = json!({
-        "tool_call_id": tool_call_id,
-        "name": tool_name,
-        "result": content,
-    });
+    let mut tr = serde_json::Map::from_iter([
+        (
+            "tool_call_id".to_string(),
+            Value::String(tool_call_id.to_string()),
+        ),
+        ("name".to_string(), Value::String(tool_name.to_string())),
+        ("result".to_string(), Value::String(content.to_string())),
+    ]);
+    if let Some(extra_fields) = tool_result_fields {
+        tr.extend(extra_fields.clone());
+    }
+    let tr = Value::Object(tr);
     (msg, tr)
 }
 
@@ -509,6 +532,29 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct RowWithResultFields {
+        tool: String,
+        args: Value,
+        output: String,
+        tool_result_fields: serde_json::Map<String, Value>,
+    }
+
+    impl EdgeToolRoundRow for RowWithResultFields {
+        fn tool_name(&self) -> &str {
+            &self.tool
+        }
+        fn tool_args(&self) -> &Value {
+            &self.args
+        }
+        fn tool_output(&self) -> &str {
+            &self.output
+        }
+        fn tool_result_fields(&self) -> Option<&serde_json::Map<String, Value>> {
+            Some(&self.tool_result_fields)
+        }
+    }
+
     #[test]
     fn take_edge_output_matches_first_unconsumed_row() {
         let rows = vec![
@@ -556,6 +602,37 @@ mod tests {
         );
         assert_eq!(out.output, "from-map");
         assert_eq!(out.duration_ms, 0);
+    }
+
+    #[test]
+    fn take_edge_output_preserves_tool_result_fields() {
+        let rows = vec![RowWithResultFields {
+            tool: "mo_query".into(),
+            args: json!({"sql": "UPDATE t SET v = 1"}),
+            output: "OK (no results)".into(),
+            tool_result_fields: serde_json::Map::from_iter([(
+                "pre_state_snapshot_id".to_string(),
+                Value::String("moq_snap_1".into()),
+            )]),
+        }];
+        let mut consumed = vec![false];
+        let by_sig: HashMap<String, String> = HashMap::new();
+        let out = take_edge_output_for_tool_call_with_duration(
+            "mo_query",
+            &json!({"sql": "UPDATE t SET v = 1"}),
+            &rows,
+            &mut consumed,
+            &by_sig,
+        );
+        assert_eq!(out.output, "OK (no results)");
+        assert_eq!(
+            out.tool_result_fields
+                .as_ref()
+                .and_then(|fields| fields.get("pre_state_snapshot_id"))
+                .and_then(Value::as_str),
+            Some("moq_snap_1")
+        );
+        assert!(consumed[0]);
     }
 
     #[test]
@@ -868,6 +945,24 @@ mod tests {
         assert_eq!(tr["tool_call_id"], "call-1");
         assert_eq!(tr["name"], "read_file");
         assert_eq!(tr["result"], "ok");
+    }
+
+    #[test]
+    fn openai_tool_roundtrip_values_with_result_fields_merges_metadata() {
+        let extra_fields = serde_json::Map::from_iter([(
+            "pre_state_snapshot_id".to_string(),
+            Value::String("moq_snap_2".into()),
+        )]);
+        let (_, tr) = openai_tool_roundtrip_values_with_result_fields(
+            "call-2",
+            "mo_query",
+            "OK (no results)",
+            Some(&extra_fields),
+        );
+        assert_eq!(tr["tool_call_id"], "call-2");
+        assert_eq!(tr["name"], "mo_query");
+        assert_eq!(tr["result"], "OK (no results)");
+        assert_eq!(tr["pre_state_snapshot_id"], "moq_snap_2");
     }
 
     #[test]

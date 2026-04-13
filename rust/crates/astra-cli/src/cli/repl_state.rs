@@ -67,6 +67,10 @@ pub(crate) struct ReplState {
     /// Session-scoped file edit journal — shared with ToolExecutors for undo.
     pub file_journal:
         std::sync::Arc<std::sync::Mutex<astra_runtime::turn::file_edit_journal::FileEditJournal>>,
+    /// Session-scoped MatrixOne snapshot journal — shared with ToolExecutors for
+    /// bounded database rollback support across turns.
+    pub database_snapshot_journal:
+        std::sync::Arc<std::sync::Mutex<crate::edge_tools::DatabaseSnapshotRollbackJournal>>,
     /// Sticky task/thread summary used to anchor ultra-short follow-ups like
     /// "继续" even after history compaction prunes earlier turns.
     pub continuation_anchor: Option<String>,
@@ -283,6 +287,9 @@ impl Default for ReplState {
             last_response: None,
             file_journal: std::sync::Arc::new(std::sync::Mutex::new(
                 astra_runtime::turn::file_edit_journal::FileEditJournal::default(),
+            )),
+            database_snapshot_journal: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::edge_tools::DatabaseSnapshotRollbackJournal::default(),
             )),
             continuation_anchor: None,
             session_goal: None,

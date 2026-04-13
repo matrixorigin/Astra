@@ -48,7 +48,9 @@ pub fn all_tool_schemas() -> Vec<Value> {
                         "path": {"type": "string", "description": "File path relative to project root"},
                         "start_line": {"type": "integer", "minimum": 1, "description": "First line to read (1-based, optional)"},
                         "end_line": {"type": "integer", "minimum": 1, "description": "Last line to read (inclusive, optional)"},
-                        "outline": {"type": "boolean", "description": "If true, return only function/class/struct/trait signatures with line numbers instead of full content. Ideal for understanding file structure."}
+                        "outline": {"type": "boolean", "description": "If true, return only function/class/struct/trait signatures with line numbers instead of full content. Ideal for understanding file structure."},
+                        "transaction_id": {"type": "string", "description": "Optional explicit batch transaction id. Consecutive tool calls in the same batch with the same id and rollback_on_failure=true execute as one rollback boundary."},
+                        "rollback_on_failure": {"type": "boolean", "description": "Optional explicit batch transaction flag. When true with transaction_id, a later failure inside the same contiguous batch transaction rolls back bounded file/database side effects recorded since the transaction began."}
                     },
                     "required": ["path"]
                 }
@@ -63,7 +65,9 @@ pub fn all_tool_schemas() -> Vec<Value> {
                     "type": "object",
                     "properties": {
                         "path": {"type": "string", "description": "File path relative to project root"},
-                        "content": {"type": "string", "description": "File content"}
+                        "content": {"type": "string", "description": "File content"},
+                        "transaction_id": {"type": "string", "description": "Optional explicit batch transaction id. Consecutive tool calls in the same batch with the same id and rollback_on_failure=true execute as one rollback boundary."},
+                        "rollback_on_failure": {"type": "boolean", "description": "Optional explicit batch transaction flag. When true with transaction_id, a later failure inside the same contiguous batch transaction rolls back bounded file/database side effects recorded since the transaction began."}
                     },
                     "required": ["path", "content"]
                 }
@@ -81,7 +85,9 @@ pub fn all_tool_schemas() -> Vec<Value> {
                         "old_str": {"type": "string", "description": "Exact string to replace"},
                         "new_str": {"type": "string", "description": "Replacement string"},
                         "dry_run": {"type": "boolean", "description": "If true, show unified diff without applying changes (default: false)"},
-                        "replace_all": {"type": "boolean", "description": "If true, replace ALL occurrences of old_str (default: false, requires unique match)"}
+                        "replace_all": {"type": "boolean", "description": "If true, replace ALL occurrences of old_str (default: false, requires unique match)"},
+                        "transaction_id": {"type": "string", "description": "Optional explicit batch transaction id. Consecutive tool calls in the same batch with the same id and rollback_on_failure=true execute as one rollback boundary."},
+                        "rollback_on_failure": {"type": "boolean", "description": "Optional explicit batch transaction flag. When true with transaction_id, a later failure inside the same contiguous batch transaction rolls back bounded file/database side effects recorded since the transaction began."}
                     },
                     "required": ["path", "old_str", "new_str"]
                 }
@@ -95,7 +101,9 @@ pub fn all_tool_schemas() -> Vec<Value> {
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "path": {"type": "string", "description": "File path relative to project root"}
+                        "path": {"type": "string", "description": "File path relative to project root"},
+                        "transaction_id": {"type": "string", "description": "Optional explicit batch transaction id. Consecutive tool calls in the same batch with the same id and rollback_on_failure=true execute as one rollback boundary."},
+                        "rollback_on_failure": {"type": "boolean", "description": "Optional explicit batch transaction flag. When true with transaction_id, a later failure inside the same contiguous batch transaction rolls back bounded file/database side effects recorded since the transaction began."}
                     },
                     "required": ["path"]
                 }
@@ -122,9 +130,92 @@ pub fn all_tool_schemas() -> Vec<Value> {
                                 "required": ["old_str", "new_str"]
                             }
                         },
-                        "dry_run": {"type": "boolean", "description": "If true, show unified diff without applying (default: false)"}
+                        "dry_run": {"type": "boolean", "description": "If true, show unified diff without applying (default: false)"},
+                        "transaction_id": {"type": "string", "description": "Optional explicit batch transaction id. Consecutive tool calls in the same batch with the same id and rollback_on_failure=true execute as one rollback boundary."},
+                        "rollback_on_failure": {"type": "boolean", "description": "Optional explicit batch transaction flag. When true with transaction_id, a later failure inside the same contiguous batch transaction rolls back bounded file/database side effects recorded since the transaction began."}
                     },
                     "required": ["path", "edits"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "rollback_file_edits",
+                "description": "Revert file edits previously recorded in the undo journal. Use as the compensation action for recent write_file, str_replace, multi_edit, or workspace-edit changes. Can revert the current turn, a specific turn, the latest edit for one file, or list recorded edit entries.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "scope": {
+                            "type": "string",
+                            "enum": ["current_turn", "turn", "file", "list"],
+                            "description": "Rollback scope. Defaults to current_turn. Use file to revert the latest recorded edit for one path, turn to revert a specific turn_index, or list to inspect journal entries."
+                        },
+                        "path": {
+                            "type": "string",
+                            "description": "File path relative to project root. Required when scope=file."
+                        },
+                        "turn_index": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "description": "Specific turn index to roll back. Required when scope=turn."
+                        }
+                    },
+                    "required": []
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "rollback_database_snapshots",
+                "description": "Restore MatrixOne pre-state snapshots captured by mutating mo_query calls. Use as the bounded compensation action for recent database mutations. Can restore the current turn, a specific turn, one explicit snapshot_id, or list recorded snapshot entries.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "scope": {
+                            "type": "string",
+                            "enum": ["current_turn", "turn", "snapshot", "list"],
+                            "description": "Rollback scope. Defaults to current_turn. Use turn to restore one snapshot per database for a prior turn, snapshot to restore an explicit snapshot_id, or list to inspect recorded snapshot entries."
+                        },
+                        "turn_index": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "description": "Specific turn index to roll back. Required when scope=turn."
+                        },
+                        "snapshot_id": {
+                            "type": "string",
+                            "description": "Snapshot identifier captured from a mutating mo_query result or audit record. Required when scope=snapshot."
+                        },
+                        "database": {
+                            "type": "string",
+                            "description": "MatrixOne database to restore for scope=snapshot when the journal entry is unavailable. Defaults to the recorded database when present."
+                        }
+                    },
+                    "required": []
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "rollback_turn_actions",
+                "description": "Orchestrate bounded rollback across the shared file edit journal and MatrixOne snapshot journal for one turn. Use to revert mixed file/database side effects from the current turn or a specific turn, or to list recorded rollback handles across both journals.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "scope": {
+                            "type": "string",
+                            "enum": ["current_turn", "turn", "list"],
+                            "description": "Rollback scope. Defaults to current_turn. Use turn to revert one prior turn across both journals, or list to inspect recorded rollback entries."
+                        },
+                        "turn_index": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "description": "Specific turn index to roll back. Required when scope=turn."
+                        }
+                    },
+                    "required": []
                 }
             }
         }),
@@ -562,12 +653,14 @@ pub fn all_tool_schemas() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "mo_query",
-                "description": "Execute a SQL query against MatrixOne database. Returns formatted table results (truncated to ~20KB). Destructive operations (DELETE, DROP, TRUNCATE) are blocked by default — pass allow_destructive=true to confirm. Use for data exploration, schema inspection, and analytics queries.",
+                "description": "Execute a SQL query against MatrixOne database. Returns formatted table results (truncated to ~20KB). Destructive operations (DELETE, DROP, TRUNCATE) are blocked by default — pass allow_destructive=true to confirm. Mutating queries capture a pre-state snapshot before execution so rollback hints can reference a concrete snapshot. Use for data exploration, schema inspection, analytics queries, and bounded writes.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "sql": {"type": "string", "description": "SQL query to execute"},
-                        "database": {"type": "string", "description": "Database name (default: MATRIXONE_DATABASE_PREFIX + MATRIXONE_DATABASE from env)"}
+                        "database": {"type": "string", "description": "Database name (default: MATRIXONE_DATABASE_PREFIX + MATRIXONE_DATABASE from env)"},
+                        "transaction_id": {"type": "string", "description": "Optional explicit batch transaction id. Consecutive tool calls in the same batch with the same id and rollback_on_failure=true execute as one rollback boundary."},
+                        "rollback_on_failure": {"type": "boolean", "description": "Optional explicit batch transaction flag. When true with transaction_id, a later failure inside the same contiguous batch transaction rolls back bounded file/database side effects recorded since the transaction began."}
                     },
                     "required": ["sql"]
                 }
@@ -577,12 +670,13 @@ pub fn all_tool_schemas() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "mo_snapshot",
-                "description": "Manage MatrixOne data snapshots for point-in-time recovery and experiment isolation. Actions: create (name a checkpoint), list (show all), drop (remove), restore (rollback to snapshot).",
+                "description": "Manage MatrixOne data snapshots for point-in-time recovery and experiment isolation. Actions: create (name a checkpoint), list (show all), drop (remove), restore (rollback to snapshot). Create and restore can target a specific database when needed.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "action": {"type": "string", "enum": ["create", "list", "drop", "restore"], "description": "Snapshot operation"},
-                        "name": {"type": "string", "description": "Snapshot name (required for create/drop/restore)"}
+                        "name": {"type": "string", "description": "Snapshot name (required for create/drop/restore)"},
+                        "database": {"type": "string", "description": "Database name for create/restore (default: from MATRIXONE_DATABASE env)"}
                     },
                     "required": ["action"]
                 }
@@ -977,12 +1071,13 @@ pub fn all_tool_schemas() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "run_chain",
-                "description": "Execute a multi-step tool chain. Each step runs a tool and passes its output to the next step via variable substitution ($prev for previous output, $step.{key} for named step output, $input.{key} for original input). Stops on first error. Use for complex multi-tool workflows like: find files → read contents → analyze.",
+                "description": "Execute a multi-step tool chain. Each step runs a tool and passes its output to the next step via variable substitution ($prev for previous output, $step.{key} for named step output, $input.{key} for original input). Stops on first error. Optionally enable rollback_on_failure to automatically revert bounded file/database side effects produced inside the chain when a later step fails. Use for complex multi-tool workflows like: find files → read contents → analyze.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "name": {"type": "string", "description": "Chain name for logging"},
                         "description": {"type": "string", "description": "What this chain does"},
+                        "rollback_on_failure": {"type": "boolean", "description": "When true, automatically invokes bounded rollback for file/database side effects recorded inside this chain if a later step fails."},
                         "steps": {
                             "type": "array",
                             "description": "Ordered list of tool invocations",

@@ -4336,10 +4336,15 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                 state.messages.push(assistant_msg);
             }
             for result in &delegation_results {
+                let summary_for_model =
+                    crate::turn::tool_result_sanitize::tool_result_content_for_model(
+                        DELEGATE_TOOL_NAME,
+                        &result.summary,
+                    );
                 let tool_msg = serde_json::json!({
                     "role": "tool",
                     "tool_call_id": result.call_id,
-                    "content": result.summary,
+                    "content": summary_for_model,
                 });
                 state.messages.push(tool_msg.clone());
                 state.tool_results.push(tool_msg);
@@ -5515,6 +5520,7 @@ mod tests {
             tool: name.to_string(),
             args: json!({}),
             output: output.to_string(),
+            tool_result_fields: None,
             status: "ok".to_string(),
             duration_ms: 10,
         }
@@ -5526,6 +5532,7 @@ mod tests {
             tool: name.to_string(),
             args,
             output: output.to_string(),
+            tool_result_fields: None,
             status: "ok".to_string(),
             duration_ms: 10,
         }
@@ -5537,6 +5544,7 @@ mod tests {
             tool: name.to_string(),
             args: json!({}),
             output: output.to_string(),
+            tool_result_fields: None,
             status: status.to_string(),
             duration_ms: 10,
         }

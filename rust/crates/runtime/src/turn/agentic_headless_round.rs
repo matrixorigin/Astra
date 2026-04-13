@@ -12,8 +12,9 @@ use super::headless_tool_assembly::{
     CACHEABLE_TOOLS, EdgeToolRoundRow, HeadlessResolvedToolSlot,
     begin_headless_tool_round_opening_ext, headless_idempotency_hit_openai_pair,
     headless_openai_duplicate_within_turn_pair, headless_unknown_local_tool_openai_pair,
-    openai_tool_roundtrip_values, resolve_headless_tool_slot,
-    take_edge_output_for_tool_call_with_duration, unknown_local_tool_error_message,
+    openai_tool_roundtrip_values, openai_tool_roundtrip_values_with_result_fields,
+    resolve_headless_tool_slot, take_edge_output_for_tool_call_with_duration,
+    unknown_local_tool_error_message,
 };
 use super::headless_tool_body_preview::emit_headless_tool_body_preview;
 use super::headless_tool_journal::{
@@ -162,7 +163,9 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
     let mut pre_resolved_ids: HashSet<&str> = HashSet::new();
     for (call_id, result_text) in pre_resolved_results {
         pre_resolved_ids.insert(call_id.as_str());
-        let (tool_msg, tr) = openai_tool_roundtrip_values(call_id, "pre_resolved", result_text);
+        let content_for_model = tool_result_content_for_model("pre_resolved", result_text);
+        let (tool_msg, tr) =
+            openai_tool_roundtrip_values(call_id, "pre_resolved", &content_for_model);
         messages.push(tool_msg);
         tool_results.push(tr);
     }
@@ -386,10 +389,12 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
         // 2. take_edge_output_for_tool_call consumes an edge result - server tool matched to edge
         let consumed_before = consumed_edge.iter().filter(|&&c| c).count();
 
-        let (mut result_str, edge_duration_ms) = if let Some(i) = synthetic_idx {
+        let (mut result_str, edge_duration_ms, tool_result_fields) = if let Some(i) = synthetic_idx
+        {
             (
                 edge_tool_round[i].tool_output().to_string(),
                 edge_tool_round[i].tool_duration_ms(),
+                edge_tool_round[i].tool_result_fields().cloned(),
             )
         } else {
             let matched = take_edge_output_for_tool_call_with_duration(
@@ -399,7 +404,11 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
                 &mut consumed_edge,
                 by_sig,
             );
-            (matched.output, matched.duration_ms)
+            (
+                matched.output,
+                matched.duration_ms,
+                matched.tool_result_fields,
+            )
         };
 
         let consumed_after = consumed_edge.iter().filter(|&&c| c).count();
@@ -706,7 +715,12 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
             model_result_str
         };
 
-        let (tool_msg, tr) = openai_tool_roundtrip_values(&id, &name, &model_result_str);
+        let (tool_msg, tr) = openai_tool_roundtrip_values_with_result_fields(
+            &id,
+            &name,
+            &model_result_str,
+            tool_result_fields.as_ref(),
+        );
         messages.push(tool_msg);
         tool_results.push(tr);
     }

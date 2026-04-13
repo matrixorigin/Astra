@@ -559,6 +559,7 @@ async fn maybe_auto_compact(
         observability_hub: obs_hub,
         observability_session: obs_session,
         file_journal: Some(state.file_journal.clone()),
+        database_snapshot_journal: Some(state.database_snapshot_journal.clone()),
         turn_index: state.turn,
         evolution_service: state.evolution_service.clone(),
     })
@@ -823,6 +824,7 @@ async fn run_chat_turn(
             observability_hub: obs_hub,
             observability_session: obs_session,
             file_journal: Some(state.file_journal.clone()),
+            database_snapshot_journal: Some(state.database_snapshot_journal.clone()),
             turn_index: state.turn,
                     evolution_service: state.evolution_service.clone(),
         }) => TurnAttempt::Completed(Box::new(result)),

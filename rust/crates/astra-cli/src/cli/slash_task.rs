@@ -302,6 +302,7 @@ pub(super) async fn handle_task_command(
                     observability_hub: None,
                     observability_session: None,
                     file_journal: None,
+                    database_snapshot_journal: None,
                     turn_index: 0,
                     evolution_service: None,
                 })

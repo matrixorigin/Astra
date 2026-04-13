@@ -26,19 +26,25 @@ pub(crate) fn is_allowed_bridge_header(name: &str) -> bool {
     name.starts_with("x-mo-") || name == "authorization"
 }
 use self::sse_events::{
-    bridge_state_tool_signatures, build_cloud_loop_progress_event_from_frame,
-    build_cloud_tool_result_event_from_frame, build_error_event_from_frame,
-    build_reasoning_delta_event_from_frame, build_text_delta_event_from_frame,
-    build_token_usage_from_usage_event, build_tool_call_event_from_frame,
-    build_tool_call_start_event_from_frame, build_tool_result_quality_event_from_frame,
-    build_turn_complete_event_from_bridge_state, build_usage_event_from_frame, find_sse_frame_end,
-    is_explain_frame, is_session_info_frame, is_turn_complete_frame, is_warning_frame,
-    parse_bridge_state_frame, render_sse_json,
+    StreamEventCursor, add_stream_event_metadata, bridge_state_tool_signatures,
+    build_cloud_loop_progress_event_from_frame, build_cloud_tool_result_event_from_frame,
+    build_error_event_from_frame, build_reasoning_delta_event_from_frame,
+    build_text_delta_event_from_frame, build_token_usage_from_usage_event,
+    build_tool_call_event_from_frame, build_tool_call_start_event_from_frame,
+    build_tool_result_quality_event_from_frame, build_turn_complete_event_from_bridge_state,
+    build_usage_event_from_frame, find_sse_frame_end, is_explain_frame, is_session_info_frame,
+    is_turn_complete_frame, is_warning_frame, parse_bridge_state_frame, parse_sse_json_frame,
+    parse_stream_event_id, render_sse_json, render_stream_event_id,
 };
 
 use crate::turn::routing::max_tool_rounds;
+use astra_core::SharedPool;
+use sqlx::{MySql, QueryBuilder, Row, query};
+#[cfg(test)]
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio_util::sync::CancellationToken;
 
 const TOOL_RESULT_AUDIT_CHARS: usize = 4000;
@@ -48,6 +54,11 @@ const MAX_SSE_BUFFER_BYTES: usize = 16 * 1024 * 1024;
 /// Cap buffered non-SSE error bodies so upstream 5xx/JSON responses cannot
 /// force unbounded memory growth while we normalize them into a local SSE error.
 const MAX_BRIDGE_ERROR_BODY_BYTES: usize = 16 * 1024;
+const BRIDGE_REPLAY_WINDOW_PREFIX: &str = "__bridge_replay__";
+const BRIDGE_REPLAY_WINDOW_MAX_FRAMES: usize = 128;
+const BRIDGE_REPLAY_WINDOW_MAX_BYTES: usize = 256 * 1024;
+const BRIDGE_PERSISTED_REPLAY_SCOPE_LIMIT: usize = 16;
+const BRIDGE_PERSISTED_REPLAY_INCOMPLETE_FLUSH_EVERY: u64 = 8;
 
 fn synthesized_session_info_event(session_id: &str, run_id: Option<&str>) -> serde_json::Value {
     let mut event = serde_json::json!({
@@ -63,6 +74,658 @@ fn synthesized_session_info_event(session_id: &str, run_id: Option<&str>) -> ser
         );
     }
     event
+}
+
+fn render_stream_event_bytes(
+    mut event: serde_json::Value,
+    next_sequence: &mut u64,
+    session_id: Option<&str>,
+    turn_chain_id: Option<&str>,
+    user_query_event_id: Option<&str>,
+) -> Bytes {
+    *next_sequence = next_sequence.saturating_add(1);
+    add_stream_event_metadata(
+        &mut event,
+        *next_sequence,
+        session_id,
+        turn_chain_id,
+        user_query_event_id,
+    );
+    Bytes::from(render_sse_json(event))
+}
+
+fn rewrite_sse_frame_with_stream_metadata(
+    frame: &[u8],
+    next_sequence: &mut u64,
+    session_id: Option<&str>,
+    turn_chain_id: Option<&str>,
+    user_query_event_id: Option<&str>,
+) -> Bytes {
+    match parse_sse_json_frame(frame) {
+        Some(event) => render_stream_event_bytes(
+            event,
+            next_sequence,
+            session_id,
+            turn_chain_id,
+            user_query_event_id,
+        ),
+        None => Bytes::copy_from_slice(frame),
+    }
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub(crate) struct BridgeReplayWindow {
+    #[serde(default)]
+    frames: Vec<String>,
+    #[serde(default)]
+    complete: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_persisted_sequence: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+struct BridgeReplaySuffix {
+    frames: Vec<Bytes>,
+    last_cursor: StreamEventCursor,
+    complete: bool,
+}
+
+impl BridgeReplayWindow {
+    fn from_cache_entry(entry: serde_json::Map<String, serde_json::Value>) -> Self {
+        serde_json::from_value(serde_json::Value::Object(entry)).unwrap_or_default()
+    }
+
+    fn into_cache_entry(self) -> serde_json::Map<String, serde_json::Value> {
+        serde_json::to_value(self)
+            .ok()
+            .and_then(|value| value.as_object().cloned())
+            .unwrap_or_default()
+    }
+
+    fn append_frame(&mut self, frame: &[u8]) -> bool {
+        let Some(cursor) = stream_cursor_from_frame(frame) else {
+            return false;
+        };
+        let Some(text) = std::str::from_utf8(frame).ok() else {
+            return false;
+        };
+
+        if let Some(overlap_index) = self.frames.iter().position(|existing| {
+            stream_cursor_from_frame(existing.as_bytes())
+                .is_some_and(|existing_cursor| existing_cursor.sequence >= cursor.sequence)
+        }) {
+            self.frames.truncate(overlap_index);
+        }
+        if self
+            .last_persisted_sequence
+            .is_some_and(|sequence| sequence >= cursor.sequence)
+        {
+            self.last_persisted_sequence = None;
+        }
+
+        self.frames.push(text.to_string());
+        while self.frames.len() > BRIDGE_REPLAY_WINDOW_MAX_FRAMES
+            || replay_window_total_bytes(&self.frames) > BRIDGE_REPLAY_WINDOW_MAX_BYTES
+        {
+            self.frames.remove(0);
+        }
+        self.complete = is_turn_complete_frame(frame);
+        true
+    }
+
+    fn last_cursor(&self) -> Option<StreamEventCursor> {
+        self.frames
+            .last()
+            .and_then(|frame| stream_cursor_from_frame(frame.as_bytes()))
+    }
+
+    fn should_persist(&self) -> bool {
+        let Some(last_cursor) = self.last_cursor() else {
+            return false;
+        };
+        if self.complete || self.last_persisted_sequence.is_none() {
+            return true;
+        }
+        last_cursor.sequence
+            >= self
+                .last_persisted_sequence
+                .unwrap_or_default()
+                .saturating_add(BRIDGE_PERSISTED_REPLAY_INCOMPLETE_FLUSH_EVERY)
+    }
+
+    fn mark_persisted(&mut self) {
+        self.last_persisted_sequence = self.last_cursor().map(|cursor| cursor.sequence);
+    }
+
+    fn suffix_after(
+        &self,
+        cursor: &StreamEventCursor,
+        allow_incomplete: bool,
+    ) -> Option<BridgeReplaySuffix> {
+        if (!allow_incomplete && !self.complete) || self.frames.is_empty() {
+            return None;
+        }
+        let parsed = self
+            .frames
+            .iter()
+            .map(|frame| stream_cursor_from_frame(frame.as_bytes()).map(|event| (event, frame)))
+            .collect::<Option<Vec<_>>>()?;
+        let first_sequence = parsed.first()?.0.sequence;
+        let last_sequence = parsed.last()?.0.sequence;
+        if cursor.sequence + 1 < first_sequence || cursor.sequence > last_sequence {
+            return None;
+        }
+        let replayed: Vec<(StreamEventCursor, &String)> = parsed
+            .into_iter()
+            .filter(|(event_cursor, _)| event_cursor.sequence > cursor.sequence)
+            .collect();
+        let last_cursor = replayed.last()?.0.clone();
+        Some(BridgeReplaySuffix {
+            frames: replayed
+                .into_iter()
+                .map(|(_, frame)| Bytes::copy_from_slice(frame.as_bytes()))
+                .collect(),
+            last_cursor,
+            complete: self.complete,
+        })
+    }
+}
+
+#[async_trait]
+pub(crate) trait BridgeReplayWindowStore: Send + Sync {
+    async fn load_latest_window(
+        &self,
+        session_id: &str,
+        scope_key: &str,
+    ) -> Result<Option<BridgeReplayWindow>, String>;
+
+    async fn persist_latest_window(
+        &self,
+        session_id: &str,
+        scope_key: &str,
+        window: &BridgeReplayWindow,
+    ) -> Result<(), String>;
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct DatabaseBridgeReplayWindowStore {
+    pool: SharedPool,
+}
+
+impl DatabaseBridgeReplayWindowStore {
+    pub(crate) fn new(pool: SharedPool) -> Self {
+        Self { pool }
+    }
+
+    async fn load_legacy_latest_window(
+        &self,
+        pool: &sqlx::Pool<MySql>,
+        session_id: &str,
+        scope_key: &str,
+    ) -> Result<Option<BridgeReplayWindow>, String> {
+        let row = query(
+            "SELECT scope_key, replay_window_json \
+             FROM agent_session_replay_windows \
+             WHERE session_id = ?",
+        )
+        .bind(session_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|error| error.to_string())?;
+
+        let Some(row) = row else {
+            return Ok(None);
+        };
+
+        let stored_scope_key: String = row
+            .try_get("scope_key")
+            .map_err(|error| error.to_string())?;
+        if stored_scope_key != scope_key {
+            return Ok(None);
+        }
+
+        let replay_window_json: String = row
+            .try_get("replay_window_json")
+            .map_err(|error| error.to_string())?;
+        let window =
+            serde_json::from_str::<BridgeReplayWindow>(&replay_window_json).map_err(|error| {
+                format!("invalid persisted replay window for session {session_id}: {error}")
+            })?;
+        Ok(Some(window))
+    }
+
+    async fn trim_scope_windows(
+        &self,
+        pool: &sqlx::Pool<MySql>,
+        session_id: &str,
+    ) -> Result<(), String> {
+        let rows = query(
+            "SELECT scope_key \
+             FROM agent_session_replay_scope_windows \
+             WHERE session_id = ? \
+             ORDER BY updated_at DESC, scope_key DESC",
+        )
+        .bind(session_id)
+        .fetch_all(pool)
+        .await
+        .map_err(|error| error.to_string())?;
+        let stale_scope_keys: Vec<String> = rows
+            .into_iter()
+            .skip(BRIDGE_PERSISTED_REPLAY_SCOPE_LIMIT)
+            .filter_map(|row| row.try_get("scope_key").ok())
+            .collect();
+        if stale_scope_keys.is_empty() {
+            return Ok(());
+        }
+
+        let mut builder = QueryBuilder::<MySql>::new(
+            "DELETE FROM agent_session_replay_scope_windows WHERE session_id = ",
+        );
+        builder.push_bind(session_id);
+        builder.push(" AND scope_key IN (");
+        {
+            let mut separated = builder.separated(", ");
+            for scope_key in &stale_scope_keys {
+                separated.push_bind(scope_key);
+            }
+        }
+        builder.push(")");
+        builder
+            .build()
+            .execute(pool)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl BridgeReplayWindowStore for DatabaseBridgeReplayWindowStore {
+    async fn load_latest_window(
+        &self,
+        session_id: &str,
+        scope_key: &str,
+    ) -> Result<Option<BridgeReplayWindow>, String> {
+        let pool = self.pool.get().clone();
+        let row = query(
+            "SELECT replay_window_json \
+             FROM agent_session_replay_scope_windows \
+             WHERE session_id = ? AND scope_key = ?",
+        )
+        .bind(session_id)
+        .bind(scope_key)
+        .fetch_optional(&pool)
+        .await
+        .map_err(|error| error.to_string())?;
+
+        if let Some(row) = row {
+            let replay_window_json: String = row
+                .try_get("replay_window_json")
+                .map_err(|error| error.to_string())?;
+            let window = serde_json::from_str::<BridgeReplayWindow>(&replay_window_json).map_err(
+                |error| {
+                    format!("invalid persisted replay window for session {session_id}: {error}")
+                },
+            )?;
+            return Ok(Some(window));
+        };
+        self.load_legacy_latest_window(&pool, session_id, scope_key)
+            .await
+    }
+
+    async fn persist_latest_window(
+        &self,
+        session_id: &str,
+        scope_key: &str,
+        window: &BridgeReplayWindow,
+    ) -> Result<(), String> {
+        let pool = self.pool.get().clone();
+        let replay_window_json =
+            serde_json::to_string(window).map_err(|error| error.to_string())?;
+        query(
+            "INSERT INTO agent_session_replay_scope_windows \
+             (session_id, scope_key, replay_window_json, created_at, updated_at) \
+             VALUES (?, ?, ?, NOW(6), NOW(6)) \
+             ON DUPLICATE KEY UPDATE \
+               replay_window_json = VALUES(replay_window_json), \
+               updated_at = NOW(6)",
+        )
+        .bind(session_id)
+        .bind(scope_key)
+        .bind(replay_window_json)
+        .execute(&pool)
+        .await
+        .map_err(|error| error.to_string())?;
+        self.trim_scope_windows(&pool, session_id).await?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone)]
+struct PersistedBridgeReplayWindowEntry {
+    window: BridgeReplayWindow,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, Default)]
+struct InMemoryBridgeReplayWindowStore {
+    entries:
+        Arc<tokio::sync::Mutex<HashMap<String, HashMap<String, PersistedBridgeReplayWindowEntry>>>>,
+}
+
+#[cfg(test)]
+#[async_trait]
+impl BridgeReplayWindowStore for InMemoryBridgeReplayWindowStore {
+    async fn load_latest_window(
+        &self,
+        session_id: &str,
+        scope_key: &str,
+    ) -> Result<Option<BridgeReplayWindow>, String> {
+        let entries = self.entries.lock().await;
+        Ok(entries
+            .get(session_id)
+            .and_then(|scopes| scopes.get(scope_key))
+            .map(|entry| entry.window.clone()))
+    }
+
+    async fn persist_latest_window(
+        &self,
+        session_id: &str,
+        scope_key: &str,
+        window: &BridgeReplayWindow,
+    ) -> Result<(), String> {
+        let mut entries = self.entries.lock().await;
+        entries.entry(session_id.to_string()).or_default().insert(
+            scope_key.to_string(),
+            PersistedBridgeReplayWindowEntry {
+                window: window.clone(),
+            },
+        );
+        Ok(())
+    }
+}
+
+fn replay_window_total_bytes(frames: &[String]) -> usize {
+    frames.iter().map(|frame| frame.len()).sum()
+}
+
+fn replay_window_now() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64()
+}
+
+fn bridge_replay_window_key(
+    session_id: &str,
+    turn_chain_id: Option<&str>,
+    user_query_event_id: Option<&str>,
+) -> String {
+    format!(
+        "{BRIDGE_REPLAY_WINDOW_PREFIX}:{session_id}:{}:{}",
+        turn_chain_id.unwrap_or_default(),
+        user_query_event_id.unwrap_or_default()
+    )
+}
+
+fn request_scope_cursor(
+    session_id: Option<&str>,
+    turn_chain_id: Option<&str>,
+    user_query_event_id: Option<&str>,
+) -> Option<StreamEventCursor> {
+    Some(StreamEventCursor {
+        sequence: 0,
+        session_id: Some(session_id?.to_string()),
+        turn_chain_id: turn_chain_id
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string),
+        user_query_event_id: user_query_event_id
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string),
+    })
+}
+
+async fn append_bridge_replay_frame(
+    cache: Arc<tokio::sync::Mutex<SessionCache>>,
+    persisted_replay_window_store: Option<Arc<dyn BridgeReplayWindowStore>>,
+    session_id: Option<&str>,
+    turn_chain_id: Option<&str>,
+    user_query_event_id: Option<&str>,
+    frame: &[u8],
+) {
+    let Some(session_id) = session_id.filter(|value| !value.is_empty()) else {
+        return;
+    };
+    let key = bridge_replay_window_key(session_id, turn_chain_id, user_query_event_id);
+    let now = replay_window_now();
+    let mut cache_guard = cache.lock().await;
+    let entry = cache_guard.get(&key, now).unwrap_or_default();
+    let mut window = BridgeReplayWindow::from_cache_entry(entry);
+    if !window.append_frame(frame) {
+        return;
+    }
+    let should_persist = window.should_persist();
+    cache_guard.insert(key.clone(), window.clone().into_cache_entry(), now);
+    drop(cache_guard);
+    if should_persist && let Some(store) = persisted_replay_window_store {
+        let mut persisted_window = window.clone();
+        persisted_window.mark_persisted();
+        if let Err(error) = store
+            .persist_latest_window(session_id, &key, &persisted_window)
+            .await
+        {
+            astra_core::agent_error!(
+                "bridge",
+                "persisted replay window update failed for session {}: {}",
+                session_id,
+                error
+            );
+        } else {
+            let mut cache_guard = cache.lock().await;
+            cache_guard.insert(
+                key,
+                persisted_window.into_cache_entry(),
+                replay_window_now(),
+            );
+        }
+    }
+}
+
+async fn replay_buffered_bridge_suffix(
+    cache: Arc<tokio::sync::Mutex<SessionCache>>,
+    resume_cursor: &StreamEventCursor,
+    session_id: Option<&str>,
+    turn_chain_id: Option<&str>,
+    user_query_event_id: Option<&str>,
+    allow_incomplete: bool,
+) -> Option<BridgeReplaySuffix> {
+    let request_scope = request_scope_cursor(session_id, turn_chain_id, user_query_event_id)?;
+    if !resume_cursor.matches_scope(&request_scope) {
+        return None;
+    }
+    let session_id = request_scope.session_id.as_deref()?;
+    let key = bridge_replay_window_key(session_id, turn_chain_id, user_query_event_id);
+    let now = replay_window_now();
+    let mut cache = cache.lock().await;
+    let entry = cache.get(&key, now)?;
+    let window = BridgeReplayWindow::from_cache_entry(entry);
+    window.suffix_after(resume_cursor, allow_incomplete)
+}
+
+async fn replay_persisted_bridge_suffix(
+    persisted_replay_window_store: Option<Arc<dyn BridgeReplayWindowStore>>,
+    resume_cursor: &StreamEventCursor,
+    session_id: Option<&str>,
+    turn_chain_id: Option<&str>,
+    user_query_event_id: Option<&str>,
+    allow_incomplete: bool,
+) -> Option<BridgeReplaySuffix> {
+    let request_scope = request_scope_cursor(session_id, turn_chain_id, user_query_event_id)?;
+    if !resume_cursor.matches_scope(&request_scope) {
+        return None;
+    }
+    let session_id = request_scope.session_id.as_deref()?;
+    let key = bridge_replay_window_key(session_id, turn_chain_id, user_query_event_id);
+    let store = persisted_replay_window_store?;
+    let window = match store.load_latest_window(session_id, &key).await {
+        Ok(window) => window?,
+        Err(error) => {
+            astra_core::agent_error!(
+                "bridge",
+                "persisted replay window load failed for session {}: {}",
+                session_id,
+                error
+            );
+            return None;
+        }
+    };
+    window.suffix_after(resume_cursor, allow_incomplete)
+}
+
+async fn replay_bridge_suffix(
+    cache: Arc<tokio::sync::Mutex<SessionCache>>,
+    persisted_replay_window_store: Option<Arc<dyn BridgeReplayWindowStore>>,
+    resume_cursor: Option<&StreamEventCursor>,
+    session_id: Option<&str>,
+    turn_chain_id: Option<&str>,
+    user_query_event_id: Option<&str>,
+    allow_incomplete: bool,
+) -> Option<BridgeReplaySuffix> {
+    let resume_cursor = resume_cursor?;
+    if let Some(suffix) = replay_buffered_bridge_suffix(
+        cache,
+        resume_cursor,
+        session_id,
+        turn_chain_id,
+        user_query_event_id,
+        allow_incomplete,
+    )
+    .await
+    {
+        return Some(suffix);
+    }
+    replay_persisted_bridge_suffix(
+        persisted_replay_window_store,
+        resume_cursor,
+        session_id,
+        turn_chain_id,
+        user_query_event_id,
+        allow_incomplete,
+    )
+    .await
+}
+
+fn replay_window_response(frames: Vec<Bytes>) -> Response {
+    let mut body = Vec::new();
+    for frame in frames {
+        body.extend_from_slice(&frame);
+    }
+    sse_stream_response(StatusCode::OK, Body::from(body))
+}
+
+fn last_event_id_cursor(headers: &HeaderMap) -> Option<StreamEventCursor> {
+    headers
+        .get("last-event-id")
+        .and_then(|value| value.to_str().ok())
+        .and_then(parse_stream_event_id)
+        .filter(StreamEventCursor::has_replay_scope)
+}
+
+fn forwarded_last_event_id(
+    resume_cursor: Option<&StreamEventCursor>,
+    replay_suffix: Option<&BridgeReplaySuffix>,
+    session_id: Option<&str>,
+    turn_chain_id: Option<&str>,
+    user_query_event_id: Option<&str>,
+) -> Option<String> {
+    let request_scope = request_scope_cursor(session_id, turn_chain_id, user_query_event_id)?;
+    let resume_cursor = resume_cursor.filter(|cursor| cursor.matches_scope(&request_scope))?;
+    let cursor = replay_suffix
+        .map(|suffix| &suffix.last_cursor)
+        .filter(|cursor| {
+            resume_cursor.matches_scope(cursor) && cursor.sequence > resume_cursor.sequence
+        })
+        .unwrap_or(resume_cursor);
+    Some(render_stream_event_id(
+        cursor.sequence,
+        cursor.session_id.as_deref(),
+        cursor.turn_chain_id.as_deref(),
+        cursor.user_query_event_id.as_deref(),
+    ))
+}
+
+fn stream_cursor_from_frame(frame: &[u8]) -> Option<StreamEventCursor> {
+    parse_sse_json_frame(frame).and_then(|event| StreamEventCursor::from_event(&event))
+}
+
+fn filter_replayed_stream_events<S>(
+    stream: S,
+    resume_cursor: Option<StreamEventCursor>,
+) -> impl futures_util::stream::Stream<Item = Result<Bytes, std::io::Error>>
+where
+    S: futures_util::stream::Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
+{
+    stream! {
+        let mut stream = Box::pin(stream);
+        let mut resume_cursor = resume_cursor;
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(bytes) => {
+                    if let Some(cursor) = resume_cursor.as_ref()
+                        && let Some(event_cursor) = stream_cursor_from_frame(&bytes)
+                        && cursor.matches_scope(&event_cursor)
+                    {
+                        if event_cursor.sequence <= cursor.sequence {
+                            continue;
+                        }
+                        resume_cursor = None;
+                    }
+                    yield Ok(bytes);
+                }
+                Err(error) => {
+                    yield Err(error);
+                    return;
+                }
+            }
+        }
+    }
+}
+
+fn record_bridge_replay_window_stream<S>(
+    stream: S,
+    cache: Arc<tokio::sync::Mutex<SessionCache>>,
+    persisted_replay_window_store: Option<Arc<dyn BridgeReplayWindowStore>>,
+    trusted_session_id: Option<String>,
+    trusted_turn_chain_id: Option<String>,
+    trusted_user_query_event_id: Option<String>,
+) -> impl futures_util::stream::Stream<Item = Result<Bytes, std::io::Error>>
+where
+    S: futures_util::stream::Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
+{
+    stream! {
+        let mut stream = Box::pin(stream);
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(bytes) => {
+                    append_bridge_replay_frame(
+                        cache.clone(),
+                        persisted_replay_window_store.clone(),
+                        trusted_session_id.as_deref(),
+                        trusted_turn_chain_id.as_deref(),
+                        trusted_user_query_event_id.as_deref(),
+                        &bytes,
+                    )
+                    .await;
+                    yield Ok(bytes);
+                }
+                Err(error) => {
+                    yield Err(error);
+                    return;
+                }
+            }
+        }
+    }
 }
 
 struct BridgeResponseStream<S> {
@@ -103,6 +766,13 @@ fn bridge_http_response_health(status: StatusCode, is_sse: bool) -> (bool, bool)
     let should_trip_breaker =
         status.is_server_error() || status == StatusCode::TOO_MANY_REQUESTS || !is_sse;
     (is_success, should_trip_breaker)
+}
+
+fn should_replay_incomplete_suffix_for_pre_stream_failure(
+    status: StatusCode,
+    is_sse: bool,
+) -> bool {
+    !is_sse && (status.is_server_error() || status == StatusCode::TOO_MANY_REQUESTS)
 }
 
 fn bridge_error_sse_message(status: StatusCode, body: &str) -> String {
@@ -155,13 +825,23 @@ fn bridge_error_sse_response(
             ),
     });
     let mut body = Vec::new();
+    let mut sequence = 0u64;
     if let Some(session_id) = trusted_session_id {
-        body.extend_from_slice(&render_sse_json(synthesized_session_info_event(
-            session_id,
+        body.extend_from_slice(&render_stream_event_bytes(
+            synthesized_session_info_event(session_id, trusted_run_id),
+            &mut sequence,
+            Some(session_id),
             trusted_run_id,
-        )));
+            None,
+        ));
     }
-    body.extend_from_slice(&render_sse_json(event));
+    body.extend_from_slice(&render_stream_event_bytes(
+        event,
+        &mut sequence,
+        trusted_session_id,
+        trusted_run_id,
+        None,
+    ));
     sse_stream_response(StatusCode::OK, Body::from(body))
 }
 
@@ -255,6 +935,7 @@ pub(crate) struct HttpChatTurnBridge {
     cache: Arc<tokio::sync::Mutex<SessionCache>>,
     circuit_breaker: Arc<CircuitBreaker>,
     health_metrics: Arc<BridgeHealthMetrics>,
+    persisted_replay_window_store: Option<Arc<dyn BridgeReplayWindowStore>>,
     turn_learning_writer: Option<Arc<dyn TurnLearningWriter>>,
 }
 
@@ -262,6 +943,10 @@ impl std::fmt::Debug for HttpChatTurnBridge {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HttpChatTurnBridge")
             .field("url", &self.url)
+            .field(
+                "has_persisted_replay_window_store",
+                &self.persisted_replay_window_store.is_some(),
+            )
             .field("has_learning_writer", &self.turn_learning_writer.is_some())
             .finish()
     }
@@ -312,8 +997,17 @@ impl HttpChatTurnBridge {
             cache,
             circuit_breaker: Arc::new(CircuitBreaker::with_defaults()),
             health_metrics: Arc::new(BridgeHealthMetrics::new()),
+            persisted_replay_window_store: None,
             turn_learning_writer: None,
         }
+    }
+
+    pub(crate) fn with_persisted_replay_window_store(
+        mut self,
+        store: Arc<dyn BridgeReplayWindowStore>,
+    ) -> Self {
+        self.persisted_replay_window_store = Some(store);
+        self
     }
 
     /// Set the pipeline learning writer for this bridge.
@@ -374,6 +1068,7 @@ impl ChatTurnBridge for HttpChatTurnBridge {
     ) -> Result<Response, (StatusCode, String)> {
         let mut bridge_headers = HeaderMap::new();
         let side_effect_request_context = parse_bridge_side_effect_request_context(&body);
+        let resume_cursor = last_event_id_cursor(headers);
         let mut request = self
             .client
             .post(&self.url)
@@ -388,9 +1083,43 @@ impl ChatTurnBridge for HttpChatTurnBridge {
         }
         request = request.body(body.to_vec());
         let (trusted_session_id, trusted_turn_chain_id) = trusted_bridge_identity(&bridge_headers);
+        let trusted_user_query_event_id = bridge_headers
+            .get("x-mo-user-query-event-id")
+            .and_then(|value| value.to_str().ok())
+            .map(ToString::to_string)
+            .filter(|value| !value.is_empty());
+
+        let replay_suffix = replay_bridge_suffix(
+            self.cache.clone(),
+            self.persisted_replay_window_store.clone(),
+            resume_cursor.as_ref(),
+            trusted_session_id.as_deref(),
+            trusted_turn_chain_id.as_deref(),
+            trusted_user_query_event_id.as_deref(),
+            true,
+        )
+        .await;
+        if let Some(suffix) = replay_suffix.as_ref()
+            && suffix.complete
+        {
+            return Ok(replay_window_response(suffix.frames.clone()));
+        }
+        let incomplete_replay_suffix = replay_suffix.filter(|suffix| !suffix.complete);
+        if let Some(last_event_id) = forwarded_last_event_id(
+            resume_cursor.as_ref(),
+            incomplete_replay_suffix.as_ref(),
+            trusted_session_id.as_deref(),
+            trusted_turn_chain_id.as_deref(),
+            trusted_user_query_event_id.as_deref(),
+        ) {
+            request = request.header("last-event-id", last_event_id);
+        }
 
         // Circuit breaker: fast-reject if bridge is in open state
         if !self.circuit_breaker.allow_request() {
+            if let Some(suffix) = incomplete_replay_suffix.clone() {
+                return Ok(replay_window_response(suffix.frames));
+            }
             let metrics = self.circuit_breaker.metrics();
             return Ok(bridge_error_sse_response(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -412,6 +1141,9 @@ impl ChatTurnBridge for HttpChatTurnBridge {
                 self.circuit_breaker.record_failure();
                 self.health_metrics
                     .record_request(latency_ms, false, is_timeout);
+                if let Some(suffix) = incomplete_replay_suffix.clone() {
+                    return Ok(replay_window_response(suffix.frames));
+                }
                 return Ok(bridge_error_sse_response(
                     StatusCode::BAD_GATEWAY,
                     error.to_string(),
@@ -440,6 +1172,12 @@ impl ChatTurnBridge for HttpChatTurnBridge {
             self.circuit_breaker.record_failure();
         }
         if !is_sse {
+            if let Some(suffix) = incomplete_replay_suffix
+                .clone()
+                .filter(|_| should_replay_incomplete_suffix_for_pre_stream_failure(status, is_sse))
+            {
+                return Ok(replay_window_response(suffix.frames));
+            }
             let error_body = read_bridge_error_body_excerpt(
                 response.bytes_stream(),
                 MAX_BRIDGE_ERROR_BODY_BYTES,
@@ -503,10 +1241,7 @@ impl ChatTurnBridge for HttpChatTurnBridge {
                     .as_deref()
                     .is_some_and(|value| value.starts_with("text/event-stream"))
             {
-                bridge_headers
-                    .get("x-mo-user-query-event-id")
-                    .and_then(|value| value.to_str().ok())
-                    .map(ToString::to_string)
+                trusted_user_query_event_id.clone()
             } else {
                 None
             },
@@ -542,7 +1277,29 @@ impl ChatTurnBridge for HttpChatTurnBridge {
             turn_session_activity_writer,
             self.turn_learning_writer.clone(),
         );
-        let response_stream = BridgeResponseStream::new(filtered_stream, client_cancel);
+        let replay_prefix_frames = incomplete_replay_suffix
+            .as_ref()
+            .map(|suffix| suffix.frames.clone())
+            .unwrap_or_default();
+        let live_resume_cursor = incomplete_replay_suffix
+            .as_ref()
+            .map(|suffix| suffix.last_cursor.clone())
+            .or(resume_cursor.clone());
+        let live_stream = record_bridge_replay_window_stream(
+            filter_replayed_stream_events(filtered_stream, live_resume_cursor),
+            self.cache.clone(),
+            self.persisted_replay_window_store.clone(),
+            trusted_session_id.clone(),
+            trusted_turn_chain_id.clone(),
+            trusted_user_query_event_id,
+        );
+        let spliced_stream = futures_util::stream::iter(
+            replay_prefix_frames
+                .into_iter()
+                .map(Ok::<Bytes, std::io::Error>),
+        )
+        .chain(live_stream);
+        let response_stream = BridgeResponseStream::new(spliced_stream, client_cancel);
         Ok(sse_stream_response(
             StatusCode::OK,
             Body::from_stream(response_stream),
@@ -619,11 +1376,34 @@ where
     }
 
     stream! {
+        let mut event_sequence = 0u64;
+        macro_rules! emit_event {
+            ($event:expr) => {
+                render_stream_event_bytes(
+                    $event,
+                    &mut event_sequence,
+                    trusted_session_id.as_deref(),
+                    trusted_turn_chain_id.as_deref(),
+                    trusted_user_query_event_id.as_deref(),
+                )
+            };
+        }
+        macro_rules! emit_frame {
+            ($frame:expr) => {
+                rewrite_sse_frame_with_stream_metadata(
+                    $frame,
+                    &mut event_sequence,
+                    trusted_session_id.as_deref(),
+                    trusted_turn_chain_id.as_deref(),
+                    trusted_user_query_event_id.as_deref(),
+                )
+            };
+        }
         if let Some(session_id) = trusted_session_id.as_deref() {
-            yield Ok(Bytes::from(render_sse_json(synthesized_session_info_event(
+            yield Ok(emit_event!(synthesized_session_info_event(
                 session_id,
                 trusted_turn_chain_id.as_deref(),
-            ))));
+            )));
         }
         let mut buffer = Vec::new();
         let mut pending_bridge_state: Option<serde_json::Map<String, serde_json::Value>> = None;
@@ -653,14 +1433,14 @@ where
                             if trusted_session_id.is_some() {
                                 continue;
                             }
-                            yield Ok(Bytes::from(frame));
+                            yield Ok(emit_frame!(&frame));
                             continue;
                         } else if suppress_next_turn_complete && is_turn_complete_frame(&frame) {
                             suppress_next_turn_complete = false;
                             continue;
                         } else if let Some(mut bridge_state) = parse_bridge_state_frame(&frame) {
                             let Some(trusted_session_id) = trusted_session_id.as_deref() else {
-                                yield Ok(Bytes::from(frame));
+                                yield Ok(emit_frame!(&frame));
                                 continue;
                             };
                             let prompt_fingerprints =
@@ -719,25 +1499,21 @@ where
                                 }
                                 suppress_next_turn_complete = true;
                                 if let Some(warning_event) = warning_event {
-                                    yield Ok(Bytes::from(render_sse_json(
-                                        serde_json::Value::Object(warning_event),
-                                    )));
+                                    yield Ok(emit_event!(serde_json::Value::Object(warning_event)));
                                 }
                                 if let Some(explain_event) = explain_event {
-                                    yield Ok(Bytes::from(render_sse_json(
-                                        serde_json::Value::Object(explain_event),
-                                    )));
+                                    yield Ok(emit_event!(serde_json::Value::Object(explain_event)));
                                 }
-                                yield Ok(Bytes::from(render_sse_json(
-                                    serde_json::Value::Object(response_guard_error),
+                                yield Ok(emit_event!(serde_json::Value::Object(
+                                    response_guard_error,
                                 )));
-                                yield Ok(Bytes::from(render_sse_json(serde_json::Value::Object(
+                                yield Ok(emit_event!(serde_json::Value::Object(
                                     build_turn_complete_event_from_bridge_state(
                                         &bridge_state,
                                         trusted_execution_state.as_ref(),
                                         followup_user_message.as_deref(),
                                     ),
-                                ))));
+                                )));
                                 received_turn_complete = true;
                                 continue;
                             }
@@ -792,110 +1568,80 @@ where
                                     if tool_rounds > max_tool_rounds() {
                                         astra_core::agent_warn!("bridge", "Turn exceeded max_tool_rounds ({}), forcing completion", max_tool_rounds());
                                         if let Some(warning_event) = pending_warning_event.take() {
-                                            yield Ok(Bytes::from(render_sse_json(
-                                                serde_json::Value::Object(warning_event),
-                                            )));
+                                            yield Ok(emit_event!(serde_json::Value::Object(warning_event)));
                                         }
                                         if let Some(explain_event) = pending_explain_event.take() {
-                                            yield Ok(Bytes::from(render_sse_json(
-                                                serde_json::Value::Object(explain_event),
-                                            )));
+                                            yield Ok(emit_event!(serde_json::Value::Object(explain_event)));
                                         }
                                         let bridge_state = pending_bridge_state
                                             .as_ref()
                                             .expect("pending bridge state should exist");
-                                        yield Ok(Bytes::from(render_sse_json(
-                                            serde_json::Value::Object(
-                                                build_max_rounds_turn_complete_event(
-                                                    bridge_state,
-                                                    trusted_execution_state.as_ref(),
-                                                    pending_followup_user_message.as_deref(),
-                                                ),
+                                        yield Ok(emit_event!(serde_json::Value::Object(
+                                            build_max_rounds_turn_complete_event(
+                                                bridge_state,
+                                                trusted_execution_state.as_ref(),
+                                                pending_followup_user_message.as_deref(),
                                             ),
                                         )));
                                         return;
-                                    }
-                                }
-                        } else if pending_bridge_state.is_some() {
-                            if let Some(text_delta_event) = build_text_delta_event_from_frame(&frame) {
-                                yield Ok(Bytes::from(render_sse_json(
-                                    serde_json::Value::Object(text_delta_event),
-                                )));
+                                     }
+                                 }
+                         } else if pending_bridge_state.is_some() {
+                             if let Some(text_delta_event) = build_text_delta_event_from_frame(&frame) {
+                                yield Ok(emit_event!(serde_json::Value::Object(text_delta_event)));
                             } else if let Some(reasoning_delta_event) =
                                 build_reasoning_delta_event_from_frame(&frame)
                             {
-                                yield Ok(Bytes::from(render_sse_json(
-                                    serde_json::Value::Object(reasoning_delta_event),
-                                )));
+                                yield Ok(emit_event!(serde_json::Value::Object(reasoning_delta_event)));
                             } else if let Some(usage_event) = build_usage_event_from_frame(&frame) {
                                 latest_token_usage = build_token_usage_from_usage_event(&usage_event);
-                                yield Ok(Bytes::from(render_sse_json(
-                                    serde_json::Value::Object(usage_event),
-                                )));
+                                yield Ok(emit_event!(serde_json::Value::Object(usage_event)));
                             } else if let Some(tool_result_quality_event) =
                                 build_tool_result_quality_event_from_frame(&frame)
                             {
-                                yield Ok(Bytes::from(render_sse_json(
-                                    serde_json::Value::Object(tool_result_quality_event),
-                                )));
+                                yield Ok(emit_event!(serde_json::Value::Object(tool_result_quality_event)));
                             } else if let Some(cloud_loop_progress_event) =
                                 build_cloud_loop_progress_event_from_frame(&frame)
                             {
-                                yield Ok(Bytes::from(render_sse_json(
-                                    serde_json::Value::Object(cloud_loop_progress_event),
-                                )));
+                                yield Ok(emit_event!(serde_json::Value::Object(cloud_loop_progress_event)));
                             } else if let Some(cloud_tool_result_event) =
                                 build_cloud_tool_result_event_from_frame(&frame)
                             {
-                                yield Ok(Bytes::from(render_sse_json(
-                                    serde_json::Value::Object(cloud_tool_result_event),
-                                )));
+                                yield Ok(emit_event!(serde_json::Value::Object(cloud_tool_result_event)));
                             } else if let Some(error_event) = build_error_event_from_frame(&frame) {
                                 saw_error_event = true;
-                                yield Ok(Bytes::from(render_sse_json(
-                                    serde_json::Value::Object(error_event),
-                                )));
+                                yield Ok(emit_event!(serde_json::Value::Object(error_event)));
                             } else if let Some(tool_call_event) = build_tool_call_event_from_frame(&frame) {
-                                yield Ok(Bytes::from(render_sse_json(
-                                    serde_json::Value::Object(tool_call_event),
-                                )));
+                                yield Ok(emit_event!(serde_json::Value::Object(tool_call_event)));
                             } else if let Some(tool_call_start_event) =
                                 build_tool_call_start_event_from_frame(&frame)
                             {
-                                yield Ok(Bytes::from(render_sse_json(
-                                    serde_json::Value::Object(tool_call_start_event),
-                                )));
+                                yield Ok(emit_event!(serde_json::Value::Object(tool_call_start_event)));
                             } else if is_warning_frame(&frame) {
                                 if pending_warning_event.is_none() {
-                                    yield Ok(Bytes::from(frame));
+                                    yield Ok(emit_frame!(&frame));
                                 }
                                 continue;
                             } else if is_explain_frame(&frame) {
                                 if pending_explain_event.is_none() {
-                                    yield Ok(Bytes::from(frame));
+                                    yield Ok(emit_frame!(&frame));
                                 }
                                 continue;
                             } else if is_turn_complete_frame(&frame) {
                                 if let Some(warning_event) = pending_warning_event.take() {
-                                    yield Ok(Bytes::from(render_sse_json(
-                                        serde_json::Value::Object(warning_event),
-                                    )));
+                                    yield Ok(emit_event!(serde_json::Value::Object(warning_event)));
                                 }
                                 if let Some(explain_event) = pending_explain_event.take() {
-                                    yield Ok(Bytes::from(render_sse_json(
-                                        serde_json::Value::Object(explain_event),
-                                    )));
+                                    yield Ok(emit_event!(serde_json::Value::Object(explain_event)));
                                 }
                                 let bridge_state = pending_bridge_state
                                     .as_ref()
                                     .expect("pending bridge state should exist");
-                                yield Ok(Bytes::from(render_sse_json(
-                                    serde_json::Value::Object(
-                                        build_turn_complete_event_from_bridge_state(
-                                            bridge_state,
-                                            trusted_execution_state.as_ref(),
-                                            pending_followup_user_message.as_deref(),
-                                        ),
+                                yield Ok(emit_event!(serde_json::Value::Object(
+                                    build_turn_complete_event_from_bridge_state(
+                                        bridge_state,
+                                        trusted_execution_state.as_ref(),
+                                        pending_followup_user_message.as_deref(),
                                     ),
                                 )));
                                 received_turn_complete = true;
@@ -905,88 +1651,66 @@ where
                                 pending_explain_event = None;
                                 latest_token_usage = None;
                             } else {
-                                yield Ok(Bytes::from(frame));
+                                yield Ok(emit_frame!(&frame));
                             }
                         } else if let Some(text_delta_event) = build_text_delta_event_from_frame(&frame) {
-                            yield Ok(Bytes::from(render_sse_json(
-                                serde_json::Value::Object(text_delta_event),
-                            )));
+                            yield Ok(emit_event!(serde_json::Value::Object(text_delta_event)));
                         } else if let Some(reasoning_delta_event) =
                             build_reasoning_delta_event_from_frame(&frame)
                         {
-                            yield Ok(Bytes::from(render_sse_json(
-                                serde_json::Value::Object(reasoning_delta_event),
-                            )));
+                            yield Ok(emit_event!(serde_json::Value::Object(reasoning_delta_event)));
                         } else if let Some(usage_event) = build_usage_event_from_frame(&frame) {
                             latest_token_usage = build_token_usage_from_usage_event(&usage_event);
-                            yield Ok(Bytes::from(render_sse_json(
-                                serde_json::Value::Object(usage_event),
-                            )));
+                            yield Ok(emit_event!(serde_json::Value::Object(usage_event)));
                         } else if let Some(tool_result_quality_event) =
                             build_tool_result_quality_event_from_frame(&frame)
                         {
-                            yield Ok(Bytes::from(render_sse_json(
-                                serde_json::Value::Object(tool_result_quality_event),
-                            )));
+                            yield Ok(emit_event!(serde_json::Value::Object(tool_result_quality_event)));
                         } else if let Some(cloud_loop_progress_event) =
                             build_cloud_loop_progress_event_from_frame(&frame)
                         {
-                            yield Ok(Bytes::from(render_sse_json(
-                                serde_json::Value::Object(cloud_loop_progress_event),
-                            )));
+                            yield Ok(emit_event!(serde_json::Value::Object(cloud_loop_progress_event)));
                         } else if let Some(cloud_tool_result_event) =
                             build_cloud_tool_result_event_from_frame(&frame)
                         {
-                            yield Ok(Bytes::from(render_sse_json(
-                                serde_json::Value::Object(cloud_tool_result_event),
-                            )));
+                            yield Ok(emit_event!(serde_json::Value::Object(cloud_tool_result_event)));
                         } else if let Some(error_event) = build_error_event_from_frame(&frame) {
                             saw_error_event = true;
-                            yield Ok(Bytes::from(render_sse_json(
-                                serde_json::Value::Object(error_event),
-                            )));
+                            yield Ok(emit_event!(serde_json::Value::Object(error_event)));
                         } else if let Some(tool_call_event) = build_tool_call_event_from_frame(&frame) {
-                            yield Ok(Bytes::from(render_sse_json(
-                                serde_json::Value::Object(tool_call_event),
-                            )));
+                            yield Ok(emit_event!(serde_json::Value::Object(tool_call_event)));
                         } else if let Some(tool_call_start_event) =
                             build_tool_call_start_event_from_frame(&frame)
                         {
-                            yield Ok(Bytes::from(render_sse_json(
-                                serde_json::Value::Object(tool_call_start_event),
-                            )));
+                            yield Ok(emit_event!(serde_json::Value::Object(tool_call_start_event)));
                         } else if is_turn_complete_frame(&frame) {
-                            yield Ok(Bytes::from(frame));
+                            yield Ok(emit_frame!(&frame));
                             received_turn_complete = true;
                             continue;
                         } else if is_warning_frame(&frame) || is_explain_frame(&frame) {
-                            yield Ok(Bytes::from(frame));
+                            yield Ok(emit_frame!(&frame));
                             continue;
                         } else {
-                            yield Ok(Bytes::from(frame));
+                            yield Ok(emit_frame!(&frame));
                         }
                     }
                 }
                 Err(error) => {
                     if let Some(warning_event) = pending_warning_event.take() {
-                        yield Ok(Bytes::from(render_sse_json(serde_json::Value::Object(
-                            warning_event,
-                        ))));
+                        yield Ok(emit_event!(serde_json::Value::Object(warning_event)));
                     }
                     if let Some(explain_event) = pending_explain_event.take() {
-                        yield Ok(Bytes::from(render_sse_json(serde_json::Value::Object(
-                            explain_event,
-                        ))));
+                        yield Ok(emit_event!(serde_json::Value::Object(explain_event)));
                     }
-                    yield Ok(Bytes::from(render_sse_json(serde_json::Value::Object(
+                    yield Ok(emit_event!(serde_json::Value::Object(
                         build_stream_error_event(
                             &format!("Failed to read bridge response: {error}"),
                             "UPSTREAM_ERROR",
                             true,
                         ),
-                    ))));
+                    )));
                     if let Some(bridge_state) = pending_bridge_state.take() {
-                        yield Ok(Bytes::from(render_sse_json(serde_json::Value::Object(
+                        yield Ok(emit_event!(serde_json::Value::Object(
                             if force_max_rounds_completion {
                                 build_max_rounds_turn_complete_event(
                                     &bridge_state,
@@ -1000,7 +1724,7 @@ where
                                     pending_followup_user_message.as_deref(),
                                 )
                             },
-                        ))));
+                        )));
                     }
                     return;
                 }
@@ -1010,7 +1734,7 @@ where
         if !buffer.is_empty() {
             if let Some(mut bridge_state) = parse_bridge_state_frame(&buffer) {
                 let Some(trusted_session_id) = trusted_session_id.as_deref() else {
-                    yield Ok(Bytes::from(buffer));
+                    yield Ok(emit_frame!(&buffer));
                     return;
                 };
                 let prompt_fingerprints = take_bridge_prompt_fingerprints(&mut bridge_state);
@@ -1061,25 +1785,19 @@ where
                         );
                     }
                     if let Some(warning_event) = warning_event {
-                        yield Ok(Bytes::from(render_sse_json(
-                            serde_json::Value::Object(warning_event),
-                        )));
+                        yield Ok(emit_event!(serde_json::Value::Object(warning_event)));
                     }
                     if let Some(explain_event) = explain_event {
-                        yield Ok(Bytes::from(render_sse_json(
-                            serde_json::Value::Object(explain_event),
-                        )));
+                        yield Ok(emit_event!(serde_json::Value::Object(explain_event)));
                     }
-                    yield Ok(Bytes::from(render_sse_json(
-                        serde_json::Value::Object(response_guard_error),
-                    )));
-                    yield Ok(Bytes::from(render_sse_json(serde_json::Value::Object(
+                    yield Ok(emit_event!(serde_json::Value::Object(response_guard_error)));
+                    yield Ok(emit_event!(serde_json::Value::Object(
                         build_turn_complete_event_from_bridge_state(
                             &bridge_state,
                             trusted_execution_state.as_ref(),
                             followup_user_message.as_deref(),
                         ),
-                    ))));
+                    )));
                     received_turn_complete = true;
                 } else {
                     let synced_bridge_state =
@@ -1143,86 +1861,62 @@ where
             } else {
                 if is_session_info_frame(&buffer) {
                     if trusted_session_id.is_none() {
-                        yield Ok(Bytes::from(buffer));
+                        yield Ok(emit_frame!(&buffer));
                     }
                 } else if suppress_next_turn_complete && is_turn_complete_frame(&buffer) {
                 } else if pending_bridge_state.is_some() {
                     if let Some(text_delta_event) = build_text_delta_event_from_frame(&buffer) {
-                        yield Ok(Bytes::from(render_sse_json(
-                            serde_json::Value::Object(text_delta_event),
-                        )));
+                        yield Ok(emit_event!(serde_json::Value::Object(text_delta_event)));
                     } else if let Some(reasoning_delta_event) =
                         build_reasoning_delta_event_from_frame(&buffer)
                     {
-                        yield Ok(Bytes::from(render_sse_json(
-                            serde_json::Value::Object(reasoning_delta_event),
-                        )));
+                        yield Ok(emit_event!(serde_json::Value::Object(reasoning_delta_event)));
                     } else if let Some(usage_event) = build_usage_event_from_frame(&buffer) {
-                        yield Ok(Bytes::from(render_sse_json(
-                            serde_json::Value::Object(usage_event),
-                        )));
+                        yield Ok(emit_event!(serde_json::Value::Object(usage_event)));
                     } else if let Some(tool_result_quality_event) =
                         build_tool_result_quality_event_from_frame(&buffer)
                     {
-                        yield Ok(Bytes::from(render_sse_json(
-                            serde_json::Value::Object(tool_result_quality_event),
-                        )));
+                        yield Ok(emit_event!(serde_json::Value::Object(tool_result_quality_event)));
                     } else if let Some(cloud_loop_progress_event) =
                         build_cloud_loop_progress_event_from_frame(&buffer)
                     {
-                        yield Ok(Bytes::from(render_sse_json(
-                            serde_json::Value::Object(cloud_loop_progress_event),
-                        )));
+                        yield Ok(emit_event!(serde_json::Value::Object(cloud_loop_progress_event)));
                     } else if let Some(cloud_tool_result_event) =
                         build_cloud_tool_result_event_from_frame(&buffer)
                     {
-                        yield Ok(Bytes::from(render_sse_json(
-                            serde_json::Value::Object(cloud_tool_result_event),
-                        )));
+                        yield Ok(emit_event!(serde_json::Value::Object(cloud_tool_result_event)));
                     } else if let Some(error_event) = build_error_event_from_frame(&buffer) {
                         saw_error_event = true;
-                        yield Ok(Bytes::from(render_sse_json(
-                            serde_json::Value::Object(error_event),
-                        )));
+                        yield Ok(emit_event!(serde_json::Value::Object(error_event)));
                     } else if let Some(tool_call_event) = build_tool_call_event_from_frame(&buffer) {
-                        yield Ok(Bytes::from(render_sse_json(
-                            serde_json::Value::Object(tool_call_event),
-                        )));
+                        yield Ok(emit_event!(serde_json::Value::Object(tool_call_event)));
                     } else if let Some(tool_call_start_event) =
                         build_tool_call_start_event_from_frame(&buffer)
                     {
-                        yield Ok(Bytes::from(render_sse_json(
-                            serde_json::Value::Object(tool_call_start_event),
-                        )));
+                        yield Ok(emit_event!(serde_json::Value::Object(tool_call_start_event)));
                     } else if is_warning_frame(&buffer) {
                         if pending_warning_event.is_none() {
-                            yield Ok(Bytes::from(buffer));
+                            yield Ok(emit_frame!(&buffer));
                         }
                     } else if is_explain_frame(&buffer) {
                         if pending_explain_event.is_none() {
-                            yield Ok(Bytes::from(buffer));
+                            yield Ok(emit_frame!(&buffer));
                         }
                     } else if is_turn_complete_frame(&buffer) {
                         if let Some(warning_event) = pending_warning_event.take() {
-                            yield Ok(Bytes::from(render_sse_json(
-                                serde_json::Value::Object(warning_event),
-                            )));
+                            yield Ok(emit_event!(serde_json::Value::Object(warning_event)));
                         }
                         if let Some(explain_event) = pending_explain_event.take() {
-                            yield Ok(Bytes::from(render_sse_json(
-                                serde_json::Value::Object(explain_event),
-                            )));
+                            yield Ok(emit_event!(serde_json::Value::Object(explain_event)));
                         }
                         let bridge_state = pending_bridge_state
                             .as_ref()
                             .expect("pending bridge state should exist");
-                        yield Ok(Bytes::from(render_sse_json(
-                            serde_json::Value::Object(
-                                build_turn_complete_event_from_bridge_state(
-                                    bridge_state,
-                                    trusted_execution_state.as_ref(),
-                                    pending_followup_user_message.as_deref(),
-                                ),
+                        yield Ok(emit_event!(serde_json::Value::Object(
+                            build_turn_complete_event_from_bridge_state(
+                                bridge_state,
+                                trusted_execution_state.as_ref(),
+                                pending_followup_user_message.as_deref(),
                             ),
                         )));
                         received_turn_complete = true;
@@ -1231,77 +1925,55 @@ where
                         pending_warning_event = None;
                         pending_explain_event = None;
                     } else {
-                        yield Ok(Bytes::from(buffer));
+                        yield Ok(emit_frame!(&buffer));
                     }
                 } else if let Some(text_delta_event) = build_text_delta_event_from_frame(&buffer) {
-                    yield Ok(Bytes::from(render_sse_json(
-                        serde_json::Value::Object(text_delta_event),
-                    )));
+                    yield Ok(emit_event!(serde_json::Value::Object(text_delta_event)));
                 } else if let Some(reasoning_delta_event) =
                     build_reasoning_delta_event_from_frame(&buffer)
                 {
-                    yield Ok(Bytes::from(render_sse_json(
-                        serde_json::Value::Object(reasoning_delta_event),
-                    )));
+                    yield Ok(emit_event!(serde_json::Value::Object(reasoning_delta_event)));
                 } else if let Some(usage_event) = build_usage_event_from_frame(&buffer) {
-                    yield Ok(Bytes::from(render_sse_json(
-                        serde_json::Value::Object(usage_event),
-                    )));
+                    yield Ok(emit_event!(serde_json::Value::Object(usage_event)));
                 } else if let Some(tool_result_quality_event) =
                     build_tool_result_quality_event_from_frame(&buffer)
                 {
-                    yield Ok(Bytes::from(render_sse_json(
-                        serde_json::Value::Object(tool_result_quality_event),
-                    )));
+                    yield Ok(emit_event!(serde_json::Value::Object(tool_result_quality_event)));
                 } else if let Some(cloud_loop_progress_event) =
                     build_cloud_loop_progress_event_from_frame(&buffer)
                 {
-                    yield Ok(Bytes::from(render_sse_json(
-                        serde_json::Value::Object(cloud_loop_progress_event),
-                    )));
+                    yield Ok(emit_event!(serde_json::Value::Object(cloud_loop_progress_event)));
                 } else if let Some(cloud_tool_result_event) =
                     build_cloud_tool_result_event_from_frame(&buffer)
                 {
-                    yield Ok(Bytes::from(render_sse_json(
-                        serde_json::Value::Object(cloud_tool_result_event),
-                    )));
+                    yield Ok(emit_event!(serde_json::Value::Object(cloud_tool_result_event)));
                 } else if let Some(error_event) = build_error_event_from_frame(&buffer) {
                     saw_error_event = true;
-                    yield Ok(Bytes::from(render_sse_json(
-                        serde_json::Value::Object(error_event),
-                    )));
+                    yield Ok(emit_event!(serde_json::Value::Object(error_event)));
                 } else if let Some(tool_call_event) = build_tool_call_event_from_frame(&buffer) {
-                    yield Ok(Bytes::from(render_sse_json(
-                        serde_json::Value::Object(tool_call_event),
-                    )));
+                    yield Ok(emit_event!(serde_json::Value::Object(tool_call_event)));
                 } else if let Some(tool_call_start_event) =
                     build_tool_call_start_event_from_frame(&buffer)
                 {
-                    yield Ok(Bytes::from(render_sse_json(
-                        serde_json::Value::Object(tool_call_start_event),
-                    )));
+                    yield Ok(emit_event!(serde_json::Value::Object(tool_call_start_event)));
                 } else if is_turn_complete_frame(&buffer) {
-                    yield Ok(Bytes::from(buffer));
+                    yield Ok(emit_frame!(&buffer));
                     received_turn_complete = true;
                 } else if is_warning_frame(&buffer) || is_explain_frame(&buffer) {
-                    yield Ok(Bytes::from(buffer));
+                    yield Ok(emit_frame!(&buffer));
                 } else {
-                    yield Ok(Bytes::from(buffer));
+                    yield Ok(emit_frame!(&buffer));
                 }
             }
         }
         if let Some(bridge_state) = pending_bridge_state {
             if let Some(warning_event) = pending_warning_event.take() {
-                yield Ok(Bytes::from(render_sse_json(serde_json::Value::Object(
-                    warning_event,
-                ))));
+                yield Ok(emit_event!(serde_json::Value::Object(warning_event)));
             }
             if let Some(explain_event) = pending_explain_event.take() {
-                yield Ok(Bytes::from(render_sse_json(serde_json::Value::Object(
-                    explain_event,
-                ))));
+                yield Ok(emit_event!(serde_json::Value::Object(explain_event)));
             }
-            yield Ok(Bytes::from(render_sse_json(serde_json::Value::Object(
+            yield Ok(emit_event!(serde_json::Value::Object(
                 if force_max_rounds_completion {
                     build_max_rounds_turn_complete_event(
                         &bridge_state,
@@ -1315,19 +1987,19 @@ where
                         pending_followup_user_message.as_deref(),
                     )
                 },
-            ))));
+            )));
             received_turn_complete = true;
         }
 
         if !received_turn_complete {
             if !saw_error_event {
-                yield Ok(Bytes::from(render_sse_json(serde_json::Value::Object(
+                yield Ok(emit_event!(serde_json::Value::Object(
                     build_stream_error_event(
                         "Bridge stream ended before turn_complete",
                         "UPSTREAM_ERROR",
                         true,
                     ),
-                ))));
+                )));
             }
             astra_core::agent_warn!("bridge", "SSE stream ended without turn_complete frame — possible interruption");
         }
@@ -1408,6 +2080,154 @@ mod tests {
         assert_eq!(event["type"], "session_info");
         assert_eq!(event["session_id"], "sess-1");
         assert_eq!(event["run_id"], "run-1");
+    }
+
+    #[test]
+    fn render_stream_event_bytes_adds_monotonic_sequence_and_correlation() {
+        let mut sequence = 0u64;
+        let first = render_stream_event_bytes(
+            serde_json::json!({"type": "text_delta", "content": "a"}),
+            &mut sequence,
+            Some("sess-1"),
+            Some("turn-1"),
+            Some("query-1"),
+        );
+        let second = render_stream_event_bytes(
+            serde_json::json!({"type": "text_delta", "content": "b"}),
+            &mut sequence,
+            Some("sess-1"),
+            Some("turn-1"),
+            Some("query-1"),
+        );
+        let first_text = String::from_utf8(first.to_vec()).expect("first frame should be utf8");
+        let first = parse_sse_json_frame(&first).expect("first frame should parse");
+        let second = parse_sse_json_frame(&second).expect("second frame should parse");
+        assert!(first_text.starts_with("id: mo-stream-v1."));
+        assert_eq!(first["sequence"], 1);
+        assert_eq!(second["sequence"], 2);
+        assert_eq!(first["turn_chain_id"], "turn-1");
+        assert_eq!(first["user_query_event_id"], "query-1");
+        assert_eq!(second["turn_chain_id"], "turn-1");
+        assert_eq!(second["user_query_event_id"], "query-1");
+        assert!(first["event_id"].as_str().is_some());
+        assert!(second["event_id"].as_str().is_some());
+    }
+
+    #[test]
+    fn rewrite_sse_frame_with_stream_metadata_rewrites_raw_json_frames() {
+        let mut sequence = 0u64;
+        let frame = b"data: {\"type\":\"warning\",\"message\":\"watch out\"}\n\n";
+        let rewritten = rewrite_sse_frame_with_stream_metadata(
+            frame,
+            &mut sequence,
+            Some("sess-2"),
+            Some("turn-2"),
+            Some("query-2"),
+        );
+        let parsed = parse_sse_json_frame(&rewritten).expect("rewritten frame should parse");
+        assert_eq!(parsed["type"], "warning");
+        assert_eq!(parsed["message"], "watch out");
+        assert_eq!(parsed["sequence"], 1);
+        assert_eq!(parsed["turn_chain_id"], "turn-2");
+        assert_eq!(parsed["user_query_event_id"], "query-2");
+        assert!(parsed["event_id"].as_str().is_some());
+    }
+
+    #[tokio::test]
+    async fn replay_wrapper_skips_replayed_prefix_when_last_event_matches_scope() {
+        use futures_util::stream;
+
+        let mut sequence = 0u64;
+        let first = render_stream_event_bytes(
+            serde_json::json!({"type": "text_delta", "content": "a"}),
+            &mut sequence,
+            Some("sess-1"),
+            Some("turn-1"),
+            Some("query-1"),
+        );
+        let second = render_stream_event_bytes(
+            serde_json::json!({"type": "text_delta", "content": "b"}),
+            &mut sequence,
+            Some("sess-1"),
+            Some("turn-1"),
+            Some("query-1"),
+        );
+        let third = render_stream_event_bytes(
+            serde_json::json!({"type": "turn_complete"}),
+            &mut sequence,
+            Some("sess-1"),
+            Some("turn-1"),
+            Some("query-1"),
+        );
+        let resume_cursor = stream_cursor_from_frame(&second).expect("resume cursor should parse");
+        let filtered = filter_replayed_stream_events(
+            stream::iter(vec![
+                Ok::<Bytes, std::io::Error>(first),
+                Ok::<Bytes, std::io::Error>(second),
+                Ok::<Bytes, std::io::Error>(third),
+            ]),
+            Some(resume_cursor),
+        );
+        let body = axum::body::to_bytes(Body::from_stream(filtered), 1024 * 1024)
+            .await
+            .expect("body should read");
+        let text = String::from_utf8(body.to_vec()).expect("utf8");
+        assert!(!text.contains("\"content\":\"a\""));
+        assert!(!text.contains("\"content\":\"b\""));
+        assert!(text.contains("\"type\":\"turn_complete\""));
+    }
+
+    #[test]
+    fn replay_window_requires_contiguous_suffix_coverage() {
+        let mut sequence = 0u64;
+        let first = render_stream_event_bytes(
+            serde_json::json!({"type": "text_delta", "content": "a"}),
+            &mut sequence,
+            Some("sess-1"),
+            Some("turn-1"),
+            Some("query-1"),
+        );
+        let second = render_stream_event_bytes(
+            serde_json::json!({"type": "text_delta", "content": "b"}),
+            &mut sequence,
+            Some("sess-1"),
+            Some("turn-1"),
+            Some("query-1"),
+        );
+        let third = render_stream_event_bytes(
+            serde_json::json!({"type": "turn_complete"}),
+            &mut sequence,
+            Some("sess-1"),
+            Some("turn-1"),
+            Some("query-1"),
+        );
+        let mut window = BridgeReplayWindow::default();
+        assert!(window.append_frame(&second));
+        assert!(window.append_frame(&third));
+        let mut first_cursor = stream_cursor_from_frame(&first).expect("first cursor");
+        let second_cursor = stream_cursor_from_frame(&second).expect("second cursor");
+        first_cursor.sequence = 0;
+        assert!(window.suffix_after(&first_cursor, false).is_none());
+        let first = stream_cursor_from_frame(&first).expect("first cursor should still parse");
+        let full_suffix = window
+            .suffix_after(&first, false)
+            .expect("window should replay suffix after first");
+        let full_text = String::from_utf8(full_suffix.frames.concat().to_vec()).expect("utf8");
+        assert!(full_text.contains("\"content\":\"b\""));
+        let suffix = window
+            .suffix_after(&second_cursor, false)
+            .expect("window should replay suffix after second");
+        let text = String::from_utf8(suffix.frames.concat().to_vec()).expect("utf8");
+        assert!(text.contains("\"type\":\"turn_complete\""));
+    }
+
+    fn trusted_resume_headers(last_event_id: &str) -> HeaderMap {
+        let mut headers = trusted_identity_headers();
+        headers.insert(
+            axum::http::header::HeaderName::from_static("last-event-id"),
+            HeaderValue::from_str(last_event_id).expect("last-event-id should be valid"),
+        );
+        headers
     }
 
     fn trusted_identity_headers() -> HeaderMap {
@@ -1499,6 +2319,666 @@ mod tests {
         assert!(text.contains("\"run_id\":\"run-1\""));
         assert!(text.contains("\"type\":\"error\""));
         assert!(text.contains("\"code\":\"UPSTREAM_ERROR\""));
+    }
+
+    #[tokio::test]
+    async fn request_send_failure_replays_cached_suffix_before_touching_upstream() {
+        use tokio::sync::Mutex;
+
+        let cache = Arc::new(Mutex::new(SessionCache::new(1000, 86400.0)));
+        let bridge = HttpChatTurnBridge::new("http://[::1".to_string(), cache.clone());
+        let mut sequence = 0u64;
+        let session_info = render_stream_event_bytes(
+            serde_json::json!({"type": "session_info", "session_id": "sess-1", "run_id": "run-1"}),
+            &mut sequence,
+            Some("sess-1"),
+            Some("run-1"),
+            None,
+        );
+        let text_delta = render_stream_event_bytes(
+            serde_json::json!({"type": "text_delta", "content": "cached"}),
+            &mut sequence,
+            Some("sess-1"),
+            Some("run-1"),
+            None,
+        );
+        let turn_complete = render_stream_event_bytes(
+            serde_json::json!({"type": "turn_complete"}),
+            &mut sequence,
+            Some("sess-1"),
+            Some("run-1"),
+            None,
+        );
+        append_bridge_replay_frame(
+            cache.clone(),
+            None,
+            Some("sess-1"),
+            Some("run-1"),
+            None,
+            &session_info,
+        )
+        .await;
+        append_bridge_replay_frame(
+            cache.clone(),
+            None,
+            Some("sess-1"),
+            Some("run-1"),
+            None,
+            &text_delta,
+        )
+        .await;
+        append_bridge_replay_frame(
+            cache.clone(),
+            None,
+            Some("sess-1"),
+            Some("run-1"),
+            None,
+            &turn_complete,
+        )
+        .await;
+        let last_event_id = parse_sse_json_frame(&text_delta)
+            .and_then(|event| {
+                event
+                    .get("event_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(ToString::to_string)
+            })
+            .expect("text delta should have event id");
+
+        let response = forward_with_noop_writers(&bridge, &trusted_resume_headers(&last_event_id))
+            .await
+            .expect("cached suffix should bypass upstream failure");
+        let text = response_text(response).await;
+
+        assert!(!text.contains("\"type\":\"error\""));
+        assert!(!text.contains("\"content\":\"cached\""));
+        assert!(text.contains("\"type\":\"turn_complete\""));
+    }
+
+    #[tokio::test]
+    async fn request_send_failure_replays_persisted_suffix_after_cache_miss() {
+        use tokio::sync::Mutex;
+
+        let persisted_replay_window_store = Arc::new(InMemoryBridgeReplayWindowStore::default());
+        let bridge = HttpChatTurnBridge::new(
+            "http://[::1".to_string(),
+            Arc::new(Mutex::new(SessionCache::new(1000, 86400.0))),
+        )
+        .with_persisted_replay_window_store(persisted_replay_window_store.clone());
+        let mut sequence = 0u64;
+        let session_info = render_stream_event_bytes(
+            serde_json::json!({"type": "session_info", "session_id": "sess-1", "run_id": "run-1"}),
+            &mut sequence,
+            Some("sess-1"),
+            Some("run-1"),
+            None,
+        );
+        let text_delta = render_stream_event_bytes(
+            serde_json::json!({"type": "text_delta", "content": "cached"}),
+            &mut sequence,
+            Some("sess-1"),
+            Some("run-1"),
+            None,
+        );
+        let turn_complete = render_stream_event_bytes(
+            serde_json::json!({"type": "turn_complete"}),
+            &mut sequence,
+            Some("sess-1"),
+            Some("run-1"),
+            None,
+        );
+        let mut window = BridgeReplayWindow::default();
+        assert!(window.append_frame(&session_info));
+        assert!(window.append_frame(&text_delta));
+        assert!(window.append_frame(&turn_complete));
+        persisted_replay_window_store
+            .persist_latest_window(
+                "sess-1",
+                &bridge_replay_window_key("sess-1", Some("run-1"), None),
+                &window,
+            )
+            .await
+            .expect("persisted replay window should store");
+        let last_event_id = parse_sse_json_frame(&text_delta)
+            .and_then(|event| {
+                event
+                    .get("event_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(ToString::to_string)
+            })
+            .expect("text delta should have event id");
+
+        let response = forward_with_noop_writers(&bridge, &trusted_resume_headers(&last_event_id))
+            .await
+            .expect("persisted suffix should bypass upstream failure");
+        let text = response_text(response).await;
+
+        assert!(!text.contains("\"type\":\"error\""));
+        assert!(!text.contains("\"content\":\"cached\""));
+        assert!(text.contains("\"type\":\"turn_complete\""));
+    }
+
+    #[tokio::test]
+    async fn append_bridge_replay_frame_persists_incomplete_scope_window() {
+        let cache = Arc::new(tokio::sync::Mutex::new(SessionCache::new(1000, 86400.0)));
+        let persisted_replay_window_store = Arc::new(InMemoryBridgeReplayWindowStore::default());
+        let mut sequence = 0u64;
+        let session_info = render_stream_event_bytes(
+            serde_json::json!({"type": "session_info", "session_id": "sess-1", "run_id": "run-1"}),
+            &mut sequence,
+            Some("sess-1"),
+            Some("run-1"),
+            None,
+        );
+
+        append_bridge_replay_frame(
+            cache,
+            Some(persisted_replay_window_store.clone()),
+            Some("sess-1"),
+            Some("run-1"),
+            None,
+            &session_info,
+        )
+        .await;
+
+        let window = persisted_replay_window_store
+            .load_latest_window(
+                "sess-1",
+                &bridge_replay_window_key("sess-1", Some("run-1"), None),
+            )
+            .await
+            .expect("load should succeed")
+            .expect("incomplete window should persist");
+        assert!(!window.complete);
+        assert_eq!(window.frames.len(), 1);
+        assert_eq!(window.last_persisted_sequence, Some(1));
+    }
+
+    #[tokio::test]
+    async fn request_send_failure_replays_persisted_incomplete_suffix() {
+        use tokio::sync::Mutex;
+
+        let persisted_replay_window_store = Arc::new(InMemoryBridgeReplayWindowStore::default());
+        let bridge = HttpChatTurnBridge::new(
+            "http://[::1".to_string(),
+            Arc::new(Mutex::new(SessionCache::new(1000, 86400.0))),
+        )
+        .with_persisted_replay_window_store(persisted_replay_window_store.clone());
+
+        let mut sequence = 0u64;
+        let session_info = render_stream_event_bytes(
+            serde_json::json!({"type": "session_info", "session_id": "sess-1", "run_id": "run-1"}),
+            &mut sequence,
+            Some("sess-1"),
+            Some("run-1"),
+            None,
+        );
+        let text_delta = render_stream_event_bytes(
+            serde_json::json!({"type": "text_delta", "content": "cached-incomplete"}),
+            &mut sequence,
+            Some("sess-1"),
+            Some("run-1"),
+            None,
+        );
+        let mut window = BridgeReplayWindow::default();
+        assert!(window.append_frame(&session_info));
+        assert!(window.append_frame(&text_delta));
+        persisted_replay_window_store
+            .persist_latest_window(
+                "sess-1",
+                &bridge_replay_window_key("sess-1", Some("run-1"), None),
+                &window,
+            )
+            .await
+            .expect("persisted replay window should store");
+        let last_event_id = parse_sse_json_frame(&session_info)
+            .and_then(|event| {
+                event
+                    .get("event_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(ToString::to_string)
+            })
+            .expect("session info should have event id");
+
+        let response = forward_with_noop_writers(&bridge, &trusted_resume_headers(&last_event_id))
+            .await
+            .expect("persisted incomplete suffix should bypass upstream failure");
+        let text = response_text(response).await;
+
+        assert!(!text.contains("\"type\":\"error\""));
+        assert!(text.contains("\"content\":\"cached-incomplete\""));
+        assert!(!text.contains("\"type\":\"turn_complete\""));
+    }
+
+    #[tokio::test]
+    async fn retryable_non_sse_response_replays_persisted_incomplete_suffix() {
+        use axum::Router;
+        use axum::http::header;
+        use axum::routing::post;
+        use tokio::net::TcpListener;
+        use tokio::sync::Mutex;
+
+        let app = Router::new().route(
+            "/",
+            post(|| async {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                    "bridge warming up",
+                )
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener should have address");
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test server should run");
+        });
+
+        let persisted_replay_window_store = Arc::new(InMemoryBridgeReplayWindowStore::default());
+        let bridge = HttpChatTurnBridge::new(
+            format!("http://{addr}/"),
+            Arc::new(Mutex::new(SessionCache::new(1000, 86400.0))),
+        )
+        .with_persisted_replay_window_store(persisted_replay_window_store.clone());
+
+        let mut sequence = 0u64;
+        let session_info = render_stream_event_bytes(
+            serde_json::json!({"type": "session_info", "session_id": "sess-1", "run_id": "run-1"}),
+            &mut sequence,
+            Some("sess-1"),
+            Some("run-1"),
+            None,
+        );
+        let text_delta = render_stream_event_bytes(
+            serde_json::json!({"type": "text_delta", "content": "cached-incomplete"}),
+            &mut sequence,
+            Some("sess-1"),
+            Some("run-1"),
+            None,
+        );
+        let mut window = BridgeReplayWindow::default();
+        assert!(window.append_frame(&session_info));
+        assert!(window.append_frame(&text_delta));
+        persisted_replay_window_store
+            .persist_latest_window(
+                "sess-1",
+                &bridge_replay_window_key("sess-1", Some("run-1"), None),
+                &window,
+            )
+            .await
+            .expect("persisted replay window should store");
+        let last_event_id = parse_sse_json_frame(&session_info)
+            .and_then(|event| {
+                event
+                    .get("event_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(ToString::to_string)
+            })
+            .expect("session info should have event id");
+
+        let response = forward_with_noop_writers(&bridge, &trusted_resume_headers(&last_event_id))
+            .await
+            .expect("retryable non-sse failure should replay durable suffix");
+        let text = response_text(response).await;
+
+        assert!(!text.contains("\"type\":\"error\""));
+        assert!(text.contains("\"content\":\"cached-incomplete\""));
+        assert!(!text.contains("\"type\":\"turn_complete\""));
+    }
+
+    #[tokio::test]
+    async fn non_sse_client_error_keeps_error_sse_even_with_persisted_incomplete_suffix() {
+        use axum::Router;
+        use axum::http::header;
+        use axum::routing::post;
+        use tokio::net::TcpListener;
+        use tokio::sync::Mutex;
+
+        let app = Router::new().route(
+            "/",
+            post(|| async {
+                (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                    "bad input",
+                )
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener should have address");
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test server should run");
+        });
+
+        let persisted_replay_window_store = Arc::new(InMemoryBridgeReplayWindowStore::default());
+        let bridge = HttpChatTurnBridge::new(
+            format!("http://{addr}/"),
+            Arc::new(Mutex::new(SessionCache::new(1000, 86400.0))),
+        )
+        .with_persisted_replay_window_store(persisted_replay_window_store.clone());
+
+        let mut sequence = 0u64;
+        let session_info = render_stream_event_bytes(
+            serde_json::json!({"type": "session_info", "session_id": "sess-1", "run_id": "run-1"}),
+            &mut sequence,
+            Some("sess-1"),
+            Some("run-1"),
+            None,
+        );
+        let text_delta = render_stream_event_bytes(
+            serde_json::json!({"type": "text_delta", "content": "cached-incomplete"}),
+            &mut sequence,
+            Some("sess-1"),
+            Some("run-1"),
+            None,
+        );
+        let mut window = BridgeReplayWindow::default();
+        assert!(window.append_frame(&session_info));
+        assert!(window.append_frame(&text_delta));
+        persisted_replay_window_store
+            .persist_latest_window(
+                "sess-1",
+                &bridge_replay_window_key("sess-1", Some("run-1"), None),
+                &window,
+            )
+            .await
+            .expect("persisted replay window should store");
+        let last_event_id = parse_sse_json_frame(&session_info)
+            .and_then(|event| {
+                event
+                    .get("event_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(ToString::to_string)
+            })
+            .expect("session info should have event id");
+
+        let response = forward_with_noop_writers(&bridge, &trusted_resume_headers(&last_event_id))
+            .await
+            .expect("client error should still produce bridge error event");
+        let text = response_text(response).await;
+
+        assert!(text.contains("\"type\":\"error\""), "{text}");
+        assert!(text.contains("VALIDATION_ERROR"), "{text}");
+        assert!(
+            !text.contains("\"content\":\"cached-incomplete\""),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_resume_splices_persisted_incomplete_suffix_before_live_stream() {
+        use axum::Router;
+        use axum::http::header;
+        use axum::routing::post;
+        use tokio::net::TcpListener;
+        use tokio::sync::Mutex;
+
+        let seen_last_event_id = Arc::new(Mutex::new(None::<String>));
+        let mut upstream_sequence = 0u64;
+        let upstream_cached = String::from_utf8(
+            render_stream_event_bytes(
+                serde_json::json!({"type": "text_delta", "content": "cached-incomplete"}),
+                &mut upstream_sequence,
+                Some("sess-1"),
+                Some("run-1"),
+                None,
+            )
+            .to_vec(),
+        )
+        .expect("cached frame should be utf8");
+        let upstream_live = String::from_utf8(
+            render_stream_event_bytes(
+                serde_json::json!({"type": "text_delta", "content": "live"}),
+                &mut upstream_sequence,
+                Some("sess-1"),
+                Some("run-1"),
+                None,
+            )
+            .to_vec(),
+        )
+        .expect("live frame should be utf8");
+        let upstream_turn_complete = String::from_utf8(
+            render_stream_event_bytes(
+                serde_json::json!({"type": "turn_complete"}),
+                &mut upstream_sequence,
+                Some("sess-1"),
+                Some("run-1"),
+                None,
+            )
+            .to_vec(),
+        )
+        .expect("turn_complete frame should be utf8");
+        let upstream_body = format!("{upstream_cached}{upstream_live}{upstream_turn_complete}");
+
+        let app = Router::new().route(
+            "/",
+            post({
+                let upstream_body = upstream_body.clone();
+                let seen_last_event_id = seen_last_event_id.clone();
+                move |headers: HeaderMap| {
+                    let upstream_body = upstream_body.clone();
+                    let seen_last_event_id = seen_last_event_id.clone();
+                    async move {
+                        *seen_last_event_id.lock().await = headers
+                            .get("last-event-id")
+                            .and_then(|value| value.to_str().ok())
+                            .map(ToString::to_string);
+                        (
+                            StatusCode::OK,
+                            [(header::CONTENT_TYPE, "text/event-stream")],
+                            upstream_body,
+                        )
+                    }
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener should have address");
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test server should run");
+        });
+
+        let persisted_replay_window_store = Arc::new(InMemoryBridgeReplayWindowStore::default());
+        let bridge = HttpChatTurnBridge::new(
+            format!("http://{addr}/"),
+            Arc::new(Mutex::new(SessionCache::new(1000, 86400.0))),
+        )
+        .with_persisted_replay_window_store(persisted_replay_window_store.clone());
+
+        let mut persisted_sequence = 0u64;
+        let session_info = render_stream_event_bytes(
+            serde_json::json!({"type": "session_info", "session_id": "sess-1", "run_id": "run-1"}),
+            &mut persisted_sequence,
+            Some("sess-1"),
+            Some("run-1"),
+            None,
+        );
+        let cached = render_stream_event_bytes(
+            serde_json::json!({"type": "text_delta", "content": "cached-incomplete"}),
+            &mut persisted_sequence,
+            Some("sess-1"),
+            Some("run-1"),
+            None,
+        );
+        let mut window = BridgeReplayWindow::default();
+        assert!(window.append_frame(&session_info));
+        assert!(window.append_frame(&cached));
+        persisted_replay_window_store
+            .persist_latest_window(
+                "sess-1",
+                &bridge_replay_window_key("sess-1", Some("run-1"), None),
+                &window,
+            )
+            .await
+            .expect("persisted replay window should store");
+
+        let last_event_id = parse_sse_json_frame(&session_info)
+            .and_then(|event| {
+                event
+                    .get("event_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(ToString::to_string)
+            })
+            .expect("session info should have event id");
+        let expected_upstream_last_event_id = parse_sse_json_frame(&cached)
+            .and_then(|event| {
+                event
+                    .get("event_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(ToString::to_string)
+            })
+            .expect("cached frame should have event id");
+
+        let response = forward_with_noop_writers(&bridge, &trusted_resume_headers(&last_event_id))
+            .await
+            .expect("successful resume should stream");
+        let text = response_text(response).await;
+
+        assert_eq!(
+            text.matches("\"content\":\"cached-incomplete\"").count(),
+            1,
+            "{text}"
+        );
+        assert_eq!(text.matches("\"content\":\"live\"").count(), 1, "{text}");
+        assert_eq!(
+            text.matches("\"type\":\"turn_complete\"").count(),
+            1,
+            "{text}"
+        );
+        assert_eq!(
+            text.matches("\"type\":\"session_info\"").count(),
+            0,
+            "{text}"
+        );
+        let cached_index = text
+            .find("\"content\":\"cached-incomplete\"")
+            .expect("cached splice should appear");
+        let live_index = text
+            .find("\"content\":\"live\"")
+            .expect("live frame should appear");
+        let turn_complete_index = text
+            .find("\"type\":\"turn_complete\"")
+            .expect("turn complete should appear");
+        assert!(cached_index < live_index);
+        assert!(live_index < turn_complete_index);
+        assert_eq!(
+            seen_last_event_id.lock().await.as_deref(),
+            Some(expected_upstream_last_event_id.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn request_send_failure_replays_scope_specific_persisted_suffix_after_newer_scope_persisted()
+     {
+        use tokio::sync::Mutex;
+
+        let persisted_replay_window_store = Arc::new(InMemoryBridgeReplayWindowStore::default());
+        let bridge = HttpChatTurnBridge::new(
+            "http://[::1".to_string(),
+            Arc::new(Mutex::new(SessionCache::new(1000, 86400.0))),
+        )
+        .with_persisted_replay_window_store(persisted_replay_window_store.clone());
+
+        let mut run_1_sequence = 0u64;
+        let run_1_session_info = render_stream_event_bytes(
+            serde_json::json!({"type": "session_info", "session_id": "sess-1", "run_id": "run-1"}),
+            &mut run_1_sequence,
+            Some("sess-1"),
+            Some("run-1"),
+            None,
+        );
+        let run_1_text_delta = render_stream_event_bytes(
+            serde_json::json!({"type": "text_delta", "content": "cached-run-1"}),
+            &mut run_1_sequence,
+            Some("sess-1"),
+            Some("run-1"),
+            None,
+        );
+        let run_1_turn_complete = render_stream_event_bytes(
+            serde_json::json!({"type": "turn_complete"}),
+            &mut run_1_sequence,
+            Some("sess-1"),
+            Some("run-1"),
+            None,
+        );
+        let mut run_1_window = BridgeReplayWindow::default();
+        assert!(run_1_window.append_frame(&run_1_session_info));
+        assert!(run_1_window.append_frame(&run_1_text_delta));
+        assert!(run_1_window.append_frame(&run_1_turn_complete));
+        persisted_replay_window_store
+            .persist_latest_window(
+                "sess-1",
+                &bridge_replay_window_key("sess-1", Some("run-1"), None),
+                &run_1_window,
+            )
+            .await
+            .expect("run-1 persisted replay window should store");
+        let run_1_last_event_id = parse_sse_json_frame(&run_1_text_delta)
+            .and_then(|event| {
+                event
+                    .get("event_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(ToString::to_string)
+            })
+            .expect("run-1 text delta should have event id");
+
+        let mut run_2_sequence = 0u64;
+        let run_2_session_info = render_stream_event_bytes(
+            serde_json::json!({"type": "session_info", "session_id": "sess-1", "run_id": "run-2"}),
+            &mut run_2_sequence,
+            Some("sess-1"),
+            Some("run-2"),
+            None,
+        );
+        let run_2_text_delta = render_stream_event_bytes(
+            serde_json::json!({"type": "text_delta", "content": "cached-run-2"}),
+            &mut run_2_sequence,
+            Some("sess-1"),
+            Some("run-2"),
+            None,
+        );
+        let run_2_turn_complete = render_stream_event_bytes(
+            serde_json::json!({"type": "turn_complete"}),
+            &mut run_2_sequence,
+            Some("sess-1"),
+            Some("run-2"),
+            None,
+        );
+        let mut run_2_window = BridgeReplayWindow::default();
+        assert!(run_2_window.append_frame(&run_2_session_info));
+        assert!(run_2_window.append_frame(&run_2_text_delta));
+        assert!(run_2_window.append_frame(&run_2_turn_complete));
+        persisted_replay_window_store
+            .persist_latest_window(
+                "sess-1",
+                &bridge_replay_window_key("sess-1", Some("run-2"), None),
+                &run_2_window,
+            )
+            .await
+            .expect("run-2 persisted replay window should store");
+
+        let response =
+            forward_with_noop_writers(&bridge, &trusted_resume_headers(&run_1_last_event_id))
+                .await
+                .expect("scope-specific persisted suffix should bypass upstream failure");
+        let text = response_text(response).await;
+
+        assert!(!text.contains("\"type\":\"error\""));
+        assert!(!text.contains("\"content\":\"cached-run-1\""));
+        assert!(!text.contains("\"content\":\"cached-run-2\""));
+        assert!(text.contains("\"type\":\"turn_complete\""));
     }
 
     #[tokio::test]

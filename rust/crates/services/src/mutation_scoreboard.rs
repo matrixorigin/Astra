@@ -258,6 +258,7 @@ impl MutationJudgment {
         verifier: Option<&MutationVerifierSummary>,
         compensation: &MutationCompensationPolicy,
         pre_state_snapshot_id: Option<&str>,
+        pre_state_snapshot_database: Option<&str>,
     ) -> Self {
         let has_pre_state_snapshot = pre_state_snapshot_id.is_some();
         let retention_score = objective.retention_score();
@@ -303,6 +304,7 @@ impl MutationJudgment {
             compensation,
             has_pre_state_snapshot,
             pre_state_snapshot_id,
+            pre_state_snapshot_database,
             &rationale,
         );
         Self {
@@ -447,6 +449,8 @@ pub struct StagedMutation {
     pub tool_args: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pre_state_snapshot_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pre_state_snapshot_database: Option<String>,
     pub state: StagedMutationState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state_note: Option<String>,
@@ -475,11 +479,46 @@ impl StagedMutation {
         verifier: Option<MutationVerifierSummary>,
         compensation: MutationCompensationPolicy,
     ) -> Self {
+        Self::new_with_pre_state_snapshot_database(
+            mutation_id,
+            session_id,
+            turn_index,
+            tool_name,
+            tool_args,
+            pre_state_snapshot_id,
+            None,
+            objective,
+            verifier,
+            compensation,
+        )
+    }
+
+    pub fn new_with_pre_state_snapshot_database(
+        mutation_id: impl Into<String>,
+        session_id: impl Into<String>,
+        turn_index: u32,
+        tool_name: impl Into<String>,
+        tool_args: Value,
+        pre_state_snapshot_id: Option<String>,
+        pre_state_snapshot_database: Option<String>,
+        objective: MutationObjectiveScore,
+        verifier: Option<MutationVerifierSummary>,
+        compensation: MutationCompensationPolicy,
+    ) -> Self {
+        let pre_state_snapshot_database = pre_state_snapshot_database.or_else(|| {
+            tool_args
+                .get("database")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|database| !database.is_empty())
+                .map(ToString::to_string)
+        });
         let judgment = MutationJudgment::evaluate(
             &objective,
             verifier.as_ref(),
             &compensation,
             pre_state_snapshot_id.as_deref(),
+            pre_state_snapshot_database.as_deref(),
         );
         let state = judgment.staged_state();
         Self {
@@ -489,6 +528,7 @@ impl StagedMutation {
             tool_name: tool_name.into(),
             tool_args,
             pre_state_snapshot_id,
+            pre_state_snapshot_database,
             state,
             state_note: None,
             state_updated_at: None,
@@ -518,6 +558,7 @@ fn build_mutation_promotion_verdict(
     compensation: &MutationCompensationPolicy,
     has_pre_state_snapshot: bool,
     pre_state_snapshot_id: Option<&str>,
+    pre_state_snapshot_database: Option<&str>,
     rationale: &[String],
 ) -> MutationPromotionVerdict {
     let mut evidence = vec![format_confidence_interval_evidence(
@@ -567,9 +608,21 @@ fn build_mutation_promotion_verdict(
         blockers.push("mutation_safety_blocked".into());
     }
 
-    let rollback_hint = compensation.compensation_summary.clone().or_else(|| {
-        pre_state_snapshot_id.map(|snapshot_id| format!("restore snapshot {snapshot_id}"))
-    });
+    let rollback_hint = if compensation.compensation_kind.as_deref() == Some("restore_database_snapshot")
+    {
+        pre_state_snapshot_id.map(|snapshot_id| match pre_state_snapshot_database {
+            Some(database) if !database.is_empty() => format!(
+                "call `rollback_database_snapshots` with scope=`snapshot`, snapshot_id=`{snapshot_id}`, and database=`{database}` to restore the captured pre-state snapshot"
+            ),
+            _ => format!(
+                "call `rollback_database_snapshots` with scope=`snapshot` and snapshot_id=`{snapshot_id}` to restore the captured pre-state snapshot"
+            ),
+        })
+    } else {
+        None
+    }
+    .or_else(|| compensation.compensation_summary.clone())
+    .or_else(|| pre_state_snapshot_id.map(|snapshot_id| format!("restore snapshot {snapshot_id}")));
     let confidence_score = retention_score.lower;
     let overall_score =
         (confidence_score * 0.45 + support_score * 0.30 + safety_score * 0.25).clamp(0.0, 1.0);
@@ -782,7 +835,7 @@ fn staged_mutations_from_persisted_decision(
             } else {
                 format!("{}:{tool_call_id}", decision.decision_id)
             };
-            let mut mutation = StagedMutation::new(
+            let mut mutation = StagedMutation::new_with_pre_state_snapshot_database(
                 mutation_id,
                 decision.session_id.clone(),
                 turn_index,
@@ -793,6 +846,10 @@ fn staged_mutations_from_persisted_decision(
                     .unwrap_or_else(|| Value::Object(Default::default())),
                 action_profile
                     .get("pre_state_snapshot_id")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string),
+                action_profile
+                    .get("pre_state_snapshot_database")
                     .and_then(Value::as_str)
                     .map(ToString::to_string),
                 objective.clone(),
@@ -870,6 +927,19 @@ mod tests {
             action_category: MutationActionCategory::Write,
             compensation_kind: Some("restore_or_delete_file".into()),
             compensation_summary: Some("restore prior contents".into()),
+        }
+    }
+
+    fn database_snapshot_policy() -> MutationCompensationPolicy {
+        MutationCompensationPolicy {
+            bounded: true,
+            reversible: true,
+            requires_pre_state: true,
+            action_category: MutationActionCategory::Write,
+            compensation_kind: Some("restore_database_snapshot".into()),
+            compensation_summary: Some(
+                "call `mo_snapshot` with action=`restore` and the captured snapshot name".into(),
+            ),
         }
     }
 
@@ -1002,6 +1072,35 @@ mod tests {
                 .evidence
                 .iter()
                 .any(|evidence| evidence == "no_structured_verifier_signal")
+        );
+    }
+
+    #[test]
+    fn database_snapshot_rollback_hint_prefers_concrete_snapshot_restore() {
+        let mutation = StagedMutation::new_with_pre_state_snapshot_database(
+            "mut-db",
+            "session-1",
+            6,
+            "mo_query",
+            serde_json::json!({"sql": "UPDATE metrics SET value = 1"}),
+            Some("moq_snap_9".into()),
+            Some("analytics".into()),
+            MutationObjectiveScore::from_learning_signal(0.93, Some(88), 0.08, 0.82, false),
+            Some(MutationVerifierSummary::from_report(&verification_report(
+                true,
+            ))),
+            database_snapshot_policy(),
+        );
+
+        assert_eq!(
+            mutation.judgment.promotion_verdict.rollback_hint.as_deref(),
+            Some(
+                "call `rollback_database_snapshots` with scope=`snapshot`, snapshot_id=`moq_snap_9`, and database=`analytics` to restore the captured pre-state snapshot"
+            )
+        );
+        assert_eq!(
+            mutation.judgment.safety_verdict,
+            MutationSafetyVerdict::Safe
         );
     }
 

@@ -1711,6 +1711,7 @@ Follow these steps:
                 observability_hub: None,
                 observability_session: state.observability_session.clone(),
                 file_journal: Some(state.file_journal.clone()),
+                database_snapshot_journal: Some(state.database_snapshot_journal.clone()),
                 turn_index: state.turn,
                 evolution_service: None,
             })

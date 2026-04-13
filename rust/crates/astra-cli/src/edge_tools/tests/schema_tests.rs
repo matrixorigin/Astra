@@ -62,6 +62,9 @@ fn tool_schemas_include_core_tools() {
         "mo_query",
         "mo_snapshot",
         "mo_branch",
+        "rollback_file_edits",
+        "rollback_database_snapshots",
+        "rollback_turn_actions",
         "github_ci_status",
         "github_repo_stats",
         "memory_store",
@@ -129,4 +132,31 @@ fn schemas_include_new_coding_tools() {
         names.contains(&"run_build_test"),
         "missing run_build_test schema"
     );
+}
+
+#[test]
+fn bounded_batch_transaction_fields_are_discoverable() {
+    let schemas = all_tool_schemas();
+    for tool in [
+        "read_file",
+        "write_file",
+        "delete_file",
+        "str_replace",
+        "multi_edit",
+        "mo_query",
+    ] {
+        let properties = schemas
+            .iter()
+            .find(|schema| schema["function"]["name"].as_str() == Some(tool))
+            .and_then(|schema| schema["function"]["parameters"]["properties"].as_object())
+            .unwrap_or_else(|| panic!("missing properties for {tool}"));
+        assert!(
+            properties.contains_key("transaction_id"),
+            "{tool} missing transaction_id"
+        );
+        assert!(
+            properties.contains_key("rollback_on_failure"),
+            "{tool} missing rollback_on_failure"
+        );
+    }
 }

@@ -82,6 +82,8 @@ pub(super) async fn handle_state_command(
                                     astra_runtime::turn::file_edit_journal::EditType::Create =>
                                         "🆕",
                                     astra_runtime::turn::file_edit_journal::EditType::Patch => "✏️",
+                                    astra_runtime::turn::file_edit_journal::EditType::Delete =>
+                                        "🗑️",
                                 },
                                 path.display(),
                                 count,
@@ -358,6 +360,7 @@ pub(super) async fn handle_state_command(
                     observability_hub: None,
                     observability_session: None,
                     file_journal: None,
+                    database_snapshot_journal: None,
                     turn_index: 0,
                     evolution_service: state.evolution_service.clone(),
                 }) => r,
@@ -457,6 +460,7 @@ pub(super) async fn handle_state_command(
                             observability_hub: None,
                             observability_session: None,
                             file_journal: None,
+                            database_snapshot_journal: None,
                             turn_index: 0,
                             evolution_service: state.evolution_service.clone(),
                         })
@@ -537,6 +541,7 @@ pub(super) async fn handle_state_command(
                                     observability_hub: None,
                                     observability_session: None,
                                     file_journal: None,
+                                    database_snapshot_journal: None,
                                     turn_index: 0,
                                     evolution_service: state.evolution_service.clone(),
                                 })
