@@ -4242,15 +4242,20 @@ mod tests {
     }
 
     #[test]
-    fn non_home_env_var_in_path_not_caught() {
-        // cat $TMPDIR/build.log — arbitrary env vars still are not statically
-        // resolvable at path-boundary time.
+    fn non_home_env_var_in_path_requires_boundary_review() {
+        // cat $TMPDIR/build.log — arbitrary env vars are unresolved at
+        // path-boundary time, so they require explicit review instead of being
+        // treated as safe literals.
         use astra_runtime::tool_sandbox::SandboxPolicy;
         let policy = SandboxPolicy::for_project("/home/user/project");
         let result = check_bash_path_boundary(&policy, "cat $TMPDIR/build.log");
         assert!(
-            result.is_none(),
-            "non-HOME env vars remain unresolved at static analysis time"
+            result
+                .as_deref()
+                .is_some_and(|msg| msg.starts_with(super::SANDBOX_DENIED_PREFIX)
+                    && msg.contains("$TMPDIR/build.log")
+                    && msg.contains("shell variable expansion")),
+            "non-HOME env vars should require boundary review when they cannot be resolved statically"
         );
     }
 
