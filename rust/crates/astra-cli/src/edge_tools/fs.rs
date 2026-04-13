@@ -1104,11 +1104,19 @@ impl ToolExecutor {
                     "rollback_database_snapshots",
                     self.rollback_database_snapshots(args),
                 );
+                let stash_result = Self::parse_rollback_tool_output(
+                    "rollback_git_stashes",
+                    self.rollback_git_stashes(args),
+                );
                 let file_entries = file_result
                     .get("entries")
                     .cloned()
                     .unwrap_or_else(|| Value::Array(Vec::new()));
                 let database_entries = database_result
+                    .get("entries")
+                    .cloned()
+                    .unwrap_or_else(|| Value::Array(Vec::new()));
+                let stash_entries = stash_result
                     .get("entries")
                     .cloned()
                     .unwrap_or_else(|| Value::Array(Vec::new()));
@@ -1130,20 +1138,34 @@ impl ToolExecutor {
                             .map(|entries| entries.len() as u64)
                             .unwrap_or(0)
                     });
+                let total_stash_entries = stash_result
+                    .get("total_entries")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_else(|| {
+                        stash_entries
+                            .as_array()
+                            .map(|entries| entries.len() as u64)
+                            .unwrap_or(0)
+                    });
                 json!({
                     "success": file_result.get("success").and_then(Value::as_bool).unwrap_or(false)
-                        && database_result.get("success").and_then(Value::as_bool).unwrap_or(false),
+                        && database_result.get("success").and_then(Value::as_bool).unwrap_or(false)
+                        && stash_result.get("success").and_then(Value::as_bool).unwrap_or(false),
                     "scope": "list",
                     "total_file_entries": total_file_entries,
                     "total_database_entries": total_database_entries,
+                    "total_git_stash_entries": total_stash_entries,
                     "file_entries": file_entries,
                     "database_entries": database_entries,
+                    "git_stash_entries": stash_entries,
                     "files": file_result,
                     "database_snapshots": database_result,
+                    "git_stashes": stash_result,
                     "summary": format!(
-                        "Listed {total_file_entries} file rollback entr{} and {total_database_entries} database snapshot entr{}",
+                        "Listed {total_file_entries} file rollback entr{}, {total_database_entries} database snapshot entr{}, and {total_stash_entries} git stash rollback entr{}",
                         if total_file_entries == 1 { "y" } else { "ies" },
-                        if total_database_entries == 1 { "y" } else { "ies" }
+                        if total_database_entries == 1 { "y" } else { "ies" },
+                        if total_stash_entries == 1 { "y" } else { "ies" }
                     ),
                 })
                 .to_string()
@@ -1157,10 +1179,15 @@ impl ToolExecutor {
                     "rollback_file_edits",
                     self.rollback_file_edits(args),
                 );
+                let stash_result = Self::parse_rollback_tool_output(
+                    "rollback_git_stashes",
+                    self.rollback_git_stashes(args),
+                );
                 let turn_index = database_result
                     .get("turn_index")
                     .and_then(Value::as_u64)
                     .or_else(|| file_result.get("turn_index").and_then(Value::as_u64))
+                    .or_else(|| stash_result.get("turn_index").and_then(Value::as_u64))
                     .or(explicit_turn_index)
                     .unwrap_or_else(|| {
                         self.journal_turn_index
@@ -1183,6 +1210,14 @@ impl ToolExecutor {
                     .get("failed")
                     .cloned()
                     .unwrap_or_else(|| Value::Array(Vec::new()));
+                let restored_git_stashes = stash_result
+                    .get("restored")
+                    .cloned()
+                    .unwrap_or_else(|| Value::Array(Vec::new()));
+                let failed_git_stash_rollbacks = stash_result
+                    .get("failed")
+                    .cloned()
+                    .unwrap_or_else(|| Value::Array(Vec::new()));
                 let reverted_file_count = reverted_files
                     .as_array()
                     .map(|entries| entries.len())
@@ -1199,35 +1234,51 @@ impl ToolExecutor {
                     .as_array()
                     .map(|entries| entries.len())
                     .unwrap_or(0);
-                let success = reverted_file_count + restored_snapshot_count > 0
-                    && failed_file_count + failed_database_count == 0;
-                let summary = if reverted_file_count + restored_snapshot_count == 0 {
+                let restored_git_stash_count = restored_git_stashes
+                    .as_array()
+                    .map(|entries| entries.len())
+                    .unwrap_or(0);
+                let failed_git_stash_count = failed_git_stash_rollbacks
+                    .as_array()
+                    .map(|entries| entries.len())
+                    .unwrap_or(0);
+                let restored_total =
+                    reverted_file_count + restored_snapshot_count + restored_git_stash_count;
+                let failed_total =
+                    failed_file_count + failed_database_count + failed_git_stash_count;
+                let success = restored_total > 0 && failed_total == 0;
+                let summary = if restored_total == 0 {
                     format!("No recorded rollback actions found for turn {turn_index}")
-                } else if failed_file_count + failed_database_count == 0 {
+                } else if failed_total == 0 {
                     format!(
-                        "Rolled back {reverted_file_count} file edit{} and {restored_snapshot_count} database snapshot{} from turn {turn_index}",
-                        if reverted_file_count == 1 { "" } else { "s" },
-                        if restored_snapshot_count == 1 {
-                            ""
-                        } else {
-                            "s"
-                        }
-                    )
-                } else {
-                    format!(
-                        "Rolled back {reverted_file_count} file edit{} and {restored_snapshot_count} database snapshot{} from turn {turn_index} with {} failure{}",
+                        "Rolled back {reverted_file_count} file edit{}, restored {restored_snapshot_count} database snapshot{}, and re-applied {restored_git_stash_count} recorded git stash{} from turn {turn_index}",
                         if reverted_file_count == 1 { "" } else { "s" },
                         if restored_snapshot_count == 1 {
                             ""
                         } else {
                             "s"
                         },
-                        failed_file_count + failed_database_count,
-                        if failed_file_count + failed_database_count == 1 {
+                        if restored_git_stash_count == 1 {
+                            ""
+                        } else {
+                            "es"
+                        }
+                    )
+                } else {
+                    format!(
+                        "Rolled back {reverted_file_count} file edit{}, restored {restored_snapshot_count} database snapshot{}, and re-applied {restored_git_stash_count} recorded git stash{} from turn {turn_index} with {failed_total} failure{}",
+                        if reverted_file_count == 1 { "" } else { "s" },
+                        if restored_snapshot_count == 1 {
                             ""
                         } else {
                             "s"
-                        }
+                        },
+                        if restored_git_stash_count == 1 {
+                            ""
+                        } else {
+                            "es"
+                        },
+                        if failed_total == 1 { "" } else { "s" }
                     )
                 };
                 json!({
@@ -1236,10 +1287,13 @@ impl ToolExecutor {
                     "turn_index": turn_index,
                     "reverted_files": reverted_files,
                     "restored_database_snapshots": restored_snapshots,
+                    "restored_git_stashes": restored_git_stashes,
                     "failed_file_rollbacks": failed_file_rollbacks,
                     "failed_database_rollbacks": failed_database_rollbacks,
+                    "failed_git_stash_rollbacks": failed_git_stash_rollbacks,
                     "files": file_result,
                     "database_snapshots": database_result,
+                    "git_stashes": stash_result,
                     "summary": summary,
                 })
                 .to_string()

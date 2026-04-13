@@ -53,6 +53,7 @@ mod github;
 mod lsp_stdio_session;
 #[path = "edge_tools/mo_tools.rs"]
 mod mo_tools;
+pub(crate) use git_gix::GitStashRollbackJournal;
 pub(crate) use mo_tools::DatabaseSnapshotRollbackJournal;
 #[path = "edge_tools/passive_cargo_check.rs"]
 mod passive_cargo_check;
@@ -386,6 +387,9 @@ pub struct ToolExecutor {
     /// executor can perform a bounded restore without reconstructing tool history.
     pub database_snapshot_journal:
         std::sync::Arc<std::sync::Mutex<mo_tools::DatabaseSnapshotRollbackJournal>>,
+    /// Git stash rollback journal — records captured stash handles so bounded
+    /// turn/batch rollback can re-apply shelved working tree state.
+    pub git_stash_journal: std::sync::Arc<std::sync::Mutex<git_gix::GitStashRollbackJournal>>,
     /// Current turn index for file journal entries. Set externally per-turn.
     pub journal_turn_index: std::sync::atomic::AtomicU32,
     /// Active worktree session state. When set, `effective_project_root()` returns
@@ -459,6 +463,9 @@ impl ToolExecutor {
             )),
             database_snapshot_journal: std::sync::Arc::new(std::sync::Mutex::new(
                 mo_tools::DatabaseSnapshotRollbackJournal::default(),
+            )),
+            git_stash_journal: std::sync::Arc::new(std::sync::Mutex::new(
+                git_gix::GitStashRollbackJournal::default(),
             )),
             journal_turn_index: std::sync::atomic::AtomicU32::new(0),
             worktree_session: std::sync::Mutex::new(None),
@@ -542,6 +549,15 @@ impl ToolExecutor {
         journal: std::sync::Arc<std::sync::Mutex<mo_tools::DatabaseSnapshotRollbackJournal>>,
     ) -> Self {
         self.database_snapshot_journal = journal;
+        self
+    }
+
+    /// Use a shared git stash rollback journal (session-scoped) instead of the default.
+    pub fn with_shared_git_stash_journal(
+        mut self,
+        journal: std::sync::Arc<std::sync::Mutex<git_gix::GitStashRollbackJournal>>,
+    ) -> Self {
+        self.git_stash_journal = journal;
         self
     }
 
@@ -776,7 +792,7 @@ impl ToolExecutor {
             return outcome;
         }
         if name == "git_stash" {
-            let mut outcome = git_gix::git_stash_with_metadata(&self.project_root, args);
+            let mut outcome = self.git_stash_with_metadata(args);
             let output = self.finalize_tool_output(outcome.output, name);
             self.record_output_size(output.len());
             outcome.output = output;
@@ -827,7 +843,7 @@ impl ToolExecutor {
                 "git_contributors" => git_gix::git_contributors(&self.project_root, args),
                 "git_log_search" => git_gix::git_log_search(&self.project_root, args),
                 "git_commit" => git_gix::git_commit(&self.project_root, args),
-                "git_stash" => git_gix::git_stash(&self.project_root, args),
+                "git_stash" => self.git_stash(args),
                 "git_checkout_file" => self.git_checkout_file(args),
                 "git_worktree" => self.git_worktree(args),
                 "find_definition" => self.find_definition(args),
@@ -1086,6 +1102,7 @@ impl ToolExecutor {
         let file_checkpoint = rollback_on_failure.then(|| self.file_journal_checkpoint());
         let database_checkpoint =
             rollback_on_failure.then(|| self.database_snapshot_journal_checkpoint());
+        let stash_checkpoint = rollback_on_failure.then(|| self.git_stash_journal_checkpoint());
         let steps = chain.steps.clone();
 
         Box::pin(async move {
@@ -1127,8 +1144,11 @@ impl ToolExecutor {
 
                 if is_err {
                     if rollback_on_failure {
-                        if let (Some(file_checkpoint), Some(database_checkpoint)) =
-                            (file_checkpoint, database_checkpoint)
+                        if let (
+                            Some(file_checkpoint),
+                            Some(database_checkpoint),
+                            Some(stash_checkpoint),
+                        ) = (file_checkpoint, database_checkpoint, stash_checkpoint)
                         {
                             let file_entries_added = self
                                 .file_journal_checkpoint()
@@ -1136,13 +1156,20 @@ impl ToolExecutor {
                             let database_entries_added = self
                                 .database_snapshot_journal_checkpoint()
                                 .saturating_sub(database_checkpoint);
-                            if file_entries_added > 0 || database_entries_added > 0 {
+                            let stash_entries_added = self
+                                .git_stash_journal_checkpoint()
+                                .saturating_sub(stash_checkpoint);
+                            if file_entries_added > 0
+                                || database_entries_added > 0
+                                || stash_entries_added > 0
+                            {
                                 let rollback_output =
                                     self.rollback_turn_actions(&serde_json::json!({
                                         "scope": "turn",
                                         "turn_index": rollback_turn_index,
                                         "file_after_sequence": file_checkpoint,
                                         "database_after_sequence": database_checkpoint,
+                                        "stash_after_sequence": stash_checkpoint,
                                     }));
                                 rollback = Some(
                                     serde_json::from_str(&rollback_output).unwrap_or_else(

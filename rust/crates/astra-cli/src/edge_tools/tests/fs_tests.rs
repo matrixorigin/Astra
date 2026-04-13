@@ -2,6 +2,37 @@ use super::*;
 
 // ── fs tools ──────────────────────────────────────────────────────────────
 
+fn init_temp_git_repo() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("temp repo");
+    std::process::Command::new("git")
+        .arg("init")
+        .current_dir(dir.path())
+        .output()
+        .expect("git init");
+    std::process::Command::new("git")
+        .args(["config", "user.name", "Test User"])
+        .current_dir(dir.path())
+        .output()
+        .expect("git config user.name");
+    std::process::Command::new("git")
+        .args(["config", "user.email", "test@example.com"])
+        .current_dir(dir.path())
+        .output()
+        .expect("git config user.email");
+    std::fs::write(dir.path().join("tracked.txt"), "committed\n").expect("seed tracked file");
+    std::process::Command::new("git")
+        .args(["add", "tracked.txt"])
+        .current_dir(dir.path())
+        .output()
+        .expect("git add");
+    std::process::Command::new("git")
+        .args(["commit", "-m", "init"])
+        .current_dir(dir.path())
+        .output()
+        .expect("git commit");
+    dir
+}
+
 #[test]
 fn read_file_missing_path_returns_error() {
     let executor = test_executor();
@@ -306,6 +337,58 @@ fn rollback_turn_actions_list_combines_file_and_db_journals() {
     );
     assert_eq!(
         rollback_json["database_entries"].as_array().map(Vec::len),
+        Some(0)
+    );
+    assert_eq!(rollback_json["total_git_stash_entries"].as_u64(), Some(0));
+}
+
+#[test]
+fn rollback_turn_actions_reapplies_recorded_git_stash_for_current_turn() {
+    let dir = init_temp_git_repo();
+    let tracked = dir.path().join("tracked.txt");
+    let executor = ToolExecutor::new(dir.path());
+    executor
+        .journal_turn_index
+        .store(12, std::sync::atomic::Ordering::Relaxed);
+
+    std::fs::write(&tracked, "working tree\n").expect("modify tracked file");
+    let stash = executor.git_stash_with_metadata(&json!({"action": "push", "message": "demo"}));
+    assert!(
+        !stash.output.starts_with("Error:"),
+        "stash push failed: {}",
+        stash.output
+    );
+    assert_eq!(
+        std::fs::read_to_string(&tracked).expect("clean worktree after stash"),
+        "committed\n"
+    );
+
+    let listed = executor.rollback_turn_actions(&json!({"scope": "list"}));
+    let listed_json: serde_json::Value = serde_json::from_str(&listed).unwrap();
+    assert_eq!(listed_json["total_git_stash_entries"].as_u64(), Some(1));
+
+    let rollback = executor.rollback_turn_actions(&json!({"scope": "current_turn"}));
+    let rollback_json: serde_json::Value = serde_json::from_str(&rollback).unwrap();
+    assert_eq!(
+        rollback_json["success"].as_bool(),
+        Some(true),
+        "got: {rollback}"
+    );
+    assert_eq!(
+        rollback_json["restored_git_stashes"]
+            .as_array()
+            .map(Vec::len),
+        Some(1)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&tracked).expect("restored working tree"),
+        "working tree\n"
+    );
+
+    let listed_after = executor.rollback_turn_actions(&json!({"scope": "list"}));
+    let listed_after_json: serde_json::Value = serde_json::from_str(&listed_after).unwrap();
+    assert_eq!(
+        listed_after_json["total_git_stash_entries"].as_u64(),
         Some(0)
     );
 }

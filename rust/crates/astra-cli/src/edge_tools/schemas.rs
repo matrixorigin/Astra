@@ -200,14 +200,14 @@ pub fn all_tool_schemas() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "rollback_turn_actions",
-                "description": "Orchestrate bounded rollback across the shared file edit journal and MatrixOne snapshot journal for one turn. Use to revert mixed file/database side effects from the current turn or a specific turn, or to list recorded rollback handles across both journals.",
+                "description": "Orchestrate bounded rollback across the shared file edit journal, MatrixOne snapshot journal, and recorded git stash rollback handles for one turn. Use to revert mixed file/database/repo-state side effects from the current turn or a specific turn, or to list recorded rollback handles across all three journals.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "scope": {
                             "type": "string",
                             "enum": ["current_turn", "turn", "list"],
-                            "description": "Rollback scope. Defaults to current_turn. Use turn to revert one prior turn across both journals, or list to inspect recorded rollback entries."
+                            "description": "Rollback scope. Defaults to current_turn. Use turn to revert one prior turn across all recorded journals, or list to inspect recorded rollback entries."
                         },
                         "turn_index": {
                             "type": "integer",
@@ -434,7 +434,9 @@ pub fn all_tool_schemas() -> Vec<Value> {
                         "action": {"type": "string", "enum": ["push", "apply", "pop", "list", "drop"], "description": "Stash operation"},
                         "message": {"type": "string", "description": "Description for push (optional)"},
                         "index": {"type": "integer", "description": "Stash index for apply/pop/drop (default 0)"},
-                        "stash_ref": {"type": "string", "description": "Exact stash selector or OID for apply. Prefer the stash_ref returned by a previous successful git_stash push."}
+                        "stash_ref": {"type": "string", "description": "Exact stash selector or OID for apply. Prefer the stash_ref returned by a previous successful git_stash push."},
+                        "transaction_id": {"type": "string", "description": "Optional explicit batch transaction id. Consecutive tool calls in the same batch with the same id and rollback_on_failure=true execute as one rollback boundary."},
+                        "rollback_on_failure": {"type": "boolean", "description": "Optional explicit batch transaction flag. When true with transaction_id, a later failure inside the same contiguous batch transaction rolls back bounded file/database/repo-state side effects recorded since the transaction began."}
                     },
                     "required": ["action"]
                 }

@@ -6,6 +6,7 @@
 //! Benefits: no subprocess overhead, no shell injection risk, no `git` binary dependency.
 
 use std::path::Path;
+use std::time::SystemTime;
 
 use gix::bstr::{BString, ByteSlice};
 use serde_json::Value;
@@ -70,6 +71,72 @@ fn apply_stash_selector(args: &Value) -> Result<String, String> {
 fn stash_index_selector(args: &Value) -> String {
     let idx = args.get("index").and_then(Value::as_u64).unwrap_or(0);
     format!("stash@{{{idx}}}")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GitStashRollbackEntry {
+    sequence: u64,
+    pub stash_ref: String,
+    pub turn_index: u32,
+    pub timestamp: SystemTime,
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct GitStashRollbackJournal {
+    entries: Vec<GitStashRollbackEntry>,
+    next_sequence: u64,
+}
+
+impl GitStashRollbackJournal {
+    fn record(&mut self, stash_ref: impl Into<String>, turn_index: u32, message: Option<String>) {
+        self.entries.push(GitStashRollbackEntry {
+            sequence: self.next_sequence,
+            stash_ref: stash_ref.into(),
+            turn_index,
+            timestamp: SystemTime::now(),
+            message,
+        });
+        self.next_sequence = self.next_sequence.saturating_add(1);
+    }
+
+    fn list(&self) -> Vec<GitStashRollbackEntry> {
+        self.entries.iter().rev().cloned().collect()
+    }
+
+    fn restore_plan_for_turn(&self, turn_index: u32) -> Vec<GitStashRollbackEntry> {
+        self.restore_plan_for_turn_since(turn_index, 0)
+    }
+
+    fn restore_plan_for_turn_since(
+        &self,
+        turn_index: u32,
+        checkpoint: u64,
+    ) -> Vec<GitStashRollbackEntry> {
+        self.entries
+            .iter()
+            .find(|entry| entry.turn_index == turn_index && entry.sequence >= checkpoint)
+            .cloned()
+            .into_iter()
+            .collect()
+    }
+
+    fn checkpoint(&self) -> u64 {
+        self.next_sequence
+    }
+
+    fn remove_stash(&mut self, stash_ref: &str) -> bool {
+        if let Some(index) = self
+            .entries
+            .iter()
+            .rposition(|entry| entry.stash_ref == stash_ref)
+        {
+            self.entries.remove(index);
+            true
+        } else {
+            false
+        }
+    }
 }
 
 fn tool_output_limit() -> usize {
@@ -1846,6 +1913,223 @@ pub(crate) fn git_stash_with_metadata(
             }
         }
         Err(e) => super::ToolExecutionOutcome::text(format!("Error: git stash failed: {e}")),
+    }
+}
+
+impl ToolExecutor {
+    fn record_git_stash_rollback(&self, stash_ref: impl Into<String>, message: Option<String>) {
+        let turn_index = self
+            .journal_turn_index
+            .load(std::sync::atomic::Ordering::Relaxed);
+        match self.git_stash_journal.lock() {
+            Ok(mut journal) => journal.record(stash_ref, turn_index, message),
+            Err(poisoned) => poisoned.into_inner().record(stash_ref, turn_index, message),
+        }
+    }
+
+    fn git_stash_entries(&self) -> Vec<GitStashRollbackEntry> {
+        match self.git_stash_journal.lock() {
+            Ok(journal) => journal.list(),
+            Err(poisoned) => poisoned.into_inner().list(),
+        }
+    }
+
+    fn git_stash_restore_plan_for_turn(&self, turn_index: u32) -> Vec<GitStashRollbackEntry> {
+        match self.git_stash_journal.lock() {
+            Ok(journal) => journal.restore_plan_for_turn(turn_index),
+            Err(poisoned) => poisoned.into_inner().restore_plan_for_turn(turn_index),
+        }
+    }
+
+    fn git_stash_restore_plan_for_turn_since(
+        &self,
+        turn_index: u32,
+        checkpoint: u64,
+    ) -> Vec<GitStashRollbackEntry> {
+        match self.git_stash_journal.lock() {
+            Ok(journal) => journal.restore_plan_for_turn_since(turn_index, checkpoint),
+            Err(poisoned) => poisoned
+                .into_inner()
+                .restore_plan_for_turn_since(turn_index, checkpoint),
+        }
+    }
+
+    pub(crate) fn git_stash_journal_checkpoint(&self) -> u64 {
+        match self.git_stash_journal.lock() {
+            Ok(journal) => journal.checkpoint(),
+            Err(poisoned) => poisoned.into_inner().checkpoint(),
+        }
+    }
+
+    fn remove_git_stash_rollback(&self, stash_ref: &str) {
+        match self.git_stash_journal.lock() {
+            Ok(mut journal) => {
+                journal.remove_stash(stash_ref);
+            }
+            Err(poisoned) => {
+                poisoned.into_inner().remove_stash(stash_ref);
+            }
+        }
+    }
+
+    fn rollback_git_stash_entry_json(entry: &GitStashRollbackEntry) -> Value {
+        let mut value = serde_json::Map::from_iter([
+            (
+                "stash_ref".to_string(),
+                Value::String(entry.stash_ref.clone()),
+            ),
+            (
+                "turn_index".to_string(),
+                Value::Number(serde_json::Number::from(entry.turn_index)),
+            ),
+        ]);
+        if let Some(message) = entry.message.as_ref() {
+            value.insert("message".to_string(), Value::String(message.clone()));
+        }
+        Value::Object(value)
+    }
+
+    pub(crate) fn rollback_git_stashes(&self, args: &Value) -> String {
+        let scope = args
+            .get("scope")
+            .and_then(Value::as_str)
+            .unwrap_or("current_turn");
+        let explicit_turn_index = if scope == "turn" {
+            match args.get("turn_index").and_then(Value::as_u64) {
+                Some(turn_index) => Some(turn_index),
+                None => {
+                    return serde_json::json!({
+                        "success": false,
+                        "error": "missing 'turn_index' for scope=turn",
+                    })
+                    .to_string();
+                }
+            }
+        } else {
+            None
+        };
+        let after_sequence = args
+            .get("stash_after_sequence")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+
+        match scope {
+            "list" => {
+                let entries = self
+                    .git_stash_entries()
+                    .into_iter()
+                    .map(|entry| Self::rollback_git_stash_entry_json(&entry))
+                    .collect::<Vec<_>>();
+                serde_json::json!({
+                    "success": true,
+                    "scope": "list",
+                    "total_entries": entries.len(),
+                    "entries": entries,
+                    "summary": format!("Listed {} recorded git stash rollback entr{}", entries.len(), if entries.len() == 1 { "y" } else { "ies" }),
+                })
+                .to_string()
+            }
+            "turn" | "current_turn" => {
+                let turn_index = explicit_turn_index.unwrap_or_else(|| {
+                    self.journal_turn_index
+                        .load(std::sync::atomic::Ordering::Relaxed) as u64
+                }) as u32;
+                let plan = if after_sequence > 0 {
+                    self.git_stash_restore_plan_for_turn_since(turn_index, after_sequence)
+                } else {
+                    self.git_stash_restore_plan_for_turn(turn_index)
+                };
+                let mut restored = Vec::new();
+                let mut failed = Vec::new();
+                for entry in &plan {
+                    let apply_output = git_stash(
+                        &self.project_root,
+                        &serde_json::json!({
+                            "action": "apply",
+                            "stash_ref": entry.stash_ref,
+                        }),
+                    );
+                    if apply_output.starts_with("Error:") {
+                        let mut failed_entry = Self::rollback_git_stash_entry_json(entry)
+                            .as_object()
+                            .cloned()
+                            .unwrap_or_default();
+                        failed_entry.insert("error".to_string(), Value::String(apply_output));
+                        failed.push(Value::Object(failed_entry));
+                    } else {
+                        self.remove_git_stash_rollback(&entry.stash_ref);
+                        restored.push(Self::rollback_git_stash_entry_json(entry));
+                    }
+                }
+                let success = !restored.is_empty() && failed.is_empty();
+                let summary = if plan.is_empty() {
+                    format!("No recorded git stash rollback handles found for turn {turn_index}")
+                } else if failed.is_empty() {
+                    format!(
+                        "Re-applied {} recorded git stash{} for turn {turn_index}",
+                        restored.len(),
+                        if restored.len() == 1 { "" } else { "es" }
+                    )
+                } else {
+                    format!(
+                        "Re-applied {} recorded git stash{} for turn {turn_index} with {} failure{}",
+                        restored.len(),
+                        if restored.len() == 1 { "" } else { "es" },
+                        failed.len(),
+                        if failed.len() == 1 { "" } else { "s" }
+                    )
+                };
+                serde_json::json!({
+                    "success": success,
+                    "scope": scope,
+                    "turn_index": turn_index,
+                    "restored": restored,
+                    "failed": failed,
+                    "summary": summary,
+                })
+                .to_string()
+            }
+            other => serde_json::json!({
+                "success": false,
+                "error": format!(
+                    "unknown scope `{other}`. Supported: current_turn, turn, list"
+                ),
+            })
+            .to_string(),
+        }
+    }
+
+    pub(crate) fn git_stash(&self, args: &Value) -> String {
+        self.git_stash_with_metadata(args).output
+    }
+
+    pub(crate) fn git_stash_with_metadata(&self, args: &Value) -> super::ToolExecutionOutcome {
+        let action = args
+            .get("action")
+            .and_then(Value::as_str)
+            .map(|action| action.trim().to_ascii_lowercase())
+            .unwrap_or_default();
+        let outcome = git_stash_with_metadata(&self.project_root, args);
+        if matches!(action.as_str(), "push" | "save")
+            && let Some(stash_ref) = outcome
+                .tool_result_fields
+                .as_ref()
+                .and_then(|fields| fields.get("stash_ref"))
+                .and_then(Value::as_str)
+        {
+            self.record_git_stash_rollback(
+                stash_ref.to_string(),
+                args.get("message")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string),
+            );
+            self.clear_file_state();
+        } else if matches!(action.as_str(), "apply" | "pop")
+            && !outcome.output.starts_with("Error:")
+        {
+            self.clear_file_state();
+        }
+        outcome
     }
 }
 

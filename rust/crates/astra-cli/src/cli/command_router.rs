@@ -447,6 +447,7 @@ pub(super) async fn execute_cli_command(
                 observability_session: None,
                 file_journal: None,
                 database_snapshot_journal: None,
+                git_stash_journal: None,
                 turn_index: 0,
                 evolution_service: None,
             })
@@ -491,6 +492,7 @@ pub(super) async fn execute_cli_command(
                         observability_session: None,
                         file_journal: None,
                         database_snapshot_journal: None,
+                        git_stash_journal: None,
                         turn_index: 0,
                         evolution_service: None,
                     })
@@ -880,6 +882,7 @@ pub(super) async fn execute_cli_command(
                 observability_session: None,
                 file_journal: None,
                 database_snapshot_journal: None,
+                git_stash_journal: None,
                 turn_index: 0,
                 evolution_service: None,
             })
@@ -928,6 +931,7 @@ pub(super) async fn execute_cli_command(
                         observability_session: None,
                         file_journal: None,
                         database_snapshot_journal: None,
+                        git_stash_journal: None,
                         turn_index: 0,
                         evolution_service: None,
                     })
@@ -1394,6 +1398,7 @@ pub(super) async fn run_print_mode(
         observability_session: None,
         file_journal: None,
         database_snapshot_journal: None,
+        git_stash_journal: None,
         turn_index: 0,
         evolution_service: None,
     })
@@ -1440,6 +1445,7 @@ pub(super) async fn run_print_mode(
                 observability_session: None,
                 file_journal: None,
                 database_snapshot_journal: None,
+                git_stash_journal: None,
                 turn_index: 0,
                 evolution_service: None,
             })

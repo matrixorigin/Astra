@@ -560,6 +560,7 @@ async fn maybe_auto_compact(
         observability_session: obs_session,
         file_journal: Some(state.file_journal.clone()),
         database_snapshot_journal: Some(state.database_snapshot_journal.clone()),
+        git_stash_journal: Some(state.git_stash_journal.clone()),
         turn_index: state.turn,
         evolution_service: state.evolution_service.clone(),
     })
@@ -825,8 +826,9 @@ async fn run_chat_turn(
             observability_session: obs_session,
             file_journal: Some(state.file_journal.clone()),
             database_snapshot_journal: Some(state.database_snapshot_journal.clone()),
+            git_stash_journal: Some(state.git_stash_journal.clone()),
             turn_index: state.turn,
-                    evolution_service: state.evolution_service.clone(),
+            evolution_service: state.evolution_service.clone(),
         }) => TurnAttempt::Completed(Box::new(result)),
         _ = tokio::signal::ctrl_c() => {
             // Trigger cancellation to interrupt any in-flight SSE streaming.

@@ -365,7 +365,7 @@ pub fn tool_action_profile(tool_name: &str, args: &Value) -> ActionCompensationP
                 ActionCategory::Execute,
                 false,
                 CompensationKind::GitApplyStash,
-                "re-apply the captured stash with `git_stash` using action=`apply` and the returned stash_ref"
+                "use `rollback_turn_actions` with scope=`current_turn` to re-apply the recorded stash for the turn, or re-apply the captured stash with `git_stash` using action=`apply` and the returned stash_ref"
                     .to_string(),
             ),
             Some("apply") => ActionCompensationProfile::manual(
