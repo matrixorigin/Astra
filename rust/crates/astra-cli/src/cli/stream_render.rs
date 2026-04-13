@@ -614,6 +614,24 @@ impl<'a> CliSseStreamHost<'a> {
         rendered
     }
 
+    fn turn_rollback_boundary_violation(tool: &str, args: &Value) -> Option<String> {
+        if tool != "bash" {
+            return None;
+        }
+        let command = args
+            .get("command")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|command| !command.is_empty())?;
+        if astra_runtime::turn::cloud_approval_policy::bash_command_is_read_only(command) {
+            return None;
+        }
+        Some(
+            "Error: non-read-only bash commands do not participate in rollback_on_failure turn boundaries. Use structured mutation tools (write_file, git_*, rollback-aware editors), use run_build_test when available for build/test work, or keep bash read-only inside this plan subtask."
+                .to_string(),
+        )
+    }
+
     async fn record_synthetic_batch_result(
         &mut self,
         req: &ToolBatchRequest,
@@ -1205,7 +1223,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             None => crate::tool_safety_guard::ToolSafetyGuard::check_request(None, tool, args),
         };
         let mut denied_output = None;
-        let allowed = match decision {
+        let mut allowed = match decision {
             crate::permission_manager::PermissionDecision::Allow => true,
             crate::permission_manager::PermissionDecision::Deny(reason) => {
                 denied_output = Some(format!("Error: {reason}"));
@@ -1306,6 +1324,13 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 }
             }
         };
+        if allowed
+            && self.active_turn_rollback.is_some()
+            && let Some(error) = Self::turn_rollback_boundary_violation(tool, args)
+        {
+            denied_output = Some(error);
+            allowed = false;
+        }
         let start = std::time::Instant::now();
         let mut tool_result_fields = None;
         let mut output = if allowed {
@@ -4862,6 +4887,144 @@ diff --git a/src/a.rs b/src/a.rs\n\
         assert!(
             !results[2].output.contains("existing"),
             "aborted turn request should not execute normally"
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_rollback_rejects_mutating_bash_and_restores_prior_state() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/tools/result"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .mount(&server)
+            .await;
+
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
+        let temp = tempdir().expect("tempdir");
+        let mut executor = crate::edge_tools::ToolExecutor::new(temp.path());
+        let mut tool_cache = EdgeToolCache::new(8);
+        executor
+            .journal_turn_index
+            .store(11, std::sync::atomic::Ordering::Relaxed);
+
+        let mut host = CliSseStreamHost::from_edge_ctx(
+            EdgeSseContext {
+                api: &api,
+                token: "tok",
+                executor_id: "edge-test",
+                executor: &mut executor,
+                render_policy: RenderPolicy::Silent,
+                perm_manager: None,
+                cancel_token: None,
+                stream_event_tx: None,
+                approval_request_tx: None,
+                skill_resolver: None,
+                skill_continuation: false,
+                turn_rollback_on_failure: true,
+                tool_cache: &mut tool_cache,
+            },
+            80,
+            false,
+        );
+
+        let results = host
+            .execute_tools_batch(vec![
+                ToolBatchRequest {
+                    request_id: "turn-bash-1".to_string(),
+                    tool: "write_file".to_string(),
+                    args: serde_json::json!({
+                        "path": "turn.txt",
+                        "content": "hello\n",
+                    }),
+                },
+                ToolBatchRequest {
+                    request_id: "turn-bash-2".to_string(),
+                    tool: "bash".to_string(),
+                    args: serde_json::json!({
+                        "command": "mkdir unsafe-dir",
+                    }),
+                },
+            ])
+            .await;
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[1].status, "error");
+        assert!(
+            results[1]
+                .output
+                .contains("non-read-only bash commands do not participate"),
+            "{}",
+            results[1].output
+        );
+        let fields = results[1]
+            .tool_result_fields
+            .as_ref()
+            .expect("rollback fields");
+        assert_eq!(fields["rollback_boundary"].as_str(), Some("turn"));
+        assert_eq!(fields["rollback_state"].as_str(), Some("rolled_back"));
+        assert!(
+            !temp.path().join("turn.txt").exists(),
+            "prior bounded state should be rolled back"
+        );
+        assert!(
+            !temp.path().join("unsafe-dir").exists(),
+            "mutating bash should be blocked before execution"
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_rollback_allows_read_only_bash() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/tools/result"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .mount(&server)
+            .await;
+
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
+        let temp = tempdir().expect("tempdir");
+        let mut executor = crate::edge_tools::ToolExecutor::new(temp.path());
+        let mut tool_cache = EdgeToolCache::new(8);
+        executor
+            .journal_turn_index
+            .store(12, std::sync::atomic::Ordering::Relaxed);
+
+        let mut host = CliSseStreamHost::from_edge_ctx(
+            EdgeSseContext {
+                api: &api,
+                token: "tok",
+                executor_id: "edge-test",
+                executor: &mut executor,
+                render_policy: RenderPolicy::Silent,
+                perm_manager: None,
+                cancel_token: None,
+                stream_event_tx: None,
+                approval_request_tx: None,
+                skill_resolver: None,
+                skill_continuation: false,
+                turn_rollback_on_failure: true,
+                tool_cache: &mut tool_cache,
+            },
+            80,
+            false,
+        );
+
+        let result = host
+            .execute_tool(
+                "turn-bash-ro",
+                "bash",
+                &serde_json::json!({"command": "pwd"}),
+            )
+            .await;
+
+        assert_ne!(result.status, "error");
+        assert!(result.tool_result_fields.is_none());
+        assert!(
+            result
+                .output
+                .contains(temp.path().to_string_lossy().as_ref()),
+            "{}",
+            result.output
         );
     }
 }
