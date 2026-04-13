@@ -798,6 +798,20 @@ impl ToolExecutor {
             outcome.output = output;
             return outcome;
         }
+        if name == "git_commit" {
+            let mut outcome = git_gix::git_commit_with_metadata(&self.project_root, args);
+            let output = self.finalize_tool_output(outcome.output, name);
+            self.record_output_size(output.len());
+            outcome.output = output;
+            return outcome;
+        }
+        if name == "git_revert_commit" {
+            let mut outcome = git_gix::git_revert_commit_with_metadata(&self.project_root, args);
+            let output = self.finalize_tool_output(outcome.output, name);
+            self.record_output_size(output.len());
+            outcome.output = output;
+            return outcome;
+        }
 
         ToolExecutionOutcome::text(self.execute(name, args).await)
     }
@@ -843,6 +857,7 @@ impl ToolExecutor {
                 "git_contributors" => git_gix::git_contributors(&self.project_root, args),
                 "git_log_search" => git_gix::git_log_search(&self.project_root, args),
                 "git_commit" => git_gix::git_commit(&self.project_root, args),
+                "git_revert_commit" => git_gix::git_revert_commit(&self.project_root, args),
                 "git_stash" => self.git_stash(args),
                 "git_checkout_file" => self.git_checkout_file(args),
                 "git_worktree" => self.git_worktree(args),

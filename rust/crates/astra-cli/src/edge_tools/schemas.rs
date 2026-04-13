@@ -426,6 +426,20 @@ pub fn all_tool_schemas() -> Vec<Value> {
         json!({
             "type": "function",
             "function": {
+                "name": "git_revert_commit",
+                "description": "Create a compensating revert commit for an earlier commit. Prefer the commit_sha returned by git_commit.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "commit_sha": {"type": "string", "description": "Full commit SHA or git revision to revert (required). Prefer the commit_sha returned by git_commit."}
+                    },
+                    "required": ["commit_sha"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
                 "name": "git_stash",
                 "description": "Save or restore working tree changes. Use to temporarily shelve changes before switching tasks.",
                 "parameters": {

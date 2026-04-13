@@ -115,6 +115,10 @@ fn schemas_include_new_coding_tools() {
         })
         .collect();
     assert!(names.contains(&"git_commit"), "missing git_commit schema");
+    assert!(
+        names.contains(&"git_revert_commit"),
+        "missing git_revert_commit schema"
+    );
     assert!(names.contains(&"git_stash"), "missing git_stash schema");
     assert!(
         names.contains(&"git_checkout_file"),
@@ -188,5 +192,31 @@ fn git_stash_schema_exposes_apply_and_stash_ref() {
     assert!(
         properties.contains_key("stash_ref"),
         "git_stash schema should expose stash_ref"
+    );
+}
+
+#[test]
+fn git_revert_commit_schema_requires_commit_sha() {
+    let schemas = all_tool_schemas();
+    let schema = schemas
+        .iter()
+        .find(|schema| schema["function"]["name"].as_str() == Some("git_revert_commit"))
+        .expect("missing git_revert_commit schema");
+    let properties = schema["function"]["parameters"]["properties"]
+        .as_object()
+        .expect("missing git_revert_commit properties");
+    let required = schema["function"]["parameters"]["required"]
+        .as_array()
+        .expect("missing git_revert_commit required list");
+
+    assert!(
+        properties.contains_key("commit_sha"),
+        "git_revert_commit schema should expose commit_sha"
+    );
+    assert!(
+        required
+            .iter()
+            .any(|value| value.as_str() == Some("commit_sha")),
+        "git_revert_commit schema should require commit_sha"
     );
 }

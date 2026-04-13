@@ -346,7 +346,12 @@ pub fn tool_action_profile(tool_name: &str, args: &Value) -> ActionCompensationP
             ActionCategory::Execute,
             false,
             CompensationKind::GitRevertCommit,
-            "create a compensating revert commit with `git revert <commit>`".to_string(),
+            "call `git_revert_commit` with the returned commit_sha to create a compensating revert commit".to_string(),
+        ),
+        "git_revert_commit" => ActionCompensationProfile::manual(
+            false,
+            ActionCategory::Execute,
+            "git_revert_commit creates a new compensating commit; undo it by reverting the new revert commit if needed",
         ),
         "git_checkout_file" => ActionCompensationProfile::compensated(
             true,
@@ -585,6 +590,22 @@ mod tests {
             profile.compensation_kind,
             Some(CompensationKind::GitRevertCommit)
         );
+        assert!(
+            profile
+                .compensation_summary
+                .as_deref()
+                .unwrap_or_default()
+                .contains("git_revert_commit")
+        );
+    }
+
+    #[test]
+    fn git_revert_commit_tool_is_manual() {
+        let profile = tool_action_profile("git_revert_commit", &json!({"commit_sha": "abc123"}));
+        assert!(!profile.bounded);
+        assert_eq!(profile.category, ActionCategory::Execute);
+        assert!(!profile.reversible);
+        assert_eq!(profile.compensation_kind, Some(CompensationKind::Manual));
     }
 
     #[test]

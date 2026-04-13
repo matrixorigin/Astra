@@ -150,7 +150,7 @@ fn output_format_section() -> &'static str {
          - **Rename/refactor**: rename_symbol(dry_run=true) → review → apply\n\
          - **File search**: glob → grep (content) → log search (commits)\n\
          - **Code edit**: read context → str_replace → run_build_test\n\
-         - **Git**: status → diff → log → show → blame; git_commit for changes\n\
+         - **Git**: status → diff → log → show → blame; git_commit for changes; git_revert_commit for bounded commit rollback\n\
          - **Build/test**: run_build_test → fix errors → repeat\n\
          - **GitHub**: list → detail → CI status\n"
 }
@@ -194,6 +194,7 @@ fn tool_conditional_section(tool_names: &[&str], selection_confidence: f64) -> S
     let has_multi_edit = tool_names.contains(&"multi_edit");
     let has_build_test = tool_names.contains(&"run_build_test");
     let has_git_mutations = tool_names.contains(&"git_commit");
+    let has_git_revert = tool_names.contains(&"git_revert_commit");
 
     let mut s = String::new();
 
@@ -296,6 +297,11 @@ fn tool_conditional_section(tool_names: &[&str], selection_confidence: f64) -> S
              - Use **git_checkout_file** to revert a file to its last committed state if an edit goes wrong.\n\
              - Commit after each logical milestone — don't accumulate too many uncommitted changes.\n",
         );
+        if has_git_revert {
+            s.push_str(
+                "             - Use **git_revert_commit** with a captured commit_sha to create a compensating revert commit when rolling back a dedicated git_commit.\n",
+            );
+        }
     }
     if has_memory {
         s.push_str(
@@ -1674,7 +1680,12 @@ mod tests {
     #[test]
     fn git_mutations_guidance_present_when_tools_available() {
         let p = build_main_system_prompt(
-            &["git_commit", "git_stash", "git_checkout_file"],
+            &[
+                "git_commit",
+                "git_revert_commit",
+                "git_stash",
+                "git_checkout_file",
+            ],
             "",
             0.5,
             Some("implementation"),
@@ -1684,6 +1695,10 @@ mod tests {
             "should include git workflow section"
         );
         assert!(p.contains("git_commit"), "should mention git_commit");
+        assert!(
+            p.contains("git_revert_commit"),
+            "should mention git_revert_commit"
+        );
         assert!(p.contains("git_stash"), "should mention git_stash");
         assert!(
             p.contains("git_checkout_file"),

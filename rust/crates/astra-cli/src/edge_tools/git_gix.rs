@@ -60,6 +60,32 @@ fn reject_stash_selector(selector: &str) -> Result<(), String> {
     }
 }
 
+fn validate_commit_ref(commit_ref: &str, param_name: &str) -> Result<String, String> {
+    let trimmed = commit_ref.trim();
+    if trimmed.is_empty() {
+        return Err(format!("Error: {param_name} must not be empty"));
+    }
+    if trimmed.starts_with('-') {
+        return Err(format!("Error: {param_name} must not start with '-'"));
+    }
+    reject_shell_meta(trimmed)?;
+    Ok(trimmed.to_string())
+}
+
+fn resolve_commit_ref(project_root: &Path, commit_ref: &str) -> Option<String> {
+    std::process::Command::new("git")
+        .args(["rev-parse", "--verify", commit_ref])
+        .current_dir(project_root)
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+fn short_commit_sha(commit_sha: &str) -> String {
+    commit_sha[..7.min(commit_sha.len())].to_string()
+}
+
 fn apply_stash_selector(args: &Value) -> Result<String, String> {
     if let Some(selector) = args.get("stash_ref").and_then(Value::as_str) {
         reject_stash_selector(selector)?;
@@ -1708,14 +1734,27 @@ fn parse_since_to_epoch(since: &str) -> Option<i64> {
 /// - `files` (optional): list of file paths to stage; if omitted, stages all changes
 /// - `all` (optional): if true, stages all tracked changes (like `git commit -a`)
 pub fn git_commit(project_root: &Path, args: &Value) -> String {
+    git_commit_with_metadata(project_root, args).output
+}
+
+pub(crate) fn git_commit_with_metadata(
+    project_root: &Path,
+    args: &Value,
+) -> super::ToolExecutionOutcome {
     let message = match args.get("message").and_then(Value::as_str) {
         Some(m) if !m.trim().is_empty() => m.trim(),
-        _ => return "Error: 'message' is required and must not be empty".to_string(),
+        _ => {
+            return super::ToolExecutionOutcome::text(
+                "Error: 'message' is required and must not be empty".to_string(),
+            );
+        }
     };
 
     // Validate message length (prevent absurdly long messages)
     if message.len() > 5000 {
-        return "Error: commit message too long (max 5000 chars)".to_string();
+        return super::ToolExecutionOutcome::text(
+            "Error: commit message too long (max 5000 chars)".to_string(),
+        );
     }
 
     // Stage files
@@ -1733,12 +1772,14 @@ pub fn git_commit(project_root: &Path, args: &Value) -> String {
             .current_dir(project_root)
             .output();
         match add_out {
-            Err(e) => return format!("Error: git add failed: {e}"),
+            Err(e) => {
+                return super::ToolExecutionOutcome::text(format!("Error: git add failed: {e}"));
+            }
             Ok(ref out) if !out.status.success() => {
-                return format!(
+                return super::ToolExecutionOutcome::text(format!(
                     "Error: git add -A failed: {}",
                     String::from_utf8_lossy(&out.stderr).trim()
-                );
+                ));
             }
             Ok(_) => {}
         }
@@ -1748,12 +1789,14 @@ pub fn git_commit(project_root: &Path, args: &Value) -> String {
         cmd.arg("add").args(&files).current_dir(project_root);
         let add_out = cmd.output();
         match add_out {
-            Err(e) => return format!("Error: git add failed: {e}"),
+            Err(e) => {
+                return super::ToolExecutionOutcome::text(format!("Error: git add failed: {e}"));
+            }
             Ok(ref out) if !out.status.success() => {
-                return format!(
+                return super::ToolExecutionOutcome::text(format!(
                     "Error: git add failed: {}",
                     String::from_utf8_lossy(&out.stderr).trim()
-                );
+                ));
             }
             Ok(_) => {}
         }
@@ -1771,26 +1814,131 @@ pub fn git_commit(project_root: &Path, args: &Value) -> String {
 
     match commit_out {
         Ok(out) if out.status.success() => {
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            // Extract commit hash from output
-            let short_hash = stdout
-                .lines()
-                .next()
-                .unwrap_or("")
-                .split_whitespace()
-                .nth(1)
-                .unwrap_or("???");
-            format!("✓ Committed: {short_hash} {message}")
+            let commit_sha = resolve_commit_ref(project_root, "HEAD");
+            let short_hash = commit_sha
+                .as_deref()
+                .map(short_commit_sha)
+                .unwrap_or_else(|| {
+                    String::from_utf8_lossy(&out.stdout)
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap_or("???")
+                        .to_string()
+                });
+            let tool_result_fields = commit_sha.map(|commit_sha| {
+                serde_json::Map::from_iter([
+                    ("commit_sha".to_string(), Value::String(commit_sha.clone())),
+                    (
+                        "commit_short_sha".to_string(),
+                        Value::String(short_commit_sha(&commit_sha)),
+                    ),
+                ])
+            });
+            super::ToolExecutionOutcome {
+                output: format!("✓ Committed: {short_hash} {message}"),
+                tool_result_fields,
+            }
         }
         Ok(out) => {
             let stderr = String::from_utf8_lossy(&out.stderr);
             if stderr.contains("nothing to commit") {
-                "Nothing to commit — working tree clean".to_string()
+                super::ToolExecutionOutcome::text(
+                    "Nothing to commit — working tree clean".to_string(),
+                )
             } else {
-                format!("Error: git commit failed: {}", stderr.trim())
+                super::ToolExecutionOutcome::text(format!(
+                    "Error: git commit failed: {}",
+                    stderr.trim()
+                ))
             }
         }
-        Err(e) => format!("Error: git commit failed: {e}"),
+        Err(e) => super::ToolExecutionOutcome::text(format!("Error: git commit failed: {e}")),
+    }
+}
+
+/// Create a compensating revert commit for an earlier git commit.
+///
+/// Parameters:
+/// - `commit_sha` (required): full commit SHA or git revision to revert
+pub fn git_revert_commit(project_root: &Path, args: &Value) -> String {
+    git_revert_commit_with_metadata(project_root, args).output
+}
+
+pub(crate) fn git_revert_commit_with_metadata(
+    project_root: &Path,
+    args: &Value,
+) -> super::ToolExecutionOutcome {
+    let commit_ref = match args.get("commit_sha").and_then(Value::as_str) {
+        Some(commit_ref) => match validate_commit_ref(commit_ref, "commit_sha") {
+            Ok(commit_ref) => commit_ref,
+            Err(error) => return super::ToolExecutionOutcome::text(error),
+        },
+        None => {
+            return super::ToolExecutionOutcome::text(
+                "Error: 'commit_sha' is required".to_string(),
+            );
+        }
+    };
+    let target_commit_sha = match resolve_commit_ref(project_root, &commit_ref) {
+        Some(commit_sha) => commit_sha,
+        None => {
+            return super::ToolExecutionOutcome::text(format!(
+                "Error: unknown commit '{commit_ref}'"
+            ));
+        }
+    };
+
+    match std::process::Command::new("git")
+        .args(["revert", "--no-edit", target_commit_sha.as_str()])
+        .current_dir(project_root)
+        .output()
+    {
+        Ok(out) if out.status.success() => {
+            let revert_commit_sha = resolve_commit_ref(project_root, "HEAD");
+            let revert_short_sha = revert_commit_sha
+                .as_deref()
+                .map(short_commit_sha)
+                .unwrap_or_else(|| "???".to_string());
+            let tool_result_fields = revert_commit_sha.map(|revert_commit_sha| {
+                serde_json::Map::from_iter([
+                    (
+                        "reverted_commit_sha".to_string(),
+                        Value::String(target_commit_sha.clone()),
+                    ),
+                    (
+                        "reverted_commit_short_sha".to_string(),
+                        Value::String(short_commit_sha(&target_commit_sha)),
+                    ),
+                    (
+                        "revert_commit_sha".to_string(),
+                        Value::String(revert_commit_sha.clone()),
+                    ),
+                    (
+                        "revert_commit_short_sha".to_string(),
+                        Value::String(short_commit_sha(&revert_commit_sha)),
+                    ),
+                ])
+            });
+            super::ToolExecutionOutcome {
+                output: format!(
+                    "✓ Reverted commit: {} via {}",
+                    short_commit_sha(&target_commit_sha),
+                    revert_short_sha
+                ),
+                tool_result_fields,
+            }
+        }
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            super::ToolExecutionOutcome::text(format!(
+                "Error: git revert failed: {}",
+                stderr.trim()
+            ))
+        }
+        Err(e) => super::ToolExecutionOutcome::text(format!("Error: git revert failed: {e}")),
     }
 }
 
@@ -3438,6 +3586,66 @@ mod tests {
         );
         // Should either succeed or report a meaningful error
         assert!(!result.is_empty(), "should return some output");
+    }
+
+    #[test]
+    fn git_commit_with_metadata_returns_commit_sha_and_revert_tool_restores_state() {
+        let repo = init_temp_repo();
+        let tracked_path = repo.path().join("tracked.txt");
+        std::fs::write(&tracked_path, "two\n").expect("update tracked file");
+
+        let outcome = git_commit_with_metadata(repo.path(), &json!({"message": "update tracked"}));
+        assert!(
+            !outcome.output.starts_with("Error:"),
+            "commit should succeed: {}",
+            outcome.output
+        );
+        let commit_fields = outcome
+            .tool_result_fields
+            .as_ref()
+            .expect("git_commit should return commit metadata");
+        let commit_sha = commit_fields
+            .get("commit_sha")
+            .and_then(Value::as_str)
+            .expect("commit_sha");
+        let commit_short_sha = commit_fields
+            .get("commit_short_sha")
+            .and_then(Value::as_str)
+            .expect("commit_short_sha");
+        assert_eq!(commit_short_sha, short_commit_sha(commit_sha));
+        assert_eq!(
+            std::fs::read_to_string(&tracked_path).expect("read committed file"),
+            "two\n"
+        );
+
+        let revert_outcome =
+            git_revert_commit_with_metadata(repo.path(), &json!({"commit_sha": commit_sha}));
+        assert!(
+            !revert_outcome.output.starts_with("Error:"),
+            "revert should succeed: {}",
+            revert_outcome.output
+        );
+        let revert_fields = revert_outcome
+            .tool_result_fields
+            .as_ref()
+            .expect("git_revert_commit should return metadata");
+        assert_eq!(
+            revert_fields
+                .get("reverted_commit_sha")
+                .and_then(Value::as_str),
+            Some(commit_sha)
+        );
+        assert!(
+            revert_fields
+                .get("revert_commit_sha")
+                .and_then(Value::as_str)
+                .is_some(),
+            "revert should report the compensating commit"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&tracked_path).expect("read reverted file"),
+            "one\n"
+        );
     }
 
     // ─── git_stash tests ────────────────────────────────────────────────────
