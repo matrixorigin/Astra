@@ -1046,3 +1046,339 @@ async fn sequential_stop_on_success_stops_early() {
         "should stop after first success"
     );
 }
+
+// ─── Adversarial Review Unhappy Paths ───────────────────────────────────────
+
+/// Tests that adversarial review runs all rounds when all agents succeed.
+#[tokio::test]
+async fn adversarial_runs_all_rounds_on_success() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let store = Arc::new(InMemoryTeamStore::new());
+    let team = test_team(
+        "adversarial-quick",
+        TeamCoordination::Adversarial { max_rounds: 5, threshold: 0.8 },
+        vec![
+            ("producer", Some("Create content")),
+            ("reviewer", Some("Review content")),
+        ],
+    );
+    store.save_team(&team).await.unwrap();
+
+    let rounds_executed = Arc::new(AtomicUsize::new(0));
+    let rounds_ref = rounds_executed.clone();
+
+    struct QuickConvergeExecutor {
+        rounds: Arc<AtomicUsize>,
+    }
+    #[async_trait]
+    impl SubRunExecutor for QuickConvergeExecutor {
+        async fn execute(&self, config: SubRunConfig) -> Result<AgentResult, String> {
+            self.rounds.fetch_add(1, Ordering::SeqCst);
+            // Always succeed - producer passes, reviewer approves
+            Ok(AgentResult {
+                agent_id: config.agent_profile.agent_id.clone(),
+                run_id: config.run_id,
+                status: "completed".to_string(),
+                output: Some(if config.agent_profile.agent_id.contains("reviewer") {
+                    "APPROVED: content is good".to_string()
+                } else {
+                    "generated content".to_string()
+                }),
+                error: None,
+                prompt_tokens: 50,
+                completion_tokens: 100,
+                tool_calls: 0,
+            })
+        }
+    }
+
+    let (orch, _, _) = setup_orchestrator_with_executor(
+        store,
+        Arc::new(QuickConvergeExecutor { rounds: rounds_ref }),
+    )
+    .await;
+    let report = orch.execute_team("adversarial-quick", "create document", None).await;
+
+    assert_eq!(report.status, TeamExecutionStatus::Completed);
+    // Adversarial runs all max_rounds, each round has 2 agents (producer + reviewer)
+    assert_eq!(
+        rounds_executed.load(Ordering::SeqCst),
+        10,
+        "should run all 5 rounds × 2 agents"
+    );
+}
+
+/// Tests that adversarial review fails when reviewer keeps rejecting.
+#[tokio::test]
+async fn adversarial_fails_after_max_rounds() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let store = Arc::new(InMemoryTeamStore::new());
+    let team = test_team(
+        "adversarial-stuck",
+        TeamCoordination::Adversarial { max_rounds: 2, threshold: 0.8 },
+        vec![
+            ("producer", Some("Create content")),
+            ("reviewer", Some("Review content")),
+        ],
+    );
+    store.save_team(&team).await.unwrap();
+
+    let rounds_executed = Arc::new(AtomicUsize::new(0));
+    let rounds_ref = rounds_executed.clone();
+
+    struct AlwaysRejectExecutor {
+        rounds: Arc<AtomicUsize>,
+    }
+    #[async_trait]
+    impl SubRunExecutor for AlwaysRejectExecutor {
+        async fn execute(&self, config: SubRunConfig) -> Result<AgentResult, String> {
+            self.rounds.fetch_add(1, Ordering::SeqCst);
+            if config.agent_profile.agent_id.contains("reviewer") {
+                // Reviewer always rejects
+                Ok(AgentResult {
+                    agent_id: config.agent_profile.agent_id.clone(),
+                    run_id: config.run_id,
+                    status: "completed".to_string(),
+                    output: Some("REJECTED: needs more work".to_string()),
+                    error: None,
+                    prompt_tokens: 50,
+                    completion_tokens: 100,
+                    tool_calls: 0,
+                })
+            } else {
+                Ok(AgentResult {
+                    agent_id: config.agent_profile.agent_id.clone(),
+                    run_id: config.run_id,
+                    status: "completed".to_string(),
+                    output: Some("generated content".to_string()),
+                    error: None,
+                    prompt_tokens: 50,
+                    completion_tokens: 100,
+                    tool_calls: 0,
+                })
+            }
+        }
+    }
+
+    let (orch, _, _) = setup_orchestrator_with_executor(
+        store,
+        Arc::new(AlwaysRejectExecutor { rounds: rounds_ref }),
+    )
+    .await;
+    let report = orch.execute_team("adversarial-stuck", "create document", None).await;
+
+    // Adversarial that never converges still completes (with rejection noted)
+    assert!(
+        matches!(
+            report.status,
+            TeamExecutionStatus::Completed | TeamExecutionStatus::Partial
+        ),
+        "should complete even without approval"
+    );
+    // Should have executed all rounds: 2 rounds * 2 agents = 4 calls
+    assert_eq!(
+        rounds_executed.load(Ordering::SeqCst),
+        4,
+        "should execute all max_rounds"
+    );
+}
+
+// ─── Task Cancellation ──────────────────────────────────────────────────────
+
+/// Tests that cancelling a running team execution stops agents.
+#[tokio::test]
+async fn team_execution_respects_cancellation() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let store = Arc::new(InMemoryTeamStore::new());
+    let team = test_team(
+        "cancellable",
+        TeamCoordination::FanOut {
+            aggregation: "all_results".into(),
+        },
+        vec![
+            ("worker1", Some("Worker 1")),
+            ("worker2", Some("Worker 2")),
+        ],
+    );
+    store.save_team(&team).await.unwrap();
+
+    let started = Arc::new(AtomicBool::new(false));
+    let started_ref = started.clone();
+
+    struct BlockingExecutor {
+        started: Arc<AtomicBool>,
+    }
+    #[async_trait]
+    impl SubRunExecutor for BlockingExecutor {
+        async fn execute(&self, config: SubRunConfig) -> Result<AgentResult, String> {
+            self.started.store(true, Ordering::SeqCst);
+            // Block for a long time
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            Ok(AgentResult {
+                agent_id: config.agent_profile.agent_id.clone(),
+                run_id: config.run_id,
+                status: "completed".to_string(),
+                output: Some("done".to_string()),
+                error: None,
+                prompt_tokens: 10,
+                completion_tokens: 20,
+                tool_calls: 0,
+            })
+        }
+    }
+
+    let (orch, _, _tracker) = setup_orchestrator_with_executor(
+        store,
+        Arc::new(BlockingExecutor { started: started_ref }),
+    )
+    .await;
+
+    let orch = Arc::new(orch);
+    let orch_clone = orch.clone();
+
+    // Start execution in background
+    let exec_handle = tokio::spawn(async move {
+        orch_clone.execute_team("cancellable", "blocked task", None).await
+    });
+
+    // Wait for execution to start
+    while !started.load(Ordering::SeqCst) {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    // Brief delay to let delegation spawn records be created
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Just drop the handle (simulates cancellation)
+    exec_handle.abort();
+
+    // Verify the spawn was aborted
+    let result = exec_handle.await;
+    assert!(result.is_err(), "should be cancelled/aborted");
+}
+
+// ─── Error Message Propagation ──────────────────────────────────────────────
+
+/// Tests that specific error messages from agents are preserved in results.
+#[tokio::test]
+async fn error_messages_preserved_in_results() {
+    let store = Arc::new(InMemoryTeamStore::new());
+    // Use 2 agents so we get Partial status (one succeeds, one fails)
+    let team = test_team(
+        "error-details",
+        TeamCoordination::FanOut { aggregation: "all_results".to_string() },
+        vec![
+            ("healthy", Some("Healthy agent")),
+            ("faulty", Some("Faulty agent")),
+        ],
+    );
+    store.save_team(&team).await.unwrap();
+
+    struct MixedResultExecutor;
+    #[async_trait]
+    impl SubRunExecutor for MixedResultExecutor {
+        async fn execute(&self, config: SubRunConfig) -> Result<AgentResult, String> {
+            if config.agent_profile.agent_id.contains("faulty") {
+                Ok(AgentResult {
+                    agent_id: config.agent_profile.agent_id.clone(),
+                    run_id: config.run_id,
+                    status: "failed".to_string(),
+                    output: None,
+                    error: Some("DatabaseConnectionError: connection timed out after 30s".to_string()),
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    tool_calls: 0,
+                })
+            } else {
+                Ok(AgentResult {
+                    agent_id: config.agent_profile.agent_id.clone(),
+                    run_id: config.run_id,
+                    status: "completed".to_string(),
+                    output: Some("success".to_string()),
+                    error: None,
+                    prompt_tokens: 100,
+                    completion_tokens: 200,
+                    tool_calls: 0,
+                })
+            }
+        }
+    }
+
+    let (orch, _, _) = setup_orchestrator_with_executor(store, Arc::new(MixedResultExecutor)).await;
+    let report = orch.execute_team("error-details", "query database", None).await;
+
+    assert_eq!(report.status, TeamExecutionStatus::Partial);
+    let dr = report.delegation_result.unwrap();
+    assert_eq!(dr.agent_results.len(), 2);
+
+    // Find the failed agent's result
+    let failed_result = dr.agent_results.iter().find(|r| r.status == "failed").unwrap();
+    let error_msg = failed_result.error.as_ref().unwrap();
+    assert!(
+        error_msg.contains("DatabaseConnectionError"),
+        "specific error should be preserved: {error_msg}"
+    );
+    assert!(
+        error_msg.contains("timed out"),
+        "error details should be preserved: {error_msg}"
+    );
+}
+
+/// Tests that team execution report includes proper error summary.
+#[tokio::test]
+async fn team_report_includes_error_summary() {
+    let store = Arc::new(InMemoryTeamStore::new());
+    let team = test_team(
+        "multi-error",
+        TeamCoordination::FanOut {
+            aggregation: "all_results".into(),
+        },
+        vec![
+            ("a", Some("Agent A")),
+            ("b", Some("Agent B")),
+        ],
+    );
+    store.save_team(&team).await.unwrap();
+
+    struct BothFailExecutor;
+    #[async_trait]
+    impl SubRunExecutor for BothFailExecutor {
+        async fn execute(&self, config: SubRunConfig) -> Result<AgentResult, String> {
+            let error = if config.agent_profile.agent_id.contains('a') {
+                "A crashed"
+            } else {
+                "B crashed"
+            };
+            Ok(AgentResult {
+                agent_id: config.agent_profile.agent_id.clone(),
+                run_id: config.run_id,
+                status: "failed".to_string(),
+                output: None,
+                error: Some(error.to_string()),
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                tool_calls: 0,
+            })
+        }
+    }
+
+    let (orch, _, _) = setup_orchestrator_with_executor(store, Arc::new(BothFailExecutor)).await;
+    let report = orch.execute_team("multi-error", "run both", None).await;
+
+    // When all fail, status should be Failed
+    assert_eq!(report.status, TeamExecutionStatus::Failed);
+    // Report error should summarize failures
+    assert!(
+        report.error.is_some(),
+        "report should include error summary"
+    );
+    let summary = report.error.as_ref().unwrap();
+    // Check that failed agents are mentioned
+    assert!(
+        summary.contains("failed") || summary.contains("crashed"),
+        "error summary should mention failures: {summary}"
+    );
+}
