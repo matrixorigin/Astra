@@ -417,6 +417,27 @@ fn shell_tokenize_with_control_spans(input: &str) -> Vec<ShellTokenSpan> {
                 continue;
             }
 
+            if ch == '(' && current.is_empty() {
+                tokens.push(ShellTokenSpan {
+                    text: "(".to_string(),
+                    start: byte_idx,
+                    end: byte_idx + ch.len_utf8(),
+                });
+                idx += 1;
+                continue;
+            }
+
+            if ch == '{' && current.ends_with("()") {
+                flush_current(&mut tokens, &mut current, &mut current_start, byte_idx);
+                tokens.push(ShellTokenSpan {
+                    text: "{".to_string(),
+                    start: byte_idx,
+                    end: byte_idx + ch.len_utf8(),
+                });
+                idx += 1;
+                continue;
+            }
+
             if matches!(ch, ';' | '\n' | '\r') {
                 flush_current(&mut tokens, &mut current, &mut current_start, byte_idx);
                 tokens.push(ShellTokenSpan {
@@ -1284,6 +1305,26 @@ fn check_shell_compound_body_path_boundary(
                 }
                 idx = close_idx + 1;
             }
+            "(" => {
+                let Some(close_byte_idx) =
+                    subshell_group_close_byte_index(command, tokens[idx].start)
+                else {
+                    idx += 1;
+                    continue;
+                };
+                if let Some(msg) = check_shell_body_span_path_boundary(
+                    policy,
+                    command,
+                    tokens[idx].end,
+                    close_byte_idx,
+                    oldpwd,
+                ) {
+                    return Some(msg);
+                }
+                while idx < tokens.len() && tokens[idx].start <= close_byte_idx {
+                    idx += 1;
+                }
+            }
             _ => idx += 1,
         }
     }
@@ -1329,6 +1370,52 @@ fn brace_group_close_token_index(tokens: &[ShellTokenSpan], open_idx: usize) -> 
             "{" => nested_groups += 1,
             "}" if nested_groups == 0 => return Some(idx),
             "}" => nested_groups -= 1,
+            _ => {}
+        }
+    }
+    None
+}
+
+fn subshell_group_close_byte_index(command: &str, open_byte_idx: usize) -> Option<usize> {
+    let chars: Vec<(usize, char)> = command.char_indices().collect();
+    let open_idx = chars
+        .iter()
+        .position(|(byte_idx, ch)| *byte_idx == open_byte_idx && *ch == '(')?;
+    let mut depth = 1usize;
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut escaped = false;
+    for idx in (open_idx + 1)..chars.len() {
+        let (byte_idx, ch) = chars[idx];
+
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' && !in_single_quote {
+            escaped = true;
+            continue;
+        }
+        if ch == '\'' && !in_double_quote {
+            in_single_quote = !in_single_quote;
+            continue;
+        }
+        if ch == '"' && !in_single_quote {
+            in_double_quote = !in_double_quote;
+            continue;
+        }
+        if in_single_quote || in_double_quote {
+            continue;
+        }
+
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(byte_idx);
+                }
+            }
             _ => {}
         }
     }
@@ -5355,6 +5442,56 @@ mod tests {
         assert!(
             result.is_none(),
             "in-project case clause bodies should remain allowed"
+        );
+    }
+
+    #[test]
+    fn subshell_static_outside_path_is_blocked() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(&policy, "(cat /etc/passwd)");
+        assert!(
+            result
+                .as_deref()
+                .is_some_and(|msg| msg.starts_with(super::SANDBOX_DENIED_PREFIX)
+                    && msg.contains("/etc/passwd")),
+            "subshell bodies should still run normal path-boundary checks"
+        );
+    }
+
+    #[test]
+    fn subshell_inside_project_is_allowed() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(&policy, "(cat src/main.rs)");
+        assert!(
+            result.is_none(),
+            "in-project subshell bodies should remain allowed"
+        );
+    }
+
+    #[test]
+    fn attached_function_body_outside_path_is_blocked() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(&policy, "foo(){ cat /etc/passwd; }\nfoo");
+        assert!(
+            result
+                .as_deref()
+                .is_some_and(|msg| msg.starts_with(super::SANDBOX_DENIED_PREFIX)
+                    && msg.contains("/etc/passwd")),
+            "attached function bodies should still run normal path-boundary checks"
+        );
+    }
+
+    #[test]
+    fn attached_function_body_inside_project_is_allowed() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(&policy, "foo(){ cat src/main.rs; }\nfoo");
+        assert!(
+            result.is_none(),
+            "in-project attached function bodies should remain allowed"
         );
     }
 
