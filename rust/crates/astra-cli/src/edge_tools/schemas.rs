@@ -479,7 +479,7 @@ pub fn all_tool_schemas() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "git_worktree",
-                "description": "Manage git worktrees for isolated parallel work. Actions: enter (create worktree and switch session into it), exit (leave worktree and restore original directory), add (create without switching), list (show all), remove (cleanup). Use 'enter' for session-scoped isolation; the session directory changes to the worktree. Use 'exit' with action='keep' to preserve work, or action='remove' to discard.",
+                "description": "Manage git worktrees for isolated parallel work. Actions: enter (create worktree and switch session into it), exit (leave worktree and restore original directory), add (create without switching), list (show all), remove (cleanup). Use 'enter' for session-scoped isolation; the session directory changes to the worktree. Clean worktrees created by enter/add are tracked for bounded rollback via rollback_turn_actions while unchanged; explicit remove or exit_action='remove' remains the manual destructive path.",
                 "parameters": {
                     "type": "object",
                     "properties": {

@@ -1,5 +1,36 @@
 use super::*;
 
+fn init_temp_git_repo() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("temp repo");
+    std::process::Command::new("git")
+        .arg("init")
+        .current_dir(dir.path())
+        .output()
+        .expect("git init");
+    std::process::Command::new("git")
+        .args(["config", "user.name", "Test User"])
+        .current_dir(dir.path())
+        .output()
+        .expect("git config user.name");
+    std::process::Command::new("git")
+        .args(["config", "user.email", "test@example.com"])
+        .current_dir(dir.path())
+        .output()
+        .expect("git config user.email");
+    std::fs::write(dir.path().join("tracked.txt"), "committed\n").expect("seed tracked file");
+    std::process::Command::new("git")
+        .args(["add", "tracked.txt"])
+        .current_dir(dir.path())
+        .output()
+        .expect("git add");
+    std::process::Command::new("git")
+        .args(["commit", "-m", "init"])
+        .current_dir(dir.path())
+        .output()
+        .expect("git commit");
+    dir
+}
+
 // ── extract_github_owner_repo edge cases ──
 
 #[test]
@@ -170,4 +201,34 @@ fn git_worktree_exit_when_not_in_session() {
     let result = exe.git_worktree(&json!({"action": "exit"}));
     assert!(result.contains("Error"));
     assert!(result.contains("Not in a worktree session"));
+}
+
+#[test]
+fn git_worktree_enter_records_rollback_handle() {
+    let dir = init_temp_git_repo();
+    let exe = ToolExecutor::new(dir.path());
+    exe.journal_turn_index
+        .store(7, std::sync::atomic::Ordering::Relaxed);
+
+    let outcome = exe.git_worktree_with_metadata(&json!({
+        "action": "enter",
+        "branch": "session-demo",
+    }));
+    assert!(
+        !outcome.output.starts_with("Error:"),
+        "enter failed: {}",
+        outcome.output
+    );
+    assert!(exe.in_worktree_session(), "should enter worktree session");
+
+    let listed = exe.rollback_turn_actions(&json!({"scope": "list"}));
+    let listed_json: serde_json::Value = serde_json::from_str(&listed).unwrap();
+    assert_eq!(listed_json["total_git_worktree_entries"].as_u64(), Some(1));
+
+    let cleanup = exe.git_worktree(&json!({
+        "action": "exit",
+        "exit_action": "remove",
+        "discard_changes": true,
+    }));
+    assert!(!cleanup.starts_with("Error:"), "cleanup failed: {cleanup}");
 }

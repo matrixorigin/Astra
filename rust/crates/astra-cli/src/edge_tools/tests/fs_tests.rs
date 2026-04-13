@@ -341,6 +341,10 @@ fn rollback_turn_actions_list_combines_file_and_db_journals() {
     );
     assert_eq!(rollback_json["total_git_stash_entries"].as_u64(), Some(0));
     assert_eq!(rollback_json["total_git_commit_entries"].as_u64(), Some(0));
+    assert_eq!(
+        rollback_json["total_git_worktree_entries"].as_u64(),
+        Some(0)
+    );
 }
 
 #[test]
@@ -491,6 +495,116 @@ fn rollback_turn_actions_refuses_git_commit_when_head_tail_moved() {
     let listed = executor.rollback_turn_actions(&json!({"scope": "list"}));
     let listed_json: serde_json::Value = serde_json::from_str(&listed).unwrap();
     assert_eq!(listed_json["total_git_commit_entries"].as_u64(), Some(1));
+}
+
+#[test]
+fn rollback_turn_actions_removes_recorded_git_worktree_for_current_turn() {
+    let dir = init_temp_git_repo();
+    let executor = ToolExecutor::new(dir.path());
+    executor
+        .journal_turn_index
+        .store(15, std::sync::atomic::Ordering::Relaxed);
+
+    let worktree_path = dir.path().join("turn-worktree");
+    let outcome = executor.git_worktree_with_metadata(&json!({
+        "action": "add",
+        "branch": "turn-worktree",
+        "path": worktree_path,
+    }));
+    assert!(
+        !outcome.output.starts_with("Error:"),
+        "git_worktree add failed: {}",
+        outcome.output
+    );
+    let recorded_path = outcome
+        .tool_result_fields
+        .as_ref()
+        .and_then(|fields| fields.get("worktree_path"))
+        .and_then(serde_json::Value::as_str)
+        .map(std::path::PathBuf::from)
+        .expect("recorded worktree path");
+    assert!(recorded_path.exists(), "worktree should exist");
+
+    let listed = executor.rollback_turn_actions(&json!({"scope": "list"}));
+    let listed_json: serde_json::Value = serde_json::from_str(&listed).unwrap();
+    assert_eq!(listed_json["total_git_worktree_entries"].as_u64(), Some(1));
+
+    let rollback = executor.rollback_turn_actions(&json!({"scope": "current_turn"}));
+    let rollback_json: serde_json::Value = serde_json::from_str(&rollback).unwrap();
+    assert_eq!(
+        rollback_json["success"].as_bool(),
+        Some(true),
+        "got: {rollback}"
+    );
+    assert_eq!(
+        rollback_json["restored_git_worktrees"]
+            .as_array()
+            .map(Vec::len),
+        Some(1)
+    );
+    assert!(!recorded_path.exists(), "worktree should be removed");
+
+    let listed_after = executor.rollback_turn_actions(&json!({"scope": "list"}));
+    let listed_after_json: serde_json::Value = serde_json::from_str(&listed_after).unwrap();
+    assert_eq!(
+        listed_after_json["total_git_worktree_entries"].as_u64(),
+        Some(0)
+    );
+}
+
+#[test]
+fn rollback_turn_actions_refuses_dirty_recorded_git_worktree() {
+    let dir = init_temp_git_repo();
+    let executor = ToolExecutor::new(dir.path());
+    executor
+        .journal_turn_index
+        .store(16, std::sync::atomic::Ordering::Relaxed);
+
+    let worktree_path = dir.path().join("dirty-worktree");
+    let outcome = executor.git_worktree_with_metadata(&json!({
+        "action": "add",
+        "branch": "dirty-worktree",
+        "path": worktree_path,
+    }));
+    assert!(
+        !outcome.output.starts_with("Error:"),
+        "git_worktree add failed: {}",
+        outcome.output
+    );
+    let recorded_path = outcome
+        .tool_result_fields
+        .as_ref()
+        .and_then(|fields| fields.get("worktree_path"))
+        .and_then(serde_json::Value::as_str)
+        .map(std::path::PathBuf::from)
+        .expect("recorded worktree path");
+    std::fs::write(recorded_path.join("dirty.txt"), "dirty\n").expect("dirty worktree");
+
+    let rollback = executor.rollback_turn_actions(&json!({"scope": "current_turn"}));
+    let rollback_json: serde_json::Value = serde_json::from_str(&rollback).unwrap();
+    assert_eq!(
+        rollback_json["success"].as_bool(),
+        Some(false),
+        "got: {rollback}"
+    );
+    assert_eq!(
+        rollback_json["failed_git_worktree_rollbacks"]
+            .as_array()
+            .map(Vec::len),
+        Some(1)
+    );
+    assert!(recorded_path.exists(), "dirty worktree should be preserved");
+
+    let cleanup = executor.git_worktree(&json!({
+        "action": "remove",
+        "path": recorded_path,
+        "force": true,
+        "delete_branch": true,
+    }));
+    assert!(
+        !cleanup.starts_with("Error:"),
+        "cleanup remove failed: {cleanup}"
+    );
 }
 
 #[test]

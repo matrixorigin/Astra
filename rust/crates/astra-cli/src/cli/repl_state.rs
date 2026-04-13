@@ -79,6 +79,10 @@ pub(crate) struct ReplState {
     /// bounded committed-history rollback support across turns.
     pub git_commit_journal:
         std::sync::Arc<std::sync::Mutex<crate::edge_tools::GitCommitRollbackJournal>>,
+    /// Session-scoped git worktree rollback journal — shared with ToolExecutors for
+    /// bounded clean worktree cleanup across turns.
+    pub git_worktree_journal:
+        std::sync::Arc<std::sync::Mutex<crate::edge_tools::GitWorktreeRollbackJournal>>,
     /// Sticky task/thread summary used to anchor ultra-short follow-ups like
     /// "继续" even after history compaction prunes earlier turns.
     pub continuation_anchor: Option<String>,
@@ -304,6 +308,9 @@ impl Default for ReplState {
             )),
             git_commit_journal: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::edge_tools::GitCommitRollbackJournal::default(),
+            )),
+            git_worktree_journal: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::edge_tools::GitWorktreeRollbackJournal::default(),
             )),
             continuation_anchor: None,
             session_goal: None,

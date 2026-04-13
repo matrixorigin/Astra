@@ -204,6 +204,7 @@ struct ActiveBatchTransaction {
     database_checkpoint: u64,
     stash_checkpoint: u64,
     commit_checkpoint: u64,
+    worktree_checkpoint: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -219,6 +220,7 @@ struct ActiveTurnRollback {
     database_checkpoint: u64,
     stash_checkpoint: u64,
     commit_checkpoint: u64,
+    worktree_checkpoint: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -239,6 +241,7 @@ impl<'a> CliSseStreamHost<'a> {
             database_checkpoint: ctx.executor.database_snapshot_journal_checkpoint(),
             stash_checkpoint: ctx.executor.git_stash_journal_checkpoint(),
             commit_checkpoint: ctx.executor.git_commit_journal_checkpoint(),
+            worktree_checkpoint: ctx.executor.git_worktree_journal_checkpoint(),
         });
         // Always buffer text from the start.  Text is accumulated in
         // `xml_tag_buffer` and only rendered one-shot at finalization when
@@ -397,6 +400,7 @@ impl<'a> CliSseStreamHost<'a> {
         database_checkpoint: u64,
         stash_checkpoint: u64,
         commit_checkpoint: u64,
+        worktree_checkpoint: u64,
     ) -> Option<Value> {
         let file_entries_added = self
             .executor
@@ -414,10 +418,15 @@ impl<'a> CliSseStreamHost<'a> {
             .executor
             .git_commit_journal_checkpoint()
             .saturating_sub(commit_checkpoint);
+        let worktree_entries_added = self
+            .executor
+            .git_worktree_journal_checkpoint()
+            .saturating_sub(worktree_checkpoint);
         if file_entries_added == 0
             && database_entries_added == 0
             && stash_entries_added == 0
             && commit_entries_added == 0
+            && worktree_entries_added == 0
         {
             return None;
         }
@@ -429,6 +438,7 @@ impl<'a> CliSseStreamHost<'a> {
             "database_after_sequence": database_checkpoint,
             "stash_after_sequence": stash_checkpoint,
             "commit_after_sequence": commit_checkpoint,
+            "worktree_after_sequence": worktree_checkpoint,
         }));
         Some(
             serde_json::from_str(&rollback_output).unwrap_or_else(|error| {
@@ -560,6 +570,7 @@ impl<'a> CliSseStreamHost<'a> {
             active.database_checkpoint,
             active.stash_checkpoint,
             active.commit_checkpoint,
+            active.worktree_checkpoint,
         )
     }
 
@@ -570,6 +581,7 @@ impl<'a> CliSseStreamHost<'a> {
             active.database_checkpoint,
             active.stash_checkpoint,
             active.commit_checkpoint,
+            active.worktree_checkpoint,
         )
     }
 
@@ -854,6 +866,7 @@ impl<'a> CliSseStreamHost<'a> {
                         database_checkpoint: self.executor.database_snapshot_journal_checkpoint(),
                         stash_checkpoint: self.executor.git_stash_journal_checkpoint(),
                         commit_checkpoint: self.executor.git_commit_journal_checkpoint(),
+                        worktree_checkpoint: self.executor.git_worktree_journal_checkpoint(),
                     });
                 }
             }

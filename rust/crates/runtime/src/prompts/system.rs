@@ -306,7 +306,7 @@ fn tool_conditional_section(tool_names: &[&str], selection_confidence: f64) -> S
         }
         if has_git_worktree {
             s.push_str(
-                "             - Use **git_worktree** for isolated parallel branch work; exit or remove worktrees explicitly instead of assuming they are part of the normal rollback journals.\n",
+                "             - Use **git_worktree** for isolated parallel branch work; clean worktrees created by `enter`/`add` can participate in `rollback_turn_actions`, but explicit `remove` or `exit_action=remove` is still the destructive manual boundary once that worktree has diverged.\n",
             );
         }
     }

@@ -1112,6 +1112,10 @@ impl ToolExecutor {
                     "rollback_git_commits",
                     self.rollback_git_commits(args),
                 );
+                let worktree_result = Self::parse_rollback_tool_output(
+                    "rollback_git_worktrees",
+                    self.rollback_git_worktrees(args),
+                );
                 let file_entries = file_result
                     .get("entries")
                     .cloned()
@@ -1125,6 +1129,10 @@ impl ToolExecutor {
                     .cloned()
                     .unwrap_or_else(|| Value::Array(Vec::new()));
                 let commit_entries = commit_result
+                    .get("entries")
+                    .cloned()
+                    .unwrap_or_else(|| Value::Array(Vec::new()));
+                let worktree_entries = worktree_result
                     .get("entries")
                     .cloned()
                     .unwrap_or_else(|| Value::Array(Vec::new()));
@@ -1164,30 +1172,44 @@ impl ToolExecutor {
                             .map(|entries| entries.len() as u64)
                             .unwrap_or(0)
                     });
+                let total_worktree_entries = worktree_result
+                    .get("total_entries")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_else(|| {
+                        worktree_entries
+                            .as_array()
+                            .map(|entries| entries.len() as u64)
+                            .unwrap_or(0)
+                    });
                 json!({
                     "success": file_result.get("success").and_then(Value::as_bool).unwrap_or(false)
                         && database_result.get("success").and_then(Value::as_bool).unwrap_or(false)
                         && stash_result.get("success").and_then(Value::as_bool).unwrap_or(false)
-                        && commit_result.get("success").and_then(Value::as_bool).unwrap_or(false),
+                        && commit_result.get("success").and_then(Value::as_bool).unwrap_or(false)
+                        && worktree_result.get("success").and_then(Value::as_bool).unwrap_or(false),
                     "scope": "list",
                     "total_file_entries": total_file_entries,
                     "total_database_entries": total_database_entries,
                     "total_git_stash_entries": total_stash_entries,
                     "total_git_commit_entries": total_commit_entries,
+                    "total_git_worktree_entries": total_worktree_entries,
                     "file_entries": file_entries,
                     "database_entries": database_entries,
                     "git_stash_entries": stash_entries,
                     "git_commit_entries": commit_entries,
+                    "git_worktree_entries": worktree_entries,
                     "files": file_result,
                     "database_snapshots": database_result,
                     "git_stashes": stash_result,
                     "git_commits": commit_result,
+                    "git_worktrees": worktree_result,
                     "summary": format!(
-                        "Listed {total_file_entries} file rollback entr{}, {total_database_entries} database snapshot entr{}, {total_stash_entries} git stash rollback entr{}, and {total_commit_entries} git commit rollback entr{}",
+                        "Listed {total_file_entries} file rollback entr{}, {total_database_entries} database snapshot entr{}, {total_stash_entries} git stash rollback entr{}, {total_commit_entries} git commit rollback entr{}, and {total_worktree_entries} git worktree rollback entr{}",
                         if total_file_entries == 1 { "y" } else { "ies" },
                         if total_database_entries == 1 { "y" } else { "ies" },
                         if total_stash_entries == 1 { "y" } else { "ies" },
-                        if total_commit_entries == 1 { "y" } else { "ies" }
+                        if total_commit_entries == 1 { "y" } else { "ies" },
+                        if total_worktree_entries == 1 { "y" } else { "ies" }
                     ),
                 })
                 .to_string()
@@ -1209,12 +1231,17 @@ impl ToolExecutor {
                     "rollback_git_stashes",
                     self.rollback_git_stashes(args),
                 );
+                let worktree_result = Self::parse_rollback_tool_output(
+                    "rollback_git_worktrees",
+                    self.rollback_git_worktrees(args),
+                );
                 let turn_index = database_result
                     .get("turn_index")
                     .and_then(Value::as_u64)
                     .or_else(|| file_result.get("turn_index").and_then(Value::as_u64))
                     .or_else(|| stash_result.get("turn_index").and_then(Value::as_u64))
                     .or_else(|| commit_result.get("turn_index").and_then(Value::as_u64))
+                    .or_else(|| worktree_result.get("turn_index").and_then(Value::as_u64))
                     .or(explicit_turn_index)
                     .unwrap_or_else(|| {
                         self.journal_turn_index
@@ -1253,6 +1280,14 @@ impl ToolExecutor {
                     .get("failed")
                     .cloned()
                     .unwrap_or_else(|| Value::Array(Vec::new()));
+                let restored_git_worktrees = worktree_result
+                    .get("restored")
+                    .cloned()
+                    .unwrap_or_else(|| Value::Array(Vec::new()));
+                let failed_git_worktree_rollbacks = worktree_result
+                    .get("failed")
+                    .cloned()
+                    .unwrap_or_else(|| Value::Array(Vec::new()));
                 let reverted_file_count = reverted_files
                     .as_array()
                     .map(|entries| entries.len())
@@ -1285,20 +1320,30 @@ impl ToolExecutor {
                     .as_array()
                     .map(|entries| entries.len())
                     .unwrap_or(0);
+                let restored_git_worktree_count = restored_git_worktrees
+                    .as_array()
+                    .map(|entries| entries.len())
+                    .unwrap_or(0);
+                let failed_git_worktree_count = failed_git_worktree_rollbacks
+                    .as_array()
+                    .map(|entries| entries.len())
+                    .unwrap_or(0);
                 let restored_total = reverted_file_count
                     + restored_snapshot_count
                     + restored_git_stash_count
-                    + reverted_git_commit_count;
+                    + reverted_git_commit_count
+                    + restored_git_worktree_count;
                 let failed_total = failed_file_count
                     + failed_database_count
                     + failed_git_stash_count
-                    + failed_git_commit_count;
+                    + failed_git_commit_count
+                    + failed_git_worktree_count;
                 let success = restored_total > 0 && failed_total == 0;
                 let summary = if restored_total == 0 {
                     format!("No recorded rollback actions found for turn {turn_index}")
                 } else if failed_total == 0 {
                     format!(
-                        "Rolled back {reverted_file_count} file edit{}, restored {restored_snapshot_count} database snapshot{}, re-applied {restored_git_stash_count} recorded git stash{}, and reverted {reverted_git_commit_count} recorded git commit{} from turn {turn_index}",
+                        "Rolled back {reverted_file_count} file edit{}, restored {restored_snapshot_count} database snapshot{}, re-applied {restored_git_stash_count} recorded git stash{}, reverted {reverted_git_commit_count} recorded git commit{}, and removed {restored_git_worktree_count} recorded git worktree{} from turn {turn_index}",
                         if reverted_file_count == 1 { "" } else { "s" },
                         if restored_snapshot_count == 1 {
                             ""
@@ -1314,11 +1359,16 @@ impl ToolExecutor {
                             ""
                         } else {
                             "s"
-                        }
+                        },
+                        if restored_git_worktree_count == 1 {
+                            ""
+                        } else {
+                            "s"
+                        },
                     )
                 } else {
                     format!(
-                        "Rolled back {reverted_file_count} file edit{}, restored {restored_snapshot_count} database snapshot{}, re-applied {restored_git_stash_count} recorded git stash{}, and reverted {reverted_git_commit_count} recorded git commit{} from turn {turn_index} with {failed_total} failure{}",
+                        "Rolled back {reverted_file_count} file edit{}, restored {restored_snapshot_count} database snapshot{}, re-applied {restored_git_stash_count} recorded git stash{}, reverted {reverted_git_commit_count} recorded git commit{}, and removed {restored_git_worktree_count} recorded git worktree{} from turn {turn_index} with {failed_total} failure{}",
                         if reverted_file_count == 1 { "" } else { "s" },
                         if restored_snapshot_count == 1 {
                             ""
@@ -1331,6 +1381,11 @@ impl ToolExecutor {
                             "es"
                         },
                         if reverted_git_commit_count == 1 {
+                            ""
+                        } else {
+                            "s"
+                        },
+                        if restored_git_worktree_count == 1 {
                             ""
                         } else {
                             "s"
@@ -1346,14 +1401,17 @@ impl ToolExecutor {
                     "restored_database_snapshots": restored_snapshots,
                     "restored_git_stashes": restored_git_stashes,
                     "reverted_git_commits": reverted_git_commits,
+                    "restored_git_worktrees": restored_git_worktrees,
                     "failed_file_rollbacks": failed_file_rollbacks,
                     "failed_database_rollbacks": failed_database_rollbacks,
                     "failed_git_stash_rollbacks": failed_git_stash_rollbacks,
                     "failed_git_commit_rollbacks": failed_git_commit_rollbacks,
+                    "failed_git_worktree_rollbacks": failed_git_worktree_rollbacks,
                     "files": file_result,
                     "database_snapshots": database_result,
                     "git_stashes": stash_result,
                     "git_commits": commit_result,
+                    "git_worktrees": worktree_result,
                     "summary": summary,
                 })
                 .to_string()

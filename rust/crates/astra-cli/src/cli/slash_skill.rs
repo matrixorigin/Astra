@@ -1714,6 +1714,7 @@ Follow these steps:
                 database_snapshot_journal: Some(state.database_snapshot_journal.clone()),
                 git_stash_journal: Some(state.git_stash_journal.clone()),
                 git_commit_journal: Some(state.git_commit_journal.clone()),
+                git_worktree_journal: Some(state.git_worktree_journal.clone()),
                 turn_index: state.turn,
                 evolution_service: None,
             })

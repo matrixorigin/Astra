@@ -5,7 +5,7 @@
 //!
 //! Benefits: no subprocess overhead, no shell injection risk, no `git` binary dependency.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use gix::bstr::{BString, ByteSlice};
@@ -2842,25 +2842,15 @@ pub fn git_worktree(project_root: &Path, args: &Value) -> String {
     }
 }
 
-pub(crate) fn worktree_add(project_root: &Path, args: &Value) -> String {
-    let branch = match args.get("branch").and_then(Value::as_str) {
-        Some(b) if !b.is_empty() => b,
-        _ => return "Error: 'branch' is required for add".to_string(),
-    };
-
-    // Security: reject shell-dangerous chars in branch name
-    if branch
-        .chars()
-        .any(|c| matches!(c, ';' | '|' | '&' | '`' | '$' | '(' | ')' | '{' | '}'))
-    {
-        return "Error: invalid branch name".to_string();
-    }
-
-    // Determine worktree path: user-provided or auto-generated sibling directory
-    let worktree_path = if let Some(p) = args.get("path").and_then(Value::as_str) {
-        std::path::PathBuf::from(p)
+fn resolve_worktree_add_path(project_root: &Path, args: &Value, branch: &str) -> PathBuf {
+    if let Some(path) = args.get("path").and_then(Value::as_str) {
+        let path = PathBuf::from(path);
+        if path.is_absolute() {
+            path
+        } else {
+            project_root.join(path)
+        }
     } else {
-        // Default: sibling directory named <repo>-<branch>
         let repo_name = project_root
             .file_name()
             .and_then(|n| n.to_str())
@@ -2870,14 +2860,49 @@ pub(crate) fn worktree_add(project_root: &Path, args: &Value) -> String {
             .parent()
             .unwrap_or(project_root)
             .join(format!("{repo_name}-{sanitized_branch}"))
+    }
+}
+
+pub(crate) fn worktree_add(project_root: &Path, args: &Value) -> String {
+    worktree_add_with_metadata(project_root, args).output
+}
+
+pub(crate) fn worktree_add_with_metadata(
+    project_root: &Path,
+    args: &Value,
+) -> super::ToolExecutionOutcome {
+    let branch = match args.get("branch").and_then(Value::as_str) {
+        Some(b) if !b.is_empty() => b,
+        _ => {
+            return super::ToolExecutionOutcome {
+                output: "Error: 'branch' is required for add".to_string(),
+                tool_result_fields: None,
+            };
+        }
     };
+
+    // Security: reject shell-dangerous chars in branch name
+    if branch
+        .chars()
+        .any(|c| matches!(c, ';' | '|' | '&' | '`' | '$' | '(' | ')' | '{' | '}'))
+    {
+        return super::ToolExecutionOutcome {
+            output: "Error: invalid branch name".to_string(),
+            tool_result_fields: None,
+        };
+    }
+
+    let worktree_path = resolve_worktree_add_path(project_root, args, branch);
 
     // Check if path already exists
     if worktree_path.exists() {
-        return format!(
-            "Error: worktree path already exists: {}",
-            worktree_path.display()
-        );
+        return super::ToolExecutionOutcome {
+            output: format!(
+                "Error: worktree path already exists: {}",
+                worktree_path.display()
+            ),
+            tool_result_fields: None,
+        };
     }
 
     // Determine if we create a new branch or use existing
@@ -2902,17 +2927,45 @@ pub(crate) fn worktree_add(project_root: &Path, args: &Value) -> String {
 
     match cmd.output() {
         Ok(o) if o.status.success() => {
-            format!(
-                "✓ Worktree created\n  Branch: {branch}\n  Path: {}\n  Use `cd {}` or set project_root to work in this worktree.",
-                worktree_path.display(),
-                worktree_path.display()
-            )
+            let mut tool_result_fields = serde_json::Map::from_iter([
+                (
+                    "worktree_path".to_string(),
+                    Value::String(worktree_path.display().to_string()),
+                ),
+                ("branch".to_string(), Value::String(branch.to_string())),
+                (
+                    "delete_branch_on_rollback".to_string(),
+                    Value::Bool(create_new),
+                ),
+                ("session_scoped".to_string(), Value::Bool(false)),
+            ]);
+            let original_head_commit = head_short(&worktree_path);
+            if !original_head_commit.is_empty() {
+                tool_result_fields.insert(
+                    "original_head_commit".to_string(),
+                    Value::String(original_head_commit),
+                );
+            }
+            super::ToolExecutionOutcome {
+                output: format!(
+                    "✓ Worktree created\n  Branch: {branch}\n  Path: {}\n  Use `cd {}` or set project_root to work in this worktree.",
+                    worktree_path.display(),
+                    worktree_path.display()
+                ),
+                tool_result_fields: Some(tool_result_fields),
+            }
         }
         Ok(o) => {
             let stderr = String::from_utf8_lossy(&o.stderr);
-            format!("Error: git worktree add failed: {}", stderr.trim())
+            super::ToolExecutionOutcome {
+                output: format!("Error: git worktree add failed: {}", stderr.trim()),
+                tool_result_fields: None,
+            }
         }
-        Err(e) => format!("Error: git worktree add failed: {e}"),
+        Err(e) => super::ToolExecutionOutcome {
+            output: format!("Error: git worktree add failed: {e}"),
+            tool_result_fields: None,
+        },
     }
 }
 
@@ -4436,6 +4489,55 @@ mod tests {
         assert!(
             result.contains("Error") && result.contains("already exists"),
             "should reject existing path: {result}"
+        );
+    }
+
+    #[test]
+    fn worktree_add_with_metadata_returns_rollback_fields() {
+        let dir = init_temp_repo();
+        let worktree_path = dir.path().join("meta-worktree");
+        let outcome = worktree_add_with_metadata(
+            dir.path(),
+            &json!({
+                "branch": "meta-worktree",
+                "path": worktree_path,
+            }),
+        );
+        assert!(
+            !outcome.output.starts_with("Error:"),
+            "worktree add failed: {}",
+            outcome.output
+        );
+        let fields = outcome.tool_result_fields.expect("metadata fields");
+        assert_eq!(
+            fields.get("branch").and_then(Value::as_str),
+            Some("meta-worktree")
+        );
+        assert_eq!(
+            fields
+                .get("worktree_path")
+                .and_then(Value::as_str)
+                .map(std::path::PathBuf::from)
+                .as_deref(),
+            Some(worktree_path.as_path())
+        );
+        assert_eq!(
+            fields
+                .get("delete_branch_on_rollback")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        let cleanup = worktree_remove(
+            dir.path(),
+            &json!({
+                "path": worktree_path,
+                "force": true,
+                "delete_branch": true,
+            }),
+        );
+        assert!(
+            !cleanup.starts_with("Error:"),
+            "cleanup remove failed: {cleanup}"
         );
     }
 

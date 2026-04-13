@@ -94,6 +94,7 @@ use file_state::FileState;
 pub(crate) use file_state::ReadDedupKey;
 #[path = "edge_tools/worktree.rs"]
 mod worktree;
+pub(crate) use worktree::GitWorktreeRollbackJournal;
 pub use worktree::WorktreeSession;
 use worktree::detect_git_remote_repos;
 #[cfg(test)]
@@ -394,6 +395,10 @@ pub struct ToolExecutor {
     /// Git commit rollback journal — records captured commit handles so bounded
     /// turn/batch rollback can revert recent committed history when it is still safe.
     pub git_commit_journal: std::sync::Arc<std::sync::Mutex<git_gix::GitCommitRollbackJournal>>,
+    /// Git worktree rollback journal — records newly created worktrees so bounded
+    /// turn/batch rollback can remove them again while they are still clean.
+    pub git_worktree_journal:
+        std::sync::Arc<std::sync::Mutex<worktree::GitWorktreeRollbackJournal>>,
     /// Current turn index for file journal entries. Set externally per-turn.
     pub journal_turn_index: std::sync::atomic::AtomicU32,
     /// Active worktree session state. When set, `effective_project_root()` returns
@@ -473,6 +478,9 @@ impl ToolExecutor {
             )),
             git_commit_journal: std::sync::Arc::new(std::sync::Mutex::new(
                 git_gix::GitCommitRollbackJournal::default(),
+            )),
+            git_worktree_journal: std::sync::Arc::new(std::sync::Mutex::new(
+                worktree::GitWorktreeRollbackJournal::default(),
             )),
             journal_turn_index: std::sync::atomic::AtomicU32::new(0),
             worktree_session: std::sync::Mutex::new(None),
@@ -574,6 +582,15 @@ impl ToolExecutor {
         journal: std::sync::Arc<std::sync::Mutex<git_gix::GitCommitRollbackJournal>>,
     ) -> Self {
         self.git_commit_journal = journal;
+        self
+    }
+
+    /// Use a shared git worktree rollback journal (session-scoped) instead of the default.
+    pub fn with_shared_git_worktree_journal(
+        mut self,
+        journal: std::sync::Arc<std::sync::Mutex<worktree::GitWorktreeRollbackJournal>>,
+    ) -> Self {
+        self.git_worktree_journal = journal;
         self
     }
 
@@ -823,6 +840,13 @@ impl ToolExecutor {
         }
         if name == "git_revert_commit" {
             let mut outcome = self.git_revert_commit_with_metadata(args);
+            let output = self.finalize_tool_output(outcome.output, name);
+            self.record_output_size(output.len());
+            outcome.output = output;
+            return outcome;
+        }
+        if name == "git_worktree" {
+            let mut outcome = self.git_worktree_with_metadata(args);
             let output = self.finalize_tool_output(outcome.output, name);
             self.record_output_size(output.len());
             outcome.output = output;
@@ -1135,6 +1159,8 @@ impl ToolExecutor {
             rollback_on_failure.then(|| self.database_snapshot_journal_checkpoint());
         let stash_checkpoint = rollback_on_failure.then(|| self.git_stash_journal_checkpoint());
         let commit_checkpoint = rollback_on_failure.then(|| self.git_commit_journal_checkpoint());
+        let worktree_checkpoint =
+            rollback_on_failure.then(|| self.git_worktree_journal_checkpoint());
         let steps = chain.steps.clone();
 
         Box::pin(async move {
@@ -1181,11 +1207,13 @@ impl ToolExecutor {
                             Some(database_checkpoint),
                             Some(stash_checkpoint),
                             Some(commit_checkpoint),
+                            Some(worktree_checkpoint),
                         ) = (
                             file_checkpoint,
                             database_checkpoint,
                             stash_checkpoint,
                             commit_checkpoint,
+                            worktree_checkpoint,
                         ) {
                             let file_entries_added = self
                                 .file_journal_checkpoint()
@@ -1199,10 +1227,14 @@ impl ToolExecutor {
                             let commit_entries_added = self
                                 .git_commit_journal_checkpoint()
                                 .saturating_sub(commit_checkpoint);
+                            let worktree_entries_added = self
+                                .git_worktree_journal_checkpoint()
+                                .saturating_sub(worktree_checkpoint);
                             if file_entries_added > 0
                                 || database_entries_added > 0
                                 || stash_entries_added > 0
                                 || commit_entries_added > 0
+                                || worktree_entries_added > 0
                             {
                                 let rollback_output =
                                     self.rollback_turn_actions(&serde_json::json!({
@@ -1212,6 +1244,7 @@ impl ToolExecutor {
                                         "database_after_sequence": database_checkpoint,
                                         "stash_after_sequence": stash_checkpoint,
                                         "commit_after_sequence": commit_checkpoint,
+                                        "worktree_after_sequence": worktree_checkpoint,
                                     }));
                                 rollback = Some(
                                     serde_json::from_str(&rollback_output).unwrap_or_else(

@@ -435,15 +435,19 @@ pub fn tool_action_profile(tool_name: &str, args: &Value) -> ActionCompensationP
             .as_deref()
         {
             Some("list" | "ls") => ActionCompensationProfile::read(true),
-            Some("enter") => ActionCompensationProfile::manual(
-                false,
+            Some("enter") => ActionCompensationProfile::compensated(
+                true,
                 ActionCategory::Execute,
-                "leave the session-scoped worktree with `git_worktree` action=`exit`; use exit_action=`remove` with discard_changes=true only when you intentionally want to delete the created worktree",
+                false,
+                CompensationKind::GitRestoreWorktree,
+                "use `rollback_turn_actions` with scope=`current_turn` during the turn to remove the recorded worktree and restore the session root while it is still clean; otherwise leave with `git_worktree` action=`exit` or remove it manually".to_string(),
             ),
-            Some("add" | "create") => ActionCompensationProfile::manual(
-                false,
+            Some("add" | "create") => ActionCompensationProfile::compensated(
+                true,
                 ActionCategory::Execute,
-                "remove the created worktree with `git_worktree` action=`remove` and the recorded path; set delete_branch=true only if you also want to delete the branch",
+                false,
+                CompensationKind::GitRestoreWorktree,
+                "use `rollback_turn_actions` with scope=`current_turn` during the turn to remove the recorded clean worktree; if it has since changed, remove it manually with `git_worktree` action=`remove` and the recorded path".to_string(),
             ),
             Some("exit") => {
                 let exit_action = string_arg(&normalized_args, "exit_action")
@@ -797,21 +801,37 @@ mod tests {
     }
 
     #[test]
-    fn git_worktree_enter_is_manual() {
+    fn git_worktree_enter_is_compensated() {
         let profile = tool_action_profile(
             "git_worktree",
             &json!({"action": "enter", "branch": "demo"}),
         );
-        assert!(!profile.bounded);
+        assert!(profile.bounded);
         assert_eq!(profile.category, ActionCategory::Execute);
-        assert!(!profile.reversible);
-        assert_eq!(profile.compensation_kind, Some(CompensationKind::Manual));
+        assert!(profile.reversible);
+        assert_eq!(
+            profile.compensation_kind,
+            Some(CompensationKind::GitRestoreWorktree)
+        );
         assert!(
             profile
                 .compensation_summary
                 .as_deref()
                 .unwrap_or_default()
-                .contains("git_worktree")
+                .contains("rollback_turn_actions")
+        );
+    }
+
+    #[test]
+    fn git_worktree_add_is_compensated() {
+        let profile =
+            tool_action_profile("git_worktree", &json!({"action": "add", "branch": "demo"}));
+        assert!(profile.bounded);
+        assert_eq!(profile.category, ActionCategory::Execute);
+        assert!(profile.reversible);
+        assert_eq!(
+            profile.compensation_kind,
+            Some(CompensationKind::GitRestoreWorktree)
         );
     }
 
