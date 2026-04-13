@@ -29,8 +29,20 @@ fn epoch_ms() -> u64 {
 
 fn is_duplicate_key_error(err: &sqlx::Error) -> bool {
     match err {
-        sqlx::Error::Database(db_err) => db_err.code().as_deref() == Some("1062"),
-        _ => false,
+        sqlx::Error::Database(db_err) => {
+            // MySQL error code 1062 = ER_DUP_ENTRY
+            if db_err.code().as_deref() == Some("1062") {
+                return true;
+            }
+            // Fallback: check error message for "Duplicate entry" pattern
+            let msg = db_err.message();
+            msg.contains("Duplicate entry") || msg.contains("ER_DUP_ENTRY")
+        }
+        // Also check Protocol and other wrapped errors
+        _ => {
+            let msg = err.to_string();
+            msg.contains("1062") && msg.contains("Duplicate entry")
+        }
     }
 }
 
