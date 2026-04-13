@@ -335,11 +335,154 @@ fn shell_tokenize_like_bash(input: &str) -> Vec<String> {
     tokens
 }
 
+fn shell_short_flag_cluster(flag: &str) -> Option<&str> {
+    let rest = flag.strip_prefix('-')?;
+    if rest.is_empty() || rest.starts_with('-') || !rest.chars().all(|ch| ch.is_ascii_alphabetic())
+    {
+        return None;
+    }
+    Some(rest)
+}
+
 fn is_nested_shell_c_flag(flag: &str) -> bool {
-    matches!(
-        flag,
-        "-c" | "-lc" | "-ic" | "-ec" | "-xc" | "-lxc" | "-lcx" | "-lec" | "-exc" | "-xec"
-    )
+    shell_short_flag_cluster(flag).is_some_and(|rest| rest.contains('c'))
+}
+
+fn is_shell_read_from_stdin_flag(flag: &str) -> bool {
+    shell_short_flag_cluster(flag).is_some_and(|rest| rest.contains('s'))
+}
+
+enum ShellFlagValueKind {
+    NestedCommand,
+    InitCommand,
+    Path,
+    Other,
+}
+
+fn shell_flag_value_kind(flag: &str) -> Option<ShellFlagValueKind> {
+    match flag {
+        "--command" => Some(ShellFlagValueKind::NestedCommand),
+        "-C" | "--init-command" => Some(ShellFlagValueKind::InitCommand),
+        "--rcfile" | "--init-file" => Some(ShellFlagValueKind::Path),
+        "-o" | "+o" | "-O" | "+O" => Some(ShellFlagValueKind::Other),
+        _ => None,
+    }
+}
+
+fn validate_command_path_arg(
+    policy: &astra_runtime::tool_sandbox::SandboxPolicy,
+    arg: &str,
+    oldpwd: Option<&std::path::Path>,
+) -> Option<String> {
+    let resolved = if arg.starts_with('/') {
+        std::path::PathBuf::from(arg)
+    } else if let Some(expanded) = expand_static_dir_reference(policy, arg, oldpwd) {
+        expanded
+    } else {
+        policy.project_root.join(arg)
+    };
+    let path_str = resolved.to_string_lossy();
+    if let Err(e) = validate_path(policy, &path_str)
+        && e.is_boundary_violation()
+    {
+        return Some(format!(
+            "{}The command references '{}' which is outside the project directory '{}'. \
+             Ask the user for permission before accessing files outside the project.",
+            super::SANDBOX_DENIED_PREFIX,
+            arg,
+            policy.project_root.display(),
+        ));
+    }
+    None
+}
+
+fn check_shell_interpreter_path_boundary(
+    policy: &astra_runtime::tool_sandbox::SandboxPolicy,
+    parts: &[String],
+    oldpwd: Option<&std::path::Path>,
+) -> Option<String> {
+    let mut idx = 1usize;
+    while idx < parts.len() {
+        let arg = parts[idx].as_str();
+
+        if let Some(inner) = arg.strip_prefix("--command=") {
+            return check_bash_path_boundary_with_oldpwd(policy, inner, oldpwd);
+        }
+        if let Some(inner) = arg.strip_prefix("--init-command=") {
+            if let Some(msg) = check_bash_path_boundary_with_oldpwd(policy, inner, oldpwd) {
+                return Some(msg);
+            }
+            idx += 1;
+            continue;
+        }
+        if let Some(path) = arg
+            .strip_prefix("--rcfile=")
+            .or_else(|| arg.strip_prefix("--init-file="))
+        {
+            if let Some(msg) = validate_command_path_arg(policy, path, oldpwd) {
+                return Some(msg);
+            }
+            idx += 1;
+            continue;
+        }
+
+        if arg == "--" {
+            return parts
+                .get(idx + 1)
+                .and_then(|script| validate_command_path_arg(policy, script, oldpwd));
+        }
+
+        if is_nested_shell_c_flag(arg) {
+            return parts
+                .get(idx + 1)
+                .and_then(|inner| check_bash_path_boundary_with_oldpwd(policy, inner, oldpwd));
+        }
+
+        if is_shell_read_from_stdin_flag(arg) {
+            return None;
+        }
+
+        match shell_flag_value_kind(arg) {
+            Some(ShellFlagValueKind::NestedCommand) => {
+                return parts
+                    .get(idx + 1)
+                    .and_then(|inner| check_bash_path_boundary_with_oldpwd(policy, inner, oldpwd));
+            }
+            Some(ShellFlagValueKind::InitCommand) => {
+                if let Some(inner) = parts.get(idx + 1)
+                    && let Some(msg) =
+                        check_bash_path_boundary_with_oldpwd(policy, inner, oldpwd)
+                {
+                    return Some(msg);
+                }
+                idx += 2;
+                continue;
+            }
+            Some(ShellFlagValueKind::Path) => {
+                if let Some(path) = parts.get(idx + 1)
+                    && let Some(msg) = validate_command_path_arg(policy, path, oldpwd)
+                {
+                    return Some(msg);
+                }
+                idx += 2;
+                continue;
+            }
+            Some(ShellFlagValueKind::Other) => {
+                idx += 2;
+                continue;
+            }
+            None => {}
+        }
+
+        if arg.starts_with('-') || arg.starts_with('+') {
+            idx += 1;
+            continue;
+        }
+
+        return validate_command_path_arg(policy, arg, oldpwd);
+    }
+
+    None
 }
 
 fn expand_static_dir_reference(
@@ -498,20 +641,7 @@ fn check_single_command_path_boundary(
     let base = parts[0].rsplit('/').next().unwrap_or(parts[0].as_str());
 
     if is_shell_interpreter_command(base) {
-        for idx in 1..parts.len() {
-            let arg = parts[idx].as_str();
-            if is_nested_shell_c_flag(arg) {
-                if let Some(inner) = parts.get(idx + 1)
-                    && let Some(msg) = check_bash_path_boundary_with_oldpwd(policy, inner, oldpwd)
-                {
-                    return Some(msg);
-                }
-                break;
-            }
-            if !arg.starts_with('-') {
-                break;
-            }
-        }
+        return check_shell_interpreter_path_boundary(policy, &parts, oldpwd);
     }
 
     if base == "xargs" {
@@ -535,27 +665,8 @@ fn check_single_command_path_boundary(
         if arg.starts_with('-') {
             continue;
         }
-        // For absolute paths, validate directly.
-        // For relative paths, resolve against project_root to catch symlinks
-        // pointing outside the sandbox (e.g., `ln -s /etc/passwd myfile`).
-        let resolved = if arg.starts_with('/') {
-            std::path::PathBuf::from(arg)
-        } else if let Some(expanded) = expand_static_dir_reference(policy, arg, oldpwd) {
-            expanded
-        } else {
-            policy.project_root.join(arg)
-        };
-        let path_str = resolved.to_string_lossy();
-        if let Err(e) = validate_path(policy, &path_str) {
-            if e.is_boundary_violation() {
-                return Some(format!(
-                    "{}The command references '{}' which is outside the project directory '{}'. \
-                     Ask the user for permission before accessing files outside the project.",
-                    super::SANDBOX_DENIED_PREFIX,
-                    arg,
-                    policy.project_root.display(),
-                ));
-            }
+        if let Some(msg) = validate_command_path_arg(policy, arg, oldpwd) {
+            return Some(msg);
         }
     }
     None
@@ -2865,6 +2976,50 @@ mod tests {
         assert!(
             result.is_some(),
             "nested bash -lc file reads should be checked recursively"
+        );
+    }
+
+    #[test]
+    fn bypass_bash_ceu_now_blocked() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(&policy, r#"bash -ceu "cat /etc/passwd""#);
+        assert!(
+            result.is_some(),
+            "nested bash -ceu file reads should be checked recursively"
+        );
+    }
+
+    #[test]
+    fn bypass_bash_script_path_now_blocked() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(&policy, "bash /etc/passwd");
+        assert!(
+            result.is_some(),
+            "shell interpreter script paths should be checked recursively"
+        );
+    }
+
+    #[test]
+    fn bypass_bash_option_value_then_script_path_now_blocked() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(&policy, "bash -O extglob /etc/passwd");
+        assert!(
+            result.is_some(),
+            "option values should not hide later shell script path arguments"
+        );
+    }
+
+    #[test]
+    fn bash_stdin_mode_positional_args_are_not_treated_as_script_paths() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(&policy, "bash -s /etc/passwd");
+        assert!(
+            result.is_none(),
+            "bash -s reads commands from stdin, so later args are positional only"
         );
     }
 

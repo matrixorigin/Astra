@@ -720,10 +720,13 @@ fn skip_env_wrapper_tokens(tokens: &[String], mut idx: usize) -> usize {
 }
 
 fn is_nested_shell_c_flag(flag: &str) -> bool {
-    matches!(
-        flag,
-        "-c" | "-lc" | "-ic" | "-ec" | "-xc" | "-lxc" | "-lcx" | "-lec" | "-exc" | "-xec"
-    )
+    let Some(rest) = flag.strip_prefix('-') else {
+        return false;
+    };
+    !rest.is_empty()
+        && !rest.starts_with('-')
+        && rest.chars().all(|ch| ch.is_ascii_alphabetic())
+        && rest.contains('c')
 }
 
 fn inline_exec_interpreter_detail(base: &str, flag: Option<&str>) -> Option<String> {
@@ -1400,6 +1403,19 @@ mod tests {
         let decision = evaluate_tool_safety_request(
             "bash",
             &json!({"command": r#"bash -lc "python3 -c 'print(1)'""#}),
+        );
+        assert!(matches!(
+            decision,
+            SafetyMiddlewareDecision::Deny(reason)
+                if reason.contains("shell_obfuscation") && reason.contains("inline interpreter execution")
+        ));
+    }
+
+    #[test]
+    fn middleware_blocks_nested_shell_python_inline_exec_with_clustered_c_flag() {
+        let decision = evaluate_tool_safety_request(
+            "bash",
+            &json!({"command": r#"bash -ceu "python3 -c 'print(1)'""#}),
         );
         assert!(matches!(
             decision,
