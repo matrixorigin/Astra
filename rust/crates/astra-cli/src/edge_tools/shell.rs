@@ -1058,6 +1058,175 @@ fn xargs_flag_requires_value(flag: &str) -> bool {
             && !flag.starts_with("--")
 }
 
+fn check_awk_path_boundary(
+    policy: &astra_runtime::tool_sandbox::SandboxPolicy,
+    parts: &[String],
+    oldpwd: Option<&std::path::Path>,
+) -> Option<String> {
+    let mut idx = 1usize;
+    let mut skipped_program = false;
+
+    while idx < parts.len() {
+        let arg = parts[idx].as_str();
+        if arg == "--" {
+            idx += 1;
+            break;
+        }
+
+        if let Some(path) = awk_inline_path_flag_value(arg) {
+            if let Some(msg) = validate_command_path_arg(policy, path, oldpwd) {
+                return Some(msg);
+            }
+            idx += 1;
+            continue;
+        }
+        if awk_inline_non_path_flag_value(arg) {
+            idx += 1;
+            continue;
+        }
+        if let Some(kind) = awk_flag_value_kind(arg) {
+            if let Some(value) = parts.get(idx + 1) {
+                if matches!(kind, ShellFlagValueKind::Path)
+                    && let Some(msg) = validate_command_path_arg(policy, value, oldpwd)
+                {
+                    return Some(msg);
+                }
+                idx += 2;
+                continue;
+            }
+            idx += 1;
+            continue;
+        }
+        if arg.starts_with('-') && arg != "-" {
+            idx += 1;
+            continue;
+        }
+        if !skipped_program {
+            skipped_program = true;
+            idx += 1;
+            continue;
+        }
+        if let Some(msg) = validate_command_path_arg(policy, arg, oldpwd) {
+            return Some(msg);
+        }
+        idx += 1;
+    }
+
+    while idx < parts.len() {
+        if let Some(msg) = validate_command_path_arg(policy, &parts[idx], oldpwd) {
+            return Some(msg);
+        }
+        idx += 1;
+    }
+
+    None
+}
+
+fn awk_flag_value_kind(flag: &str) -> Option<ShellFlagValueKind> {
+    match flag {
+        "-f" | "--file" | "-i" | "--include" => Some(ShellFlagValueKind::Path),
+        "-F" | "--field-separator" | "-v" | "--assign" => Some(ShellFlagValueKind::Other),
+        _ => None,
+    }
+}
+
+fn awk_inline_path_flag_value(flag: &str) -> Option<&str> {
+    flag.strip_prefix("-f")
+        .filter(|value| !value.is_empty())
+        .or_else(|| flag.strip_prefix("-i").filter(|value| !value.is_empty()))
+        .or_else(|| flag.strip_prefix("--file="))
+        .or_else(|| flag.strip_prefix("--include="))
+}
+
+fn awk_inline_non_path_flag_value(flag: &str) -> bool {
+    (flag.starts_with("-F") || flag.starts_with("-v")) && flag.len() > 2 && !flag.starts_with("--")
+        || flag.starts_with("--field-separator=")
+        || flag.starts_with("--assign=")
+}
+
+fn check_sed_path_boundary(
+    policy: &astra_runtime::tool_sandbox::SandboxPolicy,
+    parts: &[String],
+    oldpwd: Option<&std::path::Path>,
+) -> Option<String> {
+    let mut idx = 1usize;
+    let mut skipped_program = false;
+
+    while idx < parts.len() {
+        let arg = parts[idx].as_str();
+        if arg == "--" {
+            idx += 1;
+            break;
+        }
+
+        if let Some(path) = sed_inline_path_flag_value(arg) {
+            if let Some(msg) = validate_command_path_arg(policy, path, oldpwd) {
+                return Some(msg);
+            }
+            idx += 1;
+            continue;
+        }
+        if sed_inline_non_path_flag_value(arg) {
+            idx += 1;
+            continue;
+        }
+        if let Some(kind) = sed_flag_value_kind(arg) {
+            if let Some(value) = parts.get(idx + 1) {
+                if matches!(kind, ShellFlagValueKind::Path)
+                    && let Some(msg) = validate_command_path_arg(policy, value, oldpwd)
+                {
+                    return Some(msg);
+                }
+                idx += 2;
+                continue;
+            }
+            idx += 1;
+            continue;
+        }
+        if arg.starts_with('-') && arg != "-" {
+            idx += 1;
+            continue;
+        }
+        if !skipped_program {
+            skipped_program = true;
+            idx += 1;
+            continue;
+        }
+        if let Some(msg) = validate_command_path_arg(policy, arg, oldpwd) {
+            return Some(msg);
+        }
+        idx += 1;
+    }
+
+    while idx < parts.len() {
+        if let Some(msg) = validate_command_path_arg(policy, &parts[idx], oldpwd) {
+            return Some(msg);
+        }
+        idx += 1;
+    }
+
+    None
+}
+
+fn sed_flag_value_kind(flag: &str) -> Option<ShellFlagValueKind> {
+    match flag {
+        "-f" | "--file" => Some(ShellFlagValueKind::Path),
+        "-e" | "--expression" => Some(ShellFlagValueKind::Other),
+        _ => None,
+    }
+}
+
+fn sed_inline_path_flag_value(flag: &str) -> Option<&str> {
+    flag.strip_prefix("-f")
+        .filter(|value| !value.is_empty())
+        .or_else(|| flag.strip_prefix("--file="))
+}
+
+fn sed_inline_non_path_flag_value(flag: &str) -> bool {
+    (flag.starts_with("-e") && flag.len() > 2 && !flag.starts_with("--"))
+        || flag.starts_with("--expression=")
+}
+
 /// Check a single (non-compound) command for path boundary violations.
 fn check_single_command_path_boundary(
     policy: &astra_runtime::tool_sandbox::SandboxPolicy,
@@ -1082,6 +1251,12 @@ fn check_single_command_path_boundary(
 
     if is_shell_interpreter_command(base) {
         return check_shell_interpreter_path_boundary(policy, &parts, oldpwd);
+    }
+    if base == "awk" {
+        return check_awk_path_boundary(policy, &parts, oldpwd);
+    }
+    if base == "sed" {
+        return check_sed_path_boundary(policy, &parts, oldpwd);
     }
 
     if base == "xargs" {
