@@ -97,6 +97,19 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             is_err,
             executed_ms,
         } = executed;
+        if !self.ctx.tool_event_hooks.is_empty() && !is_err {
+            if let Some(modified) = crate::skills::hooks::evaluate_post_tool_hooks(
+                self.ctx.tool_event_hooks,
+                &execution.name,
+                &execution.args,
+                &execution.result_str,
+            )
+            .await
+            {
+                execution.result_str = modified;
+            }
+        }
+
         let args_size = serde_json::to_string(&execution.args)
             .map(|s| s.len() as u32)
             .unwrap_or(0);
@@ -149,19 +162,6 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             execution.is_edge_tool,
             executed_ms,
         );
-
-        if !self.ctx.tool_event_hooks.is_empty() && !is_err {
-            if let Some(modified) = crate::skills::hooks::evaluate_post_tool_hooks(
-                self.ctx.tool_event_hooks,
-                &execution.name,
-                &execution.args,
-                &execution.result_str,
-            )
-            .await
-            {
-                execution.result_str = modified;
-            }
-        }
 
         let model_result_str =
             tool_result_content_for_model(&execution.name, &execution.result_str);

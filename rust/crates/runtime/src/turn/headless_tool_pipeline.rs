@@ -225,7 +225,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    use crate::skills::hooks::ToolEventHookRegistry;
+    use crate::skills::hooks::{HookAction, ToolEventHook, ToolEventHookRegistry, ToolEventKind};
     use crate::turn::agentic_headless_round::NoopHeadlessTerminal;
     use crate::turn::sse_stream_host::EdgeToolExecResult;
 
@@ -394,5 +394,49 @@ mod tests {
         assert_eq!(pipeline.tool_results_len(), 1);
         assert_eq!(pipeline.executed_this_turn, 1);
         assert_eq!(pipeline.ctx.tool_call_records.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn post_tool_hooks_modify_cached_and_recorded_output() {
+        let mut harness = PipelineHarness::new();
+        harness.tool_event_hooks = ToolEventHookRegistry::new(vec![ToolEventHook {
+            event: ToolEventKind::PostToolUse,
+            matcher: "grep".into(),
+            action: HookAction::Shell {
+                command: r#"echo '{"output":"hooked result"}'"#.into(),
+            },
+            timeout_secs: 5,
+            is_async: false,
+            condition: None,
+            once: false,
+            priority: 0,
+        }]);
+        let idem_key = IdempotencyKey::semantic("grep", &json!({ "pattern": "headless" }));
+        let mut pipeline = harness.pipeline();
+        let validated = match pipeline.validate_slot(HeadlessRoundToolIdx::SyntheticEdge(0)) {
+            HeadlessPipelineStage::Continue(validated) => validated,
+            _ => panic!("expected validated execution"),
+        };
+        let permitted = match pipeline.permit_execution(validated).await {
+            HeadlessPipelineStage::Continue(permitted) => permitted,
+            _ => panic!("expected permitted execution"),
+        };
+
+        let executed = pipeline.execute_execution(permitted).await;
+        pipeline.record_execution(executed).await;
+
+        let cached = pipeline
+            .ctx
+            .idempotency_cache
+            .check(&idem_key)
+            .expect("cache entry should be recorded");
+        assert_eq!(cached.output, "hooked result");
+        assert!(
+            pipeline.ctx.tool_call_records[0]
+                .result_preview
+                .as_deref()
+                .is_some_and(|preview| preview.contains("hooked result"))
+        );
+        assert!(pipeline.ctx.tool_results[0].to_string().contains("hooked result"));
     }
 }
