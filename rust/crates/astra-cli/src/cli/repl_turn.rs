@@ -1087,25 +1087,11 @@ fn commit_turn_journal_workspace_and_sidecars(
             enqueue_ingestion(state, &verdict_event);
         }
 
-        // Log Step Protocol recorder summary (audit trail for execution phases)
-        if let Some(ref summary) = result.step_recorder_summary {
-            let summary_text = format!(
-                "step_recorder: iterations={} tools={} phases={} tool_time={}ms",
-                summary.iterations,
-                summary.total_tools,
-                summary.phase_log.len(),
-                summary.total_tool_time_ms,
-            );
-            let recorder_event = session_journal::JournalEvent::checkpoint(
-                state.session_id.as_deref(),
-                state.turn,
-                &summary_text,
-                result.prompt_tokens + result.completion_tokens,
-                result.tool_calls_count as usize,
-            );
-            let _ = journal.append(&recorder_event);
-            enqueue_ingestion(state, &recorder_event);
-        }
+        // Step Protocol recorder summary: previously emitted as a second
+        // checkpoint event, causing duplicate checkpoint entries with
+        // inconsistent token counts. The summary is already captured in the
+        // main checkpoint's `cp.summary` when the interval fires, so we
+        // skip the duplicate event.
     }
 }
 

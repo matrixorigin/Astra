@@ -1885,13 +1885,20 @@ fn finalize_turn_trace(state: &mut AgenticLoopState) {
         crate::observability_integration::on_context_assembled(&mut guard, trace.clone());
     }
     if collector.has_data() {
-        let turn_number = (state.max_turns - state.remaining_turns) as u32;
+        // Use session-global turn number when available, falling back to
+        // loop-local iteration number when there is no observability session.
+        let session_turn = state
+            .telemetry
+            .observability_session
+            .as_ref()
+            .and_then(|s| s.read().ok().map(|g| g.turn_number))
+            .unwrap_or_else(|| (state.max_turns - state.remaining_turns) as u32);
         if let Some(ref sid) = state.current_session_id {
             if let Ok(writer) = astra_services::session_journal::JournalWriter::new(sid) {
                 let event =
                     astra_services::session_journal::JournalEvent::context_assembly_recorded(
                         Some(sid),
-                        turn_number,
+                        session_turn,
                         trace.to_json_value(),
                     );
                 let _ = writer.append(&event);
@@ -4749,6 +4756,22 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
         // into both messages and tool_results in correct ordering.
         for result in &skill_results {
             pre_resolved_results.push((result.tool_call_id.clone(), result.result.clone()));
+
+            // Record skill calls in tool_call_records so the session
+            // journal captures them alongside regular tool calls.
+            state.stall.tool_call_records.push(ToolCallRecord {
+                name: result.tool_name.clone(),
+                ok: !result.result.starts_with("Unknown skill")
+                    && !result.result.starts_with("Invalid skill")
+                    && !result.result.starts_with("Skipped:")
+                    && !result.result.starts_with("Deferred:"),
+                ms: 0,
+                error: None,
+                input_bytes: None,
+                output_bytes: Some(result.result.len() as u32),
+                args_preview: Some(result.tool_call_id.clone()),
+                result_preview: Some(result.result.chars().take(500).collect::<String>()),
+            });
         }
 
         // Set skill_produced_output whenever a skill produces substantial
