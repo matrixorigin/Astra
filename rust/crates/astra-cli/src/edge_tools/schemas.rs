@@ -417,7 +417,9 @@ pub fn all_tool_schemas() -> Vec<Value> {
                     "properties": {
                         "message": {"type": "string", "description": "Commit message (required)"},
                         "files": {"type": "array", "items": {"type": "string"}, "description": "Specific files to stage (optional; if omitted, stages all changes)"},
-                        "all": {"type": "boolean", "description": "Stage all tracked changes (like git commit -a)"}
+                        "all": {"type": "boolean", "description": "Stage all tracked changes (like git commit -a)"},
+                        "transaction_id": {"type": "string", "description": "Optional explicit batch transaction id. Consecutive tool calls in the same batch with the same id and rollback_on_failure=true execute as one rollback boundary."},
+                        "rollback_on_failure": {"type": "boolean", "description": "Optional explicit batch transaction flag. When true with transaction_id, a later failure inside the same contiguous batch transaction rolls back bounded file/database/repo-state side effects recorded since the transaction began."}
                     },
                     "required": ["message"]
                 }

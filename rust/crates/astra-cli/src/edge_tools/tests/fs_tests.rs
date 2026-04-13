@@ -340,6 +340,7 @@ fn rollback_turn_actions_list_combines_file_and_db_journals() {
         Some(0)
     );
     assert_eq!(rollback_json["total_git_stash_entries"].as_u64(), Some(0));
+    assert_eq!(rollback_json["total_git_commit_entries"].as_u64(), Some(0));
 }
 
 #[test]
@@ -391,6 +392,105 @@ fn rollback_turn_actions_reapplies_recorded_git_stash_for_current_turn() {
         listed_after_json["total_git_stash_entries"].as_u64(),
         Some(0)
     );
+}
+
+#[test]
+fn rollback_turn_actions_reverts_recorded_git_commit_for_current_turn() {
+    let dir = init_temp_git_repo();
+    let tracked = dir.path().join("tracked.txt");
+    let executor = ToolExecutor::new(dir.path());
+    executor
+        .journal_turn_index
+        .store(13, std::sync::atomic::Ordering::Relaxed);
+
+    std::fs::write(&tracked, "committed in turn\n").expect("modify tracked file");
+    let commit = executor.git_commit_with_metadata(&json!({"message": "turn commit"}));
+    assert!(
+        !commit.output.starts_with("Error:"),
+        "git_commit failed: {}",
+        commit.output
+    );
+
+    let listed = executor.rollback_turn_actions(&json!({"scope": "list"}));
+    let listed_json: serde_json::Value = serde_json::from_str(&listed).unwrap();
+    assert_eq!(listed_json["total_git_commit_entries"].as_u64(), Some(1));
+
+    let rollback = executor.rollback_turn_actions(&json!({"scope": "current_turn"}));
+    let rollback_json: serde_json::Value = serde_json::from_str(&rollback).unwrap();
+    assert_eq!(
+        rollback_json["success"].as_bool(),
+        Some(true),
+        "got: {rollback}"
+    );
+    assert_eq!(
+        rollback_json["reverted_git_commits"]
+            .as_array()
+            .map(Vec::len),
+        Some(1)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&tracked).expect("restored tracked file"),
+        "committed\n"
+    );
+
+    let listed_after = executor.rollback_turn_actions(&json!({"scope": "list"}));
+    let listed_after_json: serde_json::Value = serde_json::from_str(&listed_after).unwrap();
+    assert_eq!(
+        listed_after_json["total_git_commit_entries"].as_u64(),
+        Some(0)
+    );
+}
+
+#[test]
+fn rollback_turn_actions_refuses_git_commit_when_head_tail_moved() {
+    let dir = init_temp_git_repo();
+    let tracked = dir.path().join("tracked.txt");
+    let executor = ToolExecutor::new(dir.path());
+    executor
+        .journal_turn_index
+        .store(14, std::sync::atomic::Ordering::Relaxed);
+
+    std::fs::write(&tracked, "committed in turn\n").expect("modify tracked file");
+    let commit = executor.git_commit_with_metadata(&json!({"message": "turn commit"}));
+    assert!(
+        !commit.output.starts_with("Error:"),
+        "git_commit failed: {}",
+        commit.output
+    );
+
+    std::fs::write(&tracked, "later head\n").expect("modify tracked file again");
+    let later_commit = std::process::Command::new("git")
+        .args(["commit", "-am", "later"])
+        .current_dir(dir.path())
+        .output()
+        .expect("later git commit");
+    assert!(
+        later_commit.status.success(),
+        "later commit failed: {}",
+        String::from_utf8_lossy(&later_commit.stderr)
+    );
+
+    let rollback = executor.rollback_turn_actions(&json!({"scope": "current_turn"}));
+    let rollback_json: serde_json::Value = serde_json::from_str(&rollback).unwrap();
+    assert_eq!(
+        rollback_json["success"].as_bool(),
+        Some(false),
+        "got: {rollback}"
+    );
+    assert_eq!(
+        rollback_json["failed_git_commit_rollbacks"]
+            .as_array()
+            .map(Vec::len),
+        Some(1)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&tracked).expect("tracked file should remain at later head"),
+        "later head\n"
+    );
+
+    let listed = executor.rollback_turn_actions(&json!({"scope": "list"}));
+    let listed_json: serde_json::Value = serde_json::from_str(&listed).unwrap();
+    assert_eq!(listed_json["total_git_commit_entries"].as_u64(), Some(1));
 }
 
 #[test]

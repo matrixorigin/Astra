@@ -134,6 +134,10 @@ pub(crate) struct ChatTurnParams<'a> {
     /// bounded repo-state rollback support across turns.
     pub(crate) git_stash_journal:
         Option<std::sync::Arc<std::sync::Mutex<crate::edge_tools::GitStashRollbackJournal>>>,
+    /// Session-scoped git commit rollback journal — shared with ToolExecutors for
+    /// bounded committed-history rollback support across turns.
+    pub(crate) git_commit_journal:
+        Option<std::sync::Arc<std::sync::Mutex<crate::edge_tools::GitCommitRollbackJournal>>>,
     /// Current REPL turn number — used to tag journal entries for undo.
     pub(crate) turn_index: u32,
     /// Shared evolution service for multi-axis self-evolution.

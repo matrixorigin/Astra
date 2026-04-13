@@ -86,6 +86,68 @@ fn short_commit_sha(commit_sha: &str) -> String {
     commit_sha[..7.min(commit_sha.len())].to_string()
 }
 
+fn head_first_parent_tail(project_root: &Path, count: usize) -> Option<Vec<String>> {
+    if count == 0 {
+        return Some(Vec::new());
+    }
+    std::process::Command::new("git")
+        .args([
+            "rev-list",
+            "--first-parent",
+            "--max-count",
+            &count.to_string(),
+            "HEAD",
+        ])
+        .current_dir(project_root)
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| {
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(ToString::to_string)
+                .collect()
+        })
+}
+
+fn git_worktree_is_clean(project_root: &Path) -> Result<bool, String> {
+    let output = std::process::Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(project_root)
+        .output()
+        .map_err(|error| format!("Error: git status failed: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "Error: git status failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().is_empty())
+}
+
+fn abort_git_revert(project_root: &Path) -> Result<bool, String> {
+    let output = std::process::Command::new("git")
+        .args(["revert", "--abort"])
+        .current_dir(project_root)
+        .output()
+        .map_err(|error| format!("Error: git revert --abort failed: {error}"))?;
+    if output.status.success() {
+        Ok(true)
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("no cherry-pick or revert in progress") {
+            Ok(false)
+        } else {
+            Err(format!(
+                "Error: git revert --abort failed: {}",
+                stderr.trim()
+            ))
+        }
+    }
+}
+
 fn apply_stash_selector(args: &Value) -> Result<String, String> {
     if let Some(selector) = args.get("stash_ref").and_then(Value::as_str) {
         reject_stash_selector(selector)?;
@@ -156,6 +218,72 @@ impl GitStashRollbackJournal {
             .entries
             .iter()
             .rposition(|entry| entry.stash_ref == stash_ref)
+        {
+            self.entries.remove(index);
+            true
+        } else {
+            false
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GitCommitRollbackEntry {
+    sequence: u64,
+    pub commit_sha: String,
+    pub turn_index: u32,
+    pub timestamp: SystemTime,
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct GitCommitRollbackJournal {
+    entries: Vec<GitCommitRollbackEntry>,
+    next_sequence: u64,
+}
+
+impl GitCommitRollbackJournal {
+    fn record(&mut self, commit_sha: impl Into<String>, turn_index: u32, message: Option<String>) {
+        self.entries.push(GitCommitRollbackEntry {
+            sequence: self.next_sequence,
+            commit_sha: commit_sha.into(),
+            turn_index,
+            timestamp: SystemTime::now(),
+            message,
+        });
+        self.next_sequence = self.next_sequence.saturating_add(1);
+    }
+
+    fn list(&self) -> Vec<GitCommitRollbackEntry> {
+        self.entries.iter().rev().cloned().collect()
+    }
+
+    fn restore_plan_for_turn(&self, turn_index: u32) -> Vec<GitCommitRollbackEntry> {
+        self.restore_plan_for_turn_since(turn_index, 0)
+    }
+
+    fn restore_plan_for_turn_since(
+        &self,
+        turn_index: u32,
+        checkpoint: u64,
+    ) -> Vec<GitCommitRollbackEntry> {
+        self.entries
+            .iter()
+            .rev()
+            .filter(|entry| entry.turn_index == turn_index && entry.sequence >= checkpoint)
+            .cloned()
+            .collect()
+    }
+
+    fn checkpoint(&self) -> u64 {
+        self.next_sequence
+    }
+
+    fn remove_commit(&mut self, commit_sha: &str) -> bool {
+        if let Some(index) = self
+            .entries
+            .iter()
+            .rposition(|entry| entry.commit_sha == commit_sha)
         {
             self.entries.remove(index);
             true
@@ -1933,10 +2061,17 @@ pub(crate) fn git_revert_commit_with_metadata(
         }
         Ok(out) => {
             let stderr = String::from_utf8_lossy(&out.stderr);
-            super::ToolExecutionOutcome::text(format!(
-                "Error: git revert failed: {}",
-                stderr.trim()
-            ))
+            let mut message = format!("Error: git revert failed: {}", stderr.trim());
+            match abort_git_revert(project_root) {
+                Ok(true) => {
+                    message.push_str(" (aborted in-progress revert)");
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    message.push_str(&format!(" ({error})"));
+                }
+            }
+            super::ToolExecutionOutcome::text(message)
         }
         Err(e) => super::ToolExecutionOutcome::text(format!("Error: git revert failed: {e}")),
     }
@@ -2065,6 +2200,319 @@ pub(crate) fn git_stash_with_metadata(
 }
 
 impl ToolExecutor {
+    fn record_git_commit_rollback(&self, commit_sha: impl Into<String>, message: Option<String>) {
+        let turn_index = self
+            .journal_turn_index
+            .load(std::sync::atomic::Ordering::Relaxed);
+        match self.git_commit_journal.lock() {
+            Ok(mut journal) => journal.record(commit_sha, turn_index, message),
+            Err(poisoned) => poisoned
+                .into_inner()
+                .record(commit_sha, turn_index, message),
+        }
+    }
+
+    fn git_commit_entries(&self) -> Vec<GitCommitRollbackEntry> {
+        match self.git_commit_journal.lock() {
+            Ok(journal) => journal.list(),
+            Err(poisoned) => poisoned.into_inner().list(),
+        }
+    }
+
+    fn git_commit_restore_plan_for_turn(&self, turn_index: u32) -> Vec<GitCommitRollbackEntry> {
+        match self.git_commit_journal.lock() {
+            Ok(journal) => journal.restore_plan_for_turn(turn_index),
+            Err(poisoned) => poisoned.into_inner().restore_plan_for_turn(turn_index),
+        }
+    }
+
+    fn git_commit_restore_plan_for_turn_since(
+        &self,
+        turn_index: u32,
+        checkpoint: u64,
+    ) -> Vec<GitCommitRollbackEntry> {
+        match self.git_commit_journal.lock() {
+            Ok(journal) => journal.restore_plan_for_turn_since(turn_index, checkpoint),
+            Err(poisoned) => poisoned
+                .into_inner()
+                .restore_plan_for_turn_since(turn_index, checkpoint),
+        }
+    }
+
+    pub(crate) fn git_commit_journal_checkpoint(&self) -> u64 {
+        match self.git_commit_journal.lock() {
+            Ok(journal) => journal.checkpoint(),
+            Err(poisoned) => poisoned.into_inner().checkpoint(),
+        }
+    }
+
+    fn remove_git_commit_rollback(&self, commit_sha: &str) {
+        match self.git_commit_journal.lock() {
+            Ok(mut journal) => {
+                journal.remove_commit(commit_sha);
+            }
+            Err(poisoned) => {
+                poisoned.into_inner().remove_commit(commit_sha);
+            }
+        }
+    }
+
+    fn rollback_git_commit_entry_json(entry: &GitCommitRollbackEntry) -> Value {
+        let mut value = serde_json::Map::from_iter([
+            (
+                "commit_sha".to_string(),
+                Value::String(entry.commit_sha.clone()),
+            ),
+            (
+                "commit_short_sha".to_string(),
+                Value::String(short_commit_sha(&entry.commit_sha)),
+            ),
+            (
+                "turn_index".to_string(),
+                Value::Number(serde_json::Number::from(entry.turn_index)),
+            ),
+        ]);
+        if let Some(message) = entry.message.as_ref() {
+            value.insert("message".to_string(), Value::String(message.clone()));
+        }
+        Value::Object(value)
+    }
+
+    pub(crate) fn rollback_git_commits(&self, args: &Value) -> String {
+        let scope = args
+            .get("scope")
+            .and_then(Value::as_str)
+            .unwrap_or("current_turn");
+        let explicit_turn_index = if scope == "turn" {
+            match args.get("turn_index").and_then(Value::as_u64) {
+                Some(turn_index) => Some(turn_index),
+                None => {
+                    return serde_json::json!({
+                        "success": false,
+                        "error": "missing 'turn_index' for scope=turn",
+                    })
+                    .to_string();
+                }
+            }
+        } else {
+            None
+        };
+        let after_sequence = args
+            .get("commit_after_sequence")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+
+        match scope {
+            "list" => {
+                let entries = self
+                    .git_commit_entries()
+                    .into_iter()
+                    .map(|entry| Self::rollback_git_commit_entry_json(&entry))
+                    .collect::<Vec<_>>();
+                serde_json::json!({
+                    "success": true,
+                    "scope": "list",
+                    "total_entries": entries.len(),
+                    "entries": entries,
+                    "summary": format!("Listed {} recorded git commit rollback entr{}", entries.len(), if entries.len() == 1 { "y" } else { "ies" }),
+                })
+                .to_string()
+            }
+            "turn" | "current_turn" => {
+                let turn_index = explicit_turn_index.unwrap_or_else(|| {
+                    self.journal_turn_index
+                        .load(std::sync::atomic::Ordering::Relaxed) as u64
+                }) as u32;
+                let plan = if after_sequence > 0 {
+                    self.git_commit_restore_plan_for_turn_since(turn_index, after_sequence)
+                } else {
+                    self.git_commit_restore_plan_for_turn(turn_index)
+                };
+                let mut reverted = Vec::new();
+                let mut failed = Vec::new();
+
+                if !plan.is_empty() {
+                    match git_worktree_is_clean(&self.project_root) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            let error =
+                                "working tree must be clean before automatic git commit rollback"
+                                    .to_string();
+                            failed = plan
+                                .iter()
+                                .map(|entry| {
+                                    let mut failed_entry =
+                                        Self::rollback_git_commit_entry_json(entry)
+                                            .as_object()
+                                            .cloned()
+                                            .unwrap_or_default();
+                                    failed_entry
+                                        .insert("error".to_string(), Value::String(error.clone()));
+                                    Value::Object(failed_entry)
+                                })
+                                .collect();
+                        }
+                        Err(error) => {
+                            failed = plan
+                                .iter()
+                                .map(|entry| {
+                                    let mut failed_entry =
+                                        Self::rollback_git_commit_entry_json(entry)
+                                            .as_object()
+                                            .cloned()
+                                            .unwrap_or_default();
+                                    failed_entry
+                                        .insert("error".to_string(), Value::String(error.clone()));
+                                    Value::Object(failed_entry)
+                                })
+                                .collect();
+                        }
+                    }
+                }
+
+                if failed.is_empty() && !plan.is_empty() {
+                    let expected_tail = plan
+                        .iter()
+                        .map(|entry| entry.commit_sha.clone())
+                        .collect::<Vec<_>>();
+                    let actual_tail =
+                        head_first_parent_tail(&self.project_root, expected_tail.len())
+                            .unwrap_or_default();
+                    if actual_tail != expected_tail {
+                        let error = "recorded git commits are no longer the current HEAD tail; use git_revert_commit manually".to_string();
+                        failed = plan
+                            .iter()
+                            .map(|entry| {
+                                let mut failed_entry = Self::rollback_git_commit_entry_json(entry)
+                                    .as_object()
+                                    .cloned()
+                                    .unwrap_or_default();
+                                failed_entry
+                                    .insert("error".to_string(), Value::String(error.clone()));
+                                Value::Object(failed_entry)
+                            })
+                            .collect();
+                    }
+                }
+
+                if failed.is_empty() {
+                    for entry in &plan {
+                        let outcome = crate::edge_tools::git_gix::git_revert_commit_with_metadata(
+                            &self.project_root,
+                            &serde_json::json!({
+                                "commit_sha": entry.commit_sha,
+                            }),
+                        );
+                        if outcome.output.starts_with("Error:") {
+                            let mut failed_entry = Self::rollback_git_commit_entry_json(entry)
+                                .as_object()
+                                .cloned()
+                                .unwrap_or_default();
+                            failed_entry.insert("error".to_string(), Value::String(outcome.output));
+                            failed.push(Value::Object(failed_entry));
+                            break;
+                        }
+                        self.remove_git_commit_rollback(&entry.commit_sha);
+                        self.clear_file_state();
+                        let mut reverted_entry = Self::rollback_git_commit_entry_json(entry)
+                            .as_object()
+                            .cloned()
+                            .unwrap_or_default();
+                        if let Some(fields) = outcome.tool_result_fields.as_ref() {
+                            if let Some(revert_commit_sha) =
+                                fields.get("revert_commit_sha").and_then(Value::as_str)
+                            {
+                                reverted_entry.insert(
+                                    "revert_commit_sha".to_string(),
+                                    Value::String(revert_commit_sha.to_string()),
+                                );
+                                reverted_entry.insert(
+                                    "revert_commit_short_sha".to_string(),
+                                    Value::String(short_commit_sha(revert_commit_sha)),
+                                );
+                            }
+                        }
+                        reverted.push(Value::Object(reverted_entry));
+                    }
+                }
+
+                let success = !reverted.is_empty() && failed.is_empty();
+                let summary = if plan.is_empty() {
+                    format!("No recorded git commit rollback handles found for turn {turn_index}")
+                } else if failed.is_empty() {
+                    format!(
+                        "Reverted {} recorded git commit{} for turn {turn_index}",
+                        reverted.len(),
+                        if reverted.len() == 1 { "" } else { "s" }
+                    )
+                } else {
+                    format!(
+                        "Reverted {} recorded git commit{} for turn {turn_index} with {} failure{}",
+                        reverted.len(),
+                        if reverted.len() == 1 { "" } else { "s" },
+                        failed.len(),
+                        if failed.len() == 1 { "" } else { "s" }
+                    )
+                };
+                serde_json::json!({
+                    "success": success,
+                    "scope": scope,
+                    "turn_index": turn_index,
+                    "reverted": reverted,
+                    "failed": failed,
+                    "summary": summary,
+                })
+                .to_string()
+            }
+            other => serde_json::json!({
+                "success": false,
+                "error": format!(
+                    "unknown scope `{other}`. Supported: current_turn, turn, list"
+                ),
+            })
+            .to_string(),
+        }
+    }
+
+    pub(crate) fn git_commit(&self, args: &Value) -> String {
+        self.git_commit_with_metadata(args).output
+    }
+
+    pub(crate) fn git_commit_with_metadata(&self, args: &Value) -> super::ToolExecutionOutcome {
+        let outcome =
+            crate::edge_tools::git_gix::git_commit_with_metadata(&self.project_root, args);
+        if let Some(commit_sha) = outcome
+            .tool_result_fields
+            .as_ref()
+            .and_then(|fields| fields.get("commit_sha"))
+            .and_then(Value::as_str)
+        {
+            self.record_git_commit_rollback(
+                commit_sha.to_string(),
+                args.get("message")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string),
+            );
+        }
+        outcome
+    }
+
+    pub(crate) fn git_revert_commit(&self, args: &Value) -> String {
+        self.git_revert_commit_with_metadata(args).output
+    }
+
+    pub(crate) fn git_revert_commit_with_metadata(
+        &self,
+        args: &Value,
+    ) -> super::ToolExecutionOutcome {
+        let outcome =
+            crate::edge_tools::git_gix::git_revert_commit_with_metadata(&self.project_root, args);
+        if !outcome.output.starts_with("Error:") {
+            self.clear_file_state();
+        }
+        outcome
+    }
+
     fn record_git_stash_rollback(&self, stash_ref: impl Into<String>, message: Option<String>) {
         let turn_index = self
             .journal_turn_index
@@ -3645,6 +4093,50 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&tracked_path).expect("read reverted file"),
             "one\n"
+        );
+    }
+
+    #[test]
+    fn git_revert_commit_conflict_is_aborted() {
+        let repo = init_temp_repo();
+        let tracked_path = repo.path().join("tracked.txt");
+        std::fs::write(&tracked_path, "two\n").expect("write second version");
+        let second = git_commit_with_metadata(repo.path(), &json!({"message": "second"}));
+        let second_sha = second
+            .tool_result_fields
+            .as_ref()
+            .and_then(|fields| fields.get("commit_sha"))
+            .and_then(Value::as_str)
+            .expect("second commit sha")
+            .to_string();
+
+        std::fs::write(&tracked_path, "three\n").expect("write third version");
+        let third = git_commit_with_metadata(repo.path(), &json!({"message": "third"}));
+        assert!(
+            !third.output.starts_with("Error:"),
+            "third commit should succeed: {}",
+            third.output
+        );
+
+        let revert =
+            git_revert_commit_with_metadata(repo.path(), &json!({"commit_sha": second_sha}));
+        assert!(
+            revert.output.starts_with("Error:"),
+            "reverting a non-HEAD conflicting commit should fail: {}",
+            revert.output
+        );
+        assert!(
+            revert.output.contains("aborted in-progress revert"),
+            "failure should clean up revert state: {}",
+            revert.output
+        );
+        assert_eq!(
+            std::fs::read_to_string(&tracked_path).expect("read file after aborted revert"),
+            "three\n"
+        );
+        assert!(
+            !repo.path().join(".git/REVERT_HEAD").exists(),
+            "revert conflict should not leave REVERT_HEAD behind"
         );
     }
 

@@ -304,6 +304,7 @@ pub(super) async fn handle_task_command(
                     file_journal: None,
                     database_snapshot_journal: None,
                     git_stash_journal: None,
+                    git_commit_journal: None,
                     turn_index: 0,
                     evolution_service: None,
                 })

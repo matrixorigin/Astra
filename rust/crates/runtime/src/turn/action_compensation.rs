@@ -346,7 +346,7 @@ pub fn tool_action_profile(tool_name: &str, args: &Value) -> ActionCompensationP
             ActionCategory::Execute,
             false,
             CompensationKind::GitRevertCommit,
-            "call `git_revert_commit` with the returned commit_sha to create a compensating revert commit".to_string(),
+            "use `rollback_turn_actions` with scope=`current_turn` during the turn to revert the recorded commit when it is still the current HEAD tail, or call `git_revert_commit` with the returned commit_sha for an explicit compensating revert commit".to_string(),
         ),
         "git_revert_commit" => ActionCompensationProfile::manual(
             false,

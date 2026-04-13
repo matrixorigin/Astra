@@ -197,6 +197,7 @@ struct ActiveBatchTransaction {
     file_checkpoint: u64,
     database_checkpoint: u64,
     stash_checkpoint: u64,
+    commit_checkpoint: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -396,6 +397,7 @@ impl<'a> CliSseStreamHost<'a> {
                     | "str_replace"
                     | "multi_edit"
                     | "rename_symbol"
+                    | "git_commit"
                     | "git_checkout_file"
                     | "git_stash"
                     | "notebook_edit"
@@ -465,7 +467,15 @@ impl<'a> CliSseStreamHost<'a> {
             .executor
             .git_stash_journal_checkpoint()
             .saturating_sub(active.stash_checkpoint);
-        if file_entries_added == 0 && database_entries_added == 0 && stash_entries_added == 0 {
+        let commit_entries_added = self
+            .executor
+            .git_commit_journal_checkpoint()
+            .saturating_sub(active.commit_checkpoint);
+        if file_entries_added == 0
+            && database_entries_added == 0
+            && stash_entries_added == 0
+            && commit_entries_added == 0
+        {
             return None;
         }
 
@@ -475,6 +485,7 @@ impl<'a> CliSseStreamHost<'a> {
             "file_after_sequence": active.file_checkpoint,
             "database_after_sequence": active.database_checkpoint,
             "stash_after_sequence": active.stash_checkpoint,
+            "commit_after_sequence": active.commit_checkpoint,
         }));
         Some(
             serde_json::from_str(&rollback_output).unwrap_or_else(|error| {
@@ -710,6 +721,7 @@ impl<'a> CliSseStreamHost<'a> {
                         file_checkpoint: self.executor.file_journal_checkpoint(),
                         database_checkpoint: self.executor.database_snapshot_journal_checkpoint(),
                         stash_checkpoint: self.executor.git_stash_journal_checkpoint(),
+                        commit_checkpoint: self.executor.git_commit_journal_checkpoint(),
                     });
                 }
             }
@@ -4327,6 +4339,88 @@ diff --git a/src/a.rs b/src/a.rs\n\
         );
         assert_eq!(
             rollback_fields["transaction_rollback"]["git_stashes"]["restored"]
+                .as_array()
+                .map(|entries| entries.len()),
+            Some(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn transactional_batch_reverts_git_commit_on_failure() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/tools/result"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .mount(&server)
+            .await;
+
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
+        let temp = init_temp_git_repo();
+        let tracked = temp.path().join("tracked.txt");
+        std::fs::write(&tracked, "committed in txn\n").expect("modify tracked file");
+        let mut executor = crate::edge_tools::ToolExecutor::new(temp.path());
+        let mut tool_cache = EdgeToolCache::new(8);
+        executor
+            .journal_turn_index
+            .store(8, std::sync::atomic::Ordering::Relaxed);
+
+        let mut host = CliSseStreamHost::from_edge_ctx(
+            EdgeSseContext {
+                api: &api,
+                token: "tok",
+                executor_id: "edge-test",
+                executor: &mut executor,
+                render_policy: RenderPolicy::Silent,
+                perm_manager: None,
+                cancel_token: None,
+                stream_event_tx: None,
+                approval_request_tx: None,
+                skill_resolver: None,
+                skill_continuation: false,
+                tool_cache: &mut tool_cache,
+            },
+            80,
+            false,
+        );
+
+        let results = host
+            .execute_tools_batch(vec![
+                ToolBatchRequest {
+                    request_id: "tr-1".to_string(),
+                    tool: "git_commit".to_string(),
+                    args: serde_json::json!({
+                        "message": "txn commit",
+                        "transaction_id": "tx-commit",
+                        "rollback_on_failure": true,
+                    }),
+                },
+                ToolBatchRequest {
+                    request_id: "tr-2".to_string(),
+                    tool: "read_file".to_string(),
+                    args: serde_json::json!({
+                        "path": "missing.txt",
+                        "transaction_id": "tx-commit",
+                        "rollback_on_failure": true,
+                    }),
+                },
+            ])
+            .await;
+
+        assert_eq!(results.len(), 2);
+        let rollback_fields = results[1]
+            .tool_result_fields
+            .as_ref()
+            .expect("rollback fields");
+        assert_eq!(
+            rollback_fields["transaction_state"].as_str(),
+            Some("rolled_back")
+        );
+        assert_eq!(
+            std::fs::read_to_string(&tracked).expect("restored tracked file"),
+            "committed\n"
+        );
+        assert_eq!(
+            rollback_fields["transaction_rollback"]["git_commits"]["reverted"]
                 .as_array()
                 .map(|entries| entries.len()),
             Some(1)

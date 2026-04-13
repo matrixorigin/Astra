@@ -148,6 +148,7 @@ fn bounded_batch_transaction_fields_are_discoverable() {
         "str_replace",
         "multi_edit",
         "rename_symbol",
+        "git_commit",
         "git_checkout_file",
         "git_stash",
         "notebook_edit",

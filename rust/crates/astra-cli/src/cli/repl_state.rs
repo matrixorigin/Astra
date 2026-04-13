@@ -75,6 +75,10 @@ pub(crate) struct ReplState {
     /// bounded repo-state rollback support across turns.
     pub git_stash_journal:
         std::sync::Arc<std::sync::Mutex<crate::edge_tools::GitStashRollbackJournal>>,
+    /// Session-scoped git commit rollback journal — shared with ToolExecutors for
+    /// bounded committed-history rollback support across turns.
+    pub git_commit_journal:
+        std::sync::Arc<std::sync::Mutex<crate::edge_tools::GitCommitRollbackJournal>>,
     /// Sticky task/thread summary used to anchor ultra-short follow-ups like
     /// "继续" even after history compaction prunes earlier turns.
     pub continuation_anchor: Option<String>,
@@ -297,6 +301,9 @@ impl Default for ReplState {
             )),
             git_stash_journal: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::edge_tools::GitStashRollbackJournal::default(),
+            )),
+            git_commit_journal: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::edge_tools::GitCommitRollbackJournal::default(),
             )),
             continuation_anchor: None,
             session_goal: None,
