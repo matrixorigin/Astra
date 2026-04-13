@@ -1026,7 +1026,7 @@ pub async fn partition_and_execute_skills(
             .unwrap_or_default()
             .to_string();
 
-        let args = extract_tool_args(&tc);
+        let args = extract_tool_args(tc);
 
         let result = match args {
             Some(args) => {

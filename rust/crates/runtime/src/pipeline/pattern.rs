@@ -768,6 +768,28 @@ impl PatternLibrary {
         }
     }
 
+    /// Overlay authoritative patterns into the library.
+    ///
+    /// Unlike [`Self::merge`], this replaces any existing entry for the same
+    /// signature/task pair regardless of observation counts. Use this when the
+    /// incoming patterns are the source of truth (for example a persisted
+    /// per-profile snapshot layered on top of bootstrap defaults).
+    pub fn overlay(&mut self, patterns: &[ToolChainPattern]) {
+        for pattern in patterns {
+            let key = pattern_key(&pattern.signature, pattern.task_type);
+            if !self.patterns.contains_key(&key) {
+                self.type_index
+                    .entry(pattern.task_type)
+                    .or_default()
+                    .push(key.clone());
+                if let Some(d) = pattern.domain {
+                    self.domain_index.entry(d).or_default().push(key.clone());
+                }
+            }
+            self.patterns.insert(key, pattern.clone());
+        }
+    }
+
     /// Compute tool co-occurrence scores: P(next_tool | just_used_tool).
     ///
     /// For each tool that appeared in successful patterns alongside `just_used`,

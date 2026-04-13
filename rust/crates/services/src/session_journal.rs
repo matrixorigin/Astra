@@ -2127,6 +2127,7 @@ impl JournalEvent {
 
     /// Adaptive scenario applied — emitted once per session when the adaptive
     /// profile selects a scenario and applies config adjustments.
+    #[allow(clippy::too_many_arguments)]
     pub fn adaptive_scenario_applied(
         session_id: Option<&str>,
         turn: u32,

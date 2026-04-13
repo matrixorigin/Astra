@@ -45,6 +45,7 @@ pub(crate) struct GitWorktreeRollbackJournal {
 }
 
 impl GitWorktreeRollbackJournal {
+    #[allow(clippy::too_many_arguments)]
     fn record(
         &mut self,
         worktree_path: PathBuf,

@@ -531,6 +531,25 @@ pub(super) struct BackgroundPlanContext {
     pub root_agent_id: String,
     pub durable_task_state: Option<durable_bridge::DurableTaskState>,
     pub workspace_root: PathBuf,
+    pub observability_hub:
+        Option<Arc<astra_runtime::observability_integration::ObservabilityHub>>,
+    pub observability_session: Option<
+        Arc<std::sync::RwLock<astra_runtime::observability_integration::ObservabilitySession>>,
+    >,
+    pub file_journal:
+        Arc<std::sync::Mutex<astra_runtime::turn::file_edit_journal::FileEditJournal>>,
+    pub database_snapshot_journal:
+        Arc<std::sync::Mutex<crate::edge_tools::DatabaseSnapshotRollbackJournal>>,
+    pub git_stash_journal:
+        Arc<std::sync::Mutex<crate::edge_tools::GitStashRollbackJournal>>,
+    pub git_commit_journal:
+        Arc<std::sync::Mutex<crate::edge_tools::GitCommitRollbackJournal>>,
+    pub git_worktree_journal:
+        Arc<std::sync::Mutex<crate::edge_tools::GitWorktreeRollbackJournal>>,
+    pub session_state_journal:
+        Arc<std::sync::Mutex<crate::edge_tools::SessionStateRollbackJournal>>,
+    pub task_manager: Arc<crate::edge_tools::TaskManager>,
+    pub evolution_service: Option<Arc<astra_runtime::evolution::service::EvolutionService>>,
 
     // ─── Cloud + Learning Integration ────────────────────────────────────
     pub ingestion_user_id: Option<String>,
@@ -1017,17 +1036,17 @@ async fn plan_executor_task(
                     agent_spawner: ctx.agent_spawner.clone(),
                     root_agent_id: Some(ctx.root_agent_id.as_str()),
                     root_mailbox_slot: Some(&mut ctx.root_mailbox),
-                    observability_hub: None,
-                    observability_session: None,
-                    file_journal: None,
-                    database_snapshot_journal: None,
-                    git_stash_journal: None,
-                    git_commit_journal: None,
-                    git_worktree_journal: None,
-                    session_state_journal: None,
-                    task_manager: None,
-                    turn_index: 0,
-                    evolution_service: None,
+                    observability_hub: ctx.observability_hub.clone(),
+                    observability_session: ctx.observability_session.clone(),
+                    file_journal: Some(ctx.file_journal.clone()),
+                    database_snapshot_journal: Some(ctx.database_snapshot_journal.clone()),
+                    git_stash_journal: Some(ctx.git_stash_journal.clone()),
+                    git_commit_journal: Some(ctx.git_commit_journal.clone()),
+                    git_worktree_journal: Some(ctx.git_worktree_journal.clone()),
+                    session_state_journal: Some(ctx.session_state_journal.clone()),
+                    task_manager: Some(ctx.task_manager.clone()),
+                    turn_index: ctx.turn,
+                    evolution_service: ctx.evolution_service.clone(),
                 })
                 .await;
 
@@ -1357,6 +1376,28 @@ mod tests {
             root_agent_id: "plan-test".into(),
             durable_task_state: None,
             workspace_root: std::env::temp_dir(),
+            observability_hub: None,
+            observability_session: None,
+            file_journal: Arc::new(std::sync::Mutex::new(
+                astra_runtime::turn::file_edit_journal::FileEditJournal::default(),
+            )),
+            database_snapshot_journal: Arc::new(std::sync::Mutex::new(
+                crate::edge_tools::DatabaseSnapshotRollbackJournal::default(),
+            )),
+            git_stash_journal: Arc::new(std::sync::Mutex::new(
+                crate::edge_tools::GitStashRollbackJournal::default(),
+            )),
+            git_commit_journal: Arc::new(std::sync::Mutex::new(
+                crate::edge_tools::GitCommitRollbackJournal::default(),
+            )),
+            git_worktree_journal: Arc::new(std::sync::Mutex::new(
+                crate::edge_tools::GitWorktreeRollbackJournal::default(),
+            )),
+            session_state_journal: Arc::new(std::sync::Mutex::new(
+                crate::edge_tools::SessionStateRollbackJournal::default(),
+            )),
+            task_manager: Arc::new(crate::edge_tools::TaskManager::new()),
+            evolution_service: None,
             ingestion_user_id: None,
             matrix_runtime: None,
             entity_graph,

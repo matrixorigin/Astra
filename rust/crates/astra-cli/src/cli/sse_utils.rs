@@ -52,7 +52,7 @@ pub async fn collect_sse_text(resp: reqwest::Response, stream_to_stderr: bool) -
         let Ok(bytes) = chunk else {
             result.stream_error = Some(format!(
                 "SSE stream read failed: {}",
-                chunk.err().expect("error branch checked above")
+                chunk.expect_err("error branch checked above")
             ));
             break;
         };
@@ -166,7 +166,7 @@ pub async fn stream_sse_markdown(resp: reqwest::Response) -> SseTextResult {
         let Ok(bytes) = chunk else {
             result.stream_error = Some(format!(
                 "SSE stream read failed: {}",
-                chunk.err().expect("error branch checked above")
+                chunk.expect_err("error branch checked above")
             ));
             break;
         };
@@ -290,7 +290,7 @@ pub async fn collect_sse_with_preview(resp: reqwest::Response) -> SseTextResult 
         let Ok(bytes) = chunk else {
             result.stream_error = Some(format!(
                 "SSE stream read failed: {}",
-                chunk.err().expect("error branch checked above")
+                chunk.expect_err("error branch checked above")
             ));
             break;
         };

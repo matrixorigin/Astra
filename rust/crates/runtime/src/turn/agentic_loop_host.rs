@@ -1328,7 +1328,7 @@ fn select_default_coordination_pattern(
     adaptive_context: Option<&DelegationAdaptiveContext>,
 ) -> Result<(astra_services::coordination::CoordinationPattern, Value), String> {
     let agents = parse_delegate_agents(args);
-    let scenario = adaptive_context.and_then(|ctx| ctx.scenario.clone());
+    let scenario = adaptive_context.and_then(|ctx| ctx.scenario);
     let preferred = adaptive_context.and_then(|ctx| ctx.preferred_pattern.as_deref());
     let task_requests_review = task_needs_review(task);
 
@@ -2527,8 +2527,8 @@ fn maybe_run_tuning_cycle(state: &mut AgenticLoopState) {
     let new_budget = session_guard.config.token_budget.max_turn_input_tokens;
     let old_budget_before_tuning = {
         // Compare against what it was before this cycle
-        let prev = state.max_turn_input_tokens as u32;
-        prev
+        
+        state.max_turn_input_tokens as u32
     };
     if new_budget != old_budget_before_tuning {
         let direction: i8 = if new_budget > old_budget_before_tuning {
@@ -3595,7 +3595,7 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
             adapter.reset_turn();
         }
         if let Some(ref mut collector) = state.step_signal_collector {
-            let budget = state.max_turn_input_tokens as u64;
+            let budget = state.max_turn_input_tokens;
             collector.reset(budget);
         }
 

@@ -1616,6 +1616,7 @@ fn latest_scenario(events: &[JournalEvent]) -> Option<Scenario> {
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_persistent_reflection_context(
     artifacts: &SessionArtifacts,
     signal_limit: usize,
@@ -1761,7 +1762,7 @@ fn focused_recent_event_previews(
             JournalEventType::AdaptiveExperimentEnrolled,
         ],
     };
-    recent_event_previews(events, journal_limit.min(12).max(1), event_types)
+    recent_event_previews(events, journal_limit.clamp(1, 12), event_types)
 }
 
 fn reflection_token_utilisation(artifacts: &SessionArtifacts) -> f64 {

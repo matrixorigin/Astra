@@ -42,6 +42,12 @@ pub struct SignalCollector {
     seen_keys: HashSet<u64>,
 }
 
+impl Default for SignalCollector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SignalCollector {
     pub fn new() -> Self {
         Self {

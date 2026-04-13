@@ -1966,8 +1966,6 @@ where
                 } else if is_turn_complete_frame(&buffer) {
                     yield Ok(emit_frame!(&buffer));
                     received_turn_complete = true;
-                } else if is_warning_frame(&buffer) || is_explain_frame(&buffer) {
-                    yield Ok(emit_frame!(&buffer));
                 } else {
                     yield Ok(emit_frame!(&buffer));
                 }

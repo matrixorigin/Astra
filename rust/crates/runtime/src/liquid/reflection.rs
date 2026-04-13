@@ -945,6 +945,12 @@ pub struct ReflectionEngine {
     system_prompt: String,
 }
 
+impl Default for ReflectionEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ReflectionEngine {
     pub fn new() -> Self {
         Self {

@@ -361,6 +361,7 @@ impl<'a> CliSseStreamHost<'a> {
             .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn finish_edge_tool_with_fields(
         &mut self,
         request_id: &str,
@@ -396,6 +397,7 @@ impl<'a> CliSseStreamHost<'a> {
 }
 
 impl<'a> CliSseStreamHost<'a> {
+    #[allow(clippy::too_many_arguments)]
     fn rollback_from_checkpoints(
         &self,
         turn_index: u32,

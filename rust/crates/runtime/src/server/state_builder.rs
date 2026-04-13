@@ -324,10 +324,11 @@ impl PipelineLearningStack {
 /// Creates pipeline modules (EntityGraph, PatternLibrary, ProgressiveCalibrator)
 /// and wires them into a PipelineLearningWriter for turn-outcome-driven learning.
 ///
-/// When `profile` is provided, loads cross-session learning state from
-/// `~/.astra/learning/<profile>.json` before merging defaults. This lets
-/// PatternDrift detect regressions from the very first turn instead of
-/// requiring a cold-start re-learning period.
+/// Bootstrap defaults are layered first so common patterns/entities exist on a
+/// cold start. When `profile` is provided, persisted per-profile state from
+/// `~/.astra/learning/<profile>.json` is then overlaid on top so user-learned
+/// patterns (including recent block/deprioritize signals) are not erased by the
+/// bootstrap priors.
 pub(super) fn build_pipeline_learning_stack(profile: Option<&str>) -> PipelineLearningStack {
     use crate::pipeline::{
         calibration::ProgressiveCalibrator,
@@ -342,17 +343,7 @@ pub(super) fn build_pipeline_learning_stack(profile: Option<&str>) -> PipelineLe
     // Use 0.70 as initial threshold — requires some confidence before auto-routing
     let calibrator = Arc::new(Mutex::new(ProgressiveCalibrator::new(0.70)));
 
-    // Merge cross-session persisted state first (if a profile is provided).
-    if let Some(p) = profile {
-        crate::pipeline::persistence::load_learning_state(
-            p,
-            &entity_graph,
-            &pattern_library,
-            &calibrator,
-        );
-    }
-
-    // Layer defaults on top so built-in patterns/entities are always present.
+    // Layer bootstrap defaults first so built-in patterns/entities are always present.
     if let Ok(mut eg) = entity_graph.lock() {
         eg.merge(&default_entities());
     }
@@ -361,6 +352,24 @@ pub(super) fn build_pipeline_learning_stack(profile: Option<&str>) -> PipelineLe
     }
     if let Ok(mut cal) = calibrator.lock() {
         cal.merge(&default_calibration());
+    }
+
+    // Overlay cross-session persisted state after bootstrap so user-learned
+    // patterns win over defaults even when the defaults carry larger priors.
+    if let Some(p) = profile
+        && let Some(snapshot) = crate::pipeline::persistence::load_snapshot(p)
+    {
+        if let Ok(mut eg) = entity_graph.lock() {
+            eg.merge(&snapshot.entities);
+        }
+        if let Ok(mut pl) = pattern_library.lock() {
+            pl.overlay(&snapshot.patterns);
+        }
+        if let Some(calibration) = snapshot.calibration.as_ref()
+            && let Ok(mut cal) = calibrator.lock()
+        {
+            cal.merge(calibration);
+        }
     }
 
     let writer = Arc::new(
@@ -381,6 +390,9 @@ pub(super) fn build_pipeline_learning_stack(profile: Option<&str>) -> PipelineLe
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::evolution::types::PatternAction;
+    use crate::pipeline::defaults::default_patterns;
+    use crate::pipeline::routing::{DomainHint, TaskType};
     use crate::turn::contracts::TurnLearningOutcome;
 
     #[tokio::test]
@@ -436,5 +448,22 @@ mod tests {
         assert_eq!(Arc::strong_count(&s.entity_graph), 2);
         assert_eq!(Arc::strong_count(&s.pattern_library), 2);
         assert_eq!(Arc::strong_count(&s.calibrator), 2);
+    }
+
+    #[test]
+    fn persisted_patterns_overlay_defaults_without_losing_blocked_state() {
+        let tools = vec!["grep".to_string()];
+        let mut persisted = crate::pipeline::pattern::PatternLibrary::new();
+        persisted.record_outcome(&tools, TaskType::Code, Some(DomainHint::Code), true, 0.8, None);
+        persisted.apply_evolution_action("grep", PatternAction::Block);
+
+        let mut layered = crate::pipeline::pattern::PatternLibrary::new();
+        layered.merge(&default_patterns());
+        layered.overlay(&persisted.export());
+
+        assert!(
+            layered.blocked_tool_names().iter().any(|name| name == "grep"),
+            "persisted blocked tools should survive bootstrap default layering"
+        );
     }
 }

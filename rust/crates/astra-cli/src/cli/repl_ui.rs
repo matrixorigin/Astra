@@ -1418,7 +1418,7 @@ pub(super) fn print_slash_commands(query: Option<&str>) {
         }
         if !subcmd_lines.is_empty() {
             any_results = true;
-            eprintln!("  {} {}", "🔍", "Matching Subcommands".bold().cyan());
+            eprintln!("  🔍 {}", "Matching Subcommands".bold().cyan());
             for line in subcmd_lines.iter().take(10) {
                 eprintln!("{line}");
             }

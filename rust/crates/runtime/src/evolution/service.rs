@@ -66,6 +66,12 @@ impl ProposalRoutingOutcome {
     }
 }
 
+impl Default for EvolutionService {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl EvolutionService {
     pub fn new() -> Self {
         Self {

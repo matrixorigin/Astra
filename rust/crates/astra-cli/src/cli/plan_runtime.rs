@@ -70,6 +70,16 @@ fn take_plan_context(
         root_agent_id: format!("plan-{}", uuid::Uuid::new_v4()),
         durable_task_state: state.durable_task_state.take(),
         workspace_root: std::env::current_dir().unwrap_or_default(),
+        observability_hub: state.observability_hub.clone(),
+        observability_session: state.observability_session.clone(),
+        file_journal: state.file_journal.clone(),
+        database_snapshot_journal: state.database_snapshot_journal.clone(),
+        git_stash_journal: state.git_stash_journal.clone(),
+        git_commit_journal: state.git_commit_journal.clone(),
+        git_worktree_journal: state.git_worktree_journal.clone(),
+        session_state_journal: state.session_state_journal.clone(),
+        task_manager: state.task_manager.clone(),
+        evolution_service: state.evolution_service.clone(),
         ingestion_user_id: state.ingestion_user_id.clone(),
         matrix_runtime: state.matrix_runtime.clone(),
         entity_graph: state.entity_graph.clone(),
@@ -229,7 +239,70 @@ async fn ensure_durable_task_state(
                 ),
                 std::sync::Arc::new(astra_runtime::server::delegation_engine::StubSubRunExecutor),
             );
-            state.delegation_engine = Some(std::sync::Arc::new(engine));
+        state.delegation_engine = Some(std::sync::Arc::new(engine));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use astra_services::task_orchestrator::TaskPlan;
+
+    #[test]
+    fn take_plan_context_preserves_nested_turn_runtime_context() {
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap();
+        let mut state = ReplState::default();
+        state.executing_plan = Some(TaskPlan::default());
+        state.session_id = Some("sess-plan".to_string());
+        state.turn = 7;
+
+        let hub = std::sync::Arc::new(astra_runtime::observability_integration::ObservabilityHub::new());
+        let session = hub.start_session("user-1", "sess-plan");
+        let evolution =
+            std::sync::Arc::new(astra_runtime::evolution::service::EvolutionService::new());
+        state.observability_hub = Some(hub.clone());
+        state.observability_session = Some(session.clone());
+        state.evolution_service = Some(evolution.clone());
+
+        let file_journal = state.file_journal.clone();
+        let database_snapshot_journal = state.database_snapshot_journal.clone();
+        let git_stash_journal = state.git_stash_journal.clone();
+        let git_commit_journal = state.git_commit_journal.clone();
+        let git_worktree_journal = state.git_worktree_journal.clone();
+        let session_state_journal = state.session_state_journal.clone();
+        let task_manager = state.task_manager.clone();
+
+        let ctx = take_plan_context(&mut state, &api, Some("token"), None).unwrap();
+
+        assert_eq!(ctx.turn, 7);
+        assert!(std::sync::Arc::ptr_eq(
+            ctx.observability_hub.as_ref().unwrap(),
+            &hub
+        ));
+        assert!(std::sync::Arc::ptr_eq(
+            ctx.observability_session.as_ref().unwrap(),
+            &session
+        ));
+        assert!(std::sync::Arc::ptr_eq(&ctx.file_journal, &file_journal));
+        assert!(std::sync::Arc::ptr_eq(
+            &ctx.database_snapshot_journal,
+            &database_snapshot_journal
+        ));
+        assert!(std::sync::Arc::ptr_eq(&ctx.git_stash_journal, &git_stash_journal));
+        assert!(std::sync::Arc::ptr_eq(&ctx.git_commit_journal, &git_commit_journal));
+        assert!(std::sync::Arc::ptr_eq(
+            &ctx.git_worktree_journal,
+            &git_worktree_journal
+        ));
+        assert!(std::sync::Arc::ptr_eq(
+            &ctx.session_state_journal,
+            &session_state_journal
+        ));
+        assert!(std::sync::Arc::ptr_eq(&ctx.task_manager, &task_manager));
+        assert!(std::sync::Arc::ptr_eq(
+            ctx.evolution_service.as_ref().unwrap(),
+            &evolution
+        ));
     }
 }

@@ -1063,11 +1063,7 @@ fn show_compression_trace(
         ratio_str.green()
     };
     eprintln!("  {:<22} {}", "compression_ratio:".dim(), ratio);
-    let saved = if h.tokens_before > h.tokens_after {
-        h.tokens_before - h.tokens_after
-    } else {
-        0
-    };
+    let saved = h.tokens_before.saturating_sub(h.tokens_after);
     eprintln!(
         "  {:<22} {} → {} ({} saved)",
         "tokens:".dim(),
@@ -1115,11 +1111,7 @@ fn show_compression_trace(
         );
         eprintln!("    {}", "─".repeat(72).dim());
         for t in &h.turns_compressed {
-            let saved = if t.original_tokens > t.compressed_tokens {
-                t.original_tokens - t.compressed_tokens
-            } else {
-                0
-            };
+            let saved = t.original_tokens.saturating_sub(t.compressed_tokens);
             let method = format_compression_method(&t.compression_method);
             let info_lost = if t.information_lost.is_empty() {
                 "—".to_string()
@@ -1691,10 +1683,11 @@ fn show_session_analysis(
         eprintln!();
         eprintln!("  {}", "▸ Component Proportion Shift".bold());
 
-        let component_extractors: Vec<(
-            &str,
+        type ComponentExtractor = (
+            &'static str,
             Box<dyn Fn(&astra_runtime::turn::context_assembly_trace::ContextAssemblyTrace) -> f64>,
-        )> = vec![
+        );
+        let component_extractors: Vec<ComponentExtractor> = vec![
             (
                 "system_prompt",
                 Box::new(

@@ -747,7 +747,7 @@ impl ExperimentStore {
     pub fn enable_experiment(&self, experiment_id: &str) -> bool {
         let mut experiments = self.experiments.write_or_recover();
         if let Some(exp) = experiments.get_mut(experiment_id) {
-            let old_status = exp.status.clone();
+            let old_status = exp.status;
             exp.start();
             exp.status != old_status
         } else {
@@ -761,7 +761,7 @@ impl ExperimentStore {
     pub fn disable_experiment(&self, experiment_id: &str) -> bool {
         let mut experiments = self.experiments.write_or_recover();
         if let Some(exp) = experiments.get_mut(experiment_id) {
-            let old_status = exp.status.clone();
+            let old_status = exp.status;
             exp.pause();
             exp.status != old_status
         } else {
@@ -775,7 +775,7 @@ impl ExperimentStore {
     pub fn stop_experiment(&self, experiment_id: &str) -> bool {
         let mut experiments = self.experiments.write_or_recover();
         if let Some(exp) = experiments.get_mut(experiment_id) {
-            let old_status = exp.status.clone();
+            let old_status = exp.status;
             exp.stop();
             exp.status != old_status
         } else {
@@ -789,7 +789,7 @@ impl ExperimentStore {
     pub fn cancel_experiment(&self, experiment_id: &str) -> bool {
         let mut experiments = self.experiments.write_or_recover();
         if let Some(exp) = experiments.get_mut(experiment_id) {
-            let old_status = exp.status.clone();
+            let old_status = exp.status;
             exp.cancel();
             exp.status != old_status
         } else {
@@ -1031,7 +1031,7 @@ impl ExperimentAnalyzer {
         let std_dev = variance.sqrt();
 
         // Safety: n > 0 guaranteed by the early return above.
-        let median = if n % 2 == 0 {
+        let median = if n.is_multiple_of(2) {
             (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0
         } else {
             sorted[n / 2]

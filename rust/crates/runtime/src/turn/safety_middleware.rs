@@ -715,8 +715,8 @@ fn tool_output_line_matches_prompt_injection(line: &str) -> bool {
     let lower = trimmed.to_ascii_lowercase();
 
     // Check `system:` prefix + injection payload combo.
-    if lower.starts_with("system:") {
-        let after = lower["system:".len()..].trim_start();
+    if let Some(after) = lower.strip_prefix("system:") {
+        let after = after.trim_start();
         if line_matches_any_injection_pattern(after) && !all_matches_inside_quotes(&lower) {
             return true;
         }

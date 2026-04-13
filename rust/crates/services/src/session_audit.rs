@@ -2266,7 +2266,7 @@ fn apply_cross_session_mutation_filters(
 fn sort_cross_session_mutations(mutations: &mut [StagedMutation], sort: &str) {
     match sort {
         "updated" => {
-            mutations.sort_by(|left, right| mutation_updated_cmp(left, right));
+            mutations.sort_by(mutation_updated_cmp);
         }
         "retention" => {
             mutations.sort_by(|left, right| {

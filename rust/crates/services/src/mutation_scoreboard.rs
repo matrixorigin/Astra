@@ -468,6 +468,7 @@ pub struct StagedMutation {
 }
 
 impl StagedMutation {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         mutation_id: impl Into<String>,
         session_id: impl Into<String>,
@@ -493,6 +494,7 @@ impl StagedMutation {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn new_with_pre_state_snapshot_database(
         mutation_id: impl Into<String>,
         session_id: impl Into<String>,
@@ -550,6 +552,7 @@ impl StagedMutation {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_mutation_promotion_verdict(
     retention_score: ConfidenceInterval,
     verifier: Option<&MutationVerifierSummary>,

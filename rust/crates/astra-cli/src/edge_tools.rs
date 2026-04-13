@@ -1489,7 +1489,7 @@ impl ToolExecutor {
                 "runtime": "Rust edge CLI",
             })
             .to_string(),
-            "all" | _ => {
+            _ => {
                 if let Some(ref model) = self_model {
                     model.to_detailed_text()
                 } else {

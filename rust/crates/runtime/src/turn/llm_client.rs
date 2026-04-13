@@ -377,7 +377,7 @@ pub(crate) async fn call_llm_and_collect(
                         fb_timeout.as_secs()
                     );
                     return call_llm_nonstream_fallback(
-                        &client,
+                        client,
                         messages,
                         tools,
                         model_name,

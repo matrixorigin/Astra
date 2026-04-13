@@ -1736,9 +1736,7 @@ pub(super) fn steer_observability_goal(
     state: &mut ReplState,
     goal: &str,
 ) -> Option<GoalSteeringChange> {
-    let Some(obs) = state.observability_session.as_ref() else {
-        return None;
-    };
+    let obs = state.observability_session.as_ref()?;
     let mut guard = obs.write().unwrap_or_else(|error| error.into_inner());
     let previous_goal = guard
         .goal_tracker

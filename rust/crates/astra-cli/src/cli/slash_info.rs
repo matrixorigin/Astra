@@ -1260,8 +1260,8 @@ pub(super) async fn handle_info_command(
                 agent_spawner: state.agent_spawner.clone(),
                 root_agent_id: Some("main"),
                 root_mailbox_slot: Some(&mut state.root_mailbox),
-                observability_hub: None,
-                observability_session: None,
+                observability_hub: state.observability_hub.clone(),
+                observability_session: state.observability_session.clone(),
                 file_journal: None,
                 database_snapshot_journal: None,
                 git_stash_journal: None,
@@ -2032,7 +2032,7 @@ fn print_context_breakdown(
                 let preview: String = mem.content_preview.chars().take(30).collect();
                 eprintln!(
                     "    {:<14} {:>5}  {}",
-                    format!("└ memory").dim(),
+                    "└ memory".to_string().dim(),
                     mem.tokens.to_string().dim(),
                     preview.dim()
                 );

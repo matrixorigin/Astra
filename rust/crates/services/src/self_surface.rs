@@ -27,6 +27,7 @@ pub enum SelfSurfaceDimension {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "surface", content = "body", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)]
 pub enum SelfSurfaceResponse {
     Snapshot(PersistentSelfSnapshot),
     Profile(ProfileSurface),

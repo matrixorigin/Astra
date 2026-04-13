@@ -501,9 +501,8 @@ fn handle_session_list(sub_arg: &str, state: &ReplState) {
     // Summary
     if total > showing {
         eprintln!(
-            "  {} {} (showing {}; use --all for more)",
+            "  {} sessions match (showing {}; use --all for more)",
             total.to_string().dim(),
-            "sessions match",
             showing
         );
     } else {
@@ -540,7 +539,7 @@ fn handle_session_switch(sub_arg: &str, state: &mut ReplState) {
 
     // Parse number
     let num: usize = match arg.parse() {
-        Ok(n) if n >= 1 && n <= 9 => n,
+        Ok(n) if (1..=9).contains(&n) => n,
         _ => {
             eprintln!("{}", format!("  Invalid number: {arg} (use 1-9)").red());
             return;

@@ -175,8 +175,8 @@ pub enum CompositeSnapshotError {
     },
     MergeConflict {
         dimension: SnapshotDimension,
-        left: SnapshotRef,
-        right: SnapshotRef,
+        left: Box<SnapshotRef>,
+        right: Box<SnapshotRef>,
     },
 }
 
@@ -412,8 +412,8 @@ impl StateDiff for CompositeSnapshot {
                 (Some(left), Some(right)) if left != right => {
                     return Err(CompositeSnapshotError::MergeConflict {
                         dimension,
-                        left,
-                        right,
+                        left: Box::new(left),
+                        right: Box::new(right),
                     });
                 }
                 (Some(reference), _) | (_, Some(reference)) => refs.push(reference),

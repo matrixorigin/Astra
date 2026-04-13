@@ -1708,7 +1708,7 @@ Follow these steps:
                 agent_spawner: state.agent_spawner.clone(),
                 root_agent_id: Some("main"),
                 root_mailbox_slot: Some(&mut state.root_mailbox),
-                observability_hub: None,
+                observability_hub: state.observability_hub.clone(),
                 observability_session: state.observability_session.clone(),
                 file_journal: Some(state.file_journal.clone()),
                 database_snapshot_journal: Some(state.database_snapshot_journal.clone()),

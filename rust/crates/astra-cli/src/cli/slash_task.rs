@@ -233,6 +233,9 @@ pub(super) async fn handle_task_command(
             let bg_messaging_metrics = state.messaging_metrics.clone();
             let bg_agent_spawner = state.agent_spawner.clone();
             let bg_delegation_engine = state.delegation_engine.clone();
+            let bg_observability_hub = state.observability_hub.clone();
+            let bg_observability_session = state.observability_session.clone();
+            let bg_evolution_service = state.evolution_service.clone();
             let svc_clone = svc.clone();
             let workspace_root = std::env::current_dir().unwrap_or_default();
             let bg_root_agent_id = format!("task-{task_id}");
@@ -299,8 +302,8 @@ pub(super) async fn handle_task_command(
                     agent_spawner: bg_agent_spawner.clone(),
                     root_agent_id: Some(bg_root_agent_id.as_str()),
                     root_mailbox_slot: None,
-                    observability_hub: None,
-                    observability_session: None,
+                    observability_hub: bg_observability_hub.clone(),
+                    observability_session: bg_observability_session.clone(),
                     file_journal: None,
                     database_snapshot_journal: None,
                     git_stash_journal: None,
@@ -309,7 +312,7 @@ pub(super) async fn handle_task_command(
                     session_state_journal: None,
                     task_manager: None,
                     turn_index: 0,
-                    evolution_service: None,
+                    evolution_service: bg_evolution_service.clone(),
                 })
                 .await;
 
