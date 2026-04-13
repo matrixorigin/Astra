@@ -1,0 +1,184 @@
+use std::time::Duration;
+
+use super::super::agentic_headless_round::HeadlessStderrStyle;
+use super::super::headless_tool_assembly::{
+    CACHEABLE_TOOLS, openai_tool_roundtrip_values_with_result_fields,
+};
+use super::super::headless_tool_body_preview::emit_headless_tool_body_preview;
+use super::super::headless_tool_journal::journal_record_executed_tool_call;
+use super::super::headless_tool_postprocess::{
+    HeadlessCacheableRecordCtx, format_headless_tool_duration,
+    record_headless_cacheable_success_and_semantic_hint, try_write_light_headless_step_checkpoint,
+};
+use super::super::headless_tool_status_display::{tool_call_detail, tool_result_summary};
+use super::super::headless_tool_stderr_lines::{
+    headless_stderr_error_preview_line, headless_stderr_tool_error_detail_line,
+    headless_stderr_tool_error_line, headless_stderr_tool_ok_line,
+};
+use super::*;
+use crate::turn::edge_prompt_context::make_args_preview;
+use crate::turn::tool_result_sanitize::tool_result_content_for_model;
+
+fn emit_tool_display_feedback(
+    quiet: bool,
+    term: &mut dyn HeadlessRoundTerminal,
+    name: &str,
+    args: &Value,
+    result_str: &str,
+    is_err: bool,
+    is_edge_tool: bool,
+    executed_ms: u64,
+) {
+    if !quiet && !is_edge_tool {
+        let duration_str = format_headless_tool_duration(Duration::from_millis(executed_ms));
+        let detail = tool_call_detail(name, args);
+        let summary = if !is_err {
+            tool_result_summary(name, result_str)
+        } else {
+            None
+        };
+        if is_err {
+            term.emit_line(
+                HeadlessStderrStyle::Red,
+                headless_stderr_tool_error_line(name, &duration_str, detail.as_deref()),
+            );
+            if let Some(first_line) = result_str.lines().next() {
+                let preview = headless_stderr_error_preview_line(first_line, 100);
+                term.emit_line(
+                    HeadlessStderrStyle::Dim,
+                    headless_stderr_tool_error_detail_line(&preview),
+                );
+            }
+        } else {
+            term.emit_line(
+                HeadlessStderrStyle::Green,
+                headless_stderr_tool_ok_line(
+                    name,
+                    &duration_str,
+                    detail.as_deref(),
+                    summary.as_deref(),
+                ),
+            );
+        }
+    }
+
+    if !is_edge_tool {
+        emit_headless_tool_body_preview(term, quiet, name, result_str, is_err);
+    }
+}
+
+fn maybe_persist_model_tool_result(
+    current_session_id: Option<&String>,
+    id: &str,
+    name: &str,
+    model_result_str: String,
+) -> String {
+    if let Some(sid) = current_session_id {
+        let session_dir = astra_services::session_journal::local_sessions_dir().join(sid);
+        match super::super::tool_result_storage::maybe_persist_tool_result(
+            &session_dir,
+            id,
+            name,
+            &model_result_str,
+        ) {
+            Some(replacement) => replacement,
+            None => model_result_str,
+        }
+    } else {
+        model_result_str
+    }
+}
+
+impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
+    pub(super) async fn record_execution(&mut self, executed: ExecutedExecution) {
+        let ExecutedExecution {
+            mut execution,
+            idem_key,
+            is_err,
+            executed_ms,
+        } = executed;
+        let args_size = serde_json::to_string(&execution.args)
+            .map(|s| s.len() as u32)
+            .unwrap_or(0);
+        let args_preview = make_args_preview(&execution.name, &execution.args);
+        self.ctx
+            .tool_call_records
+            .push(journal_record_executed_tool_call(
+                execution.name.clone(),
+                is_err,
+                executed_ms,
+                args_size,
+                execution.result_str.as_str(),
+                args_preview,
+            ));
+        self.ctx.step_recorder.complete_tool_with_result(
+            &execution.name,
+            is_err,
+            executed_ms,
+            false,
+            &execution.result_str,
+        );
+        self.executed_this_turn += 1;
+
+        if let Some(sid) = self.ctx.current_session_id {
+            try_write_light_headless_step_checkpoint(sid, self.ctx.step_recorder);
+        }
+
+        if !is_err && CACHEABLE_TOOLS.contains(&execution.name.as_str()) {
+            record_headless_cacheable_success_and_semantic_hint(
+                &execution.name,
+                &execution.args,
+                &idem_key,
+                HeadlessCacheableRecordCtx {
+                    result_str: &mut execution.result_str,
+                    turn_index: self.ctx.turn_index,
+                    idempotency_cache: self.ctx.idempotency_cache,
+                    step_recorder: self.ctx.step_recorder,
+                    semantic_dedup: self.ctx.semantic_dedup,
+                },
+            );
+        }
+
+        emit_tool_display_feedback(
+            self.ctx.quiet,
+            self.ctx.term,
+            &execution.name,
+            &execution.args,
+            &execution.result_str,
+            is_err,
+            execution.is_edge_tool,
+            executed_ms,
+        );
+
+        if !self.ctx.tool_event_hooks.is_empty() && !is_err {
+            if let Some(modified) = crate::skills::hooks::evaluate_post_tool_hooks(
+                self.ctx.tool_event_hooks,
+                &execution.name,
+                &execution.args,
+                &execution.result_str,
+            )
+            .await
+            {
+                execution.result_str = modified;
+            }
+        }
+
+        let model_result_str =
+            tool_result_content_for_model(&execution.name, &execution.result_str);
+        let model_result_str = maybe_persist_model_tool_result(
+            self.ctx.current_session_id,
+            &execution.id,
+            &execution.name,
+            model_result_str,
+        );
+
+        let (tool_msg, tr) = openai_tool_roundtrip_values_with_result_fields(
+            &execution.id,
+            &execution.name,
+            &model_result_str,
+            execution.tool_result_fields.as_ref(),
+        );
+        self.ctx.messages.push(tool_msg);
+        self.ctx.tool_results.push(tr);
+    }
+}
