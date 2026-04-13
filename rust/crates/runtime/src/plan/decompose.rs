@@ -1347,6 +1347,7 @@ Output the FULL plan as JSON (including existing completed subtasks unchanged) w
 Rules:
 - New subtasks get status "pending" (or omit status field).
 - Do NOT reset completed subtasks to pending unless the user explicitly asks to redo them.
+- If the user is asking a question (not requesting changes), respond naturally without JSON.
 - Keep the JSON valid and concise."#,
             );
         } else {
