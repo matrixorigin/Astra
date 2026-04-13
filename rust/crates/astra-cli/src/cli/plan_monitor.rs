@@ -326,9 +326,10 @@ fn display_plan_updates_live(
                     durable_bridge::display_delivery_report(report);
                 }
                 if state.plan_mode.is_some() {
+                    eprintln!();
                     eprintln!(
                         "{}",
-                        "  Still in plan mode — type exit when you want normal chat.".dim()
+                        "  ✓ Plan completed! Type exit for normal chat, or describe next goal.".dim()
                     );
                 }
                 return PlanMonitorOutcome::Finished;
@@ -357,9 +358,27 @@ fn display_plan_updates_live(
                     msg,
                 );
                 if state.plan_mode.is_some() {
+                    eprintln!();
+                    eprintln!("{}  {}", "📋".cyan(), "Recovery options:".bold());
                     eprintln!(
                         "{}",
-                        "  Still in plan mode — type exit to leave or resume after fixing.".dim()
+                        "    resume      — retry from where it stopped".dim()
+                    );
+                    eprintln!(
+                        "{}",
+                        "    rewind N    — reset subtask N and try again".dim()
+                    );
+                    eprintln!(
+                        "{}",
+                        "    correct ... — add guidance before resuming".dim()
+                    );
+                    eprintln!(
+                        "{}",
+                        "    show        — display current plan state".dim()
+                    );
+                    eprintln!(
+                        "{}",
+                        "    exit        — leave plan mode".dim()
                     );
                 }
                 return PlanMonitorOutcome::Finished;
