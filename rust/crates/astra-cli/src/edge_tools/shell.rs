@@ -799,6 +799,147 @@ fn process_substitution_commands(command: &str) -> Vec<&str> {
     commands
 }
 
+fn check_redirection_path_boundary(
+    policy: &astra_runtime::tool_sandbox::SandboxPolicy,
+    command: &str,
+    oldpwd: Option<&std::path::Path>,
+) -> Option<String> {
+    let chars: Vec<(usize, char)> = command.char_indices().collect();
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut escaped = false;
+    let mut idx = 0usize;
+
+    while idx < chars.len() {
+        let (_, ch) = chars[idx];
+
+        if escaped {
+            escaped = false;
+            idx += 1;
+            continue;
+        }
+
+        if ch == '\\' && !in_single_quote {
+            escaped = true;
+            idx += 1;
+            continue;
+        }
+
+        if ch == '\'' && !in_double_quote {
+            in_single_quote = !in_single_quote;
+            idx += 1;
+            continue;
+        }
+
+        if ch == '"' && !in_single_quote {
+            in_double_quote = !in_double_quote;
+            idx += 1;
+            continue;
+        }
+
+        if !in_single_quote && !in_double_quote && matches!(ch, '<' | '>') {
+            if chars.get(idx + 1).is_some_and(|(_, next)| *next == '(') {
+                idx += 1;
+                continue;
+            }
+
+            let (next_idx, consumes_path) = redirection_operator_details(&chars, idx);
+            idx = next_idx;
+            if !consumes_path {
+                continue;
+            }
+
+            while idx < chars.len() && chars[idx].1.is_whitespace() {
+                idx += 1;
+            }
+            if idx >= chars.len() {
+                break;
+            }
+
+            let target_start = chars[idx].0;
+            let mut target_in_single_quote = false;
+            let mut target_in_double_quote = false;
+            let mut target_escaped = false;
+
+            while idx < chars.len() {
+                let (byte_idx, target_ch) = chars[idx];
+
+                if target_escaped {
+                    target_escaped = false;
+                    idx += 1;
+                    continue;
+                }
+
+                if target_ch == '\\' && !target_in_single_quote {
+                    target_escaped = true;
+                    idx += 1;
+                    continue;
+                }
+
+                if target_ch == '\'' && !target_in_double_quote {
+                    target_in_single_quote = !target_in_single_quote;
+                    idx += 1;
+                    continue;
+                }
+
+                if target_ch == '"' && !target_in_single_quote {
+                    target_in_double_quote = !target_in_double_quote;
+                    idx += 1;
+                    continue;
+                }
+
+                if !target_in_single_quote
+                    && !target_in_double_quote
+                    && (target_ch.is_whitespace()
+                        || matches!(target_ch, '|' | ';' | '&' | '\n' | '\r' | '<' | '>'))
+                {
+                    let raw_target = command[target_start..byte_idx].trim();
+                    if let Some(target) = shell_tokenize_like_bash(raw_target).first()
+                        && let Some(msg) = validate_command_path_arg(policy, target, oldpwd)
+                    {
+                        return Some(msg);
+                    }
+                    break;
+                }
+
+                idx += 1;
+            }
+
+            if idx >= chars.len() {
+                let raw_target = command[target_start..].trim();
+                if let Some(target) = shell_tokenize_like_bash(raw_target).first()
+                    && let Some(msg) = validate_command_path_arg(policy, target, oldpwd)
+                {
+                    return Some(msg);
+                }
+                break;
+            }
+
+            continue;
+        }
+
+        idx += 1;
+    }
+
+    None
+}
+
+fn redirection_operator_details(chars: &[(usize, char)], idx: usize) -> (usize, bool) {
+    match (
+        chars[idx].1,
+        chars.get(idx + 1).map(|(_, ch)| *ch),
+        chars.get(idx + 2).map(|(_, ch)| *ch),
+    ) {
+        ('<', Some('<'), Some('<')) => (idx + 3, false),
+        ('<', Some('<'), _) => (idx + 2, false),
+        ('>', Some('>'), _) => (idx + 2, true),
+        ('<', Some('>'), _) => (idx + 2, true),
+        ('>', Some('|'), _) => (idx + 2, true),
+        ('<', Some('&'), _) | ('>', Some('&'), _) => (idx + 2, false),
+        _ => (idx + 1, true),
+    }
+}
+
 fn is_shell_interpreter_command(base: &str) -> bool {
     matches!(base, "bash" | "sh" | "zsh" | "dash" | "ksh" | "fish")
 }
@@ -900,6 +1041,9 @@ fn check_single_command_path_boundary(
         if let Some(msg) = check_bash_path_boundary_with_oldpwd(policy, inner, oldpwd) {
             return Some(msg);
         }
+    }
+    if let Some(msg) = check_redirection_path_boundary(policy, command, oldpwd) {
+        return Some(msg);
     }
 
     let parts = shell_tokenize_like_bash(command);
@@ -3307,17 +3451,67 @@ mod tests {
     }
 
     #[test]
-    fn bypass_redirect_input_not_caught() {
-        // cat < /etc/passwd — redirect. KNOWN LIMITATION.
-        // The `<` is not a flag so it's checked, but it's not an absolute path.
-        // The actual path `/etc/passwd` follows and IS checked.
+    fn redirect_input_path_is_caught() {
+        // cat < /etc/passwd — spaced redirection target should be checked.
         use astra_runtime::tool_sandbox::SandboxPolicy;
         let policy = SandboxPolicy::for_project("/home/user/project");
         let result = check_bash_path_boundary(&policy, "cat < /etc/passwd");
-        // `<` is skipped (not abs path), `/etc/passwd` IS caught
         assert!(
             result.is_some(),
             "redirect target path should still be caught"
+        );
+    }
+
+    #[test]
+    fn redirect_input_without_whitespace_is_caught() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(&policy, "cat</etc/passwd");
+        assert!(
+            result
+                .as_deref()
+                .is_some_and(|msg| msg.starts_with(super::SANDBOX_DENIED_PREFIX)
+                    && msg.contains("/etc/passwd")),
+            "no-space input redirection should still catch the target path"
+        );
+    }
+
+    #[test]
+    fn redirect_output_without_whitespace_on_generic_command_is_caught() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(&policy, "echo hi>/etc/output.log");
+        assert!(
+            result
+                .as_deref()
+                .is_some_and(|msg| msg.starts_with(super::SANDBOX_DENIED_PREFIX)
+                    && msg.contains("/etc/output.log")),
+            "redirection scanning should not depend on the outer command allowlist"
+        );
+    }
+
+    #[test]
+    fn redirect_input_without_whitespace_inside_project_is_allowed() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(&policy, "cat<src/main.rs");
+        assert!(
+            result.is_none(),
+            "in-project no-space redirection should remain allowed"
+        );
+    }
+
+    #[test]
+    fn nested_shell_redirect_without_whitespace_is_caught() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(&policy, "bash -lc 'cat</etc/passwd'");
+        assert!(
+            result
+                .as_deref()
+                .is_some_and(|msg| msg.starts_with(super::SANDBOX_DENIED_PREFIX)
+                    && msg.contains("/etc/passwd")),
+            "nested shell commands should inherit no-space redirection checks"
         );
     }
 
