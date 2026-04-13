@@ -273,6 +273,11 @@ pub fn internal_error_coded(
     )
 }
 
+/// MySQL/MatrixOne error code 1062 = `ER_DUP_ENTRY`.
+pub fn is_duplicate_key_error(err: &sqlx::Error) -> bool {
+    matches!(err, sqlx::Error::Database(db_err) if db_err.code().as_deref() == Some("1062"))
+}
+
 pub fn current_unix_seconds() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

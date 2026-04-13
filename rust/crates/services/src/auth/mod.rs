@@ -1,7 +1,7 @@
 use crate::storage::database_user_from_row;
 use astra_core::{
     ErrorResponse, JwtSettings, MatrixOneSettings, SharedPool, bearer_token, connect_matrixone,
-    error_response, internal_error,
+    error_response, internal_error, is_duplicate_key_error,
 };
 use async_trait::async_trait;
 use axum::{
@@ -38,25 +38,6 @@ pub use session::{
     SessionListRecord, SessionRecord, SessionService, SessionUpdateRequestData,
 };
 use validation::validate_register_request;
-
-fn is_duplicate_key_error(err: &sqlx::Error) -> bool {
-    match err {
-        sqlx::Error::Database(db_err) => {
-            // MySQL error code 1062 = ER_DUP_ENTRY
-            if db_err.code().as_deref() == Some("1062") {
-                return true;
-            }
-            // Fallback: check error message for "Duplicate entry" pattern
-            let msg = db_err.message();
-            msg.contains("Duplicate entry") || msg.contains("ER_DUP_ENTRY")
-        }
-        // Also check Protocol and other wrapped errors
-        _ => {
-            let msg = err.to_string();
-            msg.contains("1062") && msg.contains("Duplicate entry")
-        }
-    }
-}
 
 #[async_trait]
 pub trait AuthService: Send + Sync {

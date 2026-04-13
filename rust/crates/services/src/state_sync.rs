@@ -24,6 +24,7 @@
 //! - **Conflict resolution**: Higher observation count wins for entities; union for patterns
 //! - **Idempotent**: Repeated pushes produce same result (UPSERT semantics)
 
+use astra_core::is_duplicate_key_error;
 use async_trait::async_trait;
 use base64::Engine;
 use flate2::{Compression, read::GzDecoder, write::GzEncoder};
@@ -75,25 +76,6 @@ fn is_retryable_error(err: &sqlx::Error) -> bool {
         }
         // Other errors are not retryable
         _ => false,
-    }
-}
-
-fn is_duplicate_key_error(err: &sqlx::Error) -> bool {
-    match err {
-        sqlx::Error::Database(db_err) => {
-            // MySQL error code 1062 = ER_DUP_ENTRY
-            if db_err.code().as_deref() == Some("1062") {
-                return true;
-            }
-            // Fallback: check error message for "Duplicate entry" pattern
-            let msg = db_err.message();
-            msg.contains("Duplicate entry") || msg.contains("ER_DUP_ENTRY")
-        }
-        // Also check Protocol and other wrapped errors
-        _ => {
-            let msg = err.to_string();
-            msg.contains("1062") && msg.contains("Duplicate entry")
-        }
     }
 }
 

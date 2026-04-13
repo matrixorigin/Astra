@@ -14,28 +14,10 @@
 //! The restore is local-first: tries local files first, falls back to MatrixOne
 //! for data that may have been created on a different device.
 
+use astra_core::is_duplicate_key_error;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-
-fn is_duplicate_key_error(err: &sqlx::Error) -> bool {
-    match err {
-        sqlx::Error::Database(db_err) => {
-            // MySQL error code 1062 = ER_DUP_ENTRY
-            if db_err.code().as_deref() == Some("1062") {
-                return true;
-            }
-            // Fallback: check error message for "Duplicate entry" pattern
-            let msg = db_err.message();
-            msg.contains("Duplicate entry") || msg.contains("ER_DUP_ENTRY")
-        }
-        // Also check Protocol and other wrapped errors
-        _ => {
-            let msg = err.to_string();
-            msg.contains("1062") && msg.contains("Duplicate entry")
-        }
-    }
-}
 
 // ─── Restored Session State ─────────────────────────────────────────────────
 
@@ -1666,19 +1648,14 @@ mod tests {
     #[test]
     fn is_duplicate_key_error_non_database_error() {
         let err = sqlx::Error::RowNotFound;
-        assert!(!super::is_duplicate_key_error(&err));
+        assert!(!astra_core::is_duplicate_key_error(&err));
     }
 
     #[test]
-    fn is_duplicate_key_error_detects_message_fallback() {
-        // Test that "Duplicate entry" in message is detected even without code
-        // We can't easily construct a real sqlx::Error with custom message,
-        // but we can test the string fallback path.
+    fn is_duplicate_key_error_rejects_protocol_error() {
+        // Protocol errors should NOT be treated as duplicate key, even if message contains "1062"
         let fake_err = sqlx::Error::Protocol("1062: Duplicate entry 'test' for key".into());
-        assert!(
-            super::is_duplicate_key_error(&fake_err),
-            "should detect duplicate via string fallback"
-        );
+        assert!(!astra_core::is_duplicate_key_error(&fake_err));
     }
 
     #[test]
