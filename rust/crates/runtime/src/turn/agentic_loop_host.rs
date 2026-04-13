@@ -73,11 +73,6 @@ use crate::turn::agentic_post_tool_policy::{
 use crate::turn::agentic_turn_flow::{
     agentic_round_stall_preflight_with_tool_calls, append_explain_turn_batch,
 };
-use crate::turn::agentic_turn_ingest::{
-    AgenticIngestIterationControl, AgenticTurnIngestMut,
-    agentic_turn_stream_snapshot_from_sse_accum, ingest_agentic_turn_stream,
-    map_ingest_outcome_to_iteration_control,
-};
 use crate::turn::agentic_verdict_audit::AgenticVerdictAuditEvent;
 use crate::turn::chat_turn_heuristics::TaskExecutionProfile;
 use crate::turn::chat_turn_sse_dispatch::ChatTurnSseAccum;
@@ -704,7 +699,7 @@ pub fn delegate_tool_schema() -> Value {
 /// Finalize the turn trace collector: record measured token budget, feed to
 /// observability session, and persist to journal. Called from every exit path
 /// in the agentic loop so `/context breakdown` always reflects the latest turn.
-fn finalize_turn_trace(state: &mut AgenticLoopState) {
+pub(crate) fn finalize_turn_trace(state: &mut AgenticLoopState) {
     let Some(collector) = state.telemetry.turn_trace_collector.take() else {
         return;
     };
@@ -764,7 +759,7 @@ fn context_trace_turn_number(state: &AgenticLoopState) -> u32 {
 /// injection, factual-retry nudges) skip the main post-tool-policy checkpoint.
 /// This helper ensures those paths still persist the accumulated messages so that
 /// `/debug` turn inspection and session recovery have accurate per-iteration state.
-fn try_write_heavy_checkpoint(state: &mut AgenticLoopState) {
+pub(crate) fn try_write_heavy_checkpoint(state: &mut AgenticLoopState) {
     let Some(sid) = state.current_session_id.as_ref() else {
         return;
     };
@@ -959,12 +954,16 @@ pub(crate) use super::agentic_auto_reflection::{
     AUTO_REFLECTION_SIGNAL_THRESHOLD, maybe_trigger_auto_reflection,
 };
 #[allow(unused_imports)]
+pub(crate) use super::agentic_loop_execution_phase::{
+    TurnExecutionControl, TurnExecutionPhase, execute_turn_and_ingest_phase,
+};
+#[allow(unused_imports)]
 pub(crate) use super::agentic_loop_lifecycle::{
     PreparedTurnIteration, TurnIterationPrep, prepare_turn_iteration, run_loop_preamble,
 };
 
 /// Render deferred final text if any is buffered, then write heavy checkpoint.
-fn finalize_and_render<H: AgenticLoopHost>(host: &mut H, state: &mut AgenticLoopState) {
+pub(crate) fn finalize_and_render<H: AgenticLoopHost>(host: &mut H, state: &mut AgenticLoopState) {
     finalize_turn_trace(state);
     try_write_heavy_checkpoint(state);
     if !state.final_text.is_empty() {
@@ -993,368 +992,24 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
             }
         };
 
-        // ─── Step 1: Host executes the turn (payload → HTTP → SSE) ──────
-        if let Some(ref emitter) = state.messaging.progress_emitter {
-            emitter.llm_call_started(turn_index as u32);
-        }
-        let llm_wall_start = std::time::Instant::now();
-        let turn_result = host.execute_turn(state).await?;
-        // Successful LLM call — reset consecutive error counters.
-        state.rate_limit_cooldown.record_success();
-        if let Some(ref emitter) = state.messaging.progress_emitter {
-            emitter.llm_call_completed(
-                turn_index as u32,
-                turn_result.ttft_ms,
-                llm_wall_start.elapsed().as_millis() as u64,
-            );
-        }
-
-        // ─── Step 2: Ingest turn stream into loop state ─────────────────
-        let snap =
-            agentic_turn_stream_snapshot_from_sse_accum(&turn_result.accum, turn_result.ttft_ms);
-
-        // Update trace collector with runtime-measured system prompt tokens + breakdown.
-        if let Some(ref collector) = state.telemetry.turn_trace_collector {
-            if let Some(spt) = turn_result.accum.system_prompt_tokens {
-                collector.set_system_prompt_tokens(spt);
-            }
-            if let Some(ref breakdown_json) = turn_result.accum.system_prompt_breakdown {
-                if let Ok(breakdown) = serde_json::from_value::<
-                    crate::turn::context_assembly_trace::SystemPromptBreakdown,
-                >(breakdown_json.clone())
-                {
-                    collector.record_system_prompt(breakdown);
-                }
-            }
-        }
-        let edge_len = turn_result.edge_tool_round.len();
-        match map_ingest_outcome_to_iteration_control(ingest_agentic_turn_stream(
-            &snap,
-            edge_len,
-            |i| turn_result.edge_tool_round[i].tool.clone(),
-            &state.message,
-            &state.recent_tools,
-            quiet,
-            AgenticTurnIngestMut {
-                task_profile: state.task_profile,
-                first_ttft_ms: &mut state.telemetry.first_ttft_ms,
-                current_session_id: &mut state.current_session_id,
-                current_run_id: &mut state.current_run_id,
-                final_text: &mut state.final_text,
-                total_prompt: &mut state.total_prompt,
-                total_completion: &mut state.total_completion,
-                total_cache_read: &mut state.total_cache_read,
-                total_cache_creation: &mut state.total_cache_creation,
-                total_tool_calls: &mut state.total_tool_calls,
-                step_recorder: &mut state.step_recorder,
-                all_tools_used: &mut state.telemetry.all_tools_used,
-                has_any_usage: &mut state.has_any_usage,
-                forced_factual_retry: &mut state.stall.forced_factual_retry,
-                messages: &mut state.messages,
-                last_measured_prompt_tokens: &mut state.last_measured_prompt_tokens,
-                consecutive_context_window_errors: &mut state.consecutive_context_window_errors,
+        let TurnExecutionPhase {
+            llm_wall_start,
+            turn_result,
+        } = match execute_turn_and_ingest_phase(
+            host,
+            state,
+            turn_index,
+            TurnIterationPrep {
+                quiet,
+                turn_start_time,
             },
-        )) {
-            AgenticIngestIterationControl::Fatal(e) => {
-                // ── Rate-limit graceful degradation ──────────────────────
-                // When the error is a rate-limit (429 / TPM exceeded) AND
-                // the loop has already done meaningful work (tool calls
-                // executed, files written), convert from hard failure to
-                // graceful completion.  This preserves the conversation
-                // context so the next turn can continue where we left off,
-                // instead of losing all accumulated tool results.
-                let lower = e.to_lowercase();
-                let is_rate_limit = lower.contains("rate")
-                    || lower.contains("429")
-                    || lower.contains("too many requests")
-                    || lower.contains("tpm")
-                    || lower.contains("rpm");
-
-                // Record the error in the cross-turn cooldown tracker so
-                // subsequent turns can back off or abort early.
-                if is_rate_limit {
-                    let is_overload = lower.contains("529")
-                        || lower.contains("503")
-                        || lower.contains("overload");
-                    if is_overload {
-                        state.rate_limit_cooldown.record_529(None, false);
-                    } else {
-                        state.rate_limit_cooldown.record_429(None, false);
-                    }
-                }
-
-                if is_rate_limit && state.total_tool_calls > 0 {
-                    if !quiet {
-                        host.emit_headless_line(
-                            HeadlessStderrStyle::Yellow,
-                            format!(
-                                "⚠ Rate limit hit after {} tool calls — preserving work.",
-                                state.total_tool_calls,
-                            ),
-                        );
-                    }
-                    // Synthesize a final text so the conversation has a
-                    // meaningful assistant message (not an empty failure).
-                    state.final_text = format!(
-                        "[Rate limit reached after {} tool call(s). \
-                         All completed tool results are preserved above. \
-                         You can continue from where I left off in the next message.]\n\n\
-                         Error: {}",
-                        state.total_tool_calls, e,
-                    );
-                    // ─── Observability: turn end hook (rate limit path) ───
-                    if let (Some(hub), Some(session)) = (
-                        state.telemetry.observability_hub.as_ref(),
-                        state.telemetry.observability_session.as_ref(),
-                    ) {
-                        let total_ms = turn_start_time.elapsed().as_millis() as u64;
-                        let timing = crate::observability_integration::TurnTiming {
-                            turn: turn_index as u32,
-                            context_assembly_ms: 0,
-                            ttft_ms: turn_result.ttft_ms.unwrap_or(0) as u64,
-                            llm_total_ms: total_ms,
-                            tool_execution_ms: 0,
-                            total_ms,
-                        };
-                        let mut session_guard = session.write().unwrap_or_else(|e| e.into_inner());
-                        crate::observability_integration::on_turn_end(
-                            hub,
-                            &mut session_guard,
-                            timing,
-                        );
-                    }
-                    finalize_and_render(host, state);
-                    return Ok(AgenticLoopOutcome::Completed);
-                }
-
-                finalize_turn_trace(state);
-                try_write_heavy_checkpoint(state);
-                return Err(e);
-            }
-            AgenticIngestIterationControl::BreakLoop => {
-                // Agent produced final text with no tool calls — it thinks it's done.
-                // Inject verification prompt once when the agent first tries to complete.
-                // The prompt instructs the LLM to run checks, fix failures, and
-                // re-run until passing — all within the normal tool loop.
-                // Runtime does not inspect results; it trusts the LLM's tool cycle.
-                // Inject whenever `stop_hooks` is non-empty (declarative and/or auto-detect).
-                // Read-only turns omit auto-detect but may still carry declarative hooks.
-                if state.hooks.stop_hook_runs == 0
-                    && let Some(prompt) =
-                        crate::turn::stop_hooks::build_stop_hook_prompt(&state.hooks.stop_hooks)
-                {
-                    state.hooks.stop_hook_runs = 1;
-                    if !quiet {
-                        host.emit_headless_line(
-                            HeadlessStderrStyle::Yellow,
-                            "⚠ Verification required, continuing…".to_string(),
-                        );
-                    }
-                    state.messages.push(prompt);
-                    try_write_heavy_checkpoint(state);
-                    continue;
-                }
-                // ─── Observability: turn end hook (no tool calls path) ───
-                if let (Some(hub), Some(session)) = (
-                    state.telemetry.observability_hub.as_ref(),
-                    state.telemetry.observability_session.as_ref(),
-                ) {
-                    let total_ms = turn_start_time.elapsed().as_millis() as u64;
-                    let timing = crate::observability_integration::TurnTiming {
-                        turn: turn_index as u32,
-                        context_assembly_ms: 0,
-                        ttft_ms: turn_result.ttft_ms.unwrap_or(0) as u64,
-                        llm_total_ms: total_ms,
-                        tool_execution_ms: 0,
-                        total_ms,
-                    };
-                    let mut session_guard = session.write().unwrap_or_else(|e| e.into_inner());
-                    crate::observability_integration::on_turn_end(hub, &mut session_guard, timing);
-                }
-                finalize_and_render(host, state);
-                return Ok(AgenticLoopOutcome::Completed);
-            }
-            AgenticIngestIterationControl::ContinueIterating => {
-                // Ingest injected a nudge (e.g. factual retry). Continue the loop.
-                try_write_heavy_checkpoint(state);
-                continue;
-            }
-            AgenticIngestIterationControl::ProceedWithToolCalls => {}
-        }
-
-        // ─── Step 2a: Emit LLM text output for sub-run progress visibility ──
-        // In sub-run mode (quiet=false, no interactive terminal), the LLM's
-        // text response is the primary signal of agent activity. Emit a
-        // truncated preview so the parent process can show real-time progress.
-        if !quiet && !state.final_text.is_empty() {
-            let preview: String = state.final_text.chars().take(120).collect();
-            let line = if state.final_text.len() > 120 {
-                format!("{preview}…")
-            } else {
-                preview
-            };
-            host.emit_headless_line(HeadlessStderrStyle::Dim, line);
-        }
-        // If the last LLM call's prompt_tokens exceeds max_turn_input_tokens,
-        // inject a wrap-up system message and skip tool execution.  The loop
-        // continues for exactly one more iteration so the model can produce a
-        // final answer.  On the second breach (wrapup already injected),
-        // force-complete immediately.
-        if state.max_turn_input_tokens > 0 {
-            if let Some(measured) = state.last_measured_prompt_tokens {
-                if measured > state.max_turn_input_tokens {
-                    if state.budget_wrapup_injected {
-                        // Second breach after wrap-up — hard stop.
-                        if !quiet {
-                            host.emit_headless_line(
-                                HeadlessStderrStyle::Yellow,
-                                "⚠ Token budget exceeded — completing turn.".to_string(),
-                            );
-                        }
-                        // ─── Observability: turn end hook (budget exceeded) ───
-                        if let (Some(hub), Some(session)) = (
-                            state.telemetry.observability_hub.as_ref(),
-                            state.telemetry.observability_session.as_ref(),
-                        ) {
-                            let total_ms = turn_start_time.elapsed().as_millis() as u64;
-                            let timing = crate::observability_integration::TurnTiming {
-                                turn: turn_index as u32,
-                                context_assembly_ms: 0,
-                                ttft_ms: turn_result.ttft_ms.unwrap_or(0) as u64,
-                                llm_total_ms: total_ms,
-                                tool_execution_ms: 0,
-                                total_ms,
-                            };
-                            let mut session_guard =
-                                session.write().unwrap_or_else(|e| e.into_inner());
-                            crate::observability_integration::on_turn_end(
-                                hub,
-                                &mut session_guard,
-                                timing,
-                            );
-                        }
-                        finalize_and_render(host, state);
-                        return Ok(AgenticLoopOutcome::Completed);
-                    }
-                    // First breach — inject wrap-up instruction, skip tool execution.
-                    state.budget_wrapup_injected = true;
-                    if !quiet {
-                        host.emit_headless_line(
-                            HeadlessStderrStyle::Yellow,
-                            format!(
-                                "⚠ Token budget reached ({measured}/{} tokens) — wrapping up.",
-                                state.max_turn_input_tokens,
-                            ),
-                        );
-                    }
-                    state.messages.push(serde_json::json!({
-                        "role": "system",
-                        "content": "You have reached the token budget limit for this turn. \
-                            Do NOT call any more tools. Summarize your progress so far and \
-                            present your results to the user. If you have partial work, \
-                            explain what remains to be done."
-                    }));
-                    try_write_heavy_checkpoint(state);
-                    continue;
-                }
-            }
-        }
-
-        // ─── Cumulative token budget check ─────────────────────────────
-        // Skill subruns set max_cumulative_tokens to cap total cost.
-        // When exceeded, inject wrap-up (same pattern as per-turn budget).
-        if state.max_cumulative_tokens > 0 {
-            let cumulative = state.total_prompt + state.total_completion;
-            if cumulative > state.max_cumulative_tokens && !state.budget_wrapup_injected {
-                state.budget_wrapup_injected = true;
-                if !quiet {
-                    host.emit_headless_line(
-                        HeadlessStderrStyle::Yellow,
-                        format!(
-                            "⚠ Cumulative token budget reached ({cumulative}/{} tokens) — wrapping up.",
-                            state.max_cumulative_tokens,
-                        ),
-                    );
-                }
-                state.messages.push(serde_json::json!({
-                    "role": "system",
-                    "content": "You have reached the cumulative token budget. \
-                        Do NOT call any more tools. Summarize your progress so far and \
-                        present your results to the user."
-                }));
-                try_write_heavy_checkpoint(state);
-                continue;
-            }
-        }
-
-        // ─── Observability: tool selection hook ──────────────────────────
-        // Record which tools the LLM chose for this turn (before execution).
-        if let Some(session) = &state.telemetry.observability_session {
-            let selected_tools: Vec<String> = turn_result
-                .edge_tool_round
-                .iter()
-                .map(|r| r.tool.clone())
-                .collect();
-            if !selected_tools.is_empty() {
-                let explanation = crate::turn::decision_explainer::DecisionExplanation {
-                    id: format!(
-                        "tool-sel-{}-{}",
-                        state.current_session_id.as_deref().unwrap_or("?"),
-                        turn_index
-                    ),
-                    timestamp: std::time::SystemTime::now(),
-                    decision_type: crate::turn::decision_explainer::DecisionType::ToolSelection {
-                        selected_tools: selected_tools.clone(),
-                        total_available: state.telemetry.all_tools_used.len() as u32,
-                    },
-                    inputs: vec![crate::turn::decision_explainer::ExplainableInput {
-                        name: "user_query".to_string(),
-                        value: state.message.clone(),
-                        influence: 1.0,
-                        explanation: Some("Primary input driving tool selection".to_string()),
-                    }],
-                    reasoning: format!(
-                        "LLM selected {} tool(s) for this turn",
-                        selected_tools.len()
-                    ),
-                    alternatives: vec![],
-                    confidence: 0.8, // placeholder
-                };
-                let mut session_guard = session.write().unwrap_or_else(|e| e.into_inner());
-                crate::observability_integration::on_tool_selection(
-                    &mut session_guard,
-                    explanation,
-                );
-            }
-        }
-
-        // ─── Trace collector: record tool selection ──────────────────────
-        // Only record if the CLI path didn't already set tool selection
-        // (CLI has accurate per-tool costs from its ToolRegistry).
-        // The server path builds selected_tools from edge_tool_round which
-        // reflects tool USAGE (with duplicates), not tool SELECTION.
-        if let Some(ref collector) = state.telemetry.turn_trace_collector {
-            let already_has_tools = collector.has_tool_trace();
-            if !already_has_tools {
-                let selected_tools: Vec<String> = turn_result
-                    .edge_tool_round
-                    .iter()
-                    .map(|r| r.tool.clone())
-                    .collect();
-                collector.record_tool_selection(
-                    &selected_tools,
-                    state
-                        .telemetry
-                        .first_selector_strategy
-                        .as_deref()
-                        .unwrap_or("unknown"),
-                    state.telemetry.first_selector_confidence.unwrap_or(0.0),
-                    &[],
-                    state.telemetry.all_tools_used.len() as u32,
-                    state.telemetry.first_selector_ms.unwrap_or(0),
-                );
-            }
-        }
+        )
+        .await?
+        {
+            TurnExecutionControl::Proceed(phase) => phase,
+            TurnExecutionControl::ContinueLoop => continue,
+            TurnExecutionControl::Return(outcome) => return Ok(outcome),
+        };
 
         // ─── Step 3: Stall preflight ────────────────────────────────────
         let tool_calls_for_guard = agentic_round_stall_preflight_with_tool_calls(

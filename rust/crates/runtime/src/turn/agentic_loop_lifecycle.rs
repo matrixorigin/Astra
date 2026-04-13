@@ -11,6 +11,7 @@ use super::agentic_loop_host::{
 };
 use super::stall::CLI_AGENTIC_TURN_BUDGET_STALL_ABORT_MSG;
 
+#[derive(Clone, Copy)]
 pub(crate) struct TurnIterationPrep {
     pub(crate) quiet: bool,
     pub(crate) turn_start_time: Instant,
