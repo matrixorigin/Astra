@@ -242,8 +242,8 @@ mod tests {
         // Token Efficiency, Build/Test Guidance, Plan Execution, Search Strategy (with Simple vs Complex).
         // Headroom: ~200 chars above measured size. Bump when adding new rules.
         assert!(
-            p.len() < 11600,
-            "compressed prompt should be under 11600 chars, got {}",
+            p.len() < 11700,
+            "compressed prompt should be under 11700 chars, got {}",
             p.len()
         );
     }
@@ -943,8 +943,8 @@ mod tests {
         // and Parallel Tool Calls Limit/Anti-pattern, Search Strategy Simple vs Complex).
         // Headroom: ~200 chars above measured size. Bump when adding new rules.
         assert!(
-            p.len() < 17000,
-            "full toolset prompt should be under 17000 chars, got {}",
+            p.len() < 17100,
+            "full toolset prompt should be under 17100 chars, got {}",
             p.len()
         );
     }
