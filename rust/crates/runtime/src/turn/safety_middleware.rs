@@ -415,7 +415,14 @@ pub fn check_shell_command_safety(command: &str) -> Option<String> {
         ));
     }
 
-    // 6. IFS injection — can bypass word splitting validation
+    // 6. Interpreter stdin/heredoc execution — feeds code through stdin instead of a file
+    if let Some(interpreter) = check_interpreter_stdin_exec(command) {
+        return Some(format!(
+            "shell command feeds a script to `{interpreter}` via stdin or heredoc, which can execute arbitrary code outside file-path validation"
+        ));
+    }
+
+    // 7. IFS injection — can bypass word splitting validation
     if check_ifs_injection(command) {
         return Some(
             "shell command contains `$IFS` or `${IFS...}` which can bypass security validation"
@@ -423,7 +430,7 @@ pub fn check_shell_command_safety(command: &str) -> Option<String> {
         );
     }
 
-    // 7. Carriage return attack — can hide malicious commands
+    // 8. Carriage return attack — can hide malicious commands
     if check_carriage_return_attack(command) {
         return Some(
             "shell command contains carriage return (\\r) which can hide malicious commands in terminal output"
@@ -431,7 +438,7 @@ pub fn check_shell_command_safety(command: &str) -> Option<String> {
         );
     }
 
-    // 8. Backslash-escaped whitespace — can alter shell tokenization
+    // 9. Backslash-escaped whitespace — can alter shell tokenization
     if check_backslash_escaped_whitespace(command) {
         return Some(
             "shell command contains backslash-escaped whitespace that can alter command parsing"
@@ -439,7 +446,7 @@ pub fn check_shell_command_safety(command: &str) -> Option<String> {
         );
     }
 
-    // 9. /proc/*/environ access — can expose sensitive environment variables
+    // 10. /proc/*/environ access — can expose sensitive environment variables
     if check_proc_environ_access(command) {
         return Some(
             "shell command accesses `/proc/*/environ`, which can expose sensitive environment variables"
@@ -447,21 +454,21 @@ pub fn check_shell_command_safety(command: &str) -> Option<String> {
         );
     }
 
-    // 10. Zsh dangerous commands — can bypass file/network protections
+    // 11. Zsh dangerous commands — can bypass file/network protections
     if let Some(cmd) = check_zsh_dangerous_command(command) {
         return Some(format!(
             "shell command contains zsh-specific dangerous command `{cmd}` which can bypass security checks"
         ));
     }
 
-    // 11. Unicode whitespace — visual spoofing
+    // 12. Unicode whitespace — visual spoofing
     if let Some(char_desc) = check_unicode_whitespace(command) {
         return Some(format!(
             "shell command contains {char_desc} which can be used for visual spoofing"
         ));
     }
 
-    // 12. Obfuscated flags — `-e\"xec\"` / `-e$'xec'` / `\"\"\"-f` style bypass
+    // 13. Obfuscated flags — `-e\"xec\"` / `-e$'xec'` / `\"\"\"-f` style bypass
     if check_obfuscated_flags(command) {
         return Some(
             "shell command contains obfuscated flag names (quotes inside flags) which can bypass security checks"
@@ -469,7 +476,7 @@ pub fn check_shell_command_safety(command: &str) -> Option<String> {
         );
     }
 
-    // 13. Backslash-escaped shell operators — can confuse safety parsing
+    // 14. Backslash-escaped shell operators — can confuse safety parsing
     if check_backslash_escaped_operator(command) {
         return Some(
             "shell command contains backslash-escaped shell operators outside quotes, which can confuse safety parsing"
@@ -552,7 +559,7 @@ fn check_inline_interpreter_exec_segment(segment: &str) -> Option<String> {
 
         let base = token.rsplit('/').next().unwrap_or(token);
 
-        if matches!(base, "bash" | "sh" | "zsh" | "dash" | "ksh" | "fish") {
+        if is_shell_interpreter_command(base) {
             for flag_idx in idx + 1..tokens.len() {
                 let arg = tokens[flag_idx].as_str();
                 if is_nested_shell_c_flag(arg) {
@@ -575,15 +582,71 @@ fn check_inline_interpreter_exec_segment(segment: &str) -> Option<String> {
             continue;
         }
 
-        if matches!(
-            base,
-            "command" | "builtin" | "nohup" | "noglob" | "nocorrect"
-        ) {
+        if is_shell_wrapper_command(base) {
             idx += 1;
             continue;
         }
 
         return inline_exec_interpreter_detail(base, tokens.get(idx + 1).map(String::as_str));
+    }
+
+    None
+}
+
+fn check_interpreter_stdin_exec(command: &str) -> Option<String> {
+    for segment in shell_command_segments(command) {
+        if let Some(detail) = check_interpreter_stdin_exec_segment(segment) {
+            return Some(detail);
+        }
+    }
+    None
+}
+
+fn check_interpreter_stdin_exec_segment(segment: &str) -> Option<String> {
+    let tokens = shell_tokenize_like_bash(segment);
+    if tokens.is_empty() {
+        return None;
+    }
+
+    let mut idx = 0usize;
+    while idx < tokens.len() {
+        let token = tokens[idx].as_str();
+        if token.is_empty() {
+            idx += 1;
+            continue;
+        }
+        if looks_like_shell_assignment(token) {
+            idx += 1;
+            continue;
+        }
+
+        let base = token.rsplit('/').next().unwrap_or(token);
+
+        if is_shell_interpreter_command(base) {
+            for flag_idx in idx + 1..tokens.len() {
+                let arg = tokens[flag_idx].as_str();
+                if is_nested_shell_c_flag(arg) {
+                    if let Some(inner) = tokens.get(flag_idx + 1)
+                        && let Some(detail) = check_interpreter_stdin_exec(inner)
+                    {
+                        return Some(detail);
+                    }
+                    break;
+                }
+            }
+        }
+
+        if base == "env" {
+            idx = skip_env_wrapper_tokens(&tokens, idx + 1);
+            continue;
+        }
+
+        if is_shell_wrapper_command(base) {
+            idx += 1;
+            continue;
+        }
+
+        return stdin_script_interpreter_detail(base, &tokens[idx + 1..]);
     }
 
     None
@@ -719,6 +782,17 @@ fn skip_env_wrapper_tokens(tokens: &[String], mut idx: usize) -> usize {
     idx
 }
 
+fn is_shell_interpreter_command(base: &str) -> bool {
+    matches!(base, "bash" | "sh" | "zsh" | "dash" | "ksh" | "fish")
+}
+
+fn is_shell_wrapper_command(base: &str) -> bool {
+    matches!(
+        base,
+        "command" | "builtin" | "nohup" | "noglob" | "nocorrect"
+    )
+}
+
 fn is_nested_shell_c_flag(flag: &str) -> bool {
     let Some(rest) = flag.strip_prefix('-') else {
         return false;
@@ -750,6 +824,50 @@ fn is_python_interpreter(base: &str) -> bool {
         || base.strip_prefix("python").is_some_and(|suffix| {
             !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit() || c == '.')
         })
+}
+
+fn stdin_script_interpreter_detail(base: &str, args: &[String]) -> Option<String> {
+    if !supports_stdin_script_exec(base) {
+        return None;
+    }
+
+    let mut has_explicit_script_source = false;
+    let mut idx = 0usize;
+    while idx < args.len() {
+        let arg = args[idx].as_str();
+        if is_stdin_redirection_token(arg) {
+            return (!has_explicit_script_source).then(|| format!("{base} <stdin"));
+        }
+        if arg == "-" || (is_shell_interpreter_command(base) && arg == "-s") {
+            return Some(format!("{base} {arg}"));
+        }
+        if is_python_interpreter(base) && arg == "-m" {
+            if args.get(idx + 1).is_some() {
+                has_explicit_script_source = true;
+                idx += 2;
+                continue;
+            }
+            return None;
+        }
+        if arg.starts_with('-') {
+            idx += 1;
+            continue;
+        }
+        has_explicit_script_source = true;
+        idx += 1;
+    }
+
+    None
+}
+
+fn supports_stdin_script_exec(base: &str) -> bool {
+    is_python_interpreter(base)
+        || matches!(base, "node" | "nodejs")
+        || is_shell_interpreter_command(base)
+}
+
+fn is_stdin_redirection_token(arg: &str) -> bool {
+    (arg == "<" || arg.starts_with("<<") || arg.starts_with("<<<")) && !arg.starts_with("<(")
 }
 
 fn check_ifs_injection(command: &str) -> bool {
@@ -1436,6 +1554,58 @@ mod tests {
         let decision = evaluate_tool_safety_request(
             "bash",
             &json!({"command": r#"echo "python3 -c 'print(1)'""#}),
+        );
+        assert_eq!(decision, SafetyMiddlewareDecision::Allow);
+    }
+
+    #[test]
+    fn middleware_blocks_python_heredoc_exec() {
+        let decision = evaluate_tool_safety_request(
+            "bash",
+            &json!({"command": "python3 <<'PY'\nprint(1)\nPY"}),
+        );
+        assert!(matches!(
+            decision,
+            SafetyMiddlewareDecision::Deny(reason)
+                if reason.contains("shell_obfuscation") && reason.contains("stdin or heredoc")
+        ));
+    }
+
+    #[test]
+    fn middleware_blocks_python_stdin_dash_exec() {
+        let decision = evaluate_tool_safety_request("bash", &json!({"command": "python3 -"}));
+        assert!(matches!(
+            decision,
+            SafetyMiddlewareDecision::Deny(reason)
+                if reason.contains("shell_obfuscation") && reason.contains("stdin or heredoc")
+        ));
+    }
+
+    #[test]
+    fn middleware_blocks_shell_heredoc_exec() {
+        let decision =
+            evaluate_tool_safety_request("bash", &json!({"command": "bash <<'SH'\necho hi\nSH"}));
+        assert!(matches!(
+            decision,
+            SafetyMiddlewareDecision::Deny(reason)
+                if reason.contains("shell_obfuscation") && reason.contains("stdin or heredoc")
+        ));
+    }
+
+    #[test]
+    fn middleware_allows_python_script_with_input_redirect() {
+        let decision = evaluate_tool_safety_request(
+            "bash",
+            &json!({"command": "python3 scripts/check.py < input.txt"}),
+        );
+        assert_eq!(decision, SafetyMiddlewareDecision::Allow);
+    }
+
+    #[test]
+    fn middleware_allows_python_module_with_input_redirect() {
+        let decision = evaluate_tool_safety_request(
+            "bash",
+            &json!({"command": "python3 -m pytest < input.txt"}),
         );
         assert_eq!(decision, SafetyMiddlewareDecision::Allow);
     }
