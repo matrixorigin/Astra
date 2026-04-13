@@ -1102,6 +1102,40 @@ fn find_exec_subcommand_requires_boundary_review(parts: &[String]) -> Option<(St
     None
 }
 
+fn fd_subcommand_requires_boundary_review(parts: &[String]) -> Option<(String, String)> {
+    let mut idx = 1usize;
+    while idx < parts.len() {
+        let token = parts[idx].as_str();
+        if let Some(subcommand) = token.strip_prefix("--exec=") {
+            let base = subcommand.rsplit('/').next().unwrap_or(subcommand);
+            if subcommand_requires_boundary_review(base) {
+                return Some(("--exec".to_string(), base.to_string()));
+            }
+            idx += 1;
+            continue;
+        }
+        if let Some(subcommand) = token.strip_prefix("--exec-batch=") {
+            let base = subcommand.rsplit('/').next().unwrap_or(subcommand);
+            if subcommand_requires_boundary_review(base) {
+                return Some(("--exec-batch".to_string(), base.to_string()));
+            }
+            idx += 1;
+            continue;
+        }
+        if matches!(token, "-x" | "--exec" | "-X" | "--exec-batch") {
+            let subcommand = parts.get(idx + 1)?;
+            let base = subcommand.rsplit('/').next().unwrap_or(subcommand.as_str());
+            if subcommand_requires_boundary_review(base) {
+                return Some((token.to_string(), base.to_string()));
+            }
+            idx += 2;
+            continue;
+        }
+        idx += 1;
+    }
+    None
+}
+
 fn check_awk_path_boundary(
     policy: &astra_runtime::tool_sandbox::SandboxPolicy,
     parts: &[String],
@@ -1317,6 +1351,16 @@ fn check_single_command_path_boundary(
         if let Some((action, subcommand)) = find_exec_subcommand_requires_boundary_review(&parts) {
             return Some(format!(
                 "{}The command uses `find {action} {subcommand}` so file paths may be supplied from find matches and cannot be statically validated against the project directory '{}'. Ask the user for permission before using find fan-out with file-access or shell commands.",
+                super::SANDBOX_DENIED_PREFIX,
+                policy.project_root.display(),
+            ));
+        }
+        return None;
+    }
+    if matches!(base, "fd" | "fdfind") {
+        if let Some((action, subcommand)) = fd_subcommand_requires_boundary_review(&parts) {
+            return Some(format!(
+                "{}The command uses `fd {action} {subcommand}` so file paths may be supplied from search matches and cannot be statically validated against the project directory '{}'. Ask the user for permission before using fd fan-out with file-access or shell commands.",
                 super::SANDBOX_DENIED_PREFIX,
                 policy.project_root.display(),
             ));
@@ -4249,6 +4293,59 @@ mod tests {
         assert!(
             result.is_none(),
             "find fan-out should stay allowed for non-file-access subcommands"
+        );
+    }
+
+    #[test]
+    fn fd_exec_file_access_requires_boundary_review() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(&policy, "fd passwd -x cat {}");
+        assert!(
+            result
+                .as_deref()
+                .is_some_and(|msg| msg.starts_with(super::SANDBOX_DENIED_PREFIX)
+                    && msg.contains("fd -x cat")),
+            "fd -x file fan-out should require boundary review"
+        );
+    }
+
+    #[test]
+    fn fd_exec_batch_shell_requires_boundary_review() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(&policy, "fd passwd -X bash -lc 'cat {}'");
+        assert!(
+            result
+                .as_deref()
+                .is_some_and(|msg| msg.starts_with(super::SANDBOX_DENIED_PREFIX)
+                    && msg.contains("fd -X bash")),
+            "fd -X shell fan-out should require boundary review"
+        );
+    }
+
+    #[test]
+    fn fd_long_exec_file_access_requires_boundary_review() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(&policy, "fd passwd --exec cat {}");
+        assert!(
+            result
+                .as_deref()
+                .is_some_and(|msg| msg.starts_with(super::SANDBOX_DENIED_PREFIX)
+                    && msg.contains("fd --exec cat")),
+            "fd --exec file fan-out should require boundary review"
+        );
+    }
+
+    #[test]
+    fn fd_exec_echo_is_allowed() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(&policy, "fd rs -x echo {}");
+        assert!(
+            result.is_none(),
+            "fd fan-out should stay allowed for non-file-access subcommands"
         );
     }
 
