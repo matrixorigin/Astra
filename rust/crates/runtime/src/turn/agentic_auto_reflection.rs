@@ -10,6 +10,10 @@ use astra_services::self_surface::{
 use crate::str_preview::truncate_str;
 use crate::turn::agentic_headless_round::HeadlessStderrStyle;
 
+use super::agentic_adaptive_tuning::{
+    MAX_RECENT_TACTICAL_ACTIONS, record_new_evolution_promotion_events,
+    snapshot_evolution_promotion_ids,
+};
 use super::agentic_loop_host::{
     AgenticLoopHost, AgenticLoopState, HostReflectionRequest, HostReflectionResult,
 };
@@ -18,7 +22,6 @@ pub(crate) const AUTO_REFLECTION_SIGNAL_THRESHOLD: usize = 3;
 const AUTO_REFLECTION_MAX_OUTPUT_TOKENS: usize = 1200;
 const AUTO_REFLECTION_TOOL_WINDOW: usize = 24;
 const AUTO_REFLECTION_TOOL_STAT_LIMIT: usize = 8;
-pub(crate) const MAX_RECENT_TACTICAL_ACTIONS: usize = 8;
 const AUTO_REFLECTION_SELF_EVIDENCE_JOURNAL_LIMIT: usize = 12;
 
 fn build_auto_reflection_tool_stats(
@@ -507,16 +510,9 @@ pub(crate) async fn maybe_trigger_auto_reflection<H: AgenticLoopHost>(
     };
 
     evo.set_runtime_promotion_signals(state.telemetry.runtime_promotion_signals.clone());
-    let (pending_before, applied_before) =
-        super::agentic_loop_host::snapshot_evolution_promotion_ids(&evo).await;
+    let (pending_before, applied_before) = snapshot_evolution_promotion_ids(&evo).await;
     let (fast, llm_signals) = evo.flush().await;
-    super::agentic_loop_host::record_new_evolution_promotion_events(
-        state,
-        &evo,
-        &pending_before,
-        &applied_before,
-    )
-    .await;
+    record_new_evolution_promotion_events(state, &evo, &pending_before, &applied_before).await;
 
     if !fast.is_empty() {
         for proposal in fast.iter().take(MAX_RECENT_TACTICAL_ACTIONS) {
@@ -621,20 +617,14 @@ pub(crate) async fn maybe_trigger_auto_reflection<H: AgenticLoopHost>(
 
     apply_auto_reflection_usage(state, &reflection_result);
 
-    let (pending_before, applied_before) =
-        super::agentic_loop_host::snapshot_evolution_promotion_ids(&evo).await;
+    let (pending_before, applied_before) = snapshot_evolution_promotion_ids(&evo).await;
     match evo
         .ingest_reflection_response_detailed(&reflection_result.full_text, &ctx)
         .await
     {
         Ok(outcome) => {
-            super::agentic_loop_host::record_new_evolution_promotion_events(
-                state,
-                &evo,
-                &pending_before,
-                &applied_before,
-            )
-            .await;
+            record_new_evolution_promotion_events(state, &evo, &pending_before, &applied_before)
+                .await;
             state.pending_reflection_signals.clear();
             state.recent_tactical_actions.clear();
             host.emit_headless_line(

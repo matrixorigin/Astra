@@ -1,6 +1,7 @@
 pub mod action_compensation;
 pub mod activity;
 pub mod agent_progress_ui;
+pub mod agentic_adaptive_tuning;
 pub mod agentic_auto_reflection;
 pub mod agentic_delegate_interception;
 pub mod agentic_headless_round;
