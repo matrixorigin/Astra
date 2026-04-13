@@ -11500,7 +11500,8 @@ print(json.dumps({'context': 'user said: ' + msg}))
             "All signals drained"
         );
         assert_eq!(state.messages.len(), msg_count);
-        assert_eq!(evo.pending().await.len(), 1);
+        // 1 skill proposal from reflection + 1 calibration proposal from ToolFailure fast-path
+        assert_eq!(evo.pending().await.len(), 2);
     }
 
     #[tokio::test]

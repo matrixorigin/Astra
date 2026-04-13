@@ -646,17 +646,21 @@ mod tests {
         svc.add_signal(tool_failure_signal("bash", Some("review_changes")))
             .await;
         let (auto, llm) = svc.flush().await;
-        assert!(auto.is_empty());
-        assert_eq!(llm.len(), 1);
+        // Fast path produces a calibration proposal (auto-applied or queued)
+        let total = auto.len() + svc.pending().await.len();
+        assert!(total >= 1, "should produce a calibration proposal");
+        assert_eq!(llm.len(), 1, "with skill context → also needs LLM");
     }
 
     #[tokio::test]
-    async fn flush_tool_failure_without_skill_dropped() {
+    async fn flush_tool_failure_without_skill_not_llm() {
         let svc = EvolutionService::new();
         svc.add_signal(tool_failure_signal("bash", None)).await;
         let (auto, llm) = svc.flush().await;
-        assert!(auto.is_empty());
-        assert!(llm.is_empty(), "no skill context → not actionable");
+        // Fast path still produces a calibration proposal
+        let total = auto.len() + svc.pending().await.len();
+        assert!(total >= 1, "should produce a calibration proposal");
+        assert!(llm.is_empty(), "no skill context → no LLM needed");
     }
 
     #[tokio::test]
@@ -806,10 +810,12 @@ mod tests {
         .await;
 
         let (auto, llm) = svc.flush().await;
-        assert_eq!(auto.len(), 1, "drift promotes, block falls back to canary");
+        // drift promotes; block+tool_failure fall back to canary or queue
+        assert_eq!(auto.len(), 1, "drift auto-applies");
         assert_eq!(llm.len(), 1, "tool failure with skill → 1 LLM signal");
         let pending = svc.pending().await;
-        assert_eq!(pending.len(), 1);
+        // RepeatedStall → Canary, ToolFailure → Calibration (Canary/Hold)
+        assert_eq!(pending.len(), 2);
         assert_eq!(
             pending[0]
                 .promotion_verdict
