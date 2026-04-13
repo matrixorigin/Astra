@@ -73,7 +73,8 @@ use crate::semantic_dedup::SemanticDedup;
 use crate::str_preview::truncate_str;
 use crate::tool_registry::SelectionReport;
 use crate::turn::agentic_headless_round::{
-    HeadlessRoundTerminal, HeadlessStderrStyle, run_agentic_headless_tool_round,
+    HeadlessRoundTerminal, HeadlessStderrStyle, HeadlessToolRoundCtx,
+    run_agentic_headless_tool_round,
 };
 use crate::turn::agentic_post_tool_policy::{
     AgenticPostToolIterationControl, AgenticPostToolPolicyRequest, apply_agentic_post_tool_policy,
@@ -4851,35 +4852,35 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
             // lines (blocked-tool warnings, git diffs, etc.) into the user's
             // terminal after the skill's result was shown.
             let headless_quiet = quiet || state.skill_produced_output;
-            run_agentic_headless_tool_round(
+            run_agentic_headless_tool_round(HeadlessToolRoundCtx {
                 turn_index,
-                headless_quiet,
-                &state.api,
-                &state.api_token,
-                state.current_session_id.as_ref(),
-                all_tool_calls,
-                edge_round_for_headless,
-                turn_result.accum.reasoning_content.as_str(),
-                &edge_callback_outputs,
-                &mut state.messages,
-                &mut state.tool_results,
-                &valid_tool_names,
-                &mut state.restricted_tools,
-                &mut state.turn_guard,
-                &mut state.step_recorder,
-                &mut state.idempotency_cache,
-                &mut state.semantic_dedup,
-                &mut state.call_counts,
-                state.max_identical_tool_calls,
-                state.max_tools_per_turn,
-                &mut state.stall.tool_call_records,
-                &state.skills.tool_event_hooks,
-                &mut term_adapter,
-                state.messaging.mailbox.as_mut(),
-                state.permission_context.as_ref(),
-                state.messaging.progress_emitter.as_ref(),
-                &pre_resolved_results,
-            )
+                quiet: headless_quiet,
+                api: &state.api,
+                token: &state.api_token,
+                current_session_id: state.current_session_id.as_ref(),
+                tool_calls: all_tool_calls,
+                edge_tool_round: edge_round_for_headless,
+                reasoning_content: turn_result.accum.reasoning_content.as_str(),
+                edge_callback_outputs: &edge_callback_outputs,
+                messages: &mut state.messages,
+                tool_results: &mut state.tool_results,
+                valid_tool_names: &valid_tool_names,
+                restricted_tools: &mut state.restricted_tools,
+                turn_guard: &mut state.turn_guard,
+                step_recorder: &mut state.step_recorder,
+                idempotency_cache: &mut state.idempotency_cache,
+                semantic_dedup: &mut state.semantic_dedup,
+                call_counts: &mut state.call_counts,
+                max_identical_calls: state.max_identical_tool_calls,
+                max_tools_per_turn: state.max_tools_per_turn,
+                tool_call_records: &mut state.stall.tool_call_records,
+                tool_event_hooks: &state.skills.tool_event_hooks,
+                term: &mut term_adapter,
+                mailbox: state.messaging.mailbox.as_mut(),
+                permission_context: state.permission_context.as_ref(),
+                progress_emitter: state.messaging.progress_emitter.as_ref(),
+                pre_resolved_results: &pre_resolved_results,
+            })
             .await;
         }
 
