@@ -113,18 +113,87 @@ fn last_pipeline_command(command: &str) -> &str {
 ///
 /// This closes the security gap where `read_file("/outside/path")` is blocked by
 /// the sandbox but `cat /outside/path` bypasses it entirely.
+fn bash_command_segments(command: &str) -> Vec<&str> {
+    let chars: Vec<(usize, char)> = command.char_indices().collect();
+    let mut segments = Vec::new();
+    let mut segment_start = 0usize;
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut escaped = false;
+    let mut idx = 0usize;
+
+    while idx < chars.len() {
+        let (byte_idx, ch) = chars[idx];
+
+        if escaped {
+            escaped = false;
+            idx += 1;
+            continue;
+        }
+
+        if ch == '\\' && !in_single_quote {
+            escaped = true;
+            idx += 1;
+            continue;
+        }
+
+        if ch == '\'' && !in_double_quote {
+            in_single_quote = !in_single_quote;
+            idx += 1;
+            continue;
+        }
+
+        if ch == '"' && !in_single_quote {
+            in_double_quote = !in_double_quote;
+            idx += 1;
+            continue;
+        }
+
+        if !in_single_quote && !in_double_quote {
+            let is_double_separator =
+                matches!(ch, '&' | '|') && chars.get(idx + 1).is_some_and(|(_, next)| *next == ch);
+            let is_single_separator = matches!(ch, '|' | ';' | '\n' | '\r');
+
+            if is_double_separator || is_single_separator {
+                let segment = command[segment_start..byte_idx].trim();
+                if !segment.is_empty() {
+                    segments.push(segment);
+                }
+
+                segment_start = if is_double_separator {
+                    let (next_idx, next_ch) = chars[idx + 1];
+                    idx += 2;
+                    next_idx + next_ch.len_utf8()
+                } else {
+                    idx += 1;
+                    byte_idx + ch.len_utf8()
+                };
+                continue;
+            }
+        }
+
+        idx += 1;
+    }
+
+    let segment = command[segment_start..].trim();
+    if !segment.is_empty() {
+        segments.push(segment);
+    }
+
+    segments
+}
+
 fn check_bash_path_boundary(
     policy: &astra_runtime::tool_sandbox::SandboxPolicy,
     command: &str,
 ) -> Option<String> {
-    // Split on shell command separators to check ALL commands, not just the first.
-    // Covers: `cmd1 | cmd2`, `cmd1 && cmd2`, `cmd1 ; cmd2`, `cmd1 || cmd2`
-    for segment in command.split(&['|', ';'][..]) {
-        // Also split on && and ||
-        for sub in segment.split("&&") {
-            if let Some(msg) = check_single_command_path_boundary(policy, sub.trim()) {
-                return Some(msg);
-            }
+    // Split on unquoted shell command separators to check ALL commands, not
+    // just the first. Covers: `cmd1 | cmd2`, `cmd1 && cmd2`, `cmd1 ; cmd2`,
+    // `cmd1 || cmd2`, and newline-separated commands, while preserving quoted
+    // separators and line continuations.
+    for segment in bash_command_segments(command) {
+        if let Some(msg) = check_single_command_path_boundary(policy, segment) {
+            return Some(msg);
         }
     }
     None
@@ -222,17 +291,85 @@ fn check_powershell_path_boundary(
     None
 }
 
+fn shell_tokenize_like_bash(input: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut chars = input.chars().peekable();
+    let mut in_double_quote = false;
+    let mut in_single_quote = false;
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' if !in_single_quote => in_double_quote = !in_double_quote,
+            '\'' if !in_double_quote => in_single_quote = !in_single_quote,
+            '\\' if !in_single_quote => {
+                if let Some(next) = chars.next() {
+                    if next == '\n' || next == '\r' {
+                        continue;
+                    }
+                    current.push(next);
+                }
+            }
+            c if c.is_whitespace() && !in_double_quote && !in_single_quote => {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+            }
+            _ => current.push(ch),
+        }
+    }
+
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+
+    tokens
+}
+
+fn is_nested_shell_c_flag(flag: &str) -> bool {
+    matches!(
+        flag,
+        "-c" | "-lc" | "-ic" | "-ec" | "-xc" | "-lxc" | "-lcx" | "-lec" | "-exc" | "-xec"
+    )
+}
+
+fn expand_tilde_path(arg: &str) -> Option<std::path::PathBuf> {
+    let home = dirs::home_dir()?;
+    if arg == "~" {
+        return Some(home);
+    }
+    let suffix = arg.strip_prefix("~/")?;
+    Some(home.join(suffix))
+}
+
 /// Check a single (non-compound) command for path boundary violations.
 fn check_single_command_path_boundary(
     policy: &astra_runtime::tool_sandbox::SandboxPolicy,
     command: &str,
 ) -> Option<String> {
-    let parts: Vec<&str> = command.split_whitespace().collect();
+    let parts = shell_tokenize_like_bash(command);
     if parts.is_empty() {
         return None;
     }
 
-    let base = parts[0].rsplit('/').next().unwrap_or(parts[0]);
+    let base = parts[0].rsplit('/').next().unwrap_or(parts[0].as_str());
+
+    if matches!(base, "bash" | "sh" | "zsh" | "dash" | "ksh" | "fish") {
+        for idx in 1..parts.len() {
+            let arg = parts[idx].as_str();
+            if is_nested_shell_c_flag(arg) {
+                if let Some(inner) = parts.get(idx + 1)
+                    && let Some(msg) = check_bash_path_boundary(policy, inner)
+                {
+                    return Some(msg);
+                }
+                break;
+            }
+            if !arg.starts_with('-') {
+                break;
+            }
+        }
+    }
 
     // Only check commands known to access files by path argument.
     let is_file_access_cmd = matches!(
@@ -275,6 +412,8 @@ fn check_single_command_path_boundary(
         // pointing outside the sandbox (e.g., `ln -s /etc/passwd myfile`).
         let resolved = if arg.starts_with('/') {
             std::path::PathBuf::from(arg)
+        } else if let Some(expanded) = expand_tilde_path(arg) {
+            expanded
         } else {
             policy.project_root.join(arg)
         };
@@ -2453,6 +2592,17 @@ mod tests {
     }
 
     #[test]
+    fn bash_cat_quoted_space_path_allowed() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(&policy, r#"cat "docs/file with spaces.txt""#);
+        assert!(
+            result.is_none(),
+            "quoted paths should tokenize as one argument"
+        );
+    }
+
+    #[test]
     fn bash_non_file_command_not_checked() {
         use astra_runtime::tool_sandbox::SandboxPolicy;
         let policy = SandboxPolicy::for_project("/home/user/project");
@@ -2509,6 +2659,25 @@ mod tests {
     }
 
     #[test]
+    fn bash_newline_checks_all_commands() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(&policy, "echo hi\ncat /etc/passwd");
+        assert!(result.is_some(), "should block cat after newline");
+    }
+
+    #[test]
+    fn bash_line_continuation_is_not_treated_as_separator() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(&policy, "echo hi\\\ncat /etc/passwd");
+        assert!(
+            result.is_none(),
+            "escaped newline is a line continuation, not a command separator"
+        );
+    }
+
+    #[test]
     fn bash_full_path_command_detected() {
         use astra_runtime::tool_sandbox::SandboxPolicy;
         let policy = SandboxPolicy::for_project("/home/user/project");
@@ -2550,31 +2719,38 @@ mod tests {
     // These document known bypass vectors and whether they are caught.
 
     #[test]
-    fn bypass_bash_c_not_caught() {
-        // bash -c "cat /etc/passwd" — the inner command is a string argument,
-        // not parsed by our simple whitespace splitter. This is a KNOWN LIMITATION.
-        // The existing analyze_command_risks() AST parser covers this via
-        // CommandSubstitution / RemoteCodeExecution detection at the permission layer.
+    fn bypass_bash_c_now_blocked() {
         use astra_runtime::tool_sandbox::SandboxPolicy;
         let policy = SandboxPolicy::for_project("/home/user/project");
         let result = check_bash_path_boundary(&policy, r#"bash -c "cat /etc/passwd""#);
-        // Not caught by path boundary check — handled by permission_manager instead
         assert!(
-            result.is_none(),
-            "bash -c is handled by permission layer, not path check"
+            result.is_some(),
+            "nested bash -c file reads should be checked recursively"
         );
     }
 
     #[test]
-    fn bypass_command_substitution_not_caught() {
-        // $(cat /etc/passwd) — command substitution. KNOWN LIMITATION.
-        // Covered by analyze_command_risks() CommandSubstitution detection.
+    fn bypass_bash_lc_now_blocked() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(&policy, r#"bash -lc "cat /etc/passwd""#);
+        assert!(
+            result.is_some(),
+            "nested bash -lc file reads should be checked recursively"
+        );
+    }
+
+    #[test]
+    fn bypass_command_substitution_not_caught_by_path_boundary() {
+        // $(cat /etc/passwd) — command substitution. Path-boundary parsing does
+        // not introspect substitutions, but runtime safety middleware now denies
+        // this pattern before execution.
         use astra_runtime::tool_sandbox::SandboxPolicy;
         let policy = SandboxPolicy::for_project("/home/user/project");
         let result = check_bash_path_boundary(&policy, "echo $(cat /etc/passwd)");
         assert!(
             result.is_none(),
-            "command substitution handled by permission layer"
+            "command substitution is handled by higher-level shell safety guards"
         );
     }
 
@@ -2594,17 +2770,29 @@ mod tests {
     }
 
     #[test]
-    fn bypass_tilde_expansion_not_caught() {
-        // cat ~/.ssh/id_rsa — tilde is not an absolute path, so not checked.
-        // KNOWN LIMITATION: tilde expands to home dir at shell level.
-        // Mitigated by: cwd is set to project_root, and sensitive paths like
-        // ~/.ssh are covered by is_dangerous_file_path() in permission_manager.
+    fn tilde_expansion_now_blocked() {
         use astra_runtime::tool_sandbox::SandboxPolicy;
         let policy = SandboxPolicy::for_project("/home/user/project");
         let result = check_bash_path_boundary(&policy, "cat ~/.ssh/id_rsa");
         assert!(
+            result.is_some(),
+            "tilde-prefixed paths should be resolved and checked"
+        );
+    }
+
+    #[test]
+    fn tilde_expansion_inside_project_is_allowed() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let Some(home) = dirs::home_dir() else {
+            return;
+        };
+        let project_root = home.join("project");
+        let policy = SandboxPolicy::for_project(&project_root);
+        let command = format!("cat ~/project/src/main.rs");
+        let result = check_bash_path_boundary(&policy, &command);
+        assert!(
             result.is_none(),
-            "tilde paths not checked (handled by dangerous path detection)"
+            "tilde expansion should still allow paths that stay inside the project"
         );
     }
 

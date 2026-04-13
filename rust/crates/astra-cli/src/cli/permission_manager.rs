@@ -1210,6 +1210,8 @@ fn is_read_only_allowlisted(lower_cmd: &str) -> bool {
         || cmd.contains("&&")
         || cmd.contains("||")
         || cmd.contains(';')
+        || cmd.contains("$(")
+        || cmd.contains('`')
     {
         return false;
     }
@@ -1369,6 +1371,24 @@ mod tests {
         let redirected = serde_json::json!({"command": "git status > out.txt"});
         assert_eq!(
             PermissionManager::execute_decision("bash", &redirected),
+            ExecuteDecision::Ask
+        );
+    }
+
+    #[test]
+    fn execute_allowlist_rejects_command_substitution() {
+        let subst = serde_json::json!({"command": "grep foo $(cat /etc/passwd)"});
+        assert_eq!(
+            PermissionManager::execute_decision("bash", &subst),
+            ExecuteDecision::Ask
+        );
+    }
+
+    #[test]
+    fn execute_allowlist_rejects_backticks() {
+        let subst = serde_json::json!({"command": "grep foo `cat /etc/passwd`"});
+        assert_eq!(
+            PermissionManager::execute_decision("bash", &subst),
             ExecuteDecision::Ask
         );
     }
