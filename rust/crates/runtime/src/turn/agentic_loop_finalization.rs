@@ -247,3 +247,166 @@ pub(crate) fn finalize_and_render<H: AgenticLoopHost>(host: &mut H, state: &mut 
         host.render_final_text(&state.final_text);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::turn::agentic_loop_host::tests::{
+        MockHost, edge_tool_result, make_edge_tool, make_state, text_result,
+    };
+
+    use super::*;
+
+    #[tokio::test]
+    async fn single_text_turn_completes() {
+        let mut host = MockHost::new(vec![text_result("Hello, world!", 10, 5, Some(42))]);
+        let mut state = make_state();
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+        assert!(outcome.is_ok());
+        assert_eq!(state.final_text, "Hello, world!");
+        assert_eq!(state.total_prompt, 10);
+        assert_eq!(state.total_completion, 5);
+        assert!(state.has_any_usage);
+        assert_eq!(host.rendered_final_text.len(), 1);
+        assert_eq!(host.rendered_final_text[0], "Hello, world!");
+    }
+
+    #[tokio::test]
+    async fn render_final_text_called_once_at_completion() {
+        let mut host = MockHost::new(vec![
+            edge_tool_result(vec![make_edge_tool("grep", "results...")], 20, 10, Some(50)),
+            text_result("Final answer", 15, 8, Some(30)),
+        ])
+        .with_valid_tools(&["grep"]);
+        let mut state = make_state();
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+        assert!(outcome.is_ok());
+        assert_eq!(state.final_text, "Final answer");
+        assert_eq!(host.rendered_final_text.len(), 1);
+        assert_eq!(host.rendered_final_text[0], "Final answer");
+    }
+
+    #[tokio::test]
+    async fn render_final_text_not_duplicated_across_tool_then_text() {
+        let mut host = MockHost::new(vec![
+            edge_tool_result(vec![make_edge_tool("grep", "results...")], 20, 10, Some(50)),
+            edge_tool_result(
+                vec![make_edge_tool("grep", "more results")],
+                20,
+                10,
+                Some(50),
+            ),
+            text_result("Done!", 15, 8, Some(30)),
+        ])
+        .with_valid_tools(&["grep"]);
+        let mut state = make_state();
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+        assert!(outcome.is_ok());
+        assert_eq!(state.final_text, "Done!");
+        assert_eq!(host.rendered_final_text.len(), 1);
+        assert_eq!(host.rendered_final_text[0], "Done!");
+    }
+
+    #[test]
+    fn finalize_turn_trace_feeds_observability_session() {
+        let mut state = make_state();
+        let hub = crate::observability_integration::ObservabilityHub::new();
+        let session = hub.start_session("u1", "s1");
+        state.telemetry.observability_session = Some(session.clone());
+        state.max_turn_input_tokens = 100_000;
+        state.last_measured_prompt_tokens = Some(25_000);
+
+        let collector = crate::turn::turn_trace_collector::TurnTraceCollector::new(
+            "turn-0".to_string(),
+            "s1".to_string(),
+        );
+        collector.record_token_budget_estimate(14_000, 5_000, 0, 3_000, 200, 22_200, 100_000, 0.22);
+        state.telemetry.turn_trace_collector = Some(collector);
+
+        finalize_turn_trace(&mut state);
+
+        assert!(state.telemetry.turn_trace_collector.is_none());
+        let guard = session.read().unwrap();
+        assert_eq!(guard.context_traces.len(), 1);
+        let trace = &guard.context_traces[0];
+        assert_eq!(trace.turn_id, "turn-0");
+        assert_eq!(trace.token_budget.system_prompt_tokens, 14_000);
+        assert_eq!(trace.token_budget.history_tokens, 5_000);
+        assert_eq!(trace.token_budget.total_used, 22_200);
+        assert_eq!(trace.token_budget.max_tokens, 100_000);
+        assert!((trace.token_budget.budget_pressure - 0.25).abs() < 0.01);
+    }
+
+    #[test]
+    fn finalize_turn_trace_noop_when_no_collector() {
+        let mut state = make_state();
+        assert!(state.telemetry.turn_trace_collector.is_none());
+        finalize_turn_trace(&mut state);
+    }
+
+    #[test]
+    fn finalize_turn_trace_updates_on_consecutive_turns() {
+        let mut state = make_state();
+        let hub = crate::observability_integration::ObservabilityHub::new();
+        let session = hub.start_session("u1", "s1");
+        state.telemetry.observability_session = Some(session.clone());
+        state.max_turn_input_tokens = 100_000;
+
+        session.write().unwrap().turn_number = 1;
+        state.last_measured_prompt_tokens = Some(20_000);
+        state.telemetry.turn_trace_collector =
+            Some(crate::turn::turn_trace_collector::TurnTraceCollector::new(
+                "turn-0".to_string(),
+                "s1".to_string(),
+            ));
+        finalize_turn_trace(&mut state);
+
+        session.write().unwrap().turn_number = 2;
+        state.last_measured_prompt_tokens = Some(30_000);
+        state.telemetry.turn_trace_collector =
+            Some(crate::turn::turn_trace_collector::TurnTraceCollector::new(
+                "turn-1".to_string(),
+                "s1".to_string(),
+            ));
+        finalize_turn_trace(&mut state);
+
+        let guard = session.read().unwrap();
+        assert_eq!(guard.context_traces.len(), 2);
+        assert_eq!(guard.context_traces[0].turn_id, "turn-1");
+        assert_eq!(guard.context_traces[0].token_budget.total_used, 20_000);
+        assert_eq!(guard.context_traces[1].turn_id, "turn-2");
+        assert_eq!(guard.context_traces[1].token_budget.total_used, 30_000);
+    }
+
+    #[test]
+    fn finalize_turn_trace_aligns_trace_turn_id_with_journal_turn() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
+
+        let mut state = make_state();
+        let hub = crate::observability_integration::ObservabilityHub::new();
+        let session = hub.start_session("u1", "s1");
+        session.write().unwrap().turn_number = 3;
+        state.current_session_id = Some("s1".to_string());
+        state.telemetry.observability_session = Some(session.clone());
+        state.telemetry.turn_trace_collector =
+            Some(crate::turn::turn_trace_collector::TurnTraceCollector::new(
+                "turn-0".to_string(),
+                "s1".to_string(),
+            ));
+        state.max_turn_input_tokens = 100_000;
+        state.last_measured_prompt_tokens = Some(42_000);
+
+        finalize_turn_trace(&mut state);
+
+        let session_guard = session.read().unwrap();
+        assert_eq!(session_guard.context_traces.len(), 1);
+        assert_eq!(session_guard.context_traces[0].turn_id, "turn-3");
+        drop(session_guard);
+
+        let journal = std::fs::read_to_string(temp.path().join("s1.jsonl")).unwrap();
+        let event: serde_json::Value =
+            serde_json::from_str(journal.lines().next().unwrap()).unwrap();
+        assert_eq!(event["turn"], 3);
+        assert_eq!(event["context_assembly_trace"]["turn_id"], "turn-3");
+    }
+}

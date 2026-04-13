@@ -460,3 +460,62 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
         turn_start_time,
     }))
 }
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use crate::turn::agentic_loop_host::run_agentic_loop_with_host;
+    use crate::turn::agentic_loop_host::tests::{
+        MockHost, make_state, make_test_delegation_engine, text_result,
+    };
+
+    use super::*;
+
+    #[tokio::test]
+    async fn auto_inject_delegate_schema_when_engine_present() {
+        let mut host = MockHost::new(vec![text_result("done", 50, 20, Some(10))]);
+        let mut state = make_state();
+        state
+            .messages
+            .push(json!({"role": "user", "content": "hello"}));
+        state.delegation_engine = Some(make_test_delegation_engine());
+
+        let _ = run_agentic_loop_with_host(&mut host, &mut state).await;
+
+        assert_eq!(host.injected_schemas.len(), 1);
+        let injected = &host.injected_schemas[0];
+        let name = injected["function"]["name"].as_str().unwrap();
+        assert_eq!(name, "delegate");
+        assert!(host.valid_tools.contains("delegate"));
+    }
+
+    #[tokio::test]
+    async fn no_inject_when_delegation_engine_absent() {
+        let mut host = MockHost::new(vec![text_result("done", 50, 20, Some(10))]);
+        let mut state = make_state();
+        state
+            .messages
+            .push(json!({"role": "user", "content": "hello"}));
+
+        let _ = run_agentic_loop_with_host(&mut host, &mut state).await;
+
+        assert!(host.injected_schemas.is_empty());
+        assert!(!host.valid_tools.contains("delegate"));
+    }
+
+    #[tokio::test]
+    async fn injected_schema_matches_delegate_tool_schema() {
+        let mut host = MockHost::new(vec![text_result("done", 50, 20, Some(10))]);
+        let mut state = make_state();
+        state
+            .messages
+            .push(json!({"role": "user", "content": "hello"}));
+        state.delegation_engine = Some(make_test_delegation_engine());
+
+        let _ = run_agentic_loop_with_host(&mut host, &mut state).await;
+
+        let expected = delegate_tool_schema();
+        assert_eq!(host.injected_schemas[0], expected);
+    }
+}

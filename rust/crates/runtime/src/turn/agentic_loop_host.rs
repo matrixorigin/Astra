@@ -700,7 +700,7 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use astra_core::confidence::ConfidenceInterval;
     use astra_services::evaluation::types::ValueInterval;
@@ -709,21 +709,21 @@ mod tests {
 
     // ── Flexible mock host for multi-turn scenarios ─────────────────────────
 
-    struct MockHost {
+    pub(crate) struct MockHost {
         turn_results: Vec<HostTurnResult>,
         current_turn: usize,
-        valid_tools: HashSet<String>,
+        pub(crate) valid_tools: HashSet<String>,
         emitted_lines: Vec<String>,
         quiet: bool,
-        injected_schemas: Vec<Value>,
+        pub(crate) injected_schemas: Vec<Value>,
         reflection_text: Option<String>,
         reflection_error: Option<String>,
         last_reflection_prompt: Option<String>,
-        rendered_final_text: Vec<String>,
+        pub(crate) rendered_final_text: Vec<String>,
     }
 
     impl MockHost {
-        fn new(results: Vec<HostTurnResult>) -> Self {
+        pub(crate) fn new(results: Vec<HostTurnResult>) -> Self {
             Self {
                 turn_results: results,
                 current_turn: 0,
@@ -738,7 +738,7 @@ mod tests {
             }
         }
 
-        fn with_valid_tools(mut self, tools: &[&str]) -> Self {
+        pub(crate) fn with_valid_tools(mut self, tools: &[&str]) -> Self {
             self.valid_tools = tools.iter().map(|s| s.to_string()).collect();
             self
         }
@@ -824,7 +824,12 @@ mod tests {
 
     // ── Result builders ─────────────────────────────────────────────────────
 
-    fn text_result(text: &str, prompt: u64, completion: u64, ttft: Option<u64>) -> HostTurnResult {
+    pub(crate) fn text_result(
+        text: &str,
+        prompt: u64,
+        completion: u64,
+        ttft: Option<u64>,
+    ) -> HostTurnResult {
         HostTurnResult {
             accum: ChatTurnSseAccum {
                 full_text: text.to_string(),
@@ -839,7 +844,7 @@ mod tests {
         }
     }
 
-    fn edge_tool_result(
+    pub(crate) fn edge_tool_result(
         tools: Vec<EdgeToolExecResult>,
         prompt: u64,
         completion: u64,
@@ -879,7 +884,7 @@ mod tests {
         }
     }
 
-    fn make_edge_tool(name: &str, output: &str) -> EdgeToolExecResult {
+    pub(crate) fn make_edge_tool(name: &str, output: &str) -> EdgeToolExecResult {
         EdgeToolExecResult {
             request_id: format!("req-{name}"),
             tool: name.to_string(),
@@ -917,7 +922,7 @@ mod tests {
 
     // ── State builder ───────────────────────────────────────────────────────
 
-    fn make_state() -> AgenticLoopState {
+    pub(crate) fn make_state() -> AgenticLoopState {
         AgenticLoopState {
             messages: Vec::new(),
             tool_results: Vec::new(),
@@ -1015,62 +1020,6 @@ mod tests {
     }
 
     // ── Original tests ──────────────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn single_text_turn_completes() {
-        let mut host = MockHost::new(vec![text_result("Hello, world!", 10, 5, Some(42))]);
-        let mut state = make_state();
-        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
-        assert!(outcome.is_ok());
-        assert_eq!(state.final_text, "Hello, world!");
-        assert_eq!(state.total_prompt, 10);
-        assert_eq!(state.total_completion, 5);
-        assert!(state.has_any_usage);
-        // Deferred rendering: host.render_final_text() is called with the final text.
-        assert_eq!(host.rendered_final_text.len(), 1);
-        assert_eq!(host.rendered_final_text[0], "Hello, world!");
-    }
-
-    #[tokio::test]
-    async fn render_final_text_called_once_at_completion() {
-        // Two turns: tool turn (no render) → text turn (render).
-        let mut host = MockHost::new(vec![
-            edge_tool_result(vec![make_edge_tool("grep", "results...")], 20, 10, Some(50)),
-            text_result("Final answer", 15, 8, Some(30)),
-        ])
-        .with_valid_tools(&["grep"]);
-        let mut state = make_state();
-        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
-        assert!(outcome.is_ok());
-        assert_eq!(state.final_text, "Final answer");
-        // render_final_text should be called exactly once with the final text.
-        assert_eq!(host.rendered_final_text.len(), 1);
-        assert_eq!(host.rendered_final_text[0], "Final answer");
-    }
-
-    #[tokio::test]
-    async fn render_final_text_not_duplicated_across_tool_then_text() {
-        // Verify render_final_text isn't called after tool turns, only at
-        // final text completion.
-        let mut host = MockHost::new(vec![
-            edge_tool_result(vec![make_edge_tool("grep", "results...")], 20, 10, Some(50)),
-            edge_tool_result(
-                vec![make_edge_tool("grep", "more results")],
-                20,
-                10,
-                Some(50),
-            ),
-            text_result("Done!", 15, 8, Some(30)),
-        ])
-        .with_valid_tools(&["grep"]);
-        let mut state = make_state();
-        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
-        assert!(outcome.is_ok());
-        assert_eq!(state.final_text, "Done!");
-        // Key contract: render_final_text called exactly once, not once per turn.
-        assert_eq!(host.rendered_final_text.len(), 1);
-        assert_eq!(host.rendered_final_text[0], "Done!");
-    }
 
     #[test]
     fn adaptive_scenario_event_only_emits_for_real_changes() {
@@ -2325,7 +2274,8 @@ mod tests {
     // ── E2E delegation round-trip tests ─────────────────────────────────────
 
     /// Helper to build a DelegationEngine with StubSubRunExecutor for tests.
-    fn make_test_delegation_engine() -> Arc<crate::server::delegation_engine::DelegationEngine> {
+    pub(crate) fn make_test_delegation_engine()
+    -> Arc<crate::server::delegation_engine::DelegationEngine> {
         use crate::server::delegation_engine::{
             DelegationEngine, DelegationTracker, StubSubRunExecutor,
         };
@@ -2666,57 +2616,6 @@ mod tests {
     }
 
     // ── Auto-injection tests ────────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn auto_inject_delegate_schema_when_engine_present() {
-        // When delegation_engine is Some, the loop preamble should call
-        // inject_tool_schema with the delegate tool schema.
-        let mut host = MockHost::new(vec![text_result("done", 50, 20, Some(10))]);
-        let mut state = make_state();
-        state
-            .messages
-            .push(json!({"role": "user", "content": "hello"}));
-        state.delegation_engine = Some(make_test_delegation_engine());
-
-        let _ = run_agentic_loop_with_host(&mut host, &mut state).await;
-
-        assert_eq!(host.injected_schemas.len(), 1);
-        let injected = &host.injected_schemas[0];
-        let name = injected["function"]["name"].as_str().unwrap();
-        assert_eq!(name, "delegate");
-        assert!(host.valid_tools.contains("delegate"));
-    }
-
-    #[tokio::test]
-    async fn no_inject_when_delegation_engine_absent() {
-        // When delegation_engine is None, no schema should be injected.
-        let mut host = MockHost::new(vec![text_result("done", 50, 20, Some(10))]);
-        let mut state = make_state();
-        state
-            .messages
-            .push(json!({"role": "user", "content": "hello"}));
-        // delegation_engine defaults to None
-
-        let _ = run_agentic_loop_with_host(&mut host, &mut state).await;
-
-        assert!(host.injected_schemas.is_empty());
-        assert!(!host.valid_tools.contains("delegate"));
-    }
-
-    #[tokio::test]
-    async fn injected_schema_matches_delegate_tool_schema() {
-        let mut host = MockHost::new(vec![text_result("done", 50, 20, Some(10))]);
-        let mut state = make_state();
-        state
-            .messages
-            .push(json!({"role": "user", "content": "hello"}));
-        state.delegation_engine = Some(make_test_delegation_engine());
-
-        let _ = run_agentic_loop_with_host(&mut host, &mut state).await;
-
-        let expected = delegate_tool_schema();
-        assert_eq!(host.injected_schemas[0], expected);
-    }
 
     #[tokio::test]
     async fn auto_inject_only_once_across_loop() {
@@ -7421,120 +7320,6 @@ print(json.dumps({'context': 'user said: ' + msg}))
                 .iter()
                 .any(|event| event.outcome == RuntimePromotionOutcome::CanaryRolledBack)
         );
-    }
-
-    // ── finalize_turn_trace tests ───────────────────────────────────────
-
-    #[test]
-    fn finalize_turn_trace_feeds_observability_session() {
-        let mut state = make_state();
-        let hub = crate::observability_integration::ObservabilityHub::new();
-        let session = hub.start_session("u1", "s1");
-        state.telemetry.observability_session = Some(session.clone());
-        state.max_turn_input_tokens = 100_000;
-        state.last_measured_prompt_tokens = Some(25_000);
-
-        // Create collector with some data
-        let collector = crate::turn::turn_trace_collector::TurnTraceCollector::new(
-            "turn-0".to_string(),
-            "s1".to_string(),
-        );
-        collector.record_token_budget_estimate(14_000, 5_000, 0, 3_000, 200, 22_200, 100_000, 0.22);
-        state.telemetry.turn_trace_collector = Some(collector);
-
-        finalize_turn_trace(&mut state);
-
-        // Collector consumed
-        assert!(state.telemetry.turn_trace_collector.is_none());
-        // Trace fed to observability session
-        let guard = session.read().unwrap();
-        assert_eq!(guard.context_traces.len(), 1);
-        let trace = &guard.context_traces[0];
-        assert_eq!(trace.turn_id, "turn-0");
-        // CLI component estimates preserved.
-        assert_eq!(trace.token_budget.system_prompt_tokens, 14_000);
-        assert_eq!(trace.token_budget.history_tokens, 5_000);
-        // Persisted total remains aligned with the component breakdown.
-        assert_eq!(trace.token_budget.total_used, 22_200);
-        assert_eq!(trace.token_budget.max_tokens, 100_000);
-        assert!((trace.token_budget.budget_pressure - 0.25).abs() < 0.01);
-    }
-
-    #[test]
-    fn finalize_turn_trace_noop_when_no_collector() {
-        let mut state = make_state();
-        assert!(state.telemetry.turn_trace_collector.is_none());
-        // Should not panic
-        finalize_turn_trace(&mut state);
-    }
-
-    #[test]
-    fn finalize_turn_trace_updates_on_consecutive_turns() {
-        let mut state = make_state();
-        let hub = crate::observability_integration::ObservabilityHub::new();
-        let session = hub.start_session("u1", "s1");
-        state.telemetry.observability_session = Some(session.clone());
-        state.max_turn_input_tokens = 100_000;
-
-        // Turn 0
-        session.write().unwrap().turn_number = 1;
-        state.last_measured_prompt_tokens = Some(20_000);
-        state.telemetry.turn_trace_collector =
-            Some(crate::turn::turn_trace_collector::TurnTraceCollector::new(
-                "turn-0".to_string(),
-                "s1".to_string(),
-            ));
-        finalize_turn_trace(&mut state);
-
-        // Turn 1
-        session.write().unwrap().turn_number = 2;
-        state.last_measured_prompt_tokens = Some(30_000);
-        state.telemetry.turn_trace_collector =
-            Some(crate::turn::turn_trace_collector::TurnTraceCollector::new(
-                "turn-1".to_string(),
-                "s1".to_string(),
-            ));
-        finalize_turn_trace(&mut state);
-
-        let guard = session.read().unwrap();
-        assert_eq!(guard.context_traces.len(), 2);
-        assert_eq!(guard.context_traces[0].turn_id, "turn-1");
-        assert_eq!(guard.context_traces[0].token_budget.total_used, 20_000);
-        assert_eq!(guard.context_traces[1].turn_id, "turn-2");
-        assert_eq!(guard.context_traces[1].token_budget.total_used, 30_000);
-    }
-
-    #[test]
-    fn finalize_turn_trace_aligns_trace_turn_id_with_journal_turn() {
-        let temp = tempfile::tempdir().unwrap();
-        let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
-
-        let mut state = make_state();
-        let hub = crate::observability_integration::ObservabilityHub::new();
-        let session = hub.start_session("u1", "s1");
-        session.write().unwrap().turn_number = 3;
-        state.current_session_id = Some("s1".to_string());
-        state.telemetry.observability_session = Some(session.clone());
-        state.telemetry.turn_trace_collector =
-            Some(crate::turn::turn_trace_collector::TurnTraceCollector::new(
-                "turn-0".to_string(),
-                "s1".to_string(),
-            ));
-        state.max_turn_input_tokens = 100_000;
-        state.last_measured_prompt_tokens = Some(42_000);
-
-        finalize_turn_trace(&mut state);
-
-        let session_guard = session.read().unwrap();
-        assert_eq!(session_guard.context_traces.len(), 1);
-        assert_eq!(session_guard.context_traces[0].turn_id, "turn-3");
-        drop(session_guard);
-
-        let journal = std::fs::read_to_string(temp.path().join("s1.jsonl")).unwrap();
-        let event: serde_json::Value =
-            serde_json::from_str(journal.lines().next().unwrap()).unwrap();
-        assert_eq!(event["turn"], 3);
-        assert_eq!(event["context_assembly_trace"]["turn_id"], "turn-3");
     }
 
     // ── Skill deferral behavior tests ─────────────────────────────────────
