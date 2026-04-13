@@ -316,7 +316,11 @@ fn shell_tokenize_like_bash(input: &str) -> Vec<String> {
                     if next == '\n' || next == '\r' {
                         continue;
                     }
-                    current.push(next);
+                    if let Some(escaped) = escaped_shell_analysis_char(next) {
+                        current.push(escaped);
+                    } else {
+                        current.push(next);
+                    }
                 }
             }
             c if c.is_whitespace() && !in_double_quote && !in_single_quote => {
@@ -333,6 +337,33 @@ fn shell_tokenize_like_bash(input: &str) -> Vec<String> {
     }
 
     tokens
+}
+
+const ESCAPED_SHELL_DOLLAR: char = '\u{E000}';
+const ESCAPED_SHELL_TILDE: char = '\u{E001}';
+const ESCAPED_SHELL_OPEN_BRACE: char = '\u{E002}';
+const ESCAPED_SHELL_CLOSE_BRACE: char = '\u{E003}';
+
+fn escaped_shell_analysis_char(ch: char) -> Option<char> {
+    match ch {
+        '$' => Some(ESCAPED_SHELL_DOLLAR),
+        '~' => Some(ESCAPED_SHELL_TILDE),
+        '{' => Some(ESCAPED_SHELL_OPEN_BRACE),
+        '}' => Some(ESCAPED_SHELL_CLOSE_BRACE),
+        _ => None,
+    }
+}
+
+fn restore_escaped_shell_analysis_chars(arg: &str) -> String {
+    arg.chars()
+        .map(|ch| match ch {
+            ESCAPED_SHELL_DOLLAR => '$',
+            ESCAPED_SHELL_TILDE => '~',
+            ESCAPED_SHELL_OPEN_BRACE => '{',
+            ESCAPED_SHELL_CLOSE_BRACE => '}',
+            _ => ch,
+        })
+        .collect()
 }
 
 fn shell_short_flag_cluster(flag: &str) -> Option<&str> {
@@ -386,22 +417,23 @@ fn validate_plain_command_path_arg(
     arg: &str,
     oldpwd: Option<&std::path::Path>,
 ) -> Option<String> {
+    let literal_arg = restore_escaped_shell_analysis_chars(arg);
     if let Some(kind) = unresolved_static_dir_reference_kind(policy, arg, oldpwd) {
         return Some(format!(
             "{}The command references '{}' using {} which cannot be statically validated against the project directory '{}'. Ask the user for permission before accessing files outside the project.",
             super::SANDBOX_DENIED_PREFIX,
-            arg,
+            literal_arg,
             kind,
             policy.project_root.display(),
         ));
     }
 
-    let resolved = if arg.starts_with('/') {
-        std::path::PathBuf::from(arg)
+    let resolved = if literal_arg.starts_with('/') {
+        std::path::PathBuf::from(&literal_arg)
     } else if let Some(expanded) = expand_static_dir_reference(policy, arg, oldpwd) {
         expanded
     } else {
-        policy.project_root.join(arg)
+        policy.project_root.join(&literal_arg)
     };
     let path_str = resolved.to_string_lossy();
     if let Err(e) = validate_path(policy, &path_str)
@@ -411,7 +443,7 @@ fn validate_plain_command_path_arg(
             "{}The command references '{}' which is outside the project directory '{}'. \
              Ask the user for permission before accessing files outside the project.",
             super::SANDBOX_DENIED_PREFIX,
-            arg,
+            literal_arg,
             policy.project_root.display(),
         ));
     }
@@ -3868,6 +3900,17 @@ mod tests {
     }
 
     #[test]
+    fn escaped_tilde_path_is_treated_literally() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(&policy, r"cat \~/notes.txt");
+        assert!(
+            result.is_none(),
+            "escaped tilde should stay a literal relative path instead of expanding to home"
+        );
+    }
+
+    #[test]
     fn home_env_expansion_now_blocked() {
         use astra_runtime::tool_sandbox::SandboxPolicy;
         let policy = SandboxPolicy::for_project("/home/user/project");
@@ -4095,6 +4138,17 @@ mod tests {
     }
 
     #[test]
+    fn escaped_unbraced_variable_path_is_treated_literally() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(&policy, r"cat \$SECRET/passwd");
+        assert!(
+            result.is_none(),
+            "escaped shell variables should stay literal paths instead of triggering expansion review"
+        );
+    }
+
+    #[test]
     fn absolute_unbraced_variable_expansion_requires_boundary_review() {
         use astra_runtime::tool_sandbox::SandboxPolicy;
         let policy = SandboxPolicy::for_project("/home/user/project");
@@ -4121,6 +4175,17 @@ mod tests {
                     && msg.contains("${HOME_DIR}/notes.txt")
                     && msg.contains("shell variable expansion")),
             "unresolved variable-like anchors should require boundary review"
+        );
+    }
+
+    #[test]
+    fn escaped_home_like_variable_name_is_treated_literally() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(&policy, r"cat \${HOME_DIR}/notes.txt");
+        assert!(
+            result.is_none(),
+            "escaped variable syntax should stay literal instead of requiring expansion review"
         );
     }
 
