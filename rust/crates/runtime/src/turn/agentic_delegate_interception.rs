@@ -1339,7 +1339,7 @@ mod tests {
         let mut registry = AgentProfileRegistry::new();
         for agent_id in agent_ids {
             let _ = registry.register(AgentProfile::new(
-                *agent_id,
+                agent_id,
                 &agent_id.to_uppercase(),
                 AgentTier::System,
             ));

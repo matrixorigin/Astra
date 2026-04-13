@@ -476,7 +476,7 @@ impl TaskLeaseService for DatabaseTaskLeaseService {
 
         let lease_row = sqlx::query(
             "SELECT holder_agent_id, CAST(expires_at AS CHAR) AS expires_at, \
-             (expires_at > NOW(6)) AS is_active \
+             CASE WHEN expires_at > NOW(6) THEN 1 ELSE 0 END AS is_active \
              FROM task_leases WHERE task_id = ? AND user_id = ? FOR UPDATE",
         )
         .bind(task_id)

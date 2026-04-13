@@ -193,7 +193,7 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
     // Auth
     query(
         "CREATE TABLE IF NOT EXISTS auth_users (
-            user_id VARCHAR(36) PRIMARY KEY,
+            user_id VARCHAR(64) PRIMARY KEY,
             username VARCHAR(50) NOT NULL UNIQUE,
             email VARCHAR(255) NOT NULL UNIQUE,
             password_hash VARCHAR(255) NOT NULL,
@@ -208,7 +208,7 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
 
     query(
         "CREATE TABLE IF NOT EXISTS auth_roles (
-            role_id VARCHAR(36) PRIMARY KEY,
+            role_id VARCHAR(64) PRIMARY KEY,
             role_name VARCHAR(50) NOT NULL UNIQUE,
             description VARCHAR(255) NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
@@ -220,8 +220,8 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
     query(
         "CREATE TABLE IF NOT EXISTS auth_user_roles (
             id BIGINT AUTO_INCREMENT PRIMARY KEY,
-            user_id VARCHAR(36) NOT NULL,
-            role_id VARCHAR(36) NOT NULL,
+            user_id VARCHAR(64) NOT NULL,
+            role_id VARCHAR(64) NOT NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             UNIQUE KEY uq_auth_user_roles_user_role (user_id, role_id),
             INDEX idx_auth_user_roles_user_id (user_id),
@@ -233,8 +233,8 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
 
     query(
         "CREATE TABLE IF NOT EXISTS auth_refresh_tokens (
-            token_id VARCHAR(36) PRIMARY KEY,
-            user_id VARCHAR(36) NOT NULL,
+            token_id VARCHAR(64) PRIMARY KEY,
+            user_id VARCHAR(64) NOT NULL,
             token_hash VARCHAR(255) NOT NULL,
             token_prefix VARCHAR(16) NULL,
             expires_at DATETIME(6) NOT NULL,
@@ -251,13 +251,13 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
 
     query(
         "CREATE TABLE IF NOT EXISTS auth_tokens (
-            token_id VARCHAR(36) PRIMARY KEY,
+            token_id VARCHAR(64) PRIMARY KEY,
             type VARCHAR(50) NOT NULL,
             provider VARCHAR(50) NOT NULL,
             encrypted_value TEXT NULL,
             secret_ref VARCHAR(255) NULL,
             is_active SMALLINT NOT NULL DEFAULT 1,
-            scope_user_id VARCHAR(36) NULL,
+            scope_user_id VARCHAR(64) NULL,
             scope_repo VARCHAR(255) NULL,
             metadata JSON NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
@@ -271,8 +271,8 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
 
     query(
         "CREATE TABLE IF NOT EXISTS auth_audit_logs (
-            log_id VARCHAR(36) PRIMARY KEY,
-            user_id VARCHAR(36) NOT NULL,
+            log_id VARCHAR(64) PRIMARY KEY,
+            user_id VARCHAR(64) NOT NULL,
             action VARCHAR(50) NOT NULL,
             resource_type VARCHAR(50) NULL,
             resource_id VARCHAR(64) NULL,
@@ -288,15 +288,15 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
     // Sessions / events core
     query(
         "CREATE TABLE IF NOT EXISTS agent_sessions (
-            session_id VARCHAR(36) PRIMARY KEY,
-            user_id VARCHAR(36) NOT NULL,
+            session_id VARCHAR(64) PRIMARY KEY,
+            user_id VARCHAR(64) NOT NULL,
             agent_id VARCHAR(64) NULL,
             title VARCHAR(255) NULL,
             status VARCHAR(20) NOT NULL DEFAULT 'active',
             event_count BIGINT NOT NULL DEFAULT 0,
-            last_event_id VARCHAR(36) NULL,
+            last_event_id VARCHAR(64) NULL,
             summary_status VARCHAR(20) NULL,
-            summary_job_id VARCHAR(36) NULL,
+            summary_job_id VARCHAR(64) NULL,
             vector_db_snapshot_id VARCHAR(64) NULL,
             metadata JSON NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
@@ -313,7 +313,7 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
 
     query(
         "CREATE TABLE IF NOT EXISTS agent_session_replay_windows (
-            session_id VARCHAR(36) PRIMARY KEY,
+            session_id VARCHAR(64) PRIMARY KEY,
             scope_key VARCHAR(255) NOT NULL,
             replay_window_json LONGTEXT NOT NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
@@ -327,7 +327,7 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
 
     query(
         "CREATE TABLE IF NOT EXISTS agent_session_replay_scope_windows (
-            session_id VARCHAR(36) NOT NULL,
+            session_id VARCHAR(64) NOT NULL,
             scope_key VARCHAR(255) NOT NULL,
             replay_window_json LONGTEXT NOT NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
@@ -341,15 +341,15 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
 
     query(
         "CREATE TABLE IF NOT EXISTS agent_events (
-            event_id VARCHAR(36) PRIMARY KEY,
-            session_id VARCHAR(36) NOT NULL,
-            user_id VARCHAR(36) NOT NULL,
+            event_id VARCHAR(64) PRIMARY KEY,
+            session_id VARCHAR(64) NOT NULL,
+            user_id VARCHAR(64) NOT NULL,
             agent_id VARCHAR(64) NULL,
             agent_version VARCHAR(32) NULL,
             event_type VARCHAR(64) NOT NULL,
             content LONGTEXT NULL,
-            parent_event_id VARCHAR(36) NULL,
-            causal_chain_id VARCHAR(36) NULL,
+            parent_event_id VARCHAR(64) NULL,
+            causal_chain_id VARCHAR(64) NULL,
             token_usage JSON NULL,
             llm_model_used VARCHAR(128) NULL,
             llm_params JSON NULL,
@@ -362,6 +362,7 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
             token_total  BIGINT NULL,
             meta_tool_name VARCHAR(255) NULL,
             meta_duration_ms INT NULL,
+            user_feedback_score BIGINT NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             INDEX idx_agent_events_session_created (session_id, created_at),
             INDEX idx_agent_events_session_type_created (session_id, event_type, created_at),
@@ -378,8 +379,8 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
 
     query(
         "CREATE TABLE IF NOT EXISTS agent_event_edges (
-            child_event_id VARCHAR(36) NOT NULL,
-            parent_event_id VARCHAR(36) NOT NULL,
+            child_event_id VARCHAR(64) NOT NULL,
+            parent_event_id VARCHAR(64) NOT NULL,
             relation_kind VARCHAR(32) NOT NULL DEFAULT 'causal',
             parent_order INT NOT NULL DEFAULT 0,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
@@ -394,12 +395,18 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
     // Context / decisions / evaluation essentials used by turn persistence
     query(
         "CREATE TABLE IF NOT EXISTS ctx_snapshots (
-            context_capture_id VARCHAR(36) PRIMARY KEY,
-            session_id VARCHAR(36) NOT NULL,
-            event_id VARCHAR(36) NOT NULL,
+            context_capture_id VARCHAR(64) PRIMARY KEY,
+            session_id VARCHAR(64) NOT NULL,
+            event_id VARCHAR(64) NOT NULL,
             context_data JSON NULL,
             llm_request_id VARCHAR(64) NULL,
             llm_response_id VARCHAR(64) NULL,
+            token_budget INT NULL,
+            total_tokens BIGINT NULL,
+            assembly_time_ms BIGINT NULL,
+            relevance_scores JSON NULL,
+            token_usage JSON NULL,
+            task_type VARCHAR(64) NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             INDEX idx_ctx_snapshots_session_created (session_id, created_at),
             INDEX idx_ctx_snapshots_event_id (event_id)
@@ -410,10 +417,10 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
 
     query(
         "CREATE TABLE IF NOT EXISTS ctx_decision_audits (
-            decision_id VARCHAR(36) PRIMARY KEY,
-            session_id VARCHAR(36) NOT NULL,
-            event_id VARCHAR(36) NULL,
-            context_capture_id VARCHAR(36) NULL,
+            decision_id VARCHAR(64) PRIMARY KEY,
+            session_id VARCHAR(64) NOT NULL,
+            event_id VARCHAR(64) NULL,
+            context_capture_id VARCHAR(64) NULL,
             decision_type VARCHAR(64) NOT NULL,
             decision_output JSON NULL,
             model_params JSON NULL,
@@ -429,9 +436,9 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
 
     query(
         "CREATE TABLE IF NOT EXISTS skill_selection_events (
-            event_id VARCHAR(36) PRIMARY KEY,
-            session_id VARCHAR(36) NOT NULL,
-            user_id VARCHAR(36) NULL,
+            event_id VARCHAR(64) PRIMARY KEY,
+            session_id VARCHAR(64) NOT NULL,
+            user_id VARCHAR(64) NULL,
             agent_id VARCHAR(64) NULL,
             user_query LONGTEXT NULL,
             selected_skills JSON NULL,
@@ -452,7 +459,7 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
 
     query(
         "CREATE TABLE IF NOT EXISTS eval_llm_feedback (
-            feedback_id VARCHAR(36) PRIMARY KEY,
+            feedback_id VARCHAR(64) PRIMARY KEY,
             prompt_template_id VARCHAR(255) NULL,
             prompt_version VARCHAR(64) NULL,
             llm_request_id VARCHAR(64) NULL,
@@ -469,7 +476,7 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
 
     query(
         "CREATE TABLE IF NOT EXISTS infra_llm_models (
-            model_id VARCHAR(36) PRIMARY KEY,
+            model_id VARCHAR(64) PRIMARY KEY,
             model_name VARCHAR(100) NOT NULL UNIQUE,
             provider VARCHAR(50) NOT NULL,
             api_key_encrypted TEXT NULL,
@@ -498,8 +505,8 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
 
     query(
         "CREATE TABLE IF NOT EXISTS learning_snapshots (
-            snapshot_id VARCHAR(36) PRIMARY KEY,
-            user_id VARCHAR(36) NOT NULL,
+            snapshot_id VARCHAR(64) PRIMARY KEY,
+            user_id VARCHAR(64) NOT NULL,
             profile_name VARCHAR(100) NOT NULL,
             snapshot_json LONGTEXT NOT NULL,
             entity_count INT NOT NULL DEFAULT 0,
@@ -517,8 +524,8 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
 
     query(
         "CREATE TABLE IF NOT EXISTS user_preferences (
-            pref_id VARCHAR(36) PRIMARY KEY,
-            user_id VARCHAR(36) NOT NULL,
+            pref_id VARCHAR(64) PRIMARY KEY,
+            user_id VARCHAR(64) NOT NULL,
             pref_key VARCHAR(100) NOT NULL,
             pref_value LONGTEXT NOT NULL,
             version INT NOT NULL DEFAULT 1,
@@ -532,8 +539,8 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
     // Preference change history for audit trail and rollback
     query(
         "CREATE TABLE IF NOT EXISTS user_preference_history (
-            history_id VARCHAR(36) PRIMARY KEY,
-            user_id VARCHAR(36) NOT NULL,
+            history_id VARCHAR(64) PRIMARY KEY,
+            user_id VARCHAR(64) NOT NULL,
             pref_key VARCHAR(100) NOT NULL,
             old_value LONGTEXT NULL,
             new_value LONGTEXT NOT NULL,
@@ -549,9 +556,9 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
 
     query(
         "CREATE TABLE IF NOT EXISTS session_sync_log (
-            sync_id VARCHAR(36) PRIMARY KEY,
-            user_id VARCHAR(36) NOT NULL,
-            session_id VARCHAR(36) NOT NULL,
+            sync_id VARCHAR(64) PRIMARY KEY,
+            user_id VARCHAR(64) NOT NULL,
+            session_id VARCHAR(64) NOT NULL,
             sync_type VARCHAR(50) NOT NULL,
             sync_direction VARCHAR(10) NOT NULL DEFAULT 'push',
             payload_size INT NOT NULL DEFAULT 0,
@@ -568,7 +575,7 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
     // Skills registry — master catalog for registered/marketplace skills.
     query(
         "CREATE TABLE IF NOT EXISTS skills_registry (
-            skill_id VARCHAR(36) PRIMARY KEY,
+            skill_id VARCHAR(64) PRIMARY KEY,
             skill_name VARCHAR(255) NOT NULL,
             version VARCHAR(64) NOT NULL,
             description TEXT NULL,
@@ -639,11 +646,11 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
 
     query(
         "CREATE TABLE IF NOT EXISTS agent_tasks (
-            task_id VARCHAR(36) PRIMARY KEY,
-            user_id VARCHAR(36) NOT NULL,
-            session_id VARCHAR(36) NULL,
+            task_id VARCHAR(64) PRIMARY KEY,
+            user_id VARCHAR(64) NOT NULL,
+            session_id VARCHAR(64) NULL,
             agent_id VARCHAR(128) NULL,
-            parent_task_id VARCHAR(36) NULL,
+            parent_task_id VARCHAR(64) NULL,
             title VARCHAR(500) NOT NULL,
             description LONGTEXT NULL,
             status VARCHAR(20) NOT NULL DEFAULT 'pending',
@@ -674,8 +681,8 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
 
     query(
         "CREATE TABLE IF NOT EXISTS edge_agent_registry (
-            registry_id VARCHAR(36) PRIMARY KEY,
-            user_id VARCHAR(36) NOT NULL,
+            registry_id VARCHAR(64) PRIMARY KEY,
+            user_id VARCHAR(64) NOT NULL,
             edge_agent_id VARCHAR(128) NOT NULL,
             edge_id VARCHAR(128) NOT NULL,
             hostname VARCHAR(255) NULL,
@@ -692,8 +699,8 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
 
     query(
         "CREATE TABLE IF NOT EXISTS task_leases (
-            task_id VARCHAR(36) PRIMARY KEY,
-            user_id VARCHAR(36) NOT NULL,
+            task_id VARCHAR(64) PRIMARY KEY,
+            user_id VARCHAR(64) NOT NULL,
             holder_agent_id VARCHAR(128) NOT NULL,
             holder_edge_id VARCHAR(128) NULL,
             expires_at DATETIME(6) NOT NULL,
@@ -709,8 +716,8 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
     // ── Plan templates table (learning successful patterns) ──
     query(
         "CREATE TABLE IF NOT EXISTS plan_templates (
-            template_id VARCHAR(36) PRIMARY KEY,
-            user_id VARCHAR(36) NULL,
+            template_id VARCHAR(64) PRIMARY KEY,
+            user_id VARCHAR(64) NULL,
             goal_pattern VARCHAR(500) NOT NULL,
             project_type VARCHAR(50) NULL,
             template_json LONGTEXT NOT NULL,
@@ -728,9 +735,9 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
 
     query(
         "CREATE TABLE IF NOT EXISTS session_checkpoints (
-            checkpoint_id VARCHAR(36) PRIMARY KEY,
-            session_id VARCHAR(36) NOT NULL,
-            user_id VARCHAR(36) NOT NULL,
+            checkpoint_id VARCHAR(64) PRIMARY KEY,
+            session_id VARCHAR(64) NOT NULL,
+            user_id VARCHAR(64) NOT NULL,
             number INT NOT NULL,
             turn INT NOT NULL,
             title VARCHAR(500) NULL,
@@ -1069,7 +1076,7 @@ pub async fn ensure_core_schema(settings: &MatrixOneSettings) -> Result<(), sqlx
 
     query(
         "CREATE TABLE IF NOT EXISTS eval_quality_assessments (
-            assessment_id VARCHAR(36) PRIMARY KEY,
+            assessment_id VARCHAR(64) PRIMARY KEY,
             user_id       VARCHAR(36) NULL,
             target_id     VARCHAR(64) NOT NULL,
             score         DECIMAL(5,4) NOT NULL,

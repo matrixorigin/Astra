@@ -460,7 +460,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
                 let timing = crate::observability_integration::TurnTiming {
                     turn: turn_index as u32,
                     context_assembly_ms: ctx_asm_ms,
-                    ttft_ms: turn_result.ttft_ms.unwrap_or(0) as u64,
+                    ttft_ms: turn_result.ttft_ms.unwrap_or(0),
                     llm_total_ms: total_ms
                         .saturating_sub(ctx_asm_ms)
                         .saturating_sub(tool_exec_ms),
@@ -498,7 +498,7 @@ fn observe_gate_cancelled(
         let timing = crate::observability_integration::TurnTiming {
             turn: turn_index as u32,
             context_assembly_ms: 0,
-            ttft_ms: turn_result.ttft_ms.unwrap_or(0) as u64,
+            ttft_ms: turn_result.ttft_ms.unwrap_or(0),
             llm_total_ms: total_ms,
             tool_execution_ms: 0,
             total_ms,

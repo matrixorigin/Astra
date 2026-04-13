@@ -1005,7 +1005,8 @@ impl TeamPersistenceService for MatrixOneTeamStore {
 
         let rows = sqlx::query(
             "SELECT execution_id, team_id, user_id, task, status, \
-                    result_json, started_at, completed_at \
+                    result_json, CAST(started_at AS CHAR) AS started_at, \
+                    CAST(completed_at AS CHAR) AS completed_at \
              FROM team_execution_history \
              WHERE team_id = ? \
              ORDER BY started_at DESC \
@@ -1221,7 +1222,7 @@ pub struct TeamSnapshotRecord {
 pub fn builtin_teams(user_id: &str, now: &str) -> Vec<TeamDefinition> {
     vec![
         TeamDefinition {
-            team_id: format!("builtin-review-{user_id}"),
+            team_id: format!("bt-rev-{user_id}"),
             user_id: user_id.to_string(),
             name: "review".to_string(),
             description: "Adversarial code review: one agent writes, another reviews".to_string(),
@@ -1267,7 +1268,7 @@ pub fn builtin_teams(user_id: &str, now: &str) -> Vec<TeamDefinition> {
             updated_at: now.to_string(),
         },
         TeamDefinition {
-            team_id: format!("builtin-research-{user_id}"),
+            team_id: format!("bt-res-{user_id}"),
             user_id: user_id.to_string(),
             name: "research".to_string(),
             description: "Deep research: explorer gathers info, synthesizer produces report"
@@ -1309,7 +1310,7 @@ pub fn builtin_teams(user_id: &str, now: &str) -> Vec<TeamDefinition> {
             updated_at: now.to_string(),
         },
         TeamDefinition {
-            team_id: format!("builtin-dev-{user_id}"),
+            team_id: format!("bt-dev-{user_id}"),
             user_id: user_id.to_string(),
             name: "dev".to_string(),
             description:

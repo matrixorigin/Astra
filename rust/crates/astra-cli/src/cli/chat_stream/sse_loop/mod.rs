@@ -20,9 +20,10 @@ use astra_runtime::{
     plan_decompose::CHAT_PLAN_ONLY_SYSTEM,
     semantic_dedup::SemanticDedup,
     tool_registry::ToolRegistry,
+    turn::agentic_loop_finalization::run_agentic_loop_with_host,
     turn::agentic_loop_host::{
         AgenticLoopState, CancellationState, ErrorRecoveryState, MessagingState, SkillState,
-        StallTrackingState, StopHookState, TelemetryState, run_agentic_loop_with_host,
+        StallTrackingState, StopHookState, TelemetryState,
     },
     turn::agentic_turn_telemetry::step_recorder_chat_ephemeral_run_id,
     turn::chat_history_openai::openai_messages_from_repl_history,

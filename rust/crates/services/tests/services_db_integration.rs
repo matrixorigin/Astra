@@ -527,7 +527,7 @@ async fn cross_session_stats_and_audit_list_sessions_match_seeded_events() {
     for (eid, typ, tin, tout, ttot, model, tool, ts) in [
         (
             &e_turn_a1,
-            "turn",
+            "user_query",
             10_i64,
             5_i64,
             15_i64,
@@ -537,7 +537,7 @@ async fn cross_session_stats_and_audit_list_sessions_match_seeded_events() {
         ),
         (
             &e_turn_a2,
-            "turn",
+            "user_query",
             20_i64,
             10_i64,
             30_i64,
@@ -609,7 +609,7 @@ async fn cross_session_stats_and_audit_list_sessions_match_seeded_events() {
     sqlx::query(
         "INSERT INTO agent_events (event_id, session_id, user_id, event_type, content, \
          causal_chain_id, token_input, token_output, token_total, meta_tool_name, llm_model_used, created_at) \
-         VALUES (?, ?, ?, 'turn', '{}', '', 5, 5, 10, NULL, 'm1', ?)",
+         VALUES (?, ?, ?, 'user_query', '{}', '', 5, 5, 10, NULL, 'm1', ?)",
     )
     .bind(&e_turn_b1)
     .bind(&s2)
@@ -708,7 +708,7 @@ async fn cross_session_runtime_promotions_db_roundtrip() {
     let e4 = Uuid::new_v4().to_string();
     let event_ids = vec![e1.clone(), e2.clone(), e3.clone(), e4.clone()];
 
-    cleanup_agent_sessions_and_events(&pool, &[s1.clone()], &event_ids, &[]).await;
+    cleanup_agent_sessions_and_events(&pool, std::slice::from_ref(&s1), &event_ids, &[]).await;
 
     sqlx::query(
         "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count) \
@@ -924,9 +924,9 @@ async fn cross_session_mutations_db_roundtrip() {
     let event_ids = vec![event_id.clone(), ev_apply.clone(), ev_revert.clone()];
     cleanup_agent_sessions_and_events(
         &pool,
-        &[session_id.clone()],
+        std::slice::from_ref(&session_id),
         &event_ids,
-        &[decision_id.clone()],
+        std::slice::from_ref(&decision_id),
     )
     .await;
 
@@ -1076,9 +1076,9 @@ async fn cross_session_mutations_db_roundtrip() {
 
     cleanup_agent_sessions_and_events(
         &pool,
-        &[session_id.clone()],
+        std::slice::from_ref(&session_id),
         &event_ids,
-        &[decision_id.clone()],
+        std::slice::from_ref(&decision_id),
     )
     .await;
 }

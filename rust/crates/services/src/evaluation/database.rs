@@ -1724,18 +1724,28 @@ impl EvaluationService for DatabaseEvaluationService {
     }
 
     async fn memory_health(&self, user_id: &str) -> ServiceResult<MemoryHealthResponse> {
-        let storage = self.memoria_get("/v1/health/storage", user_id).await?;
+        let analyze = self.memoria_get("/v1/health/analyze", user_id).await?;
         let hygiene = self.memoria_get("/v1/health/hygiene", user_id).await?;
 
-        let mem_count = storage.get("total").and_then(|v| v.as_i64()).unwrap_or(0);
-        let active_count = storage
-            .get("active")
+        let semantic_total = analyze
+            .pointer("/semantic/total")
             .and_then(|v| v.as_i64())
-            .unwrap_or(mem_count);
-        let inactive_count = storage
-            .get("inactive")
+            .unwrap_or(0);
+        let profile_total = analyze
+            .pointer("/profile/total")
             .and_then(|v| v.as_i64())
-            .unwrap_or(mem_count.saturating_sub(active_count));
+            .unwrap_or(0);
+        let total_memories = semantic_total + profile_total;
+
+        // /storage may fail (Memoria #179); use it for active/inactive split, fallback to 0.
+        let (active_memories, inactive_count) =
+            match self.memoria_get("/v1/health/storage", user_id).await {
+                Ok(s) => (
+                    s.get("active").and_then(|v| v.as_i64()).unwrap_or(0),
+                    s.get("inactive").and_then(|v| v.as_i64()).unwrap_or(0),
+                ),
+                Err(_) => (total_memories, 0),
+            };
 
         let hygiene_issues: i64 = [
             "inactive_memories",
@@ -1761,21 +1771,27 @@ impl EvaluationService for DatabaseEvaluationService {
         .sum();
 
         Ok(MemoryHealthResponse {
-            total_memories: mem_count,
-            active_memories: active_count,
+            total_memories,
+            active_memories,
             inactive_memories: inactive_count,
             stale_working_memories,
             orphaned_records,
-            healthy: hygiene_issues == 0 && mem_count >= 0 && inactive_count >= 0,
+            healthy: hygiene_issues == 0,
         })
     }
 
     async fn memory_metrics(&self, user_id: &str) -> ServiceResult<MemoryMetricsResponse> {
-        let storage = self.memoria_get("/v1/health/storage", user_id).await?;
         let analyze = self.memoria_get("/v1/health/analyze", user_id).await?;
         let hygiene = self.memoria_get("/v1/health/hygiene", user_id).await?;
 
-        let total_memories = storage.get("total").and_then(|v| v.as_i64()).unwrap_or(0);
+        let total_memories = analyze
+            .pointer("/semantic/total")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0)
+            + analyze
+                .pointer("/profile/total")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
         let stale_count = hygiene
             .get("stale_working_memories")
             .and_then(|v| v.as_i64())

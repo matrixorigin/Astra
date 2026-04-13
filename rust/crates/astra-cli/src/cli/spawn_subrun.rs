@@ -13,9 +13,10 @@ use astra_runtime::{
     pipeline::step_protocol::InMemoryIdempotencyCache,
     pipeline::step_recorder::StepRecorder,
     semantic_dedup::SemanticDedup,
+    turn::agentic_loop_finalization::run_agentic_loop_with_host,
     turn::agentic_loop_host::{
         AgenticLoopOutcome, AgenticLoopState, CancellationState, MessagingState, SkillState,
-        StopHookState, run_agentic_loop_with_host,
+        StopHookState,
     },
     turn::chat_turn_heuristics::infer_task_execution_profile,
     turn::tool_schema_prune::openai_tool_names_from_schemas,

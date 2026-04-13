@@ -68,7 +68,6 @@ jobs:
           else
             echo '{"verdict":"fail","summary":"Contract tests failed"}' > gate_result.json
           fi
-        continue-on-error: true
 
       - name: Comment on PR
         if: always()
@@ -76,7 +75,8 @@ jobs:
         with:
           script: |
             const fs = require('fs');
-            const result = JSON.parse(fs.readFileSync('gate_result.json', 'utf8'));
+            let result = { verdict: 'fail', summary: 'Contract tests did not produce a result' };
+            try { result = JSON.parse(fs.readFileSync('gate_result.json', 'utf8')); } catch {}
             const emoji = result.verdict === 'pass' ? '✅' : '❌';
             github.rest.issues.createComment({
               issue_number: context.issue.number,
@@ -86,9 +86,14 @@ jobs:
             });
 
       - name: Check gate result
+        if: always()
         run: |
+          if [ ! -f gate_result.json ]; then
+            echo "❌ gate_result.json not found"
+            exit 1
+          fi
           verdict=$(jq -r '.verdict' gate_result.json)
-          if [ "$verdict" = "fail" ]; then
+          if [ "$verdict" != "pass" ]; then
             echo "❌ Regression gate failed"
             exit 1
           fi

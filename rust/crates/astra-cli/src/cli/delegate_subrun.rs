@@ -17,9 +17,9 @@ use astra_runtime::{
     pipeline::step_recorder::StepRecorder,
     semantic_dedup::SemanticDedup,
     server::delegation_engine::{SubRunConfig, SubRunExecutor},
+    turn::agentic_loop_finalization::run_agentic_loop_with_host,
     turn::agentic_loop_host::{
         AgenticLoopState, CancellationState, MessagingState, SkillState, StopHookState,
-        run_agentic_loop_with_host,
     },
     turn::chat_turn_heuristics::infer_task_execution_profile,
     turn::tool_schema_prune::openai_tool_names_from_schemas,

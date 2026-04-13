@@ -17,9 +17,10 @@ use astra_runtime::{
     pipeline::step_recorder::StepRecorder,
     semantic_dedup::SemanticDedup,
     turn::agentic_headless_round::HeadlessStderrStyle,
+    turn::agentic_loop_finalization::run_agentic_loop_with_host,
     turn::agentic_loop_host::{
         AgenticLoopHost, AgenticLoopState, CancellationState, HostTurnResult, SkillState,
-        StopHookState, run_agentic_loop_with_host,
+        StopHookState,
     },
     turn::chat_turn_heuristics::infer_task_execution_profile,
     turn::chat_turn_payload::{

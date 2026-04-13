@@ -105,7 +105,7 @@ pub async fn run_audit_cross_session_analytics_http() {
         sqlx::query(
             "INSERT INTO agent_events (event_id, session_id, user_id, event_type, content, \
              causal_chain_id, token_input, token_output, token_total, created_at) \
-             VALUES (?, ?, ?, 'turn', '{}', '', 1, 1, 2, ?)",
+             VALUES (?, ?, ?, 'user_query', '{}', '', 1, 1, 2, ?)",
         )
         .bind(eid)
         .bind(sid)

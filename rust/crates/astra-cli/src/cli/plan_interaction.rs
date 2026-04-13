@@ -1865,18 +1865,14 @@ mod tests {
     fn try_replace_plan_from_llm_json_prose_is_no_op() {
         let mut ps = plan::PlanModeState::new("g".into(), plan::ProjectContext::default());
         // Pure prose with no JSON → Ok(false), not an error
-        assert_eq!(
-            try_replace_plan_from_llm_json("Just use natural language.", &mut ps).unwrap(),
-            false
-        );
+        assert!(!try_replace_plan_from_llm_json("Just use natural language.", &mut ps).unwrap());
     }
 
     #[test]
     fn try_replace_plan_from_llm_json_bad_json_returns_err() {
         let mut ps = plan::PlanModeState::new("g".into(), plan::ProjectContext::default());
         // Has `{` but invalid JSON → real parse error
-        let err =
-            try_replace_plan_from_llm_json("Here is the plan: {broken", &mut ps).unwrap_err();
+        let err = try_replace_plan_from_llm_json("Here is the plan: {broken", &mut ps).unwrap_err();
         assert!(!err.is_empty());
     }
 

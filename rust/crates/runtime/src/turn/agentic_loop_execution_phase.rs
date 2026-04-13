@@ -18,7 +18,7 @@ pub(crate) struct TurnExecutionPhase {
 }
 
 pub(crate) enum TurnExecutionControl {
-    Proceed(TurnExecutionPhase),
+    Proceed(Box<TurnExecutionPhase>),
     ContinueLoop,
     Return(AgenticLoopOutcome),
 }
@@ -166,10 +166,12 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
 
     record_tool_selection(state, &turn_result, turn_index);
 
-    Ok(TurnExecutionControl::Proceed(TurnExecutionPhase {
-        llm_wall_start,
-        turn_result,
-    }))
+    Ok(TurnExecutionControl::Proceed(Box::new(
+        TurnExecutionPhase {
+            llm_wall_start,
+            turn_result,
+        },
+    )))
 }
 
 fn update_turn_trace_collector(state: &mut AgenticLoopState, turn_result: &HostTurnResult) {
@@ -201,7 +203,7 @@ fn observe_turn_end_without_tools(
         let timing = crate::observability_integration::TurnTiming {
             turn: turn_index as u32,
             context_assembly_ms: 0,
-            ttft_ms: ttft_ms.unwrap_or(0) as u64,
+            ttft_ms: ttft_ms.unwrap_or(0),
             llm_total_ms: total_ms,
             tool_execution_ms: 0,
             total_ms,
@@ -237,9 +239,7 @@ fn handle_token_budget<H: AgenticLoopHost>(
     if state.max_turn_input_tokens == 0 {
         return None;
     }
-    let Some(measured) = state.last_measured_prompt_tokens else {
-        return None;
-    };
+    let measured = state.last_measured_prompt_tokens?;
     if measured <= state.max_turn_input_tokens {
         return None;
     }

@@ -73,7 +73,7 @@ impl LearningFeedbackService for DatabaseLearningFeedbackService {
 
         // Verify event exists AND belongs to the requesting user (via session ownership)
         let owned = query(
-            "SELECT 1 FROM skill_selection_events e \
+            "SELECT 1 FROM agent_events e \
              JOIN agent_sessions s ON e.session_id = s.session_id \
              WHERE e.event_id = ? AND s.user_id = ? LIMIT 1",
         )
@@ -89,7 +89,7 @@ impl LearningFeedbackService for DatabaseLearningFeedbackService {
 
         let score = request.satisfaction_score.unwrap_or(0);
         query(
-            "UPDATE skill_selection_events \
+            "UPDATE agent_events \
              SET user_feedback_score = ? \
              WHERE event_id = ? AND user_id = ?",
         )

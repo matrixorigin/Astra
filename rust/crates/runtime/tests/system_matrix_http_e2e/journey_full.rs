@@ -1131,7 +1131,7 @@ pub async fn run_product_matrix_full_journey(
 
     let turn_cnt_row = sqlx::query(
         "SELECT COUNT(*) AS c FROM agent_events \
-         WHERE session_id = ? AND user_id = ? AND event_type = 'turn'",
+         WHERE session_id = ? AND user_id = ? AND event_type = 'user_query'",
     )
     .bind(&session_id)
     .bind(&user_id)

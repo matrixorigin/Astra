@@ -664,7 +664,7 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
         )
         .await?
         {
-            TurnExecutionControl::Proceed(phase) => phase,
+            TurnExecutionControl::Proceed(phase) => *phase,
             TurnExecutionControl::ContinueLoop => continue,
             TurnExecutionControl::Return(outcome) => return Ok(outcome),
         };
