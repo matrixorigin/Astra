@@ -581,6 +581,40 @@ mod tests {
         }
     }
 
+    #[test]
+    fn main_can_delegate_to_default_agents() {
+        use astra_services::coordination::{
+            AggregationStrategy, CoordinationPattern, DelegationRequest,
+        };
+        use std::collections::HashMap;
+
+        let mut registry = astra_services::coordination::AgentProfileRegistry::new();
+        register_default_agents(&mut registry);
+
+        // Simulate a team delegation from "main" to coder/reviewer
+        let request = DelegationRequest {
+            delegation_id: "d1".into(),
+            parent_run_id: "run-1".into(),
+            task: "Implement feature".into(),
+            pattern: CoordinationPattern::FanOut {
+                agent_ids: vec!["coder".into(), "reviewer".into()],
+                aggregation: AggregationStrategy::AllResults,
+                timeout_sec: 60,
+            },
+            user_id: "test-user".into(),
+            depth: 0,
+            context: HashMap::new(),
+        };
+
+        // This should succeed now that source_agent_id is "main" (registered)
+        let result = registry.validate_delegation(&request, "main");
+        assert!(
+            result.is_ok(),
+            "main should be able to delegate to default agents: {:?}",
+            result
+        );
+    }
+
     // ─── Worktree Path Resolution Tests ────────────────────────────────────
 
     #[test]
