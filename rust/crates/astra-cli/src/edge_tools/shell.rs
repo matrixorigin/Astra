@@ -994,6 +994,12 @@ fn is_boundary_sensitive_file_access_command(base: &str) -> bool {
             | "awk"
             | "sed"
             | "tee"
+            | "cmp"
+            | "comm"
+            | "join"
+            | "cut"
+            | "paste"
+            | "uniq"
             | "source"
             | "."
     )
@@ -4047,6 +4053,12 @@ mod tests {
             "awk '{print $1}' /etc/passwd",
             "sed -n '1p' /etc/passwd",
             "echo hi | tee /etc/output.log",
+            "cmp src/main.rs /etc/passwd",
+            "comm src/main.rs /etc/passwd",
+            "join src/main.rs /etc/passwd",
+            "cut -d: -f1 /etc/passwd",
+            "paste src/main.rs /etc/passwd",
+            "uniq /etc/passwd",
         ] {
             let result = check_bash_path_boundary(&policy, command);
             assert!(
@@ -4066,6 +4078,12 @@ mod tests {
             "awk '{print $1}' src/main.rs",
             "sed -n '1p' src/main.rs",
             "echo hi | tee build/output.log",
+            "cmp src/main.rs src/lib.rs",
+            "comm src/main.rs src/lib.rs",
+            "join src/main.rs src/lib.rs",
+            "cut -d: -f1 src/main.rs",
+            "paste src/main.rs src/lib.rs",
+            "uniq src/main.rs",
         ] {
             let result = check_bash_path_boundary(&policy, command);
             assert!(
