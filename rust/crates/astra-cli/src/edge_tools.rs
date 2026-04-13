@@ -138,6 +138,25 @@ fn tool_output_limit() -> usize {
     astra_core::RuntimeLimits::global().tool_output_limit
 }
 
+/// Per-tool output size caps (bytes).
+///
+/// Grep results are content-heavy (line-by-line matches), so a 10KB cap
+/// prevents a single broad grep from consuming most of the aggregate budget.
+/// Glob results are filename-only, so 100KB is fine. Bash has its own
+/// streaming cap at 30KB. Everything else uses the global default.
+///
+/// Inspired by Claude Code's per-tool `maxResultSizeChars` overrides
+/// (grep: 20K, glob: 100K, default: 50K).
+pub(crate) fn per_tool_output_limit(tool_name: &str) -> usize {
+    let base = tool_output_limit();
+    match tool_name {
+        "grep" => base.min(10_000),
+        "glob" => base.min(100_000),
+        "find_definition" | "find_references" => base.min(15_000),
+        _ => base,
+    }
+}
+
 /// Per-turn aggregate output budget (bytes). When cumulative tool output
 /// exceeds this, subsequent tools get tighter limits. Inspired by Claude
 /// Code's `MAX_TOOL_RESULTS_PER_MESSAGE_CHARS` (200K).
@@ -662,7 +681,12 @@ impl ToolExecutor {
     ///    smooth curve that progressively tightens as output accumulates,
     ///    reaching 25% of base at 2× the aggregate budget.
     fn scaled_output_limit(&self) -> usize {
-        let base = tool_output_limit();
+        self.scaled_output_limit_for("")
+    }
+
+    /// Per-tool variant: applies per-tool cap before pressure scaling.
+    fn scaled_output_limit_for(&self, tool_name: &str) -> usize {
+        let base = per_tool_output_limit(tool_name);
         let pressure = self.get_budget_pressure();
         let token_scale = 1.0 - (pressure * 0.75); // 0.0→1.0, 0.9→0.325
 

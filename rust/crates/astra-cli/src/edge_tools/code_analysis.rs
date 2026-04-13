@@ -12,7 +12,7 @@ use serde_json::Value;
 
 use super::{
     ToolExecutor, build_test, categorize_reference, code_intel, parse_grep_file_line,
-    tool_output_limit, truncate_output, validate_path,
+    per_tool_output_limit, tool_output_limit, truncate_output, validate_path,
 };
 
 impl ToolExecutor {
@@ -786,7 +786,7 @@ impl ToolExecutor {
             );
             truncate_output(
                 format!("{}{}", header, body_parts.join("")),
-                tool_output_limit().min(15_000),
+                per_tool_output_limit("find_definition"),
             )
         }
     }
@@ -923,7 +923,7 @@ impl ToolExecutor {
                     output.push_str(&format!("\n[{} more references not shown]", total - 50));
                 }
 
-                truncate_output(output, tool_output_limit().min(15_000))
+                truncate_output(output, per_tool_output_limit("find_references"))
             }
             Err(_) => {
                 // Fallback to grep if rg not available
@@ -951,7 +951,7 @@ impl ToolExecutor {
                                 format!("# References to '{}' ({} found)\n\n", symbol, lines.len());
                             truncate_output(
                                 format!("{header}{}", lines.join("\n")),
-                                tool_output_limit().min(15_000),
+                                per_tool_output_limit("find_references"),
                             )
                         }
                     }

@@ -1482,9 +1482,8 @@ impl ToolExecutor {
 
                 let mut result_text = lines.join("\n");
 
-                // Apply byte-level output limit (10KB cap for grep to avoid
-                // context bloat when multiple greps fire in parallel)
-                let limit = self.scaled_output_limit().min(10_000);
+                // Apply per-tool output limit (centralised in per_tool_output_limit)
+                let limit = self.scaled_output_limit_for("grep");
                 if result_text.len() > limit {
                     result_text = result_text[..result_text.floor_char_boundary(limit)].to_string();
                     result_text.push_str("\n[truncated]");
@@ -1557,8 +1556,8 @@ impl ToolExecutor {
                 if text.trim().is_empty() {
                     "No files found".to_string()
                 } else {
-                    // Apply budget-pressure-aware truncation (10KB cap like grep)
-                    let limit = self.scaled_output_limit().min(10_000);
+                    // Apply per-tool output limit (centralised in per_tool_output_limit)
+                    let limit = self.scaled_output_limit_for("glob");
                     let line_count = text.lines().count();
                     if text.len() > limit {
                         let end = text.floor_char_boundary(limit);
