@@ -386,21 +386,20 @@ fn validate_plain_command_path_arg(
     arg: &str,
     oldpwd: Option<&std::path::Path>,
 ) -> Option<String> {
-    if let Some(kind) = unresolved_static_dir_reference_kind(arg) {
-        return Some(format!(
-            "{}The command references '{}' using {} which cannot be statically validated against the project directory '{}'. Ask the user for permission before accessing files outside the project.",
-            super::SANDBOX_DENIED_PREFIX,
-            arg,
-            kind,
-            policy.project_root.display(),
-        ));
-    }
-
     let resolved = if arg.starts_with('/') {
         std::path::PathBuf::from(arg)
     } else if let Some(expanded) = expand_static_dir_reference(policy, arg, oldpwd) {
         expanded
     } else {
+        if let Some(kind) = unresolved_static_dir_reference_kind(arg) {
+            return Some(format!(
+                "{}The command references '{}' using {} which cannot be statically validated against the project directory '{}'. Ask the user for permission before accessing files outside the project.",
+                super::SANDBOX_DENIED_PREFIX,
+                arg,
+                kind,
+                policy.project_root.display(),
+            ));
+        }
         policy.project_root.join(arg)
     };
     let path_str = resolved.to_string_lossy();
@@ -598,6 +597,7 @@ fn unresolved_static_dir_reference_kind(arg: &str) -> Option<&'static str> {
         || is_complex_dir_parameter_reference(arg, "PWD")
         || is_complex_dir_parameter_reference(arg, "OLDPWD"))
     .then_some("shell parameter expansion from a directory anchor")
+    .or_else(|| contains_unresolved_shell_variable(arg).then_some("shell variable expansion"))
 }
 
 fn is_named_tilde_user_reference(arg: &str) -> bool {
@@ -632,6 +632,28 @@ fn is_complex_dir_parameter_reference(arg: &str, name: &str) -> bool {
         rest.as_bytes().first().copied(),
         Some(b':' | b'-' | b'=' | b'?' | b'+' | b'%' | b'#' | b'/' | b'^' | b',')
     )
+}
+
+fn contains_unresolved_shell_variable(arg: &str) -> bool {
+    let bytes = arg.as_bytes();
+    let mut idx = 0usize;
+    while idx < bytes.len() {
+        if bytes[idx] != b'$' {
+            idx += 1;
+            continue;
+        }
+        match bytes.get(idx + 1).copied() {
+            Some(b'{') => return true,
+            Some(next)
+                if next.is_ascii_alphanumeric()
+                    || matches!(next, b'_' | b'*' | b'@' | b'#' | b'?' | b'-' | b'$' | b'!') =>
+            {
+                return true;
+            }
+            _ => idx += 1,
+        }
+    }
+    false
 }
 
 enum BraceExpansionCandidates {
@@ -3755,13 +3777,32 @@ mod tests {
     }
 
     #[test]
-    fn home_like_variable_name_remains_unresolved() {
+    fn unbraced_variable_expansion_requires_boundary_review() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(&policy, "cat $SECRET/passwd");
+        assert!(
+            result
+                .as_deref()
+                .is_some_and(|msg| msg.starts_with(super::SANDBOX_DENIED_PREFIX)
+                    && msg.contains("$SECRET/passwd")
+                    && msg.contains("shell variable expansion")),
+            "unbraced shell variables should require boundary review"
+        );
+    }
+
+    #[test]
+    fn home_like_variable_name_requires_boundary_review() {
         use astra_runtime::tool_sandbox::SandboxPolicy;
         let policy = SandboxPolicy::for_project("/home/user/project");
         let result = check_bash_path_boundary(&policy, "cat ${HOME_DIR}/notes.txt");
         assert!(
-            result.is_none(),
-            "exact HOME/PWD/OLDPWD anchors should be matched without catching unrelated vars"
+            result
+                .as_deref()
+                .is_some_and(|msg| msg.starts_with(super::SANDBOX_DENIED_PREFIX)
+                    && msg.contains("${HOME_DIR}/notes.txt")
+                    && msg.contains("shell variable expansion")),
+            "unresolved variable-like anchors should require boundary review"
         );
     }
 
