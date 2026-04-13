@@ -30,6 +30,7 @@ build/
 htmlcov/
 *.manifest
 .models.yaml*
+!.models.yaml.example
 
 # Poetry
 # poetry.lock is tracked — required for reproducible CI builds and Docker images.

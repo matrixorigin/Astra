@@ -40,10 +40,8 @@ impl SkillSearchSettings {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AppSettings {
     pub matrixone: MatrixOneSettings,
-    pub redis: RedisSettings,
     pub application: ApplicationSettings,
     pub jwt: JwtSettings,
-    pub embedding: EmbeddingSettings,
     pub github_token: Option<String>,
     pub memoria_base_url: String,
     pub memoria_master_key: Option<String>,
@@ -77,11 +75,6 @@ impl AppSettings {
                 ),
                 database: resolve_matrixone_database_name(&lookup),
             },
-            redis: RedisSettings {
-                host: value_or_default(&lookup, "REDIS_HOST", "localhost"),
-                port: parse_or_default(&lookup, "REDIS_PORT", 6379)?,
-                password: optional_value(&lookup, "REDIS_PASSWORD"),
-            },
             application: ApplicationSettings {
                 app_env: value_or_default(&lookup, "APP_ENV", "development"),
                 log_level: value_or_default(&lookup, "LOG_LEVEL", "DEBUG"),
@@ -92,7 +85,6 @@ impl AppSettings {
                 ),
             },
             jwt: JwtSettings::from_lookup(&lookup)?,
-            embedding: EmbeddingSettings::from_lookup(&lookup)?,
             github_token: optional_value(&lookup, "GITHUB_TOKEN"),
             memoria_base_url: value_or_default(&lookup, "MEMORIA_BASE_URL", DEFAULT_MEMORIA_URL),
             memoria_master_key: optional_value(&lookup, "MEMORIA_MASTER_KEY"),
@@ -122,13 +114,6 @@ impl MatrixOneSettings {
             self.user, self.password, self.host, self.port, self.database
         )
     }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RedisSettings {
-    pub host: String,
-    pub port: u16,
-    pub password: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -180,41 +165,8 @@ impl JwtSettings {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct EmbeddingSettings {
-    pub provider: String,
-    pub model: String,
-    pub dim: u32,
-    pub api_key: String,
-    pub base_url: Option<String>,
-}
-
-impl EmbeddingSettings {
-    fn from_lookup<F>(lookup: &F) -> Result<Self, ConfigError>
-    where
-        F: Fn(&str) -> Option<String>,
-    {
-        let model = value_or_default(lookup, "EMBEDDING_MODEL", "BAAI/bge-m3");
-        let configured_dim = parse_or_default(lookup, "EMBEDDING_DIM", 0_u32)?;
-        let dim = if configured_dim == 0 {
-            infer_embedding_dim(&model)?
-        } else {
-            configured_dim
-        };
-
-        Ok(Self {
-            provider: value_or_default(lookup, "EMBEDDING_PROVIDER", "openai"),
-            model,
-            dim,
-            api_key: value_or_default(lookup, "EMBEDDING_API_KEY", ""),
-            base_url: optional_value(lookup, "EMBEDDING_BASE_URL"),
-        })
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConfigError {
     InvalidInteger { key: &'static str, value: String },
-    UnknownEmbeddingDimension { model: String },
 }
 
 impl fmt::Display for ConfigError {
@@ -223,10 +175,6 @@ impl fmt::Display for ConfigError {
             Self::InvalidInteger { key, value } => {
                 write!(f, "invalid integer for {key}: {value}")
             }
-            Self::UnknownEmbeddingDimension { model } => write!(
-                f,
-                "embedding_dim is not set and model {model:?} is not in KNOWN_DIMENSIONS. Please set EMBEDDING_DIM explicitly."
-            ),
         }
     }
 }
@@ -287,12 +235,6 @@ where
     }
 }
 
-fn infer_embedding_dim(model: &str) -> Result<u32, ConfigError> {
-    known_embedding_dimension(model).ok_or_else(|| ConfigError::UnknownEmbeddingDimension {
-        model: model.to_string(),
-    })
-}
-
 fn normalize_jwt_secret(secret: &str) -> String {
     if secret.len() >= 32 {
         secret.to_string()
@@ -300,33 +242,6 @@ fn normalize_jwt_secret(secret: &str) -> String {
         let mut padded = secret.to_string();
         padded.extend(std::iter::repeat_n('0', 32 - secret.len()));
         padded
-    }
-}
-
-fn known_embedding_dimension(model: &str) -> Option<u32> {
-    match model {
-        "BAAI/bge-m3" => Some(1024),
-        "BAAI/bge-large-en-v1.5" => Some(1024),
-        "BAAI/bge-large-zh-v1.5" => Some(1024),
-        "BAAI/bge-base-en-v1.5" => Some(768),
-        "BAAI/bge-base-zh-v1.5" => Some(768),
-        "BAAI/bge-small-en-v1.5" => Some(512),
-        "BAAI/bge-small-zh-v1.5" => Some(512),
-        "sentence-transformers/all-MiniLM-L6-v2" => Some(384),
-        "sentence-transformers/all-MiniLM-L12-v2" => Some(384),
-        "sentence-transformers/all-mpnet-base-v2" => Some(768),
-        "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2" => Some(384),
-        "sentence-transformers/paraphrase-multilingual-mpnet-base-v2" => Some(768),
-        "text-embedding-ada-002" => Some(1536),
-        "embed-english-v3.0" => Some(1024),
-        "embed-multilingual-v3.0" => Some(1024),
-        "embed-english-light-v3.0" => Some(384),
-        "embed-multilingual-light-v3.0" => Some(384),
-        "jina-embeddings-v2-base-en" => Some(768),
-        "jina-embeddings-v3" => Some(1024),
-        "nomic-embed-text-v1" => Some(768),
-        "nomic-embed-text-v1.5" => Some(768),
-        _ => None,
     }
 }
 
@@ -433,14 +348,6 @@ mod settings_contract_tests {
         defaults: FlatSettings,
         override_env: HashMap<String, String>,
         expected_override_settings: FlatSettings,
-        invalid_embedding_inference: InvalidEmbeddingInference,
-    }
-
-    #[derive(Debug, Deserialize)]
-    struct InvalidEmbeddingInference {
-        embedding_model: String,
-        embedding_dim: u32,
-        error_substring: String,
     }
 
     #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -450,17 +357,9 @@ mod settings_contract_tests {
         matrixone_user: String,
         matrixone_password: String,
         matrixone_database: String,
-        redis_host: String,
-        redis_port: u16,
-        redis_password: Option<String>,
         app_env: String,
         log_level: String,
         secret_key: String,
-        embedding_provider: String,
-        embedding_model: String,
-        embedding_dim: u32,
-        embedding_api_key: String,
-        embedding_base_url: Option<String>,
         github_token: Option<String>,
         chat_turn_bridge_url: Option<String>,
         chat_turn_bridge_secret: String,
@@ -481,17 +380,9 @@ mod settings_contract_tests {
             matrixone_user: settings.matrixone.user,
             matrixone_password: settings.matrixone.password,
             matrixone_database: settings.matrixone.database,
-            redis_host: settings.redis.host,
-            redis_port: settings.redis.port,
-            redis_password: settings.redis.password,
             app_env: settings.application.app_env,
             log_level: settings.application.log_level,
             secret_key: settings.application.secret_key,
-            embedding_provider: settings.embedding.provider,
-            embedding_model: settings.embedding.model,
-            embedding_dim: settings.embedding.dim,
-            embedding_api_key: settings.embedding.api_key,
-            embedding_base_url: settings.embedding.base_url,
             github_token: settings.github_token,
             chat_turn_bridge_url: settings.chat_turn_bridge_url,
             chat_turn_bridge_secret: settings.chat_turn_bridge_secret,
@@ -513,29 +404,5 @@ mod settings_contract_tests {
             AppSettings::from_map(&contract.override_env).expect("overrides should parse");
 
         assert_eq!(flatten(settings), contract.expected_override_settings);
-    }
-
-    #[test]
-    fn unknown_embedding_model_matches_shared_error_contract() {
-        let contract = load_contract();
-        let mut values = HashMap::new();
-        values.insert(
-            "EMBEDDING_MODEL".to_string(),
-            contract.invalid_embedding_inference.embedding_model,
-        );
-        values.insert(
-            "EMBEDDING_DIM".to_string(),
-            contract
-                .invalid_embedding_inference
-                .embedding_dim
-                .to_string(),
-        );
-
-        let error = AppSettings::from_map(&values).expect_err("unknown model should fail");
-        assert!(
-            error
-                .to_string()
-                .contains(&contract.invalid_embedding_inference.error_substring)
-        );
     }
 }
