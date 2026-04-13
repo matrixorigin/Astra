@@ -112,8 +112,17 @@ fn list_dir_skips_hidden() {
 fn read_file_with_line_range() {
     let dir = tempfile::tempdir().unwrap();
     let executor = ToolExecutor::new(dir.path());
-    executor.write_file(&json!({"path": "lines.txt", "content": "line1\nline2\nline3\nline4"}));
+    // File must be >16KB to avoid auto-expand promoting ranged read to full
+    {
+        use std::io::Write;
+        let mut f = std::fs::File::create(dir.path().join("lines.txt")).unwrap();
+        for i in 1..=200 {
+            writeln!(f, "line{i}: {}", "x".repeat(80)).unwrap();
+        }
+    }
 
     let result = executor.read_file(&json!({"path": "lines.txt", "start_line": 2, "end_line": 3}));
-    assert_eq!(result, "2\tline2\n3\tline3");
+    assert!(result.contains("2\tline2:"), "should have line 2: {result}");
+    assert!(result.contains("3\tline3:"), "should have line 3: {result}");
+    assert!(!result.contains("4\t"), "should not have line 4");
 }

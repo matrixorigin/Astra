@@ -474,13 +474,14 @@ impl ToolExecutor {
             return msg;
         }
 
-        // Auto-expand: if same file was previously read in a different range
-        // (partial read, mtime unchanged) and file fits in output budget,
-        // return the full file to eliminate fragmented multi-range reads.
-        // Hard cap at 8 KB (~2000 tokens) to prevent large files from
+        // Auto-expand: promote ranged reads to full-file reads when the file
+        // is small enough. This eliminates fragmented multi-range reads that
+        // waste tool calls (e.g., 6 read_file calls for different hunks of
+        // a 200-line file). Works on FIRST read too, not just subsequent reads.
+        // Hard cap at 16 KB (~4000 tokens) to prevent large files from
         // exploding context even if they fit the dynamic output budget.
-        const AUTO_EXPAND_MAX_BYTES: usize = 8192;
-        if is_ranged && self.was_partially_read_unchanged(&path) {
+        const AUTO_EXPAND_MAX_BYTES: usize = 16_384;
+        if is_ranged {
             let max_chars = self.scaled_output_limit().min(AUTO_EXPAND_MAX_BYTES);
             if let Ok(meta) = fs::metadata(&path)
                 && (meta.len() as usize) <= max_chars
@@ -491,8 +492,9 @@ impl ToolExecutor {
                 let total_lines = content.lines().count();
                 let numbered = add_line_numbers(&content, 1);
                 return format!(
-                    "[Auto-expanded to full file — this file was already partially read. \
-                     {total_lines} lines total. Avoid reading the same file in many small ranges.]\n\
+                    "[Auto-expanded to full file ({total_lines} lines) — \
+                     small enough to read entirely. Use this content for all \
+                     references to {path_str}; do not re-read.]\n\
                      {numbered}"
                 );
             }
@@ -1959,6 +1961,18 @@ mod tests {
         ToolExecutor::new(dir)
     }
 
+    /// Create a file large enough (>16KB) to avoid auto-expand on ranged reads.
+    /// Returns known content lines like "line 1", "line 2", etc.
+    fn write_large_file(dir: &std::path::Path, name: &str, num_lines: usize) {
+        use std::io::Write;
+        let path = dir.join(name);
+        let mut f = std::fs::File::create(&path).unwrap();
+        // Each line is ~90 chars → 200 lines ≈ 18KB > 16KB auto-expand threshold
+        for i in 1..=num_lines {
+            writeln!(f, "line {i}: {}", "x".repeat(80)).unwrap();
+        }
+    }
+
     // ── file_outline: Rust ───────────────────────────────────────────────────
 
     #[test]
@@ -2418,8 +2432,7 @@ type Handler interface {
     #[test]
     fn read_file_ranged_preserves_line_numbers() {
         let dir = tempfile::tempdir().unwrap();
-        let file_path = dir.path().join("ranged.txt");
-        std::fs::write(&file_path, "a\nb\nc\nd\ne").unwrap();
+        write_large_file(dir.path(), "ranged.txt", 200);
 
         let executor = test_executor_in(dir.path());
         let result = executor.read_file(&serde_json::json!({
@@ -2427,7 +2440,15 @@ type Handler interface {
             "start_line": 3,
             "end_line": 4
         }));
-        assert_eq!(result, "3\tc\n4\td");
+        assert!(
+            result.contains("3\tline 3:"),
+            "should have line 3: {result}"
+        );
+        assert!(
+            result.contains("4\tline 4:"),
+            "should have line 4: {result}"
+        );
+        assert!(!result.contains("5\t"), "should not have line 5: {result}");
     }
 
     #[test]
@@ -2589,18 +2610,50 @@ type Handler interface {
         drop(f);
 
         let executor = test_executor_in(dir.path());
-        // First ranged read
+        // First ranged read — should NOT auto-expand (file too large >16KB)
         let r1 = executor
             .read_file(&serde_json::json!({"path": "big.txt", "start_line": 1, "end_line": 5}));
         assert!(r1.contains("line 0"), "first range should work");
+        assert!(
+            !r1.contains("Auto-expanded"),
+            "large file should NOT auto-expand on first read"
+        );
 
-        // Second ranged read — should NOT auto-expand (file too large)
+        // Second ranged read — should also NOT auto-expand (file too large)
         let r2 = executor
             .read_file(&serde_json::json!({"path": "big.txt", "start_line": 10, "end_line": 15}));
         assert!(
             !r2.contains("Auto-expanded"),
             "should NOT auto-expand large file: {}",
             &r2[..100.min(r2.len())]
+        );
+    }
+
+    #[test]
+    fn read_file_auto_expand_small_file_on_first_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("small.txt");
+        // ~500 bytes — well under 16KB threshold
+        std::fs::write(&file_path, "alpha\nbeta\ngamma\ndelta\nepsilon\n").unwrap();
+
+        let executor = test_executor_in(dir.path());
+        // First ranged read of small file should auto-expand to full
+        let r1 = executor
+            .read_file(&serde_json::json!({"path": "small.txt", "start_line": 2, "end_line": 3}));
+        assert!(
+            r1.contains("Auto-expanded"),
+            "small file should auto-expand on first ranged read: {}",
+            &r1[..100.min(r1.len())]
+        );
+        assert!(r1.contains("alpha"), "should contain all lines");
+        assert!(r1.contains("epsilon"), "should contain all lines");
+
+        // Second read should dedup (already fully read)
+        let r2 = executor
+            .read_file(&serde_json::json!({"path": "small.txt", "start_line": 4, "end_line": 5}));
+        assert!(
+            r2.contains("already fully read") || r2.contains("unchanged"),
+            "second read should dedup: {r2}"
         );
     }
 
@@ -2680,7 +2733,7 @@ type Handler interface {
     fn full_reads_dont_increment_ranged_count() {
         let dir = tempfile::tempdir().unwrap();
         let file_path = dir.path().join("big.txt");
-        // Must be >8KB to avoid auto-expand
+        // Must be >16KB to avoid auto-expand
         let mut f = std::fs::File::create(&file_path).unwrap();
         for i in 0..500 {
             writeln!(f, "line {i}: {}", "x".repeat(80)).unwrap();
@@ -2713,7 +2766,7 @@ type Handler interface {
         let dir = tempfile::tempdir().unwrap();
         let file_a = dir.path().join("a.txt");
         let file_b = dir.path().join("b.txt");
-        // Files must be >8KB to avoid auto-expand upgrading ranged reads to full reads
+        // Files must be >16KB to avoid auto-expand upgrading ranged reads to full reads
         let mut f = std::fs::File::create(&file_a).unwrap();
         for i in 0..500 {
             writeln!(f, "a line {i}: {}", "x".repeat(80)).unwrap();
@@ -2761,12 +2814,7 @@ type Handler interface {
     #[test]
     fn read_file_consecutive_identical_range_dedups() {
         let dir = tempfile::tempdir().unwrap();
-        let file_path = dir.path().join("dup.txt");
-        let mut f = std::fs::File::create(&file_path).unwrap();
-        for i in 1..=20 {
-            writeln!(f, "row {i}").unwrap();
-        }
-        drop(f);
+        write_large_file(dir.path(), "dup.txt", 200);
 
         let executor = test_executor_in(dir.path());
         let args = serde_json::json!({
@@ -2776,7 +2824,7 @@ type Handler interface {
         });
         let first = executor.read_file(&args);
         assert!(
-            first.contains("row 1") && !first.contains("Same read_file request"),
+            first.contains("line 1") && !first.contains("Same read_file request"),
             "first read should return content: {first}"
         );
 
@@ -2854,12 +2902,7 @@ type Handler interface {
     fn read_file_range_overlap_partial_not_deduped() {
         // Lines 1-5 read, then request 3-10 — only partially covered, should NOT dedup.
         let dir = tempfile::tempdir().unwrap();
-        let file_path = dir.path().join("partial.txt");
-        let mut f = std::fs::File::create(&file_path).unwrap();
-        for i in 1..=20 {
-            writeln!(f, "line {i}").unwrap();
-        }
-        drop(f);
+        write_large_file(dir.path(), "partial.txt", 200);
 
         let executor = test_executor_in(dir.path());
         let _ = executor.read_file(&serde_json::json!({
@@ -4099,8 +4142,8 @@ type Handler interface {
         let dir = tempfile::tempdir().unwrap();
         let exe = test_executor_in(dir.path());
 
-        let path = dir.path().join("partial_target.rs");
-        std::fs::write(&path, "line1\nline2\nline3\nline4\nline5\n").unwrap();
+        // File must be >16KB to avoid auto-expand promoting ranged read to full
+        write_large_file(dir.path(), "partial_target.rs", 200);
 
         // Read with line range (partial)
         exe.read_file(&json!({"path": "partial_target.rs", "start_line": 1, "end_line": 2}));
