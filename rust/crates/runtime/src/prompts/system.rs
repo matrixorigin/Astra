@@ -195,6 +195,7 @@ fn tool_conditional_section(tool_names: &[&str], selection_confidence: f64) -> S
     let has_build_test = tool_names.contains(&"run_build_test");
     let has_git_mutations = tool_names.contains(&"git_commit");
     let has_git_revert = tool_names.contains(&"git_revert_commit");
+    let has_git_worktree = tool_names.contains(&"git_worktree");
 
     let mut s = String::new();
 
@@ -289,7 +290,7 @@ fn tool_conditional_section(tool_names: &[&str], selection_confidence: f64) -> S
              - Repeat until clean. Aim to fix ALL errors, not just the first one.\n",
         );
     }
-    if has_git_mutations {
+    if has_git_mutations || has_git_worktree {
         s.push_str(
             "\n## Git Workflow\n\
              - Use **git_commit** to commit changes (stages automatically). Write clear, concise commit messages.\n\
@@ -300,6 +301,11 @@ fn tool_conditional_section(tool_names: &[&str], selection_confidence: f64) -> S
         if has_git_revert {
             s.push_str(
                 "             - Use **git_revert_commit** with a captured commit_sha to create a compensating revert commit when rolling back a dedicated git_commit.\n",
+            );
+        }
+        if has_git_worktree {
+            s.push_str(
+                "             - Use **git_worktree** for isolated parallel branch work; exit or remove worktrees explicitly instead of assuming they are part of the normal rollback journals.\n",
             );
         }
     }
@@ -1685,6 +1691,7 @@ mod tests {
                 "git_revert_commit",
                 "git_stash",
                 "git_checkout_file",
+                "git_worktree",
             ],
             "",
             0.5,
@@ -1699,6 +1706,7 @@ mod tests {
             p.contains("git_revert_commit"),
             "should mention git_revert_commit"
         );
+        assert!(p.contains("git_worktree"), "should mention git_worktree");
         assert!(p.contains("git_stash"), "should mention git_stash");
         assert!(
             p.contains("git_checkout_file"),

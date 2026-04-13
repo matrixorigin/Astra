@@ -353,6 +353,49 @@ pub fn tool_action_profile(tool_name: &str, args: &Value) -> ActionCompensationP
             ActionCategory::Execute,
             "git_revert_commit creates a new compensating commit; undo it by reverting the new revert commit if needed",
         ),
+        "git_worktree" => match string_arg(&normalized_args, "action")
+            .map(|action| action.to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("list" | "ls") => ActionCompensationProfile::read(true),
+            Some("enter") => ActionCompensationProfile::manual(
+                false,
+                ActionCategory::Execute,
+                "leave the session-scoped worktree with `git_worktree` action=`exit`; use exit_action=`remove` with discard_changes=true only when you intentionally want to delete the created worktree",
+            ),
+            Some("add" | "create") => ActionCompensationProfile::manual(
+                false,
+                ActionCategory::Execute,
+                "remove the created worktree with `git_worktree` action=`remove` and the recorded path; set delete_branch=true only if you also want to delete the branch",
+            ),
+            Some("exit") => {
+                let exit_action = string_arg(&normalized_args, "exit_action")
+                    .map(|value| value.to_ascii_lowercase());
+                if exit_action.as_deref() == Some("remove") {
+                    ActionCompensationProfile::manual(
+                        false,
+                        ActionCategory::Destructive,
+                        "git_worktree exit with exit_action=remove can delete the worktree and discard work; use action=`enter` or recreate the worktree manually if you need to return",
+                    )
+                } else {
+                    ActionCompensationProfile::manual(
+                        false,
+                        ActionCategory::Execute,
+                        "git_worktree exit restores the original session root; re-enter the worktree or recreate it manually if you need to return",
+                    )
+                }
+            }
+            Some("remove" | "rm" | "delete") => ActionCompensationProfile::manual(
+                false,
+                ActionCategory::Destructive,
+                "git_worktree remove can delete the worktree and optionally its branch; restore it by recreating the worktree or branch manually if needed",
+            ),
+            _ => ActionCompensationProfile::manual(
+                false,
+                ActionCategory::Execute,
+                "git_worktree action is unknown or not yet modeled for automatic rollback",
+            ),
+        },
         "git_checkout_file" => ActionCompensationProfile::compensated(
             true,
             ActionCategory::Destructive,
@@ -606,6 +649,33 @@ mod tests {
         assert_eq!(profile.category, ActionCategory::Execute);
         assert!(!profile.reversible);
         assert_eq!(profile.compensation_kind, Some(CompensationKind::Manual));
+    }
+
+    #[test]
+    fn git_worktree_list_is_read_only() {
+        let profile = tool_action_profile("git_worktree", &json!({"action": "list"}));
+        assert!(profile.bounded);
+        assert_eq!(profile.category, ActionCategory::Read);
+        assert_eq!(profile.compensation_kind, None);
+    }
+
+    #[test]
+    fn git_worktree_enter_is_manual() {
+        let profile = tool_action_profile(
+            "git_worktree",
+            &json!({"action": "enter", "branch": "demo"}),
+        );
+        assert!(!profile.bounded);
+        assert_eq!(profile.category, ActionCategory::Execute);
+        assert!(!profile.reversible);
+        assert_eq!(profile.compensation_kind, Some(CompensationKind::Manual));
+        assert!(
+            profile
+                .compensation_summary
+                .as_deref()
+                .unwrap_or_default()
+                .contains("git_worktree")
+        );
     }
 
     #[test]
