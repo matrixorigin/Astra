@@ -140,13 +140,22 @@ fn build_retained_history_turns(
         if let Some(turn) = turns.last_mut() {
             turn.tokens += tokens;
             turn.has_tool_calls |= has_tool_calls;
-            if role != "tool" {
+            if retained_turn_role_priority(&role) > retained_turn_role_priority(&turn.role) {
                 turn.role = role;
             }
         }
     }
 
     turns
+}
+
+fn retained_turn_role_priority(role: &str) -> u8 {
+    match role {
+        "assistant" => 3,
+        "user" => 2,
+        "system" => 1,
+        _ => 0,
+    }
 }
 
 // ─── Outbound `/chat` JSON body (was `prepare_turn_request.rs`) ───────────────
@@ -989,6 +998,31 @@ mod tests {
         assert_eq!(turns[1].turn_index, 1);
         assert_eq!(turns[1].role, "assistant");
         assert!(turns[1].has_tool_calls);
+    }
+
+    #[test]
+    fn retained_history_trailing_system_message_does_not_override_assistant_turn() {
+        let messages = vec![
+            json!({"role": "user", "content": "review latest commit"}),
+            json!({"role": "assistant", "content": "", "tool_calls": [{"id": "call-1"}]}),
+            json!({"role": "tool", "content": "# Skill: review-changes\n..."}),
+            json!({"role": "system", "content": "## Already Fetched (do NOT re-read/re-grep these)\nshell.rs"}),
+        ];
+
+        let turns = super::build_retained_history_turns(&messages);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].role, "assistant");
+        assert!(turns[0].has_tool_calls);
+    }
+
+    #[test]
+    fn retained_history_keeps_system_role_for_system_only_history() {
+        let messages = vec![json!({"role": "system", "content": "system note"})];
+
+        let turns = super::build_retained_history_turns(&messages);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].role, "system");
+        assert!(!turns[0].has_tool_calls);
     }
 
     #[test]

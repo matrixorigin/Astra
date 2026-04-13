@@ -84,6 +84,15 @@ impl TurnTraceCollector {
         }
     }
 
+    pub fn set_turn_id(&self, turn_id: impl Into<String>) {
+        if let Ok(mut state) = self.inner.write() {
+            let turn_id = turn_id.into();
+            if !turn_id.is_empty() {
+                state.turn_id = turn_id;
+            }
+        }
+    }
+
     // ─── Recording Methods ───────────────────────────────────────────────────
 
     /// Record system prompt breakdown.

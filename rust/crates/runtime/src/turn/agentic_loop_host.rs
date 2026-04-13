@@ -1888,6 +1888,8 @@ fn finalize_turn_trace(state: &mut AgenticLoopState) {
     if let Some(ref session_id) = state.current_session_id {
         collector.set_session_id(session_id);
     }
+    let session_turn = context_trace_turn_number(state);
+    collector.set_turn_id(format!("turn-{session_turn}"));
     let measured = state.last_measured_prompt_tokens.unwrap_or(0);
     let max = state.max_turn_input_tokens;
     let budget_pressure = if max > 0 {
@@ -1908,14 +1910,6 @@ fn finalize_turn_trace(state: &mut AgenticLoopState) {
         crate::observability_integration::on_context_assembled(&mut guard, trace.clone());
     }
     if collector.has_data() {
-        // Use session-global turn number when available, falling back to
-        // loop-local iteration number when there is no observability session.
-        let session_turn = state
-            .telemetry
-            .observability_session
-            .as_ref()
-            .and_then(|s| s.read().ok().map(|g| g.turn_number))
-            .unwrap_or_else(|| (state.max_turns - state.remaining_turns) as u32);
         if let Some(ref sid) = state.current_session_id {
             if let Ok(writer) = astra_services::session_journal::JournalWriter::new(sid) {
                 let event =
@@ -1928,6 +1922,17 @@ fn finalize_turn_trace(state: &mut AgenticLoopState) {
             }
         }
     }
+}
+
+fn context_trace_turn_number(state: &AgenticLoopState) -> u32 {
+    let outer_turn = (state.max_turns - state.remaining_turns) as u32;
+    state
+        .telemetry
+        .observability_session
+        .as_ref()
+        .and_then(|s| s.read().ok().map(|g| g.turn_number))
+        .filter(|turn| *turn > 0)
+        .unwrap_or(outer_turn)
 }
 
 /// Best-effort heavy checkpoint write.
@@ -11582,6 +11587,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
         state.max_turn_input_tokens = 100_000;
 
         // Turn 0
+        session.write().unwrap().turn_number = 1;
         state.last_measured_prompt_tokens = Some(20_000);
         state.telemetry.turn_trace_collector =
             Some(crate::turn::turn_trace_collector::TurnTraceCollector::new(
@@ -11591,6 +11597,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
         finalize_turn_trace(&mut state);
 
         // Turn 1
+        session.write().unwrap().turn_number = 2;
         state.last_measured_prompt_tokens = Some(30_000);
         state.telemetry.turn_trace_collector =
             Some(crate::turn::turn_trace_collector::TurnTraceCollector::new(
@@ -11601,10 +11608,43 @@ print(json.dumps({'context': 'user said: ' + msg}))
 
         let guard = session.read().unwrap();
         assert_eq!(guard.context_traces.len(), 2);
-        assert_eq!(guard.context_traces[0].turn_id, "turn-0");
+        assert_eq!(guard.context_traces[0].turn_id, "turn-1");
         assert_eq!(guard.context_traces[0].token_budget.total_used, 20_000);
-        assert_eq!(guard.context_traces[1].turn_id, "turn-1");
+        assert_eq!(guard.context_traces[1].turn_id, "turn-2");
         assert_eq!(guard.context_traces[1].token_budget.total_used, 30_000);
+    }
+
+    #[test]
+    fn finalize_turn_trace_aligns_trace_turn_id_with_journal_turn() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
+
+        let mut state = make_state();
+        let hub = crate::observability_integration::ObservabilityHub::new();
+        let session = hub.start_session("u1", "s1");
+        session.write().unwrap().turn_number = 3;
+        state.current_session_id = Some("s1".to_string());
+        state.telemetry.observability_session = Some(session.clone());
+        state.telemetry.turn_trace_collector =
+            Some(crate::turn::turn_trace_collector::TurnTraceCollector::new(
+                "turn-0".to_string(),
+                "s1".to_string(),
+            ));
+        state.max_turn_input_tokens = 100_000;
+        state.last_measured_prompt_tokens = Some(42_000);
+
+        finalize_turn_trace(&mut state);
+
+        let session_guard = session.read().unwrap();
+        assert_eq!(session_guard.context_traces.len(), 1);
+        assert_eq!(session_guard.context_traces[0].turn_id, "turn-3");
+        drop(session_guard);
+
+        let journal = std::fs::read_to_string(temp.path().join("s1.jsonl")).unwrap();
+        let event: serde_json::Value =
+            serde_json::from_str(journal.lines().next().unwrap()).unwrap();
+        assert_eq!(event["turn"], 3);
+        assert_eq!(event["context_assembly_trace"]["turn_id"], "turn-3");
     }
 
     // ── Skill deferral behavior tests ─────────────────────────────────────
