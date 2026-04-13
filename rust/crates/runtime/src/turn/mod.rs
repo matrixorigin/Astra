@@ -50,6 +50,7 @@ pub mod goal_tracker;
 pub mod headless_tool_assembly;
 pub mod headless_tool_body_preview;
 pub mod headless_tool_journal;
+pub mod headless_tool_pipeline;
 pub mod headless_tool_postprocess;
 pub mod headless_tool_status_display;
 pub mod headless_tool_stderr_lines;
