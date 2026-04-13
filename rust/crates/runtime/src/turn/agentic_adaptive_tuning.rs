@@ -672,7 +672,7 @@ fn record_evolution_proposal_event(
 
 pub(crate) async fn snapshot_evolution_promotion_ids(
     evo: &crate::evolution::service::EvolutionService,
-) -> (HashSet<String>, HashSet<String>) {
+) -> (HashSet<String>, HashSet<String>, HashSet<String>) {
     let pending = evo
         .pending()
         .await
@@ -685,7 +685,13 @@ pub(crate) async fn snapshot_evolution_promotion_ids(
         .into_iter()
         .map(|proposal| proposal.id)
         .collect::<HashSet<_>>();
-    (pending, applied)
+    let canary = evo
+        .active_canaries()
+        .await
+        .into_iter()
+        .map(|proposal| proposal.id)
+        .collect::<HashSet<_>>();
+    (pending, applied, canary)
 }
 
 pub(crate) async fn record_new_evolution_promotion_events(
@@ -693,6 +699,7 @@ pub(crate) async fn record_new_evolution_promotion_events(
     evo: &crate::evolution::service::EvolutionService,
     pending_before: &HashSet<String>,
     applied_before: &HashSet<String>,
+    canary_before: &HashSet<String>,
 ) {
     for proposal in evo.pending().await {
         if !pending_before.contains(&proposal.id) {
@@ -702,6 +709,15 @@ pub(crate) async fn record_new_evolution_promotion_events(
     for proposal in evo.applied().await {
         if !applied_before.contains(&proposal.id) {
             record_evolution_proposal_event(state, RuntimePromotionOutcome::AutoApplied, &proposal);
+        }
+    }
+    for proposal in evo.active_canaries().await {
+        if !canary_before.contains(&proposal.id) {
+            record_evolution_proposal_event(
+                state,
+                RuntimePromotionOutcome::CanaryStarted,
+                &proposal,
+            );
         }
     }
 }
