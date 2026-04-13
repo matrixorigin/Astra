@@ -386,20 +386,21 @@ fn validate_plain_command_path_arg(
     arg: &str,
     oldpwd: Option<&std::path::Path>,
 ) -> Option<String> {
+    if let Some(kind) = unresolved_static_dir_reference_kind(arg) {
+        return Some(format!(
+            "{}The command references '{}' using {} which cannot be statically validated against the project directory '{}'. Ask the user for permission before accessing files outside the project.",
+            super::SANDBOX_DENIED_PREFIX,
+            arg,
+            kind,
+            policy.project_root.display(),
+        ));
+    }
+
     let resolved = if arg.starts_with('/') {
         std::path::PathBuf::from(arg)
     } else if let Some(expanded) = expand_static_dir_reference(policy, arg, oldpwd) {
         expanded
     } else {
-        if let Some(kind) = unresolved_static_dir_reference_kind(arg) {
-            return Some(format!(
-                "{}The command references '{}' using {} which cannot be statically validated against the project directory '{}'. Ask the user for permission before accessing files outside the project.",
-                super::SANDBOX_DENIED_PREFIX,
-                arg,
-                kind,
-                policy.project_root.display(),
-            ));
-        }
         policy.project_root.join(arg)
     };
     let path_str = resolved.to_string_lossy();
@@ -957,7 +958,8 @@ fn redirection_operator_details(chars: &[(usize, char)], idx: usize) -> (usize, 
         ('>', Some('>'), _) => (idx + 2, true),
         ('<', Some('>'), _) => (idx + 2, true),
         ('>', Some('|'), _) => (idx + 2, true),
-        ('<', Some('&'), _) | ('>', Some('&'), _) => (idx + 2, false),
+        ('<', Some('&'), _) => (idx + 2, false),
+        ('>', Some('&'), _) => (idx + 2, true),
         _ => (idx + 1, true),
     }
 }
@@ -3699,6 +3701,31 @@ mod tests {
     }
 
     #[test]
+    fn redirect_output_and_stderr_path_is_caught() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(&policy, "echo hi >&/etc/output.log");
+        assert!(
+            result
+                .as_deref()
+                .is_some_and(|msg| msg.starts_with(super::SANDBOX_DENIED_PREFIX)
+                    && msg.contains("/etc/output.log")),
+            ">&word should be treated as a file path redirection when word is not an fd"
+        );
+    }
+
+    #[test]
+    fn redirect_output_and_stderr_to_fd_is_allowed() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(&policy, "echo hi >&2");
+        assert!(
+            result.is_none(),
+            ">&2 should remain treated as file-descriptor duplication, not a path access"
+        );
+    }
+
+    #[test]
     fn redirect_input_without_whitespace_inside_project_is_allowed() {
         use astra_runtime::tool_sandbox::SandboxPolicy;
         let policy = SandboxPolicy::for_project("/home/user/project");
@@ -3978,6 +4005,21 @@ mod tests {
     }
 
     #[test]
+    fn absolute_unbraced_variable_expansion_requires_boundary_review() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(&policy, "cat /$SECRET/passwd");
+        assert!(
+            result
+                .as_deref()
+                .is_some_and(|msg| msg.starts_with(super::SANDBOX_DENIED_PREFIX)
+                    && msg.contains("/$SECRET/passwd")
+                    && msg.contains("shell variable expansion")),
+            "absolute paths containing shell variables should require boundary review"
+        );
+    }
+
+    #[test]
     fn home_like_variable_name_requires_boundary_review() {
         use astra_runtime::tool_sandbox::SandboxPolicy;
         let policy = SandboxPolicy::for_project("/home/user/project");
@@ -3989,6 +4031,21 @@ mod tests {
                     && msg.contains("${HOME_DIR}/notes.txt")
                     && msg.contains("shell variable expansion")),
             "unresolved variable-like anchors should require boundary review"
+        );
+    }
+
+    #[test]
+    fn absolute_home_like_variable_name_requires_boundary_review() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(&policy, "cat /${HOME_DIR}/notes.txt");
+        assert!(
+            result
+                .as_deref()
+                .is_some_and(|msg| msg.starts_with(super::SANDBOX_DENIED_PREFIX)
+                    && msg.contains("/${HOME_DIR}/notes.txt")
+                    && msg.contains("shell variable expansion")),
+            "absolute paths should not bypass unresolved variable review"
         );
     }
 
