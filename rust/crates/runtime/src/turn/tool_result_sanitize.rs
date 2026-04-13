@@ -38,6 +38,14 @@ pub fn tool_result_content_for_model(tool_name: &str, content: &str) -> String {
             tool_name
         );
     }
+    if sanitized.credential_redactions > 0 {
+        agent_warn!(
+            "safety",
+            "redacted {} credential/secret pattern(s) from tool result for {}",
+            sanitized.credential_redactions,
+            tool_name
+        );
+    }
     sanitized.content
 }
 

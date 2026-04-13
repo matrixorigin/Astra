@@ -8,7 +8,13 @@ use super::harness;
 
 fn enc(s: &str) -> String {
     s.chars()
-        .map(|c| if c == ' ' { "%20".to_string() } else { c.to_string() })
+        .map(|c| {
+            if c == ' ' {
+                "%20".to_string()
+            } else {
+                c.to_string()
+            }
+        })
         .collect()
 }
 
@@ -213,11 +219,7 @@ pub async fn run_audit_cross_session_analytics_http() {
     .await
     .expect("insert runtime promotion");
 
-    let q = format!(
-        "/audit/stats?since={}&until={}",
-        enc(since),
-        enc(until)
-    );
+    let q = format!("/audit/stats?since={}&until={}", enc(since), enc(until));
     let (st, body): (StatusCode, Value) = harness::get_json(app, &q, Some(auth), &[]).await;
     assert_eq!(st, StatusCode::OK, "stats body: {body}");
     assert_eq!(body["session_count"], json!(4));
@@ -234,7 +236,10 @@ pub async fn run_audit_cross_session_analytics_http() {
     let (stm, mut_body) = harness::get_json(app, &qm, Some(auth), &[]).await;
     assert_eq!(stm, StatusCode::OK, "mutations: {mut_body}");
     assert_eq!(mut_body["total"], json!(1));
-    assert_eq!(mut_body["mutations"][0]["mutation_id"], json!(format!("{decision_id}:call-e2e")));
+    assert_eq!(
+        mut_body["mutations"][0]["mutation_id"],
+        json!(format!("{decision_id}:call-e2e"))
+    );
 
     let qp = format!(
         "/audit/promotions?page=1&per_page=20&since={}&until={}",

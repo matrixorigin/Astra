@@ -13,19 +13,20 @@
 //! (ignores duplicate-name errors) so the listing path is validated against the intended DDL.
 
 use astra_core::{DEV_MATRIXONE_PASSWORD, MatrixOneSettings, SharedPool};
+use astra_services::session_audit::{
+    AuditSessionListParams, CrossSessionMutationListParams, CrossSessionRuntimePromotionListParams,
+    CrossSessionStatsParams, DatabaseSessionAuditService, RUNTIME_PROMOTION_EVENT_TYPE,
+    RuntimePromotionController, RuntimePromotionOutcome, RuntimePromotionRecommendation,
+    SessionAuditService,
+};
 use astra_services::{
     AdminAuditFilter, AdminAuditReader, DatabaseAdminAuditReader, DatabaseDecisionService,
     DatabaseEventService, DatabaseMarketplaceStatsService, DatabaseSessionService,
-    DatabaseSkillService, DecisionListFilter, DecisionService, DurableTaskLifecycle, EventListFilter,
-    EventService, MarketplaceStatsService, MatrixOneDurableTaskLifecycle, SessionListFilter,
-    SessionService, SkillService, SkillSearchQuery, StagedMutationState,
-    ensure_core_schema, MAX_API_LIST_LIMIT, MAX_API_LIST_OFFSET, MAX_MARKETPLACE_SEARCH_OFFSET,
-};
-use astra_services::session_audit::{
-    AuditSessionListParams, CrossSessionMutationListParams, CrossSessionRuntimePromotionListParams,
-    CrossSessionStatsParams, DatabaseSessionAuditService, RuntimePromotionController,
-    RuntimePromotionOutcome, RuntimePromotionRecommendation, SessionAuditService,
-    RUNTIME_PROMOTION_EVENT_TYPE,
+    DatabaseSkillService, DecisionListFilter, DecisionService, DurableTaskLifecycle,
+    EventListFilter, EventService, MAX_API_LIST_LIMIT, MAX_API_LIST_OFFSET,
+    MAX_MARKETPLACE_SEARCH_OFFSET, MarketplaceStatsService, MatrixOneDurableTaskLifecycle,
+    SessionListFilter, SessionService, SkillSearchQuery, SkillService, StagedMutationState,
+    ensure_core_schema,
 };
 use sqlx::Row;
 use std::collections::HashSet;
@@ -176,14 +177,13 @@ async fn skills_registry_index_list_order_and_get_skill_definition() {
     }
 
     let svc = DatabaseSkillService::new(settings.clone()).with_pool(shared.clone());
-    let page = svc
-        .list_skills(u32::MAX, 0)
-        .await
-        .expect("list_skills");
+    let page = svc.list_skills(u32::MAX, 0).await.expect("list_skills");
     assert_eq!(page.limit, MAX_API_LIST_LIMIT);
     assert_eq!(page.offset, 0);
 
-    let want: HashSet<String> = [id_a.clone(), id_b.clone(), id_c.clone()].into_iter().collect();
+    let want: HashSet<String> = [id_a.clone(), id_b.clone(), id_c.clone()]
+        .into_iter()
+        .collect();
     let ours: Vec<_> = page
         .skills
         .iter()
@@ -387,7 +387,9 @@ async fn events_sessions_decisions_admin_and_marketplace_search_clamps() {
 /// Matches [`astra_services::session_audit::MAX_AUDIT_SESSIONS_PER_PAGE`] (not exported).
 const MAX_AUDIT_SESSIONS_PER_PAGE: u32 = 100;
 
-fn assert_cross_session_stats_no_mutations_no_promotions(s: &astra_services::session_audit::CrossSessionStats) {
+fn assert_cross_session_stats_no_mutations_no_promotions(
+    s: &astra_services::session_audit::CrossSessionStats,
+) {
     assert_eq!(s.total_mutations, 0);
     assert_eq!(s.ready_mutations, 0);
     assert_eq!(s.approval_required_mutations, 0);
@@ -494,8 +496,7 @@ async fn cross_session_stats_and_audit_list_sessions_match_seeded_events() {
         e_stall.clone(),
     ];
 
-    cleanup_agent_sessions_and_events(&pool, &[s1.clone(), s2.clone()], &event_ids, &[])
-        .await;
+    cleanup_agent_sessions_and_events(&pool, &[s1.clone(), s2.clone()], &event_ids, &[]).await;
 
     sqlx::query(
         "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count, created_at, updated_at, last_active_at) \
@@ -707,8 +708,7 @@ async fn cross_session_runtime_promotions_db_roundtrip() {
     let e4 = Uuid::new_v4().to_string();
     let event_ids = vec![e1.clone(), e2.clone(), e3.clone(), e4.clone()];
 
-    cleanup_agent_sessions_and_events(&pool, &[s1.clone()], &event_ids, &[])
-        .await;
+    cleanup_agent_sessions_and_events(&pool, &[s1.clone()], &event_ids, &[]).await;
 
     sqlx::query(
         "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count) \
@@ -922,8 +922,13 @@ async fn cross_session_mutations_db_roundtrip() {
     let until = "2026-08-10 23:59:59.000000".to_string();
 
     let event_ids = vec![event_id.clone(), ev_apply.clone(), ev_revert.clone()];
-    cleanup_agent_sessions_and_events(&pool, &[session_id.clone()], &event_ids, &[decision_id.clone()])
-        .await;
+    cleanup_agent_sessions_and_events(
+        &pool,
+        &[session_id.clone()],
+        &event_ids,
+        &[decision_id.clone()],
+    )
+    .await;
 
     sqlx::query(
         "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count) \

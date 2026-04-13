@@ -19,9 +19,9 @@ pub mod learning_merge;
 pub mod marketplace;
 pub mod marketplace_stats;
 pub mod models;
-pub mod pagination;
 pub mod multi_agent;
 pub mod mutation_scoreboard;
+pub mod pagination;
 pub mod protocol;
 pub mod reflect;
 pub mod replay;
@@ -126,11 +126,6 @@ pub use marketplace_stats::{
     QualityReportData, SkillMarketplaceStats, SkillSearchQuery, SkillSearchResponse,
     SkillSearchResult,
 };
-pub use pagination::{
-    clamp_admin_audit_limit, clamp_api_list_pagination, clamp_marketplace_search_offset,
-    MAX_ADMIN_AUDIT_LOG_LIMIT, MAX_API_LIST_LIMIT, MAX_API_LIST_OFFSET,
-    MAX_MARKETPLACE_SEARCH_OFFSET,
-};
 pub use models::{
     DatabaseModelService, ModelCreateRequestData, ModelListItem, ModelRecord, ModelService,
     ModelUpdateRequestData, PricingData, QuirksData, ResolvedActiveLlmModel,
@@ -146,6 +141,11 @@ pub use mutation_scoreboard::{
     MutationPromotionEvaluationContext, MutationPromotionRecommendation, MutationPromotionVerdict,
     MutationRetentionVerdict, MutationSafetyVerdict, MutationScoreboard, MutationVerifierSummary,
     PersistedMutationDecision, StagedMutation, StagedMutationState,
+};
+pub use pagination::{
+    MAX_ADMIN_AUDIT_LOG_LIMIT, MAX_API_LIST_LIMIT, MAX_API_LIST_OFFSET,
+    MAX_MARKETPLACE_SEARCH_OFFSET, clamp_admin_audit_limit, clamp_api_list_pagination,
+    clamp_marketplace_search_offset,
 };
 pub use protocol::{
     ApplyDeltaRequest, ApplyDeltaResponse, ApplyOptions, Checkpoint, CheckpointOptions,

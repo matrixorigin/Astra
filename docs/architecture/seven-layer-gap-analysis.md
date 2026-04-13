@@ -193,6 +193,7 @@
 - **Runtime reward-hacking throttle** (`turn/stall.rs`, `turn/turn_guard.rs`, `turn/agentic_post_tool_policy.rs`): high-risk repetitive or exploration-only tool batches now trigger a live `TurnGuard` warning, retry the LLM with an explicit correction, and temporarily restrict the repeated tools instead of only damping downstream learning updates.
 - **Legacy bridge guard reuse** (`turn/bridge_inprocess.rs`): the backward-compatible `/chat/turn` and `/chat/stream` in-process loop now thinly reuses the shared stall preflight plus post-tool policy, so old bridge traffic also inherits live reward-hacking/stall nudges and next-round tool-schema restriction instead of bypassing the shell entirely.
 - **Tool-output prompt-injection sanitization** (`turn/safety_middleware.rs`, `turn/tool_result_sanitize.rs`, `turn/cloud_tool_delivery.rs`, `turn/agentic_headless_round.rs`, `turn/agentic_loop_host.rs`): suspicious prompt-like lines are now stripped before tool outputs re-enter model context across edge-ledger delivery, standard headless tool rounds, pre-resolved tool results, and delegated-result summaries. Raw edge-ledger SSE/persisted payloads stay intact for user visibility and forensics.
+- **Post-tool credential/secret redaction** (`turn/safety_middleware.rs`, `turn/tool_result_sanitize.rs`): high-confidence credential patterns (PEM private keys, AWS access/secret keys, GitHub tokens, bearer tokens, connection strings with embedded passwords, generic password/api_key/secret assignments) are now automatically redacted from tool outputs before they enter model context, preventing accidental secret leakage into LLM prompts. Redaction uses regex-based detection with intentionally conservative patterns (long minimum lengths, fixed prefixes) to minimize false positives. Raw audit/ledger payloads remain intact for forensic inspection. The sanitization pipeline now reports both prompt-injection strip counts and credential redaction counts.
 - **Permission gating**: Three-tier permission model with inherited restrictions.
 - **Stall detection** (`stall.rs`): Detects repeated identical tool calls, empty-name bursts.
 - **Symlink safety, path validation**: Guards against path traversal attacks.
@@ -203,10 +204,10 @@
 - **No model parameter drift detection**: System detects behavioral drift but not weight/embedding drift in fine-tuned models.
 - **Anti-hallucinated causality is heuristic-only**: The learning boundary now requires corroborating tool evidence, but it still lacks lineage-backed causal inference and richer cross-turn validation against spurious correlations.
 - **No adversarial testing framework**: No red-team/fuzzing infrastructure for systematically probing safety boundaries.
-- **Middleware is still thin**: Centralized guards now cover request-time SQL/shell preflight, legacy-bridge reuse of the shared post-tool guard, and prompt-injection stripping across the main tool-result-to-model paths, but richer post-tool validation (beyond prompt-like line stripping) plus broader adversarial guard expansion are still scattered.
+- **Middleware post-tool validation is still expanding**: Centralized guards now cover request-time SQL/shell preflight, legacy-bridge reuse of the shared post-tool guard, prompt-injection stripping, and credential/secret redaction across the main tool-result-to-model paths, but richer post-tool validation (output coherence checks, execution outcome classification) and broader adversarial guard expansion remain incremental.
 
 ### Priority Actions
-1. Expand centralized `SafetyMiddleware` beyond request-time preflight into broader post-tool/output validation.
+1. Continue expanding post-tool validation with execution outcome classification and output anomaly detection.
 2. Extend causal-support heuristics into lineage-backed anti-hallucinated-causality checks plus adversarial testing coverage for learned patterns.
 
 ---
