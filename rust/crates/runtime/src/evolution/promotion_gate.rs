@@ -10,7 +10,7 @@ use super::types::{
 };
 use crate::pipeline::calibration::{CalibrationEntry, ProgressiveCalibrator};
 use crate::pipeline::pattern::{PatternLibrary, ToolChainPattern};
-use crate::promotion_context::{PromotionEvaluationContext, apply_promotion_evaluation_context};
+use crate::runtime_promotion_signals::{RuntimePromotionScorecard, RuntimePromotionSignals};
 
 const PROMOTION_CONFIDENCE_THRESHOLD: f64 = 0.85;
 const CANARY_CONFIDENCE_THRESHOLD: f64 = 0.75;
@@ -25,18 +25,18 @@ const FULL_DATA_SUPPORT_SAMPLES: f64 = 10.0;
 pub struct ProposalPromotionContext<'a> {
     pub pattern_library: Option<&'a PatternLibrary>,
     pub calibrator: Option<&'a ProgressiveCalibrator>,
-    pub promotion_evaluation_context: Option<&'a PromotionEvaluationContext>,
+    pub promotion_signals: Option<&'a RuntimePromotionSignals>,
 }
 
 pub fn evaluate_proposal_promotion(
     proposal: &EvolutionProposal,
     ctx: ProposalPromotionContext<'_>,
 ) -> Result<ProposalPromotionVerdict, String> {
-    let mut confidence_score = proposal.confidence.clamp(0.0, 1.0);
+    let confidence_score = proposal.confidence.clamp(0.0, 1.0);
     let mut evidence = vec![format!("proposal confidence {:.2}", confidence_score)];
     let mut blockers = Vec::new();
 
-    let (mut support_score, mut safety_score, rollback_hint) = match &proposal.axis {
+    let (support_score, safety_score, rollback_hint) = match &proposal.axis {
         EvolutionAxis::Pattern { signature, action } => evaluate_pattern_axis(
             proposal,
             signature,
@@ -73,14 +73,21 @@ pub fn evaluate_proposal_promotion(
         }
     };
 
-    apply_promotion_evaluation_context(
-        ctx.promotion_evaluation_context,
-        &mut confidence_score,
-        &mut support_score,
-        &mut safety_score,
-        &mut evidence,
-        &mut blockers,
+    let mut scorecard = RuntimePromotionScorecard::new(
+        confidence_score,
+        support_score,
+        safety_score,
+        evidence,
+        blockers,
     );
+    scorecard.apply_signals(ctx.promotion_signals);
+    let RuntimePromotionScorecard {
+        confidence_score,
+        support_score,
+        safety_score,
+        evidence,
+        blockers,
+    } = scorecard;
 
     let overall_score =
         (confidence_score * 0.40 + support_score * 0.35 + safety_score * 0.25).clamp(0.0, 1.0);
@@ -339,6 +346,9 @@ mod tests {
     use crate::pipeline::calibration::ProgressiveCalibrator;
     use crate::pipeline::pattern::PatternLibrary;
     use crate::pipeline::routing::{DomainHint, TaskType};
+    use crate::runtime_promotion_signals::{RuntimePromotionGateSignal, RuntimePromotionSignals};
+    use astra_core::confidence::ConfidenceInterval;
+    use astra_services::evaluation::types::ValueInterval;
 
     fn drift_proposal(
         signature: &str,
@@ -386,7 +396,7 @@ mod tests {
             ProposalPromotionContext {
                 pattern_library: Some(&library),
                 calibrator: None,
-                promotion_evaluation_context: None,
+                promotion_signals: None,
             },
         )
         .unwrap();
@@ -432,7 +442,7 @@ mod tests {
             ProposalPromotionContext {
                 pattern_library: Some(&library),
                 calibrator: None,
-                promotion_evaluation_context: None,
+                promotion_signals: None,
             },
         )
         .unwrap();
@@ -466,7 +476,7 @@ mod tests {
             ProposalPromotionContext {
                 pattern_library: None,
                 calibrator: Some(&ProgressiveCalibrator::default()),
-                promotion_evaluation_context: None,
+                promotion_signals: None,
             },
         )
         .unwrap();
@@ -500,7 +510,7 @@ mod tests {
             ProposalPromotionContext {
                 pattern_library: None,
                 calibrator: Some(&ProgressiveCalibrator::default()),
-                promotion_evaluation_context: None,
+                promotion_signals: None,
             },
         )
         .unwrap();
@@ -561,14 +571,13 @@ mod tests {
             status: super::super::types::ApprovalStatus::Pending,
             promotion_verdict: None,
         };
-        let context = PromotionEvaluationContext {
-            noise_filtered_quality: Some(0.41),
-            noise_filtered_quality_interval: None,
-            latest_gate_passed: Some(false),
-            latest_gate_score_delta: Some(-0.10),
-            latest_gate_score_delta_interval: None,
-            calibration_error: Some(0.22),
-            calibration_error_interval: None,
+        let signals = RuntimePromotionSignals {
+            noise_filtered_quality: Some(ConfidenceInterval::new(0.41, 0.41, 0.41)),
+            latest_gate: Some(RuntimePromotionGateSignal {
+                passed: false,
+                score_delta: Some(ValueInterval::exact(-0.10)),
+            }),
+            calibration_error: Some(ValueInterval::exact(0.22)),
         };
 
         let verdict = evaluate_proposal_promotion(
@@ -576,7 +585,7 @@ mod tests {
             ProposalPromotionContext {
                 pattern_library: None,
                 calibrator: Some(&ProgressiveCalibrator::default()),
-                promotion_evaluation_context: Some(&context),
+                promotion_signals: Some(&signals),
             },
         )
         .unwrap();

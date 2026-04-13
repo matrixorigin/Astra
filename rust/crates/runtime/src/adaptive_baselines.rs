@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 use crate::ab_testing::{Experiment, ExperimentAnalysis, Recommendation, apply_config_diffs};
 use crate::evolution::types::ProposalPromotionRecommendation;
 use crate::pipeline::routing::{DomainHint, TaskType, domain_hint_to_label};
-use crate::promotion_context::{PromotionEvaluationContext, apply_promotion_evaluation_context};
 use crate::runtime_config::RuntimeConfig;
+use crate::runtime_promotion_signals::{RuntimePromotionScorecard, RuntimePromotionSignals};
 
 const BASELINE_PROMOTE_CONFIDENCE_THRESHOLD: f64 = 0.85;
 const BASELINE_CANARY_CONFIDENCE_THRESHOLD: f64 = 0.75;
@@ -346,7 +346,7 @@ pub fn evaluate_promotion_verdict(
     analysis: &ExperimentAnalysis,
     winner_variant_id: &str,
     replacing_existing: bool,
-    promotion_context: Option<&PromotionEvaluationContext>,
+    promotion_signals: Option<&RuntimePromotionSignals>,
 ) -> Result<AdaptiveBaselinePromotionVerdict, String> {
     let winner = experiment.variant(winner_variant_id).ok_or_else(|| {
         format!(
@@ -425,7 +425,7 @@ pub fn evaluate_promotion_verdict(
         ));
     }
 
-    let mut confidence_score = if significant_improvements.is_empty() {
+    let confidence_score = if significant_improvements.is_empty() {
         0.0
     } else {
         significant_improvements
@@ -444,7 +444,7 @@ pub fn evaluate_promotion_verdict(
     } else {
         significant_improvements.len() as f64 / relevant_comparisons.len() as f64
     };
-    let mut support_score = (sample_support * 0.7 + improvement_support * 0.3).clamp(0.0, 1.0);
+    let support_score = (sample_support * 0.7 + improvement_support * 0.3).clamp(0.0, 1.0);
 
     let mut safety_score: f64 = match winner.config_diff.len() {
         0 => 0.0,
@@ -465,14 +465,21 @@ pub fn evaluate_promotion_verdict(
         evidence.push("promotion would establish a fresh adaptive baseline".into());
     }
 
-    apply_promotion_evaluation_context(
-        promotion_context,
-        &mut confidence_score,
-        &mut support_score,
-        &mut safety_score,
-        &mut evidence,
-        &mut blockers,
+    let mut scorecard = RuntimePromotionScorecard::new(
+        confidence_score,
+        support_score,
+        safety_score,
+        evidence,
+        blockers,
     );
+    scorecard.apply_signals(promotion_signals);
+    let RuntimePromotionScorecard {
+        confidence_score,
+        support_score,
+        safety_score,
+        evidence,
+        blockers,
+    } = scorecard;
 
     let overall_score =
         (confidence_score * 0.40 + support_score * 0.35 + safety_score * 0.25).clamp(0.0, 1.0);
@@ -509,6 +516,9 @@ pub fn evaluate_promotion_verdict(
 mod tests {
     use super::*;
     use crate::ab_testing::{ExperimentAnalyzer, ExperimentOutcome, MetricDefinition, Variant};
+    use crate::runtime_promotion_signals::{RuntimePromotionGateSignal, RuntimePromotionSignals};
+    use astra_core::confidence::ConfidenceInterval;
+    use astra_services::evaluation::types::ValueInterval;
 
     #[test]
     fn promote_and_resolve_baseline() {
@@ -776,18 +786,17 @@ mod tests {
             ExperimentOutcome::new("t5", "treatment").with_metric("success_rate", 0.86),
         ];
         let analysis = ExperimentAnalyzer::analyze(&experiment, &outcomes);
-        let context = PromotionEvaluationContext {
-            noise_filtered_quality: Some(0.43),
-            noise_filtered_quality_interval: None,
-            latest_gate_passed: Some(false),
-            latest_gate_score_delta: Some(-0.11),
-            latest_gate_score_delta_interval: None,
-            calibration_error: Some(0.24),
-            calibration_error_interval: None,
+        let signals = RuntimePromotionSignals {
+            noise_filtered_quality: Some(ConfidenceInterval::new(0.43, 0.43, 0.43)),
+            latest_gate: Some(RuntimePromotionGateSignal {
+                passed: false,
+                score_delta: Some(ValueInterval::exact(-0.11)),
+            }),
+            calibration_error: Some(ValueInterval::exact(0.24)),
         };
 
         let verdict =
-            evaluate_promotion_verdict(&experiment, &analysis, "treatment", false, Some(&context))
+            evaluate_promotion_verdict(&experiment, &analysis, "treatment", false, Some(&signals))
                 .expect("promotion verdict");
 
         assert_eq!(

@@ -33,7 +33,7 @@ use crate::MatrixOneSettings;
 use crate::evolution::service::EvolutionService;
 use crate::observability_integration::ObservabilityHub;
 use crate::pipeline::step_recorder::StepRecorder;
-use crate::promotion_context::PromotionEvaluationContext;
+use crate::runtime_promotion_signals::{RuntimePromotionGateSignal, RuntimePromotionSignals};
 use crate::turn::agentic_loop_host::{
     AgenticLoopOutcome, AgenticLoopState, CancellationState, MessagingState, SkillState,
     StopHookState, run_agentic_loop_with_host,
@@ -102,35 +102,29 @@ fn build_runtime_evaluation_service(
     }
 }
 
-async fn load_runtime_promotion_context(
+async fn load_runtime_promotion_signals(
     matrixone: &MatrixOneSettings,
     shared_pool: Option<&SharedPool>,
     user_id: &str,
-) -> Result<PromotionEvaluationContext, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<RuntimePromotionSignals, (StatusCode, Json<ErrorResponse>)> {
     let service = build_runtime_evaluation_service(matrixone, shared_pool);
     let quality = service.get_quality_trend(user_id, 30, None).await?;
     let gate_history = service.get_gate_history(user_id, 1).await?;
     let calibration = service.get_calibration(user_id, None, 30).await?;
     let latest_gate = gate_history.gates.first();
     let calibration_error = if calibration.noise_filtered_sample_count > 0 {
-        calibration.noise_filtered_calibration_error
-    } else {
-        calibration.calibration_error
-    };
-    let calibration_error_interval = if calibration.noise_filtered_sample_count > 0 {
         calibration.noise_filtered_calibration_error_interval
     } else {
         calibration.calibration_error_interval
     };
 
-    Ok(PromotionEvaluationContext {
-        noise_filtered_quality: Some(quality.noise_filtered_overall_avg),
-        noise_filtered_quality_interval: Some(quality.noise_filtered_overall_avg_interval),
-        latest_gate_passed: latest_gate.map(|gate| gate.passed),
-        latest_gate_score_delta: latest_gate.map(|gate| gate.score_delta),
-        latest_gate_score_delta_interval: latest_gate.map(|gate| gate.score_delta_interval),
+    Ok(RuntimePromotionSignals {
+        noise_filtered_quality: Some(quality.noise_filtered_overall_avg_interval),
+        latest_gate: latest_gate.map(|gate| RuntimePromotionGateSignal {
+            passed: gate.passed,
+            score_delta: Some(gate.score_delta_interval),
+        }),
         calibration_error: Some(calibration_error),
-        calibration_error_interval: Some(calibration_error_interval),
     })
 }
 
@@ -138,7 +132,7 @@ fn initialize_runtime_controllers(
     loop_state: &mut AgenticLoopState,
     user_id: &str,
     session_id: &str,
-    promotion_context: Option<PromotionEvaluationContext>,
+    promotion_signals: Option<RuntimePromotionSignals>,
 ) {
     let learning_stack = super::state_builder::build_pipeline_learning_stack();
     let hub = Arc::new(ObservabilityHub::new());
@@ -150,11 +144,11 @@ fn initialize_runtime_controllers(
             .with_pattern_library(learning_stack.pattern_library)
             .with_calibrator(learning_stack.calibrator),
     );
-    evolution_service.set_promotion_evaluation_context(promotion_context.clone());
+    evolution_service.set_runtime_promotion_signals(promotion_signals.clone());
 
     loop_state.telemetry.observability_hub = Some(hub);
     loop_state.telemetry.observability_session = Some(session);
-    loop_state.telemetry.promotion_evaluation_context = promotion_context;
+    loop_state.telemetry.runtime_promotion_signals = promotion_signals;
     loop_state.evolution_service = Some(evolution_service);
 }
 
@@ -165,19 +159,19 @@ async fn configure_runtime_controllers(
     user_id: &str,
     session_id: &str,
 ) {
-    let promotion_context = match load_runtime_promotion_context(matrixone, shared_pool, user_id)
+    let promotion_signals = match load_runtime_promotion_signals(matrixone, shared_pool, user_id)
         .await
     {
         Ok(context) => Some(context),
         Err((status, response)) => {
             eprintln!(
-                "[promotion-context] failed to preload evaluation summaries for {user_id}: {status} {}",
+                "[promotion-signals] failed to preload evaluation summaries for {user_id}: {status} {}",
                 response.0.detail
             );
             None
         }
     };
-    initialize_runtime_controllers(loop_state, user_id, session_id, promotion_context);
+    initialize_runtime_controllers(loop_state, user_id, session_id, promotion_signals);
 }
 
 fn build_runtime_event_service(

@@ -326,7 +326,8 @@ pub struct TelemetryState {
     pub observability_hub:
         Option<std::sync::Arc<crate::observability_integration::ObservabilityHub>>,
     /// Optional preloaded evaluation summaries used to damp runtime promotions.
-    pub promotion_evaluation_context: Option<crate::promotion_context::PromotionEvaluationContext>,
+    pub runtime_promotion_signals:
+        Option<crate::runtime_promotion_signals::RuntimePromotionSignals>,
     /// Runtime promotion verdicts captured for later audit/report persistence.
     pub promotion_events: Vec<RuntimePromotionEventData>,
     /// Optional turn trace collector for detailed context assembly observability.
@@ -2223,7 +2224,7 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
 
     // ── Evolution: flush signals and auto-apply fast-path proposals ──
     if let Some(evo) = state.evolution_service.clone() {
-        evo.set_promotion_evaluation_context(state.telemetry.promotion_evaluation_context.clone());
+        evo.set_runtime_promotion_signals(state.telemetry.runtime_promotion_signals.clone());
         let (pending_before, applied_before) = snapshot_evolution_promotion_ids(&evo).await;
         let (auto_applied, _llm_signals) = evo.flush().await;
         record_new_evolution_promotion_events(state, &evo, &pending_before, &applied_before).await;
@@ -2616,10 +2617,10 @@ fn maybe_run_tuning_cycle(state: &mut AgenticLoopState) {
         let Some(winner_variant_id) = conclusion.winner_variant_id.as_deref() else {
             continue;
         };
-        match hub.promote_experiment_winner_with_context(
+        match hub.promote_experiment_winner_with_signals(
             &conclusion.experiment_id,
             winner_variant_id,
-            state.telemetry.promotion_evaluation_context.as_ref(),
+            state.telemetry.runtime_promotion_signals.as_ref(),
         ) {
             Ok(crate::adaptive_baselines::AdaptiveBaselinePromotionDecision::Promoted {
                 promotion,
@@ -3194,7 +3195,7 @@ async fn maybe_trigger_auto_reflection<H: AgenticLoopHost>(
         None => return,
     };
 
-    evo.set_promotion_evaluation_context(state.telemetry.promotion_evaluation_context.clone());
+    evo.set_runtime_promotion_signals(state.telemetry.runtime_promotion_signals.clone());
     let (pending_before, applied_before) = snapshot_evolution_promotion_ids(&evo).await;
     let (fast, llm_signals) = evo.flush().await;
     record_new_evolution_promotion_events(state, &evo, &pending_before, &applied_before).await;

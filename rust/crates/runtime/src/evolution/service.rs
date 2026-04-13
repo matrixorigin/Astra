@@ -15,7 +15,7 @@ use super::types::{
 use crate::liquid::reflection::ReflectionEngine;
 use crate::pipeline::calibration::ProgressiveCalibrator;
 use crate::pipeline::pattern::PatternLibrary;
-use crate::promotion_context::PromotionEvaluationContext;
+use crate::runtime_promotion_signals::RuntimePromotionSignals;
 
 const MAX_APPLIED_LOG: usize = 100;
 
@@ -32,8 +32,8 @@ pub struct EvolutionService {
     calibrator: Option<Arc<std::sync::Mutex<ProgressiveCalibrator>>>,
     /// Optional durable store for skill evolution proposals and approved diffs.
     evolution_store: Option<Arc<EvolutionStore>>,
-    /// Optional preloaded evaluation context shared across runtime promotions.
-    promotion_evaluation_context: std::sync::RwLock<Option<PromotionEvaluationContext>>,
+    /// Optional preloaded promotion signals shared across runtime promotions.
+    runtime_promotion_signals: std::sync::RwLock<Option<RuntimePromotionSignals>>,
     /// Cached reflection engine (stateless — reusable across calls).
     reflection_engine: ReflectionEngine,
 }
@@ -70,7 +70,7 @@ impl EvolutionService {
             pattern_library: None,
             calibrator: None,
             evolution_store: None,
-            promotion_evaluation_context: std::sync::RwLock::new(None),
+            runtime_promotion_signals: std::sync::RwLock::new(None),
             reflection_engine: ReflectionEngine::new(),
         }
     }
@@ -96,11 +96,11 @@ impl EvolutionService {
         self
     }
 
-    pub fn set_promotion_evaluation_context(&self, context: Option<PromotionEvaluationContext>) {
+    pub fn set_runtime_promotion_signals(&self, signals: Option<RuntimePromotionSignals>) {
         *self
-            .promotion_evaluation_context
+            .runtime_promotion_signals
             .write()
-            .unwrap_or_else(|e| e.into_inner()) = context;
+            .unwrap_or_else(|e| e.into_inner()) = signals;
     }
 
     /// Feed a tool result into the signal collector.
@@ -219,8 +219,8 @@ impl EvolutionService {
         &self,
         mut proposal: EvolutionProposal,
     ) -> Result<EvolutionProposal, String> {
-        let promotion_evaluation_context = self
-            .promotion_evaluation_context
+        let runtime_promotion_signals = self
+            .runtime_promotion_signals
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
@@ -235,7 +235,7 @@ impl EvolutionService {
                         ProposalPromotionContext {
                             pattern_library: Some(&library),
                             calibrator: None,
-                            promotion_evaluation_context: promotion_evaluation_context.as_ref(),
+                            promotion_signals: runtime_promotion_signals.as_ref(),
                         },
                     )?
                 } else {
@@ -244,7 +244,7 @@ impl EvolutionService {
                         ProposalPromotionContext {
                             pattern_library: None,
                             calibrator: None,
-                            promotion_evaluation_context: promotion_evaluation_context.as_ref(),
+                            promotion_signals: runtime_promotion_signals.as_ref(),
                         },
                     )?
                 }
@@ -261,7 +261,7 @@ impl EvolutionService {
                         ProposalPromotionContext {
                             pattern_library: None,
                             calibrator: Some(&calibrator),
-                            promotion_evaluation_context: promotion_evaluation_context.as_ref(),
+                            promotion_signals: runtime_promotion_signals.as_ref(),
                         },
                     )?
                 } else {
@@ -270,7 +270,7 @@ impl EvolutionService {
                         ProposalPromotionContext {
                             pattern_library: None,
                             calibrator: None,
-                            promotion_evaluation_context: promotion_evaluation_context.as_ref(),
+                            promotion_signals: runtime_promotion_signals.as_ref(),
                         },
                     )?
                 }
@@ -281,7 +281,7 @@ impl EvolutionService {
                     ProposalPromotionContext {
                         pattern_library: None,
                         calibrator: None,
-                        promotion_evaluation_context: promotion_evaluation_context.as_ref(),
+                        promotion_signals: runtime_promotion_signals.as_ref(),
                     },
                 )?
             }

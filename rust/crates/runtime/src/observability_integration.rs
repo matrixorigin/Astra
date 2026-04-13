@@ -823,14 +823,14 @@ impl ObservabilityHub {
         experiment_id: &str,
         winner_variant_id: &str,
     ) -> Result<AdaptiveBaselinePromotionDecision, String> {
-        self.promote_experiment_winner_with_context(experiment_id, winner_variant_id, None)
+        self.promote_experiment_winner_with_signals(experiment_id, winner_variant_id, None)
     }
 
-    pub fn promote_experiment_winner_with_context(
+    pub fn promote_experiment_winner_with_signals(
         &self,
         experiment_id: &str,
         winner_variant_id: &str,
-        promotion_context: Option<&crate::promotion_context::PromotionEvaluationContext>,
+        promotion_signals: Option<&crate::runtime_promotion_signals::RuntimePromotionSignals>,
     ) -> Result<AdaptiveBaselinePromotionDecision, String> {
         let experiment_store = self
             .experiment_store
@@ -859,7 +859,7 @@ impl ObservabilityHub {
             &analysis,
             winner_variant_id,
             self.adaptive_baselines.has_scope(&scope),
-            promotion_context,
+            promotion_signals,
         )?;
 
         match verdict.recommendation {
