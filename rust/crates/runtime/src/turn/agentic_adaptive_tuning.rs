@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use astra_services::session_audit::{
     RuntimePromotionController, RuntimePromotionEventData, RuntimePromotionOutcome,
@@ -672,7 +672,12 @@ fn record_evolution_proposal_event(
 
 pub(crate) async fn snapshot_evolution_promotion_ids(
     evo: &crate::evolution::service::EvolutionService,
-) -> (HashSet<String>, HashSet<String>, HashSet<String>) {
+) -> (
+    HashSet<String>,
+    HashSet<String>,
+    HashMap<String, crate::evolution::types::EvolutionProposal>,
+    HashSet<String>,
+) {
     let pending = evo
         .pending()
         .await
@@ -689,9 +694,15 @@ pub(crate) async fn snapshot_evolution_promotion_ids(
         .active_canaries()
         .await
         .into_iter()
+        .map(|proposal| (proposal.id.clone(), proposal))
+        .collect::<HashMap<_, _>>();
+    let resolved = evo
+        .resolved_canaries()
+        .await
+        .into_iter()
         .map(|proposal| proposal.id)
         .collect::<HashSet<_>>();
-    (pending, applied, canary)
+    (pending, applied, canary, resolved)
 }
 
 pub(crate) async fn record_new_evolution_promotion_events(
@@ -699,26 +710,45 @@ pub(crate) async fn record_new_evolution_promotion_events(
     evo: &crate::evolution::service::EvolutionService,
     pending_before: &HashSet<String>,
     applied_before: &HashSet<String>,
-    canary_before: &HashSet<String>,
+    canary_before: &HashMap<String, crate::evolution::types::EvolutionProposal>,
+    resolved_before: &HashSet<String>,
 ) {
     for proposal in evo.pending().await {
         if !pending_before.contains(&proposal.id) {
             record_evolution_proposal_event(state, RuntimePromotionOutcome::Queued, &proposal);
         }
     }
-    for proposal in evo.applied().await {
-        if !applied_before.contains(&proposal.id) {
-            record_evolution_proposal_event(state, RuntimePromotionOutcome::AutoApplied, &proposal);
+    let applied_after = evo.applied().await;
+    for proposal in applied_after {
+        if applied_before.contains(&proposal.id) || canary_before.contains_key(&proposal.id) {
+            continue;
         }
+        record_evolution_proposal_event(state, RuntimePromotionOutcome::AutoApplied, &proposal);
     }
-    for proposal in evo.active_canaries().await {
-        if !canary_before.contains(&proposal.id) {
+    let active_after = evo.active_canaries().await;
+    for proposal in active_after {
+        if !canary_before.contains_key(&proposal.id) {
             record_evolution_proposal_event(
                 state,
                 RuntimePromotionOutcome::CanaryStarted,
                 &proposal,
             );
         }
+    }
+    for proposal in evo.resolved_canaries().await {
+        if resolved_before.contains(&proposal.id) {
+            continue;
+        }
+        let outcome = match proposal.status {
+            crate::evolution::types::ApprovalStatus::CanaryPromoted => {
+                RuntimePromotionOutcome::CanaryPromoted
+            }
+            crate::evolution::types::ApprovalStatus::CanaryRolledBack => {
+                RuntimePromotionOutcome::CanaryRolledBack
+            }
+            _ => continue,
+        };
+        record_evolution_proposal_event(state, outcome, &proposal);
     }
 }
 

@@ -926,7 +926,7 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
     // ── Evolution: flush signals and auto-apply fast-path proposals ──
     if let Some(evo) = state.evolution_service.clone() {
         evo.set_runtime_promotion_signals(state.telemetry.runtime_promotion_signals.clone());
-        let (pending_before, applied_before, canary_before) =
+        let (pending_before, applied_before, canary_before, resolved_before) =
             snapshot_evolution_promotion_ids(&evo).await;
         let (auto_applied, _llm_signals) = evo.flush().await;
         record_new_evolution_promotion_events(
@@ -935,6 +935,7 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
             &pending_before,
             &applied_before,
             &canary_before,
+            &resolved_before,
         )
         .await;
         if !auto_applied.is_empty() {
@@ -1560,6 +1561,9 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use astra_core::confidence::ConfidenceInterval;
+    use astra_services::evaluation::types::ValueInterval;
+    use astra_services::session_audit::RuntimePromotionOutcome;
     use serde_json::json;
 
     // ── Flexible mock host for multi-turn scenarios ─────────────────────────
@@ -1838,6 +1842,34 @@ mod tests {
             tool_budget_override: None,
             pending_reflection_signals: Vec::new(),
             recent_tactical_actions: Vec::new(),
+        }
+    }
+
+    fn promote_ready_runtime_signals() -> crate::runtime_promotion_signals::RuntimePromotionSignals
+    {
+        crate::runtime_promotion_signals::RuntimePromotionSignals {
+            noise_filtered_quality: Some(ConfidenceInterval::new(0.82, 0.78, 0.86)),
+            latest_gate: Some(
+                crate::runtime_promotion_signals::RuntimePromotionGateSignal {
+                    passed: true,
+                    score_delta: Some(ValueInterval::new(0.06, 0.04, 0.08)),
+                },
+            ),
+            calibration_error: Some(ValueInterval::new(0.05, 0.03, 0.07)),
+        }
+    }
+
+    fn rollback_ready_runtime_signals() -> crate::runtime_promotion_signals::RuntimePromotionSignals
+    {
+        crate::runtime_promotion_signals::RuntimePromotionSignals {
+            noise_filtered_quality: Some(ConfidenceInterval::new(0.42, 0.39, 0.45)),
+            latest_gate: Some(
+                crate::runtime_promotion_signals::RuntimePromotionGateSignal {
+                    passed: false,
+                    score_delta: Some(ValueInterval::new(-0.12, -0.16, -0.08)),
+                },
+            ),
+            calibration_error: Some(ValueInterval::new(0.27, 0.23, 0.31)),
         }
     }
 
@@ -8233,6 +8265,70 @@ print(json.dumps({'context': 'user said: ' + msg}))
         assert!(prompt.contains("verify outputs more strictly"));
         assert!(prompt.contains("[ToolFailure] bash: Permission denied"));
         assert!(state.recent_tactical_actions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn maybe_trigger_auto_reflection_records_auto_canary_promotions() {
+        use crate::evolution::service::EvolutionService;
+        let calibrator = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::pipeline::calibration::ProgressiveCalibrator::default(),
+        ));
+        let evo = std::sync::Arc::new(EvolutionService::new().with_calibrator(calibrator));
+        let ctx = evo.build_reflection_context("s", 1, None, 0.0, &[], vec![], vec![], None);
+        let llm = r#"{"proposals": [{"axis": "calibration", "description": "Nudge fetch intent threshold", "confidence": 0.85, "details": {"axis": "intent:fetch", "adjustment": 0.14}}], "summary": "ok"}"#;
+
+        evo.ingest_reflection_response_detailed(llm, &ctx)
+            .await
+            .unwrap();
+        assert_eq!(evo.active_canaries().await.len(), 1);
+
+        let mut host = MockHost::new(vec![]);
+        let mut state = make_state();
+        state.evolution_service = Some(evo.clone());
+        state.telemetry.runtime_promotion_signals = Some(promote_ready_runtime_signals());
+
+        maybe_trigger_auto_reflection(&mut host, &mut state).await;
+
+        assert!(evo.active_canaries().await.is_empty());
+        assert!(
+            state
+                .telemetry
+                .promotion_events
+                .iter()
+                .any(|event| event.outcome == RuntimePromotionOutcome::CanaryPromoted)
+        );
+    }
+
+    #[tokio::test]
+    async fn maybe_trigger_auto_reflection_records_auto_canary_rollbacks() {
+        use crate::evolution::service::EvolutionService;
+        let calibrator = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::pipeline::calibration::ProgressiveCalibrator::default(),
+        ));
+        let evo = std::sync::Arc::new(EvolutionService::new().with_calibrator(calibrator));
+        let ctx = evo.build_reflection_context("s", 1, None, 0.0, &[], vec![], vec![], None);
+        let llm = r#"{"proposals": [{"axis": "calibration", "description": "Nudge fetch intent threshold", "confidence": 0.85, "details": {"axis": "intent:fetch", "adjustment": 0.14}}], "summary": "ok"}"#;
+
+        evo.ingest_reflection_response_detailed(llm, &ctx)
+            .await
+            .unwrap();
+        assert_eq!(evo.active_canaries().await.len(), 1);
+
+        let mut host = MockHost::new(vec![]);
+        let mut state = make_state();
+        state.evolution_service = Some(evo.clone());
+        state.telemetry.runtime_promotion_signals = Some(rollback_ready_runtime_signals());
+
+        maybe_trigger_auto_reflection(&mut host, &mut state).await;
+
+        assert!(evo.active_canaries().await.is_empty());
+        assert!(
+            state
+                .telemetry
+                .promotion_events
+                .iter()
+                .any(|event| event.outcome == RuntimePromotionOutcome::CanaryRolledBack)
+        );
     }
 
     // ── finalize_turn_trace tests ───────────────────────────────────────

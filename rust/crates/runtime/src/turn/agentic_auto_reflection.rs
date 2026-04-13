@@ -510,7 +510,7 @@ pub(crate) async fn maybe_trigger_auto_reflection<H: AgenticLoopHost>(
     };
 
     evo.set_runtime_promotion_signals(state.telemetry.runtime_promotion_signals.clone());
-    let (pending_before, applied_before, canary_before) =
+    let (pending_before, applied_before, canary_before, resolved_before) =
         snapshot_evolution_promotion_ids(&evo).await;
     let (fast, llm_signals) = evo.flush().await;
     record_new_evolution_promotion_events(
@@ -519,6 +519,7 @@ pub(crate) async fn maybe_trigger_auto_reflection<H: AgenticLoopHost>(
         &pending_before,
         &applied_before,
         &canary_before,
+        &resolved_before,
     )
     .await;
 
@@ -625,7 +626,7 @@ pub(crate) async fn maybe_trigger_auto_reflection<H: AgenticLoopHost>(
 
     apply_auto_reflection_usage(state, &reflection_result);
 
-    let (pending_before, applied_before, canary_before) =
+    let (pending_before, applied_before, canary_before, resolved_before) =
         snapshot_evolution_promotion_ids(&evo).await;
     match evo
         .ingest_reflection_response_detailed(&reflection_result.full_text, &ctx)
@@ -638,6 +639,7 @@ pub(crate) async fn maybe_trigger_auto_reflection<H: AgenticLoopHost>(
                 &pending_before,
                 &applied_before,
                 &canary_before,
+                &resolved_before,
             )
             .await;
             state.pending_reflection_signals.clear();

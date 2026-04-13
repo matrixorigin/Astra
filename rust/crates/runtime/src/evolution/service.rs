@@ -10,7 +10,7 @@ use super::signal_collector::SignalCollector;
 use super::store::EvolutionStore;
 use super::types::{
     ApprovalStatus, EvolutionAxis, EvolutionProposal, EvolutionSignal,
-    ProposalPromotionRecommendation, ToolResultContext, TurnSummary,
+    ProposalPromotionRecommendation, ProposalPromotionVerdict, ToolResultContext, TurnSummary,
 };
 
 use crate::liquid::reflection::ReflectionEngine;
@@ -32,6 +32,8 @@ pub struct EvolutionService {
     canary_registry: Mutex<CanaryRegistry>,
     /// Applied proposals log (for audit/display). Bounded to last 100.
     applied_log: Mutex<Vec<EvolutionProposal>>,
+    /// Resolved canary outcomes (promoted / rolled back) for telemetry/history.
+    resolved_canary_log: Mutex<Vec<EvolutionProposal>>,
     /// Recently processed calibration proposal identities used to suppress
     /// queue floods after identical pending/approved/rejected proposals.
     recent_calibration_dedup: Mutex<Vec<String>>,
@@ -98,6 +100,7 @@ impl EvolutionService {
             pending_proposals: Mutex::new(Vec::new()),
             canary_registry: Mutex::new(CanaryRegistry::default()),
             applied_log: Mutex::new(Vec::new()),
+            resolved_canary_log: Mutex::new(Vec::new()),
             recent_calibration_dedup: Mutex::new(Vec::new()),
             pattern_library: None,
             calibrator: None,
@@ -171,6 +174,8 @@ impl EvolutionService {
     ///
     /// Returns `(auto_applied, llm_routed_signals)`.
     pub async fn flush(&self) -> (Vec<EvolutionProposal>, Vec<EvolutionSignal>) {
+        self.auto_resolve_active_canary().await;
+
         // Inject drift signals from pattern library before draining.
         if let Some(ref lib) = self.pattern_library {
             // Collect drift reports without holding the lock across await.
@@ -365,6 +370,11 @@ impl EvolutionService {
     /// Applied proposals log.
     pub async fn applied(&self) -> Vec<EvolutionProposal> {
         self.applied_log.lock().await.clone()
+    }
+
+    /// Resolved canary outcomes log.
+    pub async fn resolved_canaries(&self) -> Vec<EvolutionProposal> {
+        self.resolved_canary_log.lock().await.clone()
     }
 
     /// Active canaries running against the live runtime state.
@@ -600,6 +610,15 @@ impl EvolutionService {
         self.remember_recent_calibration_proposals(proposals).await;
     }
 
+    async fn append_resolved_canary_log(&self, proposals: &[EvolutionProposal]) {
+        let mut log = self.resolved_canary_log.lock().await;
+        log.extend(proposals.iter().cloned());
+        if log.len() > MAX_APPLIED_LOG {
+            let excess = log.len() - MAX_APPLIED_LOG;
+            log.drain(..excess);
+        }
+    }
+
     fn should_auto_apply(&self, proposal: &EvolutionProposal) -> bool {
         proposal.promotion_verdict.as_ref().is_some_and(|verdict| {
             verdict.recommendation == ProposalPromotionRecommendation::Promote
@@ -672,6 +691,115 @@ impl EvolutionService {
         Ok(())
     }
 
+    fn evaluate_canary_with_snapshot(
+        &self,
+        proposal: &EvolutionProposal,
+        snapshot: &CanaryExecutionSnapshot,
+    ) -> Result<ProposalPromotionVerdict, String> {
+        let runtime_promotion_signals = self
+            .runtime_promotion_signals
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        evaluate_proposal_promotion(
+            proposal,
+            ProposalPromotionContext {
+                pattern_library: snapshot.pattern_library.as_ref(),
+                calibrator: snapshot.calibrator.as_ref(),
+                promotion_signals: runtime_promotion_signals.as_ref(),
+            },
+        )
+    }
+
+    async fn refresh_active_canary_verdict(
+        &self,
+        id: &str,
+        verdict: ProposalPromotionVerdict,
+    ) -> bool {
+        let mut registry = self.canary_registry.lock().await;
+        let Some(active) = registry
+            .active
+            .iter_mut()
+            .find(|proposal| proposal.id == id)
+        else {
+            return false;
+        };
+        active.promotion_verdict = Some(verdict);
+        true
+    }
+
+    async fn auto_resolve_active_canary(&self) {
+        let Some((proposal, snapshot)) = ({
+            let registry = self.canary_registry.lock().await;
+            let Some(proposal) = registry.active.first().cloned() else {
+                return;
+            };
+            let Some(snapshot) = registry.snapshots.get(&proposal.id).cloned() else {
+                astra_core::agent_warn!(
+                    "evolution",
+                    "active canary '{}' is missing a rollback snapshot",
+                    proposal.id
+                );
+                return;
+            };
+            Some((proposal, snapshot))
+        }) else {
+            return;
+        };
+
+        let verdict = match self.evaluate_canary_with_snapshot(&proposal, &snapshot) {
+            Ok(verdict) => verdict,
+            Err(err) => {
+                astra_core::agent_warn!(
+                    "evolution",
+                    "failed to re-score canary '{}': {}",
+                    proposal.id,
+                    err
+                );
+                return;
+            }
+        };
+        let recommendation = verdict.recommendation;
+        let _ = self
+            .refresh_active_canary_verdict(&proposal.id, verdict)
+            .await;
+
+        match recommendation {
+            ProposalPromotionRecommendation::Promote => {
+                match self.promote_canary(&proposal.id).await {
+                    Ok(Some(_)) => {}
+                    Ok(None) => astra_core::agent_warn!(
+                        "evolution",
+                        "active canary '{}' disappeared before auto-promotion",
+                        proposal.id
+                    ),
+                    Err(err) => astra_core::agent_warn!(
+                        "evolution",
+                        "failed to auto-promote canary '{}': {}",
+                        proposal.id,
+                        err
+                    ),
+                }
+            }
+            ProposalPromotionRecommendation::Hold => match self.rollback_canary(&proposal.id).await
+            {
+                Ok(Some(_)) => {}
+                Ok(None) => astra_core::agent_warn!(
+                    "evolution",
+                    "active canary '{}' disappeared before auto-rollback",
+                    proposal.id
+                ),
+                Err(err) => astra_core::agent_warn!(
+                    "evolution",
+                    "failed to auto-rollback canary '{}': {}",
+                    proposal.id,
+                    err
+                ),
+            },
+            ProposalPromotionRecommendation::Canary => {}
+        }
+    }
+
     async fn start_canary(&self, proposal: &EvolutionProposal) -> Option<EvolutionProposal> {
         let snapshot = self.capture_canary_snapshot(proposal)?;
         let mut registry = self.canary_registry.lock().await;
@@ -699,6 +827,8 @@ impl EvolutionService {
         };
         self.append_applied_log(std::slice::from_ref(&promoted))
             .await;
+        self.append_resolved_canary_log(std::slice::from_ref(&promoted))
+            .await;
         Ok(Some(promoted))
     }
 
@@ -719,6 +849,8 @@ impl EvolutionService {
             proposal
         };
         self.remember_recent_calibration_proposals(std::slice::from_ref(&rolled_back))
+            .await;
+        self.append_resolved_canary_log(std::slice::from_ref(&rolled_back))
             .await;
         Ok(Some(rolled_back))
     }
@@ -804,6 +936,8 @@ mod tests {
     use crate::liquid::reflection::ReflectionContext;
     use crate::pipeline::calibration::ProgressiveCalibrator;
     use crate::pipeline::routing::{DomainHint, TaskType};
+    use astra_core::confidence::ConfidenceInterval;
+    use astra_services::evaluation::types::ValueInterval;
 
     fn tool_failure_signal(tool: &str, skill: Option<&str>) -> EvolutionSignal {
         EvolutionSignal::ToolFailure {
@@ -821,6 +955,32 @@ mod tests {
             domain: Some(DomainHint::Code),
             historical_rate: 0.95,
             recent_rate: 0.05,
+        }
+    }
+
+    fn promote_ready_runtime_signals() -> RuntimePromotionSignals {
+        RuntimePromotionSignals {
+            noise_filtered_quality: Some(ConfidenceInterval::new(0.82, 0.78, 0.86)),
+            latest_gate: Some(
+                crate::runtime_promotion_signals::RuntimePromotionGateSignal {
+                    passed: true,
+                    score_delta: Some(ValueInterval::new(0.06, 0.04, 0.08)),
+                },
+            ),
+            calibration_error: Some(ValueInterval::new(0.05, 0.03, 0.07)),
+        }
+    }
+
+    fn rollback_ready_runtime_signals() -> RuntimePromotionSignals {
+        RuntimePromotionSignals {
+            noise_filtered_quality: Some(ConfidenceInterval::new(0.42, 0.39, 0.45)),
+            latest_gate: Some(
+                crate::runtime_promotion_signals::RuntimePromotionGateSignal {
+                    passed: false,
+                    score_delta: Some(ValueInterval::new(-0.12, -0.16, -0.08)),
+                },
+            ),
+            calibration_error: Some(ValueInterval::new(0.27, 0.23, 0.31)),
         }
     }
 
@@ -1501,6 +1661,90 @@ mod tests {
         assert!(svc.active_canaries().await.is_empty());
         assert!(svc.applied().await.is_empty());
 
+        let threshold =
+            calibrator
+                .lock()
+                .unwrap()
+                .calibrated_threshold("fetch", None, TaskType::Unknown);
+        assert!((threshold - 0.70).abs() < 0.01, "got {threshold}");
+    }
+
+    #[tokio::test]
+    async fn flush_auto_promotes_active_canary_with_positive_runtime_signals() {
+        let calibrator = Arc::new(std::sync::Mutex::new(ProgressiveCalibrator::default()));
+        let svc = EvolutionService::new().with_calibrator(calibrator.clone());
+        let ctx = svc.build_reflection_context("s", 1, None, 0.0, &[], vec![], vec![], None);
+        let llm = r#"{"proposals": [{"axis": "calibration", "description": "Nudge fetch intent threshold", "confidence": 0.85, "details": {"axis": "intent:fetch", "adjustment": 0.14}}], "summary": "ok"}"#;
+
+        svc.ingest_reflection_response_detailed(llm, &ctx)
+            .await
+            .unwrap();
+        let active = svc.active_canaries().await;
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].status, ApprovalStatus::CanaryActive);
+        assert_eq!(
+            active[0]
+                .promotion_verdict
+                .as_ref()
+                .map(|verdict| verdict.recommendation),
+            Some(ProposalPromotionRecommendation::Canary)
+        );
+
+        svc.set_runtime_promotion_signals(Some(promote_ready_runtime_signals()));
+        let (auto, llm) = svc.flush().await;
+        assert!(auto.is_empty());
+        assert!(llm.is_empty());
+        assert!(svc.active_canaries().await.is_empty());
+
+        let applied = svc.applied().await;
+        assert_eq!(applied.len(), 1);
+        assert_eq!(applied[0].status, ApprovalStatus::CanaryPromoted);
+        assert_eq!(
+            applied[0]
+                .promotion_verdict
+                .as_ref()
+                .map(|verdict| verdict.recommendation),
+            Some(ProposalPromotionRecommendation::Promote)
+        );
+        let resolved = svc.resolved_canaries().await;
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].status, ApprovalStatus::CanaryPromoted);
+        let threshold =
+            calibrator
+                .lock()
+                .unwrap()
+                .calibrated_threshold("fetch", None, TaskType::Unknown);
+        assert!((threshold - 0.56).abs() < 0.01, "got {threshold}");
+    }
+
+    #[tokio::test]
+    async fn flush_auto_rolls_back_active_canary_with_negative_runtime_signals() {
+        let calibrator = Arc::new(std::sync::Mutex::new(ProgressiveCalibrator::default()));
+        let svc = EvolutionService::new().with_calibrator(calibrator.clone());
+        let ctx = svc.build_reflection_context("s", 1, None, 0.0, &[], vec![], vec![], None);
+        let llm = r#"{"proposals": [{"axis": "calibration", "description": "Nudge fetch intent threshold", "confidence": 0.85, "details": {"axis": "intent:fetch", "adjustment": 0.14}}], "summary": "ok"}"#;
+
+        svc.ingest_reflection_response_detailed(llm, &ctx)
+            .await
+            .unwrap();
+        assert_eq!(svc.active_canaries().await.len(), 1);
+
+        svc.set_runtime_promotion_signals(Some(rollback_ready_runtime_signals()));
+        let (auto, llm) = svc.flush().await;
+        assert!(auto.is_empty());
+        assert!(llm.is_empty());
+        assert!(svc.active_canaries().await.is_empty());
+        assert!(svc.applied().await.is_empty());
+        let resolved = svc.resolved_canaries().await;
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].status, ApprovalStatus::CanaryRolledBack);
+        assert_eq!(
+            resolved[0]
+                .promotion_verdict
+                .as_ref()
+                .map(|verdict| verdict.recommendation),
+            Some(ProposalPromotionRecommendation::Hold)
+        );
         let threshold =
             calibrator
                 .lock()
