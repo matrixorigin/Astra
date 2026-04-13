@@ -129,6 +129,63 @@ async fn chain_without_rollback_on_failure_keeps_prior_edits() {
 }
 
 #[tokio::test]
+async fn chain_rollback_on_failure_blocks_mutating_bash_before_execution() {
+    use astra_runtime::tool_registry::ToolChain;
+
+    let dir = tempfile::tempdir().unwrap();
+    let executor = ToolExecutor::new(dir.path());
+
+    let chain = ToolChain::new("rollback_bash_block", "Write then mutating bash")
+        .with_rollback_on_failure(true)
+        .step(
+            "write_file",
+            json!({"path": "should_not_exist.txt", "content": "temporary"}),
+        )
+        .step("bash", json!({"command": "mkdir unsafe-dir"}));
+
+    let result = executor.execute_chain(&chain, json!({})).await;
+    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+
+    assert_eq!(
+        parsed["steps_executed"], 0,
+        "chain should be rejected at preflight"
+    );
+    assert!(
+        parsed["final_output"]
+            .as_str()
+            .unwrap()
+            .contains("rollback_on_failure only supports read-only bash steps"),
+        "unexpected result: {result}"
+    );
+    assert!(!dir.path().join("should_not_exist.txt").exists());
+    assert!(!dir.path().join("unsafe-dir").exists());
+}
+
+#[tokio::test]
+async fn chain_rollback_on_failure_allows_read_only_bash_step() {
+    use astra_runtime::tool_registry::ToolChain;
+
+    let dir = tempfile::tempdir().unwrap();
+    let executor = ToolExecutor::new(dir.path());
+
+    let chain = ToolChain::new("rollback_bash_read_only", "Read-only bash")
+        .with_rollback_on_failure(true)
+        .step("bash", json!({"command": "pwd"}));
+
+    let result = executor.execute_chain(&chain, json!({})).await;
+    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+
+    assert_eq!(parsed["steps_executed"], 1);
+    assert!(
+        parsed["final_output"]
+            .as_str()
+            .unwrap()
+            .contains(dir.path().to_string_lossy().as_ref()),
+        "read-only bash should still execute: {result}"
+    );
+}
+
+#[tokio::test]
 async fn chain_variable_substitution_end_to_end() {
     use astra_runtime::tool_registry::ToolChain;
 

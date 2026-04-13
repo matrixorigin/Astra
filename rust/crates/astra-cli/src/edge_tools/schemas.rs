@@ -11,7 +11,7 @@ pub fn all_tool_schemas() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "bash",
-                "description": "Execute a shell command in the project root. Use for builds, tests, installs, and other CLI tasks. FORBIDDEN for git inspection — NEVER use bash for `git status`, `git diff`, `git log`, `git show`, or similar git commands. Use git_status, git_diff, git_log, git_show tools instead. Non-read-only bash does not participate in rollback journals; inside rollback-on-failure plan subtasks, keep bash read-only and prefer structured tools such as write_file, git_*, or run_build_test. Can run curl, GitHub API, etc. Timeout varies (5-30s); override with timeout.",
+                "description": "Execute a shell command in the project root. Use for builds, tests, installs, and other CLI tasks. FORBIDDEN for git inspection — NEVER use bash for `git status`, `git diff`, `git log`, `git show`, or similar git commands. Use git_status, git_diff, git_log, git_show tools instead. Non-read-only bash does not participate in rollback journals; inside rollback-on-failure boundaries such as plan subtasks or run_chain, keep bash read-only and prefer structured tools such as write_file, git_*, or run_build_test. Can run curl, GitHub API, etc. Timeout varies (5-30s); override with timeout.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -1094,7 +1094,7 @@ pub fn all_tool_schemas() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "run_chain",
-                "description": "Execute a multi-step tool chain. Each step runs a tool and passes its output to the next step via variable substitution ($prev for previous output, $step.{key} for named step output, $input.{key} for original input). Stops on first error. Optionally enable rollback_on_failure to automatically revert bounded file/database side effects produced inside the chain when a later step fails. Use for complex multi-tool workflows like: find files → read contents → analyze.",
+                "description": "Execute a multi-step tool chain. Each step runs a tool and passes its output to the next step via variable substitution ($prev for previous output, $step.{key} for named step output, $input.{key} for original input). Stops on first error. Optionally enable rollback_on_failure to automatically revert bounded file/database side effects produced inside the chain when a later step fails. In rollback_on_failure chains, keep bash read-only because arbitrary shell mutations do not participate in rollback; prefer structured mutation tools or run_build_test when available. Use for complex multi-tool workflows like: find files → read contents → analyze.",
                 "parameters": {
                     "type": "object",
                     "properties": {

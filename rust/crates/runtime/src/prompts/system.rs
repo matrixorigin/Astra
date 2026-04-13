@@ -123,7 +123,7 @@ fn plan_execution_section() -> &'static str {
      When executing a subtask from a decomposed plan:\n\
      - **Focus on the subtask**: implement ONLY what's described. Don't scope-creep.\n\
      - **Respect files list**: if the subtask specifies files to modify, start by reading those.\n\
-     - **Keep rollback boundaries honest**: in rollback-on-failure plan subtasks, non-read-only `bash` is a manual boundary. Prefer structured mutation tools and use `run_build_test` for build/test loops when available.\n\
+     - **Keep rollback boundaries honest**: in rollback-on-failure boundaries such as plan subtasks or `run_chain`, non-read-only `bash` is a manual boundary. Prefer structured mutation tools and use `run_build_test` for build/test loops when available.\n\
      - **Meet acceptance criteria**: the subtask may include criteria — verify them before marking done.\n\
      - **Build/test after changes**: run the project's build and test commands to confirm.\n\
      - **Report clearly**: summarize what you changed and whether acceptance criteria passed.\n\
@@ -1685,12 +1685,12 @@ mod tests {
     }
 
     #[test]
-    fn plan_execution_warns_about_mutating_bash_in_rollback_subtasks() {
+    fn plan_execution_warns_about_mutating_bash_in_rollback_boundaries() {
         let p =
             build_main_system_prompt(&["bash", "run_build_test"], "", 0.5, Some("implementation"));
         assert!(
             p.contains("non-read-only `bash` is a manual boundary"),
-            "should warn that mutating bash does not participate in rollback plan subtasks"
+            "should warn that mutating bash does not participate in rollback boundaries"
         );
         assert!(
             p.contains("run_build_test"),
