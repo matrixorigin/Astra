@@ -257,40 +257,42 @@ If cloud-synced data structures changed:
 
 **⚠ CRITICAL: Do NOT start writing the review report until ALL analysis in Phases 1-5 is
 complete. While you are still making tool calls to gather information, output NOTHING as text.
-The review box below must be your FINAL text output — no tool calls after it.**
-
-**⚠ NEVER wrap the review box in markdown code fences (triple backticks).** Output the
-box-drawing characters directly — they render correctly without code fences. Code fences
-cause rendering leakage in non-TTY / piped output modes.
+The review report below must be your FINAL text output — no tool calls after it.**
 
 **⚠ Gather ALL information BEFORE writing.** If you realize mid-review you need more data,
-make the tool calls SILENTLY (no text output) before starting the review box. Any text you
+make the tool calls SILENTLY (no text output) before starting the review report. Any text you
 produce between tool calls will be discarded and wastes tokens.
 
-╔══════════════════════════════════════════════════════════════╗
-║  📝 Code Review: {target_description}                        ║
-║  Scope: {n} files, +{added}/-{removed} lines                ║
-╠══════════════════════════════════════════════════════════════╣
-║                                                              ║
-║  🔴 Critical ({n})                                           ║
-║  {issue with file:line and explanation}                      ║
-║                                                              ║
-║  🟡 Important ({n})                                          ║
-║  {issue with file:line and explanation}                      ║
-║                                                              ║
-║  💡 Suggestions ({n})                                        ║
-║  {non-blocking improvements}                                 ║
-║                                                              ║
-║  ✅ Looks Good                                               ║
-║  {aspects of the change that are well done}                  ║
-║                                                              ║
-║  📊 Impact Assessment                                        ║
-║  ├─ Public API changes: {n} ({breaking/additive/internal})   ║
-║  ├─ Test coverage: {adequate/needs-work/missing}             ║
-║  ├─ Cross-file impact: {files affected by changes}           ║
-║  └─ Semver: {major/minor/patch}                              ║
-║                                                              ║
-╚══════════════════════════════════════════════════════════════╝
+---
+
+## Code Review: {target_description}
+
+**Scope:** {n} files, +{added}/-{removed} lines
+
+### 🔴 Critical ({n})
+
+{issue with file:line and explanation}
+
+### 🟡 Important ({n})
+
+{issue with file:line and explanation}
+
+### 💡 Suggestions ({n})
+
+{non-blocking improvements}
+
+### ✅ Looks Good
+
+{aspects of the change that are well done}
+
+### 📊 Impact Assessment
+
+| Aspect | Status |
+|--------|--------|
+| Public API changes | {n} ({breaking/additive/internal}) |
+| Test coverage | {adequate/needs-work/missing} |
+| Cross-file impact | {files affected by changes} |
+| Semver | {major/minor/patch} |
 
 ### Issue Severity Guide
 
