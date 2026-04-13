@@ -196,6 +196,9 @@ fn check_bash_path_boundary_with_oldpwd(
     command: &str,
     oldpwd: Option<&std::path::Path>,
 ) -> Option<String> {
+    if let Some(msg) = check_shell_compound_body_path_boundary(policy, command, oldpwd) {
+        return Some(msg);
+    }
     if let Some(msg) = check_shell_loop_path_boundary(policy, command, oldpwd) {
         return Some(msg);
     }
@@ -1213,6 +1216,208 @@ fn is_boundary_sensitive_file_access_command(base: &str) -> bool {
 
 fn subcommand_requires_boundary_review(base: &str) -> bool {
     is_boundary_sensitive_file_access_command(base) || is_shell_interpreter_command(base)
+}
+
+fn check_shell_compound_body_path_boundary(
+    policy: &astra_runtime::tool_sandbox::SandboxPolicy,
+    command: &str,
+    oldpwd: Option<&std::path::Path>,
+) -> Option<String> {
+    let tokens = shell_tokenize_with_control_spans(command);
+    let mut idx = 0usize;
+    while idx < tokens.len() {
+        match tokens[idx].text.as_str() {
+            "if" => {
+                let Some((then_idx, else_idx, fi_idx)) = if_body_token_indices(&tokens, idx) else {
+                    idx += 1;
+                    continue;
+                };
+                if let Some(msg) = check_shell_body_span_path_boundary(
+                    policy,
+                    command,
+                    tokens[then_idx].end,
+                    else_idx
+                        .map(|body_idx| tokens[body_idx].start)
+                        .unwrap_or(tokens[fi_idx].start),
+                    oldpwd,
+                ) {
+                    return Some(msg);
+                }
+                if let Some(else_idx) = else_idx
+                    && let Some(msg) = check_shell_body_span_path_boundary(
+                        policy,
+                        command,
+                        tokens[else_idx].end,
+                        tokens[fi_idx].start,
+                        oldpwd,
+                    )
+                {
+                    return Some(msg);
+                }
+                idx = fi_idx + 1;
+            }
+            "case" => {
+                let Some(esac_idx) = case_esac_token_index(&tokens, idx) else {
+                    idx += 1;
+                    continue;
+                };
+                if let Some(msg) = check_case_clause_bodies_path_boundary(
+                    policy, command, &tokens, idx, esac_idx, oldpwd,
+                ) {
+                    return Some(msg);
+                }
+                idx = esac_idx + 1;
+            }
+            "{" => {
+                let Some(close_idx) = brace_group_close_token_index(&tokens, idx) else {
+                    idx += 1;
+                    continue;
+                };
+                if let Some(msg) = check_shell_body_span_path_boundary(
+                    policy,
+                    command,
+                    tokens[idx].end,
+                    tokens[close_idx].start,
+                    oldpwd,
+                ) {
+                    return Some(msg);
+                }
+                idx = close_idx + 1;
+            }
+            _ => idx += 1,
+        }
+    }
+    None
+}
+
+fn check_shell_body_span_path_boundary(
+    policy: &astra_runtime::tool_sandbox::SandboxPolicy,
+    command: &str,
+    body_start: usize,
+    body_end: usize,
+    oldpwd: Option<&std::path::Path>,
+) -> Option<String> {
+    let body = command[body_start..body_end].trim();
+    (!body.is_empty())
+        .then(|| check_bash_path_boundary_with_oldpwd(policy, body, oldpwd))
+        .flatten()
+}
+
+fn if_body_token_indices(
+    tokens: &[ShellTokenSpan],
+    if_idx: usize,
+) -> Option<(usize, Option<usize>, usize)> {
+    let then_idx = ((if_idx + 1)..tokens.len()).find(|idx| tokens[*idx].text.as_str() == "then")?;
+    let mut nested_ifs = 0usize;
+    let mut else_idx = None;
+    for idx in (then_idx + 1)..tokens.len() {
+        match tokens[idx].text.as_str() {
+            "if" => nested_ifs += 1,
+            "fi" if nested_ifs == 0 => return Some((then_idx, else_idx, idx)),
+            "fi" => nested_ifs -= 1,
+            "else" if nested_ifs == 0 && else_idx.is_none() => else_idx = Some(idx),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn brace_group_close_token_index(tokens: &[ShellTokenSpan], open_idx: usize) -> Option<usize> {
+    let mut nested_groups = 0usize;
+    for idx in (open_idx + 1)..tokens.len() {
+        match tokens[idx].text.as_str() {
+            "{" => nested_groups += 1,
+            "}" if nested_groups == 0 => return Some(idx),
+            "}" => nested_groups -= 1,
+            _ => {}
+        }
+    }
+    None
+}
+
+fn case_esac_token_index(tokens: &[ShellTokenSpan], case_idx: usize) -> Option<usize> {
+    let mut nested_cases = 0usize;
+    for idx in (case_idx + 1)..tokens.len() {
+        match tokens[idx].text.as_str() {
+            "case" => nested_cases += 1,
+            "esac" if nested_cases == 0 => return Some(idx),
+            "esac" => nested_cases -= 1,
+            _ => {}
+        }
+    }
+    None
+}
+
+fn check_case_clause_bodies_path_boundary(
+    policy: &astra_runtime::tool_sandbox::SandboxPolicy,
+    command: &str,
+    tokens: &[ShellTokenSpan],
+    case_idx: usize,
+    esac_idx: usize,
+    oldpwd: Option<&std::path::Path>,
+) -> Option<String> {
+    let in_idx = ((case_idx + 1)..esac_idx).find(|idx| tokens[*idx].text.as_str() == "in")?;
+    let mut idx = in_idx + 1;
+    while idx < esac_idx {
+        while idx < esac_idx && tokens[idx].text.as_str() == ";" {
+            idx += 1;
+        }
+        if idx >= esac_idx {
+            break;
+        }
+
+        let pattern_end_idx = (idx..esac_idx)
+            .find(|body_idx| case_pattern_token_closes_clause(tokens[*body_idx].text.as_str()))?;
+        let clause_end = case_clause_terminator(tokens, pattern_end_idx + 1, esac_idx)
+            .map(|(terminator_idx, _len)| tokens[terminator_idx].start)
+            .unwrap_or(tokens[esac_idx].start);
+        if let Some(msg) = check_shell_body_span_path_boundary(
+            policy,
+            command,
+            tokens[pattern_end_idx].end,
+            clause_end,
+            oldpwd,
+        ) {
+            return Some(msg);
+        }
+        idx = case_clause_terminator(tokens, pattern_end_idx + 1, esac_idx)
+            .map(|(terminator_idx, len)| terminator_idx + len)
+            .unwrap_or(esac_idx);
+    }
+    None
+}
+
+fn case_pattern_token_closes_clause(token: &str) -> bool {
+    token == ")" || token.ends_with(')')
+}
+
+fn case_clause_terminator(
+    tokens: &[ShellTokenSpan],
+    start_idx: usize,
+    esac_idx: usize,
+) -> Option<(usize, usize)> {
+    let mut nested_cases = 0usize;
+    let mut idx = start_idx;
+    while idx < esac_idx {
+        match tokens[idx].text.as_str() {
+            "case" => nested_cases += 1,
+            "esac" if nested_cases > 0 => nested_cases -= 1,
+            ";" if nested_cases == 0 => {
+                if idx + 2 < esac_idx
+                    && tokens[idx + 1].text.as_str() == ";"
+                    && tokens[idx + 2].text.as_str() == "&"
+                {
+                    return Some((idx, 3));
+                }
+                if idx + 1 < esac_idx && matches!(tokens[idx + 1].text.as_str(), ";" | "&") {
+                    return Some((idx, 2));
+                }
+            }
+            _ => {}
+        }
+        idx += 1;
+    }
+    None
 }
 
 fn check_shell_loop_path_boundary(
@@ -5037,6 +5242,119 @@ mod tests {
                 .is_some_and(|msg| msg.starts_with(super::SANDBOX_DENIED_PREFIX)
                     && msg.contains("/etc/passwd")),
             "loop bodies should still run normal path-boundary checks"
+        );
+    }
+
+    #[test]
+    fn if_then_static_outside_path_is_blocked() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(&policy, "if true; then cat /etc/passwd; fi");
+        assert!(
+            result
+                .as_deref()
+                .is_some_and(|msg| msg.starts_with(super::SANDBOX_DENIED_PREFIX)
+                    && msg.contains("/etc/passwd")),
+            "if bodies should still run normal path-boundary checks"
+        );
+    }
+
+    #[test]
+    fn if_else_static_outside_path_is_blocked() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result =
+            check_bash_path_boundary(&policy, "if false; then echo ok; else cat /etc/passwd; fi");
+        assert!(
+            result
+                .as_deref()
+                .is_some_and(|msg| msg.starts_with(super::SANDBOX_DENIED_PREFIX)
+                    && msg.contains("/etc/passwd")),
+            "else bodies should still run normal path-boundary checks"
+        );
+    }
+
+    #[test]
+    fn if_body_recurses_into_while_read_fanout() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(
+            &policy,
+            "if true; then printf '%s\\n' /etc/passwd | while read path; do cat \"$path\"; done; fi",
+        );
+        assert!(
+            result
+                .as_deref()
+                .is_some_and(|msg| msg.starts_with(super::SANDBOX_DENIED_PREFIX)
+                    && msg.contains("while read cat")),
+            "compound bodies should recurse into nested loop fan-out checks"
+        );
+    }
+
+    #[test]
+    fn if_then_inside_project_is_allowed() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(&policy, "if true; then cat src/main.rs; fi");
+        assert!(
+            result.is_none(),
+            "in-project if bodies should remain allowed"
+        );
+    }
+
+    #[test]
+    fn brace_group_static_outside_path_is_blocked() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(&policy, "{ cat /etc/passwd; echo ok; }");
+        assert!(
+            result
+                .as_deref()
+                .is_some_and(|msg| msg.starts_with(super::SANDBOX_DENIED_PREFIX)
+                    && msg.contains("/etc/passwd")),
+            "brace-group bodies should still run normal path-boundary checks"
+        );
+    }
+
+    #[test]
+    fn brace_group_inside_project_is_allowed() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(&policy, "{ cat src/main.rs; echo ok; }");
+        assert!(
+            result.is_none(),
+            "in-project brace-group bodies should remain allowed"
+        );
+    }
+
+    #[test]
+    fn case_clause_static_outside_path_is_blocked() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(
+            &policy,
+            "case \"$kind\" in passwd) cat /etc/passwd ;; *) echo ok ;; esac",
+        );
+        assert!(
+            result
+                .as_deref()
+                .is_some_and(|msg| msg.starts_with(super::SANDBOX_DENIED_PREFIX)
+                    && msg.contains("/etc/passwd")),
+            "case clause bodies should still run normal path-boundary checks"
+        );
+    }
+
+    #[test]
+    fn case_clause_inside_project_is_allowed() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(
+            &policy,
+            "case \"$kind\" in rs) cat src/main.rs ;; *) echo ok ;; esac",
+        );
+        assert!(
+            result.is_none(),
+            "in-project case clause bodies should remain allowed"
         );
     }
 
