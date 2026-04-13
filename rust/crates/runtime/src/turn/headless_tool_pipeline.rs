@@ -881,3 +881,180 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         true
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    use crate::skills::hooks::ToolEventHookRegistry;
+    use crate::turn::agentic_headless_round::NoopHeadlessTerminal;
+    use crate::turn::sse_stream_host::EdgeToolExecResult;
+
+    struct PipelineHarness {
+        api: ThinClient,
+        tool_calls: Vec<Value>,
+        edge_tool_round: Vec<EdgeToolExecResult>,
+        by_sig: HashMap<String, String>,
+        pre_resolved_ids: HashSet<String>,
+        messages: Vec<Value>,
+        tool_results: Vec<Value>,
+        valid_tool_names: HashSet<String>,
+        restricted_tools: HashSet<String>,
+        turn_guard: TurnGuard,
+        step_recorder: StepRecorder,
+        idempotency_cache: InMemoryIdempotencyCache,
+        semantic_dedup: SemanticDedup,
+        call_counts: HashMap<String, u32>,
+        tool_call_records: Vec<ToolCallRecord>,
+        tool_event_hooks: ToolEventHookRegistry,
+        term: NoopHeadlessTerminal,
+    }
+
+    impl PipelineHarness {
+        fn new() -> Self {
+            Self {
+                api: ThinClient::new("http://127.0.0.1:1", None).unwrap(),
+                tool_calls: Vec::new(),
+                edge_tool_round: vec![EdgeToolExecResult {
+                    request_id: String::new(),
+                    tool: "grep".to_string(),
+                    args: json!({ "pattern": "headless" }),
+                    output: "found result".to_string(),
+                    tool_result_fields: None,
+                    status: "ok".to_string(),
+                    duration_ms: 12,
+                }],
+                by_sig: HashMap::new(),
+                pre_resolved_ids: HashSet::new(),
+                messages: Vec::new(),
+                tool_results: Vec::new(),
+                valid_tool_names: HashSet::from(["grep".to_string()]),
+                restricted_tools: HashSet::new(),
+                turn_guard: TurnGuard::new(),
+                step_recorder: StepRecorder::new("test-session", "test-task"),
+                idempotency_cache: InMemoryIdempotencyCache::new(),
+                semantic_dedup: SemanticDedup::new(0.95),
+                call_counts: HashMap::new(),
+                tool_call_records: Vec::new(),
+                tool_event_hooks: ToolEventHookRegistry::default(),
+                term: NoopHeadlessTerminal,
+            }
+        }
+
+        fn pipeline(&mut self) -> HeadlessToolExecutionPipeline<'_, EdgeToolExecResult> {
+            HeadlessToolExecutionPipeline::new(
+                HeadlessToolExecutionCtx {
+                    turn_index: 0,
+                    quiet: true,
+                    api: &self.api,
+                    token: "",
+                    current_session_id: None,
+                    tool_calls: &self.tool_calls,
+                    edge_tool_round: &self.edge_tool_round,
+                    by_sig: &self.by_sig,
+                    pre_resolved_ids: &self.pre_resolved_ids,
+                    messages: &mut self.messages,
+                    tool_results: &mut self.tool_results,
+                    valid_tool_names: &self.valid_tool_names,
+                    restricted_tools: &mut self.restricted_tools,
+                    turn_guard: &mut self.turn_guard,
+                    step_recorder: &mut self.step_recorder,
+                    idempotency_cache: &mut self.idempotency_cache,
+                    semantic_dedup: &mut self.semantic_dedup,
+                    call_counts: &mut self.call_counts,
+                    max_identical_calls: 2,
+                    max_tools_per_turn: 15,
+                    tool_call_records: &mut self.tool_call_records,
+                    tool_event_hooks: &self.tool_event_hooks,
+                    term: &mut self.term,
+                    mailbox: None,
+                    permission_context: None,
+                    progress_emitter: None,
+                    effective_permission_timeout: Duration::from_secs(30),
+                },
+                vec![false; self.edge_tool_round.len()],
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn validate_slot_returns_validated_execution_for_synthetic_edge() {
+        let mut harness = PipelineHarness::new();
+        let mut pipeline = harness.pipeline();
+
+        match pipeline.validate_slot(HeadlessRoundToolIdx::SyntheticEdge(0)) {
+            HeadlessPipelineStage::Continue(validated) => {
+                assert_eq!(validated.execution.id, "edge-0");
+                assert_eq!(validated.execution.name, "grep");
+                assert_eq!(validated.execution.args, json!({ "pattern": "headless" }));
+                assert!(validated.execution.is_edge_tool);
+                assert_eq!(validated.execution.edge_duration_ms, 12);
+            }
+            _ => panic!("expected validated execution"),
+        }
+    }
+
+    #[tokio::test]
+    async fn permit_execution_returns_permitted_execution_for_allowed_tool() {
+        let mut harness = PipelineHarness::new();
+        let mut pipeline = harness.pipeline();
+        let validated = match pipeline.validate_slot(HeadlessRoundToolIdx::SyntheticEdge(0)) {
+            HeadlessPipelineStage::Continue(validated) => validated,
+            _ => panic!("expected validated execution"),
+        };
+
+        match pipeline.permit_execution(validated).await {
+            HeadlessPipelineStage::Continue(permitted) => {
+                assert_eq!(permitted.execution.name, "grep");
+                assert_eq!(
+                    permitted.idem_key.cache_key(),
+                    IdempotencyKey::semantic("grep", &json!({ "pattern": "headless" })).cache_key()
+                );
+            }
+            _ => panic!("expected permitted execution"),
+        }
+    }
+
+    #[tokio::test]
+    async fn permit_execution_short_circuits_restricted_tool() {
+        let mut harness = PipelineHarness::new();
+        harness.restricted_tools.insert("grep".to_string());
+        let mut pipeline = harness.pipeline();
+        let validated = match pipeline.validate_slot(HeadlessRoundToolIdx::SyntheticEdge(0)) {
+            HeadlessPipelineStage::Continue(validated) => validated,
+            _ => panic!("expected validated execution"),
+        };
+
+        match pipeline.permit_execution(validated).await {
+            HeadlessPipelineStage::ShortCircuit => {
+                assert_eq!(pipeline.tool_results_len(), 1);
+            }
+            _ => panic!("expected restricted tool short circuit"),
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_and_record_pipeline_appends_one_tool_result() {
+        let mut harness = PipelineHarness::new();
+        let mut pipeline = harness.pipeline();
+        let validated = match pipeline.validate_slot(HeadlessRoundToolIdx::SyntheticEdge(0)) {
+            HeadlessPipelineStage::Continue(validated) => validated,
+            _ => panic!("expected validated execution"),
+        };
+        let permitted = match pipeline.permit_execution(validated).await {
+            HeadlessPipelineStage::Continue(permitted) => permitted,
+            _ => panic!("expected permitted execution"),
+        };
+
+        let executed = pipeline.execute_execution(permitted).await;
+        assert!(!executed.is_err);
+        assert_eq!(executed.executed_ms, 12);
+
+        pipeline.record_execution(executed).await;
+
+        assert_eq!(pipeline.tool_results_len(), 1);
+        assert_eq!(pipeline.executed_this_turn, 1);
+        assert_eq!(pipeline.ctx.tool_call_records.len(), 1);
+    }
+}
