@@ -951,14 +951,6 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
 }
 
 #[allow(unused_imports)]
-pub(crate) use super::agentic_adaptive_tuning::{
-    DEFAULT_TUNING_CYCLE_INTERVAL, apply_adaptive_execution_profile, apply_per_turn_adaptation,
-    apply_tactical_actions, maybe_run_tuning_cycle, record_loop_completion_feedback,
-    record_new_evolution_promotion_events, should_emit_adaptive_scenario_event,
-    snapshot_evolution_promotion_ids,
-};
-
-#[allow(unused_imports)]
 pub(crate) use super::agentic_auto_reflection::{
     AUTO_REFLECTION_SIGNAL_THRESHOLD, maybe_trigger_auto_reflection,
 };
