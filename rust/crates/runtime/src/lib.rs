@@ -84,6 +84,7 @@ pub(crate) use storage::{
 
 pub mod ab_testing;
 pub mod adaptive_baselines;
+mod adaptive_execution_profile;
 mod app_state;
 pub mod auto_tuning;
 pub mod bridge;
@@ -102,7 +103,6 @@ pub mod plan_decompose;
 pub mod promotion_context;
 pub mod prompts;
 pub mod runtime_config;
-pub mod scenario_router;
 pub mod self_model;
 pub mod server;
 pub mod sync_adapters;

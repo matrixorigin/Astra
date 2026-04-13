@@ -828,7 +828,6 @@ fn apply_adaptive_execution_profile(state: &mut AgenticLoopState) {
         &[],
         Vec::new(),
     );
-    let router = crate::scenario_router::ScenarioRouter::new();
     let user_id = session_guard.user_id.clone();
     let pattern_library = hub.pattern_library();
     let pattern_library = match pattern_library.as_ref() {
@@ -847,7 +846,7 @@ fn apply_adaptive_execution_profile(state: &mut AgenticLoopState) {
     let old_config = session_guard.config.clone();
     let old_scenario = session_guard.profile.current_scenario;
 
-    let mut profile = router.select(
+    let mut profile = crate::adaptive_execution_profile::select_adaptive_execution_profile(
         &session_guard.config,
         &routing,
         &detector,

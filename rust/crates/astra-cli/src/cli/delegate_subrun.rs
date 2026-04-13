@@ -544,9 +544,15 @@ mod tests {
         register_default_agents(&mut registry);
 
         let main = registry.get("main").unwrap();
-        assert_eq!(main.tier, astra_services::coordination::AgentTier::Orchestrator);
+        assert_eq!(
+            main.tier,
+            astra_services::coordination::AgentTier::Orchestrator
+        );
         assert!(main.can_delegate, "main should be able to delegate");
-        assert!(main.delegate_to.is_empty(), "empty delegate_to = all agents");
+        assert!(
+            main.delegate_to.is_empty(),
+            "empty delegate_to = all agents"
+        );
     }
 
     #[test]

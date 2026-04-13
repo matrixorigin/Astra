@@ -1,14 +1,5 @@
-//! Scenario router — selects an [`ExecutionProfile`] per task based on detected
-//! scenario, pattern-library suggestions, and active A/B experiments.
-//!
-//! **Deprecated**: This module is superseded by `SelfModel` + LLM reasoning.
-//! The LLM uses self-awareness context to adapt its behavior per-turn rather than
-//! having a programmatic router select configuration profiles.
-//!
-//! The router is stateless: it reads from `PatternLibrary` and `ExperimentStore`
-//! but does not mutate them. Mutation (recording outcomes, creating experiments)
-//! is handled by the agentic loop and [`ExplorationEngine`].
-#![allow(deprecated)]
+//! Adaptive execution-profile selection — fuses detected scenario, pattern-library
+//! boosts, adaptive baselines, and experiment enrollment into one profile.
 
 use crate::ab_testing::{ExperimentStatus, ExperimentStore};
 use crate::adaptive_baselines::AdaptiveBaselineStore;
@@ -18,99 +9,76 @@ use crate::pipeline::routing::RoutingDecision;
 use crate::runtime_config::RuntimeConfig;
 use crate::user_profile::{Scenario, ScenarioDetector};
 
-/// Produces an [`ExecutionProfile`] for each task.
+/// Select an execution profile for the current task.
 ///
-/// **Deprecated**: Superseded by `SelfModel` self-awareness reasoning.
-#[deprecated(
-    since = "0.9.0",
-    note = "Superseded by SelfModel + LLM reasoning. See self_model.rs."
-)]
-#[derive(Default)]
-pub struct ScenarioRouter;
+/// Steps:
+/// 1. Start from base config
+/// 2. Detect scenario → apply strategy adjustments
+/// 3. Merge pattern-library boost terms
+/// 4. Check active experiments → assign variant if enrolled
+pub(crate) fn select_adaptive_execution_profile(
+    base_config: &RuntimeConfig,
+    routing: &RoutingDecision,
+    detector: &ScenarioDetector,
+    adaptive_baselines: Option<&AdaptiveBaselineStore>,
+    pattern_library: Option<&PatternLibrary>,
+    experiment_store: Option<&ExperimentStore>,
+    user_id: &str,
+) -> ExecutionProfile {
+    let mut profile = ExecutionProfile::from_base(base_config.clone());
 
-impl ScenarioRouter {
-    /// Create a new stateless scenario router.
-    pub fn new() -> Self {
-        Self
+    // 1. Scenario detection
+    if let Some((scenario, confidence)) = detector.detect() {
+        profile.apply_scenario(scenario);
+        profile.confidence = profile.confidence.min(confidence.lower);
+    } else if let Some(scenario) = scenario_from_task_type(routing.task_type) {
+        profile.apply_scenario(scenario);
     }
 
-    /// Select an execution profile for the current task.
-    ///
-    /// Steps:
-    /// 1. Start from base config
-    /// 2. Detect scenario → apply strategy adjustments
-    /// 3. Merge pattern-library boost terms
-    /// 4. Check active experiments → assign variant if enrolled
-    pub fn select(
-        &self,
-        base_config: &RuntimeConfig,
-        routing: &RoutingDecision,
-        detector: &ScenarioDetector,
-        adaptive_baselines: Option<&AdaptiveBaselineStore>,
-        pattern_library: Option<&PatternLibrary>,
-        experiment_store: Option<&ExperimentStore>,
-        user_id: &str,
-    ) -> ExecutionProfile {
-        let mut profile = ExecutionProfile::from_base(base_config.clone());
-
-        // 1. Scenario detection
-        if let Some((scenario, confidence)) = detector.detect() {
-            profile.apply_scenario(scenario);
-            profile.confidence = profile.confidence.min(confidence.lower);
-        } else if let Some(scenario) = scenario_from_task_type(routing.task_type) {
-            profile.apply_scenario(scenario);
+    // 2. Apply promoted adaptive baselines for this task/domain.
+    if let Some(store) = adaptive_baselines {
+        if store
+            .apply_to_config(routing.task_type, routing.domain_hint, &mut profile.config)
+            .is_some()
+        {
+            profile.baseline_applied = true;
         }
-
-        // 2. Apply promoted adaptive baselines for this task/domain.
-        if let Some(store) = adaptive_baselines {
-            if store
-                .apply_to_config(routing.task_type, routing.domain_hint, &mut profile.config)
-                .is_some()
-            {
-                profile.baseline_applied = true;
-            }
-        }
-
-        // 3. Pattern library boost terms
-        let mut boosts = routing.boost_terms.clone();
-        if let Some(library) = pattern_library {
-            boosts.extend(library.boost_terms_for(routing.task_type, routing.domain_hint));
-        }
-        if !boosts.is_empty() {
-            boosts.sort();
-            boosts.dedup();
-            profile.merge_boosts(boosts);
-        }
-
-        // 4. Experiment variant assignment
-        if let Some(store) = experiment_store {
-            self.try_assign_experiment(&mut profile, store, user_id);
-        }
-
-        // 5. Fold routing confidence into profile
-        profile.confidence = profile.confidence.min(routing.confidence);
-
-        profile
     }
 
-    /// Try to assign the user to an active experiment variant.
-    fn try_assign_experiment(
-        &self,
-        profile: &mut ExecutionProfile,
-        store: &ExperimentStore,
-        user_id: &str,
-    ) {
-        let mut experiments = store.list();
-        experiments.sort_by(|a, b| a.id.cmp(&b.id));
-        for experiment in experiments {
-            if experiment.status != ExperimentStatus::Running {
-                continue;
-            }
-            if let Some(variant) = experiment.assign_variant(user_id) {
-                profile.apply_variant(&experiment.id, variant);
-                // Only enroll in one experiment at a time
-                return;
-            }
+    // 3. Pattern library boost terms
+    let mut boosts = routing.boost_terms.clone();
+    if let Some(library) = pattern_library {
+        boosts.extend(library.boost_terms_for(routing.task_type, routing.domain_hint));
+    }
+    if !boosts.is_empty() {
+        boosts.sort();
+        boosts.dedup();
+        profile.merge_boosts(boosts);
+    }
+
+    // 4. Experiment variant assignment
+    if let Some(store) = experiment_store {
+        try_assign_experiment(&mut profile, store, user_id);
+    }
+
+    // 5. Fold routing confidence into profile
+    profile.confidence = profile.confidence.min(routing.confidence);
+
+    profile
+}
+
+/// Try to assign the user to an active experiment variant.
+fn try_assign_experiment(profile: &mut ExecutionProfile, store: &ExperimentStore, user_id: &str) {
+    let mut experiments = store.list();
+    experiments.sort_by(|a, b| a.id.cmp(&b.id));
+    for experiment in experiments {
+        if experiment.status != ExperimentStatus::Running {
+            continue;
+        }
+        if let Some(variant) = experiment.assign_variant(user_id) {
+            profile.apply_variant(&experiment.id, variant);
+            // Only enroll in one experiment at a time
+            return;
         }
     }
 }
@@ -119,11 +87,7 @@ impl ScenarioRouter {
 
 /// Map a task type to a likely scenario (fallback when ScenarioDetector has
 /// insufficient signal).
-#[deprecated(
-    since = "0.9.0",
-    note = "Superseded by SelfModel + LLM reasoning. See self_model.rs."
-)]
-pub fn scenario_from_task_type(task_type: crate::pipeline::routing::TaskType) -> Option<Scenario> {
+fn scenario_from_task_type(task_type: crate::pipeline::routing::TaskType) -> Option<Scenario> {
     use crate::pipeline::routing::TaskType;
     match task_type {
         TaskType::Code => Some(Scenario::Implementation),
@@ -169,11 +133,12 @@ mod tests {
     #[test]
     fn select_baseline_no_scenario() {
         let config = RuntimeConfig::default();
-        let router = ScenarioRouter::new();
         let detector = ScenarioDetector::new();
         let routing = dummy_routing(TaskType::Unknown);
 
-        let profile = router.select(&config, &routing, &detector, None, None, None, "user-1");
+        let profile = select_adaptive_execution_profile(
+            &config, &routing, &detector, None, None, None, "user-1",
+        );
 
         assert!(profile.scenario.is_none());
         assert!(profile.boost_terms.is_empty());
@@ -183,11 +148,12 @@ mod tests {
     #[test]
     fn select_falls_back_to_task_type_scenario() {
         let config = RuntimeConfig::default();
-        let router = ScenarioRouter::new();
         let detector = ScenarioDetector::new();
         let routing = dummy_routing(TaskType::Code);
 
-        let profile = router.select(&config, &routing, &detector, None, None, None, "user-1");
+        let profile = select_adaptive_execution_profile(
+            &config, &routing, &detector, None, None, None, "user-1",
+        );
 
         assert_eq!(profile.scenario, Some(Scenario::Implementation));
         assert_eq!(profile.config.tool_selection.max_tools, 4);
@@ -196,7 +162,6 @@ mod tests {
     #[test]
     fn select_with_scenario_detection() {
         let config = RuntimeConfig::default();
-        let router = ScenarioRouter::new();
         let mut detector = ScenarioDetector::new();
         // Feed debugging signals to the detector
         for _ in 0..5 {
@@ -206,7 +171,9 @@ mod tests {
         }
         let routing = dummy_routing(TaskType::Code);
 
-        let profile = router.select(&config, &routing, &detector, None, None, None, "user-1");
+        let profile = select_adaptive_execution_profile(
+            &config, &routing, &detector, None, None, None, "user-1",
+        );
 
         // Scenario should be detected (Debugging or Implementation depending on signals)
         if let Some(scenario) = profile.scenario {
@@ -222,7 +189,6 @@ mod tests {
     #[test]
     fn select_uses_conservative_scenario_confidence() {
         let config = RuntimeConfig::default();
-        let router = ScenarioRouter::new();
         let mut detector = ScenarioDetector::new();
         for _ in 0..5 {
             detector.observe_query("fix the bug in the code");
@@ -233,7 +199,9 @@ mod tests {
         routing.confidence = 1.0;
         let detected_confidence = detector.detect().expect("scenario detection").1;
 
-        let profile = router.select(&config, &routing, &detector, None, None, None, "user-1");
+        let profile = select_adaptive_execution_profile(
+            &config, &routing, &detector, None, None, None, "user-1",
+        );
 
         assert!((profile.confidence - detected_confidence.lower).abs() < f64::EPSILON);
     }
@@ -241,7 +209,6 @@ mod tests {
     #[test]
     fn select_with_experiment_enrollment() {
         let config = RuntimeConfig::default();
-        let router = ScenarioRouter::new();
         let detector = ScenarioDetector::new();
         let routing = dummy_routing(TaskType::Code);
 
@@ -259,7 +226,7 @@ mod tests {
         exp.start();
         store.register(exp);
 
-        let profile = router.select(
+        let profile = select_adaptive_execution_profile(
             &config,
             &routing,
             &detector,
@@ -277,7 +244,6 @@ mod tests {
     #[test]
     fn select_skips_completed_experiments() {
         let config = RuntimeConfig::default();
-        let router = ScenarioRouter::new();
         let detector = ScenarioDetector::new();
         let routing = dummy_routing(TaskType::Code);
 
@@ -290,7 +256,7 @@ mod tests {
         exp.stop();
         store.register(exp);
 
-        let profile = router.select(
+        let profile = select_adaptive_execution_profile(
             &config,
             &routing,
             &detector,
@@ -318,12 +284,13 @@ mod tests {
     #[test]
     fn select_folds_routing_confidence() {
         let config = RuntimeConfig::default();
-        let router = ScenarioRouter::new();
         let detector = ScenarioDetector::new();
         let mut routing = dummy_routing(TaskType::Code);
         routing.confidence = 0.4;
 
-        let profile = router.select(&config, &routing, &detector, None, None, None, "user-1");
+        let profile = select_adaptive_execution_profile(
+            &config, &routing, &detector, None, None, None, "user-1",
+        );
         // Profile confidence should be at most the routing confidence
         assert!(profile.confidence <= 0.4 + f64::EPSILON);
     }
@@ -331,7 +298,6 @@ mod tests {
     #[test]
     fn select_merges_routing_and_library_boosts() {
         let config = RuntimeConfig::default();
-        let router = ScenarioRouter::new();
         let detector = ScenarioDetector::new();
         let mut routing = dummy_routing(TaskType::Fetch);
         routing.boost_terms = vec!["view".into(), "grep".into()];
@@ -354,7 +320,7 @@ mod tests {
             None,
         );
 
-        let profile = router.select(
+        let profile = select_adaptive_execution_profile(
             &config,
             &routing,
             &detector,
@@ -372,7 +338,6 @@ mod tests {
     #[test]
     fn select_applies_promoted_baseline() {
         let config = RuntimeConfig::default();
-        let router = ScenarioRouter::new();
         let detector = ScenarioDetector::new();
         let routing = dummy_routing(TaskType::Fetch);
         let baselines = AdaptiveBaselineStore::new();
@@ -388,7 +353,7 @@ mod tests {
             .build();
         baselines.promote_winner(&experiment, "winner").unwrap();
 
-        let profile = router.select(
+        let profile = select_adaptive_execution_profile(
             &config,
             &routing,
             &detector,
