@@ -1007,6 +1007,10 @@ fn is_boundary_sensitive_file_access_command(base: &str) -> bool {
     )
 }
 
+fn subcommand_requires_boundary_review(base: &str) -> bool {
+    is_boundary_sensitive_file_access_command(base) || is_shell_interpreter_command(base)
+}
+
 fn xargs_subcommand_requires_boundary_review(parts: &[String]) -> Option<String> {
     let mut idx = 1usize;
     while idx < parts.len() {
@@ -1027,8 +1031,7 @@ fn xargs_subcommand_requires_boundary_review(parts: &[String]) -> Option<String>
 
     let subcommand = parts.get(idx)?;
     let base = subcommand.rsplit('/').next().unwrap_or(subcommand.as_str());
-    (is_boundary_sensitive_file_access_command(base) || is_shell_interpreter_command(base))
-        .then(|| base.to_string())
+    subcommand_requires_boundary_review(base).then(|| base.to_string())
 }
 
 fn xargs_flag_requires_value(flag: &str) -> bool {
@@ -1064,6 +1067,31 @@ fn xargs_flag_requires_value(flag: &str) -> bool {
             Some(b'a' | b'd' | b'E' | b'I' | b'L' | b'n' | b'P' | b's')
         ) && flag.len() > 2
             && !flag.starts_with("--")
+}
+
+fn find_exec_subcommand_requires_boundary_review(parts: &[String]) -> Option<(String, String)> {
+    let mut idx = 1usize;
+    while idx < parts.len() {
+        let token = parts[idx].as_str();
+        if matches!(token, "-exec" | "-execdir" | "-ok" | "-okdir") {
+            let subcommand = parts.get(idx + 1)?;
+            let base = subcommand.rsplit('/').next().unwrap_or(subcommand.as_str());
+            if subcommand_requires_boundary_review(base) {
+                return Some((token.to_string(), base.to_string()));
+            }
+
+            idx += 2;
+            while idx < parts.len() {
+                let inner = parts[idx].as_str();
+                if inner == ";" || inner == "+" {
+                    break;
+                }
+                idx += 1;
+            }
+        }
+        idx += 1;
+    }
+    None
 }
 
 fn check_awk_path_boundary(
@@ -1271,6 +1299,16 @@ fn check_single_command_path_boundary(
         if let Some(subcommand) = xargs_subcommand_requires_boundary_review(&parts) {
             return Some(format!(
                 "{}The command uses `xargs {subcommand}` so file paths may be supplied from stdin and cannot be statically validated against the project directory '{}'. Ask the user for permission before using xargs to fan out file-access or shell commands.",
+                super::SANDBOX_DENIED_PREFIX,
+                policy.project_root.display(),
+            ));
+        }
+        return None;
+    }
+    if base == "find" {
+        if let Some((action, subcommand)) = find_exec_subcommand_requires_boundary_review(&parts) {
+            return Some(format!(
+                "{}The command uses `find {action} {subcommand}` so file paths may be supplied from find matches and cannot be statically validated against the project directory '{}'. Ask the user for permission before using find fan-out with file-access or shell commands.",
                 super::SANDBOX_DENIED_PREFIX,
                 policy.project_root.display(),
             ));
@@ -4148,6 +4186,62 @@ mod tests {
                 "expanded command coverage should allow in-project paths for {command}"
             );
         }
+    }
+
+    #[test]
+    fn find_exec_file_access_requires_boundary_review() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(&policy, "find . -name passwd -exec cat {} \\;");
+        assert!(
+            result
+                .as_deref()
+                .is_some_and(|msg| msg.starts_with(super::SANDBOX_DENIED_PREFIX)
+                    && msg.contains("find -exec cat")),
+            "find -exec file fan-out should require boundary review"
+        );
+    }
+
+    #[test]
+    fn find_execdir_shell_requires_boundary_review() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(
+            &policy,
+            "find . -name passwd -execdir bash -lc 'cat {}' \\;",
+        );
+        assert!(
+            result
+                .as_deref()
+                .is_some_and(|msg| msg.starts_with(super::SANDBOX_DENIED_PREFIX)
+                    && msg.contains("find -execdir bash")),
+            "find -execdir shell fan-out should require boundary review"
+        );
+    }
+
+    #[test]
+    fn find_ok_file_access_requires_boundary_review() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(&policy, "find . -name passwd -ok cat {} \\;");
+        assert!(
+            result
+                .as_deref()
+                .is_some_and(|msg| msg.starts_with(super::SANDBOX_DENIED_PREFIX)
+                    && msg.contains("find -ok cat")),
+            "find -ok file fan-out should require boundary review"
+        );
+    }
+
+    #[test]
+    fn find_exec_echo_is_allowed() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(&policy, "find . -name rs -exec echo {} +");
+        assert!(
+            result.is_none(),
+            "find fan-out should stay allowed for non-file-access subcommands"
+        );
     }
 
     #[test]
