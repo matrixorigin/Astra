@@ -608,6 +608,8 @@ fn inject_runtime_turn_overrides(
 
     if is_plan_subtask {
         root.insert("is_plan_subtask".into(), json!(true));
+        root.insert("rollback_on_failure".into(), json!(true));
+        root.insert("rollback_boundary".into(), json!("turn"));
     }
     if let Some(id) = plan_subtask_id.map(str::trim).filter(|s| !s.is_empty()) {
         root.insert("plan_subtask_id".into(), json!(id));
@@ -875,6 +877,7 @@ pub(crate) async fn fetch_chat_turn_sse(
         approval_request_tx,
         skill_resolver,
         skill_continuation,
+        turn_rollback_on_failure: is_plan_subtask,
         tool_cache,
     };
 
@@ -939,6 +942,8 @@ mod tests {
         assert_eq!(payload["skill_search"]["min_catalog_size"], json!(12));
         assert_eq!(payload["skill_search"]["surface_cap"], json!(20));
         assert_eq!(payload["is_plan_subtask"], json!(true));
+        assert_eq!(payload["rollback_on_failure"], json!(true));
+        assert_eq!(payload["rollback_boundary"], json!("turn"));
         assert_eq!(payload["plan_subtask_id"], json!("sub-1"));
         assert_eq!(payload["effort"], json!("high"));
         assert_eq!(payload["agent_type"], json!("coder"));

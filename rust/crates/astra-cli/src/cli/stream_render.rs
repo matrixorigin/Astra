@@ -137,6 +137,8 @@ pub(super) struct EdgeSseContext<'a> {
     /// Text is buffered (not streamed) and thinking previews are suppressed to avoid
     /// intermediate noise between skill iterations.
     pub skill_continuation: bool,
+    /// When true, the whole turn becomes a deterministic rollback-on-failure boundary.
+    pub turn_rollback_on_failure: bool,
     /// Cross-turn tool output cache (persists across turns via `CliAgenticLoopHost`).
     pub tool_cache: &'a mut EdgeToolCache,
 }
@@ -181,6 +183,10 @@ struct CliSseStreamHost<'a> {
     skill_resolver: Option<std::sync::Arc<dyn astra_runtime::turn::skill_tool::SkillResolver>>,
     /// Skills already invoked during this SSE stream (for edge-path dedup).
     skills_invoked: std::collections::HashSet<String>,
+    /// Turn-scoped rollback checkpoints when the whole turn opts into rollback-on-failure.
+    active_turn_rollback: Option<ActiveTurnRollback>,
+    /// Once a turn-level rollback policy fires, later tool requests are short-circuited.
+    aborted_turn_rollback: Option<AbortedTurnRollback>,
     /// Cross-turn tool output cache (shared with `CliAgenticLoopHost`).
     tool_cache: &'a mut EdgeToolCache,
 }
@@ -206,10 +212,34 @@ struct AbortedBatchTransaction {
     rollback: Option<Value>,
 }
 
+#[derive(Clone, Debug)]
+struct ActiveTurnRollback {
+    turn_index: u32,
+    file_checkpoint: u64,
+    database_checkpoint: u64,
+    stash_checkpoint: u64,
+    commit_checkpoint: u64,
+}
+
+#[derive(Clone, Debug)]
+struct AbortedTurnRollback {
+    rollback: Option<Value>,
+}
+
 impl<'a> CliSseStreamHost<'a> {
     fn from_edge_ctx(ctx: EdgeSseContext<'a>, term_width: usize, render_md: bool) -> Self {
         let suppress_reasoning =
             ctx.render_policy == RenderPolicy::Silent || ctx.skill_continuation;
+        let active_turn_rollback = ctx.turn_rollback_on_failure.then(|| ActiveTurnRollback {
+            turn_index: ctx
+                .executor
+                .journal_turn_index
+                .load(std::sync::atomic::Ordering::Relaxed),
+            file_checkpoint: ctx.executor.file_journal_checkpoint(),
+            database_checkpoint: ctx.executor.database_snapshot_journal_checkpoint(),
+            stash_checkpoint: ctx.executor.git_stash_journal_checkpoint(),
+            commit_checkpoint: ctx.executor.git_commit_journal_checkpoint(),
+        });
         // Always buffer text from the start.  Text is accumulated in
         // `xml_tag_buffer` and only rendered one-shot at finalization when
         // it turns out to be the final answer (no tool calls).  This avoids
@@ -240,6 +270,8 @@ impl<'a> CliSseStreamHost<'a> {
             approval_request_tx: ctx.approval_request_tx,
             skill_resolver: ctx.skill_resolver,
             skills_invoked: std::collections::HashSet::new(),
+            active_turn_rollback,
+            aborted_turn_rollback: None,
             tool_cache: ctx.tool_cache,
         }
     }
@@ -319,12 +351,26 @@ impl<'a> CliSseStreamHost<'a> {
         status: String,
         duration_ms: u64,
     ) -> EdgeToolExecResult {
+        self.finish_edge_tool_with_fields(request_id, tool, args, output, None, status, duration_ms)
+            .await
+    }
+
+    async fn finish_edge_tool_with_fields(
+        &mut self,
+        request_id: &str,
+        tool: &str,
+        args: &serde_json::Value,
+        output: String,
+        tool_result_fields: Option<Map<String, Value>>,
+        status: String,
+        duration_ms: u64,
+    ) -> EdgeToolExecResult {
         let result = EdgeToolExecResult {
             request_id: request_id.to_string(),
             tool: tool.to_string(),
             args: args.clone(),
             output: output.clone(),
-            tool_result_fields: None,
+            tool_result_fields,
             status: status.clone(),
             duration_ms,
         };
@@ -344,6 +390,59 @@ impl<'a> CliSseStreamHost<'a> {
 }
 
 impl<'a> CliSseStreamHost<'a> {
+    fn rollback_from_checkpoints(
+        &self,
+        turn_index: u32,
+        file_checkpoint: u64,
+        database_checkpoint: u64,
+        stash_checkpoint: u64,
+        commit_checkpoint: u64,
+    ) -> Option<Value> {
+        let file_entries_added = self
+            .executor
+            .file_journal_checkpoint()
+            .saturating_sub(file_checkpoint);
+        let database_entries_added = self
+            .executor
+            .database_snapshot_journal_checkpoint()
+            .saturating_sub(database_checkpoint);
+        let stash_entries_added = self
+            .executor
+            .git_stash_journal_checkpoint()
+            .saturating_sub(stash_checkpoint);
+        let commit_entries_added = self
+            .executor
+            .git_commit_journal_checkpoint()
+            .saturating_sub(commit_checkpoint);
+        if file_entries_added == 0
+            && database_entries_added == 0
+            && stash_entries_added == 0
+            && commit_entries_added == 0
+        {
+            return None;
+        }
+
+        let rollback_output = self.executor.rollback_turn_actions(&serde_json::json!({
+            "scope": "turn",
+            "turn_index": turn_index,
+            "file_after_sequence": file_checkpoint,
+            "database_after_sequence": database_checkpoint,
+            "stash_after_sequence": stash_checkpoint,
+            "commit_after_sequence": commit_checkpoint,
+        }));
+        Some(
+            serde_json::from_str(&rollback_output).unwrap_or_else(|error| {
+                serde_json::json!({
+                    "ok": false,
+                    "error": format!(
+                        "Failed to parse rollback_turn_actions output: {error}"
+                    ),
+                    "raw_output": rollback_output,
+                })
+            }),
+        )
+    }
+
     fn has_batch_transaction_metadata(args: &Value) -> bool {
         args.as_object().is_some_and(|obj| {
             obj.contains_key("transaction_id") || obj.contains_key("rollback_on_failure")
@@ -455,49 +554,64 @@ impl<'a> CliSseStreamHost<'a> {
     }
 
     fn rollback_active_batch_transaction(&self, active: &ActiveBatchTransaction) -> Option<Value> {
-        let file_entries_added = self
-            .executor
-            .file_journal_checkpoint()
-            .saturating_sub(active.file_checkpoint);
-        let database_entries_added = self
-            .executor
-            .database_snapshot_journal_checkpoint()
-            .saturating_sub(active.database_checkpoint);
-        let stash_entries_added = self
-            .executor
-            .git_stash_journal_checkpoint()
-            .saturating_sub(active.stash_checkpoint);
-        let commit_entries_added = self
-            .executor
-            .git_commit_journal_checkpoint()
-            .saturating_sub(active.commit_checkpoint);
-        if file_entries_added == 0
-            && database_entries_added == 0
-            && stash_entries_added == 0
-            && commit_entries_added == 0
-        {
-            return None;
-        }
-
-        let rollback_output = self.executor.rollback_turn_actions(&serde_json::json!({
-            "scope": "turn",
-            "turn_index": active.turn_index,
-            "file_after_sequence": active.file_checkpoint,
-            "database_after_sequence": active.database_checkpoint,
-            "stash_after_sequence": active.stash_checkpoint,
-            "commit_after_sequence": active.commit_checkpoint,
-        }));
-        Some(
-            serde_json::from_str(&rollback_output).unwrap_or_else(|error| {
-                serde_json::json!({
-                    "ok": false,
-                    "error": format!(
-                        "Failed to parse rollback_turn_actions output: {error}"
-                    ),
-                    "raw_output": rollback_output,
-                })
-            }),
+        self.rollback_from_checkpoints(
+            active.turn_index,
+            active.file_checkpoint,
+            active.database_checkpoint,
+            active.stash_checkpoint,
+            active.commit_checkpoint,
         )
+    }
+
+    fn rollback_active_turn(&self, active: &ActiveTurnRollback) -> Option<Value> {
+        self.rollback_from_checkpoints(
+            active.turn_index,
+            active.file_checkpoint,
+            active.database_checkpoint,
+            active.stash_checkpoint,
+            active.commit_checkpoint,
+        )
+    }
+
+    fn merge_turn_rollback_fields(
+        mut existing: Option<Map<String, Value>>,
+        state: &str,
+        rollback: Option<Value>,
+    ) -> Option<Map<String, Value>> {
+        let mut fields = existing.take().unwrap_or_default();
+        fields.insert(
+            "rollback_boundary".to_string(),
+            Value::String("turn".to_string()),
+        );
+        fields.insert("rollback_on_failure".to_string(), Value::Bool(true));
+        fields.insert(
+            "rollback_state".to_string(),
+            Value::String(state.to_string()),
+        );
+        if let Some(rollback) = rollback {
+            fields.insert("rollback".to_string(), rollback);
+        }
+        Some(fields)
+    }
+
+    fn append_turn_rollback_note(output: &str, note: &str, rollback: Option<&Value>) -> String {
+        let mut rendered = output.trim_end().to_string();
+        if !rendered.is_empty() {
+            rendered.push_str("\n\n");
+        }
+        rendered.push_str(&format!("Turn rollback policy {note}."));
+        if let Some(summary) = rollback
+            .and_then(|value| value.get("summary"))
+            .and_then(Value::as_str)
+        {
+            rendered.push(' ');
+            rendered.push_str(summary);
+        } else if rollback.is_some() {
+            rendered.push_str(" Bounded rollback was attempted for earlier turn side effects.");
+        } else {
+            rendered.push_str(" No earlier bounded side effects were recorded before the failure.");
+        }
+        rendered
     }
 
     async fn record_synthetic_batch_result(
@@ -1005,6 +1119,32 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             None
         };
 
+        if let Some(rollback) = self
+            .aborted_turn_rollback
+            .as_ref()
+            .map(|aborted| aborted.rollback.clone())
+        {
+            let output = Self::append_turn_rollback_note(
+                "Error: skipped because this turn already failed earlier and rollback_on_failure aborted later tool execution",
+                "was already aborted",
+                rollback.as_ref(),
+            );
+            if let Some(idx) = tool_idx {
+                self.render.tool_done(idx, tool, args, "error", 0, &output);
+            }
+            return self
+                .finish_edge_tool_with_fields(
+                    request_id,
+                    tool,
+                    args,
+                    output,
+                    Self::merge_turn_rollback_fields(None, "aborted", rollback),
+                    "error".to_string(),
+                    0,
+                )
+                .await;
+        }
+
         // ── Edge-path dedup: call-count limit + output cache ───────────
         let dedup_sig = tool_dedup_signature(tool, args);
         let call_count = self
@@ -1168,7 +1308,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         };
         let start = std::time::Instant::now();
         let mut tool_result_fields = None;
-        let output = if allowed {
+        let mut output = if allowed {
             if tool == astra_runtime::turn::skill_tool::SKILL_TOOL_NAME {
                 // Edge-path skill dedup: if the same skill was already invoked
                 // during this SSE stream, return a short dedup message instead
@@ -1372,28 +1512,47 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             "error"
         } else {
             cloud_tool_result_status_label(&output)
-        };
+        }
+        .to_string();
         let duration_ms = start.elapsed().as_millis() as u64;
+
+        if status == "error"
+            && let Some(active) = self.active_turn_rollback.clone()
+        {
+            let rollback = self.rollback_active_turn(&active);
+            output = Self::append_turn_rollback_note(&output, "failed", rollback.as_ref());
+            tool_result_fields = Self::merge_turn_rollback_fields(
+                tool_result_fields.take(),
+                if rollback.is_some() {
+                    "rolled_back"
+                } else {
+                    "failed"
+                },
+                rollback.clone(),
+            );
+            self.aborted_turn_rollback = Some(AbortedTurnRollback { rollback });
+            self.active_turn_rollback = None;
+        }
 
         // Store successful cacheable tool results for cross-turn dedup.
         if allowed && status != "error" && CACHEABLE_TOOLS.contains(&tool) {
             self.tool_cache
                 .output_cache
-                .insert(dedup_sig.clone(), (output.clone(), status.to_string()));
+                .insert(dedup_sig.clone(), (output.clone(), status.clone()));
         }
 
         // Forward tool-completed event to observer channel
         if let Some(tx) = &self.stream_event_tx {
             let output_summary = self
                 .render
-                .format_output_summary(tool, &output, status)
+                .format_output_summary(tool, &output, &status)
                 .map(|summary| summary.text)
                 .unwrap_or_default();
             let tool_description = self.render.format_tool_description(tool, args);
             let _ = tx.send(super::chat_stream::StreamEvent::ToolCompleted {
                 name: tool.to_string(),
                 description: tool_description,
-                status: status.to_string(),
+                status: status.clone(),
                 duration_ms,
                 output_summary: if output_summary.is_empty() {
                     None
@@ -1406,7 +1565,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         // Update tool line to show completion.
         if let Some(idx) = tool_idx {
             self.render
-                .tool_done(idx, tool, args, status, duration_ms, &output);
+                .tool_done(idx, tool, args, &status, duration_ms, &output);
         }
         self.edge_tool_round.push(EdgeToolExecResult {
             request_id: request_id.to_string(),
@@ -1414,12 +1573,12 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             args: args.clone(),
             output: output.clone(),
             tool_result_fields: tool_result_fields.clone(),
-            status: status.to_string(),
+            status: status.clone(),
             duration_ms,
         });
         let body = astra_thin_client::ToolResultRequest {
             request_id: request_id.to_string(),
-            status: status.to_string(),
+            status: status.clone(),
             output: Some(output),
             duration_ms: Some(duration_ms),
         };
@@ -1550,6 +1709,19 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         if n <= 1 {
             let mut out = Vec::with_capacity(n);
             for req in requests {
+                out.push(
+                    self.execute_tool(&req.request_id, &req.tool, &req.args)
+                        .await,
+                );
+            }
+            self.render.tool_batch_progress = None;
+            return out;
+        }
+
+        if self.active_turn_rollback.is_some() || self.aborted_turn_rollback.is_some() {
+            let mut out = Vec::with_capacity(n);
+            for (i, req) in requests.iter().enumerate() {
+                self.render.tool_batch_progress = Some((i + 1, n));
                 out.push(
                     self.execute_tool(&req.request_id, &req.tool, &req.args)
                         .await,
@@ -4027,6 +4199,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 approval_request_tx: None,
                 skill_resolver: None,
                 skill_continuation: false,
+                turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
             },
             80,
@@ -4117,6 +4290,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 approval_request_tx: None,
                 skill_resolver: None,
                 skill_continuation: false,
+                turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
             },
             80,
@@ -4204,6 +4378,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 approval_request_tx: None,
                 skill_resolver: None,
                 skill_continuation: false,
+                turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
             },
             80,
@@ -4294,6 +4469,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 approval_request_tx: None,
                 skill_resolver: None,
                 skill_continuation: false,
+                turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
             },
             80,
@@ -4377,6 +4553,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 approval_request_tx: None,
                 skill_resolver: None,
                 skill_continuation: false,
+                turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
             },
             80,
@@ -4458,6 +4635,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 approval_request_tx: None,
                 skill_resolver: None,
                 skill_continuation: false,
+                turn_rollback_on_failure: false,
                 tool_cache: &mut tool_cache,
             },
             80,
@@ -4513,6 +4691,177 @@ diff --git a/src/a.rs b/src/a.rs\n\
         assert!(
             !results[2].output.contains("existing"),
             "aborted transaction request should not execute normally"
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_rollback_restores_written_file_on_failure() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/tools/result"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .mount(&server)
+            .await;
+
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
+        let temp = tempdir().expect("tempdir");
+        let mut executor = crate::edge_tools::ToolExecutor::new(temp.path());
+        let mut tool_cache = EdgeToolCache::new(8);
+        executor
+            .journal_turn_index
+            .store(9, std::sync::atomic::Ordering::Relaxed);
+
+        let mut host = CliSseStreamHost::from_edge_ctx(
+            EdgeSseContext {
+                api: &api,
+                token: "tok",
+                executor_id: "edge-test",
+                executor: &mut executor,
+                render_policy: RenderPolicy::Silent,
+                perm_manager: None,
+                cancel_token: None,
+                stream_event_tx: None,
+                approval_request_tx: None,
+                skill_resolver: None,
+                skill_continuation: false,
+                turn_rollback_on_failure: true,
+                tool_cache: &mut tool_cache,
+            },
+            80,
+            false,
+        );
+
+        let results = host
+            .execute_tools_batch(vec![
+                ToolBatchRequest {
+                    request_id: "turn-1".to_string(),
+                    tool: "write_file".to_string(),
+                    args: serde_json::json!({
+                        "path": "turn.txt",
+                        "content": "hello\n",
+                    }),
+                },
+                ToolBatchRequest {
+                    request_id: "turn-2".to_string(),
+                    tool: "read_file".to_string(),
+                    args: serde_json::json!({
+                        "path": "missing.txt",
+                    }),
+                },
+            ])
+            .await;
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[1].status, "error");
+        let rollback_fields = results[1]
+            .tool_result_fields
+            .as_ref()
+            .expect("rollback fields");
+        assert_eq!(rollback_fields["rollback_boundary"].as_str(), Some("turn"));
+        assert_eq!(
+            rollback_fields["rollback_state"].as_str(),
+            Some("rolled_back")
+        );
+        assert_eq!(rollback_fields["rollback_on_failure"].as_bool(), Some(true));
+        assert!(
+            results[1].output.contains("Turn rollback policy failed."),
+            "{}",
+            results[1].output
+        );
+        assert!(
+            !temp.path().join("turn.txt").exists(),
+            "rollback should remove the written file"
+        );
+        assert_eq!(
+            rollback_fields["rollback"]["files"]["reverted"]
+                .as_array()
+                .map(|entries| entries.len()),
+            Some(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_rollback_skips_later_requests_after_failure() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/tools/result"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .mount(&server)
+            .await;
+
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
+        let temp = tempdir().expect("tempdir");
+        std::fs::write(temp.path().join("other.txt"), "existing\n").expect("seed file");
+        let mut executor = crate::edge_tools::ToolExecutor::new(temp.path());
+        let mut tool_cache = EdgeToolCache::new(8);
+        executor
+            .journal_turn_index
+            .store(10, std::sync::atomic::Ordering::Relaxed);
+
+        let mut host = CliSseStreamHost::from_edge_ctx(
+            EdgeSseContext {
+                api: &api,
+                token: "tok",
+                executor_id: "edge-test",
+                executor: &mut executor,
+                render_policy: RenderPolicy::Silent,
+                perm_manager: None,
+                cancel_token: None,
+                stream_event_tx: None,
+                approval_request_tx: None,
+                skill_resolver: None,
+                skill_continuation: false,
+                turn_rollback_on_failure: true,
+                tool_cache: &mut tool_cache,
+            },
+            80,
+            false,
+        );
+
+        let results = host
+            .execute_tools_batch(vec![
+                ToolBatchRequest {
+                    request_id: "turn-1".to_string(),
+                    tool: "write_file".to_string(),
+                    args: serde_json::json!({
+                        "path": "turn.txt",
+                        "content": "hello\n",
+                    }),
+                },
+                ToolBatchRequest {
+                    request_id: "turn-2".to_string(),
+                    tool: "read_file".to_string(),
+                    args: serde_json::json!({
+                        "path": "missing.txt",
+                    }),
+                },
+                ToolBatchRequest {
+                    request_id: "turn-3".to_string(),
+                    tool: "read_file".to_string(),
+                    args: serde_json::json!({
+                        "path": "other.txt",
+                    }),
+                },
+            ])
+            .await;
+
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[2].status, "error");
+        assert!(
+            results[2].output.contains("already failed earlier"),
+            "{}",
+            results[2].output
+        );
+        let fields = results[2]
+            .tool_result_fields
+            .as_ref()
+            .expect("rollback fields");
+        assert_eq!(fields["rollback_boundary"].as_str(), Some("turn"));
+        assert_eq!(fields["rollback_state"].as_str(), Some("aborted"));
+        assert_eq!(fields["rollback_on_failure"].as_bool(), Some(true));
+        assert!(
+            !results[2].output.contains("existing"),
+            "aborted turn request should not execute normally"
         );
     }
 }

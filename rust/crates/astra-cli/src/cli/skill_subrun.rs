@@ -217,6 +217,7 @@ impl AgenticLoopHost for SubRunHost {
             approval_request_tx: None,
             skill_resolver: self.skill_resolver.clone(),
             skill_continuation: false,
+            turn_rollback_on_failure: false,
             tool_cache: &mut self.tool_cache,
         };
 

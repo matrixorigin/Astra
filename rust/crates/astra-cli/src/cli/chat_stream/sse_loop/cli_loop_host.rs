@@ -279,6 +279,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
                 approval_request_tx: None,
                 skill_resolver: None,
                 skill_continuation: false,
+                turn_rollback_on_failure: false,
                 tool_cache: &mut self.tool_cache,
             }),
             0,
