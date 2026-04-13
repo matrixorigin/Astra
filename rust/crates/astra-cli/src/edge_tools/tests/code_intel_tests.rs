@@ -264,7 +264,8 @@ fn resolve_import_rust_crate_path() {
         line: 1,
         is_wildcard: false,
     };
-    let candidates = executor.resolve_import_to_files(&import, code_intel::Language::Rust, &files);
+    let candidates =
+        executor.resolve_import_to_files(&import, code_intel::Language::Rust, &files, None);
     assert!(
         candidates.contains(&1),
         "should resolve to config.rs (index 1): {:?}",
@@ -292,7 +293,7 @@ fn resolve_import_python_module() {
         is_wildcard: false,
     };
     let candidates =
-        executor.resolve_import_to_files(&import, code_intel::Language::Python, &files);
+        executor.resolve_import_to_files(&import, code_intel::Language::Python, &files, None);
     assert!(
         candidates.contains(&1),
         "should resolve to config.py (index 1): {:?}",
@@ -314,11 +315,106 @@ fn resolve_import_ts_relative_path() {
         line: 1,
         is_wildcard: false,
     };
-    let candidates =
-        executor.resolve_import_to_files(&import, code_intel::Language::TypeScript, &files);
+    let candidates = executor.resolve_import_to_files(
+        &import,
+        code_intel::Language::TypeScript,
+        &files,
+        Some(std::path::Path::new("/project/src/app.ts")),
+    );
     assert!(
         candidates.contains(&1),
         "should resolve to config.ts (index 1): {:?}",
+        candidates
+    );
+}
+
+#[test]
+fn resolve_import_python_parent_relative_path() {
+    let executor = test_executor();
+    let files = vec![
+        PathBuf::from("/project/pkg/config.py"),
+        PathBuf::from("/project/pkg/sub/current.py"),
+        PathBuf::from("/project/pkg/sub/config.py"),
+    ];
+    let import = code_intel::ImportStatement {
+        path: "..config".to_string(),
+        names: vec!["Config".to_string()],
+        line: 1,
+        is_wildcard: false,
+    };
+    let candidates = executor.resolve_import_to_files(
+        &import,
+        code_intel::Language::Python,
+        &files,
+        Some(std::path::Path::new("/project/pkg/sub/current.py")),
+    );
+    assert!(
+        candidates.contains(&0),
+        "parent-relative python import should resolve to pkg/config.py: {:?}",
+        candidates
+    );
+    assert!(
+        !candidates.contains(&2),
+        "parent-relative python import should not collapse to sibling config.py: {:?}",
+        candidates
+    );
+}
+
+#[test]
+fn resolve_import_python_relative_package_import_uses_imported_name() {
+    let executor = test_executor();
+    let files = vec![
+        PathBuf::from("/project/pkg/utils.py"),
+        PathBuf::from("/project/pkg/__init__.py"),
+        PathBuf::from("/project/pkg/sub/current.py"),
+    ];
+    let import = code_intel::ImportStatement {
+        path: "..".to_string(),
+        names: vec!["utils".to_string()],
+        line: 1,
+        is_wildcard: false,
+    };
+    let candidates = executor.resolve_import_to_files(
+        &import,
+        code_intel::Language::Python,
+        &files,
+        Some(std::path::Path::new("/project/pkg/sub/current.py")),
+    );
+    assert!(
+        candidates.contains(&0),
+        "dots-only relative import should resolve imported module name: {:?}",
+        candidates
+    );
+}
+
+#[test]
+fn resolve_import_ts_grandparent_relative_path() {
+    let executor = test_executor();
+    let files = vec![
+        PathBuf::from("/project/src/shared/config.ts"),
+        PathBuf::from("/project/src/components/forms/app.ts"),
+        PathBuf::from("/project/src/components/forms/config.ts"),
+    ];
+    let import = code_intel::ImportStatement {
+        path: "../../shared/config".to_string(),
+        names: vec!["Config".to_string()],
+        line: 1,
+        is_wildcard: false,
+    };
+    let candidates = executor.resolve_import_to_files(
+        &import,
+        code_intel::Language::TypeScript,
+        &files,
+        Some(std::path::Path::new("/project/src/components/forms/app.ts")),
+    );
+    assert!(
+        candidates.contains(&0),
+        "grandparent-relative ts import should resolve to shared/config.ts: {:?}",
+        candidates
+    );
+    assert!(
+        !candidates.contains(&2),
+        "grandparent-relative ts import should not collapse to local config.ts: {:?}",
         candidates
     );
 }
@@ -337,7 +433,8 @@ fn resolve_import_rust_mod_rs() {
         line: 1,
         is_wildcard: false,
     };
-    let candidates = executor.resolve_import_to_files(&import, code_intel::Language::Rust, &files);
+    let candidates =
+        executor.resolve_import_to_files(&import, code_intel::Language::Rust, &files, None);
     // Should match mod.rs (parent dir = edge_tools) and edge_tools/shell.rs contains edge_tools
     assert!(
         candidates.contains(&0),
@@ -356,7 +453,8 @@ fn resolve_import_empty_returns_nothing() {
         line: 1,
         is_wildcard: false,
     };
-    let candidates = executor.resolve_import_to_files(&import, code_intel::Language::Rust, &files);
+    let candidates =
+        executor.resolve_import_to_files(&import, code_intel::Language::Rust, &files, None);
     assert!(
         candidates.is_empty(),
         "empty import should resolve to nothing"

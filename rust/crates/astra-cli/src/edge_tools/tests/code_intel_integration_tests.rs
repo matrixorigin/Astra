@@ -163,6 +163,54 @@ def get_user_view(user_id: int):
 }
 
 #[tokio::test]
+async fn find_definition_python_parent_relative_import_is_import_resolved() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("app/sub")).unwrap();
+    std::fs::write(dir.path().join("app/__init__.py"), "").unwrap();
+    std::fs::write(dir.path().join("app/sub/__init__.py"), "").unwrap();
+
+    std::fs::write(
+        dir.path().join("app/config.py"),
+        r#"
+class AppConfig:
+    pass
+"#,
+    )
+    .unwrap();
+
+    std::fs::write(
+        dir.path().join("app/sub/views.py"),
+        r#"
+from ..config import AppConfig
+
+def load_config() -> AppConfig:
+    return AppConfig()
+"#,
+    )
+    .unwrap();
+
+    let executor = ToolExecutor::new(dir.path());
+    let result = executor
+        .execute(
+            "find_definition",
+            &json!({
+                "symbol": "AppConfig",
+                "language": "python",
+                "file": "app/sub/views.py"
+            }),
+        )
+        .await;
+    assert!(
+        result.contains("## 📦 Import-resolved"),
+        "parent-relative import should drive import-aware resolution: {result}"
+    );
+    assert!(
+        result.contains("app/config.py"),
+        "parent-relative import should resolve to app/config.py: {result}"
+    );
+}
+
+#[tokio::test]
 async fn find_definition_multifile_typescript_project() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join("src")).unwrap();

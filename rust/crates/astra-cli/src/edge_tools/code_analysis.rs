@@ -430,13 +430,149 @@ impl ToolExecutor {
     /// Given an import path (e.g., "std::collections::HashMap" for Rust,
     /// "os.path" for Python, "./config" for TS), returns file paths within
     /// the project that likely define the imported symbol.
+    fn normalize_virtual_path(path: &Path) -> PathBuf {
+        use std::path::Component;
+
+        let mut normalized = PathBuf::new();
+        for component in path.components() {
+            match component {
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    normalized.pop();
+                }
+                _ => normalized.push(component.as_os_str()),
+            }
+        }
+        normalized
+    }
+
+    fn candidate_indices_from_paths(
+        &self,
+        file_paths: &[PathBuf],
+        candidates: Vec<PathBuf>,
+    ) -> Vec<usize> {
+        let normalized_candidates: Vec<PathBuf> = candidates
+            .into_iter()
+            .map(|path| Self::normalize_virtual_path(&path))
+            .collect();
+
+        file_paths
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, file_path)| {
+                let normalized = Self::normalize_virtual_path(file_path);
+                normalized_candidates
+                    .iter()
+                    .any(|candidate| candidate == &normalized)
+                    .then_some(idx)
+            })
+            .collect()
+    }
+
+    fn resolve_relative_import_to_files(
+        &self,
+        import: &code_intel::ImportStatement,
+        lang: code_intel::Language,
+        file_paths: &[PathBuf],
+        context_file: &Path,
+    ) -> Vec<usize> {
+        match lang {
+            code_intel::Language::Python if import.path.starts_with('.') => {
+                let leading_dots = import.path.chars().take_while(|ch| *ch == '.').count();
+                if leading_dots == 0 {
+                    return Vec::new();
+                }
+
+                let mut base_dir = context_file
+                    .parent()
+                    .unwrap_or(self.project_root.as_path())
+                    .to_path_buf();
+                for _ in 1..leading_dots {
+                    base_dir.pop();
+                }
+
+                let remainder = &import.path[leading_dots..];
+                let mut module_roots = Vec::new();
+                let remainder_segments: Vec<&str> =
+                    remainder.split('.').filter(|seg| !seg.is_empty()).collect();
+                if remainder_segments.is_empty() {
+                    module_roots.push(base_dir.clone());
+                    for name in &import.names {
+                        let name_segments: Vec<&str> =
+                            name.split('.').filter(|seg| !seg.is_empty()).collect();
+                        if name_segments.is_empty() {
+                            continue;
+                        }
+                        let mut module_root = base_dir.clone();
+                        for segment in name_segments {
+                            module_root.push(segment);
+                        }
+                        module_roots.push(module_root);
+                    }
+                } else {
+                    let mut module_root = base_dir;
+                    for segment in remainder_segments {
+                        module_root.push(segment);
+                    }
+                    module_roots.push(module_root);
+                }
+
+                let mut candidates = Vec::new();
+                for module_root in module_roots {
+                    candidates.push(module_root.with_extension("py"));
+                    candidates.push(module_root.join("__init__.py"));
+                }
+                self.candidate_indices_from_paths(file_paths, candidates)
+            }
+            code_intel::Language::TypeScript | code_intel::Language::JavaScript
+                if import.path.starts_with("./") || import.path.starts_with("../") =>
+            {
+                let base_dir = context_file
+                    .parent()
+                    .unwrap_or(self.project_root.as_path())
+                    .to_path_buf();
+                let module_root = Self::normalize_virtual_path(&base_dir.join(&import.path));
+                let extensions: &[&str] = match lang {
+                    code_intel::Language::TypeScript => &["ts", "tsx"],
+                    code_intel::Language::JavaScript => &["js", "jsx"],
+                    _ => &[],
+                };
+
+                let mut candidates = Vec::new();
+                if module_root.extension().is_some() {
+                    candidates.push(module_root.clone());
+                }
+                for ext in extensions {
+                    candidates.push(module_root.with_extension(ext));
+                    candidates.push(module_root.join("index").with_extension(ext));
+                }
+                self.candidate_indices_from_paths(file_paths, candidates)
+            }
+            _ => Vec::new(),
+        }
+    }
+
     pub(super) fn resolve_import_to_files(
         &self,
         import: &code_intel::ImportStatement,
         lang: code_intel::Language,
         file_paths: &[std::path::PathBuf],
+        context_file: Option<&Path>,
     ) -> Vec<usize> {
         let mut candidates: Vec<usize> = Vec::new();
+
+        let is_relative_import = matches!(lang, code_intel::Language::Python if import.path.starts_with('.'))
+            || matches!(
+                lang,
+                code_intel::Language::TypeScript | code_intel::Language::JavaScript
+                    if import.path.starts_with("./") || import.path.starts_with("../")
+            );
+
+        if is_relative_import {
+            return context_file
+                .map(|ctx| self.resolve_relative_import_to_files(import, lang, file_paths, ctx))
+                .unwrap_or_default();
+        }
 
         // Convert import path to file path segments
         let path_segments: Vec<&str> = match lang {
@@ -452,16 +588,11 @@ impl ToolExecutor {
             code_intel::Language::Python => {
                 // "os.path" → ["os", "path"]
                 // ".utils" → ["utils"]
-                import.path.trim_start_matches('.').split('.').collect()
+                import.path.split('.').filter(|seg| !seg.is_empty()).collect()
             }
             code_intel::Language::TypeScript | code_intel::Language::JavaScript => {
-                // "./config" → ["config"]
-                // "../utils/helper" → ["utils", "helper"]
-                let cleaned = import
-                    .path
-                    .trim_start_matches("./")
-                    .trim_start_matches("../");
-                cleaned.split('/').collect()
+                // "lib/config" → ["lib", "config"]
+                import.path.split('/').filter(|seg| !seg.is_empty()).collect()
             }
             code_intel::Language::Go => {
                 // "path/filepath" → ["path", "filepath"]
@@ -670,8 +801,12 @@ impl ToolExecutor {
                         || import.is_wildcard
                         || import.path.ends_with(symbol);
                     if matches_symbol {
-                        let candidates =
-                            self.resolve_import_to_files(import, ctx_lang, &file_paths);
+                        let candidates = self.resolve_import_to_files(
+                            import,
+                            ctx_lang,
+                            &file_paths,
+                            Some(&ctx_path),
+                        );
                         import_priority_indices.extend(candidates);
                     }
                 }
