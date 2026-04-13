@@ -1032,7 +1032,8 @@ pub(super) async fn handle_team_command(
             let config = astra_runtime::server::team_orchestrator::OrchestratorConfig {
                 user_id: user_id.clone(),
                 session_id,
-                source_agent_id: "orchestrator".to_string(),
+                // Must match the profile registered by register_default_agents()
+                source_agent_id: "main".to_string(),
                 progress: Some(progress),
             };
 

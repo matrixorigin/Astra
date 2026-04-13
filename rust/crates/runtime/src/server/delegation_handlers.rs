@@ -21,12 +21,13 @@ pub(super) async fn delegate_run_handler(
     })?;
 
     // Resolve the source agent identity from the tracker.
-    // Top-level runs (not sub-runs) default to "orchestrator".
+    // Top-level runs (not sub-runs) default to "main", which matches
+    // the root orchestrator profile registered by register_default_agents().
     let source_agent_id = engine
         .tracker()
         .get_agent_id(&run_id)
         .await
-        .unwrap_or_else(|| "orchestrator".to_string());
+        .unwrap_or_else(|| "main".to_string());
 
     // Validate the delegation request against the profile registry.
     engine
