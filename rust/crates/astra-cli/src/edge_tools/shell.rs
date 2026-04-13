@@ -386,7 +386,7 @@ fn validate_plain_command_path_arg(
     arg: &str,
     oldpwd: Option<&std::path::Path>,
 ) -> Option<String> {
-    if let Some(kind) = unresolved_static_dir_reference_kind(arg) {
+    if let Some(kind) = unresolved_static_dir_reference_kind(policy, arg, oldpwd) {
         return Some(format!(
             "{}The command references '{}' using {} which cannot be statically validated against the project directory '{}'. Ask the user for permission before accessing files outside the project.",
             super::SANDBOX_DENIED_PREFIX,
@@ -589,7 +589,11 @@ fn expand_oldpwd_dir_reference(
     Some(oldpwd.join(suffix))
 }
 
-fn unresolved_static_dir_reference_kind(arg: &str) -> Option<&'static str> {
+fn unresolved_static_dir_reference_kind(
+    policy: &astra_runtime::tool_sandbox::SandboxPolicy,
+    arg: &str,
+    oldpwd: Option<&std::path::Path>,
+) -> Option<&'static str> {
     if is_named_tilde_user_reference(arg) {
         return Some("~user home-directory expansion");
     }
@@ -598,7 +602,11 @@ fn unresolved_static_dir_reference_kind(arg: &str) -> Option<&'static str> {
         || is_complex_dir_parameter_reference(arg, "PWD")
         || is_complex_dir_parameter_reference(arg, "OLDPWD"))
     .then_some("shell parameter expansion from a directory anchor")
-    .or_else(|| contains_unresolved_shell_variable(arg).then_some("shell variable expansion"))
+    .or_else(|| {
+        (expand_static_dir_reference(policy, arg, oldpwd).is_none()
+            && contains_unresolved_shell_variable(arg))
+        .then_some("shell variable expansion")
+    })
 }
 
 fn is_named_tilde_user_reference(arg: &str) -> bool {
