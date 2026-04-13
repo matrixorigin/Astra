@@ -135,6 +135,9 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
             .map(|(name, _)| name.clone());
         let active_skill_ref = active_skill.as_deref();
         for rec in &state.stall.tool_call_records[evo_records_before..] {
+            if rec.is_synthetic_placeholder() {
+                continue;
+            }
             let ctx = crate::evolution::types::ToolResultContext {
                 tool_name: &rec.name,
                 tool_args: rec.args_preview.as_deref().unwrap_or(""),
