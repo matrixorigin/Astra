@@ -431,3 +431,61 @@ fn multi_turn_scaled_limit_affects_read_file_truncation() {
         normal_result.len()
     );
 }
+
+// ── Per-tool output limit tests ──────────────────────────────────────────
+
+#[test]
+fn per_tool_output_limit_grep_capped() {
+    let limit = super::per_tool_output_limit("grep");
+    assert!(
+        limit <= 10_000,
+        "grep should be capped at 10KB, got {limit}"
+    );
+    assert!(limit > 0);
+}
+
+#[test]
+fn per_tool_output_limit_glob_capped() {
+    let limit = super::per_tool_output_limit("glob");
+    assert!(
+        limit <= 100_000,
+        "glob should be capped at 100KB, got {limit}"
+    );
+    assert!(limit > 0);
+}
+
+#[test]
+fn per_tool_output_limit_code_analysis_capped() {
+    for tool in &["find_definition", "find_references"] {
+        let limit = super::per_tool_output_limit(tool);
+        assert!(
+            limit <= 15_000,
+            "{tool} should be capped at 15KB, got {limit}"
+        );
+        assert!(limit > 0);
+    }
+}
+
+#[test]
+fn per_tool_output_limit_unknown_uses_global() {
+    let global = super::tool_output_limit();
+    let limit = super::per_tool_output_limit("unknown_tool");
+    assert_eq!(limit, global, "unknown tools should use global limit");
+}
+
+#[test]
+fn scaled_output_limit_for_respects_per_tool_cap() {
+    let executor = test_executor();
+    let grep_limit = executor.scaled_output_limit_for("grep");
+    let global_limit = executor.scaled_output_limit();
+    // Under zero pressure, grep cap (10KB) should be lower than global
+    assert!(
+        grep_limit <= 10_000,
+        "grep scaled limit should respect 10KB cap, got {grep_limit}"
+    );
+    assert!(
+        grep_limit < global_limit || global_limit <= 10_000,
+        "grep limit ({grep_limit}) should be below global ({global_limit}) \
+         unless global is already under 10KB"
+    );
+}

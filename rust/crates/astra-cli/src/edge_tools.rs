@@ -684,7 +684,10 @@ impl ToolExecutor {
         self.scaled_output_limit_for("")
     }
 
-    /// Per-tool variant: applies per-tool cap before pressure scaling.
+    /// Per-tool variant: applies per-tool cap as the base *before* pressure
+    /// scaling. This makes per-tool caps absolute upper bounds — even at zero
+    /// pressure, grep can never exceed 10KB. Previous inline `.min(N)` calls
+    /// applied after scaling, so caps only kicked in when `scaled > N`.
     fn scaled_output_limit_for(&self, tool_name: &str) -> usize {
         let base = per_tool_output_limit(tool_name);
         let pressure = self.get_budget_pressure();
