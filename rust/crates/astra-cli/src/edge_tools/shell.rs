@@ -989,6 +989,11 @@ fn is_boundary_sensitive_file_access_command(base: &str) -> bool {
             | "sha1sum"
             | "readlink"
             | "realpath"
+            | "diff"
+            | "sort"
+            | "awk"
+            | "sed"
+            | "tee"
             | "source"
             | "."
     )
@@ -3855,6 +3860,44 @@ mod tests {
             result.is_none(),
             "simple in-project brace expansions should remain allowed"
         );
+    }
+
+    #[test]
+    fn expanded_command_coverage_blocks_outside_paths() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        for command in [
+            "diff src/main.rs /etc/passwd",
+            "sort /etc/passwd",
+            "awk '{print $1}' /etc/passwd",
+            "sed -n '1p' /etc/passwd",
+            "echo hi | tee /etc/output.log",
+        ] {
+            let result = check_bash_path_boundary(&policy, command);
+            assert!(
+                result.is_some(),
+                "expanded command coverage should block outside paths for {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn expanded_command_coverage_allows_in_project_paths() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        for command in [
+            "diff src/main.rs src/lib.rs",
+            "sort src/main.rs",
+            "awk '{print $1}' src/main.rs",
+            "sed -n '1p' src/main.rs",
+            "echo hi | tee build/output.log",
+        ] {
+            let result = check_bash_path_boundary(&policy, command);
+            assert!(
+                result.is_none(),
+                "expanded command coverage should allow in-project paths for {command}"
+            );
+        }
     }
 
     #[test]
