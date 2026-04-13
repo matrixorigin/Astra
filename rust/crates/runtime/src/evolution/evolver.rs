@@ -18,7 +18,7 @@ pub fn generate_fast_proposals(signals: &[EvolutionSignal]) -> Vec<EvolutionProp
                 recent_rate,
                 ..
             } => {
-                let drop = historical_rate - recent_rate;
+                let drop = (historical_rate - recent_rate).max(0.0);
                 // Only demote if the drop is significant (>25%).
                 if drop > 0.25 {
                     proposals.push(EvolutionProposal {

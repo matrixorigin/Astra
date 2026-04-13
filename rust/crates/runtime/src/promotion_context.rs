@@ -12,6 +12,33 @@ pub struct PromotionEvaluationContext {
     pub calibration_error_interval: Option<ValueInterval>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PromotionEvaluationThresholds {
+    pub poor_quality_floor: f64,
+    pub weak_quality_floor: f64,
+    pub strong_quality_floor: f64,
+    pub significant_gate_regression_floor: f64,
+    pub positive_gate_delta_floor: f64,
+    pub severe_calibration_error_ceiling: f64,
+    pub moderate_calibration_error_ceiling: f64,
+    pub strong_calibration_error_floor: f64,
+}
+
+impl Default for PromotionEvaluationThresholds {
+    fn default() -> Self {
+        Self {
+            poor_quality_floor: 0.45,
+            weak_quality_floor: 0.60,
+            strong_quality_floor: 0.75,
+            significant_gate_regression_floor: -0.08,
+            positive_gate_delta_floor: 0.03,
+            severe_calibration_error_ceiling: 0.25,
+            moderate_calibration_error_ceiling: 0.15,
+            strong_calibration_error_floor: 0.08,
+        }
+    }
+}
+
 fn format_value_signal(label: &str, value: f64, interval: Option<&ValueInterval>) -> String {
     if let Some(interval) = interval {
         format!(
@@ -39,6 +66,27 @@ pub fn apply_promotion_evaluation_context(
     evidence: &mut Vec<String>,
     blockers: &mut Vec<String>,
 ) {
+    let thresholds = PromotionEvaluationThresholds::default();
+    apply_promotion_evaluation_context_with_thresholds(
+        context,
+        &thresholds,
+        confidence_score,
+        support_score,
+        safety_score,
+        evidence,
+        blockers,
+    );
+}
+
+pub fn apply_promotion_evaluation_context_with_thresholds(
+    context: Option<&PromotionEvaluationContext>,
+    thresholds: &PromotionEvaluationThresholds,
+    confidence_score: &mut f64,
+    support_score: &mut f64,
+    safety_score: &mut f64,
+    evidence: &mut Vec<String>,
+    blockers: &mut Vec<String>,
+) {
     let Some(context) = context else {
         return;
     };
@@ -58,14 +106,14 @@ pub fn apply_promotion_evaluation_context(
             evidence.push(format!("global noise-filtered quality {:.2}", quality));
         }
 
-        if quality_floor < 0.45 {
+        if quality_floor < thresholds.poor_quality_floor {
             *confidence_score = (*confidence_score - 0.18).max(0.0);
             *support_score = (*support_score - 0.20).max(0.0);
             blockers.push("global quality trend is materially below promotion threshold".into());
-        } else if quality_floor < 0.60 {
+        } else if quality_floor < thresholds.weak_quality_floor {
             *confidence_score = (*confidence_score - 0.10).max(0.0);
             *support_score = (*support_score - 0.12).max(0.0);
-        } else if quality_floor >= 0.75 {
+        } else if quality_floor >= thresholds.strong_quality_floor {
             *support_score = (*support_score + 0.05).min(1.0);
         }
     }
@@ -82,7 +130,7 @@ pub fn apply_promotion_evaluation_context(
                 ));
                 *confidence_score = (*confidence_score - 0.12).max(0.0);
                 *support_score = (*support_score - 0.12).max(0.0);
-                if delta_floor <= -0.08 {
+                if delta_floor <= thresholds.significant_gate_regression_floor {
                     blockers
                         .push("latest evaluation gate shows a significant score regression".into());
                 }
@@ -100,7 +148,7 @@ pub fn apply_promotion_evaluation_context(
                     delta,
                     delta_interval,
                 ));
-                if delta_floor >= 0.03 {
+                if delta_floor >= thresholds.positive_gate_delta_floor {
                     *support_score = (*support_score + 0.03).min(1.0);
                 }
             }
@@ -118,13 +166,13 @@ pub fn apply_promotion_evaluation_context(
             calibration_error,
             calibration_interval,
         ));
-        if calibration_ceiling > 0.25 {
+        if calibration_ceiling > thresholds.severe_calibration_error_ceiling {
             *confidence_score = (*confidence_score - 0.10).max(0.0);
             *safety_score = (*safety_score - 0.08).max(0.0);
-        } else if calibration_ceiling > 0.15 {
+        } else if calibration_ceiling > thresholds.moderate_calibration_error_ceiling {
             *confidence_score = (*confidence_score - 0.05).max(0.0);
             *safety_score = (*safety_score - 0.04).max(0.0);
-        } else if calibration_ceiling < 0.08 {
+        } else if calibration_ceiling < thresholds.strong_calibration_error_floor {
             *safety_score = (*safety_score + 0.03).min(1.0);
         }
     }
@@ -217,6 +265,41 @@ mod tests {
             evidence
                 .iter()
                 .any(|line| line.contains("[-0.09, 0.01]") || line.contains("[0.10, 0.27]"))
+        );
+    }
+
+    #[test]
+    fn custom_thresholds_override_default_gate_regression_cutoff() {
+        let context = PromotionEvaluationContext {
+            latest_gate_passed: Some(false),
+            latest_gate_score_delta: Some(-0.05),
+            latest_gate_score_delta_interval: Some(ValueInterval::new(-0.05, -0.05, -0.05)),
+            ..PromotionEvaluationContext::default()
+        };
+        let thresholds = PromotionEvaluationThresholds {
+            significant_gate_regression_floor: -0.04,
+            ..PromotionEvaluationThresholds::default()
+        };
+        let mut confidence = 0.90;
+        let mut support = 0.82;
+        let mut safety = 0.81;
+        let mut evidence = Vec::new();
+        let mut blockers = Vec::new();
+
+        apply_promotion_evaluation_context_with_thresholds(
+            Some(&context),
+            &thresholds,
+            &mut confidence,
+            &mut support,
+            &mut safety,
+            &mut evidence,
+            &mut blockers,
+        );
+
+        assert!(
+            blockers
+                .iter()
+                .any(|blocker| blocker.contains("significant score regression"))
         );
     }
 }
