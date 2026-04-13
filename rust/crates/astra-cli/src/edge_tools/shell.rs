@@ -374,6 +374,18 @@ fn validate_command_path_arg(
     arg: &str,
     oldpwd: Option<&std::path::Path>,
 ) -> Option<String> {
+    if let Some(msg) = validate_brace_expansion_path_arg(policy, arg, oldpwd) {
+        return Some(msg);
+    }
+
+    validate_plain_command_path_arg(policy, arg, oldpwd)
+}
+
+fn validate_plain_command_path_arg(
+    policy: &astra_runtime::tool_sandbox::SandboxPolicy,
+    arg: &str,
+    oldpwd: Option<&std::path::Path>,
+) -> Option<String> {
     if let Some(kind) = unresolved_static_dir_reference_kind(arg) {
         return Some(format!(
             "{}The command references '{}' using {} which cannot be statically validated against the project directory '{}'. Ask the user for permission before accessing files outside the project.",
@@ -404,6 +416,38 @@ fn validate_command_path_arg(
         ));
     }
     None
+}
+
+fn validate_brace_expansion_path_arg(
+    policy: &astra_runtime::tool_sandbox::SandboxPolicy,
+    arg: &str,
+    oldpwd: Option<&std::path::Path>,
+) -> Option<String> {
+    match brace_expansion_candidates(arg)? {
+        BraceExpansionCandidates::RequiresReview => {
+            Some(brace_expansion_boundary_review_message(policy, arg))
+        }
+        BraceExpansionCandidates::Expanded(candidates) => {
+            for candidate in candidates {
+                if validate_plain_command_path_arg(policy, &candidate, oldpwd).is_some() {
+                    return Some(brace_expansion_boundary_review_message(policy, arg));
+                }
+            }
+            None
+        }
+    }
+}
+
+fn brace_expansion_boundary_review_message(
+    policy: &astra_runtime::tool_sandbox::SandboxPolicy,
+    arg: &str,
+) -> String {
+    format!(
+        "{}The command references '{}' using shell brace expansion, which may fan out to multiple paths that cannot be statically validated against the project directory '{}'. Ask the user for permission before accessing files outside the project.",
+        super::SANDBOX_DENIED_PREFIX,
+        arg,
+        policy.project_root.display(),
+    )
 }
 
 fn check_shell_interpreter_path_boundary(
@@ -590,6 +634,171 @@ fn is_complex_dir_parameter_reference(arg: &str, name: &str) -> bool {
     )
 }
 
+enum BraceExpansionCandidates {
+    Expanded(Vec<String>),
+    RequiresReview,
+}
+
+fn brace_expansion_candidates(arg: &str) -> Option<BraceExpansionCandidates> {
+    let mut start = None;
+    let mut end = None;
+    let mut depth = 0usize;
+    let mut saw_comma = false;
+
+    for (idx, ch) in arg.char_indices() {
+        match ch {
+            '{' => {
+                if depth == 0 {
+                    start = Some(idx);
+                } else {
+                    return Some(BraceExpansionCandidates::RequiresReview);
+                }
+                depth += 1;
+            }
+            '}' => {
+                if depth == 0 {
+                    return Some(BraceExpansionCandidates::RequiresReview);
+                }
+                depth -= 1;
+                if depth == 0 {
+                    end = Some(idx);
+                    break;
+                }
+            }
+            ',' if depth == 1 => saw_comma = true,
+            _ => {}
+        }
+    }
+
+    let (start, end) = match (start, end) {
+        (Some(start), Some(end)) if saw_comma => (start, end),
+        _ => return None,
+    };
+
+    if arg[end + 1..].contains('{') || arg[end + 1..].contains('}') {
+        return Some(BraceExpansionCandidates::RequiresReview);
+    }
+
+    let prefix = &arg[..start];
+    let suffix = &arg[end + 1..];
+    let inner = &arg[start + 1..end];
+    if inner.contains('{') || inner.contains('}') {
+        return Some(BraceExpansionCandidates::RequiresReview);
+    }
+
+    Some(BraceExpansionCandidates::Expanded(
+        inner
+            .split(',')
+            .map(|part| format!("{prefix}{part}{suffix}"))
+            .collect(),
+    ))
+}
+
+fn process_substitution_commands(command: &str) -> Vec<&str> {
+    let chars: Vec<(usize, char)> = command.char_indices().collect();
+    let mut commands = Vec::new();
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut escaped = false;
+    let mut idx = 0usize;
+
+    while idx < chars.len() {
+        let (_, ch) = chars[idx];
+
+        if escaped {
+            escaped = false;
+            idx += 1;
+            continue;
+        }
+
+        if ch == '\\' && !in_single_quote {
+            escaped = true;
+            idx += 1;
+            continue;
+        }
+
+        if ch == '\'' && !in_double_quote {
+            in_single_quote = !in_single_quote;
+            idx += 1;
+            continue;
+        }
+
+        if ch == '"' && !in_single_quote {
+            in_double_quote = !in_double_quote;
+            idx += 1;
+            continue;
+        }
+
+        if !in_single_quote
+            && !in_double_quote
+            && matches!(ch, '<' | '>')
+            && chars.get(idx + 1).is_some_and(|(_, next)| *next == '(')
+        {
+            let (open_idx, open_ch) = chars[idx + 1];
+            let inner_start = open_idx + open_ch.len_utf8();
+            idx += 2;
+
+            let mut depth = 1usize;
+            let mut inner_in_single_quote = false;
+            let mut inner_in_double_quote = false;
+            let mut inner_escaped = false;
+
+            while idx < chars.len() {
+                let (byte_idx, inner_ch) = chars[idx];
+
+                if inner_escaped {
+                    inner_escaped = false;
+                    idx += 1;
+                    continue;
+                }
+
+                if inner_ch == '\\' && !inner_in_single_quote {
+                    inner_escaped = true;
+                    idx += 1;
+                    continue;
+                }
+
+                if inner_ch == '\'' && !inner_in_double_quote {
+                    inner_in_single_quote = !inner_in_single_quote;
+                    idx += 1;
+                    continue;
+                }
+
+                if inner_ch == '"' && !inner_in_single_quote {
+                    inner_in_double_quote = !inner_in_double_quote;
+                    idx += 1;
+                    continue;
+                }
+
+                if !inner_in_single_quote && !inner_in_double_quote {
+                    match inner_ch {
+                        '(' => depth += 1,
+                        ')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                let inner = command[inner_start..byte_idx].trim();
+                                if !inner.is_empty() {
+                                    commands.push(inner);
+                                }
+                                idx += 1;
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+
+                idx += 1;
+            }
+            continue;
+        }
+
+        idx += 1;
+    }
+
+    commands
+}
+
 fn is_shell_interpreter_command(base: &str) -> bool {
     matches!(base, "bash" | "sh" | "zsh" | "dash" | "ksh" | "fish")
 }
@@ -687,6 +896,12 @@ fn check_single_command_path_boundary(
     command: &str,
     oldpwd: Option<&std::path::Path>,
 ) -> Option<String> {
+    for inner in process_substitution_commands(command) {
+        if let Some(msg) = check_bash_path_boundary_with_oldpwd(policy, inner, oldpwd) {
+            return Some(msg);
+        }
+    }
+
     let parts = shell_tokenize_like_bash(command);
     if parts.is_empty() {
         return None;
@@ -3353,6 +3568,57 @@ mod tests {
         assert!(
             result.is_none(),
             "exact HOME/PWD/OLDPWD anchors should be matched without catching unrelated vars"
+        );
+    }
+
+    #[test]
+    fn process_substitution_outside_project_is_blocked() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(&policy, "diff <(cat /etc/passwd) src/main.rs");
+        assert!(
+            result
+                .as_deref()
+                .is_some_and(|msg| msg.starts_with(super::SANDBOX_DENIED_PREFIX)
+                    && msg.contains("/etc/passwd")),
+            "process substitution should recurse into the nested command"
+        );
+    }
+
+    #[test]
+    fn process_substitution_inside_project_is_allowed() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(&policy, "diff <(cat src/main.rs) <(cat src/lib.rs)");
+        assert!(
+            result.is_none(),
+            "in-project process substitutions should remain allowed"
+        );
+    }
+
+    #[test]
+    fn brace_expansion_with_outside_path_requires_boundary_review() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(&policy, "cat {src/main.rs,/etc/passwd}");
+        assert!(
+            result
+                .as_deref()
+                .is_some_and(|msg| msg.starts_with(super::SANDBOX_DENIED_PREFIX)
+                    && msg.contains("{src/main.rs,/etc/passwd}")
+                    && msg.contains("brace expansion")),
+            "brace fan-out should require boundary review when one branch escapes"
+        );
+    }
+
+    #[test]
+    fn brace_expansion_inside_project_is_allowed() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(&policy, "cat src/{main,lib}.rs");
+        assert!(
+            result.is_none(),
+            "simple in-project brace expansions should remain allowed"
         );
     }
 
