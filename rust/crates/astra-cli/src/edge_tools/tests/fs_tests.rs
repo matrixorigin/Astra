@@ -190,6 +190,55 @@ fn rollback_file_edits_reverts_current_turn_creates() {
 }
 
 #[test]
+fn rollback_file_edits_restores_git_checkout_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let tracked = dir.path().join("tracked.txt");
+    std::process::Command::new("git")
+        .arg("init")
+        .current_dir(dir.path())
+        .output()
+        .expect("git init");
+    std::fs::write(&tracked, "committed\n").unwrap();
+    std::process::Command::new("git")
+        .args(["add", "tracked.txt"])
+        .current_dir(dir.path())
+        .output()
+        .expect("git add");
+    std::process::Command::new("git")
+        .args([
+            "-c",
+            "user.name=Test User",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-m",
+            "init",
+        ])
+        .current_dir(dir.path())
+        .output()
+        .expect("git commit");
+    std::fs::write(&tracked, "working tree\n").unwrap();
+
+    let executor = ToolExecutor::new(dir.path());
+    executor
+        .journal_turn_index
+        .store(9, std::sync::atomic::Ordering::Relaxed);
+    let result = executor.git_checkout_file(&json!({"path": "tracked.txt"}));
+    assert!(result.contains("Restored"), "got: {result}");
+    assert_eq!(std::fs::read_to_string(&tracked).unwrap(), "committed\n");
+
+    let rollback = executor.rollback_file_edits(&json!({"scope": "file", "path": "tracked.txt"}));
+    let rollback_json: serde_json::Value = serde_json::from_str(&rollback).unwrap();
+    assert_eq!(
+        rollback_json["success"].as_bool(),
+        Some(true),
+        "got: {rollback}"
+    );
+    assert_eq!(rollback_json["edit_type"].as_str(), Some("overwrite"));
+    assert_eq!(std::fs::read_to_string(&tracked).unwrap(), "working tree\n");
+}
+
+#[test]
 fn rollback_turn_actions_reverts_file_edits_when_no_db_snapshots_exist() {
     let dir = tempfile::tempdir().unwrap();
     let executor = ToolExecutor::new(dir.path());

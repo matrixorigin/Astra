@@ -339,12 +339,36 @@ pub fn tool_action_profile(tool_name: &str, args: &Value) -> ActionCompensationP
             CompensationKind::RestoreOrDeleteFile,
             restore_file_compensation_summary(string_arg(&normalized_args, "path"), true),
         ),
+        "git_checkout_file" => ActionCompensationProfile::compensated(
+            true,
+            ActionCategory::Destructive,
+            true,
+            CompensationKind::RestoreOrDeleteFile,
+            restore_file_compensation_summary(string_arg(&normalized_args, "path"), true),
+        ),
+        "notebook_edit" => ActionCompensationProfile::compensated(
+            true,
+            ActionCategory::Write,
+            true,
+            CompensationKind::RestoreOrDeleteFile,
+            restore_file_compensation_summary(string_arg(&normalized_args, "notebook_path"), true),
+        ),
         "edit_file" | "multi_edit" | "str_replace" => ActionCompensationProfile::compensated(
             true,
             ActionCategory::Write,
             true,
             CompensationKind::RestoreFileContents,
             restore_file_compensation_summary(string_arg(&normalized_args, "path"), false),
+        ),
+        "rename_symbol" => ActionCompensationProfile::compensated(
+            true,
+            ActionCategory::Write,
+            true,
+            CompensationKind::RestoreFileContents,
+            format!(
+                "{} to revert renamed files from the same turn",
+                rollback_turn_tool_scope_hint()
+            ),
         ),
         "rollback_database_snapshots" => ActionCompensationProfile::manual(
             true,
@@ -510,6 +534,69 @@ mod tests {
         assert_eq!(
             profile.compensation_kind,
             Some(CompensationKind::GitRevertCommit)
+        );
+    }
+
+    #[test]
+    fn git_checkout_file_uses_bounded_file_rollback() {
+        let profile = tool_action_profile("git_checkout_file", &json!({"path": "src/lib.rs"}));
+        assert!(profile.bounded);
+        assert_eq!(profile.category, ActionCategory::Destructive);
+        assert!(profile.reversible);
+        assert_eq!(
+            profile.compensation_kind,
+            Some(CompensationKind::RestoreOrDeleteFile)
+        );
+        assert!(
+            profile
+                .compensation_summary
+                .as_deref()
+                .unwrap_or_default()
+                .contains("rollback_file_edits")
+        );
+    }
+
+    #[test]
+    fn rename_symbol_uses_turn_rollback_hint() {
+        let profile = tool_action_profile(
+            "rename_symbol",
+            &json!({"symbol": "old_name", "new_name": "new_name"}),
+        );
+        assert!(profile.bounded);
+        assert_eq!(profile.category, ActionCategory::Write);
+        assert!(profile.reversible);
+        assert_eq!(
+            profile.compensation_kind,
+            Some(CompensationKind::RestoreFileContents)
+        );
+        assert!(
+            profile
+                .compensation_summary
+                .as_deref()
+                .unwrap_or_default()
+                .contains("rollback_turn_actions")
+        );
+    }
+
+    #[test]
+    fn notebook_edit_uses_file_rollback_hint() {
+        let profile = tool_action_profile(
+            "notebook_edit",
+            &json!({"notebook_path": "analysis.ipynb", "edit_mode": "replace"}),
+        );
+        assert!(profile.bounded);
+        assert_eq!(profile.category, ActionCategory::Write);
+        assert!(profile.reversible);
+        assert_eq!(
+            profile.compensation_kind,
+            Some(CompensationKind::RestoreOrDeleteFile)
+        );
+        assert!(
+            profile
+                .compensation_summary
+                .as_deref()
+                .unwrap_or_default()
+                .contains("rollback_file_edits")
         );
     }
 

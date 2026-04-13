@@ -448,7 +448,9 @@ pub fn all_tool_schemas() -> Vec<Value> {
                     "type": "object",
                     "properties": {
                         "path": {"type": "string", "description": "File path to revert"},
-                        "ref": {"type": "string", "description": "Restore from specific commit/ref (default: HEAD)"}
+                        "ref": {"type": "string", "description": "Restore from specific commit/ref (default: HEAD)"},
+                        "transaction_id": {"type": "string", "description": "Optional explicit batch transaction id. Consecutive tool calls in the same batch with the same id and rollback_on_failure=true execute as one rollback boundary."},
+                        "rollback_on_failure": {"type": "boolean", "description": "Optional explicit batch transaction flag. When true with transaction_id, a later failure inside the same contiguous batch transaction rolls back bounded file/database side effects recorded since the transaction began."}
                     },
                     "required": ["path"]
                 }
@@ -543,7 +545,9 @@ pub fn all_tool_schemas() -> Vec<Value> {
                         "new_name": {"type": "string", "description": "New name for the symbol"},
                         "path": {"type": "string", "description": "Limit rename to a subdirectory (optional)"},
                         "include": {"type": "string", "description": "File glob filter e.g. '*.rs' (optional)"},
-                        "dry_run": {"type": "boolean", "description": "Preview changes without applying (default: true). Set false to apply."}
+                        "dry_run": {"type": "boolean", "description": "Preview changes without applying (default: true). Set false to apply."},
+                        "transaction_id": {"type": "string", "description": "Optional explicit batch transaction id. Consecutive tool calls in the same batch with the same id and rollback_on_failure=true execute as one rollback boundary."},
+                        "rollback_on_failure": {"type": "boolean", "description": "Optional explicit batch transaction flag. When true with transaction_id, a later failure inside the same contiguous batch transaction rolls back bounded file/database side effects recorded since the transaction began."}
                     },
                     "required": ["symbol", "new_name"]
                 }
@@ -1529,7 +1533,9 @@ pub fn all_tool_schemas() -> Vec<Value> {
                             "type": "string",
                             "enum": ["replace", "insert", "delete"],
                             "description": "Edit operation: 'replace' updates existing cell, 'insert' adds new cell after cell_id, 'delete' removes cell. Default: replace"
-                        }
+                        },
+                        "transaction_id": {"type": "string", "description": "Optional explicit batch transaction id. Consecutive tool calls in the same batch with the same id and rollback_on_failure=true execute as one rollback boundary."},
+                        "rollback_on_failure": {"type": "boolean", "description": "Optional explicit batch transaction flag. When true with transaction_id, a later failure inside the same contiguous batch transaction rolls back bounded file/database side effects recorded since the transaction began."}
                     },
                     "required": ["notebook_path"]
                 }

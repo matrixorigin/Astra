@@ -1064,6 +1064,9 @@ impl ToolExecutor {
         let mut output = String::new();
         let mut total_replacements = 0usize;
         let mut files_changed = 0usize;
+        let turn_idx = self
+            .journal_turn_index
+            .load(std::sync::atomic::Ordering::Relaxed);
 
         if dry_run {
             output.push_str(&format!("🔍 Rename preview: {} → {}\n", symbol, new_name));
@@ -1127,9 +1130,33 @@ impl ToolExecutor {
                         new_content.push('\n');
                     }
 
+                    let journal_call_id = format!("rename_symbol:{}", abs_path.display());
+                    match self.file_journal.lock() {
+                        Ok(mut journal) => {
+                            journal.record_before(&abs_path, &journal_call_id, turn_idx)
+                        }
+                        Err(poisoned) => poisoned.into_inner().record_before(
+                            &abs_path,
+                            &journal_call_id,
+                            turn_idx,
+                        ),
+                    }
                     if let Err(e) = fs::write(&abs_path, &new_content) {
                         output.push_str(&format!("  ⚠ {}: write error: {}\n", rel_path, e));
                         continue;
+                    }
+                    self.record_write_with_content(&abs_path, &new_content);
+                    match self.file_journal.lock() {
+                        Ok(mut journal) => journal.record_after(
+                            &abs_path,
+                            &journal_call_id,
+                            new_content.as_bytes(),
+                        ),
+                        Err(poisoned) => poisoned.into_inner().record_after(
+                            &abs_path,
+                            &journal_call_id,
+                            new_content.as_bytes(),
+                        ),
                     }
                     output.push_str(&format!(
                         "  ✓ {} ({} replacement{})\n",

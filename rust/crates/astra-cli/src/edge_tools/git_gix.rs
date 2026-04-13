@@ -10,7 +10,7 @@ use std::path::Path;
 use gix::bstr::{BString, ByteSlice};
 use serde_json::Value;
 
-use super::truncate_output;
+use super::{ToolExecutor, truncate_output};
 
 const DIFF_LIMIT: usize = 40_000; // ~10K tokens — diff is the primary input for code review
 const SHOW_LIMIT: usize = 16_000; // ~4K tokens; was 30K
@@ -1802,6 +1802,56 @@ pub fn git_checkout_file(project_root: &Path, args: &Value) -> String {
             format!("Error: git checkout failed: {}", stderr.trim())
         }
         Err(e) => format!("Error: git checkout failed: {e}"),
+    }
+}
+
+impl ToolExecutor {
+    pub(crate) fn git_checkout_file(&self, args: &Value) -> String {
+        let file_arg = match args.get("path").and_then(Value::as_str) {
+            Some(path) if !path.is_empty() => path,
+            _ => return crate::edge_tools::git_gix::git_checkout_file(&self.project_root, args),
+        };
+        let path = match self.resolve_checked(file_arg) {
+            Ok(path) => path,
+            Err(error) => return error,
+        };
+
+        let turn_idx = self
+            .journal_turn_index
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let journal_call_id = format!("git_checkout_file:{}", path.display());
+        match self.file_journal.lock() {
+            Ok(mut journal) => journal.record_before(&path, &journal_call_id, turn_idx),
+            Err(poisoned) => poisoned
+                .into_inner()
+                .record_before(&path, &journal_call_id, turn_idx),
+        }
+
+        let output = crate::edge_tools::git_gix::git_checkout_file(&self.project_root, args);
+        if output.starts_with("Error:") {
+            return output;
+        }
+
+        let after_content = std::fs::read(&path).unwrap_or_default();
+        match self.file_journal.lock() {
+            Ok(mut journal) => journal.record_after(&path, &journal_call_id, &after_content),
+            Err(poisoned) => {
+                poisoned
+                    .into_inner()
+                    .record_after(&path, &journal_call_id, &after_content)
+            }
+        }
+
+        if path.exists() {
+            match std::fs::read_to_string(&path) {
+                Ok(content) => self.record_write_with_content(&path, &content),
+                Err(_) => self.record_write(&path),
+            }
+        } else {
+            self.remove_file_state(&path);
+        }
+
+        output
     }
 }
 

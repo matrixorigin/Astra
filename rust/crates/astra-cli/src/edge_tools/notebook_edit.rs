@@ -195,10 +195,32 @@ impl ToolExecutor {
 
         // Write back
         let updated_content = serde_json::to_string_pretty(&notebook).unwrap_or_default();
+        let turn_idx = self
+            .journal_turn_index
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let journal_call_id = format!("notebook_edit:{}", file_path.display());
+        match self.file_journal.lock() {
+            Ok(mut journal) => journal.record_before(&file_path, &journal_call_id, turn_idx),
+            Err(poisoned) => {
+                poisoned
+                    .into_inner()
+                    .record_before(&file_path, &journal_call_id, turn_idx)
+            }
+        }
         if let Err(e) = std::fs::write(&file_path, &updated_content) {
             return json!({ "error": format!("Failed to write notebook: {}", e) }).to_string();
         }
         self.record_write_with_content(&file_path, &updated_content);
+        match self.file_journal.lock() {
+            Ok(mut journal) => {
+                journal.record_after(&file_path, &journal_call_id, updated_content.as_bytes())
+            }
+            Err(poisoned) => poisoned.into_inner().record_after(
+                &file_path,
+                &journal_call_id,
+                updated_content.as_bytes(),
+            ),
+        }
 
         json!({
             "success": true,

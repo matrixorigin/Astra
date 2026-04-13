@@ -527,6 +527,70 @@ async fn rename_symbol_across_files() {
 }
 
 #[tokio::test]
+async fn rename_symbol_changes_can_be_rolled_back_by_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("src")).unwrap();
+    std::fs::write(
+        dir.path().join("src/lib.rs"),
+        "pub fn shared_fn() -> i32 { 42 }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("src/main.rs"),
+        "fn main() { shared_fn(); }\n",
+    )
+    .unwrap();
+
+    let executor = ToolExecutor::new(dir.path());
+    executor
+        .journal_turn_index
+        .store(12, std::sync::atomic::Ordering::Relaxed);
+    let result = executor
+        .execute(
+            "rename_symbol",
+            &json!({
+                "symbol": "shared_fn",
+                "new_name": "common_fn",
+                "dry_run": false
+            }),
+        )
+        .await;
+
+    assert!(
+        result.contains("2 file"),
+        "rename should touch both files: {result}"
+    );
+    let rollback = executor.rollback_turn_actions(&json!({"scope": "current_turn"}));
+    let rollback_json: serde_json::Value =
+        serde_json::from_str(&rollback).expect("rollback_turn_actions json");
+    assert_eq!(
+        rollback_json["success"].as_bool(),
+        Some(true),
+        "got: {rollback}"
+    );
+    assert_eq!(
+        rollback_json["reverted_files"].as_array().map(Vec::len),
+        Some(2)
+    );
+
+    let lib = std::fs::read_to_string(dir.path().join("src/lib.rs")).unwrap();
+    let main = std::fs::read_to_string(dir.path().join("src/main.rs")).unwrap();
+    assert!(lib.contains("shared_fn"), "lib should be restored: {lib}");
+    assert!(
+        main.contains("shared_fn"),
+        "main should be restored: {main}"
+    );
+    assert!(
+        !lib.contains("common_fn"),
+        "lib should not keep rename: {lib}"
+    );
+    assert!(
+        !main.contains("common_fn"),
+        "main should not keep rename: {main}"
+    );
+}
+
+#[tokio::test]
 async fn rename_symbol_word_boundary_safe() {
     let dir = tempfile::tempdir().unwrap();
     let code = "fn foo() { 1 }\nfn foobar() { foo() + 2 }\nfn foo_baz() { foo() }\n";

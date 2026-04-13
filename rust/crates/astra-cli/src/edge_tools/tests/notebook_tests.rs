@@ -90,3 +90,44 @@ fn notebook_edit_succeeds_after_full_read() {
         "Expected notebook update, got: {updated}"
     );
 }
+
+#[test]
+fn notebook_edit_can_be_rolled_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let exe = ToolExecutor::new(dir.path());
+    exe.journal_turn_index
+        .store(14, std::sync::atomic::Ordering::Relaxed);
+    let notebook_path = dir.path().join("rollback.ipynb");
+    std::fs::write(&notebook_path, r#"{"cells":[{"cell_type":"code","id":"cell-1","source":"x=1","metadata":{},"outputs":[],"execution_count":null}],"metadata":{"language_info":{"name":"python"}},"nbformat":4,"nbformat_minor":5}"#).unwrap();
+
+    let _ = exe.read_file(&json!({ "path": "rollback.ipynb" }));
+    let result = exe.notebook_edit(&json!({
+        "notebook_path": "rollback.ipynb",
+        "edit_mode": "replace",
+        "cell_id": "cell-1",
+        "new_source": "x=2"
+    }));
+    assert!(
+        result.contains("\"success\":true"),
+        "Expected success, got: {result}"
+    );
+
+    let rollback = exe.rollback_file_edits(&json!({"scope": "file", "path": "rollback.ipynb"}));
+    let rollback_json: serde_json::Value =
+        serde_json::from_str(&rollback).expect("rollback_file_edits json");
+    assert_eq!(
+        rollback_json["success"].as_bool(),
+        Some(true),
+        "got: {rollback}"
+    );
+
+    let restored = std::fs::read_to_string(&notebook_path).unwrap();
+    assert!(
+        restored.contains("x=1"),
+        "Expected original notebook, got: {restored}"
+    );
+    assert!(
+        !restored.contains("x=2"),
+        "Expected rollback to remove edit, got: {restored}"
+    );
+}

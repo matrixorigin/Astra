@@ -143,6 +143,9 @@ fn bounded_batch_transaction_fields_are_discoverable() {
         "delete_file",
         "str_replace",
         "multi_edit",
+        "rename_symbol",
+        "git_checkout_file",
+        "notebook_edit",
         "mo_query",
     ] {
         let properties = schemas

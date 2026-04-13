@@ -821,7 +821,7 @@ impl ToolExecutor {
                 "git_log_search" => git_gix::git_log_search(&self.project_root, args),
                 "git_commit" => git_gix::git_commit(&self.project_root, args),
                 "git_stash" => git_gix::git_stash(&self.project_root, args),
-                "git_checkout_file" => git_gix::git_checkout_file(&self.project_root, args),
+                "git_checkout_file" => self.git_checkout_file(args),
                 "git_worktree" => self.git_worktree(args),
                 "find_definition" => self.find_definition(args),
                 "find_references" => self.find_references(args),

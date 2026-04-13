@@ -390,7 +390,14 @@ impl<'a> CliSseStreamHost<'a> {
         is_tool_concurrency_safe(tool)
             || matches!(
                 tool,
-                "write_file" | "delete_file" | "str_replace" | "multi_edit" | "mo_query"
+                "write_file"
+                    | "delete_file"
+                    | "str_replace"
+                    | "multi_edit"
+                    | "rename_symbol"
+                    | "git_checkout_file"
+                    | "notebook_edit"
+                    | "mo_query"
             )
     }
 
@@ -4100,6 +4107,101 @@ diff --git a/src/a.rs b/src/a.rs\n\
         assert_eq!(
             std::fs::read_to_string(&victim).expect("restored file"),
             "hello\n"
+        );
+        assert_eq!(
+            rollback_fields["transaction_rollback"]["files"]["reverted"]
+                .as_array()
+                .map(|entries| entries.len()),
+            Some(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn transactional_batch_restores_notebook_edit_on_failure() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/tools/result"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .mount(&server)
+            .await;
+
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
+        let temp = tempdir().expect("tempdir");
+        let notebook = temp.path().join("analysis.ipynb");
+        std::fs::write(
+            &notebook,
+            r#"{"cells":[{"cell_type":"code","id":"cell-1","source":"x=1","metadata":{},"outputs":[],"execution_count":null}],"metadata":{"language_info":{"name":"python"}},"nbformat":4,"nbformat_minor":5}"#,
+        )
+        .expect("seed notebook");
+        let mut executor = crate::edge_tools::ToolExecutor::new(temp.path());
+        let mut tool_cache = EdgeToolCache::new(8);
+        executor
+            .journal_turn_index
+            .store(6, std::sync::atomic::Ordering::Relaxed);
+        let _ = executor.read_file(&serde_json::json!({"path": "analysis.ipynb"}));
+
+        let mut host = CliSseStreamHost::from_edge_ctx(
+            EdgeSseContext {
+                api: &api,
+                token: "tok",
+                executor_id: "edge-test",
+                executor: &mut executor,
+                render_policy: RenderPolicy::Silent,
+                perm_manager: None,
+                cancel_token: None,
+                stream_event_tx: None,
+                approval_request_tx: None,
+                skill_resolver: None,
+                skill_continuation: false,
+                tool_cache: &mut tool_cache,
+            },
+            80,
+            false,
+        );
+
+        let results = host
+            .execute_tools_batch(vec![
+                ToolBatchRequest {
+                    request_id: "tr-1".to_string(),
+                    tool: "notebook_edit".to_string(),
+                    args: serde_json::json!({
+                        "notebook_path": "analysis.ipynb",
+                        "edit_mode": "replace",
+                        "cell_id": "cell-1",
+                        "new_source": "x=2",
+                        "transaction_id": "tx-nb",
+                        "rollback_on_failure": true,
+                    }),
+                },
+                ToolBatchRequest {
+                    request_id: "tr-2".to_string(),
+                    tool: "read_file".to_string(),
+                    args: serde_json::json!({
+                        "path": "missing.txt",
+                        "transaction_id": "tx-nb",
+                        "rollback_on_failure": true,
+                    }),
+                },
+            ])
+            .await;
+
+        assert_eq!(results.len(), 2);
+        let rollback_fields = results[1]
+            .tool_result_fields
+            .as_ref()
+            .expect("rollback fields");
+        assert_eq!(
+            rollback_fields["transaction_state"].as_str(),
+            Some("rolled_back")
+        );
+        let restored = std::fs::read_to_string(&notebook).expect("restored notebook");
+        assert!(
+            restored.contains("\"x=1\""),
+            "restored notebook: {restored}"
+        );
+        assert!(
+            !restored.contains("\"x=2\""),
+            "restored notebook: {restored}"
         );
         assert_eq!(
             rollback_fields["transaction_rollback"]["files"]["reverted"]
