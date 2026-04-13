@@ -909,6 +909,13 @@ fn apply_adaptive_execution_profile(state: &mut AgenticLoopState) {
         None
     };
 
+    // Sync scenario-driven execution limit so the headless round enforces
+    // the per-turn tool cap from the active scenario, not the static default.
+    state.max_tools_per_turn = session_guard
+        .config
+        .tool_selection
+        .effective_max_tools_per_turn();
+
     // Collect attribution data while lock is held.
     let turn = session_guard.turn_number;
     let scenario_name = profile
@@ -951,11 +958,20 @@ fn apply_adaptive_execution_profile(state: &mut AgenticLoopState) {
             format!("{:.3}", profile.config.verification.strictness),
         ));
     }
-    if old_config.tool_selection.max_tools != profile.config.tool_selection.max_tools {
+    if old_config.tool_selection.max_tools_per_turn
+        != profile.config.tool_selection.max_tools_per_turn
+    {
         config_changes.push((
-            "tool_selection.max_tools".to_string(),
-            old_config.tool_selection.max_tools.to_string(),
-            profile.config.tool_selection.max_tools.to_string(),
+            "tool_selection.max_tools_per_turn".to_string(),
+            old_config
+                .tool_selection
+                .effective_max_tools_per_turn()
+                .to_string(),
+            profile
+                .config
+                .tool_selection
+                .effective_max_tools_per_turn()
+                .to_string(),
         ));
     }
     if old_config.tool_selection.tool_budget_tokens

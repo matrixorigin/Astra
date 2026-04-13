@@ -334,10 +334,11 @@ impl ToolSelectionConfig {
         }
     }
 
-    /// Resolved max tools per turn (0 → default of 15).
+    /// Resolved max tools per turn (0 → default of 15, floor of 5).
     pub fn effective_max_tools_per_turn(&self) -> u32 {
         if self.max_tools_per_turn > 0 {
-            self.max_tools_per_turn
+            // Floor of 5 prevents pathological starvation from aggressive scenarios.
+            self.max_tools_per_turn.max(5)
         } else {
             15
         }
@@ -1226,8 +1227,12 @@ mod tests {
         config.max_tools_per_turn = 10;
         assert_eq!(config.effective_max_tools_per_turn(), 10);
 
+        // Floor of 5 prevents pathological starvation
         config.max_tools_per_turn = 1;
-        assert_eq!(config.effective_max_tools_per_turn(), 1);
+        assert_eq!(config.effective_max_tools_per_turn(), 5);
+
+        config.max_tools_per_turn = 5;
+        assert_eq!(config.effective_max_tools_per_turn(), 5);
     }
 
     #[test]

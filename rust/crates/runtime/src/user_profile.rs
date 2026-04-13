@@ -410,7 +410,7 @@ impl Scenario {
     pub fn strategy_hints(&self) -> ScenarioStrategy {
         match self {
             Scenario::CodeReview => ScenarioStrategy {
-                max_tools_per_turn: 3,
+                max_tools_per_turn: 10,
                 prefer_read_only: true,
                 detail_level: Verbosity::Verbose,
                 memory_top_k: Some(7),
@@ -418,7 +418,7 @@ impl Scenario {
                 tool_budget_tokens: 900,
             },
             Scenario::Debugging => ScenarioStrategy {
-                max_tools_per_turn: 5,
+                max_tools_per_turn: 15,
                 prefer_read_only: false,
                 detail_level: Verbosity::Debug,
                 memory_top_k: Some(8),
@@ -426,7 +426,7 @@ impl Scenario {
                 tool_budget_tokens: 1100,
             },
             Scenario::Exploration => ScenarioStrategy {
-                max_tools_per_turn: 6,
+                max_tools_per_turn: 15,
                 prefer_read_only: true,
                 detail_level: Verbosity::Normal,
                 memory_top_k: Some(10),
@@ -434,7 +434,7 @@ impl Scenario {
                 tool_budget_tokens: 1000,
             },
             Scenario::Planning => ScenarioStrategy {
-                max_tools_per_turn: 2,
+                max_tools_per_turn: 8,
                 prefer_read_only: true,
                 detail_level: Verbosity::Verbose,
                 memory_top_k: None,
@@ -442,7 +442,7 @@ impl Scenario {
                 tool_budget_tokens: 600,
             },
             Scenario::Implementation => ScenarioStrategy {
-                max_tools_per_turn: 4,
+                max_tools_per_turn: 12,
                 prefer_read_only: false,
                 detail_level: Verbosity::Normal,
                 memory_top_k: None,
@@ -450,7 +450,7 @@ impl Scenario {
                 tool_budget_tokens: 1200,
             },
             Scenario::Refactoring => ScenarioStrategy {
-                max_tools_per_turn: 4,
+                max_tools_per_turn: 12,
                 prefer_read_only: false,
                 detail_level: Verbosity::Verbose,
                 memory_top_k: Some(7),
@@ -458,7 +458,7 @@ impl Scenario {
                 tool_budget_tokens: 1100,
             },
             Scenario::Testing => ScenarioStrategy {
-                max_tools_per_turn: 5,
+                max_tools_per_turn: 15,
                 prefer_read_only: false,
                 detail_level: Verbosity::Normal,
                 memory_top_k: None,
@@ -466,7 +466,7 @@ impl Scenario {
                 tool_budget_tokens: 1000,
             },
             Scenario::Documentation => ScenarioStrategy {
-                max_tools_per_turn: 3,
+                max_tools_per_turn: 10,
                 prefer_read_only: false,
                 detail_level: Verbosity::Verbose,
                 memory_top_k: None,
@@ -474,7 +474,7 @@ impl Scenario {
                 tool_budget_tokens: 600,
             },
             Scenario::DevOps => ScenarioStrategy {
-                max_tools_per_turn: 4,
+                max_tools_per_turn: 12,
                 prefer_read_only: false,
                 detail_level: Verbosity::Normal,
                 memory_top_k: None,
@@ -482,7 +482,7 @@ impl Scenario {
                 tool_budget_tokens: 900,
             },
             Scenario::Learning => ScenarioStrategy {
-                max_tools_per_turn: 4,
+                max_tools_per_turn: 12,
                 prefer_read_only: true,
                 detail_level: Verbosity::Verbose,
                 memory_top_k: Some(10),

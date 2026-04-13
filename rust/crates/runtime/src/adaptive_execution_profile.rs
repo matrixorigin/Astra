@@ -156,7 +156,10 @@ mod tests {
         );
 
         assert_eq!(profile.scenario, Some(Scenario::Implementation));
-        assert_eq!(profile.config.tool_selection.max_tools, 4);
+        assert_eq!(
+            profile.config.tool_selection.effective_max_tools_per_turn(),
+            12
+        );
     }
 
     #[test]
@@ -180,8 +183,8 @@ mod tests {
             // Verify config was adjusted
             let strategy = scenario.strategy_hints();
             assert_eq!(
-                profile.config.tool_selection.max_tools,
-                strategy.max_tools_per_turn as u32
+                profile.config.tool_selection.effective_max_tools_per_turn(),
+                (strategy.max_tools_per_turn as u32).max(5)
             );
         }
     }
