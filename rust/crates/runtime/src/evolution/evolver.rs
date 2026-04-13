@@ -54,6 +54,8 @@ pub fn generate_fast_proposals(signals: &[EvolutionSignal]) -> Vec<EvolutionProp
                         sorted.sort();
                         sorted.join("|")
                     };
+                    // Scale confidence: 3 → 0.8, 5 → 0.9, 7+ → 0.95
+                    let confidence = (0.8 + (*stall_count as f64 - 3.0) * 0.05).min(0.95);
                     proposals.push(EvolutionProposal {
                         id: make_id(),
                         signal: signal.clone(),
@@ -61,8 +63,8 @@ pub fn generate_fast_proposals(signals: &[EvolutionSignal]) -> Vec<EvolutionProp
                             signature: sig,
                             action: PatternAction::Block,
                         },
-                        confidence: 0.9,
-                        reasoning: format!("Tool chain stalled {stall_count} consecutive rounds"),
+                        confidence,
+                        reasoning: format!("Tool chain stalled {stall_count} times"),
                         created_at: now,
                         status: ApprovalStatus::Pending,
                         promotion_verdict: None,
@@ -227,6 +229,29 @@ mod tests {
         }];
         let proposals = generate_fast_proposals(&signals);
         assert!(proposals.is_empty());
+    }
+
+    #[test]
+    fn stall_confidence_scales_with_count() {
+        // 3 failures → 0.8
+        let s3 = vec![EvolutionSignal::RepeatedStall {
+            tool_chain: vec!["bash".into()],
+            stall_count: 3,
+            turn_id: "t1".into(),
+        }];
+        let p3 = generate_fast_proposals(&s3);
+        assert_eq!(p3.len(), 1);
+        assert!((p3[0].confidence - 0.8).abs() < 0.01);
+
+        // 10 failures → capped at 0.95
+        let s10 = vec![EvolutionSignal::RepeatedStall {
+            tool_chain: vec!["bash".into()],
+            stall_count: 10,
+            turn_id: "t2".into(),
+        }];
+        let p10 = generate_fast_proposals(&s10);
+        assert_eq!(p10.len(), 1);
+        assert!((p10[0].confidence - 0.95).abs() < 0.01);
     }
 
     #[test]

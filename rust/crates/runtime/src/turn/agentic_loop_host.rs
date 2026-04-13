@@ -4923,6 +4923,29 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                     .await;
                 }
             }
+
+            // Within-turn repetition: if the same tool failed 3+ times in this
+            // turn, treat it as a stall even if this is the first (or only) turn.
+            {
+                let this_turn = &state.stall.tool_call_records[evo_records_before..];
+                let mut fail_counts: std::collections::HashMap<&str, u32> =
+                    std::collections::HashMap::new();
+                for rec in this_turn {
+                    if !rec.ok {
+                        *fail_counts.entry(rec.name.as_str()).or_default() += 1;
+                    }
+                }
+                for (tool, count) in &fail_counts {
+                    if *count >= 3 {
+                        evo.add_signal(crate::evolution::types::EvolutionSignal::RepeatedStall {
+                            tool_chain: vec![(*tool).to_string()],
+                            stall_count: *count,
+                            turn_id: turn_id.to_string(),
+                        })
+                        .await;
+                    }
+                }
+            }
         }
 
         // ── Feed tool results into liquid step-level signal collector ──
