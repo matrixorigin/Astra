@@ -1067,7 +1067,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
     },
     ToolMeta {
         name: "diagnose",
-        description: "Get runtime, tool, and session health diagnostics such as resource usage, tool availability, and session status",
+        description: "Get runtime, tool, and session diagnostics",
         triggers: &[
             "system diagnostics",
             "health check",

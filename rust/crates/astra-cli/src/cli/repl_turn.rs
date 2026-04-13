@@ -1623,21 +1623,10 @@ fn report_turn_failure(
         );
 
         // Enrich with partial data rescued from AgenticLoopState
-        if !failure.partial.tool_call_records.is_empty() {
-            err_event.tool_calls = Some(failure.partial.tool_call_records.clone());
-        }
-        if failure.partial.prompt_tokens > 0 {
-            err_event.tokens_in = Some(failure.partial.prompt_tokens);
-        }
-        if failure.partial.completion_tokens > 0 {
-            err_event.tokens_out = Some(failure.partial.completion_tokens);
-        }
-        if failure.partial.tool_calls_count > 0 {
-            err_event.tool_count = Some(failure.partial.tool_calls_count);
-        }
-        if !failure.partial.tools_used.is_empty() {
-            err_event.tools_used = Some(failure.partial.tools_used.clone());
-        }
+        crate::streaming_types::apply_partial_turn_data_to_error_event(
+            &mut err_event,
+            &failure.partial,
+        );
         // Always populate metadata for post-mortem analysis.
         {
             let error_category = classify_turn_error(&failure.error);
@@ -3321,6 +3310,23 @@ mod tests {
         tool_selector::TfIdfSelector::new(registry)
     }
 
+    fn tool_call_record(
+        name: &str,
+        ok: bool,
+        result_preview: Option<&str>,
+    ) -> session_journal::ToolCallRecord {
+        session_journal::ToolCallRecord {
+            name: name.into(),
+            ok,
+            ms: 0,
+            error: None,
+            input_bytes: None,
+            output_bytes: None,
+            args_preview: None,
+            result_preview: result_preview.map(str::to_string),
+        }
+    }
+
     #[test]
     #[serial_test::serial]
     fn apply_turn_success_sets_prompt_hint_for_followup() {
@@ -3354,6 +3360,60 @@ mod tests {
         );
 
         super::repl_ui::clear_followup_prompt_hint();
+    }
+
+    #[test]
+    fn report_turn_failure_persists_filtered_partial_metrics() {
+        let (_tmp, _g) = isolated_sessions_dir();
+        let sid = format!("test-turn-failure-{}", uuid::Uuid::new_v4());
+        let mut state = ReplState {
+            journal: Some(session_journal::JournalWriter::new(&sid).unwrap()),
+            session_id: Some(sid.clone()),
+            model: Some("gpt-5".into()),
+            ..Default::default()
+        };
+        let failure = crate::TurnFailure {
+            error: "model overloaded".into(),
+            partial: crate::PartialTurnData {
+                tool_call_records: vec![
+                    tool_call_record(
+                        "bash",
+                        false,
+                        Some("Skipped: the skill already completed this work."),
+                    ),
+                    tool_call_record("read_file", true, Some("contents")),
+                ],
+                tools_used: vec!["read_file".into()],
+                prompt_tokens: 13,
+                completion_tokens: 7,
+                tool_calls_count: 1,
+                partial_text: "Partial analysis".into(),
+                ..Default::default()
+            },
+        };
+
+        report_turn_failure(
+            &mut state,
+            None,
+            "show session metrics",
+            &failure,
+            Instant::now(),
+        );
+
+        let event = state.last_turn_event.as_ref().expect("turn_error event");
+        assert_eq!(event.tool_count, Some(1));
+        assert_eq!(event.tools_used, Some(vec!["read_file".into()]));
+        assert_eq!(event.tokens_in, Some(13));
+        assert_eq!(event.tokens_out, Some(7));
+        assert_eq!(event.tool_calls.as_ref().map(Vec::len), Some(2));
+        assert_eq!(state.history.len(), 1);
+        assert_eq!(state.last_response.as_deref(), Some("Partial analysis"));
+
+        let events = session_journal::read_journal(&sid).unwrap();
+        let persisted = events.last().expect("persisted turn_error");
+        assert_eq!(persisted.tool_count, Some(1));
+        assert_eq!(persisted.tools_used, Some(vec!["read_file".into()]));
+        assert_eq!(persisted.tool_calls.as_ref().map(Vec::len), Some(2));
     }
 
     #[test]

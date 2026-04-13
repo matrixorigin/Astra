@@ -39,6 +39,27 @@ impl std::fmt::Display for TurnFailure {
     }
 }
 
+pub(crate) fn apply_partial_turn_data_to_error_event(
+    event: &mut astra_services::session_journal::JournalEvent,
+    partial: &PartialTurnData,
+) {
+    if !partial.tool_call_records.is_empty() {
+        event.tool_calls = Some(partial.tool_call_records.clone());
+    }
+    if partial.prompt_tokens > 0 {
+        event.tokens_in = Some(partial.prompt_tokens);
+    }
+    if partial.completion_tokens > 0 {
+        event.tokens_out = Some(partial.completion_tokens);
+    }
+    if partial.tool_calls_count > 0 {
+        event.tool_count = Some(partial.tool_calls_count);
+    }
+    if !partial.tools_used.is_empty() {
+        event.tools_used = Some(partial.tools_used.clone());
+    }
+}
+
 /// Result of a streaming chat turn, including token counts and tool usage data.
 #[derive(Debug)]
 pub(crate) struct StreamResult {
@@ -105,5 +126,54 @@ impl StreamResult {
     ) {
         self.routing_domain_hint = routing_domain_hint;
         self.entity_learn_skipped_no_domain = entity_learn_skipped_no_domain;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use astra_services::session_journal::{JournalEvent, ToolCallRecord};
+
+    fn tool_record(name: &str, result_preview: Option<&str>) -> ToolCallRecord {
+        ToolCallRecord {
+            name: name.into(),
+            ok: true,
+            ms: 0,
+            error: None,
+            input_bytes: None,
+            output_bytes: None,
+            args_preview: None,
+            result_preview: result_preview.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn apply_partial_turn_data_to_error_event_copies_filtered_metrics() {
+        let partial = PartialTurnData {
+            tool_call_records: vec![
+                tool_record(
+                    "bash",
+                    Some("Skipped: the skill already completed this work."),
+                ),
+                tool_record("read_file", Some("contents")),
+            ],
+            tools_used: vec!["read_file".into()],
+            prompt_tokens: 42,
+            completion_tokens: 21,
+            tool_calls_count: 1,
+            ..Default::default()
+        };
+        let mut event = JournalEvent::turn_error(Some("s1"), 1, None, "hi", "boom", 5);
+
+        apply_partial_turn_data_to_error_event(&mut event, &partial);
+
+        assert_eq!(event.tool_count, Some(1));
+        assert_eq!(
+            event.tools_used.as_deref(),
+            Some(&["read_file".to_string()][..])
+        );
+        assert_eq!(event.tokens_in, Some(42));
+        assert_eq!(event.tokens_out, Some(21));
+        assert_eq!(event.tool_calls.as_ref().map(Vec::len), Some(2));
     }
 }

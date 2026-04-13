@@ -1245,21 +1245,10 @@ async fn plan_executor_task(
                         &failure.error,
                         0,
                     );
-                    if !failure.partial.tool_call_records.is_empty() {
-                        event.tool_calls = Some(failure.partial.tool_call_records.clone());
-                    }
-                    if failure.partial.prompt_tokens > 0 {
-                        event.tokens_in = Some(failure.partial.prompt_tokens);
-                    }
-                    if failure.partial.completion_tokens > 0 {
-                        event.tokens_out = Some(failure.partial.completion_tokens);
-                    }
-                    if failure.partial.tool_calls_count > 0 {
-                        event.tool_count = Some(failure.partial.tool_calls_count);
-                    }
-                    if !failure.partial.tools_used.is_empty() {
-                        event.tools_used = Some(failure.partial.tools_used.clone());
-                    }
+                    crate::streaming_types::apply_partial_turn_data_to_error_event(
+                        &mut event,
+                        &failure.partial,
+                    );
                     emit_event(&update_tx, &ctx, event);
 
                     // Retry: mark subtask back to Pending so the next loop iteration
