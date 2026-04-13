@@ -871,7 +871,10 @@ impl VerificationRunner {
                 for p in paths {
                     let full = self.work_dir.join(p);
                     if !full.exists() {
-                        missing.push(p.clone());
+                        // Fallback: search for the filename anywhere under work_dir
+                        if find_file_in_tree(&self.work_dir, p).is_none() {
+                            missing.push(p.clone());
+                        }
                     }
                 }
                 let passed = missing.is_empty();
@@ -889,8 +892,15 @@ impl VerificationRunner {
                 should_match,
             } => {
                 let full = self.work_dir.join(file);
+                let resolved = if full.exists() {
+                    full
+                } else {
+                    // Fallback: search for the filename anywhere under work_dir
+                    find_file_in_tree(&self.work_dir, file)
+                        .ok_or_else(|| format!("read {file}: No such file or directory"))?
+                };
                 let content =
-                    std::fs::read_to_string(&full).map_err(|e| format!("read {file}: {e}"))?;
+                    std::fs::read_to_string(&resolved).map_err(|e| format!("read {file}: {e}"))?;
                 let found = content.contains(pattern);
                 let passed = found == *should_match;
                 let evidence = if found {
@@ -915,18 +925,37 @@ impl VerificationRunner {
                     std::path::PathBuf::from(path)
                 } else {
                     let full = self.work_dir.join(path);
-                    // Security: prevent relative path traversal (e.g. "../../../etc/passwd")
-                    let canonical = full
-                        .canonicalize()
-                        .map_err(|e| format!("invalid path {path}: {e}"))?;
-                    let work_canonical = self
-                        .work_dir
-                        .canonicalize()
-                        .map_err(|e| format!("work_dir canonicalization failed: {e}"))?;
-                    if !canonical.starts_with(&work_canonical) {
-                        return Err(format!("path '{path}' escapes work directory boundary"));
+                    if full.exists() {
+                        // Security: prevent relative path traversal (e.g. "../../../etc/passwd")
+                        let canonical = full
+                            .canonicalize()
+                            .map_err(|e| format!("invalid path {path}: {e}"))?;
+                        let work_canonical = self
+                            .work_dir
+                            .canonicalize()
+                            .map_err(|e| format!("work_dir canonicalization failed: {e}"))?;
+                        if !canonical.starts_with(&work_canonical) {
+                            return Err(format!("path '{path}' escapes work directory boundary"));
+                        }
+                        canonical
+                    } else {
+                        // Fallback: search for the filename anywhere under work_dir
+                        let found = find_file_in_tree(&self.work_dir, path).ok_or_else(|| {
+                            format!("invalid path {path}: No such file or directory (os error 2)")
+                        })?;
+                        // Boundary check on fallback result (symlinks could escape)
+                        let canonical = found
+                            .canonicalize()
+                            .map_err(|e| format!("invalid path {path}: {e}"))?;
+                        let work_canonical = self
+                            .work_dir
+                            .canonicalize()
+                            .map_err(|e| format!("work_dir canonicalization failed: {e}"))?;
+                        if !canonical.starts_with(&work_canonical) {
+                            return Err(format!("path '{path}' escapes work directory boundary"));
+                        }
+                        canonical
                     }
-                    canonical
                 };
                 let content =
                     std::fs::read_to_string(&resolved).map_err(|e| format!("read {path}: {e}"))?;
@@ -1259,6 +1288,58 @@ fn truncate(s: &str, max: usize) -> String {
     } else {
         format!("{}…[truncated]", &s[..max])
     }
+}
+
+/// Search for a file by its basename (or path suffix) under `root`.
+/// Returns the first match found within a bounded walk. Used as a fallback
+/// when the LLM-generated path doesn't match the actual file location.
+fn find_file_in_tree(root: &std::path::Path, target: &str) -> Option<std::path::PathBuf> {
+    use std::path::Path;
+    let target_path = Path::new(target);
+    let target_name = target_path.file_name()?.to_str()?;
+    // If target has directory components (e.g. "src/app.js"), match the suffix
+    let has_dir = target_path.parent().is_some_and(|p| p != Path::new(""));
+    let skip = [
+        "node_modules",
+        "target",
+        ".git",
+        "dist",
+        "build",
+        "__pycache__",
+        "venv",
+    ];
+    let mut stack = vec![root.to_path_buf()];
+    let mut checked = 0u32;
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            checked += 1;
+            if checked > 5000 {
+                return None;
+            }
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str.starts_with('.') || skip.contains(&name_str.as_ref()) {
+                continue;
+            }
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if name_str == target_name {
+                // If target has dir components, verify the path suffix matches
+                if has_dir {
+                    let rel = path.strip_prefix(root).unwrap_or(&path);
+                    if !rel.ends_with(target_path) {
+                        continue;
+                    }
+                }
+                return Some(path);
+            }
+        }
+    }
+    None
 }
 
 // ─── Git4Data Task Branching ────────────────────────────────────────────────
@@ -7083,5 +7164,115 @@ Time:        3.456 s
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn find_file_in_tree_finds_by_basename() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("src");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("app.js"), "hello").unwrap();
+        let found = find_file_in_tree(dir.path(), "app.js");
+        assert!(found.is_some());
+        assert!(found.unwrap().ends_with("app.js"));
+    }
+
+    #[test]
+    fn find_file_in_tree_matches_path_suffix() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::create_dir_all(dir.path().join("lib")).unwrap();
+        std::fs::write(dir.path().join("src/app.js"), "src").unwrap();
+        std::fs::write(dir.path().join("lib/app.js"), "lib").unwrap();
+        let found = find_file_in_tree(dir.path(), "src/app.js");
+        assert!(found.is_some());
+        let content = std::fs::read_to_string(found.unwrap()).unwrap();
+        assert_eq!(content, "src");
+    }
+
+    #[test]
+    fn find_file_in_tree_returns_none_for_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(find_file_in_tree(dir.path(), "nonexistent.rs").is_none());
+    }
+
+    #[test]
+    fn find_file_in_tree_skips_node_modules() {
+        let dir = tempfile::tempdir().unwrap();
+        let nm = dir.path().join("node_modules/pkg");
+        std::fs::create_dir_all(&nm).unwrap();
+        std::fs::write(nm.join("hidden.js"), "x").unwrap();
+        assert!(find_file_in_tree(dir.path(), "hidden.js").is_none());
+    }
+
+    #[tokio::test]
+    async fn verification_runner_file_exists_fallback() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // File at sub/app.js, but criteria says just "app.js"
+        std::fs::create_dir_all(tmp.path().join("sub")).unwrap();
+        std::fs::write(tmp.path().join("sub/app.js"), "hello").unwrap();
+
+        let runner = VerificationRunner::new(tmp.path().to_path_buf());
+        let criterion = VerificationCriterion {
+            id: "f1".into(),
+            description: "".into(),
+            verifier: VerifierKind::FileExists {
+                paths: vec!["app.js".into()],
+            },
+            required: true,
+            timeout_sec: 10,
+            global_only: false,
+        };
+        let result = runner.run_criterion(&criterion).await;
+        assert!(result.passed, "fallback should find sub/app.js: {:?}", result);
+    }
+
+    #[tokio::test]
+    async fn verification_runner_grep_check_fallback() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(tmp.path().join("src/index.html"), "<h1>statistics</h1>").unwrap();
+
+        let runner = VerificationRunner::new(tmp.path().to_path_buf());
+        // Criteria says "index.html" but file is at "src/index.html"
+        let criterion = VerificationCriterion {
+            id: "g1".into(),
+            description: "".into(),
+            verifier: VerifierKind::GrepCheck {
+                file: "index.html".into(),
+                pattern: "statistics".into(),
+                should_match: true,
+            },
+            required: true,
+            timeout_sec: 10,
+            global_only: false,
+        };
+        let result = runner.run_criterion(&criterion).await;
+        assert!(result.passed, "fallback should find src/index.html: {:?}", result);
+    }
+
+    #[tokio::test]
+    async fn verification_runner_read_file_contains_fallback() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("dist")).unwrap();
+        // Note: "dist" is in skip list for find_file_in_tree, so put it elsewhere
+        std::fs::create_dir_all(tmp.path().join("out")).unwrap();
+        std::fs::write(tmp.path().join("out/app.js"), "function main() {}").unwrap();
+
+        let runner = VerificationRunner::new(tmp.path().to_path_buf());
+        let criterion = VerificationCriterion {
+            id: "r1".into(),
+            description: "".into(),
+            verifier: VerifierKind::ReadFileContains {
+                path: "app.js".into(),
+                contains: vec!["function".into()],
+                not_contains: vec![],
+            },
+            required: true,
+            timeout_sec: 10,
+            global_only: false,
+        };
+        let result = runner.run_criterion(&criterion).await;
+        assert!(result.passed, "fallback should find out/app.js: {:?}", result);
     }
 }

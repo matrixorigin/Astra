@@ -153,7 +153,7 @@ pub fn acceptance_checks_to_criteria(
                 id: format!("{subtask_id}-files"),
                 description: format!("Modified files exist: {}", files.join(", ")),
                 verifier: VerifierKind::FileExists {
-                    paths: files.to_vec(),
+                    paths: files.iter().map(|p| sanitize_criteria_path(p)).collect(),
                 },
                 required: true,
                 timeout_sec: 10,
@@ -170,8 +170,52 @@ pub fn acceptance_checks_to_criteria(
                 )
             })
             .enumerate()
-            .map(|(i, vk)| wrap_verifier(format!("{subtask_id}-ac{i}"), vk.clone()))
+            .map(|(i, vk)| {
+                wrap_verifier(
+                    format!("{subtask_id}-ac{i}"),
+                    sanitize_verifier_paths(vk.clone()),
+                )
+            })
             .collect()
+    }
+}
+
+/// Strip `tmp/`, `/tmp/`, and leading `/` from paths in criteria to keep them
+/// project-relative. LLMs frequently hallucinate these prefixes.
+fn sanitize_criteria_path(path: &str) -> String {
+    let p = path
+        .strip_prefix("/tmp/")
+        .or_else(|| path.strip_prefix("tmp/"))
+        .unwrap_or(path);
+    // Also strip leading `/` to make absolute paths relative
+    p.strip_prefix('/').unwrap_or(p).to_string()
+}
+
+/// Apply path sanitization to all path fields inside a `VerifierKind`.
+fn sanitize_verifier_paths(vk: VerifierKind) -> VerifierKind {
+    match vk {
+        VerifierKind::FileExists { paths } => VerifierKind::FileExists {
+            paths: paths.iter().map(|p| sanitize_criteria_path(p)).collect(),
+        },
+        VerifierKind::GrepCheck {
+            file,
+            pattern,
+            should_match,
+        } => VerifierKind::GrepCheck {
+            file: sanitize_criteria_path(&file),
+            pattern,
+            should_match,
+        },
+        VerifierKind::ReadFileContains {
+            path,
+            contains,
+            not_contains,
+        } => VerifierKind::ReadFileContains {
+            path: sanitize_criteria_path(&path),
+            contains,
+            not_contains,
+        },
+        other => other,
     }
 }
 
@@ -822,5 +866,69 @@ mod tests {
             not_contains: vec![],
         });
         assert!(d.contains("c.rs") && d.contains("hello"));
+    }
+
+    #[test]
+    fn sanitize_criteria_path_strips_tmp_prefix() {
+        assert_eq!(sanitize_criteria_path("tmp/app.js"), "app.js");
+        assert_eq!(sanitize_criteria_path("/tmp/app.js"), "app.js");
+        assert_eq!(sanitize_criteria_path("/tmp/src/main.rs"), "src/main.rs");
+        assert_eq!(sanitize_criteria_path("src/app.js"), "src/app.js");
+        assert_eq!(sanitize_criteria_path("/usr/local/bin"), "usr/local/bin");
+    }
+
+    #[test]
+    fn sanitize_verifier_paths_cleans_all_variants() {
+        let vk = VerifierKind::GrepCheck {
+            file: "tmp/index.html".into(),
+            pattern: "hello".into(),
+            should_match: true,
+        };
+        let cleaned = sanitize_verifier_paths(vk);
+        match cleaned {
+            VerifierKind::GrepCheck { file, .. } => assert_eq!(file, "index.html"),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn sanitize_verifier_paths_passthrough_non_path_variants() {
+        let vk = VerifierKind::BuildPass {
+            cmd: "cargo build".into(),
+        };
+        let cleaned = sanitize_verifier_paths(vk.clone());
+        assert!(matches!(cleaned, VerifierKind::BuildPass { .. }));
+    }
+
+    #[test]
+    fn acceptance_checks_to_criteria_sanitizes_file_paths() {
+        let criteria = acceptance_checks_to_criteria(
+            "s1",
+            &[],
+            &["tmp/app.js".into(), "/tmp/index.html".into()],
+        );
+        assert_eq!(criteria.len(), 1);
+        match &criteria[0].verifier {
+            VerifierKind::FileExists { paths } => {
+                assert_eq!(paths, &["app.js", "index.html"]);
+            }
+            _ => panic!("expected FileExists"),
+        }
+    }
+
+    #[test]
+    fn acceptance_checks_to_criteria_sanitizes_check_paths() {
+        let checks = vec![VerifierKind::GrepCheck {
+            file: "/tmp/src/main.rs".into(),
+            pattern: "fn main".into(),
+            should_match: true,
+        }];
+        let criteria = acceptance_checks_to_criteria("s1", &checks, &[]);
+        match &criteria[0].verifier {
+            VerifierKind::GrepCheck { file, .. } => {
+                assert_eq!(file, "src/main.rs");
+            }
+            _ => panic!("expected GrepCheck"),
+        }
     }
 }

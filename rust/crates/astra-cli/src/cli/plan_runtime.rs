@@ -142,8 +142,26 @@ async fn ensure_durable_task_state(
     api: Option<&astra_thin_client::ThinClient>,
     token: Option<&str>,
 ) {
-    if state.durable_task_state.is_some() {
-        return;
+    if let Some(ref durable) = state.durable_task_state {
+        // Reuse existing contract if subtask IDs still match the plan.
+        // If the user edited the plan (added/removed subtasks), regenerate.
+        if let Some(ref plan) = state.executing_plan {
+            let contract_ids: std::collections::HashSet<&str> = durable
+                .contract
+                .subtasks
+                .iter()
+                .map(|s| s.id.as_str())
+                .collect();
+            let plan_ids: std::collections::HashSet<&str> =
+                plan.subtasks.iter().map(|s| s.id.as_str()).collect();
+            if contract_ids == plan_ids {
+                return;
+            }
+            // Mismatch — drop stale contract so it gets regenerated below
+            state.durable_task_state = None;
+        } else {
+            return;
+        }
     }
     let plan = match state.executing_plan.as_ref() {
         Some(p) => p,
@@ -239,7 +257,7 @@ async fn ensure_durable_task_state(
                 ),
                 std::sync::Arc::new(astra_runtime::server::delegation_engine::StubSubRunExecutor),
             );
-        state.delegation_engine = Some(std::sync::Arc::new(engine));
+            state.delegation_engine = Some(std::sync::Arc::new(engine));
         }
     }
 }

@@ -276,6 +276,18 @@ fn display_plan_updates_live(
                 state.current_plan_subtask_id = Some(subtask_id);
                 continue;
             }
+            PlanUpdate::SubtaskStatusSync { id, status } => {
+                if let Some(ref mut ps) = state.plan_mode {
+                    if let Some(st) = ps.plan.subtasks.iter_mut().find(|s| s.id == id) {
+                        st.status = status;
+                    }
+                }
+                continue;
+            }
+            PlanUpdate::DurableStateReturn(durable) => {
+                state.durable_task_state = Some(*durable);
+                continue;
+            }
             PlanUpdate::PlanProgress {
                 done,
                 total,
@@ -884,6 +896,25 @@ fn apply_trailing_update(update: plan_executor::PlanUpdate, state: &mut ReplStat
             state.turn += 1;
             state.current_plan_subtask_id = Some(subtask_id);
         }
+        PlanUpdate::SubtaskStatusSync { id, status } => {
+            sync_subtask_status(state, &id, status);
+        }
+        PlanUpdate::DurableStateReturn(durable) => {
+            state.durable_task_state = Some(*durable);
+        }
         _ => {}
+    }
+}
+
+/// Update the plan_mode's subtask status to keep it in sync with the executor.
+fn sync_subtask_status(
+    state: &mut ReplState,
+    subtask_id: &str,
+    status: astra_services::task_orchestrator::TaskStatus,
+) {
+    if let Some(ref mut ps) = state.plan_mode {
+        if let Some(st) = ps.plan.subtasks.iter_mut().find(|s| s.id == subtask_id) {
+            st.status = status;
+        }
     }
 }

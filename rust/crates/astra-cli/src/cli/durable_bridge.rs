@@ -44,6 +44,14 @@ pub struct DurableTaskState {
     pub last_report: Option<TaskDeliveryReport>,
 }
 
+impl std::fmt::Debug for DurableTaskState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DurableTaskState")
+            .field("contract_id", &self.contract.contract_id)
+            .finish_non_exhaustive()
+    }
+}
+
 // ─── Contract generation ─────────────────────────────────────────────────────
 
 /// Generate a [`TaskContract`] from a plan and persist it via the lifecycle.

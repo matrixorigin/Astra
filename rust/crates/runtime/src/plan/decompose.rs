@@ -534,7 +534,8 @@ Decompose this goal into 3-8 concrete subtasks. For EACH subtask, provide:
 Guidelines:
 - Order subtasks so dependencies come first
 - Each subtask should be completable in ONE focused session
-- **Paths in `acceptance_checks` must match `files` and the real output location** — if you list `/tmp/game.html` in `files`, use that exact path in `grep_check` / `read_file_contains`; mismatched paths cause false verification failures.
+- **All file paths must be relative to the project root** (the current working directory). Never use `/tmp/`, `tmp/`, or any absolute path. If the goal creates new files, place them in the project root or a sensible subdirectory (e.g. `src/`, `index.html`, `app.js`).
+- **Paths in `acceptance_checks` must match `files` exactly** — mismatched paths cause false verification failures.
 - Always include a testing subtask
 - If the goal involves refactoring, add a "verify no regression" final subtask
 

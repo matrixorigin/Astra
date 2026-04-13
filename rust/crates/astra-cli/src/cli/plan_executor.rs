@@ -109,6 +109,15 @@ pub enum PlanUpdate {
         reason: String,
         response_tx: tokio::sync::oneshot::Sender<bool>,
     },
+    /// Sync subtask status back to the REPL so plan_mode stays up-to-date
+    /// across re-runs. Sent after each subtask completes or fails.
+    SubtaskStatusSync {
+        id: String,
+        status: astra_services::task_orchestrator::TaskStatus,
+    },
+    /// Return the durable task state back to the REPL after execution ends,
+    /// so re-runs can reuse the contract instead of regenerating it.
+    DurableStateReturn(Box<crate::durable_bridge::DurableTaskState>),
 }
 
 /// Commands sent from the REPL to a background plan executor.
@@ -531,8 +540,7 @@ pub(super) struct BackgroundPlanContext {
     pub root_agent_id: String,
     pub durable_task_state: Option<durable_bridge::DurableTaskState>,
     pub workspace_root: PathBuf,
-    pub observability_hub:
-        Option<Arc<astra_runtime::observability_integration::ObservabilityHub>>,
+    pub observability_hub: Option<Arc<astra_runtime::observability_integration::ObservabilityHub>>,
     pub observability_session: Option<
         Arc<std::sync::RwLock<astra_runtime::observability_integration::ObservabilitySession>>,
     >,
@@ -540,12 +548,9 @@ pub(super) struct BackgroundPlanContext {
         Arc<std::sync::Mutex<astra_runtime::turn::file_edit_journal::FileEditJournal>>,
     pub database_snapshot_journal:
         Arc<std::sync::Mutex<crate::edge_tools::DatabaseSnapshotRollbackJournal>>,
-    pub git_stash_journal:
-        Arc<std::sync::Mutex<crate::edge_tools::GitStashRollbackJournal>>,
-    pub git_commit_journal:
-        Arc<std::sync::Mutex<crate::edge_tools::GitCommitRollbackJournal>>,
-    pub git_worktree_journal:
-        Arc<std::sync::Mutex<crate::edge_tools::GitWorktreeRollbackJournal>>,
+    pub git_stash_journal: Arc<std::sync::Mutex<crate::edge_tools::GitStashRollbackJournal>>,
+    pub git_commit_journal: Arc<std::sync::Mutex<crate::edge_tools::GitCommitRollbackJournal>>,
+    pub git_worktree_journal: Arc<std::sync::Mutex<crate::edge_tools::GitWorktreeRollbackJournal>>,
     pub session_state_journal:
         Arc<std::sync::Mutex<crate::edge_tools::SessionStateRollbackJournal>>,
     pub task_manager: Arc<crate::edge_tools::TaskManager>,
@@ -780,6 +785,11 @@ async fn plan_executor_task(
                         task_type: Some("plan".into()),
                     };
                     let _ = bridge.learn_from_task_outcome(&signal).await;
+                }
+
+                // Return durable state so re-runs can reuse the contract
+                if let Some(durable) = ctx.durable_task_state.take() {
+                    let _ = update_tx.send(PlanUpdate::DurableStateReturn(Box::new(durable)));
                 }
 
                 let _ = update_tx.send(PlanUpdate::PlanCompleted {
@@ -1156,6 +1166,10 @@ async fn plan_executor_task(
                                 done,
                             );
                             emit_event(&update_tx, &ctx, event);
+                            let _ = update_tx.send(PlanUpdate::SubtaskStatusSync {
+                                id: next_id.clone(),
+                                status: TaskStatus::Completed,
+                            });
                         } else if let Some(ref durable) = ctx.durable_task_state {
                             // Extract retry details from the durable contract
                             let (attempt, max_retries, failure_hint) = durable
@@ -1192,6 +1206,10 @@ async fn plan_executor_task(
                                     failure_hint,
                                 );
                                 st.status = TaskStatus::Completed;
+                                let _ = update_tx.send(PlanUpdate::SubtaskStatusSync {
+                                    id: next_id.clone(),
+                                    status: TaskStatus::Completed,
+                                });
                             } else {
                                 sink.subtask_verification_failed(
                                     next_id,
@@ -1259,6 +1277,14 @@ async fn plan_executor_task(
                     if *retry_count > MAX_TURN_RETRIES {
                         if let Some(st) = ctx.plan.subtasks.iter_mut().find(|s| s.id == *next_id) {
                             st.status = TaskStatus::Failed;
+                        }
+                        let _ = update_tx.send(PlanUpdate::SubtaskStatusSync {
+                            id: next_id.clone(),
+                            status: TaskStatus::Failed,
+                        });
+                        if let Some(durable) = ctx.durable_task_state.take() {
+                            let _ =
+                                update_tx.send(PlanUpdate::DurableStateReturn(Box::new(durable)));
                         }
                         let _ = update_tx.send(PlanUpdate::PlanError {
                             error: format!(
