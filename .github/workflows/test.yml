@@ -8,23 +8,19 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # Align with `astra_core::AppSettings` + MatrixOne / Redis service hostnames (GitHub Actions services).
-  MATRIXONE_HOST: matrixone
+  MATRIXONE_HOST: localhost
   MATRIXONE_PORT: "6001"
   MATRIXONE_USER: root
   MATRIXONE_PASSWORD: "111"
   MATRIXONE_DATABASE: astra_runtime
   MATRIXONE_AUTO_CREATE_DATABASE: "1"
-  REDIS_HOST: redis
-  REDIS_PORT: "6379"
   JWT_SECRET_KEY: ci-jwt-secret-key-at-least-32-chars-long
   SECRET_KEY: ci-app-secret-key-at-least-32-chars-long
   TOKEN_ENCRYPTION_KEY: ci-token-encryption-key-at-least-32-chars
   ASTRA_BRIDGE_TEST_SECRET: system-matrix-e2e-secret
   CHAT_TURN_BRIDGE_SECRET: dev-bridge-secret-change-me
-  EMBEDDING_PROVIDER: openai
-  EMBEDDING_MODEL: BAAI/bge-m3
-  EMBEDDING_DIM: "0"
+  MEMORIA_BASE_URL: http://localhost:8100
+  MEMORIA_MASTER_KEY: ci-test-master-key
 
 jobs:
   test:
@@ -35,47 +31,54 @@ jobs:
         ports:
           - 6001:6001
         options: >-
-          --health-cmd "mysql -h127.0.0.1 -P6001 -uroot -p111 -e 'SELECT 1'"
+          --health-cmd "curl -sf http://127.0.0.1:6060/debug/vars || exit 1"
           --health-interval 10s
           --health-timeout 5s
           --health-retries 10
           --health-start-period 30s
 
-      redis:
-        image: redis:7-alpine
+      memoria:
+        image: matrixorigin/memoria:latest
         ports:
-          - 6379:6379
+          - 8100:8100
+        env:
+          DATABASE_URL: mysql://root:111@matrixone:6001/memoria
+          MASTER_KEY: ci-test-master-key
+          EMBEDDING_PROVIDER: mock
+          EMBEDDING_DIM: "384"
         options: >-
-          --health-cmd "redis-cli ping"
-          --health-interval 5s
-          --health-timeout 3s
-          --health-retries 5
+          --health-cmd "curl -sf http://127.0.0.1:8100/health || exit 1"
+          --health-interval 15s
+          --health-timeout 5s
+          --health-retries 6
+          --health-start-period 15s
 
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/cache@v4
+      - uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('rust/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-registry-
+          workspaces: rust
 
-      - name: Install mysql client (for database bootstrap)
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq default-mysql-client
-
-      - name: Wait for MatrixOne
+      - name: Wait for dependencies
         run: |
           set -euo pipefail
+          echo "Waiting for MatrixOne..."
           for i in $(seq 1 90); do
-            if mysql -h matrixone -P6001 -uroot -p111 -e "SELECT 1" 2>/dev/null; then
+            if curl -sf http://localhost:6060/debug/vars >/dev/null 2>&1; then
               echo "MatrixOne is up"
               break
             fi
-            echo "waiting for MatrixOne ($i/90)..."
+            echo "  waiting ($i/90)..."
+            sleep 2
+          done
+          echo "Waiting for Memoria..."
+          for i in $(seq 1 60); do
+            if curl -sf http://localhost:8100/health >/dev/null 2>&1; then
+              echo "Memoria is up"
+              break
+            fi
+            echo "  waiting ($i/60)..."
             sleep 2
           done
 

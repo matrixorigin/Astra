@@ -1,5 +1,4 @@
 # Optional: full ignored Matrix system E2E (`system_matrix_http_e2e`).
-# Run when a MatrixOne instance and app secrets are available (repository secrets / environment).
 # See `docs/testing/system-e2e-matrix.md` for env ↔ test mapping.
 name: E2E Matrix (manual)
 
@@ -7,40 +6,74 @@ on:
   workflow_dispatch:
     inputs:
       test_name_filter:
-        description: "Optional `cargo test` name filter (substring). Empty = run all ignored tests in the binary."
+        description: "Optional `cargo test` name filter (substring). Empty = run all ignored tests."
         required: false
         default: ""
 
 jobs:
   system-matrix-e2e:
     runs-on: ubuntu-latest
-    # Uncomment when MatrixOne is available as a service or reachable host:
-    # services:
-    #   matrixone:
-    #     image: matrixorigin/matrixone:latest
-    #     ports:
-    #       - 6001:6001
+    services:
+      matrixone:
+        image: matrixorigin/matrixone:latest
+        ports:
+          - 6001:6001
+        options: >-
+          --health-cmd "curl -sf http://127.0.0.1:6060/debug/vars || exit 1"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+          --health-start-period 30s
+
+      memoria:
+        image: matrixorigin/memoria:latest
+        ports:
+          - 8100:8100
+        env:
+          DATABASE_URL: mysql://root:111@matrixone:6001/memoria
+          MASTER_KEY: ci-test-master-key
+          EMBEDDING_PROVIDER: mock
+          EMBEDDING_DIM: "384"
+        options: >-
+          --health-cmd "curl -sf http://127.0.0.1:8100/health || exit 1"
+          --health-interval 15s
+          --health-timeout 5s
+          --health-retries 6
+          --health-start-period 15s
+
+    env:
+      MATRIXONE_HOST: localhost
+      MATRIXONE_PORT: "6001"
+      MATRIXONE_USER: root
+      MATRIXONE_PASSWORD: "111"
+      MATRIXONE_DATABASE: astra_runtime
+      MATRIXONE_AUTO_CREATE_DATABASE: "1"
+      JWT_SECRET_KEY: ci-jwt-secret-key-at-least-32-chars-long
+      SECRET_KEY: ci-app-secret-key-at-least-32-chars-long
+      TOKEN_ENCRYPTION_KEY: ci-token-encryption-key-at-least-32-chars
+      ASTRA_BRIDGE_TEST_SECRET: system-matrix-e2e-secret
+      CHAT_TURN_BRIDGE_SECRET: dev-bridge-secret-change-me
+      MEMORIA_BASE_URL: http://localhost:8100
+      MEMORIA_MASTER_KEY: ci-test-master-key
 
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
 
       - name: Run system Matrix HTTP E2E (ignored tests)
-        working-directory: rust
         env:
           ASTRA_SYSTEM_MATRIX_E2E: "1"
-          ASTRA_BRIDGE_TEST_SECRET: system-matrix-e2e-secret
           TEST_NAME_FILTER: ${{ github.event.inputs.test_name_filter || '' }}
-          # Set via repo secrets / vars before relying on this job in CI:
-          # MATRIXONE_HOST, MATRIXONE_PORT, MATRIXONE_USER, MATRIXONE_PASSWORD, MATRIXONE_DATABASE
-          # JWT_SECRET_KEY, SECRET_KEY, REDIS_*, EMBEDDING_* (see astra_core::AppSettings::from_env)
         run: |
           set -euo pipefail
           FILTER="${TEST_NAME_FILTER:-}"
           if [ -n "$FILTER" ]; then
-            cargo test -p astra-runtime --test system_matrix_http_e2e \
+            cargo test --manifest-path rust/Cargo.toml -p astra-runtime --test system_matrix_http_e2e \
               --features bridge-e2e-hooks -- "$FILTER" --ignored --nocapture
           else
-            cargo test -p astra-runtime --test system_matrix_http_e2e \
+            cargo test --manifest-path rust/Cargo.toml -p astra-runtime --test system_matrix_http_e2e \
               --features bridge-e2e-hooks -- --ignored --nocapture
           fi

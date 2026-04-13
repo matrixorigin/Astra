@@ -3,122 +3,93 @@ name: Regression Gate
 on:
   pull_request:
     paths:
-      - 'prompts/**'
+      - 'rust/**'
       - 'skills/**'
       - 'config/**'
-      - 'rust/**'
 
 jobs:
   regression-gate:
     runs-on: ubuntu-latest
-    
+
     services:
       matrixone:
         image: matrixorigin/matrixone:latest
         ports:
           - 6001:6001
         options: >-
-          --health-cmd "mysql -h127.0.0.1 -P6001 -uroot -p111 -e 'SELECT 1'"
+          --health-cmd "curl -sf http://127.0.0.1:6060/debug/vars || exit 1"
           --health-interval 10s
           --health-timeout 5s
-          --health-retries 5
-      
-      redis:
-        image: redis:7-alpine
-        ports:
-          - 6379:6379
-        options: >-
-          --health-cmd "redis-cli ping"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-    
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-      
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+          --health-retries 10
+          --health-start-period 30s
 
-      - name: Cache cargo
-        uses: actions/cache@v4
+      memoria:
+        image: matrixorigin/memoria:latest
+        ports:
+          - 8100:8100
+        env:
+          DATABASE_URL: mysql://root:111@matrixone:6001/memoria
+          MASTER_KEY: ci-test-master-key
+          EMBEDDING_PROVIDER: mock
+          EMBEDDING_DIM: "384"
+        options: >-
+          --health-cmd "curl -sf http://127.0.0.1:8100/health || exit 1"
+          --health-interval 15s
+          --health-timeout 5s
+          --health-retries 6
+          --health-start-period 15s
+
+    env:
+      MATRIXONE_HOST: localhost
+      MATRIXONE_PORT: "6001"
+      MATRIXONE_USER: root
+      MATRIXONE_PASSWORD: "111"
+      MATRIXONE_DATABASE: astra_runtime
+      MATRIXONE_AUTO_CREATE_DATABASE: "1"
+      JWT_SECRET_KEY: ci-jwt-secret-key-at-least-32-chars-long
+      SECRET_KEY: ci-app-secret-key-at-least-32-chars-long
+      TOKEN_ENCRYPTION_KEY: ci-token-encryption-key-at-least-32-chars
+      CHAT_TURN_BRIDGE_SECRET: dev-bridge-secret-change-me
+      MEMORIA_BASE_URL: http://localhost:8100
+      MEMORIA_MASTER_KEY: ci-test-master-key
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('rust/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-registry-
-      
-      - name: Detect change type
-        id: detect-change
-        run: |
-          # Detect what changed
-          if git diff --name-only origin/main | grep -q '^prompts/'; then
-            echo "change_type=prompt" >> $GITHUB_OUTPUT
-            echo "change_id=prompt_$(date +%Y%m%d_%H%M%S)" >> $GITHUB_OUTPUT
-          elif git diff --name-only origin/main | grep -q '^skills/'; then
-            echo "change_type=skill" >> $GITHUB_OUTPUT
-            echo "change_id=skill_$(date +%Y%m%d_%H%M%S)" >> $GITHUB_OUTPUT
-          elif git diff --name-only origin/main | grep -q '^config/'; then
-            echo "change_type=config" >> $GITHUB_OUTPUT
-            echo "change_id=config_$(date +%Y%m%d_%H%M%S)" >> $GITHUB_OUTPUT
-          else
-            echo "change_type=selector" >> $GITHUB_OUTPUT
-            echo "change_id=selector_$(date +%Y%m%d_%H%M%S)" >> $GITHUB_OUTPUT
-          fi
-      
-      - name: Prepare change content
-        run: |
-          # Create change content JSON (placeholder - customize based on actual change)
-          echo '{"version": "test", "content": "test change"}' > change.json
-      
-      - name: Run regression gate
+          workspaces: rust
+
+      - name: Run contract tests
         id: gate
         run: |
-          if cargo test --manifest-path rust/Cargo.toml -p astra-runtime --test evaluation_contract; then
-            echo '{"verdict":"pass","summary":"Rust evaluation contracts passed"}' > gate_result.json
+          if make test-contract; then
+            echo '{"verdict":"pass","summary":"Contract tests passed"}' > gate_result.json
           else
-            echo '{"verdict":"fail","summary":"Rust evaluation contracts failed"}' > gate_result.json
+            echo '{"verdict":"fail","summary":"Contract tests failed"}' > gate_result.json
           fi
         continue-on-error: true
-      
-      - name: Generate report
-        if: always()
-        run: |
-          echo "## Regression Gate Result" > gate_comment.md
-          echo "" >> gate_comment.md
-          jq -r '.summary' gate_result.json >> gate_comment.md
-      
+
       - name: Comment on PR
         if: always()
         uses: actions/github-script@v7
         with:
           script: |
             const fs = require('fs');
-            const comment = fs.readFileSync('gate_comment.md', 'utf8');
-            
+            const result = JSON.parse(fs.readFileSync('gate_result.json', 'utf8'));
+            const emoji = result.verdict === 'pass' ? '✅' : '❌';
             github.rest.issues.createComment({
               issue_number: context.issue.number,
               owner: context.repo.owner,
               repo: context.repo.repo,
-              body: comment
+              body: `## Regression Gate\n\n${emoji} ${result.summary}`
             });
-      
+
       - name: Check gate result
         run: |
-          # Check if gate was skipped or passed
-          if [ -f gate_result.json ]; then
-            verdict=$(jq -r '.verdict' gate_result.json)
-            if [ "$verdict" = "fail" ]; then
-              echo "❌ Regression gate failed"
-              exit 1
-            elif [ "$verdict" = "skip" ]; then
-              echo "⚠️ Regression gate skipped (no golden sessions)"
-              exit 0
-            else
-              echo "✅ Regression gate passed"
-            fi
-          else
-            echo "⚠️ Gate result not found"
+          verdict=$(jq -r '.verdict' gate_result.json)
+          if [ "$verdict" = "fail" ]; then
+            echo "❌ Regression gate failed"
             exit 1
           fi
+          echo "✅ Regression gate passed"
