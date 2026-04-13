@@ -573,8 +573,6 @@ pub(crate) use super::agentic_adaptive_tuning::{
     snapshot_evolution_promotion_ids,
 };
 pub use super::agentic_loop_tool_support::delegate_tool_schema;
-#[cfg(test)]
-use super::agentic_loop_tool_support::edge_tool_status_exit_code;
 #[allow(unused_imports)]
 pub(crate) use super::agentic_loop_tool_support::{
     extract_file_path_from_tool, record_edge_tool_observability,
@@ -1081,15 +1079,6 @@ mod tests {
         assert!(!should_emit_adaptive_scenario_event(false, false, true));
         assert!(!should_emit_adaptive_scenario_event(true, true, true));
         assert!(!should_emit_adaptive_scenario_event(false, true, false));
-    }
-
-    #[test]
-    fn edge_tool_status_exit_code_maps_common_statuses() {
-        assert_eq!(edge_tool_status_exit_code("ok"), Some(0));
-        assert_eq!(edge_tool_status_exit_code("completed"), Some(0));
-        assert_eq!(edge_tool_status_exit_code("error"), Some(1));
-        assert_eq!(edge_tool_status_exit_code("partial_failure"), Some(1));
-        assert_eq!(edge_tool_status_exit_code("unknown"), None);
     }
 
     #[test]
@@ -1661,27 +1650,6 @@ mod tests {
             super::tool_call_arguments_value(&tool_call),
             json!({"task":"review","agents":["reviewer"]})
         );
-    }
-
-    #[test]
-    fn delegate_tool_schema_has_correct_structure() {
-        let schema = super::delegate_tool_schema();
-        assert_eq!(schema["type"], "function");
-        assert_eq!(schema["function"]["name"], "delegate");
-
-        let params = &schema["function"]["parameters"];
-        assert_eq!(params["type"], "object");
-
-        let required = params["required"].as_array().unwrap();
-        assert!(required.contains(&json!("task")));
-        assert!(required.contains(&json!("agents")));
-
-        let props = &params["properties"];
-        assert!(props["task"].is_object());
-        assert!(props["agents"].is_object());
-        assert!(props["pattern"].is_object());
-        assert!(props["max_rounds"].is_object());
-        assert!(props["context"].is_object());
     }
 
     #[test]
@@ -2748,25 +2716,6 @@ mod tests {
 
         let expected = delegate_tool_schema();
         assert_eq!(host.injected_schemas[0], expected);
-    }
-
-    #[test]
-    fn delegate_schema_has_required_openai_structure() {
-        let schema = delegate_tool_schema();
-        assert_eq!(schema["type"], "function");
-        assert_eq!(schema["function"]["name"], "delegate");
-        assert!(schema["function"]["description"].as_str().unwrap().len() > 10);
-        let params = &schema["function"]["parameters"];
-        assert_eq!(params["type"], "object");
-        let required = params["required"].as_array().unwrap();
-        assert!(required.contains(&json!("task")));
-        assert!(required.contains(&json!("agents")));
-        let props = &params["properties"];
-        assert!(props.get("task").is_some());
-        assert!(props.get("agents").is_some());
-        assert!(props.get("pattern").is_some());
-        assert!(props.get("max_rounds").is_some());
-        assert!(props.get("context").is_some());
     }
 
     #[tokio::test]

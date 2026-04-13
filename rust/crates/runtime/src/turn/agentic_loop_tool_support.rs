@@ -101,3 +101,79 @@ pub(crate) fn extract_file_path_from_tool(tool_name: &str, args: &Value) -> Opti
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn edge_tool_status_exit_code_maps_common_statuses() {
+        assert_eq!(edge_tool_status_exit_code("ok"), Some(0));
+        assert_eq!(edge_tool_status_exit_code("completed"), Some(0));
+        assert_eq!(edge_tool_status_exit_code("error"), Some(1));
+        assert_eq!(edge_tool_status_exit_code("partial_failure"), Some(1));
+        assert_eq!(edge_tool_status_exit_code("unknown"), None);
+    }
+
+    #[test]
+    fn delegate_tool_schema_has_correct_structure() {
+        let schema = delegate_tool_schema();
+        assert_eq!(schema["type"], "function");
+        assert_eq!(schema["function"]["name"], "delegate");
+
+        let params = &schema["function"]["parameters"];
+        assert_eq!(params["type"], "object");
+
+        let required = params["required"].as_array().unwrap();
+        assert!(required.contains(&json!("task")));
+        assert!(required.contains(&json!("agents")));
+
+        let props = &params["properties"];
+        assert!(props["task"].is_object());
+        assert!(props["agents"].is_object());
+        assert!(props["pattern"].is_object());
+        assert!(props["max_rounds"].is_object());
+        assert!(props["context"].is_object());
+    }
+
+    #[test]
+    fn delegate_schema_has_required_openai_structure() {
+        let schema = delegate_tool_schema();
+        assert_eq!(schema["type"], "function");
+        assert_eq!(schema["function"]["name"], "delegate");
+        assert!(schema["function"]["description"].as_str().unwrap().len() > 10);
+        let params = &schema["function"]["parameters"];
+        assert_eq!(params["type"], "object");
+        let required = params["required"].as_array().unwrap();
+        assert!(required.contains(&json!("task")));
+        assert!(required.contains(&json!("agents")));
+        let props = &params["properties"];
+        assert!(props.get("task").is_some());
+        assert!(props.get("agents").is_some());
+        assert!(props.get("pattern").is_some());
+        assert!(props.get("max_rounds").is_some());
+        assert!(props.get("context").is_some());
+    }
+
+    #[test]
+    fn extract_file_path_from_tool_reads_common_path_fields() {
+        assert_eq!(
+            extract_file_path_from_tool("read_file", &json!({ "path": "/tmp/a.txt" })),
+            Some("/tmp/a.txt".to_string())
+        );
+        assert_eq!(
+            extract_file_path_from_tool("write_file", &json!({ "file_path": "/tmp/b.txt" })),
+            Some("/tmp/b.txt".to_string())
+        );
+        assert_eq!(
+            extract_file_path_from_tool("glob", &json!({ "directory": "/tmp/c" })),
+            Some("/tmp/c".to_string())
+        );
+        assert_eq!(
+            extract_file_path_from_tool("bash", &json!({ "command": "pwd" })),
+            None
+        );
+    }
+}
