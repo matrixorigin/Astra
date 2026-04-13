@@ -196,6 +196,9 @@ fn check_bash_path_boundary_with_oldpwd(
     command: &str,
     oldpwd: Option<&std::path::Path>,
 ) -> Option<String> {
+    if let Some(msg) = check_shell_loop_path_boundary(policy, command, oldpwd) {
+        return Some(msg);
+    }
     // Split on unquoted shell command separators to check ALL commands, not
     // just the first. Covers: `cmd1 | cmd2`, `cmd1 && cmd2`, `cmd1 ; cmd2`,
     // `cmd1 || cmd2`, and newline-separated commands, while preserving quoted
@@ -337,6 +340,167 @@ fn shell_tokenize_like_bash(input: &str) -> Vec<String> {
     }
 
     tokens
+}
+
+#[derive(Clone, Debug)]
+struct ShellTokenSpan {
+    text: String,
+    start: usize,
+    end: usize,
+}
+
+fn shell_tokenize_with_control_spans(input: &str) -> Vec<ShellTokenSpan> {
+    let chars: Vec<(usize, char)> = input.char_indices().collect();
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut current_start = None::<usize>;
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut escaped = false;
+    let mut idx = 0usize;
+
+    let flush_current = |tokens: &mut Vec<ShellTokenSpan>,
+                         current: &mut String,
+                         current_start: &mut Option<usize>,
+                         end: usize| {
+        if let Some(start) = current_start.take()
+            && !current.is_empty()
+        {
+            tokens.push(ShellTokenSpan {
+                text: std::mem::take(current),
+                start,
+                end,
+            });
+        } else {
+            current.clear();
+        }
+    };
+
+    while idx < chars.len() {
+        let (byte_idx, ch) = chars[idx];
+
+        if escaped {
+            escaped = false;
+            current.push(ch);
+            idx += 1;
+            continue;
+        }
+
+        if ch == '\\' && !in_single_quote {
+            current_start.get_or_insert(byte_idx);
+            escaped = true;
+            idx += 1;
+            continue;
+        }
+
+        if ch == '\'' && !in_double_quote {
+            current_start.get_or_insert(byte_idx);
+            in_single_quote = !in_single_quote;
+            idx += 1;
+            continue;
+        }
+
+        if ch == '"' && !in_single_quote {
+            current_start.get_or_insert(byte_idx);
+            in_double_quote = !in_double_quote;
+            idx += 1;
+            continue;
+        }
+
+        if !in_single_quote && !in_double_quote {
+            if ch.is_whitespace() {
+                flush_current(&mut tokens, &mut current, &mut current_start, byte_idx);
+                idx += 1;
+                continue;
+            }
+
+            if matches!(ch, ';' | '\n' | '\r') {
+                flush_current(&mut tokens, &mut current, &mut current_start, byte_idx);
+                tokens.push(ShellTokenSpan {
+                    text: ";".to_string(),
+                    start: byte_idx,
+                    end: byte_idx + ch.len_utf8(),
+                });
+                idx += 1;
+                continue;
+            }
+
+            if matches!(ch, '|' | '&') {
+                flush_current(&mut tokens, &mut current, &mut current_start, byte_idx);
+                let (text, consumed, end) =
+                    if chars.get(idx + 1).is_some_and(|(_, next)| *next == ch) {
+                        let (next_idx, next_ch) = chars[idx + 1];
+                        (format!("{ch}{ch}"), 2usize, next_idx + next_ch.len_utf8())
+                    } else {
+                        (ch.to_string(), 1usize, byte_idx + ch.len_utf8())
+                    };
+                tokens.push(ShellTokenSpan {
+                    text,
+                    start: byte_idx,
+                    end,
+                });
+                idx += consumed;
+                continue;
+            }
+        }
+
+        current_start.get_or_insert(byte_idx);
+        current.push(ch);
+        idx += 1;
+    }
+
+    flush_current(&mut tokens, &mut current, &mut current_start, input.len());
+    tokens
+}
+
+fn is_shell_assignment_token(token: &str) -> bool {
+    let Some((name, _value)) = token.split_once('=') else {
+        return false;
+    };
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+
+fn first_segment_subcommand(parts: &[String]) -> Option<&str> {
+    let mut idx = 0usize;
+    while parts
+        .get(idx)
+        .is_some_and(|part| is_shell_assignment_token(part))
+    {
+        idx += 1;
+    }
+
+    let mut base = parts.get(idx)?.as_str();
+    if matches!(base, "command" | "builtin") {
+        idx += 1;
+        while parts
+            .get(idx)
+            .is_some_and(|part| is_shell_assignment_token(part))
+        {
+            idx += 1;
+        }
+        base = parts.get(idx)?.as_str();
+    } else if base == "env" {
+        idx += 1;
+        while let Some(part) = parts.get(idx) {
+            let token = part.as_str();
+            if token.starts_with('-') || is_shell_assignment_token(token) {
+                idx += 1;
+                continue;
+            }
+            base = token;
+            break;
+        }
+        if idx >= parts.len() {
+            return None;
+        }
+    }
+
+    Some(base.rsplit('/').next().unwrap_or(base))
 }
 
 const ESCAPED_SHELL_DOLLAR: char = '\u{E000}';
@@ -1049,6 +1213,127 @@ fn is_boundary_sensitive_file_access_command(base: &str) -> bool {
 
 fn subcommand_requires_boundary_review(base: &str) -> bool {
     is_boundary_sensitive_file_access_command(base) || is_shell_interpreter_command(base)
+}
+
+fn check_shell_loop_path_boundary(
+    policy: &astra_runtime::tool_sandbox::SandboxPolicy,
+    command: &str,
+    oldpwd: Option<&std::path::Path>,
+) -> Option<String> {
+    let tokens = shell_tokenize_with_control_spans(command);
+    let mut idx = 0usize;
+    while idx < tokens.len() {
+        let loop_kind = match tokens[idx].text.as_str() {
+            "while" => ShellLoopKind::WhileRead,
+            "for" => ShellLoopKind::ForIn,
+            _ => {
+                idx += 1;
+                continue;
+            }
+        };
+
+        let Some((do_idx, done_idx)) = shell_loop_body_token_indices(&tokens, idx) else {
+            idx += 1;
+            continue;
+        };
+
+        let body = command[tokens[do_idx].end..tokens[done_idx].start].trim();
+        let loop_fanout_kind = match loop_kind {
+            ShellLoopKind::WhileRead
+                if tokens[idx + 1..do_idx]
+                    .iter()
+                    .any(|token| token.text.as_str() == "read") =>
+            {
+                Some(loop_kind)
+            }
+            ShellLoopKind::ForIn
+                if tokens[idx + 1..do_idx]
+                    .iter()
+                    .any(|token| token.text.as_str() == "in") =>
+            {
+                Some(loop_kind)
+            }
+            _ => None,
+        };
+        let fanout_subcommand = loop_fanout_kind.and_then(|kind| {
+            shell_loop_body_subcommand_requires_boundary_review(body)
+                .map(|subcommand| (kind, subcommand))
+        });
+
+        if let Some(msg) = (!body.is_empty())
+            .then(|| check_bash_path_boundary_with_oldpwd(policy, body, oldpwd))
+            .flatten()
+        {
+            if let Some((kind, subcommand)) = fanout_subcommand.as_ref()
+                && msg.contains("shell variable expansion")
+            {
+                return Some(shell_loop_fanout_review_message(policy, *kind, subcommand));
+            }
+            return Some(msg);
+        }
+        if let Some((kind, subcommand)) = fanout_subcommand {
+            return Some(shell_loop_fanout_review_message(policy, kind, &subcommand));
+        }
+        idx = done_idx + 1;
+    }
+    None
+}
+
+fn shell_loop_fanout_review_message(
+    policy: &astra_runtime::tool_sandbox::SandboxPolicy,
+    loop_kind: ShellLoopKind,
+    subcommand: &str,
+) -> String {
+    format!(
+        "{}The command uses `{loop_kind} {subcommand}` so file paths may be supplied from shell loop iterations and cannot be statically validated against the project directory '{}'. Ask the user for permission before using shell loop fan-out with file-access or shell commands.",
+        super::SANDBOX_DENIED_PREFIX,
+        policy.project_root.display(),
+    )
+}
+
+fn shell_loop_body_token_indices(
+    tokens: &[ShellTokenSpan],
+    loop_idx: usize,
+) -> Option<(usize, usize)> {
+    let do_idx = ((loop_idx + 1)..tokens.len()).find(|idx| tokens[*idx].text.as_str() == "do")?;
+    let mut nested_loops = 0usize;
+    for idx in (do_idx + 1)..tokens.len() {
+        match tokens[idx].text.as_str() {
+            "while" | "for" => nested_loops += 1,
+            "done" if nested_loops == 0 => return Some((do_idx, idx)),
+            "done" => nested_loops -= 1,
+            _ => {}
+        }
+    }
+    None
+}
+
+fn shell_loop_body_subcommand_requires_boundary_review(body: &str) -> Option<String> {
+    for segment in bash_command_segments(body) {
+        let parts = shell_tokenize_like_bash(segment);
+        let Some(base) = first_segment_subcommand(&parts) else {
+            continue;
+        };
+        if subcommand_requires_boundary_review(base) {
+            return Some(base.to_string());
+        }
+    }
+    None
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ShellLoopKind {
+    WhileRead,
+    ForIn,
+}
+
+impl std::fmt::Display for ShellLoopKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WhileRead => write!(f, "while read"),
+            Self::ForIn => write!(f, "for"),
+        }
+    }
 }
 
 fn xargs_subcommand_requires_boundary_review(parts: &[String]) -> Option<String> {
@@ -4660,6 +4945,98 @@ mod tests {
         assert!(
             result.is_none(),
             "fd fan-out should stay allowed for non-file-access subcommands"
+        );
+    }
+
+    #[test]
+    fn while_read_file_access_requires_boundary_review() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(
+            &policy,
+            "printf '%s\\n' /etc/passwd | while read path; do cat \"$path\"; done",
+        );
+        assert!(
+            result
+                .as_deref()
+                .is_some_and(|msg| msg.starts_with(super::SANDBOX_DENIED_PREFIX)
+                    && msg.contains("while read cat")),
+            "while-read file fan-out should require boundary review"
+        );
+    }
+
+    #[test]
+    fn while_read_shell_requires_boundary_review() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(
+            &policy,
+            "while IFS= read -r path; do bash -lc 'cat \"$1\"' _ \"$path\"; done < src/files.txt",
+        );
+        assert!(
+            result
+                .as_deref()
+                .is_some_and(|msg| msg.starts_with(super::SANDBOX_DENIED_PREFIX)
+                    && msg.contains("while read bash")),
+            "while-read shell fan-out should require boundary review"
+        );
+    }
+
+    #[test]
+    fn while_read_echo_is_allowed() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(
+            &policy,
+            "printf '%s\\n' src/main.rs | while read path; do echo \"$path\"; done",
+        );
+        assert!(
+            result.is_none(),
+            "while-read loops should stay allowed for non-file-access subcommands"
+        );
+    }
+
+    #[test]
+    fn for_loop_file_access_requires_boundary_review() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(
+            &policy,
+            "for path in src/main.rs /etc/passwd; do cat \"$path\"; done",
+        );
+        assert!(
+            result.as_deref().is_some_and(
+                |msg| msg.starts_with(super::SANDBOX_DENIED_PREFIX) && msg.contains("for cat")
+            ),
+            "for-loop file fan-out should require boundary review"
+        );
+    }
+
+    #[test]
+    fn for_loop_echo_is_allowed() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(
+            &policy,
+            "for path in src/main.rs src/lib.rs; do echo \"$path\"; done",
+        );
+        assert!(
+            result.is_none(),
+            "for-loops should stay allowed for non-file-access subcommands"
+        );
+    }
+
+    #[test]
+    fn generic_shell_loop_static_outside_path_is_blocked() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(&policy, "while true; do cat /etc/passwd; done");
+        assert!(
+            result
+                .as_deref()
+                .is_some_and(|msg| msg.starts_with(super::SANDBOX_DENIED_PREFIX)
+                    && msg.contains("/etc/passwd")),
+            "loop bodies should still run normal path-boundary checks"
         );
     }
 
