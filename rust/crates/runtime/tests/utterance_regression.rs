@@ -1795,6 +1795,41 @@ mod tool_coverage {
         );
     }
 
+    // ── context_analysis / diagnose ──
+
+    #[test]
+    fn cn_runtime_metrics_selects_context_analysis() {
+        let s = SelectionSnapshot::from_query("刚才的执行运行指标怎么样?");
+        let names = s.tool_names();
+        assert!(names.contains(&"context_analysis"), "Got: {:?}", names);
+    }
+
+    #[test]
+    fn cn_this_session_ranks_context_analysis_above_memory_profile() {
+        let s = SelectionSnapshot::from_query("这个session的啊");
+        let names = s.tool_names();
+        let ctx_pos = names
+            .iter()
+            .position(|n| *n == "context_analysis")
+            .unwrap_or(999);
+        let mem_pos = names
+            .iter()
+            .position(|n| *n == "memory_profile")
+            .unwrap_or(999);
+        assert!(ctx_pos < mem_pos, "Got: {:?}", names);
+    }
+
+    #[test]
+    fn en_session_health_selects_diagnose() {
+        let s =
+            SelectionSnapshot::from_query("check the current session health and tool availability");
+        assert!(
+            s.tool_names().contains(&"diagnose"),
+            "Got: {:?}",
+            s.tool_names()
+        );
+    }
+
     // ── mo_snapshot ──
 
     #[test]
