@@ -26,6 +26,30 @@ use tokio::sync::Mutex;
 use tower::util::ServiceExt;
 use uuid::Uuid;
 
+/// Extract the JSON payload from an SSE frame that may include `id:` / `event:` prefix lines.
+fn extract_sse_data(frame: &str) -> &str {
+    for line in frame.lines() {
+        if let Some(rest) = line.strip_prefix("data: ") {
+            return rest;
+        }
+        if let Some(rest) = line.strip_prefix("data:") {
+            return rest;
+        }
+    }
+    panic!("SSE frame has no data: line: {frame:?}");
+}
+
+/// Strip stream metadata fields that the bridge now injects into every outbound event.
+fn strip_stream_metadata(value: &mut serde_json::Value) {
+    if let Some(obj) = value.as_object_mut() {
+        obj.remove("event_id");
+        obj.remove("sequence");
+        obj.remove("protocol_version");
+        obj.remove("turn_chain_id");
+        obj.remove("user_query_event_id");
+    }
+}
+
 #[derive(Deserialize)]
 struct BridgeContract {
     request: serde_json::Value,
@@ -763,8 +787,12 @@ macro_rules! internal_rebuild_case {
         let frames: Vec<serde_json::Value> = payload
             .trim()
             .split("\n\n")
-            .map(|frame| frame.strip_prefix("data: ").unwrap())
-            .map(|json| serde_json::from_str::<serde_json::Value>(json).unwrap())
+            .map(|frame| extract_sse_data(frame))
+            .map(|json| {
+                let mut v = serde_json::from_str::<serde_json::Value>(json).unwrap();
+                strip_stream_metadata(&mut v);
+                v
+            })
             .collect();
 
         ($check)(&frames, $label);
@@ -930,9 +958,15 @@ async fn chat_turn_bridge_returns_sse_error_when_upstream_is_unavailable() {
         .unwrap();
     let payload = String::from_utf8(body.to_vec()).unwrap();
     let event = payload
-        .strip_prefix("data: ")
-        .and_then(|value| value.strip_suffix("\n\n"))
-        .map(|value| serde_json::from_str::<serde_json::Value>(value).unwrap())
+        .trim()
+        .split("\n\n")
+        .map(|frame| extract_sse_data(frame))
+        .map(|json| {
+            let mut v = serde_json::from_str::<serde_json::Value>(json).unwrap();
+            strip_stream_metadata(&mut v);
+            v
+        })
+        .next()
         .unwrap();
     assert_eq!(event["type"], "error");
     assert_eq!(event["code"], contract.bridge_error_code);
@@ -1770,8 +1804,12 @@ async fn http_chat_turn_bridge_filters_bridge_state_events() {
     let frames = payload
         .trim()
         .split("\n\n")
-        .map(|frame| frame.strip_prefix("data: ").unwrap())
-        .map(|json| serde_json::from_str::<serde_json::Value>(json).unwrap())
+        .map(|frame| extract_sse_data(frame))
+        .map(|json| {
+            let mut v = serde_json::from_str::<serde_json::Value>(json).unwrap();
+            strip_stream_metadata(&mut v);
+            v
+        })
         .collect::<Vec<_>>();
     assert_eq!(frames.len(), 2);
     assert_trusted_session_info_frame(&frames[0], "s1");
@@ -2612,8 +2650,12 @@ async fn http_chat_turn_bridge_signals_error_on_truncated_stream() {
     let frames = payload
         .trim()
         .split("\n\n")
-        .map(|frame| frame.strip_prefix("data: ").unwrap())
-        .map(|json| serde_json::from_str::<serde_json::Value>(json).unwrap())
+        .map(|frame| extract_sse_data(frame))
+        .map(|json| {
+            let mut v = serde_json::from_str::<serde_json::Value>(json).unwrap();
+            strip_stream_metadata(&mut v);
+            v
+        })
         .collect::<Vec<_>>();
     assert_eq!(frames.len(), 3);
     assert_trusted_session_info_frame(&frames[0], "s1");
@@ -2670,8 +2712,12 @@ async fn http_chat_turn_bridge_blocks_prompt_leak_from_bridge_state() {
     let frames = payload
         .trim()
         .split("\n\n")
-        .map(|frame| frame.strip_prefix("data: ").unwrap())
-        .map(|json| serde_json::from_str::<serde_json::Value>(json).unwrap())
+        .map(|frame| extract_sse_data(frame))
+        .map(|json| {
+            let mut v = serde_json::from_str::<serde_json::Value>(json).unwrap();
+            strip_stream_metadata(&mut v);
+            v
+        })
         .collect::<Vec<_>>();
     assert_eq!(frames.len(), 3);
     assert_trusted_session_info_frame(&frames[0], "s1");
@@ -2734,8 +2780,12 @@ async fn http_chat_turn_bridge_synthesizes_warning_before_turn_complete() {
     let frames = payload
         .trim()
         .split("\n\n")
-        .map(|frame| frame.strip_prefix("data: ").unwrap())
-        .map(|json| serde_json::from_str::<serde_json::Value>(json).unwrap())
+        .map(|frame| extract_sse_data(frame))
+        .map(|json| {
+            let mut v = serde_json::from_str::<serde_json::Value>(json).unwrap();
+            strip_stream_metadata(&mut v);
+            v
+        })
         .collect::<Vec<_>>();
     assert_eq!(frames.len(), 3);
     assert_trusted_session_info_frame(&frames[0], "s1");
@@ -2799,8 +2849,12 @@ async fn http_chat_turn_bridge_synthesizes_explain_before_turn_complete() {
     let frames = payload
         .trim()
         .split("\n\n")
-        .map(|frame| frame.strip_prefix("data: ").unwrap())
-        .map(|json| serde_json::from_str::<serde_json::Value>(json).unwrap())
+        .map(|frame| extract_sse_data(frame))
+        .map(|json| {
+            let mut v = serde_json::from_str::<serde_json::Value>(json).unwrap();
+            strip_stream_metadata(&mut v);
+            v
+        })
         .collect::<Vec<_>>();
     assert_eq!(frames.len(), 3);
     assert_trusted_session_info_frame(&frames[0], "s1");
@@ -2870,8 +2924,12 @@ async fn http_chat_turn_bridge_preserves_upstream_warning_without_bridge_state()
     let frames = payload
         .trim()
         .split("\n\n")
-        .map(|frame| frame.strip_prefix("data: ").unwrap())
-        .map(|json| serde_json::from_str::<serde_json::Value>(json).unwrap())
+        .map(|frame| extract_sse_data(frame))
+        .map(|json| {
+            let mut v = serde_json::from_str::<serde_json::Value>(json).unwrap();
+            strip_stream_metadata(&mut v);
+            v
+        })
         .collect::<Vec<_>>();
     assert_eq!(frames.len(), 3);
     assert_trusted_session_info_frame(&frames[0], "s1");
@@ -2926,8 +2984,12 @@ async fn http_chat_turn_bridge_preserves_upstream_explain_without_bridge_state()
     let frames = payload
         .trim()
         .split("\n\n")
-        .map(|frame| frame.strip_prefix("data: ").unwrap())
-        .map(|json| serde_json::from_str::<serde_json::Value>(json).unwrap())
+        .map(|frame| extract_sse_data(frame))
+        .map(|json| {
+            let mut v = serde_json::from_str::<serde_json::Value>(json).unwrap();
+            strip_stream_metadata(&mut v);
+            v
+        })
         .collect::<Vec<_>>();
     assert_eq!(frames.len(), 3);
     assert_trusted_session_info_frame(&frames[0], "s1");
@@ -2987,8 +3049,12 @@ async fn http_chat_turn_bridge_synthesizes_trusted_session_info() {
     let frames = payload
         .trim()
         .split("\n\n")
-        .map(|frame| frame.strip_prefix("data: ").unwrap())
-        .map(|json| serde_json::from_str::<serde_json::Value>(json).unwrap())
+        .map(|frame| extract_sse_data(frame))
+        .map(|json| {
+            let mut v = serde_json::from_str::<serde_json::Value>(json).unwrap();
+            strip_stream_metadata(&mut v);
+            v
+        })
         .collect::<Vec<_>>();
     assert_eq!(frames.len(), 2);
     assert_trusted_session_info_frame(&frames[0], "generated-session");
@@ -3039,8 +3105,12 @@ async fn http_chat_turn_bridge_derives_has_tool_calls_from_tool_sigs() {
     let frames = payload
         .trim()
         .split("\n\n")
-        .map(|frame| frame.strip_prefix("data: ").unwrap())
-        .map(|json| serde_json::from_str::<serde_json::Value>(json).unwrap())
+        .map(|frame| extract_sse_data(frame))
+        .map(|json| {
+            let mut v = serde_json::from_str::<serde_json::Value>(json).unwrap();
+            strip_stream_metadata(&mut v);
+            v
+        })
         .collect::<Vec<_>>();
     assert_eq!(frames.len(), 2);
     assert_trusted_session_info_frame(&frames[0], "s1");
