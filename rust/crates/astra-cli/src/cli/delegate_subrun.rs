@@ -443,6 +443,21 @@ pub(crate) fn register_default_agents(
     use std::collections::HashMap;
 
     let profiles = [
+        // Root orchestrator for main REPL session — can delegate to all agents.
+        AgentProfile {
+            agent_id: "main".into(),
+            name: "Main".into(),
+            tier: AgentTier::Orchestrator,
+            system_prompt: None,
+            skill_filter: Vec::new(),
+            model_override: None,
+            can_delegate: true,
+            delegate_to: Vec::new(), // empty = all
+            max_delegation_depth: 3,
+            triggers: Vec::new(),
+            metadata: HashMap::new(),
+            mcp_servers: Vec::new(),
+        },
         AgentProfile {
             agent_id: "coder".into(),
             name: "Coder".into(),
@@ -516,10 +531,22 @@ mod tests {
         let mut registry = astra_services::coordination::AgentProfileRegistry::new();
         register_default_agents(&mut registry);
 
+        assert!(registry.get("main").is_some());
         assert!(registry.get("coder").is_some());
         assert!(registry.get("reviewer").is_some());
         assert!(registry.get("writer").is_some());
         assert!(registry.get("nonexistent").is_none());
+    }
+
+    #[test]
+    fn main_agent_can_delegate() {
+        let mut registry = astra_services::coordination::AgentProfileRegistry::new();
+        register_default_agents(&mut registry);
+
+        let main = registry.get("main").unwrap();
+        assert_eq!(main.tier, astra_services::coordination::AgentTier::Orchestrator);
+        assert!(main.can_delegate, "main should be able to delegate");
+        assert!(main.delegate_to.is_empty(), "empty delegate_to = all agents");
     }
 
     #[test]
