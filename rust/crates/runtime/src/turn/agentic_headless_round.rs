@@ -360,6 +360,24 @@ enum HeadlessToolSlotControl {
     AbortRound,
 }
 
+enum HeadlessPipelineStage<T> {
+    Continue(T),
+    ShortCircuit,
+    AbortRound,
+}
+
+struct HeadlessPreparedExecution {
+    execution: HeadlessResolvedExecution,
+    idem_key: IdempotencyKey,
+}
+
+struct HeadlessExecutedExecution {
+    execution: HeadlessResolvedExecution,
+    idem_key: IdempotencyKey,
+    is_err: bool,
+    executed_ms: u64,
+}
+
 struct HeadlessToolExecutionCtx<'a, E: EdgeToolRoundRow> {
     turn_index: usize,
     quiet: bool,
@@ -501,11 +519,312 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         }
     }
 
-    async fn finalize_execution(
+    fn validate_slot(
         &mut self,
-        mut execution: HeadlessResolvedExecution,
-        idem_key: IdempotencyKey,
-    ) {
+        item: HeadlessRoundToolIdx,
+    ) -> HeadlessPipelineStage<HeadlessPreparedExecution> {
+        if self.executed_this_turn >= self.ctx.max_tools_per_turn {
+            let slot = self.resolve_slot(item);
+            self.emit_turn_budget_stub(&slot);
+            return HeadlessPipelineStage::ShortCircuit;
+        }
+
+        let slot = self.resolve_slot(item);
+
+        if self.ctx.pre_resolved_ids.contains(slot.id.as_str()) {
+            return HeadlessPipelineStage::ShortCircuit;
+        }
+
+        if slot.name.is_empty() {
+            return match self.handle_empty_tool_name(item, &slot) {
+                HeadlessToolSlotControl::Continue => HeadlessPipelineStage::ShortCircuit,
+                HeadlessToolSlotControl::AbortRound => HeadlessPipelineStage::AbortRound,
+            };
+        }
+        self.consecutive_empty_name = 0;
+
+        let call_sig = tool_dedup_signature(&slot.name, &slot.args);
+        let count = self.ctx.call_counts.entry(call_sig).or_insert(0);
+        *count += 1;
+        if *count > self.ctx.max_identical_calls {
+            let idem_key = IdempotencyKey::semantic(&slot.name, &slot.args);
+            if let Some(_cached) = self.ctx.idempotency_cache.check(&idem_key) {
+                let body = format!(
+                    "⛔ Cached repeat (call #{} for identical args, limit: {}). \
+                     The result is already in this conversation from an earlier call. \
+                     Do NOT call this tool again with the same arguments.",
+                    *count, self.ctx.max_identical_calls
+                );
+                let (tool_msg, tr) =
+                    headless_idempotency_hit_openai_pair(&slot.id, &slot.name, &body);
+                self.ctx.messages.push(tool_msg);
+                self.ctx.tool_results.push(tr);
+            } else {
+                let (tool_msg, tr) =
+                    headless_openai_duplicate_within_turn_pair(&slot.id, &slot.name);
+                self.ctx.messages.push(tool_msg);
+                self.ctx.tool_results.push(tr);
+            }
+            self.ctx
+                .tool_call_records
+                .push(journal_record_duplicate_within_turn(
+                    slot.name.clone(),
+                    make_args_preview(&slot.name, &slot.args),
+                ));
+            self.ctx.turn_guard.health.record_cache_hit(&slot.name);
+            agent_warn!(
+                "dedup",
+                "Hard cap: tool '{}' (id={}) call #{} (limit: {})",
+                slot.name,
+                slot.id,
+                *count,
+                self.ctx.max_identical_calls
+            );
+            return HeadlessPipelineStage::ShortCircuit;
+        }
+
+        let idem_key = IdempotencyKey::semantic(&slot.name, &slot.args);
+        if CACHEABLE_TOOLS.contains(&slot.name.as_str())
+            && let Some(cached) = self.ctx.idempotency_cache.check(&idem_key)
+        {
+            if !self.ctx.quiet {
+                self.ctx.term.emit_line(
+                    HeadlessStderrStyle::Dim,
+                    headless_stderr_cache_hit_line(&slot.name),
+                );
+                emit_headless_tool_body_preview(
+                    self.ctx.term,
+                    self.ctx.quiet,
+                    &slot.name,
+                    &cached.output,
+                    false,
+                );
+            }
+            let (tool_msg, tr) =
+                headless_idempotency_hit_openai_pair(&slot.id, &slot.name, &cached.output);
+            self.ctx.messages.push(tool_msg);
+            self.ctx.tool_results.push(tr);
+            let cache_key = idem_key.cache_key();
+            self.ctx
+                .step_recorder
+                .begin_tool_with_key(&slot.name, &slot.id, Some(&cache_key));
+            self.ctx
+                .step_recorder
+                .record_cache_hit(&slot.name, cached.clone());
+            self.ctx.turn_guard.record_cache_hit(&slot.name);
+            self.ctx
+                .tool_call_records
+                .push(journal_record_cross_turn_cache_hit(
+                    slot.name.clone(),
+                    cached.output.len() as u32,
+                    make_args_preview(&slot.name, &slot.args),
+                ));
+            return HeadlessPipelineStage::ShortCircuit;
+        }
+
+        if CACHEABLE_TOOLS.contains(&slot.name.as_str())
+            && let Some((prev_turn, cached_output)) =
+                self.ctx
+                    .semantic_dedup
+                    .pre_check_block(&slot.name, &slot.args, self.ctx.turn_index)
+        {
+            let body = format!(
+                "{cached_output}\n\n⛔ BLOCKED DUPLICATE: This {} call is semantically \
+                 identical to turn {} — same tool with equivalent arguments. \
+                 Execution was skipped. Use the result above instead of calling again.",
+                slot.name,
+                prev_turn + 1,
+            );
+            let (tool_msg, tr) = headless_idempotency_hit_openai_pair(&slot.id, &slot.name, &body);
+            self.ctx.messages.push(tool_msg);
+            self.ctx.tool_results.push(tr);
+            self.ctx.turn_guard.health.record_cache_hit(&slot.name);
+            self.ctx
+                .tool_call_records
+                .push(journal_record_cross_turn_cache_hit(
+                    slot.name.clone(),
+                    cached_output.len() as u32,
+                    make_args_preview(&slot.name, &slot.args),
+                ));
+            agent_warn!(
+                "dedup",
+                "Semantic block: tool '{}' (id={}) matches turn {} via param-aware dedup",
+                slot.name,
+                slot.id,
+                prev_turn + 1,
+            );
+            return HeadlessPipelineStage::ShortCircuit;
+        }
+
+        let execution = resolve_headless_tool_execution(
+            slot,
+            self.ctx.edge_tool_round,
+            &mut self.consumed_edge,
+            self.ctx.by_sig,
+        );
+
+        if !self.ctx.valid_tool_names.contains(&execution.name) {
+            let err_msg =
+                unknown_local_tool_error_message(&execution.name, self.ctx.valid_tool_names);
+            if !self.ctx.quiet {
+                self.ctx.term.emit_line(
+                    HeadlessStderrStyle::Red,
+                    headless_stderr_unknown_tool_header(&execution.name),
+                );
+                self.ctx.term.emit_line(
+                    HeadlessStderrStyle::Dim,
+                    headless_stderr_unknown_tool_detail(&err_msg),
+                );
+            }
+            let (tool_msg, err_tr) = headless_unknown_local_tool_openai_pair(
+                &execution.id,
+                &execution.name,
+                self.ctx.valid_tool_names,
+            );
+            self.ctx.messages.push(tool_msg);
+            self.ctx.tool_results.push(err_tr);
+            self.ctx.tool_call_records.push(journal_record_unknown_tool(
+                execution.name.clone(),
+                execution.early_exit_ms,
+            ));
+            return HeadlessPipelineStage::ShortCircuit;
+        }
+
+        HeadlessPipelineStage::Continue(HeadlessPreparedExecution {
+            execution,
+            idem_key,
+        })
+    }
+
+    async fn permit_execution(
+        &mut self,
+        execution: &mut HeadlessResolvedExecution,
+    ) -> HeadlessPipelineStage<()> {
+        if self.ctx.restricted_tools.contains(&execution.name) {
+            let err_msg = format!(
+                "Tool '{}' is currently restricted and cannot be executed. \
+                 Use only the tools whose schemas were provided.",
+                execution.name
+            );
+            emit_blocked_tool_result(
+                HeadlessBlockedTool {
+                    id: &execution.id,
+                    name: &execution.name,
+                    args: &execution.args,
+                    journal_reason: err_msg.clone(),
+                    err_msg,
+                    early_exit_ms: execution.early_exit_ms,
+                    status_line: Some(format!("  ⚠ Blocked restricted tool: {}", execution.name)),
+                },
+                self.ctx.quiet,
+                self.ctx.term,
+                self.ctx.messages,
+                self.ctx.tool_results,
+                self.ctx.tool_call_records,
+            );
+            return HeadlessPipelineStage::ShortCircuit;
+        }
+
+        let args_str = serde_json::to_string(&execution.args).ok();
+        let permission_context = self.ctx.permission_context;
+        let effective_permission_timeout = self.ctx.effective_permission_timeout;
+        let mailbox = self.ctx.mailbox.as_deref_mut();
+        match super::permission_gate::check_tool_permission(
+            &execution.name,
+            args_str.as_deref(),
+            permission_context,
+            mailbox,
+            effective_permission_timeout,
+        )
+        .await
+        {
+            super::permission_gate::PermissionCheckResult::Allowed => {}
+            super::permission_gate::PermissionCheckResult::AllowedViaRequest { .. } => {
+                if !self.ctx.quiet {
+                    self.ctx.term.emit_line(
+                        HeadlessStderrStyle::Yellow,
+                        format!("  🔓 Permission granted by parent: {}", execution.name),
+                    );
+                }
+            }
+            super::permission_gate::PermissionCheckResult::Denied { reason } => {
+                let err_msg = super::permission_gate::permission_denied_error_result(
+                    &execution.name,
+                    &reason,
+                );
+                emit_blocked_tool_result(
+                    HeadlessBlockedTool {
+                        id: &execution.id,
+                        name: &execution.name,
+                        args: &execution.args,
+                        err_msg,
+                        journal_reason: reason,
+                        early_exit_ms: execution.early_exit_ms,
+                        status_line: Some(format!("  🔒 Permission denied: {}", execution.name)),
+                    },
+                    self.ctx.quiet,
+                    self.ctx.term,
+                    self.ctx.messages,
+                    self.ctx.tool_results,
+                    self.ctx.tool_call_records,
+                );
+                return HeadlessPipelineStage::ShortCircuit;
+            }
+        }
+
+        if !self.ctx.tool_event_hooks.is_empty() {
+            let decision = crate::skills::hooks::evaluate_pre_tool_hooks(
+                self.ctx.tool_event_hooks,
+                &execution.name,
+                &execution.args,
+            )
+            .await;
+            match decision {
+                crate::skills::hooks::PreToolDecision::Block(reason) => {
+                    let err_msg = format!(
+                        "Tool '{}' blocked by PreToolUse hook: {}",
+                        execution.name, reason
+                    );
+                    emit_blocked_tool_result(
+                        HeadlessBlockedTool {
+                            id: &execution.id,
+                            name: &execution.name,
+                            args: &execution.args,
+                            journal_reason: err_msg.clone(),
+                            err_msg,
+                            early_exit_ms: execution.early_exit_ms,
+                            status_line: Some(format!(
+                                "  ⚠ Hook blocked: {} — {}",
+                                execution.name, reason
+                            )),
+                        },
+                        self.ctx.quiet,
+                        self.ctx.term,
+                        self.ctx.messages,
+                        self.ctx.tool_results,
+                        self.ctx.tool_call_records,
+                    );
+                    return HeadlessPipelineStage::ShortCircuit;
+                }
+                crate::skills::hooks::PreToolDecision::AllowWithContext(ctx) => {
+                    execution.result_str =
+                        format!("{}\n\n[Hook context]: {ctx}", execution.result_str);
+                }
+                crate::skills::hooks::PreToolDecision::Allow => {}
+            }
+        }
+
+        HeadlessPipelineStage::Continue(())
+    }
+
+    async fn execute_execution(
+        &mut self,
+        prepared: HeadlessPreparedExecution,
+    ) -> HeadlessExecutedExecution {
+        let HeadlessPreparedExecution {
+            mut execution,
+            idem_key,
+        } = prepared;
         execution.result_str = hydrate_reflect_placeholder_if_needed(
             self.ctx.api,
             self.ctx.token,
@@ -575,6 +894,22 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         } else {
             tool_start.elapsed().as_millis() as u64
         };
+
+        HeadlessExecutedExecution {
+            execution,
+            idem_key,
+            is_err,
+            executed_ms,
+        }
+    }
+
+    async fn record_execution(&mut self, executed: HeadlessExecutedExecution) {
+        let HeadlessExecutedExecution {
+            mut execution,
+            idem_key,
+            is_err,
+            executed_ms,
+        } = executed;
         let args_size = serde_json::to_string(&execution.args)
             .map(|s| s.len() as u32)
             .unwrap_or(0);
@@ -661,285 +996,20 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
     }
 
     async fn run_slot(&mut self, item: HeadlessRoundToolIdx) -> HeadlessToolSlotControl {
-        if self.executed_this_turn >= self.ctx.max_tools_per_turn {
-            let slot = self.resolve_slot(item);
-            self.emit_turn_budget_stub(&slot);
-            return HeadlessToolSlotControl::Continue;
+        let mut prepared = match self.validate_slot(item) {
+            HeadlessPipelineStage::Continue(prepared) => prepared,
+            HeadlessPipelineStage::ShortCircuit => return HeadlessToolSlotControl::Continue,
+            HeadlessPipelineStage::AbortRound => return HeadlessToolSlotControl::AbortRound,
+        };
+
+        match self.permit_execution(&mut prepared.execution).await {
+            HeadlessPipelineStage::Continue(()) => {}
+            HeadlessPipelineStage::ShortCircuit => return HeadlessToolSlotControl::Continue,
+            HeadlessPipelineStage::AbortRound => return HeadlessToolSlotControl::AbortRound,
         }
 
-        let slot = self.resolve_slot(item);
-
-        if self.ctx.pre_resolved_ids.contains(slot.id.as_str()) {
-            return HeadlessToolSlotControl::Continue;
-        }
-
-        if slot.name.is_empty() {
-            return self.handle_empty_tool_name(item, &slot);
-        }
-        self.consecutive_empty_name = 0;
-
-        let call_sig = tool_dedup_signature(&slot.name, &slot.args);
-        let count = self.ctx.call_counts.entry(call_sig).or_insert(0);
-        *count += 1;
-        if *count > self.ctx.max_identical_calls {
-            let idem_key = IdempotencyKey::semantic(&slot.name, &slot.args);
-            if let Some(_cached) = self.ctx.idempotency_cache.check(&idem_key) {
-                let body = format!(
-                    "⛔ Cached repeat (call #{} for identical args, limit: {}). \
-                     The result is already in this conversation from an earlier call. \
-                     Do NOT call this tool again with the same arguments.",
-                    *count, self.ctx.max_identical_calls
-                );
-                let (tool_msg, tr) =
-                    headless_idempotency_hit_openai_pair(&slot.id, &slot.name, &body);
-                self.ctx.messages.push(tool_msg);
-                self.ctx.tool_results.push(tr);
-            } else {
-                let (tool_msg, tr) =
-                    headless_openai_duplicate_within_turn_pair(&slot.id, &slot.name);
-                self.ctx.messages.push(tool_msg);
-                self.ctx.tool_results.push(tr);
-            }
-            self.ctx
-                .tool_call_records
-                .push(journal_record_duplicate_within_turn(
-                    slot.name.clone(),
-                    make_args_preview(&slot.name, &slot.args),
-                ));
-            self.ctx.turn_guard.health.record_cache_hit(&slot.name);
-            agent_warn!(
-                "dedup",
-                "Hard cap: tool '{}' (id={}) call #{} (limit: {})",
-                slot.name,
-                slot.id,
-                *count,
-                self.ctx.max_identical_calls
-            );
-            return HeadlessToolSlotControl::Continue;
-        }
-
-        let idem_key = IdempotencyKey::semantic(&slot.name, &slot.args);
-        if CACHEABLE_TOOLS.contains(&slot.name.as_str())
-            && let Some(cached) = self.ctx.idempotency_cache.check(&idem_key)
-        {
-            if !self.ctx.quiet {
-                self.ctx.term.emit_line(
-                    HeadlessStderrStyle::Dim,
-                    headless_stderr_cache_hit_line(&slot.name),
-                );
-                emit_headless_tool_body_preview(
-                    self.ctx.term,
-                    self.ctx.quiet,
-                    &slot.name,
-                    &cached.output,
-                    false,
-                );
-            }
-            let (tool_msg, tr) =
-                headless_idempotency_hit_openai_pair(&slot.id, &slot.name, &cached.output);
-            self.ctx.messages.push(tool_msg);
-            self.ctx.tool_results.push(tr);
-            let cache_key = idem_key.cache_key();
-            self.ctx
-                .step_recorder
-                .begin_tool_with_key(&slot.name, &slot.id, Some(&cache_key));
-            self.ctx
-                .step_recorder
-                .record_cache_hit(&slot.name, cached.clone());
-            self.ctx.turn_guard.record_cache_hit(&slot.name);
-            self.ctx
-                .tool_call_records
-                .push(journal_record_cross_turn_cache_hit(
-                    slot.name.clone(),
-                    cached.output.len() as u32,
-                    make_args_preview(&slot.name, &slot.args),
-                ));
-            return HeadlessToolSlotControl::Continue;
-        }
-
-        if CACHEABLE_TOOLS.contains(&slot.name.as_str())
-            && let Some((prev_turn, cached_output)) =
-                self.ctx
-                    .semantic_dedup
-                    .pre_check_block(&slot.name, &slot.args, self.ctx.turn_index)
-        {
-            let body = format!(
-                "{cached_output}\n\n⛔ BLOCKED DUPLICATE: This {} call is semantically \
-                 identical to turn {} — same tool with equivalent arguments. \
-                 Execution was skipped. Use the result above instead of calling again.",
-                slot.name,
-                prev_turn + 1,
-            );
-            let (tool_msg, tr) = headless_idempotency_hit_openai_pair(&slot.id, &slot.name, &body);
-            self.ctx.messages.push(tool_msg);
-            self.ctx.tool_results.push(tr);
-            self.ctx.turn_guard.health.record_cache_hit(&slot.name);
-            self.ctx
-                .tool_call_records
-                .push(journal_record_cross_turn_cache_hit(
-                    slot.name.clone(),
-                    cached_output.len() as u32,
-                    make_args_preview(&slot.name, &slot.args),
-                ));
-            agent_warn!(
-                "dedup",
-                "Semantic block: tool '{}' (id={}) matches turn {} via param-aware dedup",
-                slot.name,
-                slot.id,
-                prev_turn + 1,
-            );
-            return HeadlessToolSlotControl::Continue;
-        }
-
-        let mut execution = resolve_headless_tool_execution(
-            slot,
-            self.ctx.edge_tool_round,
-            &mut self.consumed_edge,
-            self.ctx.by_sig,
-        );
-
-        if !self.ctx.valid_tool_names.contains(&execution.name) {
-            let err_msg =
-                unknown_local_tool_error_message(&execution.name, self.ctx.valid_tool_names);
-            if !self.ctx.quiet {
-                self.ctx.term.emit_line(
-                    HeadlessStderrStyle::Red,
-                    headless_stderr_unknown_tool_header(&execution.name),
-                );
-                self.ctx.term.emit_line(
-                    HeadlessStderrStyle::Dim,
-                    headless_stderr_unknown_tool_detail(&err_msg),
-                );
-            }
-            let (tool_msg, err_tr) = headless_unknown_local_tool_openai_pair(
-                &execution.id,
-                &execution.name,
-                self.ctx.valid_tool_names,
-            );
-            self.ctx.messages.push(tool_msg);
-            self.ctx.tool_results.push(err_tr);
-            self.ctx.tool_call_records.push(journal_record_unknown_tool(
-                execution.name.clone(),
-                execution.early_exit_ms,
-            ));
-            return HeadlessToolSlotControl::Continue;
-        }
-
-        if self.ctx.restricted_tools.contains(&execution.name) {
-            let err_msg = format!(
-                "Tool '{}' is currently restricted and cannot be executed. \
-                 Use only the tools whose schemas were provided.",
-                execution.name
-            );
-            emit_blocked_tool_result(
-                HeadlessBlockedTool {
-                    id: &execution.id,
-                    name: &execution.name,
-                    args: &execution.args,
-                    journal_reason: err_msg.clone(),
-                    err_msg,
-                    early_exit_ms: execution.early_exit_ms,
-                    status_line: Some(format!("  ⚠ Blocked restricted tool: {}", execution.name)),
-                },
-                self.ctx.quiet,
-                self.ctx.term,
-                self.ctx.messages,
-                self.ctx.tool_results,
-                self.ctx.tool_call_records,
-            );
-            return HeadlessToolSlotControl::Continue;
-        }
-
-        let args_str = serde_json::to_string(&execution.args).ok();
-        let permission_context = self.ctx.permission_context;
-        let effective_permission_timeout = self.ctx.effective_permission_timeout;
-        let mailbox = self.ctx.mailbox.as_deref_mut();
-        match super::permission_gate::check_tool_permission(
-            &execution.name,
-            args_str.as_deref(),
-            permission_context,
-            mailbox,
-            effective_permission_timeout,
-        )
-        .await
-        {
-            super::permission_gate::PermissionCheckResult::Allowed => {}
-            super::permission_gate::PermissionCheckResult::AllowedViaRequest { .. } => {
-                if !self.ctx.quiet {
-                    self.ctx.term.emit_line(
-                        HeadlessStderrStyle::Yellow,
-                        format!("  🔓 Permission granted by parent: {}", execution.name),
-                    );
-                }
-            }
-            super::permission_gate::PermissionCheckResult::Denied { reason } => {
-                let err_msg = super::permission_gate::permission_denied_error_result(
-                    &execution.name,
-                    &reason,
-                );
-                emit_blocked_tool_result(
-                    HeadlessBlockedTool {
-                        id: &execution.id,
-                        name: &execution.name,
-                        args: &execution.args,
-                        err_msg,
-                        journal_reason: reason,
-                        early_exit_ms: execution.early_exit_ms,
-                        status_line: Some(format!("  🔒 Permission denied: {}", execution.name)),
-                    },
-                    self.ctx.quiet,
-                    self.ctx.term,
-                    self.ctx.messages,
-                    self.ctx.tool_results,
-                    self.ctx.tool_call_records,
-                );
-                return HeadlessToolSlotControl::Continue;
-            }
-        }
-
-        if !self.ctx.tool_event_hooks.is_empty() {
-            let decision = crate::skills::hooks::evaluate_pre_tool_hooks(
-                self.ctx.tool_event_hooks,
-                &execution.name,
-                &execution.args,
-            )
-            .await;
-            match decision {
-                crate::skills::hooks::PreToolDecision::Block(reason) => {
-                    let err_msg = format!(
-                        "Tool '{}' blocked by PreToolUse hook: {}",
-                        execution.name, reason
-                    );
-                    emit_blocked_tool_result(
-                        HeadlessBlockedTool {
-                            id: &execution.id,
-                            name: &execution.name,
-                            args: &execution.args,
-                            journal_reason: err_msg.clone(),
-                            err_msg,
-                            early_exit_ms: execution.early_exit_ms,
-                            status_line: Some(format!(
-                                "  ⚠ Hook blocked: {} — {}",
-                                execution.name, reason
-                            )),
-                        },
-                        self.ctx.quiet,
-                        self.ctx.term,
-                        self.ctx.messages,
-                        self.ctx.tool_results,
-                        self.ctx.tool_call_records,
-                    );
-                    return HeadlessToolSlotControl::Continue;
-                }
-                crate::skills::hooks::PreToolDecision::AllowWithContext(ctx) => {
-                    execution.result_str =
-                        format!("{}\n\n[Hook context]: {ctx}", execution.result_str);
-                }
-                crate::skills::hooks::PreToolDecision::Allow => {}
-            }
-        }
-
-        self.finalize_execution(execution, idem_key).await;
+        let executed = self.execute_execution(prepared).await;
+        self.record_execution(executed).await;
         HeadlessToolSlotControl::Continue
     }
 }
