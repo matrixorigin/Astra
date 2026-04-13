@@ -333,12 +333,15 @@ fn is_nested_shell_c_flag(flag: &str) -> bool {
     )
 }
 
-fn expand_tilde_path(arg: &str) -> Option<std::path::PathBuf> {
+fn expand_home_dir_reference(arg: &str) -> Option<std::path::PathBuf> {
     let home = dirs::home_dir()?;
-    if arg == "~" {
+    if matches!(arg, "~" | "$HOME" | "${HOME}") {
         return Some(home);
     }
-    let suffix = arg.strip_prefix("~/")?;
+    let suffix = arg
+        .strip_prefix("~/")
+        .or_else(|| arg.strip_prefix("$HOME/"))
+        .or_else(|| arg.strip_prefix("${HOME}/"))?;
     Some(home.join(suffix))
 }
 
@@ -412,7 +415,7 @@ fn check_single_command_path_boundary(
         // pointing outside the sandbox (e.g., `ln -s /etc/passwd myfile`).
         let resolved = if arg.starts_with('/') {
             std::path::PathBuf::from(arg)
-        } else if let Some(expanded) = expand_tilde_path(arg) {
+        } else if let Some(expanded) = expand_home_dir_reference(arg) {
             expanded
         } else {
             policy.project_root.join(arg)
@@ -2797,14 +2800,43 @@ mod tests {
     }
 
     #[test]
-    fn bypass_env_var_in_path_not_caught() {
-        // cat $HOME/.bashrc — variable expansion. Not checked because we
-        // can't resolve env vars at static analysis time.
-        // Mitigated by: sandbox env filtering + dangerous path detection.
+    fn home_env_expansion_now_blocked() {
         use astra_runtime::tool_sandbox::SandboxPolicy;
         let policy = SandboxPolicy::for_project("/home/user/project");
         let result = check_bash_path_boundary(&policy, "cat $HOME/.bashrc");
-        assert!(result.is_none(), "env var paths not statically resolvable");
+        assert!(
+            result.is_some(),
+            "$HOME paths should resolve to the real home dir"
+        );
+    }
+
+    #[test]
+    fn home_env_expansion_inside_project_is_allowed() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let Some(home) = dirs::home_dir() else {
+            return;
+        };
+        let project_root = home.join("project");
+        let policy = SandboxPolicy::for_project(&project_root);
+        let command = "cat ${HOME}/project/src/main.rs";
+        let result = check_bash_path_boundary(&policy, command);
+        assert!(
+            result.is_none(),
+            "$HOME expansion should still allow paths that stay inside the project"
+        );
+    }
+
+    #[test]
+    fn non_home_env_var_in_path_not_caught() {
+        // cat $TMPDIR/build.log — arbitrary env vars still are not statically
+        // resolvable at path-boundary time.
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(&policy, "cat $TMPDIR/build.log");
+        assert!(
+            result.is_none(),
+            "non-HOME env vars remain unresolved at static analysis time"
+        );
     }
 
     #[test]
@@ -2819,15 +2851,16 @@ mod tests {
     }
 
     #[test]
-    fn bypass_python_read_not_caught() {
+    fn bypass_python_read_not_caught_by_path_boundary() {
         // python3 -c "open('/etc/passwd').read()" — interpreter invocation.
-        // KNOWN LIMITATION: handled by permission_manager execute classification.
+        // Path-boundary parsing does not inspect interpreter source code, but
+        // higher-level shell safety guards now deny inline interpreter exec.
         use astra_runtime::tool_sandbox::SandboxPolicy;
         let policy = SandboxPolicy::for_project("/home/user/project");
         let result = check_bash_path_boundary(&policy, "python3 -c \"open('/etc/passwd').read()\"");
         assert!(
             result.is_none(),
-            "interpreter commands handled by permission layer"
+            "interpreter commands are handled by higher-level shell safety guards"
         );
     }
 

@@ -408,7 +408,14 @@ pub fn check_shell_command_safety(command: &str) -> Option<String> {
         );
     }
 
-    // 5. IFS injection — can bypass word splitting validation
+    // 5. Inline interpreter execution — runs arbitrary code behind a single shell token
+    if let Some(interpreter) = check_inline_interpreter_exec(command) {
+        return Some(format!(
+            "shell command uses inline interpreter execution via `{interpreter}`, which can run arbitrary code outside file-path validation"
+        ));
+    }
+
+    // 6. IFS injection — can bypass word splitting validation
     if check_ifs_injection(command) {
         return Some(
             "shell command contains `$IFS` or `${IFS...}` which can bypass security validation"
@@ -416,7 +423,7 @@ pub fn check_shell_command_safety(command: &str) -> Option<String> {
         );
     }
 
-    // 6. Carriage return attack — can hide malicious commands
+    // 7. Carriage return attack — can hide malicious commands
     if check_carriage_return_attack(command) {
         return Some(
             "shell command contains carriage return (\\r) which can hide malicious commands in terminal output"
@@ -424,7 +431,7 @@ pub fn check_shell_command_safety(command: &str) -> Option<String> {
         );
     }
 
-    // 7. Backslash-escaped whitespace — can alter shell tokenization
+    // 8. Backslash-escaped whitespace — can alter shell tokenization
     if check_backslash_escaped_whitespace(command) {
         return Some(
             "shell command contains backslash-escaped whitespace that can alter command parsing"
@@ -432,7 +439,7 @@ pub fn check_shell_command_safety(command: &str) -> Option<String> {
         );
     }
 
-    // 8. /proc/*/environ access — can expose sensitive environment variables
+    // 9. /proc/*/environ access — can expose sensitive environment variables
     if check_proc_environ_access(command) {
         return Some(
             "shell command accesses `/proc/*/environ`, which can expose sensitive environment variables"
@@ -440,21 +447,21 @@ pub fn check_shell_command_safety(command: &str) -> Option<String> {
         );
     }
 
-    // 9. Zsh dangerous commands — can bypass file/network protections
+    // 10. Zsh dangerous commands — can bypass file/network protections
     if let Some(cmd) = check_zsh_dangerous_command(command) {
         return Some(format!(
             "shell command contains zsh-specific dangerous command `{cmd}` which can bypass security checks"
         ));
     }
 
-    // 10. Unicode whitespace — visual spoofing
+    // 11. Unicode whitespace — visual spoofing
     if let Some(char_desc) = check_unicode_whitespace(command) {
         return Some(format!(
             "shell command contains {char_desc} which can be used for visual spoofing"
         ));
     }
 
-    // 11. Obfuscated flags — `-e\"xec\"` / `-e$'xec'` / `\"\"\"-f` style bypass
+    // 12. Obfuscated flags — `-e\"xec\"` / `-e$'xec'` / `\"\"\"-f` style bypass
     if check_obfuscated_flags(command) {
         return Some(
             "shell command contains obfuscated flag names (quotes inside flags) which can bypass security checks"
@@ -462,7 +469,7 @@ pub fn check_shell_command_safety(command: &str) -> Option<String> {
         );
     }
 
-    // 12. Backslash-escaped shell operators — can confuse safety parsing
+    // 13. Backslash-escaped shell operators — can confuse safety parsing
     if check_backslash_escaped_operator(command) {
         return Some(
             "shell command contains backslash-escaped shell operators outside quotes, which can confuse safety parsing"
@@ -514,6 +521,232 @@ fn check_command_substitution(command: &str) -> bool {
     }
 
     false
+}
+
+fn check_inline_interpreter_exec(command: &str) -> Option<String> {
+    for segment in shell_command_segments(command) {
+        if let Some(detail) = check_inline_interpreter_exec_segment(segment) {
+            return Some(detail);
+        }
+    }
+    None
+}
+
+fn check_inline_interpreter_exec_segment(segment: &str) -> Option<String> {
+    let tokens = shell_tokenize_like_bash(segment);
+    if tokens.is_empty() {
+        return None;
+    }
+
+    let mut idx = 0usize;
+    while idx < tokens.len() {
+        let token = tokens[idx].as_str();
+        if token.is_empty() {
+            idx += 1;
+            continue;
+        }
+        if looks_like_shell_assignment(token) {
+            idx += 1;
+            continue;
+        }
+
+        let base = token.rsplit('/').next().unwrap_or(token);
+
+        if matches!(base, "bash" | "sh" | "zsh" | "dash" | "ksh" | "fish") {
+            for flag_idx in idx + 1..tokens.len() {
+                let arg = tokens[flag_idx].as_str();
+                if is_nested_shell_c_flag(arg) {
+                    if let Some(inner) = tokens.get(flag_idx + 1)
+                        && let Some(detail) = check_inline_interpreter_exec(inner)
+                    {
+                        return Some(detail);
+                    }
+                    break;
+                }
+                if !arg.starts_with('-') {
+                    break;
+                }
+            }
+            return None;
+        }
+
+        if base == "env" {
+            idx = skip_env_wrapper_tokens(&tokens, idx + 1);
+            continue;
+        }
+
+        if matches!(
+            base,
+            "command" | "builtin" | "nohup" | "noglob" | "nocorrect"
+        ) {
+            idx += 1;
+            continue;
+        }
+
+        return inline_exec_interpreter_detail(base, tokens.get(idx + 1).map(String::as_str));
+    }
+
+    None
+}
+
+fn shell_command_segments(command: &str) -> Vec<&str> {
+    let chars: Vec<(usize, char)> = command.char_indices().collect();
+    let mut segments = Vec::new();
+    let mut segment_start = 0usize;
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut escaped = false;
+    let mut idx = 0usize;
+
+    while idx < chars.len() {
+        let (byte_idx, ch) = chars[idx];
+
+        if escaped {
+            escaped = false;
+            idx += 1;
+            continue;
+        }
+
+        if ch == '\\' && !in_single_quote {
+            escaped = true;
+            idx += 1;
+            continue;
+        }
+
+        if ch == '\'' && !in_double_quote {
+            in_single_quote = !in_single_quote;
+            idx += 1;
+            continue;
+        }
+
+        if ch == '"' && !in_single_quote {
+            in_double_quote = !in_double_quote;
+            idx += 1;
+            continue;
+        }
+
+        if !in_single_quote && !in_double_quote {
+            let is_double_separator =
+                matches!(ch, '&' | '|') && chars.get(idx + 1).is_some_and(|(_, next)| *next == ch);
+            let is_single_separator = matches!(ch, '|' | ';' | '\n' | '\r');
+
+            if is_double_separator || is_single_separator {
+                let segment = command[segment_start..byte_idx].trim();
+                if !segment.is_empty() {
+                    segments.push(segment);
+                }
+
+                segment_start = if is_double_separator {
+                    let (next_idx, next_ch) = chars[idx + 1];
+                    idx += 2;
+                    next_idx + next_ch.len_utf8()
+                } else {
+                    idx += 1;
+                    byte_idx + ch.len_utf8()
+                };
+                continue;
+            }
+        }
+
+        idx += 1;
+    }
+
+    let segment = command[segment_start..].trim();
+    if !segment.is_empty() {
+        segments.push(segment);
+    }
+
+    segments
+}
+
+fn shell_tokenize_like_bash(input: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut chars = input.chars().peekable();
+    let mut in_double_quote = false;
+    let mut in_single_quote = false;
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' if !in_single_quote => in_double_quote = !in_double_quote,
+            '\'' if !in_double_quote => in_single_quote = !in_single_quote,
+            '\\' if !in_single_quote => {
+                if let Some(next) = chars.next() {
+                    if next == '\n' || next == '\r' {
+                        continue;
+                    }
+                    current.push(next);
+                }
+            }
+            c if c.is_whitespace() && !in_double_quote && !in_single_quote => {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+            }
+            _ => current.push(ch),
+        }
+    }
+
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+
+    tokens
+}
+
+fn looks_like_shell_assignment(token: &str) -> bool {
+    token.contains('=')
+        && !token.starts_with('=')
+        && !token.starts_with('-')
+        && !token.contains('/')
+}
+
+fn skip_env_wrapper_tokens(tokens: &[String], mut idx: usize) -> usize {
+    while idx < tokens.len() {
+        let token = tokens[idx].as_str();
+        if looks_like_shell_assignment(token) {
+            idx += 1;
+            continue;
+        }
+        match token {
+            "-u" | "--unset" | "-C" | "--chdir" | "-S" | "--split-string" => {
+                idx = (idx + 2).min(tokens.len());
+            }
+            _ if token.starts_with('-') => idx += 1,
+            _ => break,
+        }
+    }
+    idx
+}
+
+fn is_nested_shell_c_flag(flag: &str) -> bool {
+    matches!(
+        flag,
+        "-c" | "-lc" | "-ic" | "-ec" | "-xc" | "-lxc" | "-lcx" | "-lec" | "-exc" | "-xec"
+    )
+}
+
+fn inline_exec_interpreter_detail(base: &str, flag: Option<&str>) -> Option<String> {
+    let flag = flag?;
+    if is_python_interpreter(base) && flag == "-c" {
+        return Some(format!("{base} -c"));
+    }
+
+    match base {
+        "node" | "nodejs" if matches!(flag, "-e" | "--eval") || flag.starts_with("--eval=") => {
+            Some(format!("{base} --eval"))
+        }
+        "perl" | "ruby" | "lua" if flag == "-e" => Some(format!("{base} -e")),
+        "php" if flag == "-r" => Some(format!("{base} -r")),
+        _ => None,
+    }
+}
+
+fn is_python_interpreter(base: &str) -> bool {
+    base == "python"
+        || base.strip_prefix("python").is_some_and(|suffix| {
+            !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit() || c == '.')
+        })
 }
 
 fn check_ifs_injection(command: &str) -> bool {
@@ -1120,6 +1353,74 @@ mod tests {
     fn middleware_allows_arithmetic_expansion() {
         let decision =
             evaluate_tool_safety_request("bash", &json!({"command": "printf '%s' \"$((1 + 2))\""}));
+        assert_eq!(decision, SafetyMiddlewareDecision::Allow);
+    }
+
+    #[test]
+    fn middleware_blocks_python_inline_exec() {
+        let decision = evaluate_tool_safety_request(
+            "bash",
+            &json!({"command": r#"python3 -c "open('/etc/passwd').read()""#}),
+        );
+        assert!(matches!(
+            decision,
+            SafetyMiddlewareDecision::Deny(reason)
+                if reason.contains("shell_obfuscation") && reason.contains("inline interpreter execution")
+        ));
+    }
+
+    #[test]
+    fn middleware_blocks_node_inline_exec() {
+        let decision = evaluate_tool_safety_request(
+            "bash",
+            &json!({"command": r#"node --eval "require('fs').readFileSync('/etc/passwd', 'utf8')""#}),
+        );
+        assert!(matches!(
+            decision,
+            SafetyMiddlewareDecision::Deny(reason)
+                if reason.contains("shell_obfuscation") && reason.contains("inline interpreter execution")
+        ));
+    }
+
+    #[test]
+    fn middleware_blocks_env_wrapped_python_inline_exec() {
+        let decision = evaluate_tool_safety_request(
+            "bash",
+            &json!({"command": r#"env PYTHONWARNINGS=ignore python3 -c "print('hi')""#}),
+        );
+        assert!(matches!(
+            decision,
+            SafetyMiddlewareDecision::Deny(reason)
+                if reason.contains("shell_obfuscation") && reason.contains("inline interpreter execution")
+        ));
+    }
+
+    #[test]
+    fn middleware_blocks_nested_shell_python_inline_exec() {
+        let decision = evaluate_tool_safety_request(
+            "bash",
+            &json!({"command": r#"bash -lc "python3 -c 'print(1)'""#}),
+        );
+        assert!(matches!(
+            decision,
+            SafetyMiddlewareDecision::Deny(reason)
+                if reason.contains("shell_obfuscation") && reason.contains("inline interpreter execution")
+        ));
+    }
+
+    #[test]
+    fn middleware_allows_python_script_file() {
+        let decision =
+            evaluate_tool_safety_request("bash", &json!({"command": "python3 scripts/check.py"}));
+        assert_eq!(decision, SafetyMiddlewareDecision::Allow);
+    }
+
+    #[test]
+    fn middleware_allows_echoed_interpreter_literal() {
+        let decision = evaluate_tool_safety_request(
+            "bash",
+            &json!({"command": r#"echo "python3 -c 'print(1)'""#}),
+        );
         assert_eq!(decision, SafetyMiddlewareDecision::Allow);
     }
 
