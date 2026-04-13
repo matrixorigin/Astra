@@ -97,18 +97,18 @@ impl TeamRegistry {
             Team {
                 team_id: uuid::Uuid::new_v4().to_string(),
                 name: "review".to_string(),
-                description: "Adversarial code review: one agent writes, another reviews".into(),
+                description: "Adversarial code review: one agent produces the review, another critiques it for thoroughness".into(),
                 members: vec![
                     TeamMember {
                         role: "producer".to_string(),
-                        description: "Writes or modifies code to fulfill the task".into(),
-                        skills: vec!["review-changes".into()],
+                        description: "Performs code review: reads diffs, analyzes changes, and produces a detailed review with findings".into(),
+                        skills: vec![],
                         model_override: None,
                     },
                     TeamMember {
                         role: "reviewer".to_string(),
-                        description: "Reviews code for bugs, security, and correctness".into(),
-                        skills: vec!["review-changes".into()],
+                        description: "Critiques the review for completeness: checks if the producer missed bugs, security issues, or edge cases".into(),
+                        skills: vec![],
                         model_override: None,
                     },
                 ],
