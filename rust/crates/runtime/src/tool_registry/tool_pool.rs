@@ -8,6 +8,23 @@
 use serde_json::Value;
 
 use super::meta::ToolMeta;
+
+/// Sort tool schemas alphabetically by `function.name` for prompt-cache stability.
+pub(super) fn sort_schemas_by_name(schemas: &mut [Value]) {
+    schemas.sort_by(|a, b| {
+        let na = a
+            .get("function")
+            .and_then(|f| f.get("name"))
+            .and_then(|n| n.as_str())
+            .unwrap_or("");
+        let nb = b
+            .get("function")
+            .and_then(|f| f.get("name"))
+            .and_then(|n| n.as_str())
+            .unwrap_or("");
+        na.cmp(nb)
+    });
+}
 use super::registry::ToolRegistry;
 
 /// Lightweight metadata used for searching/ranking tools without loading full schemas.
@@ -230,6 +247,14 @@ pub fn select_two_phase_with_state<S: ToolSchemaStore, D: ToolDenyPredicate>(
             st.discovered.insert(n.clone());
         }
     }
+
+    // Sort tool schemas alphabetically by name for prompt-cache stability.
+    // Tool selection is score-based (above), but the final ordering in the prompt
+    // should be deterministic so the model API's prefix cache hits remain high
+    // across turns even when the scored ranking fluctuates slightly.
+    sort_schemas_by_name(&mut selected);
+    materialized_names.sort();
+
     ToolSelectionOutcome {
         schemas: selected,
         materialized_names,

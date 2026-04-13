@@ -11,6 +11,8 @@ use super::state::ConversationState;
 use crate::pipeline::routing::{RoutingDecision, ToolFilter};
 use crate::turn::routing_metrics::ConfidenceCalibrator;
 
+use super::tool_pool::sort_schemas_by_name;
+
 /// The main tool selection interface.
 ///
 /// ```text
@@ -530,6 +532,9 @@ impl ToolRegistry {
             }
         }
 
+        // Sort alphabetically for prompt-cache stability (same rationale as select_two_phase)
+        sort_schemas_by_name(&mut result);
+
         result
     }
 
@@ -547,7 +552,9 @@ impl ToolRegistry {
 
     /// Return only pinned tools (for conversational queries).
     pub fn pinned_only(&self) -> Vec<Value> {
-        self.pinned_schemas.iter().map(|(_, s)| s.clone()).collect()
+        let mut schemas: Vec<Value> = self.pinned_schemas.iter().map(|(_, s)| s.clone()).collect();
+        sort_schemas_by_name(&mut schemas);
+        schemas
     }
 
     /// Return ALL tool schemas (bypass selection — used for tool execution).
