@@ -333,6 +333,13 @@ fn is_nested_shell_c_flag(flag: &str) -> bool {
     )
 }
 
+fn expand_static_dir_reference(
+    policy: &astra_runtime::tool_sandbox::SandboxPolicy,
+    arg: &str,
+) -> Option<std::path::PathBuf> {
+    expand_home_dir_reference(arg).or_else(|| expand_project_dir_reference(policy, arg))
+}
+
 fn expand_home_dir_reference(arg: &str) -> Option<std::path::PathBuf> {
     let home = dirs::home_dir()?;
     if matches!(arg, "~" | "$HOME" | "${HOME}") {
@@ -343,6 +350,20 @@ fn expand_home_dir_reference(arg: &str) -> Option<std::path::PathBuf> {
         .or_else(|| arg.strip_prefix("$HOME/"))
         .or_else(|| arg.strip_prefix("${HOME}/"))?;
     Some(home.join(suffix))
+}
+
+fn expand_project_dir_reference(
+    policy: &astra_runtime::tool_sandbox::SandboxPolicy,
+    arg: &str,
+) -> Option<std::path::PathBuf> {
+    if matches!(arg, "$PWD" | "${PWD}" | "~+") {
+        return Some(policy.project_root.clone());
+    }
+    let suffix = arg
+        .strip_prefix("$PWD/")
+        .or_else(|| arg.strip_prefix("${PWD}/"))
+        .or_else(|| arg.strip_prefix("~+/"))?;
+    Some(policy.project_root.join(suffix))
 }
 
 fn is_shell_interpreter_command(base: &str) -> bool {
@@ -491,7 +512,7 @@ fn check_single_command_path_boundary(
         // pointing outside the sandbox (e.g., `ln -s /etc/passwd myfile`).
         let resolved = if arg.starts_with('/') {
             std::path::PathBuf::from(arg)
-        } else if let Some(expanded) = expand_home_dir_reference(arg) {
+        } else if let Some(expanded) = expand_static_dir_reference(policy, arg) {
             expanded
         } else {
             policy.project_root.join(arg)
@@ -2899,6 +2920,50 @@ mod tests {
         assert!(
             result.is_none(),
             "$HOME expansion should still allow paths that stay inside the project"
+        );
+    }
+
+    #[test]
+    fn pwd_env_expansion_outside_project_is_blocked() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(&policy, "cat $PWD/../secret.txt");
+        assert!(
+            result.is_some(),
+            "$PWD escapes should be resolved and checked"
+        );
+    }
+
+    #[test]
+    fn pwd_env_expansion_inside_project_is_allowed() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(&policy, "cat ${PWD}/src/main.rs");
+        assert!(
+            result.is_none(),
+            "$PWD expansion should still allow paths that stay inside the project"
+        );
+    }
+
+    #[test]
+    fn tilde_pwd_expansion_outside_project_is_blocked() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(&policy, "cat ~+/../secret.txt");
+        assert!(
+            result.is_some(),
+            "~+ escapes should be resolved and checked"
+        );
+    }
+
+    #[test]
+    fn tilde_pwd_expansion_inside_project_is_allowed() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(&policy, "cat ~+/src/main.rs");
+        assert!(
+            result.is_none(),
+            "~+ expansion should still allow paths that stay inside the project"
         );
     }
 
