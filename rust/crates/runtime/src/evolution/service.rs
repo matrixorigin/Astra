@@ -1,6 +1,6 @@
 //! Evolution service — orchestrates signal collection, proposal generation, and application.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -24,8 +24,12 @@ const MAX_RECENT_CALIBRATION_DEDUP: usize = 32;
 /// Orchestrates the evolution lifecycle: collect → propose → apply.
 pub struct EvolutionService {
     collector: Mutex<SignalCollector>,
-    /// Proposals generated but not yet applied (skill axis, pending user approval).
+    /// Proposals generated but not yet applied (or deferred behind the active
+    /// canary lane).
     pending_proposals: Mutex<Vec<EvolutionProposal>>,
+    /// Active canaries plus rollback snapshots. Bounded to one active canary at
+    /// a time so rollback can restore an exact pre-canary snapshot.
+    canary_registry: Mutex<CanaryRegistry>,
     /// Applied proposals log (for audit/display). Bounded to last 100.
     applied_log: Mutex<Vec<EvolutionProposal>>,
     /// Recently processed calibration proposal identities used to suppress
@@ -47,20 +51,35 @@ pub struct EvolutionService {
 pub struct ProposalIngestOutcome {
     pub processed: usize,
     pub auto_applied: usize,
+    pub canary_started: usize,
     pub queued: usize,
 }
 
 #[derive(Debug, Default)]
 struct ProposalRoutingOutcome {
     auto_applied: Vec<EvolutionProposal>,
+    canary_started: Vec<EvolutionProposal>,
     queued: Vec<EvolutionProposal>,
+}
+
+#[derive(Debug, Clone)]
+struct CanaryExecutionSnapshot {
+    pattern_library: Option<PatternLibrary>,
+    calibrator: Option<ProgressiveCalibrator>,
+}
+
+#[derive(Debug, Default)]
+struct CanaryRegistry {
+    active: Vec<EvolutionProposal>,
+    snapshots: HashMap<String, CanaryExecutionSnapshot>,
 }
 
 impl ProposalRoutingOutcome {
     fn summary(&self) -> ProposalIngestOutcome {
         ProposalIngestOutcome {
-            processed: self.auto_applied.len() + self.queued.len(),
+            processed: self.auto_applied.len() + self.canary_started.len() + self.queued.len(),
             auto_applied: self.auto_applied.len(),
+            canary_started: self.canary_started.len(),
             queued: self.queued.len(),
         }
     }
@@ -77,6 +96,7 @@ impl EvolutionService {
         Self {
             collector: Mutex::new(SignalCollector::new()),
             pending_proposals: Mutex::new(Vec::new()),
+            canary_registry: Mutex::new(CanaryRegistry::default()),
             applied_log: Mutex::new(Vec::new()),
             recent_calibration_dedup: Mutex::new(Vec::new()),
             pattern_library: None,
@@ -208,23 +228,7 @@ impl EvolutionService {
 
     /// Get all pending proposals awaiting user approval.
     pub async fn pending(&self) -> Vec<EvolutionProposal> {
-        let mut v = self.pending_proposals.lock().await.clone();
-        v.sort_by(|a, b| {
-            pending_priority(a)
-                .cmp(&pending_priority(b))
-                .then_with(|| {
-                    verdict_score(b)
-                        .partial_cmp(&verdict_score(a))
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
-                .then_with(|| {
-                    b.confidence
-                        .partial_cmp(&a.confidence)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
-                .then_with(|| a.created_at.cmp(&b.created_at))
-        });
-        v
+        sort_proposals(self.pending_proposals.lock().await.clone())
     }
 
     fn annotate_promotion_verdict(
@@ -308,26 +312,26 @@ impl EvolutionService {
             let pending = self.pending_proposals.lock().await;
             pending.iter().find(|p| p.id == id).cloned()
         };
-        let Some(candidate) = candidate else {
-            return Ok(None);
-        };
+        if let Some(candidate) = candidate {
+            self.apply_proposal(&candidate)?;
 
-        self.apply_proposal(&candidate)?;
-
-        let extracted = {
-            let mut pending = self.pending_proposals.lock().await;
-            if let Some(pos) = pending.iter().position(|p| p.id == id) {
-                let mut p = pending.remove(pos);
-                p.status = ApprovalStatus::Approved;
-                Some(p)
-            } else {
-                None
+            let extracted = {
+                let mut pending = self.pending_proposals.lock().await;
+                if let Some(pos) = pending.iter().position(|p| p.id == id) {
+                    let mut p = pending.remove(pos);
+                    p.status = ApprovalStatus::Approved;
+                    Some(p)
+                } else {
+                    None
+                }
+            };
+            if let Some(p) = extracted.as_ref() {
+                self.append_applied_log(std::slice::from_ref(p)).await;
             }
-        };
-        if let Some(p) = extracted.as_ref() {
-            self.append_applied_log(std::slice::from_ref(p)).await;
+            return Ok(extracted);
         }
-        Ok(extracted)
+
+        self.promote_canary(id).await
     }
 
     /// Reject a proposal by ID. Returns the proposal if found.
@@ -336,21 +340,21 @@ impl EvolutionService {
             let pending = self.pending_proposals.lock().await;
             pending.iter().find(|p| p.id == id).cloned()
         };
-        let Some(candidate) = candidate else {
-            return Ok(None);
-        };
-        self.persist_rejection(&candidate)?;
+        if let Some(candidate) = candidate {
+            self.persist_rejection(&candidate)?;
 
-        let mut pending = self.pending_proposals.lock().await;
-        if let Some(pos) = pending.iter().position(|p| p.id == id) {
-            let mut p = pending.remove(pos);
-            p.status = ApprovalStatus::Rejected;
-            self.remember_recent_calibration_proposals(std::slice::from_ref(&p))
-                .await;
-            Ok(Some(p))
-        } else {
-            Ok(None)
+            let mut pending = self.pending_proposals.lock().await;
+            if let Some(pos) = pending.iter().position(|p| p.id == id) {
+                let mut p = pending.remove(pos);
+                p.status = ApprovalStatus::Rejected;
+                self.remember_recent_calibration_proposals(std::slice::from_ref(&p))
+                    .await;
+                return Ok(Some(p));
+            }
+            return Ok(None);
         }
+
+        self.rollback_canary(id).await
     }
 
     /// Number of buffered signals not yet flushed.
@@ -361,6 +365,12 @@ impl EvolutionService {
     /// Applied proposals log.
     pub async fn applied(&self) -> Vec<EvolutionProposal> {
         self.applied_log.lock().await.clone()
+    }
+
+    /// Active canaries running against the live runtime state.
+    pub async fn active_canaries(&self) -> Vec<EvolutionProposal> {
+        let registry = self.canary_registry.lock().await;
+        sort_proposals(registry.active.clone())
     }
 
     /// Clear dedup keys (e.g. at conversation boundary).
@@ -515,6 +525,14 @@ impl EvolutionService {
             let pending = self.pending_proposals.lock().await;
             pending.iter().filter_map(calibration_dedup_key).collect()
         };
+        let active_calibration_keys: HashSet<String> = {
+            let registry = self.canary_registry.lock().await;
+            registry
+                .active
+                .iter()
+                .filter_map(calibration_dedup_key)
+                .collect()
+        };
         let recent_calibration_keys: HashSet<String> = {
             let recent = self.recent_calibration_dedup.lock().await;
             recent.iter().cloned().collect()
@@ -524,6 +542,7 @@ impl EvolutionService {
         for proposal in proposals {
             if let Some(key) = calibration_dedup_key(&proposal)
                 && (pending_calibration_keys.contains(&key)
+                    || active_calibration_keys.contains(&key)
                     || recent_calibration_keys.contains(&key)
                     || !batch_calibration_keys.insert(key))
             {
@@ -538,6 +557,12 @@ impl EvolutionService {
                         routed.auto_applied.push(applied);
                     }
                     Err(_) => routed.queued.push(proposal),
+                }
+            } else if self.should_start_canary(&proposal) {
+                if let Some(started) = self.start_canary(&proposal).await {
+                    routed.canary_started.push(started);
+                } else {
+                    routed.queued.push(proposal);
                 }
             } else {
                 routed.queued.push(proposal);
@@ -581,6 +606,12 @@ impl EvolutionService {
         })
     }
 
+    fn should_start_canary(&self, proposal: &EvolutionProposal) -> bool {
+        proposal.promotion_verdict.as_ref().is_some_and(|verdict| {
+            verdict.recommendation == ProposalPromotionRecommendation::Canary
+        })
+    }
+
     async fn remember_recent_calibration_proposals(&self, proposals: &[EvolutionProposal]) {
         let mut recent = self.recent_calibration_dedup.lock().await;
         for proposal in proposals {
@@ -594,6 +625,102 @@ impl EvolutionService {
             let excess = recent.len() - MAX_RECENT_CALIBRATION_DEDUP;
             recent.drain(..excess);
         }
+    }
+
+    fn capture_canary_snapshot(
+        &self,
+        proposal: &EvolutionProposal,
+    ) -> Option<CanaryExecutionSnapshot> {
+        match &proposal.axis {
+            EvolutionAxis::Pattern { .. } => {
+                let pattern_library = self.pattern_library.as_ref()?.lock().ok()?.clone();
+                Some(CanaryExecutionSnapshot {
+                    pattern_library: Some(pattern_library),
+                    calibrator: None,
+                })
+            }
+            EvolutionAxis::Calibration { .. } => {
+                let calibrator = self.calibrator.as_ref()?.lock().ok()?.clone();
+                Some(CanaryExecutionSnapshot {
+                    pattern_library: None,
+                    calibrator: Some(calibrator),
+                })
+            }
+            EvolutionAxis::Skill { .. } | EvolutionAxis::Entity { .. } => None,
+        }
+    }
+
+    fn restore_canary_snapshot(&self, snapshot: &CanaryExecutionSnapshot) -> Result<(), String> {
+        if let Some(pattern_library) = snapshot.pattern_library.as_ref() {
+            let Some(library) = self.pattern_library.as_ref() else {
+                return Err("pattern library not configured for canary rollback".into());
+            };
+            let Ok(mut library) = library.lock() else {
+                return Err("pattern library lock poisoned during canary rollback".into());
+            };
+            *library = pattern_library.clone();
+        }
+        if let Some(calibrator) = snapshot.calibrator.as_ref() {
+            let Some(active_calibrator) = self.calibrator.as_ref() else {
+                return Err("progressive calibrator not configured for canary rollback".into());
+            };
+            let Ok(mut active_calibrator) = active_calibrator.lock() else {
+                return Err("progressive calibrator lock poisoned during canary rollback".into());
+            };
+            *active_calibrator = calibrator.clone();
+        }
+        Ok(())
+    }
+
+    async fn start_canary(&self, proposal: &EvolutionProposal) -> Option<EvolutionProposal> {
+        let snapshot = self.capture_canary_snapshot(proposal)?;
+        let mut registry = self.canary_registry.lock().await;
+        if !registry.active.is_empty() {
+            return None;
+        }
+        self.apply_proposal(proposal).ok()?;
+        let mut started = proposal.clone();
+        started.status = ApprovalStatus::CanaryActive;
+        registry.snapshots.insert(started.id.clone(), snapshot);
+        registry.active.push(started.clone());
+        Some(started)
+    }
+
+    async fn promote_canary(&self, id: &str) -> Result<Option<EvolutionProposal>, String> {
+        let promoted = {
+            let mut registry = self.canary_registry.lock().await;
+            let Some(pos) = registry.active.iter().position(|p| p.id == id) else {
+                return Ok(None);
+            };
+            registry.snapshots.remove(id);
+            let mut proposal = registry.active.remove(pos);
+            proposal.status = ApprovalStatus::CanaryPromoted;
+            proposal
+        };
+        self.append_applied_log(std::slice::from_ref(&promoted))
+            .await;
+        Ok(Some(promoted))
+    }
+
+    async fn rollback_canary(&self, id: &str) -> Result<Option<EvolutionProposal>, String> {
+        let rolled_back = {
+            let mut registry = self.canary_registry.lock().await;
+            let Some(pos) = registry.active.iter().position(|p| p.id == id) else {
+                return Ok(None);
+            };
+            let snapshot =
+                registry.snapshots.get(id).cloned().ok_or_else(|| {
+                    format!("missing rollback snapshot for canary proposal '{id}'")
+                })?;
+            self.restore_canary_snapshot(&snapshot)?;
+            registry.snapshots.remove(id);
+            let mut proposal = registry.active.remove(pos);
+            proposal.status = ApprovalStatus::CanaryRolledBack;
+            proposal
+        };
+        self.remember_recent_calibration_proposals(std::slice::from_ref(&rolled_back))
+            .await;
+        Ok(Some(rolled_back))
     }
 }
 
@@ -640,6 +767,25 @@ fn verdict_score(proposal: &EvolutionProposal) -> f64 {
         .as_ref()
         .map(|verdict| verdict.overall_score)
         .unwrap_or(proposal.confidence)
+}
+
+fn sort_proposals(mut proposals: Vec<EvolutionProposal>) -> Vec<EvolutionProposal> {
+    proposals.sort_by(|a, b| {
+        pending_priority(a)
+            .cmp(&pending_priority(b))
+            .then_with(|| {
+                verdict_score(b)
+                    .partial_cmp(&verdict_score(a))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| {
+                b.confidence
+                    .partial_cmp(&a.confidence)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| a.created_at.cmp(&b.created_at))
+    });
+    proposals
 }
 
 /// Wrap in Arc for shared ownership across async tasks.
@@ -890,10 +1036,12 @@ mod tests {
         assert_eq!(auto.len(), 1, "drift auto-applies");
         assert_eq!(llm.len(), 1, "tool failure with skill → 1 LLM signal");
         let pending = svc.pending().await;
-        // RepeatedStall → Canary, ToolFailure → Calibration (Canary/Hold)
-        assert_eq!(pending.len(), 2);
+        let canaries = svc.active_canaries().await;
+        // RepeatedStall → active canary, ToolFailure → queued calibration
+        assert_eq!(pending.len(), 1);
+        assert_eq!(canaries.len(), 1);
         assert_eq!(
-            pending[0]
+            canaries[0]
                 .promotion_verdict
                 .as_ref()
                 .map(|v| v.recommendation),
@@ -1203,6 +1351,7 @@ mod tests {
             ProposalIngestOutcome {
                 processed: 1,
                 auto_applied: 1,
+                canary_started: 0,
                 queued: 0,
             }
         );
@@ -1236,6 +1385,7 @@ mod tests {
             ProposalIngestOutcome {
                 processed: 1,
                 auto_applied: 1,
+                canary_started: 0,
                 queued: 0,
             }
         );
@@ -1257,7 +1407,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ingest_low_confidence_calibration_stays_pending() {
+    async fn ingest_low_confidence_calibration_starts_canary() {
         let calibrator = Arc::new(std::sync::Mutex::new(ProgressiveCalibrator::default()));
         let svc = EvolutionService::new().with_calibrator(calibrator.clone());
         let ctx = svc.build_reflection_context("s", 1, None, 0.0, &[], vec![], vec![], None);
@@ -1273,19 +1423,22 @@ mod tests {
             ProposalIngestOutcome {
                 processed: 1,
                 auto_applied: 0,
-                queued: 1,
+                canary_started: 1,
+                queued: 0,
             }
         );
-        let pending = svc.pending().await;
-        assert_eq!(pending.len(), 1);
+        assert!(svc.pending().await.is_empty());
+        let canaries = svc.active_canaries().await;
+        assert_eq!(canaries.len(), 1);
+        assert_eq!(canaries[0].status, ApprovalStatus::CanaryActive);
         assert_eq!(
-            pending[0]
+            canaries[0]
                 .promotion_verdict
                 .as_ref()
                 .map(|v| v.recommendation),
             Some(ProposalPromotionRecommendation::Canary)
         );
-        match &pending[0].axis {
+        match &canaries[0].axis {
             EvolutionAxis::Calibration {
                 axis: CalibrationAxis::Intent(intent),
                 adjustment,
@@ -1300,7 +1453,97 @@ mod tests {
                 .lock()
                 .unwrap()
                 .calibrated_threshold("fetch", None, TaskType::Unknown);
+        assert!((threshold - 0.60).abs() < 0.01, "got {threshold}");
+    }
+
+    #[tokio::test]
+    async fn approve_active_canary_promotes_it() {
+        let calibrator = Arc::new(std::sync::Mutex::new(ProgressiveCalibrator::default()));
+        let svc = EvolutionService::new().with_calibrator(calibrator.clone());
+        let ctx = svc.build_reflection_context("s", 1, None, 0.0, &[], vec![], vec![], None);
+        let llm = r#"{"proposals": [{"axis": "calibration", "description": "Nudge fetch intent threshold", "confidence": 0.80, "details": {"axis": "intent:fetch", "adjustment": 0.10}}], "summary": "ok"}"#;
+
+        svc.ingest_reflection_response_detailed(llm, &ctx)
+            .await
+            .unwrap();
+        let proposal_id = svc.active_canaries().await[0].id.clone();
+
+        let approved = svc.approve(&proposal_id).await.unwrap().unwrap();
+        assert_eq!(approved.status, ApprovalStatus::CanaryPromoted);
+        assert!(svc.active_canaries().await.is_empty());
+        assert_eq!(
+            svc.applied().await[0].status,
+            ApprovalStatus::CanaryPromoted
+        );
+
+        let threshold =
+            calibrator
+                .lock()
+                .unwrap()
+                .calibrated_threshold("fetch", None, TaskType::Unknown);
+        assert!((threshold - 0.60).abs() < 0.01, "got {threshold}");
+    }
+
+    #[tokio::test]
+    async fn reject_active_canary_rolls_back_snapshot() {
+        let calibrator = Arc::new(std::sync::Mutex::new(ProgressiveCalibrator::default()));
+        let svc = EvolutionService::new().with_calibrator(calibrator.clone());
+        let ctx = svc.build_reflection_context("s", 1, None, 0.0, &[], vec![], vec![], None);
+        let llm = r#"{"proposals": [{"axis": "calibration", "description": "Nudge fetch intent threshold", "confidence": 0.80, "details": {"axis": "intent:fetch", "adjustment": 0.10}}], "summary": "ok"}"#;
+
+        svc.ingest_reflection_response_detailed(llm, &ctx)
+            .await
+            .unwrap();
+        let proposal_id = svc.active_canaries().await[0].id.clone();
+
+        let rejected = svc.reject(&proposal_id).await.unwrap().unwrap();
+        assert_eq!(rejected.status, ApprovalStatus::CanaryRolledBack);
+        assert!(svc.active_canaries().await.is_empty());
+        assert!(svc.applied().await.is_empty());
+
+        let threshold =
+            calibrator
+                .lock()
+                .unwrap()
+                .calibrated_threshold("fetch", None, TaskType::Unknown);
         assert!((threshold - 0.70).abs() < 0.01, "got {threshold}");
+    }
+
+    #[tokio::test]
+    async fn second_canary_queues_while_one_is_active() {
+        let calibrator = Arc::new(std::sync::Mutex::new(ProgressiveCalibrator::default()));
+        let svc = EvolutionService::new().with_calibrator(calibrator.clone());
+        let ctx = svc.build_reflection_context("s", 1, None, 0.0, &[], vec![], vec![], None);
+
+        let first = r#"{"proposals": [{"axis": "calibration", "description": "Nudge fetch intent threshold", "confidence": 0.80, "details": {"axis": "intent:fetch", "adjustment": 0.10}}], "summary": "ok"}"#;
+        let second = r#"{"proposals": [{"axis": "calibration", "description": "Nudge github domain threshold", "confidence": 0.80, "details": {"axis": "domain:github", "adjustment": 0.10}}], "summary": "ok"}"#;
+
+        svc.ingest_reflection_response_detailed(first, &ctx)
+            .await
+            .unwrap();
+        let outcome = svc
+            .ingest_reflection_response_detailed(second, &ctx)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            ProposalIngestOutcome {
+                processed: 1,
+                auto_applied: 0,
+                canary_started: 0,
+                queued: 1,
+            }
+        );
+        assert_eq!(svc.active_canaries().await.len(), 1);
+        assert_eq!(svc.pending().await.len(), 1);
+        assert_eq!(
+            svc.pending().await[0]
+                .promotion_verdict
+                .as_ref()
+                .map(|v| v.recommendation),
+            Some(ProposalPromotionRecommendation::Canary)
+        );
     }
 
     #[tokio::test]
@@ -1320,6 +1563,7 @@ mod tests {
             ProposalIngestOutcome {
                 processed: 1,
                 auto_applied: 0,
+                canary_started: 0,
                 queued: 1,
             }
         );

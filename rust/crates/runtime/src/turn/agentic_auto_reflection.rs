@@ -510,9 +510,17 @@ pub(crate) async fn maybe_trigger_auto_reflection<H: AgenticLoopHost>(
     };
 
     evo.set_runtime_promotion_signals(state.telemetry.runtime_promotion_signals.clone());
-    let (pending_before, applied_before) = snapshot_evolution_promotion_ids(&evo).await;
+    let (pending_before, applied_before, canary_before) =
+        snapshot_evolution_promotion_ids(&evo).await;
     let (fast, llm_signals) = evo.flush().await;
-    record_new_evolution_promotion_events(state, &evo, &pending_before, &applied_before).await;
+    record_new_evolution_promotion_events(
+        state,
+        &evo,
+        &pending_before,
+        &applied_before,
+        &canary_before,
+    )
+    .await;
 
     if !fast.is_empty() {
         for proposal in fast.iter().take(MAX_RECENT_TACTICAL_ACTIONS) {
@@ -617,22 +625,30 @@ pub(crate) async fn maybe_trigger_auto_reflection<H: AgenticLoopHost>(
 
     apply_auto_reflection_usage(state, &reflection_result);
 
-    let (pending_before, applied_before) = snapshot_evolution_promotion_ids(&evo).await;
+    let (pending_before, applied_before, canary_before) =
+        snapshot_evolution_promotion_ids(&evo).await;
     match evo
         .ingest_reflection_response_detailed(&reflection_result.full_text, &ctx)
         .await
     {
         Ok(outcome) => {
-            record_new_evolution_promotion_events(state, &evo, &pending_before, &applied_before)
-                .await;
+            record_new_evolution_promotion_events(
+                state,
+                &evo,
+                &pending_before,
+                &applied_before,
+                &canary_before,
+            )
+            .await;
             state.pending_reflection_signals.clear();
             state.recent_tactical_actions.clear();
             host.emit_headless_line(
                 HeadlessStderrStyle::Green,
                 format!(
-                    "Auto-reflection processed {} proposal(s): {} auto-applied, {} queued from {} signal(s).",
+                    "Auto-reflection processed {} proposal(s): {} auto-applied, {} canary-started, {} queued from {} signal(s).",
                     outcome.processed,
                     outcome.auto_applied,
+                    outcome.canary_started,
                     outcome.queued,
                     ctx.signals.len(),
                 ),

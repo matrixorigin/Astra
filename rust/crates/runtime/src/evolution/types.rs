@@ -206,6 +206,9 @@ pub struct EvolutionProposal {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApprovalStatus {
     Pending,
+    CanaryActive,
+    CanaryPromoted,
+    CanaryRolledBack,
     Approved,
     Rejected,
     AutoApplied,

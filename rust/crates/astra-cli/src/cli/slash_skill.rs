@@ -258,17 +258,17 @@ pub(super) async fn handle_skill_command(
             eprintln!(
                 "    {}  {}",
                 "/skill evolve".cyan(),
-                "Show evolution status (signals, proposals)".dim()
+                "Show evolution status (signals, pending proposals, canaries)".dim()
             );
             eprintln!(
                 "    {}  {}",
                 "/skill evolve approve <id>".cyan(),
-                "Approve and apply a pending proposal".dim()
+                "Approve a pending proposal or promote an active canary".dim()
             );
             eprintln!(
                 "    {}  {}",
                 "/skill evolve reject <id>".cyan(),
-                "Reject a pending proposal".dim()
+                "Reject a pending proposal or roll back an active canary".dim()
             );
             eprintln!();
         }
@@ -1465,6 +1465,7 @@ Follow these steps:
                 // Show evolution status
                 let signal_count = evo.signal_count().await;
                 let pending = evo.pending().await;
+                let canaries = evo.active_canaries().await;
                 let applied = evo.applied().await;
                 eprintln!(
                     "\n{}",
@@ -1484,41 +1485,62 @@ Follow these steps:
                 );
                 eprintln!(
                     "  {:<20} {}",
+                    "active canaries:".dim(),
+                    canaries.len().to_string().cyan()
+                );
+                eprintln!(
+                    "  {:<20} {}",
                     "applied proposals:".dim(),
                     applied.len().to_string().cyan()
                 );
+                let axis_label = |p: &astra_runtime::evolution::types::EvolutionProposal| match &p
+                    .axis
+                {
+                    astra_runtime::evolution::types::EvolutionAxis::Skill {
+                        skill_name,
+                        section,
+                        ..
+                    } => format!("skill:{}/{}", skill_name, section.heading()),
+                    astra_runtime::evolution::types::EvolutionAxis::Pattern {
+                        signature, ..
+                    } => {
+                        format!("pattern:{signature}")
+                    }
+                    astra_runtime::evolution::types::EvolutionAxis::Calibration { .. } => {
+                        "calibration".into()
+                    }
+                    astra_runtime::evolution::types::EvolutionAxis::Entity { entity, .. } => {
+                        format!("entity:{entity}")
+                    }
+                };
                 if !pending.is_empty() {
                     eprintln!("\n  {}", "Pending proposals:".yellow());
                     for p in &pending {
-                        let axis = match &p.axis {
-                            astra_runtime::evolution::types::EvolutionAxis::Skill {
-                                skill_name,
-                                section,
-                                ..
-                            } => format!("skill:{}/{}", skill_name, section.heading()),
-                            astra_runtime::evolution::types::EvolutionAxis::Pattern {
-                                signature,
-                                ..
-                            } => format!("pattern:{signature}"),
-                            astra_runtime::evolution::types::EvolutionAxis::Calibration {
-                                ..
-                            } => "calibration".into(),
-                            astra_runtime::evolution::types::EvolutionAxis::Entity {
-                                entity,
-                                ..
-                            } => format!("entity:{entity}"),
-                        };
                         eprintln!(
                             "    {} {} (confidence: {:.0}%)",
                             p.id.as_str().dim(),
-                            axis.cyan(),
+                            axis_label(p).cyan(),
                             p.confidence * 100.0
                         );
                         eprintln!("      {}", p.reasoning.as_str().dim());
                     }
+                }
+                if !canaries.is_empty() {
+                    eprintln!("\n  {}", "Active canaries:".magenta());
+                    for p in &canaries {
+                        eprintln!(
+                            "    {} {} (confidence: {:.0}%)",
+                            p.id.as_str().dim(),
+                            axis_label(p).magenta(),
+                            p.confidence * 100.0
+                        );
+                        eprintln!("      {}", p.reasoning.as_str().dim());
+                    }
+                }
+                if !pending.is_empty() || !canaries.is_empty() {
                     eprintln!(
                         "\n  {}",
-                        "Use /skill evolve approve <id> or /skill evolve reject <id>".dim()
+                        "Use /skill evolve approve <id> or /skill evolve reject <id> to resolve pending proposals or active canaries".dim()
                     );
                 }
                 if !applied.is_empty() {
@@ -1532,19 +1554,41 @@ Follow these steps:
                 let id = id.trim();
                 match evo.approve(id).await {
                     Ok(Some(p)) => {
-                        eprintln!("  {} Approved and applied: {}", "✓".green(), p.id);
+                        let message = match p.status {
+                            astra_runtime::evolution::types::ApprovalStatus::CanaryPromoted => {
+                                "Promoted canary"
+                            }
+                            _ => "Approved and applied",
+                        };
+                        eprintln!("  {} {}: {}", "✓".green(), message, p.id);
                     }
                     Ok(None) => {
-                        eprintln!("  {} No pending proposal with id '{}'", "✗".red(), id);
+                        eprintln!(
+                            "  {} No pending proposal or active canary with id '{}'",
+                            "✗".red(),
+                            id
+                        );
                     }
                     Err(e) => eprintln!("  {} Approval failed: {}", "✗".red(), e),
                 }
             } else if let Some(id) = sub_arg.strip_prefix("reject ") {
                 let id = id.trim();
                 match evo.reject(id).await {
-                    Ok(Some(_)) => eprintln!("  {} Rejected: {}", "✓".green(), id),
+                    Ok(Some(p)) => {
+                        let message = match p.status {
+                            astra_runtime::evolution::types::ApprovalStatus::CanaryRolledBack => {
+                                "Rolled back canary"
+                            }
+                            _ => "Rejected",
+                        };
+                        eprintln!("  {} {}: {}", "✓".green(), message, id);
+                    }
                     Ok(None) => {
-                        eprintln!("  {} No pending proposal with id '{}'", "✗".red(), id)
+                        eprintln!(
+                            "  {} No pending proposal or active canary with id '{}'",
+                            "✗".red(),
+                            id
+                        )
                     }
                     Err(e) => eprintln!("  {} Reject failed: {}", "✗".red(), e),
                 }
@@ -1552,11 +1596,11 @@ Follow these steps:
                 eprintln!("  {}", "Usage:".yellow());
                 eprintln!("    {}       Show evolution status", "/skill evolve".cyan());
                 eprintln!(
-                    "    {}  Approve a proposal",
+                    "    {}  Approve a proposal or promote a canary",
                     "/skill evolve approve <id>".cyan()
                 );
                 eprintln!(
-                    "    {}   Reject a proposal",
+                    "    {}   Reject a proposal or roll back a canary",
                     "/skill evolve reject <id>".cyan()
                 );
             }
@@ -1730,10 +1774,11 @@ Follow these steps:
             match outcome {
                 Ok(outcome) => {
                     eprintln!(
-                        "\n  {} Reflection executed live; processed {} proposal(s): {} auto-applied, {} queued.",
+                        "\n  {} Reflection executed live; processed {} proposal(s): {} auto-applied, {} canary-started, {} queued.",
                         "✓".green(),
                         outcome.processed.to_string().cyan(),
                         outcome.auto_applied.to_string().cyan(),
+                        outcome.canary_started.to_string().cyan(),
                         outcome.queued.to_string().cyan()
                     );
                     if outcome.queued > 0 {

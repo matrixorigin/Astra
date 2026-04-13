@@ -323,9 +323,11 @@ impl StoredProposal {
         };
 
         let status = match p.status {
-            ApprovalStatus::Pending => StoredStatus::Pending,
-            ApprovalStatus::Approved | ApprovalStatus::AutoApplied => StoredStatus::Applied,
-            ApprovalStatus::Rejected => StoredStatus::Rejected,
+            ApprovalStatus::Pending | ApprovalStatus::CanaryActive => StoredStatus::Pending,
+            ApprovalStatus::Approved
+            | ApprovalStatus::AutoApplied
+            | ApprovalStatus::CanaryPromoted => StoredStatus::Applied,
+            ApprovalStatus::Rejected | ApprovalStatus::CanaryRolledBack => StoredStatus::Rejected,
         };
 
         Self {

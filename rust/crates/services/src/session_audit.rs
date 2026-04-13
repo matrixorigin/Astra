@@ -293,6 +293,9 @@ pub enum RuntimePromotionController {
 pub enum RuntimePromotionOutcome {
     AutoApplied,
     Queued,
+    CanaryStarted,
+    CanaryPromoted,
+    CanaryRolledBack,
     Promoted,
     Deferred,
 }
@@ -2426,6 +2429,9 @@ impl RuntimePromotionStatsAggregate {
             RuntimePromotionOutcome::Deferred => self.deferred_runtime_promotions += 1,
             RuntimePromotionOutcome::Queued => self.queued_runtime_promotions += 1,
             RuntimePromotionOutcome::AutoApplied => self.auto_applied_runtime_promotions += 1,
+            RuntimePromotionOutcome::CanaryStarted
+            | RuntimePromotionOutcome::CanaryPromoted
+            | RuntimePromotionOutcome::CanaryRolledBack => {}
         }
         match promotion.recommendation {
             RuntimePromotionRecommendation::Promote => {
@@ -3847,6 +3853,64 @@ mod tests {
         assert_eq!(stats.runtime_promote_recommendations, 1);
         assert_eq!(stats.runtime_canary_recommendations, 1);
         assert_eq!(stats.runtime_hold_recommendations, 1);
+    }
+
+    #[test]
+    fn aggregate_runtime_promotion_stats_counts_new_canary_outcomes_only_in_total() {
+        let promotions = vec![
+            RuntimePromotionRecord::from_event(
+                "evt-1".into(),
+                "session-a".into(),
+                "2026-04-12T12:00:00Z".into(),
+                RuntimePromotionEventData {
+                    controller: RuntimePromotionController::Evolution,
+                    outcome: RuntimePromotionOutcome::CanaryStarted,
+                    recommendation: RuntimePromotionRecommendation::Canary,
+                    subject_id: "proposal-1".into(),
+                    summary: "started canary".into(),
+                    turn: None,
+                    confidence_score: 0.76,
+                    support_score: 0.64,
+                    safety_score: 0.70,
+                    overall_score: 0.69,
+                    blockers: vec![],
+                    evidence: vec![],
+                    rollback_hint: Some("rollback".into()),
+                    run_id: Some("run-a".into()),
+                },
+            ),
+            RuntimePromotionRecord::from_event(
+                "evt-2".into(),
+                "session-a".into(),
+                "2026-04-12T12:01:00Z".into(),
+                RuntimePromotionEventData {
+                    controller: RuntimePromotionController::Evolution,
+                    outcome: RuntimePromotionOutcome::CanaryRolledBack,
+                    recommendation: RuntimePromotionRecommendation::Canary,
+                    subject_id: "proposal-1".into(),
+                    summary: "rolled back canary".into(),
+                    turn: None,
+                    confidence_score: 0.76,
+                    support_score: 0.64,
+                    safety_score: 0.70,
+                    overall_score: 0.69,
+                    blockers: vec![],
+                    evidence: vec![],
+                    rollback_hint: Some("rollback".into()),
+                    run_id: Some("run-a".into()),
+                },
+            ),
+        ];
+
+        let stats = aggregate_runtime_promotion_stats(&promotions);
+
+        assert_eq!(stats.total_runtime_promotions, 2);
+        assert_eq!(stats.evolution_runtime_promotions, 2);
+        assert_eq!(stats.runtime_canary_recommendations, 2);
+        assert_eq!(stats.promoted_runtime_promotions, 0);
+        assert_eq!(stats.deferred_runtime_promotions, 0);
+        assert_eq!(stats.queued_runtime_promotions, 0);
+        assert_eq!(stats.auto_applied_runtime_promotions, 0);
     }
 
     #[test]
