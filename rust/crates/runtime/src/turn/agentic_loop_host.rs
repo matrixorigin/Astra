@@ -3521,7 +3521,7 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
 
         if state.remaining_turns == 0 {
             return Err(format!(
-                "{} ({} turns used)",
+                "{} (budget: {} turns)",
                 CLI_AGENTIC_TURN_BUDGET_STALL_ABORT_MSG, state.max_turns
             ));
         }
@@ -5769,10 +5769,16 @@ mod tests {
     async fn budget_exhausted_returns_error() {
         let mut host = MockHost::new(vec![]);
         let mut state = make_state();
+        state.max_turns = 25;
         state.remaining_turns = 0;
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(outcome.is_err());
-        assert!(outcome.unwrap_err().contains("budget"));
+        let err = outcome.unwrap_err();
+        assert!(err.contains("budget"), "should mention budget: {err}");
+        assert!(
+            err.contains("budget: 25"),
+            "should show max_turns as budget: {err}"
+        );
     }
 
     #[tokio::test]

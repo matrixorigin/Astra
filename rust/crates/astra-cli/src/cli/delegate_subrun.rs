@@ -163,6 +163,32 @@ impl CliDelegateSubRunExecutor {
     }
 }
 
+/// Build the set of restricted tools from an agent profile's `skill_filter`.
+///
+/// `skill_filter` may contain tool names (from `agent_loader`, e.g. `["read_file",
+/// "grep"]`) or skill names (from team member definitions, e.g.
+/// `["review-changes"]`).  Only entries that match at least one known tool name
+/// are treated as an allowlist; when none match, the entries are skill names and
+/// all tools remain available.
+fn build_restricted_tools(
+    skill_filter: &[String],
+    valid_tool_names: &HashSet<String>,
+) -> HashSet<String> {
+    if skill_filter.is_empty() {
+        return HashSet::new();
+    }
+    let allowed: HashSet<&str> = skill_filter.iter().map(|s| s.as_str()).collect();
+    if valid_tool_names.iter().any(|n| allowed.contains(n.as_str())) {
+        valid_tool_names
+            .iter()
+            .filter(|name| !allowed.contains(name.as_str()))
+            .cloned()
+            .collect()
+    } else {
+        HashSet::new()
+    }
+}
+
 #[async_trait]
 impl SubRunExecutor for CliDelegateSubRunExecutor {
     async fn execute(&self, config: SubRunConfig) -> Result<AgentResult, String> {
@@ -255,17 +281,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             json!({ "role": "user", "content": user_message }),
         ];
 
-        // Restricted tools from agent profile's skill_filter
-        let restricted_tools: HashSet<String> = if profile.skill_filter.is_empty() {
-            HashSet::new()
-        } else {
-            let allowed: HashSet<&str> = profile.skill_filter.iter().map(|s| s.as_str()).collect();
-            valid_tool_names
-                .iter()
-                .filter(|name| !allowed.contains(name.as_str()))
-                .cloned()
-                .collect()
-        };
+        let restricted_tools = build_restricted_tools(&profile.skill_filter, &valid_tool_names);
 
         let task_profile = infer_task_execution_profile(&config.task);
         let subrun_session_id = format!("delegate-{}-{}", config.run_id, profile.agent_id);
@@ -772,5 +788,77 @@ mod tests {
         let result = resolve_worktree_path(&ctx, "agent-f", &base, &default);
         // Canonicalize fails on nonexistent path; fall back to default
         assert_eq!(result, default);
+    }
+
+    // ─── build_restricted_tools Tests ──────────────────────────────────────
+
+    fn tools(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+    fn toolset(names: &[&str]) -> HashSet<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn empty_skill_filter_restricts_nothing() {
+        let r = build_restricted_tools(&[], &toolset(&["bash", "read_file", "grep"]));
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn tool_names_in_filter_restrict_other_tools() {
+        // agent_loader path: skill_filter = ["read_file", "grep"]
+        let r = build_restricted_tools(
+            &tools(&["read_file", "grep"]),
+            &toolset(&["bash", "read_file", "grep", "write_file"]),
+        );
+        assert!(r.contains("bash"));
+        assert!(r.contains("write_file"));
+        assert!(!r.contains("read_file"));
+        assert!(!r.contains("grep"));
+        assert_eq!(r.len(), 2);
+    }
+
+    #[test]
+    fn skill_names_in_filter_restrict_nothing() {
+        // team path: skill_filter = ["review-changes"] — no tool matches
+        let r = build_restricted_tools(
+            &tools(&["review-changes"]),
+            &toolset(&["bash", "read_file", "grep", "write_file"]),
+        );
+        assert!(r.is_empty(), "skill names must not restrict tools: {r:?}");
+    }
+
+    #[test]
+    fn multiple_skill_names_restrict_nothing() {
+        // team with multiple skills, none matching tool names
+        let r = build_restricted_tools(
+            &tools(&["review-changes", "analyze-session", "verify-task"]),
+            &toolset(&["bash", "read_file", "grep"]),
+        );
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn mixed_tool_and_skill_names_uses_tool_filter() {
+        // If at least one entry matches a tool, treat as tool allowlist
+        let r = build_restricted_tools(
+            &tools(&["bash", "review-changes"]),
+            &toolset(&["bash", "read_file", "grep"]),
+        );
+        // "bash" matches → allowlist mode → restrict read_file and grep
+        assert!(r.contains("read_file"));
+        assert!(r.contains("grep"));
+        assert!(!r.contains("bash"));
+    }
+
+    #[test]
+    fn single_tool_restricts_all_others() {
+        let r = build_restricted_tools(
+            &tools(&["bash"]),
+            &toolset(&["bash", "read_file", "write_file", "grep", "glob"]),
+        );
+        assert_eq!(r.len(), 4);
+        assert!(!r.contains("bash"));
     }
 }
