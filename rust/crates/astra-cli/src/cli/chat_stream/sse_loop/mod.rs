@@ -156,6 +156,7 @@ pub(crate) async fn stream_chat_sse(
             let spawn_ctx = edge_tools::agent_spawning::SpawnAgentContext {
                 run_id: p.session_id.unwrap_or("ephemeral").to_string(),
                 agent_id: root_agent_id.to_string(),
+                recursion_depth: 0,
                 working_dir: project_root.clone(),
                 spawner: spawner.clone(),
                 inherited_permissions: p.perm_manager.inherited_permissions_for_child(false),
@@ -432,6 +433,7 @@ pub(crate) async fn stream_chat_sse(
         tool_results: Vec::new(),
         current_session_id,
         current_run_id: None,
+        recursion_depth: 0,
         final_text: String::new(),
         total_prompt: 0,
         total_completion: 0,

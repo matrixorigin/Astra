@@ -194,6 +194,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             tool_results: Vec::new(),
             current_session_id: Some(subrun_session_id),
             current_run_id: Some(config.run_id.clone()),
+            recursion_depth: config.recursion_depth,
             final_text: String::new(),
             total_prompt: 0,
             total_completion: 0,

@@ -55,6 +55,8 @@ pub struct SubRunConfig {
     pub previous_output: Option<String>,
     /// Context key-value pairs from the delegation request.
     pub context: HashMap<String, serde_json::Value>,
+    /// Current nested agent/sub-run depth for the child loop.
+    pub recursion_depth: u8,
     /// Cooperative pause flag — checked between turns by the sub-run loop.
     /// When set to `true`, the sub-run should yield with status "paused".
     pub pause_flag: Option<Arc<AtomicBool>>,
@@ -75,6 +77,7 @@ impl std::fmt::Debug for SubRunConfig {
             .field("session_id", &self.session_id)
             .field("user_id", &self.user_id)
             .field("previous_output", &self.previous_output)
+            .field("recursion_depth", &self.recursion_depth)
             .field("pause_flag", &self.pause_flag.is_some())
             .field("checkpoint_gate", &self.checkpoint_gate.is_some())
             .field("mailbox", &self.mailbox.is_some())
@@ -1365,6 +1368,8 @@ impl DelegationEngine {
     ) -> Result<DelegationResult, String> {
         // Validate first
         self.validate(&request, source_agent_id).await?;
+        let child_recursion_depth =
+            crate::turn::agentic_recursion_guard::checked_child_recursion_depth_u32(request.depth)?;
 
         let session_id = request
             .context
@@ -1420,6 +1425,7 @@ impl DelegationEngine {
                     &request,
                     agent_ids,
                     aggregation,
+                    child_recursion_depth,
                     *timeout_sec,
                     cancel_token.as_ref(),
                 )
@@ -1434,6 +1440,7 @@ impl DelegationEngine {
                     &request,
                     &agent_ids,
                     false,
+                    child_recursion_depth,
                     *timeout_sec,
                     cancel_token.as_ref(),
                 )
@@ -1448,6 +1455,7 @@ impl DelegationEngine {
                     &request,
                     agent_ids,
                     *stop_on_success,
+                    child_recursion_depth,
                     *timeout_sec,
                     cancel_token.as_ref(),
                 )
@@ -1465,6 +1473,7 @@ impl DelegationEngine {
                     producer_id,
                     reviewer_id,
                     *max_rounds,
+                    child_recursion_depth,
                     *timeout_sec,
                     cancel_token.as_ref(),
                 )
@@ -1483,6 +1492,7 @@ impl DelegationEngine {
                     agent_id,
                     *max_turns,
                     aggregation,
+                    child_recursion_depth,
                     *timeout_sec,
                     cancel_token.as_ref(),
                 )
@@ -1546,6 +1556,7 @@ impl DelegationEngine {
         request: &DelegationRequest,
         agent_ids: &[String],
         aggregation: &AggregationStrategy,
+        child_recursion_depth: u8,
         timeout_sec: u64,
         cancel_token: Option<&Arc<tokio_util::sync::CancellationToken>>,
     ) -> Result<DelegationResult, String> {
@@ -1671,6 +1682,7 @@ impl DelegationEngine {
                 user_id: request.user_id.clone(),
                 previous_output: None,
                 context: request.context.clone(),
+                recursion_depth: child_recursion_depth,
                 pause_flag: Some(pause_flag),
                 checkpoint_gate: None,
                 mailbox,
@@ -1900,6 +1912,7 @@ impl DelegationEngine {
                                 user_id: uid,
                                 previous_output: None,
                                 context: ctx,
+                                recursion_depth: child_recursion_depth,
                                 pause_flag: None,
                                 checkpoint_gate: None,
                                 mailbox: None,
@@ -1928,6 +1941,7 @@ impl DelegationEngine {
         request: &DelegationRequest,
         agent_ids: &[String],
         stop_on_success: bool,
+        child_recursion_depth: u8,
         timeout_sec: u64,
         cancel_token: Option<&Arc<tokio_util::sync::CancellationToken>>,
     ) -> Result<DelegationResult, String> {
@@ -2060,6 +2074,7 @@ impl DelegationEngine {
                 user_id: request.user_id.clone(),
                 previous_output: previous_output.clone(),
                 context: request.context.clone(),
+                recursion_depth: child_recursion_depth,
                 pause_flag: Some(pause_flag),
                 checkpoint_gate: None,
                 mailbox,
@@ -2153,6 +2168,7 @@ impl DelegationEngine {
                         user_id: uid.clone(),
                         previous_output: prev.clone(),
                         context: ctx.clone(),
+                        recursion_depth: child_recursion_depth,
                         pause_flag: None,
                         checkpoint_gate: None,
                         mailbox: None,
@@ -2188,6 +2204,7 @@ impl DelegationEngine {
         producer_id: &str,
         reviewer_id: &str,
         max_rounds: u32,
+        child_recursion_depth: u8,
         timeout_sec: u64,
         cancel_token: Option<&Arc<tokio_util::sync::CancellationToken>>,
     ) -> Result<DelegationResult, String> {
@@ -2327,6 +2344,7 @@ impl DelegationEngine {
                 user_id: request.user_id.clone(),
                 previous_output: last_producer_output.clone(),
                 context: request.context.clone(),
+                recursion_depth: child_recursion_depth,
                 pause_flag: Some(prod_pause.clone()),
                 checkpoint_gate: None,
                 mailbox: prod_mailbox,
@@ -2414,6 +2432,7 @@ impl DelegationEngine {
                         user_id: uid.clone(),
                         previous_output: prev.clone(),
                         context: ctx.clone(),
+                        recursion_depth: child_recursion_depth,
                         pause_flag: None,
                         checkpoint_gate: None,
                         mailbox: None,
@@ -2513,6 +2532,7 @@ impl DelegationEngine {
                 user_id: request.user_id.clone(),
                 previous_output: last_producer_output.clone(),
                 context: request.context.clone(),
+                recursion_depth: child_recursion_depth,
                 pause_flag: Some(rev_pause),
                 checkpoint_gate: None,
                 mailbox: rev_mailbox,
@@ -2594,6 +2614,7 @@ impl DelegationEngine {
         agent_id: &str,
         _max_turns: u32,
         _aggregation: &AggregationStrategy,
+        child_recursion_depth: u8,
         timeout_sec: u64,
         cancel_token: Option<&Arc<tokio_util::sync::CancellationToken>>,
     ) -> Result<DelegationResult, String> {
@@ -2730,6 +2751,7 @@ impl DelegationEngine {
                 user_id: request.user_id.clone(),
                 previous_output: None,
                 context: fork_context,
+                recursion_depth: child_recursion_depth,
                 pause_flag: Some(pause_flag),
                 checkpoint_gate: None,
                 mailbox: fork_mailbox,
@@ -3754,6 +3776,7 @@ mod tests {
             user_id: "u1".into(),
             previous_output: None,
             context: HashMap::new(),
+            recursion_depth: 1,
             pause_flag: None,
             checkpoint_gate: None,
             mailbox: None,

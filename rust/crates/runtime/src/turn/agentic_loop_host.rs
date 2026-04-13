@@ -431,6 +431,8 @@ pub struct AgenticLoopState {
     pub tool_results: Vec<Value>,
     pub current_session_id: Option<String>,
     pub current_run_id: Option<String>,
+    /// Current nested agent/sub-run depth. Root loops start at 0.
+    pub recursion_depth: u8,
 
     // ── Accumulated output ──
     pub final_text: String,
@@ -1242,6 +1244,7 @@ fn parse_delegation_request(
     tool_call: &Value,
     parent_run_id: &str,
     session_id: &str,
+    recursion_depth: u8,
     skill_search: &astra_core::SkillSearchSettings,
     adaptive_context: Option<&DelegationAdaptiveContext>,
 ) -> Result<astra_services::coordination::DelegationRequest, String> {
@@ -1287,6 +1290,7 @@ fn parse_delegation_request(
     if let Some(policy) = adaptive_policy {
         context.insert("adaptive_coordination".to_string(), policy);
     }
+    crate::turn::agentic_recursion_guard::checked_child_recursion_depth(recursion_depth)?;
 
     Ok(astra_services::coordination::DelegationRequest {
         delegation_id: uuid::Uuid::new_v4().to_string(),
@@ -1294,7 +1298,7 @@ fn parse_delegation_request(
         task,
         pattern,
         user_id: "system".to_string(),
-        depth: 0,
+        depth: u32::from(recursion_depth),
         context,
     })
 }
@@ -1612,6 +1616,7 @@ async fn partition_and_execute_delegations(
     engine: &crate::server::delegation_engine::DelegationEngine,
     parent_run_id: &str,
     session_id: &str,
+    recursion_depth: u8,
     source_agent_id: &str,
     workspace_hint: Option<&str>,
     skill_search: &astra_core::SkillSearchSettings,
@@ -1632,6 +1637,7 @@ async fn partition_and_execute_delegations(
                 tc,
                 parent_run_id,
                 session_id,
+                recursion_depth,
                 skill_search,
                 adaptive_context,
             ) {
@@ -2528,7 +2534,7 @@ fn maybe_run_tuning_cycle(state: &mut AgenticLoopState) {
     let new_budget = session_guard.config.token_budget.max_turn_input_tokens;
     let old_budget_before_tuning = {
         // Compare against what it was before this cycle
-        
+
         state.max_turn_input_tokens as u32
     };
     if new_budget != old_budget_before_tuning {
@@ -4273,6 +4279,7 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                 engine,
                 state.current_run_id.as_deref().unwrap_or("unknown"),
                 state.current_session_id.as_deref().unwrap_or("unknown"),
+                state.recursion_depth,
                 "orchestrator",
                 state.hooks.workspace_root_hint.as_deref(),
                 &state.skills.search,
@@ -4594,6 +4601,7 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                 session_dir,
                 work_dir: state.hooks.workspace_root_hint.clone(),
                 available_tools: state.telemetry.all_tools_used.iter().cloned().collect(),
+                recursion_depth: state.recursion_depth,
                 extra,
             };
 
@@ -5601,6 +5609,7 @@ mod tests {
             tool_results: Vec::new(),
             current_session_id: None,
             current_run_id: None,
+            recursion_depth: 0,
             final_text: String::new(),
             total_prompt: 0,
             total_completion: 0,
@@ -6413,12 +6422,14 @@ mod tests {
             &tool_call,
             "run-123",
             "session-456",
+            2,
             &astra_core::SkillSearchSettings::default(),
             None,
         )
         .unwrap();
         assert_eq!(req.task, "write tests");
         assert_eq!(req.parent_run_id, "run-123");
+        assert_eq!(req.depth, 2);
         assert!(req.context.contains_key("session_id"));
         assert!(req.context.contains_key("skill_search"));
         assert!(req.context.contains_key("repo"));
@@ -6437,11 +6448,38 @@ mod tests {
             &tool_call,
             "run-1",
             "sess-1",
+            0,
             &astra_core::SkillSearchSettings::default(),
             None,
         );
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("missing arguments"));
+    }
+
+    #[test]
+    fn parse_delegation_request_rejects_max_recursion_depth() {
+        let tool_call = json!({
+            "type": "function",
+            "function": {
+                "name": "delegate",
+                "arguments": "{\"task\": \"review this patch\", \"agents\": [\"reviewer\"]}"
+            }
+        });
+
+        let result = super::parse_delegation_request(
+            &tool_call,
+            "run-1",
+            "sess-1",
+            crate::turn::agentic_recursion_guard::MAX_AGENT_RECURSION_DEPTH,
+            &astra_core::SkillSearchSettings::default(),
+            None,
+        );
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .contains("recursion depth 3 reached maximum 3")
+        );
     }
 
     #[test]
@@ -6462,6 +6500,7 @@ mod tests {
             &tool_call,
             "run-123",
             "session-456",
+            0,
             &astra_core::SkillSearchSettings::default(),
             Some(&adaptive_context),
         )
@@ -6495,6 +6534,7 @@ mod tests {
             &tool_call,
             "run-123",
             "session-456",
+            0,
             &astra_core::SkillSearchSettings::default(),
             Some(&adaptive_context),
         )
@@ -6851,6 +6891,7 @@ mod tests {
             &engine,
             "test-run",
             "test-session",
+            0,
             "orchestrator",
             None,
             &astra_core::SkillSearchSettings::default(),
@@ -6907,6 +6948,7 @@ mod tests {
             &engine,
             "run-1",
             "sess-1",
+            0,
             "orchestrator",
             None,
             &astra_core::SkillSearchSettings::default(),
@@ -6945,6 +6987,7 @@ mod tests {
             &engine,
             "run-1",
             "sess-1",
+            0,
             "orchestrator",
             None,
             &astra_core::SkillSearchSettings::default(),

@@ -107,6 +107,7 @@ mod tests {
         let context = SkillExecutionContext {
             task: String::new(),
             arguments: HashMap::new(),
+            recursion_depth: 0,
         };
 
         let result = executor.execute(&skill, &context).await.unwrap();
@@ -123,6 +124,7 @@ mod tests {
         let context = SkillExecutionContext {
             task: "Review auth module".into(),
             arguments: HashMap::new(),
+            recursion_depth: 0,
         };
 
         let result = executor.execute(&skill, &context).await.unwrap();
@@ -151,6 +153,7 @@ mod tests {
         let context = SkillExecutionContext {
             task: String::new(),
             arguments: HashMap::new(),
+            recursion_depth: 0,
         };
 
         let result = executor.execute(&skill, &context).await.unwrap();
@@ -179,6 +182,7 @@ mod tests {
         let context = SkillExecutionContext {
             task: "review auth module".into(),
             arguments: args,
+            recursion_depth: 0,
         };
 
         let result = executor.execute(&skill, &context).await.unwrap();
@@ -195,6 +199,7 @@ mod tests {
         let ctx = SkillExecutionContext {
             task: String::new(),
             arguments: HashMap::new(),
+            recursion_depth: 0,
         };
 
         let short_result = executor.execute(&short, &ctx).await.unwrap();
@@ -209,6 +214,7 @@ mod tests {
         let ctx = SkillExecutionContext {
             task: String::new(),
             arguments: HashMap::new(),
+            recursion_depth: 0,
         };
 
         let result = executor.execute(&skill, &ctx).await.unwrap();
@@ -222,6 +228,7 @@ mod tests {
         let ctx = SkillExecutionContext {
             task: String::new(),
             arguments: HashMap::new(),
+            recursion_depth: 0,
         };
 
         let result = executor.execute(&skill, &ctx).await.unwrap();
@@ -245,6 +252,7 @@ mod tests {
         let ctx = SkillExecutionContext {
             task: String::new(),
             arguments: HashMap::new(),
+            recursion_depth: 0,
         };
 
         let result = executor.execute(&skill, &ctx).await.unwrap();
@@ -269,6 +277,7 @@ mod tests {
         let ctx = SkillExecutionContext {
             task: String::new(),
             arguments: HashMap::new(),
+            recursion_depth: 0,
         };
 
         let result = executor.execute(&skill, &ctx).await;
@@ -293,6 +302,7 @@ mod tests {
         let ctx = SkillExecutionContext {
             task: String::new(),
             arguments: HashMap::new(),
+            recursion_depth: 0,
         };
 
         let result = executor.execute(&skill, &ctx).await;
@@ -320,6 +330,7 @@ mod tests {
         let ctx = SkillExecutionContext {
             task: String::new(),
             arguments: HashMap::new(),
+            recursion_depth: 0,
         };
 
         let result = executor.execute(&skill, &ctx).await;
@@ -347,6 +358,7 @@ mod tests {
         let ctx = SkillExecutionContext {
             task: String::new(),
             arguments: HashMap::new(),
+            recursion_depth: 0,
         };
 
         let result = executor.execute(&skill, &ctx).await;
@@ -374,6 +386,7 @@ mod tests {
         let ctx = SkillExecutionContext {
             task: String::new(),
             arguments: HashMap::new(),
+            recursion_depth: 0,
         };
 
         let result = executor.execute(&skill, &ctx).await;

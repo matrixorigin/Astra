@@ -31,6 +31,8 @@ pub struct SpawnContext {
     pub parent_run_id: String,
     /// The parent's agent ID (for tracking delegation chains).
     pub parent_agent_id: String,
+    /// Current nested agent/sub-run depth of the parent.
+    pub recursion_depth: u8,
     /// Working directory for the spawned agent.
     pub working_dir: PathBuf,
     /// Permissions inherited from the parent agent.
@@ -151,6 +153,8 @@ pub struct SpawnRunConfig {
     pub run_id: String,
     /// Agent ID (name@run_id).
     pub agent_id: String,
+    /// Current nested agent/sub-run depth of the spawned child loop.
+    pub recursion_depth: u8,
     /// The agent type (explore, code-review, task, general-purpose).
     pub agent_type: String,
     /// Detailed task prompt for the agent.
@@ -190,6 +194,7 @@ impl std::fmt::Debug for SpawnRunConfig {
         f.debug_struct("SpawnRunConfig")
             .field("run_id", &self.run_id)
             .field("agent_id", &self.agent_id)
+            .field("recursion_depth", &self.recursion_depth)
             .field("agent_type", &self.agent_type)
             .field("task", &self.task)
             .field("model", &self.model)
@@ -365,6 +370,11 @@ impl DynamicAgentSpawner {
             .agent_registry
             .get(&input.agent_type)
             .ok_or_else(|| SpawnError::UnknownAgentType(input.agent_type.clone()))?;
+        let child_recursion_depth =
+            crate::turn::agentic_recursion_guard::checked_child_recursion_depth(
+                context.recursion_depth,
+            )
+            .map_err(SpawnError::DepthLimitExceeded)?;
 
         // 2. Generate IDs
         let agent_name = input.name.clone().unwrap_or_else(|| {
@@ -482,6 +492,7 @@ impl DynamicAgentSpawner {
         let run_config = SpawnRunConfig {
             run_id: run_id.clone(),
             agent_id: agent_id.clone(),
+            recursion_depth: child_recursion_depth,
             agent_type: input.agent_type.clone(),
             task: input.prompt.clone(),
             system_prompt_addendum: agent_def.system_prompt_addendum.clone(),
@@ -932,6 +943,9 @@ pub enum SpawnError {
     #[error("Unknown agent type: {0}")]
     UnknownAgentType(String),
 
+    #[error("Recursion depth limit exceeded: {0}")]
+    DepthLimitExceeded(String),
+
     #[error("Mailbox registration failed: {0}")]
     MailboxRegistration(String),
 
@@ -1031,6 +1045,7 @@ mod tests {
         let context = SpawnContext {
             parent_run_id: "parent-123".to_string(),
             parent_agent_id: "parent".to_string(),
+            recursion_depth: 0,
             working_dir: PathBuf::from("/tmp"),
             inherited_permissions: None,
             inherited_skills: vec![],
@@ -1057,6 +1072,7 @@ mod tests {
         let context = SpawnContext {
             parent_run_id: "parent-123".to_string(),
             parent_agent_id: "parent".to_string(),
+            recursion_depth: 0,
             working_dir: PathBuf::from("/tmp"),
             inherited_permissions: None,
             inherited_skills: vec![],
@@ -1072,6 +1088,7 @@ mod tests {
         let context = SpawnContext {
             parent_run_id: "parent-123".to_string(),
             parent_agent_id: "parent".to_string(),
+            recursion_depth: 0,
             working_dir: PathBuf::from("/tmp"),
             inherited_permissions: None,
             inherited_skills: vec![],
@@ -1120,6 +1137,7 @@ mod tests {
         let context = SpawnContext {
             parent_run_id: "parent-123".to_string(),
             parent_agent_id: "parent".to_string(),
+            recursion_depth: 0,
             working_dir: PathBuf::from("/tmp"),
             inherited_permissions: None,
             inherited_skills: vec![],
@@ -1167,6 +1185,7 @@ mod tests {
         let context = SpawnContext {
             parent_run_id: "parent-123".to_string(),
             parent_agent_id: "main".to_string(),
+            recursion_depth: 0,
             inherited_permissions: None,
             inherited_skills: vec![],
             working_dir: PathBuf::from("/tmp"),
@@ -1221,6 +1240,18 @@ mod tests {
         error: Option<&'static str>,
     }
 
+    struct CapturingDepthExecutor {
+        captured_depth: std::sync::Mutex<Option<u8>>,
+    }
+
+    impl CapturingDepthExecutor {
+        fn new() -> Self {
+            Self {
+                captured_depth: std::sync::Mutex::new(None),
+            }
+        }
+    }
+
     #[async_trait]
     impl SpawnAgentExecutor for ImmediateSuccessExecutor {
         async fn execute(&self, config: SpawnRunConfig) -> Result<SpawnRunResult, String> {
@@ -1261,6 +1292,27 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl SpawnAgentExecutor for CapturingDepthExecutor {
+        async fn execute(&self, config: SpawnRunConfig) -> Result<SpawnRunResult, String> {
+            *self.captured_depth.lock().unwrap() = Some(config.recursion_depth);
+            Ok(SpawnRunResult {
+                agent_id: config.agent_id,
+                run_id: config.run_id,
+                status: "completed".into(),
+                output: Some("ok".into()),
+                error: None,
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                tool_calls: 0,
+                permission_summary: None,
+                permission_requests: 0,
+                permission_requests_approved: 0,
+                tools_blocked: 0,
+            })
+        }
+    }
+
     #[tokio::test]
     async fn test_background_completion_unregisters_mailbox() {
         let router = mock_router();
@@ -1269,6 +1321,7 @@ mod tests {
         let context = SpawnContext {
             parent_run_id: "parent-123".to_string(),
             parent_agent_id: "main".to_string(),
+            recursion_depth: 0,
             inherited_permissions: None,
             inherited_skills: vec![],
             working_dir: PathBuf::from("/tmp"),
@@ -1307,6 +1360,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_spawn_threads_child_recursion_depth_to_run_config() {
+        let executor = Arc::new(CapturingDepthExecutor::new());
+        let spawner = DynamicAgentSpawner::new(mock_router()).with_executor(executor.clone());
+        let context = SpawnContext {
+            parent_run_id: "parent-123".to_string(),
+            parent_agent_id: "main".to_string(),
+            recursion_depth: 2,
+            inherited_permissions: None,
+            inherited_skills: vec![],
+            working_dir: PathBuf::from("/tmp"),
+        };
+        let input = SpawnAgentInput {
+            description: "Depth test".to_string(),
+            prompt: "Run depth test".to_string(),
+            agent_type: "explore".to_string(),
+            model: None,
+            background: false,
+            name: None,
+            max_turns: None,
+            isolated: false,
+            allowed_tools: None,
+        };
+
+        let result = spawner.spawn(input, &context).await.unwrap();
+        assert!(matches!(result, SpawnAgentOutput::Completed { .. }));
+        assert_eq!(*executor.captured_depth.lock().unwrap(), Some(3));
+    }
+
+    #[tokio::test]
+    async fn test_spawn_rejects_when_recursion_depth_limit_reached() {
+        let spawner = DynamicAgentSpawner::new(mock_router());
+        let context = SpawnContext {
+            parent_run_id: "parent-123".to_string(),
+            parent_agent_id: "main".to_string(),
+            recursion_depth: crate::turn::agentic_recursion_guard::MAX_AGENT_RECURSION_DEPTH,
+            inherited_permissions: None,
+            inherited_skills: vec![],
+            working_dir: PathBuf::from("/tmp"),
+        };
+        let input = SpawnAgentInput {
+            description: "Depth reject".to_string(),
+            prompt: "Should fail".to_string(),
+            agent_type: "explore".to_string(),
+            model: None,
+            background: false,
+            name: None,
+            max_turns: None,
+            isolated: false,
+            allowed_tools: None,
+        };
+
+        let result = spawner.spawn(input, &context).await;
+        assert!(matches!(result, Err(SpawnError::DepthLimitExceeded(_))));
+    }
+
+    #[tokio::test]
     async fn test_sync_spawn_returns_failed_output_for_failed_run() {
         let spawner = DynamicAgentSpawner::new(mock_router()).with_executor(Arc::new(
             ImmediateStatusExecutor {
@@ -1318,6 +1427,7 @@ mod tests {
         let context = SpawnContext {
             parent_run_id: "parent-123".to_string(),
             parent_agent_id: "main".to_string(),
+            recursion_depth: 0,
             inherited_permissions: None,
             inherited_skills: vec![],
             working_dir: PathBuf::from("/tmp"),
@@ -1347,6 +1457,7 @@ mod tests {
         let context = SpawnContext {
             parent_run_id: "parent-123".to_string(),
             parent_agent_id: "parent".to_string(),
+            recursion_depth: 0,
             working_dir: PathBuf::from("/tmp"),
             inherited_permissions: None,
             inherited_skills: vec!["review-changes".to_string(), "analyze-session".to_string()],
@@ -1372,6 +1483,7 @@ mod tests {
         let context = SpawnContext {
             parent_run_id: "run-1".to_string(),
             parent_agent_id: "agent-1".to_string(),
+            recursion_depth: 0,
             working_dir: PathBuf::from("/tmp"),
             inherited_permissions: None,
             inherited_skills: Vec::new(),

@@ -37,6 +37,8 @@ pub struct SpawnAgentContext {
     pub run_id: String,
     /// Current agent's ID
     pub agent_id: String,
+    /// Current nested agent/sub-run depth of the agent.
+    pub recursion_depth: u8,
     /// Working directory
     pub working_dir: PathBuf,
     /// The spawner instance
@@ -83,6 +85,7 @@ pub async fn handle_spawn_agent_tool(args: &Value, ctx: Option<&SpawnAgentContex
     let spawn_ctx = SpawnContext {
         parent_run_id: ctx.run_id.clone(),
         parent_agent_id: ctx.agent_id.clone(),
+        recursion_depth: ctx.recursion_depth,
         working_dir: ctx.working_dir.clone(),
         inherited_permissions: Some(inherited_permissions),
         inherited_skills: ctx.active_skills.clone(),
@@ -128,6 +131,7 @@ pub fn create_spawn_context(
     SpawnAgentContext {
         run_id,
         agent_id,
+        recursion_depth: 0,
         working_dir,
         spawner,
         inherited_permissions,

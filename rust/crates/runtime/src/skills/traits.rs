@@ -36,6 +36,8 @@ pub struct SkillExecutionContext {
     pub task: String,
     /// Additional arguments passed to the skill.
     pub arguments: std::collections::HashMap<String, String>,
+    /// Current nested agent/sub-run depth of the caller.
+    pub recursion_depth: u8,
 }
 
 /// Result of a skill execution.

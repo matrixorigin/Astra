@@ -2300,6 +2300,7 @@ mod tests {
         let context = SpawnContext {
             parent_run_id: "root-run".to_string(),
             parent_agent_id: "main".to_string(),
+            recursion_depth: 0,
             inherited_permissions: None,
             inherited_skills: vec![],
             working_dir: PathBuf::from("/tmp"),

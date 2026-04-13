@@ -32,6 +32,7 @@ pub trait SkillSubRunExecutor: Send + Sync {
         model: Option<&str>,
         max_tokens: Option<u32>,
         allowed_tools: &[String],
+        parent_recursion_depth: u8,
         effort: Option<&str>,
         agent_type: Option<&str>,
     ) -> Result<SubRunResult, String>;
@@ -76,6 +77,7 @@ impl SkillExecutor for IsolatedSkillExecutor {
                 skill.manifest.model.as_deref(),
                 skill.manifest.max_tokens,
                 &skill.manifest.allowed_tools,
+                context.recursion_depth,
                 skill
                     .manifest
                     .effort
@@ -186,6 +188,7 @@ mod tests {
             _model: Option<&str>,
             _max_tokens: Option<u32>,
             _allowed_tools: &[String],
+            _parent_recursion_depth: u8,
             _effort: Option<&str>,
             _agent_type: Option<&str>,
         ) -> Result<SubRunResult, String> {
@@ -216,6 +219,7 @@ mod tests {
         let context = SkillExecutionContext {
             task: "Review auth module".into(),
             arguments: HashMap::new(),
+            recursion_depth: 0,
         };
 
         let result = executor.execute(&skill, &context).await.unwrap();
@@ -244,6 +248,7 @@ mod tests {
         let context = SkillExecutionContext {
             task: String::new(),
             arguments: HashMap::new(),
+            recursion_depth: 0,
         };
 
         let result = router.execute(&skill, &context).await.unwrap();
@@ -269,6 +274,7 @@ mod tests {
         let context = SkillExecutionContext {
             task: "test".into(),
             arguments: HashMap::new(),
+            recursion_depth: 0,
         };
 
         let result = router.execute(&skill, &context).await.unwrap();
@@ -293,6 +299,7 @@ mod tests {
         let context = SkillExecutionContext {
             task: String::new(),
             arguments: HashMap::new(),
+            recursion_depth: 0,
         };
 
         // Falls back to inline
@@ -314,6 +321,7 @@ mod tests {
             _model: Option<&str>,
             _max_tokens: Option<u32>,
             _allowed_tools: &[String],
+            _parent_recursion_depth: u8,
             _effort: Option<&str>,
             _agent_type: Option<&str>,
         ) -> Result<SubRunResult, String> {
@@ -339,6 +347,7 @@ mod tests {
         let context = SkillExecutionContext {
             task: "test".into(),
             arguments: HashMap::new(),
+            recursion_depth: 0,
         };
 
         let err = executor.execute(&skill, &context).await.unwrap_err();
@@ -364,6 +373,7 @@ mod tests {
         let context = SkillExecutionContext {
             task: "test".into(),
             arguments: HashMap::new(),
+            recursion_depth: 0,
         };
 
         let result = executor.execute(&skill, &context).await.unwrap();
@@ -413,6 +423,7 @@ mod tests {
         let context = SkillExecutionContext {
             task: "fork task".into(),
             arguments: HashMap::new(),
+            recursion_depth: 0,
         };
 
         let result = router.execute(&skill, &context).await.unwrap();
@@ -427,6 +438,7 @@ mod tests {
     struct CapturingSubRunExecutor {
         captured_effort: std::sync::Mutex<Option<String>>,
         captured_agent_type: std::sync::Mutex<Option<String>>,
+        captured_recursion_depth: std::sync::Mutex<Option<u8>>,
     }
 
     impl CapturingSubRunExecutor {
@@ -434,6 +446,7 @@ mod tests {
             Self {
                 captured_effort: std::sync::Mutex::new(None),
                 captured_agent_type: std::sync::Mutex::new(None),
+                captured_recursion_depth: std::sync::Mutex::new(None),
             }
         }
     }
@@ -448,11 +461,13 @@ mod tests {
             _model: Option<&str>,
             _max_tokens: Option<u32>,
             _allowed_tools: &[String],
+            parent_recursion_depth: u8,
             effort: Option<&str>,
             agent_type: Option<&str>,
         ) -> Result<SubRunResult, String> {
             *self.captured_effort.lock().unwrap() = effort.map(String::from);
             *self.captured_agent_type.lock().unwrap() = agent_type.map(String::from);
+            *self.captured_recursion_depth.lock().unwrap() = Some(parent_recursion_depth);
             Ok(SubRunResult {
                 output: "done".into(),
                 tokens_used: 100,
@@ -484,6 +499,7 @@ mod tests {
         let context = SkillExecutionContext {
             task: "test effort threading".into(),
             arguments: HashMap::new(),
+            recursion_depth: 2,
         };
 
         let _result = executor.execute(&skill, &context).await.unwrap();
@@ -497,6 +513,11 @@ mod tests {
             *executor_inner.captured_agent_type.lock().unwrap(),
             Some("coder".to_string()),
             "agent_type should be threaded through to SubRunExecutor"
+        );
+        assert_eq!(
+            *executor_inner.captured_recursion_depth.lock().unwrap(),
+            Some(2),
+            "recursion depth should be threaded through to SubRunExecutor"
         );
     }
 
@@ -521,10 +542,15 @@ mod tests {
         let context = SkillExecutionContext {
             task: "test".into(),
             arguments: HashMap::new(),
+            recursion_depth: 0,
         };
 
         let _result = executor.execute(&skill, &context).await.unwrap();
         assert_eq!(*executor_inner.captured_effort.lock().unwrap(), None);
         assert_eq!(*executor_inner.captured_agent_type.lock().unwrap(), None);
+        assert_eq!(
+            *executor_inner.captured_recursion_depth.lock().unwrap(),
+            Some(0)
+        );
     }
 }

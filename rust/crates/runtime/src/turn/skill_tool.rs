@@ -94,6 +94,8 @@ pub struct SkillContext {
     pub work_dir: Option<String>,
     /// Names of tools available to the agent in this turn.
     pub available_tools: Vec<String>,
+    /// Current nested agent/sub-run depth of the caller.
+    pub recursion_depth: u8,
     /// Extensible key-value pairs for host-specific context.
     pub extra: HashMap<String, String>,
 }
@@ -1455,6 +1457,7 @@ fn execute_skill<'a>(
                         let ctx = SkillExecutionContext {
                             task: task_hint.to_string(),
                             arguments: HashMap::new(),
+                            recursion_depth: skill_ctx.recursion_depth,
                         };
                         match exec.execute(&loaded, &ctx).await {
                             Ok(result) => {
@@ -2070,6 +2073,7 @@ mod tests {
             session_dir: Some("/tmp/sessions/42".into()),
             work_dir: Some("/home/user/project".into()),
             available_tools: vec!["bash".into(), "read_file".into()],
+            recursion_depth: 0,
             extra: {
                 let mut m = HashMap::new();
                 m.insert("git_branch".into(), "main".into());

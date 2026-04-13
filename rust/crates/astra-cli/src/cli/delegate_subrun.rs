@@ -296,6 +296,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             tool_results: Vec::new(),
             current_session_id: Some(config.session_id.clone()),
             current_run_id: Some(config.run_id.clone()),
+            recursion_depth: config.recursion_depth,
             final_text: String::new(),
             total_prompt: 0,
             total_completion: 0,

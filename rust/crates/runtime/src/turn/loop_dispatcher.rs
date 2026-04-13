@@ -263,6 +263,7 @@ mod tests {
             tool_results: Vec::new(),
             current_session_id: None,
             current_run_id: None,
+            recursion_depth: 0,
             final_text: String::new(),
             total_prompt: 0,
             total_completion: 0,

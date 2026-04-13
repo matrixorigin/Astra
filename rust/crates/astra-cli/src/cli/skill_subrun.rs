@@ -359,9 +359,14 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
         model: Option<&str>,
         max_tokens: Option<u32>,
         allowed_tools: &[String],
+        parent_recursion_depth: u8,
         effort: Option<&str>,
         agent_type: Option<&str>,
     ) -> Result<SubRunResult, String> {
+        let child_recursion_depth =
+            astra_runtime::turn::agentic_recursion_guard::checked_child_recursion_depth(
+                parent_recursion_depth,
+            )?;
         let effective_model = model
             .map(String::from)
             .or_else(|| self.default_model.clone());
@@ -452,6 +457,7 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             tool_results: Vec::new(),
             current_session_id: None,
             current_run_id: None,
+            recursion_depth: child_recursion_depth,
             final_text: String::new(),
             total_prompt: 0,
             total_completion: 0,
@@ -630,5 +636,35 @@ mod tests {
         host.inject_tool_schema(schema);
         assert!(host.valid_tool_names.contains("test_tool"));
         assert_eq!(host.all_schemas.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn cli_skill_subrun_rejects_when_recursion_depth_limit_reached() {
+        let executor = CliSkillSubRunExecutor::new(
+            astra_thin_client::ThinClient::new("http://unused", None).unwrap(),
+            "token".to_string(),
+            Some("test-model".to_string()),
+            PathBuf::from("."),
+            PermissionMode::Deny,
+            None,
+        );
+        let allowed_tools: Vec<String> = Vec::new();
+
+        let err = executor
+            .execute_skill_subrun(
+                "depth-test",
+                "Do work",
+                "task",
+                None,
+                None,
+                &allowed_tools,
+                astra_runtime::turn::agentic_recursion_guard::MAX_AGENT_RECURSION_DEPTH,
+                None,
+                None,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(err.contains("recursion depth 3 reached maximum 3"));
     }
 }
