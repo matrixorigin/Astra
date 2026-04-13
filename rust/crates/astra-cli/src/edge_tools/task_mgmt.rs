@@ -212,12 +212,17 @@ impl TaskManager {
             // Update subtask
             match task.subtasks.iter_mut().find(|st| st.id == st_id) {
                 Some(subtask) => {
+                    let previous_status = subtask.status.clone();
                     if let Some(status) = new_status {
                         subtask.status = status.to_string();
                     }
                     task.updated_at = now;
                     return json!({
                         "success": true,
+                        "task_id": task_id,
+                        "subtask_id": st_id,
+                        "previous_status": previous_status,
+                        "status": subtask.status,
                         "message": format!("Subtask '{}' updated to '{}'", st_id, subtask.status)
                     })
                     .to_string();
@@ -229,6 +234,7 @@ impl TaskManager {
         }
 
         // Update main task
+        let previous_status = task.status.clone();
         if let Some(status) = new_status {
             task.status = status.to_string();
         }
@@ -248,6 +254,9 @@ impl TaskManager {
 
         json!({
             "success": true,
+            "task_id": task_id,
+            "previous_status": previous_status,
+            "status": task.status,
             "message": format!("Task '{}' updated to '{}'", task_id, task.status)
         })
         .to_string()

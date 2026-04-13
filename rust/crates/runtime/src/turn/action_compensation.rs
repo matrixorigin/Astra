@@ -199,6 +199,48 @@ fn restore_deleted_file_compensation_summary(path: Option<&str>) -> String {
     )
 }
 
+fn adjust_config_compensation_summary(path: Option<&str>) -> String {
+    let target = path
+        .filter(|path| !path.is_empty())
+        .map(|path| format!("config path `{path}`"))
+        .unwrap_or_else(|| "the changed config path".to_string());
+    format!(
+        "rerun `adjust_config` with the previous `old` value from the tool result to restore {}; if a session workspace override was persisted, restore or remove that override manually",
+        target
+    )
+}
+
+fn tool_priority_compensation_summary(tool: Option<&str>) -> String {
+    let target = tool
+        .filter(|tool| !tool.is_empty())
+        .map(|tool| format!("tool `{tool}`"))
+        .unwrap_or_else(|| "the affected tool".to_string());
+    format!(
+        "use the `previous_pinned_tools` and `previous_deprioritized_tools` fields from the tool result to restore {}'s prior preference state manually, or rewrite the session workspace tool preferences directly",
+        target
+    )
+}
+
+fn set_goal_compensation_summary() -> &'static str {
+    "rerun `set_goal` with the `previous_goal` from the tool result if you need to steer back, but note that `set_goal` also clears goal-specific drift, compression, correction, and context-trace state with no automatic rollback"
+}
+
+fn compress_context_compensation_summary() -> &'static str {
+    "manual compression markers are session-local and append-only; use the previous compression counters from the tool result plus session workspace/journal state if you need to undo the marker manually"
+}
+
+fn task_create_compensation_summary() -> &'static str {
+    "use `task_stop` with the returned `task_id` to cancel the created session-local task if needed; there is no dedicated task deletion rollback tool"
+}
+
+fn task_update_compensation_summary() -> &'static str {
+    "use `task_get` plus the `previous_status` from the tool result, then rerun `task_update` to restore the earlier task or subtask status manually; appended error text is not automatically removed"
+}
+
+fn task_stop_compensation_summary() -> &'static str {
+    "use `task_update` with the `previous_status` from the tool result if you need to re-open the cancelled session-local task manually; appended cancellation notes are not automatically removed"
+}
+
 fn shell_action_profile(command: Option<&str>) -> ActionCompensationProfile {
     let Some(command) = command.filter(|command| !command.trim().is_empty()) else {
         return ActionCompensationProfile::manual(
@@ -340,6 +382,41 @@ pub fn tool_action_profile(tool_name: &str, args: &Value) -> ActionCompensationP
             true,
             CompensationKind::RestoreOrDeleteFile,
             restore_file_compensation_summary(string_arg(&normalized_args, "path"), true),
+        ),
+        "adjust_config" => ActionCompensationProfile::manual(
+            true,
+            ActionCategory::Write,
+            &adjust_config_compensation_summary(string_arg(&normalized_args, "path")),
+        ),
+        "prioritize_tool" | "deprioritize_tool" => ActionCompensationProfile::manual(
+            true,
+            ActionCategory::Write,
+            &tool_priority_compensation_summary(string_arg(&normalized_args, "tool")),
+        ),
+        "set_goal" => ActionCompensationProfile::manual(
+            true,
+            ActionCategory::Destructive,
+            set_goal_compensation_summary(),
+        ),
+        "compress_context" => ActionCompensationProfile::manual(
+            true,
+            ActionCategory::Write,
+            compress_context_compensation_summary(),
+        ),
+        "task_create" => ActionCompensationProfile::manual(
+            true,
+            ActionCategory::Write,
+            task_create_compensation_summary(),
+        ),
+        "task_update" => ActionCompensationProfile::manual(
+            true,
+            ActionCategory::Write,
+            task_update_compensation_summary(),
+        ),
+        "task_stop" => ActionCompensationProfile::manual(
+            true,
+            ActionCategory::Destructive,
+            task_stop_compensation_summary(),
         ),
         "git_commit" => ActionCompensationProfile::compensated(
             false,
@@ -609,6 +686,66 @@ mod tests {
         assert!(!profile.requires_pre_state);
         assert!(!profile.reversible);
         assert_eq!(profile.compensation_kind, Some(CompensationKind::Manual));
+    }
+
+    #[test]
+    fn session_state_tools_are_not_treated_as_reads() {
+        let adjust = tool_action_profile(
+            "adjust_config",
+            &json!({"path": "memory.retrieval_top_k", "value": 6}),
+        );
+        assert!(adjust.bounded);
+        assert_eq!(adjust.category, ActionCategory::Write);
+        assert!(!adjust.reversible);
+        assert_eq!(adjust.compensation_kind, Some(CompensationKind::Manual));
+        assert!(
+            adjust
+                .compensation_summary
+                .as_deref()
+                .unwrap_or_default()
+                .contains("adjust_config")
+        );
+
+        let set_goal = tool_action_profile("set_goal", &json!({"goal": "ship rollback shell"}));
+        assert!(set_goal.bounded);
+        assert_eq!(set_goal.category, ActionCategory::Destructive);
+        assert!(!set_goal.reversible);
+        assert_eq!(set_goal.compensation_kind, Some(CompensationKind::Manual));
+        assert!(
+            set_goal
+                .compensation_summary
+                .as_deref()
+                .unwrap_or_default()
+                .contains("previous_goal")
+        );
+    }
+
+    #[test]
+    fn task_mutators_are_bounded_manual_actions() {
+        let create = tool_action_profile("task_create", &json!({"title": "demo"}));
+        assert!(create.bounded);
+        assert_eq!(create.category, ActionCategory::Write);
+        assert!(!create.reversible);
+        assert_eq!(create.compensation_kind, Some(CompensationKind::Manual));
+        assert!(
+            create
+                .compensation_summary
+                .as_deref()
+                .unwrap_or_default()
+                .contains("task_stop")
+        );
+
+        let stop = tool_action_profile("task_stop", &json!({"task_id": "task-1"}));
+        assert!(stop.bounded);
+        assert_eq!(stop.category, ActionCategory::Destructive);
+        assert!(!stop.reversible);
+        assert_eq!(stop.compensation_kind, Some(CompensationKind::Manual));
+        assert!(
+            stop.compensation_summary
+                .as_deref()
+                .unwrap_or_default()
+                .contains("previous_status")
+        );
     }
 
     #[test]

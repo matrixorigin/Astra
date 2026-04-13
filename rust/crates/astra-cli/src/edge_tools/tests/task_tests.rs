@@ -64,7 +64,10 @@ async fn task_update_changes_status() {
             "status": "in_progress"
         }))
         .await;
-    assert!(result.contains("success"));
+    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+    assert!(parsed["success"].as_bool().unwrap());
+    assert_eq!(parsed["previous_status"], "pending");
+    assert_eq!(parsed["status"], "in_progress");
 
     // Verify status changed
     let details = exe.task_get(&json!({"task_id": "task-1"})).await;
@@ -99,6 +102,33 @@ async fn task_with_subtasks_tracks_progress() {
 
     let list2 = exe.task_list(&json!({})).await;
     assert!(list2.contains("[1/2]"));
+}
+
+#[tokio::test]
+async fn task_update_reports_previous_subtask_status() {
+    let dir = tempfile::tempdir().unwrap();
+    let exe = ToolExecutor::new(dir.path());
+
+    exe.task_create(&json!({
+        "title": "Subtask status test",
+        "subtasks": [
+            {"id": "step-1", "title": "First step"}
+        ]
+    }))
+    .await;
+
+    let result = exe
+        .task_update(&json!({
+            "task_id": "task-1",
+            "subtask_id": "step-1",
+            "status": "completed"
+        }))
+        .await;
+    let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+
+    assert!(parsed["success"].as_bool().unwrap());
+    assert_eq!(parsed["previous_status"], "pending");
+    assert_eq!(parsed["status"], "completed");
 }
 
 // ── Sleep tool tests ─────────────────────────────────────────────────────

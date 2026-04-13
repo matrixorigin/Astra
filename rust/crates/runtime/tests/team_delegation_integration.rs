@@ -767,11 +767,9 @@ async fn pipeline_continues_after_first_stage_fails() {
         }
     }
 
-    let (orch, _, _) = setup_orchestrator_with_executor(
-        store,
-        Arc::new(FailFirstExecutor { count: count_ref }),
-    )
-    .await;
+    let (orch, _, _) =
+        setup_orchestrator_with_executor(store, Arc::new(FailFirstExecutor { count: count_ref }))
+            .await;
     let report = orch.execute_team("fail-early", "build", None).await;
 
     // Pipeline completes all stages even if some fail, resulting in Partial
@@ -856,7 +854,11 @@ async fn fan_out_returns_partial_success_with_failures() {
     assert_eq!(successful.len(), 2, "2 agents should succeed");
     assert_eq!(failed.len(), 1, "1 agent should fail");
     assert!(
-        failed[0].error.as_ref().unwrap().contains("network timeout"),
+        failed[0]
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("network timeout"),
         "failure reason preserved"
     );
 }
@@ -945,11 +947,9 @@ async fn concurrent_team_executions_isolated() {
         }
     }
 
-    let (orch, _, _) = setup_orchestrator_with_executor(
-        store.clone(),
-        Arc::new(LoggingExecutor { log: log_ref }),
-    )
-    .await;
+    let (orch, _, _) =
+        setup_orchestrator_with_executor(store.clone(), Arc::new(LoggingExecutor { log: log_ref }))
+            .await;
 
     // Run both teams concurrently
     let (report1, report2) = tokio::join!(
@@ -1057,7 +1057,10 @@ async fn adversarial_runs_all_rounds_on_success() {
     let store = Arc::new(InMemoryTeamStore::new());
     let team = test_team(
         "adversarial-quick",
-        TeamCoordination::Adversarial { max_rounds: 5, threshold: 0.8 },
+        TeamCoordination::Adversarial {
+            max_rounds: 5,
+            threshold: 0.8,
+        },
         vec![
             ("producer", Some("Create content")),
             ("reviewer", Some("Review content")),
@@ -1098,7 +1101,9 @@ async fn adversarial_runs_all_rounds_on_success() {
         Arc::new(QuickConvergeExecutor { rounds: rounds_ref }),
     )
     .await;
-    let report = orch.execute_team("adversarial-quick", "create document", None).await;
+    let report = orch
+        .execute_team("adversarial-quick", "create document", None)
+        .await;
 
     assert_eq!(report.status, TeamExecutionStatus::Completed);
     // Adversarial runs all max_rounds, each round has 2 agents (producer + reviewer)
@@ -1117,7 +1122,10 @@ async fn adversarial_fails_after_max_rounds() {
     let store = Arc::new(InMemoryTeamStore::new());
     let team = test_team(
         "adversarial-stuck",
-        TeamCoordination::Adversarial { max_rounds: 2, threshold: 0.8 },
+        TeamCoordination::Adversarial {
+            max_rounds: 2,
+            threshold: 0.8,
+        },
         vec![
             ("producer", Some("Create content")),
             ("reviewer", Some("Review content")),
@@ -1167,7 +1175,9 @@ async fn adversarial_fails_after_max_rounds() {
         Arc::new(AlwaysRejectExecutor { rounds: rounds_ref }),
     )
     .await;
-    let report = orch.execute_team("adversarial-stuck", "create document", None).await;
+    let report = orch
+        .execute_team("adversarial-stuck", "create document", None)
+        .await;
 
     // Adversarial that never converges still completes (with rejection noted)
     assert!(
@@ -1198,10 +1208,7 @@ async fn team_execution_respects_cancellation() {
         TeamCoordination::FanOut {
             aggregation: "all_results".into(),
         },
-        vec![
-            ("worker1", Some("Worker 1")),
-            ("worker2", Some("Worker 2")),
-        ],
+        vec![("worker1", Some("Worker 1")), ("worker2", Some("Worker 2"))],
     );
     store.save_team(&team).await.unwrap();
 
@@ -1232,7 +1239,9 @@ async fn team_execution_respects_cancellation() {
 
     let (orch, _, _tracker) = setup_orchestrator_with_executor(
         store,
-        Arc::new(BlockingExecutor { started: started_ref }),
+        Arc::new(BlockingExecutor {
+            started: started_ref,
+        }),
     )
     .await;
 
@@ -1241,7 +1250,9 @@ async fn team_execution_respects_cancellation() {
 
     // Start execution in background
     let exec_handle = tokio::spawn(async move {
-        orch_clone.execute_team("cancellable", "blocked task", None).await
+        orch_clone
+            .execute_team("cancellable", "blocked task", None)
+            .await
     });
 
     // Wait for execution to start
@@ -1269,7 +1280,9 @@ async fn error_messages_preserved_in_results() {
     // Use 2 agents so we get Partial status (one succeeds, one fails)
     let team = test_team(
         "error-details",
-        TeamCoordination::FanOut { aggregation: "all_results".to_string() },
+        TeamCoordination::FanOut {
+            aggregation: "all_results".to_string(),
+        },
         vec![
             ("healthy", Some("Healthy agent")),
             ("faulty", Some("Faulty agent")),
@@ -1287,7 +1300,9 @@ async fn error_messages_preserved_in_results() {
                     run_id: config.run_id,
                     status: "failed".to_string(),
                     output: None,
-                    error: Some("DatabaseConnectionError: connection timed out after 30s".to_string()),
+                    error: Some(
+                        "DatabaseConnectionError: connection timed out after 30s".to_string(),
+                    ),
                     prompt_tokens: 0,
                     completion_tokens: 0,
                     tool_calls: 0,
@@ -1308,14 +1323,20 @@ async fn error_messages_preserved_in_results() {
     }
 
     let (orch, _, _) = setup_orchestrator_with_executor(store, Arc::new(MixedResultExecutor)).await;
-    let report = orch.execute_team("error-details", "query database", None).await;
+    let report = orch
+        .execute_team("error-details", "query database", None)
+        .await;
 
     assert_eq!(report.status, TeamExecutionStatus::Partial);
     let dr = report.delegation_result.unwrap();
     assert_eq!(dr.agent_results.len(), 2);
 
     // Find the failed agent's result
-    let failed_result = dr.agent_results.iter().find(|r| r.status == "failed").unwrap();
+    let failed_result = dr
+        .agent_results
+        .iter()
+        .find(|r| r.status == "failed")
+        .unwrap();
     let error_msg = failed_result.error.as_ref().unwrap();
     assert!(
         error_msg.contains("DatabaseConnectionError"),
@@ -1336,10 +1357,7 @@ async fn team_report_includes_error_summary() {
         TeamCoordination::FanOut {
             aggregation: "all_results".into(),
         },
-        vec![
-            ("a", Some("Agent A")),
-            ("b", Some("Agent B")),
-        ],
+        vec![("a", Some("Agent A")), ("b", Some("Agent B"))],
     );
     store.save_team(&team).await.unwrap();
 

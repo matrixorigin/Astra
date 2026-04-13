@@ -330,6 +330,8 @@ impl ToolExecutor {
         json!({
             "status": "ok",
             "prioritized_tool": tool,
+            "previous_pinned_tools": original_pinned,
+            "previous_deprioritized_tools": original_deprioritized,
             "pinned_tools": pinned.clone(),
             "deprioritized_tools": deprioritized.clone()
         })
@@ -378,6 +380,8 @@ impl ToolExecutor {
         json!({
             "status": "ok",
             "deprioritized_tool": tool,
+            "previous_pinned_tools": original_pinned,
+            "previous_deprioritized_tools": original_deprioritized,
             "pinned_tools": pinned.clone(),
             "deprioritized_tools": deprioritized.clone()
         })
@@ -398,6 +402,11 @@ impl ToolExecutor {
                 return json!({"error": "Failed to acquire observability session"}).to_string();
             }
         };
+        let previous_goal = session
+            .goal_tracker
+            .as_ref()
+            .map(|tracker| tracker.goal().to_string())
+            .or_else(|| session.original_query.clone());
         if let Some(session_id) = self.active_session_id.as_deref()
             && let Err(error) = crate::self_command::persist_goal_override(session_id, goal)
         {
@@ -409,11 +418,13 @@ impl ToolExecutor {
             .to_string();
         }
 
-        session.steer_goal(goal);
+        let goal_changed = session.steer_goal(goal);
 
         json!({
             "status": "ok",
+            "previous_goal": previous_goal,
             "goal": goal,
+            "goal_changed": goal_changed,
             "turn": session.turn_number
         })
         .to_string()
@@ -439,6 +450,8 @@ impl ToolExecutor {
         } else {
             session.turn_number
         };
+        let previous_compression_count = session.compressed_turns.len();
+        let already_compressed_this_turn = session.compressed_turns.contains(&turn);
 
         if let Some(session_id) = self.active_session_id.as_deref()
             && let Err(error) =
@@ -459,6 +472,8 @@ impl ToolExecutor {
             "status": "ok",
             "turn": turn,
             "reason": reason,
+            "previous_compression_count": previous_compression_count,
+            "already_compressed_this_turn": already_compressed_this_turn,
             "compression_count": session.compressed_turns.len()
         })
         .to_string()

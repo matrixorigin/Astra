@@ -89,6 +89,10 @@ async fn tool_priority_updates_self_model_snapshot() {
     let parsed2: Value = serde_json::from_str(&out2).unwrap();
     assert_eq!(parsed1["status"], "ok");
     assert_eq!(parsed2["status"], "ok");
+    assert_eq!(parsed1["previous_pinned_tools"], json!([]));
+    assert_eq!(parsed1["previous_deprioritized_tools"], json!([]));
+    assert_eq!(parsed2["previous_pinned_tools"], json!(["bash"]));
+    assert_eq!(parsed2["previous_deprioritized_tools"], json!([]));
 
     let model = exe.build_self_model_snapshot().unwrap();
     assert!(
@@ -114,6 +118,8 @@ async fn set_goal_and_compress_context_update_session_state() {
         .await;
     let parsed_goal: Value = serde_json::from_str(&set_goal_out).unwrap();
     assert_eq!(parsed_goal["status"], "ok");
+    assert!(parsed_goal["previous_goal"].is_null());
+    assert_eq!(parsed_goal["goal_changed"], true);
 
     let compress_out = exe
         .execute(
@@ -123,6 +129,8 @@ async fn set_goal_and_compress_context_update_session_state() {
         .await;
     let parsed_compress: Value = serde_json::from_str(&compress_out).unwrap();
     assert_eq!(parsed_compress["status"], "ok");
+    assert_eq!(parsed_compress["previous_compression_count"], 0);
+    assert_eq!(parsed_compress["already_compressed_this_turn"], false);
 
     let guard = session.read().unwrap();
     assert_eq!(guard.compressed_turns.len(), 1);
@@ -141,6 +149,7 @@ async fn legacy_goal_dimension_exposes_steering_state() {
         .await;
     let parsed_goal: Value = serde_json::from_str(&set_goal_out).unwrap();
     assert_eq!(parsed_goal["status"], "ok");
+    assert!(parsed_goal["previous_goal"].is_null());
 
     let goals_out = exe
         .execute("get_agent_info", &json!({"dimension": "goals"}))
@@ -182,6 +191,24 @@ async fn persisted_set_goal_appends_goal_steered_journal_event() {
         metadata.get("new_goal").and_then(|value| value.as_str()),
         Some("Persist steering event")
     );
+}
+
+#[tokio::test]
+async fn set_goal_reports_previous_goal_for_manual_restore() {
+    let (exe, _session) = executor_with_session();
+    let first = exe
+        .execute("set_goal", &json!({"goal": "First goal"}))
+        .await;
+    let second = exe
+        .execute("set_goal", &json!({"goal": "Second goal"}))
+        .await;
+
+    let parsed_first: Value = serde_json::from_str(&first).unwrap();
+    let parsed_second: Value = serde_json::from_str(&second).unwrap();
+
+    assert!(parsed_first["previous_goal"].is_null());
+    assert_eq!(parsed_second["previous_goal"], "First goal");
+    assert_eq!(parsed_second["goal_changed"], true);
 }
 
 #[tokio::test]
