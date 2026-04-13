@@ -793,14 +793,38 @@ fn is_shell_wrapper_command(base: &str) -> bool {
     )
 }
 
+fn shell_short_flag_cluster(flag: &str) -> Option<&str> {
+    let rest = flag.strip_prefix('-')?;
+    if rest.is_empty() || rest.starts_with('-') || !rest.chars().all(|ch| ch.is_ascii_alphabetic())
+    {
+        return None;
+    }
+    Some(rest)
+}
+
 fn is_nested_shell_c_flag(flag: &str) -> bool {
-    let Some(rest) = flag.strip_prefix('-') else {
-        return false;
-    };
-    !rest.is_empty()
-        && !rest.starts_with('-')
-        && rest.chars().all(|ch| ch.is_ascii_alphabetic())
-        && rest.contains('c')
+    shell_short_flag_cluster(flag).is_some_and(|rest| rest.contains('c'))
+}
+
+fn is_shell_read_from_stdin_flag(flag: &str) -> bool {
+    shell_short_flag_cluster(flag).is_some_and(|rest| rest.contains('s'))
+}
+
+enum ShellFlagValueKind {
+    NestedCommand,
+    InitCommand,
+    Other,
+}
+
+fn shell_flag_value_kind(flag: &str) -> Option<ShellFlagValueKind> {
+    match flag {
+        "--command" => Some(ShellFlagValueKind::NestedCommand),
+        "-C" | "--init-command" => Some(ShellFlagValueKind::InitCommand),
+        "--rcfile" | "--init-file" | "-o" | "+o" | "-O" | "+O" => {
+            Some(ShellFlagValueKind::Other)
+        }
+        _ => None,
+    }
 }
 
 fn inline_exec_interpreter_detail(base: &str, flag: Option<&str>) -> Option<String> {
@@ -835,11 +859,72 @@ fn stdin_script_interpreter_detail(base: &str, args: &[String]) -> Option<String
     let mut idx = 0usize;
     while idx < args.len() {
         let arg = args[idx].as_str();
+        if let Some(inner) = arg.strip_prefix("--command=") {
+            if let Some(detail) = check_interpreter_stdin_exec(inner) {
+                return Some(detail);
+            }
+            has_explicit_script_source = true;
+            idx += 1;
+            continue;
+        }
+        if let Some(inner) = arg.strip_prefix("--init-command=") {
+            if let Some(detail) = check_interpreter_stdin_exec(inner) {
+                return Some(detail);
+            }
+            idx += 1;
+            continue;
+        }
+        if arg.starts_with("--rcfile=") || arg.starts_with("--init-file=") {
+            idx += 1;
+            continue;
+        }
         if is_stdin_redirection_token(arg) {
             return (!has_explicit_script_source).then(|| format!("{base} <stdin"));
         }
-        if arg == "-" || (is_shell_interpreter_command(base) && arg == "-s") {
+        if arg == "-" || (is_shell_interpreter_command(base) && is_shell_read_from_stdin_flag(arg)) {
             return Some(format!("{base} {arg}"));
+        }
+        if is_shell_interpreter_command(base) {
+            if is_nested_shell_c_flag(arg) {
+                if let Some(inner) = args.get(idx + 1) {
+                    if let Some(detail) = check_interpreter_stdin_exec(inner) {
+                        return Some(detail);
+                    }
+                    has_explicit_script_source = true;
+                    idx += 2;
+                    continue;
+                }
+                return None;
+            }
+
+            match shell_flag_value_kind(arg) {
+                Some(ShellFlagValueKind::NestedCommand) => {
+                    if let Some(inner) = args.get(idx + 1) {
+                        if let Some(detail) = check_interpreter_stdin_exec(inner) {
+                            return Some(detail);
+                        }
+                        has_explicit_script_source = true;
+                        idx += 2;
+                        continue;
+                    }
+                    return None;
+                }
+                Some(ShellFlagValueKind::InitCommand) => {
+                    if let Some(inner) = args.get(idx + 1) {
+                        if let Some(detail) = check_interpreter_stdin_exec(inner) {
+                            return Some(detail);
+                        }
+                        idx += 2;
+                        continue;
+                    }
+                    return None;
+                }
+                Some(ShellFlagValueKind::Other) => {
+                    idx += 2;
+                    continue;
+                }
+                None => {}
+            }
         }
         if is_python_interpreter(base) && arg == "-m" {
             if args.get(idx + 1).is_some() {
@@ -1608,6 +1693,30 @@ mod tests {
             &json!({"command": "python3 -m pytest < input.txt"}),
         );
         assert_eq!(decision, SafetyMiddlewareDecision::Allow);
+    }
+
+    #[test]
+    fn middleware_blocks_shell_clustered_stdin_flag_exec() {
+        let decision =
+            evaluate_tool_safety_request("bash", &json!({"command": "printf hi | bash -es"}));
+        assert!(matches!(
+            decision,
+            SafetyMiddlewareDecision::Deny(reason)
+                if reason.contains("shell_obfuscation") && reason.contains("stdin or heredoc")
+        ));
+    }
+
+    #[test]
+    fn middleware_blocks_shell_option_value_then_stdin_exec() {
+        let decision = evaluate_tool_safety_request(
+            "bash",
+            &json!({"command": "bash -O extglob < payload.sh"}),
+        );
+        assert!(matches!(
+            decision,
+            SafetyMiddlewareDecision::Deny(reason)
+                if reason.contains("shell_obfuscation") && reason.contains("stdin or heredoc")
+        ));
     }
 
     #[test]
