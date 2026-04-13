@@ -322,6 +322,7 @@ impl<'a> CliSseStreamHost<'a> {
             tool: tool.to_string(),
             args: args.clone(),
             output: output.clone(),
+            tool_result_fields: None,
             status: status.clone(),
             duration_ms,
         };
@@ -3936,6 +3937,8 @@ diff --git a/src/a.rs b/src/a.rs\n\
         // Different tool name → different signature
         let sig3 = tool_dedup_signature("read_file", &args);
         assert_ne!(sig1, sig3);
+    }
+
     #[tokio::test]
     async fn transactional_batch_rolls_back_earlier_file_write_on_later_failure() {
         let server = MockServer::start().await;
@@ -3948,6 +3951,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
         let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
         let temp = tempdir().expect("tempdir");
         let mut executor = crate::edge_tools::ToolExecutor::new(temp.path());
+        let mut tool_cache = EdgeToolCache::new(8);
         executor
             .journal_turn_index
             .store(3, std::sync::atomic::Ordering::Relaxed);
@@ -3965,6 +3969,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 approval_request_tx: None,
                 skill_resolver: None,
                 skill_continuation: false,
+                tool_cache: &mut tool_cache,
             },
             80,
             false,
@@ -4036,6 +4041,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
         let victim = temp.path().join("txn.txt");
         std::fs::write(&victim, "hello\n").expect("seed file");
         let mut executor = crate::edge_tools::ToolExecutor::new(temp.path());
+        let mut tool_cache = EdgeToolCache::new(8);
         executor
             .journal_turn_index
             .store(4, std::sync::atomic::Ordering::Relaxed);
@@ -4053,6 +4059,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 approval_request_tx: None,
                 skill_resolver: None,
                 skill_continuation: false,
+                tool_cache: &mut tool_cache,
             },
             80,
             false,
@@ -4115,6 +4122,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
         let temp = tempdir().expect("tempdir");
         std::fs::write(temp.path().join("other.txt"), "existing\n").expect("seed file");
         let mut executor = crate::edge_tools::ToolExecutor::new(temp.path());
+        let mut tool_cache = EdgeToolCache::new(8);
         executor
             .journal_turn_index
             .store(5, std::sync::atomic::Ordering::Relaxed);
@@ -4132,6 +4140,7 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 approval_request_tx: None,
                 skill_resolver: None,
                 skill_continuation: false,
+                tool_cache: &mut tool_cache,
             },
             80,
             false,
