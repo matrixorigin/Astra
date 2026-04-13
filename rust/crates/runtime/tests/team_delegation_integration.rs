@@ -709,3 +709,340 @@ async fn fan_out_respects_max_parallel() {
         "peak concurrency should be 1 with max_parallel=1"
     );
 }
+
+// ─── Real-World Unhappy Path Scenarios ──────────────────────────────────────
+
+/// Tests pipeline behavior when first stage fails.
+/// Pipeline continues all stages even when one fails (feeding previous output to next).
+#[tokio::test]
+async fn pipeline_continues_after_first_stage_fails() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let store = Arc::new(InMemoryTeamStore::new());
+    let team = test_team(
+        "fail-early",
+        TeamCoordination::Pipeline,
+        vec![
+            ("coder", Some("Write code")),
+            ("reviewer", Some("Review code")),
+            ("deployer", Some("Deploy code")),
+        ],
+    );
+    store.save_team(&team).await.unwrap();
+
+    let execution_count = Arc::new(AtomicUsize::new(0));
+    let count_ref = execution_count.clone();
+
+    struct FailFirstExecutor {
+        count: Arc<AtomicUsize>,
+    }
+    #[async_trait]
+    impl SubRunExecutor for FailFirstExecutor {
+        async fn execute(&self, config: SubRunConfig) -> Result<AgentResult, String> {
+            let n = self.count.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                // First stage fails
+                Ok(AgentResult {
+                    agent_id: config.agent_profile.agent_id.clone(),
+                    run_id: config.run_id,
+                    status: "failed".to_string(),
+                    output: None,
+                    error: Some("compilation error".to_string()),
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    tool_calls: 0,
+                })
+            } else {
+                Ok(AgentResult {
+                    agent_id: config.agent_profile.agent_id.clone(),
+                    run_id: config.run_id,
+                    status: "completed".to_string(),
+                    output: Some("done".to_string()),
+                    error: None,
+                    prompt_tokens: 10,
+                    completion_tokens: 20,
+                    tool_calls: 0,
+                })
+            }
+        }
+    }
+
+    let (orch, _, _) = setup_orchestrator_with_executor(
+        store,
+        Arc::new(FailFirstExecutor { count: count_ref }),
+    )
+    .await;
+    let report = orch.execute_team("fail-early", "build", None).await;
+
+    // Pipeline completes all stages even if some fail, resulting in Partial
+    assert_eq!(report.status, TeamExecutionStatus::Partial);
+    // All 3 stages should execute (pipeline continues regardless of failure)
+    assert_eq!(
+        execution_count.load(Ordering::SeqCst),
+        3,
+        "pipeline should execute all stages"
+    );
+    // Check that we have results from all agents
+    let dr = report.delegation_result.unwrap();
+    assert_eq!(dr.agent_results.len(), 3);
+    // First should be failed, others completed
+    assert!(!dr.agent_results[0].is_success());
+    assert!(dr.agent_results[1].is_success());
+    assert!(dr.agent_results[2].is_success());
+}
+
+/// Tests that partial fan-out failures still return results from successful agents.
+#[tokio::test]
+async fn fan_out_returns_partial_success_with_failures() {
+    let store = Arc::new(InMemoryTeamStore::new());
+    let team = test_team(
+        "partial",
+        TeamCoordination::FanOut {
+            aggregation: "all_results".into(),
+        },
+        vec![
+            ("researcher1", Some("Research topic A")),
+            ("researcher2", Some("Research topic B")),
+            ("researcher3", Some("Research topic C")),
+        ],
+    );
+    store.save_team(&team).await.unwrap();
+
+    struct PartialFailExecutor;
+    #[async_trait]
+    impl SubRunExecutor for PartialFailExecutor {
+        async fn execute(&self, config: SubRunConfig) -> Result<AgentResult, String> {
+            // Middle agent fails
+            if config.agent_profile.agent_id.contains("researcher2") {
+                Ok(AgentResult {
+                    agent_id: config.agent_profile.agent_id.clone(),
+                    run_id: config.run_id,
+                    status: "failed".to_string(),
+                    output: None,
+                    error: Some("network timeout".to_string()),
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    tool_calls: 0,
+                })
+            } else {
+                Ok(AgentResult {
+                    agent_id: config.agent_profile.agent_id.clone(),
+                    run_id: config.run_id,
+                    status: "completed".to_string(),
+                    output: Some(format!("results from {}", config.agent_profile.agent_id)),
+                    error: None,
+                    prompt_tokens: 100,
+                    completion_tokens: 200,
+                    tool_calls: 1,
+                })
+            }
+        }
+    }
+
+    let (orch, _, _) = setup_orchestrator_with_executor(store, Arc::new(PartialFailExecutor)).await;
+    let report = orch.execute_team("partial", "research", None).await;
+
+    // With all_results aggregation, partial failures still complete (not failed)
+    let dr = report.delegation_result.unwrap();
+    assert_eq!(dr.agent_results.len(), 3, "all results should be present");
+
+    let successful: Vec<_> = dr.agent_results.iter().filter(|r| r.is_success()).collect();
+    let failed: Vec<_> = dr
+        .agent_results
+        .iter()
+        .filter(|r| !r.is_success())
+        .collect();
+
+    assert_eq!(successful.len(), 2, "2 agents should succeed");
+    assert_eq!(failed.len(), 1, "1 agent should fail");
+    assert!(
+        failed[0].error.as_ref().unwrap().contains("network timeout"),
+        "failure reason preserved"
+    );
+}
+
+/// Tests that executor panics (Err return) are captured gracefully.
+#[tokio::test]
+async fn executor_panic_captured_as_failed_result() {
+    let store = Arc::new(InMemoryTeamStore::new());
+    let team = test_team(
+        "panic-team",
+        TeamCoordination::FanOut {
+            aggregation: "all_results".into(),
+        },
+        vec![("worker", Some("Panic worker"))],
+    );
+    store.save_team(&team).await.unwrap();
+
+    struct PanicExecutor;
+    #[async_trait]
+    impl SubRunExecutor for PanicExecutor {
+        async fn execute(&self, _config: SubRunConfig) -> Result<AgentResult, String> {
+            Err("internal assertion failed".to_string())
+        }
+    }
+
+    let (orch, _, _) = setup_orchestrator_with_executor(store, Arc::new(PanicExecutor)).await;
+    let report = orch.execute_team("panic-team", "work", None).await;
+
+    assert_eq!(report.status, TeamExecutionStatus::Failed);
+    let dr = report.delegation_result.unwrap();
+    assert_eq!(dr.agent_results.len(), 1);
+    assert!(!dr.agent_results[0].is_success());
+    assert!(
+        dr.agent_results[0]
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("internal assertion failed"),
+        "executor error should be captured"
+    );
+}
+
+/// Tests that concurrent team executions don't interfere with each other.
+#[tokio::test]
+async fn concurrent_team_executions_isolated() {
+    let store = Arc::new(InMemoryTeamStore::new());
+    // Two different teams
+    let team1 = test_team(
+        "team-a",
+        TeamCoordination::Pipeline,
+        vec![("coder-a", Some("Team A coder"))],
+    );
+    let team2 = test_team(
+        "team-b",
+        TeamCoordination::Pipeline,
+        vec![("coder-b", Some("Team B coder"))],
+    );
+    store.save_team(&team1).await.unwrap();
+    store.save_team(&team2).await.unwrap();
+
+    let execution_log: Arc<tokio::sync::Mutex<Vec<String>>> =
+        Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let log_ref = execution_log.clone();
+
+    struct LoggingExecutor {
+        log: Arc<tokio::sync::Mutex<Vec<String>>>,
+    }
+    #[async_trait]
+    impl SubRunExecutor for LoggingExecutor {
+        async fn execute(&self, config: SubRunConfig) -> Result<AgentResult, String> {
+            let agent_id = config.agent_profile.agent_id.clone();
+            self.log.lock().await.push(format!("start:{agent_id}"));
+            // Simulate work
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            self.log.lock().await.push(format!("end:{agent_id}"));
+            Ok(AgentResult {
+                agent_id,
+                run_id: config.run_id,
+                status: "completed".to_string(),
+                output: Some("done".to_string()),
+                error: None,
+                prompt_tokens: 10,
+                completion_tokens: 20,
+                tool_calls: 0,
+            })
+        }
+    }
+
+    let (orch, _, _) = setup_orchestrator_with_executor(
+        store.clone(),
+        Arc::new(LoggingExecutor { log: log_ref }),
+    )
+    .await;
+
+    // Run both teams concurrently
+    let (report1, report2) = tokio::join!(
+        orch.execute_team("team-a", "task-a", None),
+        orch.execute_team("team-b", "task-b", None)
+    );
+
+    assert_eq!(report1.status, TeamExecutionStatus::Completed);
+    assert_eq!(report2.status, TeamExecutionStatus::Completed);
+
+    // Each team should have its own delegation_id
+    assert_ne!(
+        report1.delegation_id, report2.delegation_id,
+        "concurrent executions should have separate delegation IDs"
+    );
+
+    // Both agents should have executed
+    let log = execution_log.lock().await;
+    assert!(log.iter().any(|e| e.contains("coder-a")));
+    assert!(log.iter().any(|e| e.contains("coder-b")));
+}
+
+/// Tests that sequential coordination with stop_on_success stops after first success.
+#[tokio::test]
+async fn sequential_stop_on_success_stops_early() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let store = Arc::new(InMemoryTeamStore::new());
+    let team = test_team(
+        "stop-early",
+        TeamCoordination::Sequential {
+            stop_on_success: true,
+        },
+        vec![
+            ("fallback1", Some("First fallback")),
+            ("fallback2", Some("Second fallback")),
+            ("fallback3", Some("Third fallback")),
+        ],
+    );
+    store.save_team(&team).await.unwrap();
+
+    let execution_count = Arc::new(AtomicUsize::new(0));
+    let count_ref = execution_count.clone();
+
+    struct SuccessSecondExecutor {
+        count: Arc<AtomicUsize>,
+    }
+    #[async_trait]
+    impl SubRunExecutor for SuccessSecondExecutor {
+        async fn execute(&self, config: SubRunConfig) -> Result<AgentResult, String> {
+            let n = self.count.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                // First fails
+                Ok(AgentResult {
+                    agent_id: config.agent_profile.agent_id.clone(),
+                    run_id: config.run_id,
+                    status: "failed".to_string(),
+                    output: None,
+                    error: Some("not available".to_string()),
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    tool_calls: 0,
+                })
+            } else {
+                // Second succeeds
+                Ok(AgentResult {
+                    agent_id: config.agent_profile.agent_id.clone(),
+                    run_id: config.run_id,
+                    status: "completed".to_string(),
+                    output: Some("success!".to_string()),
+                    error: None,
+                    prompt_tokens: 10,
+                    completion_tokens: 20,
+                    tool_calls: 0,
+                })
+            }
+        }
+    }
+
+    let (orch, _, _) = setup_orchestrator_with_executor(
+        store,
+        Arc::new(SuccessSecondExecutor { count: count_ref }),
+    )
+    .await;
+    let report = orch.execute_team("stop-early", "try fallbacks", None).await;
+
+    // Sequential with one failure and one success results in Partial
+    // (because not all agents completed successfully)
+    assert_eq!(report.status, TeamExecutionStatus::Partial);
+    // Should have stopped after second agent succeeded
+    assert_eq!(
+        execution_count.load(Ordering::SeqCst),
+        2,
+        "should stop after first success"
+    );
+}
