@@ -467,7 +467,10 @@ For broad codebase exploration that will clearly need >3 queries, consider deleg
          - Avoid broad repo-wide regex searches when a symbol, filename, extension, or directory hint is available.\n\
          - Skip generated or bulky trees unless the task explicitly targets them: build, dist, target, coverage, htmlcov, node_modules, vendor.\n\
          - After grep finds candidates, switch to targeted reads instead of repeating more broad searches.\n\
-         - If a grep is slow or noisy, tighten path, extension, or literal term — do NOT repeat the same broad search.\n"
+         - If a grep is slow or noisy, tighten path, extension, or literal term — do NOT repeat the same broad search.\n\
+         - **grep is expensive**: use find_definition/find_references for code symbols (faster, AST-aware). \
+Limit grep to content searches where no symbol tool applies. \
+After 3-4 grep calls on the same area, switch to read_file for targeted inspection.\n"
     } else {
         ""
     }

@@ -6,8 +6,8 @@ use astra_runtime::{
     SessionActivityRecord, SessionActivityUpdatePlan, SessionCache, SessionCreateRequestData,
     SessionListFilter, SessionListRecord, SessionRecord, SessionService, SessionUpdateRequestData,
     TurnAuxiliaryEventRecord, TurnAuxiliaryEventWriter, TurnCoreEventWriter,
-    TurnCorePersistOutcome, TurnCorePersistPlan, TurnHookDbPersistPlan,
-    TurnHookDbWriter, TurnObserverRequest, TurnObserverWorker, TurnReflectionLessonRecord,
+    TurnCorePersistOutcome, TurnCorePersistPlan, TurnHookDbPersistPlan, TurnHookDbWriter,
+    TurnObserverRequest, TurnObserverWorker, TurnReflectionLessonRecord,
     TurnReflectionLessonWriter, TurnReflectionMark, TurnReflectionStateStore,
     TurnSessionActivityWriter, TurnToolEventPersistPlan, TurnToolEventWriter, build_app,
 };
@@ -2197,7 +2197,10 @@ async fn http_chat_turn_bridge_persists_tool_events_after_persist_success() {
         plan.events[1].reasoning_content.as_deref(),
         Some("need filesystem data")
     );
-    let meta = plan.events[1].metadata.as_ref().expect("tool_call metadata");
+    let meta = plan.events[1]
+        .metadata
+        .as_ref()
+        .expect("tool_call metadata");
     assert_eq!(meta["tool_call_id"], serde_json::json!("tc-edge"));
     assert_eq!(meta["name"], serde_json::json!("bash"));
     assert_eq!(meta["source"], serde_json::json!("edge"));

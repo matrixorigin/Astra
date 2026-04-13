@@ -49,9 +49,7 @@ fn mo_current_account() -> &'static str {
 fn mo_database() -> &'static str {
     use std::sync::OnceLock;
     static DB: OnceLock<String> = OnceLock::new();
-    DB.get_or_init(|| {
-        astra_core::resolve_matrixone_database_name(&|k| std::env::var(k).ok())
-    })
+    DB.get_or_init(|| astra_core::resolve_matrixone_database_name(&|k| std::env::var(k).ok()))
 }
 
 fn mo_create_snapshot_sql(name: &str) -> String {
@@ -74,9 +72,9 @@ fn mo_mysql_cmd(database: Option<&str>) -> Command {
     let user = std::env::var("MATRIXONE_USER").unwrap_or_else(|_| "root".to_string());
     let password = std::env::var("MATRIXONE_PASSWORD")
         .unwrap_or_else(|_| astra_core::DEV_MATRIXONE_PASSWORD.to_string());
-    let db = database.map(String::from).unwrap_or_else(|| {
-        astra_core::resolve_matrixone_database_name(&|k| std::env::var(k).ok())
-    });
+    let db = database
+        .map(String::from)
+        .unwrap_or_else(|| astra_core::resolve_matrixone_database_name(&|k| std::env::var(k).ok()));
 
     let mut cmd = Command::new("mysql");
     cmd.arg(format!("-h{}", host))
@@ -174,9 +172,9 @@ fn schema_hint_for_error(lower_err: &str, sql: &str, database: Option<&str>) -> 
         }
     } else if lower_err.contains("table") && lower_err.contains("does not exist") {
         // Table not found → SHOW TABLES in the database
-        let db = database
-            .map(String::from)
-            .unwrap_or_else(|| astra_core::resolve_matrixone_database_name(&|k| std::env::var(k).ok()));
+        let db = database.map(String::from).unwrap_or_else(|| {
+            astra_core::resolve_matrixone_database_name(&|k| std::env::var(k).ok())
+        });
         if !db.is_empty() {
             let tables = mo_execute_sql(&format!("SHOW TABLES IN `{db}`"), None);
             if !tables.starts_with("Error:") {

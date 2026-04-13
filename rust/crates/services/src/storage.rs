@@ -154,20 +154,21 @@ async fn ensure_matrixone_database_exists(settings: &MatrixOneSettings) -> Resul
 
     crate::snapshot_sql::validate_sql_identifier(&settings.database, "matrixone database")
         .map_err(|e| {
-            sqlx::Error::Configuration(
-                Box::new(std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
-                    as Box<dyn Error + Send + Sync>,
-            )
+            sqlx::Error::Configuration(Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                e,
+            )) as Box<dyn Error + Send + Sync>)
         })?;
     let catalog =
         std::env::var("MATRIXONE_BOOTSTRAP_CATALOG").unwrap_or_else(|_| "mysql".to_string());
-    crate::snapshot_sql::validate_sql_identifier(&catalog, "matrixone bootstrap catalog")
-        .map_err(|e| {
-            sqlx::Error::Configuration(
-                Box::new(std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
-                    as Box<dyn Error + Send + Sync>,
-            )
-        })?;
+    crate::snapshot_sql::validate_sql_identifier(&catalog, "matrixone bootstrap catalog").map_err(
+        |e| {
+            sqlx::Error::Configuration(Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                e,
+            )) as Box<dyn Error + Send + Sync>)
+        },
+    )?;
     let mut admin_settings = settings.clone();
     admin_settings.database = catalog;
     let admin_pool = connect_matrixone(&admin_settings).await?;

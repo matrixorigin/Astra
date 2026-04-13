@@ -2002,7 +2002,8 @@ mod tests {
         let u1_c = ok(svc.create_run("user-1".into(), test_request("c")).await);
         let for_u1 = ok(svc.list_runs("user-1".into(), 10, 0).await);
         assert_eq!(for_u1.total, 2);
-        let ids: std::collections::HashSet<_> = for_u1.runs.iter().map(|r| r.run_id.as_str()).collect();
+        let ids: std::collections::HashSet<_> =
+            for_u1.runs.iter().map(|r| r.run_id.as_str()).collect();
         assert!(ids.contains(u1_a.run_id.as_str()));
         assert!(ids.contains(u1_c.run_id.as_str()));
         assert!(!ids.contains(u2_b.run_id.as_str()));
