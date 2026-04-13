@@ -2,8 +2,29 @@ use std::sync::OnceLock;
 
 use serde_json::Value;
 
+use crate::tool_sandbox::{CommandRisk, analyze_command_risks};
+
 const DESTRUCTIVE_KEYWORDS: &[&str] = &["DROP", "DELETE", "TRUNCATE", "ALTER", "GRANT", "REVOKE"];
 const SHELL_EXECUTION_TOOLS: &[&str] = &["bash", "exec", "run_command", "shell"];
+
+/// Zsh-specific dangerous commands that can bypass security checks.
+/// These commands allow arbitrary file I/O, network access, or code execution
+/// without going through standard binaries that we can validate.
+/// Ref: Claude Code `bashSecurity.ts` ZSH_DANGEROUS_COMMANDS
+const ZSH_DANGEROUS_COMMANDS: &[&str] = &[
+    // zmodload is the gateway to many dangerous module-based attacks
+    "zmodload", // emulate with -c flag is an eval-equivalent
+    "emulate",  // zsh/system module builtins (file descriptor operations)
+    "sysopen", "sysread", "syswrite", "sysseek",
+    // zsh/zpty module (pseudo-terminal command execution)
+    "zpty", // zsh/net modules (network exfiltration)
+    "ztcp", "zsocket", // zsh/files module builtins (bypass binary checks)
+    "zf_rm", "zf_mv", "zf_ln", "zf_chmod", "zf_chown", "zf_mkdir", "zf_rmdir", "zf_chgrp",
+];
+
+/// Zsh precommand modifiers that should be skipped when finding the base command.
+const ZSH_PRECOMMAND_MODIFIERS: &[&str] =
+    &["noglob", "nocorrect", "exec", "command", "builtin", "-"];
 
 /// High-confidence injection patterns that are extremely unlikely in legitimate
 /// tool output. These are checked as plain substring matches (case-insensitive).
@@ -229,24 +250,76 @@ fn shell_obfuscation_guard(tool_name: &str, tool_args: &Value) -> Option<String>
 
 #[must_use]
 pub fn check_shell_command_safety(command: &str) -> Option<String> {
+    // 1. Indirect expansion ${!...} — dynamically constructs variable names
     if command.contains("${!") {
         return Some(
             "shell command contains `${!...}` indirect expansion, which can construct commands dynamically"
                 .to_string(),
         );
     }
+
+    // 2. Parameter transformation ${...@P} — can hide the real command
     if command.contains("@P}") {
         return Some(
             "shell command contains `${...@P}` parameter expansion, which can hide the real command"
                 .to_string(),
         );
     }
+
+    // 3. eval with shell expansion — code reconstruction
     if shell_command_uses_dynamic_eval(command) {
         return Some(
             "shell command uses `eval` with shell expansion, which can reconstruct commands dynamically"
                 .to_string(),
         );
     }
+
+    // 4. IFS injection — can bypass word splitting validation
+    if check_ifs_injection(command) {
+        return Some(
+            "shell command contains `$IFS` or `${IFS...}` which can bypass security validation"
+                .to_string(),
+        );
+    }
+
+    // 5. Carriage return attack — can hide malicious commands
+    if check_carriage_return_attack(command) {
+        return Some(
+            "shell command contains carriage return (\\r) which can hide malicious commands in terminal output"
+                .to_string(),
+        );
+    }
+
+    // 6. /proc/*/environ access — can expose sensitive environment variables
+    if check_proc_environ_access(command) {
+        return Some(
+            "shell command accesses `/proc/*/environ`, which can expose sensitive environment variables"
+                .to_string(),
+        );
+    }
+
+    // 7. Zsh dangerous commands — can bypass file/network protections
+    if let Some(cmd) = check_zsh_dangerous_command(command) {
+        return Some(format!(
+            "shell command contains zsh-specific dangerous command `{cmd}` which can bypass security checks"
+        ));
+    }
+
+    // 8. Unicode whitespace — visual spoofing
+    if let Some(char_desc) = check_unicode_whitespace(command) {
+        return Some(format!(
+            "shell command contains {char_desc} which can be used for visual spoofing"
+        ));
+    }
+
+    // 9. Obfuscated flags — `-e\"xec\"` / `-e$'xec'` / `\"\"\"-f` style bypass
+    if check_obfuscated_flags(command) {
+        return Some(
+            "shell command contains obfuscated flag names (quotes inside flags) which can bypass security checks"
+                .to_string(),
+        );
+    }
+
     None
 }
 
@@ -255,6 +328,260 @@ fn shell_command_uses_dynamic_eval(command: &str) -> bool {
         .split(|c: char| c.is_whitespace() || matches!(c, ';' | '|' | '&' | '\n'))
         .any(|token| token.eq_ignore_ascii_case("eval"));
     has_eval && (command.contains("$(") || command.contains("${") || command.contains('$'))
+}
+
+fn check_ifs_injection(command: &str) -> bool {
+    let bytes = command.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'$' {
+            if bytes.get(i + 1..i + 4) == Some(b"IFS".as_slice()) {
+                let next = bytes.get(i + 4).copied();
+                if !matches!(next, Some(b) if b.is_ascii_alphanumeric() || b == b'_') {
+                    return true;
+                }
+            }
+            if bytes.get(i + 1) == Some(&b'{')
+                && let Some(end) = command[i + 2..].find('}')
+            {
+                let body = &command[i + 2..i + 2 + end];
+                if body.contains("IFS") {
+                    return true;
+                }
+                i += end + 2;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+fn check_carriage_return_attack(command: &str) -> bool {
+    if !command.contains('\r') {
+        return false;
+    }
+
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut escaped = false;
+
+    for ch in command.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' && !in_single_quote {
+            escaped = true;
+            continue;
+        }
+        if ch == '\'' && !in_double_quote {
+            in_single_quote = !in_single_quote;
+            continue;
+        }
+        if ch == '"' && !in_single_quote {
+            in_double_quote = !in_double_quote;
+            continue;
+        }
+        if ch == '\r' && !in_double_quote {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn check_proc_environ_access(command: &str) -> bool {
+    let lower = command.to_ascii_lowercase();
+    lower
+        .split("/proc/")
+        .skip(1)
+        .any(|tail| tail.find("/environ").is_some_and(|idx| idx > 0))
+}
+
+fn check_zsh_dangerous_command(command: &str) -> Option<String> {
+    if let Some(detail) = analyze_command_risks(command)
+        .into_iter()
+        .find_map(|risk| match risk {
+            CommandRisk::ZshDangerous(detail) => Some(detail),
+            _ => None,
+        })
+    {
+        return Some(detail);
+    }
+
+    split_shell_like_tokens(command)
+        .into_iter()
+        .map(|token| {
+            token
+                .trim_matches(|c: char| matches!(c, ';' | '|' | '&' | '(' | ')'))
+                .to_ascii_lowercase()
+        })
+        .find(|token| !token.is_empty() && !ZSH_PRECOMMAND_MODIFIERS.contains(&token.as_str()))
+        .filter(|token| ZSH_DANGEROUS_COMMANDS.contains(&token.as_str()))
+}
+
+fn check_unicode_whitespace(command: &str) -> Option<&'static str> {
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut escaped = false;
+
+    for ch in command.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' && !in_single_quote {
+            escaped = true;
+            continue;
+        }
+        if ch == '\'' && !in_double_quote {
+            in_single_quote = !in_single_quote;
+            continue;
+        }
+        if ch == '"' && !in_single_quote {
+            in_double_quote = !in_double_quote;
+            continue;
+        }
+        if in_single_quote || in_double_quote {
+            continue;
+        }
+        match ch {
+            '\u{00A0}' => return Some("U+00A0 NO-BREAK SPACE"),
+            '\u{200B}' => return Some("U+200B ZERO WIDTH SPACE"),
+            '\u{200C}' => return Some("U+200C ZERO WIDTH NON-JOINER"),
+            '\u{200D}' => return Some("U+200D ZERO WIDTH JOINER"),
+            '\u{2060}' => return Some("U+2060 WORD JOINER"),
+            '\u{2028}' => return Some("U+2028 LINE SEPARATOR"),
+            '\u{2029}' => return Some("U+2029 PARAGRAPH SEPARATOR"),
+            '\u{3000}' => return Some("U+3000 IDEOGRAPHIC SPACE"),
+            '\u{FEFF}' => return Some("U+FEFF ZERO WIDTH NO-BREAK SPACE"),
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn check_obfuscated_flags(command: &str) -> bool {
+    split_shell_like_tokens(command)
+        .into_iter()
+        .any(|token| token_is_obfuscated_flag(&token))
+}
+
+fn split_shell_like_tokens(command: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut escaped = false;
+
+    for ch in command.chars() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' && !in_single_quote {
+            current.push(ch);
+            escaped = true;
+            continue;
+        }
+        if ch == '\'' && !in_double_quote {
+            in_single_quote = !in_single_quote;
+            current.push(ch);
+            continue;
+        }
+        if ch == '"' && !in_single_quote {
+            in_double_quote = !in_double_quote;
+            current.push(ch);
+            continue;
+        }
+        if !in_single_quote
+            && !in_double_quote
+            && (ch.is_whitespace() || matches!(ch, ';' | '|' | '&' | '(' | ')' | '<' | '>'))
+        {
+            if !current.is_empty() {
+                tokens.push(std::mem::take(&mut current));
+            }
+            continue;
+        }
+        current.push(ch);
+    }
+
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
+fn token_is_obfuscated_flag(token: &str) -> bool {
+    if token.is_empty() {
+        return false;
+    }
+
+    if let Some(rest) = token
+        .strip_prefix("$''")
+        .or_else(|| token.strip_prefix("$\"\""))
+    {
+        if rest.trim_start().starts_with('-') {
+            return true;
+        }
+    }
+
+    let mut rest = token;
+    let mut consumed_empty_quotes = false;
+    loop {
+        if let Some(stripped) = rest.strip_prefix("''") {
+            rest = stripped;
+            consumed_empty_quotes = true;
+            continue;
+        }
+        if let Some(stripped) = rest.strip_prefix("\"\"") {
+            rest = stripped;
+            consumed_empty_quotes = true;
+            continue;
+        }
+        break;
+    }
+    if consumed_empty_quotes {
+        if rest.starts_with('-') {
+            return true;
+        }
+        let mut chars = rest.chars();
+        if matches!(chars.next(), Some('\'' | '"')) && matches!(chars.next(), Some('-')) {
+            return true;
+        }
+    }
+
+    if !token.starts_with('-') {
+        return false;
+    }
+
+    if token.contains("$'") || token.contains("$\"") {
+        return true;
+    }
+
+    let mut chars = token.chars().peekable();
+    let _ = chars.next();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\'' | '"' => {
+                while let Some(next) = chars.peek().copied() {
+                    if next == '\'' || next == '"' {
+                        let _ = chars.next();
+                        continue;
+                    }
+                    return matches!(next, '-' | '_' | '$' | '`' | '\\' | '{')
+                        || next.is_ascii_alphanumeric();
+                }
+                return false;
+            }
+            c if c.is_ascii_alphanumeric() || matches!(c, '-' | '_') => {}
+            _ => return false,
+        }
+    }
+
+    false
 }
 
 fn tool_output_line_matches_prompt_injection(line: &str) -> bool {
@@ -478,6 +805,140 @@ mod tests {
             SafetyMiddlewareDecision::Deny(reason)
                 if reason.contains("shell_obfuscation") && reason.contains("eval")
         ));
+    }
+
+    #[test]
+    fn middleware_blocks_ifs_injection() {
+        let decision = evaluate_tool_safety_request("bash", &json!({"command": "printf %s $IFS"}));
+        assert!(matches!(
+            decision,
+            SafetyMiddlewareDecision::Deny(reason)
+                if reason.contains("shell_obfuscation") && reason.contains("$IFS")
+        ));
+    }
+
+    #[test]
+    fn middleware_allows_similar_non_ifs_variable_name() {
+        let decision =
+            evaluate_tool_safety_request("bash", &json!({"command": "printf %s $IFS_SUFFIX"}));
+        assert_eq!(decision, SafetyMiddlewareDecision::Allow);
+    }
+
+    #[test]
+    fn middleware_blocks_carriage_return_attack() {
+        let decision =
+            evaluate_tool_safety_request("bash", &json!({"command": "echo safe\rwhoami"}));
+        assert!(matches!(
+            decision,
+            SafetyMiddlewareDecision::Deny(reason)
+                if reason.contains("shell_obfuscation") && reason.contains("carriage return")
+        ));
+    }
+
+    #[test]
+    fn middleware_allows_carriage_return_inside_double_quotes() {
+        let decision = evaluate_tool_safety_request(
+            "bash",
+            &json!({"command": "printf \"safe\rstill-data\""}),
+        );
+        assert_eq!(decision, SafetyMiddlewareDecision::Allow);
+    }
+
+    #[test]
+    fn middleware_blocks_zsh_dangerous_builtin() {
+        let decision = evaluate_tool_safety_request(
+            "bash",
+            &json!({"command": "noglob zmodload zsh/net/tcp"}),
+        );
+        assert!(matches!(
+            decision,
+            SafetyMiddlewareDecision::Deny(reason)
+                if reason.contains("shell_obfuscation") && reason.contains("zsh-specific dangerous command")
+        ));
+    }
+
+    #[test]
+    fn middleware_blocks_proc_environ_access() {
+        let decision =
+            evaluate_tool_safety_request("bash", &json!({"command": "cat /proc/self/environ"}));
+        assert!(matches!(
+            decision,
+            SafetyMiddlewareDecision::Deny(reason)
+                if reason.contains("shell_obfuscation") && reason.contains("/proc/*/environ")
+        ));
+    }
+
+    #[test]
+    fn middleware_blocks_unicode_whitespace_spoofing() {
+        let decision =
+            evaluate_tool_safety_request("bash", &json!({"command": "git\u{00A0}status"}));
+        assert!(matches!(
+            decision,
+            SafetyMiddlewareDecision::Deny(reason)
+                if reason.contains("shell_obfuscation") && reason.contains("U+00A0")
+        ));
+    }
+
+    #[test]
+    fn middleware_allows_unicode_whitespace_inside_quotes() {
+        let decision =
+            evaluate_tool_safety_request("bash", &json!({"command": "printf '\u{00A0}'"}));
+        assert_eq!(decision, SafetyMiddlewareDecision::Allow);
+    }
+
+    #[test]
+    fn middleware_blocks_obfuscated_flag_name() {
+        let decision =
+            evaluate_tool_safety_request("bash", &json!({"command": r#"find . -e"xec" sh {} \;"#}));
+        assert!(matches!(
+            decision,
+            SafetyMiddlewareDecision::Deny(reason)
+                if reason.contains("shell_obfuscation") && reason.contains("obfuscated flag")
+        ));
+    }
+
+    #[test]
+    fn middleware_blocks_empty_quote_prefixed_flag() {
+        let decision =
+            evaluate_tool_safety_request("bash", &json!({"command": "find . ''-exec sh {} \\;"}));
+        assert!(matches!(
+            decision,
+            SafetyMiddlewareDecision::Deny(reason)
+                if reason.contains("shell_obfuscation") && reason.contains("obfuscated flag")
+        ));
+    }
+
+    #[test]
+    fn middleware_blocks_special_quote_flag_fragment() {
+        let decision = evaluate_tool_safety_request(
+            "bash",
+            &json!({"command": r#"find . -e$'xec' sh {} \;"#}),
+        );
+        assert!(matches!(
+            decision,
+            SafetyMiddlewareDecision::Deny(reason)
+                if reason.contains("shell_obfuscation") && reason.contains("obfuscated flag")
+        ));
+    }
+
+    #[test]
+    fn middleware_blocks_empty_quote_pair_adjacent_to_quoted_dash() {
+        let decision = evaluate_tool_safety_request(
+            "bash",
+            &json!({"command": r#"find . """-exec" sh {} \;"#}),
+        );
+        assert!(matches!(
+            decision,
+            SafetyMiddlewareDecision::Deny(reason)
+                if reason.contains("shell_obfuscation") && reason.contains("obfuscated flag")
+        ));
+    }
+
+    #[test]
+    fn middleware_allows_quoted_filename_argument() {
+        let decision =
+            evaluate_tool_safety_request("bash", &json!({"command": r#"find . -name "-file""#}));
+        assert_eq!(decision, SafetyMiddlewareDecision::Allow);
     }
 
     #[test]
