@@ -507,7 +507,16 @@ impl<'a> CliSseStreamHost<'a> {
         }
     }
 
-    fn batch_transaction_boundary_supported(tool: &str) -> bool {
+    fn batch_transaction_boundary_supported(tool: &str, args: &Value) -> bool {
+        if tool == "bash" {
+            return args
+                .get("command")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .is_some_and(
+                    astra_runtime::turn::cloud_approval_policy::bash_command_is_read_only,
+                );
+        }
         is_tool_concurrency_safe(tool)
             || matches!(
                 tool,
@@ -522,6 +531,21 @@ impl<'a> CliSseStreamHost<'a> {
                     | "notebook_edit"
                     | "mo_query"
             )
+    }
+
+    fn bash_boundary_violation(tool: &str, args: &Value, message: &str) -> Option<String> {
+        if tool != "bash" {
+            return None;
+        }
+        let command = args
+            .get("command")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|command| !command.is_empty())?;
+        if astra_runtime::turn::cloud_approval_policy::bash_command_is_read_only(command) {
+            return None;
+        }
+        Some(message.to_string())
     }
 
     fn merge_transaction_fields(
@@ -639,20 +663,18 @@ impl<'a> CliSseStreamHost<'a> {
     }
 
     fn turn_rollback_boundary_violation(tool: &str, args: &Value) -> Option<String> {
-        if tool != "bash" {
-            return None;
-        }
-        let command = args
-            .get("command")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|command| !command.is_empty())?;
-        if astra_runtime::turn::cloud_approval_policy::bash_command_is_read_only(command) {
-            return None;
-        }
-        Some(
-            "Error: non-read-only bash commands do not participate in rollback_on_failure turn boundaries. Use structured mutation tools (write_file, git_*, rollback-aware editors), use run_build_test when available for build/test work, or keep bash read-only inside this plan subtask."
-                .to_string(),
+        Self::bash_boundary_violation(
+            tool,
+            args,
+            "Error: non-read-only bash commands do not participate in rollback_on_failure turn boundaries. Use structured mutation tools (write_file, git_*, rollback-aware editors), use run_build_test when available for build/test work, or keep bash read-only inside this plan subtask.",
+        )
+    }
+
+    fn batch_transaction_boundary_violation(tool: &str, args: &Value) -> Option<String> {
+        Self::bash_boundary_violation(
+            tool,
+            args,
+            "Error: non-read-only bash commands do not participate in rollback_on_failure batch transactions. Use structured mutation tools (write_file, git_*, rollback-aware editors), use run_build_test when available for build/test work, or keep bash read-only inside this transaction.",
         )
     }
 
@@ -829,7 +851,44 @@ impl<'a> CliSseStreamHost<'a> {
             }
 
             if let Some(meta) = metadata.as_ref() {
-                if !Self::batch_transaction_boundary_supported(&req.tool) {
+                if let Some(error) =
+                    Self::batch_transaction_boundary_violation(&req.tool, &req.args)
+                {
+                    let rollback = active_tx
+                        .as_ref()
+                        .and_then(|active| self.rollback_active_batch_transaction(active));
+                    let result = self
+                        .record_synthetic_batch_result(
+                            req,
+                            Self::append_transaction_note(
+                                &error,
+                                &meta.id,
+                                "failed before execution",
+                                rollback.as_ref(),
+                            ),
+                            "error",
+                            Self::merge_transaction_fields(
+                                None,
+                                &meta.id,
+                                if rollback.is_some() {
+                                    "rolled_back"
+                                } else {
+                                    "failed"
+                                },
+                                rollback.clone(),
+                            ),
+                        )
+                        .await;
+                    aborted_tx = Some(AbortedBatchTransaction {
+                        id: meta.id.clone(),
+                        rollback,
+                    });
+                    active_tx = None;
+                    results.push(result);
+                    continue;
+                }
+
+                if !Self::batch_transaction_boundary_supported(&req.tool, &req.args) {
                     let rollback = active_tx
                         .as_ref()
                         .and_then(|active| self.rollback_active_batch_transaction(active));
@@ -5051,6 +5110,152 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 .contains(temp.path().to_string_lossy().as_ref()),
             "{}",
             result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn transactional_batch_rejects_mutating_bash_and_restores_prior_state() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/tools/result"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .mount(&server)
+            .await;
+
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
+        let temp = tempdir().expect("tempdir");
+        let mut executor = crate::edge_tools::ToolExecutor::new(temp.path());
+        let mut tool_cache = EdgeToolCache::new(8);
+        executor
+            .journal_turn_index
+            .store(13, std::sync::atomic::Ordering::Relaxed);
+
+        let mut host = CliSseStreamHost::from_edge_ctx(
+            EdgeSseContext {
+                api: &api,
+                token: "tok",
+                executor_id: "edge-test",
+                executor: &mut executor,
+                render_policy: RenderPolicy::Silent,
+                perm_manager: None,
+                cancel_token: None,
+                stream_event_tx: None,
+                approval_request_tx: None,
+                skill_resolver: None,
+                skill_continuation: false,
+                turn_rollback_on_failure: false,
+                tool_cache: &mut tool_cache,
+            },
+            80,
+            false,
+        );
+
+        let results = host
+            .execute_tools_batch(vec![
+                ToolBatchRequest {
+                    request_id: "tx-bash-1".to_string(),
+                    tool: "write_file".to_string(),
+                    args: serde_json::json!({
+                        "path": "txn.txt",
+                        "content": "hello\n",
+                        "transaction_id": "tx-bash",
+                        "rollback_on_failure": true,
+                    }),
+                },
+                ToolBatchRequest {
+                    request_id: "tx-bash-2".to_string(),
+                    tool: "bash".to_string(),
+                    args: serde_json::json!({
+                        "command": "mkdir unsafe-dir",
+                        "transaction_id": "tx-bash",
+                        "rollback_on_failure": true,
+                    }),
+                },
+            ])
+            .await;
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[1].status, "error");
+        assert!(
+            results[1]
+                .output
+                .contains("non-read-only bash commands do not participate"),
+            "{}",
+            results[1].output
+        );
+        let fields = results[1]
+            .tool_result_fields
+            .as_ref()
+            .expect("transaction fields");
+        assert_eq!(fields["transaction_id"].as_str(), Some("tx-bash"));
+        assert_eq!(fields["transaction_state"].as_str(), Some("rolled_back"));
+        assert!(
+            !temp.path().join("txn.txt").exists(),
+            "prior bounded state should be rolled back"
+        );
+        assert!(
+            !temp.path().join("unsafe-dir").exists(),
+            "mutating bash should be blocked before execution"
+        );
+    }
+
+    #[tokio::test]
+    async fn transactional_batch_allows_read_only_bash() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/tools/result"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .mount(&server)
+            .await;
+
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
+        let temp = tempdir().expect("tempdir");
+        let mut executor = crate::edge_tools::ToolExecutor::new(temp.path());
+        let mut tool_cache = EdgeToolCache::new(8);
+        executor
+            .journal_turn_index
+            .store(14, std::sync::atomic::Ordering::Relaxed);
+
+        let mut host = CliSseStreamHost::from_edge_ctx(
+            EdgeSseContext {
+                api: &api,
+                token: "tok",
+                executor_id: "edge-test",
+                executor: &mut executor,
+                render_policy: RenderPolicy::Silent,
+                perm_manager: None,
+                cancel_token: None,
+                stream_event_tx: None,
+                approval_request_tx: None,
+                skill_resolver: None,
+                skill_continuation: false,
+                turn_rollback_on_failure: false,
+                tool_cache: &mut tool_cache,
+            },
+            80,
+            false,
+        );
+
+        let results = host
+            .execute_tools_batch(vec![ToolBatchRequest {
+                request_id: "tx-bash-ro".to_string(),
+                tool: "bash".to_string(),
+                args: serde_json::json!({
+                    "command": "pwd",
+                    "transaction_id": "tx-bash-ro",
+                    "rollback_on_failure": true,
+                }),
+            }])
+            .await;
+
+        assert_eq!(results.len(), 1);
+        assert_ne!(results[0].status, "error");
+        assert!(
+            results[0]
+                .output
+                .contains(temp.path().to_string_lossy().as_ref()),
+            "{}",
+            results[0].output
         );
     }
 }

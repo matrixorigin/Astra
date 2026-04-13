@@ -11,7 +11,7 @@ pub fn all_tool_schemas() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "bash",
-                "description": "Execute a shell command in the project root. Use for builds, tests, installs, and other CLI tasks. FORBIDDEN for git inspection — NEVER use bash for `git status`, `git diff`, `git log`, `git show`, or similar git commands. Use git_status, git_diff, git_log, git_show tools instead. Non-read-only bash does not participate in rollback journals; inside rollback-on-failure boundaries such as plan subtasks or run_chain, keep bash read-only and prefer structured tools such as write_file, git_*, or run_build_test. Can run curl, GitHub API, etc. Timeout varies (5-30s); override with timeout.",
+                "description": "Execute a shell command in the project root. Use for builds, tests, installs, and other CLI tasks. FORBIDDEN for git inspection — NEVER use bash for `git status`, `git diff`, `git log`, `git show`, or similar git commands. Use git_status, git_diff, git_log, git_show tools instead. Non-read-only bash does not participate in rollback journals; inside rollback-on-failure boundaries such as plan subtasks, run_chain, or explicit rollback-on-failure batch transactions, keep bash read-only and prefer structured tools such as write_file, git_*, or run_build_test. Can run curl, GitHub API, etc. Timeout varies (5-30s); override with timeout.",
                 "parameters": {
                     "type": "object",
                     "properties": {
