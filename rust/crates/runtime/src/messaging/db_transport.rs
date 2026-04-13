@@ -1418,10 +1418,11 @@ mod tests {
 
     #[test]
     fn backoff_constants_are_reasonable() {
+        const _: () = assert!(CRITICAL_FAILURE_THRESHOLD >= 10);
+        // Runtime checks for Duration comparisons (not const-evaluable).
         assert!(INITIAL_BACKOFF >= Duration::from_millis(100));
         assert!(MAX_BACKOFF <= Duration::from_secs(30));
         assert!(MAX_BACKOFF > INITIAL_BACKOFF);
-        assert!(CRITICAL_FAILURE_THRESHOLD >= 10);
     }
 
     #[test]

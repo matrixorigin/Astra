@@ -2217,6 +2217,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn ensure_team_run_session_creates_remote_session_when_missing() {
         let _lock = creds_lock();
         let creds_dir = tempfile::tempdir().unwrap();
@@ -2258,6 +2259,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn ensure_team_run_session_replaces_stale_remote_session() {
         let _lock = creds_lock();
         let creds_dir = tempfile::tempdir().unwrap();

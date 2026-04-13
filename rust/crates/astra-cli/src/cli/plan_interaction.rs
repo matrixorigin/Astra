@@ -1857,11 +1857,8 @@ mod tests {
     #[test]
     fn try_replace_plan_from_llm_json_empty_text_no_op() {
         let mut ps = plan::PlanModeState::new("g".into(), plan::ProjectContext::default());
-        assert_eq!(try_replace_plan_from_llm_json("", &mut ps).unwrap(), false);
-        assert_eq!(
-            try_replace_plan_from_llm_json("   \n\t  ", &mut ps).unwrap(),
-            false
-        );
+        assert!(!try_replace_plan_from_llm_json("", &mut ps).unwrap());
+        assert!(!try_replace_plan_from_llm_json("   \n\t  ", &mut ps).unwrap());
     }
 
     #[test]
@@ -1887,7 +1884,7 @@ mod tests {
     fn try_replace_plan_from_llm_json_valid_plan_replaces() {
         let mut ps = plan::PlanModeState::new("g".into(), plan::ProjectContext::default());
         let json = r#"{"subtasks":[{"id":"t1","title":"step"}]}"#;
-        assert_eq!(try_replace_plan_from_llm_json(json, &mut ps).unwrap(), true);
+        assert!(try_replace_plan_from_llm_json(json, &mut ps).unwrap());
         assert_eq!(ps.plan.subtasks.len(), 1);
         assert_eq!(ps.plan.subtasks[0].id, "t1");
     }

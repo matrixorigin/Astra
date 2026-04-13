@@ -464,10 +464,10 @@ mod tests {
 
     #[test]
     fn skill_search_limit_clamps_to_max_results() {
-        let lim = Some(u32::MAX)
-            .unwrap_or(DEFAULT_SEARCH_LIMIT)
-            .min(super::MAX_SEARCH_RESULTS);
-        assert_eq!(lim, super::MAX_SEARCH_RESULTS);
+        // Verify the clamp logic: any user-supplied limit is capped at MAX_SEARCH_RESULTS.
+        let user_limit: u32 = 999_999;
+        let clamped = user_limit.min(super::MAX_SEARCH_RESULTS);
+        assert_eq!(clamped, super::MAX_SEARCH_RESULTS);
     }
 
     #[test]

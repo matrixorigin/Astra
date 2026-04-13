@@ -893,7 +893,7 @@ impl SessionAuditService for DatabaseSessionAuditService {
         const MODEL_SEP: char = '\u{001f}';
         let metrics_row = query(&format!(
             "SELECT \
-               COUNT(CASE WHEN event_type = 'turn' THEN 1 END) AS turn_count, \
+               COUNT(CASE WHEN event_type = 'user_query' THEN 1 END) AS turn_count, \
                COUNT(CASE WHEN event_type = 'turn_error' THEN 1 END) AS error_count, \
                COUNT(CASE WHEN event_type = 'stall_detected' THEN 1 END) AS stall_count, \
                COUNT(CASE WHEN event_type = 'checkpoint' THEN 1 END) AS checkpoint_count, \
@@ -901,9 +901,9 @@ impl SessionAuditService for DatabaseSessionAuditService {
                COUNT(CASE WHEN event_type = 'tool_call' THEN 1 END) \
                  + COUNT(CASE WHEN event_type = 'tool_error' THEN 1 END) AS tool_calls_total, \
                COUNT(CASE WHEN event_type = 'tool_error' THEN 1 END) AS tool_calls_failed, \
-               COALESCE(SUM(CASE WHEN event_type = 'turn' AND token_usage IS NOT NULL \
+               COALESCE(SUM(CASE WHEN event_type = 'user_query' AND token_usage IS NOT NULL \
                  THEN COALESCE(token_input, 0) ELSE 0 END), 0) AS tokens_in, \
-               COALESCE(SUM(CASE WHEN event_type = 'turn' AND token_usage IS NOT NULL \
+               COALESCE(SUM(CASE WHEN event_type = 'user_query' AND token_usage IS NOT NULL \
                  THEN COALESCE(token_output, 0) ELSE 0 END), 0) AS tokens_out, \
                MIN(created_at) AS first_at, \
                MAX(created_at) AS last_at, \
@@ -993,7 +993,7 @@ impl SessionAuditService for DatabaseSessionAuditService {
         // Count total turn events
         let count_row = query(
             "SELECT COUNT(*) AS cnt FROM agent_events \
-             WHERE session_id = ? AND user_id = ? AND event_type = 'turn'",
+             WHERE session_id = ? AND user_id = ? AND event_type = 'user_query'",
         )
         .bind(session_id)
         .bind(user_id)
@@ -1008,7 +1008,7 @@ impl SessionAuditService for DatabaseSessionAuditService {
              SUBSTRING(COALESCE(CAST(content AS CHAR), ''), 1, {}) AS content, \
              token_usage, llm_model_used, metadata, created_at \
              FROM agent_events \
-             WHERE session_id = ? AND user_id = ? AND event_type = 'turn' \
+             WHERE session_id = ? AND user_id = ? AND event_type = 'user_query' \
              ORDER BY created_at ASC \
              LIMIT ? OFFSET ?",
             agent_events_content_cap::TURN_LIST_PREVIEW
@@ -1100,7 +1100,7 @@ impl SessionAuditService for DatabaseSessionAuditService {
         let row = query(
             "SELECT event_id, content, token_usage, llm_model_used, metadata, created_at \
              FROM agent_events \
-             WHERE session_id = ? AND user_id = ? AND event_type = 'turn' \
+             WHERE session_id = ? AND user_id = ? AND event_type = 'user_query' \
              ORDER BY created_at ASC \
              LIMIT 1 OFFSET ?",
         )
@@ -1530,7 +1530,7 @@ impl SessionAuditService for DatabaseSessionAuditService {
         let data_sql = format!(
             "SELECT \
                s.session_id, s.status, s.created_at, s.ended_at, \
-               COUNT(CASE WHEN e.event_type = 'turn' THEN 1 END) AS turn_count, \
+               COUNT(CASE WHEN e.event_type = 'user_query' THEN 1 END) AS turn_count, \
                COALESCE(SUM(e.token_input), 0) AS tokens_in, \
                COALESCE(SUM(e.token_output), 0) AS tokens_out, \
                COUNT(CASE WHEN e.event_type IN ('tool_call', 'tool_error') THEN 1 END) AS tool_calls, \
@@ -1584,7 +1584,7 @@ impl SessionAuditService for DatabaseSessionAuditService {
         let count_sql = format!(
             "SELECT COUNT(*) AS cnt FROM (\
                SELECT s.session_id, \
-                 COUNT(CASE WHEN e.event_type = 'turn' THEN 1 END) AS turn_count \
+                 COUNT(CASE WHEN e.event_type = 'user_query' THEN 1 END) AS turn_count \
                FROM agent_sessions s \
                LEFT JOIN agent_events e ON e.session_id = s.session_id AND e.user_id = s.user_id \
                WHERE {where_clause} \
@@ -1639,7 +1639,7 @@ impl SessionAuditService for DatabaseSessionAuditService {
         let agg_sql = format!(
             "SELECT \
                COUNT(DISTINCT e.session_id) as session_count, \
-               COUNT(CASE WHEN event_type = 'turn' THEN 1 END) as total_turns, \
+               COUNT(CASE WHEN event_type = 'user_query' THEN 1 END) as total_turns, \
                COALESCE(SUM(token_input), 0) as tokens_in, \
                COALESCE(SUM(token_output), 0) as tokens_out, \
                COUNT(CASE WHEN event_type IN ('tool_call', 'tool_error') THEN 1 END) as total_tool_calls, \
@@ -2575,11 +2575,14 @@ mod tests {
 
     #[test]
     fn cross_session_input_row_caps_are_positive() {
-        assert!(MAX_CROSS_SESSION_MUTATION_DECISION_ROWS > 0);
-        assert!(MAX_CROSS_SESSION_MUTATION_EVENT_ROWS > 0);
-        assert!(MAX_CROSS_SESSION_RUNTIME_PROMOTION_ROWS > 0);
+        const _: () = {
+            assert!(MAX_CROSS_SESSION_MUTATION_DECISION_ROWS > 0);
+            assert!(MAX_CROSS_SESSION_MUTATION_EVENT_ROWS > 0);
+            assert!(MAX_CROSS_SESSION_RUNTIME_PROMOTION_ROWS > 0);
+        };
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn sample_queue_mutation(
         mutation_id: &str,
         session_id: &str,

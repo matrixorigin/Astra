@@ -588,11 +588,19 @@ impl ToolExecutor {
             code_intel::Language::Python => {
                 // "os.path" → ["os", "path"]
                 // ".utils" → ["utils"]
-                import.path.split('.').filter(|seg| !seg.is_empty()).collect()
+                import
+                    .path
+                    .split('.')
+                    .filter(|seg| !seg.is_empty())
+                    .collect()
             }
             code_intel::Language::TypeScript | code_intel::Language::JavaScript => {
                 // "lib/config" → ["lib", "config"]
-                import.path.split('/').filter(|seg| !seg.is_empty()).collect()
+                import
+                    .path
+                    .split('/')
+                    .filter(|seg| !seg.is_empty())
+                    .collect()
             }
             code_intel::Language::Go => {
                 // "path/filepath" → ["path", "filepath"]

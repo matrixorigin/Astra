@@ -881,10 +881,7 @@ impl PermissionManager {
                 if let Some(detail) = detail {
                     eprintln!("{}", detail.dim());
                 }
-                return match Self::prompt_approval(ApprovalPromptKind::ConfirmOnce) {
-                    'y' => true,
-                    _ => false,
-                };
+                return Self::prompt_approval(ApprovalPromptKind::ConfirmOnce) == 'y';
             }
         }
 

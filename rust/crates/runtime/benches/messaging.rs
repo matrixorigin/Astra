@@ -146,6 +146,8 @@ fn bench_inprocess_transport(c: &mut Criterion) {
                     delegation_id: delegation_id.into(),
                     agent_id: format!("agent-{i}"),
                     depth: 1,
+                    state: astra_core::SubRunState::Created,
+                    retry_of: None,
                 })
                 .await;
                 let _ = router

@@ -2457,12 +2457,11 @@ mod tests {
         assert_eq!(value["run"]["session_id"], session_id);
         assert_eq!(value["run"]["goal"], "finish the engine");
         assert_eq!(value["recent_steps"][0]["event_type"], "turn");
-        assert_eq!(
+        assert!(
             value["environment"]["last_context_trace_preview"]
                 .as_str()
                 .unwrap()
-                .contains("turn-7"),
-            true
+                .contains("turn-7")
         );
         assert_eq!(value["acceptance"]["ok"], true);
     }

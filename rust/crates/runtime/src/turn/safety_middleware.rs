@@ -820,9 +820,7 @@ fn shell_flag_value_kind(flag: &str) -> Option<ShellFlagValueKind> {
     match flag {
         "--command" => Some(ShellFlagValueKind::NestedCommand),
         "-C" | "--init-command" => Some(ShellFlagValueKind::InitCommand),
-        "--rcfile" | "--init-file" | "-o" | "+o" | "-O" | "+O" => {
-            Some(ShellFlagValueKind::Other)
-        }
+        "--rcfile" | "--init-file" | "-o" | "+o" | "-O" | "+O" => Some(ShellFlagValueKind::Other),
         _ => None,
     }
 }
@@ -881,7 +879,8 @@ fn stdin_script_interpreter_detail(base: &str, args: &[String]) -> Option<String
         if is_stdin_redirection_token(arg) {
             return (!has_explicit_script_source).then(|| format!("{base} <stdin"));
         }
-        if arg == "-" || (is_shell_interpreter_command(base) && is_shell_read_from_stdin_flag(arg)) {
+        if arg == "-" || (is_shell_interpreter_command(base) && is_shell_read_from_stdin_flag(arg))
+        {
             return Some(format!("{base} {arg}"));
         }
         if is_shell_interpreter_command(base) {

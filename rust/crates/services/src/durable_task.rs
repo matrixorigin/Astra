@@ -4006,7 +4006,7 @@ mod tests {
 
     #[test]
     fn verification_history_row_cap_is_positive() {
-        assert!(MAX_VERIFICATION_HISTORY_ROWS >= 1000);
+        const _: () = assert!(MAX_VERIFICATION_HISTORY_ROWS >= 1000);
     }
 
     #[test]
@@ -7224,7 +7224,11 @@ Time:        3.456 s
             global_only: false,
         };
         let result = runner.run_criterion(&criterion).await;
-        assert!(result.passed, "fallback should find sub/app.js: {:?}", result);
+        assert!(
+            result.passed,
+            "fallback should find sub/app.js: {:?}",
+            result
+        );
     }
 
     #[tokio::test]
@@ -7248,7 +7252,11 @@ Time:        3.456 s
             global_only: false,
         };
         let result = runner.run_criterion(&criterion).await;
-        assert!(result.passed, "fallback should find src/index.html: {:?}", result);
+        assert!(
+            result.passed,
+            "fallback should find src/index.html: {:?}",
+            result
+        );
     }
 
     #[tokio::test]
@@ -7273,6 +7281,10 @@ Time:        3.456 s
             global_only: false,
         };
         let result = runner.run_criterion(&criterion).await;
-        assert!(result.passed, "fallback should find out/app.js: {:?}", result);
+        assert!(
+            result.passed,
+            "fallback should find out/app.js: {:?}",
+            result
+        );
     }
 }

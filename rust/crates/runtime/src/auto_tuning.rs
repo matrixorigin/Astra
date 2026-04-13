@@ -1821,7 +1821,7 @@ mod tests {
 
         // Check the threshold was adjusted
         // Since initial is 0.3, delta is 0.1, but min is 0.5, result should be clamped to 0.5
-        let expected = (initial_threshold + 0.1).max(0.5).min(0.95);
+        let expected = (initial_threshold + 0.1).clamp(0.5, 0.95);
         assert!(
             (config.tool_selection.confidence_threshold - expected).abs() < 0.001,
             "Expected {}, got {}, initial was {}",

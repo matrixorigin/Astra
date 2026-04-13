@@ -66,6 +66,7 @@ mod passive_tsc_check;
 #[path = "edge_tools/schemas.rs"]
 mod schemas;
 #[path = "edge_tools/shell.rs"]
+#[allow(clippy::needless_range_loop)]
 mod shell;
 pub use schemas::all_tool_schemas;
 #[path = "edge_tools/env_tools.rs"]

@@ -432,10 +432,11 @@ async fn rollback_session_state_restores_self_mod_and_task_state() {
         Some(4)
     );
 
-    let session_guard = session.read().unwrap();
-    assert_eq!(session_guard.config.memory.retrieval_top_k, original_top_k);
-    assert!(session_guard.goal_tracker.is_none());
-    drop(session_guard);
+    {
+        let session_guard = session.read().unwrap();
+        assert_eq!(session_guard.config.memory.retrieval_top_k, original_top_k);
+        assert!(session_guard.goal_tracker.is_none());
+    }
 
     let self_model = exe.build_self_model_snapshot().unwrap();
     assert!(self_model.capabilities.pinned_tools.is_empty());

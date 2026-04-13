@@ -493,68 +493,6 @@ impl TraceAggregation {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_trace_builder() {
-        let trace = ContextAssemblyTraceBuilder::new("turn-1", "session-abc")
-            .with_token_budget(TokenBudgetTrace {
-                max_tokens: 100000,
-                total_used: 45000,
-                budget_pressure: 0.45,
-                ..Default::default()
-            })
-            .build();
-
-        assert_eq!(trace.turn_id, "turn-1");
-        assert_eq!(trace.session_id, "session-abc");
-        assert_eq!(trace.token_budget.max_tokens, 100000);
-        assert!((trace.token_budget.budget_pressure - 0.45).abs() < 0.001);
-    }
-
-    #[test]
-    fn test_trace_aggregation() {
-        let traces = vec![
-            ContextAssemblyTrace {
-                system_prompt: SystemPromptBreakdown {
-                    total_tokens: 1000,
-                    ..Default::default()
-                },
-                token_budget: TokenBudgetTrace {
-                    compression_triggered: true,
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
-            ContextAssemblyTrace {
-                system_prompt: SystemPromptBreakdown {
-                    total_tokens: 2000,
-                    ..Default::default()
-                },
-                token_budget: TokenBudgetTrace {
-                    compression_triggered: false,
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
-        ];
-
-        let agg = TraceAggregation::from_traces(&traces);
-        assert_eq!(agg.turn_count, 2);
-        assert!((agg.avg_system_prompt_tokens - 1500.0).abs() < 0.001);
-        assert!((agg.compression_trigger_rate - 0.5).abs() < 0.001);
-    }
-
-    #[test]
-    fn tool_trace_scores_are_clamped_non_negative() {
-        let selected_tools: Vec<String> = (0..16).map(|i| format!("tool-{i}")).collect();
-        let trace = build_tool_trace_from_selection(16, &selected_tools, "tfidf", 0.4, &[], 5);
-        assert!(trace.tools_selected.iter().all(|tool| tool.score >= 0.0));
-    }
-}
-
 // ─── Integration with Context Compression ────────────────────────────────────
 
 /// Build HistorySelectionTrace from compression pipeline results.
@@ -683,5 +621,67 @@ pub fn build_memory_trace_from_retrieval(
         memories_rejected: Vec::new(), // Would need scoring internals
         total_tokens,
         retrieval_latency_ms,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_trace_builder() {
+        let trace = ContextAssemblyTraceBuilder::new("turn-1", "session-abc")
+            .with_token_budget(TokenBudgetTrace {
+                max_tokens: 100000,
+                total_used: 45000,
+                budget_pressure: 0.45,
+                ..Default::default()
+            })
+            .build();
+
+        assert_eq!(trace.turn_id, "turn-1");
+        assert_eq!(trace.session_id, "session-abc");
+        assert_eq!(trace.token_budget.max_tokens, 100000);
+        assert!((trace.token_budget.budget_pressure - 0.45).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_trace_aggregation() {
+        let traces = vec![
+            ContextAssemblyTrace {
+                system_prompt: SystemPromptBreakdown {
+                    total_tokens: 1000,
+                    ..Default::default()
+                },
+                token_budget: TokenBudgetTrace {
+                    compression_triggered: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ContextAssemblyTrace {
+                system_prompt: SystemPromptBreakdown {
+                    total_tokens: 2000,
+                    ..Default::default()
+                },
+                token_budget: TokenBudgetTrace {
+                    compression_triggered: false,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        ];
+
+        let agg = TraceAggregation::from_traces(&traces);
+        assert_eq!(agg.turn_count, 2);
+        assert!((agg.avg_system_prompt_tokens - 1500.0).abs() < 0.001);
+        assert!((agg.compression_trigger_rate - 0.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn tool_trace_scores_are_clamped_non_negative() {
+        let selected_tools: Vec<String> = (0..16).map(|i| format!("tool-{i}")).collect();
+        let trace = build_tool_trace_from_selection(16, &selected_tools, "tfidf", 0.4, &[], 5);
+        assert!(trace.tools_selected.iter().all(|tool| tool.score >= 0.0));
     }
 }

@@ -572,7 +572,7 @@ mod tests {
         let paths = mgr.create_worktrees("del-12345678", &agents).await.unwrap();
 
         assert_eq!(paths.len(), 2);
-        for (_, p) in &paths {
+        for p in paths.values() {
             assert!(p.exists(), "worktree path should exist: {p:?}");
         }
         assert_eq!(mgr.active_worktrees().len(), 2);

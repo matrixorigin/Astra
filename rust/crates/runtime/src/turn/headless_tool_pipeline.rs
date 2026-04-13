@@ -437,6 +437,10 @@ mod tests {
                 .as_deref()
                 .is_some_and(|preview| preview.contains("hooked result"))
         );
-        assert!(pipeline.ctx.tool_results[0].to_string().contains("hooked result"));
+        assert!(
+            pipeline.ctx.tool_results[0]
+                .to_string()
+                .contains("hooked result")
+        );
     }
 }

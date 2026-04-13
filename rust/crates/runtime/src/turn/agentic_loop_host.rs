@@ -696,9 +696,6 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
 // ─── CTX_ helpers ────────────────────────────────────────────────────────────
 
 /// Extract repository name from a git remote URL.
-///
-// ─── Tests ───────────────────────────────────────────────────────────────────
-
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -5158,7 +5155,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
 
         // Budget should still be valid
         assert!(
-            final_budget >= 30_000 && final_budget <= 80_000,
+            (30_000..=80_000).contains(&final_budget),
             "budget should be in valid range: {}",
             final_budget
         );

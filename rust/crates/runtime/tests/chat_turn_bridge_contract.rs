@@ -787,7 +787,7 @@ macro_rules! internal_rebuild_case {
         let frames: Vec<serde_json::Value> = payload
             .trim()
             .split("\n\n")
-            .map(|frame| extract_sse_data(frame))
+            .map(extract_sse_data)
             .map(|json| {
                 let mut v = serde_json::from_str::<serde_json::Value>(json).unwrap();
                 strip_stream_metadata(&mut v);
@@ -960,7 +960,7 @@ async fn chat_turn_bridge_returns_sse_error_when_upstream_is_unavailable() {
     let event = payload
         .trim()
         .split("\n\n")
-        .map(|frame| extract_sse_data(frame))
+        .map(extract_sse_data)
         .map(|json| {
             let mut v = serde_json::from_str::<serde_json::Value>(json).unwrap();
             strip_stream_metadata(&mut v);
@@ -1804,7 +1804,7 @@ async fn http_chat_turn_bridge_filters_bridge_state_events() {
     let frames = payload
         .trim()
         .split("\n\n")
-        .map(|frame| extract_sse_data(frame))
+        .map(extract_sse_data)
         .map(|json| {
             let mut v = serde_json::from_str::<serde_json::Value>(json).unwrap();
             strip_stream_metadata(&mut v);
@@ -2650,7 +2650,7 @@ async fn http_chat_turn_bridge_signals_error_on_truncated_stream() {
     let frames = payload
         .trim()
         .split("\n\n")
-        .map(|frame| extract_sse_data(frame))
+        .map(extract_sse_data)
         .map(|json| {
             let mut v = serde_json::from_str::<serde_json::Value>(json).unwrap();
             strip_stream_metadata(&mut v);
@@ -2712,7 +2712,7 @@ async fn http_chat_turn_bridge_blocks_prompt_leak_from_bridge_state() {
     let frames = payload
         .trim()
         .split("\n\n")
-        .map(|frame| extract_sse_data(frame))
+        .map(extract_sse_data)
         .map(|json| {
             let mut v = serde_json::from_str::<serde_json::Value>(json).unwrap();
             strip_stream_metadata(&mut v);
@@ -2780,7 +2780,7 @@ async fn http_chat_turn_bridge_synthesizes_warning_before_turn_complete() {
     let frames = payload
         .trim()
         .split("\n\n")
-        .map(|frame| extract_sse_data(frame))
+        .map(extract_sse_data)
         .map(|json| {
             let mut v = serde_json::from_str::<serde_json::Value>(json).unwrap();
             strip_stream_metadata(&mut v);
@@ -2849,7 +2849,7 @@ async fn http_chat_turn_bridge_synthesizes_explain_before_turn_complete() {
     let frames = payload
         .trim()
         .split("\n\n")
-        .map(|frame| extract_sse_data(frame))
+        .map(extract_sse_data)
         .map(|json| {
             let mut v = serde_json::from_str::<serde_json::Value>(json).unwrap();
             strip_stream_metadata(&mut v);
@@ -2924,7 +2924,7 @@ async fn http_chat_turn_bridge_preserves_upstream_warning_without_bridge_state()
     let frames = payload
         .trim()
         .split("\n\n")
-        .map(|frame| extract_sse_data(frame))
+        .map(extract_sse_data)
         .map(|json| {
             let mut v = serde_json::from_str::<serde_json::Value>(json).unwrap();
             strip_stream_metadata(&mut v);
@@ -2984,7 +2984,7 @@ async fn http_chat_turn_bridge_preserves_upstream_explain_without_bridge_state()
     let frames = payload
         .trim()
         .split("\n\n")
-        .map(|frame| extract_sse_data(frame))
+        .map(extract_sse_data)
         .map(|json| {
             let mut v = serde_json::from_str::<serde_json::Value>(json).unwrap();
             strip_stream_metadata(&mut v);
@@ -3049,7 +3049,7 @@ async fn http_chat_turn_bridge_synthesizes_trusted_session_info() {
     let frames = payload
         .trim()
         .split("\n\n")
-        .map(|frame| extract_sse_data(frame))
+        .map(extract_sse_data)
         .map(|json| {
             let mut v = serde_json::from_str::<serde_json::Value>(json).unwrap();
             strip_stream_metadata(&mut v);
@@ -3105,7 +3105,7 @@ async fn http_chat_turn_bridge_derives_has_tool_calls_from_tool_sigs() {
     let frames = payload
         .trim()
         .split("\n\n")
-        .map(|frame| extract_sse_data(frame))
+        .map(extract_sse_data)
         .map(|json| {
             let mut v = serde_json::from_str::<serde_json::Value>(json).unwrap();
             strip_stream_metadata(&mut v);

@@ -4712,7 +4712,7 @@ mod tests {
         };
         let project_root = home.join("project");
         let policy = SandboxPolicy::for_project(&project_root);
-        let command = format!("cat ~/project/src/main.rs");
+        let command = "cat ~/project/src/main.rs";
         let result = check_bash_path_boundary(&policy, &command);
         assert!(
             result.is_none(),
