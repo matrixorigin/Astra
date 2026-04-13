@@ -1224,13 +1224,14 @@ pub enum AgenticLoopOutcome {
 
 // ─── Delegation support ──────────────────────────────────────────────────────
 
+pub const DELEGATE_TOOL_NAME: &str = super::agentic_delegate_interception::DELEGATE_TOOL_NAME;
+
 #[allow(unused_imports)]
 pub(crate) use super::agentic_delegate_interception::{
-    DELEGATE_TOOL_NAME, DelegationAdaptiveContext, DelegationExecutionResult,
-    DelegationFinalOutputSource, DelegationOutcomeMetadata, coordination_pattern_name,
-    delegation_adaptive_context, delegation_final_output_preview, format_delegation_result,
-    format_delegation_terminal_preview, is_delegation_call,
-    merge_workspace_hint_into_delegation_request, parse_coordination_pattern,
+    DelegationAdaptiveContext, DelegationExecutionResult, DelegationFinalOutputSource,
+    DelegationOutcomeMetadata, coordination_pattern_name, delegation_adaptive_context,
+    delegation_final_output_preview, format_delegation_result, format_delegation_terminal_preview,
+    is_delegation_call, merge_workspace_hint_into_delegation_request, parse_coordination_pattern,
     parse_delegate_agents, parse_delegation_request, partition_and_execute_delegations,
     pattern_from_name, select_default_coordination_pattern, task_needs_review,
     tool_call_arguments_value, tool_call_name,
