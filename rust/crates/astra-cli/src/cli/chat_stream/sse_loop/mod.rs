@@ -65,6 +65,18 @@ async fn finalize_root_mailbox(
     }
 }
 
+fn extend_restricted_with_blocked_tools(
+    restricted: &mut HashSet<String>,
+    observability_hub: Option<&Arc<astra_runtime::observability_integration::ObservabilityHub>>,
+) {
+    if let Some(hub) = observability_hub
+        && let Some(pattern_library) = hub.pattern_library()
+        && let Ok(lib) = pattern_library.lock()
+    {
+        restricted.extend(lib.blocked_tool_names());
+    }
+}
+
 pub(crate) async fn stream_chat_sse(
     mut p: ChatTurnParams<'_>,
 ) -> Result<StreamResult, crate::TurnFailure> {
@@ -236,12 +248,7 @@ pub(crate) async fn stream_chat_sse(
 
     // Seed persisted hard-blocks from cross-session learning so blocked tools
     // never appear in the visible schema set for a new CLI turn.
-    if let Some(ref hub) = p.observability_hub
-        && let Some(pattern_library) = hub.pattern_library()
-        && let Ok(lib) = pattern_library.lock()
-    {
-        initial_restricted.extend(lib.blocked_tool_names());
-    }
+    extend_restricted_with_blocked_tools(&mut initial_restricted, p.observability_hub.as_ref());
 
     let current_session_id = p.session_id.map(|s| s.to_string());
     let existing_root_mailbox = if let Some(slot) = p.root_mailbox_slot.as_deref_mut() {
@@ -640,8 +647,15 @@ pub(crate) async fn stream_chat_sse(
 #[cfg(test)]
 mod tests {
     use super::detect_turn_hook_sets;
+    use super::extend_restricted_with_blocked_tools;
+    use astra_runtime::evolution::types::PatternAction;
+    use astra_runtime::observability_integration::ObservabilityHub;
+    use astra_runtime::pipeline::pattern::PatternLibrary;
+    use astra_runtime::pipeline::routing::TaskType;
     use astra_runtime::turn::chat_turn_heuristics::infer_task_execution_profile;
+    use std::collections::HashSet;
     use std::path::Path;
+    use std::sync::{Arc, Mutex};
     use tempfile::tempdir;
 
     #[test]
@@ -758,5 +772,24 @@ hooks:
         );
         assert_eq!(s.stop_hooks.len(), 1);
         assert_eq!(s.stop_hooks[0].label, "audit");
+    }
+
+    #[test]
+    fn blocked_patterns_seed_initial_restrictions_from_observability_hub() {
+        let pattern_library = Arc::new(Mutex::new(PatternLibrary::new()));
+        {
+            let mut lib = pattern_library.lock().unwrap();
+            let tools = vec!["grep".to_string()];
+            lib.record_outcome(&tools, TaskType::Code, None, true, 0.8, None);
+            lib.apply_evolution_action("grep", PatternAction::Block);
+        }
+
+        let hub = Arc::new(ObservabilityHub::new());
+        hub.attach_pattern_library(pattern_library);
+
+        let mut restricted = HashSet::new();
+        extend_restricted_with_blocked_tools(&mut restricted, Some(&hub));
+
+        assert!(restricted.contains("grep"));
     }
 }

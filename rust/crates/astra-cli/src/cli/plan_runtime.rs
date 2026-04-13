@@ -257,7 +257,8 @@ mod tests {
         state.session_id = Some("sess-plan".to_string());
         state.turn = 7;
 
-        let hub = std::sync::Arc::new(astra_runtime::observability_integration::ObservabilityHub::new());
+        let hub =
+            std::sync::Arc::new(astra_runtime::observability_integration::ObservabilityHub::new());
         let session = hub.start_session("user-1", "sess-plan");
         let evolution =
             std::sync::Arc::new(astra_runtime::evolution::service::EvolutionService::new());
@@ -289,8 +290,14 @@ mod tests {
             &ctx.database_snapshot_journal,
             &database_snapshot_journal
         ));
-        assert!(std::sync::Arc::ptr_eq(&ctx.git_stash_journal, &git_stash_journal));
-        assert!(std::sync::Arc::ptr_eq(&ctx.git_commit_journal, &git_commit_journal));
+        assert!(std::sync::Arc::ptr_eq(
+            &ctx.git_stash_journal,
+            &git_stash_journal
+        ));
+        assert!(std::sync::Arc::ptr_eq(
+            &ctx.git_commit_journal,
+            &git_commit_journal
+        ));
         assert!(std::sync::Arc::ptr_eq(
             &ctx.git_worktree_journal,
             &git_worktree_journal

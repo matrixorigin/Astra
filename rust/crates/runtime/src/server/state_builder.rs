@@ -454,7 +454,14 @@ mod tests {
     fn persisted_patterns_overlay_defaults_without_losing_blocked_state() {
         let tools = vec!["grep".to_string()];
         let mut persisted = crate::pipeline::pattern::PatternLibrary::new();
-        persisted.record_outcome(&tools, TaskType::Code, Some(DomainHint::Code), true, 0.8, None);
+        persisted.record_outcome(
+            &tools,
+            TaskType::Code,
+            Some(DomainHint::Code),
+            true,
+            0.8,
+            None,
+        );
         persisted.apply_evolution_action("grep", PatternAction::Block);
 
         let mut layered = crate::pipeline::pattern::PatternLibrary::new();
@@ -462,7 +469,10 @@ mod tests {
         layered.overlay(&persisted.export());
 
         assert!(
-            layered.blocked_tool_names().iter().any(|name| name == "grep"),
+            layered
+                .blocked_tool_names()
+                .iter()
+                .any(|name| name == "grep"),
             "persisted blocked tools should survive bootstrap default layering"
         );
     }
