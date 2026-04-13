@@ -62,22 +62,11 @@ use crate::pipeline::step_protocol::{InMemoryIdempotencyCache, StepCheckpoint};
 use crate::pipeline::step_recorder::StepRecorder;
 use crate::semantic_dedup::SemanticDedup;
 use crate::tool_registry::SelectionReport;
-use crate::turn::agentic_headless_round::{
-    HeadlessRoundTerminal, HeadlessStderrStyle, HeadlessToolRoundCtx,
-    run_agentic_headless_tool_round,
-};
-use crate::turn::agentic_post_tool_policy::{
-    AgenticPostToolIterationControl, AgenticPostToolPolicyRequest, apply_agentic_post_tool_policy,
-    map_post_tool_policy_outcome,
-};
-use crate::turn::agentic_turn_flow::{
-    agentic_round_stall_preflight_with_tool_calls, append_explain_turn_batch,
-};
+use crate::turn::agentic_headless_round::HeadlessStderrStyle;
 use crate::turn::agentic_verdict_audit::AgenticVerdictAuditEvent;
 use crate::turn::chat_turn_heuristics::TaskExecutionProfile;
 use crate::turn::chat_turn_sse_dispatch::ChatTurnSseAccum;
 use crate::turn::sse_stream_host::EdgeToolExecResult;
-use crate::turn::tool_result_semantics::tool_dedup_signature;
 use crate::turn::turn_guard::TurnGuard;
 use tokio_util::sync::CancellationToken;
 
@@ -572,10 +561,10 @@ pub struct AgenticLoopState {
 }
 
 /// Consecutive same-category error turns before forcing a strategy change.
-const CONSECUTIVE_ERROR_BUDGET: u32 = 3;
+pub(crate) const CONSECUTIVE_ERROR_BUDGET: u32 = 3;
 
 /// Maximum number of recent file reads to track for post-compact restoration.
-const MAX_TRACKED_FILE_READS: usize = 20;
+pub(crate) const MAX_TRACKED_FILE_READS: usize = 20;
 
 fn edge_tool_status_exit_code(status: &str) -> Option<i32> {
     match status.trim().to_ascii_lowercase().as_str() {
@@ -586,7 +575,7 @@ fn edge_tool_status_exit_code(status: &str) -> Option<i32> {
     }
 }
 
-fn record_edge_tool_observability(
+pub(crate) fn record_edge_tool_observability(
     state: &mut AgenticLoopState,
     edge_tool_round: &[EdgeToolExecResult],
 ) {
@@ -896,7 +885,7 @@ async fn build_full_composite_snapshot(
 ///
 /// Covers the common file-touching tools: read_file, write_file, str_replace,
 /// grep, glob, find_definition, etc. Returns `None` for non-file tools.
-fn extract_file_path_from_tool(tool_name: &str, args: &Value) -> Option<String> {
+pub(crate) fn extract_file_path_from_tool(tool_name: &str, args: &Value) -> Option<String> {
     match tool_name {
         "read_file" | "write_file" | "str_replace" | "find_definition" => args
             .get("path")
@@ -962,6 +951,8 @@ pub(crate) use super::agentic_loop_execution_phase::{
 pub(crate) use super::agentic_loop_lifecycle::{
     PreparedTurnIteration, TurnIterationPrep, prepare_turn_iteration, run_loop_preamble,
 };
+#[allow(unused_imports)]
+pub(crate) use super::agentic_loop_tool_phase::{TurnToolPhaseControl, execute_tool_phase};
 
 /// Render deferred final text if any is buffered, then write heavy checkpoint.
 pub(crate) fn finalize_and_render<H: AgenticLoopHost>(host: &mut H, state: &mut AgenticLoopState) {
@@ -1012,539 +1003,23 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
             TurnExecutionControl::Return(outcome) => return Ok(outcome),
         };
 
-        // ─── Step 3: Stall preflight ────────────────────────────────────
-        let tool_calls_for_guard = agentic_round_stall_preflight_with_tool_calls(
-            turn_index,
-            &turn_result.accum.tool_calls,
-            &turn_result.edge_tool_round,
-            &mut state.stall.turn_sigs,
-            &mut state.stall.turn_tool_names,
-            &mut state.stall.events,
-            &mut state.turn_guard,
-        );
-
-        // ─── Step 3b: Delegation interception ───────────────────────────
-        let super::agentic_delegate_interception::DelegationInterceptionResult {
-            effective_tool_calls,
-            intercepted_any: delegation_intercepted,
-        } = super::agentic_delegate_interception::intercept_delegations(
+        match execute_tool_phase(
             host,
             state,
-            &turn_result,
-            quiet,
-        )
-        .await;
-
-        let super::agentic_tool_interception::PreparedToolRound {
-            tool_calls,
-            pre_resolved_results,
-            edge_tool_round,
-        } = super::agentic_tool_interception::prepare_intercepted_tool_round(
-            state,
-            &turn_result,
-            &effective_tool_calls,
-            delegation_intercepted,
-        )
-        .await;
-        let all_tool_calls = tool_calls.as_slice();
-        let edge_round_for_headless = edge_tool_round.as_slice();
-
-        // ─── Step 4: Headless tool round ────────────────────────────────
-        // Snapshot error counts before the round for per-turn delta tracking.
-        let errors_before_round = state.turn_guard.errors.total_errors;
-        let errors_by_cat_before = state.turn_guard.errors.errors_by_category.clone();
-
-        struct HostTerminalAdapter<'a, H: AgenticLoopHost>(&'a mut H);
-        impl<H: AgenticLoopHost> HeadlessRoundTerminal for HostTerminalAdapter<'_, H> {
-            fn emit_line(&mut self, style: HeadlessStderrStyle, line: String) {
-                self.0.emit_headless_line(style, line);
-            }
-        }
-
-        // Build edge_callback_outputs from tool_results
-        let edge_callback_outputs: HashMap<String, String> = turn_result
-            .edge_tool_round
-            .iter()
-            .map(|r| (tool_dedup_signature(&r.tool, &r.args), r.output.clone()))
-            .collect();
-
-        let evo_records_before = state.stall.tool_call_records.len();
-        {
-            let valid_tool_names = host.valid_tool_names().clone();
-            let mut term_adapter = HostTerminalAdapter(host);
-            // Suppress headless-round terminal output when a skill already
-            // produced visible output — avoids leaking internal tool progress
-            // lines (blocked-tool warnings, git diffs, etc.) into the user's
-            // terminal after the skill's result was shown.
-            let headless_quiet = quiet || state.skill_produced_output;
-            run_agentic_headless_tool_round(HeadlessToolRoundCtx {
-                turn_index,
-                quiet: headless_quiet,
-                api: &state.api,
-                token: &state.api_token,
-                current_session_id: state.current_session_id.as_ref(),
-                tool_calls: all_tool_calls,
-                edge_tool_round: edge_round_for_headless,
-                reasoning_content: turn_result.accum.reasoning_content.as_str(),
-                edge_callback_outputs: &edge_callback_outputs,
-                messages: &mut state.messages,
-                tool_results: &mut state.tool_results,
-                valid_tool_names: &valid_tool_names,
-                restricted_tools: &mut state.restricted_tools,
-                turn_guard: &mut state.turn_guard,
-                step_recorder: &mut state.step_recorder,
-                idempotency_cache: &mut state.idempotency_cache,
-                semantic_dedup: &mut state.semantic_dedup,
-                call_counts: &mut state.call_counts,
-                max_identical_calls: state.max_identical_tool_calls,
-                max_tools_per_turn: state.max_tools_per_turn,
-                tool_call_records: &mut state.stall.tool_call_records,
-                tool_event_hooks: &state.skills.tool_event_hooks,
-                term: &mut term_adapter,
-                mailbox: state.messaging.mailbox.as_mut(),
-                permission_context: state.permission_context.as_ref(),
-                progress_emitter: state.messaging.progress_emitter.as_ref(),
-                pre_resolved_results: &pre_resolved_results,
-            })
-            .await;
-        }
-
-        // ── Feed tool results into evolution signal collector ──
-        if let Some(ref evo) = state.evolution_service {
-            let turn_id = state.current_run_id.as_deref().unwrap_or("unknown");
-            // Determine active skill from the most recently invoked skill.
-            let active_skill: Option<String> = state
-                .skills
-                .invoked
-                .iter()
-                .max_by_key(|(_, v)| v.invoked_at_turn)
-                .map(|(name, _)| name.clone());
-            let active_skill_ref = active_skill.as_deref();
-            for rec in &state.stall.tool_call_records[evo_records_before..] {
-                if rec.is_synthetic_placeholder() {
-                    continue;
-                }
-                let is_error = !rec.ok;
-                let ctx = crate::evolution::types::ToolResultContext {
-                    tool_name: &rec.name,
-                    tool_args: rec.args_preview.as_deref().unwrap_or(""),
-                    result: rec.result_preview.as_deref().unwrap_or(""),
-                    is_error,
-                    duration_ms: rec.ms,
-                    active_skill: active_skill_ref,
-                    turn_id,
-                };
-                evo.on_tool_result(&ctx).await;
-            }
-
-            // Feed stall events as RepeatedStall signals.
-            if !state.stall.turn_sigs.is_empty() {
-                // Check if the last 3 turns have the same tool signature.
-                let sigs = &state.stall.turn_sigs;
-                let n = sigs.len();
-                if n >= 3 && sigs[n - 1] == sigs[n - 2] && sigs[n - 2] == sigs[n - 3] {
-                    let chain: Vec<String> = sigs[n - 1].iter().cloned().collect();
-                    evo.add_signal(crate::evolution::types::EvolutionSignal::RepeatedStall {
-                        tool_chain: chain,
-                        stall_count: 3,
-                        turn_id: turn_id.to_string(),
-                    })
-                    .await;
-                }
-            }
-
-            // Within-turn repetition: if the same tool failed 3+ times in this
-            // turn, treat it as a stall even if this is the first (or only) turn.
-            {
-                let this_turn = &state.stall.tool_call_records[evo_records_before..];
-                let mut fail_counts: std::collections::HashMap<&str, u32> =
-                    std::collections::HashMap::new();
-                for rec in this_turn {
-                    if !rec.ok {
-                        *fail_counts.entry(rec.name.as_str()).or_default() += 1;
-                    }
-                }
-                for (tool, count) in &fail_counts {
-                    if *count >= 3 {
-                        evo.add_signal(crate::evolution::types::EvolutionSignal::RepeatedStall {
-                            tool_chain: vec![(*tool).to_string()],
-                            stall_count: *count,
-                            turn_id: turn_id.to_string(),
-                        })
-                        .await;
-                    }
-                }
-            }
-        }
-
-        // ── Feed tool results into liquid step-level signal collector ──
-        if state.step_signal_collector.is_some() || state.tactical_adapter.is_some() {
-            let new_records = &state.stall.tool_call_records[evo_records_before..];
-            let mut step_actions: Vec<crate::liquid::tactical::TacticalAction> = Vec::new();
-
-            for rec in new_records {
-                let outcome = crate::liquid::step_signals::StepOutcome {
-                    tool_name: rec.name.clone(),
-                    ok: rec.ok,
-                    latency_ms: rec.ms,
-                    tokens_used: (rec.input_bytes.unwrap_or(0) + rec.output_bytes.unwrap_or(0))
-                        as u64,
-                    error_hint: rec.error.clone(),
-                };
-                // Record into step signal collector
-                let triggers = if let Some(ref mut collector) = state.step_signal_collector {
-                    collector.record(outcome)
-                } else {
-                    vec![]
-                };
-                // Evaluate triggers through tactical adapter
-                if !triggers.is_empty() {
-                    if let Some(ref mut adapter) = state.tactical_adapter {
-                        let actions = adapter.evaluate(&triggers);
-                        for action in actions {
-                            if !matches!(action, crate::liquid::tactical::TacticalAction::NoOp) {
-                                step_actions.push(action);
-                            }
-                        }
-                        adapter.advance_step();
-                    }
-                }
-            }
-
-            // Apply tactical actions as real bounded runtime mutations plus
-            // inline hints so the next round can see both the changed state
-            // and an explicit explanation.
-            if !step_actions.is_empty() {
-                let hint_parts = apply_tactical_actions(state, &step_actions);
-                if !hint_parts.is_empty() {
-                    let hint_text = format!("[Tactical Adaptation]\n{}", hint_parts.join("\n"));
-                    state.messages.push(serde_json::json!({
-                        "role": "system",
-                        "content": hint_text
-                    }));
-                }
-            }
-        }
-
-        // ── Emit progress events for permission-denied tools so
-        //    parent/UI subscribers learn about blocked operations.
-        if let Some(ref emitter) = state.messaging.progress_emitter {
-            for rec in &state.stall.tool_call_records {
-                if let Some(ref err) = rec.error {
-                    if err.starts_with("blocked_tool:") {
-                        emitter.permission_denied(
-                            &rec.name,
-                            err.trim_start_matches("blocked_tool: "),
-                            turn_index as u32,
-                        );
-                    }
-                }
-            }
-        }
-
-        append_explain_turn_batch(
-            &mut state.telemetry.explain_turns,
-            turn_result.accum.explain_turns.as_slice(),
-        );
-
-        // ─── Step 4a: Track recent file reads for post-compact restoration ──
-        {
-            let turn_num = (state.max_turns - state.remaining_turns) as u32;
-            for edge_result in &turn_result.edge_tool_round {
-                if let Some(path) =
-                    extract_file_path_from_tool(&edge_result.tool, &edge_result.args)
-                {
-                    // Deduplicate: if same path already tracked, update its turn number
-                    if let Some(existing) =
-                        state.recent_file_reads.iter_mut().find(|(p, _)| p == &path)
-                    {
-                        existing.1 = turn_num;
-                    } else {
-                        state.recent_file_reads.push((path, turn_num));
-                    }
-                    // Bound the list to prevent unbounded growth
-                    if state.recent_file_reads.len() > MAX_TRACKED_FILE_READS {
-                        // Remove oldest (lowest turn number)
-                        state.recent_file_reads.sort_by_key(|(_, t)| *t);
-                        state.recent_file_reads.remove(0);
-                    }
-                }
-            }
-        }
-
-        // ─── Observability: tool executed hook ───────────────────────────
-        // Feed tool usage into both the user profile and the goal tracker.
-        record_edge_tool_observability(state, &turn_result.edge_tool_round);
-
-        // ─── Step 4b: Conditional skill activation ──────────────────────
-        // Record file paths from edge tool executions so path-conditional
-        // skills can activate dynamically. When new skills activate, refresh
-        // the `skill` tool schema with the expanded skill list.
-        if let Some(ref registry) = state.skills.registry_for_activation {
-            let mut any_newly_activated = false;
-            for edge_result in &turn_result.edge_tool_round {
-                if let Some(path) =
-                    extract_file_path_from_tool(&edge_result.tool, &edge_result.args)
-                {
-                    let newly = registry.record_file_path(&path);
-                    if !newly.is_empty() {
-                        any_newly_activated = true;
-                        if !quiet {
-                            for name in &newly {
-                                host.emit_headless_line(
-                                    HeadlessStderrStyle::Dim,
-                                    format!("  ◆ Skill activated: {name}"),
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-            if any_newly_activated {
-                if let Some(resolver) = &state.skills.resolver {
-                    let full = resolver.available_skills();
-                    if !full.is_empty() {
-                        let (visible, open_skill_name) =
-                            crate::turn::skill_tool::visible_skills_for_host_turn(
-                                &full,
-                                state.message.as_str(),
-                                &state.skills.quality_tracker,
-                                &state.skills.pinned,
-                                &state.skills.discovered,
-                                &state.skills.search,
-                            );
-                        host.inject_tool_schema(crate::turn::skill_tool::skill_tool_schema(
-                            &visible,
-                            Some(&state.skills.quality_tracker),
-                            Some(&state.skills.pinned),
-                            open_skill_name,
-                        ));
-                        if open_skill_name {
-                            host.inject_tool_schema(
-                                crate::turn::skill_tool::discover_skills_tool_schema(),
-                            );
-                        }
-                    }
-                }
-            }
-        }
-
-        // ─── Step 4b: Error budget tracking ─────────────────────────────
-        // Track consecutive turns dominated by the same error category.
-        // If the agent keeps hitting the same error N turns in a row,
-        // inject a strategy-change nudge.
-        {
-            // Compare error counts before/after this turn's tool round.
-            let turn_errors = state
-                .turn_guard
-                .errors
-                .total_errors
-                .saturating_sub(errors_before_round);
-            if turn_errors > 0 {
-                // Find the category that grew most this turn.
-                let dominant = state
-                    .turn_guard
-                    .errors
-                    .errors_by_category
-                    .iter()
-                    .filter_map(|(cat, &count)| {
-                        let before = errors_by_cat_before.get(cat).copied().unwrap_or(0);
-                        let delta = count.saturating_sub(before);
-                        if delta > 0 { Some((*cat, delta)) } else { None }
-                    })
-                    .max_by_key(|(_, delta)| *delta)
-                    .map(|(cat, _)| cat);
-                if dominant == state.error_recovery.last_error_category {
-                    state.error_recovery.consecutive_same_error += 1;
-                } else {
-                    state.error_recovery.consecutive_same_error = 1;
-                    state.error_recovery.last_error_category = dominant;
-                }
-                if state.error_recovery.consecutive_same_error >= CONSECUTIVE_ERROR_BUDGET {
-                    let cat_name = state
-                        .error_recovery
-                        .last_error_category
-                        .map(|c| format!("{c:?}"))
-                        .unwrap_or_else(|| "Unknown".into());
-                    state.messages.push(serde_json::json!({
-                        "role": "user",
-                        "content": format!(
-                            "🔄 ERROR BUDGET EXHAUSTED: You've hit {cat_name} errors \
-                             {n} turns in a row. Your current approach is not working. \
-                             STOP repeating the same strategy. You MUST try a fundamentally \
-                             different approach: different tool, different file, different \
-                             method. If you cannot make progress, explain what's blocking you.",
-                            n = state.error_recovery.consecutive_same_error,
-                        )
-                    }));
-                    state.error_recovery.consecutive_same_error = 0; // Reset after nudge
-                }
-            } else {
-                // Successful turn — reset streak.
-                state.error_recovery.consecutive_same_error = 0;
-                state.error_recovery.last_error_category = None;
-            }
-        }
-
-        // ─── Step 4b: Checkpoint gate (mid-execution fail-fast) ─────────
-        if let Some(ref gate) = state.checkpoint_gate {
-            let freq = gate.checkpoint_frequency();
-            if freq > 0 && (turn_index as u32 + 1).is_multiple_of(freq) {
-                let run_id = state.current_run_id.as_deref().unwrap_or("unknown");
-                match gate
-                    .check(run_id, turn_index as u32, state.total_tool_calls)
-                    .await
-                {
-                    Ok(true) => { /* continue */ }
-                    Ok(false) => {
-                        // ─── Observability: turn end hook (gate cancelled) ───
-                        if let (Some(hub), Some(session)) = (
-                            state.telemetry.observability_hub.as_ref(),
-                            state.telemetry.observability_session.as_ref(),
-                        ) {
-                            let total_ms = turn_start_time.elapsed().as_millis() as u64;
-                            let timing = crate::observability_integration::TurnTiming {
-                                turn: turn_index as u32,
-                                context_assembly_ms: 0,
-                                ttft_ms: turn_result.ttft_ms.unwrap_or(0) as u64,
-                                llm_total_ms: total_ms,
-                                tool_execution_ms: 0,
-                                total_ms,
-                            };
-                            let mut session_guard =
-                                session.write().unwrap_or_else(|e| e.into_inner());
-                            crate::observability_integration::on_turn_end(
-                                hub,
-                                &mut session_guard,
-                                timing,
-                            );
-                        }
-                        state.step_recorder.end_turn(true);
-                        finalize_turn_trace(state);
-                        return Ok(AgenticLoopOutcome::Cancelled);
-                    }
-                    Err(e) => {
-                        // Gate error is non-fatal — log and continue
-                        eprintln!("[checkpoint-gate] check error: {e}");
-                    }
-                }
-            }
-        }
-
-        // ─── Step 5: Post-tool policy ───────────────────────────────────
-        match map_post_tool_policy_outcome(apply_agentic_post_tool_policy(
-            AgenticPostToolPolicyRequest {
-                turn_index: turn_index as u32,
-                message: &state.message,
-                tool_calls_for_guard: &tool_calls_for_guard,
-                intent_tool_turns: &mut state.stall.intent_tool_turns,
-                messages: &mut state.messages,
-                stall_events: &mut state.stall.events,
-                turn_guard: &mut state.turn_guard,
-                verdict_events: &mut state.stall.verdict_events,
-                restricted_tools: &mut state.restricted_tools,
-                remaining_turns: &mut state.remaining_turns,
-                step_recorder: &mut state.step_recorder,
-                current_session_id: state.current_session_id.as_ref(),
-                max_turns: state.max_turns,
-                loop_turn: turn_index,
-                recent_tools: &state.recent_tools,
-                last_heavy_checkpoint: &mut state.stall.last_heavy_checkpoint,
+            turn_index,
+            TurnIterationPrep {
+                quiet,
+                turn_start_time,
             },
-        )) {
-            AgenticPostToolIterationControl::Abort(e) => {
-                finalize_turn_trace(state);
-                return Err(e);
-            }
-            AgenticPostToolIterationControl::RetryLlmClearToolResults => {
-                state.tool_results.clear();
-            }
-            AgenticPostToolIterationControl::ProceedEndTurn => {
-                // Emit progress event for subscribers (UI, monitors).
-                if let Some(ref emitter) = state.messaging.progress_emitter {
-                    let tool_calls_this_turn =
-                        state.total_tool_calls.saturating_sub(if turn_index > 0 {
-                            state.total_tool_calls
-                        } else {
-                            0
-                        });
-                    let last_tool = turn_result
-                        .edge_tool_round
-                        .last()
-                        .map(|r| r.tool.clone())
-                        .unwrap_or_else(|| "thinking".to_string());
-                    emitter.turn_completed(turn_index as u32 + 1, tool_calls_this_turn, last_tool);
-
-                    // Emit intermediate metrics so UI can show progress (e.g., "5/30 turns, 12 tools, 8k tokens")
-                    emitter.metrics_update(
-                        turn_index as u32 + 1,
-                        state.max_turns as u32,
-                        state.total_prompt,
-                        state.total_completion,
-                        state.total_tool_calls,
-                    );
-                }
-
-                // Send progress update to parent agent (best-effort, skip for root).
-                if let Some(ref mailbox) = state.messaging.mailbox {
-                    if mailbox.has_parent().await {
-                        if let Err(e) = mailbox
-                            .send_progress(
-                                turn_index as u32,
-                                state.total_tool_calls,
-                                "turn_complete",
-                                None,
-                            )
-                            .await
-                        {
-                            astra_core::agent_warn!("mailbox", "Failed to send turn progress: {e}");
-                        }
-                    }
-                }
-
-                // ─── Observability: turn end hook ────────────────────────
-                // Capture timing and feed to auto-tuning.
-                if let (Some(hub), Some(session)) = (
-                    state.telemetry.observability_hub.as_ref(),
-                    state.telemetry.observability_session.as_ref(),
-                ) {
-                    let total_ms = turn_start_time.elapsed().as_millis() as u64;
-                    let ctx_asm_ms = (llm_wall_start - turn_start_time).as_millis() as u64;
-                    let tool_exec_ms: u64 = turn_result
-                        .edge_tool_round
-                        .iter()
-                        .map(|e| e.duration_ms)
-                        .sum();
-                    let timing = crate::observability_integration::TurnTiming {
-                        turn: turn_index as u32,
-                        context_assembly_ms: ctx_asm_ms,
-                        ttft_ms: turn_result.ttft_ms.unwrap_or(0) as u64,
-                        llm_total_ms: total_ms
-                            .saturating_sub(ctx_asm_ms)
-                            .saturating_sub(tool_exec_ms),
-                        tool_execution_ms: tool_exec_ms,
-                        total_ms,
-                    };
-                    let mut session_guard = session.write().unwrap_or_else(|e| e.into_inner());
-                    crate::observability_integration::on_turn_end(hub, &mut session_guard, timing);
-                }
-
-                // ─── Finalize turn trace collector ────────────────────────
-                // Persist context assembly trace to session journal (best-effort)
-                // and feed to observability session for /telemetry context.
-                finalize_turn_trace(state);
-
-                state.step_recorder.end_turn(false);
-
-                // ── Auto-tuning: count completed turns & periodic cycle ──
-                state.telemetry.completed_turns_for_tuning += 1;
-                maybe_run_tuning_cycle(state);
-                maybe_trigger_auto_reflection(host, state).await;
-
-                // ── Per-turn micro-adaptation ──
-                let turn_tokens = state.last_measured_prompt_tokens.unwrap_or(0);
-                apply_per_turn_adaptation(state, turn_tokens);
-            }
+            TurnExecutionPhase {
+                llm_wall_start,
+                turn_result,
+            },
+        )
+        .await?
+        {
+            TurnToolPhaseControl::ContinueLoop => continue,
+            TurnToolPhaseControl::Return(outcome) => return Ok(outcome),
         }
     }
     // Loop exhausted max_turns without explicit break — write final state.

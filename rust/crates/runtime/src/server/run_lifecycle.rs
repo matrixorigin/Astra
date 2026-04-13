@@ -903,36 +903,16 @@ impl RunLifecycleService for AgenticRunLifecycleService {
 
         tokio::spawn(async move {
             let outcome = run_agentic_loop_with_host(&mut host, &mut loop_state).await;
-
-            // Fire SessionEnd hooks (best-effort, non-blocking).
-            crate::skills::hooks::fire_session_end(
-                &loop_state.skills.session_event_hooks,
-                loop_state.current_session_id.as_deref().unwrap_or(""),
-            )
-            .await;
-            persist_runtime_promotion_events(
-                &bg_matrixone,
-                bg_shared_pool.as_ref(),
-                &bg_user_id,
-                &bg_session_id,
-                &bg_run_id,
-                &loop_state.telemetry.promotion_events,
-            )
-            .await;
-
-            // Persist learning state (patterns, calibration, entities) so the
-            // next session starts with accumulated cross-session knowledge.
-            learning_stack.save();
-
             let (events, final_status, error_msg) =
                 Self::finalize_run_events(outcome, host.take_emitted_events(), &loop_state);
             let terminal_events = terminal_events_for_persistence(&events);
 
-            // Persist final status + usage to durable store.
+            // Publish terminal run state before best-effort post-run side effects
+            // so background observers do not stay stuck in "running" because a
+            // hook, event write, or learning save is slow.
             let status_str = final_status.as_str();
             let mut persist_terminal_state = true;
 
-            // Update in-memory state with collected events and final status.
             if let Some(run) = runs.write().await.get_mut(&bg_run_id) {
                 if run.status == RunStatus::Cancelled {
                     persist_terminal_state = false;
@@ -978,6 +958,26 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     }
                 }
             }
+
+            // Fire SessionEnd hooks (best-effort, non-blocking).
+            crate::skills::hooks::fire_session_end(
+                &loop_state.skills.session_event_hooks,
+                loop_state.current_session_id.as_deref().unwrap_or(""),
+            )
+            .await;
+            persist_runtime_promotion_events(
+                &bg_matrixone,
+                bg_shared_pool.as_ref(),
+                &bg_user_id,
+                &bg_session_id,
+                &bg_run_id,
+                &loop_state.telemetry.promotion_events,
+            )
+            .await;
+
+            // Persist learning state (patterns, calibration, entities) so the
+            // next session starts with accumulated cross-session knowledge.
+            learning_stack.save();
         });
 
         Ok(ChatRunRecord {

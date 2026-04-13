@@ -8,6 +8,7 @@ pub mod agentic_headless_round;
 pub mod agentic_loop_execution_phase;
 pub mod agentic_loop_host;
 pub mod agentic_loop_lifecycle;
+pub mod agentic_loop_tool_phase;
 pub mod agentic_post_tool_policy;
 pub mod agentic_prepare_payload;
 pub mod agentic_recursion_guard;
