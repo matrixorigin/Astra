@@ -6,6 +6,7 @@ pub mod agentic_auto_reflection;
 pub mod agentic_delegate_interception;
 pub mod agentic_headless_round;
 pub mod agentic_loop_host;
+pub mod agentic_loop_lifecycle;
 pub mod agentic_post_tool_policy;
 pub mod agentic_prepare_payload;
 pub mod agentic_recursion_guard;
