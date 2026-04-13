@@ -1459,7 +1459,7 @@ fn check_skill_improvement(state: &mut ReplState, _line: &str, _result: &StreamR
     // in astra_runtime::skills::improvement, but calling LLM from here requires
     // async context + API key plumbing that's better handled via a dedicated
     // background task or post-turn hook.
-    astra_core::agent_info!(
+    astra_core::agent_debug!(
         "skill",
         "improvement check: {} filesystem skill(s) eligible, {} recent messages — analysis ready",
         filesystem_skills.len(),

@@ -4691,10 +4691,13 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
                         .and_then(Value::as_str)
                         .unwrap_or("unknown");
                     let msg = if skill_produced_output {
-                        // Hard constraint: restrict these tools so the selector
-                        // won't offer them and the loop won't execute them even
-                        // if the LLM ignores the soft prompt.
-                        state.restricted_tools.insert(tool_name.to_string());
+                        // Soft constraint: tell the model the skill already handled
+                        // this work. We deliberately do NOT hard-restrict via
+                        // `restricted_tools` because the model may have a legitimate
+                        // reason to call the same tool with different arguments in a
+                        // later iteration (e.g., `git_diff HEAD` after a skill did
+                        // `git_diff --staged`). Semantic dedup and call-count limits
+                        // catch true repeats.
                         format!(
                             "Skipped: the skill already completed this work. \
                              Do NOT call `{}` again — use the skill output above as your answer.",
@@ -12066,10 +12069,12 @@ print(json.dumps({'context': 'user said: ' + msg}))
             "skill_produced_output flag should be set when skill produces substantial output"
         );
 
-        // Hard constraint: deferred tool names should be in restricted_tools
+        // Soft constraint: deferred tools should NOT be hard-restricted — the soft
+        // prompt is sufficient, and hard-restricting prevents legitimate re-use with
+        // different arguments in later iterations.
         assert!(
-            state.restricted_tools.contains("read_file"),
-            "read_file should be restricted after skill produced output"
+            !state.restricted_tools.contains("read_file"),
+            "read_file should not be hard-restricted — soft prompt is the constraint"
         );
     }
 
