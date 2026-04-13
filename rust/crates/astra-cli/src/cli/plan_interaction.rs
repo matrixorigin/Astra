@@ -1199,6 +1199,14 @@ async fn handle_plan_command(
                 return Ok(());
             }
 
+            if plan_state.plan.subtasks.is_empty() {
+                eprintln!(
+                    "  {} Plan has no subtasks. Describe what you want to do first.",
+                    theme::icon_warn()
+                );
+                return Ok(());
+            }
+
             let plan = plan_state.plan.clone();
             let goal = plan_state.goal.clone();
 
@@ -2005,5 +2013,33 @@ mod tests {
         assert!(try_replace_plan_from_llm_json(json, &mut ps).unwrap());
         assert_eq!(ps.plan.subtasks.len(), 1);
         assert_eq!(ps.plan.subtasks[0].id, "new");
+    }
+
+    #[test]
+    fn try_replace_plan_from_llm_json_empty_subtasks_replaces() {
+        let ctx = plan::ProjectContext::default();
+        let mut ps = plan::PlanModeState::new("test".into(), ctx);
+        ps.set_plan(astra_services::task_orchestrator::TaskPlan {
+            subtasks: vec![astra_services::task_orchestrator::SubtaskPlan {
+                id: "old".into(),
+                title: "Old".into(),
+                ..Default::default()
+            }],
+            notes: None,
+        });
+        // LLM returns valid JSON with empty subtasks — should still replace
+        let json = r#"{"subtasks": []}"#;
+        assert!(try_replace_plan_from_llm_json(json, &mut ps).unwrap());
+        assert!(ps.plan.subtasks.is_empty());
+    }
+
+    #[test]
+    fn is_execute_command_matches_go_and_variants() {
+        assert!(plan::PlanModeState::is_execute_command("go"));
+        assert!(plan::PlanModeState::is_execute_command("  GO  "));
+        assert!(plan::PlanModeState::is_execute_command("execute"));
+        assert!(plan::PlanModeState::is_execute_command("开始"));
+        assert!(!plan::PlanModeState::is_execute_command("show"));
+        assert!(!plan::PlanModeState::is_execute_command(""));
     }
 }

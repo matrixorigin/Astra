@@ -116,7 +116,7 @@ impl TaskPlan {
     /// Compute overall progress as percentage.
     pub fn progress_pct(&self) -> u32 {
         if self.subtasks.is_empty() {
-            return 0;
+            return 100;
         }
         let done = self
             .subtasks
@@ -1619,9 +1619,10 @@ mod tests {
     // ── TaskPlan ──
 
     #[test]
-    fn empty_plan_zero_progress() {
+    fn empty_plan_complete_progress() {
         let plan = TaskPlan::default();
-        assert_eq!(plan.progress_pct(), 0);
+        // Empty plan = nothing to do = 100% complete
+        assert_eq!(plan.progress_pct(), 100);
         assert_eq!(plan.items_done(), 0);
         assert!(plan.ready_subtasks().is_empty());
     }

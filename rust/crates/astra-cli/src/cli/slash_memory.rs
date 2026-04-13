@@ -545,7 +545,8 @@ pub(super) async fn handle_memory_domain_command(
                 "enter" if !sub_arg.is_empty() => {
                     // Enter interactive plan mode (Kiro-style)
                     use plan_decompose::{
-                        PlanModeState, analyze_project, decomposition_prompt, format_plan,
+                        PendingClarifications, PlanModeState, analyze_project,
+                        decomposition_prompt, detect_clarification_questions, format_plan,
                         parse_plan_response,
                     };
 
@@ -585,55 +586,76 @@ pub(super) async fn handle_memory_domain_command(
 
                     match resp {
                         Ok(r) if r.status().is_success() => {
-                            let mut full_text = String::new();
-                            let mut stream = r.bytes_stream();
-                            use futures_util::StreamExt;
-
-                            while let Some(chunk) = stream.next().await {
-                                if let Ok(bytes) = chunk {
-                                    let event_str = String::from_utf8_lossy(&bytes);
-                                    for line in event_str.lines() {
-                                        if let Some(data) = line.strip_prefix("data: ")
-                                            && let Ok(json) =
-                                                serde_json::from_str::<serde_json::Value>(data)
-                                            && json.get("type").and_then(|v| v.as_str())
-                                                == Some("text_delta")
-                                            && let Some(content) =
-                                                json.get("content").and_then(|v| v.as_str())
-                                        {
-                                            full_text.push_str(content);
-                                        }
-                                    }
-                                }
+                            let sse_result = crate::sse_utils::collect_sse_with_preview(r).await;
+                            if let Some(err) = sse_result.completion_error() {
+                                eprintln!("  {} {}", theme::icon_err(), err.red());
+                                return Ok(());
                             }
-
-                            // Parse the plan
-                            let plan_result = parse_plan_response(&full_text);
+                            let full_text = sse_result.text;
 
                             // Create PlanModeState
                             let mut plan_state = PlanModeState::new(sub_arg.to_string(), context);
 
-                            // Set the plan if parsing succeeded
-                            if let Ok(ref plan) = plan_result {
-                                plan_state.set_plan(plan.clone());
-                            }
-
-                            state.plan_mode = Some(plan_state);
-
-                            // Save for session recovery
-                            if let Some(ref ps) = state.plan_mode {
-                                let _ = ps.save_to_file(&PlanModeState::state_path());
-                            }
-
-                            plan_interaction::eprint_plan_mode_banner(sub_arg);
-
-                            if let Ok(ref p) = plan_result {
-                                let formatted = format_plan(p);
-                                eprintln!("{formatted}");
+                            // Check for clarification questions first
+                            if let Some(questions) = detect_clarification_questions(&full_text) {
                                 eprintln!();
-                                plan_interaction::eprint_plan_commands_help();
-                            } else if let Err(ref e) = plan_result {
-                                eprint_plan_json_parse_failed(&full_text, &e.to_string());
+                                eprintln!(
+                                    "  {} {}",
+                                    "▸".cyan(),
+                                    format!(
+                                        "{} question{} before planning:",
+                                        questions.len(),
+                                        if questions.len() == 1 { "" } else { "s" }
+                                    )
+                                    .bold()
+                                    .cyan()
+                                );
+                                eprintln!();
+
+                                plan_state.pending_clarifications = Some(PendingClarifications {
+                                    questions: questions.clone(),
+                                    answers: Vec::new(),
+                                });
+
+                                plan_interaction::eprint_clarification_question(&questions[0]);
+                                state.plan_mode = Some(plan_state);
+                                let _ = state
+                                    .plan_mode
+                                    .as_ref()
+                                    .unwrap()
+                                    .save_to_file(&PlanModeState::state_path());
+                            } else {
+                                // Try to parse as plan
+                                match parse_plan_response(&full_text) {
+                                    Ok(plan) if plan.subtasks.is_empty() => {
+                                        // LLM returned valid JSON but no subtasks
+                                        state.plan_mode = Some(plan_state);
+                                        plan_interaction::eprint_plan_mode_banner(sub_arg);
+                                        eprintln!(
+                                            "  {} LLM returned an empty plan. Try describing your goal differently.",
+                                            theme::icon_warn()
+                                        );
+                                    }
+                                    Ok(plan) => {
+                                        plan_state.set_plan(plan.clone());
+                                        state.plan_mode = Some(plan_state);
+                                        if let Some(ref ps) = state.plan_mode {
+                                            let _ = ps.save_to_file(&PlanModeState::state_path());
+                                        }
+                                        plan_interaction::eprint_plan_mode_banner(sub_arg);
+                                        let formatted = format_plan(&plan);
+                                        eprintln!("{formatted}");
+                                        eprintln!();
+                                        plan_interaction::eprint_plan_commands_help();
+                                    }
+                                    Err(e) => {
+                                        // Parse failed — enter plan mode so user can
+                                        // rephrase, but plan stays empty.
+                                        state.plan_mode = Some(plan_state);
+                                        plan_interaction::eprint_plan_mode_banner(sub_arg);
+                                        eprint_plan_json_parse_failed(&full_text, &e.to_string());
+                                    }
+                                }
                             }
                         }
                         Ok(r) => {
@@ -1441,6 +1463,13 @@ pub(super) async fn handle_memory_domain_command(
                             }
 
                             match parse_plan_response(&full_text) {
+                                Ok(plan) if plan.subtasks.is_empty() => {
+                                    eprintln!(
+                                        "  {} LLM returned an empty plan. Try '/plan enter {}' for interactive mode.",
+                                        theme::icon_warn(),
+                                        sub_arg
+                                    );
+                                }
                                 Ok(plan) => {
                                     eprintln!();
                                     eprint!("{}", format_plan(&plan));
@@ -1862,6 +1891,14 @@ async fn _old_handle_plan_mode_input(
     if PlanModeState::is_execute_command(&input) {
         use plan_decompose::{PlanExecutionConfig, format_execution_preview};
 
+        if plan_state.plan.subtasks.is_empty() {
+            eprintln!(
+                "  {} Plan has no subtasks. Describe what you want to do first.",
+                theme::icon_warn()
+            );
+            return Ok(());
+        }
+
         let plan = plan_state.plan.clone();
         let goal = plan_state.goal.clone();
 
@@ -1960,6 +1997,14 @@ async fn _old_handle_plan_mode_input(
     // Check for step-by-step execute command
     if input.trim().to_lowercase().starts_with("step") || input.trim() == "逐步执行" {
         use plan_decompose::{PlanExecutionConfig, format_execution_preview};
+
+        if plan_state.plan.subtasks.is_empty() {
+            eprintln!(
+                "  {} Plan has no subtasks. Describe what you want to do first.",
+                theme::icon_warn()
+            );
+            return Ok(());
+        }
 
         let plan = plan_state.plan.clone();
         let goal = plan_state.goal.clone();

@@ -4404,6 +4404,25 @@ Done!"#;
     }
 
     #[test]
+    fn parse_plan_response_empty_subtasks_is_ok() {
+        let result = parse_plan_response(r#"{"subtasks": [], "notes": "nothing"}"#);
+        assert!(result.is_ok());
+        assert!(result.unwrap().subtasks.is_empty());
+    }
+
+    #[test]
+    fn parse_plan_response_clarification_array_is_err() {
+        let result = parse_plan_response(
+            r#"[{"question": "What scope?", "options": ["A", "B"], "default": 0}]"#,
+        );
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().contains("array"),
+            "should mention it's an array"
+        );
+    }
+
+    #[test]
     fn progress_tracking_after_completion() {
         let ctx = ProjectContext::default();
         let mut ps = PlanModeState::new("test".into(), ctx);
