@@ -187,12 +187,21 @@ fn check_bash_path_boundary(
     policy: &astra_runtime::tool_sandbox::SandboxPolicy,
     command: &str,
 ) -> Option<String> {
+    let oldpwd = std::env::var_os("OLDPWD").map(std::path::PathBuf::from);
+    check_bash_path_boundary_with_oldpwd(policy, command, oldpwd.as_deref())
+}
+
+fn check_bash_path_boundary_with_oldpwd(
+    policy: &astra_runtime::tool_sandbox::SandboxPolicy,
+    command: &str,
+    oldpwd: Option<&std::path::Path>,
+) -> Option<String> {
     // Split on unquoted shell command separators to check ALL commands, not
     // just the first. Covers: `cmd1 | cmd2`, `cmd1 && cmd2`, `cmd1 ; cmd2`,
     // `cmd1 || cmd2`, and newline-separated commands, while preserving quoted
     // separators and line continuations.
     for segment in bash_command_segments(command) {
-        if let Some(msg) = check_single_command_path_boundary(policy, segment) {
+        if let Some(msg) = check_single_command_path_boundary(policy, segment, oldpwd) {
             return Some(msg);
         }
     }
@@ -336,8 +345,11 @@ fn is_nested_shell_c_flag(flag: &str) -> bool {
 fn expand_static_dir_reference(
     policy: &astra_runtime::tool_sandbox::SandboxPolicy,
     arg: &str,
+    oldpwd: Option<&std::path::Path>,
 ) -> Option<std::path::PathBuf> {
-    expand_home_dir_reference(arg).or_else(|| expand_project_dir_reference(policy, arg))
+    expand_home_dir_reference(arg)
+        .or_else(|| expand_project_dir_reference(policy, arg))
+        .or_else(|| expand_oldpwd_dir_reference(arg, oldpwd))
 }
 
 fn expand_home_dir_reference(arg: &str) -> Option<std::path::PathBuf> {
@@ -364,6 +376,21 @@ fn expand_project_dir_reference(
         .or_else(|| arg.strip_prefix("${PWD}/"))
         .or_else(|| arg.strip_prefix("~+/"))?;
     Some(policy.project_root.join(suffix))
+}
+
+fn expand_oldpwd_dir_reference(
+    arg: &str,
+    oldpwd: Option<&std::path::Path>,
+) -> Option<std::path::PathBuf> {
+    let oldpwd = oldpwd?;
+    if matches!(arg, "$OLDPWD" | "${OLDPWD}" | "~-") {
+        return Some(oldpwd.to_path_buf());
+    }
+    let suffix = arg
+        .strip_prefix("$OLDPWD/")
+        .or_else(|| arg.strip_prefix("${OLDPWD}/"))
+        .or_else(|| arg.strip_prefix("~-/"))?;
+    Some(oldpwd.join(suffix))
 }
 
 fn is_shell_interpreter_command(base: &str) -> bool {
@@ -461,6 +488,7 @@ fn xargs_flag_requires_value(flag: &str) -> bool {
 fn check_single_command_path_boundary(
     policy: &astra_runtime::tool_sandbox::SandboxPolicy,
     command: &str,
+    oldpwd: Option<&std::path::Path>,
 ) -> Option<String> {
     let parts = shell_tokenize_like_bash(command);
     if parts.is_empty() {
@@ -474,7 +502,7 @@ fn check_single_command_path_boundary(
             let arg = parts[idx].as_str();
             if is_nested_shell_c_flag(arg) {
                 if let Some(inner) = parts.get(idx + 1)
-                    && let Some(msg) = check_bash_path_boundary(policy, inner)
+                    && let Some(msg) = check_bash_path_boundary_with_oldpwd(policy, inner, oldpwd)
                 {
                     return Some(msg);
                 }
@@ -512,7 +540,7 @@ fn check_single_command_path_boundary(
         // pointing outside the sandbox (e.g., `ln -s /etc/passwd myfile`).
         let resolved = if arg.starts_with('/') {
             std::path::PathBuf::from(arg)
-        } else if let Some(expanded) = expand_static_dir_reference(policy, arg) {
+        } else if let Some(expanded) = expand_static_dir_reference(policy, arg, oldpwd) {
             expanded
         } else {
             policy.project_root.join(arg)
@@ -2964,6 +2992,74 @@ mod tests {
         assert!(
             result.is_none(),
             "~+ expansion should still allow paths that stay inside the project"
+        );
+    }
+
+    #[test]
+    fn oldpwd_env_expansion_outside_project_is_blocked() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        use std::path::Path;
+
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary_with_oldpwd(
+            &policy,
+            "cat $OLDPWD/secret.txt",
+            Some(Path::new("/etc/previous")),
+        );
+        assert!(
+            result.is_some(),
+            "$OLDPWD escapes should be resolved and checked when available"
+        );
+    }
+
+    #[test]
+    fn oldpwd_env_expansion_inside_project_is_allowed() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        use std::path::Path;
+
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary_with_oldpwd(
+            &policy,
+            "cat ${OLDPWD}/note.txt",
+            Some(Path::new("/home/user/project/prev")),
+        );
+        assert!(
+            result.is_none(),
+            "$OLDPWD expansion should allow paths that stay inside the project"
+        );
+    }
+
+    #[test]
+    fn tilde_oldpwd_expansion_outside_project_is_blocked() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        use std::path::Path;
+
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary_with_oldpwd(
+            &policy,
+            "cat ~-/secret.txt",
+            Some(Path::new("/etc/previous")),
+        );
+        assert!(
+            result.is_some(),
+            "~- escapes should be resolved and checked when available"
+        );
+    }
+
+    #[test]
+    fn tilde_oldpwd_expansion_inside_project_is_allowed() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        use std::path::Path;
+
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary_with_oldpwd(
+            &policy,
+            "cat ~-/note.txt",
+            Some(Path::new("/home/user/project/prev")),
+        );
+        assert!(
+            result.is_none(),
+            "~- expansion should allow paths that stay inside the project"
         );
     }
 
