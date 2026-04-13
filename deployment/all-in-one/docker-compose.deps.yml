@@ -1,0 +1,92 @@
+# astra-engine — Dev Dependencies
+#
+# Starts MatrixOne + Memoria (memory service).
+# Used by: make dev-deps
+#
+# Usage:
+#   make dev-deps
+
+services:
+
+  matrixone-init:
+    image: ${MATRIXONE_IMAGE:-matrixorigin/matrixone:latest}
+    user: root
+    entrypoint: ["sh", "-c", "chown -R ${UID:-1000}:${GID:-1000} /mo-data && mkdir -p /mo-logs && chown -R ${UID:-1000}:${GID:-1000} /mo-logs"]
+    volumes:
+      - ${MATRIXONE_DATA_DIR:-./data/matrixone}:/mo-data
+      - ${MATRIXONE_LOG_DIR:-./data/matrixone/logs}:/mo-logs
+    networks:
+      - mo-net
+
+  matrixone:
+    image: ${MATRIXONE_IMAGE:-matrixorigin/matrixone:latest}
+    hostname: matrixone
+    user: "${UID:-1000}:${GID:-1000}"
+    depends_on:
+      matrixone-init:
+        condition: service_completed_successfully
+    entrypoint: /entrypoint.sh
+    command: []
+    ports:
+      - "${MATRIXONE_PORT:-6001}:6001"
+      - "${MATRIXONE_DEBUG_HTTP_PORT:-6060}:6060"
+    volumes:
+      - ${MATRIXONE_DATA_DIR:-./data/matrixone}:/mo-data
+      - ${MATRIXONE_LOG_DIR:-./data/matrixone/logs}:/mo-logs
+      - ./matrixone-entrypoint.sh:/entrypoint.sh:ro
+    environment:
+      - TZ=Asia/Shanghai
+    networks:
+      - mo-net
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:6060/debug/vars"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+  memoria:
+    image: ${MEMORIA_IMAGE:-matrixorigin/memoria:latest}
+    hostname: memoria
+    user: "${UID:-1000}:${GID:-1000}"
+    ports:
+      - "${MEMORIA_PORT:-8100}:8100"
+    volumes:
+      - ${MEMORIA_LOG_DIR:-./data/logs/memoria}:/var/log/memoria
+    environment:
+      - DATABASE_URL=mysql://root:111@matrixone:6001/${MEMORIA_DB_NAME:-memoria}
+      - MASTER_KEY=${MEMORIA_MASTER_KEY:-}
+      - EMBEDDING_PROVIDER=${MEMORIA_EMBEDDING_PROVIDER:-openai}
+      - EMBEDDING_MODEL=${MEMORIA_EMBEDDING_MODEL:-BAAI/bge-m3}
+      - EMBEDDING_DIM=${MEMORIA_EMBEDDING_DIM:-1024}
+      - EMBEDDING_API_KEY=${MEMORIA_EMBEDDING_API_KEY:-}
+      - EMBEDDING_BASE_URL=${MEMORIA_EMBEDDING_BASE_URL:-}
+      - EMBEDDING_ENDPOINTS=${MEMORIA_EMBEDDING_ENDPOINTS:-}
+      - RUST_LOG=${RUST_LOG:-info}
+    depends_on:
+      matrixone:
+        condition: service_healthy
+    networks:
+      - mo-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8100/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+networks:
+  mo-net:
+    driver: bridge

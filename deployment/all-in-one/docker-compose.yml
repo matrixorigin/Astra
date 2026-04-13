@@ -1,14 +1,7 @@
 # astra-engine -- All-in-One Docker Compose
 #
-# Default profile: infrastructure only (MatrixOne + Redis)
+# Default profile: infrastructure only (MatrixOne)
 # App profile: adds init + api
-#
-# Secrets (TOKEN_ENCRYPTION_KEY, JWT_SECRET_KEY, …) must be set for Compose variable
-# substitution — env_file alone does NOT participate in ${VAR:?…} interpolation.
-# Typical run from this directory:
-#   docker compose --env-file ../../.env --profile app up -d
-# Or copy / symlink ../../.env to ./.env here so the default project .env supplies values.
-# See repository .env.example (TOKEN_ENCRYPTION_KEY is required by the Rust API at startup).
 
 services:
   matrixone:
@@ -29,7 +22,7 @@ services:
     networks:
       - mo-net
     healthcheck:
-      test: ["CMD-SHELL", "mysql -h127.0.0.1 -P6001 -uroot -p111 -e 'SELECT 1' || exit 1"]
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:6060/debug/vars"]
       interval: 10s
       timeout: 5s
       retries: 10
@@ -41,23 +34,6 @@ services:
         max-size: "10m"
         max-file: "3"
 
-  redis:
-    image: redis:7.2
-    hostname: redis
-    ports:
-      - "${REDIS_PORT:-6379}:6379"
-    volumes:
-      - ${REDIS_DATA_DIR:-./data/redis}:/data
-    user: "${UID:-1000}:${GID:-1000}"
-    networks:
-      - mo-net
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
-      timeout: 3s
-      retries: 5
-    restart: unless-stopped
-
   init:
     build:
       context: ../..
@@ -67,14 +43,11 @@ services:
     environment:
       - MATRIXONE_HOST=matrixone
       - MATRIXONE_PORT=6001
-      - REDIS_URL=redis://redis:6379
     env_file:
       - path: ../../.env
         required: true
     depends_on:
       matrixone:
-        condition: service_healthy
-      redis:
         condition: service_healthy
     networks:
       - mo-net
@@ -96,10 +69,8 @@ services:
       - MATRIXONE_PORT=6001
       - MATRIXONE_DATABASE=${MATRIXONE_DATABASE:-astra_runtime}
       - MATRIXONE_DATABASE_PREFIX=${MATRIXONE_DATABASE_PREFIX:-}
-      - REDIS_URL=redis://redis:6379
-      # Required at compose parse time (use --env-file ../../.env or a local .env); see file header.
-      - JWT_SECRET_KEY=${JWT_SECRET_KEY:?JWT_SECRET_KEY is required — set in .env (see .env.example)}
-      - TOKEN_ENCRYPTION_KEY=${TOKEN_ENCRYPTION_KEY:?TOKEN_ENCRYPTION_KEY is required — set in .env (see .env.example)}
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY:-}
+      - TOKEN_ENCRYPTION_KEY=${TOKEN_ENCRYPTION_KEY:-}
     env_file:
       - path: ../../.env
         required: true

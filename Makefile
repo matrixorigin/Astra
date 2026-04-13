@@ -11,8 +11,8 @@ help:
 	@echo "  make dev-status         - Show all service status"
 	@echo "  make dev-init           - Initialize development environment"
 	@echo ""
-	@echo "Dependencies (MatrixOne + Redis):"
-	@echo "  make dev-deps-up        - Start dependency services"
+	@echo "Dependencies (MatrixOne + Memoria):"
+	@echo "  make dev-deps-up        - Start MatrixOne + Memoria"
 	@echo "  make dev-deps-down      - Stop dependency services"
 	@echo "  make dev-deps-clean     - Stop and remove all data (destructive!)"
 	@echo "  make dev-deps-status    - Show dependency status"
@@ -124,26 +124,28 @@ check-runtime:
 	@cargo build -q --manifest-path rust/Cargo.toml -p astra-runtime --release --bin astra-server && echo "   ✅ Rust binary build OK"
 
 # ============================================================================
-# Dependencies (MatrixOne + Redis)
+# Dependencies (MatrixOne + Memoria)
 # ============================================================================
+
+DEPS_COMPOSE := cd deployment/all-in-one && UID=$$(id -u) GID=$$(id -g) docker compose -f docker-compose.deps.yml --env-file ../../.env
 
 .PHONY: dev-deps-up
 dev-deps-up:
-	@echo "Starting dependency services (MatrixOne + Redis)..."
+	@echo "Starting dependency services (MatrixOne + Memoria)..."
 	@if [ -d deployment/all-in-one/data ] && [ "$$(stat -c '%u' deployment/all-in-one/data 2>/dev/null || stat -f '%u' deployment/all-in-one/data 2>/dev/null)" != "$$(id -u)" ]; then \
 		echo "❌ Error: Data directory owned by root"; \
-		echo "   Run: make dev-clean (to delete data)"; \
+		echo "   Run: make dev-deps-clean"; \
 		echo "   Or:  sudo chown -R $$(id -u):$$(id -g) deployment/all-in-one/data"; \
 		exit 1; \
 	fi
-	@mkdir -p deployment/all-in-one/data/matrixone deployment/all-in-one/data/matrixone/logs deployment/all-in-one/data/redis
-	@cd deployment/all-in-one && UID=$$(id -u) GID=$$(id -g) docker compose up -d matrixone redis
-	@echo "✅ Dependency services started"
+	@mkdir -p deployment/all-in-one/data/matrixone deployment/all-in-one/data/matrixone/logs deployment/all-in-one/data/logs/memoria
+	@$(DEPS_COMPOSE) up -d
+	@echo "✅ Dependency services started (MatrixOne :6001, Memoria :8100)"
 
 .PHONY: dev-deps-down
 dev-deps-down:
 	@echo "Stopping dependency services..."
-	@cd deployment/all-in-one && docker compose down
+	@$(DEPS_COMPOSE) down
 	@echo "✅ Dependency services stopped"
 
 .PHONY: dev-deps-clean
@@ -151,7 +153,7 @@ dev-deps-clean:
 	@echo "⚠️  WARNING: This will delete all dependency data!"
 	@printf "Are you sure? [y/N] " && read REPLY && \
 	if [ "$$REPLY" = "y" ] || [ "$$REPLY" = "Y" ]; then \
-		(cd deployment/all-in-one && docker compose down -v); \
+		($(DEPS_COMPOSE) down -v); \
 		if [ -d deployment/all-in-one/data ]; then \
 			if [ "$$(stat -c '%u' deployment/all-in-one/data 2>/dev/null || stat -f '%u' deployment/all-in-one/data 2>/dev/null)" != "$$(id -u)" ]; then \
 				sudo rm -rf deployment/all-in-one/data; \
@@ -169,11 +171,11 @@ dev-deps-clean:
 dev-deps-status:
 	@echo "Dependency Services Status:"
 	@echo "==========================="
-	@cd deployment/all-in-one && docker compose ps matrixone redis
+	@$(DEPS_COMPOSE) ps
 
 .PHONY: dev-deps-logs
 dev-deps-logs:
-	@cd deployment/all-in-one && docker compose logs -f matrixone redis
+	@$(DEPS_COMPOSE) logs -f
 
 .PHONY: dev-deps-wait
 dev-deps-wait:
@@ -449,7 +451,7 @@ test-ignored-integration:
 		$(CARGO) test $(CARGO_MANIFEST_FLAG) -p astra-services --test services_db_integration -- --ignored; \
 	fi
 
-# Online (MatrixOne + Redis): opt-in #[ignore] integration binaries (see test-ignored-integration).
+# Online (MatrixOne): opt-in #[ignore] integration binaries (see test-ignored-integration).
 .PHONY: test-online
 test-online:
 	@ASTRA_SYSTEM_MATRIX_E2E=1 ASTRA_MULTI_AGENT_IT=1 ASTRA_SERVICES_DB_IT=1 $(MAKE) test-ignored-integration
