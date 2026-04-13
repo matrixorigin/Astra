@@ -1168,6 +1168,48 @@ fn fd_subcommand_requires_boundary_review(parts: &[String]) -> Option<(String, S
     None
 }
 
+fn parallel_subcommand_requires_boundary_review(parts: &[String]) -> Option<String> {
+    let separator_idx = parts
+        .iter()
+        .position(|part| matches!(part.as_str(), ":::" | "::::" | ":::+" | "::::+"))?;
+
+    let mut idx = 1usize;
+    while idx < separator_idx {
+        let token = parts[idx].as_str();
+        if token == "--" {
+            idx += 1;
+            continue;
+        }
+        if token.starts_with('-') && token != "-" {
+            idx += parallel_flag_consumed_tokens(token);
+            continue;
+        }
+        let base = token.rsplit('/').next().unwrap_or(token);
+        return subcommand_requires_boundary_review(base).then(|| base.to_string());
+    }
+    None
+}
+
+fn parallel_flag_consumed_tokens(flag: &str) -> usize {
+    match flag {
+        "-a" | "--arg-file" | "-I" | "--replace" | "-j" | "--jobs" | "-n" | "--max-args" | "-N"
+        | "--max-replace-args" | "-P" | "--max-procs" | "-S" | "--sshlogin" | "--tagstring"
+        | "-L" => 2,
+        _ if flag.starts_with("--arg-file=")
+            || flag.starts_with("--replace=")
+            || flag.starts_with("--jobs=")
+            || flag.starts_with("--max-args=")
+            || flag.starts_with("--max-replace-args=")
+            || flag.starts_with("--max-procs=")
+            || flag.starts_with("--sshlogin=")
+            || flag.starts_with("--tagstring=") =>
+        {
+            1
+        }
+        _ => 1,
+    }
+}
+
 fn check_awk_path_boundary(
     policy: &astra_runtime::tool_sandbox::SandboxPolicy,
     parts: &[String],
@@ -1585,6 +1627,16 @@ fn check_single_command_path_boundary(
         if let Some((action, subcommand)) = fd_subcommand_requires_boundary_review(&parts) {
             return Some(format!(
                 "{}The command uses `fd {action} {subcommand}` so file paths may be supplied from search matches and cannot be statically validated against the project directory '{}'. Ask the user for permission before using fd fan-out with file-access or shell commands.",
+                super::SANDBOX_DENIED_PREFIX,
+                policy.project_root.display(),
+            ));
+        }
+        return None;
+    }
+    if base == "parallel" {
+        if let Some(subcommand) = parallel_subcommand_requires_boundary_review(&parts) {
+            return Some(format!(
+                "{}The command uses `parallel {subcommand}` so file paths may be supplied from batch inputs and cannot be statically validated against the project directory '{}'. Ask the user for permission before using parallel fan-out with file-access or shell commands.",
                 super::SANDBOX_DENIED_PREFIX,
                 policy.project_root.display(),
             ));
@@ -4608,6 +4660,74 @@ mod tests {
         assert!(
             result.is_none(),
             "fd fan-out should stay allowed for non-file-access subcommands"
+        );
+    }
+
+    #[test]
+    fn parallel_file_access_requires_boundary_review() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(&policy, "parallel cat ::: /etc/passwd");
+        assert!(
+            result
+                .as_deref()
+                .is_some_and(|msg| msg.starts_with(super::SANDBOX_DENIED_PREFIX)
+                    && msg.contains("parallel cat")),
+            "parallel file fan-out should require boundary review"
+        );
+    }
+
+    #[test]
+    fn parallel_shell_requires_boundary_review() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result =
+            check_bash_path_boundary(&policy, "parallel bash -lc 'cat {}' ::: src/main.rs");
+        assert!(
+            result
+                .as_deref()
+                .is_some_and(|msg| msg.starts_with(super::SANDBOX_DENIED_PREFIX)
+                    && msg.contains("parallel bash")),
+            "parallel shell fan-out should require boundary review"
+        );
+    }
+
+    #[test]
+    fn parallel_flagged_file_access_requires_boundary_review() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(&policy, "parallel --jobs 4 cat ::: /etc/passwd");
+        assert!(
+            result
+                .as_deref()
+                .is_some_and(|msg| msg.starts_with(super::SANDBOX_DENIED_PREFIX)
+                    && msg.contains("parallel cat")),
+            "parallel options with values should not hide the batch subcommand"
+        );
+    }
+
+    #[test]
+    fn parallel_double_dash_file_access_requires_boundary_review() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(&policy, "parallel -- cat ::: /etc/passwd");
+        assert!(
+            result
+                .as_deref()
+                .is_some_and(|msg| msg.starts_with(super::SANDBOX_DENIED_PREFIX)
+                    && msg.contains("parallel cat")),
+            "parallel -- should still expose the batch subcommand"
+        );
+    }
+
+    #[test]
+    fn parallel_echo_is_allowed() {
+        use astra_runtime::tool_sandbox::SandboxPolicy;
+        let policy = SandboxPolicy::for_project("/home/user/project");
+        let result = check_bash_path_boundary(&policy, "parallel echo ::: src/main.rs src/lib.rs");
+        assert!(
+            result.is_none(),
+            "parallel fan-out should stay allowed for non-file-access subcommands"
         );
     }
 
