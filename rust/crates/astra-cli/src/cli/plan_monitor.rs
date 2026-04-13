@@ -329,7 +329,8 @@ fn display_plan_updates_live(
                     eprintln!();
                     eprintln!(
                         "{}",
-                        "  ✓ Plan completed! Type exit for normal chat, or describe next goal.".dim()
+                        "  ✓ Plan completed! Type exit for normal chat, or describe next goal."
+                            .dim()
                     );
                 }
                 return PlanMonitorOutcome::Finished;
@@ -360,26 +361,14 @@ fn display_plan_updates_live(
                 if state.plan_mode.is_some() {
                     eprintln!();
                     eprintln!("{}  {}", "📋".cyan(), "Recovery options:".bold());
-                    eprintln!(
-                        "{}",
-                        "    resume      — retry from where it stopped".dim()
-                    );
+                    eprintln!("{}", "    resume      — retry from where it stopped".dim());
                     eprintln!(
                         "{}",
                         "    rewind N    — reset subtask N and try again".dim()
                     );
-                    eprintln!(
-                        "{}",
-                        "    correct ... — add guidance before resuming".dim()
-                    );
-                    eprintln!(
-                        "{}",
-                        "    show        — display current plan state".dim()
-                    );
-                    eprintln!(
-                        "{}",
-                        "    exit        — leave plan mode".dim()
-                    );
+                    eprintln!("{}", "    correct ... — add guidance before resuming".dim());
+                    eprintln!("{}", "    show        — display current plan state".dim());
+                    eprintln!("{}", "    exit        — leave plan mode".dim());
                 }
                 return PlanMonitorOutcome::Finished;
             }

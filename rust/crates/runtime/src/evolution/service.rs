@@ -1,5 +1,6 @@
 //! Evolution service — orchestrates signal collection, proposal generation, and application.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -18,6 +19,7 @@ use crate::pipeline::pattern::PatternLibrary;
 use crate::runtime_promotion_signals::RuntimePromotionSignals;
 
 const MAX_APPLIED_LOG: usize = 100;
+const MAX_RECENT_CALIBRATION_DEDUP: usize = 32;
 
 /// Orchestrates the evolution lifecycle: collect → propose → apply.
 pub struct EvolutionService {
@@ -26,6 +28,9 @@ pub struct EvolutionService {
     pending_proposals: Mutex<Vec<EvolutionProposal>>,
     /// Applied proposals log (for audit/display). Bounded to last 100.
     applied_log: Mutex<Vec<EvolutionProposal>>,
+    /// Recently processed calibration proposal identities used to suppress
+    /// queue floods after identical pending/approved/rejected proposals.
+    recent_calibration_dedup: Mutex<Vec<String>>,
     /// Optional pattern library for drift detection during flush.
     pattern_library: Option<Arc<std::sync::Mutex<PatternLibrary>>>,
     /// Optional progressive calibrator for calibration proposal application.
@@ -67,6 +72,7 @@ impl EvolutionService {
             collector: Mutex::new(SignalCollector::new()),
             pending_proposals: Mutex::new(Vec::new()),
             applied_log: Mutex::new(Vec::new()),
+            recent_calibration_dedup: Mutex::new(Vec::new()),
             pattern_library: None,
             calibrator: None,
             evolution_store: None,
@@ -313,7 +319,7 @@ impl EvolutionService {
             }
         };
         if let Some(p) = extracted.as_ref() {
-            self.applied_log.lock().await.push(p.clone());
+            self.append_applied_log(std::slice::from_ref(p)).await;
         }
         Ok(extracted)
     }
@@ -333,6 +339,8 @@ impl EvolutionService {
         if let Some(pos) = pending.iter().position(|p| p.id == id) {
             let mut p = pending.remove(pos);
             p.status = ApprovalStatus::Rejected;
+            self.remember_recent_calibration_proposals(std::slice::from_ref(&p))
+                .await;
             Ok(Some(p))
         } else {
             Ok(None)
@@ -497,8 +505,24 @@ impl EvolutionService {
         &self,
         proposals: Vec<EvolutionProposal>,
     ) -> Result<ProposalRoutingOutcome, String> {
+        let pending_calibration_keys: HashSet<String> = {
+            let pending = self.pending_proposals.lock().await;
+            pending.iter().filter_map(calibration_dedup_key).collect()
+        };
+        let recent_calibration_keys: HashSet<String> = {
+            let recent = self.recent_calibration_dedup.lock().await;
+            recent.iter().cloned().collect()
+        };
         let mut routed = ProposalRoutingOutcome::default();
+        let mut batch_calibration_keys = HashSet::new();
         for proposal in proposals {
+            if let Some(key) = calibration_dedup_key(&proposal)
+                && (pending_calibration_keys.contains(&key)
+                    || recent_calibration_keys.contains(&key)
+                    || !batch_calibration_keys.insert(key))
+            {
+                continue;
+            }
             let proposal = self.annotate_promotion_verdict(proposal)?;
             if self.should_auto_apply(&proposal) {
                 match self.apply_proposal(&proposal) {
@@ -541,12 +565,29 @@ impl EvolutionService {
             let excess = log.len() - MAX_APPLIED_LOG;
             log.drain(..excess);
         }
+        drop(log);
+        self.remember_recent_calibration_proposals(proposals).await;
     }
 
     fn should_auto_apply(&self, proposal: &EvolutionProposal) -> bool {
         proposal.promotion_verdict.as_ref().is_some_and(|verdict| {
             verdict.recommendation == ProposalPromotionRecommendation::Promote
         })
+    }
+
+    async fn remember_recent_calibration_proposals(&self, proposals: &[EvolutionProposal]) {
+        let mut recent = self.recent_calibration_dedup.lock().await;
+        for proposal in proposals {
+            let Some(key) = calibration_dedup_key(proposal) else {
+                continue;
+            };
+            recent.retain(|existing| existing != &key);
+            recent.push(key);
+        }
+        if recent.len() > MAX_RECENT_CALIBRATION_DEDUP {
+            let excess = recent.len() - MAX_RECENT_CALIBRATION_DEDUP;
+            recent.drain(..excess);
+        }
     }
 }
 
@@ -556,6 +597,35 @@ fn pending_priority(proposal: &EvolutionProposal) -> u8 {
         .as_ref()
         .map(|verdict| verdict.recommendation.priority())
         .unwrap_or(ProposalPromotionRecommendation::Hold.priority())
+}
+
+fn calibration_dedup_key(proposal: &EvolutionProposal) -> Option<String> {
+    let EvolutionAxis::Calibration { axis, adjustment } = &proposal.axis else {
+        return None;
+    };
+    Some(format!(
+        "{}:{}",
+        calibration_axis_identity(axis),
+        calibration_adjustment_direction(*adjustment)
+    ))
+}
+
+fn calibration_axis_identity(axis: &super::types::CalibrationAxis) -> String {
+    match axis {
+        super::types::CalibrationAxis::Intent(intent) => format!("intent:{intent}"),
+        super::types::CalibrationAxis::Domain(domain) => format!("domain:{domain:?}"),
+        super::types::CalibrationAxis::Task(task) => format!("task:{task:?}"),
+    }
+}
+
+fn calibration_adjustment_direction(adjustment: f64) -> &'static str {
+    if adjustment.is_sign_negative() {
+        "negative"
+    } else if adjustment > 0.0 {
+        "positive"
+    } else {
+        "neutral"
+    }
 }
 
 fn verdict_score(proposal: &EvolutionProposal) -> f64 {
@@ -837,6 +907,68 @@ mod tests {
         svc.clear_dedup().await;
         svc.add_signal(drift_signal("a")).await;
         assert_eq!(svc.signal_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn calibration_queue_dedups_same_scope_while_pending() {
+        let svc = EvolutionService::new();
+        svc.add_signal(EvolutionSignal::ToolFailure {
+            tool_name: "bash".into(),
+            error_snippet: "permission denied".into(),
+            skill_context: None,
+            turn_id: "t1".into(),
+        })
+        .await;
+        let (_auto, _llm) = svc.flush().await;
+        assert_eq!(svc.pending().await.len(), 1);
+
+        svc.clear_dedup().await;
+        svc.add_signal(EvolutionSignal::ToolFailure {
+            tool_name: "web_fetch".into(),
+            error_snippet: "timeout".into(),
+            skill_context: None,
+            turn_id: "t2".into(),
+        })
+        .await;
+        let (_auto, _llm) = svc.flush().await;
+        assert_eq!(
+            svc.pending().await.len(),
+            1,
+            "same calibration scope/sign should not enqueue duplicates while pending"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_calibration_proposal_enters_recent_dedup_window() {
+        let svc = EvolutionService::new();
+        svc.add_signal(EvolutionSignal::UserCorrection {
+            correction_text: "that's wrong".into(),
+            prior_assistant_text: "draft".into(),
+            skill_context: None,
+            turn_id: "t1".into(),
+        })
+        .await;
+        let (_auto, _llm) = svc.flush().await;
+        let pending = svc.pending().await;
+        assert_eq!(pending.len(), 1);
+
+        let rejected = svc.reject(&pending[0].id).await.unwrap();
+        assert!(rejected.is_some());
+        assert!(svc.pending().await.is_empty());
+
+        svc.clear_dedup().await;
+        svc.add_signal(EvolutionSignal::UserCorrection {
+            correction_text: "actually, do it this way".into(),
+            prior_assistant_text: "draft".into(),
+            skill_context: None,
+            turn_id: "t2".into(),
+        })
+        .await;
+        let (_auto, _llm) = svc.flush().await;
+        assert!(
+            svc.pending().await.is_empty(),
+            "recently rejected calibration proposal should not be re-enqueued immediately"
+        );
     }
 
     #[tokio::test]
