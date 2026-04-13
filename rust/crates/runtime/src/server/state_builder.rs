@@ -12,7 +12,7 @@ pub async fn build_server_state(
     let lease_hold_cache = Arc::new(TaskLeaseHoldCache::default());
 
     // Build shared pipeline learning modules (server-wide singleton).
-    let learning_stack = build_pipeline_learning_stack();
+    let learning_stack = build_pipeline_learning_stack(None);
 
     let state = AppState::new(
         ServiceInfo::default(),
@@ -303,11 +303,32 @@ pub(super) struct PipelineLearningStack {
     pub entity_graph: Arc<Mutex<crate::pipeline::entity::EntityGraph>>,
     pub pattern_library: Arc<Mutex<crate::pipeline::pattern::PatternLibrary>>,
     pub calibrator: Arc<Mutex<crate::pipeline::calibration::ProgressiveCalibrator>>,
+    /// Profile name used for cross-session persistence.
+    pub profile: Option<String>,
+}
+
+impl PipelineLearningStack {
+    /// Persist current learning state to disk if a profile was configured.
+    pub fn save(&self) {
+        if let Some(ref profile) = self.profile {
+            let _ = crate::pipeline::persistence::save_learning_state(
+                profile,
+                &self.entity_graph,
+                &self.pattern_library,
+                &self.calibrator,
+            );
+        }
+    }
 }
 
 /// Creates pipeline modules (EntityGraph, PatternLibrary, ProgressiveCalibrator)
 /// and wires them into a PipelineLearningWriter for turn-outcome-driven learning.
-pub(super) fn build_pipeline_learning_stack() -> PipelineLearningStack {
+///
+/// When `profile` is provided, loads cross-session learning state from
+/// `~/.astra/learning/<profile>.json` before merging defaults. This lets
+/// PatternDrift detect regressions from the very first turn instead of
+/// requiring a cold-start re-learning period.
+pub(super) fn build_pipeline_learning_stack(profile: Option<&str>) -> PipelineLearningStack {
     use crate::pipeline::{
         calibration::ProgressiveCalibrator,
         defaults::{default_calibration, default_entities, default_patterns},
@@ -321,6 +342,17 @@ pub(super) fn build_pipeline_learning_stack() -> PipelineLearningStack {
     // Use 0.70 as initial threshold — requires some confidence before auto-routing
     let calibrator = Arc::new(Mutex::new(ProgressiveCalibrator::new(0.70)));
 
+    // Merge cross-session persisted state first (if a profile is provided).
+    if let Some(p) = profile {
+        crate::pipeline::persistence::load_learning_state(
+            p,
+            &entity_graph,
+            &pattern_library,
+            &calibrator,
+        );
+    }
+
+    // Layer defaults on top so built-in patterns/entities are always present.
     if let Ok(mut eg) = entity_graph.lock() {
         eg.merge(&default_entities());
     }
@@ -342,6 +374,7 @@ pub(super) fn build_pipeline_learning_stack() -> PipelineLearningStack {
         entity_graph,
         pattern_library,
         calibrator,
+        profile: profile.map(str::to_string),
     }
 }
 
@@ -352,7 +385,7 @@ mod tests {
 
     #[tokio::test]
     async fn build_pipeline_learning_writer_creates_functional_writer() {
-        let writer = build_pipeline_learning_stack().writer;
+        let writer = build_pipeline_learning_stack(None).writer;
         // Should accept an outcome without panic
         let outcome = TurnLearningOutcome {
             query: "matrixorigin PR check".to_string(),
@@ -374,7 +407,7 @@ mod tests {
 
     #[tokio::test]
     async fn build_pipeline_learning_writer_learns_across_calls() {
-        let writer = build_pipeline_learning_stack().writer;
+        let writer = build_pipeline_learning_stack(None).writer;
         // Record two outcomes to meet PatternLibrary minimum
         for i in 0..2 {
             let outcome = TurnLearningOutcome {
@@ -399,7 +432,7 @@ mod tests {
 
     #[test]
     fn pipeline_learning_stack_shares_arcs_between_writer_and_fields() {
-        let s = build_pipeline_learning_stack();
+        let s = build_pipeline_learning_stack(None);
         assert_eq!(Arc::strong_count(&s.entity_graph), 2);
         assert_eq!(Arc::strong_count(&s.pattern_library), 2);
         assert_eq!(Arc::strong_count(&s.calibrator), 2);

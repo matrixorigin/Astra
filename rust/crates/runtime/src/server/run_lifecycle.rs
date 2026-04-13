@@ -133,16 +133,16 @@ fn initialize_runtime_controllers(
     user_id: &str,
     session_id: &str,
     promotion_signals: Option<RuntimePromotionSignals>,
-) {
-    let learning_stack = super::state_builder::build_pipeline_learning_stack();
+) -> super::state_builder::PipelineLearningStack {
+    let learning_stack = super::state_builder::build_pipeline_learning_stack(Some("default"));
     let hub = Arc::new(ObservabilityHub::new());
     hub.attach_pattern_library(learning_stack.pattern_library.clone());
     let session = hub.start_session(user_id, session_id);
 
     let evolution_service = Arc::new(
         EvolutionService::new()
-            .with_pattern_library(learning_stack.pattern_library)
-            .with_calibrator(learning_stack.calibrator),
+            .with_pattern_library(learning_stack.pattern_library.clone())
+            .with_calibrator(learning_stack.calibrator.clone()),
     );
     evolution_service.set_runtime_promotion_signals(promotion_signals.clone());
 
@@ -150,6 +150,7 @@ fn initialize_runtime_controllers(
     loop_state.telemetry.observability_session = Some(session);
     loop_state.telemetry.runtime_promotion_signals = promotion_signals;
     loop_state.evolution_service = Some(evolution_service);
+    learning_stack
 }
 
 async fn configure_runtime_controllers(
@@ -158,7 +159,7 @@ async fn configure_runtime_controllers(
     loop_state: &mut AgenticLoopState,
     user_id: &str,
     session_id: &str,
-) {
+) -> super::state_builder::PipelineLearningStack {
     let promotion_signals = match load_runtime_promotion_signals(matrixone, shared_pool, user_id)
         .await
     {
@@ -171,7 +172,7 @@ async fn configure_runtime_controllers(
             None
         }
     };
-    initialize_runtime_controllers(loop_state, user_id, session_id, promotion_signals);
+    initialize_runtime_controllers(loop_state, user_id, session_id, promotion_signals)
 }
 
 fn build_runtime_event_service(
@@ -865,7 +866,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             &pause_flag,
             &llm_cancel_token,
         );
-        configure_runtime_controllers(
+        let learning_stack = configure_runtime_controllers(
             &self.matrixone,
             self.shared_pool.as_ref(),
             &mut loop_state,
@@ -901,6 +902,10 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 &loop_state.telemetry.promotion_events,
             )
             .await;
+
+            // Persist learning state (patterns, calibration, entities) so the
+            // next session starts with accumulated cross-session knowledge.
+            learning_stack.save();
 
             let (events, final_status, error_msg) =
                 Self::finalize_run_events(outcome, host.take_emitted_events(), &loop_state);
@@ -1000,7 +1005,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             &pause_flag,
             &llm_cancel_token,
         );
-        configure_runtime_controllers(
+        let learning_stack = configure_runtime_controllers(
             &self.matrixone,
             self.shared_pool.as_ref(),
             &mut state,
@@ -1026,6 +1031,9 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             &state.telemetry.promotion_events,
         )
         .await;
+
+        // Persist cross-session learning state.
+        learning_stack.save();
 
         let (mut final_events, final_status, error_msg) =
             Self::finalize_run_events(loop_result, host.take_emitted_events(), &state);
@@ -1569,7 +1577,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             pending_reflection_signals: Vec::new(),
             recent_tactical_actions: Vec::new(),
         };
-        configure_runtime_controllers(
+        let learning_stack = configure_runtime_controllers(
             &self.matrixone,
             self.shared_pool.as_ref(),
             &mut loop_state,
@@ -1595,6 +1603,9 @@ impl SubRunExecutor for ServerSubRunExecutor {
             &loop_state.telemetry.promotion_events,
         )
         .await;
+
+        // Persist cross-session learning state.
+        learning_stack.save();
 
         match outcome {
             Ok(AgenticLoopOutcome::Completed) => Ok(astra_services::coordination::AgentResult {
