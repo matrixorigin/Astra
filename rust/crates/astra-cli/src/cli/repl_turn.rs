@@ -1725,6 +1725,7 @@ pub(super) fn steer_observability_goal(
     state: &mut ReplState,
     goal: &str,
 ) -> Option<GoalSteeringChange> {
+    let session_turn = state.turn;
     let obs = state.observability_session.as_ref()?;
     let mut guard = obs.write().unwrap_or_else(|error| error.into_inner());
     let previous_goal = guard
@@ -1737,7 +1738,7 @@ pub(super) fn steer_observability_goal(
     }
     Some(GoalSteeringChange {
         previous_goal,
-        turn: guard.turn_number,
+        turn: session_turn,
     })
 }
 
@@ -2551,6 +2552,27 @@ mod tests {
         );
         assert_eq!(guard.recent_queries, vec!["ship billing flow".to_string()]);
         assert!(guard.compressed_turns.is_empty());
+    }
+
+    #[test]
+    fn steer_observability_goal_reports_session_turn_not_internal_loop_turn() {
+        let mut state = ReplState {
+            turn: 3,
+            ..Default::default()
+        };
+        let mut obs =
+            astra_runtime::observability_integration::ObservabilitySession::new_simple("sid-steer");
+        obs.turn_number = 6;
+        obs.record_query("review session health");
+        state.observability_session = Some(std::sync::Arc::new(std::sync::RwLock::new(obs)));
+
+        let change = steer_observability_goal(&mut state, "run plan execution").expect("change");
+
+        assert_eq!(change.turn, 3);
+        assert_eq!(
+            change.previous_goal.as_deref(),
+            Some("review session health")
+        );
     }
 
     #[test]
