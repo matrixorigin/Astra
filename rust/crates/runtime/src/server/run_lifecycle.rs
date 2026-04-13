@@ -1997,12 +1997,19 @@ mod tests {
     #[tokio::test]
     async fn list_runs_filters_by_user() {
         let svc = test_service();
-        ok(svc.create_run("user-1".into(), test_request("a")).await);
-        ok(svc.create_run("user-2".into(), test_request("b")).await);
-        ok(svc.create_run("user-1".into(), test_request("c")).await);
-        let result = ok(svc.list_runs("user-1".into(), 10, 0).await);
-        assert_eq!(result.total, 2);
-        assert!(result.runs.iter().all(|r| r.status == "running"));
+        let u1_a = ok(svc.create_run("user-1".into(), test_request("a")).await);
+        let u2_b = ok(svc.create_run("user-2".into(), test_request("b")).await);
+        let u1_c = ok(svc.create_run("user-1".into(), test_request("c")).await);
+        let for_u1 = ok(svc.list_runs("user-1".into(), 10, 0).await);
+        assert_eq!(for_u1.total, 2);
+        let ids: std::collections::HashSet<_> = for_u1.runs.iter().map(|r| r.run_id.as_str()).collect();
+        assert!(ids.contains(u1_a.run_id.as_str()));
+        assert!(ids.contains(u1_c.run_id.as_str()));
+        assert!(!ids.contains(u2_b.run_id.as_str()));
+
+        let for_u2 = ok(svc.list_runs("user-2".into(), 10, 0).await);
+        assert_eq!(for_u2.total, 1);
+        assert_eq!(for_u2.runs[0].run_id, u2_b.run_id);
     }
 
     #[tokio::test]
