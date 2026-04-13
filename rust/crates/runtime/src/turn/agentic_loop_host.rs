@@ -2089,29 +2089,6 @@ fn extract_file_path_from_tool(tool_name: &str, args: &Value) -> Option<String> 
     }
 }
 
-/// Validate a model string from skill frontmatter before passing it to the API.
-///
-/// Accepts strings matching known provider naming conventions:
-/// - Alphanumeric, hyphens, underscores, dots, colons, and forward slashes
-/// - Length between 2 and 128 characters
-/// - Must start with an ASCII alphanumeric character
-///
-/// Rejects empty strings, excessively long strings, and strings with
-/// suspicious characters (shell metacharacters, whitespace, etc.).
-fn is_valid_model_string(model: &str) -> bool {
-    let len = model.len();
-    if !(2..=128).contains(&len) {
-        return false;
-    }
-    let first = model.as_bytes()[0];
-    if !first.is_ascii_alphanumeric() {
-        return false;
-    }
-    model.bytes().all(|b| {
-        b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.' || b == b':' || b == b'/'
-    })
-}
-
 fn runtime_promotion_recommendation(
     recommendation: crate::evolution::types::ProposalPromotionRecommendation,
 ) -> RuntimePromotionRecommendation {
@@ -4419,401 +4396,19 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
             &remaining_tool_calls
         };
 
-        // Normalize tool_call ids early: replace empty/missing ids with synthetic
-        // UUIDs so all downstream code (send_message, skill, headless round) sees
-        // consistent ids. Without this, APIs that return empty ids (e.g. kimi-k2.5)
-        // cause mismatches between assistant tool_calls and tool result messages.
-        let normalized_tool_calls =
-            super::headless_tool_assembly::ensure_tool_call_ids(effective_tool_calls);
-        let effective_tool_calls: &[Value] = &normalized_tool_calls;
-        // Keep a reference to the full set of tool_calls (pre-interception) for
-        // building the assistant message. Interception layers (send_message, skill)
-        // may filter effective_tool_calls down to a subset, but the assistant
-        // message must contain ALL tool_calls so every tool result has a matching id.
-        let all_tool_calls: &[Value] = &normalized_tool_calls;
-
-        // ─── Step 3b½: send_message interception ────────────────────────
-        // If the agent has a mailbox, intercept send_message tool calls and
-        // route them through the messaging system.
-        let post_send_tool_calls;
-        let mut pre_resolved_results: Vec<(String, String)> = Vec::new();
-        let effective_tool_calls = if let Some(ref mailbox) = state.messaging.mailbox {
-            let mut msg_results: Vec<(String, String)> = Vec::new();
-            let mut remaining = Vec::new();
-            for tc in effective_tool_calls {
-                if crate::messaging::send_tool::is_send_message_call(tc) {
-                    if let Some((call_id, args)) =
-                        crate::messaging::send_tool::parse_send_message_call(tc)
-                    {
-                        let send_result =
-                            crate::messaging::send_tool::execute_send_message(mailbox, &args).await;
-                        // Track metrics for successful sends.
-                        if send_result.tracked_message.is_some()
-                            || !send_result.display.starts_with("Error:")
-                        {
-                            if let Some(ref metrics) = state.messaging.metrics {
-                                metrics
-                                    .messages_sent
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            }
-                        }
-                        // Track ack-requiring messages.
-                        if let Some(tracked_msg) = send_result.tracked_message {
-                            if let Some(ref tracker) = state.messaging.ack_tracker {
-                                if state.messaging.ack_sweep_task.is_none() {
-                                    if let Some(ref mailbox) = state.messaging.mailbox {
-                                        state.messaging.ack_sweep_task =
-                                            Some(crate::messaging::ack_tracker::start_sweep_task(
-                                                Arc::clone(tracker),
-                                                mailbox.router(),
-                                                state.messaging.dead_letter_queue.clone(),
-                                                state.messaging.metrics.clone(),
-                                            ));
-                                    }
-                                }
-                                tracker.track(tracked_msg).await;
-                            }
-                        }
-                        msg_results.push((call_id, send_result.display));
-                    } else if let Some(call_id) = tc.get("id").and_then(|v| v.as_str()) {
-                        msg_results.push((
-                            call_id.to_string(),
-                            "Error: could not parse send_message arguments. Expected JSON with 'target' and 'content' fields.".to_string(),
-                        ));
-                    }
-                } else {
-                    remaining.push(tc.clone());
-                }
-            }
-            // send_message results are collected into pre_resolved_results, not
-            // pushed to messages/tool_results here. The headless round injects
-            // them after the assistant message in correct ordering.
-            post_send_tool_calls = remaining;
-            pre_resolved_results.extend(msg_results);
-            &post_send_tool_calls
-        } else {
-            effective_tool_calls
-        };
-
-        // ─── Step 3c: Skill interception ─────────────────────────────────
-        // If a skill resolver is wired, intercept "skill" tool calls and
-        // return resolved instructions as tool results.
-        let (mut skill_results, post_skill_tool_calls);
-        let _effective_tool_calls = if let Some(resolver) = &state.skills.resolver {
-            // Build runtime context for skill execution
-            let mut extra = std::collections::HashMap::new();
-
-            if let Some(ref root) = state.hooks.workspace_root_hint {
-                let root_path = std::path::Path::new(root.as_str());
-
-                // Detect git branch
-                if let Ok(output) = std::process::Command::new("git")
-                    .args(["rev-parse", "--abbrev-ref", "HEAD"])
-                    .current_dir(root)
-                    .output()
-                {
-                    if output.status.success() {
-                        let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                        if !branch.is_empty() {
-                            extra.insert("git_branch".into(), branch);
-                        }
-                    }
-                }
-
-                // Detect git repo name from remote origin
-                if let Ok(output) = std::process::Command::new("git")
-                    .args(["config", "--get", "remote.origin.url"])
-                    .current_dir(root)
-                    .output()
-                {
-                    if output.status.success() {
-                        let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                        if let Some(name) = extract_repo_name_from_url(&url) {
-                            extra.insert("git_repo".into(), name);
-                        }
-                    }
-                }
-
-                // Detect project type from marker files
-                let project_types = detect_project_types(root_path);
-                if !project_types.is_empty() {
-                    extra.insert("project_type".into(), project_types.join(","));
-                }
-            }
-
-            // OS info
-            extra.insert("os".into(), std::env::consts::OS.into());
-
-            // ── Runtime metrics for reflect skill ──
-            let turns_used = state.max_turns.saturating_sub(state.remaining_turns);
-            extra.insert("turn_number".into(), turns_used.to_string());
-            extra.insert("turns_remaining".into(), state.remaining_turns.to_string());
-            extra.insert("total_prompt_tokens".into(), state.total_prompt.to_string());
-            extra.insert(
-                "total_completion_tokens".into(),
-                state.total_completion.to_string(),
-            );
-            extra.insert(
-                "total_tool_calls".into(),
-                state.total_tool_calls.to_string(),
-            );
-            extra.insert(
-                "nudge_count".into(),
-                state.turn_guard.nudge_count.to_string(),
-            );
-            extra.insert(
-                "error_count".into(),
-                state.turn_guard.errors.total_errors.to_string(),
-            );
-            let depri = state.turn_guard.health.deprioritized_tools();
-            if !depri.is_empty() {
-                extra.insert("deprioritized_tools".into(), depri.join(", "));
-            }
-            if !state.stall.events.is_empty() {
-                let stalls: Vec<String> = state
-                    .stall
-                    .events
-                    .iter()
-                    .map(|(kind, turn)| format!("{}@t{}", kind, turn))
-                    .collect();
-                extra.insert("stall_events".into(), stalls.join(", "));
-            }
-            let eff = state.turn_guard.correction_effectiveness();
-            if eff.total_corrections > 0 {
-                extra.insert(
-                    "correction_follow_rate".into(),
-                    format!("{:.0}%", eff.follow_rate * 100.0),
-                );
-            }
-
-            let session_dir = state.current_session_id.as_ref().map(|id| {
-                dirs::home_dir()
-                    .unwrap_or_else(|| std::path::PathBuf::from("."))
-                    .join(".astra")
-                    .join("sessions")
-                    .join(id)
-                    .to_string_lossy()
-                    .into_owned()
-            });
-
-            let skill_ctx = crate::turn::skill_tool::SkillContext {
-                session_id: state.current_session_id.clone(),
-                session_dir,
-                work_dir: state.hooks.workspace_root_hint.clone(),
-                available_tools: state.telemetry.all_tools_used.iter().cloned().collect(),
-                recursion_depth: state.recursion_depth,
-                extra,
-            };
-
-            let composition_ctx = crate::skills::composition::CompositionContext::root();
-            let full_catalog = resolver.available_skills();
-            let (visible_for_mask, _) = crate::turn::skill_tool::visible_skills_for_host_turn(
-                &full_catalog,
-                state.message.as_str(),
-                &state.skills.quality_tracker,
-                &state.skills.pinned,
-                &state.skills.discovered,
-                &state.skills.search,
-            );
-            let discover_exclude =
-                crate::turn::skill_tool::skill_mask_names_lowercase(&visible_for_mask);
-
-            // ── Same-session skill dedup: return stub for already-invoked skills ──
-            let mut dedup_results: Vec<crate::turn::skill_tool::InterceptedToolResult> = Vec::new();
-            let mut fresh_tool_calls: Vec<Value> = Vec::new();
-            for tc in effective_tool_calls {
-                if crate::turn::skill_tool::is_skill_call(tc) {
-                    let skill_name = crate::turn::skill_tool::extract_skill_name(tc);
-                    if let Some(ref name) = skill_name {
-                        if let Some(prev) = state.skills.invoked.get(name.as_str()) {
-                            let call_id = tc
-                                .get("id")
-                                .and_then(Value::as_str)
-                                .filter(|s| !s.is_empty())
-                                .unwrap_or("unknown");
-                            dedup_results.push(crate::turn::skill_tool::InterceptedToolResult {
-                                tool_call_id: call_id.to_string(),
-                                tool_name: crate::turn::skill_tool::SKILL_TOOL_NAME.to_string(),
-                                result: format!(
-                                    "Skill '{}' was already loaded (turn {}). \
-                                     Follow those instructions directly — do not re-invoke.",
-                                    name, prev.invoked_at_turn
-                                ),
-                                verification_summary: None,
-                            });
-                            continue;
-                        }
-                    }
-                }
-                fresh_tool_calls.push(tc.clone());
-            }
-
-            let (sr, remaining, activation) =
-                crate::turn::skill_tool::partition_discover_and_execute_skills(
-                    &fresh_tool_calls,
-                    resolver.as_ref(),
-                    &full_catalog,
-                    &discover_exclude,
-                    &mut state.skills.discovered,
-                    state.skills.executor.as_ref(),
-                    Some(&mut state.skills.quality_tracker),
-                    Some(&composition_ctx),
-                    &skill_ctx,
-                )
-                .await;
-
-            // Record newly invoked skills + merge dedup stubs
-            let current_turn = (state.max_turns - state.remaining_turns) as u32;
-            for result in &sr {
-                // Extract skill name from the matching fresh_tool_calls
-                if let Some(tc) = fresh_tool_calls.iter().find(|t| {
-                    t.get("id").and_then(Value::as_str) == Some(result.tool_call_id.as_str())
-                }) {
-                    let name = crate::turn::skill_tool::extract_skill_name(tc);
-                    if let Some(name) = name {
-                        if crate::turn::skill_tool::is_skill_call(tc) {
-                            state.skills.invoked.insert(
-                                name.clone(),
-                                crate::turn::skill_tool::InvokedSkill {
-                                    name,
-                                    content: result.result.clone(),
-                                    invoked_at_turn: current_turn,
-                                },
-                            );
-                        }
-                    }
-                }
-            }
-            skill_results = dedup_results;
-
-            // ── Skill exclusivity: drop non-skill tool calls when skills fired ──
-            // When the model emits skill calls alongside regular tool calls in the
-            // same turn, the regular calls were generated WITHOUT seeing the skill
-            // instructions. Executing them would bypass the skill's guidance entirely.
-            // Drop them and return synthetic errors so the model re-evaluates after
-            // reading the skill content.
-            //
-            // Only trigger on *new* skill invocations (not discover_skills,
-            // not dedup stubs). A dedup stub means the skill was already loaded
-            // in a prior turn; discover_skills only lists available skills
-            // without loading instructions.
-            let new_skills_fired = fresh_tool_calls
-                .iter()
-                .any(|tc| crate::turn::skill_tool::is_skill_call(tc));
-            skill_results.extend(sr);
-            if new_skills_fired && !remaining.is_empty() {
-                // Check if any skill produced substantial output — if so, the
-                // skill likely already performed the work these deferred calls
-                // would do (e.g. reading files for a code review). Tell the LLM
-                // the work is done rather than inviting re-evaluation.
-                let skill_produced_output = skill_results.iter().any(|r| r.result.len() > 500);
-                let dropped_count = remaining.len();
-                for tc in &remaining {
-                    let call_id = tc.get("id").and_then(Value::as_str).unwrap_or("unknown");
-                    let tool_name = tc
-                        .get("function")
-                        .and_then(|f| f.get("name"))
-                        .and_then(Value::as_str)
-                        .unwrap_or("unknown");
-                    let msg = if skill_produced_output {
-                        // Soft constraint: tell the model the skill already handled
-                        // this work. We deliberately do NOT hard-restrict via
-                        // `restricted_tools` because the model may have a legitimate
-                        // reason to call the same tool with different arguments in a
-                        // later iteration (e.g., `git_diff HEAD` after a skill did
-                        // `git_diff --staged`). Semantic dedup and call-count limits
-                        // catch true repeats.
-                        format!(
-                            "Skipped: the skill already completed this work. \
-                             Do NOT call `{}` again — use the skill output above as your answer.",
-                            tool_name
-                        )
-                    } else {
-                        format!(
-                            "Deferred: skill was invoked in this turn. Read the skill \
-                             instructions above, then decide whether to call `{}` again.",
-                            tool_name
-                        )
-                    };
-                    skill_results.push(crate::turn::skill_tool::InterceptedToolResult {
-                        tool_call_id: call_id.to_string(),
-                        tool_name: tool_name.to_string(),
-                        result: msg,
-                        verification_summary: None,
-                    });
-                }
-                post_skill_tool_calls = Vec::new(); // clear remaining
-                let verb = if skill_produced_output {
-                    "skipped"
-                } else {
-                    "deferred"
-                };
-                tracing::debug!(
-                    dropped_count,
-                    verb,
-                    "skill exclusivity: {} non-skill tool call(s) {}",
-                    dropped_count,
-                    verb
-                );
-            } else {
-                post_skill_tool_calls = remaining;
-            }
-
-            // Apply skill activation effects (model override, tool restrictions).
-            // A new activation fully replaces the previous one — fields not
-            // present in the new activation are cleared so stale overrides
-            // from a prior skill don't persist indefinitely.
-            if let Some(act) = activation {
-                state.skills.model_override =
-                    act.model_override.filter(|m| is_valid_model_string(m));
-                state.skills.allowed_tools = if act.allowed_tools.is_empty() {
-                    None
-                } else {
-                    Some(act.allowed_tools.into_iter().collect())
-                };
-                state.skills.effort = act.effort;
-                state.skills.agent_type = act.agent_type;
-                state.skills.sandbox_policy = act.sandbox_policy;
-            }
-
-            &post_skill_tool_calls
-        } else {
-            skill_results = Vec::new();
-            // No skill resolver — pass through unchanged
-            post_skill_tool_calls = effective_tool_calls.to_vec();
-            &post_skill_tool_calls
-        };
-
-        // Collect skill results into pre_resolved_results (not messages).
-        // The headless round will inject them after the assistant message
-        // into both messages and tool_results in correct ordering.
-        for result in &skill_results {
-            pre_resolved_results.push((result.tool_call_id.clone(), result.result.clone()));
-
-            // Record skill calls in tool_call_records so the session
-            // journal captures them alongside regular tool calls.
-            state.stall.tool_call_records.push(ToolCallRecord {
-                name: result.tool_name.clone(),
-                ok: !result.result.starts_with("Unknown skill")
-                    && !result.result.starts_with("Invalid skill")
-                    && !result.result.starts_with("Skipped:")
-                    && !result.result.starts_with("Deferred:"),
-                ms: 0,
-                error: None,
-                input_bytes: None,
-                output_bytes: Some(result.result.len() as u32),
-                args_preview: Some(result.tool_call_id.clone()),
-                result_preview: Some(result.result.chars().take(500).collect::<String>()),
-            });
-        }
-
-        // Set skill_produced_output whenever a skill produces substantial
-        // output, regardless of whether deferral triggered. This suppresses
-        // intermediate text rendering on subsequent iterations (prevents
-        // markdown leak from draft review text).
-        if !state.skill_produced_output && skill_results.iter().any(|r| r.result.len() > 500) {
-            state.skill_produced_output = true;
-        }
+        let super::agentic_tool_interception::PreparedToolRound {
+            tool_calls,
+            pre_resolved_results,
+            edge_tool_round,
+        } = super::agentic_tool_interception::prepare_intercepted_tool_round(
+            state,
+            &turn_result,
+            effective_tool_calls,
+            !delegation_results.is_empty(),
+        )
+        .await;
+        let all_tool_calls = tool_calls.as_slice();
+        let edge_round_for_headless = edge_tool_round.as_slice();
 
         // ─── Step 4: Headless tool round ────────────────────────────────
         // Snapshot error counts before the round for per-turn delta tracking.
@@ -4833,23 +4428,6 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
             .iter()
             .map(|r| (tool_dedup_signature(&r.tool, &r.args), r.output.clone()))
             .collect();
-
-        // When delegations were handled by step 3b, filter delegate results
-        // out of edge_tool_round so the headless round's fallback path
-        // (used when effective_tool_calls is empty) doesn't reconstruct
-        // duplicate delegate tool_calls from edge results.
-        let filtered_edge_round: Vec<_>;
-        let edge_round_for_headless: &[EdgeToolExecResult] = if !delegation_results.is_empty() {
-            filtered_edge_round = turn_result
-                .edge_tool_round
-                .iter()
-                .filter(|r| r.tool != DELEGATE_TOOL_NAME)
-                .cloned()
-                .collect();
-            &filtered_edge_round
-        } else {
-            turn_result.edge_tool_round.as_slice()
-        };
 
         let evo_records_before = state.stall.tool_call_records.len();
         {
@@ -5336,56 +4914,6 @@ async fn run_agentic_loop_impl<H: AgenticLoopHost>(
 
 /// Extract repository name from a git remote URL.
 ///
-/// Handles SSH (`git@host:org/repo.git`), HTTPS (`https://host/org/repo.git`),
-/// and bare paths.
-fn extract_repo_name_from_url(url: &str) -> Option<String> {
-    // Take the last path component, strip `.git` suffix
-    let path = url.trim_end_matches('/');
-    let segment = if let Some(idx) = path.rfind('/') {
-        &path[idx + 1..]
-    } else if let Some(idx) = path.rfind(':') {
-        // SSH shorthand: git@github.com:org/repo.git
-        let after_colon = &path[idx + 1..];
-        after_colon.rsplit('/').next().unwrap_or(after_colon)
-    } else {
-        return None;
-    };
-    let name = segment.strip_suffix(".git").unwrap_or(segment);
-    if name.is_empty() {
-        None
-    } else {
-        Some(name.to_string())
-    }
-}
-
-/// Detect project types from well-known marker files in the workspace root.
-/// Returns a list of detected types (a project can be multi-language).
-fn detect_project_types(root: &std::path::Path) -> Vec<&'static str> {
-    let markers: &[(&str, &str)] = &[
-        ("Cargo.toml", "rust"),
-        ("package.json", "node"),
-        ("pyproject.toml", "python"),
-        ("setup.py", "python"),
-        ("requirements.txt", "python"),
-        ("go.mod", "go"),
-        ("pom.xml", "java"),
-        ("build.gradle", "java"),
-        ("Gemfile", "ruby"),
-        ("Makefile", "make"),
-        ("CMakeLists.txt", "cmake"),
-        ("docker-compose.yml", "docker"),
-        ("Dockerfile", "docker"),
-    ];
-    let mut seen = std::collections::HashSet::new();
-    let mut types = Vec::new();
-    for (file, lang) in markers {
-        if root.join(file).exists() && seen.insert(*lang) {
-            types.push(*lang);
-        }
-    }
-    types
-}
-
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -7449,39 +6977,53 @@ mod tests {
 
     #[test]
     fn valid_model_strings() {
-        assert!(super::is_valid_model_string("gpt-4o"));
-        assert!(super::is_valid_model_string("claude-sonnet-4-20250514"));
-        assert!(super::is_valid_model_string("claude-3.5-sonnet"));
-        assert!(super::is_valid_model_string("openai/gpt-4o"));
-        assert!(super::is_valid_model_string("anthropic:claude-3"));
-        assert!(super::is_valid_model_string("m0"));
+        assert!(crate::turn::agentic_tool_interception::is_valid_model_string("gpt-4o"));
+        assert!(
+            crate::turn::agentic_tool_interception::is_valid_model_string(
+                "claude-sonnet-4-20250514"
+            )
+        );
+        assert!(crate::turn::agentic_tool_interception::is_valid_model_string("claude-3.5-sonnet"));
+        assert!(crate::turn::agentic_tool_interception::is_valid_model_string("openai/gpt-4o"));
+        assert!(
+            crate::turn::agentic_tool_interception::is_valid_model_string("anthropic:claude-3")
+        );
+        assert!(crate::turn::agentic_tool_interception::is_valid_model_string("m0"));
     }
 
     #[test]
     fn invalid_model_strings() {
-        assert!(!super::is_valid_model_string(""));
-        assert!(!super::is_valid_model_string("x")); // too short
-        assert!(!super::is_valid_model_string("model with spaces"));
-        assert!(!super::is_valid_model_string("-starts-with-dash"));
-        assert!(!super::is_valid_model_string("has;semicolon"));
-        assert!(!super::is_valid_model_string("has$dollar"));
-        assert!(!super::is_valid_model_string("has`backtick`"));
-        assert!(!super::is_valid_model_string("has\nnewline"));
-        assert!(!super::is_valid_model_string("has\ttab"));
-        assert!(!super::is_valid_model_string(&"a".repeat(129))); // too long
+        assert!(!crate::turn::agentic_tool_interception::is_valid_model_string(""));
+        assert!(!crate::turn::agentic_tool_interception::is_valid_model_string("x")); // too short
+        assert!(
+            !crate::turn::agentic_tool_interception::is_valid_model_string("model with spaces")
+        );
+        assert!(
+            !crate::turn::agentic_tool_interception::is_valid_model_string("-starts-with-dash")
+        );
+        assert!(!crate::turn::agentic_tool_interception::is_valid_model_string("has;semicolon"));
+        assert!(!crate::turn::agentic_tool_interception::is_valid_model_string("has$dollar"));
+        assert!(!crate::turn::agentic_tool_interception::is_valid_model_string("has`backtick`"));
+        assert!(!crate::turn::agentic_tool_interception::is_valid_model_string("has\nnewline"));
+        assert!(!crate::turn::agentic_tool_interception::is_valid_model_string("has\ttab"));
+        assert!(!crate::turn::agentic_tool_interception::is_valid_model_string(&"a".repeat(129))); // too long
     }
 
     #[test]
     fn model_string_boundary_lengths() {
-        assert!(super::is_valid_model_string("ab")); // min valid
-        assert!(super::is_valid_model_string(&format!(
-            "m{}",
-            "a".repeat(127)
-        ))); // 128 = max
-        assert!(!super::is_valid_model_string(&format!(
-            "m{}",
-            "a".repeat(128)
-        ))); // 129 = over
+        assert!(crate::turn::agentic_tool_interception::is_valid_model_string("ab")); // min valid
+        assert!(
+            crate::turn::agentic_tool_interception::is_valid_model_string(&format!(
+                "m{}",
+                "a".repeat(127)
+            ))
+        ); // 128 = max
+        assert!(
+            !crate::turn::agentic_tool_interception::is_valid_model_string(&format!(
+                "m{}",
+                "a".repeat(128)
+            ))
+        ); // 129 = over
     }
 
     // ── Skill pipeline integration tests ─────────────────────────────────
@@ -7788,7 +7330,9 @@ mod tests {
     #[test]
     fn extract_repo_name_https() {
         assert_eq!(
-            extract_repo_name_from_url("https://github.com/org/my-repo.git"),
+            crate::turn::agentic_tool_interception::extract_repo_name_from_url(
+                "https://github.com/org/my-repo.git"
+            ),
             Some("my-repo".into())
         );
     }
@@ -7796,7 +7340,9 @@ mod tests {
     #[test]
     fn extract_repo_name_ssh() {
         assert_eq!(
-            extract_repo_name_from_url("git@github.com:org/my-repo.git"),
+            crate::turn::agentic_tool_interception::extract_repo_name_from_url(
+                "git@github.com:org/my-repo.git"
+            ),
             Some("my-repo".into())
         );
     }
@@ -7804,7 +7350,9 @@ mod tests {
     #[test]
     fn extract_repo_name_no_git_suffix() {
         assert_eq!(
-            extract_repo_name_from_url("https://github.com/org/my-repo"),
+            crate::turn::agentic_tool_interception::extract_repo_name_from_url(
+                "https://github.com/org/my-repo"
+            ),
             Some("my-repo".into())
         );
     }
@@ -7812,7 +7360,9 @@ mod tests {
     #[test]
     fn extract_repo_name_trailing_slash() {
         assert_eq!(
-            extract_repo_name_from_url("https://github.com/org/repo.git/"),
+            crate::turn::agentic_tool_interception::extract_repo_name_from_url(
+                "https://github.com/org/repo.git/"
+            ),
             Some("repo".into())
         );
     }
@@ -7822,7 +7372,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("Cargo.toml"), "").unwrap();
         std::fs::write(tmp.path().join("Dockerfile"), "").unwrap();
-        let types = detect_project_types(tmp.path());
+        let types = crate::turn::agentic_tool_interception::detect_project_types(tmp.path());
         assert!(types.contains(&"rust"));
         assert!(types.contains(&"docker"));
     }
@@ -7830,7 +7380,7 @@ mod tests {
     #[test]
     fn detect_project_types_empty_dir() {
         let tmp = tempfile::tempdir().unwrap();
-        let types = detect_project_types(tmp.path());
+        let types = crate::turn::agentic_tool_interception::detect_project_types(tmp.path());
         assert!(types.is_empty());
     }
 
@@ -7840,7 +7390,7 @@ mod tests {
         // Both pyproject.toml and setup.py → single "python"
         std::fs::write(tmp.path().join("pyproject.toml"), "").unwrap();
         std::fs::write(tmp.path().join("setup.py"), "").unwrap();
-        let types = detect_project_types(tmp.path());
+        let types = crate::turn::agentic_tool_interception::detect_project_types(tmp.path());
         assert_eq!(types.iter().filter(|&&t| t == "python").count(), 1);
     }
 
