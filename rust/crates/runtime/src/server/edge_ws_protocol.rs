@@ -174,8 +174,7 @@ mod tests {
 
     #[test]
     fn edge_ping_deserializes() {
-        let msg: EdgeClientMessage =
-            serde_json::from_value(json!({"type": "edge_ping"})).unwrap();
+        let msg: EdgeClientMessage = serde_json::from_value(json!({"type": "edge_ping"})).unwrap();
         assert!(matches!(msg, EdgeClientMessage::Ping));
     }
 
@@ -196,10 +195,9 @@ mod tests {
         assert_eq!(v["user_id"], "u-123");
     }
 
-    #[test]
-    fn constants_are_reasonable() {
+    const _: () = {
         assert!(EDGE_TOOL_TIMEOUT_SECS >= 60);
         assert!(EDGE_AUTH_TIMEOUT_SECS >= 10);
         assert!(EDGE_HEARTBEAT_INTERVAL_SECS >= 10);
-    }
+    };
 }

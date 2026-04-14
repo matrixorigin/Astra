@@ -440,7 +440,6 @@ pub mod git_status_codes {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
     // ── ToolResult ─────────────────────────────────────────────────────
 
@@ -581,24 +580,51 @@ mod tests {
     #[test]
     fn categorize_reference_import() {
         assert_eq!(categorize_reference("f.rs:1:use std::io;", "io"), "import");
-        assert_eq!(categorize_reference("f.rs:1:import React from 'react';", "React"), "import");
-        assert_eq!(categorize_reference("f.rs:1:from os import path", "path"), "import");
+        assert_eq!(
+            categorize_reference("f.rs:1:import React from 'react';", "React"),
+            "import"
+        );
+        assert_eq!(
+            categorize_reference("f.rs:1:from os import path", "path"),
+            "import"
+        );
     }
 
     #[test]
     fn categorize_reference_definition() {
-        assert_eq!(categorize_reference("f.rs:1:fn my_func() {}", "my_func"), "definition");
-        assert_eq!(categorize_reference("f.rs:1:pub fn my_func() {}", "my_func"), "definition");
-        assert_eq!(categorize_reference("f.rs:1:struct Foo {}", "Foo"), "definition");
-        assert_eq!(categorize_reference("f.rs:1:class MyClass:", "MyClass"), "definition");
+        assert_eq!(
+            categorize_reference("f.rs:1:fn my_func() {}", "my_func"),
+            "definition"
+        );
+        assert_eq!(
+            categorize_reference("f.rs:1:pub fn my_func() {}", "my_func"),
+            "definition"
+        );
+        assert_eq!(
+            categorize_reference("f.rs:1:struct Foo {}", "Foo"),
+            "definition"
+        );
+        assert_eq!(
+            categorize_reference("f.rs:1:class MyClass:", "MyClass"),
+            "definition"
+        );
     }
 
     #[test]
     fn categorize_reference_usage() {
-        assert_eq!(categorize_reference("f.rs:1:    my_func();", "my_func"), "usage");
-        assert_eq!(categorize_reference("f.rs:1:    x = foo.bar();", "bar"), "usage");
+        assert_eq!(
+            categorize_reference("f.rs:1:    my_func();", "my_func"),
+            "usage"
+        );
+        assert_eq!(
+            categorize_reference("f.rs:1:    x = foo.bar();", "bar"),
+            "usage"
+        );
         // Note: "let x = ..." is categorized as "definition" by design (it starts with "let ")
-        assert_eq!(categorize_reference("f.rs:1:let x = foo.bar();", "bar"), "definition");
+        assert_eq!(
+            categorize_reference("f.rs:1:let x = foo.bar();", "bar"),
+            "definition"
+        );
     }
 
     // ── APPROVAL_REQUIRED_TOOLS ────────────────────────────────────────
@@ -618,7 +644,12 @@ mod tests {
     #[test]
     fn approval_decision_variants_debug() {
         let _ = format!("{:?}", ApprovalDecision::Approved);
-        let _ = format!("{:?}", ApprovalDecision::Denied { reason: Some("nope".into()) });
+        let _ = format!(
+            "{:?}",
+            ApprovalDecision::Denied {
+                reason: Some("nope".into())
+            }
+        );
         let _ = format!("{:?}", ApprovalDecision::Timeout);
     }
 
@@ -654,7 +685,10 @@ mod tests {
         assert!(!schemas.is_empty());
         for schema in &schemas {
             // Each schema must have type: "function" and function.name
-            assert_eq!(schema.get("type").and_then(|v| v.as_str()), Some("function"));
+            assert_eq!(
+                schema.get("type").and_then(|v| v.as_str()),
+                Some("function")
+            );
             let func = schema.get("function").expect("missing 'function' key");
             assert!(func.get("name").and_then(|n| n.as_str()).is_some());
             assert!(func.get("description").and_then(|d| d.as_str()).is_some());

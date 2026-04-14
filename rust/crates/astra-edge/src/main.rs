@@ -84,8 +84,8 @@ enum ServerToEdge {
         request_id: String,
         tool: String,
         args: serde_json::Value,
-        #[serde(default = "default_timeout")]
-        timeout_secs: u64,
+        #[serde(rename = "timeout_secs", default = "default_timeout")]
+        _timeout_secs: u64,
     },
     #[serde(rename = "edge_pong")]
     Pong,
@@ -130,7 +130,9 @@ impl LocalToolExecutor {
             }
         }
         if !normalized.starts_with(&canonical_ws) {
-            return Err(format!("SANDBOX_DENIED: path escapes workspace: {path_str}"));
+            return Err(format!(
+                "SANDBOX_DENIED: path escapes workspace: {path_str}"
+            ));
         }
         Ok(normalized)
     }
@@ -148,7 +150,10 @@ impl LocalToolExecutor {
             "git_status" => self.git_cmd(&["status", "--porcelain"]),
             "git_diff" => self.git_diff(args),
             "git_log" => self.git_log(args),
-            _ => (format!("Tool '{tool}' not available on this edge agent"), true),
+            _ => (
+                format!("Tool '{tool}' not available on this edge agent"),
+                true,
+            ),
         }
     }
 
@@ -164,7 +169,10 @@ impl LocalToolExecutor {
         match std::fs::read_to_string(&path) {
             Ok(content) => {
                 let start = args.get("start_line").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
-                let end = args.get("end_line").and_then(|v| v.as_u64()).map(|v| v as usize);
+                let end = args
+                    .get("end_line")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize);
                 let lines: Vec<&str> = content.lines().collect();
                 let start_idx = start.saturating_sub(1);
                 let end_idx = end.unwrap_or(lines.len()).min(lines.len());
@@ -213,10 +221,7 @@ impl LocalToolExecutor {
             Some(s) => s,
             None => return ("Error: Missing 'old_str' parameter".into(), true),
         };
-        let new_str = args
-            .get("new_str")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let new_str = args.get("new_str").and_then(|v| v.as_str()).unwrap_or("");
         let path = match self.resolve_path(path_str) {
             Ok(p) => p,
             Err(e) => return (e, true),
@@ -261,10 +266,7 @@ impl LocalToolExecutor {
     }
 
     fn list_dir(&self, args: &serde_json::Value) -> (String, bool) {
-        let path_str = args
-            .get("path")
-            .and_then(|v| v.as_str())
-            .unwrap_or(".");
+        let path_str = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
         let path = match self.resolve_path(path_str) {
             Ok(p) => p,
             Err(e) => return (e, true),
@@ -294,10 +296,7 @@ impl LocalToolExecutor {
             Some(c) => c,
             None => return ("Error: Missing 'command' parameter".into(), true),
         };
-        let timeout_secs = args
-            .get("timeout")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(120);
+        let timeout_secs = args.get("timeout").and_then(|v| v.as_u64()).unwrap_or(120);
 
         let result = tokio::time::timeout(
             Duration::from_secs(timeout_secs),
@@ -339,17 +338,20 @@ impl LocalToolExecutor {
             Some(p) => p,
             None => return ("Error: Missing 'pattern' parameter".into(), true),
         };
-        let path = args
-            .get("path")
-            .and_then(|v| v.as_str())
-            .unwrap_or(".");
+        let path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
         let resolved = match self.resolve_path(path) {
             Ok(p) => p,
             Err(e) => return (e, true),
         };
 
         let output = std::process::Command::new("rg")
-            .args(["--no-heading", "--line-number", "--max-count", "100", pattern])
+            .args([
+                "--no-heading",
+                "--line-number",
+                "--max-count",
+                "100",
+                pattern,
+            ])
             .current_dir(&resolved)
             .output();
 
@@ -438,7 +440,11 @@ impl LocalToolExecutor {
     }
 
     fn git_log(&self, args: &serde_json::Value) -> (String, bool) {
-        let n = args.get("n").and_then(|v| v.as_u64()).unwrap_or(20).min(100);
+        let n = args
+            .get("n")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(20)
+            .min(100);
         let n_str = format!("-{n}");
         self.git_cmd(&["log", "--oneline", &n_str])
     }
@@ -461,9 +467,7 @@ async fn run_edge_connection(args: &Args) -> Result<(), Box<dyn std::error::Erro
     tracing::info!("WebSocket connected, authenticating...");
 
     // Send auth
-    let hostname = hostname::get()
-        .ok()
-        .and_then(|h| h.into_string().ok());
+    let hostname = hostname::get().ok().and_then(|h| h.into_string().ok());
     let auth_msg = EdgeToServer::Auth {
         token: args.token.clone(),
         edge_agent_id: args.edge_id.clone(),
@@ -522,7 +526,12 @@ async fn run_edge_connection(args: &Args) -> Result<(), Box<dyn std::error::Erro
                 match msg {
                     Some(Ok(Message::Text(text))) => {
                         match serde_json::from_str::<ServerToEdge>(&text) {
-                            Ok(ServerToEdge::ToolRequest { request_id, tool, args: tool_args, timeout_secs: _ }) => {
+                            Ok(ServerToEdge::ToolRequest {
+                                request_id,
+                                tool,
+                                args: tool_args,
+                                _timeout_secs: _,
+                            }) => {
                                 tracing::info!(tool = %tool, request_id = %request_id, "Executing tool");
                                 let start = Instant::now();
                                 let (output, is_error) = executor.execute(&tool, &tool_args).await;
