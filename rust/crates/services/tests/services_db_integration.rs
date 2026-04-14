@@ -12,7 +12,9 @@
 //! created before `idx_skill_active_created_at` existed, this suite runs a **test-only** `CREATE INDEX`
 //! (ignores duplicate-name errors) so the listing path is validated against the intended DDL.
 
-use astra_core::{DEV_MATRIXONE_PASSWORD, MatrixOneSettings, SharedPool, resolve_matrixone_database_name};
+use astra_core::{
+    DEV_MATRIXONE_PASSWORD, MatrixOneSettings, SharedPool, resolve_matrixone_database_name,
+};
 use astra_services::session_audit::{
     AuditSessionListParams, CrossSessionMutationListParams, CrossSessionRuntimePromotionListParams,
     CrossSessionStatsParams, DatabaseSessionAuditService, RUNTIME_PROMOTION_EVENT_TYPE,
