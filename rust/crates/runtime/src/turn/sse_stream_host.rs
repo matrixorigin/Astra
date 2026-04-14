@@ -846,8 +846,6 @@ mod tests {
                 &mut self,
                 request_id: &str,
                 _tool: &str,
-                _approval_kind: ApprovalKind,
-                _session_id: Option<&str>,
                 _detail: Option<&str>,
             ) -> EdgeApprovalResult {
                 EdgeApprovalResult {

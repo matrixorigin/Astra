@@ -833,6 +833,48 @@ pub fn read_journal_for_digest(
     Ok(parse_journal_text(&content))
 }
 
+fn approval_metadata_str(metadata: &serde_json::Value, field: &str) -> Option<String> {
+    metadata
+        .get("approval")
+        .and_then(|approval| approval.get(field))
+        .and_then(|value| value.as_str())
+        .map(ToString::to_string)
+}
+
+pub fn find_latest_approval_decision(
+    session_id: &str,
+    request_id: &str,
+) -> std::io::Result<Option<ApprovalJournalDecision>> {
+    validate_session_id(session_id)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let events = read_journal(session_id)?;
+    for event in events.into_iter().rev() {
+        if event.event_type != JournalEventType::ApprovalDecision {
+            continue;
+        }
+        let Some(metadata) = event.metadata.as_ref() else {
+            continue;
+        };
+        let Some(found_request_id) = approval_metadata_str(metadata, "request_id") else {
+            continue;
+        };
+        if found_request_id != request_id {
+            continue;
+        }
+        let Some(decision) = approval_metadata_str(metadata, "decision") else {
+            continue;
+        };
+        return Ok(Some(ApprovalJournalDecision {
+            request_id: found_request_id,
+            decision,
+            reason: approval_metadata_str(metadata, "reason"),
+            tool_name: approval_metadata_str(metadata, "tool_name"),
+            approval_kind: approval_metadata_str(metadata, "approval_kind"),
+        }));
+    }
+    Ok(None)
+}
+
 /// List all session IDs that have journal files.
 pub fn list_sessions() -> std::io::Result<Vec<String>> {
     let dir = journal_dir();
