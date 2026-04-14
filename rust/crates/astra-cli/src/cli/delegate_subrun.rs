@@ -303,6 +303,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             total_cache_read: 0,
             total_cache_creation: 0,
             total_tool_calls: 0,
+            total_evidence_tool_calls: 0,
             has_any_usage: false,
             max_turns: DELEGATE_MAX_TURNS,
             remaining_turns: DELEGATE_MAX_TURNS,
@@ -356,6 +357,8 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             message: config.task.clone(),
             recent_tools: Vec::new(),
             task_profile,
+            last_turn_policy:
+                astra_runtime::turn::agentic_loop_host::TurnInteractionPolicy::default(),
             api: self.api.clone(),
             api_token: self.token.clone(),
             delegation_engine: None,

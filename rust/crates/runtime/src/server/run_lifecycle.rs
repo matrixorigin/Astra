@@ -678,6 +678,7 @@ impl AgenticRunLifecycleService {
             total_cache_read: 0,
             total_cache_creation: 0,
             total_tool_calls: 0,
+            total_evidence_tool_calls: 0,
             has_any_usage: false,
             max_turns,
             remaining_turns: max_turns,
@@ -717,6 +718,7 @@ impl AgenticRunLifecycleService {
             message: request.message.clone(),
             recent_tools: Vec::new(),
             task_profile,
+            last_turn_policy: crate::turn::agentic_loop_host::TurnInteractionPolicy::default(),
             api: astra_thin_client::ThinClient::new("http://127.0.0.1:1", None)
                 .expect("valid dummy URL"),
             api_token: String::new(),
@@ -1545,6 +1547,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             total_cache_read: 0,
             total_cache_creation: 0,
             total_tool_calls: 0,
+            total_evidence_tool_calls: 0,
             has_any_usage: false,
             max_turns: 10,
             remaining_turns: 10,
@@ -1591,6 +1594,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             message: full_task,
             recent_tools: Vec::new(),
             task_profile,
+            last_turn_policy: crate::turn::agentic_loop_host::TurnInteractionPolicy::default(),
             api: astra_thin_client::ThinClient::new("http://127.0.0.1:1", None)
                 .expect("valid dummy URL"),
             api_token: String::new(),

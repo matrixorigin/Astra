@@ -202,6 +202,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             total_cache_read: 0,
             total_cache_creation: 0,
             total_tool_calls: 0,
+            total_evidence_tool_calls: 0,
             has_any_usage: false,
             max_turns,
             remaining_turns: max_turns,
@@ -252,6 +253,8 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             message: config.task.clone(),
             recent_tools: Vec::new(),
             task_profile,
+            last_turn_policy:
+                astra_runtime::turn::agentic_loop_host::TurnInteractionPolicy::default(),
             api: self.api.clone(),
             api_token: self.token.clone(),
             delegation_engine: None,

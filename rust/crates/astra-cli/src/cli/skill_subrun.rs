@@ -20,7 +20,8 @@ use astra_runtime::{
     turn::agentic_loop_finalization::run_agentic_loop_with_host,
     turn::agentic_loop_host::{
         AgenticLoopHost, AgenticLoopState, CancellationState, HostTurnResult, SkillState,
-        StopHookState,
+        StopHookState, TurnInteractionMode, TurnInteractionPolicy,
+        interaction_scoped_tool_restrictions,
     },
     turn::chat_turn_heuristics::infer_task_execution_profile,
     turn::chat_turn_payload::{
@@ -35,6 +36,7 @@ use super::edge_tools;
 use super::effects::ChatTurnPrepLineGuard;
 use super::permission_manager::{PermissionManager, PermissionMode};
 use super::stream_render::{EdgeSseContext, RenderPolicy, consume_turn_sse};
+use crate::chat_stream::turn_policy_from_payload_edge_tools;
 
 const SUBRUN_MAX_TURNS: usize = 25;
 
@@ -152,6 +154,12 @@ impl AgenticLoopHost for SubRunHost {
             .model_override
             .as_deref()
             .or(self.model.as_deref());
+        let interaction_mode = TurnInteractionMode::NonInteractive;
+        let interaction_scoped_restrictions =
+            interaction_scoped_tool_restrictions(interaction_mode);
+        state
+            .restricted_tools
+            .extend(interaction_scoped_restrictions.iter().cloned());
 
         let mut payload = chat_turn_base_payload(ChatTurnBasePayloadInput {
             messages: &state.messages,
@@ -191,6 +199,7 @@ impl AgenticLoopHost for SubRunHost {
             "",    // no learned context
             None,  // no learned task type
         );
+        state.last_turn_policy = turn_policy_from_payload_edge_tools(&payload, interaction_mode);
 
         set_payload_tool_results_if_non_empty(&mut payload, &state.tool_results);
 
@@ -201,6 +210,9 @@ impl AgenticLoopHost for SubRunHost {
             .map_err(|e| e.to_string())?;
 
         if !resp.status().is_success() {
+            for name in &interaction_scoped_restrictions {
+                state.restricted_tools.remove(name);
+            }
             let status = resp.status();
             let body = resp.text().await.map_err(|e| e.to_string())?;
             return Err(format!("Sub-run API error {status}: {body}"));
@@ -234,6 +246,9 @@ impl AgenticLoopHost for SubRunHost {
             self.cancel_token.as_ref().map(|t| t.as_ref()), // propagate parent cancel
         )
         .await;
+        for name in &interaction_scoped_restrictions {
+            state.restricted_tools.remove(name);
+        }
 
         Ok(HostTurnResult {
             accum: turn.core,
@@ -465,6 +480,7 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             total_cache_read: 0,
             total_cache_creation: 0,
             total_tool_calls: 0,
+            total_evidence_tool_calls: 0,
             has_any_usage: false,
             max_turns: SUBRUN_MAX_TURNS,
             remaining_turns: SUBRUN_MAX_TURNS,
@@ -511,6 +527,7 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             message: task_context.to_string(),
             recent_tools: Vec::new(),
             task_profile: infer_task_execution_profile(task_context),
+            last_turn_policy: TurnInteractionPolicy::default(),
             api: self.api.clone(),
             api_token: self.token.clone(),
             delegation_engine: None,
@@ -556,6 +573,18 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use astra_runtime::turn::agentic_loop_host::ASK_USER_TOOL_NAME;
+
+    fn schema(name: &str) -> Value {
+        json!({
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": format!("{name} tool"),
+                "parameters": { "type": "object", "properties": {} }
+            }
+        })
+    }
 
     #[test]
     fn subrun_host_is_quiet_without_progress() {
@@ -637,6 +666,28 @@ mod tests {
         host.inject_tool_schema(schema);
         assert!(host.valid_tool_names.contains("test_tool"));
         assert_eq!(host.all_schemas.len(), 1);
+    }
+
+    #[test]
+    fn subrun_payload_policy_excludes_ask_user_in_noninteractive_mode() {
+        let mut payload = json!({});
+        let interaction_mode = TurnInteractionMode::NonInteractive;
+        let mut restricted_tools = interaction_scoped_tool_restrictions(interaction_mode);
+
+        astra_runtime::turn::agentic_prepare_payload::apply_selector_hints_then_attach_filtered_edge_tools(
+            &mut payload,
+            vec![schema("mo_query"), schema(ASK_USER_TOOL_NAME)],
+            &mut restricted_tools,
+            None,
+            0.5,
+            "",
+            None,
+        );
+
+        let policy = turn_policy_from_payload_edge_tools(&payload, interaction_mode);
+        assert_eq!(policy.visible_tool_names, vec!["mo_query".to_string()]);
+        assert_eq!(policy.evidence_tool_names, vec!["mo_query".to_string()]);
+        assert!(!policy.allow_ask_user);
     }
 
     #[tokio::test]

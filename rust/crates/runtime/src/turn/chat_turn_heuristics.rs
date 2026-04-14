@@ -7,6 +7,7 @@ use std::sync::LazyLock;
 use regex::Regex;
 use serde_json::Value;
 
+use super::agentic_loop_host::{ASK_USER_TOOL_NAME, TurnInteractionPolicy};
 use super::chat_history_openai::openai_user_content_message;
 
 const DEFAULT_STALL_WINDOW: usize = 3;
@@ -322,39 +323,51 @@ pub fn should_force_factual_tool_retry(
     profile: TaskExecutionProfile,
     input: &str,
     recent_tools: &[String],
-    total_tool_calls: u32,
+    total_evidence_tool_calls: u32,
     already_retried: bool,
+    policy: &TurnInteractionPolicy,
 ) -> bool {
     profile.allow_factual_retry
         && !already_retried
-        && total_tool_calls == 0
+        && total_evidence_tool_calls == 0
+        && policy.has_evidence_tools()
         && looks_like_live_query_with_context(input, recent_tools)
 }
 
-pub fn factual_tool_retry_message(original_query: &str, selected_tools: &[String]) -> String {
-    let tools_hint = if selected_tools.is_empty() {
-        "- For workspace state: git_status, git_diff, read_file, grep, glob.\n\
-- For GitHub data: github_ci_status, github_list_prs, github_list_issues, github_repo_stats.\n\
-- For memory: memory_search, memory_profile.\n\
-- Prefer dedicated tools over bash."
+pub fn factual_tool_retry_message(original_query: &str, policy: &TurnInteractionPolicy) -> String {
+    let tools_hint = if policy.evidence_tool_names.is_empty() {
+        "This turn does not expose any evidence-gathering tools. Do not retry with bash or invented tools."
             .to_string()
     } else {
         format!(
-            "You have exactly these tools available for this turn: {}.\n\
-Only call tools from this list — do not use bash to work around missing tools.",
-            selected_tools.join(", ")
+            "You have exactly these evidence tools available for this turn: {}.\n\
+Only call tools from this list to gather evidence — do not use bash to work around missing tools.",
+            policy.evidence_tool_names.join(", ")
         )
+    };
+    let clarification_hint = if policy.allow_ask_user
+        && policy
+            .visible_tool_names
+            .iter()
+            .any(|name| name == ASK_USER_TOOL_NAME)
+    {
+        "\nIf the request is genuinely ambiguous, you may use ask_user for clarification, but ask_user does not replace evidence collection."
+    } else if !policy.can_pause_for_user {
+        "\nThis turn cannot pause for user clarification."
+    } else {
+        ""
     };
     format!(
         "Runtime correction: your previous response answered without using any tools. \
-This query requires live data from the workspace, repository, or external sources \
-that you cannot know from training data alone. Retry from scratch and call tools first.\n\
-\n\
-{tools_hint}\n\
-\n\
-Discard your previous draft and gather evidence with tools before answering.\n\
-\n\
-Original user query: {original_query}"
+        This query requires live data from the workspace, repository, or external sources \
+        that you cannot know from training data alone. Retry from scratch and call tools first.\n\
+        \n\
+        {tools_hint}\n\
+        {clarification_hint}\n\
+        \n\
+        Discard your previous draft and gather evidence with tools before answering.\n\
+        \n\
+        Original user query: {original_query}"
     )
 }
 
@@ -362,9 +375,9 @@ Original user query: {original_query}"
 #[must_use]
 pub fn openai_factual_tool_retry_user_message(
     original_query: &str,
-    selected_tools: &[String],
+    policy: &TurnInteractionPolicy,
 ) -> Value {
-    openai_user_content_message(&factual_tool_retry_message(original_query, selected_tools))
+    openai_user_content_message(&factual_tool_retry_message(original_query, policy))
 }
 
 /// Extract `owner/repo` patterns from memory text.
@@ -420,6 +433,7 @@ pub fn extract_repos_from_memory(text: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::turn::agentic_loop_host::TurnInteractionMode;
 
     #[test]
     fn factual_query_detects_github_keywords() {
@@ -567,26 +581,33 @@ mod tests {
     #[test]
     fn force_retry_only_for_first_zero_tool_factual_answer() {
         let none: Vec<String> = vec![];
+        let policy = TurnInteractionPolicy::from_visible_tool_names(
+            TurnInteractionMode::Deny,
+            vec!["github_ci_status".into()],
+        );
         assert!(should_force_factual_tool_retry(
             TaskExecutionProfile::default(),
             "最新的一个ci?",
             &none,
             0,
-            false
+            false,
+            &policy,
         ));
         assert!(!should_force_factual_tool_retry(
             TaskExecutionProfile::default(),
             "最新的一个ci?",
             &none,
             1,
-            false
+            false,
+            &policy,
         ));
         assert!(!should_force_factual_tool_retry(
             TaskExecutionProfile::default(),
             "最新的一个ci?",
             &none,
             0,
-            true
+            true,
+            &policy,
         ));
         // Analysis tasks now also allow factual retry
         assert!(should_force_factual_tool_retry(
@@ -594,14 +615,16 @@ mod tests {
             "最新的一个ci?",
             &none,
             0,
-            false
+            false,
+            &policy,
         ));
         assert!(!should_force_factual_tool_retry(
             TaskExecutionProfile::default(),
             "hello",
             &none,
             0,
-            false
+            false,
+            &policy,
         ));
     }
 
@@ -639,33 +662,67 @@ mod tests {
 
     #[test]
     fn factual_retry_message_guides_toward_dedicated_tools() {
-        // Without selected_tools: falls back to generic hints
-        let msg = factual_tool_retry_message("memoria 最新的一个ci?", &[]);
-        assert!(msg.contains("github_ci_status"));
-        assert!(msg.contains("git_status"));
-        assert!(msg.contains("read_file"));
-        assert!(msg.contains("memoria"));
+        let policy = TurnInteractionPolicy::from_visible_tool_names(
+            TurnInteractionMode::Deny,
+            vec!["mo_query".into()],
+        );
+        let msg = factual_tool_retry_message("memoria 最新的一个ci?", &policy);
+        assert!(msg.contains("mo_query"));
+        assert!(msg.contains("cannot pause for user clarification"));
         assert!(msg.contains("Discard your previous draft"));
     }
 
     #[test]
     fn factual_retry_message_lists_selected_tools_when_provided() {
-        let tools = vec!["mo_query".to_string(), "read_file".to_string()];
-        let msg = factual_tool_retry_message("看session指标", &tools);
+        let policy = TurnInteractionPolicy::from_visible_tool_names(
+            TurnInteractionMode::Deny,
+            vec!["mo_query".to_string(), "read_file".to_string()],
+        );
+        let msg = factual_tool_retry_message("看session指标", &policy);
         assert!(msg.contains("mo_query"));
         assert!(msg.contains("read_file"));
         assert!(msg.contains("Only call tools from this list"));
-        // Should NOT contain generic hints
-        assert!(!msg.contains("github_ci_status"));
+    }
+
+    #[test]
+    fn factual_retry_message_mentions_ask_user_without_listing_it_as_evidence() {
+        let policy = TurnInteractionPolicy::from_visible_tool_names(
+            TurnInteractionMode::Prompt,
+            vec!["mo_query".to_string(), "ask_user".to_string()],
+        );
+        let msg = factual_tool_retry_message("看当前 session 指标", &policy);
+        assert!(msg.contains("mo_query"));
+        assert!(msg.contains("ask_user"));
+        assert!(!msg.contains("ask_user,"));
     }
 
     #[test]
     fn openai_factual_tool_retry_user_message_shape() {
-        let v = openai_factual_tool_retry_user_message("q", &[]);
+        let policy = TurnInteractionPolicy::from_visible_tool_names(
+            TurnInteractionMode::Deny,
+            vec!["mo_query".into()],
+        );
+        let v = openai_factual_tool_retry_user_message("q", &policy);
         assert_eq!(v["role"], "user");
         let s = v["content"].as_str().unwrap();
         assert!(s.contains("Runtime correction"));
         assert!(s.contains("Original user query: q"));
+    }
+
+    #[test]
+    fn factual_retry_requires_evidence_tools() {
+        let policy = TurnInteractionPolicy::from_visible_tool_names(
+            TurnInteractionMode::Prompt,
+            vec!["ask_user".into()],
+        );
+        assert!(!should_force_factual_tool_retry(
+            TaskExecutionProfile::default(),
+            "latest CI?",
+            &[],
+            0,
+            false,
+            &policy,
+        ));
     }
 
     #[test]

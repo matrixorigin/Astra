@@ -9,6 +9,7 @@ use std::collections::HashSet;
 use astra_core::agent_warn;
 use serde_json::Value;
 
+use super::agentic_loop_host::{TurnInteractionPolicy, tool_counts_as_factual_evidence};
 use super::chat_turn_heuristics::{
     TaskExecutionProfile, openai_factual_tool_retry_user_message, should_force_factual_tool_retry,
 };
@@ -66,6 +67,7 @@ pub struct AgenticTurnIngestMut<'a> {
     pub total_cache_read: &'a mut u64,
     pub total_cache_creation: &'a mut u64,
     pub total_tool_calls: &'a mut u32,
+    pub total_evidence_tool_calls: &'a mut u32,
     pub step_recorder: &'a mut StepRecorder,
     pub all_tools_used: &'a mut HashSet<String>,
     pub has_any_usage: &'a mut bool,
@@ -75,8 +77,8 @@ pub struct AgenticTurnIngestMut<'a> {
     pub last_measured_prompt_tokens: &'a mut Option<u64>,
     /// See [`crate::turn::agentic_loop_host::AgenticLoopState::consecutive_context_window_errors`].
     pub consecutive_context_window_errors: &'a mut u32,
-    /// Tools selected for this turn — included in factual retry correction message.
-    pub selected_tools: Vec<String>,
+    /// Actual user-interaction + visible-tool policy for the just-finished turn.
+    pub turn_policy: TurnInteractionPolicy,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -170,6 +172,22 @@ pub fn ingest_agentic_turn_stream(
     } else {
         edge_round_len
     } as u32;
+    let evidence_tool_calls_this_round = if !snap.tool_calls.is_empty() {
+        snap.tool_calls
+            .iter()
+            .filter_map(tool_call_name)
+            .filter(|name| tool_counts_as_factual_evidence(name))
+            .count()
+    } else {
+        let mut count = 0usize;
+        for i in 0..edge_round_len {
+            if tool_counts_as_factual_evidence(&edge_tool_name(i)) {
+                count += 1;
+            }
+        }
+        count
+    };
+    *st.total_evidence_tool_calls += evidence_tool_calls_this_round as u32;
 
     st.step_recorder
         .record_tokens(snap.prompt_tokens, snap.completion_tokens);
@@ -200,8 +218,9 @@ pub fn ingest_agentic_turn_stream(
             st.task_profile,
             message,
             recent_tools,
-            *st.total_tool_calls,
+            *st.total_evidence_tool_calls,
             *st.forced_factual_retry,
+            &st.turn_policy,
         ) {
             *st.forced_factual_retry = true;
             if !quiet {
@@ -209,7 +228,7 @@ pub fn ingest_agentic_turn_stream(
             }
             st.messages.push(openai_factual_tool_retry_user_message(
                 message,
-                &st.selected_tools,
+                &st.turn_policy,
             ));
             st.final_text.clear();
             record_prompt_calibration_success(snap, &mut st);
@@ -237,6 +256,7 @@ fn record_prompt_calibration_success(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::turn::agentic_loop_host::TurnInteractionMode;
     use serde_json::json;
 
     struct Pack {
@@ -249,6 +269,7 @@ mod tests {
         total_cache_read: u64,
         total_cache_creation: u64,
         total_tool_calls: u32,
+        total_evidence_tool_calls: u32,
         step_recorder: StepRecorder,
         all_tools_used: HashSet<String>,
         has_any_usage: bool,
@@ -256,6 +277,7 @@ mod tests {
         messages: Vec<Value>,
         last_measured_prompt_tokens: Option<u64>,
         consecutive_context_window_errors: u32,
+        turn_policy: TurnInteractionPolicy,
     }
 
     impl Pack {
@@ -270,6 +292,7 @@ mod tests {
                 total_cache_read: 0,
                 total_cache_creation: 0,
                 total_tool_calls: 0,
+                total_evidence_tool_calls: 0,
                 step_recorder: StepRecorder::with_persistence("s", "t"),
                 all_tools_used: HashSet::new(),
                 has_any_usage: false,
@@ -277,6 +300,10 @@ mod tests {
                 messages: Vec::new(),
                 last_measured_prompt_tokens: None,
                 consecutive_context_window_errors: 0,
+                turn_policy: TurnInteractionPolicy::from_visible_tool_names(
+                    TurnInteractionMode::Deny,
+                    vec!["read_file".into()],
+                ),
             }
         }
 
@@ -292,6 +319,7 @@ mod tests {
                 total_cache_read: &mut self.total_cache_read,
                 total_cache_creation: &mut self.total_cache_creation,
                 total_tool_calls: &mut self.total_tool_calls,
+                total_evidence_tool_calls: &mut self.total_evidence_tool_calls,
                 step_recorder: &mut self.step_recorder,
                 all_tools_used: &mut self.all_tools_used,
                 has_any_usage: &mut self.has_any_usage,
@@ -299,7 +327,7 @@ mod tests {
                 messages: &mut self.messages,
                 last_measured_prompt_tokens: &mut self.last_measured_prompt_tokens,
                 consecutive_context_window_errors: &mut self.consecutive_context_window_errors,
-                selected_tools: vec![],
+                turn_policy: self.turn_policy.clone(),
             }
         }
     }
@@ -704,7 +732,8 @@ mod tests {
             error_message: &None,
         };
         let mut pack = Pack::new();
-        pack.total_tool_calls = 3; // tools were called in a previous round
+        pack.total_tool_calls = 3;
+        pack.total_evidence_tool_calls = 3; // evidence tools were called in a previous round
         let out = ingest_agentic_turn_stream(
             &snap,
             0,
@@ -717,6 +746,37 @@ mod tests {
         assert_eq!(out, AgenticTurnIngestOutcome::Break);
         assert!(!pack.forced_factual_retry);
         assert!(pack.messages.is_empty());
+    }
+
+    #[test]
+    fn factual_retry_still_fires_after_ask_user_only_rounds() {
+        let snap = AgenticTurnStreamSnapshot {
+            ttft_ms: None,
+            session_id: &None,
+            run_id: &None,
+            full_text: "Here is the latest CI status...",
+            tool_calls: &[],
+            prompt_tokens: 20,
+            completion_tokens: 20,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            has_usage: true,
+            error_message: &None,
+        };
+        let mut pack = Pack::new();
+        pack.total_tool_calls = 1; // ask_user was called previously
+        let out = ingest_agentic_turn_stream(
+            &snap,
+            0,
+            |_| String::new(),
+            "latest CI?",
+            &[],
+            true,
+            pack.ingest_mut(),
+        );
+        assert_eq!(out, AgenticTurnIngestOutcome::Continue);
+        assert!(pack.forced_factual_retry);
+        assert_eq!(pack.total_evidence_tool_calls, 0);
     }
 
     #[test]

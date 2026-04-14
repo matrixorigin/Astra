@@ -5,6 +5,7 @@
 //! multi-turn loop runs in the runtime crate.
 
 use std::collections::HashSet;
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -16,7 +17,7 @@ use astra_runtime::{
     turn::agentic_headless_round::HeadlessStderrStyle,
     turn::agentic_loop_host::{
         AgenticLoopHost, AgenticLoopState, HostReflectionRequest, HostReflectionResult,
-        HostTurnResult,
+        HostTurnResult, TurnInteractionMode, interaction_scoped_tool_restrictions,
     },
     turn::chat_turn_api_error::CHAT_TURN_POST_MAX_RETRIES,
     turn::chat_turn_payload::{ChatTurnBasePayloadInput, chat_turn_base_payload},
@@ -29,7 +30,7 @@ use crate::{
     ExplainMode,
     edge_tools::ToolExecutor,
     effects::ChatTurnPrepLineGuard,
-    permission_manager::PermissionManager,
+    permission_manager::{PermissionManager, PermissionMode},
     stream_render::{EdgeSseContext, RenderPolicy, consume_turn_sse},
 };
 
@@ -79,6 +80,35 @@ pub(crate) struct CliAgenticLoopHost<'a> {
     pub tool_cache: crate::stream_render::EdgeToolCache,
 }
 
+fn derive_turn_interaction_mode(
+    permission_mode: PermissionMode,
+    is_plan_subtask: bool,
+    has_approval_request_tx: bool,
+    render_is_silent: bool,
+    stdin_is_terminal: bool,
+) -> TurnInteractionMode {
+    if is_plan_subtask || has_approval_request_tx || render_is_silent || !stdin_is_terminal {
+        return TurnInteractionMode::NonInteractive;
+    }
+    match permission_mode {
+        PermissionMode::Prompt => TurnInteractionMode::Prompt,
+        PermissionMode::Auto => TurnInteractionMode::Auto,
+        PermissionMode::Deny => TurnInteractionMode::Deny,
+    }
+}
+
+impl CliAgenticLoopHost<'_> {
+    fn turn_interaction_mode(&self) -> TurnInteractionMode {
+        derive_turn_interaction_mode(
+            self.perm_manager.mode(),
+            self.is_plan_subtask,
+            self.approval_request_tx.is_some(),
+            self.render_policy.is_silent(),
+            std::io::stdin().is_terminal(),
+        )
+    }
+}
+
 #[async_trait]
 impl AgenticLoopHost for CliAgenticLoopHost<'_> {
     async fn execute_turn(
@@ -116,9 +146,15 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             } else {
                 HashSet::new()
             };
+        let interaction_mode = self.turn_interaction_mode();
+        let interaction_scoped_restrictions =
+            interaction_scoped_tool_restrictions(interaction_mode);
         state
             .restricted_tools
             .extend(skill_scoped_restrictions.iter().cloned());
+        state
+            .restricted_tools
+            .extend(interaction_scoped_restrictions.iter().cloned());
 
         // Propagate skill sandbox policy to the tool executor for this turn.
         // Saved/restored so it doesn't persist after the skill deactivates.
@@ -195,19 +231,26 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             skill_effort: state.skills.effort.as_ref().map(|e| e.to_string()),
             skill_agent_type: state.skills.agent_type.clone(),
             tool_budget_override: state.tool_budget_override,
+            interaction_mode,
+            turn_policy: &mut state.last_turn_policy,
             skill_continuation: state.skill_produced_output,
             tool_cache: &mut self.tool_cache,
         })
-        .await?;
+        .await;
 
         // Remove skill-scoped restrictions so they don't accumulate permanently.
         // They'll be re-computed fresh on the next turn if skill_allowed_tools is still set.
         for name in &skill_scoped_restrictions {
             state.restricted_tools.remove(name);
         }
+        for name in &interaction_scoped_restrictions {
+            state.restricted_tools.remove(name);
+        }
 
         // Restore previous sandbox policy after the turn.
         self.executor.sandbox_policy = prev_sandbox;
+
+        let turn_result = turn_result?;
 
         Ok(HostTurnResult {
             accum: turn_result.core,
@@ -389,5 +432,50 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             }
             let _ = std::io::stdout().flush();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn derive_turn_interaction_mode_maps_permission_mode_when_interactive() {
+        assert_eq!(
+            derive_turn_interaction_mode(PermissionMode::Prompt, false, false, false, true),
+            TurnInteractionMode::Prompt
+        );
+        assert_eq!(
+            derive_turn_interaction_mode(PermissionMode::Auto, false, false, false, true),
+            TurnInteractionMode::Auto
+        );
+        assert_eq!(
+            derive_turn_interaction_mode(PermissionMode::Deny, false, false, false, true),
+            TurnInteractionMode::Deny
+        );
+    }
+
+    #[test]
+    fn derive_turn_interaction_mode_forces_noninteractive_for_subtasks_and_silent_turns() {
+        assert_eq!(
+            derive_turn_interaction_mode(PermissionMode::Prompt, true, false, false, true),
+            TurnInteractionMode::NonInteractive
+        );
+        assert_eq!(
+            derive_turn_interaction_mode(PermissionMode::Prompt, false, false, true, true),
+            TurnInteractionMode::NonInteractive
+        );
+    }
+
+    #[test]
+    fn derive_turn_interaction_mode_forces_noninteractive_without_tty_or_with_approval_channel() {
+        assert_eq!(
+            derive_turn_interaction_mode(PermissionMode::Prompt, false, false, false, false),
+            TurnInteractionMode::NonInteractive
+        );
+        assert_eq!(
+            derive_turn_interaction_mode(PermissionMode::Prompt, false, true, false, true),
+            TurnInteractionMode::NonInteractive
+        );
     }
 }

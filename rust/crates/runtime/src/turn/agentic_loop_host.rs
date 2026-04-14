@@ -81,6 +81,122 @@ pub struct HostTurnResult {
     pub edge_tool_round: Vec<EdgeToolExecResult>,
 }
 
+pub const ASK_USER_TOOL_NAME: &str = "ask_user";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TurnInteractionMode {
+    #[default]
+    NonInteractive,
+    Prompt,
+    Auto,
+    Deny,
+    Headless,
+}
+
+impl TurnInteractionMode {
+    #[must_use]
+    pub fn allows_ask_user(self) -> bool {
+        matches!(self, Self::Prompt)
+    }
+
+    #[must_use]
+    pub fn can_pause_for_user(self) -> bool {
+        matches!(self, Self::Prompt)
+    }
+
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::NonInteractive => "non_interactive",
+            Self::Prompt => "prompt",
+            Self::Auto => "auto",
+            Self::Deny => "deny",
+            Self::Headless => "headless",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnInteractionPolicy {
+    pub mode: TurnInteractionMode,
+    pub visible_tool_names: Vec<String>,
+    pub evidence_tool_names: Vec<String>,
+    pub can_pause_for_user: bool,
+    pub allow_ask_user: bool,
+}
+
+impl Default for TurnInteractionPolicy {
+    fn default() -> Self {
+        Self::from_visible_tool_names(TurnInteractionMode::NonInteractive, Vec::new())
+    }
+}
+
+impl TurnInteractionPolicy {
+    #[must_use]
+    pub fn from_visible_tool_names(
+        mode: TurnInteractionMode,
+        visible_tool_names: Vec<String>,
+    ) -> Self {
+        let mut deduped_visible = Vec::new();
+        let mut seen = HashSet::new();
+        for name in visible_tool_names {
+            if seen.insert(name.clone()) {
+                deduped_visible.push(name);
+            }
+        }
+        let evidence_tool_names = deduped_visible
+            .iter()
+            .filter(|name| tool_counts_as_factual_evidence(name))
+            .cloned()
+            .collect();
+        Self {
+            mode,
+            visible_tool_names: deduped_visible,
+            evidence_tool_names,
+            can_pause_for_user: mode.can_pause_for_user(),
+            allow_ask_user: mode.allows_ask_user(),
+        }
+    }
+
+    #[must_use]
+    pub fn from_tool_schemas(mode: TurnInteractionMode, schemas: &[Value]) -> Self {
+        let mut names = Vec::new();
+        let mut seen = HashSet::new();
+        for schema in schemas {
+            if let Some(name) = schema
+                .get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(Value::as_str)
+            {
+                let owned = name.to_string();
+                if seen.insert(owned.clone()) {
+                    names.push(owned);
+                }
+            }
+        }
+        Self::from_visible_tool_names(mode, names)
+    }
+
+    #[must_use]
+    pub fn has_evidence_tools(&self) -> bool {
+        !self.evidence_tool_names.is_empty()
+    }
+}
+
+#[must_use]
+pub fn interaction_scoped_tool_restrictions(mode: TurnInteractionMode) -> HashSet<String> {
+    if mode.allows_ask_user() {
+        HashSet::new()
+    } else {
+        HashSet::from([ASK_USER_TOOL_NAME.to_string()])
+    }
+}
+
+#[must_use]
+pub fn tool_counts_as_factual_evidence(tool_name: &str) -> bool {
+    tool_name != ASK_USER_TOOL_NAME
+}
+
 /// Request for a hidden host-executed reflection subcall.
 pub struct HostReflectionRequest<'a> {
     /// Structured runtime context that motivated the reflection.
@@ -413,6 +529,7 @@ pub struct AgenticLoopState {
     pub total_cache_read: u64,
     pub total_cache_creation: u64,
     pub total_tool_calls: u32,
+    pub total_evidence_tool_calls: u32,
     pub has_any_usage: bool,
 
     // ── Turn management ──
@@ -446,6 +563,7 @@ pub struct AgenticLoopState {
     pub message: String,
     pub recent_tools: Vec<String>,
     pub task_profile: TaskExecutionProfile,
+    pub last_turn_policy: TurnInteractionPolicy,
 
     // ── API context (for cloud tool delivery) ──
     pub api: astra_thin_client::ThinClient,
@@ -932,6 +1050,7 @@ pub(crate) mod tests {
             total_cache_read: 0,
             total_cache_creation: 0,
             total_tool_calls: 0,
+            total_evidence_tool_calls: 0,
             has_any_usage: false,
             max_turns: 10,
             remaining_turns: 10,
@@ -961,6 +1080,7 @@ pub(crate) mod tests {
             message: "test query".to_string(),
             recent_tools: Vec::new(),
             task_profile: TaskExecutionProfile::default(),
+            last_turn_policy: TurnInteractionPolicy::default(),
             api: astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
             api_token: String::new(),
             delegation_engine: None,
@@ -1017,6 +1137,41 @@ pub(crate) mod tests {
     }
 
     // ── Original tests ──────────────────────────────────────────────────────
+
+    #[test]
+    fn interaction_policy_only_counts_visible_evidence_tools() {
+        let policy = TurnInteractionPolicy::from_visible_tool_names(
+            TurnInteractionMode::Prompt,
+            vec![
+                "mo_query".to_string(),
+                ASK_USER_TOOL_NAME.to_string(),
+                "read_file".to_string(),
+            ],
+        );
+
+        assert!(policy.allow_ask_user);
+        assert!(policy.can_pause_for_user);
+        assert_eq!(
+            policy.evidence_tool_names,
+            vec!["mo_query".to_string(), "read_file".to_string()]
+        );
+    }
+
+    #[test]
+    fn interaction_scoped_restrictions_hide_ask_user_outside_prompt_turns() {
+        assert!(
+            !interaction_scoped_tool_restrictions(TurnInteractionMode::Prompt)
+                .contains(ASK_USER_TOOL_NAME)
+        );
+        for mode in [
+            TurnInteractionMode::Auto,
+            TurnInteractionMode::Deny,
+            TurnInteractionMode::Headless,
+            TurnInteractionMode::NonInteractive,
+        ] {
+            assert!(interaction_scoped_tool_restrictions(mode).contains(ASK_USER_TOOL_NAME));
+        }
+    }
 
     #[test]
     fn adaptive_scenario_event_only_emits_for_real_changes() {

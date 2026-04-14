@@ -16,6 +16,7 @@ use astra_runtime::{
     prompts,
     tool_registry::{self, ToolRegistry},
     tool_selector::{self, ToolSelector},
+    turn::agentic_loop_host::{TurnInteractionMode, TurnInteractionPolicy},
     turn::agentic_prepare_payload::apply_selector_hints_then_attach_filtered_edge_tools,
     turn::agentic_turn_telemetry::{
         accumulate_selector_token_usage, capture_first_selection_report_if_empty,
@@ -210,6 +211,21 @@ struct PrepareChatTurnRequest<'a> {
     skill_agent_type: Option<String>,
     /// Scenario-driven override for the tool selection token budget.
     tool_budget_override: Option<u32>,
+    interaction_mode: TurnInteractionMode,
+    turn_policy: &'a mut TurnInteractionPolicy,
+}
+
+pub(crate) fn turn_policy_from_payload_edge_tools(
+    payload: &Value,
+    interaction_mode: TurnInteractionMode,
+) -> TurnInteractionPolicy {
+    payload
+        .get("edge_tools")
+        .and_then(Value::as_array)
+        .map(|tools| TurnInteractionPolicy::from_tool_schemas(interaction_mode, tools))
+        .unwrap_or_else(|| {
+            TurnInteractionPolicy::from_visible_tool_names(interaction_mode, Vec::new())
+        })
 }
 
 async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
@@ -488,6 +504,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
         learned_context_hint.as_str(),
         learned_task_type.as_deref(),
     );
+    *ctx.turn_policy = turn_policy_from_payload_edge_tools(&payload, ctx.interaction_mode);
     log_chat_turn_timing_phase(timing, "skill_merge_attach_edge_tools", &mut mark);
 
     touch_prep_ui_phase(&ctx.prep_ui_phase, "Finishing up…");
@@ -687,6 +704,8 @@ pub(crate) struct ChatTurnSseFetchRequest<'a> {
     pub skill_agent_type: Option<String>,
     /// Scenario-driven override for the tool selection token budget.
     pub tool_budget_override: Option<u32>,
+    pub interaction_mode: TurnInteractionMode,
+    pub turn_policy: &'a mut TurnInteractionPolicy,
     /// When true, this is a continuation turn after a skill has already produced output.
     /// Propagated to `EdgeSseContext` to buffer text and suppress thinking previews.
     pub skill_continuation: bool,
@@ -809,6 +828,8 @@ pub(crate) async fn fetch_chat_turn_sse(
         skill_effort,
         skill_agent_type,
         tool_budget_override,
+        interaction_mode,
+        turn_policy,
         skill_continuation,
         tool_cache,
     } = ctx;
@@ -853,6 +874,8 @@ pub(crate) async fn fetch_chat_turn_sse(
             skill_effort,
             skill_agent_type,
             tool_budget_override,
+            interaction_mode,
+            turn_policy,
         },
     )
     .await?;
@@ -921,8 +944,20 @@ pub(crate) async fn fetch_chat_turn_sse(
 
 #[cfg(test)]
 mod tests {
+    use astra_runtime::turn::agentic_loop_host::{ASK_USER_TOOL_NAME, TurnInteractionMode};
     use astra_runtime::turn::chat_history_openai::merge_skill_names_track;
     use serde_json::json;
+
+    fn schema(name: &str) -> serde_json::Value {
+        json!({
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": format!("{name} tool"),
+                "parameters": { "type": "object", "properties": {} }
+            }
+        })
+    }
 
     #[test]
     fn merge_skill_names_track_dedupes() {
@@ -1071,6 +1106,33 @@ mod tests {
         assert_eq!(bd.repository_memories[0].memory_id, "prefetch-0");
         assert_eq!(bd.repository_memories[0].tokens, 80);
         assert_eq!(bd.total_tokens, 8000);
+    }
+
+    #[test]
+    fn turn_policy_from_payload_edge_tools_tracks_final_payload_tools() {
+        let payload = json!({
+            "edge_tools": [schema("mo_query"), schema(ASK_USER_TOOL_NAME)]
+        });
+
+        let policy =
+            super::turn_policy_from_payload_edge_tools(&payload, TurnInteractionMode::Prompt);
+
+        assert_eq!(
+            policy.visible_tool_names,
+            vec!["mo_query".to_string(), ASK_USER_TOOL_NAME.to_string()]
+        );
+        assert_eq!(policy.evidence_tool_names, vec!["mo_query".to_string()]);
+        assert!(policy.allow_ask_user);
+    }
+
+    #[test]
+    fn turn_policy_from_payload_edge_tools_defaults_empty_when_missing() {
+        let policy =
+            super::turn_policy_from_payload_edge_tools(&json!({}), TurnInteractionMode::Auto);
+
+        assert!(policy.visible_tool_names.is_empty());
+        assert!(policy.evidence_tool_names.is_empty());
+        assert!(!policy.allow_ask_user);
     }
 }
 
