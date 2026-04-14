@@ -2027,7 +2027,7 @@ mod tests {
     fn build_runtime_turn_evaluation_event_uses_loop_state_signals() {
         let svc = test_service();
         let request = test_request("git status");
-        let mut state = svc.build_initial_state(&request, "session-1", "run-1");
+        let mut state = svc.build_initial_state(&request, "session-1", "run-1", None);
         state.recent_tools = vec!["git_status".into()];
         state.telemetry.first_budget_pressure = 0.27;
         state.stall.events.push(("repetition_stall".into(), 1));
