@@ -139,10 +139,6 @@ fn diagnostic_message(content: String) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    // NOTE: ToolExecutor tests require CLI context, disabled in astra-tools
-    // use crate::edge_tools::ToolExecutor; // CLI-specific, not available here
-    #[cfg(feature = "cli")]
-    use serde_json::json;
     use std::sync::atomic::AtomicBool;
 
     #[test]
@@ -209,39 +205,6 @@ mod tests {
             "expected rustc hint, content={content:?}"
         );
         assert!(!pending.load(Ordering::SeqCst));
-    }
-
-    #[cfg(feature = "cli")]
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn tool_executor_write_file_triggers_passive_flush() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        std::fs::write(
-            root.join("Cargo.toml"),
-            "[package]\nname=\"passive_t4\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
-        )
-        .unwrap();
-        std::fs::create_dir_all(root.join("src")).unwrap();
-        std::fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
-
-        let exe = ToolExecutor::new(root);
-        let _ = exe
-            .execute("read_file", &json!({"path": "src/main.rs"}))
-            .await;
-        let r = exe
-            .execute(
-                "write_file",
-                &json!({"path": "src/main.rs", "content": "fn main() { let _: () = 1; }\n"}),
-            )
-            .await;
-        assert!(r.contains("\"success\":true"), "write_file: {r}");
-        let msgs = exe
-            .take_passive_workspace_diagnostic_messages(root, true)
-            .await;
-        assert_eq!(msgs.len(), 1);
-        let c = msgs[0]["content"].as_str().unwrap();
-        assert!(c.contains("<new-diagnostics>"), "{c}");
     }
 
     #[tokio::test]

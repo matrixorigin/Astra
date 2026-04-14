@@ -149,10 +149,6 @@ fn tsc_available() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    // NOTE: ToolExecutor tests require CLI context, disabled in astra-tools
-    // use crate::edge_tools::ToolExecutor; // CLI-specific, not available here
-    #[cfg(feature = "cli")]
-    use serde_json::json;
     use std::sync::atomic::AtomicBool;
 
     #[test]
@@ -223,40 +219,6 @@ mod tests {
         let msgs = take_passive_tsc_messages(&pending, root, true).await;
         assert!(msgs.is_empty());
         assert!(!pending.load(Ordering::SeqCst));
-    }
-
-    #[cfg(feature = "cli")]
-    #[tokio::test]
-    async fn tool_executor_write_file_triggers_tsc_flush() {
-        if !tsc_available() {
-            return;
-        }
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        std::fs::write(
-            root.join("tsconfig.json"),
-            r#"{"compilerOptions":{"strict":true,"noEmit":true},"include":["*.ts"]}"#,
-        )
-        .unwrap();
-        std::fs::write(root.join("ok.ts"), "export const n = 1;\n").unwrap();
-
-        let exe = ToolExecutor::new(root);
-        let _ = exe.execute("read_file", &json!({"path": "ok.ts"})).await;
-        let r = exe
-            .execute(
-                "write_file",
-                &json!({"path": "ok.ts", "content": "const bad: string = 99;\n"}),
-            )
-            .await;
-        assert!(r.contains("\"success\":true"), "{r}");
-        let msgs = exe
-            .take_passive_workspace_diagnostic_messages(root, true)
-            .await;
-        assert!(
-            msgs.iter()
-                .any(|m| m["attachment_metadata"]["source"] == "tsc_no_emit"),
-            "{msgs:?}"
-        );
     }
 
     #[test]
