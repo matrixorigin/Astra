@@ -1652,10 +1652,9 @@ mod tests {
     }
 
     #[test]
-    fn is_duplicate_key_error_rejects_protocol_error() {
-        // Protocol errors should NOT be treated as duplicate key, even if message contains "1062"
+    fn is_duplicate_key_error_detects_protocol_duplicate_wrapper() {
         let fake_err = sqlx::Error::Protocol("1062: Duplicate entry 'test' for key".into());
-        assert!(!astra_core::is_duplicate_key_error(&fake_err));
+        assert!(astra_core::is_duplicate_key_error(&fake_err));
     }
 
     #[test]
