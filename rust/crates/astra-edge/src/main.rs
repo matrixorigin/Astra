@@ -84,6 +84,7 @@ enum ServerToEdge {
         request_id: String,
         tool: String,
         args: serde_json::Value,
+        #[allow(dead_code)]
         #[serde(default = "default_timeout")]
         timeout_secs: u64,
     },
