@@ -37,7 +37,7 @@ async fn run_build_test_failing_command() {
 
 #[tokio::test]
 async fn run_build_test_cargo_in_repo() {
-    // Run cargo check in our own repo
+    // Run a fast cargo metadata query in our own repo (no compilation)
     let root = {
         let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         p.pop(); // → rust/crates/
@@ -49,7 +49,7 @@ async fn run_build_test_cargo_in_repo() {
         .execute(
             "run_build_test",
             &json!({
-                "command": "cargo check -p astra-cli --message-format=short 2>&1 | tail -5"
+                "command": "cargo metadata --format-version=1 --no-deps 2>&1 | head -1"
             }),
         )
         .await;
