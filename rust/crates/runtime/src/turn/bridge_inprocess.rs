@@ -498,7 +498,7 @@ fn section_cache_key(tool_names: &[&str], task_type: Option<&str>, confidence: f
 ///   `dynamic` holds a second system message with the per-turn profile/hints, or `None`
 ///   if there is nothing dynamic. This split enables OpenAI's automatic prefix caching:
 ///   the stable message stays identical across turns so the provider can reuse the KV cache.
-fn build_system_message(
+pub(crate) fn build_system_message(
     tool_names: &[&str],
     profile_desc: &str,
     confidence: f64,
@@ -647,7 +647,10 @@ fn build_system_message(
 ///
 /// This matches Claude Code's strategy of prioritizing message history caching
 /// for multi-turn conversations while still caching the stable tool prefix.
-fn annotate_tool_schemas_for_caching(tools: &mut [Value], cache_cfg: &PromptCacheConfig) {
+pub(crate) fn annotate_tool_schemas_for_caching(
+    tools: &mut [Value],
+    cache_cfg: &PromptCacheConfig,
+) {
     if !cache_cfg.should_annotate() || tools.is_empty() {
         return;
     }
@@ -659,7 +662,7 @@ fn annotate_tool_schemas_for_caching(tools: &mut [Value], cache_cfg: &PromptCach
 
 /// Add a cache breakpoint on the last conversation message for Anthropic.
 /// This enables turn-to-turn KV cache reuse for the conversation prefix.
-fn add_message_cache_breakpoint(messages: &mut [Value], cache_cfg: &PromptCacheConfig) {
+pub(crate) fn add_message_cache_breakpoint(messages: &mut [Value], cache_cfg: &PromptCacheConfig) {
     if !cache_cfg.should_annotate() || messages.is_empty() {
         return;
     }
