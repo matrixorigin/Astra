@@ -14,6 +14,7 @@
 use super::calibration::{CalibrationExport, ProgressiveCalibrator};
 use super::entity::{EntityGraph, EntityKnowledge};
 use super::pattern::{PatternLibrary, ToolChainPattern};
+use crate::evolution::service::PersistedActiveCanary;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -88,6 +89,9 @@ pub struct LearningSnapshot {
     /// Persistent tool health data (cross-session error budgets).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_health: Vec<ToolHealthEntry>,
+    /// Active canary state needed to continue bounded promotion/rollback after restart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_canary: Option<PersistedActiveCanary>,
 }
 
 /// Persistent tool health entry for cross-session learning.
@@ -126,6 +130,7 @@ impl Default for LearningSnapshot {
             patterns: Vec::new(),
             calibration: None,
             tool_health: Vec::new(),
+            active_canary: None,
         }
     }
 }
@@ -232,6 +237,23 @@ pub fn export_from_modules_with_health(
     calibrator: &Arc<Mutex<ProgressiveCalibrator>>,
     tool_health: &[ToolHealthEntry],
 ) -> LearningSnapshot {
+    export_from_modules_with_health_and_canary(
+        entity_graph,
+        pattern_library,
+        calibrator,
+        tool_health,
+        None,
+    )
+}
+
+/// Export all learning modules into a snapshot, including tool health and active canary state.
+pub fn export_from_modules_with_health_and_canary(
+    entity_graph: &Arc<Mutex<EntityGraph>>,
+    pattern_library: &Arc<Mutex<PatternLibrary>>,
+    calibrator: &Arc<Mutex<ProgressiveCalibrator>>,
+    tool_health: &[ToolHealthEntry],
+    active_canary: Option<PersistedActiveCanary>,
+) -> LearningSnapshot {
     let entities = entity_graph.lock().map(|g| g.export()).unwrap_or_default();
     let patterns = pattern_library
         .lock()
@@ -250,6 +272,7 @@ pub fn export_from_modules_with_health(
         patterns,
         calibration,
         tool_health: tool_health.to_vec(),
+        active_canary,
     }
 }
 
@@ -344,13 +367,38 @@ pub fn save_learning_state_with_health(
     calibrator: &Arc<Mutex<ProgressiveCalibrator>>,
     tool_health: &[ToolHealthEntry],
 ) -> Result<(), String> {
-    let snapshot =
-        export_from_modules_with_health(entity_graph, pattern_library, calibrator, tool_health);
+    save_learning_state_with_health_and_canary(
+        profile,
+        entity_graph,
+        pattern_library,
+        calibrator,
+        tool_health,
+        None,
+    )
+}
+
+/// Save learning state with tool health and active canary state included.
+pub fn save_learning_state_with_health_and_canary(
+    profile: &str,
+    entity_graph: &Arc<Mutex<EntityGraph>>,
+    pattern_library: &Arc<Mutex<PatternLibrary>>,
+    calibrator: &Arc<Mutex<ProgressiveCalibrator>>,
+    tool_health: &[ToolHealthEntry],
+    active_canary: Option<PersistedActiveCanary>,
+) -> Result<(), String> {
+    let snapshot = export_from_modules_with_health_and_canary(
+        entity_graph,
+        pattern_library,
+        calibrator,
+        tool_health,
+        active_canary,
+    );
     // Only save if there's something to persist
     if snapshot.entities.is_empty()
         && snapshot.patterns.is_empty()
         && snapshot.calibration.is_none()
         && snapshot.tool_health.is_empty()
+        && snapshot.active_canary.is_none()
     {
         return Ok(());
     }
@@ -695,6 +743,7 @@ mod tests {
             patterns: vec![],
             calibration: None,
             tool_health: Vec::new(),
+            active_canary: None,
         };
         let json = serde_json::to_string(&snapshot).unwrap();
         let loaded: LearningSnapshot = serde_json::from_str(&json).unwrap();
@@ -937,12 +986,68 @@ mod tests {
                     last_updated_epoch: 0,
                 },
             ],
+            active_canary: None,
         };
         let json = serde_json::to_string(&snapshot).unwrap();
         let loaded: LearningSnapshot = serde_json::from_str(&json).unwrap();
         assert_eq!(loaded.tool_health.len(), 2);
         assert_eq!(loaded.tool_health[0].name, "bash");
         assert!((loaded.tool_health[0].failure_rate - 0.3).abs() < 0.01);
+    }
+
+    #[test]
+    fn active_canary_roundtrip_in_snapshot() {
+        let snapshot = LearningSnapshot {
+            version: 1,
+            snapshot_epoch: 0,
+            entities: vec![],
+            patterns: vec![],
+            calibration: None,
+            tool_health: Vec::new(),
+            active_canary: Some(PersistedActiveCanary {
+                proposal: crate::evolution::types::EvolutionProposal {
+                    id: "canary-1".into(),
+                    signal: crate::evolution::types::EvolutionSignal::ToolFailure {
+                        tool_name: "bash".into(),
+                        error_snippet: "timed out".into(),
+                        skill_context: None,
+                        turn_id: "t1".into(),
+                    },
+                    axis: crate::evolution::types::EvolutionAxis::Calibration {
+                        axis: crate::evolution::types::CalibrationAxis::Intent("fetch".into()),
+                        adjustment: 0.10,
+                    },
+                    confidence: 0.8,
+                    reasoning: "Nudge fetch threshold".into(),
+                    created_at: 42,
+                    status: crate::evolution::types::ApprovalStatus::CanaryActive,
+                    promotion_verdict: Some(crate::evolution::types::ProposalPromotionVerdict {
+                        recommendation:
+                            crate::evolution::types::ProposalPromotionRecommendation::Canary,
+                        confidence_score: 0.8,
+                        support_score: 0.62,
+                        safety_score: 0.75,
+                        overall_score: 0.70,
+                        evidence: vec!["persisted".into()],
+                        blockers: Vec::new(),
+                        rollback_hint: Some("apply inverse calibration adjustment -0.10".into()),
+                    }),
+                },
+                rollback_patterns: None,
+                rollback_calibration: Some(ProgressiveCalibrator::default().export()),
+            }),
+        };
+        let json = serde_json::to_string(&snapshot).unwrap();
+        let loaded: LearningSnapshot = serde_json::from_str(&json).unwrap();
+        let active = loaded
+            .active_canary
+            .expect("active canary should roundtrip");
+        assert_eq!(active.proposal.id, "canary-1");
+        assert_eq!(
+            active.proposal.status,
+            crate::evolution::types::ApprovalStatus::CanaryActive
+        );
+        assert!(active.rollback_calibration.is_some());
     }
 
     #[test]
@@ -978,6 +1083,7 @@ mod tests {
                 failure_rate: 0.8,
                 last_updated_epoch: 0,
             }],
+            active_canary: None,
         };
         save_snapshot_to(&path, &snapshot).unwrap();
         let loaded = load_snapshot_from(&path).unwrap();

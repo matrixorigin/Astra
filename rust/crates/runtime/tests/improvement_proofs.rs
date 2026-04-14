@@ -5552,6 +5552,7 @@ mod hardening_proofs {
                     last_updated_epoch: 0,
                 },
             ],
+            active_canary: None,
         };
         save_snapshot_to(&path, &snapshot).unwrap();
 

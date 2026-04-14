@@ -308,6 +308,23 @@ impl ProgressiveCalibrator {
         }
     }
 
+    /// Rebuild an authoritative calibrator snapshot from persisted data.
+    pub fn from_export(data: &CalibrationExport) -> Self {
+        Self {
+            per_intent: data.per_intent.clone(),
+            per_domain: data.per_domain.clone(),
+            per_task: data.per_task.clone(),
+            manual_intent_adjustments: data.manual_intent_adjustments.clone(),
+            manual_domain_adjustments: data.manual_domain_adjustments.clone(),
+            manual_task_adjustments: data.manual_task_adjustments.clone(),
+            base_threshold: data.base_threshold,
+            min_threshold: 0.25,
+            max_threshold: 0.95,
+            dirty: false,
+            last_sync_epoch: 0,
+        }
+    }
+
     /// Check if calibration data changed since last sync.
     pub fn has_dirty(&self) -> bool {
         self.dirty
@@ -552,6 +569,59 @@ mod tests {
         assert!(!entry.has_enough_data());
         entry.record(false);
         assert!(entry.has_enough_data());
+    }
+
+    #[test]
+    fn from_export_restores_exact_snapshot_state() {
+        let mut calibrator = ProgressiveCalibrator::default();
+        for _ in 0..6 {
+            calibrator.record(
+                "fetch",
+                Some(DomainHint::GitHub),
+                TaskType::Fetch,
+                true,
+                None,
+            );
+        }
+        calibrator
+            .apply_evolution_adjustment(&CalibrationAxis::Intent("fetch".into()), 0.12)
+            .unwrap();
+        calibrator
+            .apply_evolution_adjustment(&CalibrationAxis::Domain(DomainHint::GitHub), -0.04)
+            .unwrap();
+
+        let export = calibrator.export();
+        let restored = ProgressiveCalibrator::from_export(&export);
+        let restored_export = restored.export();
+
+        assert_eq!(restored_export.base_threshold, export.base_threshold);
+        assert_eq!(restored_export.per_intent.len(), export.per_intent.len());
+        assert_eq!(restored_export.per_domain.len(), export.per_domain.len());
+        assert_eq!(restored_export.per_task.len(), export.per_task.len());
+        assert_eq!(
+            restored_export.manual_intent_adjustments,
+            export.manual_intent_adjustments
+        );
+        assert_eq!(
+            restored_export.manual_domain_adjustments,
+            export.manual_domain_adjustments
+        );
+        assert_eq!(
+            restored_export.manual_task_adjustments,
+            export.manual_task_adjustments
+        );
+        assert_eq!(
+            restored_export.per_intent["fetch"].total,
+            export.per_intent["fetch"].total
+        );
+        assert_eq!(
+            restored_export.per_intent["fetch"].corrections,
+            export.per_intent["fetch"].corrections
+        );
+        assert_eq!(
+            restored.calibrated_threshold("fetch", Some(DomainHint::GitHub), TaskType::Fetch),
+            calibrator.calibrated_threshold("fetch", Some(DomainHint::GitHub), TaskType::Fetch)
+        );
     }
 
     // ── Default behavior ──

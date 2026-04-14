@@ -137,7 +137,7 @@ fn seed_restricted_tools_from_blocked_patterns(
     }
 }
 
-fn initialize_runtime_controllers(
+async fn initialize_runtime_controllers(
     loop_state: &mut AgenticLoopState,
     user_id: &str,
     session_id: &str,
@@ -160,6 +160,14 @@ fn initialize_runtime_controllers(
             .with_pattern_library(learning_stack.pattern_library.clone())
             .with_calibrator(learning_stack.calibrator.clone()),
     );
+    if let Some(active_canary) = learning_stack.active_canary.clone()
+        && let Err(err) = evolution_service.restore_active_canary(active_canary).await
+    {
+        astra_core::agent_warn!(
+            "evolution",
+            "Failed to restore persisted active canary: {err}"
+        );
+    }
     evolution_service.set_runtime_promotion_signals(promotion_signals.clone());
 
     loop_state.telemetry.observability_hub = Some(hub);
@@ -194,7 +202,7 @@ async fn configure_runtime_controllers(
         tracing::debug!("skipping promotion-signals preload: no shared database pool");
         None
     };
-    initialize_runtime_controllers(loop_state, user_id, session_id, promotion_signals)
+    initialize_runtime_controllers(loop_state, user_id, session_id, promotion_signals).await
 }
 
 fn build_runtime_event_service(
@@ -983,7 +991,11 @@ impl RunLifecycleService for AgenticRunLifecycleService {
 
             // Persist learning state (patterns, calibration, entities) so the
             // next session starts with accumulated cross-session knowledge.
-            learning_stack.save();
+            let active_canary = match loop_state.evolution_service.as_ref() {
+                Some(evolution_service) => evolution_service.export_active_canary().await,
+                None => None,
+            };
+            learning_stack.save_with_active_canary(active_canary);
         });
 
         Ok(ChatRunRecord {
@@ -1056,7 +1068,11 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         .await;
 
         // Persist cross-session learning state.
-        learning_stack.save();
+        let active_canary = match state.evolution_service.as_ref() {
+            Some(evolution_service) => evolution_service.export_active_canary().await,
+            None => None,
+        };
+        learning_stack.save_with_active_canary(active_canary);
 
         let (mut final_events, final_status, error_msg) =
             Self::finalize_run_events(loop_result, host.take_emitted_events(), &state);
@@ -1629,7 +1645,11 @@ impl SubRunExecutor for ServerSubRunExecutor {
         .await;
 
         // Persist cross-session learning state.
-        learning_stack.save();
+        let active_canary = match loop_state.evolution_service.as_ref() {
+            Some(evolution_service) => evolution_service.export_active_canary().await,
+            None => None,
+        };
+        learning_stack.save_with_active_canary(active_canary);
 
         match outcome {
             Ok(AgenticLoopOutcome::Completed) => Ok(astra_services::coordination::AgentResult {

@@ -14,8 +14,8 @@ use super::types::{
 };
 
 use crate::liquid::reflection::ReflectionEngine;
-use crate::pipeline::calibration::ProgressiveCalibrator;
-use crate::pipeline::pattern::PatternLibrary;
+use crate::pipeline::calibration::{CalibrationExport, ProgressiveCalibrator};
+use crate::pipeline::pattern::{PatternLibrary, ToolChainPattern};
 use crate::runtime_promotion_signals::RuntimePromotionSignals;
 
 const MAX_APPLIED_LOG: usize = 100;
@@ -68,6 +68,15 @@ struct ProposalRoutingOutcome {
 struct CanaryExecutionSnapshot {
     pattern_library: Option<PatternLibrary>,
     calibrator: Option<ProgressiveCalibrator>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PersistedActiveCanary {
+    pub proposal: EvolutionProposal,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollback_patterns: Option<Vec<ToolChainPattern>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollback_calibration: Option<CalibrationExport>,
 }
 
 #[derive(Debug, Default)]
@@ -375,6 +384,88 @@ impl EvolutionService {
     /// Resolved canary outcomes log.
     pub async fn resolved_canaries(&self) -> Vec<EvolutionProposal> {
         self.resolved_canary_log.lock().await.clone()
+    }
+
+    pub async fn export_active_canary(&self) -> Option<PersistedActiveCanary> {
+        let registry = self.canary_registry.lock().await;
+        let proposal = registry.active.first()?.clone();
+        let snapshot = registry.snapshots.get(&proposal.id)?.clone();
+        Some(PersistedActiveCanary {
+            proposal,
+            rollback_patterns: snapshot.pattern_library.map(|library| library.export()),
+            rollback_calibration: snapshot.calibrator.map(|calibrator| calibrator.export()),
+        })
+    }
+
+    pub async fn restore_active_canary(
+        &self,
+        persisted: PersistedActiveCanary,
+    ) -> Result<(), String> {
+        if persisted.proposal.status != ApprovalStatus::CanaryActive {
+            return Err(format!(
+                "persisted canary '{}' has non-active status {:?}",
+                persisted.proposal.id, persisted.proposal.status
+            ));
+        }
+
+        match &persisted.proposal.axis {
+            EvolutionAxis::Pattern { .. } => {
+                if self.pattern_library.is_none() {
+                    return Err(
+                        "pattern library not configured for persisted pattern canary restore"
+                            .into(),
+                    );
+                }
+                if persisted.rollback_patterns.is_none() {
+                    return Err(format!(
+                        "persisted pattern canary '{}' is missing its rollback snapshot",
+                        persisted.proposal.id
+                    ));
+                }
+            }
+            EvolutionAxis::Calibration { .. } => {
+                if self.calibrator.is_none() {
+                    return Err(
+                        "progressive calibrator not configured for persisted canary restore".into(),
+                    );
+                }
+                if persisted.rollback_calibration.is_none() {
+                    return Err(format!(
+                        "persisted calibration canary '{}' is missing its rollback snapshot",
+                        persisted.proposal.id
+                    ));
+                }
+            }
+            EvolutionAxis::Skill { .. } | EvolutionAxis::Entity { .. } => {
+                return Err(format!(
+                    "persisted canary '{}' has unsupported axis for live restore",
+                    persisted.proposal.id
+                ));
+            }
+        }
+
+        let mut registry = self.canary_registry.lock().await;
+        if !registry.active.is_empty() {
+            return Err("cannot restore persisted canary while another canary is active".into());
+        }
+        let proposal = persisted.proposal;
+        let pattern_library = persisted.rollback_patterns.map(|patterns| {
+            let mut library = PatternLibrary::new();
+            library.overlay(&patterns);
+            library
+        });
+        let calibrator = persisted
+            .rollback_calibration
+            .map(|calibration| ProgressiveCalibrator::from_export(&calibration));
+        registry.snapshots.insert(
+            proposal.id.clone(),
+            CanaryExecutionSnapshot {
+                pattern_library,
+                calibrator,
+            },
+        );
+        registry.active.push(proposal);
+        Ok(())
     }
 
     /// Active canaries running against the live runtime state.
@@ -1788,6 +1879,38 @@ mod tests {
                 .map(|v| v.recommendation),
             Some(ProposalPromotionRecommendation::Canary)
         );
+    }
+
+    #[tokio::test]
+    async fn persisted_active_canary_restores_and_rolls_back_after_restart() {
+        let calibrator = Arc::new(std::sync::Mutex::new(ProgressiveCalibrator::default()));
+        let svc = EvolutionService::new().with_calibrator(calibrator.clone());
+        let ctx = svc.build_reflection_context("s", 1, None, 0.0, &[], vec![], vec![], None);
+        let llm = r#"{"proposals": [{"axis": "calibration", "description": "Nudge fetch intent threshold", "confidence": 0.80, "details": {"axis": "intent:fetch", "adjustment": 0.10}}], "summary": "ok"}"#;
+
+        svc.ingest_reflection_response_detailed(llm, &ctx)
+            .await
+            .unwrap();
+        let persisted = svc.export_active_canary().await.unwrap();
+        assert_eq!(persisted.proposal.status, ApprovalStatus::CanaryActive);
+
+        let restored_live_calibrator =
+            Arc::new(std::sync::Mutex::new(calibrator.lock().unwrap().clone()));
+        let restored = EvolutionService::new().with_calibrator(restored_live_calibrator.clone());
+        restored.restore_active_canary(persisted).await.unwrap();
+
+        let active = restored.active_canaries().await;
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].status, ApprovalStatus::CanaryActive);
+
+        let proposal_id = active[0].id.clone();
+        let rejected = restored.reject(&proposal_id).await.unwrap().unwrap();
+        assert_eq!(rejected.status, ApprovalStatus::CanaryRolledBack);
+        let threshold = restored_live_calibrator
+            .lock()
+            .unwrap()
+            .calibrated_threshold("fetch", None, TaskType::Unknown);
+        assert!((threshold - 0.70).abs() < 0.01, "got {threshold}");
     }
 
     #[tokio::test]

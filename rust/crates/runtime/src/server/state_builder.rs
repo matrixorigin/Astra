@@ -303,19 +303,25 @@ pub(super) struct PipelineLearningStack {
     pub entity_graph: Arc<Mutex<crate::pipeline::entity::EntityGraph>>,
     pub pattern_library: Arc<Mutex<crate::pipeline::pattern::PatternLibrary>>,
     pub calibrator: Arc<Mutex<crate::pipeline::calibration::ProgressiveCalibrator>>,
+    pub active_canary: Option<crate::evolution::service::PersistedActiveCanary>,
     /// Profile name used for cross-session persistence.
     pub profile: Option<String>,
 }
 
 impl PipelineLearningStack {
     /// Persist current learning state to disk if a profile was configured.
-    pub fn save(&self) {
+    pub fn save_with_active_canary(
+        &self,
+        active_canary: Option<crate::evolution::service::PersistedActiveCanary>,
+    ) {
         if let Some(ref profile) = self.profile {
-            let _ = crate::pipeline::persistence::save_learning_state(
+            let _ = crate::pipeline::persistence::save_learning_state_with_health_and_canary(
                 profile,
                 &self.entity_graph,
                 &self.pattern_library,
                 &self.calibrator,
+                &[],
+                active_canary,
             );
         }
     }
@@ -356,6 +362,7 @@ pub(super) fn build_pipeline_learning_stack(profile: Option<&str>) -> PipelineLe
 
     // Overlay cross-session persisted state after bootstrap so user-learned
     // patterns win over defaults even when the defaults carry larger priors.
+    let mut active_canary = None;
     if let Some(p) = profile
         && let Some(snapshot) = crate::pipeline::persistence::load_snapshot(p)
     {
@@ -370,6 +377,7 @@ pub(super) fn build_pipeline_learning_stack(profile: Option<&str>) -> PipelineLe
         {
             cal.merge(calibration);
         }
+        active_canary = snapshot.active_canary;
     }
 
     let writer = Arc::new(
@@ -383,6 +391,7 @@ pub(super) fn build_pipeline_learning_stack(profile: Option<&str>) -> PipelineLe
         entity_graph,
         pattern_library,
         calibrator,
+        active_canary,
         profile: profile.map(str::to_string),
     }
 }

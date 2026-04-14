@@ -5,7 +5,7 @@ use crate::pipeline::routing::{DomainHint, TaskType};
 // ── Signals ──
 
 /// A typed evolution signal detected from runtime events.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum EvolutionSignal {
     /// A tool returned an error result.
     ToolFailure {
@@ -85,7 +85,7 @@ impl EvolutionSignal {
 // ── Proposals ──
 
 /// Which axis an evolution proposal targets.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum EvolutionAxis {
     /// Modify a skill's SKILL.md content.
     Skill {
@@ -110,7 +110,7 @@ pub enum EvolutionAxis {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SkillSection {
     Instructions,
     Examples,
@@ -127,7 +127,7 @@ impl SkillSection {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum SkillDiff {
     /// Append content to the end of a section.
     Append { content: String },
@@ -140,28 +140,28 @@ pub enum SkillDiff {
     Remove { marker: String },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum PatternAction {
     Demote,
     Boost,
     Block,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum CalibrationAxis {
     Intent(String),
     Domain(DomainHint),
     Task(TaskType),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum EntityAction {
     AddTool(String),
     RemoveTool(String),
     SetDomain(DomainHint),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ProposalPromotionRecommendation {
     Promote,
     Canary,
@@ -178,7 +178,7 @@ impl ProposalPromotionRecommendation {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ProposalPromotionVerdict {
     pub recommendation: ProposalPromotionRecommendation,
     pub confidence_score: f64,
@@ -191,7 +191,7 @@ pub struct ProposalPromotionVerdict {
 }
 
 /// A proposed evolution with metadata.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct EvolutionProposal {
     pub id: String,
     pub signal: EvolutionSignal,
@@ -203,7 +203,7 @@ pub struct EvolutionProposal {
     pub promotion_verdict: Option<ProposalPromotionVerdict>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ApprovalStatus {
     Pending,
     CanaryActive,

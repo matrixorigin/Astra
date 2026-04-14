@@ -260,6 +260,10 @@ impl DomainAdapter for LearningAdapter {
             patterns: merged_patterns,
             calibration: remote_snap.calibration.or(local_snap.calibration),
             tool_health: health_map.into_values().collect(),
+            // Active canaries are runtime-local rollback state. Keep them in the
+            // local learning snapshot for restart recovery, but never merge or
+            // sync them across devices.
+            active_canary: None,
         };
 
         let item_count = Self::count_items(&merged);
@@ -1269,6 +1273,7 @@ mod tests {
                 failure_rate: 0.0,
                 last_updated_epoch: 200,
             }],
+            active_canary: None,
         };
         let data = serde_json::to_vec(&remote_snapshot).unwrap();
         let checksum = sha256_checksum(&data);
