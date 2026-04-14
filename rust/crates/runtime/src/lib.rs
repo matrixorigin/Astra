@@ -266,7 +266,8 @@ pub use turn::services::{
 pub use turn::{
     action_compensation::{
         ActionCategory, ActionCompensationProfile, CompensationKind, compensation_prompt_note,
-        tool_action_profile, tool_action_profile_value,
+        explicit_approval_reason, tool_action_profile, tool_action_profile_value,
+        tool_requires_explicit_approval,
     },
     activity::{SessionActivityUpdatePlan, build_session_activity_update_plan},
     cache::SessionCache,

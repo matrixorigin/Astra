@@ -12,7 +12,7 @@ use serde_json::{Map, Value, json};
 #[cfg(test)]
 use futures_util::stream::StreamExt;
 
-use super::action_compensation::compensation_prompt_note;
+use super::action_compensation::{compensation_prompt_note, explicit_approval_reason};
 use super::cloud_approval_policy::{bash_command_is_read_only, edge_tool_requires_cloud_approval};
 use super::edge_ledger::{
     MSG_TOOL_LEDGER_TIMEOUT, approval_callback_key, persist_value_for_ledger_tool_result,
@@ -82,13 +82,14 @@ fn tool_approval_detail(tool_call: &Value) -> Option<String> {
     let raw = raw_tool_arguments(tool_call);
     let parsed = normalize_llm_function_arguments(&raw);
     let primary = permission_prompt_primary_detail(tool_name, &parsed);
+    let explicit = explicit_approval_reason(tool_name, &parsed);
     let compensation = compensation_prompt_note(tool_name, &parsed);
-    match (primary, compensation) {
-        (Some(primary), Some(compensation)) => Some(format!("{primary}\n{compensation}")),
-        (Some(primary), None) => Some(primary),
-        (None, Some(compensation)) => Some(compensation),
-        (None, None) => None,
-    }
+    let detail = [primary, explicit, compensation]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join("\n");
+    (!detail.is_empty()).then_some(detail)
 }
 
 pub fn parse_cloud_approval_outcome(entry: Option<&Value>) -> CloudApprovalResult {
@@ -436,12 +437,27 @@ mod tests {
         })
     }
 
+    fn destructive_bash_tool(id: &str) -> Value {
+        json!({
+            "id": id,
+            "type": "function",
+            "function": {"name": "bash", "arguments": r#"{"command": "rm -rf tmp"}"#}
+        })
+    }
+
     #[test]
     fn approval_detail_includes_compensation_note_for_write_tool() {
         let detail = tool_approval_detail(&write_tool("w1")).expect("detail");
         assert!(detail.contains("b.rs"));
         assert!(detail.contains("Compensation:"));
         assert!(detail.contains("restore prior contents"));
+    }
+
+    #[test]
+    fn approval_detail_includes_explicit_note_for_irreversible_tool() {
+        let detail = tool_approval_detail(&destructive_bash_tool("b1")).expect("detail");
+        assert!(detail.contains("Explicit approval required:"));
+        assert!(detail.contains("Compensation:"));
     }
 
     #[test]
