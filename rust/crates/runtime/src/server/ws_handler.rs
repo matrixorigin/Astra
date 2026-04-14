@@ -1129,6 +1129,29 @@ async fn stream_run_over_websocket(
                 }
             }
             _ = poll.tick() => {
+                // ── Phase E: Forward pending approval requests to client ──
+                for req in state
+                    .run_lifecycle_service
+                    .drain_approval_requests(run_id)
+                    .await
+                {
+                    send_msg(
+                        socket,
+                        &WsServerMessage::ToolApprovalRequest {
+                            request_id: req.get("request_id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default()
+                                .to_string(),
+                            tool: req.get("tool")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default()
+                                .to_string(),
+                            args: req.get("args").cloned().unwrap_or_default(),
+                        },
+                    )
+                    .await;
+                }
+
                 let events = match state
                     .run_lifecycle_service
                     .stream_run(run_id.to_string(), conn.user.user_id.clone(), last_index)

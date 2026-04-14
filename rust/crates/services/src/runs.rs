@@ -72,6 +72,17 @@ pub trait RunLifecycleService: Send + Sync {
             "Resume not supported",
         ))
     }
+
+    /// Drain pending tool approval requests for a run.
+    ///
+    /// Returns JSON objects with `request_id`, `tool`, `args` fields.
+    /// The WS handler calls this during its polling loop to forward
+    /// approval requests to the client.
+    ///
+    /// Default: no-op (returns empty vec).
+    async fn drain_approval_requests(&self, _run_id: &str) -> Vec<serde_json::Value> {
+        vec![]
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
