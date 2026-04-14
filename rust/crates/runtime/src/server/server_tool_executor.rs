@@ -64,6 +64,8 @@ pub struct ServerToolExecutor {
     approval_gate: Option<Arc<dyn astra_tools::ToolApprovalGate>>,
     /// Optional progress callback for streaming tool output.
     progress_callback: Option<Arc<dyn astra_tools::ToolProgressCallback>>,
+    /// Optional edge connection pool for routing to remote edge agents.
+    edge_connection_pool: Option<super::edge_connection_pool::EdgeConnectionPool>,
 }
 
 impl ServerToolExecutor {
@@ -108,6 +110,7 @@ impl ServerToolExecutor {
             url_cache: Mutex::new(HashMap::new()),
             approval_gate: None,
             progress_callback: None,
+            edge_connection_pool: None,
         }
     }
 
@@ -121,11 +124,31 @@ impl ServerToolExecutor {
         self.progress_callback = Some(cb);
     }
 
+    /// Set the edge connection pool for remote tool routing.
+    pub fn set_edge_connection_pool(
+        &mut self,
+        pool: super::edge_connection_pool::EdgeConnectionPool,
+    ) {
+        self.edge_connection_pool = Some(pool);
+    }
+
     /// Execute a tool call and return the result string.
     ///
-    /// This is the main entry point called by the headless round when
-    /// no edge agent is available.
+    /// Routing order:
+    /// 1. Try remote edge agent (if connected via WebSocket)
+    /// 2. Fall back to local server-side execution
     pub async fn execute(&self, name: &str, args: &Value) -> String {
+        // ── Try remote edge agent first ──────────────────────────────
+        if let Some(pool) = &self.edge_connection_pool {
+            if let Some(result) = pool.execute_tool_any_edge(&self.user_id, name, args).await {
+                return result.output;
+            }
+        }
+        self.execute_local(name, args).await
+    }
+
+    /// Execute a tool locally on the server (no edge routing).
+    async fn execute_local(&self, name: &str, args: &Value) -> String {
         // ── Approval gate check ──────────────────────────────────────
         if let Some(gate) = &self.approval_gate {
             if gate.requires_approval(name) {

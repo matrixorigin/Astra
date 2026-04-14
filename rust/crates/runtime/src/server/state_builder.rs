@@ -265,7 +265,8 @@ pub async fn build_server_state(
     )
     .with_pool(shared_pool.clone())
     .with_run_engine(run_engine)
-    .with_delegation_engine(Arc::clone(&delegation_engine));
+    .with_delegation_engine(Arc::clone(&delegation_engine))
+    .with_edge_connection_pool(state.edge_connection_pool.clone());
     // Wire team persistence store backed by MatrixOne.
     let team_store =
         astra_services::team_persistence::MatrixOneTeamStore::new(shared_pool.get().clone());

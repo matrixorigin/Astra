@@ -50,6 +50,9 @@ mod team_handlers;
 pub mod team_orchestrator;
 pub mod worktree_isolation;
 mod ws_handler;
+pub mod edge_ws_protocol;
+pub mod edge_connection_pool;
+mod edge_ws_handler;
 
 use self::{
     bridge_prep::prepare_chat_turn_bridge_body,

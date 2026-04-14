@@ -7,6 +7,7 @@ members = [
     "crates/astra-cli",
     "crates/astra-admin",
     "crates/astra-thin-client",
+    "crates/astra-edge",
 ]
 resolver = "2"
 
@@ -51,6 +52,9 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
     "std",
 ] }
 http-body-util = "0.1"
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
+clap = { version = "4", features = ["derive", "env"] }
+hostname = "0.4"
 
 [profile.dev]
 debug = "line-tables-only"

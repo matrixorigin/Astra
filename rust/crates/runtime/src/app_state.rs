@@ -95,6 +95,8 @@ pub struct AppState {
     /// Team persistence store — CRUD for team definitions and execution history.
     pub(crate) team_store:
         Option<Arc<dyn astra_services::team_persistence::TeamPersistenceService>>,
+    /// Live edge agent WebSocket connections for remote tool execution (Phase 6).
+    pub edge_connection_pool: crate::server::edge_connection_pool::EdgeConnectionPool,
 }
 
 impl AppState {
@@ -178,6 +180,7 @@ impl AppState {
             agent_profile_registry: Arc::new(astra_services::AgentProfileRegistry::new()),
             delegation_engine: None,
             team_store: None,
+            edge_connection_pool: crate::server::edge_connection_pool::EdgeConnectionPool::new(),
         }
     }
 

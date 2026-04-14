@@ -426,6 +426,8 @@ pub struct AgenticRunLifecycleService {
     run_engine: Option<RunEngine>,
     /// Optional delegation engine for multi-agent coordination.
     delegation_engine: Option<Arc<crate::server::delegation_engine::DelegationEngine>>,
+    /// Live edge WebSocket connection pool (Phase 6).
+    edge_connection_pool: Option<super::edge_connection_pool::EdgeConnectionPool>,
 }
 
 impl AgenticRunLifecycleService {
@@ -442,6 +444,7 @@ impl AgenticRunLifecycleService {
             edge_callback_ledger,
             run_engine: None,
             delegation_engine: None,
+            edge_connection_pool: None,
         }
     }
 
@@ -460,6 +463,14 @@ impl AgenticRunLifecycleService {
         engine: Arc<crate::server::delegation_engine::DelegationEngine>,
     ) -> Self {
         self.delegation_engine = Some(engine);
+        self
+    }
+
+    pub fn with_edge_connection_pool(
+        mut self,
+        pool: super::edge_connection_pool::EdgeConnectionPool,
+    ) -> Self {
+        self.edge_connection_pool = Some(pool);
         self
     }
 
@@ -999,13 +1010,16 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         // already-provisioned workspace for the ServerToolExecutor.
         if let Some(workspace) = server_workspace {
             let memoria_base = std::env::var("MEMORIA_BASE_URL").ok();
-            let executor = super::server_tool_executor::ServerToolExecutor::new(
+            let mut executor = super::server_tool_executor::ServerToolExecutor::new(
                 workspace,
                 user_id.clone(),
                 session_id.clone(),
                 memoria_base,
                 None,
             );
+            if let Some(pool) = &self.edge_connection_pool {
+                executor.set_edge_connection_pool(pool.clone());
+            }
             loop_state.server_tool_executor = Some(std::sync::Arc::new(executor));
         }
 
