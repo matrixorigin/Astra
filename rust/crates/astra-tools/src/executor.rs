@@ -1,6 +1,6 @@
 //! Default tool executor — the shared implementation used by CLI, server, and edge.
 //!
-//! Routes tool calls to the appropriate module (fs_ops, shell_ops, git_ops, etc.)
+//! Routes tool calls to the appropriate module (fs_ops, shell_ops, git_gix, etc.)
 //! and returns [`ToolResult`]. Consumers wrap this with their own context
 //! (e.g., `ServerToolExecutor` adds resource governance and process isolation,
 //! `CliToolExecutor` adds terminal UI and MCP dispatch).
@@ -11,18 +11,40 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::Value;
 
+use crate::github::GitHubClient;
+use crate::task_mgmt::TaskManager;
 use crate::{
     FileEditJournal, GitRollbackJournal, ToolApprovalGate, ToolContext, ToolExecutor,
     ToolProgressCallback, ToolResult,
 };
 
+// ─── Helper ─────────────────────────────────────────────────────────────────
+
+/// Convert a String-returning tool function to ToolResult.
+/// Convention: outputs starting with "Error" are error results.
+fn string_to_result(output: String) -> ToolResult {
+    if output.starts_with("Error") {
+        ToolResult::error(output)
+    } else {
+        ToolResult::text(output)
+    }
+}
+
+// ─── DefaultToolExecutor ────────────────────────────────────────────────────
+
 /// Default tool executor with the full shared tool set.
+///
+/// Covers file ops, shell, git (via gix), GitHub API, code intelligence,
+/// task management, and utility tools. CLI-specific tools (ask_user, MCP,
+/// LSP subprocess, interactive shell) are handled by wrapping executors.
 pub struct DefaultToolExecutor {
     ctx: ToolContext,
     approval_gate: Option<Arc<dyn ToolApprovalGate>>,
     progress_callback: Option<Arc<dyn ToolProgressCallback>>,
     file_journal: Option<Arc<std::sync::Mutex<dyn FileEditJournal>>>,
     git_journal: Option<Arc<std::sync::Mutex<dyn GitRollbackJournal>>>,
+    github_client: Option<GitHubClient>,
+    task_manager: Arc<TaskManager>,
 }
 
 impl DefaultToolExecutor {
@@ -33,6 +55,8 @@ impl DefaultToolExecutor {
             progress_callback: None,
             file_journal: None,
             git_journal: None,
+            github_client: None,
+            task_manager: Arc::new(TaskManager::new()),
         }
     }
 
@@ -56,14 +80,29 @@ impl DefaultToolExecutor {
         self
     }
 
+    pub fn with_github_client(mut self, client: GitHubClient) -> Self {
+        self.github_client = Some(client);
+        self
+    }
+
+    pub fn with_task_manager(mut self, mgr: Arc<TaskManager>) -> Self {
+        self.task_manager = mgr;
+        self
+    }
+
     /// Access the underlying context.
     pub fn context(&self) -> &ToolContext {
         &self.ctx
     }
 
-    /// Workspace root path.
+    /// Workspace root path (alias for `context().workspace_root`).
     pub fn workspace_root(&self) -> &Path {
         &self.ctx.workspace_root
+    }
+
+    /// Project root path (alias for `context().project_root`).
+    pub fn project_root_path(&self) -> &Path {
+        &self.ctx.project_root
     }
 }
 
@@ -115,30 +154,14 @@ impl ToolExecutor for DefaultToolExecutor {
     }
 }
 
+// ─── Dispatch ───────────────────────────────────────────────────────────────
+
 impl DefaultToolExecutor {
     async fn dispatch(&self, name: &str, args: &Value) -> ToolResult {
         let ws = &self.ctx.workspace_root;
+        let pr = &self.ctx.project_root;
+
         match name {
-            // ── Memory tools (HTTP proxy) ────────────────────────────
-            "memory_retrieve" | "memory_store" | "memory_search" | "memory_purge"
-            | "memory_correct" | "memory_profile" | "memory_feedback" => {
-                // Memoria tools are dispatched by the wrapping executor
-                // (ServerToolExecutor / CliToolExecutor) which has HTTP client config.
-                ToolResult::error(format!(
-                    "Error: Memory tool '{name}' requires a configured memoria endpoint.                      Use ServerToolExecutor or CliToolExecutor instead of DefaultToolExecutor."
-                ))
-            }
-
-            // ── Web search ───────────────────────────────────────────
-            "web_search" => {
-                let text = crate::web_search::web_search(args);
-                if text.starts_with("Error") {
-                    ToolResult::error(text)
-                } else {
-                    ToolResult::text(text)
-                }
-            }
-
             // ── File operations ──────────────────────────────────────
             "read_file" => crate::fs_ops::read_file(ws, args),
             "write_file" => crate::fs_ops::write_file(ws, args),
@@ -151,13 +174,60 @@ impl DefaultToolExecutor {
             "grep" => crate::shell_ops::grep(ws, args),
             "glob" => crate::shell_ops::glob(ws, args),
 
-            // ── Git operations ───────────────────────────────────────
-            "git_status" => crate::git_ops::status(ws),
-            "git_diff" => crate::git_ops::diff(ws, args),
-            "git_log" => crate::git_ops::log(ws, args),
-            "git_show" => crate::git_ops::show(ws, args),
-            "git_blame" => crate::git_ops::blame(ws, args),
-            "git_commit" => crate::git_ops::commit(ws, args),
+            // ── Git operations (gix-based) ───────────────────────────
+            "git_status" => string_to_result(crate::git_gix::git_status(pr)),
+            "git_diff" => string_to_result(crate::git_gix::git_diff(pr, args, 0.0, 0)),
+            "git_log" => string_to_result(crate::git_gix::git_log(pr, args)),
+            "git_show" => string_to_result(crate::git_gix::git_show(pr, args, 0.0, 0)),
+            "git_blame" => string_to_result(crate::git_gix::git_blame(pr, args)),
+            "git_commit" => string_to_result(crate::git_gix::git_commit(pr, args)),
+            "git_file_history" => string_to_result(crate::git_gix::git_file_history(pr, args)),
+            "git_log_search" => string_to_result(crate::git_gix::git_log_search(pr, args)),
+            "git_contributors" => string_to_result(crate::git_gix::git_contributors(pr, args)),
+            "git_revert_commit" => string_to_result(crate::git_gix::git_revert_commit(pr, args)),
+            "git_stash" => string_to_result(crate::git_gix::git_stash(pr, args)),
+
+            // ── GitHub API ───────────────────────────────────────────
+            "github_list_prs"
+            | "github_get_pr"
+            | "github_ci_status"
+            | "github_list_issues"
+            | "github_get_issue"
+            | "github_repo_stats"
+            | "github_create_issue" => self.dispatch_github(name, args).await,
+
+            // ── Code intelligence (tree-sitter) ──────────────────────
+            "symbols" => self.dispatch_symbols(args),
+
+            // ── Web search ───────────────────────────────────────────
+            "web_search" => string_to_result(crate::web_search::web_search(args)),
+
+            // ── Task management ──────────────────────────────────────
+            "task_create" => string_to_result(self.task_manager.create(args).await),
+            "task_list" => string_to_result(self.task_manager.list(args).await),
+            "task_get" => string_to_result(self.task_manager.get(args).await),
+            "task_update" => string_to_result(self.task_manager.update(args).await),
+            "task_stop" => string_to_result(self.task_manager.stop(args).await),
+
+            // ── Utility tools ────────────────────────────────────────
+            "tool_search" => {
+                let schemas = self.tool_schemas();
+                string_to_result(crate::tool_search::tool_search(&schemas, args))
+            }
+            "env" => string_to_result(crate::env_tools::env_tool(args)),
+            "config" => {
+                // Default limits; wrapping executors can override
+                string_to_result(crate::config_tool::config_tool(128_000, 16_000, args))
+            }
+
+            // ── Memory tools (require configured endpoint) ───────────
+            "memory_retrieve" | "memory_store" | "memory_search" | "memory_purge"
+            | "memory_correct" | "memory_profile" | "memory_feedback" => {
+                ToolResult::error(format!(
+                    "Error: Memory tool '{name}' requires a configured memoria endpoint. \
+                     Use ServerToolExecutor or CliToolExecutor instead of DefaultToolExecutor."
+                ))
+            }
 
             // ── Delegation placeholder ───────────────────────────────
             "delegate" => ToolResult::text(
@@ -168,6 +238,65 @@ impl DefaultToolExecutor {
             _ => ToolResult::error(format!(
                 "Error: Tool '{name}' not available in DefaultToolExecutor"
             )),
+        }
+    }
+
+    /// Dispatch GitHub API tools via the optional GitHubClient.
+    async fn dispatch_github(&self, name: &str, args: &Value) -> ToolResult {
+        let client = match &self.github_client {
+            Some(c) => c,
+            None => {
+                return ToolResult::error(format!(
+                    "Error: GitHub tool '{name}' requires a configured GitHub client. \
+                     Call with_github_client() when building DefaultToolExecutor."
+                ));
+            }
+        };
+        let output = match name {
+            "github_list_prs" => client.github_list_prs(args).await,
+            "github_get_pr" => client.github_get_pr(args).await,
+            "github_ci_status" => client.github_ci_status(args).await,
+            "github_list_issues" => client.github_list_issues(args).await,
+            "github_get_issue" => client.github_get_issue(args).await,
+            "github_repo_stats" => client.github_repo_stats(args).await,
+            "github_create_issue" => client.github_create_issue(args).await,
+            _ => return ToolResult::error(format!("Error: Unknown GitHub tool '{name}'")),
+        };
+        string_to_result(output)
+    }
+
+    /// Dispatch the `symbols` tool: read a file, detect language, extract symbols.
+    fn dispatch_symbols(&self, args: &Value) -> ToolResult {
+        let path_str = match args.get("path").and_then(|v| v.as_str()) {
+            Some(p) => p,
+            None => return ToolResult::error("Error: Missing 'path' parameter".into()),
+        };
+        let resolved = match crate::fs_ops::resolve_path(&self.ctx.workspace_root, path_str) {
+            Ok(p) => p,
+            Err(e) => return ToolResult::error(e),
+        };
+        let source = match std::fs::read_to_string(&resolved) {
+            Ok(s) => s,
+            Err(e) => return ToolResult::error(format!("Error: Cannot read file: {e}")),
+        };
+        let lang = match crate::code_intel::detect_language(&resolved) {
+            Some(l) => l,
+            None => {
+                return ToolResult::error(format!(
+                    "Error: Cannot detect language for '{path_str}'"
+                ));
+            }
+        };
+        let symbols = crate::code_intel::extract_symbols(&source, lang);
+        let outline = symbols
+            .iter()
+            .map(|s| format!("{}:{:?} {}", s.start_line + 1, s.kind, s.name))
+            .collect::<Vec<_>>()
+            .join("\n");
+        if outline.is_empty() {
+            ToolResult::text("No symbols found.".into())
+        } else {
+            ToolResult::text(outline)
         }
     }
 }
@@ -252,5 +381,96 @@ mod tests {
         assert!(!result.is_error);
         let content = std::fs::read_to_string(tmp.path().join("f.txt")).unwrap();
         assert_eq!(content, "new text here");
+    }
+
+    #[tokio::test]
+    async fn dispatch_env() {
+        let (_tmp, exec) = test_executor();
+        let result = exec
+            .execute("env", &serde_json::json!({"action": "list"}))
+            .await;
+        assert!(!result.is_error);
+    }
+
+    #[tokio::test]
+    async fn dispatch_tool_search() {
+        let (_tmp, exec) = test_executor();
+        let result = exec
+            .execute("tool_search", &serde_json::json!({"query": "file"}))
+            .await;
+        assert!(!result.is_error);
+    }
+
+    #[tokio::test]
+    async fn dispatch_task_lifecycle() {
+        let (_tmp, exec) = test_executor();
+        let result = exec
+            .execute(
+                "task_create",
+                &serde_json::json!({"title": "test task", "description": "do stuff"}),
+            )
+            .await;
+        assert!(!result.is_error);
+
+        let result = exec.execute("task_list", &serde_json::json!({})).await;
+        assert!(!result.is_error);
+        assert!(result.output.contains("test task"));
+    }
+
+    #[tokio::test]
+    async fn dispatch_github_without_client() {
+        let (_tmp, exec) = test_executor();
+        let result = exec
+            .execute("github_list_prs", &serde_json::json!({}))
+            .await;
+        assert!(result.is_error);
+        assert!(
+            result
+                .output
+                .contains("requires a configured GitHub client")
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_memory_without_endpoint() {
+        let (_tmp, exec) = test_executor();
+        let result = exec
+            .execute("memory_store", &serde_json::json!({"content": "test"}))
+            .await;
+        assert!(result.is_error);
+        assert!(
+            result
+                .output
+                .contains("requires a configured memoria endpoint")
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_symbols() {
+        let (tmp, exec) = test_executor();
+        std::fs::write(
+            tmp.path().join("sample.rs"),
+            "fn hello() {}\nstruct Foo {}\n",
+        )
+        .unwrap();
+        let result = exec
+            .execute("symbols", &serde_json::json!({"path": "sample.rs"}))
+            .await;
+        assert!(!result.is_error);
+        assert!(result.output.contains("hello"));
+    }
+
+    #[tokio::test]
+    async fn string_to_result_error() {
+        let r = string_to_result("Error: something went wrong".into());
+        assert!(r.is_error);
+        assert!(r.output.contains("something went wrong"));
+    }
+
+    #[tokio::test]
+    async fn string_to_result_ok() {
+        let r = string_to_result("All good".into());
+        assert!(!r.is_error);
+        assert_eq!(r.output, "All good");
     }
 }
