@@ -680,6 +680,8 @@ pub enum JournalEventType {
     Checkpoint,
     /// TurnGuard verdict emitted (unified non-happy-path audit).
     TurnGuardVerdict,
+    /// Turn quality evaluation recorded for audit and replay surfaces.
+    TurnEvaluation,
     /// Plan execution progress (subtask started, completed, plan done).
     PlanProgress,
     /// Forked from another session — records lineage for audit and sync.
@@ -2094,6 +2096,39 @@ impl JournalEvent {
             "total_timeouts": total_timeouts,
             "total_cache_hits": total_cache_hits,
             "flaky_tools": flaky_count,
+        }));
+        evt
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn turn_evaluation(
+        session_id: Option<&str>,
+        turn: Option<u32>,
+        source: &str,
+        live_query: bool,
+        success: bool,
+        quality: f64,
+        confidence: f64,
+        budget_pressure: f64,
+        stall_count: usize,
+        verdict_warning: bool,
+        tool_call_count: usize,
+        signals: Vec<serde_json::Value>,
+    ) -> Self {
+        let mut evt = Self::base(JournalEventType::TurnEvaluation, session_id);
+        evt.turn = turn;
+        evt.metadata = Some(serde_json::json!({
+            "source": source,
+            "live_query": live_query,
+            "success": success,
+            "quality": quality,
+            "confidence": confidence,
+            "budget_pressure": budget_pressure,
+            "stall_count": stall_count,
+            "verdict_warning": verdict_warning,
+            "tool_call_count": tool_call_count,
+            "signal_count": signals.len(),
+            "signals": signals,
         }));
         evt
     }
@@ -3763,6 +3798,72 @@ mod tests {
         assert_eq!(meta["force_stop"], false);
         assert_eq!(meta["non_timeout_errors"], 1);
         assert_eq!(meta["avoid_tools_count"], 0);
+    }
+
+    #[test]
+    fn turn_evaluation_event_serializes() {
+        let evt = JournalEvent::turn_evaluation(
+            Some("sess-1"),
+            Some(4),
+            "cli_repl",
+            true,
+            true,
+            0.91,
+            0.72,
+            0.18,
+            1,
+            false,
+            2,
+            vec![serde_json::json!({
+                "kind": "all_tools_healthy",
+                "weight": 0.4,
+                "message": "All tool calls completed successfully"
+            })],
+        );
+        let json = serde_json::to_string(&evt).unwrap();
+        assert!(json.contains("\"type\":\"turn_evaluation\""));
+        assert!(json.contains("\"turn\":4"));
+
+        let parsed: JournalEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.event_type, JournalEventType::TurnEvaluation);
+        let meta = parsed.metadata.unwrap();
+        assert_eq!(meta["source"], "cli_repl");
+        assert_eq!(meta["live_query"], true);
+        assert_eq!(meta["success"], true);
+        assert_eq!(meta["quality"], 0.91);
+        assert_eq!(meta["confidence"], 0.72);
+        assert_eq!(meta["budget_pressure"], 0.18);
+        assert_eq!(meta["stall_count"], 1);
+        assert_eq!(meta["verdict_warning"], false);
+        assert_eq!(meta["tool_call_count"], 2);
+        assert_eq!(meta["signal_count"], 1);
+        assert_eq!(meta["signals"][0]["kind"], "all_tools_healthy");
+    }
+
+    #[test]
+    fn turn_evaluation_event_without_turn_is_allowed() {
+        let evt = JournalEvent::turn_evaluation(
+            Some("sess-2"),
+            None,
+            "server_runtime",
+            false,
+            false,
+            0.35,
+            0.81,
+            0.64,
+            2,
+            true,
+            0,
+            vec![],
+        );
+        let json = serde_json::to_string(&evt).unwrap();
+        let parsed: JournalEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.event_type, JournalEventType::TurnEvaluation);
+        assert_eq!(parsed.turn, None);
+        let meta = parsed.metadata.unwrap();
+        assert_eq!(meta["source"], "server_runtime");
+        assert_eq!(meta["signal_count"], 0);
+        assert_eq!(meta["signals"], serde_json::json!([]));
     }
 
     // ── stall_detected event ──

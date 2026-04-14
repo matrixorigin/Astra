@@ -492,15 +492,20 @@ impl TeamExecutionOrchestrator {
                     }
                 }
                 // Cleanup delegation state even on error path
-                self.delegation_tracker
+                let failure = match self
+                    .delegation_tracker
                     .cleanup_delegation(&delegation_id)
-                    .await;
-                return self.fail_report(
-                    team_name,
-                    &delegation_id,
-                    &parent_run_id,
-                    format!("delegation failed: {e}"),
-                );
+                    .await
+                {
+                    Ok(()) => format!("delegation failed: {e}"),
+                    Err(cleanup_err) => {
+                        eprintln!(
+                            "[team-orchestrator] delegation cleanup skipped after error: {cleanup_err}"
+                        );
+                        format!("delegation failed: {e}; cleanup skipped: {cleanup_err}")
+                    }
+                };
+                return self.fail_report(team_name, &delegation_id, &parent_run_id, failure);
             }
         };
 
@@ -687,9 +692,13 @@ impl TeamExecutionOrchestrator {
         }
 
         // Cleanup delegation pause flags and progress entries
-        self.delegation_tracker
+        if let Err(cleanup_err) = self
+            .delegation_tracker
             .cleanup_delegation(&delegation_id)
-            .await;
+            .await
+        {
+            eprintln!("[team-orchestrator] delegation cleanup skipped: {cleanup_err}");
+        }
 
         TeamExecutionReport {
             team_name: team_name.to_string(),

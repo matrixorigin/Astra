@@ -853,6 +853,7 @@ fn commit_turn_journal_workspace_and_sidecars(
     state: &mut ReplState,
     line: &str,
     result: &StreamResult,
+    learning_snap: &ReplTurnLearningSnapshot,
     turn_start: Instant,
 ) {
     if let Some(journal) = state.journal.as_ref() {
@@ -1099,6 +1100,25 @@ fn commit_turn_journal_workspace_and_sidecars(
             enqueue_ingestion(state, &verdict_event);
         }
 
+        let turn_eval_event =
+            astra_runtime::pipeline::evaluation::build_turn_evaluation_journal_event(
+                state.session_id.as_deref(),
+                Some(state.turn),
+                "cli_repl",
+                line,
+                &state.recent_tools,
+                &result.tool_call_records,
+                result.stall_events.len(),
+                result.verdict_events.iter().any(|event| {
+                    event.severity.eq_ignore_ascii_case("warning")
+                        || event.severity.eq_ignore_ascii_case("critical")
+                }),
+                result.budget_pressure,
+                &learning_snap.eval,
+            );
+        let _ = journal.append(&turn_eval_event);
+        enqueue_ingestion(state, &turn_eval_event);
+
         // Step Protocol recorder summary: previously emitted as a second
         // checkpoint event, causing duplicate checkpoint entries with
         // inconsistent token counts. The summary is already captured in the
@@ -1119,34 +1139,21 @@ pub(super) fn analyze_repl_turn_learning(
     recent_tools: &[String],
     result: &StreamResult,
 ) -> ReplTurnLearningSnapshot {
-    use astra_runtime::pipeline::evaluation::{ToolCallInfo, evaluate_turn};
+    use astra_runtime::pipeline::evaluation::evaluate_tool_call_records;
     use astra_runtime::pipeline::routing::RoutingEngine;
     let routing = RoutingEngine::analyze(line, turn, recent_tools, &[], vec![]);
-    let is_live_query = looks_like_live_query_with_context(line, recent_tools);
 
-    let tool_infos: Vec<ToolCallInfo> = result
-        .tool_call_records
-        .iter()
-        .map(|r| ToolCallInfo {
-            name: r.name.clone(),
-            ok: r.ok,
-            ms: r.ms,
-            error: r.error.clone(),
-            output_bytes: r.output_bytes,
-        })
-        .collect();
+    let has_verdict_warning = result.verdict_events.iter().any(|v| {
+        v.severity.eq_ignore_ascii_case("warning") || v.severity.eq_ignore_ascii_case("critical")
+    });
 
-    let has_verdict_warning = result
-        .verdict_events
-        .iter()
-        .any(|v| v.severity == "Warning" || v.severity == "Critical");
-
-    let eval = evaluate_turn(
-        &tool_infos,
+    let eval = evaluate_tool_call_records(
+        line,
+        recent_tools,
+        &result.tool_call_records,
         result.stall_events.len(),
         has_verdict_warning,
         result.budget_pressure,
-        is_live_query,
     );
 
     ReplTurnLearningSnapshot { routing, eval }
@@ -1252,7 +1259,7 @@ fn apply_turn_success(
         && learning_snap.routing.domain_hint.is_none();
     result.set_repl_learning_journal_fields(routing_domain, entity_skipped);
 
-    commit_turn_journal_workspace_and_sidecars(state, line, &result, turn_start);
+    commit_turn_journal_workspace_and_sidecars(state, line, &result, &learning_snap, turn_start);
     record_selector_turn_outcome(selector, line, &result, &learning_snap);
 
     // ── Skill auto-improvement check ─────────────────────────────────────
@@ -3436,6 +3443,58 @@ mod tests {
         assert_eq!(persisted.tool_count, Some(1));
         assert_eq!(persisted.tools_used, Some(vec!["read_file".into()]));
         assert_eq!(persisted.tool_calls.as_ref().map(Vec::len), Some(2));
+    }
+
+    #[test]
+    fn commit_turn_persists_turn_evaluation_event() {
+        let (_tmp, _g) = isolated_sessions_dir();
+        let sid = format!("test-turn-eval-{}", uuid::Uuid::new_v4());
+        let mut state = ReplState {
+            journal: Some(session_journal::JournalWriter::new(&sid).unwrap()),
+            session_id: Some(sid.clone()),
+            model: Some("gpt-5".into()),
+            turn: 1,
+            recent_tools: vec!["git_status".into()],
+            ..Default::default()
+        };
+        let mut result = stub_stream_result("Workspace is clean.");
+        result.tools_used = vec!["git_status".into()];
+        result.tool_calls_count = 1;
+        result.tool_call_records = vec![session_journal::ToolCallRecord {
+            name: "git_status".into(),
+            ok: true,
+            ms: 12,
+            error: None,
+            input_bytes: Some(16),
+            output_bytes: Some(240),
+            args_preview: None,
+            result_preview: Some("clean".into()),
+        }];
+
+        let learning =
+            analyze_repl_turn_learning("git status", state.turn, &state.recent_tools, &result);
+        commit_turn_journal_workspace_and_sidecars(
+            &mut state,
+            "git status",
+            &result,
+            &learning,
+            Instant::now(),
+        );
+
+        let events = session_journal::read_journal(&sid).unwrap();
+        let event = events
+            .iter()
+            .find(|event| event.event_type == session_journal::JournalEventType::TurnEvaluation)
+            .expect("turn evaluation event");
+        assert_eq!(event.turn, Some(1));
+        let metadata = event.metadata.as_ref().expect("turn evaluation metadata");
+        assert_eq!(metadata["source"], "cli_repl");
+        assert_eq!(metadata["live_query"], true);
+        assert_eq!(metadata["success"], true);
+        assert_eq!(metadata["tool_call_count"], 1);
+        assert_eq!(metadata["signal_count"], 2);
+        assert_eq!(metadata["signals"][0]["kind"], "tool_error_rate");
+        assert_eq!(metadata["signals"][1]["kind"], "all_tools_healthy");
     }
 
     #[test]
