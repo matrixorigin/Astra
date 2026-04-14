@@ -26,6 +26,7 @@ use crate::bridge::rate_limit_cooldown::{PerModelCooldown, RateLimitAction};
 use crate::turn::agentic_headless_round::HeadlessStderrStyle;
 use crate::turn::agentic_loop_host::{
     AgenticLoopHost, AgenticLoopState, HostReflectionRequest, HostReflectionResult, HostTurnResult,
+    TurnInteractionMode, TurnInteractionPolicy, interaction_scoped_tool_restrictions,
 };
 use crate::turn::chat_turn_sse_dispatch::ChatTurnSseAccum;
 use crate::turn::llm_client::{
@@ -333,6 +334,7 @@ impl ServerAgenticLoopHost {
     /// Compute the tool schemas visible for the current turn after applying
     /// health-based restrictions. This is the server-path equivalent of the
     /// CLI's deny-at-assembly behavior.
+    #[cfg(test)]
     fn visible_turn_tools(&self, state: &mut AgenticLoopState) -> Vec<Value> {
         merge_deprioritized_tools_into_restricted(&state.turn_guard, &mut state.restricted_tools);
         self.filtered_turn_tools(&state.restricted_tools)
@@ -607,7 +609,12 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             .unwrap_or("")
             .to_string();
 
-        let visible_tools = self.visible_turn_tools(state);
+        merge_deprioritized_tools_into_restricted(&state.turn_guard, &mut state.restricted_tools);
+        let mut effective_restricted = state.restricted_tools.clone();
+        effective_restricted.extend(interaction_scoped_tool_restrictions(
+            TurnInteractionMode::Headless,
+        ));
+        let visible_tools = self.filtered_turn_tools(&effective_restricted);
         let system_prompt = self.build_system_prompt(&user_content, &visible_tools);
 
         // Append skill-level hints (effort, agent_type) when active.
@@ -658,6 +665,8 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             state.consecutive_context_window_errors,
         );
         let final_tools = prune_tool_schemas(&visible_tools, tier);
+        state.last_turn_policy =
+            TurnInteractionPolicy::from_tool_schemas(TurnInteractionMode::Headless, &final_tools);
 
         let llm_cancel = llm_cancel_for_state(state);
 
@@ -978,6 +987,7 @@ fn progress_event_to_sse(evt: &crate::orchestration::AgentProgressEvent) -> Opti
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::turn::agentic_loop_host::ASK_USER_TOOL_NAME;
     use crate::turn::agentic_loop_host::run_agentic_loop_with_host;
     use crate::turn::sse_stream_host::EdgeToolExecResult;
 
@@ -1015,6 +1025,19 @@ mod tests {
                 }
             }),
         ]
+    }
+
+    fn sample_edge_tools_with_ask_user() -> Vec<Value> {
+        let mut tools = sample_edge_tools();
+        tools.push(json!({
+            "type": "function",
+            "function": {
+                "name": ASK_USER_TOOL_NAME,
+                "description": "Ask the user for clarification",
+                "parameters": { "type": "object", "properties": {} }
+            }
+        }));
+        tools
     }
 
     #[test]
@@ -1369,6 +1392,7 @@ mod tests {
             total_cache_read: 0,
             total_cache_creation: 0,
             total_tool_calls: 0,
+            total_evidence_tool_calls: 0,
             has_any_usage: false,
             max_turns: 10,
             remaining_turns: 10,
@@ -1392,6 +1416,7 @@ mod tests {
             message: "test query".to_string(),
             recent_tools: Vec::new(),
             task_profile: TaskExecutionProfile::default(),
+            last_turn_policy: crate::turn::agentic_loop_host::TurnInteractionPolicy::default(),
             api: astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).unwrap(),
             api_token: "test-token".to_string(),
             delegation_engine: None,
@@ -1443,6 +1468,38 @@ mod tests {
         assert!(state.restricted_tools.contains("bash"));
         assert!(state.restricted_tools.contains("read_file"));
     }
+
+    #[test]
+    fn headless_turn_policy_excludes_ask_user_from_final_tools() {
+        let host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u".to_string(),
+            "s".to_string(),
+        )
+        .with_edge_tools(sample_edge_tools_with_ask_user())
+        .build();
+
+        let mut state = create_test_state();
+        merge_deprioritized_tools_into_restricted(&state.turn_guard, &mut state.restricted_tools);
+        let mut effective_restricted = state.restricted_tools.clone();
+        effective_restricted.extend(interaction_scoped_tool_restrictions(
+            TurnInteractionMode::Headless,
+        ));
+        let visible_tools = host.filtered_turn_tools(&effective_restricted);
+        let final_tools =
+            prune_tool_schemas(&visible_tools, crate::prompts::CompactionTier::Normal);
+        let policy =
+            TurnInteractionPolicy::from_tool_schemas(TurnInteractionMode::Headless, &final_tools);
+
+        assert_eq!(
+            policy.visible_tool_names,
+            vec!["bash".to_string(), "read_file".to_string()]
+        );
+        assert_eq!(policy.evidence_tool_names, policy.visible_tool_names);
+        assert!(!policy.allow_ask_user);
+    }
+
     #[tokio::test]
     async fn server_host_mock_text_response() {
         let mut host = MockServerHost::with_text_response("Hello from server", 100, 50);

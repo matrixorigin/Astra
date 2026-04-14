@@ -8,6 +8,8 @@ mod agentic_loop_turn;
 mod agentic_sse_loop;
 mod cli_loop_host;
 
+pub(crate) use agentic_loop_turn::turn_policy_from_payload_edge_tools;
+
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -442,6 +444,7 @@ pub(crate) async fn stream_chat_sse(
         total_cache_read: 0,
         total_cache_creation: 0,
         total_tool_calls: 0,
+        total_evidence_tool_calls: 0,
         has_any_usage: false,
         max_turns,
         remaining_turns: max_turns,
@@ -539,6 +542,7 @@ pub(crate) async fn stream_chat_sse(
         message: p.message.to_string(),
         recent_tools: p.recent_tools.to_vec(),
         task_profile,
+        last_turn_policy: astra_runtime::turn::agentic_loop_host::TurnInteractionPolicy::default(),
         api: p.api.clone(),
         api_token: p.token.to_string(),
         delegation_engine: p.delegation_engine,
