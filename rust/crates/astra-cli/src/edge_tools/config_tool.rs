@@ -39,6 +39,10 @@ impl ToolExecutor {
                 "turn_limit",
                 "Max turns per conversation (env: MO_MAX_TURNS)",
             ),
+            (
+                "plan_subtask_turn_limit",
+                "Max turns per plan subtask, 0=use turn_limit (env: MO_PLAN_SUBTASK_MAX_TURNS)",
+            ),
             ("list", "Show all available settings"),
         ];
 
@@ -140,6 +144,16 @@ impl ToolExecutor {
                     "setting": "turn_limit",
                     "value": current,
                     "env_var": "MO_MAX_TURNS"
+                }).to_string()
+            }
+            "plan_subtask_turn_limit" => {
+                let current = std::env::var("MO_PLAN_SUBTASK_MAX_TURNS").unwrap_or_else(|_| "0".to_string());
+                let effective = astra_core::RuntimeLimits::global().effective_plan_subtask_turns();
+                json!({
+                    "setting": "plan_subtask_turn_limit",
+                    "value": current,
+                    "effective": effective,
+                    "env_var": "MO_PLAN_SUBTASK_MAX_TURNS"
                 }).to_string()
             }
             _ => json!({

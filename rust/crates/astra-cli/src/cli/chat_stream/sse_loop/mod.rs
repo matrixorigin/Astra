@@ -292,7 +292,11 @@ pub(crate) async fn stream_chat_sse(
         TurnGuard::with_health_and_profile(health, task_profile)
     };
 
-    let max_turns = RuntimeLimits::global().max_turns;
+    let max_turns = if p.is_plan_subtask {
+        RuntimeLimits::global().effective_plan_subtask_turns()
+    } else {
+        RuntimeLimits::global().max_turns
+    };
     let step_recorder = StepRecorder::with_persistence(
         current_session_id.as_deref().unwrap_or("ephemeral"),
         step_recorder_chat_ephemeral_run_id(start.elapsed().as_millis()).as_str(),

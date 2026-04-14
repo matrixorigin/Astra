@@ -10,9 +10,9 @@ use super::tool_call_shape::{tool_call_arguments_value, tool_call_name};
 /// (e.g. read_file with different args each turn) triggered false stalls.
 pub const SERVER_STALL_WINDOW: usize = 3;
 
-/// User-visible error when the agentic loop exhausts the per-request remaining-turn budget (stall guard).
-pub const CLI_AGENTIC_TURN_BUDGET_STALL_ABORT_MSG: &str =
-    "Turn budget exhausted. To increase, set MO_MAX_TURNS=100 (current default: 50).";
+/// User-visible error prefix when the agentic loop exhausts the per-request remaining-turn budget.
+/// Call sites append the actual budget number, e.g. `format!("{} (budget: {} turns)", MSG, n)`.
+pub const CLI_AGENTIC_TURN_BUDGET_STALL_ABORT_MSG: &str = "Turn budget exhausted. To increase, set MO_MAX_TURNS (interactive) or MO_PLAN_SUBTASK_MAX_TURNS (plan subtasks).";
 
 /// Tools considered "exploration" — low-value if used repeatedly without
 /// a "productive" tool call in between.

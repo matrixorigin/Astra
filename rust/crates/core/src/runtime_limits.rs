@@ -5,6 +5,7 @@
 //!
 //! ```text
 //! MO_MAX_TURNS=50              # conversation turns per session
+//! MO_PLAN_SUBTASK_MAX_TURNS=0  # per-subtask turn budget (0 = use MO_MAX_TURNS)
 //! MO_MAX_TOOL_ROUNDS=15        # tool execution rounds per turn
 //! MO_TURN_TIMEOUT_S=300        # seconds before a turn is force-completed
 //! MO_GLOBAL_OUTPUT_LIMIT=80000 # combined tool output bytes
@@ -25,6 +26,9 @@ static LIMITS: OnceLock<RuntimeLimits> = OnceLock::new();
 pub struct RuntimeLimits {
     /// Maximum conversation turns per session.
     pub max_turns: usize,
+    /// Per-subtask turn budget for plan execution.
+    /// 0 means fall back to `max_turns`.
+    pub plan_subtask_max_turns: usize,
     /// Maximum tool execution rounds per turn.
     pub max_tool_rounds: i64,
     /// Per-turn hard timeout in seconds.
@@ -49,6 +53,7 @@ impl Default for RuntimeLimits {
     fn default() -> Self {
         Self {
             max_turns: 50,
+            plan_subtask_max_turns: 0,
             max_tool_rounds: 15,
             turn_timeout_s: 300.0,
             global_output_limit: 200_000,
@@ -67,6 +72,10 @@ impl RuntimeLimits {
         let d = Self::default();
         Self {
             max_turns: env_parse("MO_MAX_TURNS", d.max_turns),
+            plan_subtask_max_turns: env_parse(
+                "MO_PLAN_SUBTASK_MAX_TURNS",
+                d.plan_subtask_max_turns,
+            ),
             max_tool_rounds: env_parse("MO_MAX_TOOL_ROUNDS", d.max_tool_rounds),
             turn_timeout_s: env_parse("MO_TURN_TIMEOUT_S", d.turn_timeout_s),
             global_output_limit: env_parse("MO_GLOBAL_OUTPUT_LIMIT", d.global_output_limit),
@@ -81,6 +90,16 @@ impl RuntimeLimits {
     /// Get the global `RuntimeLimits` singleton (loaded from env on first call).
     pub fn global() -> &'static RuntimeLimits {
         LIMITS.get_or_init(Self::from_env)
+    }
+
+    /// Effective turn budget for a plan subtask.
+    /// Returns `plan_subtask_max_turns` if set (> 0), otherwise `max_turns`.
+    pub fn effective_plan_subtask_turns(&self) -> usize {
+        if self.plan_subtask_max_turns > 0 {
+            self.plan_subtask_max_turns
+        } else {
+            self.max_turns
+        }
     }
 }
 
@@ -119,6 +138,7 @@ mod tests {
     fn defaults_match_original_constants() {
         let d = RuntimeLimits::default();
         assert_eq!(d.max_turns, 50);
+        assert_eq!(d.plan_subtask_max_turns, 0);
         assert_eq!(d.max_tool_rounds, 15);
         assert!((d.turn_timeout_s - 300.0).abs() < f64::EPSILON);
         assert_eq!(d.global_output_limit, 200_000);
@@ -148,5 +168,25 @@ mod tests {
     #[test]
     fn dev_password_constant_matches_original() {
         assert_eq!(DEV_MATRIXONE_PASSWORD, "111");
+    }
+
+    #[test]
+    fn effective_plan_subtask_turns_falls_back_to_max_turns() {
+        let limits = RuntimeLimits {
+            plan_subtask_max_turns: 0,
+            max_turns: 50,
+            ..Default::default()
+        };
+        assert_eq!(limits.effective_plan_subtask_turns(), 50);
+    }
+
+    #[test]
+    fn effective_plan_subtask_turns_uses_explicit_value() {
+        let limits = RuntimeLimits {
+            plan_subtask_max_turns: 80,
+            max_turns: 50,
+            ..Default::default()
+        };
+        assert_eq!(limits.effective_plan_subtask_turns(), 80);
     }
 }

@@ -1038,6 +1038,42 @@ pub async fn handle_plan_mode_input(
     Ok(())
 }
 
+// ─── Plan Resume Recovery ────────────────────────────────────────────────────
+
+/// Result of attempting to recover a plan for resume after executor failure.
+#[derive(Debug)]
+enum PlanResumeRecovery {
+    /// Plan has work remaining — Failed subtasks reset to Pending. Contains the
+    /// recovered plan ready for a new executor.
+    Ready(astra_services::task_orchestrator::TaskPlan),
+    /// All subtasks are already Completed — nothing to resume.
+    NothingToDo,
+}
+
+/// Recover a plan for resume: reset Failed→Pending and return a clone if work remains.
+///
+/// Called when the executor is gone (PlanError) but `plan_mode` still holds the
+/// plan with up-to-date subtask statuses (via `SubtaskStatusSync`).
+fn recover_plan_for_resume(
+    plan: &mut astra_services::task_orchestrator::TaskPlan,
+) -> PlanResumeRecovery {
+    use astra_services::task_orchestrator::TaskStatus;
+
+    let has_work = plan
+        .subtasks
+        .iter()
+        .any(|s| s.status == TaskStatus::Pending || s.status == TaskStatus::Failed);
+    if !has_work {
+        return PlanResumeRecovery::NothingToDo;
+    }
+    for st in &mut plan.subtasks {
+        if st.status == TaskStatus::Failed {
+            st.status = TaskStatus::Pending;
+        }
+    }
+    PlanResumeRecovery::Ready(plan.clone())
+}
+
 /// Handle a parsed `PlanCommand`.
 async fn handle_plan_command(
     cmd: PlanCommand,
@@ -1336,6 +1372,7 @@ async fn handle_plan_command(
 
         PlanCommand::Resume => {
             if let Some(ref handle) = state.plan_handle {
+                // Executor is alive (paused) — send Resume command.
                 let corrections = if state.plan_execution_corrections.is_empty() {
                     None
                 } else {
@@ -1349,8 +1386,20 @@ async fn handle_plan_command(
                     }
                     Err(e) => eprintln!("  {} {}", theme::icon_err(), e),
                 }
-            } else if state.executing_plan.is_some() {
-                eprintln!("  {} Resuming plan execution...", "▶".cyan());
+            } else if let Some(ref mut ps) = state.plan_mode {
+                match recover_plan_for_resume(&mut ps.plan) {
+                    PlanResumeRecovery::Ready(plan) => {
+                        state.executing_plan = Some(plan);
+                        eprintln!("  {} Resuming plan execution...", "▶".cyan());
+                    }
+                    PlanResumeRecovery::NothingToDo => {
+                        eprintln!(
+                            "  {} {}",
+                            theme::icon_warn(),
+                            "All subtasks already completed — nothing to resume".yellow()
+                        );
+                    }
+                }
             } else {
                 eprintln!(
                     "  {} {}",
@@ -2050,5 +2099,102 @@ mod tests {
         assert!(plan::PlanModeState::is_execute_command("开始"));
         assert!(!plan::PlanModeState::is_execute_command("show"));
         assert!(!plan::PlanModeState::is_execute_command(""));
+    }
+
+    #[test]
+    fn recover_plan_for_resume_resets_failed_to_pending() {
+        use astra_services::task_orchestrator::TaskPlan;
+        let mut plan = TaskPlan {
+            subtasks: vec![
+                SubtaskPlan {
+                    id: "s1".into(),
+                    title: "done".into(),
+                    status: TaskStatus::Completed,
+                    ..Default::default()
+                },
+                SubtaskPlan {
+                    id: "s2".into(),
+                    title: "failed".into(),
+                    status: TaskStatus::Failed,
+                    ..Default::default()
+                },
+                SubtaskPlan {
+                    id: "s3".into(),
+                    title: "pending".into(),
+                    status: TaskStatus::Pending,
+                    ..Default::default()
+                },
+            ],
+            notes: None,
+        };
+        let result = super::recover_plan_for_resume(&mut plan);
+        match result {
+            super::PlanResumeRecovery::Ready(recovered) => {
+                assert_eq!(recovered.subtasks[0].status, TaskStatus::Completed);
+                assert_eq!(recovered.subtasks[1].status, TaskStatus::Pending);
+                assert_eq!(recovered.subtasks[2].status, TaskStatus::Pending);
+            }
+            other => panic!("expected Ready, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn recover_plan_for_resume_all_completed_returns_nothing() {
+        use astra_services::task_orchestrator::TaskPlan;
+        let mut plan = TaskPlan {
+            subtasks: vec![
+                SubtaskPlan {
+                    id: "s1".into(),
+                    title: "done".into(),
+                    status: TaskStatus::Completed,
+                    ..Default::default()
+                },
+                SubtaskPlan {
+                    id: "s2".into(),
+                    title: "also done".into(),
+                    status: TaskStatus::Completed,
+                    ..Default::default()
+                },
+            ],
+            notes: None,
+        };
+        assert!(matches!(
+            super::recover_plan_for_resume(&mut plan),
+            super::PlanResumeRecovery::NothingToDo
+        ));
+    }
+
+    #[test]
+    fn recover_plan_for_resume_preserves_completed_subtasks() {
+        use astra_services::task_orchestrator::TaskPlan;
+        let mut plan = TaskPlan {
+            subtasks: vec![
+                SubtaskPlan {
+                    id: "s1".into(),
+                    title: "done".into(),
+                    status: TaskStatus::Completed,
+                    ..Default::default()
+                },
+                SubtaskPlan {
+                    id: "s2".into(),
+                    title: "failed".into(),
+                    status: TaskStatus::Failed,
+                    ..Default::default()
+                },
+            ],
+            notes: None,
+        };
+        if let super::PlanResumeRecovery::Ready(recovered) =
+            super::recover_plan_for_resume(&mut plan)
+        {
+            // Completed subtask untouched
+            assert_eq!(recovered.subtasks[0].status, TaskStatus::Completed);
+            // ready_subtasks() should now return s2 (Pending, no deps)
+            let ready = recovered.ready_subtasks();
+            assert_eq!(ready.len(), 1);
+            assert_eq!(ready[0].id, "s2");
+        } else {
+            panic!("expected Ready");
+        }
     }
 }

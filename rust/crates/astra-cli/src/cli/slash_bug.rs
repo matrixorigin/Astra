@@ -135,6 +135,7 @@ fn build_bug_report(state: &ReplState) -> String {
         ("MO_API_KEY", true),
         ("MO_MODEL", false),
         ("MO_MAX_TURNS", false),
+        ("MO_PLAN_SUBTASK_MAX_TURNS", false),
         ("MO_MAX_TOOL_RETRIES", false),
         ("MO_RETRY_BASE_MS", false),
         ("MO_BUDGET_LIMIT", false),
