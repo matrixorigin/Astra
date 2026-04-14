@@ -12,6 +12,7 @@
 //! environment, not the overlay. This is intentional — mutating the real
 //! process env is unsound under Rust 2024 edition.
 
+#![allow(dead_code)]
 use std::collections::HashMap;
 use std::process::Command;
 use std::sync::RwLock;
@@ -44,10 +45,10 @@ fn overlay_write() -> std::sync::RwLockWriteGuard<'static, Option<HashMap<String
 /// Read an env var, checking the overlay first then falling back to real env.
 pub(crate) fn overlay_get(name: &str) -> Option<String> {
     let guard = overlay_read();
-    if let Some(ref map) = *guard {
-        if let Some(entry) = map.get(name) {
-            return entry.clone(); // Some(val) = set, None = removed
-        }
+    if let Some(ref map) = *guard
+        && let Some(entry) = map.get(name)
+    {
+        return entry.clone(); // Some(val) = set, None = removed
     }
     std::env::var(name).ok()
 }
@@ -110,7 +111,7 @@ pub fn apply_overlay(cmd: &mut Command) {
 // ─── Env tool functions ──────────────────────────────────────────────────────
 
 /// Dispatch an env tool call to the appropriate sub-command.
-pub(crate) fn env_tool(args: &Value) -> String {
+pub fn env_tool(args: &Value) -> String {
     let operation = args
         .get("operation")
         .and_then(|v| v.as_str())
@@ -312,7 +313,7 @@ fn env_search(args: &Value) -> String {
 }
 
 /// Check if a variable name suggests it contains sensitive data.
-pub(crate) fn is_sensitive_var(name: &str) -> bool {
+pub fn is_sensitive_var(name: &str) -> bool {
     let upper = name.to_uppercase();
     // Core patterns
     upper.contains("KEY")

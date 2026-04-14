@@ -6,6 +6,7 @@
 //! Kill switch: `ASTRA_PASSIVE_TSC_CHECK=0|false|off`
 //! Timeout: `ASTRA_PASSIVE_TSC_TIMEOUT_SECS` (default 90, max 300)
 
+#![allow(dead_code)]
 use std::io::ErrorKind;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -45,7 +46,7 @@ fn is_ts_like_source(path: &Path) -> bool {
 
 /// Whether a successful disk write should schedule passive `tsc --noEmit`.
 #[must_use]
-pub(crate) fn should_schedule_passive_tsc(project_root: &Path, edited_path: &Path) -> bool {
+pub fn should_schedule_passive_tsc(project_root: &Path, edited_path: &Path) -> bool {
     if !passive_tsc_check_enabled() {
         return false;
     }
@@ -75,7 +76,7 @@ fn diagnostic_message(content: String) -> Value {
 }
 
 /// Drain pending, run `tsc --noEmit -p tsconfig.json` when appropriate.
-pub(crate) async fn take_passive_tsc_messages(
+pub async fn take_passive_tsc_messages(
     pending: &AtomicBool,
     project_root: &Path,
     tool_results_nonempty: bool,
@@ -148,8 +149,6 @@ fn tsc_available() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::edge_tools::ToolExecutor;
-    use serde_json::json;
     use std::sync::atomic::AtomicBool;
 
     #[test]
@@ -220,39 +219,6 @@ mod tests {
         let msgs = take_passive_tsc_messages(&pending, root, true).await;
         assert!(msgs.is_empty());
         assert!(!pending.load(Ordering::SeqCst));
-    }
-
-    #[tokio::test]
-    async fn tool_executor_write_file_triggers_tsc_flush() {
-        if !tsc_available() {
-            return;
-        }
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        std::fs::write(
-            root.join("tsconfig.json"),
-            r#"{"compilerOptions":{"strict":true,"noEmit":true},"include":["*.ts"]}"#,
-        )
-        .unwrap();
-        std::fs::write(root.join("ok.ts"), "export const n = 1;\n").unwrap();
-
-        let exe = ToolExecutor::new(root);
-        let _ = exe.execute("read_file", &json!({"path": "ok.ts"})).await;
-        let r = exe
-            .execute(
-                "write_file",
-                &json!({"path": "ok.ts", "content": "const bad: string = 99;\n"}),
-            )
-            .await;
-        assert!(r.contains("\"success\":true"), "{r}");
-        let msgs = exe
-            .take_passive_workspace_diagnostic_messages(root, true)
-            .await;
-        assert!(
-            msgs.iter()
-                .any(|m| m["attachment_metadata"]["source"] == "tsc_no_emit"),
-            "{msgs:?}"
-        );
     }
 
     #[test]

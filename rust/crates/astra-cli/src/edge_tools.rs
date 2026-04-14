@@ -35,16 +35,13 @@ pub mod delta_log;
 pub mod agent_messaging;
 #[path = "edge_tools/agent_spawning.rs"]
 pub mod agent_spawning;
-#[path = "edge_tools/build_test.rs"]
-mod build_test;
-#[path = "edge_tools/code_intel.rs"]
-pub mod code_intel;
+use astra_tools::build_test;
+pub use astra_tools::code_intel;
 #[path = "edge_tools/context_sharing.rs"]
 pub mod context_sharing;
 #[path = "edge_tools/fs.rs"]
 mod fs_tools;
-#[path = "edge_tools/fuzzy_replacer.rs"]
-pub(crate) mod fuzzy_replacer;
+pub(crate) use astra_tools::fuzzy_replacer;
 #[path = "edge_tools/git_gix.rs"]
 mod git_gix;
 #[path = "edge_tools/github.rs"]
@@ -53,25 +50,22 @@ mod github;
 mod lsp_stdio_session;
 #[path = "edge_tools/mo_tools.rs"]
 mod mo_tools;
+use astra_tools::passive_cargo_check;
 pub(crate) use git_gix::GitCommitRollbackJournal;
 pub(crate) use git_gix::GitStashRollbackJournal;
 pub(crate) use mo_tools::DatabaseSnapshotRollbackJournal;
 pub(crate) use session_state::SessionStateRollbackJournal;
-#[path = "edge_tools/passive_cargo_check.rs"]
-mod passive_cargo_check;
 #[path = "edge_tools/passive_lsp.rs"]
 mod passive_lsp;
-#[path = "edge_tools/passive_tsc_check.rs"]
-mod passive_tsc_check;
+use astra_tools::passive_tsc_check;
 #[path = "edge_tools/schemas.rs"]
 mod schemas;
 #[path = "edge_tools/shell.rs"]
 #[allow(clippy::needless_range_loop)]
 mod shell;
-pub use schemas::all_tool_schemas;
-#[path = "edge_tools/env_tools.rs"]
-mod env_tools;
+use astra_tools::env_tools;
 pub use env_tools::apply_overlay as apply_env_overlay;
+pub use schemas::all_tool_schemas;
 #[path = "edge_tools/code_analysis.rs"]
 mod code_analysis;
 #[path = "edge_tools/config_tool.rs"]
@@ -90,8 +84,7 @@ mod notebook_edit;
 mod self_mod_tools;
 #[path = "edge_tools/session_state.rs"]
 mod session_state;
-#[path = "edge_tools/task_mgmt.rs"]
-mod task_mgmt;
+use astra_tools::task_mgmt;
 pub(crate) use task_mgmt::TaskManager;
 #[path = "edge_tools/web_search.rs"]
 mod web_search;
@@ -242,20 +235,7 @@ fn normalize_empty_output(output: String, tool_name: &str) -> String {
     }
 }
 
-#[derive(Debug, Clone, Default)]
-pub(crate) struct ToolExecutionOutcome {
-    pub output: String,
-    pub tool_result_fields: Option<serde_json::Map<String, Value>>,
-}
-
-impl ToolExecutionOutcome {
-    fn text(output: String) -> Self {
-        Self {
-            output,
-            tool_result_fields: None,
-        }
-    }
-}
+pub(crate) use astra_tools::git_gix::ToolExecutionOutcome;
 
 /// Parse a grep output line to extract the file path and line number.
 /// Handles format: `file:line:content` or `file:line:col:content`.

@@ -8,6 +8,7 @@
 //!
 //! Enables automated change→test→fix cycles by providing structured feedback.
 
+#![allow(dead_code)]
 use regex::Regex;
 use std::collections::HashSet;
 use std::sync::LazyLock;
@@ -896,11 +897,11 @@ impl BuildTestResult {
     /// `scope_at_line()` to find the containing function/class. This adds
     /// context like "in fn process_data" or "in impl Foo > fn bar" to each error.
     pub fn enrich_with_scope(&mut self, project_root: &std::path::Path) {
-        use super::code_intel::{detect_language, scope_at_line};
+        use crate::code_intel::{detect_language, scope_at_line};
         use std::collections::HashMap;
 
         // Cache file contents to avoid re-reading for multiple errors in same file
-        let mut file_cache: HashMap<String, Option<(String, super::code_intel::Language)>> =
+        let mut file_cache: HashMap<String, Option<(String, crate::code_intel::Language)>> =
             HashMap::new();
 
         for loc in self.error_locations.iter_mut() {
@@ -1017,6 +1018,7 @@ pub struct BuildTestTracker {
 }
 
 impl BuildTestTracker {
+    #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         Self {
             previous_sigs: HashSet::new(),
@@ -2534,7 +2536,7 @@ error[E0425]: cannot find value `nonexistent` in this scope
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let mut result = BuildTestResult {
             error_locations: vec![ErrorLocation::new(
-                "src/edge_tools/code_intel.rs".into(),
+                "src/code_intel.rs".into(),
                 138,
                 5,
                 "E0425".into(),

@@ -5,6 +5,7 @@
 //! Kill switch: `ASTRA_PASSIVE_CARGO_CHECK=0|false|off`
 //! Timeout: `ASTRA_PASSIVE_CARGO_TIMEOUT_SECS` (default 45, max 300)
 
+#![allow(dead_code)]
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -13,7 +14,7 @@ use serde_json::{Value, json};
 use tokio::process::Command;
 use tokio::time::timeout;
 
-use super::build_test;
+use crate::build_test;
 
 /// Max chars for injected diagnostic text (keeps `/chat` payload bounded).
 const MAX_PASSIVE_DIAG_CHARS: usize = 12_000;
@@ -38,7 +39,7 @@ fn passive_cargo_timeout() -> Duration {
 
 /// Whether a successful disk write to `edited_path` should schedule a passive check.
 #[must_use]
-pub(crate) fn should_schedule_passive_cargo(project_root: &Path, edited_path: &Path) -> bool {
+pub fn should_schedule_passive_cargo(project_root: &Path, edited_path: &Path) -> bool {
     if !passive_cargo_check_enabled() {
         return false;
     }
@@ -57,7 +58,7 @@ fn truncate_diag_body(s: &str) -> String {
 }
 
 /// Drain pending flag, run `cargo check` if appropriate, return messages to append to `payload["messages"]`.
-pub(crate) async fn take_passive_cargo_messages(
+pub async fn take_passive_cargo_messages(
     pending: &AtomicBool,
     project_root: &Path,
     tool_results_nonempty: bool,
@@ -138,8 +139,6 @@ fn diagnostic_message(content: String) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::edge_tools::ToolExecutor;
-    use serde_json::json;
     use std::sync::atomic::AtomicBool;
 
     #[test]
@@ -206,38 +205,6 @@ mod tests {
             "expected rustc hint, content={content:?}"
         );
         assert!(!pending.load(Ordering::SeqCst));
-    }
-
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn tool_executor_write_file_triggers_passive_flush() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        std::fs::write(
-            root.join("Cargo.toml"),
-            "[package]\nname=\"passive_t4\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
-        )
-        .unwrap();
-        std::fs::create_dir_all(root.join("src")).unwrap();
-        std::fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
-
-        let exe = ToolExecutor::new(root);
-        let _ = exe
-            .execute("read_file", &json!({"path": "src/main.rs"}))
-            .await;
-        let r = exe
-            .execute(
-                "write_file",
-                &json!({"path": "src/main.rs", "content": "fn main() { let _: () = 1; }\n"}),
-            )
-            .await;
-        assert!(r.contains("\"success\":true"), "write_file: {r}");
-        let msgs = exe
-            .take_passive_workspace_diagnostic_messages(root, true)
-            .await;
-        assert_eq!(msgs.len(), 1);
-        let c = msgs[0]["content"].as_str().unwrap();
-        assert!(c.contains("<new-diagnostics>"), "{c}");
     }
 
     #[tokio::test]

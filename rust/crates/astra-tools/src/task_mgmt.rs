@@ -3,6 +3,7 @@
 //! Tasks are in-memory only — they survive across tool calls but not across
 //! CLI restarts. Each task can contain subtasks with dependency tracking.
 
+#![allow(dead_code)]
 use serde_json::{Value, json};
 use std::sync::{
     Mutex,
@@ -32,15 +33,21 @@ pub struct SessionSubtask {
 }
 
 /// In-memory task store for the current session.
-pub(crate) struct TaskManager {
+pub struct TaskManager {
     tasks: Mutex<Vec<SessionTask>>,
     id_counter: AtomicU32,
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct TaskManagerSnapshot {
+pub struct TaskManagerSnapshot {
     pub tasks: Vec<SessionTask>,
     pub next_task_id: u32,
+}
+
+impl Default for TaskManager {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl TaskManager {
