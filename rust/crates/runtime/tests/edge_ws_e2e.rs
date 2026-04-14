@@ -295,3 +295,220 @@ async fn edge_ws_multiple_edges_per_user() {
 
     server.abort();
 }
+
+#[tokio::test]
+async fn edge_tool_error_result_propagated() {
+    let (addr, state, server) = spawn_test_server().await;
+
+    let ws = ws_auth(addr, "edge-err", "err-host").await;
+    let (mut write, mut read) = ws.split();
+
+    let pool = state.edge_connection_pool.clone();
+    let tool_task = tokio::spawn(async move {
+        let args = serde_json::json!({ "command": "fail-cmd" });
+        pool.execute_tool("test-user-1", "edge-err", "bash", &args)
+            .await
+    });
+
+    // Receive the tool request
+    let req = read.next().await.unwrap().unwrap();
+    let req_json: serde_json::Value =
+        serde_json::from_str(&req.into_text().unwrap()).unwrap();
+    let request_id = req_json["request_id"].as_str().unwrap().to_string();
+
+    // Edge reports an error result
+    let result_msg = json!({
+        "type": "edge_tool_result",
+        "request_id": request_id,
+        "output": "command not found: fail-cmd",
+        "is_error": true,
+        "duration_ms": 5
+    });
+    write
+        .send(Message::Text(result_msg.to_string().into()))
+        .await
+        .unwrap();
+
+    let result = tool_task.await.unwrap().expect("should get error result");
+    assert!(result.is_error);
+    assert_eq!(result.output, "command not found: fail-cmd");
+
+    write.close().await.ok();
+    server.abort();
+}
+
+#[tokio::test]
+async fn edge_tool_disconnect_during_request_returns_none() {
+    let (addr, state, server) = spawn_test_server().await;
+
+    let ws = ws_auth(addr, "edge-slow", "slow-host").await;
+    let (write, mut read) = ws.split();
+
+    let pool = state.edge_connection_pool.clone();
+
+    // Start a tool request in background
+    let tool_task = tokio::spawn(async move {
+        let args = serde_json::json!({ "command": "slow" });
+        pool.execute_tool("test-user-1", "edge-slow", "bash", &args)
+            .await
+    });
+
+    // Wait for the tool request to arrive at the edge
+    let req = read.next().await.unwrap().unwrap();
+    let req_json: serde_json::Value =
+        serde_json::from_str(&req.into_text().unwrap()).unwrap();
+    assert_eq!(req_json["type"], "edge_tool_request");
+
+    // Drop both halves — this closes the WS, triggering server cleanup
+    drop(write);
+    drop(read);
+
+    // The tool_task should resolve with None after the server detects
+    // the disconnect and unregisters the edge (drops pending oneshots)
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        tool_task,
+    )
+    .await
+    .expect("task should complete within 10s")
+    .expect("task should not panic");
+
+    assert!(result.is_none(), "disconnected edge should return None");
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn edge_reconnect_after_disconnect() {
+    let (addr, state, server) = spawn_test_server().await;
+
+    // First connection
+    let ws1 = ws_auth(addr, "edge-rc", "rc-host").await;
+    assert!(state.edge_connection_pool.has_connected_edge("test-user-1"));
+
+    // Disconnect
+    drop(ws1);
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(!state.edge_connection_pool.has_connected_edge("test-user-1"));
+
+    // Reconnect with same edge_agent_id
+    let ws2 = ws_auth(addr, "edge-rc", "rc-host").await;
+    assert!(state.edge_connection_pool.has_connected_edge("test-user-1"));
+    let edges = state.edge_connection_pool.get_user_edges("test-user-1");
+    assert_eq!(edges.len(), 1);
+    assert_eq!(edges[0].edge_agent_id, "edge-rc");
+
+    // Tool request should work on the new connection
+    let pool = state.edge_connection_pool.clone();
+    let (mut write, mut read) = ws2.split();
+
+    let tool_task = tokio::spawn(async move {
+        let args = serde_json::json!({ "path": "." });
+        pool.execute_tool("test-user-1", "edge-rc", "list_dir", &args)
+            .await
+    });
+
+    let req = read.next().await.unwrap().unwrap();
+    let req_json: serde_json::Value =
+        serde_json::from_str(&req.into_text().unwrap()).unwrap();
+    assert_eq!(req_json["tool"], "list_dir");
+    let request_id = req_json["request_id"].as_str().unwrap().to_string();
+
+    let result_msg = json!({
+        "type": "edge_tool_result",
+        "request_id": request_id,
+        "output": "file1.txt\nfile2.txt",
+        "is_error": false
+    });
+    write
+        .send(Message::Text(result_msg.to_string().into()))
+        .await
+        .unwrap();
+
+    let result = tool_task.await.unwrap().expect("should get result");
+    assert_eq!(result.output, "file1.txt\nfile2.txt");
+    assert!(!result.is_error);
+
+    write.close().await.ok();
+    server.abort();
+}
+
+#[tokio::test]
+async fn edge_invalid_first_message_rejected() {
+    let (addr, _state, server) = spawn_test_server().await;
+
+    let url = format!("ws://{addr}/edge/ws");
+    let (mut ws, _) = connect_async(&url).await.expect("WS connect");
+
+    // Send a non-auth message first
+    let bad_msg = json!({ "type": "edge_ping" });
+    ws.send(Message::Text(bad_msg.to_string().into()))
+        .await
+        .unwrap();
+
+    let resp = ws.next().await.unwrap().unwrap();
+    let resp_json: serde_json::Value =
+        serde_json::from_str(&resp.into_text().unwrap()).unwrap();
+    assert_eq!(resp_json["type"], "edge_auth_error");
+    assert!(resp_json["message"]
+        .as_str()
+        .unwrap()
+        .contains("first message must be edge_auth"));
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn edge_malformed_json_handled_gracefully() {
+    let (addr, state, server) = spawn_test_server().await;
+
+    let ws = ws_auth(addr, "edge-mal", "mal-host").await;
+    let (mut write, mut read) = ws.split();
+
+    // Send malformed JSON — should not crash the server
+    write
+        .send(Message::Text("not valid json {{{".into()))
+        .await
+        .unwrap();
+
+    // Connection should still work — try a ping
+    let ping = json!({ "type": "edge_ping" });
+    write
+        .send(Message::Text(ping.to_string().into()))
+        .await
+        .unwrap();
+
+    let pong = read.next().await.unwrap().unwrap();
+    let pong_json: serde_json::Value =
+        serde_json::from_str(&pong.into_text().unwrap()).unwrap();
+    assert_eq!(pong_json["type"], "edge_pong");
+
+    // Edge is still in pool
+    assert!(state.edge_connection_pool.has_connected_edge("test-user-1"));
+
+    write.close().await.ok();
+    server.abort();
+}
+
+#[tokio::test]
+async fn edge_deliver_result_for_unknown_request_returns_false() {
+    let (addr, state, server) = spawn_test_server().await;
+
+    let _ws = ws_auth(addr, "edge-unk", "unk-host").await;
+
+    // Try to deliver a result for a request that doesn't exist
+    use astra_runtime::server::edge_connection_pool::EdgeToolResult;
+    let delivered = state.edge_connection_pool.deliver_tool_result(
+        "test-user-1",
+        "edge-unk",
+        "nonexistent-request-id",
+        EdgeToolResult {
+            output: "orphaned".into(),
+            is_error: false,
+            duration_ms: None,
+        },
+    );
+    assert!(!delivered);
+
+    server.abort();
+}
