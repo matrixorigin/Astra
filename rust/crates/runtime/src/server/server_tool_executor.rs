@@ -278,15 +278,11 @@ impl ServerToolExecutor {
             "delegate" => "Delegation request acknowledged. The delegation engine will execute \
                 this request and provide results in the next round."
                 .to_string(),
-            // ── Unknown tool fallback ──────────────────────────────────
-            _ => {
-                format!(
-                    "Error: Tool '{name}' is not available in server-side execution mode. \
-                     Available: bash, read_file, write_file, str_replace, delete_file, \
-                     list_dir, grep, glob, git_status, git_diff, git_log, git_show, \
-                     git_blame, git_commit, memory_*, web_search"
-                )
-            }
+            // ── Delegate to DefaultToolExecutor for all other tools ────
+            // Covers: git_file_history, git_log_search, git_contributors,
+            // git_revert_commit, git_stash, github_*, symbols, task_*,
+            // tool_search, env, config, multi_edit, sleep, web_fetch, etc.
+            _ => self.default_executor.execute(name, args).await.output,
         };
 
         let output = astra_tools::normalize_empty_output(output, name);

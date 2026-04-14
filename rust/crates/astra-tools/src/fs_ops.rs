@@ -206,6 +206,80 @@ pub fn list_dir(workspace_root: &Path, args: &Value) -> ToolResult {
     ToolResult::text(result.join("\n"))
 }
 
+/// Apply multiple edits to a single file atomically (all-or-nothing).
+///
+/// Each edit must have `old_str` and `new_str`. All edits are validated
+/// first (no partial application). `old_str` must match exactly once.
+pub fn multi_edit(workspace_root: &Path, args: &Value) -> ToolResult {
+    let path_str = match args.get("path").and_then(|v| v.as_str()) {
+        Some(p) => p,
+        None => return ToolResult::error("Error: Missing 'path' parameter".into()),
+    };
+    let edits = match args.get("edits").and_then(|v| v.as_array()) {
+        Some(e) => e,
+        None => return ToolResult::error("Error: Missing 'edits' array".into()),
+    };
+    if edits.is_empty() {
+        return ToolResult::error("Error: 'edits' array is empty".into());
+    }
+    let dry_run = args
+        .get("dry_run")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let path = match resolve_path(workspace_root, path_str) {
+        Ok(p) => p,
+        Err(e) => return ToolResult::error(e),
+    };
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) => return ToolResult::error(format!("Error: Cannot read file: {e}")),
+    };
+
+    // Validate all edits first (atomic: all or nothing)
+    let mut working = content.clone();
+    for (i, edit) in edits.iter().enumerate() {
+        let old_str = match edit.get("old_str").and_then(|v| v.as_str()) {
+            Some(s) => s,
+            None => return ToolResult::error(format!("Error: edit[{i}] missing 'old_str'")),
+        };
+        let new_str = match edit.get("new_str").and_then(|v| v.as_str()) {
+            Some(s) => s,
+            None => return ToolResult::error(format!("Error: edit[{i}] missing 'new_str'")),
+        };
+        if old_str == new_str {
+            return ToolResult::error(format!(
+                "Error: edit[{i}] old_str and new_str are identical"
+            ));
+        }
+        let count = working.matches(old_str).count();
+        if count == 0 {
+            return ToolResult::error(format!("Error: edit[{i}] old_str not found in {path_str}"));
+        }
+        if count > 1 {
+            return ToolResult::error(format!(
+                "Error: edit[{i}] old_str found {count} times in {path_str}. Must match exactly once."
+            ));
+        }
+        working = working.replacen(old_str, new_str, 1);
+    }
+
+    if dry_run {
+        return ToolResult::text(format!(
+            "Dry run: {} edit(s) would be applied to {path_str}",
+            edits.len()
+        ));
+    }
+
+    match std::fs::write(&path, &working) {
+        Ok(()) => ToolResult::text(format!(
+            "Successfully applied {} edit(s) to {path_str}",
+            edits.len()
+        )),
+        Err(e) => ToolResult::error(format!("Error: Cannot write file: {e}")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -294,5 +368,70 @@ mod tests {
         let result = read_file(tmp.path(), &args);
         assert!(result.is_error);
         assert!(result.output.contains("SANDBOX_DENIED"));
+    }
+
+    #[test]
+    fn multi_edit_applies_all() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("f.txt"), "aaa bbb ccc").unwrap();
+        let args = serde_json::json!({
+            "path": "f.txt",
+            "edits": [
+                {"old_str": "aaa", "new_str": "AAA"},
+                {"old_str": "ccc", "new_str": "CCC"}
+            ]
+        });
+        let result = multi_edit(tmp.path(), &args);
+        assert!(!result.is_error);
+        let content = std::fs::read_to_string(tmp.path().join("f.txt")).unwrap();
+        assert_eq!(content, "AAA bbb CCC");
+    }
+
+    #[test]
+    fn multi_edit_aborts_on_missing() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("f.txt"), "aaa bbb").unwrap();
+        let args = serde_json::json!({
+            "path": "f.txt",
+            "edits": [
+                {"old_str": "aaa", "new_str": "AAA"},
+                {"old_str": "zzz", "new_str": "ZZZ"}
+            ]
+        });
+        let result = multi_edit(tmp.path(), &args);
+        assert!(result.is_error);
+        // Original file should be unchanged (atomic)
+        let content = std::fs::read_to_string(tmp.path().join("f.txt")).unwrap();
+        assert_eq!(content, "aaa bbb");
+    }
+
+    #[test]
+    fn multi_edit_dry_run() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("f.txt"), "foo bar").unwrap();
+        let args = serde_json::json!({
+            "path": "f.txt",
+            "edits": [{"old_str": "foo", "new_str": "baz"}],
+            "dry_run": true
+        });
+        let result = multi_edit(tmp.path(), &args);
+        assert!(!result.is_error);
+        assert!(result.output.contains("Dry run"));
+        // File unchanged
+        let content = std::fs::read_to_string(tmp.path().join("f.txt")).unwrap();
+        assert_eq!(content, "foo bar");
+    }
+
+    #[test]
+    fn multi_edit_rejects_ambiguous() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("f.txt"), "aaa aaa").unwrap();
+        let args = serde_json::json!({
+            "path": "f.txt",
+            "edits": [{"old_str": "aaa", "new_str": "bbb"}]
+        });
+        let result = multi_edit(tmp.path(), &args);
+        assert!(result.is_error);
+        assert!(result.output.contains("2 times"));
     }
 }
