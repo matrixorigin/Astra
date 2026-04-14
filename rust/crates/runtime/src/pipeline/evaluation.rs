@@ -9,6 +9,11 @@
 //! - Repeated tool calls (retry loops)
 //! - Correction patterns in user follow-up
 
+use astra_services::session_journal::{JournalEvent, ToolCallRecord};
+use serde_json::json;
+
+use crate::turn::chat_turn_heuristics::looks_like_live_query_with_context;
+
 /// Signals detected during evaluation.
 #[derive(Debug, Clone, PartialEq)]
 pub enum EvalSignal {
@@ -167,11 +172,111 @@ pub fn evaluate_turn(
     }
 }
 
+pub fn evaluate_tool_call_records(
+    input: &str,
+    recent_tools: &[String],
+    tool_call_records: &[ToolCallRecord],
+    stall_count: usize,
+    verdict_warning: bool,
+    budget_pressure: f64,
+) -> TurnEvaluation {
+    let tool_calls = tool_call_records
+        .iter()
+        .map(|record| ToolCallInfo {
+            name: record.name.clone(),
+            ok: record.ok,
+            ms: record.ms,
+            error: record.error.clone(),
+            output_bytes: record.output_bytes,
+        })
+        .collect::<Vec<_>>();
+    let is_live_query = looks_like_live_query_with_context(input, recent_tools);
+    evaluate_turn(
+        &tool_calls,
+        stall_count,
+        verdict_warning,
+        budget_pressure,
+        is_live_query,
+    )
+}
+
+pub fn eval_signal_to_json(signal: &EvalSignal) -> serde_json::Value {
+    match signal {
+        EvalSignal::ToolErrorRate(rate) => json!({
+            "kind": "tool_error_rate",
+            "weight": rate,
+        }),
+        EvalSignal::EmptyToolOutput => json!({
+            "kind": "empty_tool_output",
+            "message": "At least one successful tool call returned minimal output",
+        }),
+        EvalSignal::StallDetected => json!({
+            "kind": "stall_detected",
+            "message": "TurnGuard recorded a stall or divergence event",
+        }),
+        EvalSignal::HighBudgetPressure => json!({
+            "kind": "high_budget_pressure",
+            "message": "Budget pressure crossed the high-pressure threshold",
+        }),
+        EvalSignal::RepeatToolCall(name) => json!({
+            "kind": "repeat_tool_call",
+            "tool": name,
+            "message": format!("Repeated tool call pattern detected for `{name}`"),
+        }),
+        EvalSignal::VerdictWarning => json!({
+            "kind": "verdict_warning",
+            "message": "TurnGuard emitted a warning-or-higher verdict",
+        }),
+        EvalSignal::NoToolsNeeded => json!({
+            "kind": "missing_needed_tools",
+            "message": "The turn looked like a live query but completed without tool calls",
+        }),
+        EvalSignal::AllToolsHealthy => json!({
+            "kind": "all_tools_healthy",
+            "message": "All tool calls completed successfully with non-empty output",
+        }),
+    }
+}
+
+pub fn eval_signals_to_json(signals: &[EvalSignal]) -> Vec<serde_json::Value> {
+    signals.iter().map(eval_signal_to_json).collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_turn_evaluation_journal_event(
+    session_id: Option<&str>,
+    turn: Option<u32>,
+    source: &str,
+    input: &str,
+    recent_tools: &[String],
+    tool_call_records: &[ToolCallRecord],
+    stall_count: usize,
+    verdict_warning: bool,
+    budget_pressure: f64,
+    eval: &TurnEvaluation,
+) -> JournalEvent {
+    JournalEvent::turn_evaluation(
+        session_id,
+        turn,
+        source,
+        looks_like_live_query_with_context(input, recent_tools),
+        eval.success,
+        eval.quality,
+        eval.confidence,
+        budget_pressure,
+        stall_count,
+        verdict_warning,
+        tool_call_records.len(),
+        eval_signals_to_json(&eval.signals),
+    )
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use astra_services::session_journal::JournalEventType;
 
     fn ok_call(name: &str) -> ToolCallInfo {
         ToolCallInfo {
@@ -200,6 +305,19 @@ mod tests {
             ms: 100,
             error: None,
             output_bytes: Some(0),
+        }
+    }
+
+    fn journal_ok_call(name: &str) -> ToolCallRecord {
+        ToolCallRecord {
+            name: name.to_string(),
+            ok: true,
+            ms: 100,
+            error: None,
+            input_bytes: Some(12),
+            output_bytes: Some(500),
+            args_preview: None,
+            result_preview: Some("ok".to_string()),
         }
     }
 
@@ -331,5 +449,54 @@ mod tests {
         let simple = evaluate_turn(&[ok_call("bash")], 0, false, 0.3, false);
         let complex = evaluate_turn(&[err_call("bash"), err_call("grep")], 2, true, 0.9, false);
         assert!(complex.confidence > simple.confidence);
+    }
+
+    #[test]
+    fn evaluate_tool_call_records_reuses_live_query_heuristic() {
+        let eval = evaluate_tool_call_records(
+            "Check the latest git status",
+            &["git_status".to_string()],
+            &[],
+            0,
+            false,
+            0.2,
+        );
+        assert!(!eval.success);
+        assert!(eval.signals.contains(&EvalSignal::NoToolsNeeded));
+    }
+
+    #[test]
+    fn build_turn_evaluation_journal_event_serializes_normalized_signals() {
+        let records = vec![journal_ok_call("git_status")];
+        let eval = evaluate_tool_call_records(
+            "Check the latest git status",
+            &["git_status".to_string()],
+            &records,
+            0,
+            false,
+            0.2,
+        );
+
+        let event = build_turn_evaluation_journal_event(
+            Some("sess-1"),
+            Some(2),
+            "cli_repl",
+            "Check the latest git status",
+            &["git_status".to_string()],
+            &records,
+            0,
+            false,
+            0.2,
+            &eval,
+        );
+
+        assert_eq!(event.event_type, JournalEventType::TurnEvaluation);
+        let metadata = event.metadata.expect("turn evaluation metadata");
+        assert_eq!(metadata["source"], "cli_repl");
+        assert_eq!(metadata["live_query"], true);
+        assert_eq!(metadata["tool_call_count"], 1);
+        assert_eq!(metadata["signal_count"], 2);
+        assert_eq!(metadata["signals"][0]["kind"], "tool_error_rate");
+        assert_eq!(metadata["signals"][1]["kind"], "all_tools_healthy");
     }
 }

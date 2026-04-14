@@ -2279,6 +2279,7 @@ fn event_type_name(event_type: &JournalEventType) -> String {
         JournalEventType::StallDetected => "stall_detected",
         JournalEventType::Checkpoint => "checkpoint",
         JournalEventType::TurnGuardVerdict => "turn_guard_verdict",
+        JournalEventType::TurnEvaluation => "turn_evaluation",
         JournalEventType::PlanProgress => "plan_progress",
         JournalEventType::SessionFork => "session_fork",
         JournalEventType::SyncMarker => "sync_marker",

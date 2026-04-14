@@ -1529,6 +1529,7 @@ fn evolution_record_from_event(event: &JournalEvent) -> Option<EvolutionRecord> 
     let (kind, status) = match event.event_type {
         JournalEventType::TurnError | JournalEventType::Error => ("failure", "observed"),
         JournalEventType::StallDetected => ("stall", "observed"),
+        JournalEventType::TurnEvaluation => ("evaluation", "recorded"),
         JournalEventType::DriftDetected => ("drift", "observed"),
         JournalEventType::AdaptiveScenarioApplied => ("scenario", "applied"),
         JournalEventType::AdaptivePerTurnApplied => ("adaptation", "applied"),
@@ -1884,7 +1885,7 @@ fn phase_for_event_type(event_type: &JournalEventType) -> &'static str {
         | JournalEventType::Error
         | JournalEventType::StallDetected
         | JournalEventType::DriftDetected => "reflect",
-        JournalEventType::VerificationCompleted => "evaluate",
+        JournalEventType::VerificationCompleted | JournalEventType::TurnEvaluation => "evaluate",
         JournalEventType::AdaptiveScenarioApplied
         | JournalEventType::AdaptivePerTurnApplied
         | JournalEventType::AdaptiveExperimentEnrolled
@@ -2012,6 +2013,25 @@ fn summarize_event(event: &JournalEvent) -> String {
                 .map(|kind| format!(" ({kind})"))
                 .unwrap_or_default()
         ),
+        JournalEventType::TurnEvaluation => event
+            .metadata
+            .as_ref()
+            .map(|metadata| {
+                let source = metadata
+                    .get("source")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("runtime");
+                let quality = metadata
+                    .get("quality")
+                    .and_then(|value| value.as_f64())
+                    .unwrap_or(0.0);
+                let confidence = metadata
+                    .get("confidence")
+                    .and_then(|value| value.as_f64())
+                    .unwrap_or(0.0);
+                format!("turn evaluation ({source}): q={quality:.2}, conf={confidence:.2}")
+            })
+            .unwrap_or_else(|| "turn evaluation recorded".to_string()),
         JournalEventType::DriftDetected => event
             .metadata
             .as_ref()
@@ -2087,6 +2107,7 @@ fn event_type_name(event_type: &JournalEventType) -> String {
         JournalEventType::StallDetected => "stall_detected",
         JournalEventType::Checkpoint => "checkpoint",
         JournalEventType::TurnGuardVerdict => "turn_guard_verdict",
+        JournalEventType::TurnEvaluation => "turn_evaluation",
         JournalEventType::PlanProgress => "plan_progress",
         JournalEventType::SessionFork => "session_fork",
         JournalEventType::SyncMarker => "sync_marker",

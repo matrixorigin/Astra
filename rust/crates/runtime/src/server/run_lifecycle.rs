@@ -111,6 +111,59 @@ fn build_server_skill_executor(
     Some(Arc::new(router))
 }
 
+fn has_turn_verdict_warning(
+    verdict_events: &[crate::turn::agentic_verdict_audit::AgenticVerdictAuditEvent],
+) -> bool {
+    verdict_events.iter().any(|event| {
+        event.severity.eq_ignore_ascii_case("warning")
+            || event.severity.eq_ignore_ascii_case("critical")
+    })
+}
+
+fn build_runtime_turn_evaluation_event(
+    session_id: &str,
+    source: &str,
+    state: &AgenticLoopState,
+) -> astra_services::session_journal::JournalEvent {
+    let verdict_warning = has_turn_verdict_warning(&state.stall.verdict_events);
+    let eval = crate::pipeline::evaluation::evaluate_tool_call_records(
+        &state.message,
+        &state.recent_tools,
+        &state.stall.tool_call_records,
+        state.stall.events.len(),
+        verdict_warning,
+        state.telemetry.first_budget_pressure,
+    );
+    crate::pipeline::evaluation::build_turn_evaluation_journal_event(
+        Some(session_id),
+        None,
+        source,
+        &state.message,
+        &state.recent_tools,
+        &state.stall.tool_call_records,
+        state.stall.events.len(),
+        verdict_warning,
+        state.telemetry.first_budget_pressure,
+        &eval,
+    )
+}
+
+fn persist_turn_evaluation_journal(session_id: &str, source: &str, state: &AgenticLoopState) {
+    if session_id.is_empty() {
+        return;
+    }
+
+    let event = build_runtime_turn_evaluation_event(session_id, source, state);
+    match astra_services::session_journal::JournalWriter::new(session_id) {
+        Ok(journal) => {
+            if let Err(err) = journal.append(&event) {
+                eprintln!("  ⚠ turn evaluation journal append failed: {err}");
+            }
+        }
+        Err(err) => eprintln!("  ⚠ turn evaluation journal init failed: {err}"),
+    }
+}
+
 fn skill_search_from_context(
     context: &std::collections::HashMap<String, serde_json::Value>,
 ) -> astra_core::SkillSearchSettings {
@@ -1141,6 +1194,10 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 }
             }
 
+            if persist_terminal_state {
+                persist_turn_evaluation_journal(&bg_session_id, "server_runtime", &loop_state);
+            }
+
             // Fire SessionEnd hooks (best-effort, non-blocking).
             crate::skills::hooks::fire_session_end(
                 &loop_state.skills.session_event_hooks,
@@ -1253,6 +1310,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
 
         let (mut final_events, final_status, error_msg) =
             Self::finalize_run_events(loop_result, host.take_emitted_events(), &state);
+        persist_turn_evaluation_journal(&session_id, "server_runtime", &state);
         let mut all_events = vec![json!({"event_type": "run_started", "data": {}})];
         all_events.append(&mut final_events);
 
@@ -1835,6 +1893,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             &loop_state.telemetry.promotion_events,
         )
         .await;
+        persist_turn_evaluation_journal(&config.session_id, "server_subrun", &loop_state);
 
         // Persist cross-session learning state.
         let active_canary = match loop_state.evolution_service.as_ref() {
@@ -1909,6 +1968,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use astra_services::session_journal::{JournalEventType, ToolCallRecord};
 
     /// Unwrap a `Result<T, (StatusCode, Json<ErrorResponse>)>` in tests.
     fn ok<T>(result: Result<T, (StatusCode, Json<ErrorResponse>)>) -> T {
@@ -1961,6 +2021,56 @@ mod tests {
             max_candidates: 5,
             explain: false,
         }
+    }
+
+    #[test]
+    fn build_runtime_turn_evaluation_event_uses_loop_state_signals() {
+        let svc = test_service();
+        let request = test_request("git status");
+        let mut state = svc.build_initial_state(&request, "session-1", "run-1");
+        state.recent_tools = vec!["git_status".into()];
+        state.telemetry.first_budget_pressure = 0.27;
+        state.stall.events.push(("repetition_stall".into(), 1));
+        state.stall.verdict_events.push(
+            crate::turn::agentic_verdict_audit::AgenticVerdictAuditEvent {
+                turn: 1,
+                severity: "warning".into(),
+                injections: vec!["stall detected".into()],
+                avoid_tools: vec!["git_status".into()],
+                deprioritized_tools: vec![],
+                force_stop: false,
+                nudge_count: 1,
+                total_errors: 0,
+                deprioritized_count: 0,
+                total_timeouts: 0,
+                timeout_dominant_tools: vec![],
+                total_cache_hits: 0,
+                flaky_count: 0,
+            },
+        );
+        state.stall.tool_call_records.push(ToolCallRecord {
+            name: "git_status".into(),
+            ok: true,
+            ms: 14,
+            error: None,
+            input_bytes: Some(8),
+            output_bytes: Some(180),
+            args_preview: None,
+            result_preview: Some("clean".into()),
+        });
+
+        let event = build_runtime_turn_evaluation_event("session-1", "server_runtime", &state);
+
+        assert_eq!(event.event_type, JournalEventType::TurnEvaluation);
+        assert_eq!(event.turn, None);
+        let metadata = event.metadata.expect("turn evaluation metadata");
+        assert_eq!(metadata["source"], "server_runtime");
+        assert_eq!(metadata["live_query"], true);
+        assert_eq!(metadata["stall_count"], 1);
+        assert_eq!(metadata["verdict_warning"], true);
+        assert_eq!(metadata["tool_call_count"], 1);
+        assert!(metadata["quality"].as_f64().unwrap() < 0.8);
+        assert_eq!(metadata["signals"][0]["kind"], "tool_error_rate");
     }
 
     #[test]

@@ -1018,6 +1018,55 @@ pub(super) fn handle_session_command(arg: &str, state: &mut ReplState) {
                                     details,
                                 );
                             }
+                            session_journal::JournalEventType::TurnEvaluation => {
+                                let metadata = evt.metadata.as_ref();
+                                let source = metadata
+                                    .and_then(|m| m.get("source"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("runtime");
+                                let quality = metadata
+                                    .and_then(|m| m.get("quality"))
+                                    .and_then(|v| v.as_f64())
+                                    .unwrap_or(0.0);
+                                let confidence = metadata
+                                    .and_then(|m| m.get("confidence"))
+                                    .and_then(|v| v.as_f64())
+                                    .unwrap_or(0.0);
+                                let success = metadata
+                                    .and_then(|m| m.get("success"))
+                                    .and_then(|v| v.as_bool())
+                                    .unwrap_or(false);
+                                let signals = metadata
+                                    .and_then(|m| m.get("signals"))
+                                    .and_then(|v| v.as_array())
+                                    .map(|signals| {
+                                        signals
+                                            .iter()
+                                            .filter_map(|signal| {
+                                                signal.get("kind").and_then(|kind| kind.as_str())
+                                            })
+                                            .take(2)
+                                            .collect::<Vec<_>>()
+                                            .join(", ")
+                                    })
+                                    .filter(|summary| !summary.is_empty())
+                                    .map(|summary| format!(" [{summary}]"))
+                                    .unwrap_or_default();
+                                eprintln!(
+                                    "  {} {} {}eval[{}]: q={:.2} conf={:.2}{}",
+                                    ts_short.dim(),
+                                    if success {
+                                        "◎".green().to_string()
+                                    } else {
+                                        theme::icon_warn().to_string()
+                                    },
+                                    evt.turn.map(|turn| format!("T{turn} ")).unwrap_or_default(),
+                                    source.dim(),
+                                    quality,
+                                    confidence,
+                                    signals,
+                                );
+                            }
                             session_journal::JournalEventType::PlanProgress => {
                                 let action = evt
                                     .metadata
