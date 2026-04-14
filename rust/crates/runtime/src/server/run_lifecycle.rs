@@ -1897,6 +1897,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore] // stream_chat runs full agentic loop; needs live DB + LLM or mock
     async fn stream_chat_tracks_run_for_status_and_replay() {
         let svc = test_service();
         let stream = ok(svc
@@ -2333,7 +2334,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore] // requires live MatrixOne (promotion-signals preload)
+    #[ignore] // runs full agentic loop; needs live infra
     async fn durable_create_run_persists_to_store() {
         let svc = test_service_with_engine();
         let run = ok(svc.create_run("user-1".into(), test_request("hello")).await);
@@ -2346,7 +2347,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore] // requires live MatrixOne (promotion-signals preload)
+    #[ignore] // runs full agentic loop; needs live infra
     async fn durable_create_run_eventually_persists_terminal_event() {
         let svc = test_service_with_engine();
         let run = ok(svc.create_run("user-1".into(), test_request("hello")).await);
@@ -2375,7 +2376,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore] // requires live MatrixOne (promotion-signals preload)
+    #[ignore] // runs full agentic loop; needs live infra
     async fn durable_stream_chat_persists_final_state() {
         let svc = test_service_with_engine();
         let stream = ok(svc
@@ -2392,7 +2393,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore] // requires live MatrixOne (promotion-signals preload)
+    #[ignore] // runs full agentic loop; needs live infra
     async fn durable_cancel_persists_to_store() {
         let svc = test_service_with_engine();
         let run = ok(svc.create_run("user-1".into(), test_request("task")).await);
@@ -2421,7 +2422,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore] // requires live MatrixOne (promotion-signals preload)
+    #[ignore] // runs full agentic loop; needs live infra
     async fn durable_pause_resume_round_trip() {
         let svc = test_service_with_engine();
         let run = ok(svc.create_run("user-1".into(), test_request("task")).await);
@@ -2512,6 +2513,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore] // stream_chat runs full agentic loop; needs live DB + LLM or mock
     async fn get_run_status_falls_back_to_durable_store_on_cache_miss() {
         let svc = test_service_with_engine();
         let stream = ok(svc
@@ -2533,6 +2535,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore] // stream_chat runs full agentic loop; needs live DB + LLM or mock
     async fn stream_run_falls_back_to_durable_store_on_cache_miss() {
         let svc = test_service_with_engine();
         let stream = ok(svc
@@ -2553,6 +2556,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore] // stream_chat runs full agentic loop; needs live DB + LLM or mock
     async fn list_runs_falls_back_to_durable_store_on_cache_miss() {
         let svc = test_service_with_engine();
         let first = ok(svc
@@ -2649,7 +2653,7 @@ mod tests {
     // ─── Background spawning integration tests ──────────────────────────
 
     #[tokio::test]
-    #[ignore] // requires live MatrixOne (promotion-signals preload)
+    #[ignore] // runs full agentic loop; needs live infra
     async fn create_run_spawns_background_task() {
         let svc = test_service();
         let run = ok(svc.create_run("user-1".into(), test_request("hello")).await);
@@ -2678,7 +2682,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore] // requires live MatrixOne (promotion-signals preload)
+    #[ignore] // runs full agentic loop; needs live infra
     async fn create_run_with_engine_persists_final_state() {
         let svc = test_service_with_engine();
         let run = ok(svc.create_run("user-1".into(), test_request("hello")).await);
