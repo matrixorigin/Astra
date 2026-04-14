@@ -36,8 +36,7 @@ pub mod agent_messaging;
 #[path = "edge_tools/agent_spawning.rs"]
 pub mod agent_spawning;
 use astra_tools::build_test;
-#[path = "edge_tools/code_intel.rs"]
-pub mod code_intel;
+pub use astra_tools::code_intel;
 #[path = "edge_tools/context_sharing.rs"]
 pub mod context_sharing;
 #[path = "edge_tools/fs.rs"]
@@ -236,20 +235,7 @@ fn normalize_empty_output(output: String, tool_name: &str) -> String {
     }
 }
 
-#[derive(Debug, Clone, Default)]
-pub(crate) struct ToolExecutionOutcome {
-    pub output: String,
-    pub tool_result_fields: Option<serde_json::Map<String, Value>>,
-}
-
-impl ToolExecutionOutcome {
-    fn text(output: String) -> Self {
-        Self {
-            output,
-            tool_result_fields: None,
-        }
-    }
-}
+pub(crate) use astra_tools::git_gix::ToolExecutionOutcome;
 
 /// Parse a grep output line to extract the file path and line number.
 /// Handles format: `file:line:content` or `file:line:col:content`.

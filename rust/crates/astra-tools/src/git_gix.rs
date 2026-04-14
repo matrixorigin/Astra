@@ -17,6 +17,7 @@ const DIFF_LIMIT: usize = 40_000; // ~10K tokens — diff is the primary input f
 const SHOW_LIMIT: usize = 16_000;
 
 /// Outcome of a tool execution with optional metadata fields.
+#[derive(Debug, Clone, Default)]
 pub struct ToolExecutionOutcome {
     pub output: String,
     pub tool_result_fields: Option<serde_json::Map<String, serde_json::Value>>,
@@ -125,11 +126,11 @@ fn resolve_commit_ref(project_root: &Path, commit_ref: &str) -> Option<String> {
         .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-fn short_commit_sha(commit_sha: &str) -> String {
+pub fn short_commit_sha(commit_sha: &str) -> String {
     commit_sha[..7.min(commit_sha.len())].to_string()
 }
 
-fn head_first_parent_tail(project_root: &Path, count: usize) -> Option<Vec<String>> {
+pub fn head_first_parent_tail(project_root: &Path, count: usize) -> Option<Vec<String>> {
     if count == 0 {
         return Some(Vec::new());
     }
@@ -155,7 +156,7 @@ fn head_first_parent_tail(project_root: &Path, count: usize) -> Option<Vec<Strin
         })
 }
 
-fn git_worktree_is_clean(project_root: &Path) -> Result<bool, String> {
+pub fn git_worktree_is_clean(project_root: &Path) -> Result<bool, String> {
     let output = std::process::Command::new("git")
         .args(["status", "--porcelain"])
         .current_dir(project_root)
@@ -220,7 +221,12 @@ pub struct GitStashRollbackJournal {
 }
 
 impl GitStashRollbackJournal {
-    fn record(&mut self, stash_ref: impl Into<String>, turn_index: u32, message: Option<String>) {
+    pub fn record(
+        &mut self,
+        stash_ref: impl Into<String>,
+        turn_index: u32,
+        message: Option<String>,
+    ) {
         self.entries.push(GitStashRollbackEntry {
             sequence: self.next_sequence,
             stash_ref: stash_ref.into(),
@@ -231,15 +237,15 @@ impl GitStashRollbackJournal {
         self.next_sequence = self.next_sequence.saturating_add(1);
     }
 
-    fn list(&self) -> Vec<GitStashRollbackEntry> {
+    pub fn list(&self) -> Vec<GitStashRollbackEntry> {
         self.entries.iter().rev().cloned().collect()
     }
 
-    fn restore_plan_for_turn(&self, turn_index: u32) -> Vec<GitStashRollbackEntry> {
+    pub fn restore_plan_for_turn(&self, turn_index: u32) -> Vec<GitStashRollbackEntry> {
         self.restore_plan_for_turn_since(turn_index, 0)
     }
 
-    fn restore_plan_for_turn_since(
+    pub fn restore_plan_for_turn_since(
         &self,
         turn_index: u32,
         checkpoint: u64,
@@ -252,11 +258,11 @@ impl GitStashRollbackJournal {
             .collect()
     }
 
-    fn checkpoint(&self) -> u64 {
+    pub fn checkpoint(&self) -> u64 {
         self.next_sequence
     }
 
-    fn remove_stash(&mut self, stash_ref: &str) -> bool {
+    pub fn remove_stash(&mut self, stash_ref: &str) -> bool {
         if let Some(index) = self
             .entries
             .iter()
@@ -286,7 +292,12 @@ pub struct GitCommitRollbackJournal {
 }
 
 impl GitCommitRollbackJournal {
-    fn record(&mut self, commit_sha: impl Into<String>, turn_index: u32, message: Option<String>) {
+    pub fn record(
+        &mut self,
+        commit_sha: impl Into<String>,
+        turn_index: u32,
+        message: Option<String>,
+    ) {
         self.entries.push(GitCommitRollbackEntry {
             sequence: self.next_sequence,
             commit_sha: commit_sha.into(),
@@ -297,15 +308,15 @@ impl GitCommitRollbackJournal {
         self.next_sequence = self.next_sequence.saturating_add(1);
     }
 
-    fn list(&self) -> Vec<GitCommitRollbackEntry> {
+    pub fn list(&self) -> Vec<GitCommitRollbackEntry> {
         self.entries.iter().rev().cloned().collect()
     }
 
-    fn restore_plan_for_turn(&self, turn_index: u32) -> Vec<GitCommitRollbackEntry> {
+    pub fn restore_plan_for_turn(&self, turn_index: u32) -> Vec<GitCommitRollbackEntry> {
         self.restore_plan_for_turn_since(turn_index, 0)
     }
 
-    fn restore_plan_for_turn_since(
+    pub fn restore_plan_for_turn_since(
         &self,
         turn_index: u32,
         checkpoint: u64,
@@ -318,11 +329,11 @@ impl GitCommitRollbackJournal {
             .collect()
     }
 
-    fn checkpoint(&self) -> u64 {
+    pub fn checkpoint(&self) -> u64 {
         self.next_sequence
     }
 
-    fn remove_commit(&mut self, commit_sha: &str) -> bool {
+    pub fn remove_commit(&mut self, commit_sha: &str) -> bool {
         if let Some(index) = self
             .entries
             .iter()
