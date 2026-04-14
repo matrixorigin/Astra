@@ -40,6 +40,7 @@ mod meta_handlers;
 mod platform_handlers;
 mod reflect_handlers;
 mod request_trace;
+mod resource_handlers;
 mod router_builder;
 pub mod run_engine;
 mod run_handlers;

@@ -257,6 +257,15 @@ pub async fn build_server_state(
         ),
     );
 
+    // ── Resource governor (Phase 5) ───────────────────────────────────
+    let resource_governor =
+        astra_services::resource_governor::DatabaseResourceGovernor::new(shared_pool.clone());
+    if let Err(e) = resource_governor.ensure_tables().await {
+        eprintln!("[state_builder] resource_governor table init failed: {e}");
+    }
+    let resource_governor: std::sync::Arc<dyn astra_services::resource_governor::ResourceGovernor> =
+        std::sync::Arc::new(resource_governor);
+
     // Create lifecycle service with delegation engine wired in.
     let run_lifecycle = super::run_lifecycle::AgenticRunLifecycleService::new(
         settings.matrixone.clone(),
@@ -266,7 +275,9 @@ pub async fn build_server_state(
     .with_pool(shared_pool.clone())
     .with_run_engine(run_engine)
     .with_delegation_engine(Arc::clone(&delegation_engine))
-    .with_edge_connection_pool(state.edge_connection_pool.clone());
+    .with_edge_connection_pool(state.edge_connection_pool.clone())
+    .with_resource_governor(resource_governor.clone());
+
     // Wire team persistence store backed by MatrixOne.
     let team_store =
         astra_services::team_persistence::MatrixOneTeamStore::new(shared_pool.get().clone());
@@ -280,7 +291,8 @@ pub async fn build_server_state(
         .with_run_lifecycle_service(Arc::new(run_lifecycle))
         .with_agent_profile_registry(profile_registry)
         .with_delegation_engine(delegation_engine)
-        .with_team_store(team_store);
+        .with_team_store(team_store)
+        .with_resource_governor(resource_governor.clone());
 
     let matrix_rt = Arc::new(crate::matrix_cloud_runtime::MatrixCloudRuntime::attach(
         shared_pool.clone(),

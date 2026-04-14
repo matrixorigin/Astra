@@ -25,6 +25,7 @@ pub mod pagination;
 pub mod protocol;
 pub mod reflect;
 pub mod replay;
+pub mod resource_governor;
 pub mod runs;
 pub mod sandbox;
 pub mod self_surface;

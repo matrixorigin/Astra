@@ -64,6 +64,9 @@ pub struct ServerToolExecutor {
     approval_gate: Option<Arc<dyn astra_tools::ToolApprovalGate>>,
     /// Optional progress callback for streaming tool output.
     progress_callback: Option<Arc<dyn astra_tools::ToolProgressCallback>>,
+    /// Optional resource governor for usage tracking (Phase 5).
+    resource_governor:
+        Option<std::sync::Arc<dyn astra_services::resource_governor::ResourceGovernor>>,
     /// Optional edge connection pool for routing to remote edge agents.
     edge_connection_pool: Option<super::edge_connection_pool::EdgeConnectionPool>,
 }
@@ -110,6 +113,7 @@ impl ServerToolExecutor {
             url_cache: Mutex::new(HashMap::new()),
             approval_gate: None,
             progress_callback: None,
+            resource_governor: None,
             edge_connection_pool: None,
         }
     }
@@ -132,6 +136,14 @@ impl ServerToolExecutor {
         self.edge_connection_pool = Some(pool);
     }
 
+    /// Set the resource governor for usage tracking.
+    pub fn set_resource_governor(
+        &mut self,
+        governor: std::sync::Arc<dyn astra_services::resource_governor::ResourceGovernor>,
+    ) {
+        self.resource_governor = Some(governor);
+    }
+
     /// Execute a tool call and return the result string.
     ///
     /// Routing order:
@@ -144,6 +156,15 @@ impl ServerToolExecutor {
                 return result.output;
             }
         }
+        // ── Fire-and-forget resource usage recording (Phase 5) ────────
+        if let Some(ref gov) = self.resource_governor {
+            let gov = gov.clone();
+            let uid = self.user_id.clone();
+            tokio::spawn(async move {
+                gov.record_tool_calls(&uid, 1).await;
+            });
+        }
+
         self.execute_local(name, args).await
     }
 
