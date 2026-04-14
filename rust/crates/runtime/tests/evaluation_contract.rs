@@ -82,10 +82,10 @@ fn build_unconfigured_app() -> axum::Router {
 fn dummy_matrixone() -> MatrixOneSettings {
     MatrixOneSettings {
         host: "127.0.0.1".to_string(),
-        port: 6001,
+        port: 1,
         user: "root".to_string(),
-        password: "111".to_string(),
-        database: "astra".to_string(),
+        password: "unused".to_string(),
+        database: "unused".to_string(),
     }
 }
 

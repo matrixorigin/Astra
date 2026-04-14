@@ -176,17 +176,23 @@ async fn configure_runtime_controllers(
     user_id: &str,
     session_id: &str,
 ) -> super::state_builder::PipelineLearningStack {
-    let promotion_signals = match load_runtime_promotion_signals(matrixone, shared_pool, user_id)
-        .await
-    {
-        Ok(context) => Some(context),
-        Err((status, response)) => {
-            eprintln!(
-                "[promotion-signals] failed to preload evaluation summaries for {user_id}: {status} {}",
-                response.0.detail
-            );
-            None
+    // Promotion signals require a live database connection. When no shared pool
+    // is available (e.g. edge-only mode) skip the preload rather than creating a
+    // throwaway connection that may hang on unreachable hosts.
+    let promotion_signals = if shared_pool.is_some() {
+        match load_runtime_promotion_signals(matrixone, shared_pool, user_id).await {
+            Ok(context) => Some(context),
+            Err((status, response)) => {
+                eprintln!(
+                    "[promotion-signals] failed to preload evaluation summaries for {user_id}: {status} {}",
+                    response.0.detail
+                );
+                None
+            }
         }
+    } else {
+        tracing::debug!("skipping promotion-signals preload: no shared database pool");
+        None
     };
     initialize_runtime_controllers(loop_state, user_id, session_id, promotion_signals)
 }
