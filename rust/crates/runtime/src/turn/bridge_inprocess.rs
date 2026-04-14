@@ -69,8 +69,9 @@ use crate::{
     },
     turn::cloud_tool_delivery::{
         cloud_tool_requires_approval_for_delivery, sse_maps_through_tool_request,
-        tool_approval_detail_for_delivery, tool_path_hint_for_delivery,
-        wait_approval_ledger_for_tool, wait_tool_result_ledger_for_tool,
+        tool_approval_detail_for_delivery, tool_approval_kind_for_delivery,
+        tool_path_hint_for_delivery, wait_approval_ledger_for_tool,
+        wait_tool_result_ledger_for_tool,
     },
     turn::edge_ledger::{
         assistant_message_with_tool_calls_and_reasoning, ensure_tool_call_ids,
@@ -2125,9 +2126,11 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                         .unwrap_or("");
                     let path = tool_path_hint_for_delivery(tc);
                     let detail = tool_approval_detail_for_delivery(tc);
+                    let approval_kind = tool_approval_kind_for_delivery(tc);
                     yield render_sse_map(&build_approval_required_event(
                         id,
                         tool_name,
+                        approval_kind,
                         path.as_deref(),
                         detail.as_deref(),
                     ));

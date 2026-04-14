@@ -9,6 +9,7 @@ use astra_runtime::turn::tool_argument_hints::{
     command_hint_from_args, path_hint_from_args, permission_prompt_primary_detail,
 };
 use astra_runtime::{compensation_prompt_note, explicit_approval_reason};
+use astra_thin_client::ApprovalKind;
 
 /// Permission mode controls how tool approval decisions are handled.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -208,8 +209,8 @@ pub(super) struct PermissionManager {
 }
 
 impl PermissionManager {
-    fn cloud_detail_requires_explicit_approval(detail: Option<&str>) -> bool {
-        detail.is_some_and(|detail| detail.contains("Explicit approval required:"))
+    fn cloud_approval_is_explicit(approval_kind: ApprovalKind) -> bool {
+        matches!(approval_kind, ApprovalKind::Explicit)
     }
 
     /// Return the current permission mode (for propagation to sub-runs).
@@ -417,10 +418,11 @@ impl PermissionManager {
         &mut self,
         tool: &str,
         detail: Option<&str>,
+        approval_kind: ApprovalKind,
         quiet: bool,
     ) -> astra_thin_client::ApprovalDecision {
         use astra_thin_client::ApprovalDecision;
-        let explicit = Self::cloud_detail_requires_explicit_approval(detail);
+        let explicit = Self::cloud_approval_is_explicit(approval_kind);
         if quiet {
             return if self.mode == PermissionMode::Auto && !explicit {
                 ApprovalDecision::Allow
@@ -479,10 +481,11 @@ impl PermissionManager {
         &mut self,
         tool: &str,
         detail: Option<&str>,
+        approval_kind: ApprovalKind,
         quiet: bool,
     ) -> astra_thin_client::ApprovalDecision {
         use astra_thin_client::ApprovalDecision;
-        let explicit = Self::cloud_detail_requires_explicit_approval(detail);
+        let explicit = Self::cloud_approval_is_explicit(approval_kind);
         if quiet {
             return if self.mode == PermissionMode::Auto && !explicit {
                 ApprovalDecision::Allow
@@ -1322,7 +1325,7 @@ mod tests {
     fn resolve_cloud_approval_quiet_denies_without_auto() {
         let mut pm = PermissionManager::new(false);
         assert!(matches!(
-            pm.resolve_cloud_approval("write_file", Some("x.rs"), true),
+            pm.resolve_cloud_approval("write_file", Some("x.rs"), ApprovalKind::Standard, true),
             astra_thin_client::ApprovalDecision::Deny
         ));
     }
@@ -1331,7 +1334,7 @@ mod tests {
     fn resolve_cloud_approval_quiet_allows_when_auto() {
         let mut pm = PermissionManager::new(true);
         assert!(matches!(
-            pm.resolve_cloud_approval("write_file", Some("x.rs"), true),
+            pm.resolve_cloud_approval("write_file", Some("x.rs"), ApprovalKind::Standard, true),
             astra_thin_client::ApprovalDecision::Allow
         ));
     }
@@ -1726,7 +1729,8 @@ mod tests {
     fn deny_mode_cloud_approval_denied() {
         let dir = tempfile::tempdir().unwrap();
         let mut pm = PermissionManager::with_project_mode(PermissionMode::Deny, dir.path());
-        let decision = pm.resolve_cloud_approval("bash", Some("/tmp"), false);
+        let decision =
+            pm.resolve_cloud_approval("bash", Some("/tmp"), ApprovalKind::Standard, false);
         assert_eq!(decision, astra_thin_client::ApprovalDecision::Deny);
     }
 
@@ -1734,7 +1738,8 @@ mod tests {
     fn auto_mode_cloud_approval_allowed() {
         let dir = tempfile::tempdir().unwrap();
         let mut pm = PermissionManager::with_project_mode(PermissionMode::Auto, dir.path());
-        let decision = pm.resolve_cloud_approval("bash", Some("/tmp"), false);
+        let decision =
+            pm.resolve_cloud_approval("bash", Some("/tmp"), ApprovalKind::Standard, false);
         assert_eq!(decision, astra_thin_client::ApprovalDecision::Allow);
     }
 
@@ -1742,12 +1747,22 @@ mod tests {
     fn auto_mode_cloud_explicit_approval_is_not_auto_allowed() {
         let dir = tempfile::tempdir().unwrap();
         let mut pm = PermissionManager::with_project_mode(PermissionMode::Auto, dir.path());
+        let decision =
+            pm.resolve_cloud_approval("bash", Some("/tmp"), ApprovalKind::Explicit, true);
+        assert_eq!(decision, astra_thin_client::ApprovalDecision::Deny);
+    }
+
+    #[test]
+    fn cloud_approval_detail_text_no_longer_drives_explicit_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Auto, dir.path());
         let decision = pm.resolve_cloud_approval(
             "bash",
             Some("Explicit approval required: action scope is unbounded."),
+            ApprovalKind::Standard,
             true,
         );
-        assert_eq!(decision, astra_thin_client::ApprovalDecision::Deny);
+        assert_eq!(decision, astra_thin_client::ApprovalDecision::Allow);
     }
 
     #[test]
@@ -2232,7 +2247,7 @@ mod tests {
     async fn cloud_approval_async_quiet_denies_without_auto() {
         let mut pm = PermissionManager::new(false);
         let decision = pm
-            .resolve_cloud_approval_async("write_file", Some("x.rs"), true)
+            .resolve_cloud_approval_async("write_file", Some("x.rs"), ApprovalKind::Standard, true)
             .await;
         assert_eq!(decision, astra_thin_client::ApprovalDecision::Deny);
     }
@@ -2241,7 +2256,7 @@ mod tests {
     async fn cloud_approval_async_quiet_allows_when_auto() {
         let mut pm = PermissionManager::new(true);
         let decision = pm
-            .resolve_cloud_approval_async("write_file", Some("x.rs"), true)
+            .resolve_cloud_approval_async("write_file", Some("x.rs"), ApprovalKind::Standard, true)
             .await;
         assert_eq!(decision, astra_thin_client::ApprovalDecision::Allow);
     }
@@ -2251,7 +2266,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut pm = PermissionManager::with_project_mode(PermissionMode::Auto, dir.path());
         let decision = pm
-            .resolve_cloud_approval_async("bash", Some("/tmp"), false)
+            .resolve_cloud_approval_async("bash", Some("/tmp"), ApprovalKind::Standard, false)
             .await;
         assert_eq!(decision, astra_thin_client::ApprovalDecision::Allow);
     }
@@ -2261,7 +2276,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut pm = PermissionManager::with_project_mode(PermissionMode::Deny, dir.path());
         let decision = pm
-            .resolve_cloud_approval_async("bash", Some("/tmp"), false)
+            .resolve_cloud_approval_async("bash", Some("/tmp"), ApprovalKind::Standard, false)
             .await;
         assert_eq!(decision, astra_thin_client::ApprovalDecision::Deny);
     }
@@ -2272,7 +2287,7 @@ mod tests {
         let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
         pm.session_overrides.insert("bash".to_string(), true);
         let decision = pm
-            .resolve_cloud_approval_async("bash", Some("/tmp"), false)
+            .resolve_cloud_approval_async("bash", Some("/tmp"), ApprovalKind::Standard, false)
             .await;
         assert_eq!(decision, astra_thin_client::ApprovalDecision::Allow);
     }
@@ -2283,7 +2298,7 @@ mod tests {
         let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
         pm.session_overrides.insert("bash".to_string(), false);
         let decision = pm
-            .resolve_cloud_approval_async("bash", Some("/tmp"), false)
+            .resolve_cloud_approval_async("bash", Some("/tmp"), ApprovalKind::Standard, false)
             .await;
         assert_eq!(decision, astra_thin_client::ApprovalDecision::Deny);
     }
@@ -2353,7 +2368,12 @@ mod tests {
 
         // 2nd call: cloud approval must auto-allow (session override)
         let decision2 = pm
-            .resolve_cloud_approval_async("write_file", Some("src/main.rs"), false)
+            .resolve_cloud_approval_async(
+                "write_file",
+                Some("src/main.rs"),
+                ApprovalKind::Standard,
+                false,
+            )
             .await;
         assert_eq!(decision2, astra_thin_client::ApprovalDecision::Allow);
 
@@ -2369,17 +2389,66 @@ mod tests {
     /// behavior for all non-interactive paths.
     #[tokio::test]
     async fn async_sync_parity_all_early_returns() {
-        let cases: Vec<(PermissionMode, bool, &str, Option<bool>)> = vec![
+        let cases: Vec<(PermissionMode, bool, &str, Option<bool>, ApprovalKind)> = vec![
             // (mode, quiet, tool, session_override) → expected same result
-            (PermissionMode::Auto, true, "bash", None),
-            (PermissionMode::Auto, false, "bash", None),
-            (PermissionMode::Deny, true, "bash", None),
-            (PermissionMode::Deny, false, "bash", None),
-            (PermissionMode::Prompt, true, "bash", None),
-            (PermissionMode::Prompt, false, "bash", Some(true)),
-            (PermissionMode::Prompt, false, "bash", Some(false)),
+            (
+                PermissionMode::Auto,
+                true,
+                "bash",
+                None,
+                ApprovalKind::Standard,
+            ),
+            (
+                PermissionMode::Auto,
+                false,
+                "bash",
+                None,
+                ApprovalKind::Standard,
+            ),
+            (
+                PermissionMode::Auto,
+                true,
+                "bash",
+                None,
+                ApprovalKind::Explicit,
+            ),
+            (
+                PermissionMode::Deny,
+                true,
+                "bash",
+                None,
+                ApprovalKind::Standard,
+            ),
+            (
+                PermissionMode::Deny,
+                false,
+                "bash",
+                None,
+                ApprovalKind::Standard,
+            ),
+            (
+                PermissionMode::Prompt,
+                true,
+                "bash",
+                None,
+                ApprovalKind::Standard,
+            ),
+            (
+                PermissionMode::Prompt,
+                false,
+                "bash",
+                Some(true),
+                ApprovalKind::Standard,
+            ),
+            (
+                PermissionMode::Prompt,
+                false,
+                "bash",
+                Some(false),
+                ApprovalKind::Standard,
+            ),
         ];
-        for (mode, quiet, tool, override_val) in cases {
+        for (mode, quiet, tool, override_val, approval_kind) in cases {
             let dir = tempfile::tempdir().unwrap();
             let mut pm_sync = PermissionManager::with_project_mode(mode, dir.path());
             let mut pm_async = PermissionManager::with_project_mode(mode, dir.path());
@@ -2387,9 +2456,10 @@ mod tests {
                 pm_sync.session_overrides.insert(tool.to_string(), v);
                 pm_async.session_overrides.insert(tool.to_string(), v);
             }
-            let sync_result = pm_sync.resolve_cloud_approval(tool, Some("detail"), quiet);
+            let sync_result =
+                pm_sync.resolve_cloud_approval(tool, Some("detail"), approval_kind, quiet);
             let async_result = pm_async
-                .resolve_cloud_approval_async(tool, Some("detail"), quiet)
+                .resolve_cloud_approval_async(tool, Some("detail"), approval_kind, quiet)
                 .await;
             assert_eq!(
                 sync_result, async_result,

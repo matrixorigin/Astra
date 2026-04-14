@@ -1,5 +1,7 @@
 use serde_json::{Map, Value};
 
+use astra_thin_client::ApprovalKind;
+
 use crate::try_repair_tool_args;
 
 pub fn build_stream_error_event(message: &str, code: &str, retryable: bool) -> Map<String, Value> {
@@ -157,6 +159,7 @@ pub fn build_edge_tool_call_event(tool_call: &Map<String, Value>) -> Map<String,
 pub fn build_approval_required_event(
     request_id: &str,
     tool_name: &str,
+    approval_kind: ApprovalKind,
     path: Option<&str>,
     detail: Option<&str>,
 ) -> Map<String, Value> {
@@ -170,6 +173,10 @@ pub fn build_approval_required_event(
             Value::String(request_id.to_string()),
         ),
         ("tool".to_string(), Value::String(tool_name.to_string())),
+        (
+            "approval_kind".to_string(),
+            serde_json::to_value(approval_kind).unwrap_or(Value::String("explicit".to_string())),
+        ),
     ]);
     if let Some(p) = path.filter(|s| !s.is_empty()) {
         m.insert("path".to_string(), Value::String(p.to_string()));
@@ -222,19 +229,35 @@ mod tests {
 
     #[test]
     fn approval_required_includes_optional_path() {
-        let ev = build_approval_required_event("a1", "write_file", Some("p/x.rs"), None);
+        let ev = build_approval_required_event(
+            "a1",
+            "write_file",
+            ApprovalKind::Standard,
+            Some("p/x.rs"),
+            None,
+        );
         assert_eq!(
             ev.get("type").and_then(Value::as_str),
             Some("approval_required")
         );
         assert_eq!(ev.get("request_id").and_then(Value::as_str), Some("a1"));
         assert_eq!(ev.get("tool").and_then(Value::as_str), Some("write_file"));
+        assert_eq!(
+            ev.get("approval_kind").and_then(Value::as_str),
+            Some("standard")
+        );
         assert_eq!(ev.get("path").and_then(Value::as_str), Some("p/x.rs"));
     }
 
     #[test]
     fn approval_required_includes_optional_detail() {
-        let ev = build_approval_required_event("a1", "bash", None, Some("git status"));
+        let ev = build_approval_required_event(
+            "a1",
+            "bash",
+            ApprovalKind::Explicit,
+            None,
+            Some("git status"),
+        );
         assert_eq!(ev.get("detail").and_then(Value::as_str), Some("git status"));
     }
 
@@ -474,14 +497,15 @@ mod tests {
 
     #[test]
     fn approval_required_omits_empty_path() {
-        let ev = build_approval_required_event("r1", "bash", Some(""), Some(""));
+        let ev =
+            build_approval_required_event("r1", "bash", ApprovalKind::Explicit, Some(""), Some(""));
         assert!(ev.get("path").is_none());
         assert!(ev.get("detail").is_none());
     }
 
     #[test]
     fn approval_required_omits_none_path() {
-        let ev = build_approval_required_event("r1", "bash", None, None);
+        let ev = build_approval_required_event("r1", "bash", ApprovalKind::Explicit, None, None);
         assert!(ev.get("path").is_none());
         assert!(ev.get("detail").is_none());
     }
