@@ -12,7 +12,7 @@ use dashmap::DashMap;
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
-use super::edge_ws_protocol::{EdgeServerMessage, EDGE_TOOL_TIMEOUT_SECS};
+use super::edge_ws_protocol::{EDGE_TOOL_TIMEOUT_SECS, EdgeServerMessage};
 
 /// Sender half that pushes frames into an edge agent's WebSocket write loop.
 pub type EdgeWsSender = mpsc::UnboundedSender<EdgeServerMessage>;
@@ -194,8 +194,7 @@ impl EdgeConnectionPool {
 
     /// Remove stale connections (sender closed).
     pub fn cleanup_stale(&self) {
-        self.connections
-            .retain(|_, conn| !conn.sender.is_closed());
+        self.connections.retain(|_, conn| !conn.sender.is_closed());
     }
 
     /// Number of active connections.

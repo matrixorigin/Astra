@@ -63,10 +63,7 @@ impl AuthService for StubAuthService {
         &self,
         headers: &HeaderMap,
     ) -> Result<AuthUserRecord, (StatusCode, axum::Json<ErrorResponse>)> {
-        match headers
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-        {
+        match headers.get("authorization").and_then(|v| v.to_str().ok()) {
             Some("Bearer test-edge-token") => Ok(AuthUserRecord {
                 user_id: "test-user-1".to_string(),
                 username: "edgeuser".to_string(),
@@ -114,9 +111,7 @@ async fn ws_auth(
     addr: std::net::SocketAddr,
     edge_id: &str,
     hostname: &str,
-) -> tokio_tungstenite::WebSocketStream<
-    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-> {
+) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
     let url = format!("ws://{addr}/edge/ws");
     let (mut ws, _) = connect_async(&url).await.expect("WS connect");
 
@@ -132,8 +127,7 @@ async fn ws_auth(
         .unwrap();
 
     let resp = ws.next().await.unwrap().unwrap();
-    let resp_json: serde_json::Value =
-        serde_json::from_str(&resp.into_text().unwrap()).unwrap();
+    let resp_json: serde_json::Value = serde_json::from_str(&resp.into_text().unwrap()).unwrap();
     assert_eq!(resp_json["type"], "edge_auth_ok");
     assert_eq!(resp_json["user_id"], "test-user-1");
 
@@ -190,8 +184,7 @@ async fn edge_ws_bad_token_rejected() {
         .unwrap();
 
     let resp = ws.next().await.expect("msg").expect("ok");
-    let resp_json: serde_json::Value =
-        serde_json::from_str(&resp.into_text().unwrap()).unwrap();
+    let resp_json: serde_json::Value = serde_json::from_str(&resp.into_text().unwrap()).unwrap();
     assert_eq!(resp_json["type"], "edge_auth_error");
 
     server.abort();
@@ -213,8 +206,7 @@ async fn edge_ws_ping_pong() {
 
     // Should receive edge_pong
     let pong = read.next().await.unwrap().unwrap();
-    let pong_json: serde_json::Value =
-        serde_json::from_str(&pong.into_text().unwrap()).unwrap();
+    let pong_json: serde_json::Value = serde_json::from_str(&pong.into_text().unwrap()).unwrap();
     assert_eq!(pong_json["type"], "edge_pong");
 
     write.close().await.ok();
@@ -238,8 +230,7 @@ async fn edge_ws_tool_request_roundtrip() {
 
     // Edge should receive a tool_request via WS
     let tool_req = read.next().await.unwrap().unwrap();
-    let req_json: serde_json::Value =
-        serde_json::from_str(&tool_req.into_text().unwrap()).unwrap();
+    let req_json: serde_json::Value = serde_json::from_str(&tool_req.into_text().unwrap()).unwrap();
     assert_eq!(req_json["type"], "edge_tool_request");
     assert_eq!(req_json["tool"], "bash");
     let request_id = req_json["request_id"].as_str().unwrap().to_string();

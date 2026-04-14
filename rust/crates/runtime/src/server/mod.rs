@@ -29,6 +29,10 @@ pub mod conflict_resolver;
 pub mod delegation_engine;
 mod delegation_handlers;
 mod edge_callback_handlers;
+pub mod edge_connection_pool;
+mod edge_status_handler;
+mod edge_ws_handler;
+pub mod edge_ws_protocol;
 mod http_helpers;
 mod http_types;
 mod learning_handlers;
@@ -50,10 +54,6 @@ mod team_handlers;
 pub mod team_orchestrator;
 pub mod worktree_isolation;
 mod ws_handler;
-pub mod edge_ws_protocol;
-pub mod edge_connection_pool;
-mod edge_ws_handler;
-mod edge_status_handler;
 
 use self::{
     bridge_prep::prepare_chat_turn_bridge_body,

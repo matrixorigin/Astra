@@ -791,7 +791,8 @@ mod tests {
     fn read_file_respects_start_and_end_line() {
         let (exec, dir) = test_executor();
         std::fs::write(dir.path().join("f.txt"), "a\nb\nc\nd\ne\n").unwrap();
-        let result = exec.server_read_file(&json!({"path": "f.txt", "start_line": 2, "end_line": 4}));
+        let result =
+            exec.server_read_file(&json!({"path": "f.txt", "start_line": 2, "end_line": 4}));
         assert!(!result.contains("1\ta"));
         assert!(result.contains("2\tb"));
         assert!(result.contains("3\tc"));
@@ -964,9 +965,7 @@ mod tests {
     #[tokio::test]
     async fn bash_stderr_is_captured() {
         let (exec, _dir) = test_executor();
-        let result = exec
-            .server_bash(&json!({"command": "echo err >&2"}))
-            .await;
+        let result = exec.server_bash(&json!({"command": "echo err >&2"})).await;
         assert!(result.contains("stderr:"));
         assert!(result.contains("err"));
     }
@@ -1050,7 +1049,9 @@ mod tests {
         let (exec, _dir) = test_executor();
         // We can't actually call Memoria, but we can verify the execute path
         // doesn't panic and returns a reasonable error (no MEMORIA_BASE_URL set).
-        let result = exec.execute("memory_store", &json!({"content": "test"})).await;
+        let result = exec
+            .execute("memory_store", &json!({"content": "test"}))
+            .await;
         // Should attempt the call (may fail due to no server, but shouldn't crash)
         assert!(!result.is_empty());
     }
