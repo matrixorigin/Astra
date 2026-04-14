@@ -39,7 +39,7 @@ fn passive_cargo_timeout() -> Duration {
 
 /// Whether a successful disk write to `edited_path` should schedule a passive check.
 #[must_use]
-pub(crate) fn should_schedule_passive_cargo(project_root: &Path, edited_path: &Path) -> bool {
+pub fn should_schedule_passive_cargo(project_root: &Path, edited_path: &Path) -> bool {
     if !passive_cargo_check_enabled() {
         return false;
     }
@@ -58,7 +58,7 @@ fn truncate_diag_body(s: &str) -> String {
 }
 
 /// Drain pending flag, run `cargo check` if appropriate, return messages to append to `payload["messages"]`.
-pub(crate) async fn take_passive_cargo_messages(
+pub async fn take_passive_cargo_messages(
     pending: &AtomicBool,
     project_root: &Path,
     tool_results_nonempty: bool,

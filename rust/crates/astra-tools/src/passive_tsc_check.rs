@@ -46,7 +46,7 @@ fn is_ts_like_source(path: &Path) -> bool {
 
 /// Whether a successful disk write should schedule passive `tsc --noEmit`.
 #[must_use]
-pub(crate) fn should_schedule_passive_tsc(project_root: &Path, edited_path: &Path) -> bool {
+pub fn should_schedule_passive_tsc(project_root: &Path, edited_path: &Path) -> bool {
     if !passive_tsc_check_enabled() {
         return false;
     }
@@ -76,7 +76,7 @@ fn diagnostic_message(content: String) -> Value {
 }
 
 /// Drain pending, run `tsc --noEmit -p tsconfig.json` when appropriate.
-pub(crate) async fn take_passive_tsc_messages(
+pub async fn take_passive_tsc_messages(
     pending: &AtomicBool,
     project_root: &Path,
     tool_results_nonempty: bool,

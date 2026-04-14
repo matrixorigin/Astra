@@ -33,15 +33,21 @@ pub struct SessionSubtask {
 }
 
 /// In-memory task store for the current session.
-pub(crate) struct TaskManager {
+pub struct TaskManager {
     tasks: Mutex<Vec<SessionTask>>,
     id_counter: AtomicU32,
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct TaskManagerSnapshot {
+pub struct TaskManagerSnapshot {
     pub tasks: Vec<SessionTask>,
     pub next_task_id: u32,
+}
+
+impl Default for TaskManager {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl TaskManager {
