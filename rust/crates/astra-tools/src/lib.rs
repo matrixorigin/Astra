@@ -436,3 +436,264 @@ pub mod git_status_codes {
     pub const RENAMED: char = 'R';
     pub const UNTRACKED_PREFIX: &str = "??";
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    // ── ToolResult ─────────────────────────────────────────────────────
+
+    #[test]
+    fn tool_result_text() {
+        let r = ToolResult::text("hello".into());
+        assert_eq!(r.output, "hello");
+        assert!(!r.is_error);
+        assert!(r.metadata.is_none());
+    }
+
+    #[test]
+    fn tool_result_error() {
+        let r = ToolResult::error("boom".into());
+        assert_eq!(r.output, "boom");
+        assert!(r.is_error);
+    }
+
+    #[test]
+    fn tool_result_default_is_empty() {
+        let r = ToolResult::default();
+        assert!(r.output.is_empty());
+        assert!(!r.is_error);
+        assert!(r.metadata.is_none());
+    }
+
+    // ── SandboxConfig ──────────────────────────────────────────────────
+
+    #[test]
+    fn sandbox_standard_defaults() {
+        let cfg = SandboxConfig::standard("/projects/foo");
+        assert_eq!(cfg.project_root, PathBuf::from("/projects/foo"));
+        assert_eq!(cfg.mode, SandboxMode::Standard);
+        assert!(cfg.network_allowed);
+        assert_eq!(cfg.max_output_bytes, 200_000);
+        assert_eq!(cfg.command_timeout, Duration::from_secs(120));
+        assert!(cfg.allowed_paths.contains(&PathBuf::from("/tmp")));
+    }
+
+    #[test]
+    fn sandbox_strict_defaults() {
+        let cfg = SandboxConfig::strict("/srv/workspace");
+        assert_eq!(cfg.mode, SandboxMode::Strict);
+        assert!(!cfg.network_allowed);
+        assert_eq!(cfg.allowed_paths, vec![PathBuf::from("/tmp")]);
+    }
+
+    #[test]
+    fn sandbox_mode_ordering() {
+        assert!(SandboxMode::Permissive < SandboxMode::Standard);
+        assert!(SandboxMode::Standard < SandboxMode::Strict);
+        assert!(SandboxMode::Strict < SandboxMode::ReadOnly);
+    }
+
+    // ── Output utilities ───────────────────────────────────────────────
+
+    #[test]
+    fn truncate_output_short_stays_intact() {
+        let s = "short output".to_string();
+        assert_eq!(truncate_output(s.clone(), 1000), s);
+    }
+
+    #[test]
+    fn truncate_output_long_gets_cut() {
+        let s = "a\n".repeat(5000); // 10000 chars
+        let result = truncate_output(s, 100);
+        assert!(result.len() < 200);
+        assert!(result.ends_with("[truncated]"));
+    }
+
+    #[test]
+    fn truncate_output_prefers_newline_boundary() {
+        let s = "line one\nline two\nline three that is quite long\n".to_string();
+        let result = truncate_output(s, 30);
+        // Should cut at a newline
+        assert!(result.ends_with("[truncated]"));
+        assert!(!result.contains("line three"));
+    }
+
+    #[test]
+    fn normalize_empty_output_replaces_blank() {
+        let result = normalize_empty_output("".into(), "bash");
+        assert_eq!(result, "(bash completed with no output)");
+    }
+
+    #[test]
+    fn normalize_empty_output_replaces_whitespace() {
+        let result = normalize_empty_output("   \n\t  ".into(), "grep");
+        assert_eq!(result, "(grep completed with no output)");
+    }
+
+    #[test]
+    fn normalize_empty_output_keeps_real_content() {
+        let result = normalize_empty_output("hello".into(), "bash");
+        assert_eq!(result, "hello");
+    }
+
+    #[test]
+    fn per_tool_output_limit_grep_is_capped() {
+        let base = tool_output_limit();
+        let grep_limit = per_tool_output_limit("grep");
+        assert!(grep_limit <= 10_000);
+        assert!(grep_limit <= base);
+    }
+
+    #[test]
+    fn per_tool_output_limit_bash_uses_base() {
+        let base = tool_output_limit();
+        assert_eq!(per_tool_output_limit("bash"), base);
+    }
+
+    // ── Utility functions ──────────────────────────────────────────────
+
+    #[test]
+    fn utf16_col_ascii() {
+        assert_eq!(utf16_col_to_char_idx("hello world", 5), 5);
+    }
+
+    #[test]
+    fn utf16_col_beyond_line_end() {
+        let idx = utf16_col_to_char_idx("hi", 999);
+        assert_eq!(idx, 2); // line.chars().count()
+    }
+
+    #[test]
+    fn parse_grep_file_line_valid() {
+        let (file, line) = parse_grep_file_line("src/main.rs:42:fn main()").unwrap();
+        assert_eq!(file, "src/main.rs");
+        assert_eq!(line, 42);
+    }
+
+    #[test]
+    fn parse_grep_file_line_invalid() {
+        assert!(parse_grep_file_line("no colons here").is_none());
+        assert!(parse_grep_file_line("file:notanum:text").is_none());
+    }
+
+    #[test]
+    fn categorize_reference_import() {
+        assert_eq!(categorize_reference("f.rs:1:use std::io;", "io"), "import");
+        assert_eq!(categorize_reference("f.rs:1:import React from 'react';", "React"), "import");
+        assert_eq!(categorize_reference("f.rs:1:from os import path", "path"), "import");
+    }
+
+    #[test]
+    fn categorize_reference_definition() {
+        assert_eq!(categorize_reference("f.rs:1:fn my_func() {}", "my_func"), "definition");
+        assert_eq!(categorize_reference("f.rs:1:pub fn my_func() {}", "my_func"), "definition");
+        assert_eq!(categorize_reference("f.rs:1:struct Foo {}", "Foo"), "definition");
+        assert_eq!(categorize_reference("f.rs:1:class MyClass:", "MyClass"), "definition");
+    }
+
+    #[test]
+    fn categorize_reference_usage() {
+        assert_eq!(categorize_reference("f.rs:1:    my_func();", "my_func"), "usage");
+        assert_eq!(categorize_reference("f.rs:1:    x = foo.bar();", "bar"), "usage");
+        // Note: "let x = ..." is categorized as "definition" by design (it starts with "let ")
+        assert_eq!(categorize_reference("f.rs:1:let x = foo.bar();", "bar"), "definition");
+    }
+
+    // ── APPROVAL_REQUIRED_TOOLS ────────────────────────────────────────
+
+    #[test]
+    fn approval_required_tools_includes_dangerous_ops() {
+        assert!(APPROVAL_REQUIRED_TOOLS.contains(&"bash"));
+        assert!(APPROVAL_REQUIRED_TOOLS.contains(&"write_file"));
+        assert!(APPROVAL_REQUIRED_TOOLS.contains(&"delete_file"));
+        assert!(APPROVAL_REQUIRED_TOOLS.contains(&"git_commit"));
+        assert!(!APPROVAL_REQUIRED_TOOLS.contains(&"read_file"));
+        assert!(!APPROVAL_REQUIRED_TOOLS.contains(&"grep"));
+    }
+
+    // ── ApprovalDecision ───────────────────────────────────────────────
+
+    #[test]
+    fn approval_decision_variants_debug() {
+        let _ = format!("{:?}", ApprovalDecision::Approved);
+        let _ = format!("{:?}", ApprovalDecision::Denied { reason: Some("nope".into()) });
+        let _ = format!("{:?}", ApprovalDecision::Timeout);
+    }
+
+    // ── Schemas ────────────────────────────────────────────────────────
+
+    #[test]
+    fn all_tool_schemas_has_expected_tools() {
+        let schemas = schemas::all_tool_schemas();
+        let names: Vec<String> = schemas
+            .iter()
+            .filter_map(|s| {
+                s.get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(|n| n.as_str())
+                    .map(String::from)
+            })
+            .collect();
+        // Core tools that must be present
+        assert!(names.contains(&"bash".into()));
+        assert!(names.contains(&"read_file".into()));
+        assert!(names.contains(&"write_file".into()));
+        assert!(names.contains(&"str_replace".into()));
+        assert!(names.contains(&"grep".into()));
+        assert!(names.contains(&"glob".into()));
+        assert!(names.contains(&"memory_store".into()));
+        assert!(names.contains(&"memory_search".into()));
+        assert!(names.contains(&"memory_profile".into()));
+    }
+
+    #[test]
+    fn all_tool_schemas_valid_structure() {
+        let schemas = schemas::all_tool_schemas();
+        assert!(!schemas.is_empty());
+        for schema in &schemas {
+            // Each schema must have type: "function" and function.name
+            assert_eq!(schema.get("type").and_then(|v| v.as_str()), Some("function"));
+            let func = schema.get("function").expect("missing 'function' key");
+            assert!(func.get("name").and_then(|n| n.as_str()).is_some());
+            assert!(func.get("description").and_then(|d| d.as_str()).is_some());
+        }
+    }
+
+    // ── Persist large output ───────────────────────────────────────────
+
+    #[test]
+    fn maybe_persist_small_output_passes_through() {
+        let out = "small output".to_string();
+        let result = maybe_persist_large_output(out.clone(), 0, "bash");
+        assert_eq!(result, out);
+    }
+
+    #[test]
+    fn maybe_persist_under_soft_limit_passes_through() {
+        let out = "x".repeat(PERSIST_THRESHOLD + 1);
+        let result = maybe_persist_large_output(out.clone(), 0, "bash");
+        // Under AGGREGATE_SOFT_LIMIT, even large output passes through
+        assert_eq!(result, out);
+    }
+
+    #[test]
+    fn maybe_persist_error_output_passes_through() {
+        let out = format!("Error: {}", "x".repeat(PERSIST_THRESHOLD + 1));
+        let result = maybe_persist_large_output(out.clone(), AGGREGATE_SOFT_LIMIT + 1, "bash");
+        // Error output is never persisted
+        assert_eq!(result, out);
+    }
+
+    // ── git_status_codes ───────────────────────────────────────────────
+
+    #[test]
+    fn git_status_codes_constants() {
+        assert_eq!(git_status_codes::MODIFIED, 'M');
+        assert_eq!(git_status_codes::ADDED, 'A');
+        assert_eq!(git_status_codes::DELETED, 'D');
+        assert_eq!(git_status_codes::RENAMED, 'R');
+        assert_eq!(git_status_codes::UNTRACKED_PREFIX, "??");
+    }
+}
