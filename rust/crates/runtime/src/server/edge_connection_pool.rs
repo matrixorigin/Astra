@@ -5,7 +5,6 @@
 //! stored in [`AppState`] and queried by the tool routing layer to decide
 //! whether to route tool calls to a remote edge or fall back to the server.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
