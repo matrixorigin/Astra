@@ -56,8 +56,7 @@ use super::server_loop_host::ServerAgenticLoopHostBuilder;
 /// Build skill registry + resolver for server-side agentic loops.
 ///
 /// Returns `(registry_for_activation, resolver)` using the global default
-/// registry (Local + Bundled providers). Fork-context skills require a
-/// `skill_executor` which is CLI-only; the server gets inline resolution only.
+/// registry (Local + Bundled providers).
 fn build_server_skill_resolver() -> (
     Option<Arc<crate::skills::UnifiedSkillRegistry>>,
     Option<Arc<dyn crate::turn::skill_tool::SkillResolver>>,
@@ -79,6 +78,37 @@ fn build_server_skill_resolver() -> (
         Some(Arc::new(adapter))
     };
     (Some(registry), resolver)
+}
+
+/// Build a server-side skill executor that supports both Inline and Fork
+/// execution contexts via [`SkillExecutionRouter`].
+fn build_server_skill_executor(
+    matrixone: &MatrixOneSettings,
+    encryptor: &Arc<FernetTokenEncryptor>,
+    shared_pool: Option<&SharedPool>,
+    model_override: Option<&str>,
+    edge_tools: &[Value],
+    edge_profile: &Map<String, Value>,
+    skill_resolver: Option<Arc<dyn crate::turn::skill_tool::SkillResolver>>,
+    session_id: &str,
+) -> Option<Arc<dyn crate::skills::traits::SkillExecutor>> {
+    use super::server_skill_subrun::ServerSkillSubRunExecutor;
+    use crate::skills::executor::isolated::{IsolatedSkillExecutor, SkillExecutionRouter};
+
+    let subrun_executor = ServerSkillSubRunExecutor::new(
+        matrixone.clone(),
+        Arc::clone(encryptor),
+        session_id.to_string(),
+    )
+    .with_pool(shared_pool.cloned())
+    .with_default_model(model_override.map(String::from))
+    .with_edge_tools(edge_tools.to_vec())
+    .with_edge_profile(edge_profile.clone())
+    .with_skill_resolver(skill_resolver);
+
+    let isolated = Arc::new(IsolatedSkillExecutor::new(Arc::new(subrun_executor)));
+    let router = SkillExecutionRouter::new(Some(isolated));
+    Some(Arc::new(router))
 }
 
 fn skill_search_from_context(
@@ -666,6 +696,21 @@ impl AgenticRunLifecycleService {
             .map(|root| crate::skills::hooks::load_all_hooks(std::path::Path::new(root)))
             .unwrap_or_default();
 
+        // Build the server-side skill fork executor so skills with
+        // execution_context: Fork can run in isolated sub-agent loops.
+        let edge_tools = Self::extract_edge_tools(request);
+        let edge_profile = Self::extract_edge_profile(request);
+        let skill_executor = build_server_skill_executor(
+            &self.matrixone,
+            &self.encryptor,
+            self.shared_pool.as_ref(),
+            request.model.as_deref(),
+            &edge_tools,
+            &edge_profile,
+            skill_resolver.clone(),
+            session_id,
+        );
+
         AgenticLoopState {
             messages: vec![user_message],
             tool_results: Vec::new(),
@@ -699,6 +744,7 @@ impl AgenticRunLifecycleService {
             skills: SkillState {
                 registry_for_activation: skill_registry,
                 resolver: skill_resolver,
+                executor: skill_executor,
                 quality_tracker: crate::skills::quality::SkillQualityTracker::new(),
                 improvement_tracker: crate::skills::improvement::ImprovementTracker::new(),
                 search: skill_search,
