@@ -12,6 +12,7 @@ use astra_runtime::turn::sse_stream_host::{
 };
 use astra_runtime::turn::tool_result_semantics::cloud_tool_result_status_label;
 use astra_runtime::turn::tool_result_semantics::tool_dedup_signature;
+use astra_services::session_journal::{JournalEvent, JournalWriter};
 use crossterm::style::Stylize;
 use futures_util::StreamExt;
 use serde_json::{Map, Value};
@@ -185,6 +186,8 @@ struct CliSseStreamHost<'a> {
     skills_invoked: std::collections::HashSet<String>,
     /// Turn-scoped rollback checkpoints when the whole turn opts into rollback-on-failure.
     active_turn_rollback: Option<ActiveTurnRollback>,
+    /// True once the current turn has emitted an execution-boundary-opened event.
+    turn_rollback_boundary_emitted: bool,
     /// Once a turn-level rollback policy fires, later tool requests are short-circuited.
     aborted_turn_rollback: Option<AbortedTurnRollback>,
     /// Cross-turn tool output cache (shared with `CliAgenticLoopHost`).
@@ -229,6 +232,9 @@ struct ActiveTurnRollback {
 struct AbortedTurnRollback {
     rollback: Option<Value>,
 }
+
+const EXECUTION_BOUNDARY_KIND_TOOL_BATCH: &str = "tool_batch";
+const EXECUTION_BOUNDARY_KIND_TURN_ROLLBACK: &str = "turn_rollback";
 
 impl<'a> CliSseStreamHost<'a> {
     fn from_edge_ctx(ctx: EdgeSseContext<'a>, term_width: usize, render_md: bool) -> Self {
@@ -277,6 +283,7 @@ impl<'a> CliSseStreamHost<'a> {
             skill_resolver: ctx.skill_resolver,
             skills_invoked: std::collections::HashSet::new(),
             active_turn_rollback,
+            turn_rollback_boundary_emitted: false,
             aborted_turn_rollback: None,
             tool_cache: ctx.tool_cache,
         }
@@ -664,6 +671,188 @@ impl<'a> CliSseStreamHost<'a> {
         rendered
     }
 
+    fn execution_boundary_checkpoints(
+        file_checkpoint: u64,
+        database_checkpoint: u64,
+        stash_checkpoint: u64,
+        commit_checkpoint: u64,
+        worktree_checkpoint: u64,
+        session_state_checkpoint: u64,
+    ) -> Value {
+        serde_json::json!({
+            "file_checkpoint": file_checkpoint,
+            "database_checkpoint": database_checkpoint,
+            "stash_checkpoint": stash_checkpoint,
+            "commit_checkpoint": commit_checkpoint,
+            "worktree_checkpoint": worktree_checkpoint,
+            "session_state_checkpoint": session_state_checkpoint,
+        })
+    }
+
+    fn append_session_journal_event(&self, event: JournalEvent) {
+        let Some(session_id) = self.executor.active_session_id() else {
+            return;
+        };
+        let Ok(writer) = JournalWriter::new(session_id) else {
+            return;
+        };
+        let _ = writer.append(&event);
+    }
+
+    fn emit_execution_boundary_opened(
+        &self,
+        turn_index: u32,
+        boundary_kind: &str,
+        transaction_id: Option<&str>,
+        checkpoints: Value,
+    ) {
+        let Some(session_id) = self.executor.active_session_id() else {
+            return;
+        };
+        self.append_session_journal_event(JournalEvent::execution_boundary_opened(
+            Some(session_id),
+            turn_index,
+            boundary_kind,
+            transaction_id,
+            checkpoints,
+        ));
+    }
+
+    fn emit_execution_boundary_committed(
+        &self,
+        turn_index: u32,
+        boundary_kind: &str,
+        transaction_id: Option<&str>,
+        detail: Option<Value>,
+    ) {
+        let Some(session_id) = self.executor.active_session_id() else {
+            return;
+        };
+        self.append_session_journal_event(JournalEvent::execution_boundary_committed(
+            Some(session_id),
+            turn_index,
+            boundary_kind,
+            transaction_id,
+            detail,
+        ));
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit_execution_boundary_aborted(
+        &self,
+        turn_index: u32,
+        boundary_kind: &str,
+        transaction_id: Option<&str>,
+        reason: &str,
+        trigger_request_id: Option<&str>,
+        trigger_tool_name: Option<&str>,
+        rollback: Option<Value>,
+    ) {
+        let Some(session_id) = self.executor.active_session_id() else {
+            return;
+        };
+        self.append_session_journal_event(JournalEvent::execution_boundary_aborted(
+            Some(session_id),
+            turn_index,
+            boundary_kind,
+            transaction_id,
+            reason,
+            trigger_tool_name,
+            trigger_request_id,
+            rollback,
+        ));
+    }
+
+    fn emit_batch_transaction_opened(&self, active: &ActiveBatchTransaction) {
+        self.emit_execution_boundary_opened(
+            active.turn_index,
+            EXECUTION_BOUNDARY_KIND_TOOL_BATCH,
+            Some(&active.id),
+            Self::execution_boundary_checkpoints(
+                active.file_checkpoint,
+                active.database_checkpoint,
+                active.stash_checkpoint,
+                active.commit_checkpoint,
+                active.worktree_checkpoint,
+                active.session_state_checkpoint,
+            ),
+        );
+    }
+
+    fn emit_batch_transaction_committed(&self, active: &ActiveBatchTransaction) {
+        self.emit_execution_boundary_committed(
+            active.turn_index,
+            EXECUTION_BOUNDARY_KIND_TOOL_BATCH,
+            Some(&active.id),
+            None,
+        );
+    }
+
+    fn emit_batch_transaction_aborted(
+        &self,
+        active: &ActiveBatchTransaction,
+        reason: &str,
+        trigger_request_id: Option<&str>,
+        trigger_tool_name: Option<&str>,
+        rollback: Option<Value>,
+    ) {
+        self.emit_execution_boundary_aborted(
+            active.turn_index,
+            EXECUTION_BOUNDARY_KIND_TOOL_BATCH,
+            Some(&active.id),
+            reason,
+            trigger_request_id,
+            trigger_tool_name,
+            rollback,
+        );
+    }
+
+    fn emit_turn_rollback_opened(&self, active: &ActiveTurnRollback) {
+        self.emit_execution_boundary_opened(
+            active.turn_index,
+            EXECUTION_BOUNDARY_KIND_TURN_ROLLBACK,
+            None,
+            Self::execution_boundary_checkpoints(
+                active.file_checkpoint,
+                active.database_checkpoint,
+                active.stash_checkpoint,
+                active.commit_checkpoint,
+                active.worktree_checkpoint,
+                active.session_state_checkpoint,
+            ),
+        );
+    }
+
+    fn emit_turn_rollback_committed(&self, active: &ActiveTurnRollback) {
+        self.emit_execution_boundary_committed(
+            active.turn_index,
+            EXECUTION_BOUNDARY_KIND_TURN_ROLLBACK,
+            None,
+            Some(serde_json::json!({
+                "executed_requests": self.edge_tool_round.len(),
+            })),
+        );
+    }
+
+    fn emit_turn_rollback_aborted(
+        &self,
+        active: &ActiveTurnRollback,
+        reason: &str,
+        trigger_request_id: Option<&str>,
+        trigger_tool_name: Option<&str>,
+        rollback: Option<Value>,
+    ) {
+        self.emit_execution_boundary_aborted(
+            active.turn_index,
+            EXECUTION_BOUNDARY_KIND_TURN_ROLLBACK,
+            None,
+            reason,
+            trigger_request_id,
+            trigger_tool_name,
+            rollback,
+        );
+    }
+
     fn turn_rollback_boundary_violation(tool: &str, args: &Value) -> Option<String> {
         Self::bash_boundary_violation(
             tool,
@@ -803,6 +992,13 @@ impl<'a> CliSseStreamHost<'a> {
                         )
                         .await;
                     if let Some(active) = active_tx.take() {
+                        self.emit_batch_transaction_aborted(
+                            &active,
+                            &error,
+                            Some(&req.request_id),
+                            Some(&req.tool),
+                            rollback.clone(),
+                        );
                         aborted_tx = Some(AbortedBatchTransaction {
                             id: active.id,
                             rollback,
@@ -849,7 +1045,29 @@ impl<'a> CliSseStreamHost<'a> {
                 .zip(metadata.as_ref())
                 .is_some_and(|(active, meta)| active.id == meta.id);
             if !continuing_active_transaction {
-                active_tx = None;
+                if let Some(active) = active_tx.take() {
+                    self.emit_batch_transaction_committed(&active);
+                }
+            }
+
+            if let Some(meta) = metadata.as_ref()
+                && active_tx.is_none()
+            {
+                let active = ActiveBatchTransaction {
+                    id: meta.id.clone(),
+                    turn_index: self
+                        .executor
+                        .journal_turn_index
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    file_checkpoint: self.executor.file_journal_checkpoint(),
+                    database_checkpoint: self.executor.database_snapshot_journal_checkpoint(),
+                    stash_checkpoint: self.executor.git_stash_journal_checkpoint(),
+                    commit_checkpoint: self.executor.git_commit_journal_checkpoint(),
+                    worktree_checkpoint: self.executor.git_worktree_journal_checkpoint(),
+                    session_state_checkpoint: self.executor.session_state_journal_checkpoint(),
+                };
+                self.emit_batch_transaction_opened(&active);
+                active_tx = Some(active);
             }
 
             if let Some(meta) = metadata.as_ref() {
@@ -881,11 +1099,24 @@ impl<'a> CliSseStreamHost<'a> {
                             ),
                         )
                         .await;
-                    aborted_tx = Some(AbortedBatchTransaction {
-                        id: meta.id.clone(),
-                        rollback,
-                    });
-                    active_tx = None;
+                    if let Some(active) = active_tx.take() {
+                        self.emit_batch_transaction_aborted(
+                            &active,
+                            &error,
+                            Some(&req.request_id),
+                            Some(&req.tool),
+                            rollback.clone(),
+                        );
+                        aborted_tx = Some(AbortedBatchTransaction {
+                            id: active.id,
+                            rollback,
+                        });
+                    } else {
+                        aborted_tx = Some(AbortedBatchTransaction {
+                            id: meta.id.clone(),
+                            rollback,
+                        });
+                    }
                     results.push(result);
                     continue;
                 }
@@ -919,29 +1150,29 @@ impl<'a> CliSseStreamHost<'a> {
                             ),
                         )
                         .await;
-                    aborted_tx = Some(AbortedBatchTransaction {
-                        id: meta.id.clone(),
-                        rollback,
-                    });
-                    active_tx = None;
+                    if let Some(active) = active_tx.take() {
+                        self.emit_batch_transaction_aborted(
+                            &active,
+                            &format!(
+                                "tool `{}` does not support rollback-on-failure batch transactions",
+                                req.tool
+                            ),
+                            Some(&req.request_id),
+                            Some(&req.tool),
+                            rollback.clone(),
+                        );
+                        aborted_tx = Some(AbortedBatchTransaction {
+                            id: active.id,
+                            rollback,
+                        });
+                    } else {
+                        aborted_tx = Some(AbortedBatchTransaction {
+                            id: meta.id.clone(),
+                            rollback,
+                        });
+                    }
                     results.push(result);
                     continue;
-                }
-
-                if active_tx.is_none() {
-                    active_tx = Some(ActiveBatchTransaction {
-                        id: meta.id.clone(),
-                        turn_index: self
-                            .executor
-                            .journal_turn_index
-                            .load(std::sync::atomic::Ordering::Relaxed),
-                        file_checkpoint: self.executor.file_journal_checkpoint(),
-                        database_checkpoint: self.executor.database_snapshot_journal_checkpoint(),
-                        stash_checkpoint: self.executor.git_stash_journal_checkpoint(),
-                        commit_checkpoint: self.executor.git_commit_journal_checkpoint(),
-                        worktree_checkpoint: self.executor.git_worktree_journal_checkpoint(),
-                        session_state_checkpoint: self.executor.session_state_journal_checkpoint(),
-                    });
                 }
             }
 
@@ -954,6 +1185,7 @@ impl<'a> CliSseStreamHost<'a> {
                     && result.status == "error"
                 {
                     let rollback = self.rollback_active_batch_transaction(active);
+                    let failure_reason = result.output.clone();
                     result.output = Self::append_transaction_note(
                         &result.output,
                         &active.id,
@@ -975,15 +1207,27 @@ impl<'a> CliSseStreamHost<'a> {
                             *last = result.clone();
                         }
                     }
-                    aborted_tx = Some(AbortedBatchTransaction {
-                        id: active.id.clone(),
-                        rollback,
-                    });
-                    active_tx = None;
+                    if let Some(active) = active_tx.take() {
+                        self.emit_batch_transaction_aborted(
+                            &active,
+                            &failure_reason,
+                            Some(&req.request_id),
+                            Some(&req.tool),
+                            rollback.clone(),
+                        );
+                        aborted_tx = Some(AbortedBatchTransaction {
+                            id: active.id,
+                            rollback,
+                        });
+                    }
                 }
             }
 
             results.push(result);
+        }
+
+        if let Some(active) = active_tx.take() {
+            self.emit_batch_transaction_committed(&active);
         }
 
         results
@@ -1085,6 +1329,12 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         self.render.tick_thinking_pane();
     }
 
+    fn on_session_id(&mut self, session_id: &str) {
+        if self.executor.active_session_id() != Some(session_id) {
+            self.executor.set_active_session_id(session_id.to_string());
+        }
+    }
+
     fn on_render_effects(&mut self, effects: Vec<SseRenderEffect>) {
         // Forward to stream event channel (even when quiet/suppress are on)
         if let Some(tx) = &self.stream_event_tx {
@@ -1175,6 +1425,11 @@ impl SseStreamHost for CliSseStreamHost<'_> {
 
     fn on_stream_complete(&mut self) {
         self.render.stop_thinking();
+        if self.turn_rollback_boundary_emitted
+            && let Some(active) = self.active_turn_rollback.take()
+        {
+            self.emit_turn_rollback_committed(&active);
+        }
     }
 
     async fn execute_tool(
@@ -1248,6 +1503,13 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     0,
                 )
                 .await;
+        }
+
+        if !self.turn_rollback_boundary_emitted
+            && let Some(active) = self.active_turn_rollback.clone()
+        {
+            self.emit_turn_rollback_opened(&active);
+            self.turn_rollback_boundary_emitted = true;
         }
 
         // ── Edge-path dedup: call-count limit + output cache ───────────
@@ -1632,6 +1894,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             && let Some(active) = self.active_turn_rollback.clone()
         {
             let rollback = self.rollback_active_turn(&active);
+            let failure_reason = output.clone();
             output = Self::append_turn_rollback_note(&output, "failed", rollback.as_ref());
             tool_result_fields = Self::merge_turn_rollback_fields(
                 tool_result_fields.take(),
@@ -1640,6 +1903,13 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 } else {
                     "failed"
                 },
+                rollback.clone(),
+            );
+            self.emit_turn_rollback_aborted(
+                &active,
+                &failure_reason,
+                Some(request_id),
+                Some(tool),
                 rollback.clone(),
             );
             self.aborted_turn_rollback = Some(AbortedTurnRollback { rollback });
@@ -1817,8 +2087,20 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             self.render.tool_batch_progress = Some((1, n));
         }
 
+        let has_batch_transaction = requests
+            .iter()
+            .any(|req| Self::has_batch_transaction_metadata(&req.args));
+
         // Fast path: ≤1 tool — use existing sequential code.
         if n <= 1 {
+            if has_batch_transaction
+                && self.active_turn_rollback.is_none()
+                && self.aborted_turn_rollback.is_none()
+            {
+                let out = self.execute_transactional_batch(&requests).await;
+                self.render.tool_batch_progress = None;
+                return out;
+            }
             let mut out = Vec::with_capacity(n);
             for req in requests {
                 out.push(
@@ -1843,10 +2125,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             return out;
         }
 
-        if requests
-            .iter()
-            .any(|req| Self::has_batch_transaction_metadata(&req.args))
-        {
+        if has_batch_transaction {
             let out = self.execute_transactional_batch(&requests).await;
             self.render.tool_batch_progress = None;
             return out;
@@ -3655,6 +3934,7 @@ pub(super) fn dispatch_turn_event_block(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use astra_services::session_journal::{self, JournalDirGuard, JournalEvent, JournalEventType};
     use tempfile::tempdir;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -3688,6 +3968,29 @@ mod tests {
             .output()
             .expect("git commit");
         dir
+    }
+
+    fn boundary_events(session_id: &str) -> Vec<JournalEvent> {
+        session_journal::read_journal(session_id)
+            .expect("read journal")
+            .into_iter()
+            .filter(|event| {
+                matches!(
+                    event.event_type,
+                    JournalEventType::ExecutionBoundaryOpened
+                        | JournalEventType::ExecutionBoundaryCommitted
+                        | JournalEventType::ExecutionBoundaryAborted
+                )
+            })
+            .collect()
+    }
+
+    fn boundary_metadata(event: &JournalEvent) -> &Value {
+        event
+            .metadata
+            .as_ref()
+            .and_then(|meta| meta.get("execution_boundary"))
+            .expect("execution boundary metadata")
     }
 
     fn sse(event_type: &str, extra: &str) -> String {
@@ -4806,6 +5109,183 @@ diff --git a/src/a.rs b/src/a.rs\n\
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn transactional_batch_records_boundary_open_and_commit_events() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/tools/result"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .mount(&server)
+            .await;
+
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
+        let temp = tempdir().expect("tempdir");
+        let _journal_guard = JournalDirGuard::new(temp.path().join("sessions"));
+        let session_id = "tx-boundary-commit";
+        let mut executor =
+            crate::edge_tools::ToolExecutor::new(temp.path()).with_active_session_id(session_id);
+        let mut tool_cache = EdgeToolCache::new(8);
+        executor
+            .journal_turn_index
+            .store(15, std::sync::atomic::Ordering::Relaxed);
+
+        let mut host = CliSseStreamHost::from_edge_ctx(
+            EdgeSseContext {
+                api: &api,
+                token: "tok",
+                executor_id: "edge-test",
+                executor: &mut executor,
+                render_policy: RenderPolicy::Silent,
+                perm_manager: None,
+                cancel_token: None,
+                stream_event_tx: None,
+                approval_request_tx: None,
+                skill_resolver: None,
+                skill_continuation: false,
+                turn_rollback_on_failure: false,
+                tool_cache: &mut tool_cache,
+            },
+            80,
+            false,
+        );
+
+        let results = host
+            .execute_tools_batch(vec![ToolBatchRequest {
+                request_id: "tx-boundary-1".to_string(),
+                tool: "write_file".to_string(),
+                args: serde_json::json!({
+                    "path": "txn.txt",
+                    "content": "hello\n",
+                    "transaction_id": "tx-journal",
+                    "rollback_on_failure": true,
+                }),
+            }])
+            .await;
+
+        assert_eq!(results.len(), 1);
+        assert_ne!(results[0].status, "error");
+
+        let events = boundary_events(session_id);
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events[0].event_type,
+            JournalEventType::ExecutionBoundaryOpened
+        );
+        assert_eq!(
+            events[1].event_type,
+            JournalEventType::ExecutionBoundaryCommitted
+        );
+
+        let opened = boundary_metadata(&events[0]);
+        assert_eq!(opened["kind"].as_str(), Some("tool_batch"));
+        assert_eq!(opened["transaction_id"].as_str(), Some("tx-journal"));
+        assert_eq!(opened["rollback_on_failure"].as_bool(), Some(true));
+
+        let committed = boundary_metadata(&events[1]);
+        assert_eq!(committed["kind"].as_str(), Some("tool_batch"));
+        assert_eq!(committed["transaction_id"].as_str(), Some("tx-journal"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn transactional_batch_records_boundary_abort_event() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/tools/result"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .mount(&server)
+            .await;
+
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
+        let temp = tempdir().expect("tempdir");
+        let _journal_guard = JournalDirGuard::new(temp.path().join("sessions"));
+        let session_id = "tx-boundary-abort";
+        let mut executor =
+            crate::edge_tools::ToolExecutor::new(temp.path()).with_active_session_id(session_id);
+        let mut tool_cache = EdgeToolCache::new(8);
+        executor
+            .journal_turn_index
+            .store(16, std::sync::atomic::Ordering::Relaxed);
+
+        let mut host = CliSseStreamHost::from_edge_ctx(
+            EdgeSseContext {
+                api: &api,
+                token: "tok",
+                executor_id: "edge-test",
+                executor: &mut executor,
+                render_policy: RenderPolicy::Silent,
+                perm_manager: None,
+                cancel_token: None,
+                stream_event_tx: None,
+                approval_request_tx: None,
+                skill_resolver: None,
+                skill_continuation: false,
+                turn_rollback_on_failure: false,
+                tool_cache: &mut tool_cache,
+            },
+            80,
+            false,
+        );
+
+        let results = host
+            .execute_tools_batch(vec![
+                ToolBatchRequest {
+                    request_id: "tx-boundary-1".to_string(),
+                    tool: "write_file".to_string(),
+                    args: serde_json::json!({
+                        "path": "txn.txt",
+                        "content": "hello\n",
+                        "transaction_id": "tx-journal",
+                        "rollback_on_failure": true,
+                    }),
+                },
+                ToolBatchRequest {
+                    request_id: "tx-boundary-2".to_string(),
+                    tool: "read_file".to_string(),
+                    args: serde_json::json!({
+                        "path": "missing.txt",
+                        "transaction_id": "tx-journal",
+                        "rollback_on_failure": true,
+                    }),
+                },
+            ])
+            .await;
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[1].status, "error");
+
+        let events = boundary_events(session_id);
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events[0].event_type,
+            JournalEventType::ExecutionBoundaryOpened
+        );
+        assert_eq!(
+            events[1].event_type,
+            JournalEventType::ExecutionBoundaryAborted
+        );
+
+        let aborted = boundary_metadata(&events[1]);
+        assert_eq!(aborted["kind"].as_str(), Some("tool_batch"));
+        assert_eq!(aborted["transaction_id"].as_str(), Some("tx-journal"));
+        assert_eq!(
+            aborted["trigger_request_id"].as_str(),
+            Some("tx-boundary-2")
+        );
+        assert_eq!(aborted["trigger_tool_name"].as_str(), Some("read_file"));
+        assert!(
+            aborted["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("No such file or directory")),
+            "{aborted}"
+        );
+        assert_eq!(
+            aborted["rollback"]["files"]["reverted"]
+                .as_array()
+                .map(|entries| entries.len()),
+            Some(1)
+        );
+    }
+
     #[tokio::test]
     async fn turn_rollback_restores_written_file_on_failure() {
         let server = MockServer::start().await;
@@ -5112,6 +5592,176 @@ diff --git a/src/a.rs b/src/a.rs\n\
                 .contains(temp.path().to_string_lossy().as_ref()),
             "{}",
             result.output
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn turn_rollback_records_boundary_open_and_commit_events() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/tools/result"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .mount(&server)
+            .await;
+
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
+        let temp = tempdir().expect("tempdir");
+        std::fs::write(temp.path().join("ok.txt"), "hello\n").expect("seed file");
+        let _journal_guard = JournalDirGuard::new(temp.path().join("sessions"));
+        let session_id = "turn-boundary-commit";
+        let mut executor =
+            crate::edge_tools::ToolExecutor::new(temp.path()).with_active_session_id(session_id);
+        let mut tool_cache = EdgeToolCache::new(8);
+        executor
+            .journal_turn_index
+            .store(17, std::sync::atomic::Ordering::Relaxed);
+
+        let mut host = CliSseStreamHost::from_edge_ctx(
+            EdgeSseContext {
+                api: &api,
+                token: "tok",
+                executor_id: "edge-test",
+                executor: &mut executor,
+                render_policy: RenderPolicy::Silent,
+                perm_manager: None,
+                cancel_token: None,
+                stream_event_tx: None,
+                approval_request_tx: None,
+                skill_resolver: None,
+                skill_continuation: false,
+                turn_rollback_on_failure: true,
+                tool_cache: &mut tool_cache,
+            },
+            80,
+            false,
+        );
+
+        let results = host
+            .execute_tools_batch(vec![ToolBatchRequest {
+                request_id: "turn-boundary-1".to_string(),
+                tool: "read_file".to_string(),
+                args: serde_json::json!({
+                    "path": "ok.txt",
+                }),
+            }])
+            .await;
+        assert_eq!(results.len(), 1);
+        assert_ne!(results[0].status, "error");
+
+        host.on_stream_complete();
+
+        let events = boundary_events(session_id);
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events[0].event_type,
+            JournalEventType::ExecutionBoundaryOpened
+        );
+        assert_eq!(
+            events[1].event_type,
+            JournalEventType::ExecutionBoundaryCommitted
+        );
+
+        let opened = boundary_metadata(&events[0]);
+        assert_eq!(opened["kind"].as_str(), Some("turn_rollback"));
+        assert_eq!(opened["rollback_on_failure"].as_bool(), Some(true));
+
+        let committed = boundary_metadata(&events[1]);
+        assert_eq!(committed["kind"].as_str(), Some("turn_rollback"));
+        assert_eq!(committed["detail"]["executed_requests"].as_u64(), Some(1));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn turn_rollback_records_boundary_abort_event() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/tools/result"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .mount(&server)
+            .await;
+
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
+        let temp = tempdir().expect("tempdir");
+        let _journal_guard = JournalDirGuard::new(temp.path().join("sessions"));
+        let session_id = "turn-boundary-abort";
+        let mut executor =
+            crate::edge_tools::ToolExecutor::new(temp.path()).with_active_session_id(session_id);
+        let mut tool_cache = EdgeToolCache::new(8);
+        executor
+            .journal_turn_index
+            .store(18, std::sync::atomic::Ordering::Relaxed);
+
+        let mut host = CliSseStreamHost::from_edge_ctx(
+            EdgeSseContext {
+                api: &api,
+                token: "tok",
+                executor_id: "edge-test",
+                executor: &mut executor,
+                render_policy: RenderPolicy::Silent,
+                perm_manager: None,
+                cancel_token: None,
+                stream_event_tx: None,
+                approval_request_tx: None,
+                skill_resolver: None,
+                skill_continuation: false,
+                turn_rollback_on_failure: true,
+                tool_cache: &mut tool_cache,
+            },
+            80,
+            false,
+        );
+
+        let results = host
+            .execute_tools_batch(vec![
+                ToolBatchRequest {
+                    request_id: "turn-boundary-1".to_string(),
+                    tool: "write_file".to_string(),
+                    args: serde_json::json!({
+                        "path": "turn.txt",
+                        "content": "hello\n",
+                    }),
+                },
+                ToolBatchRequest {
+                    request_id: "turn-boundary-2".to_string(),
+                    tool: "read_file".to_string(),
+                    args: serde_json::json!({
+                        "path": "missing.txt",
+                    }),
+                },
+            ])
+            .await;
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[1].status, "error");
+
+        let events = boundary_events(session_id);
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events[0].event_type,
+            JournalEventType::ExecutionBoundaryOpened
+        );
+        assert_eq!(
+            events[1].event_type,
+            JournalEventType::ExecutionBoundaryAborted
+        );
+
+        let aborted = boundary_metadata(&events[1]);
+        assert_eq!(aborted["kind"].as_str(), Some("turn_rollback"));
+        assert_eq!(
+            aborted["trigger_request_id"].as_str(),
+            Some("turn-boundary-2")
+        );
+        assert_eq!(aborted["trigger_tool_name"].as_str(), Some("read_file"));
+        assert!(
+            aborted["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("No such file or directory")),
+            "{aborted}"
+        );
+        assert_eq!(
+            aborted["rollback"]["files"]["reverted"]
+                .as_array()
+                .map(|entries| entries.len()),
+            Some(1)
         );
     }
 
