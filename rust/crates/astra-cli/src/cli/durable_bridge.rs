@@ -2238,9 +2238,10 @@ mod tests {
         let session_dir = tmp.path().join("session");
         std::fs::create_dir_all(&session_dir).unwrap();
 
-        // Create both files the plan expects
-        std::fs::write(tmp.path().join("module.py"), "# module\n").unwrap();
-        std::fs::write(tmp.path().join("test_module.py"), "def test_ok(): pass\n").unwrap();
+        // Create both files the plan expects (use .txt to avoid Python project detection
+        // which would inject a pytest global check that fails in CI without pytest)
+        std::fs::write(tmp.path().join("module.txt"), "module\n").unwrap();
+        std::fs::write(tmp.path().join("test_module.txt"), "test\n").unwrap();
 
         let lifecycle = create_local_lifecycle(&session_dir, tmp.path());
         let plan = TaskPlan {
@@ -2252,9 +2253,9 @@ mod tests {
                     depends_on: vec![],
                     status: TaskStatus::Pending,
                     effort: None,
-                    files: vec!["module.py".into()],
+                    files: vec!["module.txt".into()],
                     acceptance_checks: vec![VerifierKind::FileExists {
-                        paths: vec!["module.py".into()],
+                        paths: vec!["module.txt".into()],
                     }],
                 },
                 SubtaskPlan {
@@ -2264,9 +2265,9 @@ mod tests {
                     depends_on: vec!["s1".into()],
                     status: TaskStatus::Pending,
                     effort: None,
-                    files: vec!["test_module.py".into()],
+                    files: vec!["test_module.txt".into()],
                     acceptance_checks: vec![VerifierKind::FileExists {
-                        paths: vec!["test_module.py".into()],
+                        paths: vec!["test_module.txt".into()],
                     }],
                 },
             ],
