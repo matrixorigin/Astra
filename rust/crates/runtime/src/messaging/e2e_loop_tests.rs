@@ -198,6 +198,7 @@ mod tests {
             tool_budget_override: None,
             pending_reflection_signals: Vec::new(),
             recent_tactical_actions: Vec::new(),
+            server_tool_executor: None,
         }
     }
 
@@ -641,6 +642,7 @@ mod tests {
             permission_context: Some(&permission_context),
             progress_emitter: None,
             pre_resolved_results: &[],
+            server_tool_executor: None,
         })
         .await;
 
@@ -709,6 +711,7 @@ mod tests {
             permission_context: None,
             progress_emitter: None,
             pre_resolved_results: &[],
+            server_tool_executor: None,
         })
         .await;
 
@@ -806,6 +809,7 @@ mod tests {
             permission_context: None,
             progress_emitter: None,
             pre_resolved_results: &pre_resolved,
+            server_tool_executor: None,
         })
         .await;
 
@@ -923,6 +927,7 @@ mod tests {
             permission_context: None,
             progress_emitter: None,
             pre_resolved_results: &pre_resolved,
+            server_tool_executor: None,
         })
         .await;
 
@@ -1029,6 +1034,7 @@ mod tests {
             permission_context: None,
             progress_emitter: None,
             pre_resolved_results: &pre_resolved,
+            server_tool_executor: None,
         })
         .await;
 
@@ -1120,6 +1126,7 @@ mod tests {
             permission_context: None,
             progress_emitter: None,
             pre_resolved_results: &[],
+            server_tool_executor: None,
         })
         .await;
 
@@ -1238,6 +1245,7 @@ mod tests {
             permission_context: Some(&child_permission_ctx),
             progress_emitter: None,
             pre_resolved_results: &[],
+            server_tool_executor: None,
         })
         .await;
 
@@ -1356,6 +1364,7 @@ mod tests {
             permission_context: Some(&child_permission_ctx),
             progress_emitter: None,
             pre_resolved_results: &[],
+            server_tool_executor: None,
         })
         .await;
 
@@ -1432,6 +1441,7 @@ mod tests {
             permission_context: None,
             progress_emitter: None,
             pre_resolved_results: &[],
+            server_tool_executor: None,
         })
         .await;
 

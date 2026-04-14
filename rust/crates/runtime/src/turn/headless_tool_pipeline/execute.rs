@@ -13,6 +13,10 @@ use super::super::hydrate_reflect::hydrate_reflect_placeholder_if_needed;
 use super::*;
 use crate::turn::tool_result_semantics::is_tool_error;
 
+/// The sentinel error prefix emitted by `take_edge_output_for_tool_call_with_duration`
+/// when no edge agent matched the tool call.
+const EDGE_PROTOCOL_ERROR_PREFIX: &str = "Error: headless edge protocol";
+
 impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
     pub(super) async fn execute_execution(
         &mut self,
@@ -22,6 +26,18 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
             mut execution,
             idem_key,
         } = permitted;
+
+        // ── Server-side tool execution fallback ────────────────────────
+        // When no edge agent is connected (web-only mode), the edge tool
+        // round is empty and `resolve_headless_tool_execution` returns the
+        // edge protocol error.  If a server tool executor is available,
+        // execute the tool directly on the server instead.
+        if !execution.is_edge_tool && execution.result_str.starts_with(EDGE_PROTOCOL_ERROR_PREFIX) {
+            if let Some(executor) = self.ctx.server_tool_executor {
+                execution.result_str = executor.execute(&execution.name, &execution.args).await;
+            }
+        }
+
         execution.result_str = hydrate_reflect_placeholder_if_needed(
             self.ctx.api,
             self.ctx.token,

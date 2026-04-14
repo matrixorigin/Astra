@@ -121,6 +121,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
             permission_context: state.permission_context.as_ref(),
             progress_emitter: state.messaging.progress_emitter.as_ref(),
             pre_resolved_results: &pre_resolved_results,
+            server_tool_executor: state.server_tool_executor.as_deref(),
         })
         .await;
     }

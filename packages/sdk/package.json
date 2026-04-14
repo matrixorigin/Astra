@@ -1,0 +1,47 @@
+{
+  "name": "@astra/sdk",
+  "version": "0.1.0",
+  "description": "TypeScript SDK for Astra — streaming chat, tool execution, and WebSocket support",
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    },
+    "./react": {
+      "types": "./dist/react.d.ts",
+      "import": "./dist/react.js",
+      "require": "./dist/react.cjs"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "typecheck": "tsc --noEmit",
+    "test": "jest"
+  },
+  "peerDependencies": {
+    "react": ">=18.0.0"
+  },
+  "peerDependenciesMeta": {
+    "react": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@types/jest": "^29.5.0",
+    "@types/react": "^19.0.12",
+    "jest": "^30.3.0",
+    "react": "^19.0.0",
+    "ts-jest": "^29.4.6",
+    "tsup": "^8.4.0",
+    "typescript": "^5.8.3"
+  }
+}

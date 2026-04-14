@@ -32,6 +32,7 @@ dirs = "6.0.0"
 fastrand = "2"
 astra-core.workspace = true
 astra-services.workspace = true
+astra-tools.workspace = true
 astra-thin-client.workspace = true
 async-stream.workspace = true
 async-trait.workspace = true

@@ -3,6 +3,7 @@ members = [
     "crates/core",
     "crates/services",
     "crates/runtime",
+    "crates/astra-tools",
     "crates/astra-cli",
     "crates/astra-admin",
     "crates/astra-thin-client",
@@ -15,6 +16,7 @@ edition = "2024"
 
 [workspace.dependencies]
 astra-core = { path = "crates/core" }
+astra-tools = { path = "crates/astra-tools" }
 astra-services = { path = "crates/services" }
 astra-runtime = { path = "crates/runtime" }
 astra-thin-client = { path = "crates/astra-thin-client" }

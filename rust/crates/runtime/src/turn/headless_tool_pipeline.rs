@@ -96,6 +96,9 @@ pub(crate) struct HeadlessToolExecutionCtx<'a, E: EdgeToolRoundRow> {
     pub permission_context: Option<&'a PermissionSyncHandle>,
     pub progress_emitter: Option<&'a crate::orchestration::AgentProgressEmitter>,
     pub effective_permission_timeout: Duration,
+    /// Optional server-side tool executor for web agent sessions (no CLI edge agent).
+    /// When present, tools that have no edge match are executed directly by the server.
+    pub server_tool_executor: Option<&'a crate::server::server_tool_executor::ServerToolExecutor>,
 }
 
 pub(crate) struct HeadlessToolExecutionPipeline<'a, E: EdgeToolRoundRow> {
@@ -310,6 +313,7 @@ mod tests {
                     permission_context: None,
                     progress_emitter: None,
                     effective_permission_timeout: Duration::from_secs(30),
+                    server_tool_executor: None,
                 },
                 vec![false; self.edge_tool_round.len()],
             )

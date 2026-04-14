@@ -675,6 +675,11 @@ pub struct AgenticLoopState {
     /// Recent tactical adaptations applied while the current reflection window
     /// was accumulating. Drained into the next auto-reflection context.
     pub recent_tactical_actions: Vec<String>,
+
+    // ── Server-side tool execution ──
+    /// Optional server-side tool executor for web agent sessions (no CLI edge agent).
+    /// When present, tools that have no edge match are executed directly by the server.
+    pub server_tool_executor: Option<Arc<crate::server::server_tool_executor::ServerToolExecutor>>,
 }
 
 /// Consecutive same-category error turns before forcing a strategy change.
@@ -1105,6 +1110,7 @@ pub(crate) mod tests {
             tool_budget_override: None,
             pending_reflection_signals: Vec::new(),
             recent_tactical_actions: Vec::new(),
+            server_tool_executor: None,
         }
     }
 

@@ -1,0 +1,49 @@
+[package]
+name = "astra-tools"
+version.workspace = true
+edition.workspace = true
+description = "Extracted tool execution library for astra-engine. Shared by CLI and server."
+
+[dependencies]
+astra-core.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+regex.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml = "0.9.34"
+sha2.workspace = true
+base64.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+url = "2.5"
+
+# Git operations (gix)
+gix = { version = "0.81.0", features = ["status", "blame", "mailmap", "revision"] }
+
+# Code intelligence (tree-sitter)
+tree-sitter = "0.24"
+tree-sitter-rust = "0.23"
+tree-sitter-python = "0.23"
+tree-sitter-typescript = "0.23"
+tree-sitter-go = "0.23"
+tree-sitter-java = "0.23"
+tree-sitter-cpp = "0.23"
+tree-sitter-ruby = "0.23"
+
+# System (process control, file ops)
+nix = { version = "0.31.2", features = ["fs"] }
+dirs = "6.0.0"
+
+[dev-dependencies]
+tempfile = "3"
+serde_json.workspace = true
+
+[features]
+default = []
+# Enable CLI-specific tool features (MCP dispatch, passive LSP, colored output)
+cli = []

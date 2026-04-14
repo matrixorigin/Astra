@@ -11,6 +11,7 @@ path = "src/main.rs"
 astra-core.workspace = true
 astra-services.workspace = true
 astra-runtime.workspace = true
+astra-tools.workspace = true
 astra-thin-client.workspace = true
 async-trait.workspace = true
 axum.workspace = true

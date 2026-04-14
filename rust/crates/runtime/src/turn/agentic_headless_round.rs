@@ -87,6 +87,8 @@ pub struct HeadlessToolRoundCtx<'a, E: EdgeToolRoundRow> {
     /// before the headless round. Injected immediately after the assistant message
     /// to maintain correct ordering: assistant(tool_calls) → tool(pre_resolved) → tool(executed).
     pub pre_resolved_results: &'a [(String, String)],
+    /// Optional server-side tool executor for web agent sessions.
+    pub server_tool_executor: Option<&'a crate::server::server_tool_executor::ServerToolExecutor>,
 }
 
 struct HeadlessPreparedRound<'a> {
@@ -193,6 +195,7 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
         permission_context,
         progress_emitter,
         pre_resolved_results,
+        server_tool_executor,
     } = ctx;
     let HeadlessPreparedRound {
         effective_permission_timeout,
@@ -242,6 +245,7 @@ pub async fn run_agentic_headless_tool_round<E: EdgeToolRoundRow>(
             permission_context,
             progress_emitter,
             effective_permission_timeout,
+            server_tool_executor,
         },
         consumed_edge,
     );

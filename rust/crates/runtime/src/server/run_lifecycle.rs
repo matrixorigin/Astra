@@ -744,6 +744,7 @@ impl AgenticRunLifecycleService {
             tool_budget_override: None,
             pending_reflection_signals: Vec::new(),
             recent_tactical_actions: Vec::new(),
+            server_tool_executor: None,
         }
     }
 
@@ -765,6 +766,27 @@ impl AgenticRunLifecycleService {
     /// Extract edge profile from the request context, or provide empty defaults.
     fn extract_edge_profile(request: &ChatRequestData) -> Map<String, Value> {
         Self::extract_edge_context(request).edge_profile.to_map()
+    }
+
+    /// Provision a sandboxed workspace directory for server-side tool execution.
+    fn provision_server_workspace(&self, session_id: &str) -> std::path::PathBuf {
+        // Sanitize session_id to prevent path traversal — only allow
+        // alphanumeric chars, hyphens, and underscores (covers UUID format).
+        let safe_id: String = session_id
+            .chars()
+            .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
+            .collect();
+        assert!(
+            !safe_id.is_empty(),
+            "session_id must contain at least one valid character"
+        );
+
+        let base = std::env::var("ASTRA_SERVER_WORKSPACES")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::env::temp_dir().join("astra-workspaces"));
+        let workspace = base.join(&safe_id);
+        let _ = std::fs::create_dir_all(&workspace);
+        workspace
     }
 
     /// Collect run events into SSE-compatible format.
@@ -907,6 +929,22 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             &session_id,
         )
         .await;
+
+        // ── Server-side tool execution (web-only mode) ─────────────────
+        // When no edge tools are provided (no CLI connected), provision a
+        // ServerToolExecutor so tools execute directly on the server.
+        if host.edge_tools_empty() {
+            let workspace = self.provision_server_workspace(&session_id);
+            let memoria_base = std::env::var("MEMORIA_BASE_URL").ok();
+            let executor = super::server_tool_executor::ServerToolExecutor::new(
+                workspace,
+                user_id.clone(),
+                session_id.clone(),
+                memoria_base,
+                None,
+            );
+            loop_state.server_tool_executor = Some(std::sync::Arc::new(executor));
+        }
 
         // Clone handles we need inside the spawned task.
         let runs = self.runs_handle();
@@ -1620,6 +1658,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             tool_budget_override: None,
             pending_reflection_signals: Vec::new(),
             recent_tactical_actions: Vec::new(),
+            server_tool_executor: None,
         };
         let learning_stack = configure_runtime_controllers(
             &self.matrixone,

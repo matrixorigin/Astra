@@ -185,12 +185,27 @@ pub(super) enum WsServerMessage {
 
     /// Tool requires user approval before execution.
     #[serde(rename = "tool_approval_request")]
-    #[allow(dead_code)] // Protocol variant — will be used when approval gate lands
+    #[allow(dead_code)] // Protocol variant — constructed in approval gate handler (Phase 5)
     ToolApprovalRequest {
         request_id: String,
         tool: String,
         args: serde_json::Value,
     },
+
+    /// Tool execution started on server.
+    #[serde(rename = "tool_execution_started")]
+    #[allow(dead_code)] // Phase 5: wired when server executor emits progress
+    ToolExecutionStarted { call_id: String, tool: String },
+
+    /// Incremental output from a running tool.
+    #[serde(rename = "tool_output_delta")]
+    #[allow(dead_code)] // Phase 5: wired when server executor emits progress
+    ToolOutputDelta { call_id: String, content: String },
+
+    /// Tool execution completed on server.
+    #[serde(rename = "tool_execution_completed")]
+    #[allow(dead_code)] // Phase 5: wired when server executor emits progress
+    ToolExecutionCompleted { call_id: String, success: bool },
 
     /// Error during processing.
     #[serde(rename = "error")]

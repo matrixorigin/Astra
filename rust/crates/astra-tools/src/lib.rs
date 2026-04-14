@@ -1,0 +1,438 @@
+//! # astra-tools
+//!
+//! Extracted tool execution library for astra-engine. This crate contains the
+//! pure tool logic (file I/O, shell, git, code intelligence, etc.) decoupled
+//! from CLI-specific concerns (terminal rendering, MCP dispatch, passive LSP).
+//!
+//! Both the CLI (`CliToolExecutor`) and the server (`ServerToolExecutor`) depend
+//! on this crate and compose its `DefaultToolExecutor` with their own wrappers.
+
+pub mod memoria;
+pub mod schemas;
+pub mod web_search;
+
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use async_trait::async_trait;
+use serde_json::Value;
+
+// ─── Core trait ─────────────────────────────────────────────────────────────
+
+/// Result of a single tool execution.
+#[derive(Debug, Clone, Default)]
+pub struct ToolResult {
+    /// Primary text output (shown to LLM and user).
+    pub output: String,
+    /// Optional structured metadata fields (e.g., for tool_call_end events).
+    pub metadata: Option<serde_json::Map<String, Value>>,
+    /// Whether this result represents an error condition.
+    pub is_error: bool,
+}
+
+impl ToolResult {
+    /// Convenience constructor for a plain text result.
+    pub fn text(output: String) -> Self {
+        Self {
+            output,
+            metadata: None,
+            is_error: false,
+        }
+    }
+
+    /// Convenience constructor for an error result.
+    pub fn error(message: String) -> Self {
+        Self {
+            output: message,
+            metadata: None,
+            is_error: true,
+        }
+    }
+}
+
+/// Trait for executing tools. Implementations provide the actual tool logic
+/// while allowing different execution contexts (CLI, server, test).
+#[async_trait]
+pub trait ToolExecutor: Send + Sync {
+    /// Execute a tool by name with the given JSON arguments.
+    async fn execute(&self, name: &str, args: &Value) -> ToolResult;
+
+    /// Return the JSON schemas for all available tools (OpenAI function-calling format).
+    fn tool_schemas(&self) -> Vec<Value>;
+
+    /// The root directory for file operations and path resolution.
+    fn project_root(&self) -> &Path;
+
+    /// Execute a tool and return extended metadata (e.g., rollback journal entries).
+    /// Default implementation delegates to `execute()`.
+    async fn execute_with_metadata(&self, name: &str, args: &Value) -> ToolResult {
+        self.execute(name, args).await
+    }
+}
+
+// ─── Sandbox configuration ──────────────────────────────────────────────────
+
+/// Sandbox enforcement level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SandboxMode {
+    /// No restrictions — backward compatible.
+    Permissive,
+    /// Path boundary enforcement + env filtering.
+    Standard,
+    /// Full isolation: Standard + restricted shell + optional namespace.
+    Strict,
+    /// Read-only access: no writes, no shell mutations.
+    ReadOnly,
+}
+
+/// Sandbox configuration for tool execution.
+#[derive(Debug, Clone)]
+pub struct SandboxConfig {
+    /// Primary project directory.
+    pub project_root: PathBuf,
+    /// Additional allowed path prefixes.
+    pub allowed_paths: Vec<PathBuf>,
+    /// Sandbox enforcement level.
+    pub mode: SandboxMode,
+    /// Maximum output size in bytes before truncation.
+    pub max_output_bytes: usize,
+    /// Maximum command execution time.
+    pub command_timeout: Duration,
+    /// Whether to allow network access from bash commands.
+    pub network_allowed: bool,
+}
+
+impl SandboxConfig {
+    /// Create a standard sandbox config for a project directory.
+    pub fn standard(project_root: impl Into<PathBuf>) -> Self {
+        let root = project_root.into();
+        Self {
+            project_root: root,
+            allowed_paths: vec![
+                PathBuf::from("/tmp"),
+                dirs::home_dir()
+                    .unwrap_or_else(|| PathBuf::from("/root"))
+                    .join(".config"),
+            ],
+            mode: SandboxMode::Standard,
+            max_output_bytes: 200_000,
+            command_timeout: Duration::from_secs(120),
+            network_allowed: true,
+        }
+    }
+
+    /// Create a strict sandbox for server-side execution.
+    pub fn strict(project_root: impl Into<PathBuf>) -> Self {
+        let root = project_root.into();
+        Self {
+            project_root: root,
+            allowed_paths: vec![PathBuf::from("/tmp")],
+            mode: SandboxMode::Strict,
+            max_output_bytes: 200_000,
+            command_timeout: Duration::from_secs(120),
+            network_allowed: false,
+        }
+    }
+}
+
+// ─── Journal traits ─────────────────────────────────────────────────────────
+
+/// Trait for recording file edit history (undo support).
+pub trait FileEditJournal: Send + Sync {
+    /// Record the before-state of a file about to be edited.
+    fn record_before(&mut self, path: &Path, tool_call_id: &str, turn_index: u32);
+    /// Record the after-state of a file that was just written.
+    fn record_after(&mut self, path: &Path, tool_call_id: &str, content: &[u8]);
+    /// Undo all edits to a specific file.
+    fn undo_file(&mut self, path: &Path) -> Result<Vec<PathBuf>, String>;
+    /// Undo all edits from a specific turn.
+    fn undo_turn(&mut self, turn_index: u32) -> Result<Vec<PathBuf>, String>;
+}
+
+/// Trait for recording git operations (rollback support).
+pub trait GitRollbackJournal: Send + Sync {
+    /// Record a commit that was just created (for potential revert).
+    fn record_commit(&mut self, commit_hash: &str, message: &str);
+    /// Record a stash that was just created (for potential restore).
+    fn record_stash(&mut self, stash_ref: &str, message: &str);
+    /// Revert the most recent recorded commit.
+    fn revert_last_commit(&mut self) -> Result<String, String>;
+    /// Restore the most recent recorded stash.
+    fn restore_last_stash(&mut self) -> Result<String, String>;
+}
+
+// ─── Tool approval gate ─────────────────────────────────────────────────────
+
+/// Decision from the approval gate.
+#[derive(Debug, Clone)]
+pub enum ApprovalDecision {
+    /// Tool execution approved.
+    Approved,
+    /// Tool execution denied with optional reason.
+    Denied { reason: Option<String> },
+    /// Approval timed out.
+    Timeout,
+}
+
+/// Trait for gating tool execution behind user approval (e.g., over WebSocket).
+///
+/// Implementations send a request to the frontend and wait for the user's
+/// decision. The gate is optional — when no gate is configured, all tools
+/// execute immediately.
+#[async_trait]
+pub trait ToolApprovalGate: Send + Sync {
+    /// Request approval for a tool invocation. The implementation should send
+    /// the request to the UI and block until the user responds or timeout.
+    async fn request_approval(
+        &self,
+        request_id: &str,
+        tool_name: &str,
+        args: &Value,
+    ) -> ApprovalDecision;
+
+    /// Returns `true` if this tool requires approval before execution.
+    fn requires_approval(&self, tool_name: &str) -> bool;
+}
+
+// ─── Tool progress callback ─────────────────────────────────────────────────
+
+/// Callback for streaming tool execution progress to the frontend.
+///
+/// Implementations forward events over WebSocket or SSE so the UI can show
+/// real-time tool output (e.g., bash streaming, file diff preview).
+#[async_trait]
+pub trait ToolProgressCallback: Send + Sync {
+    /// Tool execution is about to start.
+    async fn tool_started(&self, call_id: &str, tool_name: &str, args: &Value);
+
+    /// Incremental output from the tool (e.g., bash stdout line).
+    async fn tool_output_delta(&self, call_id: &str, delta: &str);
+
+    /// Tool execution completed.
+    async fn tool_completed(&self, call_id: &str, result: &str, success: bool);
+}
+
+/// Tools that require user approval in server-side execution by default.
+pub const APPROVAL_REQUIRED_TOOLS: &[&str] = &[
+    "bash",
+    "write_file",
+    "str_replace",
+    "delete_file",
+    "git_commit",
+];
+
+// ─── Output management utilities ────────────────────────────────────────────
+
+/// Global output size limit. Override with `MO_GLOBAL_OUTPUT_LIMIT` env var.
+pub fn global_output_limit() -> usize {
+    astra_core::RuntimeLimits::global().global_output_limit
+}
+
+/// Per-tool default output limit. Override with `MO_TOOL_OUTPUT_LIMIT` env var.
+pub fn tool_output_limit() -> usize {
+    astra_core::RuntimeLimits::global().tool_output_limit
+}
+
+/// Per-tool output size caps (bytes).
+pub fn per_tool_output_limit(tool_name: &str) -> usize {
+    let base = tool_output_limit();
+    match tool_name {
+        "grep" => base.min(10_000),
+        "glob" => base.min(100_000),
+        "find_definition" | "find_references" => base.min(15_000),
+        _ => base,
+    }
+}
+
+/// Per-turn aggregate output budget (bytes).
+pub const AGGREGATE_OUTPUT_BUDGET: usize = 200_000;
+
+/// Soft threshold for aggregate-aware gating.
+pub const AGGREGATE_SOFT_LIMIT: usize = 120_000;
+
+/// Per-tool persistence threshold (chars).
+pub const PERSIST_THRESHOLD: usize = 50_000;
+
+/// Preview size for persisted output references.
+pub const PERSIST_PREVIEW_BYTES: usize = 2000;
+
+/// Truncate tool output to `max_bytes`, cutting at a newline boundary when
+/// possible to avoid mid-line cuts that confuse the LLM.
+pub fn truncate_output(mut output: String, max_bytes: usize) -> String {
+    if output.len() > max_bytes {
+        let end = output.floor_char_boundary(max_bytes);
+        let cut = output[..end]
+            .rfind('\n')
+            .filter(|&pos| pos > end / 2)
+            .map(|pos| pos + 1)
+            .unwrap_or(end);
+        output.truncate(cut);
+        output.push_str("\n[truncated]");
+    }
+    output
+}
+
+/// Normalize empty/whitespace-only tool output to a short marker.
+pub fn normalize_empty_output(output: String, tool_name: &str) -> String {
+    if output.trim().is_empty() {
+        format!("({tool_name} completed with no output)")
+    } else {
+        output
+    }
+}
+
+/// Directory for persisted tool results within the astra home.
+pub fn tool_results_dir() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".astra")
+        .join("tool-results")
+}
+
+/// Persist large tool output to disk when aggregate budget is under pressure.
+pub fn maybe_persist_large_output(
+    output: String,
+    aggregate_bytes: usize,
+    _tool_name: &str,
+) -> String {
+    if output.len() < PERSIST_THRESHOLD {
+        return output;
+    }
+    if aggregate_bytes <= AGGREGATE_SOFT_LIMIT {
+        return output;
+    }
+    if output.starts_with("Error:") {
+        return output;
+    }
+
+    let dir = tool_results_dir();
+    if std::fs::create_dir_all(&dir).is_err() {
+        return output;
+    }
+
+    let hash = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        output.hash(&mut h);
+        format!("{:016x}", h.finish())
+    };
+    let filepath = dir.join(format!("{hash}.txt"));
+
+    if !filepath.exists() && std::fs::write(&filepath, &output).is_err() {
+        return output;
+    }
+
+    let preview_end = output.len().min(PERSIST_PREVIEW_BYTES);
+    let preview_end = output[..preview_end]
+        .rfind('\n')
+        .filter(|&pos| pos > preview_end / 2)
+        .map(|pos| pos + 1)
+        .unwrap_or(preview_end);
+    let preview = &output[..output.floor_char_boundary(preview_end)];
+    let total_lines = output.lines().count();
+
+    format!(
+        "<persisted-output>\n\
+         Output too large ({} bytes, ~{} lines) for context window. \
+         Full output saved to: {}\n\n\
+         Preview (first ~{} bytes):\n\
+         {}\n...\n\
+         </persisted-output>\n\
+         Use read_file with start_line/end_line to read specific sections of the persisted file.",
+        output.len(),
+        total_lines,
+        filepath.display(),
+        PERSIST_PREVIEW_BYTES,
+        preview,
+    )
+}
+
+// ─── Shared utility functions ───────────────────────────────────────────────
+
+/// Convert UTF-16 column position to char index (for LSP protocol compatibility).
+pub fn utf16_col_to_char_idx(line: &str, col_utf16: usize) -> usize {
+    let mut utf16_offset = 0;
+    for (char_idx, c) in line.chars().enumerate() {
+        if utf16_offset + c.len_utf16() > col_utf16 {
+            return char_idx;
+        }
+        utf16_offset += c.len_utf16();
+    }
+    line.chars().count()
+}
+
+/// Parse a grep output line to extract the file path and line number.
+pub fn parse_grep_file_line(line: &str) -> Option<(&str, usize)> {
+    let first_colon = line.find(':')?;
+    let file = &line[..first_colon];
+    let rest = &line[first_colon + 1..];
+    let second_colon = rest.find(':')?;
+    let line_str = &rest[..second_colon];
+    let line_num: usize = line_str.parse().ok()?;
+    Some((file, line_num))
+}
+
+/// Categorize a grep reference line as definition, import, call, or usage.
+pub fn categorize_reference(line: &str, _symbol: &str) -> &'static str {
+    let content = if let Some(first_colon) = line.find(':') {
+        let rest = &line[first_colon + 1..];
+        if let Some(second_colon) = rest.find(':') {
+            rest[second_colon + 1..].trim()
+        } else {
+            rest.trim()
+        }
+    } else {
+        line.trim()
+    };
+
+    let lower = content.to_lowercase();
+
+    if lower.starts_with("use ")
+        || lower.starts_with("pub use ")
+        || lower.starts_with("import ")
+        || lower.starts_with("from ")
+        || lower.contains("require(")
+        || lower.starts_with("#include")
+    {
+        return "import";
+    }
+
+    if lower.starts_with("fn ")
+        || lower.starts_with("pub fn ")
+        || lower.starts_with("pub(crate) fn ")
+        || lower.starts_with("async fn ")
+        || lower.starts_with("pub async fn ")
+        || lower.starts_with("def ")
+        || lower.starts_with("class ")
+        || lower.starts_with("struct ")
+        || lower.starts_with("enum ")
+        || lower.starts_with("trait ")
+        || lower.starts_with("type ")
+        || lower.starts_with("interface ")
+        || lower.starts_with("const ")
+        || lower.starts_with("pub const ")
+        || lower.starts_with("static ")
+        || lower.starts_with("pub static ")
+        || lower.starts_with("let ")
+        || lower.starts_with("pub let ")
+        || lower.starts_with("var ")
+        || lower.starts_with("function ")
+        || lower.starts_with("export function ")
+        || lower.starts_with("export default ")
+        || lower.starts_with("export class ")
+        || lower.starts_with("export const ")
+    {
+        return "definition";
+    }
+
+    "usage"
+}
+
+/// Git porcelain status codes for git status --porcelain output parsing.
+pub mod git_status_codes {
+    pub const MODIFIED: char = 'M';
+    pub const ADDED: char = 'A';
+    pub const DELETED: char = 'D';
+    pub const RENAMED: char = 'R';
+    pub const UNTRACKED_PREFIX: &str = "??";
+}

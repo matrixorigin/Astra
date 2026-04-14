@@ -78,6 +78,8 @@ pub struct ServerAgenticLoopHost {
     edge_profile: Map<String, Value>,
     valid_tools: HashSet<String>,
     selection_confidence: f64,
+    /// `true` when tools were auto-populated from astra-tools (no CLI connected).
+    server_side_tools: bool,
 
     // ── Tool execution (used by RunLifecycleService wiring) ──
     #[allow(dead_code)] // needed once RunLifecycleService uses ledger-based tool execution
@@ -174,8 +176,16 @@ impl ServerAgenticLoopHostBuilder {
     }
 
     pub fn build(self) -> ServerAgenticLoopHost {
-        let valid_tools = self
-            .edge_tools
+        // When no edge tools are provided (web-only mode), populate with
+        // server-side tool schemas from astra-tools so the LLM knows what's available.
+        let server_side_tools = self.edge_tools.is_empty();
+        let edge_tools = if server_side_tools {
+            astra_tools::schemas::all_tool_schemas()
+        } else {
+            self.edge_tools
+        };
+
+        let valid_tools = edge_tools
             .iter()
             .filter_map(|t| {
                 t.get("function")
@@ -192,10 +202,11 @@ impl ServerAgenticLoopHostBuilder {
             encryptor: self.encryptor,
             shared_pool: self.shared_pool,
             model_override: self.model_override,
-            edge_tools: self.edge_tools,
+            edge_tools,
             edge_profile: self.edge_profile,
             valid_tools,
             selection_confidence: self.selection_confidence,
+            server_side_tools,
             edge_callback_ledger: self.edge_callback_ledger,
             user_id: self.user_id,
             session_id: self.session_id,
@@ -231,6 +242,11 @@ impl ServerAgenticLoopHost {
             }
         }
         std::mem::take(&mut self.emitted_events)
+    }
+
+    /// Returns `true` when no CLI edge agent is connected (tools are server-side).
+    pub fn edge_tools_empty(&self) -> bool {
+        self.server_side_tools
     }
 
     /// Build the system prompt from edge context and the tool schemas visible
@@ -1067,7 +1083,9 @@ mod tests {
         .build();
 
         assert!(host.is_quiet());
-        assert!(host.valid_tool_names().is_empty());
+        // When no edge tools are provided, server-side tool schemas are auto-populated
+        assert!(host.server_side_tools);
+        assert!(!host.valid_tool_names().is_empty());
         assert!(host.emitted_events.is_empty());
     }
 
@@ -1441,6 +1459,7 @@ mod tests {
             tool_budget_override: None,
             pending_reflection_signals: Vec::new(),
             recent_tactical_actions: Vec::new(),
+            server_tool_executor: None,
         }
     }
 

@@ -41,6 +41,7 @@ pub mod run_engine;
 mod run_handlers;
 pub mod run_lifecycle;
 pub mod server_loop_host;
+pub mod server_tool_executor;
 mod session_handlers;
 mod state_builder;
 mod task_handlers;

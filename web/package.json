@@ -18,7 +18,8 @@
     "react-dom": "^19.0.0",
     "react-markdown": "^10.1.0",
     "rehype-highlight": "^7.0.2",
-    "remark-gfm": "^4.0.1"
+    "remark-gfm": "^4.0.1",
+    "@astra/sdk": "file:../packages/sdk"
   },
   "devDependencies": {
     "@jest/types": "^30.3.0",
