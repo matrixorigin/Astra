@@ -11,8 +11,10 @@ import { TokenUsageBar } from './token-usage-bar';
 import type { ChatConfig } from '@/lib/workspace/types';
 import type { SessionSummary, EventSummary } from '@/lib/models/platform';
 import { ConnectionStatus } from '@/components/streaming/connection-status';
+import { EdgeConnectionBadge } from '@/components/workspace/edge-connection-badge';
 import { EventLogViewer } from '@/components/events/event-log-viewer';
 import { AgentTree } from '@/components/agents/agent-tree';
+import { useEdgeConnections } from '@/hooks/use-edge-connections';
 
 type SidePanel = 'tools' | 'plan' | 'agents' | 'events' | 'context';
 
@@ -29,6 +31,7 @@ export function WorkspaceShell({
 }) {
   const [activeConfig, setActiveConfig] = useState<ChatConfig>(config);
   const chat = useChatStream(activeConfig);
+  const edge = useEdgeConnections();
   const [sidePanel, setSidePanel] = useState<SidePanel>('tools');
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
 
@@ -88,6 +91,7 @@ export function WorkspaceShell({
                     : 'disconnected'
               }
             />
+            <EdgeConnectionBadge edges={edge.edges} hasEdge={edge.hasEdge} />
           </div>
           <div className="flex items-center gap-3 text-xs text-slate-500">
             {displaySessionId ? (

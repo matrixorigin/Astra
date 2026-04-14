@@ -48,6 +48,8 @@ pub(super) fn build_router(state: AppState) -> Router {
         .route("/chat/ws", get(ws_handler::ws_chat_handler))
         // WebSocket endpoint for remote edge agent connections (Phase 6)
         .route("/edge/ws", get(edge_ws_handler::edge_ws_handler))
+        // Edge connection status (authenticated, returns user's connected edges)
+        .route("/edges/status", get(edge_status_handler::edge_status_handler))
         .route(
             "/chat/runs/{run_id}",
             get(run_handlers::get_run_status_handler).delete(run_handlers::cancel_run_handler),
