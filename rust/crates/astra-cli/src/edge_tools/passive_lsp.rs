@@ -738,6 +738,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn should_use_rust_requires_env_rs_and_cargo() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -753,6 +754,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn should_use_ts_requires_env_tsconfig_or_package() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -765,6 +767,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn should_use_rust_accepts_project_config_without_env() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -790,6 +793,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn active_status_reports_project_config_error() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();

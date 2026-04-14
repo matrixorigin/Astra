@@ -8,26 +8,45 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  MATRIXONE_HOST: localhost
-  MATRIXONE_PORT: "6001"
-  MATRIXONE_USER: root
-  MATRIXONE_PASSWORD: "111"
-  MATRIXONE_DATABASE: astra_runtime
-  MATRIXONE_AUTO_CREATE_DATABASE: "1"
-  JWT_SECRET_KEY: ci-jwt-secret-key-at-least-32-chars-long
-  SECRET_KEY: ci-app-secret-key-at-least-32-chars-long
-  TOKEN_ENCRYPTION_KEY: ci-token-encryption-key-at-least-32-chars
-  ASTRA_BRIDGE_TEST_SECRET: system-matrix-e2e-secret
-  CHAT_TURN_BRIDGE_SECRET: dev-bridge-secret-change-me
-  MEMORIA_BASE_URL: http://localhost:8100
-  MEMORIA_MASTER_KEY: ci-test-master-key
-  MEMORIA_EMBEDDING_PROVIDER: mock
-  MEMORIA_EMBEDDING_DIM: "384"
 
 jobs:
-  test:
+  # ── Fast: no external deps ────────────────────────────────────────────
+  test-offline:
+    name: Offline Tests
     runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+          shared-key: ci
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Run offline tests
+        run: make test-offline
 
+  # ── Slow: needs MatrixOne + Memoria ───────────────────────────────────
+  test-online:
+    name: Online Tests
+    runs-on: ubuntu-latest
+    needs: test-offline
+    env:
+      MATRIXONE_HOST: localhost
+      MATRIXONE_PORT: "6001"
+      MATRIXONE_USER: root
+      MATRIXONE_PASSWORD: "111"
+      MATRIXONE_DATABASE: astra_runtime
+      MATRIXONE_DATABASE_PREFIX: "test_"
+      MATRIXONE_AUTO_CREATE_DATABASE: "1"
+      JWT_SECRET_KEY: ci-jwt-secret-key-at-least-32-chars-long
+      SECRET_KEY: ci-app-secret-key-at-least-32-chars-long
+      TOKEN_ENCRYPTION_KEY: ci-token-encryption-key-at-least-32-chars
+      ASTRA_BRIDGE_TEST_SECRET: system-matrix-e2e-secret
+      CHAT_TURN_BRIDGE_SECRET: dev-bridge-secret-change-me
+      MEMORIA_BASE_URL: http://localhost:8100
+      MEMORIA_MASTER_KEY: ci-test-master-key
+      MEMORIA_EMBEDDING_PROVIDER: mock
+      MEMORIA_EMBEDDING_DIM: "384"
     steps:
       - uses: actions/checkout@v4
       - name: Prepare dependency env
@@ -44,21 +63,20 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
-
+          shared-key: ci
+          save-if: false
       - name: Wait for dependencies
         run: make dev-deps-wait
-
-      - name: Run full test suite (test-offline + test-online)
+      - name: Run online tests
         env:
           ASTRA_SYSTEM_MATRIX_E2E: "1"
           ASTRA_SYSTEM_MATRIX_E2E_TEST_THREADS: "1"
           ASTRA_MULTI_AGENT_IT: "1"
-        run: make test
-
+          ASTRA_SERVICES_DB_IT: "1"
+        run: make test-online
       - name: Dump dependency logs
         if: failure()
         run: make dev-deps-logs-once
-
       - name: Stop dependencies
         if: always()
         run: make dev-deps-down

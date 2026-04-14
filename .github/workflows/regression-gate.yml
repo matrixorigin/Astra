@@ -43,6 +43,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
+          shared-key: ci
+          save-if: false
       - name: Wait for dependencies
         run: make dev-deps-wait
 

@@ -385,17 +385,20 @@ pub async fn bootstrap() -> BootstrapResult {
     let settings = AppSettings::from_env().expect("AppSettings::from_env (see astra-server env)");
     let matrixone_database = settings.matrixone.database.clone();
     let url = settings.matrixone.database_url();
+
+    let memoria = Arc::new(E2eMemoriaStub::default());
+    // build_server_state runs ensure_core_schema which creates the database when
+    // MATRIXONE_AUTO_CREATE_DATABASE=1, so it must run before the assertion pool connects.
+    let state = build_server_state(settings)
+        .await
+        .expect("build_server_state")
+        .with_memoria_forwarder(memoria.clone());
+
     let pool = sqlx::mysql::MySqlPoolOptions::new()
         .max_connections(4)
         .connect(&url)
         .await
         .expect("connect MatrixOne for assertions");
-
-    let memoria = Arc::new(E2eMemoriaStub::default());
-    let state = build_server_state(settings)
-        .await
-        .expect("build_server_state")
-        .with_memoria_forwarder(memoria.clone());
 
     let app = build_app(state);
 

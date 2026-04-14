@@ -475,6 +475,10 @@ test-ignored-integration:
 # Online (MatrixOne): opt-in #[ignore] integration binaries (see test-ignored-integration).
 .PHONY: test-online
 test-online:
+	@if [ ! -f .env ]; then \
+		echo "No .env found — creating from .env.example..."; \
+		cp .env.example .env; \
+	fi
 	@ASTRA_SYSTEM_MATRIX_E2E=1 ASTRA_MULTI_AGENT_IT=1 ASTRA_SERVICES_DB_IT=1 $(MAKE) test-ignored-integration
 
 .PHONY: test-contract
