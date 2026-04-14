@@ -13,7 +13,9 @@ mod command;
 mod git_safety;
 mod path;
 mod policy;
+mod process_isolation;
 mod shell_hardening;
+mod tier;
 
 pub use command::{
     CommandRisk, SandboxCommandError, analyze_command_risks, filter_environment, sandbox_command,
@@ -24,7 +26,9 @@ pub use git_safety::{
 };
 pub use path::{SandboxPathError, validate_path};
 pub use policy::{SandboxMode, SandboxPolicy};
+pub use process_isolation::{IsolatedOutput, IsolationConfig, execute_isolated};
 pub use shell_hardening::{
     DANGEROUS_FILE_PATHS, SENSITIVE_ENV_VARS, ShellHardeningConfig, build_hardened_command,
     is_dangerous_file_path, scrub_secrets_from_env,
 };
+pub use tier::{ToolTier, classify_tool, effective_tier};

@@ -145,6 +145,9 @@ async fn handle_edge_connection(socket: WebSocket, state: AppState) {
     let read_loop = async {
         let mut heartbeat = tokio::time::interval(heartbeat_interval);
         heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Consume the immediate first tick so the first pong is sent after
+        // `heartbeat_interval`, not immediately on loop entry.
+        heartbeat.tick().await;
 
         loop {
             tokio::select! {

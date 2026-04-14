@@ -21,7 +21,10 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-use crate::tool_sandbox::{SandboxMode, SandboxPolicy};
+use crate::tool_sandbox::{
+    IsolationConfig, SandboxMode, SandboxPolicy, ToolTier, effective_tier, execute_isolated,
+    filter_environment,
+};
 use crate::turn::file_edit_journal::FileEditJournal;
 
 /// Server-side tool executor for web agent sessions.
@@ -519,42 +522,62 @@ impl ServerToolExecutor {
             .unwrap_or(30.0)
             .min(self.sandbox_policy.max_execution_secs);
 
-        let timeout = Duration::from_secs_f64(timeout_secs);
-        let output = tokio::time::timeout(timeout, async {
-            tokio::process::Command::new("bash")
-                .arg("-c")
-                .arg(command)
-                .current_dir(&self.workspace_root)
-                .output()
-                .await
-        })
-        .await;
-
-        match output {
-            Ok(Ok(out)) => {
-                let stdout = String::from_utf8_lossy(&out.stdout);
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                let mut result = String::new();
-                if !stdout.is_empty() {
-                    result.push_str(&stdout);
-                }
-                if !stderr.is_empty() {
-                    if !result.is_empty() {
-                        result.push('\n');
-                    }
-                    result.push_str("stderr:\n");
-                    result.push_str(&stderr);
-                }
-                if !out.status.success() {
-                    result.push_str(&format!(
-                        "\n(exit code: {})",
-                        out.status.code().unwrap_or(-1)
-                    ));
-                }
-                result
+        let tier = effective_tier("bash", self.sandbox_policy.mode);
+        match tier {
+            ToolTier::Isolated => {
+                let mut config = IsolationConfig::strict(self.workspace_root.clone());
+                config.timeout = Duration::from_secs_f64(timeout_secs);
+                config.net_namespace = !self.sandbox_policy.network_allowed;
+                let env = filter_environment(&self.sandbox_policy);
+                let out = execute_isolated(command, &env, &config).await;
+                out.combined_output()
             }
-            Ok(Err(e)) => format!("Error: Failed to execute command: {e}"),
-            Err(_) => format!("Error: Command timed out after {timeout_secs}s"),
+            ToolTier::Sandboxed => {
+                let mut config = IsolationConfig::sandboxed(self.workspace_root.clone());
+                config.timeout = Duration::from_secs_f64(timeout_secs);
+                let env = filter_environment(&self.sandbox_policy);
+                let out = execute_isolated(command, &env, &config).await;
+                out.combined_output()
+            }
+            ToolTier::InProcess => {
+                // Permissive mode — direct execution (backward compat).
+                let timeout = Duration::from_secs_f64(timeout_secs);
+                let output = tokio::time::timeout(timeout, async {
+                    tokio::process::Command::new("bash")
+                        .arg("-c")
+                        .arg(command)
+                        .current_dir(&self.workspace_root)
+                        .output()
+                        .await
+                })
+                .await;
+                match output {
+                    Ok(Ok(out)) => {
+                        let stdout = String::from_utf8_lossy(&out.stdout);
+                        let stderr = String::from_utf8_lossy(&out.stderr);
+                        let mut result = String::new();
+                        if !stdout.is_empty() {
+                            result.push_str(&stdout);
+                        }
+                        if !stderr.is_empty() {
+                            if !result.is_empty() {
+                                result.push('\n');
+                            }
+                            result.push_str("stderr:\n");
+                            result.push_str(&stderr);
+                        }
+                        if !out.status.success() {
+                            result.push_str(&format!(
+                                "\n(exit code: {})",
+                                out.status.code().unwrap_or(-1)
+                            ));
+                        }
+                        result
+                    }
+                    Ok(Err(e)) => format!("Error: Failed to execute command: {e}"),
+                    Err(_) => format!("Error: Command timed out after {timeout_secs}s"),
+                }
+            }
         }
     }
 
