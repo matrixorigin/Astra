@@ -112,15 +112,21 @@ impl IsolatedOutput {
     }
 }
 
-/// Check if `unshare` is available on this system.
+/// Check if `unshare` with user namespace mapping actually works.
+///
+/// The binary may exist but the kernel may block unprivileged user namespaces
+/// (e.g., inside containers without CAP_SYS_ADMIN).  We probe once and cache.
 fn unshare_available() -> bool {
-    std::process::Command::new("unshare")
-        .arg("--help")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::process::Command::new("unshare")
+            .args(["--map-root-user", "--", "true"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    })
 }
 
 /// Check if cgroup v2 is mounted.
