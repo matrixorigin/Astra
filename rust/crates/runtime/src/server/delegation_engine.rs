@@ -453,15 +453,23 @@ impl DelegationTracker {
         let Some(ref sid) = self.session_id else {
             return;
         };
-        let writer = match astra_services::session_journal::JournalWriter::new(sid) {
-            Ok(w) => w,
-            Err(_) => return,
-        };
         let mut event = astra_services::session_journal::JournalEvent::base_public(
             event_type,
             Some(sid.as_str()),
         );
         event.metadata = Some(metadata);
+        self.persist_journal_entry(event);
+    }
+
+    /// Persist a fully constructed journal event (best-effort).
+    fn persist_journal_entry(&self, event: astra_services::session_journal::JournalEvent) {
+        let Some(ref sid) = self.session_id else {
+            return;
+        };
+        let writer = match astra_services::session_journal::JournalWriter::new(sid) {
+            Ok(w) => w,
+            Err(_) => return,
+        };
         if let Err(e) = writer.append(&event) {
             astra_core::agent_warn!("delegation", "Failed to write journal event: {e}");
         }
@@ -800,11 +808,24 @@ impl DelegationTracker {
     ///
     /// Cleans up resources and updates progress tracking.
     pub async fn complete_sub_run(&self, run_id: &str, terminal_state: SubRunState) {
+        self.complete_sub_run_with_result(run_id, terminal_state, None, None)
+            .await;
+    }
+
+    /// Mark a sub-run as complete and persist the terminal result metadata.
+    pub async fn complete_sub_run_with_result(
+        &self,
+        run_id: &str,
+        terminal_state: SubRunState,
+        error: Option<&str>,
+        output_preview: Option<&str>,
+    ) {
         debug_assert!(terminal_state.is_terminal());
 
         // Transition state in record
         let mut delegation_id = None;
         let mut agent_id = None;
+        let mut final_state = terminal_state;
         {
             let mut delegations = self.delegations.write().await;
             for records in delegations.values_mut() {
@@ -815,6 +836,7 @@ impl DelegationTracker {
                             .state
                             .try_transition(terminal_state)
                             .unwrap_or(terminal_state);
+                        final_state = record.state;
                         delegation_id = Some(record.delegation_id.clone());
                         agent_id = Some(record.agent_id.clone());
                         break;
@@ -831,13 +853,25 @@ impl DelegationTracker {
 
         // Update progress + emit SSE event
         if let (Some(did), Some(aid)) = (delegation_id, agent_id) {
-            self.update_progress(&did, &aid, terminal_state).await;
+            self.persist_journal_entry(
+                astra_services::session_journal::JournalEvent::delegation_sub_run_completed(
+                    self.session_id.as_deref(),
+                    &did,
+                    run_id,
+                    &aid,
+                    final_state.as_str(),
+                    error,
+                    output_preview,
+                ),
+            );
+
+            self.update_progress(&did, &aid, final_state).await;
 
             // Emit completion SSE event for web clients
             if let Some(ref broadcaster) = self.progress_broadcaster {
                 use crate::orchestration::{AgentProgressEvent, ProgressEventType};
-                let status_str = format!("{:?}", terminal_state);
-                let event_type = if terminal_state == SubRunState::Completed {
+                let status_str = format!("{:?}", final_state);
+                let event_type = if final_state == SubRunState::Completed {
                     ProgressEventType::Completed {
                         result_summary: format!("Sub-run {} finished", run_id),
                         total_tool_calls: 0,
@@ -866,9 +900,20 @@ impl DelegationTracker {
     /// Cleans up all tracking state for a completed delegation:
     /// progress entries, pause flags, parent mappings, and delegation records.
     /// Call after the delegation lifecycle is fully complete.
-    pub async fn cleanup_delegation(&self, delegation_id: &str) {
+    pub async fn cleanup_delegation(&self, delegation_id: &str) -> Result<(), String> {
         // Gather run_ids before cleanup
         let records = self.get_sub_runs(delegation_id).await;
+        let non_terminal: Vec<String> = records
+            .iter()
+            .filter(|record| !record.state.is_terminal())
+            .map(|record| format!("{}({})", record.run_id, record.state.as_str()))
+            .collect();
+        if !non_terminal.is_empty() {
+            return Err(format!(
+                "delegation {delegation_id} still has non-terminal sub-runs: {}",
+                non_terminal.join(", ")
+            ));
+        }
         let run_ids: Vec<String> = records.iter().map(|r| r.run_id.clone()).collect();
 
         // Acquire locks in consistent order: delegations → parents → pause_flags → progress
@@ -884,6 +929,7 @@ impl DelegationTracker {
             pause_flags.remove(rid);
         }
         progress_map.remove(delegation_id);
+        Ok(())
     }
 
     /// Get the full retry chain for a run: [original, retry1, retry2, ...]
@@ -1173,8 +1219,15 @@ impl DelegationEngine {
 
                     if attempt >= max_retries {
                         // Exhausted retries — mark as verification failure
+                        let verification_error =
+                            format!("verification gate failed after {attempt} attempts: {reason}");
                         self.tracker
-                            .complete_sub_run(&current.run_id, SubRunState::VerificationFailed)
+                            .complete_sub_run_with_result(
+                                &current.run_id,
+                                SubRunState::VerificationFailed,
+                                Some(verification_error.as_str()),
+                                current.output.as_deref(),
+                            )
                             .await;
                         astra_core::log_persist!(
                             self.run_engine
@@ -1191,9 +1244,7 @@ impl DelegationEngine {
                         );
                         return AgentResult {
                             status: STATUS_VERIFICATION_FAILED.to_string(),
-                            error: Some(format!(
-                                "verification gate failed after {attempt} attempts: {reason}"
-                            )),
+                            error: Some(verification_error),
                             ..current
                         };
                     }
@@ -1271,7 +1322,12 @@ impl DelegationEngine {
 
                     // Mark the original as verification-failed before retrying
                     self.tracker
-                        .complete_sub_run(&original_run_id, SubRunState::VerificationFailed)
+                        .complete_sub_run_with_result(
+                            &original_run_id,
+                            SubRunState::VerificationFailed,
+                            Some(reason.as_str()),
+                            current.output.as_deref(),
+                        )
                         .await;
 
                     // Transition retry to Running before execution
@@ -1316,14 +1372,17 @@ impl DelegationEngine {
                     } {
                         Ok(r) => {
                             // Transition retry to Running→Completed/Failed
+                            let terminal_state = if r.is_success() {
+                                SubRunState::Completed
+                            } else {
+                                SubRunState::Failed
+                            };
                             self.tracker
-                                .complete_sub_run(
+                                .complete_sub_run_with_result(
                                     &r.run_id,
-                                    if r.is_success() {
-                                        SubRunState::Completed
-                                    } else {
-                                        SubRunState::Failed
-                                    },
+                                    terminal_state,
+                                    r.error.as_deref(),
+                                    r.output.as_deref(),
                                 )
                                 .await;
                             astra_core::log_persist!(
@@ -1338,7 +1397,12 @@ impl DelegationEngine {
                         }
                         Err(e) => {
                             self.tracker
-                                .complete_sub_run(&retry_run_id, SubRunState::Failed)
+                                .complete_sub_run_with_result(
+                                    &retry_run_id,
+                                    SubRunState::Failed,
+                                    Some(e.as_str()),
+                                    None,
+                                )
                                 .await;
                             return AgentResult {
                                 status: STATUS_FAILED.to_string(),
@@ -1500,22 +1564,8 @@ impl DelegationEngine {
             }
         };
 
-        // Journal: sub-run completions + delegation completed
+        // Journal: delegation completed
         if let Ok(ref dr) = result {
-            for ar in &dr.agent_results {
-                Self::write_journal_event(
-                    session_id,
-                    astra_services::session_journal::JournalEvent::delegation_sub_run_completed(
-                        Some(session_id),
-                        &request.delegation_id,
-                        &ar.run_id,
-                        &ar.agent_id,
-                        &ar.status,
-                        ar.error.as_deref(),
-                        ar.output.as_deref(),
-                    ),
-                );
-            }
             let succeeded = dr.agent_results.iter().filter(|r| r.is_success()).count();
             let failed = dr.agent_results.len() - succeeded;
             Self::write_journal_event(
@@ -1816,7 +1866,13 @@ impl DelegationEngine {
                         SubRunState::Failed
                     }
                 };
-                tracker.complete_sub_run(&run_id, final_state).await;
+                let (error, output_preview) = match &result {
+                    Ok(r) => (r.error.as_deref(), r.output.as_deref()),
+                    Err(e) => (Some(e.as_str()), None),
+                };
+                tracker
+                    .complete_sub_run_with_result(&run_id, final_state, error, output_preview)
+                    .await;
                 (result, agent_id, run_id)
             });
             id_map.insert(abort_handle.id(), (captured_agent_id, captured_run_id));
@@ -1857,15 +1913,21 @@ impl DelegationEngine {
                         &panic_run_id,
                         "status"
                     );
+                    let panic_error = format!("task join error (panic): {e}");
                     self.tracker
-                        .complete_sub_run(&panic_run_id, SubRunState::Failed)
+                        .complete_sub_run_with_result(
+                            &panic_run_id,
+                            SubRunState::Failed,
+                            Some(panic_error.as_str()),
+                            None,
+                        )
                         .await;
                     results.push(AgentResult {
                         agent_id: panic_agent_id,
                         run_id: panic_run_id,
                         status: STATUS_FAILED.to_string(),
                         output: None,
-                        error: Some(format!("task join error (panic): {}", e)),
+                        error: Some(panic_error),
                         prompt_tokens: 0,
                         completion_tokens: 0,
                         tool_calls: 0,
@@ -2106,7 +2168,12 @@ impl DelegationEngine {
                     let final_state =
                         SubRunState::from_str(&r.status).unwrap_or(SubRunState::Failed);
                     self.tracker
-                        .complete_sub_run(&sub_run_id, final_state)
+                        .complete_sub_run_with_result(
+                            &sub_run_id,
+                            final_state,
+                            r.error.as_deref(),
+                            r.output.as_deref(),
+                        )
                         .await;
                     r
                 }
@@ -2120,7 +2187,12 @@ impl DelegationEngine {
                         "status"
                     );
                     self.tracker
-                        .complete_sub_run(&sub_run_id, SubRunState::Failed)
+                        .complete_sub_run_with_result(
+                            &sub_run_id,
+                            SubRunState::Failed,
+                            Some(e.as_str()),
+                            None,
+                        )
                         .await;
                     AgentResult {
                         agent_id: agent_id.clone(),
@@ -2376,7 +2448,12 @@ impl DelegationEngine {
                     let final_state =
                         SubRunState::from_str(&r.status).unwrap_or(SubRunState::Failed);
                     self.tracker
-                        .complete_sub_run(&prod_run_id, final_state)
+                        .complete_sub_run_with_result(
+                            &prod_run_id,
+                            final_state,
+                            r.error.as_deref(),
+                            r.output.as_deref(),
+                        )
                         .await;
                     r
                 }
@@ -2390,7 +2467,12 @@ impl DelegationEngine {
                         "status"
                     );
                     self.tracker
-                        .complete_sub_run(&prod_run_id, SubRunState::Failed)
+                        .complete_sub_run_with_result(
+                            &prod_run_id,
+                            SubRunState::Failed,
+                            Some(e.as_str()),
+                            None,
+                        )
                         .await;
                     AgentResult {
                         agent_id: producer_id.to_string(),
@@ -2564,7 +2646,12 @@ impl DelegationEngine {
                     let final_state =
                         SubRunState::from_str(&r.status).unwrap_or(SubRunState::Failed);
                     self.tracker
-                        .complete_sub_run(&rev_run_id, final_state)
+                        .complete_sub_run_with_result(
+                            &rev_run_id,
+                            final_state,
+                            r.error.as_deref(),
+                            r.output.as_deref(),
+                        )
                         .await;
                     r
                 }
@@ -2578,7 +2665,12 @@ impl DelegationEngine {
                         "status"
                     );
                     self.tracker
-                        .complete_sub_run(&rev_run_id, SubRunState::Failed)
+                        .complete_sub_run_with_result(
+                            &rev_run_id,
+                            SubRunState::Failed,
+                            Some(e.as_str()),
+                            None,
+                        )
                         .await;
                     AgentResult {
                         agent_id: reviewer_id.to_string(),
@@ -2830,7 +2922,13 @@ impl DelegationEngine {
                         SubRunState::Failed
                     }
                 };
-                tracker.complete_sub_run(&run_id, final_state).await;
+                let (error, output_preview) = match &result {
+                    Ok(r) => (r.error.as_deref(), r.output.as_deref()),
+                    Err(e) => (Some(e.as_str()), None),
+                };
+                tracker
+                    .complete_sub_run_with_result(&run_id, final_state, error, output_preview)
+                    .await;
                 (result, agent_id, run_id)
             });
             handles.push((handle, captured_agent_id, captured_run_id));
@@ -2868,15 +2966,21 @@ impl DelegationEngine {
                             "Fork: failed to persist panic status for {panic_run_id}: {e2}"
                         );
                     }
+                    let panic_error = format!("fork task panicked: {e}");
                     self.tracker
-                        .complete_sub_run(&panic_run_id, SubRunState::Failed)
+                        .complete_sub_run_with_result(
+                            &panic_run_id,
+                            SubRunState::Failed,
+                            Some(panic_error.as_str()),
+                            None,
+                        )
                         .await;
                     results.push(AgentResult {
                         agent_id: panic_agent_id,
                         run_id: panic_run_id,
                         status: "failed".to_string(),
                         output: None,
-                        error: Some(format!("fork task panicked: {}", e)),
+                        error: Some(panic_error),
                         prompt_tokens: 0,
                         completion_tokens: 0,
                         tool_calls: 0,
@@ -4234,6 +4338,62 @@ mod tests {
         let _ = std::fs::remove_dir_all(sessions_dir);
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn tracker_complete_sub_run_writes_sub_run_completed_event() {
+        let sessions_dir = std::env::temp_dir().join(format!(
+            "delegation-engine-subrun-complete-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(&sessions_dir);
+        let tracker = DelegationTracker::with_session("sess-subrun-complete".into());
+
+        tracker
+            .record_sub_run(SubRunRecord {
+                run_id: "run-1".into(),
+                parent_run_id: "parent-1".into(),
+                delegation_id: "del-1".into(),
+                agent_id: "coder".into(),
+                depth: 1,
+                state: SubRunState::Running,
+                retry_of: None,
+            })
+            .await;
+        tracker
+            .complete_sub_run_with_result(
+                "run-1",
+                SubRunState::Failed,
+                Some("boom"),
+                Some("partial output"),
+            )
+            .await;
+
+        let journal_path = sessions_dir.join("sess-subrun-complete.jsonl");
+        let content = std::fs::read_to_string(&journal_path).unwrap();
+        let completed_events: Vec<astra_services::session_journal::JournalEvent> = content
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<astra_services::session_journal::JournalEvent>(line).unwrap()
+            })
+            .filter(|evt| {
+                evt.event_type
+                    == astra_services::session_journal::JournalEventType::DelegationSubRunCompleted
+            })
+            .collect();
+
+        assert_eq!(completed_events.len(), 1);
+        let meta = completed_events[0].metadata.as_ref().unwrap();
+        assert_eq!(meta["delegation_id"], "del-1");
+        assert_eq!(meta["sub_run_id"], "run-1");
+        assert_eq!(meta["agent_id"], "coder");
+        assert_eq!(meta["status"], "failed");
+        assert_eq!(meta["error"], "boom");
+        assert_eq!(meta["output_preview"], "partial output");
+
+        let _ = std::fs::remove_file(journal_path);
+        let _ = std::fs::remove_dir_all(sessions_dir);
+    }
+
     #[tokio::test]
     async fn gate_exhausted_retries_sequential() {
         let (reg, engine, tracker, _) = setup_with_executor(Arc::new(EchoExecutor));
@@ -5124,7 +5284,7 @@ mod tests {
                 delegation_id: "d1".into(),
                 agent_id: "a1".into(),
                 depth: 1,
-                state: SubRunState::Running,
+                state: SubRunState::Completed,
                 retry_of: None,
             })
             .await;
@@ -5135,11 +5295,40 @@ mod tests {
         assert!(tracker.get_progress("d1").await.is_some());
         assert_eq!(tracker.get_sub_runs("d1").await.len(), 1);
 
-        tracker.cleanup_delegation("d1").await;
+        tracker.cleanup_delegation("d1").await.unwrap();
         assert!(tracker.get_pause_flag("r1").await.is_none());
         assert!(tracker.get_progress("d1").await.is_none());
         assert_eq!(tracker.get_sub_runs("d1").await.len(), 0);
         assert!(tracker.get_children("parent").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn tracker_cleanup_delegation_rejects_nonterminal_sub_runs() {
+        let tracker = DelegationTracker::new();
+        tracker
+            .record_sub_run(SubRunRecord {
+                run_id: "r1".into(),
+                parent_run_id: "parent".into(),
+                delegation_id: "d1".into(),
+                agent_id: "a1".into(),
+                depth: 1,
+                state: SubRunState::Running,
+                retry_of: None,
+            })
+            .await;
+
+        let _f1 = tracker.register_pause_flag("r1").await;
+        tracker.init_progress("d1", &["a1".into()]).await;
+
+        let err = tracker
+            .cleanup_delegation("d1")
+            .await
+            .expect_err("non-terminal delegation should not be cleaned up");
+        assert!(err.contains("r1(running)"), "{err}");
+        assert!(tracker.get_pause_flag("r1").await.is_some());
+        assert!(tracker.get_progress("d1").await.is_some());
+        assert_eq!(tracker.get_sub_runs("d1").await.len(), 1);
+        assert_eq!(tracker.get_children("parent").await, vec!["r1".to_string()]);
     }
 
     #[tokio::test]
