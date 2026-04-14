@@ -273,10 +273,22 @@ pub fn internal_error_coded(
     )
 }
 
-/// MySQL/MatrixOne error code 1062 = `ER_DUP_ENTRY`.
+/// MySQL/MatrixOne duplicate-key errors may surface as vendor code 1062,
+/// SQLSTATE 23000, or wrapped message-only errors.
 pub fn is_duplicate_key_error(err: &sqlx::Error) -> bool {
-    matches!(err, sqlx::Error::Database(db_err) if db_err.code().as_deref() == Some("23000")
-        || db_err.message().contains("Duplicate entry"))
+    match err {
+        sqlx::Error::Database(db_err) => {
+            let message = db_err.message();
+            matches!(db_err.code().as_deref(), Some("1062") | Some("23000"))
+                || message.contains("Duplicate entry")
+                || message.contains("ER_DUP_ENTRY")
+        }
+        _ => {
+            let message = err.to_string();
+            message.contains("Duplicate entry")
+                && (message.contains("1062") || message.contains("ER_DUP_ENTRY"))
+        }
+    }
 }
 
 pub fn current_unix_seconds() -> f64 {
@@ -351,6 +363,18 @@ mod tests {
         let err = std::io::Error::new(std::io::ErrorKind::NotFound, "file gone");
         let (status, _) = internal_error(err);
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn duplicate_key_error_detects_protocol_wrappers() {
+        let err = sqlx::Error::Protocol("1062: Duplicate entry 'test' for key".into());
+        assert!(is_duplicate_key_error(&err));
+    }
+
+    #[test]
+    fn duplicate_key_error_rejects_unrelated_protocol_wrappers() {
+        let err = sqlx::Error::Protocol("connection reset by peer".into());
+        assert!(!is_duplicate_key_error(&err));
     }
 
     // --- current_unix_seconds ---
