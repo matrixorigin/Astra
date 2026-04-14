@@ -1010,6 +1010,7 @@ mod tests {
                     signal: crate::evolution::types::EvolutionSignal::ToolFailure {
                         tool_name: "bash".into(),
                         error_snippet: "timed out".into(),
+                        failure_category: None,
                         skill_context: None,
                         turn_id: "t1".into(),
                     },

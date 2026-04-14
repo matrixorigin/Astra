@@ -259,6 +259,7 @@ mod tests {
         let signals = vec![EvolutionSignal::ToolFailure {
             tool_name: "bash".into(),
             error_snippet: "Error: permission denied".into(),
+            failure_category: None,
             skill_context: Some("review_changes".into()),
             turn_id: "t1".into(),
         }];
@@ -279,6 +280,7 @@ mod tests {
         let s = EvolutionSignal::ToolFailure {
             tool_name: "bash".into(),
             error_snippet: "err".into(),
+            failure_category: None,
             skill_context: Some("review_changes".into()),
             turn_id: "t1".into(),
         };
@@ -290,6 +292,7 @@ mod tests {
         let s = EvolutionSignal::ToolFailure {
             tool_name: "bash".into(),
             error_snippet: "err".into(),
+            failure_category: None,
             skill_context: None,
             turn_id: "t1".into(),
         };
@@ -332,6 +335,7 @@ mod tests {
             EvolutionSignal::ToolFailure {
                 tool_name: "bash".into(),
                 error_snippet: "err".into(),
+                failure_category: None,
                 skill_context: Some("s".into()),
                 turn_id: "t1".into(),
             },

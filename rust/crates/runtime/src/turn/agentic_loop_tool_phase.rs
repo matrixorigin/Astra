@@ -31,6 +31,20 @@ pub(crate) enum TurnToolPhaseControl {
     Return(AgenticLoopOutcome),
 }
 
+fn tool_record_result_text(rec: &astra_services::session_journal::ToolCallRecord) -> &str {
+    rec.result_preview
+        .as_deref()
+        .or(rec.error.as_deref())
+        .unwrap_or("")
+}
+
+fn tool_record_was_rejected(rec: &astra_services::session_journal::ToolCallRecord) -> bool {
+    rec.error
+        .as_deref()
+        .map(|error| error.starts_with("blocked_tool:"))
+        .unwrap_or(false)
+}
+
 pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
     host: &mut H,
     state: &mut AgenticLoopState,
@@ -139,11 +153,19 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
             if rec.is_synthetic_placeholder() {
                 continue;
             }
+            let result_text = tool_record_result_text(rec);
+            let classification = crate::turn::action_compensation::classify_execution_outcome(
+                result_text,
+                !rec.ok,
+                rec.ms,
+                tool_record_was_rejected(rec),
+            );
             let ctx = crate::evolution::types::ToolResultContext {
                 tool_name: &rec.name,
                 tool_args: rec.args_preview.as_deref().unwrap_or(""),
-                result: rec.result_preview.as_deref().unwrap_or(""),
+                result: result_text,
                 is_error: !rec.ok,
+                failure_category: classification.failure_category,
                 duration_ms: rec.ms,
                 active_skill: active_skill_ref,
                 turn_id,
@@ -483,6 +505,46 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
     }
 
     Ok(TurnToolPhaseControl::ContinueLoop)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{tool_record_result_text, tool_record_was_rejected};
+    use astra_services::session_journal::ToolCallRecord;
+
+    fn tool_record(ok: bool, error: Option<&str>, result_preview: Option<&str>) -> ToolCallRecord {
+        ToolCallRecord {
+            name: "bash".into(),
+            ok,
+            ms: 100,
+            error: error.map(str::to_string),
+            input_bytes: None,
+            output_bytes: None,
+            args_preview: Some("{\"command\":\"echo hi\"}".into()),
+            result_preview: result_preview.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn blocked_tool_records_fall_back_to_error_text_and_mark_rejected() {
+        let rec = tool_record(
+            false,
+            Some("blocked_tool: Explicit approval required: action scope is unbounded."),
+            None,
+        );
+        assert_eq!(
+            tool_record_result_text(&rec),
+            "blocked_tool: Explicit approval required: action scope is unbounded."
+        );
+        assert!(tool_record_was_rejected(&rec));
+    }
+
+    #[test]
+    fn executed_tool_records_prefer_result_preview() {
+        let rec = tool_record(false, Some("Error: command failed"), Some("stderr preview"));
+        assert_eq!(tool_record_result_text(&rec), "stderr preview");
+        assert!(!tool_record_was_rejected(&rec));
+    }
 }
 
 fn observe_gate_cancelled(

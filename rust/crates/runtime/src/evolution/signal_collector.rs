@@ -80,6 +80,7 @@ impl SignalCollector {
         let signal = EvolutionSignal::ToolFailure {
             tool_name: ctx.tool_name.to_string(),
             error_snippet: snippet,
+            failure_category: ctx.failure_category,
             skill_context: ctx.active_skill.map(String::from),
             turn_id: ctx.turn_id.to_string(),
         };
@@ -162,6 +163,7 @@ mod tests {
             tool_args: "{}",
             result,
             is_error: true,
+            failure_category: None,
             duration_ms: 100,
             active_skill: None,
             turn_id,
@@ -182,6 +184,33 @@ mod tests {
     }
 
     #[test]
+    fn preserves_failure_category_in_tool_failure() {
+        let mut c = SignalCollector::new();
+        let ctx = ToolResultContext {
+            tool_name: "cargo_test",
+            tool_args: "{}",
+            result: "error[E0433]: failed to resolve",
+            is_error: true,
+            failure_category: Some(crate::turn::action_compensation::FailureCategory::CompileError),
+            duration_ms: 100,
+            active_skill: None,
+            turn_id: "t1",
+        };
+        c.on_tool_result(&ctx);
+        match &c.signals()[0] {
+            EvolutionSignal::ToolFailure {
+                failure_category, ..
+            } => {
+                assert_eq!(
+                    *failure_category,
+                    Some(crate::turn::action_compensation::FailureCategory::CompileError)
+                );
+            }
+            _ => panic!("expected ToolFailure"),
+        }
+    }
+
+    #[test]
     fn skips_successful_tool_result() {
         let mut c = SignalCollector::new();
         let ctx = ToolResultContext {
@@ -189,6 +218,7 @@ mod tests {
             tool_args: "{}",
             result: "ok",
             is_error: false,
+            failure_category: None,
             duration_ms: 50,
             active_skill: None,
             turn_id: "t1",
@@ -358,6 +388,7 @@ mod tests {
             tool_args: "{}",
             result: "Error: fail",
             is_error: true,
+            failure_category: None,
             duration_ms: 100,
             active_skill: Some("review_changes"),
             turn_id: "t1",

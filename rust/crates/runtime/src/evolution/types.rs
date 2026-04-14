@@ -1,6 +1,7 @@
 //! Core types for the evolution engine.
 
 use crate::pipeline::routing::{DomainHint, TaskType};
+use crate::turn::action_compensation::FailureCategory;
 
 // ── Signals ──
 
@@ -11,6 +12,7 @@ pub enum EvolutionSignal {
     ToolFailure {
         tool_name: String,
         error_snippet: String,
+        failure_category: Option<FailureCategory>,
         skill_context: Option<String>,
         turn_id: String,
     },
@@ -223,6 +225,7 @@ pub struct ToolResultContext<'a> {
     pub tool_args: &'a str,
     pub result: &'a str,
     pub is_error: bool,
+    pub failure_category: Option<FailureCategory>,
     pub duration_ms: u64,
     pub active_skill: Option<&'a str>,
     pub turn_id: &'a str,
@@ -247,12 +250,14 @@ mod tests {
         let s1 = EvolutionSignal::ToolFailure {
             tool_name: "bash".into(),
             error_snippet: "command not found".into(),
+            failure_category: None,
             skill_context: None,
             turn_id: "t1".into(),
         };
         let s2 = EvolutionSignal::ToolFailure {
             tool_name: "bash".into(),
             error_snippet: "command not found".into(),
+            failure_category: None,
             skill_context: Some("review_changes".into()),
             turn_id: "t2".into(),
         };
@@ -264,12 +269,14 @@ mod tests {
         let s1 = EvolutionSignal::ToolFailure {
             tool_name: "bash".into(),
             error_snippet: "command not found".into(),
+            failure_category: None,
             skill_context: None,
             turn_id: "t1".into(),
         };
         let s2 = EvolutionSignal::ToolFailure {
             tool_name: "read_file".into(),
             error_snippet: "command not found".into(),
+            failure_category: None,
             skill_context: None,
             turn_id: "t1".into(),
         };
@@ -281,6 +288,7 @@ mod tests {
         let s1 = EvolutionSignal::ToolFailure {
             tool_name: "bash".into(),
             error_snippet: "error".into(),
+            failure_category: None,
             skill_context: None,
             turn_id: "t1".into(),
         };
@@ -299,12 +307,14 @@ mod tests {
         let s1 = EvolutionSignal::ToolFailure {
             tool_name: "bash".into(),
             error_snippet: long.clone(),
+            failure_category: None,
             skill_context: None,
             turn_id: "t1".into(),
         };
         let s2 = EvolutionSignal::ToolFailure {
             tool_name: "bash".into(),
             error_snippet: format!("{long}EXTRA_SUFFIX"),
+            failure_category: None,
             skill_context: None,
             turn_id: "t1".into(),
         };
@@ -326,6 +336,7 @@ mod tests {
             signal: EvolutionSignal::ToolFailure {
                 tool_name: "bash".into(),
                 error_snippet: "err".into(),
+                failure_category: None,
                 skill_context: None,
                 turn_id: "t1".into(),
             },
