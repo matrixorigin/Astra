@@ -422,17 +422,19 @@ impl PermissionManager {
         quiet: bool,
     ) -> astra_thin_client::ApprovalDecision {
         use astra_thin_client::ApprovalDecision;
-        let explicit = Self::cloud_approval_is_explicit(approval_kind);
         if quiet {
-            return if self.mode == PermissionMode::Auto && !explicit {
+            return if self.mode == PermissionMode::Auto {
                 ApprovalDecision::Allow
             } else {
                 ApprovalDecision::Deny
             };
         }
+        let explicit = Self::cloud_approval_is_explicit(approval_kind);
         if explicit {
-            if self.mode == PermissionMode::Deny {
-                return ApprovalDecision::Deny;
+            match self.mode {
+                PermissionMode::Deny => return ApprovalDecision::Deny,
+                PermissionMode::Auto => return ApprovalDecision::Allow,
+                PermissionMode::Prompt => {}
             }
             eprintln!(
                 "{}",
@@ -485,17 +487,19 @@ impl PermissionManager {
         quiet: bool,
     ) -> astra_thin_client::ApprovalDecision {
         use astra_thin_client::ApprovalDecision;
-        let explicit = Self::cloud_approval_is_explicit(approval_kind);
         if quiet {
-            return if self.mode == PermissionMode::Auto && !explicit {
+            return if self.mode == PermissionMode::Auto {
                 ApprovalDecision::Allow
             } else {
                 ApprovalDecision::Deny
             };
         }
+        let explicit = Self::cloud_approval_is_explicit(approval_kind);
         if explicit {
-            if self.mode == PermissionMode::Deny {
-                return ApprovalDecision::Deny;
+            match self.mode {
+                PermissionMode::Deny => return ApprovalDecision::Deny,
+                PermissionMode::Auto => return ApprovalDecision::Allow,
+                PermissionMode::Prompt => {}
             }
             eprintln!(
                 "{}",
@@ -1158,8 +1162,14 @@ impl PermissionManager {
         }
 
         if let Some(reason) = explicit_approval_reason(name, args) {
-            if self.mode == PermissionMode::Deny {
-                return PermissionDecision::Deny("Explicit approval required (deny mode)".into());
+            match self.mode {
+                PermissionMode::Deny => {
+                    return PermissionDecision::Deny(
+                        "Explicit approval required (deny mode)".into(),
+                    );
+                }
+                PermissionMode::Auto => return PermissionDecision::Allow,
+                PermissionMode::Prompt => {}
             }
             let (header, detail) = Self::format_tool_display(name, args);
             return PermissionDecision::NeedApproval {
@@ -1744,11 +1754,31 @@ mod tests {
     }
 
     #[test]
-    fn auto_mode_cloud_explicit_approval_is_not_auto_allowed() {
+    fn auto_mode_cloud_explicit_quiet_auto_allows() {
         let dir = tempfile::tempdir().unwrap();
         let mut pm = PermissionManager::with_project_mode(PermissionMode::Auto, dir.path());
         let decision =
             pm.resolve_cloud_approval("bash", Some("/tmp"), ApprovalKind::Explicit, true);
+        assert_eq!(decision, astra_thin_client::ApprovalDecision::Allow);
+    }
+
+    /// Regression: Auto mode must auto-allow Explicit tools in interactive (non-quiet) mode.
+    /// Previously, Explicit + Auto + quiet=false would still prompt the user.
+    #[test]
+    fn auto_mode_cloud_explicit_interactive_auto_allows() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Auto, dir.path());
+        let decision =
+            pm.resolve_cloud_approval("write_file", Some("new.rs"), ApprovalKind::Explicit, false);
+        assert_eq!(decision, astra_thin_client::ApprovalDecision::Allow);
+    }
+
+    #[test]
+    fn deny_mode_cloud_explicit_interactive_denies() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Deny, dir.path());
+        let decision =
+            pm.resolve_cloud_approval("write_file", Some("new.rs"), ApprovalKind::Explicit, false);
         assert_eq!(decision, astra_thin_client::ApprovalDecision::Deny);
     }
 
@@ -1897,17 +1927,25 @@ mod tests {
     }
 
     #[test]
-    fn explicit_irreversible_actions_still_require_approval_in_auto_mode() {
-        let mut pm = PermissionManager::new(true);
-        pm.session_overrides.insert("git_commit".to_string(), true);
+    fn explicit_irreversible_actions_auto_allowed_in_auto_mode() {
+        let mut pm = PermissionManager::new(true); // auto mode
         let args = serde_json::json!({"message": "ship it"});
         let decision = pm.check_nonblocking("git_commit", &args);
-        match decision {
-            PermissionDecision::NeedApproval { reason, .. } => {
-                assert!(reason.contains("Explicit approval required"));
-            }
-            other => panic!("expected NeedApproval, got: {other:?}"),
-        }
+        assert!(
+            matches!(decision, PermissionDecision::Allow),
+            "Auto mode should auto-allow explicit tools, got: {decision:?}"
+        );
+    }
+
+    #[test]
+    fn explicit_irreversible_actions_need_approval_in_prompt_mode() {
+        let mut pm = PermissionManager::new(false); // prompt mode
+        let args = serde_json::json!({"message": "ship it"});
+        let decision = pm.check_nonblocking("git_commit", &args);
+        assert!(
+            matches!(decision, PermissionDecision::NeedApproval { .. }),
+            "Prompt mode should require approval for explicit tools, got: {decision:?}"
+        );
     }
 
     // ── Security: session overrides cannot bypass safety checks ──────────────
@@ -2277,6 +2315,38 @@ mod tests {
         let mut pm = PermissionManager::with_project_mode(PermissionMode::Deny, dir.path());
         let decision = pm
             .resolve_cloud_approval_async("bash", Some("/tmp"), ApprovalKind::Standard, false)
+            .await;
+        assert_eq!(decision, astra_thin_client::ApprovalDecision::Deny);
+    }
+
+    /// Regression: async Explicit + Auto must auto-allow without prompting.
+    #[tokio::test]
+    async fn cloud_approval_async_explicit_auto_allows() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Auto, dir.path());
+        let decision = pm
+            .resolve_cloud_approval_async(
+                "write_file",
+                Some("new.rs"),
+                ApprovalKind::Explicit,
+                false,
+            )
+            .await;
+        assert_eq!(decision, astra_thin_client::ApprovalDecision::Allow);
+    }
+
+    /// Regression: async Explicit + Deny must deny without prompting.
+    #[tokio::test]
+    async fn cloud_approval_async_explicit_deny_denies() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Deny, dir.path());
+        let decision = pm
+            .resolve_cloud_approval_async(
+                "write_file",
+                Some("new.rs"),
+                ApprovalKind::Explicit,
+                false,
+            )
             .await;
         assert_eq!(decision, astra_thin_client::ApprovalDecision::Deny);
     }
