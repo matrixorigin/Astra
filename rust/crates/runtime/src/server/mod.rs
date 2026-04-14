@@ -56,6 +56,7 @@ pub mod team_orchestrator;
 pub mod worktree_isolation;
 pub mod ws_approval_gate;
 mod ws_handler;
+pub mod ws_progress_callback;
 
 use self::{
     bridge_prep::prepare_chat_turn_bridge_body,
