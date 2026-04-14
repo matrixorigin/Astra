@@ -479,6 +479,8 @@ test-online:
 		echo "No .env found — creating from .env.example..."; \
 		cp .env.example .env; \
 	fi
+	@echo "Running astra-runtime ignored unit tests (live DB)..."
+	@$(CARGO) test $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) -- --ignored
 	@ASTRA_SYSTEM_MATRIX_E2E=1 ASTRA_MULTI_AGENT_IT=1 ASTRA_SERVICES_DB_IT=1 $(MAKE) test-ignored-integration
 
 .PHONY: test-contract
