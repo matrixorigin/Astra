@@ -72,6 +72,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             messages: &mut state.messages,
             last_measured_prompt_tokens: &mut state.last_measured_prompt_tokens,
             consecutive_context_window_errors: &mut state.consecutive_context_window_errors,
+            selected_tools: turn_result.edge_tool_round.iter().map(|r| r.tool.clone()).collect(),
         },
     )) {
         AgenticIngestIterationControl::Fatal(e) => {

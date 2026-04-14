@@ -75,6 +75,8 @@ pub struct AgenticTurnIngestMut<'a> {
     pub last_measured_prompt_tokens: &'a mut Option<u64>,
     /// See [`crate::turn::agentic_loop_host::AgenticLoopState::consecutive_context_window_errors`].
     pub consecutive_context_window_errors: &'a mut u32,
+    /// Tools selected for this turn — included in factual retry correction message.
+    pub selected_tools: Vec<String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -206,7 +208,7 @@ pub fn ingest_agentic_turn_stream(
                 eprintln!("  ↻ No tool call on a live-data query; forcing one corrective retry…");
             }
             st.messages
-                .push(openai_factual_tool_retry_user_message(message));
+                .push(openai_factual_tool_retry_user_message(message, &st.selected_tools));
             st.final_text.clear();
             record_prompt_calibration_success(snap, &mut st);
             return AgenticTurnIngestOutcome::Continue;
@@ -295,6 +297,7 @@ mod tests {
                 messages: &mut self.messages,
                 last_measured_prompt_tokens: &mut self.last_measured_prompt_tokens,
                 consecutive_context_window_errors: &mut self.consecutive_context_window_errors,
+                selected_tools: vec![],
             }
         }
     }

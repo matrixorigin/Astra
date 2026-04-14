@@ -331,16 +331,26 @@ pub fn should_force_factual_tool_retry(
         && looks_like_live_query_with_context(input, recent_tools)
 }
 
-pub fn factual_tool_retry_message(original_query: &str) -> String {
+pub fn factual_tool_retry_message(original_query: &str, selected_tools: &[String]) -> String {
+    let tools_hint = if selected_tools.is_empty() {
+        "- For workspace state: git_status, git_diff, read_file, grep, glob.\n\
+- For GitHub data: github_ci_status, github_list_prs, github_list_issues, github_repo_stats.\n\
+- For memory: memory_search, memory_profile.\n\
+- Prefer dedicated tools over bash."
+            .to_string()
+    } else {
+        format!(
+            "You have exactly these tools available for this turn: {}.\n\
+Only call tools from this list — do not use bash to work around missing tools.",
+            selected_tools.join(", ")
+        )
+    };
     format!(
         "Runtime correction: your previous response answered without using any tools. \
 This query requires live data from the workspace, repository, or external sources \
 that you cannot know from training data alone. Retry from scratch and call tools first.\n\
 \n\
-- For workspace state: git_status, git_diff, read_file, grep, glob.\n\
-- For GitHub data: github_ci_status, github_list_prs, github_list_issues, github_repo_stats.\n\
-- For memory: memory_search, memory_profile.\n\
-- Prefer dedicated tools over bash.\n\
+{tools_hint}\n\
 \n\
 Discard your previous draft and gather evidence with tools before answering.\n\
 \n\
@@ -350,8 +360,8 @@ Original user query: {original_query}"
 
 /// OpenAI `messages` entry for [`factual_tool_retry_message`].
 #[must_use]
-pub fn openai_factual_tool_retry_user_message(original_query: &str) -> Value {
-    openai_user_content_message(&factual_tool_retry_message(original_query))
+pub fn openai_factual_tool_retry_user_message(original_query: &str, selected_tools: &[String]) -> Value {
+    openai_user_content_message(&factual_tool_retry_message(original_query, selected_tools))
 }
 
 /// Extract `owner/repo` patterns from memory text.
@@ -626,7 +636,8 @@ mod tests {
 
     #[test]
     fn factual_retry_message_guides_toward_dedicated_tools() {
-        let msg = factual_tool_retry_message("memoria 最新的一个ci?");
+        // Without selected_tools: falls back to generic hints
+        let msg = factual_tool_retry_message("memoria 最新的一个ci?", &[]);
         assert!(msg.contains("github_ci_status"));
         assert!(msg.contains("git_status"));
         assert!(msg.contains("read_file"));
@@ -635,8 +646,19 @@ mod tests {
     }
 
     #[test]
+    fn factual_retry_message_lists_selected_tools_when_provided() {
+        let tools = vec!["mo_query".to_string(), "read_file".to_string()];
+        let msg = factual_tool_retry_message("看session指标", &tools);
+        assert!(msg.contains("mo_query"));
+        assert!(msg.contains("read_file"));
+        assert!(msg.contains("Only call tools from this list"));
+        // Should NOT contain generic hints
+        assert!(!msg.contains("github_ci_status"));
+    }
+
+    #[test]
     fn openai_factual_tool_retry_user_message_shape() {
-        let v = openai_factual_tool_retry_user_message("q");
+        let v = openai_factual_tool_retry_user_message("q", &[]);
         assert_eq!(v["role"], "user");
         let s = v["content"].as_str().unwrap();
         assert!(s.contains("Runtime correction"));
