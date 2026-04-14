@@ -80,12 +80,14 @@ fn build_unconfigured_app() -> axum::Router {
 }
 
 fn dummy_matrixone() -> MatrixOneSettings {
+    // Use an invalid host so sqlx connection fails immediately without retrying
+    // for the full acquire_timeout duration.
     MatrixOneSettings {
-        host: "127.0.0.1".to_string(),
+        host: "invalid.test".to_string(),
         port: 1,
-        user: "root".to_string(),
-        password: "unused".to_string(),
-        database: "unused".to_string(),
+        user: "x".to_string(),
+        password: "x".to_string(),
+        database: "x".to_string(),
     }
 }
 
