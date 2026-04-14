@@ -83,6 +83,17 @@ pub trait RunLifecycleService: Send + Sync {
     async fn drain_approval_requests(&self, _run_id: &str) -> Vec<serde_json::Value> {
         vec![]
     }
+
+    /// Drain pending tool progress events for a run.
+    ///
+    /// Returns JSON objects with `kind` field (`started`, `delta`, `completed`).
+    /// The WS handler calls this during its polling loop to forward
+    /// progress events to the client.
+    ///
+    /// Default: no-op (returns empty vec).
+    async fn drain_progress_events(&self, _run_id: &str) -> Vec<serde_json::Value> {
+        vec![]
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]

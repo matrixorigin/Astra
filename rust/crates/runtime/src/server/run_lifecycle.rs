@@ -17,6 +17,8 @@ use axum::Json;
 use axum::http::StatusCode;
 use serde_json::{Map, Value, json};
 use tokio::sync::{Mutex as TokioMutex, RwLock, mpsc};
+
+use super::ws_progress_callback::ProgressEvent;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -487,6 +489,9 @@ pub struct AgenticRunLifecycleService {
     /// Per-run approval request channel receivers (Phase E).
     /// Key: run_id → receiver that the WS handler drains.
     approval_channels: Arc<TokioMutex<HashMap<String, mpsc::UnboundedReceiver<serde_json::Value>>>>,
+    /// Per-run progress event channel receivers (Phase F.3).
+    /// Key: run_id → receiver that the WS handler drains.
+    progress_channels: Arc<TokioMutex<HashMap<String, mpsc::UnboundedReceiver<ProgressEvent>>>>,
 }
 
 impl AgenticRunLifecycleService {
@@ -506,6 +511,7 @@ impl AgenticRunLifecycleService {
             resource_governor: None,
             edge_connection_pool: None,
             approval_channels: Arc::new(TokioMutex::new(HashMap::new())),
+            progress_channels: Arc::new(TokioMutex::new(HashMap::new())),
         }
     }
 
@@ -1120,11 +1126,22 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 .await
                 .insert(run_id.clone(), approval_rx);
 
+            // ── Phase F.3: Wire WebSocket progress callback ─────────
+            let (progress_tx, progress_rx) = mpsc::unbounded_channel();
+            let progress_cb =
+                super::ws_progress_callback::WebSocketProgressCallback::new(progress_tx);
+            executor.set_progress_callback(std::sync::Arc::new(progress_cb));
+            self.progress_channels
+                .lock()
+                .await
+                .insert(run_id.clone(), progress_rx);
+
             loop_state.server_tool_executor = Some(std::sync::Arc::new(executor));
         }
 
         // Clone handles we need inside the spawned task.
         let bg_approval_channels = self.approval_channels.clone();
+        let bg_progress_channels = self.progress_channels.clone();
         let runs = self.runs_handle();
         let run_engine = self.run_engine.clone();
         let bg_run_id = run_id.clone();
@@ -1138,8 +1155,9 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             let (events, final_status, error_msg) =
                 Self::finalize_run_events(outcome, host.take_emitted_events(), &loop_state);
 
-            // Clean up approval channel for this run.
+            // Clean up channels for this run.
             bg_approval_channels.lock().await.remove(&bg_run_id);
+            bg_progress_channels.lock().await.remove(&bg_run_id);
             let terminal_events = terminal_events_for_persistence(&events);
 
             // Publish terminal run state before best-effort post-run side effects
@@ -1413,6 +1431,18 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             requests.push(req);
         }
         requests
+    }
+
+    async fn drain_progress_events(&self, run_id: &str) -> Vec<serde_json::Value> {
+        let mut channels = self.progress_channels.lock().await;
+        let Some(rx) = channels.get_mut(run_id) else {
+            return vec![];
+        };
+        let mut events = Vec::new();
+        while let Ok(evt) = rx.try_recv() {
+            events.push(serde_json::to_value(&evt).unwrap_or_default());
+        }
+        events
     }
 
     async fn cancel_run(

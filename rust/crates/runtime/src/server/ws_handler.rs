@@ -194,17 +194,14 @@ pub(super) enum WsServerMessage {
 
     /// Tool execution started on server.
     #[serde(rename = "tool_execution_started")]
-    #[allow(dead_code)] // Phase 5: wired when server executor emits progress
     ToolExecutionStarted { call_id: String, tool: String },
 
     /// Incremental output from a running tool.
     #[serde(rename = "tool_output_delta")]
-    #[allow(dead_code)] // Phase 5: wired when server executor emits progress
     ToolOutputDelta { call_id: String, content: String },
 
     /// Tool execution completed on server.
     #[serde(rename = "tool_execution_completed")]
-    #[allow(dead_code)] // Phase 5: wired when server executor emits progress
     ToolExecutionCompleted { call_id: String, success: bool },
 
     /// Error during processing.
@@ -1150,6 +1147,64 @@ async fn stream_run_over_websocket(
                         },
                     )
                     .await;
+                }
+
+                // ── Phase F.3: Forward pending progress events to client ──
+                for evt in state
+                    .run_lifecycle_service
+                    .drain_progress_events(run_id)
+                    .await
+                {
+                    match evt.get("kind").and_then(|v| v.as_str()) {
+                        Some("started") => {
+                            send_msg(
+                                socket,
+                                &WsServerMessage::ToolExecutionStarted {
+                                    call_id: evt.get("call_id")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or_default()
+                                        .to_string(),
+                                    tool: evt.get("tool")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or_default()
+                                        .to_string(),
+                                },
+                            )
+                            .await;
+                        }
+                        Some("delta") => {
+                            send_msg(
+                                socket,
+                                &WsServerMessage::ToolOutputDelta {
+                                    call_id: evt.get("call_id")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or_default()
+                                        .to_string(),
+                                    content: evt.get("content")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or_default()
+                                        .to_string(),
+                                },
+                            )
+                            .await;
+                        }
+                        Some("completed") => {
+                            send_msg(
+                                socket,
+                                &WsServerMessage::ToolExecutionCompleted {
+                                    call_id: evt.get("call_id")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or_default()
+                                        .to_string(),
+                                    success: evt.get("success")
+                                        .and_then(|v| v.as_bool())
+                                        .unwrap_or(false),
+                                },
+                            )
+                            .await;
+                        }
+                        _ => {}
+                    }
                 }
 
                 let events = match state
