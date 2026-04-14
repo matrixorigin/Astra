@@ -1,4 +1,5 @@
 use super::*;
+use astra_services::session_journal::{self, JournalDirGuard, JournalEventType};
 
 // ── chat_stream (SSE agentic loop) ────────────────────────────────────
 
@@ -452,4 +453,155 @@ async fn stream_chat_sse_with_tool_call_loop() {
     assert_eq!(result.full_text, "Done!");
     assert!(result.tool_calls_count > 0);
     assert!(call_count.load(std::sync::atomic::Ordering::SeqCst) >= 2);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn stream_chat_sse_journals_transaction_boundaries_end_to_end() {
+    let temp = tempfile::tempdir().unwrap();
+    let _guard = JournalDirGuard::new(temp.path());
+    #[derive(Clone)]
+    struct StreamingMockState {
+        call_count: std::sync::Arc<std::sync::atomic::AtomicU32>,
+        tool_results: std::sync::Arc<tokio::sync::Mutex<Vec<serde_json::Value>>>,
+    }
+
+    let state = StreamingMockState {
+        call_count: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        tool_results: std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new())),
+    };
+    let app = Router::new()
+        .route(
+            "/chat/turn",
+            post({
+                let state = state.clone();
+                move || {
+                    let state = state.clone();
+                    async move {
+                        let n = state
+                            .call_count
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let body = if n == 0 {
+                            "data: {\"type\":\"session_info\",\"session_id\":\"sess-tx-e2e\"}\n\n\
+                             data: {\"type\":\"tool_request\",\"request_id\":\"tr-tx-1\",\"tool\":\"bash\",\"args\":{\"command\":\"echo hi\",\"transaction_id\":\"tx-e2e\",\"rollback_on_failure\":true}}\n\n\
+                             data: [DONE]\n\n"
+                                .to_string()
+                        } else {
+                            sse_text_response("Done!", "sess-tx-e2e")
+                        };
+                        ([("content-type", "text/event-stream")], body)
+                    }
+                }
+            }),
+        )
+        .route(
+            "/tools/result",
+            post({
+                let state = state.clone();
+                move |axum::Json(body): axum::Json<serde_json::Value>| {
+                    let state = state.clone();
+                    async move {
+                        state.tool_results.lock().await.push(body);
+                        axum::Json(serde_json::json!({ "ok": true }))
+                    }
+                }
+            }),
+        );
+    let base = spawn_mock(app).await;
+    let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
+    let registry = tool_registry::ToolRegistry::new(edge_tools::all_tool_schemas());
+    let selector = tool_selector::TfIdfSelector::new(registry);
+    let mut pm = PermissionManager::new(true);
+    let mut skill_qt = astra_runtime::skills::quality::SkillQualityTracker::new();
+    let skill_search = astra_core::SkillSearchSettings::default();
+    let result = stream_chat_sse(ChatTurnParams {
+        api: &api,
+        token: "fake-token",
+        message: "write inside a transaction",
+        session_id: None,
+        model: None,
+        explain: ExplainMode::Off,
+        render_md: false,
+        history: &[],
+        perm_manager: &mut pm,
+        verbose_mode: false,
+        render_policy: crate::stream_render::RenderPolicy::Silent,
+        selector: &selector,
+        recent_tools: &[],
+        tool_health_entries: &[],
+        unified_skill_registry: astra_runtime::skills::empty_unified_registry(),
+        plan_only_chat: false,
+        is_plan_subtask: false,
+        plan_subtask_id: None,
+        delegation_engine: None,
+        cancel_token: None,
+        plan_assemble_line_release: None,
+        stream_event_tx: None,
+        approval_request_tx: None,
+        mcp_manager: None,
+        skill_search: &skill_search,
+        skill_quality_tracker: &mut skill_qt,
+        discovered_skills: None,
+        messaging_metrics: None,
+        agent_spawner: None,
+        root_agent_id: None,
+        root_mailbox_slot: None,
+        observability_hub: None,
+        observability_session: None,
+        file_journal: None,
+        database_snapshot_journal: None,
+        git_stash_journal: None,
+        git_commit_journal: None,
+        git_worktree_journal: None,
+        session_state_journal: None,
+        task_manager: None,
+        turn_index: 0,
+        evolution_service: None,
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(result.full_text, "Done!");
+    assert!(result.tool_calls_count > 0);
+
+    let tool_results = state.tool_results.lock().await;
+    assert_eq!(tool_results.len(), 1);
+    assert_eq!(tool_results[0]["request_id"].as_str(), Some("tr-tx-1"));
+    drop(tool_results);
+
+    let boundary_events: Vec<_> = session_journal::read_journal("sess-tx-e2e")
+        .unwrap()
+        .into_iter()
+        .filter(|event| {
+            matches!(
+                event.event_type,
+                JournalEventType::ExecutionBoundaryOpened
+                    | JournalEventType::ExecutionBoundaryCommitted
+            )
+        })
+        .collect();
+    assert_eq!(boundary_events.len(), 2);
+    assert_eq!(
+        boundary_events[0].event_type,
+        JournalEventType::ExecutionBoundaryOpened
+    );
+    assert_eq!(
+        boundary_events[1].event_type,
+        JournalEventType::ExecutionBoundaryCommitted
+    );
+
+    let opened = boundary_events[0]
+        .metadata
+        .as_ref()
+        .and_then(|meta| meta.get("execution_boundary"))
+        .expect("opened boundary metadata");
+    assert_eq!(opened["kind"].as_str(), Some("tool_batch"));
+    assert_eq!(opened["transaction_id"].as_str(), Some("tx-e2e"));
+
+    let committed = boundary_events[1]
+        .metadata
+        .as_ref()
+        .and_then(|meta| meta.get("execution_boundary"))
+        .expect("committed boundary metadata");
+    assert_eq!(committed["kind"].as_str(), Some("tool_batch"));
+    assert_eq!(committed["transaction_id"].as_str(), Some("tx-e2e"));
 }

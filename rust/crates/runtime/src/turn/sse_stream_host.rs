@@ -203,6 +203,12 @@ pub trait SseStreamHost: Send {
     /// CLI: refreshes the thinking pane elapsed timer so the UI never looks frozen.
     fn on_idle_tick(&mut self) {}
 
+    /// Called when a `session_info` SSE event yields a session ID.
+    ///
+    /// Hosts that need the server-issued session identity during the same turn
+    /// (for example, before flushing pending tool requests) can capture it here.
+    fn on_session_id(&mut self, _session_id: &str) {}
+
     /// Execute a tool request that arrived via `tool_request` SSE event.
     /// Returns the execution result (output, status, duration).
     async fn execute_tool(
@@ -285,6 +291,7 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
     let mut approval_results: Vec<EdgeApprovalResult> = Vec::new();
     let mut abort: Option<SseAbortReason> = None;
     let mut first_sse_frame_seen = false;
+    let mut reported_session_id: Option<String> = None;
 
     host.on_before_sse_read_loop();
 
@@ -345,6 +352,12 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
                 host.on_first_sse_frame();
             }
             let effects = dispatch_chat_turn_sse_event_block(&event_str, &mut accum, &mut pending);
+            if accum.session_id.as_deref() != reported_session_id.as_deref()
+                && let Some(session_id) = accum.session_id.as_deref()
+            {
+                host.on_session_id(session_id);
+                reported_session_id = Some(session_id.to_string());
+            }
             host.on_render_effects(effects);
             // Skill-exclusivity: reorder so skill calls execute before
             // non-skill calls within the same batch.
@@ -381,6 +394,11 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
             host.on_first_sse_frame();
         }
         let effects = dispatch_chat_turn_sse_event_block(&tail, &mut accum, &mut pending);
+        if accum.session_id.as_deref() != reported_session_id.as_deref()
+            && let Some(session_id) = accum.session_id.as_deref()
+        {
+            host.on_session_id(session_id);
+        }
         host.on_render_effects(effects);
         prioritize_skill_tools(&mut pending);
         flush_pending_via_host(&mut pending, host, &mut tool_results, &mut approval_results).await;
@@ -779,6 +797,79 @@ mod tests {
         assert!(abort.is_none());
         assert_eq!(result.accum.session_id.as_deref(), Some("sess-42"));
         assert_eq!(result.accum.run_id.as_deref(), Some("run-7"));
+    }
+
+    #[tokio::test]
+    async fn session_id_hook_runs_before_tool_request_flush() {
+        let events = format!(
+            "{}{}",
+            sse_event("session_info", ",\"session_id\":\"sess-hook\""),
+            sse_event(
+                "tool_request",
+                ",\"request_id\":\"tr-1\",\"tool\":\"bash\",\"args\":{\"command\":\"echo hi\"}",
+            ),
+        );
+        let chunks = chunks_from_sse(&events);
+        let mut stream = stream::iter(chunks);
+
+        let order = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        struct SessionAwareHost(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+        #[async_trait]
+        impl SseStreamHost for SessionAwareHost {
+            fn on_render_effects(&mut self, _effects: Vec<SseRenderEffect>) {}
+
+            fn on_stream_complete(&mut self) {}
+
+            fn on_session_id(&mut self, session_id: &str) {
+                self.0.lock().unwrap().push(format!("session:{session_id}"));
+            }
+
+            async fn execute_tool(
+                &mut self,
+                request_id: &str,
+                tool: &str,
+                args: &Value,
+            ) -> EdgeToolExecResult {
+                self.0.lock().unwrap().push(format!("tool:{request_id}"));
+                EdgeToolExecResult {
+                    request_id: request_id.to_string(),
+                    tool: tool.to_string(),
+                    args: args.clone(),
+                    output: "ok".to_string(),
+                    tool_result_fields: None,
+                    status: "ok".to_string(),
+                    duration_ms: 1,
+                }
+            }
+
+            async fn resolve_approval(
+                &mut self,
+                request_id: &str,
+                _tool: &str,
+                _detail: Option<&str>,
+            ) -> EdgeApprovalResult {
+                EdgeApprovalResult {
+                    request_id: request_id.to_string(),
+                    decision: "allow".to_string(),
+                    reason: None,
+                }
+            }
+        }
+
+        let mut host = SessionAwareHost(order.clone());
+        let (result, abort) = consume_sse_stream(
+            &mut stream,
+            &mut host,
+            std::time::Duration::from_millis(STREAM_IDLE_TIMEOUT_MS),
+        )
+        .await;
+
+        assert!(abort.is_none());
+        assert_eq!(result.accum.session_id.as_deref(), Some("sess-hook"));
+        assert_eq!(
+            order.lock().unwrap().as_slice(),
+            &["session:sess-hook".to_string(), "tool:tr-1".to_string()]
+        );
     }
 
     #[tokio::test]
