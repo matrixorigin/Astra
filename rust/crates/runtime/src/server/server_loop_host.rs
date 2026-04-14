@@ -28,6 +28,10 @@ use crate::turn::agentic_loop_host::{
     AgenticLoopHost, AgenticLoopState, HostReflectionRequest, HostReflectionResult, HostTurnResult,
     TurnInteractionMode, TurnInteractionPolicy, interaction_scoped_tool_restrictions,
 };
+use crate::turn::bridge_inprocess::{
+    PromptCacheConfig, add_message_cache_breakpoint, annotate_tool_schemas_for_caching,
+    build_system_message,
+};
 use crate::turn::chat_turn_sse_dispatch::ChatTurnSseAccum;
 use crate::turn::llm_client::{
     LlmCallResult, LlmCancel, cached_system_prompt, call_llm_and_collect, classify_llm_error,
@@ -251,7 +255,17 @@ impl ServerAgenticLoopHost {
 
     /// Build the system prompt from edge context and the tool schemas visible
     /// to the current turn.
-    fn build_system_prompt(&self, user_content: &str, tools: &[Value]) -> String {
+    ///
+    /// Returns `(structured_system_messages, plain_text_for_estimates)`.
+    /// The structured messages include Anthropic cache_control annotations when
+    /// applicable, enabling prompt caching on the runs path.
+    fn build_system_messages_cached(
+        &self,
+        user_content: &str,
+        tools: &[Value],
+        state: &AgenticLoopState,
+        cache_cfg: &PromptCacheConfig,
+    ) -> (Vec<Value>, String) {
         let tool_names: Vec<&str> = tools
             .iter()
             .filter_map(|t| {
@@ -308,12 +322,19 @@ impl ServerAgenticLoopHost {
         };
         let profile_with_hints = format!("{profile_desc}{skill_hint}{learned_context_hint}");
 
-        let base = cached_system_prompt(
-            &tool_names,
-            &profile_with_hints,
-            self.selection_confidence,
-            task_type,
-        );
+        // Skill effort/agent_type hints (dynamic per-turn)
+        let mut extra_dynamic = String::new();
+        if let Some(ref effort) = state.skills.effort {
+            extra_dynamic.push_str(&format!(
+                "\n\n## Effort Level\nThe active skill requests effort level: **{effort}**. \
+                 Adjust thoroughness accordingly.",
+            ));
+        }
+        if let Some(ref agent_type) = state.skills.agent_type {
+            extra_dynamic.push_str(&format!(
+                "\n\n## Agent Type\nYou are acting as a **{agent_type}** agent for this skill.",
+            ));
+        }
 
         // Memory signal detection
         let memory_signal_hint = if let Some(category) =
@@ -337,7 +358,33 @@ impl ServerAgenticLoopHost {
             .map(|s| format!("\n\n{s}"))
             .unwrap_or_default();
 
-        format!("{base}{memory_signal_hint}{system_override}")
+        // All dynamic per-turn content (not cached)
+        let full_dynamic =
+            format!("{profile_with_hints}{extra_dynamic}{memory_signal_hint}{system_override}");
+
+        // Build structured system messages with Anthropic cache annotations.
+        // Stable sections (Global/Session) get cache_control; dynamic content does not.
+        let (sys_msg, dynamic_msg, _sections) = build_system_message(
+            &tool_names,
+            &full_dynamic,
+            self.selection_confidence,
+            task_type,
+            cache_cfg,
+        );
+        let mut system_messages = vec![sys_msg];
+        if let Some(dm) = dynamic_msg {
+            system_messages.push(dm);
+        }
+
+        // Plain text for token estimation (no cache annotations)
+        let plain = cached_system_prompt(
+            &tool_names,
+            &full_dynamic,
+            self.selection_confidence,
+            task_type,
+        );
+
+        (system_messages, plain)
     }
 
     /// Compute the tool schemas visible for the current turn after applying
@@ -356,21 +403,91 @@ impl ServerAgenticLoopHost {
         self.filtered_turn_tools(&state.restricted_tools)
     }
 
+    /// Test-only: returns the plain-text system prompt (no cache annotations).
+    #[cfg(test)]
+    fn build_system_prompt(&self, user_content: &str, visible_tools: &[Value]) -> String {
+        let tool_names: Vec<&str> = visible_tools
+            .iter()
+            .filter_map(|t| {
+                t.get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(Value::as_str)
+            })
+            .collect();
+
+        // Replicate the dynamic section assembly from build_system_messages_cached.
+        let mut profile_parts = Vec::new();
+        if let Some(cwd) = self.edge_profile.get("cwd").and_then(Value::as_str) {
+            profile_parts.push(format!("cwd: {cwd}"));
+        }
+        if let Some(branch) = self.edge_profile.get("git_branch").and_then(Value::as_str) {
+            profile_parts.push(format!("git_branch: {branch}"));
+        }
+        let skill_hint = self
+            .edge_profile
+            .get("active_skills")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                let names: Vec<&str> = arr.iter().filter_map(Value::as_str).collect();
+                if names.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        "\n\n## Active Output Skills\nThe user has enabled these output constraints: {}. \
+                         Follow their formatting rules strictly.",
+                        names.join(", ")
+                    )
+                }
+            })
+            .unwrap_or_default();
+        let learned_context_hint = self
+            .edge_profile
+            .get("learned_context_hint")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(|hint| format!("\n\n## Learned Runtime Context\n{hint}"))
+            .unwrap_or_default();
+        let task_type = crate::prompts::detect_task_type(user_content);
+        let profile_desc = if profile_parts.is_empty() {
+            String::new()
+        } else {
+            format!("\n\n# Project Profile\n{}", profile_parts.join("\n"))
+        };
+        let memory_signal_hint = if let Some(category) =
+            crate::prompts::memory_lifecycle::detect_store_signal(user_content)
+        {
+            let ns = crate::prompts::memory_lifecycle::suggest_namespace(category);
+            format!(
+                "\n\n⚡ MEMORY SIGNAL DETECTED: category=\"{category}\", namespace=\"{ns}\". \
+                 Store the user's intent with memory_store BEFORE doing anything else."
+            )
+        } else {
+            String::new()
+        };
+        let full_dynamic =
+            format!("{profile_desc}{skill_hint}{learned_context_hint}{memory_signal_hint}");
+
+        cached_system_prompt(
+            &tool_names,
+            &full_dynamic,
+            self.selection_confidence,
+            task_type,
+        )
+    }
+
     /// Build the LLM message array from loop state.
     async fn build_llm_messages(
         &self,
-        system_prompt: &str,
+        system_messages: Vec<Value>,
         state: &AgenticLoopState,
         visible_tools: &[Value],
         model_name: &str,
         api_key: &str,
         base_url: &str,
         provider: &str,
+        cache_cfg: &PromptCacheConfig,
     ) -> Vec<Value> {
-        let mut llm_messages = vec![json!({
-            "role": "system",
-            "content": system_prompt
-        })];
+        let mut llm_messages = system_messages;
 
         // Compute compaction tier
         let budget = crate::prompts::budget_for_model(Some(model_name));
@@ -478,6 +595,9 @@ impl ServerAgenticLoopHost {
             llm_messages.push(listing.clone());
         }
 
+        // Add cache breakpoint on the last conversation message for Anthropic.
+        add_message_cache_breakpoint(&mut llm_messages, cache_cfg);
+
         llm_messages
     }
 
@@ -493,6 +613,16 @@ impl ServerAgenticLoopHost {
             .get("completion")
             .and_then(Value::as_u64)
             .unwrap_or(0);
+        let cache_read_tokens = result
+            .usage
+            .get("cache_read_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let cache_creation_tokens = result
+            .usage
+            .get("cache_creation_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
 
         ChatTurnSseAccum {
             full_text: result.full_text.clone(),
@@ -501,8 +631,8 @@ impl ServerAgenticLoopHost {
             has_tool_calls: !result.tool_calls.is_empty(),
             prompt_tokens,
             completion_tokens,
-            cache_read_tokens: 0,
-            cache_creation_tokens: 0,
+            cache_read_tokens,
+            cache_creation_tokens,
             has_usage: !result.usage.is_empty(),
             session_id: None,
             run_id: None,
@@ -631,31 +761,24 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             TurnInteractionMode::Headless,
         ));
         let visible_tools = self.filtered_turn_tools(&effective_restricted);
-        let system_prompt = self.build_system_prompt(&user_content, &visible_tools);
 
-        // Append skill-level hints (effort, agent_type) when active.
-        let mut system_prompt = system_prompt;
-        if let Some(ref effort) = state.skills.effort {
-            system_prompt.push_str(&format!(
-                "\n\n## Effort Level\nThe active skill requests effort level: **{effort}**. \
-                 Adjust thoroughness accordingly.",
-            ));
-        }
-        if let Some(ref agent_type) = state.skills.agent_type {
-            system_prompt.push_str(&format!(
-                "\n\n## Agent Type\nYou are acting as a **{agent_type}** agent for this skill.",
-            ));
-        }
+        // Latch prompt cache config from provider info (once per turn is fine;
+        // provider doesn't change within a turn).
+        let cache_cfg = PromptCacheConfig::latch(&provider, &model_name);
+
+        let (system_messages, system_prompt_plain) =
+            self.build_system_messages_cached(&user_content, &visible_tools, state, &cache_cfg);
 
         let llm_messages = self
             .build_llm_messages(
-                &system_prompt,
+                system_messages,
                 state,
                 &visible_tools,
                 &model_name,
                 &api_key,
                 &base_url,
                 &provider,
+                &cache_cfg,
             )
             .await;
 
@@ -671,7 +794,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                     .unwrap_or(50)
             })
             .sum();
-        let mut est_msgs = vec![json!({"role": "system", "content": system_prompt})];
+        let mut est_msgs = vec![json!({"role": "system", "content": system_prompt_plain})];
         est_msgs.extend(state.messages.iter().cloned());
         let cache_est = crate::prompts::estimate_tokens_cache_aware(&est_msgs, tool_schema_tokens);
         let tier = crate::prompts::compaction_tier_calibrated(
@@ -680,7 +803,9 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             state.last_measured_prompt_tokens,
             state.consecutive_context_window_errors,
         );
-        let final_tools = prune_tool_schemas(&visible_tools, tier);
+        let mut final_tools = prune_tool_schemas(&visible_tools, tier);
+        // Annotate tool schemas with cache_control for Anthropic.
+        annotate_tool_schemas_for_caching(&mut final_tools, &cache_cfg);
         state.last_turn_policy =
             TurnInteractionPolicy::from_tool_schemas(TurnInteractionMode::Headless, &final_tools);
 
@@ -1300,13 +1425,14 @@ mod tests {
 
         let msgs = host
             .build_llm_messages(
-                "system prompt text",
+                vec![json!({"role": "system", "content": "system prompt text"})],
                 &state,
                 &host.edge_tools,
                 "gpt-4",
                 "sk-test",
                 "https://api.test.com",
                 "openai",
+                &PromptCacheConfig::latch("openai", "gpt-4"),
             )
             .await;
         assert!(msgs.len() >= 2, "should have system + user messages");
