@@ -8,8 +8,11 @@ use astra_runtime::{
     AppState, AuthLoginRequestData, AuthRefreshRequestData, AuthRegisterRequestData, AuthService,
     AuthTokenRecord, AuthUserRecord, ErrorResponse, HealthChecker, ServiceInfo, build_app,
     turn::cloud_tool_delivery::deliver_tool_calls_through_edge_ledger,
-    turn::edge_ledger::{approval_callback_key, take_ledger_entry, tool_callback_key},
+    turn::edge_ledger::{
+        LEDGER_MAX_ENTRIES, approval_callback_key, take_ledger_entry, tool_callback_key,
+    },
 };
+use astra_services::session_journal::{JournalDirGuard, find_latest_approval_decision};
 use async_trait::async_trait;
 use axum::{
     Router, body,
@@ -167,6 +170,69 @@ async fn post_approval_respond_populates_ledger_then_take_consumes() {
         .await
         .expect("row present");
     assert_eq!(got["kind"], "approval_respond");
+}
+
+#[tokio::test]
+async fn post_approval_respond_journals_when_ledger_is_full() {
+    let temp = tempfile::tempdir().unwrap();
+    let _guard = JournalDirGuard::new(temp.path());
+    let (app, ledger) = e2e_app();
+    {
+        let mut guard = ledger.lock().await;
+        for idx in 0..LEDGER_MAX_ENTRIES {
+            guard.insert(format!("fill-{idx}"), json!({"kind": "filler"}));
+        }
+    }
+
+    let key = approval_callback_key("e2e-user", "ap-overflow");
+    let (st, j) = post_json(
+        app.clone(),
+        "/approval/respond",
+        json!({
+            "request_id": "ap-overflow",
+            "decision": "deny",
+            "reason": "policy",
+            "session_id": "sess-approval",
+            "tool_name": "write_file",
+            "approval_kind": "standard"
+        }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(j["ok"], true);
+    assert_eq!(j["ledger_enqueued"], false);
+    assert!(!ledger.lock().await.contains_key(&key));
+    assert_eq!(ledger.lock().await.len(), LEDGER_MAX_ENTRIES);
+
+    let found = find_latest_approval_decision("sess-approval", "ap-overflow")
+        .unwrap()
+        .expect("journal decision");
+    assert_eq!(found.decision, "deny");
+    assert_eq!(found.reason.as_deref(), Some("policy"));
+    assert_eq!(found.tool_name.as_deref(), Some("write_file"));
+    assert_eq!(found.approval_kind.as_deref(), Some("standard"));
+}
+
+#[tokio::test]
+async fn post_tool_result_rejects_when_ledger_is_full() {
+    let (app, ledger) = e2e_app();
+    {
+        let mut guard = ledger.lock().await;
+        for idx in 0..LEDGER_MAX_ENTRIES {
+            guard.insert(format!("fill-{idx}"), json!({"kind": "filler"}));
+        }
+    }
+
+    let key = tool_callback_key("e2e-user", "tc-overflow");
+    let (st, _) = post_json(
+        app.clone(),
+        "/tools/result",
+        json!({"request_id": "tc-overflow", "status": "ok", "output": "out"}),
+    )
+    .await;
+    assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(!ledger.lock().await.contains_key(&key));
+    assert_eq!(ledger.lock().await.len(), LEDGER_MAX_ENTRIES);
 }
 
 #[tokio::test]

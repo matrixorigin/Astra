@@ -7,6 +7,7 @@
 
 use super::*;
 
+use astra_services::session_journal::{JournalEvent, JournalWriter, validate_session_id};
 use astra_thin_client::ASTRA_EDGE_ID_HEADER;
 use serde::Deserialize;
 
@@ -20,6 +21,41 @@ fn edge_id_from_headers(headers: &HeaderMap) -> String {
         .to_string()
 }
 
+fn ledger_capacity_error() -> (StatusCode, Json<ErrorResponse>) {
+    error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        format!("edge callback ledger full ({LEDGER_MAX_ENTRIES})"),
+    )
+}
+
+fn insert_ledger_entry(
+    ledger: &mut std::collections::HashMap<String, serde_json::Value>,
+    key: String,
+    value: serde_json::Value,
+) -> Result<bool, ()> {
+    if !ledger.contains_key(&key) && ledger.len() >= LEDGER_MAX_ENTRIES {
+        return Err(());
+    }
+    ledger.insert(key, value);
+    Ok(true)
+}
+
+fn insert_approval_ledger_entry(
+    ledger: &mut std::collections::HashMap<String, serde_json::Value>,
+    key: String,
+    value: serde_json::Value,
+    durable_fallback_ready: bool,
+) -> Result<bool, ()> {
+    if !ledger.contains_key(&key) && ledger.len() >= LEDGER_MAX_ENTRIES {
+        if durable_fallback_ready {
+            return Ok(false);
+        }
+        return Err(());
+    }
+    ledger.insert(key, value);
+    Ok(true)
+}
+
 pub(super) async fn post_tool_result_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -29,10 +65,8 @@ pub(super) async fn post_tool_result_handler(
     let edge_id = edge_id_from_headers(&headers);
     let key = tool_callback_key(&user.user_id, &body.request_id);
     let mut lock = state.edge_callback_ledger.lock().await;
-    if lock.len() >= LEDGER_MAX_ENTRIES {
-        lock.clear();
-    }
-    lock.insert(
+    insert_ledger_entry(
+        &mut lock,
         key,
         serde_json::json!({
             "kind": "tool_result",
@@ -40,7 +74,8 @@ pub(super) async fn post_tool_result_handler(
             "edge_id": edge_id,
             "body": serde_json::to_value(&body).unwrap_or_default(),
         }),
-    );
+    )
+    .map_err(|()| ledger_capacity_error())?;
     Ok(Json(serde_json::json!({
         "ok": true,
         "request_id": body.request_id,
@@ -53,22 +88,59 @@ pub(super) async fn post_approval_respond_handler(
     Json(body): Json<astra_thin_client::ApprovalRespondRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
+    let edge_id = edge_id_from_headers(&headers);
+    if let Some(session_id) = body.session_id.as_deref() {
+        validate_session_id(session_id)
+            .map_err(|error| error_response(StatusCode::BAD_REQUEST, error))?;
+        let decision = match &body.decision {
+            astra_thin_client::ApprovalDecision::Allow => "allow",
+            astra_thin_client::ApprovalDecision::Deny => "deny",
+            astra_thin_client::ApprovalDecision::AllowSession => "allow_session",
+        };
+        let approval_kind = body.approval_kind.as_ref().map(|kind| match kind {
+            astra_thin_client::ApprovalKind::Standard => "standard",
+            astra_thin_client::ApprovalKind::Explicit => "explicit",
+        });
+        let writer = JournalWriter::new(session_id).map_err(|error| {
+            error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("approval journal unavailable: {error}"),
+            )
+        })?;
+        writer
+            .append(&JournalEvent::approval_decision(
+                Some(session_id),
+                &body.request_id,
+                body.tool_name.as_deref(),
+                approval_kind,
+                decision,
+                body.reason.as_deref(),
+            ))
+            .map_err(|error| {
+                error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("approval journal append failed: {error}"),
+                )
+            })?;
+    }
     let key = approval_callback_key(&user.user_id, &body.request_id);
     let mut lock = state.edge_callback_ledger.lock().await;
-    if lock.len() >= LEDGER_MAX_ENTRIES {
-        lock.clear();
-    }
-    lock.insert(
+    let ledger_enqueued = insert_approval_ledger_entry(
+        &mut lock,
         key,
         serde_json::json!({
             "kind": "approval_respond",
             "user_id": user.user_id,
+            "edge_id": edge_id,
             "body": serde_json::to_value(&body).unwrap_or_default(),
         }),
-    );
+        body.session_id.is_some(),
+    )
+    .map_err(|()| ledger_capacity_error())?;
     Ok(Json(serde_json::json!({
         "ok": true,
         "request_id": body.request_id,
+        "ledger_enqueued": ledger_enqueued,
     })))
 }
 

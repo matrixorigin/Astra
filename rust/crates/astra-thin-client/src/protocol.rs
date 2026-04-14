@@ -97,6 +97,12 @@ pub struct ApprovalRespondRequest {
     pub decision: ApprovalDecision,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_kind: Option<ApprovalKind>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -542,6 +548,34 @@ mod tests {
         let j = serde_json::json!({"message":"x"});
         let r: ChatStreamRequest = serde_json::from_value(j).unwrap();
         assert_eq!(r.max_candidates, 8);
+    }
+
+    #[test]
+    fn approval_respond_request_roundtrip_preserves_optional_context() {
+        let req = ApprovalRespondRequest {
+            request_id: "ap-1".into(),
+            decision: ApprovalDecision::Allow,
+            reason: Some("looks good".into()),
+            session_id: Some("sess-1".into()),
+            tool_name: Some("write_file".into()),
+            approval_kind: Some(ApprovalKind::Standard),
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        let back: ApprovalRespondRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(req, back);
+    }
+
+    #[test]
+    fn approval_respond_request_backwards_compatible_without_optional_context() {
+        let json = serde_json::json!({
+            "request_id": "ap-legacy",
+            "decision": "deny",
+            "reason": "no"
+        });
+        let back: ApprovalRespondRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(back.session_id, None);
+        assert_eq!(back.tool_name, None);
+        assert_eq!(back.approval_kind, None);
     }
 
     #[test]

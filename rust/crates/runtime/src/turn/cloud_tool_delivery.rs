@@ -4,10 +4,12 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use astra_services::session_journal::{JournalEvent, JournalWriter, find_latest_approval_decision};
 use astra_thin_client::{ApprovalKind, ApprovalRespondRequest};
 use serde_json::{Map, Value, json};
+use uuid::Uuid;
 
 #[cfg(test)]
 use futures_util::stream::StreamExt;
@@ -15,8 +17,9 @@ use futures_util::stream::StreamExt;
 use super::action_compensation::{compensation_prompt_note, explicit_approval_reason};
 use super::cloud_approval_policy::{bash_command_is_read_only, edge_tool_requires_cloud_approval};
 use super::edge_ledger::{
-    MSG_TOOL_LEDGER_TIMEOUT, approval_callback_key, persist_value_for_ledger_tool_result,
-    take_ledger_entry, tool_callback_key, tool_content_from_ledger_entry,
+    DEFAULT_POLL_INTERVAL_MS, MSG_TOOL_LEDGER_TIMEOUT, approval_callback_key,
+    persist_value_for_ledger_tool_result, take_ledger_entry, tool_callback_key,
+    tool_content_from_ledger_entry,
 };
 use super::stream_events::{
     build_approval_required_event, build_edge_tool_call_event, build_tool_call_end_event,
@@ -29,6 +32,7 @@ use super::tool_result_sanitize::tool_result_content_for_model;
 
 pub const MSG_APPROVAL_LEDGER_TIMEOUT: &str =
     "timed out waiting for edge POST /approval/respond (§5.5 ledger)";
+const JOURNAL_REPLAY_POLL_INTERVAL_MS: u64 = 250;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CloudApprovalResult {
@@ -108,20 +112,32 @@ fn tool_approval_kind(tool_call: &Value) -> ApprovalKind {
 }
 
 pub fn parse_cloud_approval_outcome(entry: Option<&Value>) -> CloudApprovalResult {
+    parse_cloud_approval_outcome_with_decision(entry).0
+}
+
+fn parse_cloud_approval_outcome_with_decision(
+    entry: Option<&Value>,
+) -> (CloudApprovalResult, Option<String>) {
     let Some(wrapper) = entry else {
-        return CloudApprovalResult::Timeout;
+        return (CloudApprovalResult::Timeout, None);
     };
     let body = wrapper.get("body").unwrap_or(wrapper);
     let Ok(req) = serde_json::from_value::<ApprovalRespondRequest>(body.clone()) else {
-        return CloudApprovalResult::Malformed;
+        return (CloudApprovalResult::Malformed, None);
     };
-    match req.decision {
+    let decision = match req.decision {
+        astra_thin_client::ApprovalDecision::Allow => "allow",
+        astra_thin_client::ApprovalDecision::Deny => "deny",
+        astra_thin_client::ApprovalDecision::AllowSession => "allow_session",
+    };
+    let result = match req.decision {
         astra_thin_client::ApprovalDecision::Allow
         | astra_thin_client::ApprovalDecision::AllowSession => CloudApprovalResult::Allowed,
         astra_thin_client::ApprovalDecision::Deny => {
             CloudApprovalResult::Denied { reason: req.reason }
         }
-    }
+    };
+    (result, Some(decision.to_string()))
 }
 
 fn denied_tool_content(reason: Option<&str>) -> String {
@@ -157,6 +173,157 @@ pub struct EdgeToolRoundDelivery {
     pub persist_tool_results: Vec<Value>,
 }
 
+#[derive(Clone)]
+pub(crate) struct ApprovalAuditContext {
+    pub user_id: String,
+    pub session_id: String,
+    pub agent_id: Option<String>,
+    pub parent_event_id: Option<String>,
+    pub parent_event_ids: Vec<String>,
+    pub causal_chain_id: String,
+    pub auxiliary_event_writer: Arc<dyn crate::TurnAuxiliaryEventWriter>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApprovalOutcomeSource {
+    Ledger,
+    Journal,
+}
+
+impl ApprovalOutcomeSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Ledger => "ledger",
+            Self::Journal => "journal",
+        }
+    }
+}
+
+fn approval_kind_str(approval_kind: ApprovalKind) -> &'static str {
+    match approval_kind {
+        ApprovalKind::Standard => "standard",
+        ApprovalKind::Explicit => "explicit",
+    }
+}
+
+fn append_approval_required_journal_event(
+    session_id: &str,
+    request_id: &str,
+    tool_name: &str,
+    approval_kind: ApprovalKind,
+    detail: Option<&str>,
+) -> Result<(), String> {
+    let writer = JournalWriter::new(session_id).map_err(|error| error.to_string())?;
+    writer
+        .append(&JournalEvent::approval_required(
+            Some(session_id),
+            request_id,
+            tool_name,
+            approval_kind_str(approval_kind),
+            detail,
+        ))
+        .map_err(|error| error.to_string())
+}
+
+fn append_approval_timeout_journal_event(
+    session_id: &str,
+    request_id: &str,
+    tool_name: &str,
+    approval_kind: ApprovalKind,
+) -> Result<(), String> {
+    let writer = JournalWriter::new(session_id).map_err(|error| error.to_string())?;
+    writer
+        .append(&JournalEvent::approval_timeout(
+            Some(session_id),
+            request_id,
+            tool_name,
+            approval_kind_str(approval_kind),
+        ))
+        .map_err(|error| error.to_string())
+}
+
+async fn persist_approval_aux_event(
+    context: &ApprovalAuditContext,
+    event_type: &str,
+    request_id: &str,
+    tool_name: &str,
+    approval_kind: ApprovalKind,
+    detail: Option<&str>,
+    decision: Option<&str>,
+    reason: Option<&str>,
+    outcome_source: Option<ApprovalOutcomeSource>,
+) -> Result<(), String> {
+    let metadata = json!({
+        "request_id": request_id,
+        "tool_name": tool_name,
+        "approval_kind": approval_kind_str(approval_kind),
+        "detail": detail,
+        "decision": decision,
+        "reason": reason,
+        "outcome_source": outcome_source.map(ApprovalOutcomeSource::as_str),
+    });
+    let content = serde_json::to_string(&metadata).map_err(|error| error.to_string())?;
+    context
+        .auxiliary_event_writer
+        .persist_events(vec![crate::TurnAuxiliaryEventRecord {
+            event_id: Uuid::now_v7().to_string(),
+            user_id: context.user_id.clone(),
+            session_id: context.session_id.clone(),
+            agent_id: context.agent_id.clone(),
+            event_type: event_type.to_string(),
+            content,
+            parent_event_id: context.parent_event_id.clone(),
+            parent_event_ids: context.parent_event_ids.clone(),
+            causal_chain_id: context.causal_chain_id.clone(),
+            metadata: Some(metadata),
+            reasoning_content: None,
+        }])
+        .await
+}
+
+pub(crate) async fn record_approval_required_audit(
+    context: &ApprovalAuditContext,
+    request_id: &str,
+    tool_name: &str,
+    approval_kind: ApprovalKind,
+    detail: Option<&str>,
+) -> Result<(), String> {
+    append_approval_required_journal_event(
+        &context.session_id,
+        request_id,
+        tool_name,
+        approval_kind,
+        detail,
+    )?;
+    persist_approval_aux_event(
+        context,
+        "approval_required",
+        request_id,
+        tool_name,
+        approval_kind,
+        detail,
+        None,
+        None,
+        None,
+    )
+    .await
+}
+
+fn journal_decision_to_cloud_result(
+    decision: astra_services::session_journal::ApprovalJournalDecision,
+) -> (CloudApprovalResult, Option<String>, Option<String>) {
+    let decision_name = decision.decision.clone();
+    let reason = decision.reason.clone();
+    let result = match decision_name.as_str() {
+        "allow" | "allow_session" => CloudApprovalResult::Allowed,
+        "deny" => CloudApprovalResult::Denied {
+            reason: reason.clone(),
+        },
+        _ => CloudApprovalResult::Malformed,
+    };
+    (result, Some(decision_name), reason)
+}
+
 /// After the bridge has yielded `build_approval_required_event`, waits on the approval ledger.
 /// `Ok(())` means allowed; `Err` is a finished tool round (denied / timeout / malformed).
 pub(crate) async fn wait_approval_ledger_for_tool(
@@ -164,6 +331,7 @@ pub(crate) async fn wait_approval_ledger_for_tool(
     user_id: &str,
     tc: &Value,
     ledger_wait: Duration,
+    approval_audit: Option<&ApprovalAuditContext>,
 ) -> Result<(), EdgeToolRoundDelivery> {
     let Some(tc_map) = tc.as_object() else {
         return Ok(());
@@ -174,9 +342,128 @@ pub(crate) async fn wait_approval_ledger_for_tool(
         .and_then(|f| f.get("name"))
         .and_then(Value::as_str)
         .unwrap_or("");
+    let approval_kind = tool_approval_kind(tc);
+    let detail = tool_approval_detail(tc);
     let ap_key = approval_callback_key(user_id, id);
-    let ap_entry = take_ledger_entry(ledger, &ap_key, ledger_wait).await;
-    match parse_cloud_approval_outcome(ap_entry.as_ref()) {
+    let poll = Duration::from_millis(DEFAULT_POLL_INTERVAL_MS);
+    let journal_poll = Duration::from_millis(JOURNAL_REPLAY_POLL_INTERVAL_MS);
+    let started = Instant::now();
+    let mut last_journal_lookup: Option<Instant> = None;
+    let (approval_outcome, decision_name, outcome_reason, outcome_source) = loop {
+        if let Some(entry) = {
+            let mut guard = ledger.lock().await;
+            guard.remove(&ap_key)
+        } {
+            let (result, decision_name) = parse_cloud_approval_outcome_with_decision(Some(&entry));
+            let reason = match &result {
+                CloudApprovalResult::Denied { reason } => reason.clone(),
+                _ => None,
+            };
+            break (
+                result,
+                decision_name,
+                reason,
+                Some(ApprovalOutcomeSource::Ledger),
+            );
+        }
+        if let Some(context) = approval_audit
+            && last_journal_lookup
+                .map(|last| last.elapsed() >= journal_poll)
+                .unwrap_or(true)
+        {
+            last_journal_lookup = Some(Instant::now());
+            match find_latest_approval_decision(&context.session_id, id) {
+                Ok(Some(decision)) => {
+                    let (result, decision_name, reason) =
+                        journal_decision_to_cloud_result(decision);
+                    break (
+                        result,
+                        decision_name,
+                        reason,
+                        Some(ApprovalOutcomeSource::Journal),
+                    );
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    astra_core::agent_error!(
+                        "approval",
+                        "approval journal replay lookup failed for {}: {}",
+                        context.session_id,
+                        error
+                    );
+                }
+            }
+        }
+        if started.elapsed() >= ledger_wait {
+            break (CloudApprovalResult::Timeout, None, None, None);
+        }
+        tokio::time::sleep(poll).await;
+    };
+
+    if let Some(context) = approval_audit {
+        match &approval_outcome {
+            CloudApprovalResult::Allowed | CloudApprovalResult::Denied { .. } => {
+                if let Err(error) = persist_approval_aux_event(
+                    context,
+                    "approval_decision",
+                    id,
+                    tool_name,
+                    approval_kind,
+                    detail.as_deref(),
+                    decision_name.as_deref(),
+                    outcome_reason.as_deref(),
+                    outcome_source,
+                )
+                .await
+                {
+                    astra_core::agent_error!(
+                        "approval",
+                        "approval decision audit persist failed for {}: {}",
+                        id,
+                        error
+                    );
+                }
+            }
+            CloudApprovalResult::Timeout => {
+                if let Err(error) = append_approval_timeout_journal_event(
+                    &context.session_id,
+                    id,
+                    tool_name,
+                    approval_kind,
+                ) {
+                    astra_core::agent_error!(
+                        "approval",
+                        "approval timeout journal persist failed for {}: {}",
+                        id,
+                        error
+                    );
+                }
+                if let Err(error) = persist_approval_aux_event(
+                    context,
+                    "approval_timeout",
+                    id,
+                    tool_name,
+                    approval_kind,
+                    detail.as_deref(),
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                {
+                    astra_core::agent_error!(
+                        "approval",
+                        "approval timeout audit persist failed for {}: {}",
+                        id,
+                        error
+                    );
+                }
+            }
+            CloudApprovalResult::Malformed => {}
+        }
+    }
+
+    match approval_outcome {
         CloudApprovalResult::Denied { reason } => Err(EdgeToolRoundDelivery {
             sse_maps: vec![build_tool_call_end_event(
                 id,
@@ -327,7 +614,7 @@ pub async fn deliver_tool_calls_through_edge_ledger(
                 path.as_deref(),
                 detail.as_deref(),
             ));
-            match wait_approval_ledger_for_tool(ledger, user_id, tc, ledger_wait).await {
+            match wait_approval_ledger_for_tool(ledger, user_id, tc, ledger_wait, None).await {
                 Ok(()) => {}
                 Err(part) => {
                     out.sse_maps.extend(part.sse_maps);
@@ -392,7 +679,7 @@ pub async fn deliver_tool_calls_concurrent(
             path.as_deref(),
             detail.as_deref(),
         ));
-        match wait_approval_ledger_for_tool(ledger, user_id, tc, ledger_wait).await {
+        match wait_approval_ledger_for_tool(ledger, user_id, tc, ledger_wait, None).await {
             Ok(()) => {}
             Err(part) => {
                 out.sse_maps.extend(part.sse_maps);
@@ -601,6 +888,9 @@ mod tests {
                         request_id: "w1".into(),
                         decision: ApprovalDecision::Allow,
                         reason: None,
+                        session_id: None,
+                        tool_name: None,
+                        approval_kind: None,
                     }).unwrap()
                 }),
             );
@@ -649,6 +939,9 @@ mod tests {
                         request_id: "w2".into(),
                         decision: ApprovalDecision::Deny,
                         reason: Some("policy".into()),
+                        session_id: None,
+                        tool_name: None,
+                        approval_kind: None,
                     }).unwrap()
                 }),
             );
@@ -687,6 +980,9 @@ mod tests {
                         request_id: "w1".into(),
                         decision: ApprovalDecision::Allow,
                         reason: None,
+                        session_id: None,
+                        tool_name: None,
+                        approval_kind: None,
                     }).unwrap()
                 }),
             );
@@ -811,6 +1107,9 @@ mod tests {
                         request_id: "w1".into(),
                         decision: ApprovalDecision::Deny,
                         reason: Some("nope".into()),
+                        session_id: None,
+                        tool_name: None,
+                        approval_kind: None,
                     }).unwrap()
                 }),
             );

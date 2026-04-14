@@ -1115,6 +1115,73 @@ pub(super) fn handle_session_command(arg: &str, state: &mut ReplState) {
                                     );
                                 }
                             }
+                            session_journal::JournalEventType::ApprovalRequired => {
+                                let approval =
+                                    evt.metadata.as_ref().and_then(|m| m.get("approval"));
+                                let tool = approval
+                                    .and_then(|m| m.get("tool_name"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("?");
+                                let kind = approval
+                                    .and_then(|m| m.get("approval_kind"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("standard");
+                                eprintln!(
+                                    "  {} {} approval required: {} ({})",
+                                    ts_short.dim(),
+                                    "⛔".yellow(),
+                                    tool,
+                                    kind,
+                                );
+                            }
+                            session_journal::JournalEventType::ApprovalDecision => {
+                                let approval =
+                                    evt.metadata.as_ref().and_then(|m| m.get("approval"));
+                                let tool = approval
+                                    .and_then(|m| m.get("tool_name"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("?");
+                                let decision = approval
+                                    .and_then(|m| m.get("decision"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("?");
+                                let reason = approval
+                                    .and_then(|m| m.get("reason"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("");
+                                if reason.is_empty() {
+                                    eprintln!(
+                                        "  {} {} approval decision: {} → {}",
+                                        ts_short.dim(),
+                                        "✓".green(),
+                                        tool,
+                                        decision,
+                                    );
+                                } else {
+                                    eprintln!(
+                                        "  {} {} approval decision: {} → {} ({})",
+                                        ts_short.dim(),
+                                        "✓".green(),
+                                        tool,
+                                        decision,
+                                        reason.dim(),
+                                    );
+                                }
+                            }
+                            session_journal::JournalEventType::ApprovalTimeout => {
+                                let approval =
+                                    evt.metadata.as_ref().and_then(|m| m.get("approval"));
+                                let tool = approval
+                                    .and_then(|m| m.get("tool_name"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("?");
+                                eprintln!(
+                                    "  {} {} approval timed out: {}",
+                                    ts_short.dim(),
+                                    theme::icon_warn(),
+                                    tool,
+                                );
+                            }
                             session_journal::JournalEventType::SessionFork => {
                                 let parent = evt
                                     .session_lineage
@@ -1556,6 +1623,24 @@ pub(super) fn handle_session_command(arg: &str, state: &mut ReplState) {
                         .iter()
                         .filter(|e| e.event_type == session_journal::JournalEventType::TurnError)
                         .collect();
+                    let approval_required = events
+                        .iter()
+                        .filter(|e| {
+                            e.event_type == session_journal::JournalEventType::ApprovalRequired
+                        })
+                        .count();
+                    let approval_decisions = events
+                        .iter()
+                        .filter(|e| {
+                            e.event_type == session_journal::JournalEventType::ApprovalDecision
+                        })
+                        .count();
+                    let approval_timeouts = events
+                        .iter()
+                        .filter(|e| {
+                            e.event_type == session_journal::JournalEventType::ApprovalTimeout
+                        })
+                        .count();
                     let total_tokens_in: u64 = turns.iter().filter_map(|e| e.tokens_in).sum();
                     let total_tokens_out: u64 = turns.iter().filter_map(|e| e.tokens_out).sum();
                     let total_tools: u32 = turns.iter().filter_map(|e| e.tool_count).sum();
@@ -1570,6 +1655,15 @@ pub(super) fn handle_session_command(arg: &str, state: &mut ReplState) {
                         total_tools,
                         total_ms as f64 / 1000.0,
                     );
+                    if approval_required > 0 || approval_decisions > 0 || approval_timeouts > 0 {
+                        eprintln!(
+                            "  {} {} required, {} decisions, {} timeouts",
+                            "Approvals:".bold(),
+                            approval_required,
+                            approval_decisions,
+                            approval_timeouts,
+                        );
+                    }
                     eprintln!();
                 }
                 Err(e) => {

@@ -19,8 +19,10 @@ use astra_runtime::{
     MatrixOneSettings, ServiceInfo, SessionActivityRecord, SessionCreateRequestData,
     SessionListFilter, SessionListRecord, SessionRecord, SessionService, SessionUpdateRequestData,
     TurnToolEventPersistPlan, TurnToolEventWriter, build_app,
-    turn::bridge_inprocess::InProcessChatTurnBridge, turn::edge_ledger::MSG_TOOL_LEDGER_TIMEOUT,
+    turn::bridge_inprocess::InProcessChatTurnBridge,
+    turn::edge_ledger::{LEDGER_MAX_ENTRIES, MSG_TOOL_LEDGER_TIMEOUT},
 };
+use astra_services::session_journal::{JournalDirGuard, find_latest_approval_decision};
 use async_trait::async_trait;
 use axum::{
     Router,
@@ -202,7 +204,9 @@ fn tool_call(id: &str, name: &str, args: Value) -> Value {
     json!({ "id": id, "type": "function", "function": { "name": name, "arguments": serde_json::to_string(&args).unwrap() } })
 }
 
-fn build_app_with_capture(capture: Capture) -> Router {
+fn build_app_with_capture_and_ledger(
+    capture: Capture,
+) -> (Router, Arc<Mutex<HashMap<String, Value>>>) {
     let enc = Arc::new(FernetTokenEncryptor::new("rt-e2e-fernet-key-32chars!!").expect("fernet"));
     let base = AppState::new(ServiceInfo::default(), Arc::new(StubHealth))
         .with_auth_service(Arc::new(StubAuth))
@@ -219,11 +223,15 @@ fn build_app_with_capture(capture: Capture) -> Router {
         },
         enc,
     )
-    .with_edge_callback_ledger(ledger);
+    .with_edge_callback_ledger(ledger.clone());
     let state = base
         .with_chat_turn_bridge(Arc::new(bridge))
         .with_chat_turn_bridge_secret("rt-e2e-bridge-secret");
-    build_app(state)
+    (build_app(state), ledger)
+}
+
+fn build_app_with_capture(capture: Capture) -> Router {
+    build_app_with_capture_and_ledger(capture).0
 }
 
 async fn chat_turn(app: &Router, payload: Value) -> (StatusCode, Vec<u8>) {
@@ -560,6 +568,114 @@ async fn approval_gate_allow_then_tool_request() {
         !full.contains(MSG_TOOL_LEDGER_TIMEOUT),
         "unexpected timeout"
     );
+}
+
+#[tokio::test]
+async fn approval_journal_fallback_survives_ledger_overflow() {
+    init_env();
+    let temp = tempfile::tempdir().unwrap();
+    let _guard = JournalDirGuard::new(temp.path());
+    let capture = Capture::default();
+    let (app, ledger) = build_app_with_capture_and_ledger(capture.clone());
+    {
+        let mut guard = ledger.lock().await;
+        for idx in 0..LEDGER_MAX_ENTRIES {
+            guard.insert(format!("fill-{idx}"), json!({"kind": "filler"}));
+        }
+    }
+
+    let payload = json!({
+        "agent_id": "rt-agent",
+        "messages": [{ "role": "user", "content": "create hello.txt" }],
+        "edge_tools": [tool_schema("write_file")],
+        "test_llm_rounds": [
+            { "tool_calls": [tool_call("tc-wf-journal", "write_file", json!({"path": "hello.txt", "content": "hello"}))] },
+            { "full_text": "File created successfully." }
+        ]
+    });
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/chat/turn")
+        .header("authorization", TOKEN)
+        .header("content-type", "application/json")
+        .header("x-mo-bridge-test-secret", SECRET)
+        .body(Body::from(payload.to_string()))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let mut stream = resp.into_body().into_data_stream();
+    let mut acc = Vec::new();
+    let mut approved = false;
+    let mut result_posted = false;
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.expect("sse chunk");
+        acc.extend_from_slice(&chunk);
+        let s = String::from_utf8_lossy(&acc);
+
+        if !approved && s.contains("\"type\":\"approval_required\"") && s.contains("tc-wf-journal")
+        {
+            let (st, body) = post_json(
+                &app,
+                "/approval/respond",
+                json!({
+                    "request_id": "tc-wf-journal",
+                    "decision": "allow",
+                    "session_id": "s-rt-e2e",
+                    "tool_name": "write_file",
+                    "approval_kind": "standard"
+                }),
+            )
+            .await;
+            assert_eq!(st, StatusCode::OK);
+            assert_eq!(body["ledger_enqueued"], false);
+            approved = true;
+            ledger.lock().await.clear();
+        }
+
+        if approved
+            && !result_posted
+            && s.contains("\"type\":\"tool_request\"")
+            && s.contains("tc-wf-journal")
+        {
+            let (st, _) = post_json(
+                &app,
+                "/tools/result",
+                json!({
+                    "request_id": "tc-wf-journal",
+                    "status": "ok",
+                    "output": "{\"success\":true}"
+                }),
+            )
+            .await;
+            assert_eq!(st, StatusCode::OK);
+            result_posted = true;
+        }
+    }
+
+    let full = String::from_utf8_lossy(&acc);
+    assert!(approved, "approval_required event never appeared");
+    assert!(
+        result_posted,
+        "journal fallback never unblocked tool_request"
+    );
+    assert!(
+        full.contains("File created successfully"),
+        "missing round 2 text"
+    );
+    assert!(
+        !full.contains(MSG_TOOL_LEDGER_TIMEOUT),
+        "unexpected timeout"
+    );
+
+    let found = find_latest_approval_decision("s-rt-e2e", "tc-wf-journal")
+        .unwrap()
+        .expect("journal decision");
+    assert_eq!(found.decision, "allow");
+    assert_eq!(found.tool_name.as_deref(), Some("write_file"));
+    assert_eq!(found.approval_kind.as_deref(), Some("standard"));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

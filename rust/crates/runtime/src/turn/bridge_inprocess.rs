@@ -68,7 +68,8 @@ use crate::{
         CliAgenticStallPreflightRequest, apply_cli_agentic_stall_preflight,
     },
     turn::cloud_tool_delivery::{
-        cloud_tool_requires_approval_for_delivery, sse_maps_through_tool_request,
+        ApprovalAuditContext, cloud_tool_requires_approval_for_delivery,
+        record_approval_required_audit, sse_maps_through_tool_request,
         tool_approval_detail_for_delivery, tool_approval_kind_for_delivery,
         tool_path_hint_for_delivery, wait_approval_ledger_for_tool,
         wait_tool_result_ledger_for_tool,
@@ -2130,6 +2131,31 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                     let path = tool_path_hint_for_delivery(tc);
                     let detail = tool_approval_detail_for_delivery(tc);
                     let approval_kind = tool_approval_kind_for_delivery(tc);
+                    let approval_audit_context = ApprovalAuditContext {
+                        user_id: user_id.clone(),
+                        session_id: session_id.clone(),
+                        agent_id: agent_id.clone(),
+                        parent_event_id: Some(user_query_event_id.clone()),
+                        parent_event_ids: vec![user_query_event_id.clone()],
+                        causal_chain_id: turn_chain_id.clone(),
+                        auxiliary_event_writer: turn_auxiliary_event_writer.clone(),
+                    };
+                    if let Err(error) = record_approval_required_audit(
+                        &approval_audit_context,
+                        id,
+                        tool_name,
+                        approval_kind,
+                        detail.as_deref(),
+                    )
+                    .await
+                    {
+                        astra_core::agent_error!(
+                            "approval",
+                            "approval required audit persist failed for {}: {}",
+                            id,
+                            error
+                        );
+                    }
                     yield render_sse_map(&build_approval_required_event(
                         id,
                         tool_name,
@@ -2144,6 +2170,7 @@ impl ChatTurnBridge for InProcessChatTurnBridge {
                                 &user_id,
                                 tc,
                                 ledger_wait,
+                                Some(&approval_audit_context),
                             ),
                         )
                         .await

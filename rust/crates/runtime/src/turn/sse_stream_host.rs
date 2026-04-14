@@ -220,6 +220,7 @@ pub trait SseStreamHost: Send {
         request_id: &str,
         tool: &str,
         approval_kind: ApprovalKind,
+        session_id: Option<&str>,
         detail: Option<&str>,
     ) -> EdgeApprovalResult;
 
@@ -351,8 +352,14 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
             // Skill-exclusivity: reorder so skill calls execute before
             // non-skill calls within the same batch.
             prioritize_skill_tools(&mut pending);
-            flush_pending_via_host(&mut pending, host, &mut tool_results, &mut approval_results)
-                .await;
+            flush_pending_via_host(
+                &mut pending,
+                host,
+                accum.session_id.as_deref(),
+                &mut tool_results,
+                &mut approval_results,
+            )
+            .await;
         }
     }
 
@@ -385,7 +392,14 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
         let effects = dispatch_chat_turn_sse_event_block(&tail, &mut accum, &mut pending);
         host.on_render_effects(effects);
         prioritize_skill_tools(&mut pending);
-        flush_pending_via_host(&mut pending, host, &mut tool_results, &mut approval_results).await;
+        flush_pending_via_host(
+            &mut pending,
+            host,
+            accum.session_id.as_deref(),
+            &mut tool_results,
+            &mut approval_results,
+        )
+        .await;
     }
 
     host.on_stream_complete();
@@ -427,6 +441,7 @@ fn prioritize_skill_tools(items: &mut Vec<ChatTurnEdgePending>) {
 async fn flush_pending_via_host<H: SseStreamHost>(
     pending: &mut Vec<ChatTurnEdgePending>,
     host: &mut H,
+    session_id: Option<&str>,
     tool_results: &mut Vec<EdgeToolExecResult>,
     approval_results: &mut Vec<EdgeApprovalResult>,
 ) {
@@ -473,7 +488,13 @@ async fn flush_pending_via_host<H: SseStreamHost>(
                 continue;
             }
             let result = host
-                .resolve_approval(&request_id, &tool, approval_kind, detail.as_deref())
+                .resolve_approval(
+                    &request_id,
+                    &tool,
+                    approval_kind,
+                    session_id,
+                    detail.as_deref(),
+                )
                 .await;
             approval_results.push(result);
         }
@@ -517,6 +538,7 @@ impl SseStreamHost for NoopSseStreamHost {
         request_id: &str,
         _tool: &str,
         _approval_kind: ApprovalKind,
+        _session_id: Option<&str>,
         _detail: Option<&str>,
     ) -> EdgeApprovalResult {
         EdgeApprovalResult {
@@ -594,6 +616,7 @@ impl SseStreamHost for RecordingSseStreamHost {
         request_id: &str,
         _tool: &str,
         approval_kind: ApprovalKind,
+        _session_id: Option<&str>,
         _detail: Option<&str>,
     ) -> EdgeApprovalResult {
         self.approval_kinds.push(approval_kind);
@@ -1279,6 +1302,7 @@ mod tests {
                 rid: &str,
                 _: &str,
                 _: ApprovalKind,
+                _: Option<&str>,
                 _: Option<&str>,
             ) -> EdgeApprovalResult {
                 EdgeApprovalResult {

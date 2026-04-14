@@ -502,6 +502,18 @@ impl ToolCallRecord {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalJournalDecision {
+    pub request_id: String,
+    pub decision: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_kind: Option<String>,
+}
+
 #[inline]
 fn is_false(b: &bool) -> bool {
     !*b
@@ -692,6 +704,12 @@ pub enum JournalEventType {
     PlanLifecycle,
     /// Effective goal steering changed (manual goal set, active plan goal took over).
     GoalSteered,
+    /// An approval prompt was emitted for a tool call.
+    ApprovalRequired,
+    /// An approval decision was received for a tool call.
+    ApprovalDecision,
+    /// An approval prompt timed out before a decision arrived.
+    ApprovalTimeout,
     /// Context assembly trace recorded (observability: prompt building details).
     ContextAssemblyRecorded,
     /// Focus drift detected during a turn (severity, cause, evidence).
@@ -783,6 +801,48 @@ pub fn read_journal(session_id: &str) -> std::io::Result<Vec<JournalEvent>> {
     }
     let content = std::fs::read_to_string(&path)?;
     Ok(parse_journal_text(&content).0)
+}
+
+fn approval_metadata_str(metadata: &serde_json::Value, field: &str) -> Option<String> {
+    metadata
+        .get("approval")
+        .and_then(|approval| approval.get(field))
+        .and_then(|value| value.as_str())
+        .map(ToString::to_string)
+}
+
+pub fn find_latest_approval_decision(
+    session_id: &str,
+    request_id: &str,
+) -> std::io::Result<Option<ApprovalJournalDecision>> {
+    validate_session_id(session_id)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let events = read_journal(session_id)?;
+    for event in events.into_iter().rev() {
+        if event.event_type != JournalEventType::ApprovalDecision {
+            continue;
+        }
+        let Some(metadata) = event.metadata.as_ref() else {
+            continue;
+        };
+        let Some(found_request_id) = approval_metadata_str(metadata, "request_id") else {
+            continue;
+        };
+        if found_request_id != request_id {
+            continue;
+        }
+        let Some(decision) = approval_metadata_str(metadata, "decision") else {
+            continue;
+        };
+        return Ok(Some(ApprovalJournalDecision {
+            request_id: found_request_id,
+            decision,
+            reason: approval_metadata_str(metadata, "reason"),
+            tool_name: approval_metadata_str(metadata, "tool_name"),
+            approval_kind: approval_metadata_str(metadata, "approval_kind"),
+        }));
+    }
+    Ok(None)
 }
 
 /// Read journal for offline analysis tools. Returns an error if the JSONL file is missing.
@@ -1417,6 +1477,76 @@ impl JournalEvent {
         if let Some(n) = note.filter(|s| !s.is_empty()) {
             evt.user_input = Some(truncate(n, 200));
         }
+        evt
+    }
+
+    pub fn approval_required(
+        session_id: Option<&str>,
+        request_id: &str,
+        tool_name: &str,
+        approval_kind: &str,
+        detail: Option<&str>,
+    ) -> Self {
+        let mut evt = Self::base(JournalEventType::ApprovalRequired, session_id);
+        evt.user_input = Some(truncate(
+            &format!("approval_required {tool_name} {request_id}"),
+            200,
+        ));
+        evt.metadata = Some(serde_json::json!({
+            "approval": {
+                "request_id": request_id,
+                "tool_name": tool_name,
+                "approval_kind": approval_kind,
+                "detail": detail.filter(|s| !s.is_empty()),
+            }
+        }));
+        evt
+    }
+
+    pub fn approval_decision(
+        session_id: Option<&str>,
+        request_id: &str,
+        tool_name: Option<&str>,
+        approval_kind: Option<&str>,
+        decision: &str,
+        reason: Option<&str>,
+    ) -> Self {
+        let mut evt = Self::base(JournalEventType::ApprovalDecision, session_id);
+        let summary_tool = tool_name.filter(|s| !s.is_empty()).unwrap_or("unknown");
+        evt.user_input = Some(truncate(
+            &format!("approval_decision {summary_tool} {request_id} {decision}"),
+            200,
+        ));
+        evt.metadata = Some(serde_json::json!({
+            "approval": {
+                "request_id": request_id,
+                "tool_name": tool_name.filter(|s| !s.is_empty()),
+                "approval_kind": approval_kind.filter(|s| !s.is_empty()),
+                "decision": decision,
+                "reason": reason.filter(|s| !s.is_empty()),
+            }
+        }));
+        evt
+    }
+
+    pub fn approval_timeout(
+        session_id: Option<&str>,
+        request_id: &str,
+        tool_name: &str,
+        approval_kind: &str,
+    ) -> Self {
+        let mut evt = Self::base(JournalEventType::ApprovalTimeout, session_id);
+        evt.error = Some(truncate(
+            &format!("approval timeout for {tool_name} ({request_id})"),
+            200,
+        ));
+        evt.metadata = Some(serde_json::json!({
+            "approval": {
+                "request_id": request_id,
+                "tool_name": tool_name,
+                "approval_kind": approval_kind,
+            }
+        }));
         evt
     }
 
@@ -2276,6 +2406,68 @@ pub fn run_session_maintenance(
         return SessionMaintenanceResult::default();
     }
     run_session_maintenance_in(dir, ttl_days, compress_after_days)
+}
+
+#[cfg(test)]
+mod approval_tests {
+    use super::*;
+
+    #[test]
+    fn find_latest_approval_decision_reads_latest_matching_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let writer = JournalWriter::new("sess-approval").unwrap();
+
+        writer
+            .append(&JournalEvent::approval_decision(
+                Some("sess-approval"),
+                "req-1",
+                Some("write_file"),
+                Some("standard"),
+                "allow",
+                None,
+            ))
+            .unwrap();
+        writer
+            .append(&JournalEvent::approval_decision(
+                Some("sess-approval"),
+                "req-2",
+                Some("bash"),
+                Some("explicit"),
+                "deny",
+                Some("too dangerous"),
+            ))
+            .unwrap();
+
+        let found = find_latest_approval_decision("sess-approval", "req-2")
+            .unwrap()
+            .expect("approval decision");
+        assert_eq!(found.request_id, "req-2");
+        assert_eq!(found.decision, "deny");
+        assert_eq!(found.reason.as_deref(), Some("too dangerous"));
+        assert_eq!(found.tool_name.as_deref(), Some("bash"));
+        assert_eq!(found.approval_kind.as_deref(), Some("explicit"));
+    }
+
+    #[test]
+    fn find_latest_approval_decision_ignores_non_matching_events() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let writer = JournalWriter::new("sess-approval").unwrap();
+
+        writer
+            .append(&JournalEvent::approval_required(
+                Some("sess-approval"),
+                "req-1",
+                "write_file",
+                "standard",
+                Some("src/lib.rs"),
+            ))
+            .unwrap();
+
+        let found = find_latest_approval_decision("sess-approval", "req-1").unwrap();
+        assert!(found.is_none());
+    }
 }
 
 /// Testable version that operates on an explicit directory.

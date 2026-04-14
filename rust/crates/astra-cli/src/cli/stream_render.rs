@@ -1741,6 +1741,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         request_id: &str,
         tool: &str,
         approval_kind: astra_thin_client::ApprovalKind,
+        session_id: Option<&str>,
         detail: Option<&str>,
     ) -> EdgeApprovalResult {
         // `resolve_cloud_approval` writes to stderr only. Never bump `lines_written` here:
@@ -1772,6 +1773,9 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             request_id: request_id.to_string(),
             decision,
             reason: None,
+            session_id: session_id.map(ToString::to_string),
+            tool_name: Some(tool.to_string()),
+            approval_kind: Some(approval_kind),
         };
         let post_result = self.api.post_approval(Some(self.token), &body).await;
 
