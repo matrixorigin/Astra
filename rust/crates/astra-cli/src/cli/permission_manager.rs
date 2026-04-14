@@ -1,6 +1,5 @@
 use super::*;
 
-use astra_runtime::compensation_prompt_note;
 use astra_runtime::tool_sandbox::{
     CommandRisk, GitSafetyViolation, analyze_command_risks, is_dangerous_file_path,
     validate_git_command,
@@ -9,6 +8,7 @@ use astra_runtime::turn::cloud_approval_policy::{CloudGatedToolKind, cloud_gated
 use astra_runtime::turn::tool_argument_hints::{
     command_hint_from_args, path_hint_from_args, permission_prompt_primary_detail,
 };
+use astra_runtime::{compensation_prompt_note, explicit_approval_reason};
 
 /// Permission mode controls how tool approval decisions are handled.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -208,6 +208,10 @@ pub(super) struct PermissionManager {
 }
 
 impl PermissionManager {
+    fn cloud_detail_requires_explicit_approval(detail: Option<&str>) -> bool {
+        detail.is_some_and(|detail| detail.contains("Explicit approval required:"))
+    }
+
     /// Return the current permission mode (for propagation to sub-runs).
     pub(super) fn mode(&self) -> PermissionMode {
         self.mode
@@ -416,8 +420,26 @@ impl PermissionManager {
         quiet: bool,
     ) -> astra_thin_client::ApprovalDecision {
         use astra_thin_client::ApprovalDecision;
+        let explicit = Self::cloud_detail_requires_explicit_approval(detail);
         if quiet {
-            return if self.mode == PermissionMode::Auto {
+            return if self.mode == PermissionMode::Auto && !explicit {
+                ApprovalDecision::Allow
+            } else {
+                ApprovalDecision::Deny
+            };
+        }
+        if explicit {
+            if self.mode == PermissionMode::Deny {
+                return ApprovalDecision::Deny;
+            }
+            eprintln!(
+                "{}",
+                format!("  ☁  Cloud approval required: {tool}").yellow()
+            );
+            if let Some(detail) = detail.filter(|s| !s.is_empty()) {
+                eprintln!("{}", Self::format_prompt_detail(detail).dim());
+            }
+            return if Self::prompt_approval(ApprovalPromptKind::ConfirmOnce) == 'y' {
                 ApprovalDecision::Allow
             } else {
                 ApprovalDecision::Deny
@@ -460,8 +482,31 @@ impl PermissionManager {
         quiet: bool,
     ) -> astra_thin_client::ApprovalDecision {
         use astra_thin_client::ApprovalDecision;
+        let explicit = Self::cloud_detail_requires_explicit_approval(detail);
         if quiet {
-            return if self.mode == PermissionMode::Auto {
+            return if self.mode == PermissionMode::Auto && !explicit {
+                ApprovalDecision::Allow
+            } else {
+                ApprovalDecision::Deny
+            };
+        }
+        if explicit {
+            if self.mode == PermissionMode::Deny {
+                return ApprovalDecision::Deny;
+            }
+            eprintln!(
+                "{}",
+                format!("  ☁  Cloud approval required: {tool}").yellow()
+            );
+            if let Some(detail) = detail.filter(|s| !s.is_empty()) {
+                eprintln!("{}", Self::format_prompt_detail(detail).dim());
+            }
+            let ch = tokio::task::spawn_blocking(|| {
+                Self::prompt_approval(ApprovalPromptKind::ConfirmOnce)
+            })
+            .await
+            .unwrap_or('n');
+            return if ch == 'y' {
                 ApprovalDecision::Allow
             } else {
                 ApprovalDecision::Deny
@@ -667,6 +712,9 @@ impl PermissionManager {
         let brief = permission_prompt_primary_detail(name, args).unwrap_or_else(|| "…".into());
         let header = format!("{icon} {name}");
         let mut detail_lines = vec![Self::format_prompt_detail(&brief)];
+        if let Some(explicit) = explicit_approval_reason(name, args) {
+            detail_lines.push(Self::format_prompt_detail(&explicit));
+        }
         if let Some(compensation) = compensation_prompt_note(name, args) {
             detail_lines.push(Self::format_prompt_detail(&compensation));
         }
@@ -837,9 +885,6 @@ impl PermissionManager {
         }
 
         let side_effect = Self::classify(name);
-        if side_effect == SideEffect::Read {
-            return true;
-        }
 
         // Step 2: Git safety checks.
         // Hard violations always require explicit approval.
@@ -922,6 +967,23 @@ impl PermissionManager {
                 format!("  ✗  DANGEROUS pattern in {name} — denied").red()
             );
             return false;
+        }
+
+        if let Some(reason) = explicit_approval_reason(name, args) {
+            if self.mode == PermissionMode::Deny {
+                eprintln!("  {}", reason.red());
+                return false;
+            }
+            let (header, detail) = Self::format_tool_display(name, args);
+            eprintln!("  {}", format!("⚠  {header}").yellow());
+            if let Some(detail) = detail {
+                eprintln!("{}", detail.dim());
+            }
+            return Self::prompt_approval(ApprovalPromptKind::ConfirmOnce) == 'y';
+        }
+
+        if side_effect == SideEffect::Read {
+            return true;
         }
 
         // Step 5: Session overrides (AFTER bypass-immune safety checks).
@@ -1023,9 +1085,6 @@ impl PermissionManager {
 
         // Step 2: Read-only tools always allowed (before overrides, same as check()).
         let side_effect = Self::classify(name);
-        if side_effect == SideEffect::Read {
-            return PermissionDecision::Allow;
-        }
 
         // Step 3: Git safety checks.
         // Hard violations (injection, config manipulation) are bypass-immune.
@@ -1093,6 +1152,23 @@ impl PermissionManager {
             }
         } else if Self::is_dangerous(name, args) {
             return PermissionDecision::Deny("Dangerous pattern".into());
+        }
+
+        if let Some(reason) = explicit_approval_reason(name, args) {
+            if self.mode == PermissionMode::Deny {
+                return PermissionDecision::Deny("Explicit approval required (deny mode)".into());
+            }
+            let (header, detail) = Self::format_tool_display(name, args);
+            return PermissionDecision::NeedApproval {
+                tool: name.to_string(),
+                header,
+                detail,
+                reason,
+            };
+        }
+
+        if side_effect == SideEffect::Read {
+            return PermissionDecision::Allow;
         }
 
         // Step 5: Session overrides (AFTER bypass-immune safety checks).
@@ -1663,6 +1739,18 @@ mod tests {
     }
 
     #[test]
+    fn auto_mode_cloud_explicit_approval_is_not_auto_allowed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pm = PermissionManager::with_project_mode(PermissionMode::Auto, dir.path());
+        let decision = pm.resolve_cloud_approval(
+            "bash",
+            Some("Explicit approval required: action scope is unbounded."),
+            true,
+        );
+        assert_eq!(decision, astra_thin_client::ApprovalDecision::Deny);
+    }
+
+    #[test]
     fn cloud_approval_auto_run_switches_session_to_auto() {
         let dir = tempfile::tempdir().unwrap();
         let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
@@ -1790,6 +1878,20 @@ mod tests {
                 assert!(detail.contains("restore prior contents"));
             }
             other => panic!("expected NeedApproval with detail, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn explicit_irreversible_actions_still_require_approval_in_auto_mode() {
+        let mut pm = PermissionManager::new(true);
+        pm.session_overrides.insert("git_commit".to_string(), true);
+        let args = serde_json::json!({"message": "ship it"});
+        let decision = pm.check_nonblocking("git_commit", &args);
+        match decision {
+            PermissionDecision::NeedApproval { reason, .. } => {
+                assert!(reason.contains("Explicit approval required"));
+            }
+            other => panic!("expected NeedApproval, got: {other:?}"),
         }
     }
 
@@ -2188,21 +2290,22 @@ mod tests {
 
     // ── Regression: session override from cloud approval must persist to local check ──
 
-    /// Simulates the double-approval flow: cloud approval sets session override,
-    /// then local check_nonblocking must see it and auto-allow.
-    /// This is the exact scenario that was broken before the async fix.
+    /// Simulates the double-approval flow for a standard reversible action:
+    /// cloud approval sets a session override, then local check_nonblocking
+    /// must see it and auto-allow. Explicit-approval actions intentionally do
+    /// not use this path.
     #[tokio::test]
     async fn cloud_always_persists_to_local_check_nonblocking() {
         let dir = tempfile::tempdir().unwrap();
         let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
 
         // Simulate user selecting "always allow this tool" in cloud approval
-        let decision = pm.apply_cloud_approval_choice("bash", 'a');
+        let decision = pm.apply_cloud_approval_choice("write_file", 'a');
         assert_eq!(decision, astra_thin_client::ApprovalDecision::AllowSession);
 
         // Now the local check_nonblocking must auto-allow (no prompt)
-        let args = serde_json::json!({"command": "cargo test --release"});
-        let local = pm.check_nonblocking("bash", &args);
+        let args = serde_json::json!({"path": "src/lib.rs", "content": "pub fn ok() {}\n"});
+        let local = pm.check_nonblocking("write_file", &args);
         assert!(
             matches!(local, PermissionDecision::Allow),
             "local check must auto-allow after cloud 'always': got {local:?}"
@@ -2239,25 +2342,25 @@ mod tests {
         let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
 
         // 1st call: user selects 'a' in cloud approval
-        pm.apply_cloud_approval_choice("bash", 'a');
+        pm.apply_cloud_approval_choice("write_file", 'a');
 
         // 1st call: local check
-        let args1 = serde_json::json!({"command": "cargo test"});
+        let args1 = serde_json::json!({"path": "src/lib.rs", "content": "pub fn one() {}\n"});
         assert!(matches!(
-            pm.check_nonblocking("bash", &args1),
+            pm.check_nonblocking("write_file", &args1),
             PermissionDecision::Allow
         ));
 
         // 2nd call: cloud approval must auto-allow (session override)
         let decision2 = pm
-            .resolve_cloud_approval_async("bash", Some("echo hello"), false)
+            .resolve_cloud_approval_async("write_file", Some("src/main.rs"), false)
             .await;
         assert_eq!(decision2, astra_thin_client::ApprovalDecision::Allow);
 
         // 2nd call: local check must also auto-allow
-        let args2 = serde_json::json!({"command": "echo hello"});
+        let args2 = serde_json::json!({"path": "src/main.rs", "content": "fn main() {}\n"});
         assert!(matches!(
-            pm.check_nonblocking("bash", &args2),
+            pm.check_nonblocking("write_file", &args2),
             PermissionDecision::Allow
         ));
     }

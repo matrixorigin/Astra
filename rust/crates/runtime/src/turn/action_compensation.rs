@@ -574,6 +574,42 @@ pub fn tool_action_profile(tool_name: &str, args: &Value) -> ActionCompensationP
     }
 }
 
+fn profile_requires_explicit_approval(
+    tool_name: &str,
+    profile: &ActionCompensationProfile,
+) -> bool {
+    if profile.category == ActionCategory::Read {
+        return false;
+    }
+    if !profile.bounded {
+        return true;
+    }
+    !profile.reversible && cloud_gated_tool_kind(tool_name).is_some()
+}
+
+pub fn tool_requires_explicit_approval(tool_name: &str, args: &Value) -> bool {
+    let profile = tool_action_profile(tool_name, args);
+    profile_requires_explicit_approval(tool_name, &profile)
+}
+
+pub fn explicit_approval_reason(tool_name: &str, args: &Value) -> Option<String> {
+    let profile = tool_action_profile(tool_name, args);
+    if !profile_requires_explicit_approval(tool_name, &profile) {
+        return None;
+    }
+    let reason = match (profile.bounded, profile.reversible) {
+        (false, false) => {
+            "Explicit approval required: action scope is unbounded and rollback is not automatic."
+        }
+        (false, true) => "Explicit approval required: action scope is unbounded.",
+        (true, false) => {
+            "Explicit approval required: no automatic rollback is registered for this write/execute action."
+        }
+        (true, true) => return None,
+    };
+    Some(reason.to_string())
+}
+
 pub fn tool_action_profile_value(tool_name: &str, args: &Value) -> Value {
     serde_json::to_value(tool_action_profile(tool_name, args)).unwrap_or(Value::Null)
 }
@@ -956,5 +992,38 @@ mod tests {
             policy.compensation_kind.as_deref(),
             Some("restore_or_delete_file")
         );
+    }
+
+    #[test]
+    fn explicit_approval_only_targets_irreversible_or_unbounded_boundary_actions() {
+        assert!(!tool_requires_explicit_approval(
+            "write_file",
+            &json!({"path": "src/lib.rs"})
+        ));
+        assert!(!tool_requires_explicit_approval(
+            "adjust_config",
+            &json!({"path": "memory.retrieval_top_k", "value": 6})
+        ));
+        assert!(tool_requires_explicit_approval(
+            "git_commit",
+            &json!({"message": "ship it"})
+        ));
+        assert!(tool_requires_explicit_approval(
+            "bash",
+            &json!({"command": "rm -rf tmp"})
+        ));
+    }
+
+    #[test]
+    fn explicit_approval_reason_describes_boundary_gap() {
+        let git_commit_reason = explicit_approval_reason("git_commit", &json!({"message": "x"}))
+            .expect("git commit should require explicit approval");
+        assert!(git_commit_reason.contains("unbounded"));
+
+        let bash_reason = explicit_approval_reason("bash", &json!({"command": "rm -rf tmp"}))
+            .expect("destructive bash should require explicit approval");
+        assert!(bash_reason.contains("rollback"));
+
+        assert!(explicit_approval_reason("write_file", &json!({"path": "x"})).is_none());
     }
 }

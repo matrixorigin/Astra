@@ -553,19 +553,27 @@ pub(crate) fn git_show(
     let message = String::from_utf8_lossy(commit.message_raw_sloppy()).to_string();
     out.push_str(&format!("\n    {}\n", message.trim()));
 
-    // Merge commits: gix first-parent diff produces useless tree-level output.
-    // Fall back to `git show --first-parent` via CLI for an actual code diff.
+    // Merge commits: gix first-parent diff produces useless tree-level output,
+    // and `git show --first-parent` can legitimately return only the commit
+    // header when the merge tree matches the first parent. Ask git for the
+    // per-parent tree diff instead so merge commits still show meaningful
+    // stats/patches.
     let is_merge = commit.parent_ids().count() > 1;
     if is_merge {
-        let mut cli_args = vec!["show", "--first-parent", "--no-ext-diff", "--no-color"];
+        let mut cli_args = vec![
+            "diff-tree",
+            "-m",
+            "-r",
+            "--no-commit-id",
+            "--no-ext-diff",
+            "--no-color",
+        ];
         if stat_only {
             cli_args.push("--stat");
         } else {
             cli_args.push("-p");
         }
-        // commit_ref is already validated above
-        let cli_ref = commit_ref.to_string();
-        cli_args.push(&cli_ref);
+        cli_args.push(commit_ref);
         if let Some(f) = file_filter {
             cli_args.push("--");
             cli_args.push(f);
@@ -577,9 +585,12 @@ pub(crate) fn git_show(
             .ok();
         if let Some(output) = cli_out {
             if output.status.success() {
-                let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-                if !stdout.trim().is_empty() {
-                    return truncate_show_at(stdout, limit);
+                let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if !stdout.is_empty() {
+                    out.push('\n');
+                    out.push_str(&stdout);
+                    out.push('\n');
+                    return truncate_show_at(out, limit);
                 }
                 // Empty output with file filter means the file wasn't changed.
                 // Fall through to gix to at least show the commit header.
@@ -3168,6 +3179,59 @@ mod tests {
         dir
     }
 
+    fn run_git(dir: &std::path::Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("git command");
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn git_stdout(dir: &std::path::Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("git command");
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    fn init_temp_repo_with_ours_merge() -> TempDir {
+        let dir = init_temp_repo();
+        let root = dir.path();
+        let default_branch = git_stdout(root, &["branch", "--show-current"]);
+        run_git(root, &["checkout", "-b", "feature"]);
+        std::fs::write(root.join("tracked.txt"), "feature branch change\n").expect("write feature");
+        run_git(root, &["add", "tracked.txt"]);
+        run_git(root, &["commit", "-m", "feature change"]);
+        run_git(root, &["checkout", &default_branch]);
+        run_git(
+            root,
+            &[
+                "merge",
+                "--no-ff",
+                "-s",
+                "ours",
+                "feature",
+                "-m",
+                "merge feature",
+            ],
+        );
+        dir
+    }
+
     #[test]
     fn git_status_returns_output() {
         let root = repo_root();
@@ -3495,6 +3559,43 @@ mod tests {
         assert!(
             result.contains("files changed") || result.contains("[root commit]"),
             "should show stats or root: {result}"
+        );
+    }
+
+    #[test]
+    fn git_show_merge_commit_stat_only_has_stats() {
+        let dir = init_temp_repo_with_ours_merge();
+        let result = git_show(
+            dir.path(),
+            &json!({"commit": "HEAD", "stat_only": true}),
+            0.0,
+            0,
+        );
+        assert!(
+            result.contains("commit "),
+            "should show commit header: {result}"
+        );
+        assert!(
+            result.contains(" file changed") || result.contains(" files changed"),
+            "merge commit stat_only should show stats: {result}"
+        );
+        assert!(
+            result.contains("tracked.txt"),
+            "merge commit stat_only should mention changed file: {result}"
+        );
+    }
+
+    #[test]
+    fn git_show_merge_commit_has_diff_content() {
+        let dir = init_temp_repo_with_ours_merge();
+        let result = git_show(dir.path(), &json!({"commit": "HEAD"}), 0.0, 0);
+        assert!(
+            result.contains("commit "),
+            "should show commit header: {result}"
+        );
+        assert!(
+            result.contains("diff --git") || result.contains("--- a/tracked.txt"),
+            "merge commit should include diff output: {result}"
         );
     }
 

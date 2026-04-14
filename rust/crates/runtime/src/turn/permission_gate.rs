@@ -12,6 +12,7 @@ use crate::messaging::router::AgentMailbox;
 use crate::orchestration::permission_sync::{
     PermissionMode, PermissionRequest, PermissionSyncContext, PermissionUpdate,
 };
+use crate::turn::action_compensation::explicit_approval_reason;
 use crate::turn::tool_argument_hints::{
     normalize_llm_function_arguments, permission_prompt_primary_detail,
 };
@@ -65,14 +66,11 @@ pub async fn check_tool_permission(
         .unwrap_or_else(|| serde_json::json!({}));
     let permission_hint = permission_prompt_primary_detail(tool_name, &normalized_args);
     let rule_match_hint = permission_hint.as_deref();
+    let explicit_approval = explicit_approval_reason(tool_name, &normalized_args);
 
     // Check local permission rules
     {
         let ctx_guard = ctx.read().await;
-        if ctx_guard.is_allowed(tool_name, rule_match_hint) {
-            return PermissionCheckResult::Allowed;
-        }
-
         if ctx_guard.is_denied(tool_name, rule_match_hint) {
             drop(ctx_guard);
             ctx.write().await.record_blocked_tool(tool_name);
@@ -81,20 +79,25 @@ pub async fn check_tool_permission(
             };
         }
 
+        if explicit_approval.is_none() && ctx_guard.is_allowed(tool_name, rule_match_hint) {
+            return PermissionCheckResult::Allowed;
+        }
+
         // Auto mode: approve locally without mailbox round-trip.
         // This avoids the 30s permission-request timeout that would otherwise
         // block child agents whose parent happens to be mid-LLM-call.
         // Still respects the allowed_tools allowlist — tools not on the list
         // are denied even in Auto mode.
         if ctx_guard.mode() == PermissionMode::Auto {
-            if ctx_guard.inherited.is_tool_allowed_by_allowlist(tool_name) {
-                return PermissionCheckResult::Allowed;
-            } else {
+            if !ctx_guard.inherited.is_tool_allowed_by_allowlist(tool_name) {
                 drop(ctx_guard);
                 ctx.write().await.record_blocked_tool(tool_name);
                 return PermissionCheckResult::Denied {
                     reason: format!("Tool '{}' not in allowed tools list", tool_name),
                 };
+            }
+            if explicit_approval.is_none() {
+                return PermissionCheckResult::Allowed;
             }
         }
 
@@ -103,7 +106,9 @@ pub async fn check_tool_permission(
             drop(ctx_guard);
             ctx.write().await.record_blocked_tool(tool_name);
             return PermissionCheckResult::Denied {
-                reason: format!("Tool '{}' denied by permission mode", tool_name),
+                reason: explicit_approval
+                    .clone()
+                    .unwrap_or_else(|| format!("Tool '{}' denied by permission mode", tool_name)),
             };
         }
     }
@@ -112,16 +117,24 @@ pub async fn check_tool_permission(
     let Some(mailbox) = mailbox else {
         ctx.write().await.record_blocked_tool(tool_name);
         return PermissionCheckResult::Denied {
-            reason: format!(
-                "Tool '{}' requires permission but no parent available",
-                tool_name
+            reason: explicit_approval.clone().map_or_else(
+                || {
+                    format!(
+                        "Tool '{}' requires permission but no parent available",
+                        tool_name
+                    )
+                },
+                |reason| format!("{reason} No parent is available to approve this tool call."),
             ),
         };
     };
 
     // Build permission request
-    let mut request = PermissionRequest::new(tool_name, normalized_args)
-        .with_reason(format!("Requesting permission to use tool: {}", tool_name));
+    let mut request = PermissionRequest::new(tool_name, normalized_args).with_reason(
+        explicit_approval
+            .clone()
+            .unwrap_or_else(|| format!("Requesting permission to use tool: {tool_name}")),
+    );
     if let Some(ref hint) = permission_hint {
         request = request.with_hint(hint.clone());
     }
@@ -259,8 +272,14 @@ mod tests {
         let ctx = Arc::new(RwLock::new(PermissionSyncContext::new(inherited)));
 
         // Should approve without needing a mailbox
-        let result =
-            check_tool_permission("bash", None, Some(&ctx), None, Duration::from_secs(1)).await;
+        let result = check_tool_permission(
+            "bash",
+            Some(r#"{"command":"echo hi"}"#),
+            Some(&ctx),
+            None,
+            Duration::from_secs(1),
+        )
+        .await;
         assert!(
             matches!(result, PermissionCheckResult::Allowed),
             "Auto mode should approve tools locally"
@@ -305,6 +324,118 @@ mod tests {
             "Auto mode should never send mailbox requests"
         );
         assert_eq!(telemetry.tools_blocked, 1);
+    }
+
+    #[tokio::test]
+    async fn explicit_actions_are_denied_without_parent_even_in_auto_mode() {
+        let inherited = InheritedPermissions {
+            mode: PermissionMode::Auto,
+            allow_rules: vec![PermissionRule::parse("git_commit")],
+            deny_rules: vec![],
+            ask_rules: vec![],
+            allowed_tools: None,
+            is_background: false,
+        };
+        let ctx = Arc::new(RwLock::new(PermissionSyncContext::new(inherited)));
+
+        let result = check_tool_permission(
+            "git_commit",
+            Some(r#"{"message":"ship it"}"#),
+            Some(&ctx),
+            None,
+            Duration::from_secs(1),
+        )
+        .await;
+        match result {
+            PermissionCheckResult::Denied { reason } => {
+                assert!(reason.contains("Explicit approval required"));
+            }
+            other => panic!("expected denied explicit approval, got {other:?}"),
+        }
+
+        let telemetry = ctx.read().await.telemetry();
+        assert_eq!(telemetry.permission_requests, 0);
+        assert_eq!(telemetry.tools_blocked, 1);
+    }
+
+    #[tokio::test]
+    async fn explicit_actions_request_parent_even_when_tool_is_allowed() {
+        use crate::messaging::in_process::InProcessTransport;
+        use crate::messaging::router::AgentMailboxRouter;
+        use crate::messaging::types::AgentAddress;
+        use crate::server::delegation_engine::{DelegationTracker, SubRunRecord, SubRunState};
+
+        let transport = Arc::new(InProcessTransport::new());
+        let tracker = Arc::new(DelegationTracker::new());
+        let router = Arc::new(AgentMailboxRouter::new(transport, tracker.clone()));
+
+        let parent_addr = AgentAddress::new("run-parent", "orchestrator");
+        let child_addr = AgentAddress::new("run-child", "worker");
+        let mut parent_mailbox = router.register(parent_addr.clone(), None).await.unwrap();
+        let mut child_mailbox = router.register(child_addr.clone(), None).await.unwrap();
+
+        tracker
+            .record_sub_run(SubRunRecord {
+                run_id: "run-child".into(),
+                parent_run_id: "run-parent".into(),
+                delegation_id: "del-explicit".into(),
+                agent_id: "worker".into(),
+                depth: 1,
+                state: SubRunState::Created,
+                retry_of: None,
+            })
+            .await;
+
+        let inherited = InheritedPermissions {
+            mode: PermissionMode::Auto,
+            allow_rules: vec![PermissionRule::parse("git_commit")],
+            deny_rules: vec![],
+            ask_rules: vec![],
+            allowed_tools: None,
+            is_background: false,
+        };
+        let ctx = Arc::new(RwLock::new(PermissionSyncContext::new(inherited)));
+
+        let router_clone = router.clone();
+        let parent_addr_clone = parent_addr.clone();
+        let child_addr_clone = child_addr.clone();
+        let responder = tokio::spawn(async move {
+            loop {
+                if let Some(msg) = parent_mailbox.try_recv() {
+                    let correlation_id = msg.correlation_id.clone().unwrap();
+                    let response =
+                        crate::orchestration::permission_sync::PermissionResponse::approve();
+                    router_clone
+                        .send(response.to_message(
+                            &parent_addr_clone,
+                            &child_addr_clone,
+                            &correlation_id,
+                        ))
+                        .await
+                        .unwrap();
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+
+        let result = check_tool_permission(
+            "git_commit",
+            Some(r#"{"message":"ship it"}"#),
+            Some(&ctx),
+            Some(&mut child_mailbox),
+            Duration::from_secs(1),
+        )
+        .await;
+        responder.await.unwrap();
+
+        assert!(matches!(
+            result,
+            PermissionCheckResult::AllowedViaRequest { .. }
+        ));
+        let telemetry = ctx.read().await.telemetry();
+        assert_eq!(telemetry.permission_requests, 1);
+        assert_eq!(telemetry.permission_requests_approved, 1);
     }
 
     #[tokio::test]
