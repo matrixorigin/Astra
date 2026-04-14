@@ -507,6 +507,30 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
     Ok(TurnToolPhaseControl::ContinueLoop)
 }
 
+fn observe_gate_cancelled(
+    state: &mut AgenticLoopState,
+    turn_index: usize,
+    turn_start_time: std::time::Instant,
+    turn_result: &super::agentic_loop_host::HostTurnResult,
+) {
+    if let (Some(hub), Some(session)) = (
+        state.telemetry.observability_hub.as_ref(),
+        state.telemetry.observability_session.as_ref(),
+    ) {
+        let total_ms = turn_start_time.elapsed().as_millis() as u64;
+        let timing = crate::observability_integration::TurnTiming {
+            turn: turn_index as u32,
+            context_assembly_ms: 0,
+            ttft_ms: turn_result.ttft_ms.unwrap_or(0),
+            llm_total_ms: total_ms,
+            tool_execution_ms: 0,
+            total_ms,
+        };
+        let mut session_guard = session.write().unwrap_or_else(|e| e.into_inner());
+        crate::observability_integration::on_turn_end(hub, &mut session_guard, timing);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{tool_record_result_text, tool_record_was_rejected};
@@ -544,29 +568,5 @@ mod tests {
         let rec = tool_record(false, Some("Error: command failed"), Some("stderr preview"));
         assert_eq!(tool_record_result_text(&rec), "stderr preview");
         assert!(!tool_record_was_rejected(&rec));
-    }
-}
-
-fn observe_gate_cancelled(
-    state: &mut AgenticLoopState,
-    turn_index: usize,
-    turn_start_time: std::time::Instant,
-    turn_result: &super::agentic_loop_host::HostTurnResult,
-) {
-    if let (Some(hub), Some(session)) = (
-        state.telemetry.observability_hub.as_ref(),
-        state.telemetry.observability_session.as_ref(),
-    ) {
-        let total_ms = turn_start_time.elapsed().as_millis() as u64;
-        let timing = crate::observability_integration::TurnTiming {
-            turn: turn_index as u32,
-            context_assembly_ms: 0,
-            ttft_ms: turn_result.ttft_ms.unwrap_or(0),
-            llm_total_ms: total_ms,
-            tool_execution_ms: 0,
-            total_ms,
-        };
-        let mut session_guard = session.write().unwrap_or_else(|e| e.into_inner());
-        crate::observability_integration::on_turn_end(hub, &mut session_guard, timing);
     }
 }
