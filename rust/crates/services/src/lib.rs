@@ -34,6 +34,7 @@ pub mod session_audit;
 pub mod session_checkpoint;
 pub mod session_fork;
 pub mod session_journal;
+pub mod session_reaper;
 pub mod session_restore;
 pub mod session_workspace;
 pub mod skill_config;
