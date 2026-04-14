@@ -24,12 +24,13 @@ jobs:
         with:
           ref: ${{ github.head_ref || github.ref_name }}
       - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@nextest
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
           shared-key: ci-offline
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo test --manifest-path rust/Cargo.toml -p astra-cli
+      - run: cargo nextest run --manifest-path rust/Cargo.toml -p astra-cli --test-threads=4 --timeout=6s
 
   test-offline-runtime:
     name: "Offline: astra-runtime"

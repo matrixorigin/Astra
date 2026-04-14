@@ -207,8 +207,10 @@ pub fn ingest_agentic_turn_stream(
             if !quiet {
                 eprintln!("  ↻ No tool call on a live-data query; forcing one corrective retry…");
             }
-            st.messages
-                .push(openai_factual_tool_retry_user_message(message, &st.selected_tools));
+            st.messages.push(openai_factual_tool_retry_user_message(
+                message,
+                &st.selected_tools,
+            ));
             st.final_text.clear();
             record_prompt_calibration_success(snap, &mut st);
             return AgenticTurnIngestOutcome::Continue;

@@ -360,7 +360,10 @@ Original user query: {original_query}"
 
 /// OpenAI `messages` entry for [`factual_tool_retry_message`].
 #[must_use]
-pub fn openai_factual_tool_retry_user_message(original_query: &str, selected_tools: &[String]) -> Value {
+pub fn openai_factual_tool_retry_user_message(
+    original_query: &str,
+    selected_tools: &[String],
+) -> Value {
     openai_user_content_message(&factual_tool_retry_message(original_query, selected_tools))
 }
 
