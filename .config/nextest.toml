@@ -1,0 +1,6 @@
+[profile.default]
+test-threads = 4
+
+[[profile.default.overrides]]
+filter = "all()"
+slow-timeout = { period = "6s", terminate-after = 1 }
