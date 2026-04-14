@@ -88,6 +88,18 @@ pub(super) async fn handle_stats_command(arg: &str, state: &ReplState) {
                     agg.total_approval_timeouts
                 );
             }
+            if agg.total_execution_boundaries_opened > 0
+                || agg.total_execution_boundaries_committed > 0
+                || agg.total_execution_boundaries_aborted > 0
+            {
+                eprintln!(
+                    "  {:<14} {} opened, {} committed, {} aborted",
+                    "boundaries:".dim(),
+                    agg.total_execution_boundaries_opened,
+                    agg.total_execution_boundaries_committed,
+                    agg.total_execution_boundaries_aborted
+                );
+            }
             eprintln!();
         }
         _ => {
@@ -162,6 +174,18 @@ pub(super) async fn handle_stats_command(arg: &str, state: &ReplState) {
                     stats.approval_required_count,
                     stats.approval_decision_count,
                     stats.approval_timeout_count
+                );
+            }
+            if stats.execution_boundary_opened_count > 0
+                || stats.execution_boundary_committed_count > 0
+                || stats.execution_boundary_aborted_count > 0
+            {
+                eprintln!(
+                    "  {:<14} {} opened, {} committed, {} aborted",
+                    "boundaries:".dim(),
+                    stats.execution_boundary_opened_count,
+                    stats.execution_boundary_committed_count,
+                    stats.execution_boundary_aborted_count
                 );
             }
             eprintln!(

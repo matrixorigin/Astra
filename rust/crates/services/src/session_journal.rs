@@ -514,6 +514,13 @@ pub struct ApprovalJournalDecision {
     pub approval_kind: Option<String>,
 }
 
+fn normalize_optional_str(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
 #[inline]
 fn is_false(b: &bool) -> bool {
     !*b
@@ -710,6 +717,12 @@ pub enum JournalEventType {
     ApprovalDecision,
     /// An approval prompt timed out before a decision arrived.
     ApprovalTimeout,
+    /// A rollback-capable execution boundary started tracking side effects.
+    ExecutionBoundaryOpened,
+    /// A rollback-capable execution boundary finished successfully.
+    ExecutionBoundaryCommitted,
+    /// A rollback-capable execution boundary aborted and may have rolled back prior work.
+    ExecutionBoundaryAborted,
     /// Context assembly trace recorded (observability: prompt building details).
     ContextAssemblyRecorded,
     /// Focus drift detected during a turn (severity, cause, evidence).
@@ -1546,6 +1559,138 @@ impl JournalEvent {
                 "tool_name": tool_name,
                 "approval_kind": approval_kind,
             }
+        }));
+        evt
+    }
+
+    pub fn execution_boundary_opened(
+        session_id: Option<&str>,
+        turn: u32,
+        boundary_kind: &str,
+        transaction_id: Option<&str>,
+        checkpoints: serde_json::Value,
+    ) -> Self {
+        let mut evt = Self::base(JournalEventType::ExecutionBoundaryOpened, session_id);
+        evt.turn = Some(turn);
+        let tx_label = transaction_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("-");
+        evt.user_input = Some(truncate(
+            &format!("execution_boundary_opened {boundary_kind} {tx_label}"),
+            200,
+        ));
+        evt.metadata = Some(serde_json::json!({
+            "execution_boundary": {
+                "kind": boundary_kind,
+                "transaction_id": normalize_optional_str(transaction_id),
+                "rollback_on_failure": true,
+                "checkpoints": checkpoints,
+            }
+        }));
+        evt
+    }
+
+    pub fn execution_boundary_committed(
+        session_id: Option<&str>,
+        turn: u32,
+        boundary_kind: &str,
+        transaction_id: Option<&str>,
+        detail: Option<serde_json::Value>,
+    ) -> Self {
+        let mut evt = Self::base(JournalEventType::ExecutionBoundaryCommitted, session_id);
+        evt.turn = Some(turn);
+        let tx_label = transaction_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("-");
+        evt.user_input = Some(truncate(
+            &format!("execution_boundary_committed {boundary_kind} {tx_label}"),
+            200,
+        ));
+        let mut boundary = serde_json::Map::from_iter([
+            (
+                "kind".to_string(),
+                serde_json::Value::String(boundary_kind.to_string()),
+            ),
+            (
+                "transaction_id".to_string(),
+                normalize_optional_str(transaction_id)
+                    .map(serde_json::Value::String)
+                    .unwrap_or(serde_json::Value::Null),
+            ),
+            (
+                "rollback_on_failure".to_string(),
+                serde_json::Value::Bool(true),
+            ),
+        ]);
+        if let Some(detail) = detail {
+            boundary.insert("detail".to_string(), detail);
+        }
+        evt.metadata = Some(serde_json::json!({
+            "execution_boundary": serde_json::Value::Object(boundary),
+        }));
+        evt
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn execution_boundary_aborted(
+        session_id: Option<&str>,
+        turn: u32,
+        boundary_kind: &str,
+        transaction_id: Option<&str>,
+        reason: &str,
+        trigger_tool_name: Option<&str>,
+        trigger_request_id: Option<&str>,
+        rollback: Option<serde_json::Value>,
+    ) -> Self {
+        let mut evt = Self::base(JournalEventType::ExecutionBoundaryAborted, session_id);
+        evt.turn = Some(turn);
+        let tx_label = transaction_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("-");
+        evt.error = Some(truncate(
+            &format!("execution boundary aborted: {boundary_kind} {tx_label}"),
+            200,
+        ));
+        let mut boundary = serde_json::Map::from_iter([
+            (
+                "kind".to_string(),
+                serde_json::Value::String(boundary_kind.to_string()),
+            ),
+            (
+                "transaction_id".to_string(),
+                normalize_optional_str(transaction_id)
+                    .map(serde_json::Value::String)
+                    .unwrap_or(serde_json::Value::Null),
+            ),
+            (
+                "rollback_on_failure".to_string(),
+                serde_json::Value::Bool(true),
+            ),
+            (
+                "reason".to_string(),
+                serde_json::Value::String(truncate(reason, 500)),
+            ),
+        ]);
+        if let Some(trigger_tool_name) = normalize_optional_str(trigger_tool_name) {
+            boundary.insert(
+                "trigger_tool_name".to_string(),
+                serde_json::Value::String(trigger_tool_name),
+            );
+        }
+        if let Some(trigger_request_id) = normalize_optional_str(trigger_request_id) {
+            boundary.insert(
+                "trigger_request_id".to_string(),
+                serde_json::Value::String(trigger_request_id),
+            );
+        }
+        if let Some(rollback) = rollback {
+            boundary.insert("rollback".to_string(), rollback);
+        }
+        evt.metadata = Some(serde_json::json!({
+            "execution_boundary": serde_json::Value::Object(boundary),
         }));
         evt
     }
@@ -2467,6 +2612,81 @@ mod approval_tests {
 
         let found = find_latest_approval_decision("sess-approval", "req-1").unwrap();
         assert!(found.is_none());
+    }
+
+    #[test]
+    fn execution_boundary_events_round_trip() {
+        let opened = JournalEvent::execution_boundary_opened(
+            Some("sess-boundary"),
+            7,
+            "tool_batch",
+            Some("tx-7"),
+            serde_json::json!({
+                "file_after_sequence": 3,
+                "database_after_sequence": 1,
+            }),
+        );
+        let committed = JournalEvent::execution_boundary_committed(
+            Some("sess-boundary"),
+            7,
+            "tool_batch",
+            Some("tx-7"),
+            Some(serde_json::json!({
+                "completed_request_id": "tr-2",
+            })),
+        );
+        let aborted = JournalEvent::execution_boundary_aborted(
+            Some("sess-boundary"),
+            7,
+            "turn_rollback",
+            None,
+            "tool failed",
+            Some("write_file"),
+            Some("tr-3"),
+            Some(serde_json::json!({
+                "summary": "Rolled back 1 file edit from turn 7",
+            })),
+        );
+
+        let opened_json = serde_json::to_string(&opened).unwrap();
+        let committed_json = serde_json::to_string(&committed).unwrap();
+        let aborted_json = serde_json::to_string(&aborted).unwrap();
+
+        let restored_opened: JournalEvent = serde_json::from_str(&opened_json).unwrap();
+        let restored_committed: JournalEvent = serde_json::from_str(&committed_json).unwrap();
+        let restored_aborted: JournalEvent = serde_json::from_str(&aborted_json).unwrap();
+
+        assert_eq!(
+            restored_opened.event_type,
+            JournalEventType::ExecutionBoundaryOpened
+        );
+        assert_eq!(
+            restored_committed.event_type,
+            JournalEventType::ExecutionBoundaryCommitted
+        );
+        assert_eq!(
+            restored_aborted.event_type,
+            JournalEventType::ExecutionBoundaryAborted
+        );
+        assert_eq!(restored_opened.turn, Some(7));
+        assert_eq!(
+            restored_opened
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("execution_boundary"))
+                .and_then(|m| m.get("transaction_id"))
+                .and_then(serde_json::Value::as_str),
+            Some("tx-7")
+        );
+        assert_eq!(
+            restored_aborted
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("execution_boundary"))
+                .and_then(|m| m.get("trigger_tool_name"))
+                .and_then(serde_json::Value::as_str),
+            Some("write_file")
+        );
     }
 }
 

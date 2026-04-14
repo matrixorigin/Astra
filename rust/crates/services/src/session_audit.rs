@@ -65,6 +65,9 @@ pub struct SessionAuditSummary {
     pub stall_count: u32,
     pub checkpoint_count: u32,
     pub compact_count: u32,
+    pub execution_boundary_opened_count: u32,
+    pub execution_boundary_committed_count: u32,
+    pub execution_boundary_aborted_count: u32,
     pub approval_required_count: u32,
     pub approval_decision_count: u32,
     pub approval_timeout_count: u32,
@@ -215,6 +218,9 @@ pub struct CrossSessionStats {
     pub total_tool_failures: u32,
     pub total_errors: u32,
     pub total_stalls: u32,
+    pub total_execution_boundaries_opened: u32,
+    pub total_execution_boundaries_committed: u32,
+    pub total_execution_boundaries_aborted: u32,
     pub total_approval_required: u32,
     pub total_approval_decisions: u32,
     pub total_approval_timeouts: u32,
@@ -904,6 +910,9 @@ impl SessionAuditService for DatabaseSessionAuditService {
                COUNT(CASE WHEN event_type = 'stall_detected' THEN 1 END) AS stall_count, \
                COUNT(CASE WHEN event_type = 'checkpoint' THEN 1 END) AS checkpoint_count, \
                COUNT(CASE WHEN event_type = 'compact' THEN 1 END) AS compact_count, \
+               COUNT(CASE WHEN event_type = 'execution_boundary_opened' THEN 1 END) AS execution_boundary_opened_count, \
+               COUNT(CASE WHEN event_type = 'execution_boundary_committed' THEN 1 END) AS execution_boundary_committed_count, \
+               COUNT(CASE WHEN event_type = 'execution_boundary_aborted' THEN 1 END) AS execution_boundary_aborted_count, \
                COUNT(CASE WHEN event_type = 'approval_required' THEN 1 END) AS approval_required_count, \
                COUNT(CASE WHEN event_type = 'approval_decision' THEN 1 END) AS approval_decision_count, \
                COUNT(CASE WHEN event_type = 'approval_timeout' THEN 1 END) AS approval_timeout_count, \
@@ -939,6 +948,15 @@ impl SessionAuditService for DatabaseSessionAuditService {
             .try_get::<i64, _>("checkpoint_count")
             .unwrap_or(0) as u32;
         let compact_count: u32 = metrics_row.try_get::<i64, _>("compact_count").unwrap_or(0) as u32;
+        let execution_boundary_opened_count: u32 = metrics_row
+            .try_get::<i64, _>("execution_boundary_opened_count")
+            .unwrap_or(0) as u32;
+        let execution_boundary_committed_count: u32 = metrics_row
+            .try_get::<i64, _>("execution_boundary_committed_count")
+            .unwrap_or(0) as u32;
+        let execution_boundary_aborted_count: u32 = metrics_row
+            .try_get::<i64, _>("execution_boundary_aborted_count")
+            .unwrap_or(0) as u32;
         let approval_required_count: u32 = metrics_row
             .try_get::<i64, _>("approval_required_count")
             .unwrap_or(0) as u32;
@@ -987,6 +1005,9 @@ impl SessionAuditService for DatabaseSessionAuditService {
             stall_count,
             checkpoint_count,
             compact_count,
+            execution_boundary_opened_count,
+            execution_boundary_committed_count,
+            execution_boundary_aborted_count,
             approval_required_count,
             approval_decision_count,
             approval_timeout_count,
@@ -1663,14 +1684,17 @@ impl SessionAuditService for DatabaseSessionAuditService {
                COUNT(CASE WHEN event_type = 'user_query' THEN 1 END) as total_turns, \
                COALESCE(SUM(token_input), 0) as tokens_in, \
                COALESCE(SUM(token_output), 0) as tokens_out, \
-               COUNT(CASE WHEN event_type IN ('tool_call', 'tool_error') THEN 1 END) as total_tool_calls, \
-               COUNT(CASE WHEN event_type = 'tool_error' THEN 1 END) as total_tool_failures, \
-               COUNT(CASE WHEN event_type IN ('turn_error', 'error') THEN 1 END) as total_errors, \
-               COUNT(CASE WHEN event_type = 'stall_detected' THEN 1 END) as total_stalls, \
-               COUNT(CASE WHEN event_type = 'approval_required' THEN 1 END) as total_approval_required, \
-               COUNT(CASE WHEN event_type = 'approval_decision' THEN 1 END) as total_approval_decisions, \
-               COUNT(CASE WHEN event_type = 'approval_timeout' THEN 1 END) as total_approval_timeouts \
-              FROM agent_events e \
+                COUNT(CASE WHEN event_type IN ('tool_call', 'tool_error') THEN 1 END) as total_tool_calls, \
+                COUNT(CASE WHEN event_type = 'tool_error' THEN 1 END) as total_tool_failures, \
+                COUNT(CASE WHEN event_type IN ('turn_error', 'error') THEN 1 END) as total_errors, \
+                COUNT(CASE WHEN event_type = 'stall_detected' THEN 1 END) as total_stalls, \
+                COUNT(CASE WHEN event_type = 'execution_boundary_opened' THEN 1 END) as total_execution_boundaries_opened, \
+                COUNT(CASE WHEN event_type = 'execution_boundary_committed' THEN 1 END) as total_execution_boundaries_committed, \
+                COUNT(CASE WHEN event_type = 'execution_boundary_aborted' THEN 1 END) as total_execution_boundaries_aborted, \
+                COUNT(CASE WHEN event_type = 'approval_required' THEN 1 END) as total_approval_required, \
+                COUNT(CASE WHEN event_type = 'approval_decision' THEN 1 END) as total_approval_decisions, \
+                COUNT(CASE WHEN event_type = 'approval_timeout' THEN 1 END) as total_approval_timeouts \
+               FROM agent_events e \
               WHERE {where_clause}"
         );
         let mut aq = sqlx::query(&agg_sql);
@@ -1688,6 +1712,15 @@ impl SessionAuditService for DatabaseSessionAuditService {
         let total_tool_failures = agg.try_get::<i64, _>("total_tool_failures").unwrap_or(0) as u32;
         let total_errors = agg.try_get::<i64, _>("total_errors").unwrap_or(0) as u32;
         let total_stalls = agg.try_get::<i64, _>("total_stalls").unwrap_or(0) as u32;
+        let total_execution_boundaries_opened = agg
+            .try_get::<i64, _>("total_execution_boundaries_opened")
+            .unwrap_or(0) as u32;
+        let total_execution_boundaries_committed = agg
+            .try_get::<i64, _>("total_execution_boundaries_committed")
+            .unwrap_or(0) as u32;
+        let total_execution_boundaries_aborted = agg
+            .try_get::<i64, _>("total_execution_boundaries_aborted")
+            .unwrap_or(0) as u32;
         let total_approval_required = agg
             .try_get::<i64, _>("total_approval_required")
             .unwrap_or(0) as u32;
@@ -1802,6 +1835,9 @@ impl SessionAuditService for DatabaseSessionAuditService {
             total_tool_failures,
             total_errors,
             total_stalls,
+            total_execution_boundaries_opened,
+            total_execution_boundaries_committed,
+            total_execution_boundaries_aborted,
             total_approval_required,
             total_approval_decisions,
             total_approval_timeouts,
@@ -2807,6 +2843,9 @@ mod tests {
             stall_count: 0,
             checkpoint_count: 2,
             compact_count: 0,
+            execution_boundary_opened_count: 3,
+            execution_boundary_committed_count: 2,
+            execution_boundary_aborted_count: 1,
             approval_required_count: 3,
             approval_decision_count: 2,
             approval_timeout_count: 1,
@@ -2861,6 +2900,9 @@ mod tests {
             total_tool_failures: 15,
             total_errors: 5,
             total_stalls: 2,
+            total_execution_boundaries_opened: 9,
+            total_execution_boundaries_committed: 7,
+            total_execution_boundaries_aborted: 2,
             total_approval_required: 12,
             total_approval_decisions: 10,
             total_approval_timeouts: 2,
@@ -2922,6 +2964,9 @@ mod tests {
             total_tool_failures: 0,
             total_errors: 0,
             total_stalls: 0,
+            total_execution_boundaries_opened: 0,
+            total_execution_boundaries_committed: 0,
+            total_execution_boundaries_aborted: 0,
             total_approval_required: 0,
             total_approval_decisions: 0,
             total_approval_timeouts: 0,
@@ -3191,6 +3236,9 @@ mod tests {
             stall_count: 0,
             checkpoint_count: 0,
             compact_count: 0,
+            execution_boundary_opened_count: 0,
+            execution_boundary_committed_count: 0,
+            execution_boundary_aborted_count: 0,
             approval_required_count: 0,
             approval_decision_count: 0,
             approval_timeout_count: 0,
@@ -3216,6 +3264,9 @@ mod tests {
             total_tool_failures: 5,
             total_errors: 2,
             total_stalls: 1,
+            total_execution_boundaries_opened: 6,
+            total_execution_boundaries_committed: 4,
+            total_execution_boundaries_aborted: 2,
             total_approval_required: 8,
             total_approval_decisions: 6,
             total_approval_timeouts: 2,

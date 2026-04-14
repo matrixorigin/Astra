@@ -546,6 +546,11 @@ impl ToolExecutor {
     }
 
     pub fn with_active_session_id(mut self, session_id: impl Into<String>) -> Self {
+        self.set_active_session_id(session_id);
+        self
+    }
+
+    pub fn set_active_session_id(&mut self, session_id: impl Into<String>) {
         let session_id = session_id.into();
         if let Ok(ws) = astra_services::session_workspace::read_workspace(&session_id) {
             if let Ok(mut pinned) = self.self_mod_pinned_tools.lock() {
@@ -556,7 +561,10 @@ impl ToolExecutor {
             }
         }
         self.active_session_id = Some(session_id);
-        self
+    }
+
+    pub(crate) fn active_session_id(&self) -> Option<&str> {
+        self.active_session_id.as_deref()
     }
 
     /// Use a shared file edit journal (session-scoped) instead of the default.
