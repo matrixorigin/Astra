@@ -4514,7 +4514,7 @@ mod tests {
             id: "timeout".into(),
             description: "should timeout".into(),
             verifier: VerifierKind::Command {
-                cmd: "sleep 30".into(),
+                cmd: "sleep 2".into(),
                 expected_exit: 0,
             },
             required: true,
