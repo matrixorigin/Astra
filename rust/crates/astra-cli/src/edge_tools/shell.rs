@@ -6278,7 +6278,7 @@ mod tests {
         let script = dir.path().join("slow.sh");
         std::fs::write(
             &script,
-            "#!/bin/bash\nfor i in $(seq 1 5); do echo \"match_line_$i\"; done; sleep 60",
+            "#!/bin/bash\nfor i in $(seq 1 5); do echo \"match_line_$i\"; done; sleep 5",
         )
         .unwrap();
         #[cfg(unix)]
@@ -6423,7 +6423,7 @@ mod tests {
         let script = dir.path().join("partial.sh");
         std::fs::write(
             &script,
-            "#!/bin/bash\necho 'complete_line_1'\necho 'complete_line_2'\nprintf 'incomplete_no_newline'\nsleep 60",
+            "#!/bin/bash\necho 'complete_line_1'\necho 'complete_line_2'\nprintf 'incomplete_no_newline'\nsleep 5",
         )
         .unwrap();
         #[cfg(unix)]
@@ -6463,7 +6463,7 @@ mod tests {
         // Create a script that hangs without producing output (simulates grep
         // scanning a huge tree with no matches before timeout)
         let script = dir.path().join("hang.sh");
-        std::fs::write(&script, "#!/bin/bash\nsleep 60").unwrap();
+        std::fs::write(&script, "#!/bin/bash\nsleep 5").unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -6545,7 +6545,7 @@ mod tests {
         let script = dir.path().join("slow_grep.sh");
         std::fs::write(
             &script,
-            "#!/bin/bash\nfor i in $(seq 1 10); do echo \"file$i.txt:1:needle_$i\"; done; sleep 60",
+            "#!/bin/bash\nfor i in $(seq 1 10); do echo \"file$i.txt:1:needle_$i\"; done; sleep 5",
         )
         .unwrap();
         #[cfg(unix)]
