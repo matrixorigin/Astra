@@ -76,6 +76,30 @@ pub(super) async fn handle_stats_command(arg: &str, state: &ReplState) {
                 agg.total_tokens_out,
                 agg.overall_tool_error_rate * 100.0,
             );
+            if agg.total_approval_required > 0
+                || agg.total_approval_decisions > 0
+                || agg.total_approval_timeouts > 0
+            {
+                eprintln!(
+                    "  {:<14} {} required, {} decisions, {} timeouts",
+                    "approvals:".dim(),
+                    agg.total_approval_required,
+                    agg.total_approval_decisions,
+                    agg.total_approval_timeouts
+                );
+            }
+            if agg.total_execution_boundaries_opened > 0
+                || agg.total_execution_boundaries_committed > 0
+                || agg.total_execution_boundaries_aborted > 0
+            {
+                eprintln!(
+                    "  {:<14} {} opened, {} committed, {} aborted",
+                    "boundaries:".dim(),
+                    agg.total_execution_boundaries_opened,
+                    agg.total_execution_boundaries_committed,
+                    agg.total_execution_boundaries_aborted
+                );
+            }
             eprintln!();
         }
         _ => {
@@ -139,6 +163,30 @@ pub(super) async fn handle_stats_command(arg: &str, state: &ReplState) {
             }
             if stats.checkpoint_count > 0 {
                 eprintln!("  {:<14} {}", "checkpoints:".dim(), stats.checkpoint_count);
+            }
+            if stats.approval_required_count > 0
+                || stats.approval_decision_count > 0
+                || stats.approval_timeout_count > 0
+            {
+                eprintln!(
+                    "  {:<14} {} required, {} decisions, {} timeouts",
+                    "approvals:".dim(),
+                    stats.approval_required_count,
+                    stats.approval_decision_count,
+                    stats.approval_timeout_count
+                );
+            }
+            if stats.execution_boundary_opened_count > 0
+                || stats.execution_boundary_committed_count > 0
+                || stats.execution_boundary_aborted_count > 0
+            {
+                eprintln!(
+                    "  {:<14} {} opened, {} committed, {} aborted",
+                    "boundaries:".dim(),
+                    stats.execution_boundary_opened_count,
+                    stats.execution_boundary_committed_count,
+                    stats.execution_boundary_aborted_count
+                );
             }
             eprintln!(
                 "\n  {}",

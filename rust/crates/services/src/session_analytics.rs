@@ -11,6 +11,12 @@ pub struct SessionStats {
     pub stall_count: u32,
     pub checkpoint_count: u32,
     pub compact_count: u32,
+    pub execution_boundary_opened_count: u32,
+    pub execution_boundary_committed_count: u32,
+    pub execution_boundary_aborted_count: u32,
+    pub approval_required_count: u32,
+    pub approval_decision_count: u32,
+    pub approval_timeout_count: u32,
     pub total_tokens_in: u64,
     pub total_tokens_out: u64,
     pub total_cache_read: u64,
@@ -69,6 +75,18 @@ pub fn compute_session_stats(session_id: &str, events: &[JournalEvent]) -> Sessi
             JournalEventType::StallDetected => stats.stall_count += 1,
             JournalEventType::Checkpoint => stats.checkpoint_count += 1,
             JournalEventType::Compact => stats.compact_count += 1,
+            JournalEventType::ExecutionBoundaryOpened => {
+                stats.execution_boundary_opened_count += 1;
+            }
+            JournalEventType::ExecutionBoundaryCommitted => {
+                stats.execution_boundary_committed_count += 1;
+            }
+            JournalEventType::ExecutionBoundaryAborted => {
+                stats.execution_boundary_aborted_count += 1;
+            }
+            JournalEventType::ApprovalRequired => stats.approval_required_count += 1,
+            JournalEventType::ApprovalDecision => stats.approval_decision_count += 1,
+            JournalEventType::ApprovalTimeout => stats.approval_timeout_count += 1,
             _ => {}
         }
     }
@@ -95,6 +113,12 @@ pub struct AggregateSummary {
     pub total_turns: u32,
     pub total_errors: u32,
     pub total_stalls: u32,
+    pub total_execution_boundaries_opened: u32,
+    pub total_execution_boundaries_committed: u32,
+    pub total_execution_boundaries_aborted: u32,
+    pub total_approval_required: u32,
+    pub total_approval_decisions: u32,
+    pub total_approval_timeouts: u32,
     pub total_tokens_in: u64,
     pub total_tokens_out: u64,
     pub total_tool_calls: u32,
@@ -112,6 +136,12 @@ pub fn aggregate_stats(stats: &[SessionStats]) -> AggregateSummary {
         agg.total_turns += s.turn_count;
         agg.total_errors += s.error_count;
         agg.total_stalls += s.stall_count;
+        agg.total_execution_boundaries_opened += s.execution_boundary_opened_count;
+        agg.total_execution_boundaries_committed += s.execution_boundary_committed_count;
+        agg.total_execution_boundaries_aborted += s.execution_boundary_aborted_count;
+        agg.total_approval_required += s.approval_required_count;
+        agg.total_approval_decisions += s.approval_decision_count;
+        agg.total_approval_timeouts += s.approval_timeout_count;
         agg.total_tokens_in += s.total_tokens_in;
         agg.total_tokens_out += s.total_tokens_out;
         agg.total_tool_calls += s.total_tool_calls;
@@ -281,6 +311,73 @@ mod tests {
     }
 
     #[test]
+    fn execution_boundary_counts() {
+        let events = vec![
+            JournalEvent::execution_boundary_opened(
+                Some("s1"),
+                7,
+                "tool_batch",
+                Some("tx-1"),
+                serde_json::json!({}),
+            ),
+            JournalEvent::execution_boundary_committed(
+                Some("s1"),
+                7,
+                "tool_batch",
+                Some("tx-1"),
+                None,
+            ),
+            JournalEvent::execution_boundary_opened(
+                Some("s1"),
+                8,
+                "turn_rollback",
+                None,
+                serde_json::json!({}),
+            ),
+            JournalEvent::execution_boundary_aborted(
+                Some("s1"),
+                8,
+                "turn_rollback",
+                None,
+                "tool failed",
+                Some("write_file"),
+                Some("req-2"),
+                None,
+            ),
+        ];
+        let stats = compute_session_stats("s1", &events);
+        assert_eq!(stats.execution_boundary_opened_count, 2);
+        assert_eq!(stats.execution_boundary_committed_count, 1);
+        assert_eq!(stats.execution_boundary_aborted_count, 1);
+    }
+
+    #[test]
+    fn approval_counts() {
+        let events = vec![
+            JournalEvent::approval_required(
+                Some("s1"),
+                "req-1",
+                "write_file",
+                "standard",
+                Some("write a file"),
+            ),
+            JournalEvent::approval_decision(
+                Some("s1"),
+                "req-1",
+                Some("write_file"),
+                Some("standard"),
+                "allow",
+                None,
+            ),
+            JournalEvent::approval_timeout(Some("s1"), "req-2", "bash", "explicit"),
+        ];
+        let stats = compute_session_stats("s1", &events);
+        assert_eq!(stats.approval_required_count, 1);
+        assert_eq!(stats.approval_decision_count, 1);
+        assert_eq!(stats.approval_timeout_count, 1);
+    }
+
+    #[test]
     fn tool_error_rate_computation() {
         let mut turn = make_turn(100, 50, 500, 3);
         turn.tool_calls = Some(vec![
@@ -337,6 +434,12 @@ mod tests {
             turn_count: 10,
             error_count: 1,
             stall_count: 2,
+            execution_boundary_opened_count: 4,
+            execution_boundary_committed_count: 3,
+            execution_boundary_aborted_count: 1,
+            approval_required_count: 3,
+            approval_decision_count: 2,
+            approval_timeout_count: 1,
             total_tokens_in: 5000,
             total_tokens_out: 3000,
             total_tool_calls: 20,
@@ -347,6 +450,12 @@ mod tests {
             turn_count: 5,
             error_count: 0,
             stall_count: 0,
+            execution_boundary_opened_count: 2,
+            execution_boundary_committed_count: 1,
+            execution_boundary_aborted_count: 1,
+            approval_required_count: 1,
+            approval_decision_count: 1,
+            approval_timeout_count: 0,
             total_tokens_in: 2000,
             total_tokens_out: 1000,
             total_tool_calls: 10,
@@ -358,6 +467,12 @@ mod tests {
         assert_eq!(agg.total_turns, 15);
         assert_eq!(agg.total_errors, 1);
         assert_eq!(agg.total_stalls, 2);
+        assert_eq!(agg.total_execution_boundaries_opened, 6);
+        assert_eq!(agg.total_execution_boundaries_committed, 4);
+        assert_eq!(agg.total_execution_boundaries_aborted, 2);
+        assert_eq!(agg.total_approval_required, 4);
+        assert_eq!(agg.total_approval_decisions, 3);
+        assert_eq!(agg.total_approval_timeouts, 1);
         assert_eq!(agg.total_tokens_in, 7000);
         assert_eq!(agg.total_tool_calls, 30);
         assert_eq!(agg.total_failed_tools, 3);
