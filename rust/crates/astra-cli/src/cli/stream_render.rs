@@ -1740,6 +1740,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         &mut self,
         request_id: &str,
         tool: &str,
+        approval_kind: astra_thin_client::ApprovalKind,
         detail: Option<&str>,
     ) -> EdgeApprovalResult {
         // `resolve_cloud_approval` writes to stderr only. Never bump `lines_written` here:
@@ -1753,8 +1754,13 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         self.render.stop_thinking();
         let decision = match &mut self.perm_manager {
             Some(pm) => {
-                pm.resolve_cloud_approval_async(tool, detail, self.render_policy.is_silent())
-                    .await
+                pm.resolve_cloud_approval_async(
+                    tool,
+                    detail,
+                    approval_kind,
+                    self.render_policy.is_silent(),
+                )
+                .await
             }
             None => astra_thin_client::ApprovalDecision::Deny,
         };
@@ -3735,17 +3741,19 @@ mod tests {
         let mut r = TurnResult::new();
         let mut s = StreamRenderState::new();
         let mut pending = Vec::new();
-        let block = "data: {\"type\":\"approval_required\",\"request_id\":\"ap-1\",\"tool\":\"write_file\",\"path\":\"src/x.rs\",\"detail\":\"src/x.rs\"}\n\n";
+        let block = "data: {\"type\":\"approval_required\",\"request_id\":\"ap-1\",\"tool\":\"write_file\",\"approval_kind\":\"standard\",\"path\":\"src/x.rs\",\"detail\":\"src/x.rs\"}\n\n";
         dispatch_turn_event_block(block, &mut r, &mut s, RenderPolicy::Silent, &mut pending);
         assert_eq!(pending.len(), 1);
         match &pending[0] {
             ChatTurnEdgePending::ApprovalRequired {
                 request_id,
                 tool,
+                approval_kind,
                 detail,
             } => {
                 assert_eq!(request_id, "ap-1");
                 assert_eq!(tool, "write_file");
+                assert_eq!(*approval_kind, astra_thin_client::ApprovalKind::Standard);
                 assert_eq!(detail.as_deref(), Some("src/x.rs"));
             }
             _ => panic!("expected ApprovalRequired"),

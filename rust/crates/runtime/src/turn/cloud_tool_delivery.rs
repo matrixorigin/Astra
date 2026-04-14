@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use astra_thin_client::ApprovalRespondRequest;
+use astra_thin_client::{ApprovalKind, ApprovalRespondRequest};
 use serde_json::{Map, Value, json};
 
 #[cfg(test)]
@@ -90,6 +90,21 @@ fn tool_approval_detail(tool_call: &Value) -> Option<String> {
         .collect::<Vec<_>>()
         .join("\n");
     (!detail.is_empty()).then_some(detail)
+}
+
+fn tool_approval_kind(tool_call: &Value) -> ApprovalKind {
+    let tool_name = tool_call
+        .get("function")
+        .and_then(|f| f.get("name"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let raw = raw_tool_arguments(tool_call);
+    let parsed = normalize_llm_function_arguments(&raw);
+    if explicit_approval_reason(tool_name, &parsed).is_some() {
+        ApprovalKind::Explicit
+    } else {
+        ApprovalKind::Standard
+    }
 }
 
 pub fn parse_cloud_approval_outcome(entry: Option<&Value>) -> CloudApprovalResult {
@@ -277,6 +292,10 @@ pub(crate) fn tool_approval_detail_for_delivery(tool_call: &Value) -> Option<Str
     tool_approval_detail(tool_call)
 }
 
+pub(crate) fn tool_approval_kind_for_delivery(tool_call: &Value) -> ApprovalKind {
+    tool_approval_kind(tool_call)
+}
+
 pub async fn deliver_tool_calls_through_edge_ledger(
     ledger: &Arc<tokio::sync::Mutex<HashMap<String, Value>>>,
     user_id: &str,
@@ -300,9 +319,11 @@ pub async fn deliver_tool_calls_through_edge_ledger(
         if cloud_tool_requires_approval(tc) {
             let path = tool_path_hint(tc);
             let detail = tool_approval_detail(tc);
+            let approval_kind = tool_approval_kind(tc);
             out.sse_maps.push(build_approval_required_event(
                 id,
                 tool_name,
+                approval_kind,
                 path.as_deref(),
                 detail.as_deref(),
             ));
@@ -363,9 +384,11 @@ pub async fn deliver_tool_calls_concurrent(
             .unwrap_or("");
         let path = tool_path_hint(tc);
         let detail = tool_approval_detail(tc);
+        let approval_kind = tool_approval_kind(tc);
         out.sse_maps.push(build_approval_required_event(
             id,
             tool_name,
+            approval_kind,
             path.as_deref(),
             detail.as_deref(),
         ));

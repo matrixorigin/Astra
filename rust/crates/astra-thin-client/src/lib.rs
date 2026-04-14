@@ -23,9 +23,9 @@ pub use edge::{
 };
 pub use error::ThinClientError;
 pub use protocol::{
-    ApprovalDecision, ApprovalRespondRequest, ChatStreamRequest, EdgeHeartbeatRequest,
-    EdgeRegisterRequest, SessionCreateRequest, SessionUpdateRequest, StreamEvent,
-    TaskLeaseMutationRequest, ToolResultRequest, classify_stream_event,
+    ApprovalDecision, ApprovalKind, ApprovalRespondRequest, ChatStreamRequest,
+    EdgeHeartbeatRequest, EdgeRegisterRequest, SessionCreateRequest, SessionUpdateRequest,
+    StreamEvent, TaskLeaseMutationRequest, ToolResultRequest, classify_stream_event,
 };
 /// SSE / buffered HTTP response from [`ThinClient::post_chat_turn`] (transport type for consumers like CLI stream rendering).
 pub use reqwest::Response as HttpResponse;

@@ -542,6 +542,7 @@ async fn approval_gate_allow_then_tool_request() {
         .iter()
         .position(|e| e["type"] == "approval_required")
         .unwrap();
+    assert_eq!(events[approval_idx]["approval_kind"], "standard");
     let request_idx = events
         .iter()
         .position(|e| e["type"] == "tool_request" && e.to_string().contains("tc-wf-1"))
@@ -620,6 +621,11 @@ async fn approval_denied_skips_tool_execution() {
 
     // tool_request should NOT appear for a denied tool
     let events = parse_sse_events(&full);
+    let approval_event = events
+        .iter()
+        .find(|e| e["type"] == "approval_required" && e.to_string().contains("tc-deny-1"))
+        .expect("approval_required event for denied bash");
+    assert_eq!(approval_event["approval_kind"], "explicit");
     let tool_requests: Vec<_> = events
         .iter()
         .filter(|e| e["type"] == "tool_request" && e.to_string().contains("tc-deny-1"))

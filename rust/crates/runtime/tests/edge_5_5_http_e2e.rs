@@ -196,10 +196,14 @@ async fn http_handler_payload_matches_delivery_parser() {
     let d =
         deliver_tool_calls_through_edge_ledger(&ledger, "e2e-user", &[tc], Duration::from_secs(2))
             .await;
-    assert!(
-        d.sse_maps
-            .iter()
-            .any(|m| m.get("type").and_then(|v| v.as_str()) == Some("approval_required"))
+    let approval = d
+        .sse_maps
+        .iter()
+        .find(|m| m.get("type").and_then(|v| v.as_str()) == Some("approval_required"))
+        .expect("approval_required event");
+    assert_eq!(
+        approval.get("approval_kind").and_then(|v| v.as_str()),
+        Some("standard")
     );
     assert!(
         d.sse_maps

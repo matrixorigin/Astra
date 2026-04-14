@@ -4,6 +4,7 @@
 //! accumulator and returns terminal UI hints. [`ChatTurnSseFramer`] turns arbitrary byte chunks
 //! into complete event blocks via [`super::sse_blocks`] and records time-to-first-token.
 
+use astra_thin_client::ApprovalKind;
 use serde_json::Value;
 use std::time::Instant;
 
@@ -45,6 +46,7 @@ pub enum ChatTurnEdgePending {
     ApprovalRequired {
         request_id: String,
         tool: String,
+        approval_kind: ApprovalKind,
         detail: Option<String>,
     },
 }
@@ -113,6 +115,14 @@ fn normalize_tool_call_for_accum(event: &Value) -> Option<Value> {
             "arguments": arguments,
         }
     }))
+}
+
+fn approval_kind_from_event(event: &Value) -> ApprovalKind {
+    event
+        .get("approval_kind")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<ApprovalKind>(value).ok())
+        .unwrap_or(ApprovalKind::Explicit)
 }
 
 fn apply_one_event(
@@ -214,6 +224,7 @@ fn apply_one_event(
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
+            let approval_kind = approval_kind_from_event(event);
             let detail = event
                 .get("detail")
                 .and_then(|v| v.as_str())
@@ -228,6 +239,7 @@ fn apply_one_event(
                 edge_pending.push(ChatTurnEdgePending::ApprovalRequired {
                     request_id,
                     tool,
+                    approval_kind,
                     detail,
                 });
             }
@@ -655,20 +667,36 @@ mod tests {
     fn approval_required_enqueues_pending() {
         let mut a = ChatTurnSseAccum::default();
         let mut pending = Vec::new();
-        let block = "data: {\"type\":\"approval_required\",\"request_id\":\"ap-1\",\"tool\":\"write_file\",\"path\":\"src/x.rs\",\"detail\":\"src/x.rs\"}\n\n";
+        let block = "data: {\"type\":\"approval_required\",\"request_id\":\"ap-1\",\"tool\":\"write_file\",\"approval_kind\":\"standard\",\"path\":\"src/x.rs\",\"detail\":\"src/x.rs\"}\n\n";
         dispatch_chat_turn_sse_event_block(block, &mut a, &mut pending);
         assert_eq!(pending.len(), 1);
         match &pending[0] {
             ChatTurnEdgePending::ApprovalRequired {
                 request_id,
                 tool,
+                approval_kind,
                 detail,
             } => {
                 assert_eq!(request_id, "ap-1");
                 assert_eq!(tool, "write_file");
+                assert_eq!(*approval_kind, ApprovalKind::Standard);
                 assert_eq!(detail.as_deref(), Some("src/x.rs"));
             }
             _ => panic!("expected ApprovalRequired"),
+        }
+    }
+
+    #[test]
+    fn approval_required_without_kind_defaults_to_explicit() {
+        let mut a = ChatTurnSseAccum::default();
+        let mut pending = Vec::new();
+        let block = "data: {\"type\":\"approval_required\",\"request_id\":\"ap-1\",\"tool\":\"bash\",\"detail\":\"rm -rf tmp\"}\n\n";
+        dispatch_chat_turn_sse_event_block(block, &mut a, &mut pending);
+        match &pending[0] {
+            ChatTurnEdgePending::ApprovalRequired { approval_kind, .. } => {
+                assert_eq!(*approval_kind, ApprovalKind::Explicit);
+            }
+            other => panic!("expected ApprovalRequired, got {other:?}"),
         }
     }
 
