@@ -54,6 +54,7 @@ mod task_handlers;
 mod team_handlers;
 pub mod team_orchestrator;
 pub mod worktree_isolation;
+pub mod ws_approval_gate;
 mod ws_handler;
 
 use self::{

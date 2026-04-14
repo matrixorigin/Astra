@@ -21,6 +21,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
+use astra_tools::executor::DefaultToolExecutor;
+use astra_tools::{ToolContext, ToolExecutor};
+
 use crate::tool_sandbox::{
     IsolationConfig, SandboxMode, SandboxPolicy, ToolTier, effective_tier, execute_isolated,
     filter_environment,
@@ -72,6 +75,8 @@ pub struct ServerToolExecutor {
         Option<std::sync::Arc<dyn astra_services::resource_governor::ResourceGovernor>>,
     /// Optional edge connection pool for routing to remote edge agents.
     edge_connection_pool: Option<super::edge_connection_pool::EdgeConnectionPool>,
+    /// Shared default executor for delegating common tool logic.
+    default_executor: DefaultToolExecutor,
 }
 
 impl ServerToolExecutor {
@@ -96,11 +101,22 @@ impl ServerToolExecutor {
         let memoria_client =
             astra_tools::memoria::MemoriaClient::new(cloud_base.clone(), cloud_token.clone());
 
+        let default_executor = DefaultToolExecutor::new(ToolContext {
+            project_root: workspace_root.clone(),
+            workspace_root: workspace_root.clone(),
+            user_id: user_id.clone(),
+            session_id: session_id.clone(),
+            sandbox: astra_tools::SandboxConfig::standard(workspace_root.clone()),
+            http_client: None,
+            logger: std::sync::Arc::new(astra_tools::TracingLogger),
+        });
+
         Self {
             workspace_root,
             user_id,
             session_id,
             sandbox_policy,
+            default_executor,
             file_journal: Arc::new(Mutex::new(FileEditJournal::new(500))),
             journal_turn_index: AtomicU32::new(0),
             aggregate_output_bytes: AtomicUsize::new(0),
@@ -216,23 +232,48 @@ impl ServerToolExecutor {
             }
             // ── Web search (standalone function) ───────────────────────
             "web_search" => astra_tools::web_search::web_search(args),
-            // ── File operations (delegated to sandbox) ─────────────────
-            "read_file" => self.server_read_file(args),
+            // ── File operations ─────────────────────────────────────────
+            // Write operations use server-specific journal recording.
+            // Read-only operations delegate to DefaultToolExecutor.
+            "read_file" => {
+                self.default_executor
+                    .execute("read_file", args)
+                    .await
+                    .output
+            }
             "write_file" => self.server_write_file(args),
             "str_replace" => self.server_str_replace(args),
             "delete_file" => self.server_delete_file(args),
-            "list_dir" => self.server_list_dir(args),
-            // ── Shell operations (sandboxed) ───────────────────────────
+            "list_dir" => self.default_executor.execute("list_dir", args).await.output,
+            // ── Shell operations ───────────────────────────────────────
+            // bash uses tiered process isolation (server-specific).
+            // grep + glob delegate to DefaultToolExecutor.
             "bash" => self.server_bash(args).await,
-            "grep" => self.server_grep(args),
-            "glob" => self.server_glob(args),
-            // ── Git operations (read-only safe for server) ─────────────
-            "git_status" => self.server_git_status(),
-            "git_diff" => self.server_git_diff(args),
-            "git_log" => self.server_git_log(args),
-            "git_show" => self.server_git_show(args),
-            "git_blame" => self.server_git_blame(args),
-            "git_commit" => self.server_git_commit(args),
+            "grep" => self.default_executor.execute("grep", args).await.output,
+            "glob" => self.default_executor.execute("glob", args).await.output,
+            // ── Git operations ─────────────────────────────────────────
+            // All git ops delegate to DefaultToolExecutor.
+            "git_status" => {
+                self.default_executor
+                    .execute("git_status", args)
+                    .await
+                    .output
+            }
+            "git_diff" => self.default_executor.execute("git_diff", args).await.output,
+            "git_log" => self.default_executor.execute("git_log", args).await.output,
+            "git_show" => self.default_executor.execute("git_show", args).await.output,
+            "git_blame" => {
+                self.default_executor
+                    .execute("git_blame", args)
+                    .await
+                    .output
+            }
+            "git_commit" => {
+                self.default_executor
+                    .execute("git_commit", args)
+                    .await
+                    .output
+            }
             // ── Delegation placeholder ─────────────────────────────────
             "delegate" => "Delegation request acknowledged. The delegation engine will execute \
                 this request and provide results in the next round."
@@ -324,48 +365,6 @@ impl ServerToolExecutor {
             ));
         }
         Ok(final_path)
-    }
-
-    fn server_read_file(&self, args: &Value) -> String {
-        let path_str = match args.get("path").and_then(|v| v.as_str()) {
-            Some(p) => p,
-            None => return "Error: Missing 'path' parameter".to_string(),
-        };
-        let path = match self.resolve_path(path_str) {
-            Ok(p) => p,
-            Err(e) => return e,
-        };
-        let content = match std::fs::read_to_string(&path) {
-            Ok(c) => c,
-            Err(e) => return format!("Error: Cannot read file: {e}"),
-        };
-
-        let start_line = args
-            .get("start_line")
-            .and_then(|v| v.as_u64())
-            .map(|l| l as usize);
-        let end_line = args
-            .get("end_line")
-            .and_then(|v| v.as_u64())
-            .map(|l| l as usize);
-
-        let lines: Vec<&str> = content.lines().collect();
-        let start = start_line.unwrap_or(1).saturating_sub(1);
-        let end = end_line.unwrap_or(lines.len()).min(lines.len());
-
-        if start >= lines.len() {
-            return format!(
-                "Error: start_line {} exceeds file length {}",
-                start + 1,
-                lines.len()
-            );
-        }
-
-        let mut result = String::new();
-        for (i, line) in lines[start..end].iter().enumerate() {
-            result.push_str(&format!("{}\t{}\n", start + i + 1, line));
-        }
-        result
     }
 
     fn server_write_file(&self, args: &Value) -> String {
@@ -481,32 +480,6 @@ impl ServerToolExecutor {
         }
     }
 
-    fn server_list_dir(&self, args: &Value) -> String {
-        let path_str = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
-        let path = match self.resolve_path(path_str) {
-            Ok(p) => p,
-            Err(e) => return e,
-        };
-
-        let entries = match std::fs::read_dir(&path) {
-            Ok(entries) => entries,
-            Err(e) => return format!("Error: Cannot list directory: {e}"),
-        };
-
-        let mut result = Vec::new();
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
-            if is_dir {
-                result.push(format!("{name}/"));
-            } else {
-                result.push(name);
-            }
-        }
-        result.sort();
-        result.join("\n")
-    }
-
     // ────────────────────────────────────────────────────────────────────────
     // Shell operations (sandboxed)
     // ────────────────────────────────────────────────────────────────────────
@@ -580,161 +553,6 @@ impl ServerToolExecutor {
             }
         }
     }
-
-    fn server_grep(&self, args: &Value) -> String {
-        let pattern = match args.get("pattern").and_then(|v| v.as_str()) {
-            Some(p) => p,
-            None => return "Error: Missing 'pattern' parameter".to_string(),
-        };
-        let path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
-
-        let resolved = match self.resolve_path(path) {
-            Ok(p) => p,
-            Err(e) => return e,
-        };
-
-        let mut cmd = std::process::Command::new("grep");
-        cmd.arg("-rn")
-            .arg("--include=*.rs")
-            .arg("--include=*.ts")
-            .arg("--include=*.tsx")
-            .arg("--include=*.js")
-            .arg("--include=*.jsx")
-            .arg("--include=*.py")
-            .arg("--include=*.go")
-            .arg("--include=*.java")
-            .arg("--include=*.toml")
-            .arg("--include=*.json")
-            .arg("--include=*.yaml")
-            .arg("--include=*.yml")
-            .arg("--include=*.md")
-            .arg(pattern)
-            .arg(&resolved)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-
-        match cmd.output() {
-            Ok(out) => {
-                let result = String::from_utf8_lossy(&out.stdout).to_string();
-                if result.is_empty() {
-                    format!("No matches found for pattern: {pattern}")
-                } else {
-                    result
-                }
-            }
-            Err(e) => format!("Error: grep failed: {e}"),
-        }
-    }
-
-    fn server_glob(&self, args: &Value) -> String {
-        let pattern = match args.get("pattern").and_then(|v| v.as_str()) {
-            Some(p) => p,
-            None => return "Error: Missing 'pattern' parameter".to_string(),
-        };
-
-        // Use find for basic glob matching
-        let mut cmd = std::process::Command::new("find");
-        cmd.arg(&self.workspace_root)
-            .arg("-name")
-            .arg(pattern)
-            .arg("-type")
-            .arg("f")
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-
-        match cmd.output() {
-            Ok(out) => {
-                let result = String::from_utf8_lossy(&out.stdout).to_string();
-                if result.is_empty() {
-                    format!("No files found matching pattern: {pattern}")
-                } else {
-                    result
-                }
-            }
-            Err(e) => format!("Error: glob failed: {e}"),
-        }
-    }
-
-    // ────────────────────────────────────────────────────────────────────────
-    // Git operations
-    // ────────────────────────────────────────────────────────────────────────
-
-    fn git_command(&self, git_args: &[&str]) -> String {
-        let output = std::process::Command::new("git")
-            .args(git_args)
-            .current_dir(&self.workspace_root)
-            .output();
-
-        match output {
-            Ok(out) => {
-                let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-                let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-                if out.status.success() {
-                    stdout
-                } else {
-                    format!("Error: git {}: {}", git_args.join(" "), stderr)
-                }
-            }
-            Err(e) => format!("Error: git command failed: {e}"),
-        }
-    }
-
-    fn server_git_status(&self) -> String {
-        self.git_command(&["status", "--porcelain", "-b"])
-    }
-
-    fn server_git_diff(&self, args: &Value) -> String {
-        let mut git_args = vec!["diff"];
-        if let Some(true) = args.get("staged").and_then(|v| v.as_bool()) {
-            git_args.push("--cached");
-        }
-        if let Some(path) = args.get("path").and_then(|v| v.as_str()) {
-            git_args.push("--");
-            git_args.push(path);
-        }
-        self.git_command(&git_args)
-    }
-
-    fn server_git_log(&self, args: &Value) -> String {
-        let n = args
-            .get("n")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(10)
-            .min(100);
-        let n_str = format!("-{n}");
-        let mut git_args = vec!["log", "--oneline", &n_str];
-        if let Some(path) = args.get("path").and_then(|v| v.as_str()) {
-            git_args.push("--");
-            git_args.push(path);
-        }
-        self.git_command(&git_args)
-    }
-
-    fn server_git_show(&self, args: &Value) -> String {
-        let revision = args
-            .get("revision")
-            .and_then(|v| v.as_str())
-            .unwrap_or("HEAD");
-        self.git_command(&["show", "--stat", revision])
-    }
-
-    fn server_git_blame(&self, args: &Value) -> String {
-        let path = match args.get("path").and_then(|v| v.as_str()) {
-            Some(p) => p,
-            None => return "Error: Missing 'path' parameter".to_string(),
-        };
-        self.git_command(&["blame", "--line-porcelain", path])
-    }
-
-    fn server_git_commit(&self, args: &Value) -> String {
-        let message = match args.get("message").and_then(|v| v.as_str()) {
-            Some(m) => m,
-            None => return "Error: Missing 'message' parameter".to_string(),
-        };
-        // Stage all changes first
-        let _ = self.git_command(&["add", "-A"]);
-        self.git_command(&["commit", "-m", message])
-    }
 }
 
 /// Generate a short UUID-like identifier for call tracking.
@@ -767,40 +585,40 @@ mod tests {
 
     // ── Path traversal security ────────────────────────────────────────
 
-    #[test]
-    fn resolve_path_allows_relative_inside_workspace() {
+    #[tokio::test]
+    async fn resolve_path_allows_relative_inside_workspace() {
         let (exec, _dir) = test_executor();
         let result = exec.resolve_path("src/main.rs");
         assert!(result.is_ok());
         assert!(result.unwrap().starts_with(exec.workspace_root()));
     }
 
-    #[test]
-    fn resolve_path_blocks_parent_traversal() {
+    #[tokio::test]
+    async fn resolve_path_blocks_parent_traversal() {
         let (exec, _dir) = test_executor();
         let result = exec.resolve_path("../../etc/passwd");
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("SANDBOX_DENIED"));
     }
 
-    #[test]
-    fn resolve_path_blocks_absolute_outside_workspace() {
+    #[tokio::test]
+    async fn resolve_path_blocks_absolute_outside_workspace() {
         let (exec, _dir) = test_executor();
         let result = exec.resolve_path("/etc/passwd");
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("SANDBOX_DENIED"));
     }
 
-    #[test]
-    fn resolve_path_allows_absolute_inside_workspace() {
+    #[tokio::test]
+    async fn resolve_path_allows_absolute_inside_workspace() {
         let (exec, dir) = test_executor();
         let inner = dir.path().join("foo.txt");
         let result = exec.resolve_path(inner.to_str().unwrap());
         assert!(result.is_ok());
     }
 
-    #[test]
-    fn resolve_path_normalizes_dot_dot_in_middle() {
+    #[tokio::test]
+    async fn resolve_path_normalizes_dot_dot_in_middle() {
         let (exec, _dir) = test_executor();
         // src/../../../etc/passwd should be blocked
         let result = exec.resolve_path("src/../../../etc/passwd");
@@ -808,8 +626,8 @@ mod tests {
         assert!(result.unwrap_err().contains("SANDBOX_DENIED"));
     }
 
-    #[test]
-    fn resolve_path_allows_dot_dot_within_workspace() {
+    #[tokio::test]
+    async fn resolve_path_allows_dot_dot_within_workspace() {
         let (exec, dir) = test_executor();
         // Create nested dir so the path stays inside workspace
         std::fs::create_dir_all(dir.path().join("a/b")).unwrap();
@@ -821,22 +639,28 @@ mod tests {
 
     // ── File operations ────────────────────────────────────────────────
 
-    #[test]
-    fn read_file_returns_content_with_line_numbers() {
+    #[tokio::test]
+    async fn read_file_returns_content_with_line_numbers() {
         let (exec, dir) = test_executor();
         std::fs::write(dir.path().join("hello.txt"), "line1\nline2\nline3\n").unwrap();
-        let result = exec.server_read_file(&json!({"path": "hello.txt"}));
+        let result = exec
+            .execute("read_file", &json!({"path": "hello.txt"}))
+            .await;
         assert!(result.contains("1\tline1"));
         assert!(result.contains("2\tline2"));
         assert!(result.contains("3\tline3"));
     }
 
-    #[test]
-    fn read_file_respects_start_and_end_line() {
+    #[tokio::test]
+    async fn read_file_respects_start_and_end_line() {
         let (exec, dir) = test_executor();
         std::fs::write(dir.path().join("f.txt"), "a\nb\nc\nd\ne\n").unwrap();
-        let result =
-            exec.server_read_file(&json!({"path": "f.txt", "start_line": 2, "end_line": 4}));
+        let result = exec
+            .execute(
+                "read_file",
+                &json!({"path": "f.txt", "start_line": 2, "end_line": 4}),
+            )
+            .await;
         assert!(!result.contains("1\ta"));
         assert!(result.contains("2\tb"));
         assert!(result.contains("3\tc"));
@@ -844,132 +668,170 @@ mod tests {
         assert!(!result.contains("5\te"));
     }
 
-    #[test]
-    fn read_file_missing_file_returns_error() {
+    #[tokio::test]
+    async fn read_file_missing_file_returns_error() {
         let (exec, _dir) = test_executor();
-        let result = exec.server_read_file(&json!({"path": "nonexistent.txt"}));
+        let result = exec
+            .execute("read_file", &json!({"path": "nonexistent.txt"}))
+            .await;
         assert!(result.starts_with("Error:"));
     }
 
-    #[test]
-    fn read_file_missing_path_param_returns_error() {
+    #[tokio::test]
+    async fn read_file_missing_path_param_returns_error() {
         let (exec, _dir) = test_executor();
-        let result = exec.server_read_file(&json!({}));
+        let result = exec.execute("read_file", &json!({})).await;
         assert!(result.contains("Missing 'path'"));
     }
 
-    #[test]
-    fn read_file_blocks_path_traversal() {
+    #[tokio::test]
+    async fn read_file_blocks_path_traversal() {
         let (exec, _dir) = test_executor();
-        let result = exec.server_read_file(&json!({"path": "../../etc/passwd"}));
+        let result = exec
+            .execute("read_file", &json!({"path": "../../etc/passwd"}))
+            .await;
         assert!(result.contains("SANDBOX_DENIED"));
     }
 
-    #[test]
-    fn write_file_creates_and_writes() {
+    #[tokio::test]
+    async fn write_file_creates_and_writes() {
         let (exec, dir) = test_executor();
-        let result = exec.server_write_file(&json!({"path": "out.txt", "content": "hello world"}));
+        let result = exec
+            .execute(
+                "write_file",
+                &json!({"path": "out.txt", "content": "hello world"}),
+            )
+            .await;
         assert!(result.contains("Successfully wrote"));
         let content = std::fs::read_to_string(dir.path().join("out.txt")).unwrap();
         assert_eq!(content, "hello world");
     }
 
-    #[test]
-    fn write_file_creates_parent_dirs() {
+    #[tokio::test]
+    async fn write_file_creates_parent_dirs() {
         let (exec, dir) = test_executor();
-        let result = exec.server_write_file(&json!({
-            "path": "deep/nested/dir/file.txt",
-            "content": "deep content"
-        }));
+        let result = exec
+            .execute(
+                "write_file",
+                &json!({
+                    "path": "deep/nested/dir/file.txt",
+                    "content": "deep content"
+                }),
+            )
+            .await;
         assert!(result.contains("Successfully wrote"));
         assert!(dir.path().join("deep/nested/dir/file.txt").exists());
     }
 
-    #[test]
-    fn write_file_blocks_path_traversal() {
+    #[tokio::test]
+    async fn write_file_blocks_path_traversal() {
         let (exec, _dir) = test_executor();
-        let result = exec.server_write_file(&json!({
-            "path": "../../evil.txt",
-            "content": "pwned"
-        }));
+        let result = exec
+            .execute(
+                "write_file",
+                &json!({
+                    "path": "../../evil.txt",
+                    "content": "pwned"
+                }),
+            )
+            .await;
         assert!(result.contains("SANDBOX_DENIED"));
     }
 
-    #[test]
-    fn str_replace_single_occurrence() {
+    #[tokio::test]
+    async fn str_replace_single_occurrence() {
         let (exec, dir) = test_executor();
         std::fs::write(dir.path().join("code.rs"), "fn old_name() {}").unwrap();
-        let result = exec.server_str_replace(&json!({
-            "path": "code.rs",
-            "old_str": "old_name",
-            "new_str": "new_name"
-        }));
+        let result = exec
+            .execute(
+                "str_replace",
+                &json!({
+                    "path": "code.rs",
+                    "old_str": "old_name",
+                    "new_str": "new_name"
+                }),
+            )
+            .await;
         assert!(result.contains("Successfully replaced"));
         let content = std::fs::read_to_string(dir.path().join("code.rs")).unwrap();
         assert_eq!(content, "fn new_name() {}");
     }
 
-    #[test]
-    fn str_replace_rejects_multiple_matches() {
+    #[tokio::test]
+    async fn str_replace_rejects_multiple_matches() {
         let (exec, dir) = test_executor();
         std::fs::write(dir.path().join("dup.txt"), "foo bar foo").unwrap();
-        let result = exec.server_str_replace(&json!({
-            "path": "dup.txt",
-            "old_str": "foo",
-            "new_str": "baz"
-        }));
+        let result = exec
+            .execute(
+                "str_replace",
+                &json!({
+                    "path": "dup.txt",
+                    "old_str": "foo",
+                    "new_str": "baz"
+                }),
+            )
+            .await;
         assert!(result.contains("found 2 times"));
     }
 
-    #[test]
-    fn str_replace_not_found() {
+    #[tokio::test]
+    async fn str_replace_not_found() {
         let (exec, dir) = test_executor();
         std::fs::write(dir.path().join("nope.txt"), "hello").unwrap();
-        let result = exec.server_str_replace(&json!({
-            "path": "nope.txt",
-            "old_str": "missing",
-            "new_str": "x"
-        }));
+        let result = exec
+            .execute(
+                "str_replace",
+                &json!({
+                    "path": "nope.txt",
+                    "old_str": "missing",
+                    "new_str": "x"
+                }),
+            )
+            .await;
         assert!(result.contains("not found"));
     }
 
-    #[test]
-    fn delete_file_removes_existing() {
+    #[tokio::test]
+    async fn delete_file_removes_existing() {
         let (exec, dir) = test_executor();
         let target = dir.path().join("to_delete.txt");
         std::fs::write(&target, "temp").unwrap();
         assert!(target.exists());
-        let result = exec.server_delete_file(&json!({"path": "to_delete.txt"}));
+        let result = exec
+            .execute("delete_file", &json!({"path": "to_delete.txt"}))
+            .await;
         assert!(result.contains("Successfully deleted"));
         assert!(!target.exists());
     }
 
-    #[test]
-    fn delete_file_nonexistent_returns_error() {
+    #[tokio::test]
+    async fn delete_file_nonexistent_returns_error() {
         let (exec, _dir) = test_executor();
-        let result = exec.server_delete_file(&json!({"path": "ghost.txt"}));
+        let result = exec
+            .execute("delete_file", &json!({"path": "ghost.txt"}))
+            .await;
         assert!(result.contains("File not found"));
     }
 
-    #[test]
-    fn list_dir_shows_files_and_dirs() {
+    #[tokio::test]
+    async fn list_dir_shows_files_and_dirs() {
         let (exec, dir) = test_executor();
         std::fs::write(dir.path().join("a.txt"), "").unwrap();
         std::fs::write(dir.path().join("b.rs"), "").unwrap();
         std::fs::create_dir(dir.path().join("subdir")).unwrap();
-        let result = exec.server_list_dir(&json!({"path": "."}));
+        let result = exec.execute("list_dir", &json!({"path": "."})).await;
         assert!(result.contains("a.txt"));
         assert!(result.contains("b.rs"));
         assert!(result.contains("subdir/"));
     }
 
-    #[test]
-    fn list_dir_sorted_output() {
+    #[tokio::test]
+    async fn list_dir_sorted_output() {
         let (exec, dir) = test_executor();
         std::fs::write(dir.path().join("z.txt"), "").unwrap();
         std::fs::write(dir.path().join("a.txt"), "").unwrap();
         std::fs::write(dir.path().join("m.txt"), "").unwrap();
-        let result = exec.server_list_dir(&json!({"path": "."}));
+        let result = exec.execute("list_dir", &json!({"path": "."})).await;
         let lines: Vec<&str> = result.lines().collect();
         assert_eq!(lines, vec!["a.txt", "m.txt", "z.txt"]);
     }
@@ -988,28 +850,32 @@ mod tests {
     #[tokio::test]
     async fn bash_echo_returns_output() {
         let (exec, _dir) = test_executor();
-        let result = exec.server_bash(&json!({"command": "echo hello"})).await;
+        let result = exec
+            .execute("bash", &json!({"command": "echo hello"}))
+            .await;
         assert_eq!(result.trim(), "hello");
     }
 
     #[tokio::test]
     async fn bash_missing_command_returns_error() {
         let (exec, _dir) = test_executor();
-        let result = exec.server_bash(&json!({})).await;
+        let result = exec.execute("bash", &json!({})).await;
         assert!(result.contains("Missing 'command'"));
     }
 
     #[tokio::test]
     async fn bash_nonzero_exit_includes_exit_code() {
         let (exec, _dir) = test_executor();
-        let result = exec.server_bash(&json!({"command": "exit 42"})).await;
+        let result = exec.execute("bash", &json!({"command": "exit 42"})).await;
         assert!(result.contains("exit code: 42"));
     }
 
     #[tokio::test]
     async fn bash_stderr_is_captured() {
         let (exec, _dir) = test_executor();
-        let result = exec.server_bash(&json!({"command": "echo err >&2"})).await;
+        let result = exec
+            .execute("bash", &json!({"command": "echo err >&2"}))
+            .await;
         assert!(result.contains("stderr:"));
         assert!(result.contains("err"));
     }
@@ -1026,33 +892,35 @@ mod tests {
 
     // ── Grep ───────────────────────────────────────────────────────────
 
-    #[test]
-    fn grep_finds_pattern_in_files() {
+    #[tokio::test]
+    async fn grep_finds_pattern_in_files() {
         let (exec, dir) = test_executor();
         std::fs::write(dir.path().join("test.rs"), "fn main() {}\nfn helper() {}").unwrap();
-        let result = exec.server_grep(&json!({"pattern": "fn main"}));
+        let result = exec.execute("grep", &json!({"pattern": "fn main"})).await;
         assert!(result.contains("fn main"));
     }
 
-    #[test]
-    fn grep_no_matches_returns_message() {
+    #[tokio::test]
+    async fn grep_no_matches_returns_message() {
         let (exec, dir) = test_executor();
         std::fs::write(dir.path().join("empty.rs"), "nothing here").unwrap();
-        let result = exec.server_grep(&json!({"pattern": "ZZZZNOTFOUND"}));
+        let result = exec
+            .execute("grep", &json!({"pattern": "ZZZZNOTFOUND"}))
+            .await;
         assert!(result.contains("No matches found"));
     }
 
     // ── Git operations ─────────────────────────────────────────────────
 
-    #[test]
-    fn git_status_in_non_git_dir_returns_error() {
+    #[tokio::test]
+    async fn git_status_in_non_git_dir_returns_error() {
         let (exec, _dir) = test_executor();
-        let result = exec.server_git_status();
+        let result = exec.execute("git_status", &json!({})).await;
         assert!(result.contains("Error:") || result.contains("fatal"));
     }
 
-    #[test]
-    fn git_log_caps_at_100() {
+    #[tokio::test]
+    async fn git_log_caps_at_100() {
         let (exec, dir) = test_executor();
         // Initialize a git repo
         std::process::Command::new("git")
@@ -1082,7 +950,7 @@ mod tests {
             .output()
             .unwrap();
         // Request 999 — should be capped at 100
-        let result = exec.server_git_log(&json!({"n": 999}));
+        let result = exec.execute("git_log", &json!({"n": 999})).await;
         assert!(result.contains("initial"));
     }
 
@@ -1102,8 +970,8 @@ mod tests {
 
     // ── Output management ──────────────────────────────────────────────
 
-    #[test]
-    fn set_turn_index_and_reset_aggregate() {
+    #[tokio::test]
+    async fn set_turn_index_and_reset_aggregate() {
         let (exec, _dir) = test_executor();
         exec.set_turn_index(5);
         assert_eq!(exec.journal_turn_index.load(Ordering::Relaxed), 5);
@@ -1112,8 +980,8 @@ mod tests {
         assert_eq!(exec.aggregate_output_bytes.load(Ordering::Relaxed), 0);
     }
 
-    #[test]
-    fn workspace_root_returns_correct_path() {
+    #[tokio::test]
+    async fn workspace_root_returns_correct_path() {
         let (exec, dir) = test_executor();
         assert_eq!(exec.workspace_root(), dir.path());
     }

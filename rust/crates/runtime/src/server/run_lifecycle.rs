@@ -16,7 +16,7 @@ use async_trait::async_trait;
 use axum::Json;
 use axum::http::StatusCode;
 use serde_json::{Map, Value, json};
-use tokio::sync::{Mutex as TokioMutex, RwLock};
+use tokio::sync::{Mutex as TokioMutex, RwLock, mpsc};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -431,6 +431,9 @@ pub struct AgenticRunLifecycleService {
         Option<std::sync::Arc<dyn astra_services::resource_governor::ResourceGovernor>>,
     /// Live edge WebSocket connection pool (Phase 6).
     edge_connection_pool: Option<super::edge_connection_pool::EdgeConnectionPool>,
+    /// Per-run approval request channel receivers (Phase E).
+    /// Key: run_id → receiver that the WS handler drains.
+    approval_channels: Arc<TokioMutex<HashMap<String, mpsc::UnboundedReceiver<serde_json::Value>>>>,
 }
 
 impl AgenticRunLifecycleService {
@@ -449,6 +452,7 @@ impl AgenticRunLifecycleService {
             delegation_engine: None,
             resource_governor: None,
             edge_connection_pool: None,
+            approval_channels: Arc::new(TokioMutex::new(HashMap::new())),
         }
     }
 
@@ -1049,10 +1053,25 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             if let Some(pool) = &self.edge_connection_pool {
                 executor.set_edge_connection_pool(pool.clone());
             }
+
+            // ── Phase E: Wire WebSocket approval gate ───────────────
+            let (approval_tx, approval_rx) = mpsc::unbounded_channel();
+            let approval_gate = super::ws_approval_gate::WebSocketApprovalGate::new(
+                user_id.clone(),
+                self.edge_callback_ledger.clone(),
+                approval_tx,
+            );
+            executor.set_approval_gate(std::sync::Arc::new(approval_gate));
+            self.approval_channels
+                .lock()
+                .await
+                .insert(run_id.clone(), approval_rx);
+
             loop_state.server_tool_executor = Some(std::sync::Arc::new(executor));
         }
 
         // Clone handles we need inside the spawned task.
+        let bg_approval_channels = self.approval_channels.clone();
         let runs = self.runs_handle();
         let run_engine = self.run_engine.clone();
         let bg_run_id = run_id.clone();
@@ -1065,6 +1084,9 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             let outcome = run_agentic_loop_with_host(&mut host, &mut loop_state).await;
             let (events, final_status, error_msg) =
                 Self::finalize_run_events(outcome, host.take_emitted_events(), &loop_state);
+
+            // Clean up approval channel for this run.
+            bg_approval_channels.lock().await.remove(&bg_run_id);
             let terminal_events = terminal_events_for_persistence(&events);
 
             // Publish terminal run state before best-effort post-run side effects
@@ -1321,6 +1343,18 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         }
 
         Err(error_response(StatusCode::NOT_FOUND, "Run not found"))
+    }
+
+    async fn drain_approval_requests(&self, run_id: &str) -> Vec<serde_json::Value> {
+        let mut channels = self.approval_channels.lock().await;
+        let Some(rx) = channels.get_mut(run_id) else {
+            return vec![];
+        };
+        let mut requests = Vec::new();
+        while let Ok(req) = rx.try_recv() {
+            requests.push(req);
+        }
+        requests
     }
 
     async fn cancel_run(

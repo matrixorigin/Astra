@@ -11,6 +11,11 @@ pub mod memoria;
 pub mod schemas;
 pub mod web_search;
 
+pub mod executor;
+pub mod fs_ops;
+pub mod git_ops;
+pub mod shell_ops;
+
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -132,6 +137,111 @@ impl SandboxConfig {
             command_timeout: Duration::from_secs(120),
             network_allowed: false,
         }
+    }
+}
+
+// ─── Tool context ───────────────────────────────────────────────────────────
+
+/// Unified execution context passed to all tool modules.
+///
+/// Replaces ad-hoc parameter passing with a single struct that carries
+/// everything a tool needs to run: paths, identity, sandbox rules, and logging.
+#[derive(Clone)]
+pub struct ToolContext {
+    /// Primary project directory (git root).
+    pub project_root: PathBuf,
+    /// Workspace root for this session (may differ from project_root in server mode).
+    pub workspace_root: PathBuf,
+    /// Authenticated user running the tools.
+    pub user_id: String,
+    /// Session identifier for multi-tenant isolation.
+    pub session_id: String,
+    /// Sandbox enforcement rules.
+    pub sandbox: SandboxConfig,
+    /// Shared HTTP client for tools that make network requests (GitHub, web_search).
+    pub http_client: Option<reqwest::Client>,
+    /// Logger for tool-level diagnostics (replaces eprintln! in extracted modules).
+    pub logger: std::sync::Arc<dyn ToolLogger>,
+}
+
+impl ToolContext {
+    /// Create a minimal context for unit tests.
+    pub fn test(project_root: impl Into<PathBuf>) -> Self {
+        let root = project_root.into();
+        Self {
+            workspace_root: root.clone(),
+            sandbox: SandboxConfig::standard(&root),
+            project_root: root,
+            user_id: "test-user".into(),
+            session_id: "test-session".into(),
+            http_client: None,
+            logger: std::sync::Arc::new(TracingLogger),
+        }
+    }
+}
+
+impl std::fmt::Debug for ToolContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ToolContext")
+            .field("project_root", &self.project_root)
+            .field("workspace_root", &self.workspace_root)
+            .field("user_id", &self.user_id)
+            .field("session_id", &self.session_id)
+            .field("sandbox_mode", &self.sandbox.mode)
+            .finish()
+    }
+}
+
+// ─── Tool logger ────────────────────────────────────────────────────────────
+
+/// Trait-based logging for tool modules.
+///
+/// Extracted tool code must NOT use `eprintln!` (breaks server mode).
+/// Instead, tools receive a `&dyn ToolLogger` via [`ToolContext`] and log
+/// through it.  The CLI provides [`StderrLogger`], the server provides
+/// [`TracingLogger`] (default).
+pub trait ToolLogger: Send + Sync {
+    fn debug(&self, msg: &str);
+    fn info(&self, msg: &str);
+    fn warn(&self, msg: &str);
+    fn error(&self, msg: &str);
+}
+
+/// Logger that routes to the `tracing` crate (server default).
+#[derive(Debug, Clone, Copy)]
+pub struct TracingLogger;
+
+impl ToolLogger for TracingLogger {
+    fn debug(&self, msg: &str) {
+        tracing::debug!("{}", msg);
+    }
+    fn info(&self, msg: &str) {
+        tracing::info!("{}", msg);
+    }
+    fn warn(&self, msg: &str) {
+        tracing::warn!("{}", msg);
+    }
+    fn error(&self, msg: &str) {
+        tracing::error!("{}", msg);
+    }
+}
+
+/// Logger that writes to stderr (CLI backward compat).
+#[derive(Debug, Clone, Copy)]
+pub struct StderrLogger;
+
+impl ToolLogger for StderrLogger {
+    fn debug(&self, msg: &str) {
+        eprintln!("[DEBUG] {msg}");
+    }
+    fn info(&self, msg: &str) {
+        eprintln!("[INFO] {msg}");
+    }
+    fn warn(&self, msg: &str) {
+        eprintln!("[WARN] {msg}");
+    }
+    fn error(&self, msg: &str) {
+        eprintln!("[ERROR] {msg}");
     }
 }
 
