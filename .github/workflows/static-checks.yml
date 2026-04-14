@@ -22,7 +22,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
-          shared-key: ci
+          shared-key: ci-offline
           save-if: false
       - name: Run clippy
         run: make lint

@@ -14,9 +14,10 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # ── Fast: no external deps ────────────────────────────────────────────
-  test-offline:
-    name: Offline Tests
+  # ── Offline: split by crate for parallel execution and easier fault isolation ──
+
+  test-offline-cli:
+    name: "Offline: astra-cli"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -24,12 +25,52 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
-          shared-key: ci
+          shared-key: ci-offline
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Run offline tests
-        run: make test-offline
+      - run: cargo test --manifest-path rust/Cargo.toml -p astra-cli
 
-  # ── Slow: needs MatrixOne + Memoria ───────────────────────────────────
+  test-offline-runtime:
+    name: "Offline: astra-runtime"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+          shared-key: ci-offline
+          save-if: false
+      - run: cargo test --manifest-path rust/Cargo.toml -p astra-runtime
+      - name: Run bridge-e2e-hooks tests
+        run: cargo test --manifest-path rust/Cargo.toml -p astra-runtime --features bridge-e2e-hooks
+
+  test-offline-services:
+    name: "Offline: astra-services"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+          shared-key: ci-offline
+          save-if: false
+      - run: cargo test --manifest-path rust/Cargo.toml -p astra-services
+
+  test-offline-core:
+    name: "Offline: core crates"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+          shared-key: ci-offline
+          save-if: false
+      - run: cargo test --manifest-path rust/Cargo.toml -p astra-core -p astra-thin-client -p astra-admin-cli
+
+  # ── Online: needs MatrixOne + Memoria ─────────────────────────────────
   test-online:
     name: Online Tests
     runs-on: ubuntu-latest
@@ -66,8 +107,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
-          shared-key: ci
-          save-if: false
+          shared-key: ci-online
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Wait for dependencies
         run: make dev-deps-wait
       - name: Run online tests

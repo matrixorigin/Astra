@@ -153,6 +153,7 @@ mod tests {
     use std::sync::atomic::AtomicBool;
 
     #[test]
+    #[serial_test::serial]
     fn should_schedule_requires_tsconfig_and_ts_extension() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
