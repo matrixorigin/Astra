@@ -2368,6 +2368,7 @@ fn run_command_with_cleanup(
                         let _ = Command::new("kill")
                             .args(["-9", &format!("-{pid}")])
                             .output();
+                        let _ = child.kill();
                     }
                     #[cfg(not(unix))]
                     {
@@ -2536,6 +2537,7 @@ fn run_command_streaming(
                             let _ = Command::new("kill")
                                 .args(["-9", &format!("-{pid}")])
                                 .output();
+                            let _ = child.kill();
                         }
                         #[cfg(not(unix))]
                         {
@@ -2603,6 +2605,7 @@ fn size_watchdog(
                 let _ = Command::new("kill")
                     .args(["-9", &format!("-{pid}")])
                     .output();
+                let _ = child.kill();
             }
             #[cfg(not(unix))]
             {
@@ -2701,9 +2704,12 @@ fn run_readonly_command_with_partial(
                     #[cfg(unix)]
                     {
                         let pid = child.id();
+                        // Kill the entire process group (catches child processes).
+                        // Fall back to direct kill so child.wait() never blocks forever.
                         let _ = Command::new("kill")
                             .args(["-9", &format!("-{pid}")])
                             .output();
+                        let _ = child.kill();
                     }
                     #[cfg(not(unix))]
                     {
@@ -2902,6 +2908,7 @@ impl ToolExecutor {
                             let _ = Command::new("kill")
                                 .args(["-9", &format!("-{pid}")])
                                 .output();
+                            let _ = child.kill();
                         }
                         #[cfg(not(unix))]
                         {
