@@ -40,6 +40,7 @@ mod meta_handlers;
 mod platform_handlers;
 mod reflect_handlers;
 mod request_trace;
+mod resource_handlers;
 mod router_builder;
 pub mod run_engine;
 mod run_handlers;
@@ -117,6 +118,7 @@ pub async fn serve(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
     // Spawn periodic expired data cleanup (runs every 6 hours)
     if let Some(ref pool) = state.shared_pool {
         spawn_data_cleanup(pool.clone());
+        astra_services::session_reaper::spawn_session_reaper(pool.clone());
     }
 
     axum::serve(listener, build_app(state)).await?;

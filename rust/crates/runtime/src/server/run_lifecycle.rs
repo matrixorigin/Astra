@@ -426,6 +426,9 @@ pub struct AgenticRunLifecycleService {
     run_engine: Option<RunEngine>,
     /// Optional delegation engine for multi-agent coordination.
     delegation_engine: Option<Arc<crate::server::delegation_engine::DelegationEngine>>,
+    /// Per-user resource governor (Phase 5).
+    resource_governor:
+        Option<std::sync::Arc<dyn astra_services::resource_governor::ResourceGovernor>>,
     /// Live edge WebSocket connection pool (Phase 6).
     edge_connection_pool: Option<super::edge_connection_pool::EdgeConnectionPool>,
 }
@@ -444,6 +447,7 @@ impl AgenticRunLifecycleService {
             edge_callback_ledger,
             run_engine: None,
             delegation_engine: None,
+            resource_governor: None,
             edge_connection_pool: None,
         }
     }
@@ -471,6 +475,14 @@ impl AgenticRunLifecycleService {
         pool: super::edge_connection_pool::EdgeConnectionPool,
     ) -> Self {
         self.edge_connection_pool = Some(pool);
+        self
+    }
+
+    pub fn with_resource_governor(
+        mut self,
+        governor: std::sync::Arc<dyn astra_services::resource_governor::ResourceGovernor>,
+    ) -> Self {
+        self.resource_governor = Some(governor);
         self
     }
 
@@ -961,6 +973,18 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         user_id: String,
         request: ChatRequestData,
     ) -> Result<ChatRunRecord, (StatusCode, Json<ErrorResponse>)> {
+        // ── Resource governance check (Phase 5) ─────────────────────
+        if let Some(ref gov) = self.resource_governor {
+            if let astra_services::resource_governor::LimitCheck::Denied { reason } =
+                gov.check_session_create(&user_id).await
+            {
+                return Err(error_response(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    format!("Resource limit exceeded: {reason}"),
+                ));
+            }
+        }
+
         let run_id = Uuid::new_v4().to_string();
         let session_id = request
             .session_id
@@ -974,6 +998,11 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         // Persist to durable store if available
         self.persist_run_start_if_configured(&run_id, &user_id, &session_id)
             .await;
+
+        // Record session creation for resource tracking (Phase 5).
+        if let Some(ref gov) = self.resource_governor {
+            gov.record_session_created(&user_id).await;
+        }
 
         // Spawn background agentic loop.
         let edge_tools = Self::extract_edge_tools(&request);

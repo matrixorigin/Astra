@@ -95,6 +95,8 @@ pub struct AppState {
     /// Team persistence store — CRUD for team definitions and execution history.
     pub(crate) team_store:
         Option<Arc<dyn astra_services::team_persistence::TeamPersistenceService>>,
+    /// Per-user resource governor for limit checking and usage tracking (Phase 5).
+    pub resource_governor: std::sync::Arc<dyn astra_services::resource_governor::ResourceGovernor>,
     /// Live edge agent WebSocket connections for remote tool execution (Phase 6).
     pub edge_connection_pool: crate::server::edge_connection_pool::EdgeConnectionPool,
 }
@@ -180,6 +182,9 @@ impl AppState {
             agent_profile_registry: Arc::new(astra_services::AgentProfileRegistry::new()),
             delegation_engine: None,
             team_store: None,
+            resource_governor: std::sync::Arc::new(
+                astra_services::resource_governor::InMemoryResourceGovernor::new(),
+            ),
             edge_connection_pool: crate::server::edge_connection_pool::EdgeConnectionPool::new(),
         }
     }
@@ -598,6 +603,14 @@ impl AppState {
         store: Arc<dyn astra_services::team_persistence::TeamPersistenceService>,
     ) -> Self {
         self.team_store = Some(store);
+        self
+    }
+
+    pub fn with_resource_governor(
+        mut self,
+        governor: Arc<dyn astra_services::resource_governor::ResourceGovernor>,
+    ) -> Self {
+        self.resource_governor = governor;
         self
     }
 

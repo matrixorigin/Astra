@@ -620,6 +620,19 @@ pub(super) fn build_router(state: AppState) -> Router {
             "/introspection/memory/recall",
             get(introspection::get_memory_recall_handler),
         )
+        // ── Resource governance endpoints (Phase 5) ──────────────────────
+        .route(
+            "/resources/usage",
+            get(resource_handlers::get_resource_usage_handler),
+        )
+        .route(
+            "/resources/limits",
+            get(resource_handlers::get_resource_limits_handler),
+        )
+        .route(
+            "/admin/resources/limits/{user_id}",
+            axum::routing::put(resource_handlers::set_resource_limits_handler),
+        )
         .with_state(state)
 }
 
