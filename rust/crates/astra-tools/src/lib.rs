@@ -11,10 +11,17 @@ pub mod memoria;
 pub mod schemas;
 pub mod web_search;
 
+pub mod build_test;
+pub mod code_intel;
+pub mod env_tools;
 pub mod executor;
 pub mod fs_ops;
+pub mod fuzzy_replacer;
 pub mod git_ops;
+pub mod passive_cargo_check;
+pub mod passive_tsc_check;
 pub mod shell_ops;
+pub mod task_mgmt;
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
