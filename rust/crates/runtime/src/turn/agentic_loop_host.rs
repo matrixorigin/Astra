@@ -1232,6 +1232,22 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn budget_exhausted_with_progress_completes_gracefully() {
+        let mut host = MockHost::new(vec![]);
+        let mut state = make_state();
+        state.max_turns = 15;
+        state.remaining_turns = 0;
+        state.total_tool_calls = 3;
+        state.total_prompt = 120;
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+        assert!(outcome.is_ok());
+        assert!(state.final_text.contains("Turn budget exhausted"));
+        assert!(state.final_text.contains("3 completed tool call(s)"));
+        assert_eq!(host.rendered_final_text.last(), Some(&state.final_text));
+    }
+
+    #[tokio::test]
     async fn host_error_propagates() {
         let mut host = MockHost::new(vec![]);
         let mut state = make_state();

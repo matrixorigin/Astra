@@ -181,49 +181,84 @@ const WRITE_INDICATORS: &[&str] = &[
     "exec ",
 ];
 
-/// Check if a bash command is read-only (safe for concurrent execution).
-///
-/// Returns `true` if the command appears to only read data without side effects.
-/// Used to allow read-only bash commands to run concurrently without user approval.
-///
-/// # Algorithm
-/// 1. Check for write indicators (redirection, dangerous commands)
-/// 2. Match against known read-only command prefixes
-/// 3. Default to false (require approval) for unknown commands
-pub fn bash_command_is_read_only(command: &str) -> bool {
+fn effective_bash_command(command: &str) -> &str {
     let cmd = command.trim();
-
-    // Empty command is not read-only (edge case)
-    if cmd.is_empty() {
-        return false;
-    }
-
-    // Check for write indicators first
-    for indicator in WRITE_INDICATORS {
-        if cmd.contains(indicator) {
-            return false;
-        }
-    }
-
-    // Check if command starts with a known read-only command
-    // Handle both direct commands and cd-prefixed commands
-    let effective_cmd = if cmd.starts_with("cd ") && cmd.contains("&&") {
-        // Extract command after `cd ... && `
+    if cmd.starts_with("cd ") && cmd.contains("&&") {
         cmd.split("&&").nth(1).map(str::trim).unwrap_or(cmd)
     } else {
         cmd
-    };
+    }
+}
 
+fn strip_benign_fd_redirects(command: &str) -> String {
+    command
+        .replace("2>&1", " ")
+        .replace("1>&2", " ")
+        .replace("2>/dev/null", " ")
+        .replace("1>/dev/null", " ")
+        .replace(">/dev/null", " ")
+}
+
+fn has_write_indicators(command: &str) -> bool {
+    WRITE_INDICATORS
+        .iter()
+        .any(|indicator| command.contains(indicator))
+}
+
+fn matches_read_only_prefix(command: &str) -> bool {
     for ro_cmd in READ_ONLY_COMMANDS {
-        if let Some(rest) = effective_cmd.strip_prefix(ro_cmd) {
+        if let Some(rest) = command.strip_prefix(ro_cmd) {
             // Ensure it's a word boundary (not a prefix of a longer command)
             if rest.is_empty() || rest.starts_with(' ') || rest.starts_with('\n') {
                 return true;
             }
         }
     }
-
     false
+}
+
+fn bash_segment_is_read_only(command: &str) -> bool {
+    let cmd = command.trim();
+    !cmd.is_empty() && !has_write_indicators(cmd) && matches_read_only_prefix(cmd)
+}
+
+/// Check if a bash command is read-only (safe for concurrent execution).
+///
+/// Returns `true` if the command appears to only read data without side effects.
+/// Used to allow read-only bash commands to run concurrently without user approval.
+///
+/// # Algorithm
+/// 1. Normalize harmless fd forwarding (`2>&1`, `1>&2`, `/dev/null`)
+/// 2. Split read-only pipelines (`cargo check | head -50`) into segments
+/// 3. Reject any segment with write indicators; otherwise match read-only prefixes
+/// 4. Default to false (require approval) for unknown commands
+pub fn bash_command_is_read_only(command: &str) -> bool {
+    let cmd = effective_bash_command(command);
+
+    // Empty command is not read-only (edge case)
+    if cmd.is_empty() {
+        return false;
+    }
+
+    let normalized = strip_benign_fd_redirects(cmd);
+    let normalized = normalized.trim();
+    if normalized.is_empty() {
+        return false;
+    }
+
+    if normalized.contains('|') {
+        let segments: Vec<&str> = normalized
+            .split('|')
+            .map(str::trim)
+            .filter(|segment| !segment.is_empty())
+            .collect();
+        return !segments.is_empty()
+            && segments
+                .iter()
+                .all(|segment| bash_segment_is_read_only(segment));
+    }
+
+    bash_segment_is_read_only(normalized)
 }
 
 /// Kind of side effect for tools gated before edge execution.
@@ -362,6 +397,10 @@ mod tests {
         assert!(bash_command_is_read_only("cargo check"));
         assert!(bash_command_is_read_only("cargo clippy"));
         assert!(bash_command_is_read_only("npm list"));
+        assert!(bash_command_is_read_only("cargo check 2>&1 | head -50"));
+        assert!(bash_command_is_read_only(
+            "cd rust && cargo test --no-run 2>&1 | tail -20"
+        ));
 
         // cd-prefixed commands
         assert!(bash_command_is_read_only("cd project && ls"));
@@ -403,6 +442,9 @@ mod tests {
         assert!(!bash_command_is_read_only("ls | tee output.txt"));
         assert!(!bash_command_is_read_only("echo test | xargs rm"));
         assert!(!bash_command_is_read_only("cat script.sh | bash"));
+        assert!(!bash_command_is_read_only(
+            "cargo check 2>&1 | tee build.log"
+        ));
     }
 
     #[test]

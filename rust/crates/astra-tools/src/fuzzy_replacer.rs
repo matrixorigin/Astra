@@ -21,7 +21,7 @@
 
 #![allow(dead_code)]
 /// Result of a fuzzy match: the actual content substring and which strategy matched.
-pub(crate) struct FuzzyMatch<'a> {
+pub struct FuzzyMatch<'a> {
     /// The actual substring from the file content to replace.
     pub actual: &'a str,
     /// Human-readable name of the strategy that matched.
@@ -30,7 +30,7 @@ pub(crate) struct FuzzyMatch<'a> {
 
 /// Try all fuzzy replacer strategies in cascade order.
 /// Returns the first unique match, or None if no strategy finds exactly one match.
-pub(crate) fn fuzzy_find_replacement<'a>(
+pub fn fuzzy_find_replacement<'a>(
     content: &'a str,
     old_str: &str,
     replace_all: bool,
@@ -564,7 +564,7 @@ fn quote_normalized_actual<'a>(content: &'a str, search: &str) -> Option<&'a str
     Some(&content[content_start..content_end])
 }
 
-pub(crate) fn quote_normalized_match_count(content: &str, search: &str) -> usize {
+pub fn quote_normalized_match_count(content: &str, search: &str) -> usize {
     let norm_search = normalize_quotes(search);
     let norm_content = normalize_quotes(content);
     norm_content.matches(&norm_search).count()

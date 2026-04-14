@@ -34,7 +34,7 @@
 use crate::pipeline::calibration::ProgressiveCalibrator;
 use crate::pipeline::entity::{EntityGraph, extract_entities};
 use crate::pipeline::pattern::PatternLibrary;
-use crate::pipeline::routing::{DomainHint, RoutingEngine, TaskType};
+use crate::pipeline::routing::{DomainHint, RoutingEngine, TaskType, domain_hint_to_label};
 use crate::tool_registry::{self, TOOL_CATALOG, ToolQualityTracker, ToolRegistry};
 use crate::turn::routing_metrics::ConfidenceCalibrator;
 use astra_thin_client::ThinClient;
@@ -250,6 +250,28 @@ pub struct TfIdfSelector {
     /// Progressive 3-axis calibrator. When present, replaces the single-axis
     /// ConfidenceCalibrator with per-intent × per-domain × per-task calibration.
     progressive_calibrator: Option<Arc<Mutex<ProgressiveCalibrator>>>,
+}
+
+fn routing_memory_hints_for_selection(
+    ctx: &SelectionContext<'_>,
+    boost_terms: &[String],
+) -> Vec<String> {
+    let mut hints = boost_terms.to_vec();
+    for domain in &ctx.memory_domain_hints {
+        hints.push(domain_hint_to_label(*domain).to_string());
+    }
+    for entry in &ctx.file_context {
+        hints.push(entry.clone());
+        if matches!(
+            entry.as_str(),
+            "rust" | "typescript" | "javascript" | "python" | "go" | "java" | "cpp" | "docker"
+        ) {
+            hints.push("code".to_string());
+        }
+    }
+    hints.sort();
+    hints.dedup();
+    hints
 }
 
 impl TfIdfSelector {
@@ -614,13 +636,14 @@ impl ToolSelector for TfIdfSelector {
             .chain(entity_boost.iter())
             .cloned()
             .collect();
+        let routing_memory_hints = routing_memory_hints_for_selection(ctx, &all_boost);
 
         // ── Phase 2: Compute unified routing decision ──
         let routing = RoutingEngine::analyze(
             ctx.query,
             ctx.turn_count,
             ctx.recent_tools,
-            &[], // memory_hints (populated by caller via boost_terms)
+            &routing_memory_hints,
             all_boost.clone(),
         );
 
@@ -2625,6 +2648,76 @@ mod tests {
         assert!(
             r2.confidence >= r1.confidence,
             "boosted confidence ({}) should be >= unboosted ({})",
+            r2.confidence,
+            r1.confidence
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_domain_hints_raise_confidence_without_query_signals() {
+        let selector = TfIdfSelector::new(mock_registry());
+        let ctx_no_hint = SelectionContext {
+            query: "matrixorigin",
+            turn_count: 1,
+            recent_tools: &[],
+            budget_tokens: 800,
+            boost_terms: vec![],
+            budget_pressure: 0.0,
+            memory_domain_hints: vec![],
+            restricted_tools: vec![],
+            file_context: vec![],
+        };
+        let ctx_with_hint = SelectionContext {
+            query: "matrixorigin",
+            turn_count: 1,
+            recent_tools: &[],
+            budget_tokens: 800,
+            boost_terms: vec![],
+            budget_pressure: 0.0,
+            memory_domain_hints: vec![DomainHint::GitHub],
+            restricted_tools: vec![],
+            file_context: vec![],
+        };
+        let r1 = selector.select(&ctx_no_hint).await;
+        let r2 = selector.select(&ctx_with_hint).await;
+        assert!(
+            r2.confidence > r1.confidence,
+            "memory-domain confidence ({}) should exceed baseline ({})",
+            r2.confidence,
+            r1.confidence
+        );
+    }
+
+    #[tokio::test]
+    async fn file_context_raises_confidence_for_ambiguous_code_query() {
+        let selector = TfIdfSelector::new(mock_registry());
+        let ctx_plain = SelectionContext {
+            query: "improve webhook capability",
+            turn_count: 1,
+            recent_tools: &[],
+            budget_tokens: 800,
+            boost_terms: vec![],
+            budget_pressure: 0.0,
+            memory_domain_hints: vec![],
+            restricted_tools: vec![],
+            file_context: vec![],
+        };
+        let ctx_code = SelectionContext {
+            query: "improve webhook capability",
+            turn_count: 1,
+            recent_tools: &[],
+            budget_tokens: 800,
+            boost_terms: vec![],
+            budget_pressure: 0.0,
+            memory_domain_hints: vec![],
+            restricted_tools: vec![],
+            file_context: vec!["rust".into()],
+        };
+        let r1 = selector.select(&ctx_plain).await;
+        let r2 = selector.select(&ctx_code).await;
+        assert!(
+            r2.confidence > r1.confidence,
+            "file-context confidence ({}) should exceed baseline ({})",
             r2.confidence,
             r1.confidence
         );

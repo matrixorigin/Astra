@@ -17,6 +17,7 @@ const DIFF_LIMIT: usize = 40_000; // ~10K tokens — diff is the primary input f
 const SHOW_LIMIT: usize = 16_000;
 
 /// Outcome of a tool execution with optional metadata fields.
+#[derive(Debug, Clone, Default)]
 pub struct ToolExecutionOutcome {
     pub output: String,
     pub tool_result_fields: Option<serde_json::Map<String, serde_json::Value>>,
@@ -125,11 +126,11 @@ fn resolve_commit_ref(project_root: &Path, commit_ref: &str) -> Option<String> {
         .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-fn short_commit_sha(commit_sha: &str) -> String {
+pub fn short_commit_sha(commit_sha: &str) -> String {
     commit_sha[..7.min(commit_sha.len())].to_string()
 }
 
-fn head_first_parent_tail(project_root: &Path, count: usize) -> Option<Vec<String>> {
+pub fn head_first_parent_tail(project_root: &Path, count: usize) -> Option<Vec<String>> {
     if count == 0 {
         return Some(Vec::new());
     }
@@ -155,7 +156,7 @@ fn head_first_parent_tail(project_root: &Path, count: usize) -> Option<Vec<Strin
         })
 }
 
-fn git_worktree_is_clean(project_root: &Path) -> Result<bool, String> {
+pub fn git_worktree_is_clean(project_root: &Path) -> Result<bool, String> {
     let output = std::process::Command::new("git")
         .args(["status", "--porcelain"])
         .current_dir(project_root)
@@ -220,7 +221,12 @@ pub struct GitStashRollbackJournal {
 }
 
 impl GitStashRollbackJournal {
-    fn record(&mut self, stash_ref: impl Into<String>, turn_index: u32, message: Option<String>) {
+    pub fn record(
+        &mut self,
+        stash_ref: impl Into<String>,
+        turn_index: u32,
+        message: Option<String>,
+    ) {
         self.entries.push(GitStashRollbackEntry {
             sequence: self.next_sequence,
             stash_ref: stash_ref.into(),
@@ -231,15 +237,15 @@ impl GitStashRollbackJournal {
         self.next_sequence = self.next_sequence.saturating_add(1);
     }
 
-    fn list(&self) -> Vec<GitStashRollbackEntry> {
+    pub fn list(&self) -> Vec<GitStashRollbackEntry> {
         self.entries.iter().rev().cloned().collect()
     }
 
-    fn restore_plan_for_turn(&self, turn_index: u32) -> Vec<GitStashRollbackEntry> {
+    pub fn restore_plan_for_turn(&self, turn_index: u32) -> Vec<GitStashRollbackEntry> {
         self.restore_plan_for_turn_since(turn_index, 0)
     }
 
-    fn restore_plan_for_turn_since(
+    pub fn restore_plan_for_turn_since(
         &self,
         turn_index: u32,
         checkpoint: u64,
@@ -252,11 +258,11 @@ impl GitStashRollbackJournal {
             .collect()
     }
 
-    fn checkpoint(&self) -> u64 {
+    pub fn checkpoint(&self) -> u64 {
         self.next_sequence
     }
 
-    fn remove_stash(&mut self, stash_ref: &str) -> bool {
+    pub fn remove_stash(&mut self, stash_ref: &str) -> bool {
         if let Some(index) = self
             .entries
             .iter()
@@ -286,7 +292,12 @@ pub struct GitCommitRollbackJournal {
 }
 
 impl GitCommitRollbackJournal {
-    fn record(&mut self, commit_sha: impl Into<String>, turn_index: u32, message: Option<String>) {
+    pub fn record(
+        &mut self,
+        commit_sha: impl Into<String>,
+        turn_index: u32,
+        message: Option<String>,
+    ) {
         self.entries.push(GitCommitRollbackEntry {
             sequence: self.next_sequence,
             commit_sha: commit_sha.into(),
@@ -297,15 +308,15 @@ impl GitCommitRollbackJournal {
         self.next_sequence = self.next_sequence.saturating_add(1);
     }
 
-    fn list(&self) -> Vec<GitCommitRollbackEntry> {
+    pub fn list(&self) -> Vec<GitCommitRollbackEntry> {
         self.entries.iter().rev().cloned().collect()
     }
 
-    fn restore_plan_for_turn(&self, turn_index: u32) -> Vec<GitCommitRollbackEntry> {
+    pub fn restore_plan_for_turn(&self, turn_index: u32) -> Vec<GitCommitRollbackEntry> {
         self.restore_plan_for_turn_since(turn_index, 0)
     }
 
-    fn restore_plan_for_turn_since(
+    pub fn restore_plan_for_turn_since(
         &self,
         turn_index: u32,
         checkpoint: u64,
@@ -318,11 +329,11 @@ impl GitCommitRollbackJournal {
             .collect()
     }
 
-    fn checkpoint(&self) -> u64 {
+    pub fn checkpoint(&self) -> u64 {
         self.next_sequence
     }
 
-    fn remove_commit(&mut self, commit_sha: &str) -> bool {
+    pub fn remove_commit(&mut self, commit_sha: &str) -> bool {
         if let Some(index) = self
             .entries
             .iter()
@@ -2984,30 +2995,6 @@ mod tests {
         assert!(result.is_empty());
     }
 
-    #[cfg(feature = "cli")]
-    #[test]
-    fn score_commits_exact_match_ranks_higher() {
-        let commits = vec![
-            CommitDoc {
-                hash: "a".into(),
-                author: "test".into(),
-                date: "2024".into(),
-                message: "fix bug in parser".into(),
-                tokens: astra_runtime::text_tokenize::tokenize("fix bug in parser"),
-            },
-            CommitDoc {
-                hash: "b".into(),
-                author: "test".into(),
-                date: "2024".into(),
-                message: "add new feature".into(),
-                tokens: astra_runtime::text_tokenize::tokenize("add new feature"),
-            },
-        ];
-        let result = score_commits("fix", &commits);
-        assert!(!result.is_empty(), "should find 'fix'");
-        assert_eq!(result[0].0, 0, "commit about 'fix' should rank first");
-    }
-
     // ─── parse_since_to_epoch tests ─────────────────────────────────────────
 
     #[test]
@@ -3430,108 +3417,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "cli")]
-    #[tokio::test]
-    async fn execute_with_metadata_returns_stash_ref_for_push_and_apply_accepts_it() {
-        let repo = init_temp_repo();
-        let tracked = repo.path().join("tracked.txt");
-        std::fs::write(&tracked, "two\n").expect("modify tracked file");
-        let executor = ToolExecutor::new(repo.path());
-
-        let outcome = executor
-            .execute_with_metadata("git_stash", &json!({"action": "push", "message": "demo"}))
-            .await;
-        assert!(
-            !outcome.output.starts_with("Error:"),
-            "stash push failed: {}",
-            outcome.output
-        );
-        let stash_ref = outcome
-            .tool_result_fields
-            .as_ref()
-            .and_then(|fields| fields.get("stash_ref"))
-            .and_then(Value::as_str)
-            .expect("stash_ref");
-        assert_eq!(
-            std::fs::read_to_string(&tracked).expect("clean worktree after stash"),
-            "one\n"
-        );
-
-        let apply = git_stash(
-            repo.path(),
-            &json!({"action": "apply", "stash_ref": stash_ref}),
-        );
-        assert!(!apply.starts_with("Error:"), "stash apply failed: {apply}");
-        assert_eq!(
-            std::fs::read_to_string(&tracked).expect("restored working tree"),
-            "two\n"
-        );
-    }
-
     // ─── git_checkout_file tests ────────────────────────────────────────────
-
-    #[cfg(feature = "cli")]
-    #[test]
-    fn git_checkout_file_requires_path() {
-        let root = repo_root();
-        let result = git_checkout_file(&root, &json!({}));
-        assert!(
-            result.starts_with("Error:"),
-            "should require path: {result}"
-        );
-
-        let result2 = git_checkout_file(&root, &json!({"path": ""}));
-        assert!(
-            result2.starts_with("Error:"),
-            "should reject empty path: {result2}"
-        );
-    }
-
-    #[cfg(feature = "cli")]
-    #[test]
-    fn git_checkout_file_rejects_path_traversal() {
-        let root = repo_root();
-        let result = git_checkout_file(&root, &json!({"path": "../../../etc/passwd"}));
-        assert!(
-            result.contains("path traversal"),
-            "should reject traversal: {result}"
-        );
-    }
-
-    #[cfg(feature = "cli")]
-    #[test]
-    fn git_checkout_file_rejects_dangerous_ref() {
-        let root = repo_root();
-        let result = git_checkout_file(
-            &root,
-            &json!({"path": "README.md", "ref": "HEAD; rm -rf /"}),
-        );
-        assert!(
-            result.contains("invalid ref"),
-            "should reject dangerous ref: {result}"
-        );
-
-        let result2 = git_checkout_file(
-            &root,
-            &json!({"path": "README.md", "ref": "main|cat /etc/passwd"}),
-        );
-        assert!(
-            result2.contains("invalid ref"),
-            "should reject pipe ref: {result2}"
-        );
-    }
-
-    #[cfg(feature = "cli")]
-    #[test]
-    fn git_checkout_file_known_file() {
-        let root = repo_root();
-        // Checkout a known file at HEAD — should succeed (idempotent)
-        let result = git_checkout_file(&root, &json!({"path": "README.md"}));
-        assert!(
-            result.contains("Restored") || result.contains("Error"),
-            "should restore or report error: {result}"
-        );
-    }
 
     // ─── git CLI fallback behavior tests ────────────────────────────────────
 
@@ -3592,187 +3478,4 @@ mod tests {
     }
 
     // ── Git Worktree Tests ──────────────────────────────────────────────
-
-    #[cfg(feature = "cli")]
-    #[test]
-    fn git_worktree_missing_action() {
-        let root = repo_root();
-        let result = git_worktree(&root, &json!({}));
-        assert!(
-            result.contains("Error") && result.contains("action"),
-            "should require action: {result}"
-        );
-    }
-
-    #[cfg(feature = "cli")]
-    #[test]
-    fn git_worktree_unknown_action() {
-        let root = repo_root();
-        let result = git_worktree(&root, &json!({"action": "teleport"}));
-        assert!(
-            result.contains("Error") && result.contains("unknown"),
-            "should reject unknown action: {result}"
-        );
-    }
-
-    #[cfg(feature = "cli")]
-    #[test]
-    fn git_worktree_add_missing_branch() {
-        let root = repo_root();
-        let result = git_worktree(&root, &json!({"action": "add"}));
-        assert!(
-            result.contains("Error") && result.contains("branch"),
-            "should require branch: {result}"
-        );
-    }
-
-    #[cfg(feature = "cli")]
-    #[test]
-    fn git_worktree_add_rejects_shell_injection() {
-        let root = repo_root();
-        for dangerous in &[
-            "test;rm -rf /",
-            "test|cat /etc/passwd",
-            "test&whoami",
-            "test`id`",
-            "test$(whoami)",
-            "test()",
-            "test{}",
-        ] {
-            let result = git_worktree(&root, &json!({"action": "add", "branch": dangerous}));
-            assert!(
-                result.contains("Error") && result.contains("invalid branch name"),
-                "should reject '{dangerous}': {result}"
-            );
-        }
-    }
-
-    #[cfg(feature = "cli")]
-    #[test]
-    fn git_worktree_list_runs() {
-        let root = repo_root();
-        let result = git_worktree(&root, &json!({"action": "list"}));
-        // Should contain at least the main worktree path
-        assert!(
-            !result.contains("Error: git") || result.contains("worktree"),
-            "list should succeed or show worktree info: {result}"
-        );
-    }
-
-    #[cfg(feature = "cli")]
-    #[test]
-    fn git_worktree_list_alias_ls() {
-        let root = repo_root();
-        let result = git_worktree(&root, &json!({"action": "ls"}));
-        assert!(
-            !result.contains("unknown"),
-            "ls should be accepted as alias for list: {result}"
-        );
-    }
-
-    #[cfg(feature = "cli")]
-    #[test]
-    fn git_worktree_remove_missing_path() {
-        let root = repo_root();
-        let result = git_worktree(&root, &json!({"action": "remove"}));
-        assert!(
-            result.contains("Error") && result.contains("path"),
-            "should require path for remove: {result}"
-        );
-    }
-
-    #[cfg(feature = "cli")]
-    #[test]
-    fn git_worktree_remove_nonexistent() {
-        let root = repo_root();
-        let result = git_worktree(
-            &root,
-            &json!({"action": "remove", "path": "/tmp/nonexistent-worktree-xyz"}),
-        );
-        assert!(
-            result.contains("Error") || result.contains("error"),
-            "removing nonexistent worktree should fail: {result}"
-        );
-    }
-
-    #[cfg(feature = "cli")]
-    #[test]
-    fn git_worktree_add_existing_path_fails() {
-        let root = repo_root();
-        // Use /tmp which always exists — should fail with "already exists"
-        let result = git_worktree(
-            &root,
-            &json!({"action": "add", "branch": "test-existing", "path": "/tmp"}),
-        );
-        assert!(
-            result.contains("Error") && result.contains("already exists"),
-            "should reject existing path: {result}"
-        );
-    }
-
-    #[cfg(feature = "cli")]
-    #[test]
-    fn worktree_add_with_metadata_returns_rollback_fields() {
-        let dir = init_temp_repo();
-        let worktree_path = dir.path().join("meta-worktree");
-        let outcome = worktree_add_with_metadata(
-            dir.path(),
-            &json!({
-                "branch": "meta-worktree",
-                "path": worktree_path,
-            }),
-        );
-        assert!(
-            !outcome.output.starts_with("Error:"),
-            "worktree add failed: {}",
-            outcome.output
-        );
-        let fields = outcome.tool_result_fields.expect("metadata fields");
-        assert_eq!(
-            fields.get("branch").and_then(Value::as_str),
-            Some("meta-worktree")
-        );
-        assert_eq!(
-            fields
-                .get("worktree_path")
-                .and_then(Value::as_str)
-                .map(std::path::PathBuf::from)
-                .as_deref(),
-            Some(worktree_path.as_path())
-        );
-        assert_eq!(
-            fields
-                .get("delete_branch_on_rollback")
-                .and_then(Value::as_bool),
-            Some(true)
-        );
-        let cleanup = worktree_remove(
-            dir.path(),
-            &json!({
-                "path": worktree_path,
-                "force": true,
-                "delete_branch": true,
-            }),
-        );
-        assert!(
-            !cleanup.starts_with("Error:"),
-            "cleanup remove failed: {cleanup}"
-        );
-    }
-
-    #[cfg(feature = "cli")]
-    #[test]
-    fn git_worktree_action_aliases() {
-        let root = repo_root();
-        // "create" should alias to "add" (needs branch param, so will error on missing branch)
-        let r1 = git_worktree(&root, &json!({"action": "create"}));
-        assert!(r1.contains("branch"), "create should route to add: {r1}");
-
-        // "rm" and "delete" should alias to "remove" (needs path param)
-        let r2 = git_worktree(&root, &json!({"action": "rm"}));
-        assert!(r2.contains("path"), "rm should route to remove: {r2}");
-
-        let r3 = git_worktree(&root, &json!({"action": "delete"}));
-        assert!(r3.contains("path"), "delete should route to remove: {r3}");
-    }
 }

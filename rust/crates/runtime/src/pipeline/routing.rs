@@ -358,6 +358,29 @@ fn extract_domain_hint(signals: &ConversationState, memory_hints: &[String]) -> 
         if text.contains("git") && !text.contains("github") {
             return Some(DomainHint::Git);
         }
+        if text.contains("memory") || text.contains("remember") || text.contains("preference") {
+            return Some(DomainHint::Memory);
+        }
+        if text.contains("database")
+            || text.contains("sql")
+            || text.contains("matrixone")
+            || text.contains("mysql")
+        {
+            return Some(DomainHint::Database);
+        }
+        if text.contains("code")
+            || text.contains("file")
+            || text.contains("rust")
+            || text.contains("typescript")
+            || text.contains("javascript")
+            || text.contains("python")
+            || text.contains("go")
+            || text.contains("java")
+            || text.contains("cpp")
+            || text.contains("docker")
+        {
+            return Some(DomainHint::Code);
+        }
     }
 
     None
@@ -727,6 +750,12 @@ mod tests {
     fn domain_github_from_memory() {
         let d = analyze_with_memory("check matrixorigin", &["matrixorigin = GitHub repository"]);
         assert_eq!(d.domain_hint, Some(DomainHint::GitHub));
+    }
+
+    #[test]
+    fn domain_code_from_memory() {
+        let d = analyze_with_memory("improve webhook capability", &["rust code workspace"]);
+        assert_eq!(d.domain_hint, Some(DomainHint::Code));
     }
 
     // ── Tool Filter Strategy ─────────────────────────────────────────────

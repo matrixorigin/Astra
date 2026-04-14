@@ -8,6 +8,7 @@ use super::agentic_adaptive_tuning::apply_adaptive_execution_profile;
 use super::agentic_headless_round::HeadlessStderrStyle;
 use super::agentic_loop_host::{
     AgenticLoopHost, AgenticLoopOutcome, AgenticLoopState, delegate_tool_schema,
+    try_write_heavy_checkpoint,
 };
 use super::stall::CLI_AGENTIC_TURN_BUDGET_STALL_ABORT_MSG;
 
@@ -20,6 +21,32 @@ pub(crate) struct TurnIterationPrep {
 pub(crate) enum PreparedTurnIteration {
     Ready(TurnIterationPrep),
     Finished(AgenticLoopOutcome),
+}
+
+fn should_complete_budget_exhaustion_gracefully(state: &AgenticLoopState) -> bool {
+    state.total_tool_calls > 0
+        || state.total_prompt > 0
+        || state.total_completion > 0
+        || state.stall.last_heavy_checkpoint.is_some()
+}
+
+fn budget_exhaustion_completion_text(state: &AgenticLoopState) -> String {
+    let checkpoint_note = if state.stall.last_heavy_checkpoint.is_some() {
+        " The latest checkpoint was saved, so you can continue in the next message."
+    } else {
+        " You can continue in the next message."
+    };
+    if state.total_tool_calls > 0 {
+        format!(
+            "[Turn budget exhausted after {} agentic turn(s). {} completed tool call(s) are preserved above.{}]\n",
+            state.max_turns, state.total_tool_calls, checkpoint_note
+        )
+    } else {
+        format!(
+            "[Turn budget exhausted after {} agentic turn(s). Partial progress is preserved.{}]\n",
+            state.max_turns, checkpoint_note
+        )
+    }
 }
 
 pub(crate) async fn run_loop_preamble<H: AgenticLoopHost>(
@@ -169,6 +196,21 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
     }
 
     if state.remaining_turns == 0 {
+        if should_complete_budget_exhaustion_gracefully(state) {
+            try_write_heavy_checkpoint(state);
+            if state.final_text.trim().is_empty() {
+                state.final_text = budget_exhaustion_completion_text(state);
+            }
+            if !quiet {
+                host.emit_headless_line(
+                    HeadlessStderrStyle::Yellow,
+                    "⚠ Turn budget exhausted — preserving progress and ending the turn.".into(),
+                );
+            }
+            return Ok(PreparedTurnIteration::Finished(
+                AgenticLoopOutcome::Completed,
+            ));
+        }
         return Err(format!(
             "{} (budget: {} turns)",
             CLI_AGENTIC_TURN_BUDGET_STALL_ABORT_MSG, state.max_turns

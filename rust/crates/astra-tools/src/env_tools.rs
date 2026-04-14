@@ -111,7 +111,7 @@ pub fn apply_overlay(cmd: &mut Command) {
 // ─── Env tool functions ──────────────────────────────────────────────────────
 
 /// Dispatch an env tool call to the appropriate sub-command.
-pub(crate) fn env_tool(args: &Value) -> String {
+pub fn env_tool(args: &Value) -> String {
     let operation = args
         .get("operation")
         .and_then(|v| v.as_str())
@@ -313,7 +313,7 @@ fn env_search(args: &Value) -> String {
 }
 
 /// Check if a variable name suggests it contains sensitive data.
-pub(crate) fn is_sensitive_var(name: &str) -> bool {
+pub fn is_sensitive_var(name: &str) -> bool {
     let upper = name.to_uppercase();
     // Core patterns
     upper.contains("KEY")
