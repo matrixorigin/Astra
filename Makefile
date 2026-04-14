@@ -177,20 +177,41 @@ dev-deps-status:
 dev-deps-logs:
 	@$(DEPS_COMPOSE) logs -f
 
+.PHONY: dev-deps-logs-once
+dev-deps-logs-once:
+	@$(DEPS_COMPOSE) logs --no-color
+
 .PHONY: dev-deps-wait
 dev-deps-wait:
-	@echo "Waiting for dependency services (max 20s)..."
-	@for i in 1 2 3 4 5 6 7 8 9 10; do \
-		if [ "$$(docker inspect --format='{{.State.Running}}' all-in-one-matrixone-1 2>/dev/null)" = "true" ]; then \
+	@echo "Waiting for MatrixOne..."
+	@for i in $$(seq 1 90); do \
+		if curl -sf "http://127.0.0.1:$${MATRIXONE_DEBUG_HTTP_PORT:-6060}/debug/vars" >/dev/null 2>&1; then \
+			echo "✅ MatrixOne is healthy"; \
+			break; \
+		fi; \
+		if [ "$$i" -eq 90 ]; then \
+			echo "❌ MatrixOne not ready after 180s"; \
+			echo "   Tip: Check with 'make dev-deps-status' or 'make dev-deps-logs-once'"; \
+			exit 1; \
+		fi; \
+		echo "  Waiting for MatrixOne... ($$i/90)"; \
+		sleep 2; \
+	done
+	@echo "Waiting for Memoria..."
+	@for i in $$(seq 1 60); do \
+		if curl -sf "http://127.0.0.1:$${MEMORIA_PORT:-8100}/health" >/dev/null 2>&1; then \
+			echo "✅ Memoria is healthy"; \
 			echo "✅ Dependency services ready"; \
 			exit 0; \
 		fi; \
-		echo "  Waiting... ($$i/10)"; \
+		if [ "$$i" -eq 60 ]; then \
+			echo "❌ Memoria not ready after 120s"; \
+			echo "   Tip: Check with 'make dev-deps-status' or 'make dev-deps-logs-once'"; \
+			exit 1; \
+		fi; \
+		echo "  Waiting for Memoria... ($$i/60)"; \
 		sleep 2; \
-	done; \
-	echo "❌ Dependency services not ready after 20s"; \
-	echo "   Tip: Check with 'make dev-deps-status'"; \
-	exit 1
+	done
 
 .PHONY: dev-db-connect
 dev-db-connect:

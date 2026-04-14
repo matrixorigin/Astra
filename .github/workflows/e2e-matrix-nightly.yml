@@ -13,33 +13,6 @@ on:
 jobs:
   system-matrix-e2e:
     runs-on: ubuntu-latest
-    services:
-      matrixone:
-        image: matrixorigin/matrixone:latest
-        ports:
-          - 6001:6001
-        options: >-
-          --health-cmd "curl -sf http://127.0.0.1:6060/debug/vars || exit 1"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 10
-          --health-start-period 30s
-
-      memoria:
-        image: matrixorigin/memoria:latest
-        ports:
-          - 8100:8100
-        env:
-          DATABASE_URL: mysql://root:111@matrixone:6001/memoria
-          MASTER_KEY: ci-test-master-key
-          EMBEDDING_PROVIDER: mock
-          EMBEDDING_DIM: "384"
-        options: >-
-          --health-cmd "curl -sf http://127.0.0.1:8100/health || exit 1"
-          --health-interval 15s
-          --health-timeout 5s
-          --health-retries 6
-          --health-start-period 15s
 
     env:
       MATRIXONE_HOST: localhost
@@ -55,13 +28,27 @@ jobs:
       CHAT_TURN_BRIDGE_SECRET: dev-bridge-secret-change-me
       MEMORIA_BASE_URL: http://localhost:8100
       MEMORIA_MASTER_KEY: ci-test-master-key
+      MEMORIA_EMBEDDING_PROVIDER: mock
+      MEMORIA_EMBEDDING_DIM: "384"
 
     steps:
       - uses: actions/checkout@v4
+      - name: Prepare dependency env
+        run: |
+          cp .env.example .env
+          {
+            echo "MEMORIA_MASTER_KEY=${MEMORIA_MASTER_KEY}"
+            echo "MEMORIA_EMBEDDING_PROVIDER=${MEMORIA_EMBEDDING_PROVIDER}"
+            echo "MEMORIA_EMBEDDING_DIM=${MEMORIA_EMBEDDING_DIM}"
+          } >> .env
+      - name: Start dependencies
+        run: make dev-deps-up
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
+      - name: Wait for dependencies
+        run: make dev-deps-wait
 
       - name: Run system Matrix HTTP E2E (ignored tests)
         env:
@@ -77,3 +64,11 @@ jobs:
             cargo test --manifest-path rust/Cargo.toml -p astra-runtime --test system_matrix_http_e2e \
               --features bridge-e2e-hooks -- --ignored --nocapture
           fi
+
+      - name: Dump dependency logs
+        if: failure()
+        run: make dev-deps-logs-once
+
+      - name: Stop dependencies
+        if: always()
+        run: make dev-deps-down

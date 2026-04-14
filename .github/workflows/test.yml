@@ -21,66 +21,32 @@ env:
   CHAT_TURN_BRIDGE_SECRET: dev-bridge-secret-change-me
   MEMORIA_BASE_URL: http://localhost:8100
   MEMORIA_MASTER_KEY: ci-test-master-key
+  MEMORIA_EMBEDDING_PROVIDER: mock
+  MEMORIA_EMBEDDING_DIM: "384"
 
 jobs:
   test:
     runs-on: ubuntu-latest
-    services:
-      matrixone:
-        image: matrixorigin/matrixone:latest
-        ports:
-          - 6001:6001
-        options: >-
-          --health-cmd "curl -sf http://127.0.0.1:6060/debug/vars || exit 1"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 10
-          --health-start-period 30s
-
-      memoria:
-        image: matrixorigin/memoria:latest
-        ports:
-          - 8100:8100
-        env:
-          DATABASE_URL: mysql://root:111@matrixone:6001/memoria
-          MASTER_KEY: ci-test-master-key
-          EMBEDDING_PROVIDER: mock
-          EMBEDDING_DIM: "384"
-        options: >-
-          --health-cmd "curl -sf http://127.0.0.1:8100/health || exit 1"
-          --health-interval 15s
-          --health-timeout 5s
-          --health-retries 6
-          --health-start-period 15s
 
     steps:
       - uses: actions/checkout@v4
+      - name: Prepare dependency env
+        run: |
+          cp .env.example .env
+          {
+            echo "MEMORIA_MASTER_KEY=${MEMORIA_MASTER_KEY}"
+            echo "MEMORIA_EMBEDDING_PROVIDER=${MEMORIA_EMBEDDING_PROVIDER}"
+            echo "MEMORIA_EMBEDDING_DIM=${MEMORIA_EMBEDDING_DIM}"
+          } >> .env
+      - name: Start dependencies
+        run: make dev-deps-up
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
 
       - name: Wait for dependencies
-        run: |
-          set -euo pipefail
-          echo "Waiting for MatrixOne..."
-          for i in $(seq 1 90); do
-            if curl -sf http://localhost:6060/debug/vars >/dev/null 2>&1; then
-              echo "MatrixOne is up"
-              break
-            fi
-            echo "  waiting ($i/90)..."
-            sleep 2
-          done
-          echo "Waiting for Memoria..."
-          for i in $(seq 1 60); do
-            if curl -sf http://localhost:8100/health >/dev/null 2>&1; then
-              echo "Memoria is up"
-              break
-            fi
-            echo "  waiting ($i/60)..."
-            sleep 2
-          done
+        run: make dev-deps-wait
 
       - name: Run full test suite (test-offline + test-online)
         env:
@@ -88,3 +54,11 @@ jobs:
           ASTRA_SYSTEM_MATRIX_E2E_TEST_THREADS: "1"
           ASTRA_MULTI_AGENT_IT: "1"
         run: make test
+
+      - name: Dump dependency logs
+        if: failure()
+        run: make dev-deps-logs-once
+
+      - name: Stop dependencies
+        if: always()
+        run: make dev-deps-down
