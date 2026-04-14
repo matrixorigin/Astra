@@ -80,10 +80,13 @@ impl EdgeConnectionPool {
         );
     }
 
-    /// Remove an edge connection.
+    /// Remove an edge connection. Cancels any pending tool requests.
     pub fn unregister(&self, user_id: &str, edge_agent_id: &str) {
         let key = pool_key(user_id, edge_agent_id);
-        self.connections.remove(&key);
+        if let Some((_, conn)) = self.connections.remove(&key) {
+            // Drop all pending oneshot senders so execute_tool callers get None
+            conn.pending_results.clear();
+        }
     }
 
     /// Check if a user has any connected edge agent.
