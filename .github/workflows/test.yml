@@ -33,7 +33,6 @@ jobs:
   test-online:
     name: Online Tests
     runs-on: ubuntu-latest
-    needs: test-offline
     env:
       MATRIXONE_HOST: localhost
       MATRIXONE_PORT: "6001"
