@@ -31,8 +31,7 @@ use crate::turn::file_edit_journal::FileEditJournal;
 pub struct ServerToolExecutor {
     /// Workspace root for this session.
     workspace_root: PathBuf,
-    /// User ID owning this session.
-    #[allow(dead_code)] // Phase 5: used for audit logging and multi-tenant isolation
+    /// User ID owning this session (used for Memoria isolation).
     user_id: String,
     /// Session ID for isolation.
     session_id: String,
@@ -156,7 +155,17 @@ impl ServerToolExecutor {
             "memory_retrieve" | "memory_store" | "memory_search" | "memory_purge"
             | "memory_correct" | "memory_profile" => {
                 let op = name.strip_prefix("memory_").unwrap_or(name);
-                self.memoria_client.call(op, args).await
+                // Force-inject user_id and session_id for per-user isolation,
+                // mirroring the server's /memory/* proxy in auth_handlers.rs.
+                let mut isolated_args = args.clone();
+                if let Some(obj) = isolated_args.as_object_mut() {
+                    obj.insert(
+                        "session_id".to_string(),
+                        Value::String(self.user_id.clone()),
+                    );
+                    obj.insert("user_id".to_string(), Value::String(self.user_id.clone()));
+                }
+                self.memoria_client.call(op, &isolated_args).await
             }
             // ── Web search (standalone function) ───────────────────────
             "web_search" => astra_tools::web_search::web_search(args),

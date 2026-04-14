@@ -271,6 +271,18 @@ impl MemoriaClient {
     }
 
     fn build_direct_request(base: &str, op: &str, args: &Value) -> (String, Value) {
+        // Helper: propagate session_id and user_id when present in args
+        // so Memoria can scope operations to the correct user.
+        let inject_identity = |pl: &mut Value| {
+            if let Some(obj) = pl.as_object_mut() {
+                if let Some(sid) = args.get("session_id").and_then(Value::as_str) {
+                    obj.insert("session_id".to_string(), json!(sid));
+                }
+                if let Some(uid) = args.get("user_id").and_then(Value::as_str) {
+                    obj.insert("user_id".to_string(), json!(uid));
+                }
+            }
+        };
         match op {
             "retrieve" => {
                 let query = args.get("query").and_then(Value::as_str).unwrap_or("");
@@ -279,6 +291,7 @@ impl MemoriaClient {
                 if let Some(mc) = args.get("min_confidence").and_then(Value::as_f64) {
                     pl["min_confidence"] = json!(mc);
                 }
+                inject_identity(&mut pl);
                 (format!("{base}/v1/memories/retrieve"), pl)
             }
             "store" => {
@@ -291,9 +304,7 @@ impl MemoriaClient {
                 if let Some(tier) = args.get("trust_tier").and_then(Value::as_str) {
                     payload["trust_tier"] = json!(tier);
                 }
-                if let Some(sid) = args.get("session_id").and_then(Value::as_str) {
-                    payload["session_id"] = json!(sid);
-                }
+                inject_identity(&mut payload);
                 (format!("{base}/v1/memories"), payload)
             }
             "search" => {
@@ -303,6 +314,7 @@ impl MemoriaClient {
                 if let Some(mc) = args.get("min_confidence").and_then(Value::as_f64) {
                     pl["min_confidence"] = json!(mc);
                 }
+                inject_identity(&mut pl);
                 (format!("{base}/v1/memories/search"), pl)
             }
             "purge" => {
@@ -311,10 +323,9 @@ impl MemoriaClient {
                     .get("reason")
                     .and_then(Value::as_str)
                     .unwrap_or("user request");
-                (
-                    format!("{base}/v1/memories/purge"),
-                    json!({"topic": topic, "reason": reason}),
-                )
+                let mut pl = json!({"topic": topic, "reason": reason});
+                inject_identity(&mut pl);
+                (format!("{base}/v1/memories/purge"), pl)
             }
             "correct" => {
                 let memory_id = args.get("memory_id").and_then(Value::as_str).unwrap_or("");
@@ -326,12 +337,16 @@ impl MemoriaClient {
                     .get("reason")
                     .and_then(Value::as_str)
                     .unwrap_or("correction");
-                (
-                    format!("{base}/v1/memories/correct"),
-                    json!({"memory_id": memory_id, "new_content": new_content, "reason": reason}),
-                )
+                let mut pl =
+                    json!({"memory_id": memory_id, "new_content": new_content, "reason": reason});
+                inject_identity(&mut pl);
+                (format!("{base}/v1/memories/correct"), pl)
             }
-            "profile" => (format!("{base}/v1/memories/profile"), json!({})),
+            "profile" => {
+                let mut pl = json!({});
+                inject_identity(&mut pl);
+                (format!("{base}/v1/memories/profile"), pl)
+            }
             _ => (
                 String::new(),
                 json!({"error": format!("Unknown memoria op: {op}")}),
@@ -379,4 +394,76 @@ pub async fn memoria_consolidate_fire_and_forget() {
         .json(&json!({"force": false}))
         .send()
         .await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn build_direct_request_propagates_session_and_user_id() {
+        let args = json!({
+            "query": "rust patterns",
+            "top_k": 3,
+            "session_id": "user-42",
+            "user_id": "user-42"
+        });
+
+        // retrieve
+        let (_, pl) = MemoriaClient::build_direct_request("http://mem", "retrieve", &args);
+        assert_eq!(pl["session_id"], "user-42");
+        assert_eq!(pl["user_id"], "user-42");
+        assert_eq!(pl["query"], "rust patterns");
+
+        // search
+        let (_, pl) = MemoriaClient::build_direct_request("http://mem", "search", &args);
+        assert_eq!(pl["session_id"], "user-42");
+        assert_eq!(pl["user_id"], "user-42");
+
+        // store
+        let store_args = json!({
+            "content": "hello",
+            "session_id": "user-42",
+            "user_id": "user-42"
+        });
+        let (_, pl) = MemoriaClient::build_direct_request("http://mem", "store", &store_args);
+        assert_eq!(pl["session_id"], "user-42");
+        assert_eq!(pl["user_id"], "user-42");
+
+        // purge
+        let purge_args = json!({
+            "topic": "old",
+            "session_id": "user-42",
+            "user_id": "user-42"
+        });
+        let (_, pl) = MemoriaClient::build_direct_request("http://mem", "purge", &purge_args);
+        assert_eq!(pl["session_id"], "user-42");
+        assert_eq!(pl["user_id"], "user-42");
+
+        // correct
+        let correct_args = json!({
+            "memory_id": "m1",
+            "new_content": "fixed",
+            "session_id": "user-42",
+            "user_id": "user-42"
+        });
+        let (_, pl) = MemoriaClient::build_direct_request("http://mem", "correct", &correct_args);
+        assert_eq!(pl["session_id"], "user-42");
+        assert_eq!(pl["user_id"], "user-42");
+
+        // profile
+        let profile_args = json!({"session_id": "user-42", "user_id": "user-42"});
+        let (_, pl) = MemoriaClient::build_direct_request("http://mem", "profile", &profile_args);
+        assert_eq!(pl["session_id"], "user-42");
+        assert_eq!(pl["user_id"], "user-42");
+    }
+
+    #[test]
+    fn build_direct_request_omits_identity_when_absent() {
+        let args = json!({"query": "test"});
+        let (_, pl) = MemoriaClient::build_direct_request("http://mem", "retrieve", &args);
+        assert!(pl.get("session_id").is_none());
+        assert!(pl.get("user_id").is_none());
+    }
 }
