@@ -1,0 +1,250 @@
+//! Integration tests for the session feedback loop (边做边学).
+//!
+//! Tests the full cycle:
+//! 1. User message with implicit feedback signal detected
+//! 2. Signal injected into prompt context
+//! 3. Denial patterns extracted and auto-rules generated
+//! 4. Signal bridged to learning pipeline
+
+use std::sync::{Arc, Mutex};
+
+use astra_runtime::pipeline::{
+    calibration::ProgressiveCalibrator,
+    learning::PipelineLearningWriter,
+    routing::{DomainHint, TaskType},
+};
+use astra_runtime::turn::approval_fingerprint::{
+    ApprovalFingerprint, DenialAction, DenialTracker,
+};
+use astra_runtime::turn::implicit_feedback::{
+    detect_implicit_feedback_signal, implicit_feedback_context_injection, implicit_feedback_rating,
+};
+use astra_runtime::orchestration::permission_sync::PermissionRule;
+
+// ─── Phase A + B: Detection → Injection ─────────────────────────────────────
+
+#[test]
+fn end_to_end_correction_detected_and_injected() {
+    // User says "不对" (wrong) after a previous assistant response
+    let user_input = "不对，应该用另一种方法";
+    let prev_assistant = "I suggest using the bash tool to list files.";
+
+    // Phase A/B: Detect implicit feedback
+    let signal = detect_implicit_feedback_signal(user_input, Some(prev_assistant));
+    assert_eq!(signal.signal_type, "correction");
+    assert!(signal.confidence >= 0.7);
+
+    // Generate context injection
+    let injection = implicit_feedback_context_injection(&signal);
+    assert!(injection.is_some());
+    let text = injection.unwrap();
+
+    // Verify injection contains key elements
+    assert!(text.contains("[Session Feedback]"));
+    assert!(text.contains("correction"));
+    assert!(text.contains("confidence"));
+}
+
+#[test]
+fn end_to_end_frustration_detected_and_injected() {
+    // Use patterns that are in our detection rules
+    let user_input = "terrible response, this is useless";
+    let prev_assistant = "Here is the result of your query.";
+
+    let signal = detect_implicit_feedback_signal(user_input, Some(prev_assistant));
+    assert_eq!(signal.signal_type, "frustration");
+
+    let injection = implicit_feedback_context_injection(&signal);
+    assert!(injection.is_some());
+    assert!(injection.unwrap().contains("dissatisfaction"));
+}
+
+#[test]
+fn end_to_end_positive_not_injected() {
+    let user_input = "太好了，这正是我需要的！";
+
+    let signal = detect_implicit_feedback_signal(user_input, None);
+    assert_eq!(signal.signal_type, "positive");
+
+    // Positive signals should NOT produce injection
+    let injection = implicit_feedback_context_injection(&signal);
+    assert!(injection.is_none());
+}
+
+// ─── Phase C: Denial Pattern → Auto-Rules ───────────────────────────────────
+
+#[test]
+fn end_to_end_repeated_denials_generate_auto_rule() {
+    let mut tracker = DenialTracker::default();
+
+    // User denies the same dangerous command twice
+    let fp1 = ApprovalFingerprint::shell("bash", "rm -rf /important", false);
+    let fp2 = ApprovalFingerprint::shell("bash", "rm -rf /data", false);
+
+    // First denial - no rule yet
+    tracker.record_with_reason(&fp1, false, Some("too dangerous"));
+    assert!(tracker.extract_auto_deny_rules().is_empty());
+
+    // Second denial with same prefix pattern - should generate rule
+    tracker.record_with_reason(&fp2, false, Some("still dangerous"));
+
+    let rules = tracker.extract_auto_deny_rules();
+    assert!(!rules.is_empty(), "should generate auto-deny rule after 2 denials");
+
+    // Verify the generated rule matches the pattern
+    let bash_rm_rule = rules
+        .iter()
+        .find(|r| r.tool == "bash" && r.pattern.as_ref().map(|p| p.contains("rm")).unwrap_or(false));
+    assert!(bash_rm_rule.is_some());
+}
+
+#[test]
+fn end_to_end_varied_denials_generate_bare_tool_rule() {
+    let mut tracker = DenialTracker::default();
+
+    // User denies 3 different bash commands
+    tracker.record_with_reason(
+        &ApprovalFingerprint::shell("bash", "curl evil.com", false),
+        false,
+        None,
+    );
+    tracker.record_with_reason(
+        &ApprovalFingerprint::shell("bash", "wget malware.io", false),
+        false,
+        None,
+    );
+    tracker.record_with_reason(
+        &ApprovalFingerprint::shell("bash", "nc -e /bin/sh", false),
+        false,
+        None,
+    );
+
+    let rules = tracker.extract_auto_deny_rules();
+
+    // Should generate bare "bash" rule after 3 varied denials
+    let bare_bash = rules.iter().find(|r| r.tool == "bash" && r.pattern.is_none());
+    assert!(bare_bash.is_some(), "should generate bare tool rule after 3 varied denials");
+}
+
+#[test]
+fn end_to_end_denial_action_escalates() {
+    let mut tracker = DenialTracker::default();
+    let fp = ApprovalFingerprint::shell("bash", "dangerous", false);
+
+    // First two denials - continue
+    assert_eq!(tracker.record(&fp, false), DenialAction::Continue);
+    assert_eq!(tracker.record(&fp, false), DenialAction::Continue);
+
+    // Third denial - skip tool (default limit is 3)
+    assert_eq!(tracker.record(&fp, false), DenialAction::SkipTool);
+}
+
+// ─── Phase D: Signal → Learning Pipeline ────────────────────────────────────
+
+#[test]
+fn end_to_end_correction_updates_calibrator() {
+    let cal = Arc::new(Mutex::new(ProgressiveCalibrator::new(0.15)));
+    let writer = PipelineLearningWriter::new().with_progressive_calibrator(cal.clone());
+
+    // User says "错了" (wrong)
+    let signal = detect_implicit_feedback_signal("错了，这不对", None);
+    assert_eq!(signal.signal_type, "correction");
+
+    // Bridge to learning pipeline
+    writer.record_implicit_feedback(&signal, "code", Some(DomainHint::Code), TaskType::Code);
+
+    // Verify calibrator recorded the correction
+    let c = cal.lock().unwrap();
+    let stats = c.intent_stats("code");
+    assert!(stats.is_some());
+    assert!(stats.unwrap().correction_rate() > 0.0);
+}
+
+#[test]
+fn end_to_end_positive_records_success() {
+    let cal = Arc::new(Mutex::new(ProgressiveCalibrator::new(0.15)));
+    let writer = PipelineLearningWriter::new().with_progressive_calibrator(cal.clone());
+
+    let signal = detect_implicit_feedback_signal("perfect, thank you!", None);
+    assert_eq!(signal.signal_type, "positive");
+
+    writer.record_implicit_feedback(&signal, "fetch", Some(DomainHint::GitHub), TaskType::Fetch);
+
+    let c = cal.lock().unwrap();
+    let stats = c.intent_stats("fetch");
+    assert!(stats.is_some());
+    // Positive = was_corrected=false, so correction_rate should be 0
+    assert_eq!(stats.unwrap().correction_rate(), 0.0);
+}
+
+#[test]
+fn end_to_end_rating_mapping() {
+    // Verify the feedback rating scale
+    assert_eq!(implicit_feedback_rating("correction"), 1);
+    assert_eq!(implicit_feedback_rating("frustration"), 1);
+    assert_eq!(implicit_feedback_rating("rephrasing"), 2);
+    assert_eq!(implicit_feedback_rating("clarification"), 3);
+    assert_eq!(implicit_feedback_rating("neutral"), 3);
+    assert_eq!(implicit_feedback_rating("positive"), 5);
+}
+
+// ─── Full Cycle Integration ─────────────────────────────────────────────────
+
+#[test]
+fn full_feedback_cycle_correction_to_learning() {
+    // Simulate a full feedback cycle:
+    // 1. User provides correction
+    // 2. Signal detected and injection generated
+    // 3. Learning pipeline updated
+
+    let cal = Arc::new(Mutex::new(ProgressiveCalibrator::new(0.15)));
+    let writer = PipelineLearningWriter::new().with_progressive_calibrator(cal.clone());
+
+    // Step 1: User message with correction
+    let user_input = "wrong, that's not what I asked for";
+    let prev_response = "Here is the result.";
+
+    // Step 2: Detect and generate injection
+    let signal = detect_implicit_feedback_signal(user_input, Some(prev_response));
+    let injection = implicit_feedback_context_injection(&signal);
+
+    assert!(injection.is_some(), "correction should generate injection");
+
+    // Step 3: Update learning pipeline
+    writer.record_implicit_feedback(&signal, "reasoning", None, TaskType::Reasoning);
+
+    // Verify the full cycle worked
+    let c = cal.lock().unwrap();
+    assert!(c.intent_stats("reasoning").is_some());
+    assert!(c.intent_stats("reasoning").unwrap().correction_rate() > 0.0);
+}
+
+#[test]
+fn full_denial_cycle_to_auto_rule() {
+    // Simulate denial cycle:
+    // 1. User denies tool calls
+    // 2. Auto-rules extracted
+    // 3. Rules can be applied to permission context
+
+    let mut tracker = DenialTracker::default();
+
+    // Simulate two denials of the same dangerous command pattern
+    // Both have "rm -rf" as the prefix (first 2 tokens)
+    let fp1 = ApprovalFingerprint::shell("bash", "rm -rf /important/data", false);
+    let fp2 = ApprovalFingerprint::shell("bash", "rm -rf /sensitive/files", false);
+
+    tracker.record_with_reason(&fp1, false, Some("dangerous deletion"));
+    tracker.record_with_reason(&fp2, false, Some("another dangerous deletion"));
+
+    // Extract rules
+    let rules = tracker.extract_auto_deny_rules();
+
+    // Verify rules are actionable - should have pattern for "rm -rf"
+    assert!(!rules.is_empty(), "should generate auto-deny rule after 2 similar denials");
+
+    // Rules should match the "rm -rf" prefix
+    let matches_rm = |rule: &PermissionRule| {
+        rule.tool == "bash" && rule.pattern.as_ref().map(|p| p.contains("rm")).unwrap_or(false)
+    };
+    assert!(rules.iter().any(matches_rm), "should generate rule for rm commands");
+}
