@@ -141,8 +141,44 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                     ),
                 ));
             }
-            // Non-rate-limit fatal errors do not record a structured interruption
-            // — they surface as `AgenticLoopOutcome::Error` directly.
+
+            // ── Context-window overflow: compact and retry ────────────
+            let is_context_overflow = e
+                .contains(crate::turn::llm_client::CONTEXT_WINDOW_ERROR_PREFIX)
+                || crate::turn::llm_client::is_context_window_error(&lower);
+            if is_context_overflow
+                && state.consecutive_context_window_errors
+                    <= super::compaction_replay::MAX_COMPACT_RETRIES
+            {
+                if let Some(result) = super::compaction_replay::try_compact_for_retry(
+                    &mut state.messages,
+                    state.last_measured_prompt_tokens,
+                    state.max_turn_input_tokens,
+                ) {
+                    let summary = super::compaction_replay::compaction_summary(&result);
+                    if !prep.quiet {
+                        host.emit_headless_line(
+                            HeadlessStderrStyle::Yellow,
+                            format!("♻ Context overflow — {}; retrying turn…", summary),
+                        );
+                    }
+                    try_write_heavy_checkpoint(state);
+                    return Ok(TurnExecutionControl::ContinueLoop);
+                }
+            }
+            // If we reach here with a context overflow that couldn't be
+            // compacted (or retries exhausted), record a structured
+            // interruption so the session can resume from checkpoint.
+            if is_context_overflow {
+                state.interruption = Some(InterruptionRecord::new(
+                    InterruptionKind::ContextOverflow,
+                    ResumeAction::CompactAndRetry,
+                    interruption_state_summary(
+                        state,
+                        Some(format!("Context overflow after compaction: {}", e)),
+                    ),
+                ));
+            }
 
             finalize_turn_trace(state);
             try_write_heavy_checkpoint(state);

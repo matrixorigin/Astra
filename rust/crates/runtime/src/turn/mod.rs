@@ -40,6 +40,7 @@ pub mod chat_turn_step_plan;
 pub mod cloud;
 pub mod cloud_approval_policy;
 pub mod cloud_tool_delivery;
+pub mod compaction_replay;
 pub mod complete;
 pub mod confidence_contract;
 pub mod context_assembly_trace;
