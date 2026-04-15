@@ -94,6 +94,7 @@ pub mod routing_metrics;
 pub mod safety_middleware;
 pub(crate) mod services;
 pub mod session_cache;
+pub mod session_replay_harness;
 pub mod skill_instructions_merge;
 pub mod skill_tool;
 pub mod snapshot;
