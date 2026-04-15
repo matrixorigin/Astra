@@ -1,6 +1,6 @@
 //! System HTTP end-to-end: real Axum app + MatrixOne + full `build_server_state` wiring.
 //!
-//! ## Tests in this binary (nine ignored tests)
+//! ## Tests in this binary (ten ignored tests)
 //! - **`product_matrix_api_journey_hits_multiple_tables`** — full product journey (sessions → agents →
 //!   events → jobs → `chat/turn` SSE + `agent_events` assertions → logout), including
 //!   `GET /platform/snapshot` after session activity.
@@ -13,9 +13,10 @@
 //! - **`e2e_matrix_session_cancel_delete`** — `POST .../cancel` + DB `cancelled`, then `DELETE` + 404.
 //! - **`e2e_matrix_chat_stream_session_info`** — `POST /chat/stream` buffered SSE; first `session_info`
 //!   event contains `run_id`.
-//! - **`e2e_matrix_auth_session_negative_paths`** — `GET /sessions` without auth (401), duplicate
-//!   `POST /auth/register` (400), bad `POST /auth/login` (401), then successful login (replaces stub
-//!   `auth_contract` / `session_contract` negative coverage).
+//! - **`e2e_matrix_auth_session_negative_paths`** — `GET /sessions` without auth (401), plus
+//!   mode-aware auth negatives: in `local_jwt` validates duplicate register/bad login; in
+//!   `trusted_moi` validates local auth endpoints are disabled (replaces stub `auth_contract` /
+//!   `session_contract` negative coverage).
 //! - **`e2e_matrix_memory_proxy_user_isolation`** — unauthenticated memory returns 401; spoofed
 //!   `user_id` / `session_id` in body are overwritten to JWT user on forward (replaces `memory_contract`
 //!   isolation tests).
@@ -23,6 +24,9 @@
 //!   `provider: mock` + `infra_llm_models` SQL checks (replaces `model_crud_contract`).
 //! - **`e2e_matrix_audit_cross_session_analytics_http`** — SQL-seeded `agent_events` / `ctx_decision_audits`,
 //!   then `GET /audit/stats`, `/audit/mutations`, `/audit/promotions` with JWT auth (cross-session audit).
+//! - **`e2e_matrix_trusted_moi_user_system_integration`** — run server in `trusted_moi` mode,
+//!   authenticate via external JWT claims, verify local auth endpoints are disabled, and assert
+//!   session/memory ownership maps to upstream user id.
 //!
 //! Session list/get/put, close/resume, activity, and DB checks for close/resume live only in the full
 //! journey (not duplicated in a separate test).
@@ -50,6 +54,7 @@ mod journey_audit_cross_session;
 mod journey_extended;
 mod journey_full;
 mod journey_tasks_runs;
+mod journey_trusted_moi;
 
 use harness::require_system_e2e_env;
 
@@ -58,8 +63,13 @@ use harness::require_system_e2e_env;
 async fn product_matrix_api_journey_hits_multiple_tables() {
     require_system_e2e_env();
     let mut b = harness::bootstrap().await;
-    journey_full::run_product_matrix_full_journey(&b.ctx, &mut b.auth_header, &mut b.refresh_token)
-        .await;
+    journey_full::run_product_matrix_full_journey(
+        &b.ctx,
+        &mut b.auth_header,
+        &mut b.refresh_token,
+        b.auth_mode,
+    )
+    .await;
     b.ctx.pool.close().await;
 }
 
@@ -117,4 +127,11 @@ async fn e2e_matrix_models_admin_crud() {
 async fn e2e_matrix_audit_cross_session_analytics_http() {
     require_system_e2e_env();
     journey_audit_cross_session::run_audit_cross_session_analytics_http().await;
+}
+
+#[tokio::test]
+#[ignore = "live MatrixOne + full secrets; ASTRA_SYSTEM_MATRIX_E2E=1 — see module doc"]
+async fn e2e_matrix_trusted_moi_user_system_integration() {
+    require_system_e2e_env();
+    journey_trusted_moi::run_trusted_moi_user_system_integration().await;
 }

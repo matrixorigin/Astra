@@ -6,7 +6,7 @@ use serde_json::json;
 use sqlx::Row;
 
 use super::harness::{
-    E2E_PASSWORD, bootstrap, collect_sse_body_text, delete_no_content, get_json,
+    E2E_PASSWORD, E2eAuthMode, bootstrap, collect_sse_body_text, delete_no_content, get_json,
     grant_astra_admin_role, post_empty, post_json, put_json,
 };
 use axum::{body::Body, http::Request};
@@ -129,57 +129,87 @@ pub async fn run_auth_and_session_negative_paths() {
         "GET /sessions without auth: {j_sess}"
     );
 
-    let dup_email = format!("dup_{}@e2e.test", ctx.suffix);
-    let (st_dup, j_dup) = post_json(
-        app,
-        "/auth/register",
-        None,
-        json!({
-            "username": ctx.username,
-            "email": dup_email,
-            "password": "DifferentPass-1",
-            "display_name": "duplicate probe"
-        }),
-    )
-    .await;
-    assert_eq!(
-        st_dup,
-        StatusCode::BAD_REQUEST,
-        "duplicate username register: {j_dup}"
-    );
-    assert_eq!(
-        j_dup["detail"].as_str(),
-        Some("Username already exists"),
-        "duplicate username detail: {j_dup}"
-    );
+    match b.auth_mode {
+        E2eAuthMode::LocalJwt => {
+            let dup_email = format!("dup_{}@e2e.test", ctx.suffix);
+            let (st_dup, j_dup) = post_json(
+                app,
+                "/auth/register",
+                None,
+                json!({
+                    "username": ctx.username,
+                    "email": dup_email,
+                    "password": "DifferentPass-1",
+                    "display_name": "duplicate probe"
+                }),
+            )
+            .await;
+            assert_eq!(
+                st_dup,
+                StatusCode::BAD_REQUEST,
+                "duplicate username register: {j_dup}"
+            );
+            assert_eq!(
+                j_dup["detail"].as_str(),
+                Some("Username already exists"),
+                "duplicate username detail: {j_dup}"
+            );
 
-    let (st_bad_login, j_bad) = post_json(
-        app,
-        "/auth/login",
-        None,
-        json!({ "username": ctx.username, "password": "wrong-password-not-real" }),
-    )
-    .await;
-    assert_eq!(
-        st_bad_login,
-        StatusCode::UNAUTHORIZED,
-        "bad password login: {j_bad}"
-    );
-    assert_eq!(
-        j_bad["detail"].as_str(),
-        Some("Invalid username or password"),
-        "bad login detail: {j_bad}"
-    );
+            let (st_bad_login, j_bad) = post_json(
+                app,
+                "/auth/login",
+                None,
+                json!({ "username": ctx.username, "password": "wrong-password-not-real" }),
+            )
+            .await;
+            assert_eq!(
+                st_bad_login,
+                StatusCode::UNAUTHORIZED,
+                "bad password login: {j_bad}"
+            );
+            assert_eq!(
+                j_bad["detail"].as_str(),
+                Some("Invalid username or password"),
+                "bad login detail: {j_bad}"
+            );
 
-    // Sanity: bearer still works after negative calls
-    let (st_ok, j_ok) = post_json(
-        app,
-        "/auth/login",
-        None,
-        json!({ "username": ctx.username, "password": E2E_PASSWORD }),
-    )
-    .await;
-    assert_eq!(st_ok, StatusCode::OK, "login still ok: {j_ok}");
+            // Sanity: login still works after negative calls.
+            let (st_ok, j_ok) = post_json(
+                app,
+                "/auth/login",
+                None,
+                json!({ "username": ctx.username, "password": E2E_PASSWORD }),
+            )
+            .await;
+            assert_eq!(st_ok, StatusCode::OK, "login still ok: {j_ok}");
+        }
+        E2eAuthMode::TrustedMoi => {
+            for (path, payload) in [
+                (
+                    "/auth/register",
+                    json!({
+                        "username": "should-not-work",
+                        "email": "should-not-work@e2e.test",
+                        "password": "ignored"
+                    }),
+                ),
+                ("/auth/login", json!({ "username": "x", "password": "y" })),
+                ("/auth/refresh", json!({ "refresh_token": "not-used" })),
+            ] {
+                let (status, body) = post_json(app, path, None, payload).await;
+                assert_eq!(
+                    status,
+                    StatusCode::FORBIDDEN,
+                    "trusted_moi local auth endpoint should be disabled: {path} {body}"
+                );
+                assert_eq!(
+                    body["detail"].as_str(),
+                    Some("Local auth endpoints are disabled in trusted_moi mode"),
+                    "trusted_moi local auth detail: {path} {body}"
+                );
+            }
+        }
+    }
 
     ctx.pool.close().await;
 }
@@ -232,12 +262,32 @@ pub async fn run_chat_stream_session_info_smoke() {
 pub async fn run_models_admin_crud_with_db() {
     let b = bootstrap().await;
     let ctx = &b.ctx;
-    grant_astra_admin_role(&ctx.pool, &ctx.user_id).await;
-
     let app = &ctx.app;
     let auth = b.auth_header.as_str();
     let pool = &ctx.pool;
     let model_name = format!("e2e_mtx_mdl_{}", ctx.suffix);
+
+    if b.auth_mode == E2eAuthMode::TrustedMoi {
+        let (st_forbidden, body) = post_json(
+            app,
+            "/models",
+            Some(auth),
+            json!({
+                "name": model_name,
+                "provider": "mock",
+                "api_key": "e2e-key-not-used"
+            }),
+        )
+        .await;
+        assert!(
+            st_forbidden == StatusCode::UNAUTHORIZED || st_forbidden == StatusCode::FORBIDDEN,
+            "trusted_moi admin model CRUD should be blocked by current admin auth path: {body}"
+        );
+        ctx.pool.close().await;
+        return;
+    }
+
+    grant_astra_admin_role(&ctx.pool, &ctx.user_id).await;
 
     let (st_c, j_c) = post_json(
         app,

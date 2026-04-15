@@ -46,6 +46,8 @@ jobs:
           shared-key: ci-offline
           save-if: false
       - run: cargo test --manifest-path rust/Cargo.toml -p astra-runtime
+      - name: Run trusted_moi auth integration tests
+        run: cargo test --manifest-path rust/Cargo.toml -p astra-runtime --test trusted_moi_auth_integration -- --nocapture
       - name: Run bridge-e2e-hooks tests
         run: cargo test --manifest-path rust/Cargo.toml -p astra-runtime --features bridge-e2e-hooks
 
