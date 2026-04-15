@@ -7,9 +7,9 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::RwLock;
 
-use crate::skills::loader;
-use crate::skills::manifest::{LoadedSkill, SkillManifest, SkillSourceKind};
-use crate::skills::traits::{SkillError, SkillProvider};
+use crate::loader;
+use crate::manifest::{LoadedSkill, SkillManifest, SkillSourceKind};
+use crate::traits::{SkillError, SkillProvider};
 
 /// A skill discovered from an MCP server.
 #[derive(Clone, Debug)]
@@ -242,9 +242,8 @@ Server B instructions.
         provider.register_mcp_skill("server-b", skill_b).unwrap();
 
         // Both are registered (discover deduplicates by name, but both exist internally)
-        let cache = provider.cache.read().unwrap();
-        assert_eq!(cache.len(), 2);
-        drop(cache);
+        let cache_len = { provider.cache.read().unwrap().len() };
+        assert_eq!(cache_len, 2);
 
         // discover returns deduplicated manifests (one per unique name)
         // Deterministic: alphabetically-first server ("server-a") wins

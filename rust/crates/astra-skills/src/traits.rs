@@ -41,6 +41,9 @@ pub struct SkillExecutionContext {
 }
 
 /// Result of a skill execution.
+///
+/// Note: `verification_results` is typed as `Vec<serde_json::Value>` in this crate.
+/// When used with astra_services, convert to/from `VerificationResult`.
 #[derive(Clone, Debug)]
 pub struct SkillExecutionResult {
     /// The text output produced by the skill.
@@ -53,8 +56,8 @@ pub struct SkillExecutionResult {
     pub duration_ms: u64,
     /// Whether the skill completed successfully.
     pub success: bool,
-    /// Per-criterion verification results (empty if no criteria declared).
-    pub verification_results: Vec<astra_services::VerificationResult>,
+    /// Per-criterion verification results as JSON (empty if no criteria declared).
+    pub verification_results: Vec<serde_json::Value>,
     /// Structured error category (if failed).
     pub error_category: Option<super::manifest::SkillErrorKind>,
 }
@@ -76,9 +79,6 @@ pub trait SkillExecutor: Send + Sync {
 // ── SkillResolver (backward-compatible) ──────────────────────────────────────
 
 /// Lightweight description of a skill for tool schema generation.
-///
-/// Kept in sync with [`super::super::turn::skill_tool::SkillToolInfo`] for
-/// backward compatibility.
 #[derive(Clone, Debug)]
 pub struct SkillToolInfo {
     pub name: String,
@@ -92,9 +92,6 @@ pub struct SkillToolInfo {
 }
 
 /// A fully resolved skill ready for execution.
-///
-/// Kept in sync with [`super::super::turn::skill_tool::ResolvedSkill`] for
-/// backward compatibility.
 #[derive(Clone, Debug)]
 pub struct ResolvedSkill {
     pub name: String,
@@ -106,7 +103,8 @@ pub struct ResolvedSkill {
     pub hooks: super::hooks::SkillHooks,
     pub skill_dir: Option<String>,
     pub source: super::manifest::SkillSourceKind,
-    pub success_criteria: Vec<astra_services::VerificationCriterion>,
+    /// Success criteria as JSON (typed as VerificationCriterion in astra_services).
+    pub success_criteria: Vec<serde_json::Value>,
     pub composition: Option<super::manifest::SkillComposition>,
     pub input_schema: Option<serde_json::Value>,
     pub aliases: Vec<String>,
@@ -116,10 +114,6 @@ pub struct ResolvedSkill {
 }
 
 /// Resolves skill names to instructions.
-///
-/// This trait exists in both `turn::skill_tool` (original) and here (new framework).
-/// The [`UnifiedSkillResolver`](super::registry::UnifiedSkillResolver) adapter
-/// bridges the two.
 pub trait SkillResolver: Send + Sync {
     /// Resolve a skill by name, loading instructions if needed.
     fn resolve(&self, name: &str) -> Result<ResolvedSkill, SkillError>;

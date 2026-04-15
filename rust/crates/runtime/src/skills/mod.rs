@@ -26,22 +26,23 @@
 //! The existing `turn::skill_tool::SkillResolver` trait is bridged via
 //! [`registry::LegacySkillResolverAdapter`].
 
-pub mod activation;
-pub mod arguments;
-pub mod composition;
+// Re-export core skill types from astra-skills crate.
+// These are the standalone, service-independent types.
+pub use astra_skills::{
+    activation, arguments, composition, hooks, loader, manifest, pack, quality, traits, version,
+};
+
+// Re-export providers - note: BundledSkillProvider comes from both places,
+// but we populate it with dynamic_skills here in runtime.
+pub use astra_skills::providers::{bundled, local, mcp};
+
+// Runtime-specific modules that depend on astra-services or other runtime types.
 pub mod executor;
 pub mod handlers;
-pub mod hooks;
 pub mod improvement;
-pub mod loader;
-pub mod manifest;
-pub mod pack;
 pub mod providers;
-pub mod quality;
 pub mod registry;
-pub mod traits;
 pub mod verify;
-pub mod version;
 pub mod watcher;
 
 // Re-export HTTP handlers at the module root for backward compatibility
@@ -49,17 +50,17 @@ pub mod watcher;
 pub use handlers::*;
 
 // Re-export key framework types for convenience.
-pub use composition::{CompositionContext, CompositionError};
+pub use astra_skills::composition::{CompositionContext, CompositionError};
+pub use astra_skills::manifest::{ExecutionContext, LoadedSkill, SkillManifest, SkillSourceKind};
+pub use astra_skills::providers::{BundledSkillProvider, LocalSkillProvider, McpSkillProvider};
+pub use astra_skills::quality::{SkillOutcome, SkillQualityEntry, SkillQualityTracker};
+pub use astra_skills::traits::{SkillError, SkillExecutor, SkillProvider, SkillResolver};
+pub use astra_skills::version::{Dependency, DependencyResolver, Version, VersionConstraint};
+
 pub use improvement::{ImprovementProposal, ImprovementTracker, SkillImprovement};
-pub use manifest::{ExecutionContext, LoadedSkill, SkillManifest, SkillSourceKind};
-pub use providers::{
-    BundledSkillProvider, DatabaseSkillProvider, LocalSkillProvider, McpSkillProvider,
-};
-pub use quality::{SkillOutcome, SkillQualityEntry, SkillQualityTracker};
+pub use providers::DatabaseSkillProvider;
 pub use registry::{SharedSkillRegistry, UnifiedSkillRegistry, UnifiedSkillResolver};
-pub use traits::{SkillError, SkillExecutor, SkillProvider, SkillResolver};
 pub use verify::SkillVerifier;
-pub use version::{Dependency, DependencyResolver, Version, VersionConstraint};
 
 /// Returns a shared reference to a static empty `UnifiedSkillRegistry`.
 /// Useful in tests and server contexts where no local skill providers apply.

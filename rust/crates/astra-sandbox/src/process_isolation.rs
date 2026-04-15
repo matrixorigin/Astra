@@ -100,10 +100,10 @@ impl IsolatedOutput {
             out.push_str("stderr:\n");
             out.push_str(&self.stderr);
         }
-        if let Some(code) = self.exit_code {
-            if code != 0 {
-                out.push_str(&format!("\n(exit code: {code})"));
-            }
+        if let Some(code) = self.exit_code
+            && code != 0
+        {
+            out.push_str(&format!("\n(exit code: {code})"));
         }
         if self.timed_out {
             out.push_str("\n(timed out)");

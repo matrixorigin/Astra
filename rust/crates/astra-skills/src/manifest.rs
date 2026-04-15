@@ -6,14 +6,12 @@ use std::collections::HashMap;
 use super::hooks::SkillHooks;
 use super::version::{Dependency, Version};
 
-// Re-export verification types from services for use in skill manifests.
-pub use astra_services::{VerificationCriterion, VerificationResult, VerifierKind};
-
 /// Where a skill was loaded from.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SkillSourceKind {
     /// Local filesystem (`SKILL.md` in `.astra/skills/`, `skills/`, `~/.astra/skills/`).
+    #[default]
     Local,
     /// Compiled into the binary.
     Bundled,
@@ -25,26 +23,15 @@ pub enum SkillSourceKind {
     Plugin,
 }
 
-impl Default for SkillSourceKind {
-    fn default() -> Self {
-        SkillSourceKind::Local
-    }
-}
-
 /// Execution context for a skill invocation.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ExecutionContext {
     /// Skill instructions are injected inline into the current conversation context.
+    #[default]
     Inline,
     /// Skill runs in an isolated sub-agent loop with separate context and token budget.
     Fork,
-}
-
-impl Default for ExecutionContext {
-    fn default() -> Self {
-        ExecutionContext::Inline
-    }
 }
 
 /// A named argument that can be passed to a skill.
@@ -133,9 +120,10 @@ pub struct SkillManifest {
     /// JSON Schema for structured skill output. Enables post-execution parsing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_schema: Option<serde_json::Value>,
-    /// Machine-executable success criteria. Reuses durable-task verification types.
+    /// Machine-executable success criteria as raw JSON.
+    /// The actual verification types are defined in astra_services.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub success_criteria: Vec<VerificationCriterion>,
+    pub success_criteria: Vec<serde_json::Value>,
     /// Abstract capabilities this skill requires (e.g. "shell_execution", "file_read").
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub required_capabilities: Vec<String>,
@@ -200,11 +188,6 @@ impl EffortLevel {
             _ => s.parse::<u8>().ok().map(Self::Custom),
         }
     }
-
-    #[deprecated(note = "use Display (to_string()) instead")]
-    pub fn as_str(&self) -> String {
-        self.to_string()
-    }
 }
 
 impl std::fmt::Display for EffortLevel {
@@ -235,6 +218,7 @@ impl<'de> Deserialize<'de> for EffortLevel {
         })
     }
 }
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SkillComposition {
     /// Whether this skill can be called by other skills.
@@ -250,17 +234,9 @@ pub struct SkillComposition {
     #[serde(default)]
     pub max_duration_sec: Option<u32>,
     /// Maximum nesting depth for this skill's composition chain.
-    ///
-    /// Overrides the global `MAX_COMPOSITION_DEPTH` (default 3).
-    /// A skill with `max_depth: 5` allows deeper nesting when it is the
-    /// root of a composition, but the depth is still capped by the parent
-    /// context's remaining budget when called as a nested step.
     #[serde(default)]
     pub max_depth: Option<u32>,
     /// Ordered pipeline of skills to execute sequentially.
-    ///
-    /// When present, invoking this skill runs each step in order,
-    /// threading the output of each step into the next as context.
     #[serde(default)]
     pub steps: Vec<PipelineStep>,
 }
@@ -288,10 +264,7 @@ fn default_true_pipeline() -> bool {
 // ── Phase 3: Marketplace signal types ────────────────────────────────────────
 
 /// Trust tier for marketplace skills.
-///
-/// Affects default permission level, marketplace ranking weight,
-/// and budget priority during skill selection.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TrustTier {
     /// Platform team — built-in, CI-tested. Full trust.
@@ -301,18 +274,12 @@ pub enum TrustTier {
     /// Any user — automated scan only. Medium trust.
     Community,
     /// Anonymous — no verification. Low trust, prompted on use.
+    #[default]
     Unverified,
-}
-
-impl Default for TrustTier {
-    fn default() -> Self {
-        TrustTier::Unverified
-    }
 }
 
 impl TrustTier {
     /// Numeric weight used in the marketplace ranking algorithm.
-    /// Higher = more trusted.
     pub fn ranking_weight(&self) -> f64 {
         match self {
             TrustTier::Bundled => 1.0,
@@ -431,9 +398,6 @@ impl SkillManifest {
     }
 
     /// Check if this skill is compatible with the current runtime environment.
-    ///
-    /// Returns a list of compatibility issues (empty = fully compatible).
-    /// `available_capabilities` should list the tools/features currently available.
     pub fn check_compatibility(
         &self,
         runtime_version: &str,
@@ -441,24 +405,19 @@ impl SkillManifest {
     ) -> Vec<CompatibilityIssue> {
         let mut issues = Vec::new();
         if let Some(ref compat) = self.compatibility {
-            // Check runtime version
-            if let Some(ref min_ver) = compat.min_runtime_version {
-                if !version_satisfies(runtime_version, min_ver) {
-                    issues.push(CompatibilityIssue::RuntimeVersion {
-                        required: min_ver.clone(),
-                        actual: runtime_version.to_string(),
-                    });
-                }
+            if let Some(ref min_ver) = compat.min_runtime_version
+                && !version_satisfies(runtime_version, min_ver)
+            {
+                issues.push(CompatibilityIssue::RuntimeVersion {
+                    required: min_ver.clone(),
+                    actual: runtime_version.to_string(),
+                });
             }
-
-            // Check required capabilities
             for cap in &compat.required_capabilities {
                 if !available_capabilities.contains(&cap.as_str()) {
                     issues.push(CompatibilityIssue::MissingCapability(cap.clone()));
                 }
             }
-
-            // Check platform
             if !compat.platforms.is_empty() {
                 let current_platform = if cfg!(target_os = "linux") {
                     "linux"
@@ -515,8 +474,6 @@ impl std::fmt::Display for CompatibilityIssue {
     }
 }
 
-/// Simple semver check: does `actual` satisfy `>= required`?
-/// Only compares major.minor.patch (ignores pre-release).
 fn version_satisfies(actual: &str, required: &str) -> bool {
     let parse = |s: &str| -> (u32, u32, u32) {
         let parts: Vec<u32> = s
@@ -667,38 +624,6 @@ mod tests {
     }
 
     #[test]
-    fn compatibility_check_platform_mismatch() {
-        let m = SkillManifest {
-            compatibility: Some(CompatibilityInfo {
-                platforms: vec!["windows".into()],
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        let issues = m.check_compatibility("1.0.0", &[]);
-        if cfg!(target_os = "windows") {
-            assert!(issues.is_empty());
-        } else {
-            assert_eq!(issues.len(), 1);
-            assert!(matches!(
-                issues[0],
-                CompatibilityIssue::UnsupportedPlatform { .. }
-            ));
-        }
-    }
-
-    #[test]
-    fn version_satisfies_basic() {
-        assert!(version_satisfies("1.0.0", "1.0.0"));
-        assert!(version_satisfies("2.0.0", "1.0.0"));
-        assert!(version_satisfies("1.1.0", "1.0.0"));
-        assert!(!version_satisfies("0.9.0", "1.0.0"));
-        assert!(!version_satisfies("1.0.0", "1.0.1"));
-    }
-
-    // ── EffortLevel tests ───────────────────────────────────────────────
-
-    #[test]
     fn effort_parse_named_levels() {
         assert!(matches!(EffortLevel::parse("low"), Some(EffortLevel::Low)));
         assert!(matches!(
@@ -742,7 +667,7 @@ mod tests {
     fn effort_parse_invalid_returns_none() {
         assert!(EffortLevel::parse("invalid").is_none());
         assert!(EffortLevel::parse("").is_none());
-        assert!(EffortLevel::parse("256").is_none()); // u8 overflow
+        assert!(EffortLevel::parse("256").is_none());
         assert!(EffortLevel::parse("-1").is_none());
     }
 

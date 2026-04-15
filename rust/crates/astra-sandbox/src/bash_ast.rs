@@ -262,7 +262,7 @@ fn command_name(node: Node<'_>, ctx: &RiskCtx<'_>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tool_sandbox::CommandRisk;
+    use crate::CommandRisk;
 
     #[test]
     fn parse_bash_smoke() {

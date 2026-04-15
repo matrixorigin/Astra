@@ -1475,7 +1475,12 @@ fn execute_skill<'a>(
                                     let verifier =
                                         crate::skills::verify::SkillVerifier::new(work_dir);
                                     let mut manifest = SkillManifest::default();
-                                    manifest.success_criteria = skill.success_criteria.clone();
+                                    // Convert VerificationCriterion to serde_json::Value
+                                    manifest.success_criteria = skill
+                                        .success_criteria
+                                        .iter()
+                                        .filter_map(|c| serde_json::to_value(c).ok())
+                                        .collect();
                                     let (all_passed, results) = verifier.verify(&manifest).await;
 
                                     let mut output = result.output;
