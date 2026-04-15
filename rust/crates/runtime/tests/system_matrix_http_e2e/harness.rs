@@ -141,6 +141,9 @@ async fn build_state_with_mode(
         restore_env_var_for_e2e("TRUSTED_MOI_JWT_ISSUER", None);
         restore_env_var_for_e2e("TRUSTED_MOI_JWT_AUDIENCE", None);
         set_env_var_for_e2e("TRUSTED_MOI_JWT_LEEWAY_SECS", "30");
+    } else {
+        // Force local mode for this bootstrap path so service auth mode is deterministic.
+        set_env_var_for_e2e("ASTRA_AUTH_MODE", "local_jwt");
     }
 
     let settings = AppSettings::from_env().expect("AppSettings::from_env (see astra-server env)");
@@ -148,14 +151,12 @@ async fn build_state_with_mode(
     let url = settings.matrixone.database_url();
     let state = build_server_state(settings).await;
 
-    if trusted_moi_mode {
-        restore_env_var_for_e2e("ASTRA_AUTH_MODE", prev_auth_mode);
-        restore_env_var_for_e2e("TRUSTED_MOI_JWT_SECRET_KEY", prev_trusted_secret);
-        restore_env_var_for_e2e("TRUSTED_MOI_JWT_ALGORITHM", prev_trusted_algorithm);
-        restore_env_var_for_e2e("TRUSTED_MOI_JWT_ISSUER", prev_trusted_issuer);
-        restore_env_var_for_e2e("TRUSTED_MOI_JWT_AUDIENCE", prev_trusted_audience);
-        restore_env_var_for_e2e("TRUSTED_MOI_JWT_LEEWAY_SECS", prev_trusted_leeway);
-    }
+    restore_env_var_for_e2e("ASTRA_AUTH_MODE", prev_auth_mode);
+    restore_env_var_for_e2e("TRUSTED_MOI_JWT_SECRET_KEY", prev_trusted_secret);
+    restore_env_var_for_e2e("TRUSTED_MOI_JWT_ALGORITHM", prev_trusted_algorithm);
+    restore_env_var_for_e2e("TRUSTED_MOI_JWT_ISSUER", prev_trusted_issuer);
+    restore_env_var_for_e2e("TRUSTED_MOI_JWT_AUDIENCE", prev_trusted_audience);
+    restore_env_var_for_e2e("TRUSTED_MOI_JWT_LEEWAY_SECS", prev_trusted_leeway);
 
     (
         state
@@ -527,6 +528,7 @@ pub enum E2eAuthMode {
 }
 
 pub fn current_auth_mode() -> E2eAuthMode {
+    dotenvy::dotenv().ok();
     let mode = std::env::var("ASTRA_AUTH_MODE")
         .unwrap_or_else(|_| "local_jwt".to_string())
         .trim()
@@ -755,12 +757,28 @@ pub async fn bootstrap_trusted_moi() -> TrustedMoiBootstrapResult {
         .connect(&url)
         .await
         .expect("connect MatrixOne for assertions");
+    let matrixone_settings = AppSettings::from_env()
+        .expect("AppSettings::from_env (see astra-server env)")
+        .matrixone;
+    let evaluation_pool = SharedPool::new(&matrixone_settings)
+        .await
+        .expect("connect MatrixOne shared pool for evaluation");
+    let memoria_health_base_url = start_mock_memoria_health().await;
+    let state = state.with_evaluation_service(Arc::new(
+        DatabaseEvaluationService::new(matrixone_settings)
+            .with_pool(evaluation_pool)
+            .with_memoria_config(
+                memoria_health_base_url,
+                Some("system-e2e-mock-master-key".to_string()),
+            ),
+    ));
     let app = build_app(state);
 
     let suffix = Uuid::new_v4().simple().to_string();
     let username = format!("moi_matrix_{suffix}");
     let email = format!("moi_matrix_{suffix}@e2e.test");
-    let user_id = format!("moi-user-{suffix}");
+    // Keep external user id within 36 chars so it can fit service tables that use VARCHAR(36).
+    let user_id = format!("moi_{}", &suffix[..28]);
     let edge_agent_id = format!("edge-{suffix}");
 
     let token = build_hs256_jwt(

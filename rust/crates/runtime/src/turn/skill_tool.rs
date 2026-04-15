@@ -166,6 +166,10 @@ pub struct ResolvedSkill {
     pub composition: Option<crate::skills::manifest::SkillComposition>,
     /// Input schema for argument validation (JSON Schema subset).
     pub input_schema: Option<Value>,
+    /// Output schema for execution-result validation (JSON Schema subset).
+    pub output_schema: Option<Value>,
+    /// Remote execution endpoint. When set, runtime dispatches over HTTP.
+    pub remote_url: Option<String>,
     /// Alternative names for this skill.
     pub aliases: Vec<String>,
     /// Effort level hint for reasoning depth.
@@ -1288,6 +1292,137 @@ async fn execute_pipeline(
     )
 }
 
+fn remote_response_to_text(payload: &Value) -> String {
+    for key in ["result", "output", "content", "message"] {
+        if let Some(value) = payload.get(key) {
+            if let Some(text) = value.as_str() {
+                return text.to_string();
+            }
+            if !value.is_null() {
+                return value.to_string();
+            }
+        }
+    }
+    payload.to_string()
+}
+
+struct RemoteSkillExecutionResult {
+    text: String,
+    payload_json: Option<Value>,
+}
+
+fn validate_skill_output_schema(
+    skill: &ResolvedSkill,
+    output_text: String,
+    output_payload_json: Option<&Value>,
+) -> (String, Option<SkillVerificationOutcome>) {
+    let Some(schema) = skill.output_schema.as_ref() else {
+        return (output_text, None);
+    };
+    let validation_errors = if let Some(payload_json) = output_payload_json {
+        crate::skills::composition::validate_input(schema, payload_json)
+    } else {
+        crate::skills::composition::validate_output(schema, &output_text)
+    };
+    if validation_errors.is_empty() {
+        return (
+            output_text,
+            Some(SkillVerificationOutcome {
+                all_required_passed: true,
+                summary: None,
+            }),
+        );
+    }
+
+    let mut warning = String::new();
+    if !output_text.trim().is_empty() {
+        warning.push_str(&output_text);
+        warning.push_str("\n\n");
+    }
+    warning.push_str(&format!(
+        "⚠️ Output schema validation failed for skill '{}':\n{}",
+        skill.name,
+        validation_errors
+            .iter()
+            .map(|err| format!("- {err}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    ));
+    (
+        warning,
+        Some(SkillVerificationOutcome {
+            all_required_passed: false,
+            summary: None,
+        }),
+    )
+}
+
+async fn execute_remote_skill(
+    remote_url: &str,
+    skill: &ResolvedSkill,
+    task_hint: &str,
+    skill_ctx: &SkillContext,
+) -> Result<RemoteSkillExecutionResult, String> {
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|err| format!("failed to initialize HTTP client: {err}"))?;
+
+    let payload = serde_json::json!({
+        "skill_name": skill.name,
+        "task": task_hint,
+        "arguments": {
+            "task": task_hint,
+        },
+        "context": {
+            "session_id": skill_ctx.session_id,
+            "session_dir": skill_ctx.session_dir,
+            "work_dir": skill_ctx.work_dir,
+            "available_tools": skill_ctx.available_tools,
+            "recursion_depth": skill_ctx.recursion_depth,
+            "extra": skill_ctx.extra,
+        }
+    });
+    let response = http
+        .post(remote_url)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|err| format!("request failed: {err}"))?;
+    let status = response.status();
+    let body = response
+        .bytes()
+        .await
+        .map_err(|err| format!("failed to read response body: {err}"))?;
+
+    if !status.is_success() {
+        let detail = String::from_utf8_lossy(&body).trim().to_string();
+        return Err(if detail.is_empty() {
+            format!("HTTP {}", status.as_u16())
+        } else {
+            format!("HTTP {}: {detail}", status.as_u16())
+        });
+    }
+
+    if body.is_empty() {
+        return Ok(RemoteSkillExecutionResult {
+            text: String::new(),
+            payload_json: None,
+        });
+    }
+    if let Ok(json) = serde_json::from_slice::<Value>(&body) {
+        return Ok(RemoteSkillExecutionResult {
+            text: remote_response_to_text(&json),
+            payload_json: Some(json),
+        });
+    }
+    Ok(RemoteSkillExecutionResult {
+        text: String::from_utf8_lossy(&body).to_string(),
+        payload_json: None,
+    })
+}
+
 /// Execute a single skill call and return the output text + activation metadata.
 ///
 /// When the skill has `execution_context: Fork` and an executor is available,
@@ -1425,6 +1560,29 @@ fn execute_skill<'a>(
 
                 // Run pre-invocation hooks exactly once before any execution path.
                 run_hooks(&skill.hooks.pre_invoke, is_mcp);
+
+                // Remote execution: dispatch to external endpoint.
+                if let Some(remote_url) = skill.remote_url.as_deref() {
+                    match execute_remote_skill(remote_url, &skill, task_hint, skill_ctx).await {
+                        Ok(remote_output) => {
+                            let (output, verification) = validate_skill_output_schema(
+                                &skill,
+                                remote_output.text,
+                                remote_output.payload_json.as_ref(),
+                            );
+                            run_hooks(&skill.hooks.post_invoke, is_mcp);
+                            return (output, Some(build_activation(&skill)), verification);
+                        }
+                        Err(err) => {
+                            run_hooks(&skill.hooks.on_error, is_mcp);
+                            return (
+                                format!("Remote skill '{}' failed: {err}", skill_name),
+                                None,
+                                None,
+                            );
+                        }
+                    }
+                }
 
                 // Fork execution: delegate to the executor for isolated sub-agent run
                 if skill.execution_context == ExecutionContext::Fork {
@@ -1673,6 +1831,8 @@ mod tests {
                     success_criteria: Vec::new(),
                     composition: None,
                     input_schema: None,
+                    output_schema: None,
+                    remote_url: None,
                     aliases: Vec::new(),
 
                     effort: None,
@@ -1973,6 +2133,232 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_skill_remote_dispatches_http_endpoint() {
+        use axum::{Json, Router, routing::post};
+
+        struct RemoteResolver {
+            url: String,
+        }
+        impl SkillResolver for RemoteResolver {
+            fn resolve(&self, name: &str) -> Result<ResolvedSkill, String> {
+                Ok(ResolvedSkill {
+                    name: name.into(),
+                    instructions: "Remote skill placeholder.".into(),
+                    model: None,
+                    max_tokens: None,
+                    allowed_tools: vec![],
+                    execution_context: ExecutionContext::Inline,
+                    hooks: crate::skills::hooks::SkillHooks::default(),
+                    skill_dir: None,
+                    source: SkillSourceKind::Database,
+                    success_criteria: Vec::new(),
+                    composition: None,
+                    input_schema: None,
+                    output_schema: None,
+                    remote_url: Some(self.url.clone()),
+                    aliases: vec![],
+                    effort: None,
+                    agent_type: None,
+                    trust_tier: crate::skills::manifest::TrustTier::Community,
+                })
+            }
+
+            fn available_skills(&self) -> Vec<SkillToolInfo> {
+                vec![]
+            }
+        }
+
+        let app = Router::new().route(
+            "/remote-skill",
+            post(|Json(body): Json<Value>| async move {
+                let task = body.get("task").and_then(Value::as_str).unwrap_or("");
+                Json(serde_json::json!({
+                    "result": format!("remote handled: {task}")
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let resolver = RemoteResolver {
+            url: format!("http://{addr}/remote-skill"),
+        };
+        let (output, activation, _) = execute_skill(
+            &resolver,
+            None,
+            "remote-e2e",
+            "ping remote",
+            None,
+            &SkillContext::default(),
+        )
+        .await;
+        assert_eq!(output, "remote handled: ping remote");
+        assert!(activation.is_some());
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn execute_skill_remote_output_schema_is_verified() {
+        use axum::{Json, Router, routing::post};
+
+        struct RemoteResolverWithOutputSchema {
+            url: String,
+        }
+        impl SkillResolver for RemoteResolverWithOutputSchema {
+            fn resolve(&self, name: &str) -> Result<ResolvedSkill, String> {
+                Ok(ResolvedSkill {
+                    name: name.into(),
+                    instructions: "Remote skill placeholder.".into(),
+                    model: None,
+                    max_tokens: None,
+                    allowed_tools: vec![],
+                    execution_context: ExecutionContext::Inline,
+                    hooks: crate::skills::hooks::SkillHooks::default(),
+                    skill_dir: None,
+                    source: SkillSourceKind::Database,
+                    success_criteria: Vec::new(),
+                    composition: None,
+                    input_schema: None,
+                    output_schema: Some(serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "result": { "type": "string" }
+                        },
+                        "required": ["result"]
+                    })),
+                    remote_url: Some(self.url.clone()),
+                    aliases: vec![],
+                    effort: None,
+                    agent_type: None,
+                    trust_tier: crate::skills::manifest::TrustTier::Community,
+                })
+            }
+            fn available_skills(&self) -> Vec<SkillToolInfo> {
+                vec![]
+            }
+        }
+
+        let app = Router::new().route(
+            "/remote-skill",
+            post(|Json(body): Json<Value>| async move {
+                let task = body.get("task").and_then(Value::as_str).unwrap_or("");
+                Json(serde_json::json!({
+                    "result": format!("remote schema pass: {task}")
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let resolver = RemoteResolverWithOutputSchema {
+            url: format!("http://{addr}/remote-skill"),
+        };
+        let (output, activation, verification) = execute_skill(
+            &resolver,
+            None,
+            "remote-schema-pass",
+            "ping remote",
+            None,
+            &SkillContext::default(),
+        )
+        .await;
+        assert_eq!(output, "remote schema pass: ping remote");
+        assert!(activation.is_some());
+        let verification = verification.expect("expected output-schema verification outcome");
+        assert!(verification.all_required_passed);
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn execute_skill_remote_output_schema_failure_marks_verification() {
+        use axum::{Json, Router, routing::post};
+
+        struct RemoteResolverWithOutputSchema {
+            url: String,
+        }
+        impl SkillResolver for RemoteResolverWithOutputSchema {
+            fn resolve(&self, name: &str) -> Result<ResolvedSkill, String> {
+                Ok(ResolvedSkill {
+                    name: name.into(),
+                    instructions: "Remote skill placeholder.".into(),
+                    model: None,
+                    max_tokens: None,
+                    allowed_tools: vec![],
+                    execution_context: ExecutionContext::Inline,
+                    hooks: crate::skills::hooks::SkillHooks::default(),
+                    skill_dir: None,
+                    source: SkillSourceKind::Database,
+                    success_criteria: Vec::new(),
+                    composition: None,
+                    input_schema: None,
+                    output_schema: Some(serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "result": { "type": "string" }
+                        },
+                        "required": ["result"]
+                    })),
+                    remote_url: Some(self.url.clone()),
+                    aliases: vec![],
+                    effort: None,
+                    agent_type: None,
+                    trust_tier: crate::skills::manifest::TrustTier::Community,
+                })
+            }
+            fn available_skills(&self) -> Vec<SkillToolInfo> {
+                vec![]
+            }
+        }
+
+        let app = Router::new().route(
+            "/remote-skill",
+            post(|Json(_body): Json<Value>| async move {
+                Json(serde_json::json!({
+                    "status": "ok"
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let resolver = RemoteResolverWithOutputSchema {
+            url: format!("http://{addr}/remote-skill"),
+        };
+        let (output, activation, verification) = execute_skill(
+            &resolver,
+            None,
+            "remote-schema-fail",
+            "ping remote",
+            None,
+            &SkillContext::default(),
+        )
+        .await;
+        assert!(output.contains("Output schema validation failed"));
+        assert!(activation.is_some());
+        let verification = verification.expect("expected output-schema verification outcome");
+        assert!(!verification.all_required_passed);
+
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn execute_skill_fork_returns_verification_summary() {
         use async_trait::async_trait;
 
@@ -2004,6 +2390,8 @@ mod tests {
                     }],
                     composition: None,
                     input_schema: None,
+                    output_schema: None,
+                    remote_url: None,
                     aliases: vec![],
                     effort: None,
                     agent_type: None,
@@ -2119,6 +2507,8 @@ mod tests {
                     success_criteria: vec![],
                     composition: None,
                     input_schema: None,
+                    output_schema: None,
+                    remote_url: None,
                     aliases: vec![],
                     effort: None,
                     agent_type: None,
@@ -2553,6 +2943,8 @@ mod tests {
                     success_criteria: Vec::new(),
                     composition: None,
                     input_schema: None,
+                    output_schema: None,
+                    remote_url: None,
                     aliases: Vec::new(),
 
                     effort: None,
@@ -2599,6 +2991,8 @@ mod tests {
                     success_criteria: Vec::new(),
                     composition: None,
                     input_schema: None,
+                    output_schema: None,
+                    remote_url: None,
                     aliases: Vec::new(),
 
                     effort: None,
@@ -2676,6 +3070,8 @@ mod tests {
             success_criteria: Vec::new(),
             composition: None,
             input_schema: None,
+            output_schema: None,
+            remote_url: None,
             aliases: Vec::new(),
 
             effort: None,
@@ -2702,6 +3098,8 @@ mod tests {
             success_criteria: Vec::new(),
             composition: None,
             input_schema: None,
+            output_schema: None,
+            remote_url: None,
             aliases: Vec::new(),
 
             effort: None,
@@ -2869,6 +3267,8 @@ mod tests {
             success_criteria: Vec::new(),
             composition: None,
             input_schema: None,
+            output_schema: None,
+            remote_url: None,
             aliases: Vec::new(),
 
             effort: Some(EffortLevel::High),
@@ -2924,6 +3324,8 @@ mod tests {
                         success_criteria: Vec::new(),
                         composition: None,
                         input_schema: None,
+                        output_schema: None,
+                        remote_url: None,
                         aliases: Vec::new(),
 
                         effort: None,
@@ -2943,6 +3345,8 @@ mod tests {
                         success_criteria: Vec::new(),
                         composition: None,
                         input_schema: None,
+                        output_schema: None,
+                        remote_url: None,
                         aliases: Vec::new(),
 
                         effort: None,
@@ -3028,6 +3432,8 @@ mod tests {
                         success_criteria: Vec::new(),
                         composition: None,
                         input_schema: None,
+                        output_schema: None,
+                        remote_url: None,
                         aliases: Vec::new(),
 
                         effort: None,
@@ -3095,6 +3501,8 @@ mod tests {
                     success_criteria: Vec::new(),
                     composition: None, // not composable
                     input_schema: None,
+                    output_schema: None,
+                    remote_url: None,
                     aliases: Vec::new(),
 
                     effort: None,
@@ -3151,6 +3559,8 @@ mod tests {
                         steps: vec![],
                     }),
                     input_schema: None,
+                    output_schema: None,
+                    remote_url: None,
                     aliases: Vec::new(),
 
                     effort: None,
@@ -3207,6 +3617,8 @@ mod tests {
                         steps: vec![],
                     }),
                     input_schema: None,
+                    output_schema: None,
+                    remote_url: None,
                     aliases: Vec::new(),
 
                     effort: None,
@@ -3259,6 +3671,8 @@ mod tests {
                     success_criteria: Vec::new(),
                     composition: None,
                     input_schema: None,
+                    output_schema: None,
+                    remote_url: None,
                     aliases: Vec::new(),
 
                     effort: None,
@@ -3315,6 +3729,8 @@ mod tests {
                         },
                         "required": ["target_path"]
                     })),
+                    output_schema: None,
+                    remote_url: None,
                     aliases: Vec::new(),
 
                     effort: None,
@@ -3433,6 +3849,8 @@ mod tests {
                         ],
                     }),
                     input_schema: None,
+                    output_schema: None,
+                    remote_url: None,
                     aliases: Vec::new(),
                     effort: None,
                     agent_type: None,
@@ -3458,6 +3876,8 @@ mod tests {
                         steps: vec![],
                     }),
                     input_schema: None,
+                    output_schema: None,
+                    remote_url: None,
                     aliases: Vec::new(),
                     effort: None,
                     agent_type: None,
@@ -3574,6 +3994,8 @@ mod tests {
                             ],
                         }),
                         input_schema: None,
+                        output_schema: None,
+                        remote_url: None,
                         aliases: Vec::new(),
                         effort: None,
                         agent_type: None,
@@ -3599,6 +4021,8 @@ mod tests {
                             steps: vec![],
                         }),
                         input_schema: None,
+                        output_schema: None,
+                        remote_url: None,
                         aliases: Vec::new(),
                         effort: None,
                         agent_type: None,

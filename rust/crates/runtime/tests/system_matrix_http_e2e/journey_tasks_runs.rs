@@ -213,6 +213,7 @@ pub async fn run_chat_run_pause_resume_http() {
     let auth = &b.auth_header;
     let app = &ctx.app;
     let session_id = ctx.session_id.clone();
+    let mock_model = format!("mock-{}", ctx.suffix);
 
     let (st_chat, chat_j) = post_json(
         app,
@@ -221,6 +222,7 @@ pub async fn run_chat_run_pause_resume_http() {
         json!({
             "message": "matrix e2e background run",
             "session_id": session_id,
+            "model": mock_model,
             "max_candidates": 1
         }),
     )

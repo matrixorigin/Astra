@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use astra_services::skills::SkillService;
 
-use crate::skills::manifest::{LoadedSkill, SkillManifest, SkillSourceKind};
+use crate::skills::manifest::{ExecutionContext, LoadedSkill, SkillManifest, SkillSourceKind};
 use crate::skills::traits::{SkillError, SkillProvider};
 
 /// Adapts `SkillService` (database-backed) to the `SkillProvider` trait.
@@ -22,6 +22,53 @@ pub struct DatabaseSkillProvider {
 impl DatabaseSkillProvider {
     pub fn new(service: Arc<dyn SkillService>) -> Self {
         Self { service }
+    }
+
+    fn get_str<'a>(
+        obj: &'a serde_json::Map<String, serde_json::Value>,
+        key: &str,
+    ) -> Option<&'a str> {
+        obj.get(key).and_then(serde_json::Value::as_str)
+    }
+
+    fn get_string_vec(obj: &serde_json::Map<String, serde_json::Value>, key: &str) -> Vec<String> {
+        obj.get(key)
+            .and_then(serde_json::Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn parse_execution_context(
+        obj: &serde_json::Map<String, serde_json::Value>,
+    ) -> ExecutionContext {
+        match Self::get_str(obj, "execution_context")
+            .unwrap_or("")
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "fork" => ExecutionContext::Fork,
+            _ => ExecutionContext::Inline,
+        }
+    }
+
+    fn parse_trust_tier(
+        obj: &serde_json::Map<String, serde_json::Value>,
+    ) -> crate::skills::manifest::TrustTier {
+        match Self::get_str(obj, "trust_tier")
+            .unwrap_or("")
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "bundled" => crate::skills::manifest::TrustTier::Bundled,
+            "verified" => crate::skills::manifest::TrustTier::Verified,
+            "community" => crate::skills::manifest::TrustTier::Community,
+            _ => crate::skills::manifest::TrustTier::Unverified,
+        }
     }
 }
 
@@ -76,14 +123,18 @@ impl SkillProvider for DatabaseSkillProvider {
             })?;
 
         let version = record.version.parse().unwrap_or_default();
-
-        let instructions = record
-            .metadata
-            .as_ref()
-            .and_then(|m| m.get("instructions"))
-            .and_then(|v| v.as_str())
+        let metadata = record.metadata.unwrap_or_else(|| serde_json::json!({}));
+        let metadata_obj = metadata.as_object().cloned().unwrap_or_default();
+        let instructions = Self::get_str(&metadata_obj, "instructions")
             .unwrap_or("")
             .to_string();
+        let remote_url = Self::get_str(&metadata_obj, "remote_url").map(str::to_string);
+        let input_schema = metadata_obj.get("input_schema").cloned();
+        let output_schema = metadata_obj.get("output_schema").cloned();
+        let user_invocable = metadata_obj
+            .get("user_invocable")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true);
 
         let instruction_tokens = (instructions.len() as u32) / 4;
 
@@ -92,6 +143,17 @@ impl SkillProvider for DatabaseSkillProvider {
             version,
             description: record.description.unwrap_or_default(),
             source: SkillSourceKind::Database,
+            execution_context: Self::parse_execution_context(&metadata_obj),
+            user_invocable,
+            triggers: Self::get_string_vec(&metadata_obj, "triggers"),
+            when_to_use: Self::get_str(&metadata_obj, "when_to_use").map(str::to_string),
+            category: Self::get_str(&metadata_obj, "category").map(str::to_string),
+            tags: Self::get_string_vec(&metadata_obj, "tags"),
+            input_schema,
+            output_schema,
+            remote_url,
+            aliases: Self::get_string_vec(&metadata_obj, "aliases"),
+            trust_tier: Self::parse_trust_tier(&metadata_obj),
             ..Default::default()
         };
 
@@ -155,13 +217,35 @@ mod tests {
             self.skills
                 .iter()
                 .find(|s| s.skill_name == skill_id || s.skill_id == skill_id)
-                .map(|s| SkillRecord {
-                    skill_id: s.skill_id.clone(),
-                    skill_name: s.skill_name.clone(),
-                    version: s.version.clone(),
-                    description: s.description.clone(),
-                    metadata: Some(serde_json::json!({"instructions": "DB skill instructions."})),
-                    created_at: s.created_at.clone(),
+                .map(|s| {
+                    let metadata = if s.skill_name == "remote-http" {
+                        serde_json::json!({
+                            "skill_type": "remote",
+                            "remote_url": "http://127.0.0.1:18080/skills/execute",
+                            "input_schema": {
+                                "type": "object",
+                                "properties": {
+                                    "task": {"type": "string"}
+                                }
+                            },
+                            "output_schema": {
+                                "type": "object",
+                                "properties": {
+                                    "result": {"type": "string"}
+                                }
+                            }
+                        })
+                    } else {
+                        serde_json::json!({"instructions": "DB skill instructions."})
+                    };
+                    SkillRecord {
+                        skill_id: s.skill_id.clone(),
+                        skill_name: s.skill_name.clone(),
+                        version: s.version.clone(),
+                        description: s.description.clone(),
+                        metadata: Some(metadata),
+                        created_at: s.created_at.clone(),
+                    }
                 })
                 .ok_or_else(|| {
                     (
@@ -237,6 +321,16 @@ mod tests {
                     category: Some("devops".into()),
                     created_at: None,
                 },
+                SkillListItem {
+                    skill_id: "remote-http@1.0.0".into(),
+                    skill_name: "remote-http".into(),
+                    version: "1.0.0".into(),
+                    description: Some("Remote HTTP skill".into()),
+                    status: Some("active".into()),
+                    source: Some("user".into()),
+                    category: Some("integration".into()),
+                    created_at: None,
+                },
             ],
         })
     }
@@ -245,11 +339,12 @@ mod tests {
     async fn discover_lists_all_skills() {
         let provider = DatabaseSkillProvider::new(mock_service());
         let manifests = provider.discover().await.unwrap();
-        assert_eq!(manifests.len(), 2);
+        assert_eq!(manifests.len(), 3);
 
         let names: Vec<&str> = manifests.iter().map(|m| m.name.as_str()).collect();
         assert!(names.contains(&"review"));
         assert!(names.contains(&"deploy"));
+        assert!(names.contains(&"remote-http"));
 
         assert!(
             manifests
@@ -272,5 +367,18 @@ mod tests {
         let provider = DatabaseSkillProvider::new(mock_service());
         let result = provider.load("nonexistent").await;
         assert!(matches!(result, Err(SkillError::NotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn load_remote_skill_maps_remote_url_and_schema() {
+        let provider = DatabaseSkillProvider::new(mock_service());
+        let loaded = provider.load("remote-http").await.unwrap();
+        assert_eq!(loaded.manifest.name, "remote-http");
+        assert_eq!(
+            loaded.manifest.remote_url.as_deref(),
+            Some("http://127.0.0.1:18080/skills/execute")
+        );
+        assert!(loaded.manifest.input_schema.is_some());
+        assert!(loaded.manifest.output_schema.is_some());
     }
 }

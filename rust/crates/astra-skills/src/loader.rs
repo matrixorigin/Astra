@@ -170,6 +170,7 @@ pub fn parse_skill_md(content: &str) -> Result<(SkillManifest, String), SkillErr
         metadata: HashMap::new(),
         input_schema: raw.input_schema,
         output_schema: raw.output_schema,
+        remote_url: None,
         success_criteria: raw.success_criteria,
         required_capabilities: raw.required_capabilities,
         composition: raw.composition,

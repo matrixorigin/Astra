@@ -29,6 +29,7 @@ use astra_services::runs::{
     RunLifecycleService, RunListRecord, RunMutationRecord, RunStatusRecord,
 };
 use astra_services::session_audit::{RUNTIME_PROMOTION_EVENT_TYPE, RuntimePromotionEventData};
+use astra_services::skills::SkillService;
 
 use crate::FernetTokenEncryptor;
 use crate::MatrixOneSettings;
@@ -60,15 +61,29 @@ const RUNTIME_CONTEXT_TRACE_AGENT_ID: &str = "astra-server";
 
 /// Build skill registry + resolver for server-side agentic loops.
 ///
-/// Returns `(registry_for_activation, resolver)` using the global default
-/// registry (Local + Bundled providers).
-fn build_server_skill_resolver() -> (
+/// Returns `(registry_for_activation, resolver)` using runtime providers
+/// (Local + Bundled + optional Database provider).
+fn build_server_skill_resolver(
+    skill_service: Option<Arc<dyn SkillService>>,
+) -> (
     Option<Arc<crate::skills::UnifiedSkillRegistry>>,
     Option<Arc<dyn crate::turn::skill_tool::SkillResolver>>,
 ) {
     use crate::turn::skill_tool::SkillResolver as _;
 
-    let registry = crate::skills::default_unified_registry().clone();
+    let mut registry = crate::skills::UnifiedSkillRegistry::new();
+    registry.add_provider(Box::new(crate::skills::LocalSkillProvider::standard()));
+    registry.add_provider(Box::new(
+        crate::skills::BundledSkillProvider::with_defaults(),
+    ));
+    if let Some(service) = skill_service {
+        registry.add_provider(Box::new(crate::skills::DatabaseSkillProvider::new(service)));
+    }
+    let registry = Arc::new(registry);
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        let r = Arc::clone(&registry);
+        let _ = std::thread::scope(|s| s.spawn(|| handle.block_on(r.discover_all())).join().ok());
+    }
     if registry.is_empty() {
         return (None, None);
     }
@@ -515,6 +530,8 @@ pub struct AgenticRunLifecycleService {
         Option<std::sync::Arc<dyn astra_services::resource_governor::ResourceGovernor>>,
     /// Live edge WebSocket connection pool (Phase 6).
     edge_connection_pool: Option<super::edge_connection_pool::EdgeConnectionPool>,
+    /// Optional database skill provider for runtime skill resolution.
+    skill_service: Option<Arc<dyn SkillService>>,
     /// Per-run approval request channel receivers (Phase E).
     /// Key: run_id → receiver that the WS handler drains.
     approval_channels: Arc<TokioMutex<HashMap<String, mpsc::UnboundedReceiver<serde_json::Value>>>>,
@@ -539,6 +556,7 @@ impl AgenticRunLifecycleService {
             delegation_engine: None,
             resource_governor: None,
             edge_connection_pool: None,
+            skill_service: None,
             approval_channels: Arc::new(TokioMutex::new(HashMap::new())),
             progress_channels: Arc::new(TokioMutex::new(HashMap::new())),
         }
@@ -575,6 +593,11 @@ impl AgenticRunLifecycleService {
         governor: std::sync::Arc<dyn astra_services::resource_governor::ResourceGovernor>,
     ) -> Self {
         self.resource_governor = Some(governor);
+        self
+    }
+
+    pub fn with_skill_service(mut self, service: Arc<dyn SkillService>) -> Self {
+        self.skill_service = Some(service);
         self
     }
 
@@ -787,7 +810,8 @@ impl AgenticRunLifecycleService {
             detect_turn_hook_sets, is_plan_subtask_from_chat_context, project_root_for_stop_hooks,
         };
 
-        let (skill_registry, skill_resolver) = build_server_skill_resolver();
+        let (skill_registry, skill_resolver) =
+            build_server_skill_resolver(self.skill_service.clone());
         use crate::turn::turn_guard::TurnGuard;
 
         let user_message = json!({
@@ -1750,6 +1774,7 @@ pub struct ServerSubRunExecutor {
     shared_pool: Option<SharedPool>,
     edge_callback_ledger: Arc<TokioMutex<HashMap<String, Value>>>,
     edge_connection_pool: Option<super::edge_connection_pool::EdgeConnectionPool>,
+    skill_service: Option<Arc<dyn SkillService>>,
 }
 
 impl ServerSubRunExecutor {
@@ -1764,6 +1789,7 @@ impl ServerSubRunExecutor {
             shared_pool: None,
             edge_callback_ledger,
             edge_connection_pool: None,
+            skill_service: None,
         }
     }
 
@@ -1777,6 +1803,11 @@ impl ServerSubRunExecutor {
         pool: super::edge_connection_pool::EdgeConnectionPool,
     ) -> Self {
         self.edge_connection_pool = Some(pool);
+        self
+    }
+
+    pub fn with_skill_service(mut self, service: Arc<dyn SkillService>) -> Self {
+        self.skill_service = Some(service);
         self
     }
 }
@@ -1883,7 +1914,8 @@ impl SubRunExecutor for ServerSubRunExecutor {
             .map(|root| crate::skills::hooks::load_all_hooks(std::path::Path::new(root)))
             .unwrap_or_default();
 
-        let (skill_registry, skill_resolver) = build_server_skill_resolver();
+        let (skill_registry, skill_resolver) =
+            build_server_skill_resolver(self.skill_service.clone());
 
         let mut loop_state = AgenticLoopState {
             messages: vec![user_message],
@@ -2155,6 +2187,147 @@ mod tests {
             max_candidates: 5,
             explain: false,
         }
+    }
+
+    #[tokio::test]
+    async fn build_initial_state_includes_database_skill_provider_when_wired() {
+        use astra_services::skills::{
+            SkillInfoRecord, SkillListItem, SkillListRecord, SkillPublishRequestData, SkillRecord,
+            SkillRegisterRequestData, SkillService, SkillStatusRecord, SkillVersionRecord,
+        };
+        use async_trait::async_trait;
+
+        struct MockSkillService;
+
+        #[async_trait]
+        impl SkillService for MockSkillService {
+            async fn register_skill(
+                &self,
+                _: String,
+                _: SkillRegisterRequestData,
+            ) -> Result<SkillRecord, (StatusCode, Json<ErrorResponse>)> {
+                unimplemented!()
+            }
+
+            async fn list_skills(
+                &self,
+                limit: u32,
+                offset: u32,
+            ) -> Result<SkillListRecord, (StatusCode, Json<ErrorResponse>)> {
+                if offset > 0 {
+                    return Ok(SkillListRecord {
+                        skills: Vec::new(),
+                        total: 1,
+                        limit,
+                        offset,
+                    });
+                }
+                Ok(SkillListRecord {
+                    skills: vec![SkillListItem {
+                        skill_id: "remote-db@1.0.0".to_string(),
+                        skill_name: "remote-db".to_string(),
+                        version: "1.0.0".to_string(),
+                        description: Some("Remote DB skill".to_string()),
+                        status: Some("active".to_string()),
+                        source: Some("user".to_string()),
+                        category: Some("integration".to_string()),
+                        created_at: None,
+                    }],
+                    total: 1,
+                    limit,
+                    offset,
+                })
+            }
+
+            async fn get_skill(
+                &self,
+                skill_id: String,
+                _version: Option<String>,
+            ) -> Result<SkillRecord, (StatusCode, Json<ErrorResponse>)> {
+                if skill_id == "remote-db" || skill_id == "remote-db@1.0.0" {
+                    return Ok(SkillRecord {
+                        skill_id: "remote-db@1.0.0".to_string(),
+                        skill_name: "remote-db".to_string(),
+                        version: "1.0.0".to_string(),
+                        description: Some("Remote DB skill".to_string()),
+                        metadata: Some(serde_json::json!({
+                            "skill_type": "remote",
+                            "remote_url": "http://127.0.0.1:18080/remote-skill",
+                            "when_to_use": "when task needs remote orchestration"
+                        })),
+                        created_at: None,
+                    });
+                }
+                Err((
+                    StatusCode::NOT_FOUND,
+                    Json(ErrorResponse::new("not found".to_string())),
+                ))
+            }
+
+            async fn get_skill_info(
+                &self,
+                _: String,
+                _: String,
+            ) -> Result<SkillInfoRecord, (StatusCode, Json<ErrorResponse>)> {
+                unimplemented!()
+            }
+
+            async fn list_skill_versions(
+                &self,
+                _: String,
+            ) -> Result<Vec<SkillVersionRecord>, (StatusCode, Json<ErrorResponse>)> {
+                unimplemented!()
+            }
+
+            async fn get_skill_status(
+                &self,
+                _: String,
+                _: u32,
+            ) -> Result<SkillStatusRecord, (StatusCode, Json<ErrorResponse>)> {
+                unimplemented!()
+            }
+
+            async fn publish_skill(
+                &self,
+                _: String,
+                _: SkillPublishRequestData,
+            ) -> Result<serde_json::Value, (StatusCode, Json<ErrorResponse>)> {
+                unimplemented!()
+            }
+
+            async fn unpublish_skill(
+                &self,
+                _: String,
+                _: String,
+            ) -> Result<serde_json::Value, (StatusCode, Json<ErrorResponse>)> {
+                unimplemented!()
+            }
+        }
+
+        let svc = test_service().with_skill_service(Arc::new(MockSkillService));
+        let state = svc.build_initial_state(&test_request("hello"), "session-1", "run-1", None);
+        let resolver = state
+            .skills
+            .resolver
+            .as_ref()
+            .expect("skill resolver should be configured");
+        let names: Vec<String> = resolver
+            .available_skills()
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert!(
+            names.iter().any(|name| name == "remote-db"),
+            "expected database skill in available skills: {names:?}"
+        );
+
+        let resolved = resolver
+            .resolve("remote-db")
+            .expect("resolver should load database skill");
+        assert_eq!(
+            resolved.remote_url.as_deref(),
+            Some("http://127.0.0.1:18080/remote-skill")
+        );
     }
 
     #[test]

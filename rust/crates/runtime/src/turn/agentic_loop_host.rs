@@ -2262,6 +2262,8 @@ pub(crate) mod tests {
                         success_criteria: Vec::new(),
                         composition: None,
                         input_schema: None,
+                        output_schema: None,
+                        remote_url: None,
                         aliases: Vec::new(),
 
                         effort: None,
