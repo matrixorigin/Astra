@@ -28,10 +28,12 @@ pub mod task_mgmt;
 pub mod tool_search;
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::Value;
+use tokio_util::sync::CancellationToken;
 
 // ─── Core trait ─────────────────────────────────────────────────────────────
 
@@ -184,6 +186,8 @@ pub struct ToolContext {
     pub http_client: Option<reqwest::Client>,
     /// Logger for tool-level diagnostics (replaces eprintln! in extracted modules).
     pub logger: std::sync::Arc<dyn ToolLogger>,
+    /// Optional cooperative cancellation for long-running async tools.
+    pub cancel_token: Option<Arc<CancellationToken>>,
 }
 
 impl ToolContext {
@@ -198,6 +202,7 @@ impl ToolContext {
             session_id: "test-session".into(),
             http_client: None,
             logger: std::sync::Arc::new(TracingLogger),
+            cancel_token: None,
         }
     }
 }

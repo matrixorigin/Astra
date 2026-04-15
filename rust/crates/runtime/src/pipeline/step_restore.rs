@@ -54,6 +54,11 @@ pub struct RestoredSession {
     /// point. When present, describes why the previous run was interrupted and
     /// what the caller should do to resume (e.g., wait, compact, intervene).
     pub interruption: Option<serde_json::Value>,
+    /// Serialized approval overrides restored from checkpoint.
+    /// The caller should merge these into PermissionManager on resume.
+    pub approval_overrides: Option<serde_json::Value>,
+    /// Consecutive context-window errors counter restored from checkpoint.
+    pub consecutive_context_window_errors: u32,
 }
 
 /// Error types for session restore.
@@ -137,6 +142,8 @@ fn build_restored_session(
         completed_tool_results: completed_results,
         learning_snapshot_id: heavy.learning_snapshot_id,
         interruption: heavy.interruption,
+        approval_overrides: heavy.approval_overrides,
+        consecutive_context_window_errors: heavy.consecutive_context_window_errors,
     }))
 }
 
@@ -261,7 +268,7 @@ pub fn restore_summary(restored: &RestoredSession) -> String {
         .values()
         .map(|v| v.len())
         .sum();
-    format!(
+    let mut s = format!(
         "Restored session: turn={}, messages={}, cache={} entries, \
          completed_tools={}, blocked={}, budget_tokens={}, budget_rounds={}",
         restored.resume_turn,
@@ -271,7 +278,17 @@ pub fn restore_summary(restored: &RestoredSession) -> String {
         restored.blocked_tools.len(),
         restored.budget_remaining_tokens,
         restored.budget_remaining_rounds,
-    )
+    );
+    if restored.consecutive_context_window_errors > 0 {
+        s.push_str(&format!(
+            ", ctx_window_errors={}",
+            restored.consecutive_context_window_errors
+        ));
+    }
+    if restored.approval_overrides.is_some() {
+        s.push_str(", approval_overrides=yes");
+    }
+    s
 }
 
 /// Validate and convert raw event payloads into structured tool completion records.
@@ -375,6 +392,8 @@ mod tests {
             delegation_pattern: None,
             delegation_sub_run_summaries: Vec::new(),
             interruption: None,
+            approval_overrides: None,
+            consecutive_context_window_errors: 0,
         }
     }
 
@@ -472,6 +491,8 @@ mod tests {
             completed_tool_results: HashMap::new(),
             learning_snapshot_id: None,
             interruption: None,
+            approval_overrides: None,
+            consecutive_context_window_errors: 0,
         };
 
         let summary = restore_summary(&restored);

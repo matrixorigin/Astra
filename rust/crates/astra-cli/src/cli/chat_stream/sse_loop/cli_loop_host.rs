@@ -254,6 +254,9 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
         // Restore previous sandbox policy after the turn.
         self.executor.sandbox_policy = prev_sandbox;
 
+        // Sync latest approval overrides into state for checkpoint persistence.
+        state.approval_overrides = self.perm_manager.export_session_overrides();
+
         let turn_result = turn_result?;
 
         Ok(HostTurnResult {

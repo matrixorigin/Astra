@@ -340,18 +340,26 @@ pub fn all_tool_schemas() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "grep",
-                "description": "Search for a pattern in files. Returns matching lines with file:line context (output truncated to ~10KB, 100 lines max by default). Supports content/files_with_matches/count modes, pagination via offset, and optional scope_context annotations. For large codebases, narrow path or pattern for complete results.",
+                "description": "Search for a pattern in files. Returns matching lines with file:line context (output truncated to ~10KB, 100 lines max by default). Supports content/files_with_matches/count modes, pagination via offset, optional scope_context annotations, and respects .gitignore/.astraignore when present. For large codebases, narrow path or pattern for complete results.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "pattern": {"type": "string", "description": "Regex pattern to search for"},
                         "path": {"type": "string", "description": "Directory or file to search (default: project root)"},
                         "include": {"type": "string", "description": "File glob filter e.g. '*.rs'"},
+                        "glob": {"type": "string", "description": "Alias of include using ripgrep-style glob syntax, e.g. '**/*.rs'"},
+                        "type": {"type": "string", "description": "Common file type filter, e.g. rust, python, typescript, tsx, javascript, jsx, go, java, c, cpp, ruby, shell, json, yaml, toml, markdown"},
                         "case_sensitive": {"type": "boolean", "description": "Case sensitive (default false)"},
+                        "fixed_strings": {"type": "boolean", "description": "Treat pattern as a literal string instead of a regex (like grep -F / rg -F)."},
+                        "word_match": {"type": "boolean", "description": "Require whole-word matches only (like grep -w / rg -w)."},
                         "context_lines": {"type": "integer", "description": "Lines of context before and after each match (like grep -C)"},
+                        "before_context_lines": {"type": "integer", "description": "Lines of context before each match (like grep -B). Overrides the 'before' side of context_lines when provided."},
+                        "after_context_lines": {"type": "integer", "description": "Lines of context after each match (like grep -A). Overrides the 'after' side of context_lines when provided."},
                         "max_matches": {"type": "integer", "description": "Max matches per file (limits output, saves tokens)"},
+                        "multiline": {"type": "boolean", "description": "Allow regex matches to span newlines within a file. Useful for block patterns and multi-line structures."},
                         "scope_context": {"type": "boolean", "description": "Annotate each match with its containing function/class name (tree-sitter)"},
                         "output_mode": {"type": "string", "enum": ["content", "files_with_matches", "count"], "description": "Output mode: 'content' (default, matching lines), 'files_with_matches' (file paths only), 'count' (match counts per file)"},
+                        "sort_by": {"type": "string", "enum": ["mtime", "path"], "description": "Sort matching files by newest modified time first (default 'mtime') or alphabetically by path."},
                         "offset": {"type": "integer", "minimum": 0, "description": "Skip first N result lines (for pagination)"},
                         "head_limit": {"type": "integer", "minimum": 0, "description": "Max result lines to return after offset. Defaults to 100; set 0 for unlimited."}
                     },
@@ -363,12 +371,15 @@ pub fn all_tool_schemas() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "glob",
-                "description": "Find files matching a glob pattern.",
+                "description": "Find files matching a glob pattern. Respects .gitignore/.astraignore when present and supports pagination via offset/head_limit.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "pattern": {"type": "string", "description": "Glob pattern e.g. '**/*.rs'"},
-                        "path": {"type": "string", "description": "Root directory (default: project root)"}
+                        "path": {"type": "string", "description": "Root directory (default: project root)"},
+                        "sort_by": {"type": "string", "enum": ["mtime", "path"], "description": "Sort matching files by newest modified time first (default 'mtime') or alphabetically by path."},
+                        "offset": {"type": "integer", "minimum": 0, "description": "Skip first N matching files (for pagination)"},
+                        "head_limit": {"type": "integer", "minimum": 0, "description": "Max matching files to return after offset. Defaults to 100; set 0 for unlimited."}
                     },
                     "required": ["pattern"]
                 }

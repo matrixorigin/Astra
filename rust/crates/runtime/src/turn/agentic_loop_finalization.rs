@@ -216,6 +216,12 @@ pub(crate) fn try_write_heavy_checkpoint(state: &mut AgenticLoopState) {
         .as_ref()
         .and_then(|ir| serde_json::to_value(ir).ok());
 
+    // Serialize approval overrides (if any) for session continuity.
+    let approval_overrides_json = state
+        .approval_overrides
+        .as_ref()
+        .and_then(|ao| ao.to_json());
+
     let Some(heavy) = state
         .step_recorder
         .build_heavy_checkpoint_with_interruption(
@@ -231,6 +237,8 @@ pub(crate) fn try_write_heavy_checkpoint(state: &mut AgenticLoopState) {
                 .collect::<Vec<_>>(),
             &state.recent_tools,
             interruption_json,
+            approval_overrides_json,
+            state.consecutive_context_window_errors,
         )
     else {
         return;

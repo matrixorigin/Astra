@@ -917,6 +917,7 @@ impl AgenticRunLifecycleService {
             recent_tactical_actions: Vec::new(),
             server_tool_executor: None,
             interruption: None,
+            approval_overrides: None,
             confidence_trend: Default::default(),
             last_confidence_diagnosis: None,
         }
@@ -1142,7 +1143,8 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 session_id.clone(),
                 memoria_base,
                 None,
-            );
+            )
+            .with_cancel_token(loop_state.cancellation.token.clone());
             if let Some(pool) = &self.edge_connection_pool {
                 executor.set_edge_connection_pool(pool.clone());
             }
@@ -1971,6 +1973,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             recent_tactical_actions: Vec::new(),
             server_tool_executor: None,
             interruption: None,
+            approval_overrides: None,
             confidence_trend: Default::default(),
             last_confidence_diagnosis: None,
         };
@@ -1987,7 +1990,8 @@ impl SubRunExecutor for ServerSubRunExecutor {
                 config.session_id.clone(),
                 memoria_base,
                 None,
-            );
+            )
+            .with_cancel_token(config.cancel_token.clone());
             if let Some(pool) = &self.edge_connection_pool {
                 executor.set_edge_connection_pool(pool.clone());
             }

@@ -171,6 +171,7 @@ async fn run_edge_connection(args: &Args) -> Result<(), Box<dyn std::error::Erro
         sandbox: astra_tools::SandboxConfig::standard(&workspace),
         http_client: Some(http_client.clone()),
         logger: std::sync::Arc::new(astra_tools::TracingLogger),
+        cancel_token: None,
     };
 
     // Build executor with optional GitHub client (from GITHUB_TOKEN env var)

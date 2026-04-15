@@ -97,6 +97,9 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         self.ctx
             .tool_call_records
             .push(journal_record_unknown_tool(slot.name.clone(), 0));
+        // Track unknown tool as a failure so ToolHealthTracker can deprioritize
+        // after CONSECUTIVE_FAILURE_THRESHOLD hits (prevents infinite retry loops).
+        self.ctx.turn_guard.health.record_failure(&slot.name);
         if self.consecutive_empty_name >= Self::MAX_CONSECUTIVE_EMPTY_NAME {
             agent_warn!(
                 "step",
@@ -277,6 +280,9 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
                 execution.name.clone(),
                 execution.early_exit_ms,
             ));
+            // Track unknown tool as a failure so ToolHealthTracker can deprioritize
+            // after CONSECUTIVE_FAILURE_THRESHOLD hits (prevents infinite retry loops).
+            self.ctx.turn_guard.health.record_failure(&execution.name);
             return HeadlessPipelineStage::ShortCircuit;
         }
 

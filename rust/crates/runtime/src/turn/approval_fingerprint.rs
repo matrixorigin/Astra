@@ -212,7 +212,7 @@ fn path_pattern_matches(pattern: &str, candidate: &str) -> bool {
 // ─── Denial Tracking ─────────────────────────────────────────────────────────
 
 /// Limits for denial tracking (inspired by Claude Code's `denialTracking.ts`).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DenialLimits {
     /// Max consecutive denials for the same fingerprint before fallback.
     pub max_consecutive: u32,
@@ -238,7 +238,7 @@ impl Default for DenialLimits {
 ///
 /// Phase C: Also records denial reasons and fingerprint details to
 /// auto-generate session deny rules when patterns repeat.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct DenialTracker {
     /// Per-fingerprint consecutive denial count.
     consecutive: HashMap<u64, u32>,
@@ -401,7 +401,7 @@ impl DenialTracker {
 /// Replaces the previous `HashMap<String, bool>` (tool-name-only) with
 /// fingerprint-aware matching that distinguishes between different commands
 /// and paths for the same tool.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct FingerprintedOverrides {
     /// Ordered list of (fingerprint, allowed) rules, checked in insertion order.
     rules: Vec<(ApprovalFingerprint, bool)>,
@@ -459,6 +459,31 @@ impl FingerprintedOverrides {
     /// Iterate over all stored overrides.
     pub fn iter(&self) -> impl Iterator<Item = &(ApprovalFingerprint, bool)> {
         self.rules.iter()
+    }
+
+    /// Serialize to JSON for checkpoint persistence.
+    /// Returns `None` if there are no overrides to persist.
+    #[must_use]
+    pub fn to_json(&self) -> Option<serde_json::Value> {
+        if self.rules.is_empty() {
+            return None;
+        }
+        serde_json::to_value(self).ok()
+    }
+
+    /// Merge overrides restored from a checkpoint.
+    /// Session-priority merge: existing (live) overrides take precedence over
+    /// restored ones, so a user who changed their mind mid-session wins.
+    pub fn merge_from_json(&mut self, json: &serde_json::Value) {
+        let Ok(restored) = serde_json::from_value::<FingerprintedOverrides>(json.clone()) else {
+            return;
+        };
+        for (fp, allowed) in restored.rules {
+            // Only insert if no live override already covers this fingerprint.
+            if self.check(&fp).is_none() {
+                self.rules.push((fp, allowed));
+            }
+        }
     }
 }
 
@@ -683,5 +708,62 @@ mod tests {
 
         tracker.reset();
         assert!(tracker.extract_auto_deny_rules().is_empty());
+    }
+
+    #[test]
+    fn fingerprinted_overrides_roundtrip_json() {
+        let mut overrides = FingerprintedOverrides::default();
+        overrides.insert(
+            ApprovalFingerprint::shell("bash", "git commit -m 'wip'", false),
+            true,
+        );
+        overrides.insert(
+            ApprovalFingerprint::file_op("write_file", Some("src/main.rs")),
+            false,
+        );
+
+        let json = overrides.to_json().expect("non-empty should serialize");
+        let mut restored = FingerprintedOverrides::default();
+        restored.merge_from_json(&json);
+
+        assert_eq!(restored.len(), 2);
+        let git_fp = ApprovalFingerprint::shell("bash", "git commit -m 'test'", false);
+        assert_eq!(restored.check(&git_fp), Some(true));
+    }
+
+    #[test]
+    fn fingerprinted_overrides_empty_returns_none() {
+        let overrides = FingerprintedOverrides::default();
+        assert!(overrides.to_json().is_none());
+    }
+
+    #[test]
+    fn merge_from_json_does_not_overwrite_existing() {
+        let mut live = FingerprintedOverrides::default();
+        live.insert(ApprovalFingerprint::bare("bash"), false); // denied in live session
+
+        let mut checkpoint = FingerprintedOverrides::default();
+        checkpoint.insert(ApprovalFingerprint::bare("bash"), true); // allowed in checkpoint
+        let json = checkpoint.to_json().unwrap();
+
+        live.merge_from_json(&json);
+        // Live (deny) wins over checkpoint (allow).
+        let fp = ApprovalFingerprint::shell("bash", "ls", true);
+        assert_eq!(live.check(&fp), Some(false));
+    }
+
+    #[test]
+    fn denial_tracker_roundtrip_json() {
+        let mut tracker = DenialTracker::with_limits(DenialLimits {
+            max_consecutive: 3,
+            max_total: 10,
+        });
+        let fp = ApprovalFingerprint::bare("bash");
+        tracker.record(&fp, false);
+        tracker.record(&fp, false);
+
+        let json = serde_json::to_value(&tracker).unwrap();
+        let restored: DenialTracker = serde_json::from_value(json).unwrap();
+        assert_eq!(restored.total_denials(), 2);
     }
 }

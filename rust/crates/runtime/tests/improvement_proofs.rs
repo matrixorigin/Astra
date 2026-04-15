@@ -4993,6 +4993,8 @@ mod file_event_store_proofs {
             delegation_pattern: None,
             delegation_sub_run_summaries: Vec::new(),
             interruption: None,
+            approval_overrides: None,
+            consecutive_context_window_errors: 0,
         };
         let ckpt = StepCheckpoint::Heavy(Box::new(heavy));
         write_step_checkpoint(&sid, 1, &ckpt).unwrap();
@@ -6141,6 +6143,8 @@ mod crash_recovery_proofs {
             delegation_pattern: None,
             delegation_sub_run_summaries: Vec::new(),
             interruption: None,
+            approval_overrides: None,
+            consecutive_context_window_errors: 0,
         };
 
         // Serialize → deserialize roundtrip
@@ -6187,6 +6191,8 @@ mod crash_recovery_proofs {
             delegation_pattern: None,
             delegation_sub_run_summaries: Vec::new(),
             interruption: None,
+            approval_overrides: None,
+            consecutive_context_window_errors: 0,
         };
 
         // Simulate: slots 0,1 completed; slot 2 failed; slot 3 running; slot 4 pending
@@ -6302,6 +6308,8 @@ mod crash_recovery_proofs {
             completed_tool_results: completed,
             learning_snapshot_id: Some("snap-xyz".to_string()),
             interruption: None,
+            approval_overrides: None,
+            consecutive_context_window_errors: 0,
         };
 
         let summary = restore_summary(&restored);
@@ -6339,6 +6347,8 @@ mod crash_recovery_proofs {
             delegation_pattern: None,
             delegation_sub_run_summaries: Vec::new(),
             interruption: None,
+            approval_overrides: None,
+            consecutive_context_window_errors: 0,
         };
 
         // Strict should reject
@@ -7020,6 +7030,8 @@ mod checkpoint_cloud_persistence_proofs {
             delegation_pattern: None,
             delegation_sub_run_summaries: Vec::new(),
             interruption: None,
+            approval_overrides: None,
+            consecutive_context_window_errors: 0,
         }
     }
 
@@ -7142,6 +7154,8 @@ mod checkpoint_cloud_persistence_proofs {
             delegation_pattern: None,
             delegation_sub_run_summaries: Vec::new(),
             interruption: None,
+            approval_overrides: None,
+            consecutive_context_window_errors: 0,
         }));
         let json = serde_json::to_string(&cp).unwrap();
         let restored: StepCheckpoint = serde_json::from_str(&json).unwrap();

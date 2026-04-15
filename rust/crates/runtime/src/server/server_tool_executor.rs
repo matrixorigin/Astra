@@ -1017,6 +1017,7 @@ impl ServerToolExecutor {
             sandbox: astra_tools::SandboxConfig::standard(workspace_root.clone()),
             http_client: Some(http_client.clone()),
             logger: std::sync::Arc::new(astra_tools::TracingLogger),
+            cancel_token: None,
         });
         // Wire GitHubClient into DefaultToolExecutor if token available
         let github_token = std::env::var("GITHUB_TOKEN").ok();
@@ -1070,6 +1071,14 @@ impl ServerToolExecutor {
     /// Set the progress callback for streaming tool output.
     pub fn set_progress_callback(&mut self, cb: Arc<dyn astra_tools::ToolProgressCallback>) {
         self.progress_callback = Some(cb);
+    }
+
+    pub fn with_cancel_token(
+        mut self,
+        token: Option<Arc<tokio_util::sync::CancellationToken>>,
+    ) -> Self {
+        self.default_executor = self.default_executor.with_cancel_token(token);
+        self
     }
 
     /// Set the edge connection pool for remote tool routing.

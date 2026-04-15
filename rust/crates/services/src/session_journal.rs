@@ -741,6 +741,8 @@ pub enum JournalEventType {
     InterruptionRecorded,
     /// Low or very-low selector confidence diagnosed (tier, reasons, fallback action).
     ConfidenceDiagnosisRecorded,
+    /// Compaction retry completed — records tier, tokens freed, and per-layer breakdown.
+    CompactionRetry,
 }
 
 /// Writer that appends events to a session journal file.
@@ -2587,6 +2589,38 @@ impl JournalEvent {
         evt.selector_confidence = Some(confidence);
         evt.metadata = Some(serde_json::json!({
             "confidence_diagnosis": diagnosis_json,
+        }));
+        evt
+    }
+
+    /// Build a compaction retry telemetry event.
+    ///
+    /// Emitted after a successful compaction retry to capture operational metrics:
+    /// tier escalation, tokens freed, budget satisfaction, and per-layer breakdown.
+    #[allow(clippy::too_many_arguments)]
+    pub fn compaction_retry(
+        session_id: Option<&str>,
+        turn: u32,
+        tier: &str,
+        tokens_freed: u64,
+        budget_likely_satisfied: bool,
+        retry_count: u32,
+        layers: Vec<(String, u64)>,
+        consecutive_context_window_errors: u32,
+    ) -> Self {
+        let mut evt = Self::base(JournalEventType::CompactionRetry, session_id);
+        evt.turn = Some(turn);
+        evt.metadata = Some(serde_json::json!({
+            "compaction": {
+                "tier": tier,
+                "tokens_freed": tokens_freed,
+                "budget_likely_satisfied": budget_likely_satisfied,
+                "retry_count": retry_count,
+                "consecutive_context_window_errors": consecutive_context_window_errors,
+                "layers": layers.iter().map(|(name, freed)| {
+                    serde_json::json!({ "name": name, "tokens_freed": freed })
+                }).collect::<Vec<_>>(),
+            }
         }));
         evt
     }

@@ -476,6 +476,8 @@ mod tests {
             delegation_pattern: None,
             delegation_sub_run_summaries: Vec::new(),
             interruption: None,
+            approval_overrides: None,
+            consecutive_context_window_errors: 0,
         }
     }
 

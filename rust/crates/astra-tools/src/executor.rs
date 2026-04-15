@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::Value;
+use tokio_util::sync::CancellationToken;
 
 use crate::github::GitHubClient;
 use crate::task_mgmt::TaskManager;
@@ -96,6 +97,11 @@ impl DefaultToolExecutor {
 
     pub fn with_task_manager(mut self, mgr: Arc<TaskManager>) -> Self {
         self.task_manager = mgr;
+        self
+    }
+
+    pub fn with_cancel_token(mut self, token: Option<Arc<CancellationToken>>) -> Self {
+        self.ctx.cancel_token = token;
         self
     }
 
@@ -188,8 +194,8 @@ impl DefaultToolExecutor {
 
             // ── Shell operations ─────────────────────────────────────
             "bash" => crate::shell_ops::execute_bash(ws, args).await,
-            "grep" => crate::shell_ops::grep(ws, args).await,
-            "glob" => crate::shell_ops::glob(ws, args).await,
+            "grep" => crate::shell_ops::grep(&self.ctx, args).await,
+            "glob" => crate::shell_ops::glob(&self.ctx, args).await,
 
             // ── Git operations (gix-based) ───────────────────────────
             "git_status" => string_to_result(crate::git_gix::git_status(pr)),
