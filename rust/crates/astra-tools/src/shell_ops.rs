@@ -999,43 +999,113 @@ async fn run_grep_with_grep(
     request: &GrepRequest<'_>,
     cancel_token: Option<&CancellationToken>,
 ) -> Result<ReadOnlyCommandOutput, String> {
-    let mut cmd = Command::new("grep");
-    cmd.current_dir(request.workspace_root).kill_on_drop(true);
-
-    match request.output_mode {
-        SearchOutputMode::Content => {
-            cmd.arg("-rnHE");
+    let deadline = tokio::time::Instant::now() + GREP_TIMEOUT;
+    let enumerated = enumerate_search_files(request, cancel_token, deadline).await?;
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    let mut stdout_capped = false;
+    let mut exit_code = if enumerated.files.is_empty() {
+        if enumerated.timed_out || enumerated.cancelled {
+            -1
+        } else {
+            1
         }
-        SearchOutputMode::FilesWithMatches => {
-            cmd.arg("-rlHE");
+    } else {
+        1
+    };
+    let mut timed_out = enumerated.timed_out;
+    let mut cancelled = enumerated.cancelled;
+    let mut saw_match_output = false;
+
+    for chunk in enumerated.files.chunks(200) {
+        if timed_out || cancelled || stdout_capped {
+            break;
         }
-        SearchOutputMode::Count => {
-            cmd.arg("-rcHE");
+        if tokio::time::Instant::now() >= deadline {
+            timed_out = true;
+            break;
         }
+        if cancel_token.is_some_and(CancellationToken::is_cancelled) {
+            cancelled = true;
+            break;
+        }
+
+        let mut cmd = Command::new("grep");
+        cmd.current_dir(request.workspace_root).kill_on_drop(true);
+        match request.output_mode {
+            SearchOutputMode::Content => {
+                cmd.arg("-nHE");
+            }
+            SearchOutputMode::FilesWithMatches => {
+                cmd.arg("-lHE");
+            }
+            SearchOutputMode::Count => {
+                cmd.arg("-cHE");
+            }
+        }
+        if !request.case_sensitive {
+            cmd.arg("-i");
+        }
+        append_context_flags(
+            &mut cmd,
+            request.before_context_lines,
+            request.after_context_lines,
+        );
+        if let Some(max) = request.max_matches {
+            cmd.arg(format!("-m{max}"));
+        }
+        append_default_grep_excludes(&mut cmd);
+        cmd.arg("-e").arg(request.pattern).arg("--");
+        for file in chunk {
+            cmd.arg(file);
+        }
+
+        let remaining = deadline
+            .checked_duration_since(tokio::time::Instant::now())
+            .unwrap_or_else(|| Duration::from_millis(1));
+        let chunk_output = run_readonly_command_with_partial(
+            &mut cmd,
+            remaining,
+            RAW_GREP_OUTPUT_LIMIT,
+            cancel_token,
+        )
+        .await?;
+
+        if !chunk_output.stdout.trim().is_empty() {
+            saw_match_output = true;
+            exit_code = 0;
+            append_output_chunk(
+                &mut stdout,
+                &chunk_output.stdout,
+                RAW_GREP_OUTPUT_LIMIT,
+                &mut stdout_capped,
+            );
+        } else if exit_code == 1 && chunk_output.exit_code > 1 {
+            exit_code = chunk_output.exit_code;
+        }
+
+        if !chunk_output.stderr.trim().is_empty() {
+            if !stderr.is_empty() && !stderr.ends_with('\n') {
+                stderr.push('\n');
+            }
+            stderr.push_str(chunk_output.stderr.trim_end());
+        }
+
+        timed_out |= chunk_output.timed_out;
+        cancelled |= chunk_output.cancelled;
     }
 
-    if !request.case_sensitive {
-        cmd.arg("-i");
+    if !saw_match_output && (timed_out || cancelled) {
+        exit_code = -1;
     }
-    append_context_flags(
-        &mut cmd,
-        request.before_context_lines,
-        request.after_context_lines,
-    );
-    if let Some(max) = request.max_matches {
-        cmd.arg(format!("-m{max}"));
-    }
-    for include in &request.include_globs {
-        cmd.arg("--include").arg(include);
-    }
-    append_default_grep_excludes(&mut cmd);
-    cmd.arg("-e")
-        .arg(request.pattern)
-        .arg("--")
-        .arg(request.target);
 
-    run_readonly_command_with_partial(&mut cmd, GREP_TIMEOUT, RAW_GREP_OUTPUT_LIMIT, cancel_token)
-        .await
+    Ok(ReadOnlyCommandOutput {
+        stdout,
+        stderr,
+        exit_code,
+        timed_out,
+        cancelled,
+    })
 }
 
 async fn run_grep_multiline_locally(
@@ -1283,6 +1353,16 @@ fn append_output_line(output: &mut String, line: &str, max_bytes: usize, capped:
         append_capped(output, "\n", max_bytes, capped);
     }
     append_capped(output, line, max_bytes, capped);
+}
+
+fn append_output_chunk(output: &mut String, chunk: &str, max_bytes: usize, capped: &mut bool) {
+    if *capped || chunk.is_empty() {
+        return;
+    }
+    if !output.is_empty() && !output.ends_with('\n') {
+        append_capped(output, "\n", max_bytes, capped);
+    }
+    append_capped(output, chunk, max_bytes, capped);
 }
 
 async fn run_glob_with_rg(
