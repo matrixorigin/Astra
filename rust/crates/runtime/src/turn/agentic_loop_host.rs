@@ -708,6 +708,11 @@ pub struct AgenticLoopState {
     /// interruption context for structured resumption.
     pub interruption: Option<super::interruption::InterruptionRecord>,
 
+    // ── Approval checkpoint persistence ──
+    /// Approval overrides synchronized from CLI's PermissionManager before each turn.
+    /// Written to HeavyCheckpoint so approval decisions survive session restarts.
+    pub approval_overrides: Option<super::approval_fingerprint::FingerprintedOverrides>,
+
     // ── Confidence tracking ──
     /// Tracks selector confidence trends across turns to detect floor loops.
     pub confidence_trend: super::confidence_contract::ConfidenceTrendTracker,
@@ -1145,6 +1150,7 @@ pub(crate) mod tests {
             recent_tactical_actions: Vec::new(),
             server_tool_executor: None,
             interruption: None,
+            approval_overrides: None,
             confidence_trend: Default::default(),
             last_confidence_diagnosis: None,
         }

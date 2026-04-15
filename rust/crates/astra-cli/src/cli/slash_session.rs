@@ -1787,6 +1787,30 @@ pub(super) fn handle_session_command(arg: &str, state: &mut ReplState) {
                                     tier,
                                 );
                             }
+                            session_journal::JournalEventType::CompactionRetry => {
+                                let retry_count = evt
+                                    .metadata
+                                    .as_ref()
+                                    .and_then(|m| m.get("compaction"))
+                                    .and_then(|v| v.get("retry_count"))
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0);
+                                let tokens_freed = evt
+                                    .metadata
+                                    .as_ref()
+                                    .and_then(|m| m.get("compaction"))
+                                    .and_then(|v| v.get("tokens_freed"))
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0);
+                                eprintln!(
+                                    "  {} {} T{} compaction retry #{} (freed {} tokens)",
+                                    ts_short.dim(),
+                                    "🗜️",
+                                    evt.turn.unwrap_or(0),
+                                    retry_count,
+                                    tokens_freed,
+                                );
+                            }
                         }
                     }
                     // Summary stats

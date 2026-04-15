@@ -171,6 +171,33 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                             ),
                         );
                     }
+
+                    // Emit structured compaction telemetry for observability.
+                    if let Some(sid) = state.current_session_id.as_deref() {
+                        let turn = (state.max_turns - state.remaining_turns) as u32;
+                        let tokens_freed = result.pipeline_outcome.total_tokens_freed;
+                        let budget_likely_satisfied = result.budget_likely_satisfied;
+                        let layers: Vec<(String, u64)> = result
+                            .pipeline_outcome
+                            .layer_results
+                            .iter()
+                            .map(|(name, cr)| (name.clone(), cr.estimated_tokens_freed))
+                            .collect();
+                        let evt = astra_services::session_journal::JournalEvent::compaction_retry(
+                            Some(sid),
+                            turn,
+                            tier_label,
+                            tokens_freed,
+                            budget_likely_satisfied,
+                            state.consecutive_context_window_errors,
+                            layers,
+                        );
+                        if let Ok(writer) = astra_services::session_journal::JournalWriter::new(sid)
+                        {
+                            let _ = writer.append(&evt);
+                        }
+                    }
+
                     try_write_heavy_checkpoint(state);
                     return Ok(TurnExecutionControl::ContinueLoop);
                 }

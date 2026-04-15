@@ -838,6 +838,15 @@ pub struct HeavyCheckpoint {
     /// context overflow, cancellation, etc.).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interruption: Option<serde_json::Value>,
+    /// Serialized approval overrides (FingerprintedOverrides) for session continuity.
+    /// When restored, merged into the live PermissionManager so approval decisions
+    /// survive session restarts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_overrides: Option<serde_json::Value>,
+    /// Consecutive context-window errors counter for compaction tier escalation.
+    /// Persisted so aggressive-tier compaction survives session resume.
+    #[serde(default)]
+    pub consecutive_context_window_errors: u32,
 }
 
 /// Unified checkpoint type (stored in Step)
@@ -955,6 +964,8 @@ impl StepCheckpoint {
             delegation_pattern: None,
             delegation_sub_run_summaries: Vec::new(),
             interruption: None,
+            approval_overrides: None,
+            consecutive_context_window_errors: 0,
         }))
     }
 
@@ -2926,6 +2937,8 @@ mod tests {
             delegation_pattern: None,
             delegation_sub_run_summaries: Vec::new(),
             interruption: None,
+            approval_overrides: None,
+            consecutive_context_window_errors: 0,
         }));
         let err = cp.validate().unwrap_err();
         assert!(matches!(err, ProtocolError::CheckpointCorrupt(_)));
@@ -2957,6 +2970,8 @@ mod tests {
             delegation_pattern: None,
             delegation_sub_run_summaries: Vec::new(),
             interruption: None,
+            approval_overrides: None,
+            consecutive_context_window_errors: 0,
         }));
         assert!(cp.validate().is_ok());
     }

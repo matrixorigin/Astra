@@ -2309,6 +2309,7 @@ fn event_type_name(event_type: &JournalEventType) -> String {
         JournalEventType::AdaptiveTuningRuleTriggered => "adaptive_tuning_rule_triggered",
         JournalEventType::InterruptionRecorded => "interruption_recorded",
         JournalEventType::ConfidenceDiagnosisRecorded => "confidence_diagnosis_recorded",
+        JournalEventType::CompactionRetry => "compaction_retry",
     }
     .to_string()
 }
