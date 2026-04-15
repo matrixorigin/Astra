@@ -46,7 +46,7 @@ const stream = client.streamChat(
   {
     onEvent(event) {
       if (event.type === 'text_delta') {
-        process.stdout.write(event.delta);
+        process.stdout.write(event.content);
       }
     },
   },
@@ -68,7 +68,7 @@ const ws = new AstraWebSocket({
 await ws.connect();
 
 // Listen for specific event types
-ws.on('text_delta', (event) => console.log(event.delta));
+ws.on('text_delta', (event) => console.log(event.content));
 ws.on('tool_approval_request', (event) => {
   ws.approveToolCall({ callId: event.request_id, approved: true });
 });
@@ -84,11 +84,16 @@ ws.resumeRun('run-id');
 
 ```tsx
 import { useAstraChat } from '@astra/sdk/react';
+import { AstraClient } from '@astra/sdk';
+
+const client = new AstraClient({
+  baseUrl: 'http://localhost:8000',
+  accessToken: token,
+});
 
 function Chat() {
   const { messages, sendMessage, isStreaming, plan, usage } = useAstraChat({
-    baseUrl: 'http://localhost:8000',
-    accessToken: token,
+    client,
   });
 
   return (
@@ -168,6 +173,25 @@ import type {
   // ... and more
 } from '@astra/sdk';
 ```
+
+## Testing
+
+```bash
+cd packages/sdk
+npm test        # 67 tests across 4 suites
+```
+
+Test coverage:
+- `client.test.ts` — AstraClient REST methods, auth, auto-refresh (24 tests)
+- `websocket.test.ts` — AstraWebSocket connection, events, methods (12 tests)
+- `sse-client.test.ts` — SSEClient connection, parsing, state, abort (16 tests)
+- `hooks.test.ts` — useAstraChat & useAstraRun React hooks (15 tests)
+
+## Migration from web/ Internal APIs
+
+Types (`StreamEvent`, `ChatMessage`, `ToolCall`, etc.) are already re-exported from `@astra/sdk` by `web/lib/streaming/types.ts` and `web/lib/workspace/types.ts`.
+
+The web app's `useChatStream` hook uses cookie-based auth via Next.js proxy (`/api/backend/chat/stream`), while the SDK uses JWT auth directly. Full hook migration requires an auth adapter layer.
 
 ## License
 
