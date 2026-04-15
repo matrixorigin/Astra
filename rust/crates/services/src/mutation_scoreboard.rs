@@ -1108,6 +1108,60 @@ mod tests {
     }
 
     #[test]
+    fn session_state_compensation_stays_staged_apply_ready_without_snapshot() {
+        let mutation = StagedMutation::new(
+            "mut-session",
+            "session-1",
+            7,
+            "adjust_config",
+            serde_json::json!({"path": "memory.retrieval_top_k", "value": 6}),
+            None,
+            MutationObjectiveScore::from_learning_signal(0.91, Some(86), 0.04, 0.83, false),
+            Some(MutationVerifierSummary::from_report(&verification_report(
+                true,
+            ))),
+            MutationCompensationPolicy {
+                bounded: true,
+                reversible: true,
+                requires_pre_state: false,
+                action_category: MutationActionCategory::Write,
+                compensation_kind: Some("restore_session_state".into()),
+                compensation_summary: Some(
+                    "call `rollback_session_state` with scope=`current_turn` to restore the previous session state"
+                        .into(),
+                ),
+            },
+        );
+
+        assert_eq!(
+            mutation.judgment.safety_verdict,
+            MutationSafetyVerdict::Safe
+        );
+        assert!(
+            mutation
+                .judgment
+                .promotion_verdict
+                .evidence
+                .iter()
+                .any(|evidence| evidence == "bounded_reversible_compensation")
+        );
+        assert!(
+            mutation
+                .judgment
+                .promotion_verdict
+                .evidence
+                .iter()
+                .all(|evidence| evidence != "missing_pre_state_snapshot")
+        );
+        assert_eq!(
+            mutation.judgment.promotion_verdict.rollback_hint.as_deref(),
+            Some(
+                "call `rollback_session_state` with scope=`current_turn` to restore the previous session state"
+            )
+        );
+    }
+
+    #[test]
     fn uncertain_retention_score_stays_review_instead_of_reject() {
         let mutation = StagedMutation::new(
             "mut-uncertain",

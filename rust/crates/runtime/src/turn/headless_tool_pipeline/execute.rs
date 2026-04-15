@@ -34,7 +34,12 @@ impl<'a, E: EdgeToolRoundRow> HeadlessToolExecutionPipeline<'a, E> {
         // execute the tool directly on the server instead.
         if !execution.is_edge_tool && execution.result_str.starts_with(EDGE_PROTOCOL_ERROR_PREFIX) {
             if let Some(executor) = self.ctx.server_tool_executor {
-                execution.result_str = executor.execute(&execution.name, &execution.args).await;
+                executor.set_turn_index(self.ctx.turn_index.min(u32::MAX as usize) as u32);
+                let result = executor
+                    .execute_with_metadata(&execution.name, &execution.args)
+                    .await;
+                execution.tool_result_fields = result.metadata;
+                execution.result_str = result.output;
             }
         }
 

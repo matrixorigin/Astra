@@ -184,7 +184,7 @@ impl ServerAgenticLoopHostBuilder {
         // server-side tool schemas from astra-tools so the LLM knows what's available.
         let server_side_tools = self.edge_tools.is_empty();
         let edge_tools = if server_side_tools {
-            astra_tools::schemas::all_tool_schemas()
+            astra_tools::schemas::server_executor_tool_schemas()
         } else {
             self.edge_tools
         };
@@ -1211,6 +1211,26 @@ mod tests {
         // When no edge tools are provided, server-side tool schemas are auto-populated
         assert!(host.server_side_tools);
         assert!(!host.valid_tool_names().is_empty());
+        assert!(host.valid_tool_names().contains("rollback_file_edits"));
+        assert!(host.valid_tool_names().contains("adjust_config"));
+        assert!(host.valid_tool_names().contains("prioritize_tool"));
+        assert!(host.valid_tool_names().contains("deprioritize_tool"));
+        assert!(host.valid_tool_names().contains("set_goal"));
+        assert!(host.valid_tool_names().contains("compress_context"));
+        assert!(host.valid_tool_names().contains("rollback_session_state"));
+        assert!(host.valid_tool_names().contains("task_create"));
+        assert!(host.valid_tool_names().contains("task_list"));
+        assert!(host.valid_tool_names().contains("task_get"));
+        assert!(host.valid_tool_names().contains("task_update"));
+        assert!(host.valid_tool_names().contains("task_stop"));
+        assert!(host.valid_tool_names().contains("mo_query"));
+        assert!(
+            host.valid_tool_names()
+                .contains("rollback_database_snapshots")
+        );
+        assert!(host.valid_tool_names().contains("memory_store"));
+        assert!(!host.valid_tool_names().contains("multi_edit"));
+        assert!(!host.valid_tool_names().contains("powershell"));
         assert!(host.emitted_events.is_empty());
     }
 

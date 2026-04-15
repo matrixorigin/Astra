@@ -5,6 +5,85 @@
 
 use serde_json::{Value, json};
 
+pub const DEFAULT_EXECUTOR_TOOL_NAMES: &[&str] = &[
+    "bash",
+    "read_file",
+    "write_file",
+    "str_replace",
+    "delete_file",
+    "list_dir",
+    "grep",
+    "glob",
+    "git_status",
+    "git_diff",
+    "git_log",
+    "git_show",
+    "git_blame",
+    "git_commit",
+    "git_revert_commit",
+    "web_search",
+];
+
+pub const SERVER_EXECUTOR_TOOL_NAMES: &[&str] = &[
+    "bash",
+    "read_file",
+    "write_file",
+    "str_replace",
+    "delete_file",
+    "rollback_file_edits",
+    "list_dir",
+    "adjust_config",
+    "prioritize_tool",
+    "deprioritize_tool",
+    "set_goal",
+    "compress_context",
+    "rollback_session_state",
+    "task_create",
+    "task_list",
+    "task_get",
+    "task_update",
+    "task_stop",
+    "mo_query",
+    "rollback_database_snapshots",
+    "grep",
+    "glob",
+    "git_status",
+    "git_diff",
+    "git_log",
+    "git_show",
+    "git_blame",
+    "git_commit",
+    "git_revert_commit",
+    "web_search",
+    "memory_retrieve",
+    "memory_store",
+    "memory_search",
+    "memory_purge",
+    "memory_correct",
+    "memory_profile",
+];
+
+fn filter_tool_schemas_by_name(allowed_names: &[&str]) -> Vec<Value> {
+    all_tool_schemas()
+        .into_iter()
+        .filter(|schema| {
+            schema
+                .get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(Value::as_str)
+                .is_some_and(|name| allowed_names.contains(&name))
+        })
+        .collect()
+}
+
+pub fn default_executor_tool_schemas() -> Vec<Value> {
+    filter_tool_schemas_by_name(DEFAULT_EXECUTOR_TOOL_NAMES)
+}
+
+pub fn server_executor_tool_schemas() -> Vec<Value> {
+    filter_tool_schemas_by_name(SERVER_EXECUTOR_TOOL_NAMES)
+}
+
 pub fn all_tool_schemas() -> Vec<Value> {
     vec![
         json!({
@@ -1779,4 +1858,58 @@ pub fn all_tool_schemas() -> Vec<Value> {
             }
         }),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn schema_names(schemas: &[Value]) -> Vec<&str> {
+        schemas
+            .iter()
+            .filter_map(|schema| {
+                schema
+                    .get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(Value::as_str)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn default_executor_tool_schemas_exclude_unsupported_tools() {
+        let schemas = default_executor_tool_schemas();
+        let names = schema_names(&schemas);
+        assert!(names.contains(&"git_revert_commit"));
+        assert!(!names.contains(&"rollback_file_edits"));
+        assert!(!names.contains(&"memory_store"));
+        assert!(!names.contains(&"powershell"));
+        assert!(!names.contains(&"multi_edit"));
+    }
+
+    #[test]
+    fn server_executor_tool_schemas_match_server_supported_surface() {
+        let schemas = server_executor_tool_schemas();
+        let names = schema_names(&schemas);
+        assert!(names.contains(&"rollback_file_edits"));
+        assert!(names.contains(&"adjust_config"));
+        assert!(names.contains(&"prioritize_tool"));
+        assert!(names.contains(&"deprioritize_tool"));
+        assert!(names.contains(&"set_goal"));
+        assert!(names.contains(&"compress_context"));
+        assert!(names.contains(&"rollback_session_state"));
+        assert!(names.contains(&"task_create"));
+        assert!(names.contains(&"task_list"));
+        assert!(names.contains(&"task_get"));
+        assert!(names.contains(&"task_update"));
+        assert!(names.contains(&"task_stop"));
+        assert!(names.contains(&"mo_query"));
+        assert!(names.contains(&"rollback_database_snapshots"));
+        assert!(names.contains(&"memory_store"));
+        assert!(names.contains(&"git_revert_commit"));
+        assert!(!names.contains(&"rollback_turn_actions"));
+        assert!(!names.contains(&"powershell"));
+        assert!(!names.contains(&"memory_feedback"));
+        assert!(!names.contains(&"multi_edit"));
+    }
 }

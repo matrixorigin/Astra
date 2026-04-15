@@ -30,6 +30,15 @@ fn string_to_result(output: String) -> ToolResult {
     }
 }
 
+fn outcome_to_result(outcome: crate::git_gix::ToolExecutionOutcome) -> ToolResult {
+    let is_error = outcome.output.starts_with("Error");
+    ToolResult {
+        output: outcome.output,
+        metadata: outcome.tool_result_fields,
+        is_error,
+    }
+}
+
 // ─── DefaultToolExecutor ────────────────────────────────────────────────────
 
 /// Default tool executor with the full shared tool set.
@@ -146,7 +155,7 @@ impl ToolExecutor for DefaultToolExecutor {
     }
 
     fn tool_schemas(&self) -> Vec<Value> {
-        crate::schemas::all_tool_schemas()
+        crate::schemas::default_executor_tool_schemas()
     }
 
     fn project_root(&self) -> &Path {
@@ -183,12 +192,14 @@ impl DefaultToolExecutor {
             "git_log" => string_to_result(crate::git_gix::git_log(pr, args)),
             "git_show" => string_to_result(crate::git_gix::git_show(pr, args, 0.0, 0)),
             "git_blame" => string_to_result(crate::git_gix::git_blame(pr, args)),
-            "git_commit" => string_to_result(crate::git_gix::git_commit(pr, args)),
+            "git_commit" => outcome_to_result(crate::git_gix::git_commit_with_metadata(pr, args)),
             "git_file_history" => string_to_result(crate::git_gix::git_file_history(pr, args)),
             "git_log_search" => string_to_result(crate::git_gix::git_log_search(pr, args)),
             "git_contributors" => string_to_result(crate::git_gix::git_contributors(pr, args)),
-            "git_revert_commit" => string_to_result(crate::git_gix::git_revert_commit(pr, args)),
-            "git_stash" => string_to_result(crate::git_gix::git_stash(pr, args)),
+            "git_revert_commit" => {
+                outcome_to_result(crate::git_gix::git_revert_commit_with_metadata(pr, args))
+            }
+            "git_stash" => outcome_to_result(crate::git_gix::git_stash_with_metadata(pr, args)),
 
             // ── GitHub API ───────────────────────────────────────────
             "github_list_prs"
@@ -408,7 +419,10 @@ impl DefaultToolExecutor {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
+    use serde_json::Value;
     use tempfile::TempDir;
 
     fn test_executor() -> (TempDir, DefaultToolExecutor) {
@@ -416,6 +430,24 @@ mod tests {
         let ctx = ToolContext::test(tmp.path());
         let exec = DefaultToolExecutor::new(ctx);
         (tmp, exec)
+    }
+
+    fn init_git_repo(dir: &Path) {
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["config", "user.name", "Test User"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
     }
 
     #[tokio::test]
@@ -631,5 +663,50 @@ mod tests {
             .await;
         assert!(result.is_error);
         assert!(result.output.contains("http"));
+    }
+
+    #[tokio::test]
+    async fn dispatch_git_revert_commit() {
+        let (tmp, exec) = test_executor();
+        init_git_repo(tmp.path());
+
+        let tracked = tmp.path().join("tracked.txt");
+        std::fs::write(&tracked, "original\n").unwrap();
+        let initial = exec
+            .execute("git_commit", &serde_json::json!({"message": "initial"}))
+            .await;
+        assert!(!initial.is_error, "got: {}", initial.output);
+
+        std::fs::write(&tracked, "changed\n").unwrap();
+        let committed = exec
+            .execute(
+                "git_commit",
+                &serde_json::json!({"message": "change tracked"}),
+            )
+            .await;
+        assert!(!committed.is_error, "got: {}", committed.output);
+        let commit_sha = committed
+            .metadata
+            .as_ref()
+            .and_then(|fields| fields.get("commit_sha"))
+            .and_then(Value::as_str)
+            .expect("commit_sha metadata");
+
+        let reverted = exec
+            .execute(
+                "git_revert_commit",
+                &serde_json::json!({"commit_sha": commit_sha}),
+            )
+            .await;
+        assert!(!reverted.is_error, "got: {}", reverted.output);
+        assert_eq!(std::fs::read_to_string(&tracked).unwrap(), "original\n");
+        assert_eq!(
+            reverted
+                .metadata
+                .as_ref()
+                .and_then(|fields| fields.get("reverted_commit_sha"))
+                .and_then(Value::as_str),
+            Some(commit_sha)
+        );
     }
 }

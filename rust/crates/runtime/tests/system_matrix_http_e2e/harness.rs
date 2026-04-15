@@ -8,18 +8,21 @@
 use std::sync::Arc;
 use std::sync::OnceLock;
 
+use astra_core::SharedPool;
 use astra_core::config::AppSettings;
-use astra_runtime::{MemoriaForwarder, build_app, build_server_state};
+use astra_runtime::{DatabaseEvaluationService, MemoriaForwarder, build_app, build_server_state};
 use async_trait::async_trait;
 use axum::{
-    Router,
+    Json, Router,
     body::{self, Body},
     http::{Request, StatusCode},
+    routing::get,
 };
 use futures_util::StreamExt;
 use serde_json::{Value, json};
 use sqlx::Row;
 use sqlx::mysql::MySqlRow;
+use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tower::util::ServiceExt;
 use uuid::Uuid;
@@ -56,6 +59,58 @@ impl MemoriaForwarder for E2eMemoriaStub {
         }
         Ok(json!({ "memory_id": "e2e-stub-memory" }))
     }
+}
+
+async fn start_mock_memoria_health() -> String {
+    let app = Router::new()
+        .route(
+            "/v1/health/storage",
+            get(|| async move {
+                Json(json!({
+                    "total": 12,
+                    "active": 9,
+                    "inactive": 3
+                }))
+            }),
+        )
+        .route(
+            "/v1/health/analyze",
+            get(|| async move {
+                Json(json!({
+                    "semantic": {
+                        "total": 4,
+                        "avg_confidence": 0.8
+                    },
+                    "profile": {
+                        "total": 8,
+                        "avg_confidence": 0.6
+                    }
+                }))
+            }),
+        )
+        .route(
+            "/v1/health/hygiene",
+            get(|| async move {
+                Json(json!({
+                    "inactive_memories": 0,
+                    "stale_working_memories": 2,
+                    "orphan_memory_entity_links": 0,
+                    "orphan_entity_links": 0,
+                    "orphan_graph_nodes": 0
+                }))
+            }),
+        );
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mock memoria health");
+    let addr = listener.local_addr().expect("mock memoria local addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("serve mock memoria health");
+    });
+    tokio::task::yield_now().await;
+    format!("http://{addr}")
 }
 
 pub async fn get_json(
@@ -383,6 +438,7 @@ pub async fn bootstrap() -> BootstrapResult {
     dotenvy::dotenv().ok();
 
     let settings = AppSettings::from_env().expect("AppSettings::from_env (see astra-server env)");
+    let matrixone_settings = settings.matrixone.clone();
     let matrixone_database = settings.matrixone.database.clone();
     let url = settings.matrixone.database_url();
 
@@ -399,6 +455,19 @@ pub async fn bootstrap() -> BootstrapResult {
         .connect(&url)
         .await
         .expect("connect MatrixOne for assertions");
+
+    let evaluation_pool = SharedPool::new(&matrixone_settings)
+        .await
+        .expect("connect MatrixOne shared pool for evaluation");
+    let memoria_health_base_url = start_mock_memoria_health().await;
+    let state = state.with_evaluation_service(Arc::new(
+        DatabaseEvaluationService::new(matrixone_settings)
+            .with_pool(evaluation_pool)
+            .with_memoria_config(
+                memoria_health_base_url,
+                Some("system-e2e-mock-master-key".to_string()),
+            ),
+    ));
 
     let app = build_app(state);
 
