@@ -267,6 +267,20 @@ pub fn build_resume_guidance(interruption_json: &serde_json::Value) -> Option<St
                  instructions before proceeding.\n",
             );
         }
+        "critical_verdict" => {
+            guidance.push_str(
+                "  Action: The previous run was stopped by TurnGuard due to repeated \
+                 errors and stalls. Review what went wrong, try a different approach, \
+                 and avoid the tool patterns that caused failures.\n",
+            );
+        }
+        "approval_rejected" => {
+            guidance.push_str(
+                "  Action: Tool approvals were repeatedly denied. Use only read-only \
+                 tools or ask the user for explicit permission before attempting \
+                 write operations.\n",
+            );
+        }
         _ => {
             if !user_msg.is_empty() {
                 guidance.push_str(&format!("  Detail: {user_msg}\n"));
@@ -508,5 +522,106 @@ mod tests {
     #[test]
     fn classify_error_unknown_returns_none() {
         assert!(classify_error("some random error").is_none());
+    }
+
+    // ── new interruption kind tests ──
+
+    #[test]
+    fn critical_verdict_is_resumable() {
+        assert!(InterruptionKind::CriticalVerdict.is_resumable());
+    }
+
+    #[test]
+    fn approval_rejected_is_resumable() {
+        assert!(InterruptionKind::ApprovalRejected.is_resumable());
+    }
+
+    #[test]
+    fn cumulative_budget_exceeded_is_resumable() {
+        assert!(InterruptionKind::CumulativeBudgetExceeded.is_resumable());
+    }
+
+    #[test]
+    fn server_overload_is_resumable() {
+        assert!(InterruptionKind::ServerOverload.is_resumable());
+    }
+
+    #[test]
+    fn cooldown_rejected_is_resumable() {
+        assert!(InterruptionKind::CooldownRejected.is_resumable());
+    }
+
+    #[test]
+    fn resume_guidance_critical_verdict() {
+        let irj = serde_json::json!({
+            "kind": "critical_verdict",
+            "resumable": true,
+            "has_checkpoint": true,
+            "tool_calls_completed": 8,
+            "turns_completed": 4,
+            "remaining_turns": 0,
+            "user_message": ""
+        });
+        let guidance = build_resume_guidance(&irj).unwrap();
+        assert!(guidance.contains("critical_verdict"));
+        assert!(guidance.contains("TurnGuard"));
+        assert!(guidance.contains("different approach"));
+    }
+
+    #[test]
+    fn resume_guidance_approval_rejected() {
+        let irj = serde_json::json!({
+            "kind": "approval_rejected",
+            "resumable": true,
+            "has_checkpoint": true,
+            "tool_calls_completed": 3,
+            "turns_completed": 2,
+            "remaining_turns": 8,
+            "user_message": ""
+        });
+        let guidance = build_resume_guidance(&irj).unwrap();
+        assert!(guidance.contains("approval_rejected"));
+        assert!(guidance.contains("read-only"));
+    }
+
+    #[test]
+    fn resume_guidance_cumulative_budget() {
+        let irj = serde_json::json!({
+            "kind": "cumulative_budget_exceeded",
+            "resumable": true,
+            "has_checkpoint": true,
+            "tool_calls_completed": 20,
+            "turns_completed": 10,
+            "remaining_turns": 0,
+            "user_message": ""
+        });
+        let guidance = build_resume_guidance(&irj).unwrap();
+        assert!(guidance.contains("cumulative_budget_exceeded"));
+        assert!(guidance.contains("Prioritize"));
+    }
+
+    #[test]
+    fn all_interruption_kinds_have_labels() {
+        let kinds = [
+            InterruptionKind::BudgetExhausted,
+            InterruptionKind::TokenBudgetExceeded,
+            InterruptionKind::CumulativeBudgetExceeded,
+            InterruptionKind::RateLimited,
+            InterruptionKind::CooldownRejected,
+            InterruptionKind::UserCancelled,
+            InterruptionKind::ContextOverflow,
+            InterruptionKind::AuthFailure,
+            InterruptionKind::CriticalVerdict,
+            InterruptionKind::ApprovalRejected,
+            InterruptionKind::ServerOverload,
+        ];
+        for kind in kinds {
+            let label = kind.label();
+            assert!(!label.is_empty(), "{kind:?} should have a label");
+            assert!(
+                label.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+                "label should be snake_case: {label}"
+            );
+        }
     }
 }

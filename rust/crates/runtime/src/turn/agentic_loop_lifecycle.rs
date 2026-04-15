@@ -637,6 +637,50 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
         }
     }
 
+    // ── Compaction-on-resume: if turn 0 has many messages (restored from
+    // checkpoint), estimate context pressure from raw content size and
+    // proactively compress before the first LLM call.  This prevents an
+    // immediate 413 when resuming from a CompactAndRetry interruption.
+    if turn_index == 0 && state.messages.len() > 10 && state.max_turn_input_tokens > 0 {
+        let total_chars: usize = state
+            .messages
+            .iter()
+            .filter_map(|m| m.get("content").and_then(Value::as_str))
+            .map(|s| s.len())
+            .sum();
+        let estimated_tokens = total_chars as f64 / 4.0;
+        let estimated_pressure = estimated_tokens / state.max_turn_input_tokens as f64;
+        if estimated_pressure >= 0.75 {
+            let budget = super::context_compression::TokenBudget {
+                max_prompt_tokens: state.max_turn_input_tokens,
+                last_measured_tokens: estimated_tokens as u64,
+                chars_per_token: 4.0,
+            };
+            let pipeline = if estimated_pressure >= 0.90 {
+                super::context_compression::CompressionPipeline::aggressive_pipeline()
+            } else {
+                super::context_compression::CompressionPipeline::default_pipeline()
+            };
+            let outcome = pipeline.compress_if_needed(&mut state.messages, &budget);
+            if outcome.total_tokens_freed > 0 && !quiet {
+                let tier = if estimated_pressure >= 0.90 {
+                    "aggressive"
+                } else {
+                    "default"
+                };
+                host.emit_headless_line(
+                    HeadlessStderrStyle::Yellow,
+                    format!(
+                        "  ⚡ Resume {} compression: freed ~{} tokens at ~{:.0}% est. pressure",
+                        tier,
+                        outcome.total_tokens_freed,
+                        estimated_pressure * 100.0,
+                    ),
+                );
+            }
+        }
+    }
+
     Ok(PreparedTurnIteration::Ready(TurnIterationPrep {
         quiet,
         turn_start_time,

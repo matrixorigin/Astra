@@ -391,6 +391,18 @@ fn should_wrap_up_for_cumulative_budget<H: AgenticLoopHost>(
     }
 
     state.budget_wrapup_injected = true;
+    // Record structured interruption for cumulative budget exhaustion.
+    state.interruption = Some(InterruptionRecord::new(
+        InterruptionKind::CumulativeBudgetExceeded,
+        ResumeAction::ContinueImmediately,
+        interruption_state_summary(
+            state,
+            Some(format!(
+                "Cumulative token budget: {cumulative}/{} tokens",
+                state.max_cumulative_tokens,
+            )),
+        ),
+    ));
     if !quiet {
         host.emit_headless_line(
             HeadlessStderrStyle::Yellow,

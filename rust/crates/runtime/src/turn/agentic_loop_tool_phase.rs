@@ -1125,6 +1125,20 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
         },
     )) {
         AgenticPostToolIterationControl::Abort(e) => {
+            // Wire CriticalVerdict interruption so the checkpoint / journal
+            // carry a structured record for resumption.
+            if state.interruption.is_none() {
+                use super::agentic_loop_lifecycle::interruption_state_summary;
+                use super::interruption::{InterruptionKind, InterruptionRecord, ResumeAction};
+                state.interruption = Some(InterruptionRecord::new(
+                    InterruptionKind::CriticalVerdict,
+                    ResumeAction::ContinueImmediately,
+                    interruption_state_summary(
+                        state,
+                        Some(format!("TurnGuard critical verdict: {e}")),
+                    ),
+                ));
+            }
             let updated_promotion_signals = refresh_runtime_promotion_signals_from_turn(
                 state.telemetry.runtime_promotion_signals.as_ref(),
                 &state.message,
