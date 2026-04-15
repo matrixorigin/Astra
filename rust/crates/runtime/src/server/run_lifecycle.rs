@@ -1142,7 +1142,8 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 session_id.clone(),
                 memoria_base,
                 None,
-            );
+            )
+            .with_cancel_token(loop_state.cancellation.token.clone());
             if let Some(pool) = &self.edge_connection_pool {
                 executor.set_edge_connection_pool(pool.clone());
             }
@@ -1987,7 +1988,8 @@ impl SubRunExecutor for ServerSubRunExecutor {
                 config.session_id.clone(),
                 memoria_base,
                 None,
-            );
+            )
+            .with_cancel_token(config.cancel_token.clone());
             if let Some(pool) = &self.edge_connection_pool {
                 executor.set_edge_connection_pool(pool.clone());
             }

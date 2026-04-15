@@ -9,6 +9,7 @@ use regex::Regex;
 use serde_json::Value;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
+use tokio_util::sync::CancellationToken;
 
 use crate::{ToolResult, per_tool_output_limit, truncate_output};
 
@@ -56,6 +57,7 @@ struct ReadOnlyCommandOutput {
     stderr: String,
     exit_code: i32,
     timed_out: bool,
+    cancelled: bool,
 }
 
 struct GrepRequest<'a> {
@@ -126,7 +128,8 @@ pub async fn execute_bash(workspace_root: &Path, args: &Value) -> ToolResult {
 }
 
 /// Search files with bounded, cancellable subprocess execution.
-pub async fn grep(workspace_root: &Path, args: &Value) -> ToolResult {
+pub async fn grep(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
+    let workspace_root = ctx.workspace_root.as_path();
     let pattern = match args.get("pattern").and_then(|v| v.as_str()) {
         Some(p) => p,
         None => return ToolResult::error("Error: Missing 'pattern' parameter".into()),
@@ -176,9 +179,9 @@ pub async fn grep(workspace_root: &Path, args: &Value) -> ToolResult {
     };
 
     let command_output = if ripgrep_available() {
-        run_grep_with_rg(&request).await
+        run_grep_with_rg(&request, ctx.cancel_token.as_deref()).await
     } else {
-        run_grep_with_grep(&request).await
+        run_grep_with_grep(&request, ctx.cancel_token.as_deref()).await
     };
 
     let ReadOnlyCommandOutput {
@@ -186,6 +189,7 @@ pub async fn grep(workspace_root: &Path, args: &Value) -> ToolResult {
         stderr,
         exit_code,
         timed_out,
+        cancelled,
     } = match command_output {
         Ok(output) => output,
         Err(e) => return ToolResult::error(e),
@@ -200,6 +204,9 @@ pub async fn grep(workspace_root: &Path, args: &Value) -> ToolResult {
     }
 
     if stdout.trim().is_empty() && exit_code != 0 {
+        if cancelled {
+            return ToolResult::error("Error: grep was cancelled before returning results.".into());
+        }
         if timed_out {
             return ToolResult::error(
                 "Error: grep timed out after 20s with no results. Narrow the search with 'path', 'include', or a more specific pattern.".into(),
@@ -255,7 +262,15 @@ pub async fn grep(workspace_root: &Path, args: &Value) -> ToolResult {
     let mut result_text = visible_lines.join("\n");
     result_text = truncate_output(result_text, per_tool_output_limit("grep"));
 
-    if timed_out {
+    if cancelled {
+        if !result_text.is_empty() {
+            result_text.push_str(
+                "\n\n[grep cancelled — showing partial results captured before cancellation.]",
+            );
+        } else {
+            result_text = "[grep cancelled before partial results were captured]".into();
+        }
+    } else if timed_out {
         if !result_text.is_empty() {
             result_text.push_str(
                 "\n\n[grep timed out after 20s — showing partial results. Narrow the search with 'path' or 'include'.]",
@@ -279,7 +294,8 @@ pub async fn grep(workspace_root: &Path, args: &Value) -> ToolResult {
 }
 
 /// Find files matching a glob pattern without blocking the async executor.
-pub async fn glob(workspace_root: &Path, args: &Value) -> ToolResult {
+pub async fn glob(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
+    let workspace_root = ctx.workspace_root.as_path();
     let pattern = match args.get("pattern").and_then(|v| v.as_str()) {
         Some(p) => p,
         None => return ToolResult::error("Error: Missing 'pattern' parameter".into()),
@@ -307,9 +323,15 @@ pub async fn glob(workspace_root: &Path, args: &Value) -> ToolResult {
     }
 
     let command_output = if ripgrep_available() {
-        run_glob_with_rg(workspace_root, &target, pattern).await
+        run_glob_with_rg(
+            workspace_root,
+            &target,
+            pattern,
+            ctx.cancel_token.as_deref(),
+        )
+        .await
     } else {
-        run_glob_with_find(workspace_root, &target).await
+        run_glob_with_find(workspace_root, &target, ctx.cancel_token.as_deref()).await
     };
 
     let ReadOnlyCommandOutput {
@@ -317,12 +339,13 @@ pub async fn glob(workspace_root: &Path, args: &Value) -> ToolResult {
         stderr,
         exit_code,
         timed_out,
+        cancelled,
     } = match command_output {
         Ok(output) => output,
         Err(e) => return ToolResult::error(e),
     };
 
-    if stdout.trim().is_empty() && exit_code != 0 && !timed_out {
+    if stdout.trim().is_empty() && exit_code != 0 && !timed_out && !cancelled {
         return if stderr.trim().is_empty() {
             ToolResult::error("Error: glob failed".into())
         } else {
@@ -340,7 +363,9 @@ pub async fn glob(workspace_root: &Path, args: &Value) -> ToolResult {
     files.dedup();
 
     if files.is_empty() {
-        return if timed_out {
+        return if cancelled {
+            ToolResult::text("No files found before glob was cancelled".into())
+        } else if timed_out {
             ToolResult::text("No files found before glob timed out".into())
         } else {
             ToolResult::text("No files found".into())
@@ -351,7 +376,11 @@ pub async fn glob(workspace_root: &Path, args: &Value) -> ToolResult {
     let mut result_text = files.join("\n");
     result_text = truncate_output(result_text, per_tool_output_limit("glob"));
 
-    if timed_out {
+    if cancelled {
+        result_text.push_str(
+            "\n\n[glob cancelled — showing partial results captured before cancellation.]",
+        );
+    } else if timed_out {
         result_text.push_str(
             "\n\n[glob timed out after 15s — showing partial results. Narrow the search with 'path' or a more specific pattern.]",
         );
@@ -411,7 +440,10 @@ fn parse_search_output_mode(args: &Value) -> Result<SearchOutputMode, String> {
     }
 }
 
-async fn run_grep_with_rg(request: &GrepRequest<'_>) -> Result<ReadOnlyCommandOutput, String> {
+async fn run_grep_with_rg(
+    request: &GrepRequest<'_>,
+    cancel_token: Option<&CancellationToken>,
+) -> Result<ReadOnlyCommandOutput, String> {
     let mut cmd = Command::new("rg");
     cmd.current_dir(request.workspace_root)
         .kill_on_drop(true)
@@ -452,10 +484,14 @@ async fn run_grep_with_rg(request: &GrepRequest<'_>) -> Result<ReadOnlyCommandOu
         .arg("--")
         .arg(request.target);
 
-    run_readonly_command_with_partial(&mut cmd, GREP_TIMEOUT, RAW_GREP_OUTPUT_LIMIT).await
+    run_readonly_command_with_partial(&mut cmd, GREP_TIMEOUT, RAW_GREP_OUTPUT_LIMIT, cancel_token)
+        .await
 }
 
-async fn run_grep_with_grep(request: &GrepRequest<'_>) -> Result<ReadOnlyCommandOutput, String> {
+async fn run_grep_with_grep(
+    request: &GrepRequest<'_>,
+    cancel_token: Option<&CancellationToken>,
+) -> Result<ReadOnlyCommandOutput, String> {
     let mut cmd = Command::new("grep");
     cmd.current_dir(request.workspace_root).kill_on_drop(true);
 
@@ -489,13 +525,15 @@ async fn run_grep_with_grep(request: &GrepRequest<'_>) -> Result<ReadOnlyCommand
         .arg("--")
         .arg(request.target);
 
-    run_readonly_command_with_partial(&mut cmd, GREP_TIMEOUT, RAW_GREP_OUTPUT_LIMIT).await
+    run_readonly_command_with_partial(&mut cmd, GREP_TIMEOUT, RAW_GREP_OUTPUT_LIMIT, cancel_token)
+        .await
 }
 
 async fn run_glob_with_rg(
     workspace_root: &Path,
     target: &str,
     pattern: &str,
+    cancel_token: Option<&CancellationToken>,
 ) -> Result<ReadOnlyCommandOutput, String> {
     let mut cmd = Command::new("rg");
     cmd.current_dir(workspace_root)
@@ -505,12 +543,14 @@ async fn run_glob_with_rg(
     append_default_rg_excludes(&mut cmd);
     cmd.arg("-g").arg(pattern).arg(target);
 
-    run_readonly_command_with_partial(&mut cmd, GLOB_TIMEOUT, RAW_GLOB_OUTPUT_LIMIT).await
+    run_readonly_command_with_partial(&mut cmd, GLOB_TIMEOUT, RAW_GLOB_OUTPUT_LIMIT, cancel_token)
+        .await
 }
 
 async fn run_glob_with_find(
     workspace_root: &Path,
     target: &str,
+    cancel_token: Option<&CancellationToken>,
 ) -> Result<ReadOnlyCommandOutput, String> {
     let mut cmd = Command::new("find");
     cmd.current_dir(workspace_root).kill_on_drop(true);
@@ -529,7 +569,8 @@ async fn run_glob_with_find(
         .arg("f")
         .arg("-print");
 
-    run_readonly_command_with_partial(&mut cmd, GLOB_TIMEOUT, RAW_GLOB_OUTPUT_LIMIT).await
+    run_readonly_command_with_partial(&mut cmd, GLOB_TIMEOUT, RAW_GLOB_OUTPUT_LIMIT, cancel_token)
+        .await
 }
 
 fn append_default_rg_excludes(cmd: &mut Command) {
@@ -550,6 +591,7 @@ async fn run_readonly_command_with_partial(
     cmd: &mut Command,
     timeout: Duration,
     max_stdout_bytes: usize,
+    cancel_token: Option<&CancellationToken>,
 ) -> Result<ReadOnlyCommandOutput, String> {
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
@@ -575,6 +617,7 @@ async fn run_readonly_command_with_partial(
     let mut stdout_capped = false;
     let mut exit_code = None;
     let mut timed_out = false;
+    let mut cancelled = false;
 
     loop {
         drain_search_chunks(
@@ -597,7 +640,19 @@ async fn run_readonly_command_with_partial(
                     let _ = child.wait().await;
                     break;
                 }
-                tokio::time::sleep(Duration::from_millis(25)).await;
+                if let Some(token) = cancel_token {
+                    tokio::select! {
+                        _ = token.cancelled() => {
+                            cancelled = true;
+                            let _ = child.kill().await;
+                            let _ = child.wait().await;
+                            break;
+                        }
+                        _ = tokio::time::sleep(Duration::from_millis(25)) => {}
+                    }
+                } else {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
             }
             Err(e) => return Err(format!("Error: search command failed: {e}")),
         }
@@ -613,7 +668,9 @@ async fn run_readonly_command_with_partial(
         &mut stdout_capped,
     );
 
-    if timed_out && let Some(last_newline) = stdout_text.rfind('\n') {
+    if (timed_out || cancelled)
+        && let Some(last_newline) = stdout_text.rfind('\n')
+    {
         stdout_text.truncate(last_newline);
     }
 
@@ -622,6 +679,7 @@ async fn run_readonly_command_with_partial(
         stderr: stderr_text,
         exit_code: exit_code.unwrap_or(-1),
         timed_out,
+        cancelled,
     })
 }
 
@@ -856,11 +914,12 @@ mod tests {
     #[tokio::test]
     async fn grep_default_head_limit_applies() {
         let dir = tempdir().unwrap();
+        let ctx = crate::ToolContext::test(dir.path());
         let content: String = (0..150).map(|i| format!("needle line {i}\n")).collect();
         std::fs::write(dir.path().join("big.txt"), content).unwrap();
 
         let result = grep(
-            dir.path(),
+            &ctx,
             &serde_json::json!({
                 "pattern": "needle",
                 "path": "."
@@ -881,12 +940,13 @@ mod tests {
     #[tokio::test]
     async fn grep_count_mode_filters_zeroes_and_honors_head_limit() {
         let dir = tempdir().unwrap();
+        let ctx = crate::ToolContext::test(dir.path());
         std::fs::write(dir.path().join("a.txt"), "needle\nneedle\n").unwrap();
         std::fs::write(dir.path().join("b.txt"), "needle\n").unwrap();
         std::fs::write(dir.path().join("c.txt"), "nothing\n").unwrap();
 
         let result = grep(
-            dir.path(),
+            &ctx,
             &serde_json::json!({
                 "pattern": "needle",
                 "path": ".",
@@ -909,6 +969,7 @@ mod tests {
     #[tokio::test]
     async fn grep_scope_context_adds_symbol_annotation() {
         let dir = tempdir().unwrap();
+        let ctx = crate::ToolContext::test(dir.path());
         std::fs::write(
             dir.path().join("sample.rs"),
             "fn alpha() {\n    let needle = 1;\n}\n",
@@ -916,7 +977,7 @@ mod tests {
         .unwrap();
 
         let result = grep(
-            dir.path(),
+            &ctx,
             &serde_json::json!({
                 "pattern": "needle",
                 "path": ".",
@@ -936,13 +997,14 @@ mod tests {
     #[tokio::test]
     async fn glob_skips_default_generated_directories() {
         let dir = tempdir().unwrap();
+        let ctx = crate::ToolContext::test(dir.path());
         std::fs::create_dir_all(dir.path().join("src")).unwrap();
         std::fs::create_dir_all(dir.path().join("target")).unwrap();
         std::fs::write(dir.path().join("src").join("main.rs"), "").unwrap();
         std::fs::write(dir.path().join("target").join("cached.rs"), "").unwrap();
 
         let result = glob(
-            dir.path(),
+            &ctx,
             &serde_json::json!({
                 "pattern": "*.rs",
                 "path": "."
@@ -966,9 +1028,10 @@ mod tests {
     #[tokio::test]
     async fn glob_rejects_path_traversal_patterns() {
         let dir = tempdir().unwrap();
+        let ctx = crate::ToolContext::test(dir.path());
 
         let result = glob(
-            dir.path(),
+            &ctx,
             &serde_json::json!({
                 "pattern": "../../etc/*"
             }),
@@ -980,6 +1043,37 @@ mod tests {
             result.output.contains("path traversal"),
             "got: {}",
             result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn readonly_command_cancels_and_keeps_partial_output() {
+        let token = CancellationToken::new();
+        let trigger = token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            trigger.cancel();
+        });
+
+        let mut cmd = Command::new("bash");
+        cmd.arg("-c")
+            .arg("for i in $(seq 1 5); do echo line_$i; sleep 0.1; done; sleep 5");
+
+        let output = run_readonly_command_with_partial(
+            &mut cmd,
+            Duration::from_secs(10),
+            RAW_GREP_OUTPUT_LIMIT,
+            Some(&token),
+        )
+        .await
+        .expect("command should return partial output on cancellation");
+
+        assert!(output.cancelled, "expected cancelled output");
+        assert!(!output.timed_out, "cancellation should not report timeout");
+        assert!(
+            output.stdout.contains("line_1"),
+            "expected partial stdout, got: {}",
+            output.stdout
         );
     }
 
