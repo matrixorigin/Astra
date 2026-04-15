@@ -340,7 +340,7 @@ pub fn all_tool_schemas() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "grep",
-                "description": "Search for a pattern in files. Returns matching lines with file:line context (output truncated to ~10KB, 100 lines max by default). Supports content/files_with_matches/count modes, pagination via offset, optional scope_context annotations, and respects .astraignore when present. For large codebases, narrow path or pattern for complete results.",
+                "description": "Search for a pattern in files. Returns matching lines with file:line context (output truncated to ~10KB, 100 lines max by default). Supports content/files_with_matches/count modes, pagination via offset, optional scope_context annotations, and respects .gitignore/.astraignore when present. For large codebases, narrow path or pattern for complete results.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -369,7 +369,7 @@ pub fn all_tool_schemas() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "glob",
-                "description": "Find files matching a glob pattern. Respects .astraignore when present.",
+                "description": "Find files matching a glob pattern. Respects .gitignore/.astraignore when present.",
                 "parameters": {
                     "type": "object",
                     "properties": {

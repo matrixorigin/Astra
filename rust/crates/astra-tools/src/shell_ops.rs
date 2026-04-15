@@ -8,6 +8,7 @@ use std::time::Duration;
 use regex::Regex;
 use serde_json::Value;
 use tokio::io::AsyncReadExt;
+use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 
@@ -312,12 +313,22 @@ pub async fn grep(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
         .lines()
         .map(|line| normalize_grep_output_line(line, output_mode))
         .collect();
+    let mut grep_paths = lines
+        .iter()
+        .filter_map(|line| extract_search_result_path(line, output_mode))
+        .collect::<Vec<_>>();
+    dedup_preserve_order(&mut grep_paths);
+    let gitignored_paths = match load_gitignored_search_paths(workspace_root, &grep_paths).await {
+        Ok(paths) => paths,
+        Err(e) => return ToolResult::error(e),
+    };
     sort_grep_result_lines(
         &mut lines,
         workspace_root,
         output_mode,
         sort_mode,
         &request.ignore_rules,
+        &gitignored_paths,
     );
     let paged_lines = if offset > 0 {
         if offset >= lines.len() {
@@ -458,6 +469,11 @@ pub async fn glob(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
         .filter(|line| glob_matches_path(pattern, line))
         .filter(|line| !should_ignore_search_path(line, &ignore_rules))
         .collect();
+    let gitignored_paths = match load_gitignored_search_paths(workspace_root, &files).await {
+        Ok(paths) => paths,
+        Err(e) => return ToolResult::error(e),
+    };
+    files.retain(|line| !gitignored_paths.contains(line));
     dedup_preserve_order(&mut files);
     sort_search_paths(&mut files, workspace_root, sort_mode);
 
@@ -680,21 +696,22 @@ fn sort_grep_result_lines(
     output_mode: SearchOutputMode,
     sort_mode: SearchSortMode,
     ignore_rules: &[SearchIgnoreRule],
+    gitignored_paths: &std::collections::HashSet<String>,
 ) {
     if lines.len() < 2 {
         lines.retain(|line| {
-            extract_search_result_path(line, output_mode)
-                .is_none_or(|path| !should_ignore_search_path(&path, ignore_rules))
+            extract_search_result_path(line, output_mode).is_none_or(|path| {
+                !should_ignore_search_path(&path, ignore_rules) && !gitignored_paths.contains(&path)
+            })
         });
         return;
     }
 
     let mut groups = group_grep_result_lines(lines, output_mode);
     groups.retain(|group| {
-        group
-            .path
-            .as_ref()
-            .is_none_or(|path| !should_ignore_search_path(path, ignore_rules))
+        group.path.as_ref().is_none_or(|path| {
+            !should_ignore_search_path(path, ignore_rules) && !gitignored_paths.contains(path)
+        })
     });
     let mut cache = std::collections::HashMap::new();
     groups.sort_by(|left, right| match (&left.path, &right.path) {
@@ -864,6 +881,68 @@ fn should_ignore_search_path(path: &str, rules: &[SearchIgnoreRule]) -> bool {
         }
     }
     ignored
+}
+
+async fn load_gitignored_search_paths(
+    workspace_root: &Path,
+    paths: &[String],
+) -> Result<std::collections::HashSet<String>, String> {
+    let mut candidates = paths
+        .iter()
+        .filter(|path| !path.is_empty())
+        .cloned()
+        .collect::<Vec<_>>();
+    dedup_preserve_order(&mut candidates);
+    if candidates.is_empty() {
+        return Ok(std::collections::HashSet::new());
+    }
+
+    let mut cmd = Command::new("git");
+    cmd.current_dir(workspace_root)
+        .kill_on_drop(true)
+        .arg("check-ignore")
+        .arg("--stdin")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(_) => return Ok(std::collections::HashSet::new()),
+    };
+
+    if let Some(mut stdin) = child.stdin.take() {
+        let payload = format!("{}\n", candidates.join("\n"));
+        stdin
+            .write_all(payload.as_bytes())
+            .await
+            .map_err(|e| format!("Error: failed to write gitignore query: {e}"))?;
+    }
+
+    let output = tokio::time::timeout(Duration::from_secs(5), child.wait_with_output())
+        .await
+        .map_err(|_| "Error: git check-ignore timed out.".to_string())?
+        .map_err(|e| format!("Error: git check-ignore failed: {e}"))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let exit_code = output.status.code().unwrap_or(-1);
+    if exit_code == 0 {
+        return Ok(stdout.lines().map(strip_current_dir_prefix).collect());
+    }
+    if exit_code == 1 {
+        return Ok(std::collections::HashSet::new());
+    }
+    if stderr.contains("not a git repository") || stderr.contains("outside repository") {
+        return Ok(std::collections::HashSet::new());
+    }
+
+    let detail = stderr.trim();
+    Err(if detail.is_empty() {
+        "Error: git check-ignore failed: unknown git error".into()
+    } else {
+        format!("Error: git check-ignore failed: {detail}")
+    })
 }
 
 async fn run_grep_with_rg(
@@ -1058,8 +1137,13 @@ async fn enumerate_search_files(
     let target_path = request.workspace_root.join(request.target);
     if target_path.is_file() {
         let relative = relative_search_target(request.workspace_root, &target_path);
+        let gitignored =
+            load_gitignored_search_paths(request.workspace_root, std::slice::from_ref(&relative))
+                .await?;
         return Ok(EnumeratedSearchFiles {
-            files: if matches_search_file_filters(&relative, &request.include_globs) {
+            files: if matches_search_file_filters(&relative, &request.include_globs)
+                && !gitignored.contains(&relative)
+            {
                 vec![relative]
             } else {
                 Vec::new()
@@ -1084,6 +1168,8 @@ async fn enumerate_search_files(
         .filter(|line| matches_search_file_filters(line, &request.include_globs))
         .filter(|line| !should_ignore_search_path(line, &request.ignore_rules))
         .collect::<Vec<_>>();
+    let gitignored = load_gitignored_search_paths(request.workspace_root, &files).await?;
+    files.retain(|line| !gitignored.contains(line));
     files.sort();
     files.dedup();
 
@@ -1960,6 +2046,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn grep_respects_gitignore_patterns() {
+        let dir = tempdir().unwrap();
+        let ctx = crate::ToolContext::test(dir.path());
+        assert!(
+            StdCommand::new("git")
+                .current_dir(dir.path())
+                .arg("init")
+                .arg("-q")
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::fs::write(dir.path().join(".gitignore"), "ignored.rs\n").unwrap();
+        std::fs::write(dir.path().join("ignored.rs"), "needle\n").unwrap();
+        std::fs::write(dir.path().join("shown.rs"), "needle\n").unwrap();
+
+        let result = grep(
+            &ctx,
+            &serde_json::json!({
+                "pattern": "needle",
+                "path": ".",
+                "output_mode": "files_with_matches",
+                "sort_by": "path"
+            }),
+        )
+        .await;
+
+        assert!(!result.is_error, "grep should succeed: {}", result.output);
+        assert_eq!(result.output.lines().collect::<Vec<_>>(), vec!["shown.rs"]);
+    }
+
+    #[tokio::test]
     async fn glob_skips_default_generated_directories() {
         let dir = tempdir().unwrap();
         let ctx = crate::ToolContext::test(dir.path());
@@ -2079,6 +2197,46 @@ mod tests {
         assert!(
             !result.output.contains("dist/bundle.js"),
             "ignored file should be filtered out: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn glob_respects_gitignore_patterns() {
+        let dir = tempdir().unwrap();
+        let ctx = crate::ToolContext::test(dir.path());
+        assert!(
+            StdCommand::new("git")
+                .current_dir(dir.path())
+                .arg("init")
+                .arg("-q")
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::fs::write(dir.path().join(".gitignore"), "ignored.txt\n").unwrap();
+        std::fs::write(dir.path().join("ignored.txt"), "").unwrap();
+        std::fs::write(dir.path().join("shown.txt"), "").unwrap();
+
+        let result = glob(
+            &ctx,
+            &serde_json::json!({
+                "pattern": "*.txt",
+                "path": ".",
+                "sort_by": "path"
+            }),
+        )
+        .await;
+
+        assert!(!result.is_error, "glob should succeed: {}", result.output);
+        assert!(
+            result.output.contains("shown.txt"),
+            "got: {}",
+            result.output
+        );
+        assert!(
+            !result.output.contains("ignored.txt"),
+            "gitignored file should be filtered out: {}",
             result.output
         );
     }
