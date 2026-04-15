@@ -64,7 +64,11 @@ impl FeedbackStore {
             .entry(session_id.to_string())
             .or_insert_with(|| SessionRules { rules: Vec::new() });
 
-        if entry.rules.iter().any(|r| r.rule == feedback.rule) {
+        if entry
+            .rules
+            .iter()
+            .any(|r| r.rule.eq_ignore_ascii_case(&feedback.rule))
+        {
             return;
         }
         if entry.rules.len() >= MAX_RULES_PER_SESSION {
@@ -259,6 +263,18 @@ mod tests {
         store.add("s1", make_fb("rule A"));
         store.add("s1", make_fb("rule A"));
         assert_eq!(store.len("s1"), 1);
+    }
+
+    #[test]
+    fn deduplicates_case_insensitive() {
+        let store = FeedbackStore::new();
+        store.add("s1", make_fb("Don't use mocks"));
+        store.add("s1", make_fb("don't use mocks"));
+        assert_eq!(
+            store.len("s1"),
+            1,
+            "case-insensitive dedup should prevent duplicate"
+        );
     }
 
     #[test]
