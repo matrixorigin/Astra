@@ -832,6 +832,12 @@ pub struct HeavyCheckpoint {
     /// Completed sub-run summaries for delegation recovery
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub delegation_sub_run_summaries: Vec<DelegationSubRunSummary>,
+    /// Structured interruption record — captures why the session was interrupted
+    /// and what the caller should do to resume. Present only when the checkpoint
+    /// was written in response to an interruption (budget exhaustion, rate limit,
+    /// context overflow, cancellation, etc.).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interruption: Option<serde_json::Value>,
 }
 
 /// Unified checkpoint type (stored in Step)
@@ -948,6 +954,7 @@ impl StepCheckpoint {
             delegation_id: None,
             delegation_pattern: None,
             delegation_sub_run_summaries: Vec::new(),
+            interruption: None,
         }))
     }
 
@@ -2918,6 +2925,7 @@ mod tests {
             delegation_id: None,
             delegation_pattern: None,
             delegation_sub_run_summaries: Vec::new(),
+            interruption: None,
         }));
         let err = cp.validate().unwrap_err();
         assert!(matches!(err, ProtocolError::CheckpointCorrupt(_)));
@@ -2948,6 +2956,7 @@ mod tests {
             delegation_id: None,
             delegation_pattern: None,
             delegation_sub_run_summaries: Vec::new(),
+            interruption: None,
         }));
         assert!(cp.validate().is_ok());
     }

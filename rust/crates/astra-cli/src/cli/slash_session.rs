@@ -4700,6 +4700,14 @@ pub(super) async fn handle_resume_command(arg: &str, profile: Option<&str>, stat
                 if state.recent_tools.is_empty() {
                     state.recent_tools = step_restored.recent_tools;
                 }
+                // Inject resume guidance when restoring from an interrupted checkpoint.
+                if let Some(ref irj) = step_restored.interruption {
+                    if let Some(guidance) =
+                        astra_runtime::turn::interruption::build_resume_guidance(irj)
+                    {
+                        state.resume_guidance = Some(guidance);
+                    }
+                }
                 eprintln!("  {} {}", "↻".cyan(), summary.dim());
             } else if let Ok(Some(heavy)) =
                 astra_runtime::pipeline::step_checkpoint::read_latest_heavy_checkpoint(

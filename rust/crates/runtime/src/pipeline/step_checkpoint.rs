@@ -475,6 +475,7 @@ mod tests {
             delegation_id: None,
             delegation_pattern: None,
             delegation_sub_run_summaries: Vec::new(),
+            interruption: None,
         }
     }
 
@@ -556,6 +557,40 @@ mod tests {
         let restored: HeavyCheckpoint = serde_json::from_str(&json_str).unwrap();
         assert_eq!(restored.messages.len(), 3);
         assert_eq!(restored.messages[1]["content"], "帮我查一下PR状态");
+    }
+
+    #[test]
+    fn heavy_checkpoint_interruption_roundtrip() {
+        let irj = json!({
+            "kind": "rate_limited",
+            "resumable": true,
+            "has_checkpoint": true,
+            "tool_calls_completed": 7,
+            "turns_completed": 3,
+            "remaining_turns": 7,
+            "user_message": "[rate_limited] 7 tool call(s) completed."
+        });
+        let mut heavy = make_heavy("step-irq", vec![json!({"role":"user","content":"hi"})]);
+        heavy.interruption = Some(irj.clone());
+
+        let json_str = serde_json::to_string(&heavy).unwrap();
+        let restored: HeavyCheckpoint = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(restored.interruption, Some(irj));
+    }
+
+    #[test]
+    fn heavy_checkpoint_without_interruption_deserializes() {
+        // Backward compat: old checkpoints without the interruption field.
+        let json_str = r#"{
+            "light": {"protocol_version": 1, "cursor": {"phase": "Perceive", "slots": [], "parallel": false}, "step_id": "s", "task_id": "t", "agent_id": "a", "progress": 0.5, "total_tokens": 0, "created_at": 0},
+            "messages": [],
+            "budget_remaining_tokens": 0,
+            "budget_remaining_rounds": 0,
+            "blocked_tools": [],
+            "recent_tools": []
+        }"#;
+        let heavy: HeavyCheckpoint = serde_json::from_str(json_str).unwrap();
+        assert!(heavy.interruption.is_none());
     }
 
     #[test]

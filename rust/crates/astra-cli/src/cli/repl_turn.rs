@@ -272,7 +272,12 @@ pub(super) async fn handle_chat_input(
 
     eprintln!();
 
-    let effective_line = build_effective_line(&line, state);
+    // Consume one-shot resume guidance before building the effective line.
+    let resume_guidance = state.resume_guidance.take();
+    let mut effective_line = build_effective_line(&line, state);
+    if let Some(guidance) = resume_guidance {
+        effective_line = format!("{guidance}\n\n{effective_line}");
+    }
     let turn_start = Instant::now();
 
     maybe_auto_compact(state, &ctx, token, &effective_line).await?;
@@ -1977,6 +1982,7 @@ fn build_manual_heavy_step_checkpoint(
         delegation_id: None,
         delegation_pattern: None,
         delegation_sub_run_summaries: Vec::new(),
+        interruption: None,
     };
     StepCheckpoint::Heavy(Box::new(heavy))
 }

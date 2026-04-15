@@ -246,6 +246,10 @@ pub(crate) struct ReplState {
     /// Each entry is (user_msg, assistant_msg, turn_number).
     pub redo_stack: Vec<(String, String, u32)>,
 
+    /// Resume guidance message from a previously interrupted checkpoint.
+    /// One-shot: consumed and cleared after the first turn that uses it.
+    pub resume_guidance: Option<String>,
+
     /// Turns where history compaction occurred (for drift detection).
     pub drift_compressed_turns: Vec<u32>,
     /// Turns where user provided correction/redirection (for drift detection).
@@ -412,6 +416,7 @@ impl Default for ReplState {
             root_mailbox: None,
             pending_idle_agent_messages: Vec::new(),
             redo_stack: Vec::new(),
+            resume_guidance: None,
             drift_compressed_turns: Vec::new(),
             drift_user_corrections: Vec::new(),
             drift_original_query: None,

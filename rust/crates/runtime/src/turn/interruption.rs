@@ -195,6 +195,128 @@ pub struct InterruptionStateSummary {
     pub error_detail: Option<String>,
 }
 
+/// Build a system-level resume guidance message from a persisted interruption record.
+///
+/// When a session is restored from a checkpoint that was written during an
+/// interruption, this function produces a system message that tells the LLM
+/// what happened and how to proceed. Injected at the top of the context
+/// window so the model can adjust its plan accordingly.
+///
+/// Returns `None` if the interruption JSON is missing or unparseable.
+#[must_use]
+pub fn build_resume_guidance(interruption_json: &serde_json::Value) -> Option<String> {
+    let kind = interruption_json.get("kind")?.as_str()?;
+    let resumable = interruption_json
+        .get("resumable")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let tool_calls = interruption_json
+        .get("tool_calls_completed")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let turns = interruption_json
+        .get("turns_completed")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let has_checkpoint = interruption_json
+        .get("has_checkpoint")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let user_msg = interruption_json
+        .get("user_message")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    if !resumable {
+        return None;
+    }
+
+    let mut guidance = String::new();
+    guidance.push_str("[RESUME CONTEXT] This session was previously interrupted.\n");
+    guidance.push_str(&format!("  Reason: {kind}\n"));
+    guidance.push_str(&format!(
+        "  Progress: {turns} turn(s), {tool_calls} tool call(s) completed\n"
+    ));
+    if has_checkpoint {
+        guidance.push_str("  Checkpoint: saved — prior tool results are preserved in context\n");
+    }
+
+    // Kind-specific advice
+    match kind {
+        "budget_exhausted" | "token_budget_exceeded" | "cumulative_budget_exceeded" => {
+            guidance.push_str(
+                "  Action: Prioritize completing the most important remaining work first. \
+                 Avoid exploratory tool calls — focus on delivering a result.\n",
+            );
+        }
+        "rate_limited" | "cooldown_rejected" | "server_overload" => {
+            guidance.push_str(
+                "  Action: The rate limit has likely expired. Resume normally, \
+                 but batch tool calls to minimize API round-trips.\n",
+            );
+        }
+        "context_overflow" => {
+            guidance.push_str(
+                "  Action: Context was compacted. Some older tool results may be \
+                 summarized. Re-read any files you need before making edits.\n",
+            );
+        }
+        "user_cancelled" => {
+            guidance.push_str(
+                "  Action: The user cancelled the previous run. Wait for their \
+                 instructions before proceeding.\n",
+            );
+        }
+        _ => {
+            if !user_msg.is_empty() {
+                guidance.push_str(&format!("  Detail: {user_msg}\n"));
+            }
+        }
+    }
+
+    Some(guidance)
+}
+
+/// Classify a streaming/API error string into an [`InterruptionKind`] and
+/// [`ResumeAction`], if the error matches a known pattern.
+///
+/// Used as a catch-all at the end of the fatal-error path so that *every*
+/// early exit produces a structured interruption record rather than a bare
+/// string error.
+#[must_use]
+pub fn classify_error(error: &str) -> Option<(InterruptionKind, ResumeAction)> {
+    let lower = error.to_lowercase();
+
+    // Auth / credential failures
+    if lower.contains("401")
+        || lower.contains("unauthorized")
+        || lower.contains("authentication")
+        || lower.contains("invalid.*key")
+        || lower.contains("api key")
+    {
+        return Some((
+            InterruptionKind::AuthFailure,
+            ResumeAction::RequiresIntervention {
+                description: "API key or credentials are invalid — please refresh.".into(),
+            },
+        ));
+    }
+
+    // Server overload (503 / 529)
+    if lower.contains("503")
+        || lower.contains("529")
+        || lower.contains("overload")
+        || lower.contains("service unavailable")
+    {
+        return Some((
+            InterruptionKind::ServerOverload,
+            ResumeAction::WaitAndRetry { delay_seconds: 60 },
+        ));
+    }
+
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -285,5 +407,106 @@ mod tests {
         );
         assert!(record.kind.is_resumable());
         assert!(record.user_message.contains("compacted"));
+    }
+
+    // ── resume guidance tests ──
+
+    #[test]
+    fn resume_guidance_budget_exhausted() {
+        let irj = serde_json::json!({
+            "kind": "budget_exhausted",
+            "resumable": true,
+            "has_checkpoint": true,
+            "tool_calls_completed": 12,
+            "turns_completed": 15,
+            "remaining_turns": 0,
+            "user_message": "[budget_exhausted] 12 tool call(s) completed. A checkpoint was saved."
+        });
+        let guidance = build_resume_guidance(&irj).expect("should produce guidance");
+        assert!(guidance.contains("[RESUME CONTEXT]"));
+        assert!(guidance.contains("budget_exhausted"));
+        assert!(guidance.contains("15 turn(s)"));
+        assert!(guidance.contains("12 tool call(s)"));
+        assert!(guidance.contains("Checkpoint: saved"));
+        assert!(guidance.contains("Prioritize"));
+    }
+
+    #[test]
+    fn resume_guidance_rate_limited() {
+        let irj = serde_json::json!({
+            "kind": "rate_limited",
+            "resumable": true,
+            "has_checkpoint": true,
+            "tool_calls_completed": 5,
+            "turns_completed": 3,
+            "remaining_turns": 7,
+            "user_message": ""
+        });
+        let guidance = build_resume_guidance(&irj).unwrap();
+        assert!(guidance.contains("rate_limited"));
+        assert!(guidance.contains("batch tool calls"));
+    }
+
+    #[test]
+    fn resume_guidance_context_overflow() {
+        let irj = serde_json::json!({
+            "kind": "context_overflow",
+            "resumable": true,
+            "has_checkpoint": false,
+            "tool_calls_completed": 0,
+            "turns_completed": 1,
+            "remaining_turns": 9,
+            "user_message": ""
+        });
+        let guidance = build_resume_guidance(&irj).unwrap();
+        assert!(guidance.contains("context_overflow"));
+        assert!(guidance.contains("compacted"));
+    }
+
+    #[test]
+    fn resume_guidance_non_resumable_returns_none() {
+        let irj = serde_json::json!({
+            "kind": "auth_failure",
+            "resumable": false,
+            "has_checkpoint": false,
+            "tool_calls_completed": 0,
+            "turns_completed": 0,
+            "remaining_turns": 10,
+            "user_message": ""
+        });
+        assert!(build_resume_guidance(&irj).is_none());
+    }
+
+    #[test]
+    fn resume_guidance_missing_fields_returns_none() {
+        let irj = serde_json::json!({});
+        assert!(build_resume_guidance(&irj).is_none());
+    }
+
+    // ── classify_error tests ──
+
+    #[test]
+    fn classify_error_auth_401() {
+        let (kind, action) = classify_error("HTTP 401 Unauthorized").unwrap();
+        assert_eq!(kind, InterruptionKind::AuthFailure);
+        matches!(action, ResumeAction::RequiresIntervention { .. });
+    }
+
+    #[test]
+    fn classify_error_server_503() {
+        let (kind, action) = classify_error("503 Service Unavailable").unwrap();
+        assert_eq!(kind, InterruptionKind::ServerOverload);
+        matches!(action, ResumeAction::WaitAndRetry { .. });
+    }
+
+    #[test]
+    fn classify_error_overload_529() {
+        let (kind, _) = classify_error("Error: 529 overloaded").unwrap();
+        assert_eq!(kind, InterruptionKind::ServerOverload);
+    }
+
+    #[test]
+    fn classify_error_unknown_returns_none() {
+        assert!(classify_error("some random error").is_none());
     }
 }

@@ -550,6 +550,26 @@ impl StepRecorder {
         blocked_tools: &[String],
         recent_tools: &[String],
     ) -> Option<HeavyCheckpoint> {
+        self.build_heavy_checkpoint_with_interruption(
+            messages,
+            budget_remaining_tokens,
+            budget_remaining_rounds,
+            blocked_tools,
+            recent_tools,
+            None,
+        )
+    }
+
+    /// Build a heavy checkpoint, optionally including a structured interruption record.
+    pub fn build_heavy_checkpoint_with_interruption(
+        &self,
+        messages: &[serde_json::Value],
+        budget_remaining_tokens: u64,
+        budget_remaining_rounds: u32,
+        blocked_tools: &[String],
+        recent_tools: &[String],
+        interruption: Option<serde_json::Value>,
+    ) -> Option<HeavyCheckpoint> {
         let light = self.build_light_checkpoint()?;
         Some(HeavyCheckpoint {
             light,
@@ -566,6 +586,7 @@ impl StepRecorder {
             delegation_id: None,
             delegation_pattern: None,
             delegation_sub_run_summaries: Vec::new(),
+            interruption,
         })
     }
 

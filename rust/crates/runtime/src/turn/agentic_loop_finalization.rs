@@ -76,19 +76,30 @@ pub(crate) fn try_write_heavy_checkpoint(state: &mut AgenticLoopState) {
         return;
     };
     let ckpt_num = state.step_recorder.summary().checkpoints;
-    let Some(heavy) = state.step_recorder.build_heavy_checkpoint(
-        &state.messages,
-        0,
-        state.remaining_turns as u32,
-        &state
-            .turn_guard
-            .health
-            .deprioritized_tools()
-            .iter()
-            .map(|s| s.to_string())
-            .collect::<Vec<_>>(),
-        &state.recent_tools,
-    ) else {
+
+    // Serialize the interruption record (if any) for checkpoint persistence.
+    let interruption_json = state
+        .interruption
+        .as_ref()
+        .and_then(|ir| serde_json::to_value(ir).ok());
+
+    let Some(heavy) = state
+        .step_recorder
+        .build_heavy_checkpoint_with_interruption(
+            &state.messages,
+            0,
+            state.remaining_turns as u32,
+            &state
+                .turn_guard
+                .health
+                .deprioritized_tools()
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>(),
+            &state.recent_tools,
+            interruption_json,
+        )
+    else {
         return;
     };
     let cp = StepCheckpoint::Heavy(Box::new(heavy));

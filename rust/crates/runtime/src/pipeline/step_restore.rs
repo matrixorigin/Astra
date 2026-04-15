@@ -50,6 +50,10 @@ pub struct RestoredSession {
     pub completed_tool_results: HashMap<String, Vec<String>>,
     /// Learning snapshot ID (for cross-session knowledge)
     pub learning_snapshot_id: Option<String>,
+    /// Structured interruption record from the checkpoint that created this restore
+    /// point. When present, describes why the previous run was interrupted and
+    /// what the caller should do to resume (e.g., wait, compact, intervene).
+    pub interruption: Option<serde_json::Value>,
 }
 
 /// Error types for session restore.
@@ -132,6 +136,7 @@ fn build_restored_session(
         protocol_version: heavy.light.protocol_version,
         completed_tool_results: completed_results,
         learning_snapshot_id: heavy.learning_snapshot_id,
+        interruption: heavy.interruption,
     }))
 }
 
@@ -369,6 +374,7 @@ mod tests {
             delegation_id: None,
             delegation_pattern: None,
             delegation_sub_run_summaries: Vec::new(),
+            interruption: None,
         }
     }
 
@@ -465,6 +471,7 @@ mod tests {
             protocol_version: PROTOCOL_VERSION,
             completed_tool_results: HashMap::new(),
             learning_snapshot_id: None,
+            interruption: None,
         };
 
         let summary = restore_summary(&restored);

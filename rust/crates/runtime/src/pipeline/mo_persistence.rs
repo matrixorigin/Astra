@@ -107,6 +107,7 @@ impl MatrixOneCheckpointWriter {
                     delegation_id: None,
                     delegation_pattern: None,
                     delegation_sub_run_summaries: Vec::new(),
+                    interruption: None,
                 };
                 StepCheckpoint::Heavy(Box::new(heavy))
             }
@@ -594,6 +595,7 @@ mod tests {
             delegation_id: None,
             delegation_pattern: None,
             delegation_sub_run_summaries: Vec::new(),
+            interruption: None,
         };
         let cp = StepCheckpoint::Heavy(Box::new(heavy));
         let json = serde_json::to_string(&cp).unwrap();
