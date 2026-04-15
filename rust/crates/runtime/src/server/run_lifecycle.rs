@@ -887,6 +887,7 @@ impl AgenticRunLifecycleService {
             server_tool_executor: None,
             interruption: None,
             confidence_trend: Default::default(),
+            last_confidence_diagnosis: None,
         }
     }
 
@@ -1900,6 +1901,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             server_tool_executor: None,
             interruption: None,
             confidence_trend: Default::default(),
+            last_confidence_diagnosis: None,
         };
         let learning_stack = configure_runtime_controllers(
             &self.matrixone,

@@ -469,6 +469,13 @@ impl PermissionManager {
                 ApprovalDecision::Deny
             };
         }
+        match self.denial_tracker.should_prompt(&fp) {
+            astra_runtime::turn::approval_fingerprint::DenialAction::SkipTool => {
+                return ApprovalDecision::Deny;
+            }
+            astra_runtime::turn::approval_fingerprint::DenialAction::FallbackToUser => {}
+            astra_runtime::turn::approval_fingerprint::DenialAction::Continue => {}
+        }
 
         eprintln!(
             "{}",
@@ -539,6 +546,13 @@ impl PermissionManager {
             } else {
                 ApprovalDecision::Deny
             };
+        }
+        match self.denial_tracker.should_prompt(&fp) {
+            astra_runtime::turn::approval_fingerprint::DenialAction::SkipTool => {
+                return ApprovalDecision::Deny;
+            }
+            astra_runtime::turn::approval_fingerprint::DenialAction::FallbackToUser => {}
+            astra_runtime::turn::approval_fingerprint::DenialAction::Continue => {}
         }
 
         eprintln!(
@@ -1036,10 +1050,24 @@ impl PermissionManager {
         if let Some(detail) = detail {
             eprintln!("{}", detail.dim());
         }
+        // Check denial limits before prompting.
+        let fp = astra_runtime::turn::approval_fingerprint::ApprovalFingerprint::bare(name);
+        match self.denial_tracker.should_prompt(&fp) {
+            astra_runtime::turn::approval_fingerprint::DenialAction::SkipTool => {
+                eprintln!(
+                    "  {}",
+                    format!("  ✗ {name}: auto-denied (repeated denials)").dim()
+                );
+                return false;
+            }
+            astra_runtime::turn::approval_fingerprint::DenialAction::FallbackToUser => {
+                // Still show the prompt but could add escalation context
+            }
+            astra_runtime::turn::approval_fingerprint::DenialAction::Continue => {}
+        }
         match Self::prompt_approval(ApprovalPromptKind::LocalStandard) {
             'y' => true,
             'a' => {
-                let fp = astra_runtime::turn::approval_fingerprint::ApprovalFingerprint::bare(name);
                 self.session_overrides.insert(fp, true);
                 // Persist as a project-level allow rule with command pattern
                 let rule = Self::make_allow_rule(name, args);
@@ -1056,13 +1084,15 @@ impl PermissionManager {
                 true
             }
             's' => {
-                let fp = astra_runtime::turn::approval_fingerprint::ApprovalFingerprint::bare(name);
                 self.session_overrides.insert(fp.clone(), false);
                 self.denial_tracker.record(&fp, false);
                 eprintln!("  {}", format!("  ✗ {name}: skipped for session").dim());
                 false
             }
-            _ => false,
+            _ => {
+                self.denial_tracker.record(&fp, false);
+                false
+            }
         }
     }
 
@@ -1231,6 +1261,19 @@ impl PermissionManager {
             PermissionMode::Auto => PermissionDecision::Allow,
             PermissionMode::Deny => PermissionDecision::Deny("Denied by mode".into()),
             PermissionMode::Prompt => {
+                // Check denial limits before prompting.
+                let fp = astra_runtime::turn::approval_fingerprint::ApprovalFingerprint::bare(name);
+                match self.denial_tracker.should_prompt(&fp) {
+                    astra_runtime::turn::approval_fingerprint::DenialAction::SkipTool => {
+                        return PermissionDecision::Deny(format!(
+                            "{name}: auto-denied (repeated denials)"
+                        ));
+                    }
+                    astra_runtime::turn::approval_fingerprint::DenialAction::FallbackToUser => {
+                        // Still show the prompt but add escalation context
+                    }
+                    astra_runtime::turn::approval_fingerprint::DenialAction::Continue => {}
+                }
                 let (header, detail) = Self::format_tool_display(name, args);
                 PermissionDecision::NeedApproval {
                     tool: name.to_string(),

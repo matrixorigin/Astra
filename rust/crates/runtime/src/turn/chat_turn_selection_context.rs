@@ -19,6 +19,7 @@ pub fn build_agentic_tool_selection_context<'a>(
     file_context: Vec<String>,
     follow_up_tool_round: bool,
     tool_budget_override: Option<u32>,
+    previous_confidence_fallback: Option<crate::turn::confidence_contract::ConfidenceFallback>,
 ) -> SelectionContext<'a> {
     let turn_count = history_pair_count as u32 + 1;
     let base = tool_budget_override
@@ -35,6 +36,7 @@ pub fn build_agentic_tool_selection_context<'a>(
         memory_domain_hints,
         restricted_tools,
         file_context,
+        previous_confidence_fallback,
     }
 }
 
@@ -58,6 +60,7 @@ mod tests {
             vec![],
             false,
             None,
+            None,
         );
         let ctx_b = build_agentic_tool_selection_context(
             "hi",
@@ -70,6 +73,7 @@ mod tests {
             vec![],
             vec![],
             true,
+            None,
             None,
         );
         assert_eq!(ctx_b.budget_tokens, ctx_a.budget_tokens * 2);
@@ -94,6 +98,7 @@ mod tests {
             vec![],
             false,
             None,
+            None,
         );
         assert_eq!(ctx_none.budget_tokens, default_budget);
 
@@ -110,6 +115,7 @@ mod tests {
             vec![],
             false,
             Some(1200),
+            None,
         );
         assert_eq!(ctx_override.budget_tokens, 1200);
 
@@ -126,6 +132,7 @@ mod tests {
             vec![],
             false,
             Some(0),
+            None,
         );
         assert_eq!(ctx_zero.budget_tokens, default_budget);
 
@@ -142,6 +149,7 @@ mod tests {
             vec![],
             true,
             Some(1200),
+            None,
         );
         assert_eq!(ctx_followup.budget_tokens, 2400);
     }
