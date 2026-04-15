@@ -131,7 +131,7 @@ impl PipelineLearningWriter {
 
         // Convert 1-5 rating to 0-100 feedback score
         let rating = implicit_feedback_rating(&signal.signal_type);
-        let base_score = ((rating - 1) as i64) * 25; // 1→0, 2→25, 3→50, 4→75, 5→100
+        let base_score = (rating - 1) * 25; // 1→0, 2→25, 3→50, 4→75, 5→100
         let confidence_factor = signal.confidence;
         let feedback_score = Some((base_score as f64 * confidence_factor).round() as i64);
 
