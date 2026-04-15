@@ -2606,6 +2606,7 @@ impl JournalEvent {
         budget_likely_satisfied: bool,
         retry_count: u32,
         layers: Vec<(String, u64)>,
+        consecutive_context_window_errors: u32,
     ) -> Self {
         let mut evt = Self::base(JournalEventType::CompactionRetry, session_id);
         evt.turn = Some(turn);
@@ -2615,6 +2616,7 @@ impl JournalEvent {
                 "tokens_freed": tokens_freed,
                 "budget_likely_satisfied": budget_likely_satisfied,
                 "retry_count": retry_count,
+                "consecutive_context_window_errors": consecutive_context_window_errors,
                 "layers": layers.iter().map(|(name, freed)| {
                     serde_json::json!({ "name": name, "tokens_freed": freed })
                 }).collect::<Vec<_>>(),

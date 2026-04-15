@@ -268,7 +268,7 @@ pub fn restore_summary(restored: &RestoredSession) -> String {
         .values()
         .map(|v| v.len())
         .sum();
-    format!(
+    let mut s = format!(
         "Restored session: turn={}, messages={}, cache={} entries, \
          completed_tools={}, blocked={}, budget_tokens={}, budget_rounds={}",
         restored.resume_turn,
@@ -278,7 +278,17 @@ pub fn restore_summary(restored: &RestoredSession) -> String {
         restored.blocked_tools.len(),
         restored.budget_remaining_tokens,
         restored.budget_remaining_rounds,
-    )
+    );
+    if restored.consecutive_context_window_errors > 0 {
+        s.push_str(&format!(
+            ", ctx_window_errors={}",
+            restored.consecutive_context_window_errors
+        ));
+    }
+    if restored.approval_overrides.is_some() {
+        s.push_str(", approval_overrides=yes");
+    }
+    s
 }
 
 /// Validate and convert raw event payloads into structured tool completion records.

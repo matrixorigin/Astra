@@ -191,6 +191,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                             budget_likely_satisfied,
                             state.consecutive_context_window_errors,
                             layers,
+                            state.consecutive_context_window_errors,
                         );
                         if let Ok(writer) = astra_services::session_journal::JournalWriter::new(sid)
                         {
