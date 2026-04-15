@@ -574,6 +574,7 @@ pub(crate) async fn stream_chat_sse(
         server_tool_executor: None,
         interruption: None,
         confidence_trend: Default::default(),
+        last_confidence_diagnosis: None,
     };
 
     // ─── Run the runtime loop ────────────────────────────────────────────

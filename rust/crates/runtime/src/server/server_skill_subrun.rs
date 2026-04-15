@@ -302,6 +302,7 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             server_tool_executor: None,
             interruption: None,
             confidence_trend: Default::default(),
+            last_confidence_diagnosis: None,
         };
 
         if let Err(err) = run_agentic_loop_with_host(&mut host, &mut state).await {

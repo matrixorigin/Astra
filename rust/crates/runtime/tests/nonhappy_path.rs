@@ -1274,6 +1274,7 @@ mod chat_stream_turnguard_e2e {
             memory_domain_hints: vec![],
             restricted_tools: restricted,
             file_context: vec![],
+            previous_confidence_fallback: None,
         };
         let result = selector.select(&ctx).await;
         assert!(
@@ -1444,6 +1445,7 @@ mod chat_stream_turnguard_e2e {
             memory_domain_hints: vec![],
             restricted_tools: restricted,
             file_context: vec![],
+            previous_confidence_fallback: None,
         };
         let result = selector.select(&ctx).await;
         assert!(

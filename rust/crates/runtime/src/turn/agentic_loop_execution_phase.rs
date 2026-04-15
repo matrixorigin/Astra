@@ -394,7 +394,53 @@ fn record_tool_selection(
 ) {
     // Feed confidence trend tracker with latest selector confidence.
     if let Some(conf) = state.telemetry.first_selector_confidence {
-        state.confidence_trend.record(conf);
+        let floor_loop = state.confidence_trend.record(conf);
+
+        // Compute diagnosis from available signals.
+        let query_tokens = state.message.split_whitespace().count();
+        let dynamic_tools = turn_result.edge_tool_round.len();
+        let diagnosis = crate::turn::confidence_contract::ConfidenceDiagnosis::diagnose(
+            conf,
+            dynamic_tools,     // signal_count proxy
+            dynamic_tools > 0, // task_type_known proxy
+            0,                 // memory_hint_count: not available here
+            0,                 // file_context_count: not available here
+            false,             // disambiguation: not available here
+            query_tokens,
+        );
+
+        if floor_loop {
+            tracing::warn!(
+                streak = state.confidence_trend.floor_streak(),
+                avg = %format!("{:.2}", state.confidence_trend.average_confidence()),
+                "confidence-floor loop detected"
+            );
+        } else if diagnosis.is_actionable() {
+            tracing::info!(
+                tier = diagnosis.tier.label(),
+                confidence = %format!("{:.2}", conf),
+                "low-confidence tool selection"
+            );
+        }
+
+        state.last_confidence_diagnosis = Some(diagnosis);
+
+        // Emit journal event for actionable (low/very-low) confidence diagnoses.
+        if let Some(ref diag) = state.last_confidence_diagnosis {
+            if diag.is_actionable() {
+                if let Some(ref sid) = state.current_session_id {
+                    if let Ok(writer) = astra_services::session_journal::JournalWriter::new(sid) {
+                        let evt = astra_services::session_journal::JournalEvent::confidence_diagnosis_recorded(
+                            Some(sid),
+                            turn_index as u32,
+                            conf,
+                            diag.to_json(),
+                        );
+                        let _ = writer.append(&evt);
+                    }
+                }
+            }
+        }
     }
 
     if let Some(session) = &state.telemetry.observability_session {

@@ -235,6 +235,10 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
             turn_policy: &mut state.last_turn_policy,
             skill_continuation: state.skill_produced_output,
             tool_cache: &mut self.tool_cache,
+            previous_confidence_fallback: state
+                .last_confidence_diagnosis
+                .as_ref()
+                .map(|d| d.fallback.clone()),
         })
         .await;
 

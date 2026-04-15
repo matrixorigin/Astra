@@ -690,6 +690,8 @@ pub struct AgenticLoopState {
     // ── Confidence tracking ──
     /// Tracks selector confidence trends across turns to detect floor loops.
     pub confidence_trend: super::confidence_contract::ConfidenceTrendTracker,
+    /// Last diagnosis computed after tool selection (for telemetry and fallback).
+    pub last_confidence_diagnosis: Option<super::confidence_contract::ConfidenceDiagnosis>,
 }
 
 /// Consecutive same-category error turns before forcing a strategy change.
@@ -1123,6 +1125,7 @@ pub(crate) mod tests {
             server_tool_executor: None,
             interruption: None,
             confidence_trend: Default::default(),
+            last_confidence_diagnosis: None,
         }
     }
 

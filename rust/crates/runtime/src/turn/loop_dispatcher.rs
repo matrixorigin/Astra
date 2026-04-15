@@ -322,6 +322,7 @@ mod tests {
             server_tool_executor: None,
             interruption: None,
             confidence_trend: Default::default(),
+            last_confidence_diagnosis: None,
         }
     }
 

@@ -1580,6 +1580,7 @@ mod tests {
             memory_domain_hints: vec![],
             restricted_tools: vec![],
             file_context: vec![],
+            previous_confidence_fallback: None,
         };
         let res = selector.select(&sel_ctx).await;
         assert!(!res.tool_names.is_empty());
@@ -1600,6 +1601,7 @@ mod tests {
             memory_domain_hints: vec![],
             restricted_tools: vec![],
             file_context: vec![],
+            previous_confidence_fallback: None,
         };
         let res = selector.select(&sel_ctx).await;
         assert!(!res.tool_names.is_empty());
