@@ -358,10 +358,13 @@ pub async fn grep(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
     }
     let paged_lines = if offset > 0 {
         if offset >= lines.len() {
-            return ToolResult::text(format!(
-                "No more results (offset {} >= {} lines)",
+            return ToolResult::text(no_more_results_message(
                 offset,
-                lines.len()
+                lines.len(),
+                "lines",
+                timed_out,
+                cancelled,
+                stdout_capped,
             ));
         }
         &lines[offset..]
@@ -541,10 +544,13 @@ pub async fn glob(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
     let total_files = files.len();
     let paged_files = if offset > 0 {
         if offset >= files.len() {
-            return ToolResult::text(format!(
-                "No more results (offset {} >= {} files)",
+            return ToolResult::text(no_more_results_message(
                 offset,
-                files.len()
+                files.len(),
+                "files",
+                timed_out,
+                cancelled,
+                stdout_capped,
             ));
         }
         &files[offset..]
@@ -1070,10 +1076,11 @@ async fn load_gitignored_search_paths(
 
     if let Some(mut stdin) = child.stdin.take() {
         let payload = format!("{}\n", candidates.join("\n"));
-        stdin
-            .write_all(payload.as_bytes())
-            .await
-            .map_err(|e| format!("Error: failed to write gitignore query: {e}"))?;
+        if let Err(error) = stdin.write_all(payload.as_bytes()).await
+            && error.kind() != std::io::ErrorKind::BrokenPipe
+        {
+            return Err(format!("Error: failed to write gitignore query: {error}"));
+        }
     }
 
     let output = tokio::time::timeout(Duration::from_secs(5), child.wait_with_output())
@@ -1716,6 +1723,35 @@ fn format_search_warning(stderr: &str) -> String {
         .collect::<Vec<_>>()
         .join(" | ");
     truncate_output(compact, 500)
+}
+
+fn no_more_results_message(
+    offset: usize,
+    captured: usize,
+    unit: &str,
+    timed_out: bool,
+    cancelled: bool,
+    stdout_capped: bool,
+) -> String {
+    let mut caveats = Vec::new();
+    if cancelled {
+        caveats.push("search was cancelled before completion");
+    }
+    if timed_out {
+        caveats.push("search timed out before completion");
+    }
+    if stdout_capped {
+        caveats.push("backend output was capped before pagination");
+    }
+
+    if caveats.is_empty() {
+        format!("No more results (offset {offset} >= {captured} {unit})")
+    } else {
+        format!(
+            "No more captured results (offset {offset} >= {captured} {unit}). Note: {} so additional results may exist.",
+            caveats.join(", ")
+        )
+    }
 }
 
 fn append_context_flags(cmd: &mut Command, before: Option<usize>, after: Option<usize>) {
@@ -2993,6 +3029,35 @@ printf 'probe.txt:1:needle\n'
         assert!(output.stdout.len() <= 128, "stdout should be capped");
         assert!(!output.timed_out, "cap should not look like timeout");
         assert!(!output.cancelled, "cap should not look like cancellation");
+    }
+
+    #[test]
+    fn no_more_results_message_stays_simple_when_search_completed() {
+        assert_eq!(
+            no_more_results_message(5, 1, "files", false, false, false),
+            "No more results (offset 5 >= 1 files)"
+        );
+    }
+
+    #[test]
+    fn no_more_results_message_mentions_incomplete_capture() {
+        let message = no_more_results_message(5, 1, "lines", true, false, true);
+        assert!(
+            message.contains("No more captured results"),
+            "expected captured-results wording, got: {message}"
+        );
+        assert!(
+            message.contains("search timed out before completion"),
+            "expected timeout caveat, got: {message}"
+        );
+        assert!(
+            message.contains("backend output was capped before pagination"),
+            "expected cap caveat, got: {message}"
+        );
+        assert!(
+            message.contains("additional results may exist"),
+            "expected uncertainty note, got: {message}"
+        );
     }
 
     #[test]
