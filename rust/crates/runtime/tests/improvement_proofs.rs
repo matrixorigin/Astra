@@ -3548,6 +3548,7 @@ mod learning_improves_selection {
                 memory_domain_hints: hints,
                 restricted_tools: vec![],
                 file_context: vec![],
+                previous_confidence_fallback: None,
             })
             .await;
 
@@ -3562,6 +3563,7 @@ mod learning_improves_selection {
                 memory_domain_hints: vec![],
                 restricted_tools: vec![],
                 file_context: vec![],
+                previous_confidence_fallback: None,
             })
             .await;
 
@@ -8836,6 +8838,7 @@ mod co_occurrence_scoring_proofs {
             memory_domain_hints: vec![],
             restricted_tools: vec![],
             file_context: vec![],
+            previous_confidence_fallback: None,
         };
         let result_with = selector.select(&ctx_with_recent).await;
 
@@ -8850,6 +8853,7 @@ mod co_occurrence_scoring_proofs {
             memory_domain_hints: vec![],
             restricted_tools: vec![],
             file_context: vec![],
+            previous_confidence_fallback: None,
         };
         let result_without = selector.select(&ctx_without_recent).await;
 
@@ -8995,6 +8999,7 @@ mod file_context_scoring_proofs {
             memory_domain_hints: vec![],
             restricted_tools: vec![],
             file_context: vec!["typescript".to_string()],
+            previous_confidence_fallback: None,
         };
         let result = selector.select(&ctx).await;
         assert!(!result.failed, "selection with file_context should succeed");

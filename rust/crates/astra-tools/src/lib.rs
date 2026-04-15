@@ -64,6 +64,17 @@ impl ToolResult {
             is_error: true,
         }
     }
+
+    /// Convert a legacy `String` output into a `ToolResult`.
+    ///
+    /// Heuristic: strings starting with `"Error"` are treated as errors.
+    pub fn from_string(output: String) -> Self {
+        if output.starts_with("Error") {
+            Self::error(output)
+        } else {
+            Self::text(output)
+        }
+    }
 }
 
 /// Trait for executing tools. Implementations provide the actual tool logic

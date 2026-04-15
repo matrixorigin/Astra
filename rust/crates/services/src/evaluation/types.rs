@@ -81,6 +81,14 @@ pub struct GateValidateRequest {
     pub score_regression_threshold: f64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SessionQualityAssessmentRequest {
+    pub session_id: String,
+    pub score: f64,
+    #[serde(default)]
+    pub step_count: i32,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ClosedLoopQuery {
     #[serde(default = "default_days")]
@@ -248,6 +256,20 @@ mod tests {
         assert_eq!(req.golden_session_count, 50);
         assert!((req.error_rate_threshold - 0.05).abs() < 1e-9);
         assert!((req.score_regression_threshold - (-0.1)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn session_quality_assessment_request_defaults_step_count() {
+        let req: SessionQualityAssessmentRequest =
+            serde_json::from_str(r#"{"session_id":"sess-1","score":0.72}"#).unwrap();
+        assert_eq!(
+            req,
+            SessionQualityAssessmentRequest {
+                session_id: "sess-1".to_string(),
+                score: 0.72,
+                step_count: 0,
+            }
+        );
     }
 
     #[test]

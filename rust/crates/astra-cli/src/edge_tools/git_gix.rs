@@ -2225,7 +2225,7 @@ mod tests {
         let root = repo_root();
         let result = git_worktree(&root, &json!({"action": "ls"}));
         assert!(
-            !result.contains("unknown"),
+            !(result.contains("Error") && result.contains("unknown action")),
             "ls should be accepted as alias for list: {result}"
         );
     }

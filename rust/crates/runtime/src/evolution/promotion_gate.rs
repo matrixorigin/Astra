@@ -344,9 +344,12 @@ fn recommendation_for(
 mod tests {
     use super::*;
     use crate::pipeline::calibration::ProgressiveCalibrator;
+    use crate::pipeline::evaluation::TurnEvaluation;
     use crate::pipeline::pattern::PatternLibrary;
     use crate::pipeline::routing::{DomainHint, TaskType};
-    use crate::runtime_promotion_signals::{RuntimePromotionGateSignal, RuntimePromotionSignals};
+    use crate::runtime_promotion_signals::{
+        RuntimePromotionGateSignal, RuntimePromotionSignals, RuntimeTurnEvaluationSignal,
+    };
     use astra_core::confidence::ConfidenceInterval;
     use astra_services::evaluation::types::ValueInterval;
 
@@ -579,6 +582,7 @@ mod tests {
                 score_delta: Some(ValueInterval::exact(-0.10)),
             }),
             calibration_error: Some(ValueInterval::exact(0.22)),
+            ..RuntimePromotionSignals::default()
         };
 
         let verdict = evaluate_proposal_promotion(
@@ -600,6 +604,61 @@ mod tests {
                 .blockers
                 .iter()
                 .any(|blocker| blocker.contains("significant score regression"))
+        );
+    }
+
+    #[test]
+    fn recent_runtime_turn_failure_blocks_bounded_calibration_promotion() {
+        let proposal = EvolutionProposal {
+            id: "ev_recent_turn_failure".into(),
+            signal: EvolutionSignal::LlmReflection {
+                context_id: "ctx".into(),
+            },
+            axis: EvolutionAxis::Calibration {
+                axis: CalibrationAxis::Intent("fetch".into()),
+                adjustment: 0.10,
+            },
+            confidence: 0.91,
+            reasoning: "bounded calibration".into(),
+            created_at: 0,
+            status: super::super::types::ApprovalStatus::Pending,
+            promotion_verdict: None,
+        };
+        let signals = RuntimePromotionSignals::with_recent_turn_feedback(
+            None,
+            Some(RuntimeTurnEvaluationSignal::from_turn_evaluation(
+                &TurnEvaluation {
+                    success: false,
+                    quality: 0.20,
+                    confidence: 0.72,
+                    signals: Vec::new(),
+                },
+                2,
+                1,
+                true,
+            )),
+        )
+        .expect("recent turn feedback");
+
+        let verdict = evaluate_proposal_promotion(
+            &proposal,
+            ProposalPromotionContext {
+                pattern_library: None,
+                calibrator: Some(&ProgressiveCalibrator::default()),
+                promotion_signals: Some(&signals),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            verdict.recommendation,
+            ProposalPromotionRecommendation::Hold
+        );
+        assert!(
+            verdict
+                .blockers
+                .iter()
+                .any(|blocker| blocker.contains("recent runtime turn quality"))
         );
     }
 }

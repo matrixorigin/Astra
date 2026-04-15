@@ -127,7 +127,7 @@ check-runtime:
 # Dependencies (MatrixOne + Memoria)
 # ============================================================================
 
-DEPS_COMPOSE := cd deployment/all-in-one && UID=$$(id -u) GID=$$(id -g) docker compose -f docker-compose.deps.yml --env-file ../../.env
+DEPS_COMPOSE := cd deployment/all-in-one && env UID=$$(id -u) GID=$$(id -g) docker compose -f docker-compose.deps.yml --env-file ../../.env
 
 .PHONY: dev-deps-up
 dev-deps-up:
@@ -185,7 +185,7 @@ dev-deps-logs-once:
 dev-deps-wait:
 	@echo "Waiting for MatrixOne..."
 	@for i in $$(seq 1 90); do \
-		if curl -sf "http://127.0.0.1:$${MATRIXONE_DEBUG_HTTP_PORT:-6060}/debug/vars" >/dev/null 2>&1; then \
+		if curl --noproxy '*' -sf "http://127.0.0.1:$${MATRIXONE_DEBUG_HTTP_PORT:-6060}/debug/vars" >/dev/null 2>&1; then \
 			echo "✅ MatrixOne is healthy"; \
 			break; \
 		fi; \
@@ -199,7 +199,7 @@ dev-deps-wait:
 	done
 	@echo "Waiting for Memoria..."
 	@for i in $$(seq 1 60); do \
-		if curl -sf "http://127.0.0.1:$${MEMORIA_PORT:-8100}/health" >/dev/null 2>&1; then \
+		if curl --noproxy '*' -sf "http://127.0.0.1:$${MEMORIA_PORT:-8100}/health" >/dev/null 2>&1; then \
 			echo "✅ Memoria is healthy"; \
 			echo "✅ Dependency services ready"; \
 			exit 0; \

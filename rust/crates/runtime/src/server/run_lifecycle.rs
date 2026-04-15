@@ -37,8 +37,8 @@ use crate::observability_integration::ObservabilityHub;
 use crate::pipeline::step_recorder::StepRecorder;
 use crate::runtime_promotion_signals::{RuntimePromotionGateSignal, RuntimePromotionSignals};
 use crate::turn::agentic_loop_host::{
-    AgenticLoopOutcome, AgenticLoopState, CancellationState, MessagingState, SkillState,
-    StopHookState, run_agentic_loop_with_host,
+    AgenticLoopOutcome, AgenticLoopState, CancellationState, EvaluationPersistenceContext,
+    MessagingState, SkillState, StopHookState, run_agentic_loop_with_host,
 };
 use crate::{
     DatabaseEvaluationService, DatabaseEventService, EvaluationService, EventCreateRequestData,
@@ -113,7 +113,7 @@ fn build_server_skill_executor(
     Some(Arc::new(router))
 }
 
-fn has_turn_verdict_warning(
+pub(crate) fn has_turn_verdict_warning(
     verdict_events: &[crate::turn::agentic_verdict_audit::AgenticVerdictAuditEvent],
 ) -> bool {
     verdict_events.iter().any(|event| {
@@ -187,12 +187,10 @@ fn build_runtime_evaluation_service(
     }
 }
 
-async fn load_runtime_promotion_signals(
-    matrixone: &MatrixOneSettings,
-    shared_pool: Option<&SharedPool>,
+pub(crate) async fn load_runtime_promotion_signals_with_service(
+    service: &impl EvaluationService,
     user_id: &str,
 ) -> Result<RuntimePromotionSignals, (StatusCode, Json<ErrorResponse>)> {
-    let service = build_runtime_evaluation_service(matrixone, shared_pool);
     let quality = service.get_quality_trend(user_id, 30, None).await?;
     let gate_history = service.get_gate_history(user_id, 1).await?;
     let calibration = service.get_calibration(user_id, None, 30).await?;
@@ -210,6 +208,7 @@ async fn load_runtime_promotion_signals(
             score_delta: Some(gate.score_delta_interval),
         }),
         calibration_error: Some(calibration_error),
+        recent_turn: None,
     })
 }
 
@@ -227,6 +226,7 @@ async fn initialize_runtime_controllers(
     user_id: &str,
     session_id: &str,
     promotion_signals: Option<RuntimePromotionSignals>,
+    evaluation_persistence: Option<EvaluationPersistenceContext>,
 ) -> super::state_builder::PipelineLearningStack {
     let learning_stack = super::state_builder::build_pipeline_learning_stack(Some("default"));
     let hub = Arc::new(ObservabilityHub::new());
@@ -258,6 +258,7 @@ async fn initialize_runtime_controllers(
     loop_state.telemetry.observability_hub = Some(hub);
     loop_state.telemetry.observability_session = Some(session);
     loop_state.telemetry.runtime_promotion_signals = promotion_signals;
+    loop_state.telemetry.evaluation_persistence = evaluation_persistence;
     loop_state.evolution_service = Some(evolution_service);
     learning_stack
 }
@@ -272,8 +273,14 @@ async fn configure_runtime_controllers(
     // Promotion signals require a live database connection. When no shared pool
     // is available (e.g. edge-only mode) skip the preload rather than creating a
     // throwaway connection that may hang on unreachable hosts.
-    let promotion_signals = if shared_pool.is_some() {
-        match load_runtime_promotion_signals(matrixone, shared_pool, user_id).await {
+    let evaluation_persistence = shared_pool.map(|pool| EvaluationPersistenceContext {
+        user_id: user_id.to_string(),
+        evaluation_service: build_runtime_evaluation_service(matrixone, Some(pool)),
+    });
+    let promotion_signals = if let Some(context) = evaluation_persistence.as_ref() {
+        match load_runtime_promotion_signals_with_service(&context.evaluation_service, user_id)
+            .await
+        {
             Ok(context) => Some(context),
             Err((status, response)) => {
                 eprintln!(
@@ -287,7 +294,14 @@ async fn configure_runtime_controllers(
         tracing::debug!("skipping promotion-signals preload: no shared database pool");
         None
     };
-    initialize_runtime_controllers(loop_state, user_id, session_id, promotion_signals).await
+    initialize_runtime_controllers(
+        loop_state,
+        user_id,
+        session_id,
+        promotion_signals,
+        evaluation_persistence,
+    )
+    .await
 }
 
 fn build_runtime_event_service(
@@ -887,6 +901,7 @@ impl AgenticRunLifecycleService {
             server_tool_executor: None,
             interruption: None,
             confidence_trend: Default::default(),
+            last_confidence_diagnosis: None,
         }
     }
 
@@ -1904,6 +1919,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             server_tool_executor: None,
             interruption: None,
             confidence_trend: Default::default(),
+            last_confidence_diagnosis: None,
         };
         let learning_stack = configure_runtime_controllers(
             &self.matrixone,

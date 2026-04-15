@@ -2,6 +2,9 @@ use std::collections::HashMap;
 
 use serde_json::Value;
 
+use astra_services::EvaluationService;
+use astra_services::evaluation::SessionQualityAssessmentRequest;
+
 use super::agentic_adaptive_tuning::{
     apply_per_turn_adaptation, apply_tactical_actions, maybe_run_tuning_cycle,
 };
@@ -29,10 +32,86 @@ use super::agentic_turn_flow::{
     agentic_round_stall_preflight_with_tool_calls, append_explain_turn_batch,
 };
 use super::tool_result_semantics::tool_dedup_signature;
+use crate::runtime_promotion_signals::{RuntimePromotionSignals, RuntimeTurnEvaluationSignal};
 
 pub(crate) enum TurnToolPhaseControl {
     ContinueLoop,
     Return(AgenticLoopOutcome),
+}
+
+fn build_runtime_session_quality_assessment(
+    session_id: &str,
+    quality: f64,
+    total_tools: usize,
+) -> SessionQualityAssessmentRequest {
+    SessionQualityAssessmentRequest {
+        session_id: session_id.to_string(),
+        score: quality,
+        step_count: i32::try_from(total_tools).unwrap_or(i32::MAX),
+    }
+}
+
+async fn refresh_runtime_promotion_signals_from_db(state: &mut AgenticLoopState) {
+    let (session_id, persistence) = match (
+        state.current_session_id.as_deref(),
+        state.telemetry.evaluation_persistence.clone(),
+    ) {
+        (Some(session_id), Some(persistence)) if !session_id.is_empty() => {
+            (session_id.to_string(), persistence)
+        }
+        _ => return,
+    };
+    let verdict_warning =
+        crate::server::run_lifecycle::has_turn_verdict_warning(&state.stall.verdict_events);
+    let evaluation = crate::pipeline::evaluation::evaluate_tool_call_records(
+        &state.message,
+        &state.recent_tools,
+        &state.stall.tool_call_records,
+        state.stall.events.len(),
+        verdict_warning,
+        state.telemetry.first_budget_pressure,
+    );
+    let assessment = build_runtime_session_quality_assessment(
+        &session_id,
+        evaluation.quality,
+        state.step_recorder.summary().total_tools,
+    );
+
+    if let Err((status, response)) = persistence
+        .evaluation_service
+        .record_session_quality_assessment(&persistence.user_id, assessment)
+        .await
+    {
+        astra_core::agent_warn!(
+            "promotion-signals",
+            "Failed to persist session quality assessment for {}: {} {}",
+            session_id,
+            status,
+            response.0.detail
+        );
+        return;
+    }
+
+    match crate::server::run_lifecycle::load_runtime_promotion_signals_with_service(
+        &persistence.evaluation_service,
+        &persistence.user_id,
+    )
+    .await
+    {
+        Ok(signals) => {
+            state.telemetry.runtime_promotion_signals = Some(signals.clone());
+            if let Some(evolution_service) = state.evolution_service.as_ref() {
+                evolution_service.set_runtime_promotion_signals(Some(signals));
+            }
+        }
+        Err((status, response)) => astra_core::agent_warn!(
+            "promotion-signals",
+            "Failed to refresh runtime promotion signals for {}: {} {}",
+            session_id,
+            status,
+            response.0.detail
+        ),
+    }
 }
 
 fn tool_record_result_text(rec: &astra_services::session_journal::ToolCallRecord) -> &str {
@@ -47,6 +126,56 @@ fn tool_record_was_rejected(rec: &astra_services::session_journal::ToolCallRecor
         .as_deref()
         .map(|error| error.starts_with("blocked_tool:"))
         .unwrap_or(false)
+}
+
+fn turn_has_warning_verdict(
+    turn_index: usize,
+    verdict_events: &[super::agentic_verdict_audit::AgenticVerdictAuditEvent],
+) -> bool {
+    verdict_events.iter().any(|event| {
+        event.turn == turn_index as u32
+            && (event.severity.eq_ignore_ascii_case("warning")
+                || event.severity.eq_ignore_ascii_case("critical"))
+    })
+}
+
+fn refresh_runtime_promotion_signals_from_turn(
+    existing: Option<&RuntimePromotionSignals>,
+    input: &str,
+    recent_tools: &[String],
+    turn_index: usize,
+    tool_call_records: &[astra_services::session_journal::ToolCallRecord],
+    stall_events: &[(String, u32)],
+    verdict_events: &[super::agentic_verdict_audit::AgenticVerdictAuditEvent],
+    budget_pressure: f64,
+) -> Option<RuntimePromotionSignals> {
+    let stall_count = stall_events
+        .iter()
+        .filter(|(_, recorded_turn)| *recorded_turn == turn_index as u32)
+        .count();
+    let verdict_warning = turn_has_warning_verdict(turn_index, verdict_events);
+    let evaluation = crate::pipeline::evaluation::evaluate_tool_call_records(
+        input,
+        recent_tools,
+        tool_call_records,
+        stall_count,
+        verdict_warning,
+        budget_pressure,
+    );
+    let recent_turn = (!tool_call_records.is_empty()
+        || stall_count > 0
+        || verdict_warning
+        || evaluation.confidence >= 0.6)
+        .then(|| {
+            RuntimeTurnEvaluationSignal::from_turn_evaluation(
+                &evaluation,
+                tool_call_records.len(),
+                stall_count,
+                verdict_warning,
+            )
+        });
+
+    RuntimePromotionSignals::with_recent_turn_feedback(existing, recent_turn)
 }
 
 const EXECUTION_BOUNDARY_KIND_TURN_ROLLBACK: &str = "turn_rollback";
@@ -919,8 +1048,20 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
             {
                 Ok(true) => {}
                 Ok(false) => {
+                    let updated_promotion_signals = refresh_runtime_promotion_signals_from_turn(
+                        state.telemetry.runtime_promotion_signals.as_ref(),
+                        &state.message,
+                        &state.recent_tools,
+                        turn_index,
+                        &state.stall.tool_call_records[evo_records_before..],
+                        &state.stall.events,
+                        &state.stall.verdict_events,
+                        state.telemetry.first_budget_pressure,
+                    );
+                    state.telemetry.runtime_promotion_signals = updated_promotion_signals;
                     observe_gate_cancelled(state, turn_index, prep.turn_start_time, &turn_result);
                     state.step_recorder.end_turn(true);
+                    refresh_runtime_promotion_signals_from_db(state).await;
                     finalize_turn_trace(state);
                     return Ok(TurnToolPhaseControl::Return(AgenticLoopOutcome::Cancelled));
                 }
@@ -952,6 +1093,19 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
         },
     )) {
         AgenticPostToolIterationControl::Abort(e) => {
+            let updated_promotion_signals = refresh_runtime_promotion_signals_from_turn(
+                state.telemetry.runtime_promotion_signals.as_ref(),
+                &state.message,
+                &state.recent_tools,
+                turn_index,
+                &state.stall.tool_call_records[evo_records_before..],
+                &state.stall.events,
+                &state.stall.verdict_events,
+                state.telemetry.first_budget_pressure,
+            );
+            state.telemetry.runtime_promotion_signals = updated_promotion_signals;
+            state.step_recorder.end_turn(true);
+            refresh_runtime_promotion_signals_from_db(state).await;
             finalize_turn_trace(state);
             return Err(e);
         }
@@ -1022,8 +1176,20 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
                 crate::observability_integration::on_turn_end(hub, &mut session_guard, timing);
             }
 
+            let updated_promotion_signals = refresh_runtime_promotion_signals_from_turn(
+                state.telemetry.runtime_promotion_signals.as_ref(),
+                &state.message,
+                &state.recent_tools,
+                turn_index,
+                &state.stall.tool_call_records[evo_records_before..],
+                &state.stall.events,
+                &state.stall.verdict_events,
+                state.telemetry.first_budget_pressure,
+            );
+            state.telemetry.runtime_promotion_signals = updated_promotion_signals;
             finalize_turn_trace(state);
             state.step_recorder.end_turn(false);
+            refresh_runtime_promotion_signals_from_db(state).await;
             state.telemetry.completed_turns_for_tuning += 1;
             maybe_run_tuning_cycle(state);
             maybe_trigger_auto_reflection(host, state).await;
@@ -1062,6 +1228,7 @@ fn observe_gate_cancelled(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use astra_core::confidence::ConfidenceInterval;
     use astra_services::session_journal::{
         JournalEvent, JournalEventType, JournalWriter, ToolCallRecord,
     };
@@ -1105,6 +1272,26 @@ mod tests {
         assert!(!tool_record_was_rejected(&rec));
     }
 
+    #[test]
+    fn runtime_session_quality_assessment_uses_session_score_and_tools() {
+        assert_eq!(
+            build_runtime_session_quality_assessment("sess-9", 0.63, 7),
+            SessionQualityAssessmentRequest {
+                session_id: "sess-9".to_string(),
+                score: 0.63,
+                step_count: 7,
+            }
+        );
+    }
+
+    #[test]
+    fn runtime_session_quality_assessment_saturates_large_tool_counts() {
+        assert_eq!(
+            build_runtime_session_quality_assessment("sess-9", 0.63, usize::MAX).step_count,
+            i32::MAX
+        );
+    }
+
     fn tool_record(name: &str, ok: bool) -> ToolCallRecord {
         ToolCallRecord {
             name: name.to_string(),
@@ -1131,6 +1318,67 @@ mod tests {
             row.extend(fields);
         }
         Value::Object(row)
+    }
+
+    #[test]
+    fn refresh_runtime_promotion_signals_captures_live_query_failures_without_tools() {
+        let existing = RuntimePromotionSignals {
+            noise_filtered_quality: Some(ConfidenceInterval::exact(0.78)),
+            ..RuntimePromotionSignals::default()
+        };
+
+        let updated = refresh_runtime_promotion_signals_from_turn(
+            Some(&existing),
+            "Check the latest git status",
+            &["git_status".to_string()],
+            2,
+            &[],
+            &[],
+            &[],
+            0.2,
+        )
+        .expect("recent turn signal should be captured");
+
+        assert_eq!(
+            updated.noise_filtered_quality,
+            existing.noise_filtered_quality
+        );
+        let recent = updated.recent_turn.expect("recent turn");
+        assert!(!recent.success);
+        assert_eq!(recent.tool_call_count, 0);
+        assert_eq!(recent.quality, ConfidenceInterval::exact(0.2));
+    }
+
+    #[test]
+    fn refresh_runtime_promotion_signals_clears_stale_recent_turn_for_neutral_turns() {
+        let existing = RuntimePromotionSignals::with_recent_turn_feedback(
+            None,
+            Some(RuntimeTurnEvaluationSignal::from_turn_evaluation(
+                &crate::pipeline::evaluation::TurnEvaluation {
+                    success: false,
+                    quality: 0.22,
+                    confidence: 0.72,
+                    signals: Vec::new(),
+                },
+                2,
+                1,
+                true,
+            )),
+        )
+        .expect("seed recent turn");
+
+        let updated = refresh_runtime_promotion_signals_from_turn(
+            Some(&existing),
+            "Thanks!",
+            &[],
+            3,
+            &[],
+            &[],
+            &[],
+            0.0,
+        );
+
+        assert!(updated.is_none());
     }
 
     fn read_journal_events(session_id: &str) -> Vec<JournalEvent> {

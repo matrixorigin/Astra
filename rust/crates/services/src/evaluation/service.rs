@@ -29,6 +29,11 @@ pub trait EvaluationService: Send + Sync {
         limit: i32,
         min_score: f64,
     ) -> ServiceResult<SessionScoresListResponse>;
+    async fn record_session_quality_assessment(
+        &self,
+        user_id: &str,
+        request: SessionQualityAssessmentRequest,
+    ) -> ServiceResult<()>;
     async fn validate_gate(
         &self,
         user_id: &str,

@@ -495,6 +495,7 @@ pub(crate) async fn stream_chat_sse(
             turn_trace_collector: None,
             completed_turns_for_tuning: 0,
             runtime_promotion_signals: None,
+            evaluation_persistence: None,
             promotion_events: Vec::new(),
         },
         skills: SkillState {
@@ -574,6 +575,7 @@ pub(crate) async fn stream_chat_sse(
         server_tool_executor: None,
         interruption: None,
         confidence_trend: Default::default(),
+        last_confidence_diagnosis: None,
     };
 
     // ─── Run the runtime loop ────────────────────────────────────────────

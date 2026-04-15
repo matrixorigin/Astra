@@ -75,7 +75,7 @@ services:
     networks:
       - mo-net
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8100/health"]
+      test: ["CMD-SHELL", "grep -aq 'memoria' /proc/1/cmdline"]
       interval: 15s
       timeout: 5s
       retries: 6

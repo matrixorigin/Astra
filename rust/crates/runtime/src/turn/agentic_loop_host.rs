@@ -52,6 +52,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
+use astra_services::DatabaseEvaluationService;
 use astra_services::session_audit::RuntimePromotionEventData;
 use astra_services::session_journal::ToolCallRecord;
 use async_trait::async_trait;
@@ -417,6 +418,8 @@ pub struct TelemetryState {
     /// Optional preloaded evaluation summaries used to damp runtime promotions.
     pub runtime_promotion_signals:
         Option<crate::runtime_promotion_signals::RuntimePromotionSignals>,
+    /// Optional evaluation persistence context for refreshing DB-backed runtime signals.
+    pub evaluation_persistence: Option<EvaluationPersistenceContext>,
     /// Runtime promotion verdicts captured for later audit/report persistence.
     pub promotion_events: Vec<RuntimePromotionEventData>,
     /// Optional turn trace collector for detailed context assembly observability.
@@ -425,6 +428,12 @@ pub struct TelemetryState {
     pub turn_trace_collector: Option<crate::turn::turn_trace_collector::TurnTraceCollector>,
     /// Number of turns completed in this loop invocation (for tuning cycle trigger).
     pub completed_turns_for_tuning: u32,
+}
+
+#[derive(Clone, Debug)]
+pub struct EvaluationPersistenceContext {
+    pub user_id: String,
+    pub evaluation_service: DatabaseEvaluationService,
 }
 
 /// Stall and verdict tracking state for the agentic loop.
@@ -690,6 +699,8 @@ pub struct AgenticLoopState {
     // ── Confidence tracking ──
     /// Tracks selector confidence trends across turns to detect floor loops.
     pub confidence_trend: super::confidence_contract::ConfidenceTrendTracker,
+    /// Last diagnosis computed after tool selection (for telemetry and fallback).
+    pub last_confidence_diagnosis: Option<super::confidence_contract::ConfidenceDiagnosis>,
 }
 
 /// Consecutive same-category error turns before forcing a strategy change.
@@ -1123,6 +1134,7 @@ pub(crate) mod tests {
             server_tool_executor: None,
             interruption: None,
             confidence_trend: Default::default(),
+            last_confidence_diagnosis: None,
         }
     }
 
@@ -1137,6 +1149,7 @@ pub(crate) mod tests {
                 },
             ),
             calibration_error: Some(ValueInterval::new(0.05, 0.03, 0.07)),
+            ..crate::runtime_promotion_signals::RuntimePromotionSignals::default()
         }
     }
 
@@ -1151,6 +1164,7 @@ pub(crate) mod tests {
                 },
             ),
             calibration_error: Some(ValueInterval::new(0.27, 0.23, 0.31)),
+            ..crate::runtime_promotion_signals::RuntimePromotionSignals::default()
         }
     }
 

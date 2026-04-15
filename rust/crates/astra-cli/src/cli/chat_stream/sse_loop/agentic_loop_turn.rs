@@ -213,6 +213,8 @@ struct PrepareChatTurnRequest<'a> {
     tool_budget_override: Option<u32>,
     interaction_mode: TurnInteractionMode,
     turn_policy: &'a mut TurnInteractionPolicy,
+    previous_confidence_fallback:
+        Option<astra_runtime::turn::confidence_contract::ConfidenceFallback>,
 }
 
 pub(crate) fn turn_policy_from_payload_edge_tools(
@@ -375,6 +377,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
             ctx.file_context.to_vec(),
             false,
             ctx.tool_budget_override,
+            ctx.previous_confidence_fallback.clone(),
         );
         touch_prep_ui_phase(&ctx.prep_ui_phase, "Thinking…");
         let sel_result = ctx
@@ -430,6 +433,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> Value {
             ctx.file_context.to_vec(),
             true,
             ctx.tool_budget_override,
+            ctx.previous_confidence_fallback.clone(),
         );
         touch_prep_ui_phase(&ctx.prep_ui_phase, "Thinking…");
         let sel_start = Instant::now();
@@ -711,6 +715,9 @@ pub(crate) struct ChatTurnSseFetchRequest<'a> {
     pub skill_continuation: bool,
     /// Cross-turn tool output cache (persists across turns via `CliAgenticLoopHost`).
     pub tool_cache: &'a mut crate::stream_render::EdgeToolCache,
+    /// Fallback from previous turn's confidence diagnosis for broadening.
+    pub previous_confidence_fallback:
+        Option<astra_runtime::turn::confidence_contract::ConfidenceFallback>,
 }
 
 /// stderr prep line + timing toggles for [`fetch_chat_turn_sse`].
@@ -832,6 +839,7 @@ pub(crate) async fn fetch_chat_turn_sse(
         turn_policy,
         skill_continuation,
         tool_cache,
+        previous_confidence_fallback,
     } = ctx;
 
     let ui = chat_turn_sse_fetch_ui(render_policy, plan_assemble_line_release.as_ref());
@@ -876,6 +884,7 @@ pub(crate) async fn fetch_chat_turn_sse(
             tool_budget_override,
             interaction_mode,
             turn_policy,
+            previous_confidence_fallback,
         },
     )
     .await?;

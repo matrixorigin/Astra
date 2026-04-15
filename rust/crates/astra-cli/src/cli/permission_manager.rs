@@ -11,6 +11,35 @@ use astra_runtime::turn::tool_argument_hints::{
 use astra_runtime::{compensation_prompt_note, explicit_approval_reason};
 use astra_thin_client::ApprovalKind;
 
+/// Build a content-aware fingerprint from tool name and arguments.
+///
+/// For shell/execute tools, extracts the command prefix (e.g. `git commit`).
+/// For file/write tools, extracts the path pattern (e.g. `src/turn/**`).
+/// Falls back to [`ApprovalFingerprint::bare`] when no content is available.
+fn content_aware_fingerprint(
+    name: &str,
+    args: &serde_json::Value,
+) -> astra_runtime::turn::approval_fingerprint::ApprovalFingerprint {
+    use astra_runtime::turn::approval_fingerprint::ApprovalFingerprint;
+
+    match cloud_gated_tool_kind(name) {
+        Some(CloudGatedToolKind::Execute) => {
+            if let Some(cmd) = command_hint_from_args(args) {
+                let lower = cmd.to_ascii_lowercase();
+                let is_ro = is_read_only_allowlisted(&lower);
+                ApprovalFingerprint::shell(name, cmd, is_ro)
+            } else {
+                ApprovalFingerprint::bare(name)
+            }
+        }
+        Some(CloudGatedToolKind::Write) => {
+            let path = path_hint_from_args(args);
+            ApprovalFingerprint::file_op(name, path.as_deref())
+        }
+        None => ApprovalFingerprint::bare(name),
+    }
+}
+
 /// Permission mode controls how tool approval decisions are handled.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(super) enum PermissionMode {
@@ -461,13 +490,30 @@ impl PermissionManager {
             PermissionMode::Deny => return ApprovalDecision::Deny,
             PermissionMode::Prompt => {}
         }
-        let fp = astra_runtime::turn::approval_fingerprint::ApprovalFingerprint::bare(tool);
+        let fp = match (cloud_gated_tool_kind(tool), detail) {
+            (Some(CloudGatedToolKind::Execute), Some(cmd)) => {
+                astra_runtime::turn::approval_fingerprint::ApprovalFingerprint::shell(
+                    tool, cmd, false,
+                )
+            }
+            (Some(CloudGatedToolKind::Write), d) => {
+                astra_runtime::turn::approval_fingerprint::ApprovalFingerprint::file_op(tool, d)
+            }
+            _ => astra_runtime::turn::approval_fingerprint::ApprovalFingerprint::bare(tool),
+        };
         if let Some(allowed) = self.session_overrides.check(&fp) {
             return if allowed {
                 ApprovalDecision::Allow
             } else {
                 ApprovalDecision::Deny
             };
+        }
+        match self.denial_tracker.should_prompt(&fp) {
+            astra_runtime::turn::approval_fingerprint::DenialAction::SkipTool => {
+                return ApprovalDecision::Deny;
+            }
+            astra_runtime::turn::approval_fingerprint::DenialAction::FallbackToUser => {}
+            astra_runtime::turn::approval_fingerprint::DenialAction::Continue => {}
         }
 
         eprintln!(
@@ -479,6 +525,7 @@ impl PermissionManager {
         }
         self.apply_cloud_approval_choice(
             tool,
+            detail,
             Self::prompt_approval(ApprovalPromptKind::CloudStandard),
         )
     }
@@ -532,13 +579,30 @@ impl PermissionManager {
             PermissionMode::Deny => return ApprovalDecision::Deny,
             PermissionMode::Prompt => {}
         }
-        let fp = astra_runtime::turn::approval_fingerprint::ApprovalFingerprint::bare(tool);
+        let fp = match (cloud_gated_tool_kind(tool), detail) {
+            (Some(CloudGatedToolKind::Execute), Some(cmd)) => {
+                astra_runtime::turn::approval_fingerprint::ApprovalFingerprint::shell(
+                    tool, cmd, false,
+                )
+            }
+            (Some(CloudGatedToolKind::Write), d) => {
+                astra_runtime::turn::approval_fingerprint::ApprovalFingerprint::file_op(tool, d)
+            }
+            _ => astra_runtime::turn::approval_fingerprint::ApprovalFingerprint::bare(tool),
+        };
         if let Some(allowed) = self.session_overrides.check(&fp) {
             return if allowed {
                 ApprovalDecision::Allow
             } else {
                 ApprovalDecision::Deny
             };
+        }
+        match self.denial_tracker.should_prompt(&fp) {
+            astra_runtime::turn::approval_fingerprint::DenialAction::SkipTool => {
+                return ApprovalDecision::Deny;
+            }
+            astra_runtime::turn::approval_fingerprint::DenialAction::FallbackToUser => {}
+            astra_runtime::turn::approval_fingerprint::DenialAction::Continue => {}
         }
 
         eprintln!(
@@ -553,7 +617,7 @@ impl PermissionManager {
         })
         .await
         .unwrap_or('n');
-        self.apply_cloud_approval_choice(tool, ch)
+        self.apply_cloud_approval_choice(tool, detail, ch)
     }
 
     fn classify(name: &str) -> SideEffect {
@@ -828,6 +892,7 @@ impl PermissionManager {
     fn apply_cloud_approval_choice(
         &mut self,
         tool: &str,
+        detail: Option<&str>,
         choice: char,
     ) -> astra_thin_client::ApprovalDecision {
         use astra_thin_client::ApprovalDecision;
@@ -835,7 +900,19 @@ impl PermissionManager {
         match choice {
             'y' => ApprovalDecision::Allow,
             'a' => {
-                let fp = astra_runtime::turn::approval_fingerprint::ApprovalFingerprint::bare(tool);
+                let fp = match (cloud_gated_tool_kind(tool), detail) {
+                    (Some(CloudGatedToolKind::Execute), Some(cmd)) => {
+                        astra_runtime::turn::approval_fingerprint::ApprovalFingerprint::shell(
+                            tool, cmd, false,
+                        )
+                    }
+                    (Some(CloudGatedToolKind::Write), d) => {
+                        astra_runtime::turn::approval_fingerprint::ApprovalFingerprint::file_op(
+                            tool, d,
+                        )
+                    }
+                    _ => astra_runtime::turn::approval_fingerprint::ApprovalFingerprint::bare(tool),
+                };
                 self.session_overrides.insert(fp, true);
                 eprintln!("{}", format!("  ✓ {tool}: allowed for this session").dim());
                 ApprovalDecision::AllowSession
@@ -850,7 +927,19 @@ impl PermissionManager {
                 ApprovalDecision::Allow
             }
             's' => {
-                let fp = astra_runtime::turn::approval_fingerprint::ApprovalFingerprint::bare(tool);
+                let fp = match (cloud_gated_tool_kind(tool), detail) {
+                    (Some(CloudGatedToolKind::Execute), Some(cmd)) => {
+                        astra_runtime::turn::approval_fingerprint::ApprovalFingerprint::shell(
+                            tool, cmd, false,
+                        )
+                    }
+                    (Some(CloudGatedToolKind::Write), d) => {
+                        astra_runtime::turn::approval_fingerprint::ApprovalFingerprint::file_op(
+                            tool, d,
+                        )
+                    }
+                    _ => astra_runtime::turn::approval_fingerprint::ApprovalFingerprint::bare(tool),
+                };
                 self.session_overrides.insert(fp.clone(), false);
                 self.denial_tracker.record(&fp, false);
                 eprintln!("  {}", format!("  ✗ {tool}: skipped for session").dim());
@@ -929,9 +1018,10 @@ impl PermissionManager {
                     if self.mode == PermissionMode::Auto {
                         return true;
                     }
-                    if let Some(allowed) = self.session_overrides.check(
-                        &astra_runtime::turn::approval_fingerprint::ApprovalFingerprint::bare(name),
-                    ) {
+                    if let Some(allowed) = self
+                        .session_overrides
+                        .check(&content_aware_fingerprint(name, args))
+                    {
                         return allowed;
                     }
                 }
@@ -1010,7 +1100,7 @@ impl PermissionManager {
         // Step 5: Session overrides (AFTER bypass-immune safety checks).
         if let Some(allowed) = self
             .session_overrides
-            .check(&astra_runtime::turn::approval_fingerprint::ApprovalFingerprint::bare(name))
+            .check(&content_aware_fingerprint(name, args))
         {
             return allowed;
         }
@@ -1036,10 +1126,24 @@ impl PermissionManager {
         if let Some(detail) = detail {
             eprintln!("{}", detail.dim());
         }
+        // Check denial limits before prompting.
+        let fp = content_aware_fingerprint(name, args);
+        match self.denial_tracker.should_prompt(&fp) {
+            astra_runtime::turn::approval_fingerprint::DenialAction::SkipTool => {
+                eprintln!(
+                    "  {}",
+                    format!("  ✗ {name}: auto-denied (repeated denials)").dim()
+                );
+                return false;
+            }
+            astra_runtime::turn::approval_fingerprint::DenialAction::FallbackToUser => {
+                // Still show the prompt but could add escalation context
+            }
+            astra_runtime::turn::approval_fingerprint::DenialAction::Continue => {}
+        }
         match Self::prompt_approval(ApprovalPromptKind::LocalStandard) {
             'y' => true,
             'a' => {
-                let fp = astra_runtime::turn::approval_fingerprint::ApprovalFingerprint::bare(name);
                 self.session_overrides.insert(fp, true);
                 // Persist as a project-level allow rule with command pattern
                 let rule = Self::make_allow_rule(name, args);
@@ -1056,13 +1160,15 @@ impl PermissionManager {
                 true
             }
             's' => {
-                let fp = astra_runtime::turn::approval_fingerprint::ApprovalFingerprint::bare(name);
                 self.session_overrides.insert(fp.clone(), false);
                 self.denial_tracker.record(&fp, false);
                 eprintln!("  {}", format!("  ✗ {name}: skipped for session").dim());
                 false
             }
-            _ => false,
+            _ => {
+                self.denial_tracker.record(&fp, false);
+                false
+            }
         }
     }
 
@@ -1086,7 +1192,7 @@ impl PermissionManager {
             // Check session overrides first
             if let Some(allowed) = self
                 .session_overrides
-                .check(&astra_runtime::turn::approval_fingerprint::ApprovalFingerprint::bare(name))
+                .check(&content_aware_fingerprint(name, args))
             {
                 return if allowed {
                     PermissionDecision::Allow
@@ -1137,9 +1243,10 @@ impl PermissionManager {
                     if self.mode == PermissionMode::Auto {
                         return PermissionDecision::Allow;
                     }
-                    if let Some(allowed) = self.session_overrides.check(
-                        &astra_runtime::turn::approval_fingerprint::ApprovalFingerprint::bare(name),
-                    ) {
+                    if let Some(allowed) = self
+                        .session_overrides
+                        .check(&content_aware_fingerprint(name, args))
+                    {
                         return if allowed {
                             PermissionDecision::Allow
                         } else {
@@ -1212,7 +1319,7 @@ impl PermissionManager {
         // Step 5: Session overrides (AFTER bypass-immune safety checks).
         if let Some(allowed) = self
             .session_overrides
-            .check(&astra_runtime::turn::approval_fingerprint::ApprovalFingerprint::bare(name))
+            .check(&content_aware_fingerprint(name, args))
         {
             return if allowed {
                 PermissionDecision::Allow
@@ -1231,6 +1338,19 @@ impl PermissionManager {
             PermissionMode::Auto => PermissionDecision::Allow,
             PermissionMode::Deny => PermissionDecision::Deny("Denied by mode".into()),
             PermissionMode::Prompt => {
+                // Check denial limits before prompting.
+                let fp = content_aware_fingerprint(name, args);
+                match self.denial_tracker.should_prompt(&fp) {
+                    astra_runtime::turn::approval_fingerprint::DenialAction::SkipTool => {
+                        return PermissionDecision::Deny(format!(
+                            "{name}: auto-denied (repeated denials)"
+                        ));
+                    }
+                    astra_runtime::turn::approval_fingerprint::DenialAction::FallbackToUser => {
+                        // Still show the prompt but add escalation context
+                    }
+                    astra_runtime::turn::approval_fingerprint::DenialAction::Continue => {}
+                }
                 let (header, detail) = Self::format_tool_display(name, args);
                 PermissionDecision::NeedApproval {
                     tool: name.to_string(),
@@ -1836,7 +1956,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
 
-        let decision = pm.apply_cloud_approval_choice("bash", '!');
+        let decision = pm.apply_cloud_approval_choice("bash", None, '!');
 
         assert_eq!(decision, astra_thin_client::ApprovalDecision::Allow);
         assert_eq!(pm.mode, PermissionMode::Auto);
@@ -1847,7 +1967,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
 
-        let decision = pm.apply_cloud_approval_choice("bash", 'a');
+        let decision = pm.apply_cloud_approval_choice("bash", None, 'a');
 
         assert_eq!(decision, astra_thin_client::ApprovalDecision::AllowSession);
         assert_eq!(pm.session_overrides.check(&bare_fp("bash")), Some(true));
@@ -1858,7 +1978,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
 
-        let decision = pm.apply_cloud_approval_choice("bash", 's');
+        let decision = pm.apply_cloud_approval_choice("bash", None, 's');
 
         assert_eq!(decision, astra_thin_client::ApprovalDecision::Deny);
         assert_eq!(pm.session_overrides.check(&bare_fp("bash")), Some(false));
@@ -2421,7 +2541,7 @@ mod tests {
         let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
 
         // Simulate user selecting "always allow this tool" in cloud approval
-        let decision = pm.apply_cloud_approval_choice("write_file", 'a');
+        let decision = pm.apply_cloud_approval_choice("write_file", None, 'a');
         assert_eq!(decision, astra_thin_client::ApprovalDecision::AllowSession);
 
         // Now the local check_nonblocking must auto-allow (no prompt)
@@ -2441,7 +2561,7 @@ mod tests {
         let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
 
         // Simulate user selecting "auto-run session" in cloud approval
-        let decision = pm.apply_cloud_approval_choice("bash", '!');
+        let decision = pm.apply_cloud_approval_choice("bash", None, '!');
         assert_eq!(decision, astra_thin_client::ApprovalDecision::Allow);
         assert_eq!(pm.mode, PermissionMode::Auto);
 
@@ -2463,7 +2583,7 @@ mod tests {
         let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
 
         // 1st call: user selects 'a' in cloud approval
-        pm.apply_cloud_approval_choice("write_file", 'a');
+        pm.apply_cloud_approval_choice("write_file", None, 'a');
 
         // 1st call: local check
         let args1 = serde_json::json!({"path": "src/lib.rs", "content": "pub fn one() {}\n"});

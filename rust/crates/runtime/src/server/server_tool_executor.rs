@@ -24,6 +24,7 @@ use serde_json::{Value, json};
 
 use astra_tools::executor::DefaultToolExecutor;
 use astra_tools::{ToolContext, ToolExecutor};
+use async_trait::async_trait;
 
 use crate::tool_sandbox::{
     IsolationConfig, SandboxMode, SandboxPolicy, ToolTier, effective_tier, execute_isolated,
@@ -3017,6 +3018,34 @@ fn tool_result_from_output(output: String) -> astra_tools::ToolResult {
         astra_tools::ToolResult::error(output)
     } else {
         astra_tools::ToolResult::text(output)
+    }
+}
+
+// ─── ToolExecutor trait implementation ────────────────────────────────────────
+//
+// This allows ServerToolExecutor to be used polymorphically wherever
+// `dyn ToolExecutor` (or `impl ToolExecutor`) is required, e.g. in
+// shared pipeline code that doesn't know whether it runs on the server
+// or on an edge/CLI client.
+
+#[async_trait]
+impl ToolExecutor for ServerToolExecutor {
+    async fn execute(&self, name: &str, args: &Value) -> astra_tools::ToolResult {
+        // Delegate to the concrete method that already returns ToolResult.
+        ServerToolExecutor::execute_with_metadata(self, name, args).await
+    }
+
+    fn tool_schemas(&self) -> Vec<Value> {
+        self.default_executor.tool_schemas()
+    }
+
+    fn project_root(&self) -> &Path {
+        &self.workspace_root
+    }
+
+    async fn execute_with_metadata(&self, name: &str, args: &Value) -> astra_tools::ToolResult {
+        // Explicitly delegate to the inherent method (not the default trait impl).
+        ServerToolExecutor::execute_with_metadata(self, name, args).await
     }
 }
 

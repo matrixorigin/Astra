@@ -1,14 +1,14 @@
 use serde_json::{Map, Value, json};
 
 /// Maximum tool execution rounds per turn. Reads from `MO_MAX_TOOL_ROUNDS` env
-/// var at process start, defaulting to 10.
+/// var at process start, defaulting to 15.
 pub fn max_tool_rounds() -> i64 {
     astra_core::RuntimeLimits::global().max_tool_rounds
 }
 
 /// Compile-time constant for tests that need `const` assertions.
 /// Runtime value from `max_tool_rounds()` may differ if env var is set.
-pub const MAX_TOOL_ROUNDS: i64 = 10;
+pub const MAX_TOOL_ROUNDS: i64 = 15;
 
 pub fn detect_correction(query: &str) -> bool {
     let pattern = regex::Regex::new(
