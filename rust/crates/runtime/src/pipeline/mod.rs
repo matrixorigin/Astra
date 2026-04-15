@@ -18,6 +18,7 @@ pub mod entity;
 pub mod evaluation;
 pub mod event;
 pub mod feedback_extraction;
+pub mod feedback_store;
 pub mod learning;
 pub mod learning_quality_gate;
 pub mod mo_persistence;
