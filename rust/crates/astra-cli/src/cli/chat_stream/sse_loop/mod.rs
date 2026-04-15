@@ -475,6 +475,7 @@ pub(crate) async fn stream_chat_sse(
             last_heavy_checkpoint: None,
             tool_call_records: Vec::new(),
             forced_factual_retry: false,
+            nudge_count: 0,
         },
         telemetry: TelemetryState {
             explain_turns: Vec::new(),

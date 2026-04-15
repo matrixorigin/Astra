@@ -72,6 +72,56 @@ const TOKEN_BUDGET: usize = 12_000;
 /// Short results cost few tokens and provide useful context.
 const MIN_COMPACT_SIZE: usize = 500;
 
+/// Pressure-adaptive compaction parameters.
+///
+/// When context pressure rises, keep fewer results and use a tighter token
+/// budget so that the next LLM call has more headroom.
+#[derive(Debug, Clone, Copy)]
+pub struct AdaptiveCompactConfig {
+    pub keep_recent: usize,
+    pub token_budget: usize,
+}
+
+impl Default for AdaptiveCompactConfig {
+    fn default() -> Self {
+        Self {
+            keep_recent: KEEP_RECENT,
+            token_budget: TOKEN_BUDGET,
+        }
+    }
+}
+
+impl AdaptiveCompactConfig {
+    /// Compute adaptive parameters from context pressure (0.0–1.0+).
+    ///
+    /// | Pressure      | keep_recent | token_budget |
+    /// |---------------|-------------|--------------|
+    /// | < 0.60        | 6           | 12 000       |
+    /// | 0.60 – 0.75   | 4           | 8 000        |
+    /// | 0.75 – 0.90   | 2           | 4 000        |
+    /// | ≥ 0.90        | 1           | 2 000        |
+    pub fn from_pressure(pressure: f64) -> Self {
+        if pressure >= 0.90 {
+            Self {
+                keep_recent: 1,
+                token_budget: 2_000,
+            }
+        } else if pressure >= 0.75 {
+            Self {
+                keep_recent: 2,
+                token_budget: 4_000,
+            }
+        } else if pressure >= 0.60 {
+            Self {
+                keep_recent: 4,
+                token_budget: 8_000,
+            }
+        } else {
+            Self::default()
+        }
+    }
+}
+
 /// Rough token estimate for a string. ~4 bytes per token for English/code.
 /// Underestimates for CJK (~2 bytes/token) — acceptable since the budget
 /// is a soft threshold, not a hard limit.
@@ -83,7 +133,27 @@ fn estimate_tokens(s: &str) -> usize {
 ///
 /// Returns the number of tool results compacted and estimated tokens saved.
 pub fn compact_tool_results(messages: &mut [Value], keep_recent: Option<usize>) -> CompactStats {
-    let keep = keep_recent.unwrap_or(KEEP_RECENT);
+    let config = keep_recent
+        .map(|k| AdaptiveCompactConfig {
+            keep_recent: k,
+            token_budget: TOKEN_BUDGET,
+        })
+        .unwrap_or_default();
+    compact_tool_results_with_config(messages, &config)
+}
+
+/// Pressure-adaptive variant: compact with parameters derived from context
+/// pressure so that high-pressure turns free more headroom.
+pub fn compact_tool_results_adaptive(messages: &mut [Value], pressure: f64) -> CompactStats {
+    let config = AdaptiveCompactConfig::from_pressure(pressure);
+    compact_tool_results_with_config(messages, &config)
+}
+
+fn compact_tool_results_with_config(
+    messages: &mut [Value],
+    config: &AdaptiveCompactConfig,
+) -> CompactStats {
+    let keep = config.keep_recent;
 
     // Build tool_call_id → tool_name mapping from assistant messages.
     let mut id_to_name: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
@@ -128,13 +198,14 @@ pub fn compact_tool_results(messages: &mut [Value], keep_recent: Option<usize>) 
     let count_based = compactable.len().saturating_sub(keep);
 
     // Token-based: find the minimum number of oldest results to clear
-    // so that the remaining total stays under TOKEN_BUDGET.
+    // so that the remaining total stays under the configured token budget.
     let total_tokens: usize = compactable.iter().map(|(_, t)| t).sum();
-    let token_based = if total_tokens > TOKEN_BUDGET {
+    let budget = config.token_budget;
+    let token_based = if total_tokens > budget {
         let mut cumulative = 0usize;
         let mut n = 0usize;
         for &(_, tokens) in &compactable {
-            if total_tokens - cumulative <= TOKEN_BUDGET {
+            if total_tokens - cumulative <= budget {
                 break;
             }
             cumulative += tokens;
@@ -1178,5 +1249,63 @@ mod tests {
         assert_eq!(stats.results_compacted, 0, "empty/null/single under keep");
         assert_eq!(messages[2]["content"], "");
         assert!(messages[3]["content"].is_null());
+    }
+
+    // ── Adaptive compaction ───────────────────────────────────────────────
+
+    #[test]
+    fn adaptive_config_tiers() {
+        let low = AdaptiveCompactConfig::from_pressure(0.3);
+        assert_eq!(low.keep_recent, 6);
+        assert_eq!(low.token_budget, 12_000);
+
+        let med = AdaptiveCompactConfig::from_pressure(0.65);
+        assert_eq!(med.keep_recent, 4);
+        assert_eq!(med.token_budget, 8_000);
+
+        let high = AdaptiveCompactConfig::from_pressure(0.80);
+        assert_eq!(high.keep_recent, 2);
+        assert_eq!(high.token_budget, 4_000);
+
+        let extreme = AdaptiveCompactConfig::from_pressure(0.95);
+        assert_eq!(extreme.keep_recent, 1);
+        assert_eq!(extreme.token_budget, 2_000);
+    }
+
+    #[test]
+    fn adaptive_compaction_more_aggressive_at_high_pressure() {
+        let big = "x".repeat(6000); // ~1500 tokens each
+        let mut msgs_low = vec![
+            json!({"role": "user", "content": "task"}),
+            assistant_with_tools(&[
+                ("c1", "read_file"),
+                ("c2", "read_file"),
+                ("c3", "read_file"),
+                ("c4", "read_file"),
+                ("c5", "read_file"),
+                ("c6", "read_file"),
+                ("c7", "read_file"),
+                ("c8", "read_file"),
+            ]),
+            tool_result("c1", &big),
+            tool_result("c2", &big),
+            tool_result("c3", &big),
+            tool_result("c4", &big),
+            tool_result("c5", &big),
+            tool_result("c6", &big),
+            tool_result("c7", &big),
+            tool_result("c8", &big),
+        ];
+        let mut msgs_high = msgs_low.clone();
+
+        let stats_low = compact_tool_results_adaptive(&mut msgs_low, 0.3);
+        let stats_high = compact_tool_results_adaptive(&mut msgs_high, 0.92);
+
+        assert!(
+            stats_high.results_compacted > stats_low.results_compacted,
+            "high pressure ({}) should compact more than low ({})",
+            stats_high.results_compacted,
+            stats_low.results_compacted
+        );
     }
 }

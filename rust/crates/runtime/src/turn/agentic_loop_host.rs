@@ -455,6 +455,9 @@ pub struct StallTrackingState {
     pub tool_call_records: Vec<ToolCallRecord>,
     /// Whether a factual-retry was forced this loop.
     pub forced_factual_retry: bool,
+    /// How many stall correction nudges have been injected this loop.
+    /// Limits nudge frequency (at most one per stall type per session).
+    pub nudge_count: u32,
 }
 
 /// Inter-agent messaging state for the agentic loop.

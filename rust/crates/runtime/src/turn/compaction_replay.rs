@@ -42,17 +42,33 @@ pub(crate) struct CompactionReplayResult {
 ///
 /// Returns `None` if there are too few messages to compact or if no tokens were
 /// freed (compaction is futile). Returns `Some(result)` with details on success.
+///
+/// The `retry_count` parameter enables tiered escalation:
+/// - retry 1: default pipeline (balanced thresholds)
+/// - retry 2+: aggressive pipeline (lower thresholds, fewer preserved turns)
+/// Convenience wrapper: run first-tier (default pipeline) compaction.
+///
+/// Used in tests and as the backwards-compatible entry point.
+#[cfg(test)]
 pub(crate) fn try_compact_for_retry(
     messages: &mut Vec<Value>,
     last_measured_tokens: Option<u64>,
     model_context_limit: u64,
+) -> Option<CompactionReplayResult> {
+    try_compact_for_retry_tiered(messages, last_measured_tokens, model_context_limit, 1)
+}
+
+pub(crate) fn try_compact_for_retry_tiered(
+    messages: &mut Vec<Value>,
+    last_measured_tokens: Option<u64>,
+    model_context_limit: u64,
+    retry_count: u32,
 ) -> Option<CompactionReplayResult> {
     if messages.len() <= 4 {
         return None; // Too few messages to compact meaningfully
     }
 
     // Build a budget that reflects the overflow.
-    // If we have measured tokens, use them; otherwise estimate from message content.
     let measured = last_measured_tokens.unwrap_or_else(|| {
         let total_chars: usize = messages.iter().map(|m| m.to_string().len()).sum();
         (total_chars / 4) as u64 // rough ~4 chars/token
@@ -72,11 +88,15 @@ pub(crate) fn try_compact_for_retry(
     };
 
     if !budget.is_over_budget() && budget.pressure() < 0.85 {
-        // Not under pressure — compaction won't help.
         return None;
     }
 
-    let pipeline = CompressionPipeline::default_pipeline();
+    // Tiered escalation: default pipeline on first retry, aggressive on subsequent.
+    let pipeline = if retry_count <= 1 {
+        CompressionPipeline::default_pipeline()
+    } else {
+        CompressionPipeline::aggressive_pipeline()
+    };
     let outcome = pipeline.compress_if_needed(messages, &budget);
 
     if outcome.total_tokens_freed == 0 {
@@ -210,5 +230,25 @@ mod tests {
     fn max_compact_retries_is_reasonable() {
         const { assert!(MAX_COMPACT_RETRIES >= 1) };
         const { assert!(MAX_COMPACT_RETRIES <= 5) };
+    }
+
+    #[test]
+    fn tiered_escalation_uses_aggressive_on_retry_2() {
+        let mut msgs1 = make_messages(20);
+        let mut msgs2 = msgs1.clone();
+
+        let r1 = try_compact_for_retry_tiered(&mut msgs1, Some(200_000), 100_000, 1);
+        let r2 = try_compact_for_retry_tiered(&mut msgs2, Some(200_000), 100_000, 2);
+
+        assert!(r1.is_some(), "tier-1 should compact");
+        assert!(r2.is_some(), "tier-2 should compact");
+
+        // Aggressive pipeline should free at least as many tokens
+        let freed_1 = r1.unwrap().tokens_freed;
+        let freed_2 = r2.unwrap().tokens_freed;
+        assert!(
+            freed_2 >= freed_1,
+            "aggressive tier ({freed_2}) should free >= default ({freed_1})"
+        );
     }
 }

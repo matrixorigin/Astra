@@ -16,10 +16,10 @@ use super::agentic_headless_round::{
     HeadlessRoundTerminal, HeadlessStderrStyle, HeadlessToolRoundCtx,
     run_agentic_headless_tool_round,
 };
-use super::agentic_loop_execution_phase::TurnExecutionPhase;
+use super::agentic_loop_execution_phase::{TurnExecutionPhase, observe_turn_end_without_tools};
 use super::agentic_loop_host::{
     AgenticLoopHost, AgenticLoopOutcome, AgenticLoopState, CONSECUTIVE_ERROR_BUDGET,
-    MAX_TRACKED_FILE_READS, extract_file_path_from_tool, finalize_turn_trace,
+    MAX_TRACKED_FILE_READS, extract_file_path_from_tool, finalize_and_render, finalize_turn_trace,
     record_edge_tool_observability,
 };
 use super::agentic_loop_lifecycle::TurnIterationPrep;
@@ -688,6 +688,38 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
         llm_wall_start,
         turn_result,
     } = phase;
+
+    // ── Budget wrapup enforcement ─────────────────────────────────────
+    // If the LLM was already told to wrap up (budget_wrapup_injected) but
+    // still returned tool calls, skip tool execution and force-complete.
+    // This prevents wasting tokens and time on tools that will be discarded.
+    if state.budget_wrapup_injected && !turn_result.accum.tool_calls.is_empty() {
+        if !prep.quiet {
+            host.emit_headless_line(
+                super::agentic_headless_round::HeadlessStderrStyle::Yellow,
+                format!(
+                    "⚠ Budget wrapup active — skipping {} tool call(s), force-completing.",
+                    turn_result.accum.tool_calls.len(),
+                ),
+            );
+        }
+        state.interruption = Some(super::interruption::InterruptionRecord::new(
+            super::interruption::InterruptionKind::TokenBudgetExceeded,
+            super::interruption::ResumeAction::ContinueImmediately,
+            super::agentic_loop_lifecycle::interruption_state_summary(
+                state,
+                Some("LLM ignored wrapup instruction and attempted tool calls".to_string()),
+            ),
+        ));
+        observe_turn_end_without_tools(
+            state,
+            turn_index,
+            prep.turn_start_time,
+            turn_result.ttft_ms,
+        );
+        finalize_and_render(host, state);
+        return Ok(TurnToolPhaseControl::Return(AgenticLoopOutcome::Completed));
+    }
 
     let tool_calls_for_guard = agentic_round_stall_preflight_with_tool_calls(
         turn_index,

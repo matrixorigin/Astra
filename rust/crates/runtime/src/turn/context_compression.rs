@@ -172,6 +172,31 @@ impl CompressionPipeline {
         Self::from_config(&CompressionConfig::default())
     }
 
+    /// Aggressive pipeline for second-chance compaction retries.
+    ///
+    /// Uses lower pressure thresholds so every layer fires immediately,
+    /// shorter age thresholds, smaller tool-result limits, and fewer
+    /// preserved turns. This is the "last resort before giving up" path.
+    pub fn aggressive_pipeline() -> Self {
+        let mut p = Self::new();
+        // Layer 1: aggressive tool truncation — 5-minute age, tiny keep
+        p.add_layer(Box::new(ToolResultTruncation::new(
+            Duration::from_secs(300), // 5 min instead of 60 min
+            512,                      // keep ~512 chars instead of config default
+            0.0,                      // always trigger
+        )));
+        // Layer 2: duplicate read elimination — always trigger
+        p.add_layer(Box::new(DuplicateReadElimination::new(0.0)));
+        // Layer 3: tiered compaction — keep only last 2 turn pairs
+        p.add_layer(Box::new(TieredCompaction::new(
+            2,   // keep 2 turn pairs (very aggressive)
+            0.0, // always trigger
+        )));
+        // Layer 4: reactive compact — always trigger
+        p.add_layer(Box::new(ReactiveCompact::new(0.0)));
+        p
+    }
+
     /// Build a pipeline configured from RuntimeConfig's CompressionConfig.
     pub fn from_config(config: &CompressionConfig) -> Self {
         let mut p = Self::new();
@@ -920,5 +945,41 @@ mod tests {
         assert_eq!(msgs[0]["content"], "System prompt 1");
         assert_eq!(msgs[1]["role"], "system");
         assert_eq!(msgs[1]["content"], "System prompt 2");
+    }
+
+    #[test]
+    fn aggressive_pipeline_has_four_layers() {
+        let p = CompressionPipeline::aggressive_pipeline();
+        assert_eq!(
+            p.layers.len(),
+            4,
+            "aggressive pipeline should have 4 layers"
+        );
+    }
+
+    #[test]
+    fn aggressive_pipeline_triggers_at_lower_pressure_than_default() {
+        let mut msgs_default: Vec<Value> = vec![json!({"role": "system", "content": "sys"})];
+        for i in 0..10 {
+            msgs_default.push(json!({"role": "user", "content": format!("question {}", i)}));
+            let long = "x".repeat(3000);
+            msgs_default.push(json!({"role": "assistant", "content": long}));
+        }
+        let mut msgs_aggressive = msgs_default.clone();
+
+        // Moderate pressure: 70% (below default thresholds, but above aggressive 0.0)
+        let b = budget(100_000, 70_000);
+        let out_default =
+            CompressionPipeline::default_pipeline().compress_if_needed(&mut msgs_default, &b);
+        let out_aggressive =
+            CompressionPipeline::aggressive_pipeline().compress_if_needed(&mut msgs_aggressive, &b);
+
+        // Aggressive should free at least as much (likely more because lower thresholds)
+        assert!(
+            out_aggressive.total_tokens_freed >= out_default.total_tokens_freed,
+            "aggressive ({}) should free >= default ({})",
+            out_aggressive.total_tokens_freed,
+            out_default.total_tokens_freed,
+        );
     }
 }

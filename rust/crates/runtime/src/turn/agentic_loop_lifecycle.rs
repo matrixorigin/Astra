@@ -536,15 +536,104 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
     }
 
     if turn_index > 0 {
-        let mc = super::microcompact::compact_tool_results(&mut state.messages, None);
+        // ── Stall correction: inject a nudge if stall was detected ────
+        // Stall events are recorded during the tool phase of the *previous*
+        // turn.  If any new events appeared, build a reflection and inject it
+        // so the LLM can self-correct before the next tool round.
+        //
+        // Limit: at most 3 nudges per loop to avoid nudge-spam which itself
+        // wastes context.
+        const MAX_NUDGES: u32 = 3;
+        if !state.stall.events.is_empty() && state.stall.nudge_count < MAX_NUDGES {
+            let recent_events: Vec<_> = state
+                .stall
+                .events
+                .iter()
+                .filter(|(_, t)| *t as usize >= turn_index.saturating_sub(1))
+                .collect();
+            if !recent_events.is_empty() {
+                let error_tools: Vec<&str> = state.turn_guard.health.deprioritized_tools();
+                let reflection = super::stall::build_stall_reflection(
+                    &state.stall.turn_sigs,
+                    &error_tools,
+                    state.stall.nudge_count as usize,
+                );
+                let nudge = reflection.to_nudge_message();
+                state.messages.push(serde_json::json!({
+                    "role": "system",
+                    "content": nudge,
+                }));
+                state.stall.nudge_count += 1;
+                if !quiet {
+                    host.emit_headless_line(
+                        HeadlessStderrStyle::Yellow,
+                        format!(
+                            "  ⚠ Stall correction injected (nudge #{}) — {}",
+                            state.stall.nudge_count, reflection.what_happened,
+                        ),
+                    );
+                }
+            }
+        }
+
+        // Compute context pressure from last measured prompt tokens.
+        let pressure = if state.max_turn_input_tokens > 0 {
+            state
+                .last_measured_prompt_tokens
+                .map(|p| p as f64 / state.max_turn_input_tokens as f64)
+                .unwrap_or(0.0)
+        } else {
+            0.0
+        };
+
+        // Adaptive microcompact: scale aggressiveness with context pressure.
+        let mc = super::microcompact::compact_tool_results_adaptive(&mut state.messages, pressure);
         if mc.results_compacted > 0 && !quiet {
             host.emit_headless_line(
                 HeadlessStderrStyle::Dim,
                 format!(
-                    "  ♻ Compacted {} old tool result(s), ~{} tokens saved",
-                    mc.results_compacted, mc.tokens_saved,
+                    "  ♻ Compacted {} old tool result(s), ~{} tokens saved (pressure {:.0}%)",
+                    mc.results_compacted,
+                    mc.tokens_saved,
+                    pressure * 100.0,
                 ),
             );
+        }
+
+        // Proactive compression gate: if pressure is still high after
+        // microcompact, run the full compression pipeline *before* calling
+        // the LLM, preventing 413 errors instead of reacting to them.
+        if pressure >= 0.75 {
+            let budget = super::context_compression::TokenBudget {
+                max_prompt_tokens: state.max_turn_input_tokens,
+                last_measured_tokens: state
+                    .last_measured_prompt_tokens
+                    .unwrap_or(0)
+                    .saturating_sub(mc.tokens_saved as u64 * 4),
+                chars_per_token: 4.0,
+            };
+            let pipeline = if pressure >= 0.90 {
+                super::context_compression::CompressionPipeline::aggressive_pipeline()
+            } else {
+                super::context_compression::CompressionPipeline::default_pipeline()
+            };
+            let outcome = pipeline.compress_if_needed(&mut state.messages, &budget);
+            if outcome.total_tokens_freed > 0 && !quiet {
+                let tier = if pressure >= 0.90 {
+                    "aggressive"
+                } else {
+                    "default"
+                };
+                host.emit_headless_line(
+                    HeadlessStderrStyle::Yellow,
+                    format!(
+                        "  ⚡ Proactive {} compression: freed ~{} tokens at {:.0}% pressure",
+                        tier,
+                        outcome.total_tokens_freed,
+                        pressure * 100.0,
+                    ),
+                );
+            }
         }
     }
 
