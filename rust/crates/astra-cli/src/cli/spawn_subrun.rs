@@ -266,6 +266,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             last_composite_snapshot: None,
             last_measured_prompt_tokens: None,
             consecutive_context_window_errors: 0,
+            compaction_effectiveness: Default::default(),
             max_turn_input_tokens: astra_core::RuntimeLimits::global().max_turn_input_tokens,
             budget_wrapup_injected: false,
             skill_produced_output: false,

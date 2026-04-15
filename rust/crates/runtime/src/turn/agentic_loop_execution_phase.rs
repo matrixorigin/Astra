@@ -146,6 +146,14 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             let is_context_overflow = e
                 .contains(crate::turn::llm_client::CONTEXT_WINDOW_ERROR_PREFIX)
                 || crate::turn::llm_client::is_context_window_error(&lower);
+            if is_context_overflow {
+                // If a prior compaction ran but we still got a 413, mark it insufficient.
+                if state.compaction_effectiveness.last_tokens_freed > 0
+                    && !state.compaction_effectiveness.last_was_insufficient
+                {
+                    state.compaction_effectiveness.mark_insufficient();
+                }
+            }
             if is_context_overflow
                 && state.consecutive_context_window_errors
                     <= super::compaction_replay::MAX_COMPACT_RETRIES
@@ -156,11 +164,10 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                     state.max_turn_input_tokens,
                     state.consecutive_context_window_errors,
                 ) {
-                    let tier_label = if state.consecutive_context_window_errors <= 1 {
-                        "default"
-                    } else {
-                        "aggressive"
-                    };
+                    let tier_label = result.tier.label();
+                    state
+                        .compaction_effectiveness
+                        .record_compaction(result.tokens_freed);
                     let summary = super::compaction_replay::compaction_summary(&result);
                     if !prep.quiet {
                         host.emit_headless_line(

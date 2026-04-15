@@ -197,6 +197,31 @@ impl CompressionPipeline {
         p
     }
 
+    /// Emergency pipeline for third-chance compaction when aggressive wasn't enough.
+    ///
+    /// Strips all tool results to stubs, keeps only the last turn pair,
+    /// and fires every layer unconditionally. This is the absolute last
+    /// resort before propagating an interruption.
+    pub fn emergency_pipeline() -> Self {
+        let mut p = Self::new();
+        // Layer 1: strip ALL tool results regardless of age
+        p.add_layer(Box::new(ToolResultTruncation::new(
+            Duration::from_secs(0), // age 0 = everything is old
+            128,                    // keep bare minimum for context
+            0.0,                    // always trigger
+        )));
+        // Layer 2: duplicate read elimination — always trigger
+        p.add_layer(Box::new(DuplicateReadElimination::new(0.0)));
+        // Layer 3: tiered compaction — keep only last 1 turn pair
+        p.add_layer(Box::new(TieredCompaction::new(
+            1,   // keep only the most recent turn pair
+            0.0, // always trigger
+        )));
+        // Layer 4: reactive compact — always trigger
+        p.add_layer(Box::new(ReactiveCompact::new(0.0)));
+        p
+    }
+
     /// Build a pipeline configured from RuntimeConfig's CompressionConfig.
     pub fn from_config(config: &CompressionConfig) -> Self {
         let mut p = Self::new();
