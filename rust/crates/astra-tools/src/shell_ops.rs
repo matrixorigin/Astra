@@ -47,6 +47,12 @@ enum SearchOutputMode {
 }
 
 #[derive(Clone, Copy)]
+enum SearchSortMode {
+    Mtime,
+    Path,
+}
+
+#[derive(Clone, Copy)]
 enum StreamKind {
     Stdout,
     Stderr,
@@ -70,6 +76,11 @@ struct MultilineMatchBlock {
     start_line: usize,
     end_line: usize,
     match_ranges: Vec<(usize, usize)>,
+}
+
+struct SearchResultGroup {
+    path: Option<String>,
+    lines: Vec<String>,
 }
 
 struct GrepRequest<'a> {
@@ -204,6 +215,10 @@ pub async fn grep(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
         Ok(mode) => mode,
         Err(e) => return ToolResult::error(e),
     };
+    let sort_mode = match parse_search_sort_mode(args) {
+        Ok(mode) => mode,
+        Err(e) => return ToolResult::error(e),
+    };
     let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
     let head_limit = args
         .get("head_limit")
@@ -281,7 +296,11 @@ pub async fn grep(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
         stdout
     };
 
-    let lines: Vec<&str> = filtered.lines().collect();
+    let mut lines: Vec<String> = filtered
+        .lines()
+        .map(|line| normalize_grep_output_line(line, output_mode))
+        .collect();
+    sort_grep_result_lines(&mut lines, workspace_root, output_mode, sort_mode);
     let paged_lines = if offset > 0 {
         if offset >= lines.len() {
             return ToolResult::text(format!(
@@ -292,7 +311,7 @@ pub async fn grep(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
         }
         &lines[offset..]
     } else {
-        &lines[..]
+        lines.as_slice()
     };
 
     let effective_limit = match head_limit {
@@ -364,6 +383,10 @@ pub async fn glob(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
         Err(e) => return ToolResult::error(e),
     };
     let target = relative_search_target(workspace_root, &resolved);
+    let sort_mode = match parse_search_sort_mode(args) {
+        Ok(mode) => mode,
+        Err(e) => return ToolResult::error(e),
+    };
 
     if resolved.is_file() {
         return if glob_matches_path(pattern, &target) {
@@ -410,8 +433,8 @@ pub async fn glob(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
         .filter(|line| !line.is_empty())
         .filter(|line| glob_matches_path(pattern, line))
         .collect();
-    files.sort();
-    files.dedup();
+    dedup_preserve_order(&mut files);
+    sort_search_paths(&mut files, workspace_root, sort_mode);
 
     if files.is_empty() {
         return if cancelled {
@@ -487,6 +510,20 @@ fn parse_search_output_mode(args: &Value) -> Result<SearchOutputMode, String> {
         "count" => Ok(SearchOutputMode::Count),
         other => Err(format!(
             "Error: unsupported output_mode '{other}'. Use 'content', 'files_with_matches', or 'count'."
+        )),
+    }
+}
+
+fn parse_search_sort_mode(args: &Value) -> Result<SearchSortMode, String> {
+    match args
+        .get("sort_by")
+        .and_then(|value| value.as_str())
+        .unwrap_or("mtime")
+    {
+        "mtime" => Ok(SearchSortMode::Mtime),
+        "path" => Ok(SearchSortMode::Path),
+        other => Err(format!(
+            "Error: unsupported sort_by '{other}'. Use 'mtime' or 'path'."
         )),
     }
 }
@@ -575,6 +612,153 @@ fn search_type_globs(type_name: &str) -> Result<&'static [&'static str], String>
 fn dedup_preserve_order(values: &mut Vec<String>) {
     let mut seen = std::collections::HashSet::new();
     values.retain(|value| seen.insert(value.clone()));
+}
+
+fn sort_search_paths(paths: &mut [String], workspace_root: &Path, sort_mode: SearchSortMode) {
+    match sort_mode {
+        SearchSortMode::Path => paths.sort(),
+        SearchSortMode::Mtime => {
+            let mut cache = std::collections::HashMap::new();
+            paths.sort_by(|left, right| {
+                search_path_mtime_ms(workspace_root, right, &mut cache)
+                    .cmp(&search_path_mtime_ms(workspace_root, left, &mut cache))
+                    .then(left.cmp(right))
+            });
+        }
+    }
+}
+
+fn search_path_mtime_ms(
+    workspace_root: &Path,
+    path: &str,
+    cache: &mut std::collections::HashMap<String, u128>,
+) -> u128 {
+    if let Some(value) = cache.get(path) {
+        return *value;
+    }
+
+    let resolved = workspace_root.join(path);
+    let value = resolved
+        .metadata()
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0);
+    cache.insert(path.to_string(), value);
+    value
+}
+
+fn sort_grep_result_lines(
+    lines: &mut Vec<String>,
+    workspace_root: &Path,
+    output_mode: SearchOutputMode,
+    sort_mode: SearchSortMode,
+) {
+    if lines.len() < 2 {
+        return;
+    }
+
+    let mut groups = group_grep_result_lines(lines, output_mode);
+    let mut cache = std::collections::HashMap::new();
+    groups.sort_by(|left, right| match (&left.path, &right.path) {
+        (Some(left_path), Some(right_path)) => match sort_mode {
+            SearchSortMode::Path => left_path.cmp(right_path),
+            SearchSortMode::Mtime => search_path_mtime_ms(workspace_root, right_path, &mut cache)
+                .cmp(&search_path_mtime_ms(workspace_root, left_path, &mut cache))
+                .then(left_path.cmp(right_path)),
+        },
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    });
+
+    *lines = groups
+        .into_iter()
+        .flat_map(|group| group.lines)
+        .collect::<Vec<_>>();
+}
+
+fn group_grep_result_lines(
+    lines: &[String],
+    output_mode: SearchOutputMode,
+) -> Vec<SearchResultGroup> {
+    let mut groups: Vec<SearchResultGroup> = Vec::new();
+    let mut index_by_path = std::collections::HashMap::<String, usize>::new();
+    let mut current_group: Option<usize> = None;
+
+    for line in lines {
+        if line == "--" {
+            if let Some(index) = current_group {
+                groups[index].lines.push(line.clone());
+            }
+            continue;
+        }
+
+        let Some(path) = extract_search_result_path(line, output_mode) else {
+            groups.push(SearchResultGroup {
+                path: None,
+                lines: vec![line.clone()],
+            });
+            current_group = None;
+            continue;
+        };
+
+        let index = if let Some(index) = index_by_path.get(&path).copied() {
+            index
+        } else {
+            let index = groups.len();
+            groups.push(SearchResultGroup {
+                path: Some(path.clone()),
+                lines: Vec::new(),
+            });
+            index_by_path.insert(path, index);
+            index
+        };
+        groups[index].lines.push(line.clone());
+        current_group = Some(index);
+    }
+
+    groups
+}
+
+fn extract_search_result_path(line: &str, output_mode: SearchOutputMode) -> Option<String> {
+    static CONTENT_MATCH_RE: OnceLock<Regex> = OnceLock::new();
+    static CONTENT_CONTEXT_RE: OnceLock<Regex> = OnceLock::new();
+    static COUNT_RE: OnceLock<Regex> = OnceLock::new();
+
+    match output_mode {
+        SearchOutputMode::FilesWithMatches => Some(line.to_string()),
+        SearchOutputMode::Count => COUNT_RE
+            .get_or_init(|| Regex::new(r"^(.+?):\d+$").expect("valid count regex"))
+            .captures(line)
+            .and_then(|captures| captures.get(1))
+            .map(|path| path.as_str().to_string()),
+        SearchOutputMode::Content => CONTENT_MATCH_RE
+            .get_or_init(|| Regex::new(r"^(.+?):\d+:").expect("valid content regex"))
+            .captures(line)
+            .and_then(|captures| captures.get(1))
+            .or_else(|| {
+                CONTENT_CONTEXT_RE
+                    .get_or_init(|| Regex::new(r"^(.+?)-\d+-").expect("valid context regex"))
+                    .captures(line)
+                    .and_then(|captures| captures.get(1))
+            })
+            .map(|path| path.as_str().to_string()),
+    }
+}
+
+fn normalize_grep_output_line(line: &str, output_mode: SearchOutputMode) -> String {
+    if line == "--" {
+        return line.to_string();
+    }
+
+    match output_mode {
+        SearchOutputMode::FilesWithMatches => strip_current_dir_prefix(line),
+        SearchOutputMode::Content | SearchOutputMode::Count => {
+            line.strip_prefix("./").unwrap_or(line).to_string()
+        }
+    }
 }
 
 async fn run_grep_with_rg(
@@ -1567,6 +1751,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn grep_files_with_matches_defaults_to_newest_files_first() {
+        let dir = tempdir().unwrap();
+        let ctx = crate::ToolContext::test(dir.path());
+        std::fs::write(dir.path().join("a-old.rs"), "needle\n").unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(dir.path().join("z-new.rs"), "needle\n").unwrap();
+
+        let result = grep(
+            &ctx,
+            &serde_json::json!({
+                "pattern": "needle",
+                "path": ".",
+                "output_mode": "files_with_matches"
+            }),
+        )
+        .await;
+
+        assert!(!result.is_error, "grep should succeed: {}", result.output);
+        let lines: Vec<&str> = result.output.lines().collect();
+        assert_eq!(
+            lines,
+            vec!["z-new.rs", "a-old.rs"],
+            "got: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn grep_sort_by_path_overrides_newest_first() {
+        let dir = tempdir().unwrap();
+        let ctx = crate::ToolContext::test(dir.path());
+        std::fs::write(dir.path().join("a-old.rs"), "needle\n").unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(dir.path().join("z-new.rs"), "needle\n").unwrap();
+
+        let result = grep(
+            &ctx,
+            &serde_json::json!({
+                "pattern": "needle",
+                "path": ".",
+                "output_mode": "files_with_matches",
+                "sort_by": "path"
+            }),
+        )
+        .await;
+
+        assert!(!result.is_error, "grep should succeed: {}", result.output);
+        let lines: Vec<&str> = result.output.lines().collect();
+        assert_eq!(
+            lines,
+            vec!["a-old.rs", "z-new.rs"],
+            "got: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
     async fn glob_skips_default_generated_directories() {
         let dir = tempdir().unwrap();
         let ctx = crate::ToolContext::test(dir.path());
@@ -1594,6 +1835,66 @@ mod tests {
             !result.output.contains("target/cached.rs"),
             "default glob should skip generated dirs: {}",
             result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn glob_sort_by_path_overrides_newest_first() {
+        let dir = tempdir().unwrap();
+        let ctx = crate::ToolContext::test(dir.path());
+        std::fs::write(dir.path().join("a-old.txt"), "").unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(dir.path().join("z-new.txt"), "").unwrap();
+
+        let default_result = glob(
+            &ctx,
+            &serde_json::json!({
+                "pattern": "*.txt",
+                "path": "."
+            }),
+        )
+        .await;
+        assert!(
+            !default_result.is_error,
+            "glob should succeed: {}",
+            default_result.output
+        );
+        let default_lines: Vec<&str> = default_result
+            .output
+            .lines()
+            .filter(|line| !line.starts_with('('))
+            .collect();
+        assert_eq!(
+            default_lines,
+            vec!["z-new.txt", "a-old.txt"],
+            "got: {}",
+            default_result.output
+        );
+
+        let path_result = glob(
+            &ctx,
+            &serde_json::json!({
+                "pattern": "*.txt",
+                "path": ".",
+                "sort_by": "path"
+            }),
+        )
+        .await;
+        assert!(
+            !path_result.is_error,
+            "glob should succeed: {}",
+            path_result.output
+        );
+        let path_lines: Vec<&str> = path_result
+            .output
+            .lines()
+            .filter(|line| !line.starts_with('('))
+            .collect();
+        assert_eq!(
+            path_lines,
+            vec!["a-old.txt", "z-new.txt"],
+            "got: {}",
+            path_result.output
         );
     }
 

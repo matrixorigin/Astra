@@ -357,6 +357,7 @@ pub fn all_tool_schemas() -> Vec<Value> {
                         "multiline": {"type": "boolean", "description": "Allow regex matches to span newlines within a file. Useful for block patterns and multi-line structures."},
                         "scope_context": {"type": "boolean", "description": "Annotate each match with its containing function/class name (tree-sitter)"},
                         "output_mode": {"type": "string", "enum": ["content", "files_with_matches", "count"], "description": "Output mode: 'content' (default, matching lines), 'files_with_matches' (file paths only), 'count' (match counts per file)"},
+                        "sort_by": {"type": "string", "enum": ["mtime", "path"], "description": "Sort matching files by newest modified time first (default 'mtime') or alphabetically by path."},
                         "offset": {"type": "integer", "minimum": 0, "description": "Skip first N result lines (for pagination)"},
                         "head_limit": {"type": "integer", "minimum": 0, "description": "Max result lines to return after offset. Defaults to 100; set 0 for unlimited."}
                     },
@@ -373,7 +374,8 @@ pub fn all_tool_schemas() -> Vec<Value> {
                     "type": "object",
                     "properties": {
                         "pattern": {"type": "string", "description": "Glob pattern e.g. '**/*.rs'"},
-                        "path": {"type": "string", "description": "Root directory (default: project root)"}
+                        "path": {"type": "string", "description": "Root directory (default: project root)"},
+                        "sort_by": {"type": "string", "enum": ["mtime", "path"], "description": "Sort matching files by newest modified time first (default 'mtime') or alphabetically by path."}
                     },
                     "required": ["pattern"]
                 }
