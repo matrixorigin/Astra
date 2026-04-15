@@ -9,9 +9,9 @@ use sqlx::Row;
 use tower::util::ServiceExt;
 
 use super::harness::{
-    MatrixE2eCtx, cleanup_edge_registry, cleanup_session_data, delete_json, delete_no_content,
-    get_json, post_empty, post_json, post_json_with_headers, put_json, row_get_opt_i64,
-    row_get_opt_str, row_get_str, wait_for_agent_event_types,
+    E2eAuthMode, MatrixE2eCtx, cleanup_edge_registry, cleanup_session_data, delete_json,
+    delete_no_content, get_json, post_empty, post_json, post_json_with_headers, put_json,
+    row_get_opt_i64, row_get_opt_str, row_get_str, wait_for_agent_event_types,
 };
 
 async fn run_tool_backed_chat_turn(
@@ -124,6 +124,7 @@ pub async fn run_product_matrix_full_journey(
     ctx: &MatrixE2eCtx,
     auth_header: &mut String,
     refresh_token: &mut String,
+    auth_mode: E2eAuthMode,
 ) {
     let session_id = ctx.session_id.clone();
     let user_id = ctx.user_id.clone();
@@ -1413,5 +1414,17 @@ pub async fn run_product_matrix_full_journey(
         json!({ "refresh_token": refresh_token.as_str() }),
     )
     .await;
-    assert_eq!(st_out, StatusCode::OK, "logout: {out_j}");
+    match auth_mode {
+        E2eAuthMode::LocalJwt => {
+            assert_eq!(st_out, StatusCode::OK, "logout: {out_j}");
+        }
+        E2eAuthMode::TrustedMoi => {
+            assert_eq!(st_out, StatusCode::FORBIDDEN, "trusted_moi logout: {out_j}");
+            assert_eq!(
+                out_j["detail"].as_str(),
+                Some("Local auth endpoints are disabled in trusted_moi mode"),
+                "trusted_moi logout detail: {out_j}"
+            );
+        }
+    }
 }

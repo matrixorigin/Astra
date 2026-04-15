@@ -10,6 +10,26 @@ pub async fn build_server_state(
     ensure_core_schema(&settings.matrixone).await?;
     let shared_pool = SharedPool::new(&settings.matrixone).await?;
     let lease_hold_cache = Arc::new(TaskLeaseHoldCache::default());
+    let auth_mode = std::env::var("ASTRA_AUTH_MODE")
+        .unwrap_or_else(|_| "local_jwt".to_string())
+        .trim()
+        .to_ascii_lowercase();
+    let auth_service: Arc<dyn AuthService> = match auth_mode.as_str() {
+        "" | "local_jwt" | "local" | "database" => Arc::new(
+            DatabaseAuthService::new(settings.matrixone.clone(), settings.jwt.clone())
+                .with_pool(shared_pool.clone()),
+        ),
+        "trusted_moi" => Arc::new(
+            astra_services::auth::TrustedMoiAuthService::from_env()
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?,
+        ),
+        other => {
+            return Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("unsupported ASTRA_AUTH_MODE={other}; expected local_jwt or trusted_moi"),
+            )));
+        }
+    };
 
     // Build shared pipeline learning modules (server-wide singleton).
     let learning_stack = build_pipeline_learning_stack(None);
@@ -19,10 +39,7 @@ pub async fn build_server_state(
         Arc::new(MatrixOneHealthChecker::new(settings.matrixone.clone())),
     )
     .with_shared_pool(shared_pool.clone())
-    .with_auth_service(Arc::new(
-        DatabaseAuthService::new(settings.matrixone.clone(), settings.jwt.clone())
-            .with_pool(shared_pool.clone()),
-    ))
+    .with_auth_service(auth_service)
     .with_session_service(Arc::new(
         DatabaseSessionService::new(settings.matrixone.clone()).with_pool(shared_pool.clone()),
     ))
