@@ -191,7 +191,8 @@ impl PermissionSettings {
 
 pub(super) struct PermissionManager {
     mode: PermissionMode,
-    session_overrides: HashMap<String, bool>,
+    session_overrides: astra_runtime::turn::approval_fingerprint::FingerprintedOverrides,
+    denial_tracker: astra_runtime::turn::approval_fingerprint::DenialTracker,
     /// Persistent rules loaded from project settings file.
     settings: PermissionSettings,
     /// Project root for settings persistence.
@@ -255,7 +256,9 @@ impl PermissionManager {
         };
         Self {
             mode,
-            session_overrides: HashMap::new(),
+            session_overrides:
+                astra_runtime::turn::approval_fingerprint::FingerprintedOverrides::default(),
+            denial_tracker: astra_runtime::turn::approval_fingerprint::DenialTracker::default(),
             settings: PermissionSettings::default(),
             project_root: None,
             cached_allow: Vec::new(),
@@ -288,7 +291,9 @@ impl PermissionManager {
         let cached_user_deny = user_settings.parsed_deny_rules();
         Self {
             mode,
-            session_overrides: HashMap::new(),
+            session_overrides:
+                astra_runtime::turn::approval_fingerprint::FingerprintedOverrides::default(),
+            denial_tracker: astra_runtime::turn::approval_fingerprint::DenialTracker::default(),
             settings,
             project_root: Some(project_root.to_path_buf()),
             cached_allow,
@@ -322,7 +327,9 @@ impl PermissionManager {
         let cached_user_deny = user_settings.parsed_deny_rules();
         Self {
             mode,
-            session_overrides: HashMap::new(),
+            session_overrides:
+                astra_runtime::turn::approval_fingerprint::FingerprintedOverrides::default(),
+            denial_tracker: astra_runtime::turn::approval_fingerprint::DenialTracker::default(),
             settings,
             project_root: Some(project_root.to_path_buf()),
             cached_allow,
@@ -399,7 +406,7 @@ impl PermissionManager {
         for rule in self.cached_user_deny.iter().chain(self.cached_deny.iter()) {
             inherited.add_deny(RuntimePermissionRule::parse(&rule.to_string()));
         }
-        for (tool, allowed) in &self.session_overrides {
+        for (tool, allowed) in &self.session_overrides.to_legacy_overrides() {
             let runtime_rule = RuntimePermissionRule::parse(tool);
             if *allowed {
                 inherited.deny_rules.retain(|rule| rule != &runtime_rule);
@@ -454,7 +461,8 @@ impl PermissionManager {
             PermissionMode::Deny => return ApprovalDecision::Deny,
             PermissionMode::Prompt => {}
         }
-        if let Some(&allowed) = self.session_overrides.get(tool) {
+        let fp = astra_runtime::turn::approval_fingerprint::ApprovalFingerprint::bare(tool);
+        if let Some(allowed) = self.session_overrides.check(&fp) {
             return if allowed {
                 ApprovalDecision::Allow
             } else {
@@ -524,7 +532,8 @@ impl PermissionManager {
             PermissionMode::Deny => return ApprovalDecision::Deny,
             PermissionMode::Prompt => {}
         }
-        if let Some(&allowed) = self.session_overrides.get(tool) {
+        let fp = astra_runtime::turn::approval_fingerprint::ApprovalFingerprint::bare(tool);
+        if let Some(allowed) = self.session_overrides.check(&fp) {
             return if allowed {
                 ApprovalDecision::Allow
             } else {
@@ -826,7 +835,8 @@ impl PermissionManager {
         match choice {
             'y' => ApprovalDecision::Allow,
             'a' => {
-                self.session_overrides.insert(tool.to_string(), true);
+                let fp = astra_runtime::turn::approval_fingerprint::ApprovalFingerprint::bare(tool);
+                self.session_overrides.insert(fp, true);
                 eprintln!("{}", format!("  ✓ {tool}: allowed for this session").dim());
                 ApprovalDecision::AllowSession
             }
@@ -840,7 +850,9 @@ impl PermissionManager {
                 ApprovalDecision::Allow
             }
             's' => {
-                self.session_overrides.insert(tool.to_string(), false);
+                let fp = astra_runtime::turn::approval_fingerprint::ApprovalFingerprint::bare(tool);
+                self.session_overrides.insert(fp.clone(), false);
+                self.denial_tracker.record(&fp, false);
                 eprintln!("  {}", format!("  ✗ {tool}: skipped for session").dim());
                 ApprovalDecision::Deny
             }
@@ -917,7 +929,9 @@ impl PermissionManager {
                     if self.mode == PermissionMode::Auto {
                         return true;
                     }
-                    if let Some(&allowed) = self.session_overrides.get(name) {
+                    if let Some(allowed) = self.session_overrides.check(
+                        &astra_runtime::turn::approval_fingerprint::ApprovalFingerprint::bare(name),
+                    ) {
                         return allowed;
                     }
                 }
@@ -994,7 +1008,10 @@ impl PermissionManager {
         }
 
         // Step 5: Session overrides (AFTER bypass-immune safety checks).
-        if let Some(&allowed) = self.session_overrides.get(name) {
+        if let Some(allowed) = self
+            .session_overrides
+            .check(&astra_runtime::turn::approval_fingerprint::ApprovalFingerprint::bare(name))
+        {
             return allowed;
         }
 
@@ -1022,7 +1039,8 @@ impl PermissionManager {
         match Self::prompt_approval(ApprovalPromptKind::LocalStandard) {
             'y' => true,
             'a' => {
-                self.session_overrides.insert(name.to_string(), true);
+                let fp = astra_runtime::turn::approval_fingerprint::ApprovalFingerprint::bare(name);
+                self.session_overrides.insert(fp, true);
                 // Persist as a project-level allow rule with command pattern
                 let rule = Self::make_allow_rule(name, args);
                 self.add_allow_rule(&rule);
@@ -1038,7 +1056,9 @@ impl PermissionManager {
                 true
             }
             's' => {
-                self.session_overrides.insert(name.to_string(), false);
+                let fp = astra_runtime::turn::approval_fingerprint::ApprovalFingerprint::bare(name);
+                self.session_overrides.insert(fp.clone(), false);
+                self.denial_tracker.record(&fp, false);
                 eprintln!("  {}", format!("  ✗ {name}: skipped for session").dim());
                 false
             }
@@ -1064,7 +1084,10 @@ impl PermissionManager {
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("Access to path outside project boundary");
             // Check session overrides first
-            if let Some(&allowed) = self.session_overrides.get(name) {
+            if let Some(allowed) = self
+                .session_overrides
+                .check(&astra_runtime::turn::approval_fingerprint::ApprovalFingerprint::bare(name))
+            {
                 return if allowed {
                     PermissionDecision::Allow
                 } else {
@@ -1114,7 +1137,9 @@ impl PermissionManager {
                     if self.mode == PermissionMode::Auto {
                         return PermissionDecision::Allow;
                     }
-                    if let Some(&allowed) = self.session_overrides.get(name) {
+                    if let Some(allowed) = self.session_overrides.check(
+                        &astra_runtime::turn::approval_fingerprint::ApprovalFingerprint::bare(name),
+                    ) {
                         return if allowed {
                             PermissionDecision::Allow
                         } else {
@@ -1185,7 +1210,10 @@ impl PermissionManager {
         }
 
         // Step 5: Session overrides (AFTER bypass-immune safety checks).
-        if let Some(&allowed) = self.session_overrides.get(name) {
+        if let Some(allowed) = self
+            .session_overrides
+            .check(&astra_runtime::turn::approval_fingerprint::ApprovalFingerprint::bare(name))
+        {
             return if allowed {
                 PermissionDecision::Allow
             } else {
@@ -1216,7 +1244,11 @@ impl PermissionManager {
 
     /// Record a session override from an async approval response.
     pub(super) fn record_approval(&mut self, name: &str, allowed: bool) {
-        self.session_overrides.insert(name.to_string(), allowed);
+        let fp = astra_runtime::turn::approval_fingerprint::ApprovalFingerprint::bare(name);
+        self.session_overrides.insert(fp.clone(), allowed);
+        if !allowed {
+            self.denial_tracker.record(&fp, false);
+        }
     }
 
     /// Whether this manager has a project root (for scope display).
@@ -1247,9 +1279,9 @@ impl PermissionManager {
                 "  Session overrides ({}):",
                 self.session_overrides.len()
             );
-            for (tool, allowed) in &self.session_overrides {
+            for (fp, allowed) in self.session_overrides.iter() {
                 let icon = if *allowed { "✓" } else { "✗" };
-                let _ = writeln!(out, "    {icon} {tool}");
+                let _ = writeln!(out, "    {icon} {}", fp.display_summary());
             }
         }
         if self.cached_allow.is_empty()
@@ -1328,6 +1360,10 @@ fn is_read_only_allowlisted(lower_cmd: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn bare_fp(tool: &str) -> astra_runtime::turn::approval_fingerprint::ApprovalFingerprint {
+        astra_runtime::turn::approval_fingerprint::ApprovalFingerprint::bare(tool)
+    }
 
     // ── classify ──────────────────────────────────────────────────────────────
 
@@ -1546,7 +1582,7 @@ mod tests {
     #[test]
     fn session_override_skip_persists() {
         let mut pm = PermissionManager::new(false);
-        pm.session_overrides.insert("bash".to_string(), false);
+        pm.session_overrides.insert(bare_fp("bash"), false);
         let args = serde_json::json!({"command": "echo hello"});
         assert!(!pm.check("bash", &args));
         assert!(!pm.check("bash", &args));
@@ -1555,7 +1591,7 @@ mod tests {
     #[test]
     fn session_override_always_persists() {
         let mut pm = PermissionManager::new(false);
-        pm.session_overrides.insert("bash".to_string(), true);
+        pm.session_overrides.insert(bare_fp("bash"), true);
         let args = serde_json::json!({"command": "echo hello"});
         assert!(pm.check("bash", &args));
     }
@@ -1814,7 +1850,7 @@ mod tests {
         let decision = pm.apply_cloud_approval_choice("bash", 'a');
 
         assert_eq!(decision, astra_thin_client::ApprovalDecision::AllowSession);
-        assert_eq!(pm.session_overrides.get("bash"), Some(&true));
+        assert_eq!(pm.session_overrides.check(&bare_fp("bash")), Some(true));
     }
 
     #[test]
@@ -1825,7 +1861,7 @@ mod tests {
         let decision = pm.apply_cloud_approval_choice("bash", 's');
 
         assert_eq!(decision, astra_thin_client::ApprovalDecision::Deny);
-        assert_eq!(pm.session_overrides.get("bash"), Some(&false));
+        assert_eq!(pm.session_overrides.check(&bare_fp("bash")), Some(false));
     }
 
     #[test]
@@ -1955,7 +1991,7 @@ mod tests {
         // CRITICAL: Even if user previously approved "bash", dangerous git
         // operations must still require manual approval.
         let mut pm = PermissionManager::new(true); // auto mode
-        pm.session_overrides.insert("bash".to_string(), true);
+        pm.session_overrides.insert(bare_fp("bash"), true);
         let args = serde_json::json!({"command": "git push --force"});
         // Must NOT be Allow — git safety is bypass-immune
         let decision = pm.check_nonblocking("bash", &args);
@@ -1969,7 +2005,7 @@ mod tests {
     fn session_override_cannot_bypass_dangerous_command() {
         // CRITICAL: "always approve bash" must not auto-approve sudo/rm -rf/etc.
         let mut pm = PermissionManager::new(true);
-        pm.session_overrides.insert("bash".to_string(), true);
+        pm.session_overrides.insert(bare_fp("bash"), true);
         let args = serde_json::json!({"command": "sudo rm -rf /"});
         let decision = pm.check_nonblocking("bash", &args);
         assert!(
@@ -1982,7 +2018,7 @@ mod tests {
     fn session_override_cannot_bypass_dangerous_path() {
         // CRITICAL: "always approve write_file" must not auto-approve writes to .git/
         let mut pm = PermissionManager::new(true);
-        pm.session_overrides.insert("write_file".to_string(), true);
+        pm.session_overrides.insert(bare_fp("write_file"), true);
         let args = serde_json::json!({"path": ".git/config", "content": "bad"});
         let decision = pm.check_nonblocking("write_file", &args);
         assert!(
@@ -1995,7 +2031,7 @@ mod tests {
     fn session_override_still_allows_safe_commands() {
         // Session override should still work for commands that pass all safety checks.
         let mut pm = PermissionManager::new(false); // prompt mode
-        pm.session_overrides.insert("bash".to_string(), true);
+        pm.session_overrides.insert(bare_fp("bash"), true);
         let args = serde_json::json!({"command": "echo hello"});
         let decision = pm.check_nonblocking("bash", &args);
         assert!(
@@ -2008,7 +2044,7 @@ mod tests {
     fn check_session_override_cannot_bypass_git_safety() {
         // Same test for the synchronous check() path
         let mut pm = PermissionManager::new(true);
-        pm.session_overrides.insert("bash".to_string(), true);
+        pm.session_overrides.insert(bare_fp("bash"), true);
         let args = serde_json::json!({"command": "rm -rf /"});
         assert!(
             !pm.check("bash", &args),
@@ -2236,8 +2272,8 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
-        pm.session_overrides.insert("bash".to_string(), true);
-        pm.session_overrides.insert("edit".to_string(), false);
+        pm.session_overrides.insert(bare_fp("bash"), true);
+        pm.session_overrides.insert(bare_fp("edit"), false);
 
         let inherited = pm.inherited_permissions_for_child(true);
 
@@ -2355,7 +2391,7 @@ mod tests {
     async fn cloud_approval_async_session_override_allows() {
         let dir = tempfile::tempdir().unwrap();
         let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
-        pm.session_overrides.insert("bash".to_string(), true);
+        pm.session_overrides.insert(bare_fp("bash"), true);
         let decision = pm
             .resolve_cloud_approval_async("bash", Some("/tmp"), ApprovalKind::Standard, false)
             .await;
@@ -2366,7 +2402,7 @@ mod tests {
     async fn cloud_approval_async_session_override_denies() {
         let dir = tempfile::tempdir().unwrap();
         let mut pm = PermissionManager::with_project_mode(PermissionMode::Prompt, dir.path());
-        pm.session_overrides.insert("bash".to_string(), false);
+        pm.session_overrides.insert(bare_fp("bash"), false);
         let decision = pm
             .resolve_cloud_approval_async("bash", Some("/tmp"), ApprovalKind::Standard, false)
             .await;
@@ -2523,8 +2559,8 @@ mod tests {
             let mut pm_sync = PermissionManager::with_project_mode(mode, dir.path());
             let mut pm_async = PermissionManager::with_project_mode(mode, dir.path());
             if let Some(v) = override_val {
-                pm_sync.session_overrides.insert(tool.to_string(), v);
-                pm_async.session_overrides.insert(tool.to_string(), v);
+                pm_sync.session_overrides.insert(bare_fp(tool), v);
+                pm_async.session_overrides.insert(bare_fp(tool), v);
             }
             let sync_result =
                 pm_sync.resolve_cloud_approval(tool, Some("detail"), approval_kind, quiet);
