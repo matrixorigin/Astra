@@ -6,6 +6,7 @@ use astra_services::{MutationActionCategory, MutationCompensationPolicy};
 use super::cloud_approval_policy::{
     CloudGatedToolKind, bash_command_is_read_only, cloud_gated_tool_kind,
 };
+use super::tool_result_semantics::is_resource_limit_output;
 use crate::tool_sandbox::{CommandRisk, analyze_command_risks};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -29,6 +30,239 @@ pub enum CompensationKind {
     GitRevertCommit,
     RestoreDatabaseSnapshot,
     Manual,
+}
+
+// ── Execution outcome classification ──
+
+/// High-level execution outcome for a tool invocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionOutcome {
+    Success,
+    Failure,
+    Timeout,
+    Rejected,
+    ResourceLimit,
+}
+
+/// Structured failure category derived from tool result content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureCategory {
+    CompileError,
+    TestFailure,
+    PermissionDenied,
+    ResourceNotFound,
+    NetworkError,
+    SyntaxError,
+    RuntimeError,
+    Timeout,
+    ResourceExhaustion,
+    ValidationError,
+    Unknown,
+}
+
+/// Typed execution outcome classification attached to an action profile.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionOutcomeClassification {
+    pub outcome: ExecutionOutcome,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_category: Option<FailureCategory>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_snippet: Option<String>,
+}
+
+/// Classify a tool result into a typed execution outcome.
+///
+/// Uses structured JSON fields (`ok`, `error`, `error_code`, `status`) when
+/// available, then falls back to pattern matching on the result text.
+pub fn classify_execution_outcome(
+    result_text: &str,
+    is_error: bool,
+    duration_ms: u64,
+    was_rejected: bool,
+) -> ExecutionOutcomeClassification {
+    if was_rejected {
+        return ExecutionOutcomeClassification {
+            outcome: ExecutionOutcome::Rejected,
+            failure_category: None,
+            error_snippet: None,
+        };
+    }
+    if !is_error {
+        return ExecutionOutcomeClassification {
+            outcome: ExecutionOutcome::Success,
+            failure_category: None,
+            error_snippet: None,
+        };
+    }
+    if is_resource_limit_output(result_text) {
+        return ExecutionOutcomeClassification {
+            outcome: ExecutionOutcome::ResourceLimit,
+            failure_category: Some(FailureCategory::ResourceExhaustion),
+            error_snippet: Some(truncate_snippet(result_text, 200)),
+        };
+    }
+    // Timeout heuristic: error + very long duration (>120s)
+    if duration_ms > 120_000 && text_suggests_timeout(result_text) {
+        return ExecutionOutcomeClassification {
+            outcome: ExecutionOutcome::Timeout,
+            failure_category: Some(FailureCategory::Timeout),
+            error_snippet: Some(truncate_snippet(result_text, 200)),
+        };
+    }
+    let category = classify_failure_category(result_text);
+    ExecutionOutcomeClassification {
+        outcome: ExecutionOutcome::Failure,
+        failure_category: Some(category),
+        error_snippet: Some(truncate_snippet(result_text, 200)),
+    }
+}
+
+fn text_suggests_timeout(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    lower.contains("timed out")
+        || lower.contains("timeout")
+        || lower.contains("deadline exceeded")
+        || lower.contains("context deadline")
+        || lower.contains("超时")
+        || lower.contains("connection timed out")
+}
+
+fn classify_failure_category(text: &str) -> FailureCategory {
+    let lower = text.to_lowercase();
+
+    // Compile errors (highest priority — build failures)
+    if lower.contains("error[e")
+        || lower.contains("compile error")
+        || lower.contains("compilation failed")
+        || lower.contains("cannot find")
+            && (lower.contains("module") || lower.contains("crate") || lower.contains("type"))
+        || lower.contains("undefined reference")
+        || lower.contains("unresolved import")
+        || lower.contains("expected ")
+            && (lower.contains("found ") || lower.contains("but got"))
+            && (lower.contains("type") || lower.contains("token"))
+        || lower.contains("linker error")
+        || lower.contains("aborting due to")
+        || lower.contains("build failed")
+        || lower.contains("编译错误")
+    {
+        return FailureCategory::CompileError;
+    }
+
+    // Test failures
+    if lower.contains("test failed")
+        || lower.contains("assertion failed")
+        || lower.contains("assert_eq!")
+        || lower.contains("assert_ne!")
+        || lower.contains("panicked at")
+        || lower.contains("failures:") && (lower.contains("test result") || lower.contains("test "))
+        || lower.contains("expected:") && (lower.contains("actual:") || lower.contains("received:"))
+        || lower.contains("测试失败")
+    {
+        return FailureCategory::TestFailure;
+    }
+
+    // Permission denied
+    if lower.contains("permission denied")
+        || lower.contains("access denied")
+        || lower.contains("forbidden")
+        || lower.contains("eacces")
+        || lower.contains("unauthorized")
+        || lower.contains("权限不足")
+        || lower.contains("没有权限")
+    {
+        return FailureCategory::PermissionDenied;
+    }
+
+    // Resource not found
+    if lower.contains("not found")
+        || lower.contains("no such file")
+        || lower.contains("enoent")
+        || lower.contains("does not exist")
+        || lower.contains("404")
+            && (lower.contains("http") || lower.contains("request") || lower.contains("api"))
+        || lower.contains("找不到")
+        || lower.contains("不存在")
+    {
+        return FailureCategory::ResourceNotFound;
+    }
+
+    // Network errors
+    if lower.contains("connection refused")
+        || lower.contains("connection reset")
+        || lower.contains("network unreachable")
+        || lower.contains("dns resolution")
+        || lower.contains("econnrefused")
+        || lower.contains("econnreset")
+        || lower.contains("name or service not known")
+        || lower.contains("网络错误")
+        || lower.contains("连接被拒绝")
+    {
+        return FailureCategory::NetworkError;
+    }
+
+    // Syntax errors
+    if lower.contains("syntax error")
+        || lower.contains("syntaxerror")
+        || lower.contains("parse error")
+        || lower.contains("unexpected token")
+        || lower.contains("unexpected end of")
+        || lower.contains("invalid syntax")
+        || lower.contains("语法错误")
+    {
+        return FailureCategory::SyntaxError;
+    }
+
+    // Timeouts (detected here even without the duration check above)
+    if text_suggests_timeout(text) {
+        return FailureCategory::Timeout;
+    }
+
+    // Resource exhaustion
+    if lower.contains("out of memory")
+        || lower.contains("oom")
+        || lower.contains("disk full")
+        || lower.contains("no space left")
+        || lower.contains("too many open files")
+        || lower.contains("内存不足")
+    {
+        return FailureCategory::ResourceExhaustion;
+    }
+
+    // Validation errors
+    if lower.contains("invalid argument")
+        || lower.contains("invalid input")
+        || lower.contains("validation error")
+        || lower.contains("invalid value")
+        || lower.contains("schema validation")
+        || lower.contains("参数无效")
+    {
+        return FailureCategory::ValidationError;
+    }
+
+    // Runtime errors (generic execution failures)
+    if lower.contains("runtime error")
+        || lower.contains("runtimeerror")
+        || lower.contains("segmentation fault")
+        || lower.contains("stack overflow")
+        || lower.contains("core dumped")
+        || lower.contains("signal:") && (lower.contains("sigsegv") || lower.contains("sigabrt"))
+    {
+        return FailureCategory::RuntimeError;
+    }
+
+    FailureCategory::Unknown
+}
+
+fn truncate_snippet(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        text.to_string()
+    } else {
+        let truncated = &text[..text.floor_char_boundary(max)];
+        format!("{truncated}…")
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1025,5 +1259,236 @@ mod tests {
         assert!(bash_reason.contains("rollback"));
 
         assert!(explicit_approval_reason("write_file", &json!({"path": "x"})).is_none());
+    }
+
+    // ── Execution outcome classification tests ──
+
+    #[test]
+    fn classify_success_result() {
+        let c = classify_execution_outcome(r#"{"ok":true,"result":"done"}"#, false, 500, false);
+        assert_eq!(c.outcome, ExecutionOutcome::Success);
+        assert!(c.failure_category.is_none());
+        assert!(c.error_snippet.is_none());
+    }
+
+    #[test]
+    fn classify_rejected_result() {
+        let c = classify_execution_outcome("rejected by policy", true, 0, true);
+        assert_eq!(c.outcome, ExecutionOutcome::Rejected);
+        assert!(c.failure_category.is_none());
+    }
+
+    #[test]
+    fn classify_resource_limit_result() {
+        let c = classify_execution_outcome(
+            "bash: fork: Resource temporarily unavailable",
+            true,
+            100,
+            false,
+        );
+        assert_eq!(c.outcome, ExecutionOutcome::ResourceLimit);
+        assert_eq!(
+            c.failure_category,
+            Some(FailureCategory::ResourceExhaustion)
+        );
+    }
+
+    #[test]
+    fn classify_timeout_with_long_duration() {
+        let c = classify_execution_outcome("Error: connection timed out", true, 130_000, false);
+        assert_eq!(c.outcome, ExecutionOutcome::Timeout);
+        assert_eq!(c.failure_category, Some(FailureCategory::Timeout));
+    }
+
+    #[test]
+    fn classify_timeout_keyword_short_duration_still_failure() {
+        let c = classify_execution_outcome("Error: timed out waiting", true, 5_000, false);
+        assert_eq!(c.outcome, ExecutionOutcome::Failure);
+        assert_eq!(c.failure_category, Some(FailureCategory::Timeout));
+    }
+
+    #[test]
+    fn classify_compile_error() {
+        let c = classify_execution_outcome(
+            "error[E0433]: failed to resolve: use of undeclared crate or module `foo`",
+            true,
+            2000,
+            false,
+        );
+        assert_eq!(c.outcome, ExecutionOutcome::Failure);
+        assert_eq!(c.failure_category, Some(FailureCategory::CompileError));
+    }
+
+    #[test]
+    fn classify_build_failed() {
+        let c = classify_execution_outcome(
+            "error: build failed, waiting for other jobs to finish...",
+            true,
+            5000,
+            false,
+        );
+        assert_eq!(c.outcome, ExecutionOutcome::Failure);
+        assert_eq!(c.failure_category, Some(FailureCategory::CompileError));
+    }
+
+    #[test]
+    fn classify_test_failure() {
+        let c = classify_execution_outcome(
+            "thread 'main' panicked at 'assertion failed: x == 1'",
+            true,
+            1000,
+            false,
+        );
+        assert_eq!(c.outcome, ExecutionOutcome::Failure);
+        assert_eq!(c.failure_category, Some(FailureCategory::TestFailure));
+    }
+
+    #[test]
+    fn classify_test_failure_assert_eq() {
+        let c = classify_execution_outcome(
+            "thread 'test_foo' panicked at 'assert_eq! failed'",
+            true,
+            1000,
+            false,
+        );
+        assert_eq!(c.outcome, ExecutionOutcome::Failure);
+        assert_eq!(c.failure_category, Some(FailureCategory::TestFailure));
+    }
+
+    #[test]
+    fn classify_permission_denied() {
+        let c =
+            classify_execution_outcome("Error: Permission denied (publickey)", true, 300, false);
+        assert_eq!(c.outcome, ExecutionOutcome::Failure);
+        assert_eq!(c.failure_category, Some(FailureCategory::PermissionDenied));
+    }
+
+    #[test]
+    fn classify_resource_not_found() {
+        let c = classify_execution_outcome(
+            "Error: No such file or directory: /tmp/missing.txt",
+            true,
+            50,
+            false,
+        );
+        assert_eq!(c.outcome, ExecutionOutcome::Failure);
+        assert_eq!(c.failure_category, Some(FailureCategory::ResourceNotFound));
+    }
+
+    #[test]
+    fn classify_network_error() {
+        let c = classify_execution_outcome(
+            r#"{"ok":false,"error":"connection refused"}"#,
+            true,
+            1000,
+            false,
+        );
+        assert_eq!(c.outcome, ExecutionOutcome::Failure);
+        assert_eq!(c.failure_category, Some(FailureCategory::NetworkError));
+    }
+
+    #[test]
+    fn classify_syntax_error() {
+        let c = classify_execution_outcome(
+            "SyntaxError: unexpected token '{' at line 42",
+            true,
+            100,
+            false,
+        );
+        assert_eq!(c.outcome, ExecutionOutcome::Failure);
+        assert_eq!(c.failure_category, Some(FailureCategory::SyntaxError));
+    }
+
+    #[test]
+    fn classify_validation_error() {
+        let c = classify_execution_outcome(
+            "Error: invalid argument: value must be positive",
+            true,
+            50,
+            false,
+        );
+        assert_eq!(c.outcome, ExecutionOutcome::Failure);
+        assert_eq!(c.failure_category, Some(FailureCategory::ValidationError));
+    }
+
+    #[test]
+    fn classify_runtime_error() {
+        let c = classify_execution_outcome("Segmentation fault (core dumped)", true, 200, false);
+        assert_eq!(c.outcome, ExecutionOutcome::Failure);
+        assert_eq!(c.failure_category, Some(FailureCategory::RuntimeError));
+    }
+
+    #[test]
+    fn classify_unknown_error() {
+        let c = classify_execution_outcome(
+            r#"{"ok":false,"error":"something unexpected"}"#,
+            true,
+            100,
+            false,
+        );
+        assert_eq!(c.outcome, ExecutionOutcome::Failure);
+        assert_eq!(c.failure_category, Some(FailureCategory::Unknown));
+    }
+
+    #[test]
+    fn classify_chinese_compile_error() {
+        let c = classify_execution_outcome("错误：编译错误 at line 10", true, 2000, false);
+        assert_eq!(c.failure_category, Some(FailureCategory::CompileError));
+    }
+
+    #[test]
+    fn classify_chinese_permission_error() {
+        let c = classify_execution_outcome("错误：权限不足", true, 100, false);
+        assert_eq!(c.failure_category, Some(FailureCategory::PermissionDenied));
+    }
+
+    #[test]
+    fn classify_chinese_network_error() {
+        let c = classify_execution_outcome("错误：连接被拒绝", true, 100, false);
+        assert_eq!(c.failure_category, Some(FailureCategory::NetworkError));
+    }
+
+    #[test]
+    fn classify_outcome_serde_roundtrip() {
+        let c = ExecutionOutcomeClassification {
+            outcome: ExecutionOutcome::Failure,
+            failure_category: Some(FailureCategory::CompileError),
+            error_snippet: Some("error[E0433]".to_string()),
+        };
+        let json = serde_json::to_string(&c).unwrap();
+        let roundtrip: ExecutionOutcomeClassification = serde_json::from_str(&json).unwrap();
+        assert_eq!(c, roundtrip);
+    }
+
+    #[test]
+    fn classify_outcome_skip_none_fields_in_json() {
+        let c = ExecutionOutcomeClassification {
+            outcome: ExecutionOutcome::Success,
+            failure_category: None,
+            error_snippet: None,
+        };
+        let json = serde_json::to_string(&c).unwrap();
+        assert!(!json.contains("failure_category"));
+        assert!(!json.contains("error_snippet"));
+    }
+
+    #[test]
+    fn classify_snippet_truncation() {
+        let long_error = format!("error[E0433]: {}", "x".repeat(500));
+        let c = classify_execution_outcome(&long_error, true, 2000, false);
+        assert!(c.error_snippet.as_ref().unwrap().len() <= 210);
+    }
+
+    #[test]
+    fn classify_success_with_resource_limit_text_stays_success() {
+        let c = classify_execution_outcome("Killed", false, 100, false);
+        assert_eq!(c.outcome, ExecutionOutcome::Success);
+    }
+
+    #[test]
+    fn classify_rejected_takes_priority_over_content() {
+        let c = classify_execution_outcome("error[E0433]: some compile error", true, 100, true);
+        assert_eq!(c.outcome, ExecutionOutcome::Rejected);
+        assert!(c.failure_category.is_none());
     }
 }

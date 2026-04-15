@@ -1034,6 +1034,7 @@ mod tests {
         EvolutionSignal::ToolFailure {
             tool_name: tool.into(),
             error_snippet: "Error: test".into(),
+            failure_category: None,
             skill_context: skill.map(String::from),
             turn_id: "t1".into(),
         }
@@ -1231,6 +1232,7 @@ mod tests {
             tool_args: "{}",
             result: "Error: command not found",
             is_error: true,
+            failure_category: None,
             duration_ms: 100,
             active_skill: Some("review_changes"),
             turn_id: "t1",
@@ -1320,6 +1322,7 @@ mod tests {
         svc.add_signal(EvolutionSignal::ToolFailure {
             tool_name: "bash".into(),
             error_snippet: "permission denied".into(),
+            failure_category: None,
             skill_context: None,
             turn_id: "t1".into(),
         })
@@ -1331,6 +1334,7 @@ mod tests {
         svc.add_signal(EvolutionSignal::ToolFailure {
             tool_name: "web_fetch".into(),
             error_snippet: "timeout".into(),
+            failure_category: None,
             skill_context: None,
             turn_id: "t2".into(),
         })
@@ -1481,6 +1485,7 @@ mod tests {
         let signals = vec![EvolutionSignal::ToolFailure {
             tool_name: "bash".into(),
             error_snippet: "not found".into(),
+            failure_category: None,
             skill_context: Some("ops".into()),
             turn_id: "t1".into(),
         }];

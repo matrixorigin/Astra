@@ -375,6 +375,7 @@ mod tests {
             signal: EvolutionSignal::ToolFailure {
                 tool_name: "bash".into(),
                 error_snippet: "err".into(),
+                failure_category: None,
                 skill_context: Some(skill.into()),
                 turn_id: "t1".into(),
             },
