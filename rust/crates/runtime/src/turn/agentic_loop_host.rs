@@ -52,9 +52,9 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use astra_services::DatabaseEvaluationService;
 use astra_services::session_audit::RuntimePromotionEventData;
 use astra_services::session_journal::ToolCallRecord;
+use astra_services::{DatabaseEvaluationService, DatabaseEventService};
 use async_trait::async_trait;
 use serde_json::Value;
 
@@ -420,6 +420,8 @@ pub struct TelemetryState {
         Option<crate::runtime_promotion_signals::RuntimePromotionSignals>,
     /// Optional evaluation persistence context for refreshing DB-backed runtime signals.
     pub evaluation_persistence: Option<EvaluationPersistenceContext>,
+    /// Optional event persistence context for mirroring context traces into cloud events.
+    pub context_trace_persistence: Option<ContextTracePersistenceContext>,
     /// Runtime promotion verdicts captured for later audit/report persistence.
     pub promotion_events: Vec<RuntimePromotionEventData>,
     /// Optional turn trace collector for detailed context assembly observability.
@@ -434,6 +436,13 @@ pub struct TelemetryState {
 pub struct EvaluationPersistenceContext {
     pub user_id: String,
     pub evaluation_service: DatabaseEvaluationService,
+}
+
+#[derive(Clone, Debug)]
+pub struct ContextTracePersistenceContext {
+    pub user_id: String,
+    pub event_service: DatabaseEventService,
+    pub agent_id: String,
 }
 
 /// Stall and verdict tracking state for the agentic loop.
@@ -788,7 +797,7 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
             PreparedTurnIteration::Finished(outcome) => {
                 if matches!(outcome, AgenticLoopOutcome::Completed) && !state.final_text.is_empty()
                 {
-                    finalize_and_render(host, state);
+                    finalize_and_render(host, state).await;
                 }
                 return Ok(outcome);
             }
@@ -833,7 +842,7 @@ pub(crate) async fn run_agentic_loop_impl<H: AgenticLoopHost>(
         }
     }
     // Loop exhausted max_turns without explicit break — write final state.
-    finalize_and_render(host, state);
+    finalize_and_render(host, state).await;
     Ok(AgenticLoopOutcome::Completed)
 }
 

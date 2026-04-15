@@ -346,6 +346,7 @@ fn complement_interval(interval: ConfidenceInterval) -> ConfidenceInterval {
 fn context_trace_confidence_expr(alias: &str) -> String {
     format!(
         "COALESCE(\
+            CAST(JSON_UNQUOTE(JSON_EXTRACT({alias}.metadata, '$.tool_selection.confidence')) AS DOUBLE), \
             CAST(JSON_UNQUOTE(JSON_EXTRACT({alias}.metadata, '$.tool_selection.selection_confidence')) AS DOUBLE), \
             CAST(JSON_UNQUOTE(JSON_EXTRACT({alias}.metadata, '$.selection_confidence')) AS DOUBLE)\
         )"
@@ -2062,6 +2063,14 @@ mod tests {
         assert_eq!(clamp_extract_limit(0), 1);
         assert_eq!(clamp_extract_limit(500), 500);
         assert_eq!(clamp_extract_limit(5000), MAX_EXTRACT_SAMPLES);
+    }
+
+    #[test]
+    fn context_trace_confidence_expr_accepts_current_signal_shape() {
+        let expr = context_trace_confidence_expr("ev");
+        assert!(expr.contains("$.tool_selection.confidence"));
+        assert!(expr.contains("$.tool_selection.selection_confidence"));
+        assert!(expr.contains("$.selection_confidence"));
     }
 
     #[test]

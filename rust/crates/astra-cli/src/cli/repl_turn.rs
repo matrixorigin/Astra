@@ -1,9 +1,8 @@
 use std::time::Instant;
 
-use astra_services::session_workspace::{
-    ContextTraceBudgetSignal, ContextTraceHistorySignal, ContextTraceMemorySignal,
-    ContextTraceSignal, ContextTraceTimingSignal, ContextTraceToolSelection,
-};
+use astra_services::session_workspace::ContextTraceSignal;
+#[cfg(test)]
+use astra_services::session_workspace::{ContextTraceBudgetSignal, ContextTraceToolSelection};
 
 use super::*;
 
@@ -1822,88 +1821,7 @@ pub(super) fn apply_pending_goal_progress_state(state: &mut ReplState) {
 fn latest_context_trace_signal(state: &ReplState) -> Option<ContextTraceSignal> {
     let obs = state.observability_session.as_ref()?;
     let guard = obs.read().ok()?;
-    let trace = guard.context_traces.last()?;
-    let timing = guard.turn_timings.last().cloned();
-
-    let tool_selection = (!trace.tools.selection_strategy.is_empty()
-        || !trace.tools.tools_selected.is_empty()
-        || trace.tools.tools_available > 0)
-        .then(|| ContextTraceToolSelection {
-            tools_available: trace.tools.tools_available,
-            selected_tools: trace
-                .tools
-                .tools_selected
-                .iter()
-                .map(|tool| tool.tool_name.clone())
-                .collect(),
-            rejected_tools: trace.tools.tools_rejected.len(),
-            strategy: trace.tools.selection_strategy.clone(),
-            confidence: trace.tools.selection_confidence,
-            latency_ms: trace.tools.selection_latency_ms,
-        });
-    let memory = (!trace.memory.query.trim().is_empty()
-        || !trace.memory.memories_selected.is_empty()
-        || trace.memory.candidates_considered > 0)
-        .then(|| ContextTraceMemorySignal {
-            query: trace.memory.query.trim().chars().take(160).collect(),
-            candidates_considered: trace.memory.candidates_considered,
-            selected_memory_ids: trace
-                .memory
-                .memories_selected
-                .iter()
-                .map(|memory| memory.memory_id.clone())
-                .collect(),
-            total_tokens: trace.memory.total_tokens,
-            latency_ms: trace.memory.retrieval_latency_ms,
-        });
-    let history = (trace.history.total_turns_available > 0
-        || !trace.history.turns_retained.is_empty()
-        || !trace.history.turns_compressed.is_empty()
-        || !trace.history.turns_dropped.is_empty())
-    .then_some(ContextTraceHistorySignal {
-        total_turns_available: trace.history.total_turns_available,
-        retained_turns: trace.history.turns_retained.len(),
-        compressed_turns: trace.history.turns_compressed.len(),
-        dropped_turns: trace.history.turns_dropped.len(),
-        compression_ratio: trace.history.compression_ratio,
-        tokens_before: trace.history.tokens_before,
-        tokens_after: trace.history.tokens_after,
-    });
-    let budget = (trace.token_budget.max_tokens > 0 || trace.token_budget.total_used > 0)
-        .then_some({
-            ContextTraceBudgetSignal {
-                max_tokens: trace.token_budget.max_tokens,
-                total_used: trace.token_budget.total_used,
-                budget_pressure: trace.token_budget.budget_pressure,
-                compression_triggered: trace.token_budget.compression_triggered,
-            }
-        });
-    let timing = timing.map(|timing| ContextTraceTimingSignal {
-        turn: timing.turn,
-        context_assembly_ms: timing.context_assembly_ms,
-        ttft_ms: timing.ttft_ms,
-        llm_total_ms: timing.llm_total_ms,
-        tool_execution_ms: timing.tool_execution_ms,
-        total_ms: timing.total_ms,
-    });
-
-    Some(ContextTraceSignal {
-        turn_id: trace.turn_id.clone(),
-        captured_at: Some(chrono::DateTime::<chrono::Utc>::from(trace.timestamp).to_rfc3339()),
-        tool_selection,
-        memory,
-        history,
-        budget,
-        timing,
-        explanations: trace
-            .explanations
-            .iter()
-            .filter_map(|explanation| {
-                let trimmed = explanation.reasoning.trim();
-                (!trimmed.is_empty()).then(|| trimmed.chars().take(200).collect::<String>())
-            })
-            .collect(),
-    })
+    astra_runtime::observability_integration::latest_context_trace_signal(&guard)
 }
 
 fn sync_context_trace_to_workspace(

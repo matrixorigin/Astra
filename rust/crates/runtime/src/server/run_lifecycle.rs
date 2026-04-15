@@ -37,8 +37,9 @@ use crate::observability_integration::ObservabilityHub;
 use crate::pipeline::step_recorder::StepRecorder;
 use crate::runtime_promotion_signals::{RuntimePromotionGateSignal, RuntimePromotionSignals};
 use crate::turn::agentic_loop_host::{
-    AgenticLoopOutcome, AgenticLoopState, CancellationState, EvaluationPersistenceContext,
-    MessagingState, SkillState, StopHookState, run_agentic_loop_with_host,
+    AgenticLoopOutcome, AgenticLoopState, CancellationState, ContextTracePersistenceContext,
+    EvaluationPersistenceContext, MessagingState, SkillState, StopHookState,
+    run_agentic_loop_with_host,
 };
 use crate::{
     DatabaseEvaluationService, DatabaseEventService, EvaluationService, EventCreateRequestData,
@@ -52,6 +53,8 @@ use astra_core::{
 
 use super::run_engine::RunEngine;
 use super::server_loop_host::ServerAgenticLoopHostBuilder;
+
+const RUNTIME_CONTEXT_TRACE_AGENT_ID: &str = "astra-server";
 
 // ─── Skill wiring for server paths ──────────────────────────────────────────
 
@@ -227,6 +230,7 @@ async fn initialize_runtime_controllers(
     session_id: &str,
     promotion_signals: Option<RuntimePromotionSignals>,
     evaluation_persistence: Option<EvaluationPersistenceContext>,
+    context_trace_persistence: Option<ContextTracePersistenceContext>,
 ) -> super::state_builder::PipelineLearningStack {
     let learning_stack = super::state_builder::build_pipeline_learning_stack(Some("default"));
     let hub = Arc::new(ObservabilityHub::new());
@@ -259,6 +263,7 @@ async fn initialize_runtime_controllers(
     loop_state.telemetry.observability_session = Some(session);
     loop_state.telemetry.runtime_promotion_signals = promotion_signals;
     loop_state.telemetry.evaluation_persistence = evaluation_persistence;
+    loop_state.telemetry.context_trace_persistence = context_trace_persistence;
     loop_state.evolution_service = Some(evolution_service);
     learning_stack
 }
@@ -276,6 +281,11 @@ async fn configure_runtime_controllers(
     let evaluation_persistence = shared_pool.map(|pool| EvaluationPersistenceContext {
         user_id: user_id.to_string(),
         evaluation_service: build_runtime_evaluation_service(matrixone, Some(pool)),
+    });
+    let context_trace_persistence = shared_pool.map(|pool| ContextTracePersistenceContext {
+        user_id: user_id.to_string(),
+        event_service: build_runtime_event_service(matrixone, Some(pool)),
+        agent_id: RUNTIME_CONTEXT_TRACE_AGENT_ID.to_string(),
     });
     let promotion_signals = if let Some(context) = evaluation_persistence.as_ref() {
         match load_runtime_promotion_signals_with_service(&context.evaluation_service, user_id)
@@ -300,6 +310,7 @@ async fn configure_runtime_controllers(
         session_id,
         promotion_signals,
         evaluation_persistence,
+        context_trace_persistence,
     )
     .await
 }

@@ -127,7 +127,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                     prep.turn_start_time,
                     turn_result.ttft_ms,
                 );
-                finalize_and_render(host, state);
+                finalize_and_render(host, state).await;
                 return Ok(TurnExecutionControl::Return(AgenticLoopOutcome::Completed));
             }
 
@@ -180,7 +180,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                 ));
             }
 
-            finalize_turn_trace(state);
+            finalize_turn_trace(state).await;
             try_write_heavy_checkpoint(state);
             return Err(e);
         }
@@ -207,7 +207,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                 prep.turn_start_time,
                 turn_result.ttft_ms,
             );
-            finalize_and_render(host, state);
+            finalize_and_render(host, state).await;
             return Ok(TurnExecutionControl::Return(AgenticLoopOutcome::Completed));
         }
         AgenticIngestIterationControl::ContinueIterating => {
@@ -218,7 +218,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     }
 
     emit_subrun_text_preview(host, state, prep.quiet);
-    if let Some(control) = handle_token_budget(host, state, turn_index, prep, &turn_result) {
+    if let Some(control) = handle_token_budget(host, state, turn_index, prep, &turn_result).await {
         return Ok(control);
     }
     if should_wrap_up_for_cumulative_budget(host, state, prep.quiet) {
@@ -290,7 +290,7 @@ fn emit_subrun_text_preview<H: AgenticLoopHost>(
     }
 }
 
-fn handle_token_budget<H: AgenticLoopHost>(
+async fn handle_token_budget<H: AgenticLoopHost>(
     host: &mut H,
     state: &mut AgenticLoopState,
     turn_index: usize,
@@ -329,7 +329,7 @@ fn handle_token_budget<H: AgenticLoopHost>(
             prep.turn_start_time,
             turn_result.ttft_ms,
         );
-        finalize_and_render(host, state);
+        finalize_and_render(host, state).await;
         return Some(TurnExecutionControl::Return(AgenticLoopOutcome::Completed));
     }
 

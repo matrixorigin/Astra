@@ -1061,8 +1061,8 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
                     state.telemetry.runtime_promotion_signals = updated_promotion_signals;
                     observe_gate_cancelled(state, turn_index, prep.turn_start_time, &turn_result);
                     state.step_recorder.end_turn(true);
+                    finalize_turn_trace(state).await;
                     refresh_runtime_promotion_signals_from_db(state).await;
-                    finalize_turn_trace(state);
                     return Ok(TurnToolPhaseControl::Return(AgenticLoopOutcome::Cancelled));
                 }
                 Err(e) => {
@@ -1105,8 +1105,8 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
             );
             state.telemetry.runtime_promotion_signals = updated_promotion_signals;
             state.step_recorder.end_turn(true);
+            finalize_turn_trace(state).await;
             refresh_runtime_promotion_signals_from_db(state).await;
-            finalize_turn_trace(state);
             return Err(e);
         }
         AgenticPostToolIterationControl::RetryLlmClearToolResults => {
@@ -1187,8 +1187,8 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
                 state.telemetry.first_budget_pressure,
             );
             state.telemetry.runtime_promotion_signals = updated_promotion_signals;
-            finalize_turn_trace(state);
             state.step_recorder.end_turn(false);
+            finalize_turn_trace(state).await;
             refresh_runtime_promotion_signals_from_db(state).await;
             state.telemetry.completed_turns_for_tuning += 1;
             maybe_run_tuning_cycle(state);
