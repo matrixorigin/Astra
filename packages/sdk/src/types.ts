@@ -372,3 +372,58 @@ export type SessionInfo = {
   createdAt: string;
   lastActive: string;
 };
+
+// ─── Auth Types ────────────────────────────────────────────────────
+
+export type AuthResult = {
+  access_token: string;
+  refresh_token: string;
+  user_id: string;
+};
+
+export type UserInfo = {
+  user_id: string;
+  username: string;
+  created_at: string;
+};
+
+// ─── Memory Types ──────────────────────────────────────────────────
+
+export type MemoryEntry = {
+  content: string;
+  memory_type?: 'semantic' | 'episodic' | 'procedural';
+  session_id?: string;
+  trust_tier?: string;
+};
+
+export type MemorySearchResult = {
+  id: string;
+  content: string;
+  score: number;
+  memory_type?: string;
+  created_at?: string;
+};
+
+// ─── Skill Types ───────────────────────────────────────────────────
+
+export type SkillInfo = {
+  id: string;
+  name: string;
+  description: string;
+  status: string;
+};
+
+// ─── Audit Types ───────────────────────────────────────────────────
+
+export type SessionActivity = {
+  timestamp: string;
+  event_type: string;
+  details: Record<string, unknown>;
+};
+
+export type SessionAudit = {
+  session_id: string;
+  events: SessionActivity[];
+  tool_calls: number;
+  turns: number;
+};

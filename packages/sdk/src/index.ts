@@ -49,6 +49,17 @@ export type {
   ChatRequest,
   RunStatus,
   SessionInfo,
+  // Auth types
+  AuthResult,
+  UserInfo,
+  // Memory types
+  MemoryEntry,
+  MemorySearchResult,
+  // Skill types
+  SkillInfo,
+  // Audit types
+  SessionActivity,
+  SessionAudit,
 } from './types';
 
 export { AstraClient, AstraApiError } from './client';
