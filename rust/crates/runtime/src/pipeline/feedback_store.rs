@@ -3,77 +3,125 @@
 //! Stores `StructuredFeedback` rules extracted from user corrections and
 //! injects matching rules into subsequent turn system prompts. This closes
 //! the feedback loop: detect → extract → store → inject.
+//!
+//! Rules are isolated per session_id — no cross-session leakage.
 
+use std::collections::HashMap;
 use std::sync::Mutex;
 
 use astra_turn_types::StructuredFeedback;
 
-/// Maximum stored feedback rules per session (prevents unbounded growth).
-const MAX_RULES: usize = 50;
+/// Maximum stored feedback rules per session.
+const MAX_RULES_PER_SESSION: usize = 20;
+
+/// Maximum tracked sessions before oldest is evicted.
+const MAX_SESSIONS: usize = 200;
 
 /// Session-scoped store for structured feedback rules.
 ///
 /// Thread-safe via internal `Mutex`. Designed to be shared as `Arc<FeedbackStore>`
-/// across turns within a single session.
+/// across the bridge singleton — rules are keyed by session_id.
 pub struct FeedbackStore {
-    rules: Mutex<Vec<StructuredFeedback>>,
+    sessions: Mutex<HashMap<String, SessionRules>>,
+    /// Insertion-order tracking for LRU eviction of sessions.
+    order: Mutex<Vec<String>>,
+}
+
+struct SessionRules {
+    rules: Vec<StructuredFeedback>,
 }
 
 impl FeedbackStore {
     pub fn new() -> Self {
         Self {
-            rules: Mutex::new(Vec::new()),
+            sessions: Mutex::new(HashMap::new()),
+            order: Mutex::new(Vec::new()),
         }
     }
 
-    /// Store a feedback rule. Deduplicates by rule text.
-    /// Evicts oldest rule when at capacity.
-    pub fn add(&self, feedback: StructuredFeedback) {
-        let mut rules = self.rules.lock().unwrap_or_else(|e| e.into_inner());
-        // Deduplicate by rule text
-        if rules.iter().any(|r| r.rule == feedback.rule) {
+    /// Store a feedback rule for a session. Deduplicates by rule text.
+    pub fn add(&self, session_id: &str, feedback: StructuredFeedback) {
+        let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+
+        // LRU eviction of oldest session if at capacity
+        if !sessions.contains_key(session_id) {
+            let mut order = self.order.lock().unwrap_or_else(|e| e.into_inner());
+            if order.len() >= MAX_SESSIONS {
+                if let Some(oldest) = order.first().cloned() {
+                    order.remove(0);
+                    sessions.remove(&oldest);
+                }
+            }
+            order.push(session_id.to_string());
+        }
+
+        let entry = sessions
+            .entry(session_id.to_string())
+            .or_insert_with(|| SessionRules { rules: Vec::new() });
+
+        if entry.rules.iter().any(|r| r.rule == feedback.rule) {
             return;
         }
-        if rules.len() >= MAX_RULES {
-            rules.remove(0);
+        if entry.rules.len() >= MAX_RULES_PER_SESSION {
+            entry.rules.remove(0);
         }
-        rules.push(feedback);
+        entry.rules.push(feedback);
     }
 
-    /// Number of stored rules.
-    pub fn len(&self) -> usize {
-        self.rules.lock().unwrap_or_else(|e| e.into_inner()).len()
+    /// Number of stored rules for a session.
+    pub fn len(&self, session_id: &str) -> usize {
+        self.sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(session_id)
+            .map(|s| s.rules.len())
+            .unwrap_or(0)
     }
 
-    /// Whether the store is empty.
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
+    /// Whether a session has any rules.
+    pub fn is_empty(&self, session_id: &str) -> bool {
+        self.len(session_id) == 0
     }
 
-    /// Build a context injection string from all stored rules.
-    /// Returns empty string if no rules are stored.
-    pub fn build_injection(&self) -> String {
-        let rules = self.rules.lock().unwrap_or_else(|e| e.into_inner());
-        if rules.is_empty() {
+    /// Build a context injection string for a specific session.
+    pub fn build_injection(&self, session_id: &str) -> String {
+        let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(entry) = sessions.get(session_id) else {
+            return String::new();
+        };
+        if entry.rules.is_empty() {
             return String::new();
         }
         let mut lines = vec!["[Learned Feedback Rules]".to_string()];
-        for fb in rules.iter() {
-            let mut entry = format!("- Rule: {}", fb.rule);
+        for fb in &entry.rules {
+            let mut line = format!("- Rule: {}", fb.rule);
             if fb.reason != "Not stated" {
-                entry.push_str(&format!(" | Why: {}", fb.reason));
+                line.push_str(&format!(" | Why: {}", fb.reason));
             }
             if fb.apply_when != "General" {
-                entry.push_str(&format!(" | When: {}", fb.apply_when));
+                line.push_str(&format!(" | When: {}", fb.apply_when));
             }
-            lines.push(entry);
+            lines.push(line);
         }
         lines.join("\n")
     }
 
-    /// Get a snapshot of all stored rules.
-    pub fn rules(&self) -> Vec<StructuredFeedback> {
-        self.rules.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    /// Get a snapshot of rules for a session.
+    pub fn rules(&self, session_id: &str) -> Vec<StructuredFeedback> {
+        self.sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(session_id)
+            .map(|s| s.rules.clone())
+            .unwrap_or_default()
+    }
+
+    /// Number of tracked sessions.
+    pub fn session_count(&self) -> usize {
+        self.sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
     }
 }
 
@@ -87,7 +135,17 @@ impl Default for FeedbackStore {
 mod tests {
     use super::*;
 
-    fn make_feedback(rule: &str, reason: &str, apply_when: &str) -> StructuredFeedback {
+    fn make_fb(rule: &str) -> StructuredFeedback {
+        StructuredFeedback {
+            rule: rule.into(),
+            reason: "Not stated".into(),
+            apply_when: "General".into(),
+            source_signal: "correction".into(),
+            confidence: 0.9,
+        }
+    }
+
+    fn make_fb_full(rule: &str, reason: &str, apply_when: &str) -> StructuredFeedback {
         StructuredFeedback {
             rule: rule.into(),
             reason: reason.into(),
@@ -97,112 +155,135 @@ mod tests {
         }
     }
 
+    // ── Session isolation ──
+
     #[test]
-    fn add_and_retrieve() {
+    fn sessions_are_isolated() {
         let store = FeedbackStore::new();
-        store.add(make_feedback("don't use mocks", "prod divergence", "integration tests"));
-        assert_eq!(store.len(), 1);
-        let rules = store.rules();
-        assert_eq!(rules[0].rule, "don't use mocks");
+        store.add("s1", make_fb("rule A"));
+        store.add("s2", make_fb("rule B"));
+
+        assert_eq!(store.len("s1"), 1);
+        assert_eq!(store.len("s2"), 1);
+        assert!(store.build_injection("s1").contains("rule A"));
+        assert!(!store.build_injection("s1").contains("rule B"));
+        assert!(store.build_injection("s2").contains("rule B"));
+        assert!(!store.build_injection("s2").contains("rule A"));
     }
 
     #[test]
-    fn deduplicates_by_rule_text() {
+    fn unknown_session_returns_empty() {
         let store = FeedbackStore::new();
-        store.add(make_feedback("don't use mocks", "reason 1", "General"));
-        store.add(make_feedback("don't use mocks", "reason 2", "Specific"));
-        assert_eq!(store.len(), 1);
+        assert!(store.is_empty("nonexistent"));
+        assert!(store.build_injection("nonexistent").is_empty());
+        assert!(store.rules("nonexistent").is_empty());
+    }
+
+    // ── Dedup ──
+
+    #[test]
+    fn deduplicates_within_session() {
+        let store = FeedbackStore::new();
+        store.add("s1", make_fb("rule A"));
+        store.add("s1", make_fb("rule A"));
+        assert_eq!(store.len("s1"), 1);
     }
 
     #[test]
-    fn evicts_oldest_at_capacity() {
+    fn same_rule_different_sessions_not_deduped() {
         let store = FeedbackStore::new();
-        for i in 0..MAX_RULES + 5 {
-            store.add(make_feedback(&format!("rule {i}"), "Not stated", "General"));
+        store.add("s1", make_fb("rule A"));
+        store.add("s2", make_fb("rule A"));
+        assert_eq!(store.len("s1"), 1);
+        assert_eq!(store.len("s2"), 1);
+    }
+
+    // ── Capacity ──
+
+    #[test]
+    fn evicts_oldest_rule_at_capacity() {
+        let store = FeedbackStore::new();
+        for i in 0..MAX_RULES_PER_SESSION + 3 {
+            store.add("s1", make_fb(&format!("rule {i}")));
         }
-        assert_eq!(store.len(), MAX_RULES);
-        let rules = store.rules();
-        // Oldest 5 should be evicted
-        assert_eq!(rules[0].rule, "rule 5");
-        assert_eq!(rules[MAX_RULES - 1].rule, format!("rule {}", MAX_RULES + 4));
+        assert_eq!(store.len("s1"), MAX_RULES_PER_SESSION);
+        let rules = store.rules("s1");
+        assert_eq!(rules[0].rule, "rule 3");
     }
 
     #[test]
-    fn empty_store_returns_empty_injection() {
+    fn evicts_oldest_session_at_capacity() {
         let store = FeedbackStore::new();
-        assert!(store.build_injection().is_empty());
-        assert!(store.is_empty());
+        for i in 0..MAX_SESSIONS + 5 {
+            store.add(&format!("s{i}"), make_fb("rule"));
+        }
+        assert!(store.session_count() <= MAX_SESSIONS);
+        // Oldest sessions should be evicted
+        assert!(store.is_empty("s0"));
+        assert!(!store.is_empty(&format!("s{}", MAX_SESSIONS + 4)));
     }
 
+    // ── Injection format ──
+
     #[test]
-    fn injection_includes_rule() {
+    fn empty_session_empty_injection() {
         let store = FeedbackStore::new();
-        store.add(make_feedback("don't use mocks", "Not stated", "General"));
-        let injection = store.build_injection();
-        assert!(injection.contains("[Learned Feedback Rules]"));
-        assert!(injection.contains("don't use mocks"));
+        assert!(store.build_injection("s1").is_empty());
     }
 
     #[test]
     fn injection_includes_reason_when_stated() {
         let store = FeedbackStore::new();
-        store.add(make_feedback("use real DB", "mocks diverged from prod", "General"));
-        let injection = store.build_injection();
-        assert!(injection.contains("Why: mocks diverged from prod"));
+        store.add("s1", make_fb_full("use real DB", "mocks diverged", "General"));
+        let inj = store.build_injection("s1");
+        assert!(inj.contains("Why: mocks diverged"));
     }
 
     #[test]
     fn injection_omits_reason_when_not_stated() {
         let store = FeedbackStore::new();
-        store.add(make_feedback("use real DB", "Not stated", "General"));
-        let injection = store.build_injection();
-        assert!(!injection.contains("Why:"));
+        store.add("s1", make_fb("use real DB"));
+        let inj = store.build_injection("s1");
+        assert!(!inj.contains("Why:"));
     }
 
     #[test]
     fn injection_includes_apply_when_when_specific() {
         let store = FeedbackStore::new();
-        store.add(make_feedback("use real DB", "Not stated", "integration tests"));
-        let injection = store.build_injection();
-        assert!(injection.contains("When: integration tests"));
+        store.add("s1", make_fb_full("use real DB", "Not stated", "integration tests"));
+        let inj = store.build_injection("s1");
+        assert!(inj.contains("When: integration tests"));
     }
 
     #[test]
     fn injection_omits_apply_when_when_general() {
         let store = FeedbackStore::new();
-        store.add(make_feedback("use real DB", "Not stated", "General"));
-        let injection = store.build_injection();
-        assert!(!injection.contains("When:"));
+        store.add("s1", make_fb("use real DB"));
+        let inj = store.build_injection("s1");
+        assert!(!inj.contains("When:"));
     }
 
-    #[test]
-    fn injection_multiple_rules() {
-        let store = FeedbackStore::new();
-        store.add(make_feedback("rule A", "Not stated", "General"));
-        store.add(make_feedback("rule B", "reason B", "context B"));
-        let injection = store.build_injection();
-        assert!(injection.contains("rule A"));
-        assert!(injection.contains("rule B"));
-        assert!(injection.contains("Why: reason B"));
-        assert!(injection.contains("When: context B"));
-    }
+    // ── Thread safety ──
 
     #[test]
-    fn thread_safe_concurrent_access() {
+    fn concurrent_access() {
         use std::sync::Arc;
         let store = Arc::new(FeedbackStore::new());
         let handles: Vec<_> = (0..10)
             .map(|i| {
                 let s = store.clone();
                 std::thread::spawn(move || {
-                    s.add(make_feedback(&format!("rule {i}"), "Not stated", "General"));
-                    s.len()
+                    let sid = format!("s{}", i % 3);
+                    s.add(&sid, make_fb(&format!("rule {i}")));
+                    s.len(&sid)
                 })
             })
             .collect();
         for h in handles {
             h.join().unwrap();
         }
-        assert_eq!(store.len(), 10);
+        // 10 rules across 3 sessions
+        let total: usize = (0..3).map(|i| store.len(&format!("s{i}"))).sum();
+        assert_eq!(total, 10);
     }
 }
