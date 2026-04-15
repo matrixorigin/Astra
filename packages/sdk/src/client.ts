@@ -1,10 +1,16 @@
 import type {
   AstraClientConfig,
+  AuthResult,
   ChatRequest,
+  MemoryEntry,
+  MemorySearchResult,
   RunStatus,
+  SessionAudit,
   SessionInfo,
+  SkillInfo,
   StreamEvent,
   ConnectionState,
+  UserInfo,
 } from './types';
 import { SSEClient } from './sse-client';
 
@@ -26,6 +32,37 @@ export class AstraClient {
   }
 
   // ─── Auth ──────────────────────────────────────────────────────────
+
+  /** Register a new user account. */
+  async register(username: string, password: string): Promise<AuthResult> {
+    const result = await this.post<AuthResult>('/api/auth/register', { username, password });
+    this.accessToken = result.access_token;
+    this.refreshTokenValue = result.refresh_token;
+    return result;
+  }
+
+  /** Log in with username/password. Stores tokens automatically. */
+  async login(username: string, password: string): Promise<AuthResult> {
+    const result = await this.post<AuthResult>('/api/auth/login', { username, password });
+    this.accessToken = result.access_token;
+    this.refreshTokenValue = result.refresh_token;
+    return result;
+  }
+
+  /** Log out and clear stored tokens. */
+  async logout(): Promise<void> {
+    try {
+      await this.post('/api/auth/logout');
+    } finally {
+      this.accessToken = null;
+      this.refreshTokenValue = null;
+    }
+  }
+
+  /** Get the current authenticated user's info. */
+  async getMe(): Promise<UserInfo> {
+    return this.fetch<UserInfo>('/api/auth/me');
+  }
 
   setTokens(accessToken: string, refreshToken?: string): void {
     this.accessToken = accessToken;
@@ -112,6 +149,14 @@ export class AstraClient {
     return this.fetch<SessionInfo[]>('/api/sessions');
   }
 
+  async deleteSession(sessionId: string): Promise<void> {
+    await this.fetch(`/api/sessions/${sessionId}`, { method: 'DELETE' });
+  }
+
+  async getSessionAudit(sessionId: string): Promise<SessionAudit> {
+    return this.fetch<SessionAudit>(`/api/sessions/${sessionId}/audit`);
+  }
+
   // ─── Runs ──────────────────────────────────────────────────────────
 
   async createRun(request: ChatRequest): Promise<RunStatus> {
@@ -126,8 +171,40 @@ export class AstraClient {
     await this.post(`/api/runs/${runId}/cancel`);
   }
 
+  async pauseRun(runId: string): Promise<void> {
+    await this.post(`/api/runs/${runId}/pause`);
+  }
+
+  async resumeRun(runId: string): Promise<void> {
+    await this.post(`/api/runs/${runId}/resume`);
+  }
+
   async getRunEvents(runId: string, startIndex = 0): Promise<StreamEvent[]> {
     return this.fetch<StreamEvent[]>(`/api/runs/${runId}/events?start=${startIndex}`);
+  }
+
+  // ─── Memory ─────────────────────────────────────────────────────────
+
+  async memoryStore(entry: MemoryEntry): Promise<{ id: string }> {
+    return this.post<{ id: string }>('/api/memory/store', entry);
+  }
+
+  async memorySearch(query: string, topK = 10): Promise<MemorySearchResult[]> {
+    return this.post<MemorySearchResult[]>('/api/memory/search', { query, top_k: topK });
+  }
+
+  async memoryRetrieve(query: string, topK = 5): Promise<MemorySearchResult[]> {
+    return this.post<MemorySearchResult[]>('/api/memory/retrieve', { query, top_k: topK });
+  }
+
+  async memoryPurge(topic: string): Promise<void> {
+    await this.post('/api/memory/purge', { topic });
+  }
+
+  // ─── Skills ─────────────────────────────────────────────────────────
+
+  async listSkills(): Promise<SkillInfo[]> {
+    return this.fetch<SkillInfo[]>('/api/skills');
   }
 
   // ─── Streaming ─────────────────────────────────────────────────────
