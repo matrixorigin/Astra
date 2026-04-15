@@ -422,6 +422,8 @@ pub struct ToolExecutor {
     /// Per-turn mutation accounting for adjust_config governor.
     /// (turn_number, mutations_applied_on_turn)
     self_mod_mutation_counter: std::sync::Mutex<(u32, u32)>,
+    /// Shared tool executor for delegating unknown tools to astra-tools.
+    default_executor: astra_tools::executor::DefaultToolExecutor,
 }
 
 impl ToolExecutor {
@@ -430,7 +432,7 @@ impl ToolExecutor {
         let preferred_repos = detect_git_remote_repos(&root);
         let sandbox = astra_runtime::tool_sandbox::SandboxPolicy::for_project(&root);
         Self {
-            project_root: root,
+            project_root: root.clone(),
             cloud_base: None,
             cloud_token: None,
             // TODO: Consider using a zeroize-capable wrapper for tokens to prevent
@@ -486,6 +488,17 @@ impl ToolExecutor {
             self_mod_pinned_tools: std::sync::Mutex::new(Vec::new()),
             self_mod_deprioritized_tools: std::sync::Mutex::new(Vec::new()),
             self_mod_mutation_counter: std::sync::Mutex::new((0, 0)),
+            default_executor: astra_tools::executor::DefaultToolExecutor::new(
+                astra_tools::ToolContext {
+                    project_root: root.clone(),
+                    workspace_root: root.clone(),
+                    user_id: String::new(),
+                    session_id: String::new(),
+                    sandbox: astra_tools::SandboxConfig::standard(&root),
+                    http_client: None,
+                    logger: std::sync::Arc::new(astra_tools::TracingLogger),
+                },
+            ),
         }
     }
 
@@ -1096,16 +1109,11 @@ impl ToolExecutor {
                 "brief" => self.brief(args),
                 "context_analysis" => self.context_analysis(args),
                 _ if name.starts_with("mcp_") => self.execute_mcp_tool(name, args).await,
-                _ => format!(
-                    "Unknown tool: {name}. Available tools: bash, read_file, write_file, str_replace, \
-                 list_dir, grep, glob, symbols, find_definition, find_references, git_status, \
-                 git_diff, git_log, git_show, git_blame, call_graph, run_build_test, web_fetch, \
-                 mo_query, memory_search, memory_profile, adjust_config, prioritize_tool, \
-                 deprioritize_tool, set_goal, compress_context, ask_user, task_create, task_list, \
-                 task_get, task_update, task_stop, sleep, tool_search, web_search, send_message, \
-                 spawn_agent, share_context, query_context, context_analysis, \
-                 diagnose, lsp, env, notebook_edit, config, powershell, brief"
-                ),
+                _ => {
+                    // Delegate unknown tools to the shared DefaultToolExecutor.
+                    use astra_tools::ToolExecutor as _;
+                    self.default_executor.execute(name, args).await.output
+                }
             }
         };
         // Normalize empty output, then apply global safety net
