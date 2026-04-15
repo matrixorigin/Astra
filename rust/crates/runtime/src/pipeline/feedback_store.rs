@@ -141,19 +141,20 @@ impl FeedbackStore {
         rules: &'a [StructuredFeedback],
         user_message: &str,
     ) -> Vec<&'a StructuredFeedback> {
-        let msg_words: std::collections::HashSet<&str> = user_message
+        let msg_lower = user_message.to_lowercase();
+        let msg_words: std::collections::HashSet<&str> = msg_lower
             .split(|c: char| !c.is_alphanumeric() && c != '_' && c != '-')
-            .filter(|w| w.len() >= 3)
+            .filter(|w| w.chars().count() >= 2)
             .collect();
 
         let mut relevant = Vec::new();
         let mut irrelevant = Vec::new();
 
         for fb in rules {
-            let rule_text = format!("{} {}", fb.rule, fb.apply_when);
+            let rule_text = format!("{} {}", fb.rule, fb.apply_when).to_lowercase();
             let has_overlap = rule_text
                 .split(|c: char| !c.is_alphanumeric() && c != '_' && c != '-')
-                .filter(|w| w.len() >= 3)
+                .filter(|w| w.chars().count() >= 2)
                 .any(|w| msg_words.contains(w));
 
             if has_overlap {
@@ -464,6 +465,30 @@ mod tests {
         let injection = store.build_injection("s1");
         let rule_count = injection.matches("- Rule:").count();
         assert_eq!(rule_count, 6, "unfiltered should return all rules");
+    }
+
+    #[test]
+    fn filtered_injection_case_insensitive() {
+        let store = FeedbackStore::new();
+        store.add("s1", make_fb_with_apply("Don't use Mocks", "Testing"));
+        let injection = store.build_injection_filtered("s1", Some("write tests with mocks"));
+        assert!(
+            injection.contains("Don't use Mocks"),
+            "case-insensitive match should find 'Mocks' via 'mocks'"
+        );
+    }
+
+    #[test]
+    fn filtered_injection_chinese_keyword_match() {
+        let store = FeedbackStore::new();
+        store.add("s1", make_fb_with_apply("不要用bash执行git命令", "General"));
+        store.add("s1", make_fb_with_apply("always run clippy", "General"));
+        let injection = store.build_injection_filtered("s1", Some("用bash运行测试"));
+        // "bash" overlaps — should match
+        assert!(
+            injection.contains("bash"),
+            "Chinese+ASCII mixed keyword should match"
+        );
     }
 
     #[test]
