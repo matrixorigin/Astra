@@ -221,6 +221,36 @@ impl AgentMailbox {
     }
 }
 
+/// Safety-net cleanup: unregister the mailbox from the router on drop.
+///
+/// Explicit `router.unregister()` calls at usage sites remain the primary
+/// cleanup mechanism. This Drop impl catches cases where a mailbox is
+/// dropped without explicit cleanup (e.g., child agents in delegation).
+///
+/// Uses `tokio::task::spawn` because `unregister` is async and `Drop` is sync.
+/// The spawned task is fire-and-forget — if the runtime is shutting down,
+/// the unregister may not complete, but that's acceptable since the transport
+/// is being torn down anyway.
+impl Drop for AgentMailbox {
+    fn drop(&mut self) {
+        let router = Arc::clone(&self.router);
+        let addr = self.address.clone();
+        // Best-effort: spawn only if a tokio runtime is available.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                if let Err(e) = router.unregister(&addr).await {
+                    tracing::debug!(
+                        target: "astra_runtime::messaging",
+                        addr = %addr,
+                        error = ?e,
+                        "mailbox drop: unregister failed (may already be cleaned up)",
+                    );
+                }
+            });
+        }
+    }
+}
+
 // ─── AgentMailboxRouter ─────────────────────────────────────────────────────
 
 /// Central message router that resolves targets and dispatches via a transport.
@@ -350,6 +380,33 @@ impl AgentMailboxRouter {
     /// Used by the send_message tool to display broadcast recipients.
     pub async fn list_registered_agents(&self) -> Vec<String> {
         self.agent_id_index.read().await.keys().cloned().collect()
+    }
+
+    /// Check whether a specific run_id is registered in the address registry.
+    pub async fn is_run_registered(&self, run_id: &str) -> bool {
+        self.address_registry.read().await.contains_key(run_id)
+    }
+
+    /// Register an agent only if its run_id is not already registered.
+    ///
+    /// Returns `Ok(Some(mailbox))` if newly registered, `Ok(None)` if already
+    /// present (no-op), or `Err` on transport failure.
+    ///
+    /// This prevents clobbering a caller's pre-registered mailbox.
+    pub async fn register_if_absent(
+        self: &Arc<Self>,
+        addr: AgentAddress,
+        delegation_id: Option<String>,
+    ) -> Result<Option<AgentMailbox>, MailboxError> {
+        // Fast path: check under read lock. If present, skip registration.
+        // There is a small TOCTOU window between this check and register(),
+        // but register() handles re-registration gracefully (overwrites with
+        // warning), and in practice the same parent_run_id (UUID) is never
+        // registered concurrently.
+        if self.address_registry.read().await.contains_key(&addr.run_id) {
+            return Ok(None);
+        }
+        self.register(addr, delegation_id).await.map(Some)
     }
 
     /// Resolve the address of a parent run.

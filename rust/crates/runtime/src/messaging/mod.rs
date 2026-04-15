@@ -52,6 +52,8 @@ mod delegation_mailbox_tests;
 mod e2e_loop_tests;
 #[cfg(test)]
 mod integration_tests;
+#[cfg(test)]
+mod orchestrator_mailbox_tests;
 
 // Re-export key types for convenience.
 pub use ack_tracker::{AckConfig, AckOutcome, PendingAckTracker};

@@ -1479,6 +1479,39 @@ impl DelegationEngine {
             .init_progress(&request.delegation_id, &agent_ids_for_journal)
             .await;
 
+        // Register the parent/orchestrator with the mailbox router so child
+        // agents can send progress and messages to `MessageTarget::Parent`.
+        // Without this, `resolve_parent_addr` falls back to a synthetic address
+        // that has no inbox in the transport, causing `AgentNotFound` errors.
+        //
+        // Uses `register_if_absent` to atomically skip if the caller already
+        // registered this run_id (e.g., CLI layer or tests that pre-register
+        // a parent mailbox to receive messages).
+        let parent_mailbox = if let Some(router) = &self.mailbox_router {
+            let parent_addr = crate::messaging::types::AgentAddress {
+                run_id: request.parent_run_id.clone(),
+                agent_id: source_agent_id.to_string(),
+            };
+            match router.register_if_absent(parent_addr, None).await {
+                Ok(mb) => mb, // Some(mailbox) if newly registered, None if already present
+                Err(e) => {
+                    tracing::warn!(
+                        target: "astra_runtime::delegation",
+                        parent_run_id = %request.parent_run_id,
+                        error = %e,
+                        "failed to register parent mailbox; child progress messages will be lost",
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        // Note: parent_mailbox cleanup on panic is handled by AgentMailbox's
+        // Drop impl, which spawns a background unregister task. On the normal
+        // path, we unregister explicitly below for proper error handling.
+
         let result = match &request.pattern {
             CoordinationPattern::FanOut {
                 agent_ids,
@@ -1563,6 +1596,23 @@ impl DelegationEngine {
                 .await
             }
         };
+
+        // Unregister the parent mailbox now that all children have completed.
+        // This prevents resource leaks and address collisions with future runs.
+        if let (Some(router), Some(mb)) = (&self.mailbox_router, &parent_mailbox) {
+            let addr = mb.address.clone();
+            if let Err(e) = router.unregister(&addr).await {
+                tracing::warn!(
+                    target: "astra_runtime::delegation",
+                    parent_run_id = %addr.run_id,
+                    error = %e,
+                    "failed to unregister parent mailbox after delegation",
+                );
+            }
+        }
+        // Drop parent_mailbox explicitly before journal write so the Drop
+        // impl doesn't race with the explicit unregister above.
+        drop(parent_mailbox);
 
         // Journal: delegation completed
         if let Ok(ref dr) = result {
@@ -1879,7 +1929,28 @@ impl DelegationEngine {
         }
 
         let mut results = Vec::new();
-        while let Some(join_result) = join_set.join_next().await {
+        // Cancellation-aware collection: if the cancel token fires while we're
+        // waiting for results, abort all remaining tasks and drain what's left.
+        // Without this, the loop blocks until all tasks complete even after cancel.
+        let mut cancelled = false;
+        while let Some(join_result) = {
+            if cancelled {
+                // After abort_all, drain remaining results without waiting.
+                join_set.join_next().await
+            } else if let Some(token) = cancel_token {
+                tokio::select! {
+                    biased;
+                    r = join_set.join_next() => r,
+                    _ = token.cancelled() => {
+                        cancelled = true;
+                        join_set.abort_all();
+                        join_set.join_next().await
+                    }
+                }
+            } else {
+                join_set.join_next().await
+            }
+        } {
             match join_result {
                 Ok((Ok(result), _, _)) => results.push(result),
                 Ok((Err(e), agent_id, run_id)) => {
@@ -2744,11 +2815,9 @@ impl DelegationEngine {
         } else {
             None
         };
-        let mut handles: Vec<(
-            tokio::task::JoinHandle<(Result<AgentResult, String>, String, String)>,
-            String,
-            String,
-        )> = Vec::with_capacity(tasks.len());
+        let mut handles: tokio::task::JoinSet<(Result<AgentResult, String>, String, String)> =
+            tokio::task::JoinSet::new();
+        let mut fork_id_map: HashMap<tokio::task::Id, (String, String)> = HashMap::new();
         for (i, task) in tasks.iter().enumerate() {
             let run_id = uuid::Uuid::new_v4().to_string();
             self.run_engine
@@ -2863,7 +2932,7 @@ impl DelegationEngine {
             // Capture identity before moving config (panic context)
             let captured_agent_id = config.agent_profile.agent_id.clone();
             let captured_run_id = config.run_id.clone();
-            let handle = tokio::spawn(async move {
+            let abort_handle = handles.spawn(async move {
                 let _permit = match sem {
                     Some(ref s) => Some(s.acquire().await.expect("semaphore closed")),
                     None => None,
@@ -2931,17 +3000,34 @@ impl DelegationEngine {
                     .await;
                 (result, agent_id, run_id)
             });
-            handles.push((handle, captured_agent_id, captured_run_id));
+            fork_id_map.insert(abort_handle.id(), (captured_agent_id, captured_run_id));
         }
 
-        // Collect all results
-        let mut results = Vec::with_capacity(handles.len());
-        for (handle, panic_agent_id, panic_run_id) in handles {
-            match handle.await {
+        // Collect all results (cancellation-aware, abort-on-drop via JoinSet)
+        let mut results = Vec::with_capacity(tasks.len());
+        let mut fork_cancelled = false;
+        while let Some(join_result) = {
+            if fork_cancelled {
+                handles.join_next().await
+            } else if let Some(token) = cancel_token {
+                tokio::select! {
+                    biased;
+                    r = handles.join_next() => r,
+                    _ = token.cancelled() => {
+                        fork_cancelled = true;
+                        handles.abort_all();
+                        handles.join_next().await
+                    }
+                }
+            } else {
+                handles.join_next().await
+            }
+        } {
+            match join_result {
                 Ok((Ok(r), _, _)) => results.push(r),
-                Ok((Err(e), agent_id_from_task, run_id_from_task)) => results.push(AgentResult {
-                    agent_id: agent_id_from_task,
-                    run_id: run_id_from_task,
+                Ok((Err(e), agent_id, run_id)) => results.push(AgentResult {
+                    agent_id,
+                    run_id,
                     status: "failed".to_string(),
                     output: None,
                     error: Some(e),
@@ -2950,7 +3036,10 @@ impl DelegationEngine {
                     tool_calls: 0,
                 }),
                 Err(e) => {
-                    // JoinError (panic) — use captured identity
+                    let (panic_agent_id, panic_run_id) = fork_id_map
+                        .get(&e.id())
+                        .cloned()
+                        .unwrap_or_else(|| ("unknown".to_string(), "unknown".to_string()));
                     if let Err(e2) = self
                         .run_engine
                         .persist_status(
