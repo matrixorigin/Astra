@@ -353,7 +353,8 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
                 subrun_session_id.clone(),
                 memoria_base,
                 None,
-            );
+            )
+            .with_cancel_token(self.cancel_token.clone());
             if let Some(pool) = &self.edge_connection_pool {
                 executor.set_edge_connection_pool(pool.clone());
             }

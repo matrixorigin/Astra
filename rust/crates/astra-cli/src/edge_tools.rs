@@ -497,6 +497,7 @@ impl ToolExecutor {
                     sandbox: astra_tools::SandboxConfig::standard(&root),
                     http_client: None,
                     logger: std::sync::Arc::new(astra_tools::TracingLogger),
+                    cancel_token: None,
                 },
             ),
         }
