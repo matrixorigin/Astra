@@ -280,6 +280,8 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             pending_reflection_signals: Vec::new(),
             recent_tactical_actions: Vec::new(),
             server_tool_executor: None,
+            interruption: None,
+            confidence_trend: Default::default(),
         };
 
         // Inherit skills from parent: pre-populate discovered skills

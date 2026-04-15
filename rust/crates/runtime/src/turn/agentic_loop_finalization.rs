@@ -213,6 +213,23 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
 ) -> Result<AgenticLoopOutcome, String> {
     let result = run_agentic_loop_impl(host, state).await;
 
+    // Emit structured interruption to journal if one was recorded.
+    if let Some(ref interruption) = state.interruption {
+        if let Ok(json) = serde_json::to_value(interruption) {
+            if let Some(ref sid) = state.current_session_id {
+                let turn_num = (state.max_turns - state.remaining_turns) as u32;
+                let evt = astra_services::session_journal::JournalEvent::interruption_recorded(
+                    Some(sid.as_str()),
+                    turn_num,
+                    json,
+                );
+                if let Ok(writer) = astra_services::session_journal::JournalWriter::new(sid) {
+                    let _ = writer.append(&evt);
+                }
+            }
+        }
+    }
+
     if let Some(evo) = state.evolution_service.clone() {
         evo.set_runtime_promotion_signals(state.telemetry.runtime_promotion_signals.clone());
         let (pending_before, applied_before, canary_before, resolved_before) =

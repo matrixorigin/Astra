@@ -553,6 +553,8 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             pending_reflection_signals: Vec::new(),
             recent_tactical_actions: Vec::new(),
             server_tool_executor: None,
+            interruption: None,
+            confidence_trend: Default::default(),
         };
 
         if let Err(err) = run_agentic_loop_with_host(&mut host, &mut state).await {

@@ -10,6 +10,9 @@ use super::agentic_loop_host::{
     AgenticLoopHost, AgenticLoopOutcome, AgenticLoopState, delegate_tool_schema,
     try_write_heavy_checkpoint,
 };
+use super::interruption::{
+    InterruptionKind, InterruptionRecord, InterruptionStateSummary, ResumeAction,
+};
 use super::stall::CLI_AGENTIC_TURN_BUDGET_STALL_ABORT_MSG;
 
 #[derive(Clone, Copy)]
@@ -46,6 +49,20 @@ fn budget_exhaustion_completion_text(state: &AgenticLoopState) -> String {
             "[Turn budget exhausted after {} agentic turn(s). Partial progress is preserved.{}]\n",
             state.max_turns, checkpoint_note
         )
+    }
+}
+
+/// Build an interruption state summary from the current loop state.
+pub(crate) fn interruption_state_summary(
+    state: &AgenticLoopState,
+    error_detail: Option<String>,
+) -> InterruptionStateSummary {
+    InterruptionStateSummary {
+        has_checkpoint: state.stall.last_heavy_checkpoint.is_some(),
+        tool_calls_completed: state.total_tool_calls,
+        turns_completed: (state.max_turns - state.remaining_turns) as u32,
+        remaining_turns: state.remaining_turns as u32,
+        error_detail,
     }
 }
 
@@ -172,6 +189,12 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
                 .as_ref()
                 .is_some_and(|t| t.is_cancelled())
         {
+            try_write_heavy_checkpoint(state);
+            state.interruption = Some(InterruptionRecord::new(
+                InterruptionKind::UserCancelled,
+                ResumeAction::ContinueImmediately,
+                interruption_state_summary(state, None),
+            ));
             return Ok(PreparedTurnIteration::Finished(
                 AgenticLoopOutcome::Cancelled,
             ));
@@ -190,6 +213,12 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
             .as_ref()
             .is_some_and(|t| t.is_cancelled())
     {
+        try_write_heavy_checkpoint(state);
+        state.interruption = Some(InterruptionRecord::new(
+            InterruptionKind::UserCancelled,
+            ResumeAction::ContinueImmediately,
+            interruption_state_summary(state, None),
+        ));
         return Ok(PreparedTurnIteration::Finished(
             AgenticLoopOutcome::Cancelled,
         ));
@@ -198,6 +227,11 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
     if state.remaining_turns == 0 {
         if should_complete_budget_exhaustion_gracefully(state) {
             try_write_heavy_checkpoint(state);
+            state.interruption = Some(InterruptionRecord::new(
+                InterruptionKind::BudgetExhausted,
+                ResumeAction::ContinueImmediately,
+                interruption_state_summary(state, None),
+            ));
             if state.final_text.trim().is_empty() {
                 state.final_text = budget_exhaustion_completion_text(state);
             }
@@ -263,10 +297,27 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
                     reason.as_str(),
                     state.total_tool_calls,
                 );
+                state.interruption = Some(InterruptionRecord::new(
+                    InterruptionKind::CooldownRejected,
+                    ResumeAction::WaitAndRetry {
+                        delay_seconds: reset_in_ms / 1000,
+                    },
+                    interruption_state_summary(
+                        state,
+                        Some(format!("Rate limit: {}", reason.as_str())),
+                    ),
+                ));
                 return Ok(PreparedTurnIteration::Finished(
                     AgenticLoopOutcome::Completed,
                 ));
             }
+            state.interruption = Some(InterruptionRecord::new(
+                InterruptionKind::CooldownRejected,
+                ResumeAction::WaitAndRetry {
+                    delay_seconds: reset_in_ms / 1000,
+                },
+                interruption_state_summary(state, Some(format!("Rate limit: {}", reason.as_str()))),
+            ));
             return Err(format!(
                 "Rate limit cooldown active ({}). Resets in ~{secs}s. Please wait and retry.",
                 reason.as_str(),

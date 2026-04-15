@@ -6,11 +6,13 @@ use super::agentic_loop_host::{
     finalize_turn_trace, try_write_heavy_checkpoint,
 };
 use super::agentic_loop_lifecycle::TurnIterationPrep;
+use super::agentic_loop_lifecycle::interruption_state_summary;
 use super::agentic_turn_ingest::{
     AgenticIngestIterationControl, AgenticTurnIngestMut,
     agentic_turn_stream_snapshot_from_sse_accum, ingest_agentic_turn_stream,
     map_ingest_outcome_to_iteration_control,
 };
+use super::interruption::{InterruptionKind, InterruptionRecord, ResumeAction};
 
 pub(crate) struct TurnExecutionPhase {
     pub(crate) llm_wall_start: Instant,
@@ -111,6 +113,14 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                      Error: {}",
                     state.total_tool_calls, e,
                 );
+                state.interruption = Some(InterruptionRecord::new(
+                    InterruptionKind::RateLimited,
+                    ResumeAction::WaitAndRetry { delay_seconds: 30 },
+                    interruption_state_summary(
+                        state,
+                        Some(format!("Rate limit during streaming: {}", e)),
+                    ),
+                ));
                 observe_turn_end_without_tools(
                     state,
                     turn_index,
@@ -120,6 +130,19 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                 finalize_and_render(host, state);
                 return Ok(TurnExecutionControl::Return(AgenticLoopOutcome::Completed));
             }
+
+            if is_rate_limit {
+                state.interruption = Some(InterruptionRecord::new(
+                    InterruptionKind::RateLimited,
+                    ResumeAction::WaitAndRetry { delay_seconds: 30 },
+                    interruption_state_summary(
+                        state,
+                        Some(format!("Rate limit during streaming: {}", e)),
+                    ),
+                ));
+            }
+            // Non-rate-limit fatal errors do not record a structured interruption
+            // — they surface as `AgenticLoopOutcome::Error` directly.
 
             finalize_turn_trace(state);
             try_write_heavy_checkpoint(state);
@@ -253,6 +276,17 @@ fn handle_token_budget<H: AgenticLoopHost>(
                 "⚠ Token budget exceeded — completing turn.".to_string(),
             );
         }
+        state.interruption = Some(InterruptionRecord::new(
+            InterruptionKind::TokenBudgetExceeded,
+            ResumeAction::ContinueImmediately,
+            interruption_state_summary(
+                state,
+                Some(format!(
+                    "Token budget: {}/{} tokens",
+                    measured, state.max_turn_input_tokens,
+                )),
+            ),
+        ));
         observe_turn_end_without_tools(
             state,
             turn_index,
@@ -322,6 +356,11 @@ fn record_tool_selection(
     turn_result: &HostTurnResult,
     turn_index: usize,
 ) {
+    // Feed confidence trend tracker with latest selector confidence.
+    if let Some(conf) = state.telemetry.first_selector_confidence {
+        state.confidence_trend.record(conf);
+    }
+
     if let Some(session) = &state.telemetry.observability_session {
         let selected_tools: Vec<String> = turn_result
             .edge_tool_round

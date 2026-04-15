@@ -737,6 +737,8 @@ pub enum JournalEventType {
     AdaptiveExperimentEnrolled,
     /// Tuning rule evaluated and triggered a config change.
     AdaptiveTuningRuleTriggered,
+    /// A structured interruption was recorded (budget exhaustion, rate limit, cancel, etc.).
+    InterruptionRecorded,
 }
 
 /// Writer that appends events to a session journal file.
@@ -2541,6 +2543,32 @@ impl JournalEvent {
             "rule_name": rule_name,
             "signal_type": signal_type,
             "config_changes": changes,
+        }));
+        evt
+    }
+
+    /// Record a structured interruption (budget exhaustion, rate limit, cancel, etc.).
+    pub fn interruption_recorded(
+        session_id: Option<&str>,
+        turn: u32,
+        interruption_json: serde_json::Value,
+    ) -> Self {
+        let mut evt = Self::base(JournalEventType::InterruptionRecorded, session_id);
+        evt.turn = Some(turn);
+        let kind_str = interruption_json
+            .get("kind")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        let resumable = interruption_json
+            .get("resumable")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        evt.user_input = Some(truncate(
+            &format!("interruption: {} (resumable={})", kind_str, resumable,),
+            200,
+        ));
+        evt.metadata = Some(serde_json::json!({
+            "interruption": interruption_json,
         }));
         evt
     }
